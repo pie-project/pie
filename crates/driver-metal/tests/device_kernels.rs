@@ -14,7 +14,6 @@
 //!
 //! [`real_kernels`]: ../real_kernels/index.html
 
-
 use std::path::PathBuf;
 
 use driver_metal::Error;

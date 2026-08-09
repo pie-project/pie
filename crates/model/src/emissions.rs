@@ -12,10 +12,10 @@
 //! along from the bin, because which digest corrected which guess is the
 //! history that explains the values.
 
-use crate::shared::llama_like::forward::emit::emit_llama_like_cuda_inc;
-use crate::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
 use crate::qwen_3_5::forward::emit::emit_qwen35_cuda_inc;
 use crate::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
+use crate::shared::llama_like::forward::emit::emit_llama_like_cuda_inc;
+use crate::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
 
 /// One committed emission: which family directory it lands in, the file
 /// stem, and the full generated text.
@@ -41,7 +41,11 @@ impl CudaEmission {
 /// Every `.inc` the repository commits, in emission order.
 pub fn committed_cuda_emissions() -> Vec<CudaEmission> {
     let mut out = Vec::new();
-    let llama = |name: &'static str, text: String| CudaEmission { family: "llama_like", name, text };
+    let llama = |name: &'static str, text: String| CudaEmission {
+        family: "llama_like",
+        name,
+        text,
+    };
 
     // Qwen3-0.6B on L40S (the parity-anchored deployment). The binding
     // unties the lm_head (live digest `te0`, measured 2026-08-02), so

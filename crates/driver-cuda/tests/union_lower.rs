@@ -21,10 +21,10 @@
 
 use std::collections::BTreeSet;
 
+use driver_cuda::fire::recordings::predicate_of;
 use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
 use model::shared::llama_like::forward::llama_like_cuda;
 use model_compiler::lower::{CondRegion, Fire, GuardMode, Launch, Lowered, Row, lower_with};
-use driver_cuda::fire::recordings::predicate_of;
 use model_compiler::trace::FireClass;
 
 fn lowered(class: FireClass, rows: usize, guards: GuardMode) -> Lowered {
@@ -36,10 +36,23 @@ fn lowered(class: FireClass, rows: usize, guards: GuardMode) -> Lowered {
     // `lora` on, so the family's `HasLora` guard has something to be
     // undecided ABOUT — under `Resolve` this is what picks the arm, and
     // under `Union` it must stop mattering.
-    let rows: Vec<Row> =
-        vec![Row { samples: true, lora: true, ..Row::default() }; rows];
-    lower_with(&plan, &rows, Fire { captures_across_splits: false }, guards)
-        .expect("the live form lowers")
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            lora: true,
+            ..Row::default()
+        };
+        rows
+    ];
+    lower_with(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+        guards,
+    )
+    .expect("the live form lowers")
 }
 
 /// The path from the root to `cond`, as tree-node indices — the same walk
@@ -49,7 +62,9 @@ fn path(conds: &[CondRegion], cond: u32) -> Vec<u32> {
     let mut at = cond;
     while at != Launch::NO_COND {
         out.push(at);
-        let Some(node) = conds.get(at as usize) else { break };
+        let Some(node) = conds.get(at as usize) else {
+            break;
+        };
         at = node.parent;
     }
     out.reverse();
@@ -91,12 +106,27 @@ fn the_union_keeps_a_well_formed_tree() {
     // a driver deriving the pair would match the wrong node.
     for (i, r) in l.conds.iter().enumerate() {
         let sib = l.conds.get(r.sibling as usize).unwrap_or_else(|| {
-            panic!("node {i} names sibling {}, which is not in the tree", r.sibling)
+            panic!(
+                "node {i} names sibling {}, which is not in the tree",
+                r.sibling
+            )
         });
-        assert_eq!(sib.sibling as usize, i, "node {i}'s sibling does not name it back");
-        assert_ne!(sib.on_true, r.on_true, "node {i} and its sibling are the same arm");
-        assert_eq!(sib.parent, r.parent, "node {i} and its sibling sit under different parents");
-        assert_eq!(sib.slot, r.slot, "node {i} and its sibling read different predicates");
+        assert_eq!(
+            sib.sibling as usize, i,
+            "node {i}'s sibling does not name it back"
+        );
+        assert_ne!(
+            sib.on_true, r.on_true,
+            "node {i} and its sibling are the same arm"
+        );
+        assert_eq!(
+            sib.parent, r.parent,
+            "node {i} and its sibling sit under different parents"
+        );
+        assert_eq!(
+            sib.slot, r.slot,
+            "node {i} and its sibling read different predicates"
+        );
     }
 }
 
@@ -177,9 +207,18 @@ fn the_union_filtered_by_its_predicates_is_the_resolved_form() {
                 &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
                 FireClass::Decode,
             );
-            let fire = Fire { captures_across_splits: false };
-            let rows: Vec<Row> =
-                vec![Row { samples: true, lora, hooked, ..Row::default() }; 4];
+            let fire = Fire {
+                captures_across_splits: false,
+            };
+            let rows: Vec<Row> = vec![
+                Row {
+                    samples: true,
+                    lora,
+                    hooked,
+                    ..Row::default()
+                };
+                4
+            ];
 
             let resolved = lower_with(&plan, &rows, fire, GuardMode::Resolve).expect("lowers");
             let union = lower_with(&plan, &rows, fire, GuardMode::Union).expect("lowers");
@@ -196,7 +235,11 @@ fn the_union_filtered_by_its_predicates_is_the_resolved_form() {
                 .iter()
                 .filter(|x| live(x.cond))
                 .map(|x| {
-                    (union.kernels[x.kernel as usize].as_str(), x.rows.clone(), x.layers.clone())
+                    (
+                        union.kernels[x.kernel as usize].as_str(),
+                        x.rows.clone(),
+                        x.layers.clone(),
+                    )
                 })
                 .collect();
             let want: Vec<_> = resolved
@@ -231,9 +274,24 @@ fn a_lora_free_fire_unions_to_the_same_program() {
         &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
         FireClass::Decode,
     );
-    let fire = Fire { captures_across_splits: false };
-    let with: Vec<Row> = vec![Row { samples: true, lora: true, ..Row::default() }; 4];
-    let without: Vec<Row> = vec![Row { samples: true, ..Row::default() }; 4];
+    let fire = Fire {
+        captures_across_splits: false,
+    };
+    let with: Vec<Row> = vec![
+        Row {
+            samples: true,
+            lora: true,
+            ..Row::default()
+        };
+        4
+    ];
+    let without: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        4
+    ];
 
     let a = lower_with(&plan, &with, fire, GuardMode::Union).expect("lowers");
     let b = lower_with(&plan, &without, fire, GuardMode::Union).expect("lowers");

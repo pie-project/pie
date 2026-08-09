@@ -39,9 +39,9 @@ pub mod chat;
 use std::sync::{Arc, OnceLock};
 
 use crate::catalog::{Deployed, LoadShape, Variant};
+use crate::manifest::Manifest;
 use crate::shared::llama_like::project;
 use crate::shared::llama_like::spec::LlamaLikeFacts;
-use crate::manifest::Manifest;
 
 use model_compiler::facts::{NormPlacement, QkNorm};
 use model_compiler::trace::{NormVariant, RopeKind};
@@ -332,6 +332,25 @@ pub fn rows() -> &'static [&'static dyn Variant] {
     ROWS.get_or_init(|| VARIANTS.iter().map(|v| v as &'static dyn Variant).collect())
 }
 
+impl Llama3 {
+    /// The scalars this row states, read ONCE.
+    ///
+    /// Both [`Variant::deployment`] and [`Variant::trace`] take it. They
+    /// used to read `rope_theta`, `norm_eps` and `window` off `self`
+    /// separately — the same three fields, spelled twice, with nothing
+    /// holding the two spellings together.
+    fn row(&self) -> project::RowScalars {
+        project::RowScalars {
+            rope_theta: self.rope_theta,
+            norm_eps: self.norm_eps,
+            window: self.window,
+            rope_rescaled: true,
+            // Unread: this generation is dense, so no router is stated.
+            norm_topk_prob: true,
+        }
+    }
+}
+
 impl Variant for Llama3 {
     fn id(&self) -> &'static str {
         self.id
@@ -347,7 +366,11 @@ impl Variant for Llama3 {
     /// is dense, so the mixture fields are not merely zero by default —
     /// there is no Llama 3 mixture to state.
     fn load_shape(&self) -> LoadShape {
-        LoadShape::dense(self.shape.layers, self.shape.head_dim, self.shape.tied_embeddings)
+        LoadShape::dense(
+            self.shape.layers,
+            self.shape.head_dim,
+            self.shape.tied_embeddings,
+        )
     }
 
     fn deployment(
@@ -355,8 +378,7 @@ impl Variant for Llama3 {
         load: Deployed<'_>,
     ) -> Result<crate::deployment::Deployment, crate::deployment::Refusal> {
         let _ = load;
-        let mut deployment =
-            project::deployment(&self.shape, self.rope_theta, self.norm_eps, self.window);
+        let mut deployment = project::deployment(&self.shape, self.row());
         // THE RESCALING, which nothing carried for the length of this
         // refactor. `driver-metal` read these four numbers off the
         // `pie.model/1` descriptor and built its decode ladder from
@@ -396,7 +418,9 @@ impl Variant for Llama3 {
         builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
         match builder.naming() {
-            crate::shared::policy::Naming::Hf => crate::shared::llama_like::contract::author_llama_like(builder),
+            crate::shared::policy::Naming::Hf => {
+                crate::shared::llama_like::contract::author_llama_like(builder)
+            }
             // A DIFFERENT BACKEND'S READING of the same checkpoint, and
             // the reason this is a `match` rather than a call: the MLX
             // author renames every tensor to the binder's own vocabulary
@@ -404,7 +428,9 @@ impl Variant for Llama3 {
             // HF contract published the checkpoint's raw names AND left
             // MLX's fp16 sidecars uncast, so a bf16 kernel read a scale
             // of 6e-3 as 1e-20 and every logit came out zero.
-            crate::shared::policy::Naming::Mlx => crate::shared::llama_like::contract::author_llama_mlx(builder),
+            crate::shared::policy::Naming::Mlx => {
+                crate::shared::llama_like::contract::author_llama_mlx(builder)
+            }
         }
     }
 
@@ -429,17 +455,7 @@ impl Variant for Llama3 {
         class: model_compiler::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
-        project::trace(
-            &self.shape,
-            project::MetalRow {
-                rope_theta: self.rope_theta,
-                norm_eps: self.norm_eps,
-                window: self.window,
-                rope_rescaled: true,
-            },
-            class,
-            load,
-        )
+        project::trace(&self.shape, self.row(), class, load)
     }
 
     /// The header protocol, which is NOT ChatML.
@@ -470,7 +486,9 @@ mod tests {
     #[test]
     fn every_row_projects() {
         for v in VARIANTS {
-            let d = v.deployment(Deployed::single()).expect("dense llama is servable");
+            let d = v
+                .deployment(Deployed::single())
+                .expect("dense llama is servable");
             assert_eq!(d.layers, v.shape.layers);
             assert_eq!(d.attention.len() as u32, v.shape.layers);
             assert_eq!(d.shape.hidden, v.shape.hidden);
@@ -483,7 +501,10 @@ mod tests {
 
             let ls = v.load_shape();
             assert_eq!(ls.layers, v.shape.layers);
-            assert_eq!(ls.head_dim, v.shape.head_dim, "the TRUE head dim, never a padded one");
+            assert_eq!(
+                ls.head_dim, v.shape.head_dim,
+                "the TRUE head dim, never a padded one"
+            );
             assert_eq!(ls.tied_embeddings, v.shape.tied_embeddings);
             assert_eq!(ls.n_experts, 0);
             assert_eq!(ls.mamba_groups, 0);
@@ -507,7 +528,13 @@ mod tests {
         let ids: Vec<&str> = rows().iter().map(|v| v.id()).collect();
         assert_eq!(
             ids,
-            ["llama-3.2-1b", "llama-3.2-3b", "llama-3.1-8b", "llama-3.1-70b", "llama-3.3-70b"]
+            [
+                "llama-3.2-1b",
+                "llama-3.2-3b",
+                "llama-3.1-8b",
+                "llama-3.1-70b",
+                "llama-3.3-70b"
+            ]
         );
     }
 
@@ -523,8 +550,15 @@ mod tests {
     #[test]
     fn the_row_answers_what_the_driver_advertises() {
         for v in VARIANTS {
-            let a = v.deployment(Deployed::single()).expect("dense llama deploys").advertised;
-            assert_eq!(a.arch, "llama", "{}: the family label a guest program sees", v.id);
+            let a = v
+                .deployment(Deployed::single())
+                .expect("dense llama deploys")
+                .advertised;
+            assert_eq!(
+                a.arch, "llama",
+                "{}: the family label a guest program sees",
+                v.id
+            );
             assert_eq!(
                 a.max_model_len, 131_072,
                 "{}: 3.1 raised the ceiling and 3.2 and 3.3 kept it",
@@ -552,8 +586,14 @@ mod tests {
             .strip_suffix("forcausallm")
             .expect("the suffix the worker strips")
             .to_string();
-        assert_eq!(stem, ARCH, "the worker would refuse a real Llama 3 checkpoint");
-        assert_ne!(ARCH, "llama3", "pie's own nickname, which no checkpoint carries");
+        assert_eq!(
+            stem, ARCH,
+            "the worker would refuse a real Llama 3 checkpoint"
+        );
+        assert_ne!(
+            ARCH, "llama3",
+            "pie's own nickname, which no checkpoint carries"
+        );
     }
 
     /// One label over five rows, which is what a FAMILY means: `llama`
@@ -564,12 +604,20 @@ mod tests {
     fn one_family_label_covers_five_distinct_rows() {
         let labels: std::collections::BTreeSet<&str> = VARIANTS
             .iter()
-            .map(|v| v.deployment(Deployed::single()).expect("deploys").advertised.arch)
+            .map(|v| {
+                v.deployment(Deployed::single())
+                    .expect("deploys")
+                    .advertised
+                    .arch
+            })
             .collect();
         assert_eq!(labels.len(), 1, "one label: {labels:?}");
         let ids: std::collections::BTreeSet<&str> = VARIANTS.iter().map(|v| v.id).collect();
         assert_eq!(ids.len(), VARIANTS.len(), "five ids");
-        assert!(ids.len() > labels.len(), "a label per row is not a family label");
+        assert!(
+            ids.len() > labels.len(),
+            "a label per row is not a family label"
+        );
     }
 
     /// The scaled rope ladder is a fact about the checkpoint, and the
@@ -596,7 +644,9 @@ mod tests {
     #[test]
     fn the_rescaling_reaches_the_deployment_with_the_rows_own_factor() {
         for v in VARIANTS {
-            let d = v.deployment(Deployed::single()).expect("every llama-3 row deploys");
+            let d = v
+                .deployment(Deployed::single())
+                .expect("every llama-3 row deploys");
             let Some(crate::deployment::RopeScaling::Llama3 {
                 factor,
                 low_freq_factor,
@@ -637,7 +687,11 @@ mod tests {
         assert_eq!(f("llama-3.3-70b"), 8.0);
         let distinct: std::collections::BTreeSet<u32> =
             VARIANTS.iter().map(|v| v.rope_factor.to_bits()).collect();
-        assert_eq!(distinct.len(), 2, "two values, so a shared const cannot express them");
+        assert_eq!(
+            distinct.len(),
+            2,
+            "two values, so a shared const cannot express them"
+        );
     }
 
     /// The tie is the ABSENCE of `lm_head`, which is the only way a
@@ -695,7 +749,10 @@ mod tests {
             assert_eq!(extent("layer.{}.self_attn.q_proj"), vec![q, hidden]);
             assert_eq!(extent("layer.{}.self_attn.k_proj"), vec![kv, hidden]);
             assert_eq!(extent("layer.{}.self_attn.v_proj"), vec![kv, hidden]);
-            assert_eq!(extent("embed_tokens"), vec![u64::from(v.shape.vocab), hidden]);
+            assert_eq!(
+                extent("embed_tokens"),
+                vec![u64::from(v.shape.vocab), hidden]
+            );
         }
     }
 
@@ -733,11 +790,18 @@ mod tests {
     /// the softmax scale differs between the two.
     #[test]
     fn the_1b_dispatches_to_a_narrower_attention_head() {
-        let small = row("llama-3.2-1b").deployment(Deployed::single()).expect("servable");
-        let large = row("llama-3.1-8b").deployment(Deployed::single()).expect("servable");
+        let small = row("llama-3.2-1b")
+            .deployment(Deployed::single())
+            .expect("servable");
+        let large = row("llama-3.1-8b")
+            .deployment(Deployed::single())
+            .expect("servable");
         assert_eq!(small.attention[0].head_dim, 64);
         assert_eq!(large.attention[0].head_dim, 128);
-        assert_eq!(small.shape.head_dim_kernel, 64, "64 is instantiated; nothing pads");
+        assert_eq!(
+            small.shape.head_dim_kernel, 64,
+            "64 is instantiated; nothing pads"
+        );
         assert_eq!(large.shape.head_dim_kernel, 128);
         assert!(small.attention[0].sm_scale > large.attention[0].sm_scale);
     }
@@ -767,14 +831,23 @@ mod tests {
 
         let inst = row("llama-3.1-8b").chat(tok.clone());
         let turn = tok.decode(&inst.user("Hi"), false);
-        assert_eq!(turn, "<|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|>");
-        assert!(!turn.contains("<|im_start|>"), "the `_ =>` ChatML arm is gone");
+        assert_eq!(
+            turn,
+            "<|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|>"
+        );
+        assert!(
+            !turn.contains("<|im_start|>"),
+            "the `_ =>` ChatML arm is gone"
+        );
         assert_eq!(
             tok.decode(&inst.cue(), false),
             "<|start_header_id|>assistant<|end_header_id|>\n\n",
             "the cue is the assistant header with nothing after it"
         );
-        assert!(!inst.seal().is_empty(), "<|eot_id|> is in the vocabulary above");
+        assert!(
+            !inst.seal().is_empty(),
+            "<|eot_id|> is in the vocabulary above"
+        );
     }
 
     /// Every row's chat answer is the same template, reached without a
@@ -785,11 +858,17 @@ mod tests {
         use crate::instruct::Instruct;
         use tokenizer::Tokenizer;
 
-        let vocab: Vec<String> =
-            ["<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>", "\n\n", "user", "Hi"]
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect();
+        let vocab: Vec<String> = [
+            "<|start_header_id|>",
+            "<|end_header_id|>",
+            "<|eot_id|>",
+            "\n\n",
+            "user",
+            "Hi",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
         let tok = Arc::new(Tokenizer::from_vocab(&vocab));
         for v in VARIANTS {
             let text = tok.decode(&v.chat(tok.clone()).user("Hi"), false);
@@ -809,7 +888,10 @@ mod tests {
         use model_loader::checkpoint::CheckpointMetadata;
         use model_loader::plan::StorageTarget;
 
-        let metadata = CheckpointMetadata { files: Vec::new(), tensors: Vec::new() };
+        let metadata = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: Vec::new(),
+        };
         let encoding = crate::encoding::Encoding::dense();
         let target = StorageTarget::default();
         let policy = crate::shared::policy::Policy::default();
@@ -823,7 +905,8 @@ mod tests {
                 &target,
                 &policy,
             );
-            v.author(&mut builder).unwrap_or_else(|e| panic!("{} refused to author: {e:?}", v.id));
+            v.author(&mut builder)
+                .unwrap_or_else(|e| panic!("{} refused to author: {e:?}", v.id));
         }
     }
 
@@ -838,8 +921,15 @@ mod tests {
 
         for v in VARIANTS {
             for class in [FireClass::Decode, FireClass::Prefill] {
-                let plan = v.trace(class, Deployed::single()).expect("llama-like traces");
-                assert!(plan.family.contains("llama_like"), "{}: {}", v.id, plan.family);
+                let plan = v
+                    .trace(class, Deployed::single())
+                    .expect("llama-like traces");
+                assert!(
+                    plan.family.contains("llama_like"),
+                    "{}: {}",
+                    v.id,
+                    plan.family
+                );
                 assert!(!plan.ops.is_empty(), "{}", v.id);
                 assert!(!plan.values.is_empty(), "{}", v.id);
             }
@@ -847,7 +937,9 @@ mod tests {
         // A deeper stack is a longer text, which is the one relation
         // between a row's numbers and its trace worth asserting here.
         let trace_of = |id: &str| {
-            row(id).trace(FireClass::Decode, Deployed::single()).expect("traces")
+            row(id)
+                .trace(FireClass::Decode, Deployed::single())
+                .expect("traces")
         };
         let small = trace_of("llama-3.2-1b");
         let large = trace_of("llama-3.1-70b");

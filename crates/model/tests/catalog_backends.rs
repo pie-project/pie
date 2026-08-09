@@ -11,9 +11,10 @@
 //! two disagreed — an `architectures[0]` string chose a derivation, a
 //! `model_type` string chose a chat template, and a checkpoint that
 //! satisfied neither got a `_ =>` arm — and this table disagreed with
-//! both in the same way. It listed `gemma4`, which the Metal load path
-//! refused on entirely separate grounds, so the answer to "served?"
-//! depended on which of the two you asked. It omitted `gemma3`, whose
+//! both in the same way. It listed `gpt_oss`, whose every publication
+//! either fails this crate's manifest or names tensors `driver-metal`
+//! has no handle for, so the answer to "served?" depended on which of
+//! the two you asked. It omitted `gemma3`, whose
 //! model the Metal text actually states. And it named `llama4`, for
 //! which no row exists at all.
 //!
@@ -158,17 +159,14 @@ fn every_row_either_traces_metal_or_refuses_it_in_words() {
     );
 }
 
-/// The rows that serve Metal are exactly the rows whose text is the
-/// family's, and they are named.
+/// Only the family's generations serve Metal, and none of them is dark.
 ///
 /// A list, in a test, which is the thing this refactor deleted from a
 /// driver — and the difference is where it lives and what it is
 /// checked against. `LLAMA_LIKE` was consulted to DECIDE the answer,
 /// in the driver, from a string that reached it through a config file.
 /// This is derived from the answers the rows give and compared against
-/// the GENERATIONS a reader was told serve Metal; if a generation gains
-/// a Metal text, this fails and is edited, which is the point of
-/// writing it down.
+/// the GENERATIONS a reader was told serve Metal.
 ///
 /// The expected set is built from each generation's own `rows()` rather
 /// than from a list of row ids or a prefix match on them. Both of those
@@ -177,39 +175,67 @@ fn every_row_either_traces_metal_or_refuses_it_in_words() {
 /// a `gemma_3` row whose id names no gemma-3 at all. A row id is a
 /// NAME, and deciding anything from the shape of a name is the habit
 /// this whole refactor is unwinding.
+///
+/// # Why this is two weaker claims and not one equality
+///
+/// It asserted that the serving rows are EXACTLY the listed
+/// generations' rows, and that is false in both of the ways a row can
+/// differ from its generation.
+///
+/// `phi-3-mini-4k` is a listed row that refuses: its heads are 96 wide
+/// and `sdpa_paged.metal` instantiates 64, 128, 256 and 512, so the
+/// text would name a symbol no shader defines. CUDA pads to 128 and
+/// strips; Metal has no pad in the text. `gemma-4-26b-a4b` is a listed
+/// row that refuses because it has no text on ANY backend — the build
+/// has no routed-expert gemma-4 block, and it says the same to CUDA.
+/// Neither is a generation losing Metal, and an equality cannot say so.
+///
+/// So the two directions are stated separately, and the second is the
+/// one that was missing. A whole generation going dark is what actually
+/// happened: gemma-4 spent a merge refusing Metal by name while
+/// `llama_like_metal` stated every width it needed, and this test
+/// AGREED with the refusal because the roster had been edited to match
+/// it. A roster compared against itself proves nothing. Requiring each
+/// listed generation to keep at least one serving row is a claim about
+/// the TEXT, and it is the claim that would have failed.
 #[test]
 fn the_rows_that_serve_metal_are_the_llama_like_ones() {
-    // The eight generations whose forward IS `llama_like`: the seven
-    // that call the family projection directly, plus gemma-3, whose own
-    // projection writes gemma's seven fields over the family's and calls
-    // the same text.
-    let expected: Vec<&'static str> = [
-        model::qwen_2::rows(),
-        model::qwen_3::rows(),
-        model::llama_3::rows(),
-        model::mistral_3::rows(),
-        model::phi_3::rows(),
-        model::olmo_2::rows(),
-        model::olmo_3::rows(),
-        model::gemma_3::rows(),
-    ]
-    .iter()
-    .flat_map(|g| g.iter().map(|r| r.id()))
-    .collect();
+    // The NINE generations whose forward reaches `llama_like_metal`: the
+    // seven that call the family projection directly, plus gemma-3 and
+    // gemma-4, whose own projections write their fields over the
+    // family's and call the same text.
+    let generations: [(&str, &[&'static dyn catalog::Variant]); 9] = [
+        ("qwen_2", model::qwen_2::rows()),
+        ("qwen_3", model::qwen_3::rows()),
+        ("llama_3", model::llama_3::rows()),
+        ("mistral_3", model::mistral_3::rows()),
+        ("phi_3", model::phi_3::rows()),
+        ("olmo_2", model::olmo_2::rows()),
+        ("olmo_3", model::olmo_3::rows()),
+        ("gemma_3", model::gemma_3::rows()),
+        ("gemma_4", model::gemma_4::rows()),
+    ];
+    let expected: Vec<&'static str> = generations
+        .iter()
+        .flat_map(|(_, g)| g.iter().map(|r| r.id()))
+        .collect();
 
+    // ONE: nothing outside those generations reaches a Metal text.
     let mut rows = 0usize;
     for row in catalog::catalog() {
         rows += 1;
         let id = row.id();
-        let serves = row.trace(FireClass::Decode, Deployed::metal(&BINDING)).is_ok();
-        assert_eq!(
-            serves,
-            expected.contains(&id),
-            "`{id}` {} Metal, and the generations listed in this test say \
-             otherwise. A generation gaining or losing a Metal text is a thing \
-             a reader should have to notice",
-            if serves { "serves" } else { "refuses" }
-        );
+        if row
+            .trace(FireClass::Decode, Deployed::metal(&BINDING))
+            .is_ok()
+        {
+            assert!(
+                expected.contains(&id),
+                "`{id}` serves Metal and belongs to no generation this test \
+                 lists. A generation gaining a Metal text is a thing a reader \
+                 should have to notice"
+            );
+        }
     }
     assert_the_catalog_was_walked(rows);
     assert!(
@@ -217,24 +243,164 @@ fn the_rows_that_serve_metal_are_the_llama_like_ones() {
         "every row in the catalog belongs to a llama-like generation, so this \
          test is comparing a set against itself"
     );
+
+    // TWO: and none of them has gone dark. Per GENERATION, because a
+    // row may refuse on its own measured grounds — a head width with no
+    // kernel, an expert block with no text — while its generation is
+    // served. A generation with no serving row at all is the gemma-4
+    // regression, and nothing else here would have caught it.
+    for (name, g) in &generations {
+        assert!(
+            g.iter().any(|r| r
+                .trace(FireClass::Decode, Deployed::metal(&BINDING))
+                .is_ok()),
+            "no `{name}` row answers a Metal load, so this generation has \
+             gone dark. Either its text was lost or every row of it refuses \
+             for a reason worth reading; both are edits to this test, and \
+             neither is silent"
+        );
+    }
 }
 
-/// WHETHER a build has a text is not a question about bytes.
+/// No door serves a routed bank at a point the shader never stamped.
+///
+/// `llama_like_metal` is one text with three doors. Twelve generations
+/// reach it through `shared::llama_like::project::trace`; `gemma_3` and
+/// `gemma_4` reach it directly, because each writes its own fields over
+/// the family's projection and so cannot use the shared `trace`.
+///
+/// The refusals guarding that text are about the KERNEL SET and not
+/// about a row — `trace`'s own doc says so — and they lived at ONE
+/// door. The other two carried the shard check alone. So the question
+/// this asks is not "does each door hold a copy of the ladder" but the
+/// property the ladder is for: can a routed bank reach
+/// `affine_qmv_routed` at a group it was never stamped at, through any
+/// door at all.
+///
+/// # What the measurement found, including what it falsified
+///
+/// It cannot, and the two doors stop it for DIFFERENT reasons — which
+/// is worth writing down, because the obvious reading was wrong:
+///
+///   * The shared door refuses by [`NO_METAL_ROUTED_ENCODING`].
+///     `qwen3-30b-a3b` and `qwen3-235b-a22b` are the rows that say so.
+///   * gemma-4's door never gets the question. `gemma-4-26b-a4b` is
+///     refused EARLIER and by its own text — this build has no
+///     routed-expert text for a gemma-4 block — so its only routed row
+///     stops before any binding is consulted.
+///
+/// The first draft of this test asserted that gemma-4's door produced
+/// the routed refusal, on the assumption that a routed gemma-4 reached
+/// it. It does not, and the test said so. The refusal is still wired at
+/// that door, where it will matter the day the routed text lands; what
+/// is asserted here is only what is true today.
+///
+/// # Why `a_row_answers_the_same_way_at_every_encoding` does not cover it
+///
+/// That test is one-directional on purpose: it forbids a row REFUSED at
+/// the probe and SERVED at a real encoding. This is the other
+/// direction — served where it cannot run — and a permissive door is
+/// invisible to a test that only looks for refusals that are too
+/// strict.
+#[test]
+fn no_door_serves_a_routed_bank_at_an_unstamped_point() {
+    // Group 128 is a point the routed matvec is not stamped at:
+    // `AffineQ::group_size` is a template constant and the shader
+    // compiles `affine_qmv_routed` at group 64 / 4 bits alone.
+    let unstamped = MetalBinding {
+        quant_group: 128,
+        quant_bits: 4,
+        moe_mxfp4: false,
+        ..BINDING
+    };
+
+    let mut rows = 0usize;
+    let mut named_the_encoding: Vec<&'static str> = Vec::new();
+    let mut routed_rows = 0usize;
+    for row in catalog::catalog() {
+        rows += 1;
+        // A row is routed if its LOAD says so; this is the catalog's
+        // own answer and not a guess from the row's name.
+        let routed = row.load_shape().n_experts > 0;
+        if !routed {
+            continue;
+        }
+        routed_rows += 1;
+        match row.trace(FireClass::Decode, Deployed::metal(&unstamped)) {
+            Ok(_) => panic!(
+                "`{}` is routed and SERVED at group {}, which the shader \
+                 never stamped `affine_qmv_routed` at. Its expert bank would \
+                 be dequantised with every scale read from the wrong offset",
+                row.id(),
+                unstamped.quant_group
+            ),
+            Err(Refusal::Unsupported(m)) if m.contains("routed matvec") => {
+                named_the_encoding.push(row.id());
+            }
+            // Refused for some earlier reason of its own — no routed
+            // text, no Metal text at all. Also safe, and the reason is
+            // in the row's own words.
+            Err(_) => {}
+        }
+    }
+    assert_the_catalog_was_walked(rows);
+
+    assert!(
+        routed_rows > 0,
+        "the catalog has no routed row, so this test asked nothing"
+    );
+    assert!(
+        !named_the_encoding.is_empty(),
+        "{routed_rows} routed row(s) were asked and NONE reached \
+         `NO_METAL_ROUTED_ENCODING`. Every one of them is being stopped by \
+         some earlier refusal, so the encoding check is unexercised and this \
+         test would pass with it deleted"
+    );
+}
+
+/// A REFUSAL before the bytes arrive must hold for every encoding.
 ///
 /// `driver-metal`'s `serve/load.rs` asks "do you serve this row" BEFORE
-/// any weights have arrived, through a probe binding — so a row whose
-/// answer moved with a group size, a bit width or the expert bank's
-/// format would be answering a question it cannot yet ask, and the
-/// pre-staging refusal would be a guess. The catalog's counterpart to
-/// `driver-metal`'s own `a_row_is_served_the_same_way_at_every_encoding`,
-/// asked from this side of the boundary so that neither crate is the
-/// only place it holds.
+/// any weights have arrived, through a probe binding — so a row that
+/// refuses at the probe and would have been served at the encoding the
+/// load turns out to have is turning away a checkpoint this build can
+/// run. The catalog's counterpart to `driver-metal`'s own
+/// `a_row_is_served_the_same_way_at_every_encoding`, asked from this
+/// side of the boundary so that neither crate is the only place it
+/// holds — including its DIRECTION, which is the part that matters.
+///
+/// # Why this is one-directional and was not
+///
+/// It asserted EQUALITY, on the premise that "whether a build has a
+/// text is not a question about bytes". For the expert bank it is:
+/// `quant/qmv.metal` instantiates `affine_qmv_routed` at group 64
+/// alone, because `AffineQ::group_size` is a template constant, so a
+/// routed row whose bank arrives at g128/b8 names a kernel no shader
+/// defines. `qwen3-30b-a3b` is the row that says so, and
+/// `shared::llama_like::project::NO_METAL_ROUTED_ENCODING` is the
+/// sentence it says it with.
+///
+/// The permissive direction was never the premise. The probe exists so
+/// 17 GB of gemma is not staged to reach an answer identification
+/// already had, and a later refusal at the real encoding costs a load
+/// rather than a wrong answer. What it may not do is refuse something
+/// a real encoding would have served, and that is what this holds.
 #[test]
 fn a_row_answers_the_same_way_at_every_encoding() {
     let encodings = [
         BINDING,
-        MetalBinding { quant_group: 32, quant_bits: 4, moe_mxfp4: true, ..BINDING },
-        MetalBinding { quant_group: 128, quant_bits: 8, moe_mxfp4: false, ..BINDING },
+        MetalBinding {
+            quant_group: 32,
+            quant_bits: 4,
+            moe_mxfp4: true,
+            ..BINDING
+        },
+        MetalBinding {
+            quant_group: 128,
+            quant_bits: 8,
+            moe_mxfp4: false,
+            ..BINDING
+        },
         MetalBinding {
             fuse_residual_gemv: false,
             paged_multi_batch: false,
@@ -245,14 +411,15 @@ fn a_row_answers_the_same_way_at_every_encoding() {
     let mut rows = 0usize;
     for row in catalog::catalog() {
         rows += 1;
-        let want = row.trace(FireClass::Decode, Deployed::metal(&BINDING)).is_ok();
+        let want = row
+            .trace(FireClass::Decode, Deployed::metal(&BINDING))
+            .is_ok();
         for b in &encodings {
-            assert_eq!(
-                row.trace(FireClass::Decode, Deployed::metal(b)).is_ok(),
-                want,
-                "`{}` answers differently at g{}/b{} (bank mxfp4: {}), so \
-                 whether this build HAS a text for it depends on how its bytes \
-                 arrived — and the load path asks before any have",
+            assert!(
+                want || row.trace(FireClass::Decode, Deployed::metal(b)).is_err(),
+                "`{}` is refused at the probe binding and served at g{}/b{} \
+                 (bank mxfp4: {}), so the pre-staging refusal turns away a \
+                 checkpoint this build can run",
                 row.id(),
                 b.quant_group,
                 b.quant_bits,
@@ -278,7 +445,11 @@ fn a_row_answers_the_same_way_at_every_encoding() {
 #[test]
 fn two_encodings_of_one_row_state_the_same_program() {
     let four = BINDING;
-    let eight = MetalBinding { quant_group: 128, quant_bits: 8, ..BINDING };
+    let eight = MetalBinding {
+        quant_group: 128,
+        quant_bits: 8,
+        ..BINDING
+    };
     let mut compared = 0usize;
     for row in catalog::catalog() {
         let (Ok(a), Ok(b)) = (
@@ -288,7 +459,12 @@ fn two_encodings_of_one_row_state_the_same_program() {
             continue;
         };
         compared += 1;
-        assert_eq!(a.family, b.family, "`{}`: an encoding changed the family", row.id());
+        assert_eq!(
+            a.family,
+            b.family,
+            "`{}`: an encoding changed the family",
+            row.id()
+        );
         assert_eq!(
             a.values,
             b.values,
@@ -296,11 +472,26 @@ fn two_encodings_of_one_row_state_the_same_program() {
              a model fact — and a model fact belongs to the row",
             row.id()
         );
-        assert_eq!(a.ops.len(), b.ops.len(), "`{}`: an encoding moved an op", row.id());
+        assert_eq!(
+            a.ops.len(),
+            b.ops.len(),
+            "`{}`: an encoding moved an op",
+            row.id()
+        );
         for (i, (x, y)) in a.ops.iter().zip(&b.ops).enumerate() {
             assert_eq!(x.layer, y.layer, "`{}`: op {i} moved layers", row.id());
-            assert_eq!(x.inputs, y.inputs, "`{}`: op {i} reads different values", row.id());
-            assert_eq!(x.outputs, y.outputs, "`{}`: op {i} writes different values", row.id());
+            assert_eq!(
+                x.inputs,
+                y.inputs,
+                "`{}`: op {i} reads different values",
+                row.id()
+            );
+            assert_eq!(
+                x.outputs,
+                y.outputs,
+                "`{}`: op {i} writes different values",
+                row.id()
+            );
         }
     }
     assert!(

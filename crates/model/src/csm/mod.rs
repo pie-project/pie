@@ -75,7 +75,10 @@ pub struct Csm {
 /// instead, which is a fixture the projections are tested through, so
 /// the one CSM config checked into this repository is still read by
 /// something.
-pub const VARIANTS: &[Csm] = &[Csm { id: "csm-1b", shape: CsmFacts::csm_1b() }];
+pub const VARIANTS: &[Csm] = &[Csm {
+    id: "csm-1b",
+    shape: CsmFacts::csm_1b(),
+}];
 
 /// This generation's contribution to [`crate::catalog::catalog`].
 ///
@@ -188,9 +191,14 @@ mod tests {
         let mut seen = std::collections::BTreeSet::new();
         for v in VARIANTS {
             assert!(!v.id.is_empty(), "a row with no name cannot be asked for");
-            assert!(seen.insert(v.id), "'{}' names two rows, and a lookup would pick one", v.id);
             assert!(
-                v.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                seen.insert(v.id),
+                "'{}' names two rows, and a lookup would pick one",
+                v.id
+            );
+            assert!(
+                v.id.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
                 "'{}' is not a name a URL or a CLI flag carries unescaped",
                 v.id
             );
@@ -239,23 +247,33 @@ mod tests {
     #[test]
     fn the_load_shape_describes_the_backbone_and_says_so() {
         let s = only_row().load_shape();
-        assert_eq!(s.layers, 16, "the backbone's depth, not the package's 16 + 4");
+        assert_eq!(
+            s.layers, 16,
+            "the backbone's depth, not the package's 16 + 4"
+        );
         assert_eq!(s.head_dim, 64);
         assert_eq!(s.n_experts, 0, "csm routes nothing");
         assert_eq!(s.mamba_groups, 0, "csm scans nothing");
         assert_eq!(s.kv_shared_layers, 0);
-        assert!(!s.tied_embeddings, "`tie_word_embeddings: false` — lm_head is shipped");
+        assert!(
+            !s.tied_embeddings,
+            "`tie_word_embeddings: false` — lm_head is shipped"
+        );
     }
 
     /// The deployment refuses, and the refusal names what is missing.
     #[test]
     fn the_row_refuses_to_deploy_and_names_the_stacks() {
-        let err =
-            only_row().deployment(Deployed::single()).expect_err("this build serves no speech");
+        let err = only_row()
+            .deployment(Deployed::single())
+            .expect_err("this build serves no speech");
         assert_eq!(err, Refusal::Unsupported(project::NO_DEPLOYMENT));
         let said = err.to_string();
         for named in ["backbone", "depth", "codec"] {
-            assert!(said.contains(named), "the refusal does not name the {named}: {said}");
+            assert!(
+                said.contains(named),
+                "the refusal does not name the {named}: {said}"
+            );
         }
     }
 
@@ -267,7 +285,9 @@ mod tests {
     /// most expensive kind of wrong error message.
     #[test]
     fn the_refusal_blames_the_build_and_not_the_checkpoint() {
-        let err = only_row().deployment(Deployed::single()).expect_err("refuses");
+        let err = only_row()
+            .deployment(Deployed::single())
+            .expect_err("refuses");
         assert!(matches!(err, Refusal::Unsupported(_)));
         assert!(err.to_string().starts_with("this build cannot serve it"));
     }
@@ -284,8 +304,9 @@ mod tests {
     /// property: the text points at what is absent.
     #[test]
     fn the_refusal_carries_a_sentence_rather_than_a_label() {
-        let Refusal::Unsupported(why) =
-            only_row().deployment(Deployed::single()).expect_err("refuses")
+        let Refusal::Unsupported(why) = only_row()
+            .deployment(Deployed::single())
+            .expect_err("refuses")
         else {
             panic!("csm is unsupported, not malformed");
         };
@@ -294,7 +315,10 @@ mod tests {
             "'{why}' reads as a label; the payload exists so an operator learns what this \
              build wanted and did not have"
         );
-        assert!(why.contains("csm"), "the refusal must name the model it is about");
+        assert!(
+            why.contains("csm"),
+            "the refusal must name the model it is about"
+        );
     }
 
     /// Nothing is advertised, because there is no deployment to
@@ -346,16 +370,24 @@ mod tests {
     fn chat_is_answered_with_the_speaker_protocol_and_not_chatml() {
         use crate::instruct::Instruct;
         use std::sync::Arc;
-        let vocab: Vec<String> =
-            ["<|begin_of_text|>", "<|end_of_text|>", "[0]", "[1]", "Hello"]
-                .iter()
-                .map(ToString::to_string)
-                .collect();
+        let vocab: Vec<String> = [
+            "<|begin_of_text|>",
+            "<|end_of_text|>",
+            "[0]",
+            "[1]",
+            "Hello",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
         let tok = Arc::new(tokenizer::Tokenizer::from_vocab(&vocab));
         let inst = only_row().chat(tok.clone());
         let rendered = tok.decode(&inst.user("Hello"), false);
         assert_eq!(rendered, "<|begin_of_text|>[0]Hello<|end_of_text|>");
-        assert!(!rendered.contains("<|im_start|>"), "chatml is not this model's protocol");
+        assert!(
+            !rendered.contains("<|im_start|>"),
+            "chatml is not this model's protocol"
+        );
         assert_eq!(tok.decode(&inst.cue(), false), "<|begin_of_text|>[1]");
     }
 }

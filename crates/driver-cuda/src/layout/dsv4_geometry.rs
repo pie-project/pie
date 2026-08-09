@@ -34,7 +34,11 @@ pub const fn compressor_coff(ratio: i32) -> u32 {
 /// the C++ expresses by leaving that layer's tensors empty.
 #[must_use]
 pub const fn state_width(ratio: i32, head_dim: u32) -> Option<u32> {
-    if ratio <= 0 { None } else { Some(compressor_coff(ratio) * head_dim) }
+    if ratio <= 0 {
+        None
+    } else {
+        Some(compressor_coff(ratio) * head_dim)
+    }
 }
 
 /// Bytes of compressor state per token, summed over every compressing layer.
@@ -166,7 +170,10 @@ mod tests {
     fn cache_bytes_are_per_token_bytes_times_the_token_capacity() {
         let ratios = [2, 0, 4, 8];
         let per_token = compress_bytes_per_token(&ratios, 128);
-        assert_eq!(compress_cache_bytes(&ratios, 4, 128, 16, 64), per_token * 16 * 64);
+        assert_eq!(
+            compress_cache_bytes(&ratios, 4, 128, 16, 64),
+            per_token * 16 * 64
+        );
     }
 
     #[test]
@@ -186,6 +193,9 @@ mod tests {
             compress_cache_bytes(&ratios, 2, 128, 1, 1),
             compress_bytes_per_token(&[2, 2], 128)
         );
-        assert_eq!(compress_bytes_per_token(&ratios, 128), 4 * compress_bytes_per_token(&[2], 128));
+        assert_eq!(
+            compress_bytes_per_token(&ratios, 128),
+            4 * compress_bytes_per_token(&[2], 128)
+        );
     }
 }

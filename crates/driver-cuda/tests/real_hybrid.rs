@@ -45,13 +45,13 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use driver_cuda::device::{Allocator, DeviceBuffer, OwnedStream};
-use driver_cuda::dtype::DType;
 use driver_cuda::bind::abi::{KvCacheLayerView, KvCacheScheme};
-use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
 use driver_cuda::bind::{
     AttnCtx, AttnRegions, DispatchCtx, DispatchPlan, Frame, GdnCtx, PrefillPlan, Resolver, run,
 };
+use driver_cuda::device::{Allocator, DeviceBuffer, OwnedStream};
+use driver_cuda::dtype::DType;
+use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
 use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
 use model::qwen_3_5::forward::qwen3_5_hybrid_cuda;
 use model_compiler::lower::{Arg, Fire, Row, lower};
@@ -73,12 +73,15 @@ impl Checkpoint {
         let home = std::env::var_os("HOME")?;
         let snaps =
             PathBuf::from(home).join(format!(".cache/huggingface/hub/{cache_dir}/snapshots"));
-        let snap = std::fs::read_dir(&snaps).ok()?.filter_map(Result::ok).find_map(|e| {
-            let d = e.path();
-            (d.join("model.safetensors").is_file()
-                || d.join("model.safetensors.index.json").is_file())
-            .then_some(d)
-        })?;
+        let snap = std::fs::read_dir(&snaps)
+            .ok()?
+            .filter_map(Result::ok)
+            .find_map(|e| {
+                let d = e.path();
+                (d.join("model.safetensors").is_file()
+                    || d.join("model.safetensors.index.json").is_file())
+                .then_some(d)
+            })?;
         let files: Vec<PathBuf> = if snap.join("model.safetensors").is_file() {
             vec![snap.join("model.safetensors")]
         } else {
@@ -100,8 +103,7 @@ impl Checkpoint {
         for (fi, f) in files.iter().enumerate() {
             let raw = std::fs::read(f).ok()?;
             let header_len = u64::from_le_bytes(raw[..8].try_into().ok()?) as usize;
-            let header: serde_json::Value =
-                serde_json::from_slice(&raw[8..8 + header_len]).ok()?;
+            let header: serde_json::Value = serde_json::from_slice(&raw[8..8 + header_len]).ok()?;
             let payload = 8 + header_len;
             for (name, meta) in header.as_object()? {
                 if name == "__metadata__" {
@@ -140,11 +142,18 @@ impl Checkpoint {
 /// — the qwen3_5 binder, `bind_qwen3_5_weight`'s vocabulary as data.
 fn bind(ckpt: &Checkpoint, sink: &mut dyn FnMut(String, Vec<u8>)) {
     let p = "model.language_model";
-    sink("embed".into(), ckpt.bytes(&format!("{p}.embed_tokens.weight")).to_vec());
-    sink("final_norm".into(), ckpt.bytes(&format!("{p}.norm.weight")).to_vec());
+    sink(
+        "embed".into(),
+        ckpt.bytes(&format!("{p}.embed_tokens.weight")).to_vec(),
+    );
+    sink(
+        "final_norm".into(),
+        ckpt.bytes(&format!("{p}.norm.weight")).to_vec(),
+    );
     for n in 0..24u32 {
         let lp = format!("{p}.layers.{n}");
-        let mut w = |trace: &str, hf: String| sink(format!("layer.{n}.{trace}"), ckpt.bytes(&hf).to_vec());
+        let mut w =
+            |trace: &str, hf: String| sink(format!("layer.{n}.{trace}"), ckpt.bytes(&hf).to_vec());
         w("attn_norm", format!("{lp}.input_layernorm.weight"));
         w("mlp_norm", format!("{lp}.post_attention_layernorm.weight"));
         w("down", format!("{lp}.mlp.down_proj.weight"));
@@ -186,7 +195,9 @@ impl Resolver for Live<'_> {
 #[allow(clippy::too_many_lines)]
 fn the_hybrid_matches_transformers_on_real_weights() {
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("qwen3.5 hybrid A/B") else { return };
+    let Some(_dev) = device_or_skip("qwen3.5 hybrid A/B") else {
+        return;
+    };
     let Some(ckpt) = Checkpoint::open("models--Qwen--Qwen3.5-0.8B-Base") else {
         eprintln!("skipped: Qwen3.5-0.8B-Base not in the HF cache");
         return;
@@ -249,13 +260,29 @@ fn the_hybrid_matches_transformers_on_real_weights() {
     let plan = qwen3_5_hybrid_cuda(&hybrid, &cuda, FireClass::Prefill);
     // A prefill: one request, TOKENS rows -- every row multi-token, which
     // is what `GuardPred::WindowOne` reads (graph.md §4.1).
-    let rows: Vec<Row> =
-        vec![Row { samples: true, multi_token: true, ..Row::default() }; TOKENS];
-    let l = lower(&plan, &rows, Fire { captures_across_splits: false }).expect("lowers");
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            multi_token: true,
+            ..Row::default()
+        };
+        TOKENS
+    ];
+    let l = lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("lowers");
     let dplan = DispatchPlan::new(&plan, &l);
 
     let arena = alloc.alloc(l.arena_bytes).expect("arena");
-    let frame = Frame { arena: arena.as_ptr(), arena_bytes: l.arena_bytes };
+    let frame = Frame {
+        arena: arena.as_ptr(),
+        arena_bytes: l.arena_bytes,
+    };
 
     let up = |data: &[u8]| {
         let mut b = alloc.alloc(data.len()).expect("upload");
@@ -310,10 +337,11 @@ fn the_hybrid_matches_transformers_on_real_weights() {
         .iter()
         .enumerate()
         .map(|(i, kv)| {
-            let (k, v) = kv.as_ref().map_or(
-                (core::ptr::null_mut(), core::ptr::null_mut()),
-                |(k, v)| (k.as_ptr(), v.as_ptr()),
-            );
+            let (k, v) = kv
+                .as_ref()
+                .map_or((core::ptr::null_mut(), core::ptr::null_mut()), |(k, v)| {
+                    (k.as_ptr(), v.as_ptr())
+                });
             KvCacheLayerView {
                 layer: i32::try_from(i).expect("layer"),
                 source_layer: i32::try_from(i).expect("layer"),
@@ -392,9 +420,11 @@ fn the_hybrid_matches_transformers_on_real_weights() {
     let csr_lens = up(&u32s(&last_lens_h));
     let qo_indptr = up(&u32s(&qo_indptr_h));
     let row_valid = up(&[1u8; TOKENS]);
-    let ids = up(&prompt.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>());
-    let positions =
-        up(&(0i32..7).flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>());
+    let ids = up(&prompt
+        .iter()
+        .flat_map(|t| t.to_le_bytes())
+        .collect::<Vec<u8>>());
+    let positions = up(&(0i32..7).flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>());
     let lse = alloc.alloc(TOKENS * Q_HEADS as usize * 4).expect("lse");
 
     let mut sops = LiveStagingOps;
@@ -402,8 +432,17 @@ fn the_hybrid_matches_transformers_on_real_weights() {
     let mut pplan = PrefillPlan::new();
     ws.begin_plan_update(&mut sops).expect("begin");
     pplan.plan_prefill(
-        &qo_indptr_h, &page_indptr_h, &last_lens_h,
-        Q_HEADS, KV_HEADS, HEAD_DIM, PAGE, ws.view(), raw_stream, false, -1,
+        &qo_indptr_h,
+        &page_indptr_h,
+        &last_lens_h,
+        Q_HEADS,
+        KV_HEADS,
+        HEAD_DIM,
+        PAGE,
+        ws.view(),
+        raw_stream,
+        false,
+        -1,
     );
     ws.end_plan_update(&mut sops, raw_stream);
 
@@ -418,12 +457,11 @@ fn the_hybrid_matches_transformers_on_real_weights() {
         Arg::Named { value, .. } => *value,
         other => panic!("the dispatch's q is a pin, got {other:?}"),
     };
-    let o_out: *mut std::ffi::c_void =
-        match &l.args[l.launches[fi + 1].args.start as usize] {
-            Arg::Arena { at, .. } => unsafe { arena.as_ptr().cast::<u8>().add(*at) }.cast(),
-            Arg::Named { value, .. } => named_bufs[value].as_ptr(),
-            other => panic!("the gate reads the attention slot, got {other:?}"),
-        };
+    let o_out: *mut std::ffi::c_void = match &l.args[l.launches[fi + 1].args.start as usize] {
+        Arg::Arena { at, .. } => unsafe { arena.as_ptr().cast::<u8>().add(*at) }.cast(),
+        Arg::Named { value, .. } => named_bufs[value].as_ptr(),
+        other => panic!("the gate reads the attention slot, got {other:?}"),
+    };
 
     let attn = AttnCtx {
         decode_plan: core::ptr::null_mut(),
@@ -460,9 +498,8 @@ fn the_hybrid_matches_transformers_on_real_weights() {
     };
 
     let mut cublas_ops = driver_cuda::device::cublas::LiveCublas;
-    let mut cublas =
-        driver_cuda::device::cublas::CublasHandle::create(&mut cublas_ops, raw_stream)
-            .expect("cublas");
+    let mut cublas = driver_cuda::device::cublas::CublasHandle::create(&mut cublas_ops, raw_stream)
+        .expect("cublas");
     let ctx = DispatchCtx {
         // Every row sampled, so no compaction is stated and the gather
         // has no index list to read.
@@ -511,9 +548,20 @@ fn the_hybrid_matches_transformers_on_real_weights() {
         }
     }
 
-    let mut resolver = Live { weights: &weights, named: &named_bufs };
-    let ran = run(&l, &dplan, frame, &mut resolver, &ctx, AttnRegions::whole(Some(&attn)), Some(&gdn))
-        .unwrap_or_else(|e| panic!("the hybrid A/B walk refused: {e:?}"));
+    let mut resolver = Live {
+        weights: &weights,
+        named: &named_bufs,
+    };
+    let ran = run(
+        &l,
+        &dplan,
+        frame,
+        &mut resolver,
+        &ctx,
+        AttnRegions::whole(Some(&attn)),
+        Some(&gdn),
+    )
+    .unwrap_or_else(|e| panic!("the hybrid A/B walk refused: {e:?}"));
     assert_eq!(ran, l.launches.len());
     stream.as_ref().synchronize().expect("the fire retires");
 
@@ -541,8 +589,10 @@ fn the_hybrid_matches_transformers_on_real_weights() {
             f32::from_bits(u32::from(bits) << 16)
         };
         let head: Vec<f32> = (0..8).map(|c| h(TOKENS - 1, c)).collect();
-        let norm: f32 =
-            (0..1024).map(|c| h(TOKENS - 1, c).powi(2)).sum::<f32>().sqrt();
+        let norm: f32 = (0..1024)
+            .map(|c| h(TOKENS - 1, c).powi(2))
+            .sum::<f32>()
+            .sqrt();
         eprintln!("ours residual last row head: {head:?} norm={norm:.4}");
     }
 
@@ -550,7 +600,9 @@ fn the_hybrid_matches_transformers_on_real_weights() {
     let lv = logits_value.expect("the logits pin");
     let logits = &named_bufs[&lv];
     let mut back = vec![0u8; logits.len()];
-    logits.copy_to_host(&mut back, stream.as_ref()).expect("d2h logits");
+    logits
+        .copy_to_host(&mut back, stream.as_ref())
+        .expect("d2h logits");
     stream.as_ref().synchronize().expect("sync");
     let last = TOKENS - 1;
     let logit = |t: usize| {
@@ -601,7 +653,10 @@ fn the_hybrid_matches_transformers_on_real_weights() {
     }
     for (t, hf) in ids5.iter().zip(&vals5) {
         let ours = logit(*t);
-        assert!((ours - hf).abs() < 1.25, "top-5 token {t}: ours {ours} vs HF {hf}");
+        assert!(
+            (ours - hf).abs() < 1.25,
+            "top-5 token {t}: ours {ours} vs HF {hf}"
+        );
     }
     let probes: Vec<usize> = reference["probe_ids"]
         .as_array()
@@ -623,7 +678,10 @@ fn the_hybrid_matches_transformers_on_real_weights() {
         .collect();
     for (t, hf) in probes.iter().zip(&probe_vals) {
         let ours = logit(*t);
-        assert!((ours - hf).abs() < 0.6, "probe token {t}: ours {ours} vs HF {hf}");
+        assert!(
+            (ours - hf).abs() < 0.6,
+            "probe token {t}: ours {ours} vs HF {hf}"
+        );
     }
 
     ws.release(&mut sops);

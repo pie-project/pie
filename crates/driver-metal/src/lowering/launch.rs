@@ -337,7 +337,10 @@ mod tests {
         for (rule, expected) in [
             (Rule::Qmv, shapes::qmv(d.width)),
             (Rule::Rms, shapes::rms(d.width, d.axis, 1)),
-            (Rule::Rope, shapes::rope(d.rotary_dims, d.width / d.head_dim)),
+            (
+                Rule::Rope,
+                shapes::rope(d.rotary_dims, d.width / d.head_dim),
+            ),
             (Rule::Elementwise, shapes::residual(d.width)),
             (Rule::ElementwiseRows, shapes::embed(d.width)),
             (Rule::PerHead, shapes::kv_append(d.head_dim, d.kv_heads)),
@@ -377,22 +380,34 @@ mod tests {
             (Rule::Rms, shapes::rms_mb(d.width, 1, n)),
             // The shapes whose batched form puts the row on its own axis.
             // `mb_geometry`'s arms are the reference for each.
-            (Rule::ElementwiseRows, Launch {
-                grid: [d.width, n, 1],
-                tg: [256, 1, 1],
-            }),
-            (Rule::PerHead, Launch {
-                grid: [d.head_dim, d.kv_heads, n],
-                tg: [d.head_dim, 1, 1],
-            }),
-            (Rule::Rope, Launch {
-                grid: [d.rotary_dims / 2, d.width / d.head_dim, n],
-                tg: [d.rotary_dims / 2, 1, 1],
-            }),
-            (Rule::SdpaVector, Launch {
-                grid: [d.q_heads * 1024, n, 1],
-                tg: [1024, 1, 1],
-            }),
+            (
+                Rule::ElementwiseRows,
+                Launch {
+                    grid: [d.width, n, 1],
+                    tg: [256, 1, 1],
+                },
+            ),
+            (
+                Rule::PerHead,
+                Launch {
+                    grid: [d.head_dim, d.kv_heads, n],
+                    tg: [d.head_dim, 1, 1],
+                },
+            ),
+            (
+                Rule::Rope,
+                Launch {
+                    grid: [d.rotary_dims / 2, d.width / d.head_dim, n],
+                    tg: [d.rotary_dims / 2, 1, 1],
+                },
+            ),
+            (
+                Rule::SdpaVector,
+                Launch {
+                    grid: [d.q_heads * 1024, n, 1],
+                    tg: [1024, 1, 1],
+                },
+            ),
             // The router, which was NOT in this list and was wrong because of
             // it. `route.metal` reads its row from `tgid.y` and the rule
             // returned `grid: [w, 1, 1]`, so a mixture PREFILL routed row 0
@@ -402,10 +417,13 @@ mod tests {
             //
             // Absent from the M>1 list is exactly how it stayed wrong -- the
             // M=1 list has it and is right there, so the rule looked covered.
-            (Rule::RouterLane, Launch {
-                grid: [shapes::router_lane_width(d.n_experts), n, 1],
-                tg: [shapes::router_lane_width(d.n_experts), 1, 1],
-            }),
+            (
+                Rule::RouterLane,
+                Launch {
+                    grid: [shapes::router_lane_width(d.n_experts), n, 1],
+                    tg: [shapes::router_lane_width(d.n_experts), 1, 1],
+                },
+            ),
             // And its twin, which must NOT move. `route_sort` reduces across
             // every (row, slot) pair through threadgroup atomics; one copy
             // per row would have each clearing and rewriting the permutation
@@ -596,15 +614,21 @@ mod tests {
             kv_heads: 8,
             ..dims()
         };
-        let q = eval(Rule::Rope, Dims {
-            width: d.q_heads * d.head_dim,
-            ..d
-        })
+        let q = eval(
+            Rule::Rope,
+            Dims {
+                width: d.q_heads * d.head_dim,
+                ..d
+            },
+        )
         .expect("q rotates");
-        let k = eval(Rule::Rope, Dims {
-            width: d.kv_heads * d.head_dim,
-            ..d
-        })
+        let k = eval(
+            Rule::Rope,
+            Dims {
+                width: d.kv_heads * d.head_dim,
+                ..d
+            },
+        )
         .expect("k rotates");
 
         assert_eq!(q.grid, [64, 32, 4], "q covers its own thirty-two heads");

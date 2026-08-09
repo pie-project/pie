@@ -62,19 +62,19 @@ use tensor_ir::fnv1a64;
 use tensor_ir::op::tags;
 use tensor_ir::registry::Stage;
 
-use crate::device::archive::Archives;
-use crate::device::context::Context;
-use crate::program::compile::{Compiler, Math};
-use crate::program::executable::{
-    FusedExecutable, GroupedExecutable, ProgramExecutable, ProgramStage, Pso, RegionExecutable,
-    StageExecutable,
-};
 use crate::channel::{
     Backend, Bounded, CacheStats, Emitted, ExecPlan, Failure, Lookup, MAX_CHANNELS,
     MAX_NEGATIVE_ENTRIES, MAX_PROGRAM_ENTRIES, MAX_STAGE_ENTRIES, Slot, Stages, Versions,
     cache_identity, channel_effects, combined_signature, op_metadata, port_consumes,
 };
+use crate::device::archive::Archives;
+use crate::device::context::Context;
 use crate::layout::shader;
+use crate::program::compile::{Compiler, Math};
+use crate::program::executable::{
+    FusedExecutable, GroupedExecutable, ProgramExecutable, ProgramStage, Pso, RegionExecutable,
+    StageExecutable,
+};
 use crate::{Error, Result};
 
 /// `PTIR_OP_CHAN_TAKE`, as the plan encodes it.

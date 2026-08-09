@@ -16,8 +16,8 @@
 //!
 //! [`Qwen35CudaFacts`]: super::forward::facts::Qwen35CudaFacts
 
-use serde::{Deserialize, Serialize};
 use model_compiler::trace::NormVariant;
+use serde::{Deserialize, Serialize};
 
 /// Facts for one qwen3_5_moe-family MoE MLP block — a traced FRAGMENT, not
 /// a model.
@@ -473,7 +473,12 @@ mod tests {
         assert_eq!(f.layers, 64);
         assert_eq!(f.full_attn_interval, 4);
         assert_eq!((f.gdn.key_heads, f.gdn.value_heads), (16, 48));
-        assert!(matches!(f.mlp, Qwen35MlpKind::Dense { intermediate: 17_408 }));
+        assert!(matches!(
+            f.mlp,
+            Qwen35MlpKind::Dense {
+                intermediate: 17_408
+            }
+        ));
         assert!(!f.tied_embeddings, "27B ships its own head");
     }
 

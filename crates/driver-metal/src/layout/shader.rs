@@ -540,12 +540,10 @@ mod batch_tests {
             .map(|(k, v)| (PathBuf::from(*k), (*v).to_string()))
             .collect();
         move |path: &Path| {
-            map.get(path)
-                .cloned()
-                .ok_or_else(|| Error::ShaderRead {
-                    path: path.to_path_buf(),
-                    source: io::Error::new(io::ErrorKind::NotFound, "absent"),
-                })
+            map.get(path).cloned().ok_or_else(|| Error::ShaderRead {
+                path: path.to_path_buf(),
+                source: io::Error::new(io::ErrorKind::NotFound, "absent"),
+            })
         }
     }
 
@@ -571,11 +569,7 @@ mod batch_tests {
         let mut reads = 0;
         let mut read = files(&[("a.metal", "A"), ("b.metal", "B")]);
         let batch = Batch::load_with(
-            &requests(&[
-                ("a.metal", "one"),
-                ("b.metal", "two"),
-                ("a.metal", "three"),
-            ]),
+            &requests(&[("a.metal", "one"), ("b.metal", "two"), ("a.metal", "three")]),
             |path| {
                 reads += 1;
                 read(path)

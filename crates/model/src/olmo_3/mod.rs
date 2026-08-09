@@ -36,9 +36,9 @@ pub mod chat;
 use std::sync::{Arc, OnceLock};
 
 use crate::catalog::{Deployed, LoadShape, Variant};
+use crate::manifest::Manifest;
 use crate::shared::llama_like::project;
 use crate::shared::llama_like::spec::LlamaLikeFacts;
-use crate::manifest::Manifest;
 
 use model_compiler::facts::{NormPlacement, QkNorm};
 use model_compiler::trace::{NormVariant, RopeKind};
@@ -189,6 +189,25 @@ pub fn rows() -> &'static [&'static dyn Variant] {
     ROWS.get_or_init(|| VARIANTS.iter().map(|v| v as &'static dyn Variant).collect())
 }
 
+impl Olmo3 {
+    /// The scalars this row states, read ONCE.
+    ///
+    /// Both [`Variant::deployment`] and [`Variant::trace`] take it. They
+    /// used to read `rope_theta`, `norm_eps` and `window` off `self`
+    /// separately — the same three fields, spelled twice, with nothing
+    /// holding the two spellings together.
+    fn row(&self) -> project::RowScalars {
+        project::RowScalars {
+            rope_theta: self.rope_theta,
+            norm_eps: self.norm_eps,
+            window: self.window,
+            rope_rescaled: true,
+            // Unread: this generation is dense, so no router is stated.
+            norm_topk_prob: true,
+        }
+    }
+}
+
 impl Variant for Olmo3 {
     fn id(&self) -> &'static str {
         self.id
@@ -199,7 +218,11 @@ impl Variant for Olmo3 {
     }
 
     fn load_shape(&self) -> LoadShape {
-        LoadShape::dense(self.shape.layers, self.shape.head_dim, self.shape.tied_embeddings)
+        LoadShape::dense(
+            self.shape.layers,
+            self.shape.head_dim,
+            self.shape.tied_embeddings,
+        )
     }
 
     fn deployment(
@@ -207,8 +230,7 @@ impl Variant for Olmo3 {
         load: Deployed<'_>,
     ) -> Result<crate::deployment::Deployment, crate::deployment::Refusal> {
         let _ = load;
-        let mut deployment =
-            project::deployment(&self.shape, self.rope_theta, self.norm_eps, self.window);
+        let mut deployment = project::deployment(&self.shape, self.row());
         deployment.rope_scaling = Some(ROPE_SCALING);
         deployment.advertised = crate::deployment::Advertised {
             arch: ARCH,
@@ -230,7 +252,9 @@ impl Variant for Olmo3 {
         builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
         match builder.naming() {
-            crate::shared::policy::Naming::Hf => crate::shared::llama_like::contract::author_dense(builder),
+            crate::shared::policy::Naming::Hf => {
+                crate::shared::llama_like::contract::author_dense(builder)
+            }
             // The registry this replaced held NO MLX row for olmo-3, and
             // the absence was a silence the caller read as "no
             // contract". Stated as the refusal it always was.
@@ -258,17 +282,7 @@ impl Variant for Olmo3 {
         class: model_compiler::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
-        project::trace(
-            &self.shape,
-            project::MetalRow {
-                rope_theta: self.rope_theta,
-                norm_eps: self.norm_eps,
-                window: self.window,
-                rope_rescaled: true,
-            },
-            class,
-            load,
-        )
+        project::trace(&self.shape, self.row(), class, load)
     }
 
     /// ChatML-SHAPED, and its own template all the same: OLMo 3 moved
@@ -307,7 +321,11 @@ mod tests {
     /// the file carries. The formula is therefore not an assumption.
     #[test]
     fn an_omitted_attention_factor_is_the_formula_olmo_3_states() {
-        let crate::deployment::RopeScaling::Yarn { factor, attention_factor, .. } = ROPE_SCALING
+        let crate::deployment::RopeScaling::Yarn {
+            factor,
+            attention_factor,
+            ..
+        } = ROPE_SCALING
         else {
             panic!("OLMo 3 rescales by YaRN");
         };
@@ -357,8 +375,15 @@ mod tests {
     #[test]
     fn the_row_answers_what_the_driver_advertises() {
         for v in VARIANTS {
-            let a = v.deployment(Deployed::single()).expect("dense olmo3 is servable").advertised;
-            assert_eq!(a.arch, "olmo3", "{}: the family label a guest program sees", v.id);
+            let a = v
+                .deployment(Deployed::single())
+                .expect("dense olmo3 is servable")
+                .advertised;
+            assert_eq!(
+                a.arch, "olmo3",
+                "{}: the family label a guest program sees",
+                v.id
+            );
             assert_eq!(
                 a.max_model_len, 65_536,
                 "{}: the corpus config and the 32B release both state 65536",
@@ -381,7 +406,11 @@ mod tests {
             .expect("the suffix the worker strips")
             .to_string();
         assert_eq!(stem, ARCH);
-        assert_eq!(ARCH, ARCH.to_lowercase(), "the worker compares against a lowercased stem");
+        assert_eq!(
+            ARCH,
+            ARCH.to_lowercase(),
+            "the worker compares against a lowercased stem"
+        );
         assert!(!ARCH.contains('-'), "no separator survives the reduction");
     }
 
@@ -389,7 +418,9 @@ mod tests {
     #[test]
     fn every_row_projects() {
         for v in VARIANTS {
-            let d = v.deployment(Deployed::single()).expect("dense olmo3 is servable");
+            let d = v
+                .deployment(Deployed::single())
+                .expect("dense olmo3 is servable");
             assert_eq!(d.layers, v.shape.layers);
             assert_eq!(d.attention.len() as u32, v.shape.layers);
             assert_eq!(d.shape.hidden, v.shape.hidden);
@@ -401,7 +432,10 @@ mod tests {
             let ls = v.load_shape();
             assert_eq!(ls.layers, v.shape.layers);
             assert_eq!(ls.head_dim, 128, "{}", v.id);
-            assert_eq!(ls.head_dim, v.shape.head_dim, "the TRUE head dim, never a padded one");
+            assert_eq!(
+                ls.head_dim, v.shape.head_dim,
+                "the TRUE head dim, never a padded one"
+            );
             assert!(!ls.tied_embeddings, "no OLMo 3 row ties its head");
             assert_eq!(ls.n_experts, 0);
             assert_eq!(ls.mamba_groups, 0);
@@ -467,7 +501,10 @@ mod tests {
 
             let m = v.manifest();
             let spec = |name: &str| {
-                m.tensors.iter().find(|t| t.name == name).expect("stated one way or the other")
+                m.tensors
+                    .iter()
+                    .find(|t| t.name == name)
+                    .expect("stated one way or the other")
             };
             assert_eq!(
                 spec("layer.{}.post_attention_layernorm").presence,
@@ -482,8 +519,18 @@ mod tests {
                 v.id
             );
             let q_norm = spec("layer.{}.self_attn.q_norm");
-            assert_eq!(q_norm.presence, crate::manifest::Presence::Required, "{}", v.id);
-            assert_eq!(q_norm.extents, vec![u64::from(v.shape.q_width())], "{}", v.id);
+            assert_eq!(
+                q_norm.presence,
+                crate::manifest::Presence::Required,
+                "{}",
+                v.id
+            );
+            assert_eq!(
+                q_norm.extents,
+                vec![u64::from(v.shape.q_width())],
+                "{}",
+                v.id
+            );
         }
     }
 
@@ -503,7 +550,12 @@ mod tests {
 
         let m = thirty_two.manifest();
         let extent = |name: &str| -> Vec<u64> {
-            m.tensors.iter().find(|t| t.name == name).expect("stated").extents.clone()
+            m.tensors
+                .iter()
+                .find(|t| t.name == name)
+                .expect("stated")
+                .extents
+                .clone()
         };
         assert_eq!(extent("layer.{}.self_attn.k_proj"), vec![1024, 5120]);
         assert_eq!(extent("layer.{}.self_attn.q_proj"), vec![5120, 5120]);
@@ -519,8 +571,17 @@ mod tests {
             assert_eq!(v.shape.vocab, 100_278, "{}", v.id);
             assert_ne!(v.shape.vocab, 100_352, "{}: that is OLMo 2's", v.id);
             let m = v.manifest();
-            let embed = m.tensors.iter().find(|t| t.name == "embed_tokens").expect("stated");
-            assert_eq!(embed.extents, vec![100_278, u64::from(v.shape.hidden)], "{}", v.id);
+            let embed = m
+                .tensors
+                .iter()
+                .find(|t| t.name == "embed_tokens")
+                .expect("stated");
+            assert_eq!(
+                embed.extents,
+                vec![100_278, u64::from(v.shape.hidden)],
+                "{}",
+                v.id
+            );
         }
     }
 
@@ -559,8 +620,16 @@ mod tests {
                 v.id
             );
             let cue = tok.decode(&inst.cue(), false);
-            assert!(cue.starts_with("<|im_start|>assistant\n"), "{}: {cue}", v.id);
-            assert!(cue.contains("<think>"), "{}: the turn opens inside a think block", v.id);
+            assert!(
+                cue.starts_with("<|im_start|>assistant\n"),
+                "{}: {cue}",
+                v.id
+            );
+            assert!(
+                cue.contains("<think>"),
+                "{}: the turn opens inside a think block",
+                v.id
+            );
         }
     }
 
@@ -571,7 +640,10 @@ mod tests {
         use model_loader::checkpoint::CheckpointMetadata;
         use model_loader::plan::StorageTarget;
 
-        let metadata = CheckpointMetadata { files: Vec::new(), tensors: Vec::new() };
+        let metadata = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: Vec::new(),
+        };
         let encoding = crate::encoding::Encoding::dense();
         let target = StorageTarget::default();
         let policy = crate::shared::policy::Policy::default();
@@ -585,7 +657,8 @@ mod tests {
                 &target,
                 &policy,
             );
-            v.author(&mut builder).unwrap_or_else(|e| panic!("{} refused to author: {e:?}", v.id));
+            v.author(&mut builder)
+                .unwrap_or_else(|e| panic!("{} refused to author: {e:?}", v.id));
         }
     }
 
@@ -596,8 +669,15 @@ mod tests {
 
         for v in VARIANTS {
             for class in [FireClass::Decode, FireClass::Prefill] {
-                let plan = v.trace(class, Deployed::single()).expect("llama-like traces");
-                assert!(plan.family.contains("llama_like"), "{}: {}", v.id, plan.family);
+                let plan = v
+                    .trace(class, Deployed::single())
+                    .expect("llama-like traces");
+                assert!(
+                    plan.family.contains("llama_like"),
+                    "{}: {}",
+                    v.id,
+                    plan.family
+                );
                 assert!(!plan.ops.is_empty(), "{}", v.id);
             }
         }
@@ -607,6 +687,9 @@ mod tests {
         let thirty_two = row("olmo-3-32b")
             .trace(model_compiler::trace::FireClass::Decode, Deployed::single())
             .expect("traces");
-        assert!(thirty_two.ops.len() > seven.ops.len(), "64 layers out-op 32");
+        assert!(
+            thirty_two.ops.len() > seven.ops.len(),
+            "64 layers out-op 32"
+        );
     }
 }

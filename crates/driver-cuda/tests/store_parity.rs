@@ -193,10 +193,12 @@ fn render_recurrent(o: &mut String) {
                                         );
                                         for layer in 0..st.len() {
                                             for s in 0..slots {
-                                                let cs =
-                                                    tri(|| l.conv_state(layer as u32, s).map(|a| a.offset));
+                                                let cs = tri(|| {
+                                                    l.conv_state(layer as u32, s).map(|a| a.offset)
+                                                });
                                                 let rs = tri(|| {
-                                                    l.recurrent_state(layer as u32, s).map(|a| a.offset)
+                                                    l.recurrent_state(layer as u32, s)
+                                                        .map(|a| a.offset)
                                                 });
                                                 let _ = writeln!(
                                                     o,
@@ -266,12 +268,42 @@ struct SwapCase {
 }
 
 const SWAP_CASES: [SwapCase; 6] = [
-    SwapCase { layers: 1, widths: &[64], src: &[0], dst: &[0] },
-    SwapCase { layers: 1, widths: &[64], src: &[0, 1], dst: &[1, 0] },
-    SwapCase { layers: 2, widths: &[64, 64], src: &[0, 2], dst: &[3, 1] },
-    SwapCase { layers: 3, widths: &[32, 128], src: &[0, 1, 2], dst: &[4, 5, 6] },
-    SwapCase { layers: 2, widths: &[16, 256], src: &[7], dst: &[0] },
-    SwapCase { layers: 1, widths: &[64], src: &[], dst: &[] },
+    SwapCase {
+        layers: 1,
+        widths: &[64],
+        src: &[0],
+        dst: &[0],
+    },
+    SwapCase {
+        layers: 1,
+        widths: &[64],
+        src: &[0, 1],
+        dst: &[1, 0],
+    },
+    SwapCase {
+        layers: 2,
+        widths: &[64, 64],
+        src: &[0, 2],
+        dst: &[3, 1],
+    },
+    SwapCase {
+        layers: 3,
+        widths: &[32, 128],
+        src: &[0, 1, 2],
+        dst: &[4, 5, 6],
+    },
+    SwapCase {
+        layers: 2,
+        widths: &[16, 256],
+        src: &[7],
+        dst: &[0],
+    },
+    SwapCase {
+        layers: 1,
+        widths: &[64],
+        src: &[],
+        dst: &[],
+    },
 ];
 
 const NPAGES: u64 = 8;
@@ -366,8 +398,12 @@ fn render_swap(o: &mut String) {
                         let n = op.bytes as usize;
                         let chunk = src_bytes[s..s + n].to_vec();
                         let target = match op.dst {
-                            Pool::Device { layer, buffer } => &mut dev[layer as usize][buffer as usize],
-                            Pool::Host { layer, buffer } => &mut host[layer as usize][buffer as usize],
+                            Pool::Device { layer, buffer } => {
+                                &mut dev[layer as usize][buffer as usize]
+                            }
+                            Pool::Host { layer, buffer } => {
+                                &mut host[layer as usize][buffer as usize]
+                            }
                         };
                         target[d..d + n].copy_from_slice(&chunk);
                     }
@@ -466,7 +502,11 @@ fn render_profile(o: &mut String) {
     }
 
     let k = base_key();
-    let _ = writeln!(o, "KEYMATCH\tbaseline\t-\t{}", u8::from(k.matches(|n| field_of(&k, n))));
+    let _ = writeln!(
+        o,
+        "KEYMATCH\tbaseline\t-\t{}",
+        u8::from(k.matches(|n| field_of(&k, n)))
+    );
     for field in KEY_FIELDS {
         for mode in 0..6 {
             let mutated = |name: &str| -> StoredField {
@@ -482,7 +522,11 @@ fn render_profile(o: &mut String) {
                     _ => StoredField::Int(132),
                 }
             };
-            let _ = writeln!(o, "KEYMATCH\t{field}\t{mode}\t{}", u8::from(k.matches(mutated)));
+            let _ = writeln!(
+                o,
+                "KEYMATCH\t{field}\t{mode}\t{}",
+                u8::from(k.matches(mutated))
+            );
         }
     }
 }
@@ -530,12 +574,29 @@ fn the_grid_still_covers_every_layer_it_claims_to() {
     std::panic::set_hook(previous);
 
     assert_eq!(out.lines().count(), GOLDEN_ROWS);
-    let count = |k: &str| out.lines().filter(|l| l.starts_with(&format!("{k}\t"))).count();
+    let count = |k: &str| {
+        out.lines()
+            .filter(|l| l.starts_with(&format!("{k}\t")))
+            .count()
+    };
     for kind in [
-        "MLA", "DSV4", "RECSTRIDE", "RECADDR", "RECMTP", "RECOOB", "SWAPCASE", "SWAPOP",
-        "SWAPHASH", "SWAPERR", "KEYJSON", "KEYMATCH",
+        "MLA",
+        "DSV4",
+        "RECSTRIDE",
+        "RECADDR",
+        "RECMTP",
+        "RECOOB",
+        "SWAPCASE",
+        "SWAPOP",
+        "SWAPHASH",
+        "SWAPERR",
+        "KEYJSON",
+        "KEYMATCH",
     ] {
-        assert!(count(kind) > 0, "no {kind} rows: a whole layer stopped being exercised");
+        assert!(
+            count(kind) > 0,
+            "no {kind} rows: a whole layer stopped being exercised"
+        );
     }
     assert_eq!(count("MLA"), 2 * 5 * 5 * 5 * 5);
     assert_eq!(count("DSV4"), RATIO_SETS.len() * 6);
@@ -558,25 +619,44 @@ fn every_layer_produces_varying_output() {
     std::panic::set_hook(previous);
 
     let distinct = |k: &str| {
-        let mut v: Vec<&str> =
-            out.lines().filter(|l| l.starts_with(&format!("{k}\t"))).collect();
+        let mut v: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with(&format!("{k}\t")))
+            .collect();
         v.sort_unstable();
         v.dedup();
         v.len()
     };
-    for (kind, min) in
-        [("MLA", 100), ("DSV4", 20), ("RECSTRIDE", 100), ("RECADDR", 100), ("SWAPHASH", 20)]
-    {
-        assert!(distinct(kind) >= min, "{kind} has only {} distinct rows", distinct(kind));
+    for (kind, min) in [
+        ("MLA", 100),
+        ("DSV4", 20),
+        ("RECSTRIDE", 100),
+        ("RECADDR", 100),
+        ("SWAPHASH", 20),
+    ] {
+        assert!(
+            distinct(kind) >= min,
+            "{kind} has only {} distinct rows",
+            distinct(kind)
+        );
     }
 
     // All three outcomes must appear, or the panic/null split is not being
     // exercised and the API distinction is unproven.
     let oob: Vec<&str> = out.lines().filter(|l| l.starts_with("RECOOB\t")).collect();
-    assert!(oob.iter().any(|l| l.ends_with("\t-2\t-2")), "nothing ever went out of range");
-    assert!(oob.iter().any(|l| l.ends_with("\t-1\t-1")), "no full-attention layer probed");
     assert!(
-        oob.iter().any(|l| l.split('\t').nth(4).is_some_and(|v| v.parse::<i64>().unwrap_or(-1) > 0)),
+        oob.iter().any(|l| l.ends_with("\t-2\t-2")),
+        "nothing ever went out of range"
+    );
+    assert!(
+        oob.iter().any(|l| l.ends_with("\t-1\t-1")),
+        "no full-attention layer probed"
+    );
+    assert!(
+        oob.iter().any(|l| l
+            .split('\t')
+            .nth(4)
+            .is_some_and(|v| v.parse::<i64>().unwrap_or(-1) > 0)),
         "no RECOOB row resolved to a real offset"
     );
     // Bounds win over the null: an out-of-range slot on a full-attention
@@ -589,9 +669,18 @@ fn every_layer_produces_varying_output() {
     );
 
     // And the match sweep must produce both answers.
-    let km: Vec<&str> = out.lines().filter(|l| l.starts_with("KEYMATCH\t")).collect();
-    assert!(km.iter().any(|l| l.ends_with("\t1")), "nothing ever matched");
-    assert!(km.iter().any(|l| l.ends_with("\t0")), "nothing ever failed to match");
+    let km: Vec<&str> = out
+        .lines()
+        .filter(|l| l.starts_with("KEYMATCH\t"))
+        .collect();
+    assert!(
+        km.iter().any(|l| l.ends_with("\t1")),
+        "nothing ever matched"
+    );
+    assert!(
+        km.iter().any(|l| l.ends_with("\t0")),
+        "nothing ever failed to match"
+    );
 }
 
 /// Ignored by default; run with `--ignored --nocapture` to regenerate the Rust

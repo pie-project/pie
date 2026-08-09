@@ -57,9 +57,18 @@ pub fn facts_digest(facts: &Qwen35HybridFacts, cuda: &Qwen35CudaFacts) -> String
         // and the digest has to say which it was emitted from.
         match cuda.proj_repr {
             WeightRepr::Bf16 => 0,
-            WeightRepr::Scaled { layout: ScaleLayout::PerTensor, .. } => 1,
-            WeightRepr::Scaled { layout: ScaleLayout::PerChannel, .. } => 2,
-            WeightRepr::Scaled { layout: ScaleLayout::PerGroup, .. } => 3,
+            WeightRepr::Scaled {
+                layout: ScaleLayout::PerTensor,
+                ..
+            } => 1,
+            WeightRepr::Scaled {
+                layout: ScaleLayout::PerChannel,
+                ..
+            } => 2,
+            WeightRepr::Scaled {
+                layout: ScaleLayout::PerGroup,
+                ..
+            } => 3,
             WeightRepr::Mxfp4Marlin => 4,
         },
     )
@@ -71,7 +80,20 @@ use model_compiler::trace::{FireClass, ForwardPlan, OpKind};
 
 /// The parameter list shared with `qwen3_5_forward_declared`, minus the
 /// plan and the per-class-constant inputs (`is_pure_decode`,
-/// `commit_lens` — the service classes get their own fns later).
+/// `commit_lens`).
+///
+/// `commit_lens` is not "later" — `.wiki/driver/graph.md` §4.2 RETIRED
+/// the service classes, and a speculative decode now buffers its tokens
+/// and folds only the accepted prefix, so there is no repair pass to
+/// emit. The emitter used to carry a whole second axis for it: an
+/// `emit_class_fn_commit` entry point, a `commit: bool` threaded
+/// through five functions, a signature variant that appended
+/// `commit_lens`, and a reset stage that was skipped under it. Nothing
+/// ever called it, so every one of those branches emitted the `false`
+/// side — removing the axis left all 153,887 lines of
+/// `committed_cuda_emissions` byte-identical. What it had been emitting
+/// instead was a claim: that this emitter can produce a commit-advance
+/// class, standing beside a retirement note saying that class is gone.
 const PARAMS: &str = "\
     const Qwen3_5Weights& w,\n\
     const HfConfig& cfg,\n\
@@ -189,37 +211,8 @@ fn emit_class_fn(
     fn_name: &str,
     is_decode: bool,
 ) -> String {
-    emit_class_fn_impl(plan, facts, cuda, fn_name, is_decode, false)
-}
-
-/// The commit-advance variant: the signature gains `commit_lens` and the
-/// conv/FLA emissions thread it; the reset stage is skipped (advancing
-/// the existing committed state — the interpreter's arm).
-fn emit_class_fn_commit(
-    plan: &ForwardPlan,
-    facts: &Qwen35HybridFacts,
-    cuda: &Qwen35CudaFacts,
-    fn_name: &str,
-) -> String {
-    emit_class_fn_impl(plan, facts, cuda, fn_name, false, true)
-}
-
-fn emit_class_fn_impl(
-    plan: &ForwardPlan,
-    facts: &Qwen35HybridFacts,
-    cuda: &Qwen35CudaFacts,
-    fn_name: &str,
-    is_decode: bool,
-    commit: bool,
-) -> String {
     let mut b = Body::default();
-    if commit {
-        b.line(&format!(
-            "inline void {fn_name}(\n{PARAMS},\n    const std::int32_t* commit_lens)\n{{"
-        ));
-    } else {
-        b.line(&format!("inline void {fn_name}(\n{PARAMS})\n{{"));
-    }
+    b.line(&format!("inline void {fn_name}(\n{PARAMS})\n{{"));
     b.line("    // Locals mirror the interpreter's preamble.");
     b.line("    const int N = total_tokens;");
     b.line("    const int R = num_requests;");
@@ -251,10 +244,6 @@ fn emit_class_fn_impl(
     b.line("                     N, R);");
     b.line("    }");
     b.line("");
-    if commit {
-        b.line("    // No reset: the commit replay advances the existing");
-        b.line("    // committed state (the interpreter's commit arm).");
-    } else {
     b.line("    // Per-slot reset for freshly (re)assigned rs slots — the");
     b.line("    // interpreter's reset stage, verbatim (no commit-advance");
     b.line("    // arm: the service classes stay on the interpreter walk).");
@@ -272,13 +261,12 @@ fn emit_class_fn_impl(
     b.line("                }");
     b.line("            }");
     b.line("        }");
-    if !is_decode && !commit {
+    if !is_decode {
         b.line("    } else {");
         b.line("        // Legacy null-slot prefill: reset all.");
         b.line("        state_cache.reset(stream);");
     }
     b.line("    }");
-    }
     b.line("");
     b.line("    const kernels::attn::DecodePlanCache* decode_plan =");
     b.line("        plan_state.decode_plan ? plan_state.decode_plan.get() : nullptr;");
@@ -309,7 +297,6 @@ fn emit_class_fn_impl(
         facts,
         cuda,
         is_decode,
-        commit,
         0,
         plan.ops.len(),
         &mut repeat_next_is_k,
@@ -324,7 +311,6 @@ fn emit_range(
     facts: &Qwen35HybridFacts,
     cuda: &Qwen35CudaFacts,
     is_decode: bool,
-    commit: bool,
     start: usize,
     end: usize,
     repeat_next_is_k: &mut bool,
@@ -345,8 +331,13 @@ fn emit_range(
                 b.stmt(&format!("{kw} ({}) {{", cond_of(&arm.pred)));
                 b.indent += 1;
                 emit_range(
-                    b, plan, facts, cuda, is_decode, commit,
-                    region, region + arm.ops as usize,
+                    b,
+                    plan,
+                    facts,
+                    cuda,
+                    is_decode,
+                    region,
+                    region + arm.ops as usize,
                     repeat_next_is_k,
                 );
                 b.indent -= 1;
@@ -355,8 +346,13 @@ fn emit_range(
             b.stmt("} else {");
             b.indent += 1;
             emit_range(
-                b, plan, facts, cuda, is_decode, commit,
-                region, region + *else_ops as usize,
+                b,
+                plan,
+                facts,
+                cuda,
+                is_decode,
+                region,
+                region + *else_ops as usize,
                 repeat_next_is_k,
             );
             b.indent -= 1;
@@ -364,7 +360,7 @@ fn emit_range(
             i = region + *else_ops as usize;
             continue;
         }
-        emit_op(b, op, plan, facts, cuda, is_decode, commit, repeat_next_is_k);
+        emit_op(b, op, plan, facts, cuda, is_decode, repeat_next_is_k);
         i += 1;
     }
 }
@@ -376,28 +372,27 @@ fn emit_range(
 /// (`dsl::cuda::rmsnorm`); a semantic one still records the kind. Same
 /// buffers, same weights, one body.
 fn emit_row_norm_q35(b: &mut Body, weight: &str) {
-            // Gemma fold everywhere (the walk's drift check is emission-
-            // time here: the trace carries the variant the facts stated).
-            if weight == "final_norm" {
-                b.stmt("kernels::norm::rmsnorm_gemma_bf16(");
-                b.stmt("    ws.y.data(), require(w.final_norm, \"final_norm\")->data(),");
-                b.stmt("    ws.norm_x.data(), N, H, eps, stream);");
-                return;
-            }
-            let (layer, field) = split_layer_weight(weight)
-                .unwrap_or_else(|| panic!("emitter(q35): norm weight {weight}"));
-            let member = match field {
-                "attn_norm" => "attn_norm_pre",
-                "mlp_norm" => "mlp_norm_pre",
-                other => panic!("emitter(q35): row-norm field {other}"),
-            };
-            b.stmt("kernels::norm::rmsnorm_gemma_bf16(");
-            b.stmt(&format!(
-                "    ws.y.data(), require(w.layers[{layer}].{member}, \"{weight}\")->data(),"
-            ));
-            b.stmt("    ws.norm_x.data(), N, H, eps, stream);");
+    // Gemma fold everywhere (the walk's drift check is emission-
+    // time here: the trace carries the variant the facts stated).
+    if weight == "final_norm" {
+        b.stmt("kernels::norm::rmsnorm_gemma_bf16(");
+        b.stmt("    ws.y.data(), require(w.final_norm, \"final_norm\")->data(),");
+        b.stmt("    ws.norm_x.data(), N, H, eps, stream);");
+        return;
+    }
+    let (layer, field) =
+        split_layer_weight(weight).unwrap_or_else(|| panic!("emitter(q35): norm weight {weight}"));
+    let member = match field {
+        "attn_norm" => "attn_norm_pre",
+        "mlp_norm" => "mlp_norm_pre",
+        other => panic!("emitter(q35): row-norm field {other}"),
+    };
+    b.stmt("kernels::norm::rmsnorm_gemma_bf16(");
+    b.stmt(&format!(
+        "    ws.y.data(), require(w.layers[{layer}].{member}, \"{weight}\")->data(),"
+    ));
+    b.stmt("    ws.norm_x.data(), N, H, eps, stream);");
 }
-
 
 fn emit_op(
     b: &mut Body,
@@ -406,7 +401,6 @@ fn emit_op(
     facts: &Qwen35HybridFacts,
     cuda: &Qwen35CudaFacts,
     is_decode: bool,
-    commit: bool,
     repeat_next_is_k: &mut bool,
 ) {
     let _ = (plan, is_decode);
@@ -421,7 +415,11 @@ fn emit_op(
         OpKind::Rmsnorm { weight, .. } => {
             emit_row_norm_q35(b, weight);
         }
-        OpKind::Matmul { weight, beta_one, selector } => {
+        OpKind::Matmul {
+            weight,
+            beta_one,
+            selector,
+        } => {
             assert!(selector.is_none(), "emitter(q35): dyn matmul out of scope");
             let (layer, field) = split_layer_weight(weight)
                 .unwrap_or_else(|| panic!("emitter(q35): matmul weight {weight}"));
@@ -432,7 +430,11 @@ fn emit_op(
                 )
             };
             match field {
-                "in_proj_qkvz" => b.stmt(&raw("la_in_proj_qkvz", "la.mixed_qkvz.data()", "conv_dim + V_dim")),
+                "in_proj_qkvz" => b.stmt(&raw(
+                    "la_in_proj_qkvz",
+                    "la.mixed_qkvz.data()",
+                    "conv_dim + V_dim",
+                )),
                 "in_proj_ba" => b.stmt(&raw("la_in_proj_ba", "la.ba.data()", "2 * V_h")),
                 "in_proj_qkv" => b.stmt(&raw("la_in_proj_qkv", "la.mixed_qkv.data()", "conv_dim")),
                 "in_proj_z" => b.stmt(&raw("la_in_proj_z", "la.z.data()", "V_dim")),
@@ -636,10 +638,21 @@ fn emit_op(
             b.stmt("    static_cast<std::size_t>(N) * H * sizeof(std::uint16_t),");
             b.stmt("    cudaMemcpyDeviceToDevice, stream));");
         }
-        OpKind::Launch { kernel, weights, state, params } => {
-            emit_launch(b, kernel, weights, state.as_ref(), params, op, facts, commit,
-                        repeat_next_is_k)
-        }
+        OpKind::Launch {
+            kernel,
+            weights,
+            state,
+            params,
+        } => emit_launch(
+            b,
+            kernel,
+            weights,
+            state.as_ref(),
+            params,
+            op,
+            facts,
+            repeat_next_is_k,
+        ),
         other => panic!("emitter(q35): op kind {other:?} out of scope"),
     }
 }
@@ -653,11 +666,9 @@ fn emit_launch(
     params: &[u32],
     op: &model_compiler::trace::Op,
     facts: &Qwen35HybridFacts,
-    commit: bool,
     repeat_next_is_k: &mut bool,
 ) {
     let _ = op;
-    let commit_arg = if commit { "commit_lens" } else { "/*commit_lens=*/nullptr" };
     let sl = state.map(|s| s.layer).unwrap_or(0);
     // The interpreter's binding lambdas, emitted per site with the layer
     // constant: the conv weight bank and the model-layer→kv-slot map.
@@ -710,7 +721,7 @@ fn emit_launch(
             b.stmt("      static_cast<long long>(state_cache.conv_kernel()) *");
             b.stmt("          state_cache.conv_dim(),");
             b.stmt("      R, conv_dim, conv_K, stream, write_state,");
-            b.stmt(&format!("      {commit_arg}); }}"));
+            b.stmt("      /*commit_lens=*/nullptr); }");
         }
         k @ ("ssm::recurrent_gated_delta_step_batched"
         | "ssm::recurrent_gated_delta_step_batched_state_bf16"
@@ -744,7 +755,8 @@ fn emit_launch(
         | "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16"
         | "ssm::chunk_gated_delta_prefill_batched"
         | "ssm::chunk_gated_delta_prefill_batched_state_bf16") => {
-            let gqa_direct = k.contains("_gqa") || (!k.contains("warp_tiled") && !k.contains("cached"));
+            let gqa_direct =
+                k.contains("_gqa") || (!k.contains("warp_tiled") && !k.contains("cached"));
             let bf16 = k.ends_with("state_bf16");
             let fla = !k.contains("warp_tiled") && !k.contains("cached");
             let cast = if bf16 { "" } else { "static_cast<float*>" };
@@ -763,7 +775,7 @@ fn emit_launch(
             if k.contains("_gqa") || fla {
                 if fla {
                     b.stmt("    R, K_h, V_h, K_d, V_d, stream, write_state,");
-                    b.stmt(&format!("    {commit_arg});"));
+                    b.stmt("    /*commit_lens=*/nullptr);");
                 } else {
                     b.stmt("    R, K_h, V_h, K_d, V_d, stream, write_state);");
                 }
@@ -847,13 +859,23 @@ fn emit_launch(
             b.stmt("    const std::size_t n_ab =");
             b.stmt("        static_cast<std::size_t>(N) * V_h * sizeof(std::uint16_t);");
             let (d1, s1, d2, s2, d3, s3) = if load {
-                ("la.mixed_qkv.data()", "stash",
-                 "la.a.data()", "stash + a_off",
-                 "la.b.data()", "stash + b_off")
+                (
+                    "la.mixed_qkv.data()",
+                    "stash",
+                    "la.a.data()",
+                    "stash + a_off",
+                    "la.b.data()",
+                    "stash + b_off",
+                )
             } else {
-                ("stash", "la.mixed_qkv.data()",
-                 "stash + a_off", "la.a.data()",
-                 "stash + b_off", "la.b.data()")
+                (
+                    "stash",
+                    "la.mixed_qkv.data()",
+                    "stash + a_off",
+                    "la.a.data()",
+                    "stash + b_off",
+                    "la.b.data()",
+                )
             };
             for (dst, src, n) in [(d1, s1, "n_qkv"), (d2, s2, "n_ab"), (d3, s3, "n_ab")] {
                 b.stmt("    CUDA_CHECK(cudaMemcpyAsync(");
@@ -894,9 +916,7 @@ fn emit_launch(
         }
         // The ROW norms, now that `cuda::rmsnorm` states the fold.
         "norm::rmsnorm_bf16" | "norm::rmsnorm_gemma_bf16" => {
-            let weight = weights
-                .first()
-                .expect("a stated row norm names its weight");
+            let weight = weights.first().expect("a stated row norm names its weight");
             emit_row_norm_q35(b, weight);
         }
         other => panic!("emitter(q35): stated kernel {other} out of scope"),

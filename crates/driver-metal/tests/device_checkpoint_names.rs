@@ -38,13 +38,12 @@
 //! when there is one block, and a refusal cannot demand a slab of a stack
 //! whose row states none.
 
-
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use driver_metal::device::Context;
-use driver_metal::weights::load::load;
 use driver_metal::lowering::resolve::{Names, Store};
+use driver_metal::weights::load::load;
 use model::catalog::{MetalBinding, Variant};
 use model_compiler::lower::{Arg, Fire, Row, lower};
 use model_compiler::trace::FireClass;
@@ -71,7 +70,12 @@ fn snapshot() -> Option<PathBuf> {
 /// tell apart. Every `affine_qmv_fast_bfloat16_gs_N_b_M` symbol the text
 /// names carries that pair in its name, so a gate that guessed it would
 /// report missing kernels for a checkpoint that is fine.
-fn served(dir: &std::path::Path) -> (&'static dyn model::catalog::Variant, model::encoding::Encoding) {
+fn served(
+    dir: &std::path::Path,
+) -> (
+    &'static dyn model::catalog::Variant,
+    model::encoding::Encoding,
+) {
     let meta = model_loader::checkpoint::read::parse_checkpoint_metadata(dir)
         .unwrap_or_else(|e| panic!("{} did not read as a checkpoint: {e:?}", dir.display()));
     let row = model::catalog::identify(&meta, &model::catalog::Override::None)
@@ -80,13 +84,18 @@ fn served(dir: &std::path::Path) -> (&'static dyn model::catalog::Variant, model
     // file when it does not. A converted `.pie` archive has the first; a raw
     // HuggingFace snapshot -- which is what `PIE_METAL_NAMES_SNAPSHOT`
     // usually points at -- has only the second.
-    let config = match model_loader::checkpoint::read::read_meta(&meta, model::encoding::CONFIG_OBJECT) {
-        Ok(Some(bytes)) => String::from_utf8(bytes).expect("the embedded config is utf8"),
-        _ => std::fs::read_to_string(dir.join("config.json"))
-            .unwrap_or_else(|e| panic!("{}/config.json: {e}", dir.display())),
-    };
-    let encoding = model::encoding::Encoding::from_config_json(&config)
-        .unwrap_or_else(|e| panic!("{}: the config does not state its encoding: {e}", dir.display()));
+    let config =
+        match model_loader::checkpoint::read::read_meta(&meta, model::encoding::CONFIG_OBJECT) {
+            Ok(Some(bytes)) => String::from_utf8(bytes).expect("the embedded config is utf8"),
+            _ => std::fs::read_to_string(dir.join("config.json"))
+                .unwrap_or_else(|e| panic!("{}/config.json: {e}", dir.display())),
+        };
+    let encoding = model::encoding::Encoding::from_config_json(&config).unwrap_or_else(|e| {
+        panic!(
+            "{}: the config does not state its encoding: {e}",
+            dir.display()
+        )
+    });
     (row, encoding)
 }
 
@@ -190,7 +199,10 @@ fn the_checkpoint_answers_the_names_the_text_states() {
     let arch = match row.deployment(model::catalog::Deployed::single()) {
         Ok(d) => d.advertised.arch,
         Err(why) => {
-            eprintln!("SKIP: the matched row `{}` does not deploy: {why}", row.id());
+            eprintln!(
+                "SKIP: the matched row `{}` does not deploy: {why}",
+                row.id()
+            );
             return;
         }
     };
@@ -201,7 +213,10 @@ fn the_checkpoint_answers_the_names_the_text_states() {
         // happen instead was a page of 576 "missing" names, every one of them
         // missing for the single reason that nothing here claims to serve
         // this checkpoint.
-        eprintln!("SKIP: no metal text for row `{}` (`{arch}`): {why}", row.id());
+        eprintln!(
+            "SKIP: no metal text for row `{}` (`{arch}`): {why}",
+            row.id()
+        );
         return;
     }
 
@@ -233,9 +248,8 @@ fn the_checkpoint_answers_the_names_the_text_states() {
     // `loaded.mxfp4` is the one question left, and it is the seam's own: a
     // bank the load left in the publisher's format states an mxfp4 symbol
     // rather than an affine one.
-    let binding = driver_metal::model::binding::observed(geometry.quant, |t| {
-        loaded.mxfp4.contains(t)
-    });
+    let binding =
+        driver_metal::model::binding::observed(geometry.quant, |t| loaded.mxfp4.contains(t));
 
     let named = HashMap::new();
     let mut store = Store::new(Names::mlx(), &loaded.tensors, &named);
@@ -293,7 +307,10 @@ fn what_this_checkpoint_published() {
         }
     };
     let names = loaded.names();
-    eprintln!("{} tensors published; layer 0 and the globals:", names.len());
+    eprintln!(
+        "{} tensors published; layer 0 and the globals:",
+        names.len()
+    );
     for name in &names {
         if name.starts_with("layers.0.") || !name.starts_with("layers.") {
             eprintln!("  {name}");
@@ -402,14 +419,16 @@ fn check_one_snapshot(dir: &std::path::Path) {
     // so there is nothing left to disagree.
     let arch = deployment.advertised.arch;
     if let Err(why) = driver_metal::model::binding::serves(row) {
-        eprintln!("    SKIP: no metal text for row `{}` (`{arch}`): {why}", row.id());
+        eprintln!(
+            "    SKIP: no metal text for row `{}` (`{arch}`): {why}",
+            row.id()
+        );
         return;
     }
 
     let target = driver_metal::loader::metal_storage_target();
-    let (plan, _) =
-        driver_metal::loader::compile_load_plan_for(&dir, &target, row, &encoding)
-            .expect("the plan compiles");
+    let (plan, _) = driver_metal::loader::compile_load_plan_for(&dir, &target, row, &encoding)
+        .expect("the plan compiles");
     let published: BTreeSet<&str> = plan.tensors.iter().map(|t| t.name.as_str()).collect();
 
     // ONE map. gemma4 used to need its own, and the arch variable said which
@@ -431,7 +450,10 @@ fn check_one_snapshot(dir: &std::path::Path) {
     ) {
         Ok(g) => g,
         Err(why) => {
-            eprintln!("    SKIP: the geometry refuses this checkpoint -- {}", why.0);
+            eprintln!(
+                "    SKIP: the geometry refuses this checkpoint -- {}",
+                why.0
+            );
             return;
         }
     };

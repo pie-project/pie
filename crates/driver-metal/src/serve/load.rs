@@ -55,7 +55,10 @@ impl Shell {
         let meta = model_loader::checkpoint::read::parse_checkpoint_metadata(&desc.snapshot_dir)
             .map_err(|e| Error::Unserved {
                 what: "load_model",
-                message: format!("{} did not read as a checkpoint: {e:?}", desc.snapshot_dir.display()),
+                message: format!(
+                    "{} did not read as a checkpoint: {e:?}",
+                    desc.snapshot_dir.display()
+                ),
             })?;
         let config_json = match model_loader::checkpoint::read::read_meta(
             &meta,
@@ -63,7 +66,10 @@ impl Shell {
         ) {
             Ok(Some(bytes)) => String::from_utf8(bytes).map_err(|e| Error::Unserved {
                 what: "load_model",
-                message: format!("the embedded {} is not utf8: {e}", model::encoding::CONFIG_OBJECT),
+                message: format!(
+                    "the embedded {} is not utf8: {e}",
+                    model::encoding::CONFIG_OBJECT
+                ),
             })?,
             Ok(None) => {
                 let path = self.boot_config.as_ref().ok_or_else(|| Error::Unserved {
@@ -378,7 +384,9 @@ impl Shell {
             // its trim task only when both are, and a page size with no
             // budget describes a pool that can be measured but not resized.
             elastic_page_bytes: crate::device::PAGE,
-            elastic_budget_pages: crate::device::pages_for_bytes(elastic_budget_bytes(&self.context)),
+            elastic_budget_pages: crate::device::pages_for_bytes(elastic_budget_bytes(
+                &self.context,
+            )),
             has_mtp_logits: false,
             has_mtp_drafts: false,
             has_value_head: false,

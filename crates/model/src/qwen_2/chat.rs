@@ -10,8 +10,8 @@
 // GLM-5 and Nemotron-H bind it. The generation that implements a thing keeps
 // it; the others name it.
 use crate::shared::chatml::{ChatMLConfig, QwenInstruct};
-use tokenizer::Tokenizer;
 use std::sync::Arc;
+use tokenizer::Tokenizer;
 
 // The implementation below mirrors the published Qwen2 jinja chat template;
 // the verbatim copy that used to sit here as a static was never read — the

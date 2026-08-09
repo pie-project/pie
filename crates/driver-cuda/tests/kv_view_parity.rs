@@ -164,7 +164,10 @@ fn the_live_cache_describes_the_layers_the_shell_describes_by_hand() {
         )
         .unwrap_or_else(|e| panic!("{name}: the layout plans: {e:?}"));
 
-        let mut ops = Addrs { next: 0x1000, log: Vec::new() };
+        let mut ops = Addrs {
+            next: 0x1000,
+            log: Vec::new(),
+        };
         let cache = KvCache::<NoPool>::materialize(layout, &mut ops)
             .unwrap_or_else(|e| panic!("{name}: the cache materializes: {e:?}"));
 
@@ -183,15 +186,24 @@ fn the_live_cache_describes_the_layers_the_shell_describes_by_hand() {
             );
 
             assert_eq!(live.layer, mine.layer, "{name} layer {l}: layer");
-            assert_eq!(live.source_layer, mine.source_layer, "{name} layer {l}: source");
+            assert_eq!(
+                live.source_layer, mine.source_layer,
+                "{name} layer {l}: source"
+            );
             assert_eq!(live.num_pages, mine.num_pages, "{name} layer {l}: pages");
-            assert_eq!(live.page_size, mine.page_size, "{name} layer {l}: page size");
+            assert_eq!(
+                live.page_size, mine.page_size,
+                "{name} layer {l}: page size"
+            );
             assert_eq!(
                 live.num_kv_heads, mine.num_kv_heads,
                 "{name} layer {l}: kv heads"
             );
             assert_eq!(live.head_dim, mine.head_dim, "{name} layer {l}: head dim");
-            assert_eq!(live.block_size, mine.block_size, "{name} layer {l}: block size");
+            assert_eq!(
+                live.block_size, mine.block_size,
+                "{name} layer {l}: block size"
+            );
             assert_eq!(
                 live.k_scales, mine.k_scales,
                 "{name} layer {l}: a native cache carries no scales"
@@ -206,8 +218,14 @@ fn the_live_cache_describes_the_layers_the_shell_describes_by_hand() {
                 live.k_bf16_pages, mine.k_bf16_pages,
                 "{name} layer {l}: a native cache's bf16 view IS its pages"
             );
-            assert_eq!(live.v_bf16_pages, mine.v_bf16_pages, "{name} layer {l}: v bf16");
-            assert_eq!(live.hnd_layout, mine.hnd_layout, "{name} layer {l}: hnd layout");
+            assert_eq!(
+                live.v_bf16_pages, mine.v_bf16_pages,
+                "{name} layer {l}: v bf16"
+            );
+            assert_eq!(
+                live.hnd_layout, mine.hnd_layout,
+                "{name} layer {l}: hnd layout"
+            );
             assert_eq!(
                 live.native_bf16, mine.native_bf16,
                 "{name} layer {l}: the storage IS the model's bf16"
@@ -238,7 +256,10 @@ fn a_shared_layer_borrows_pages_and_allocates_none() {
         false,
     )
     .expect("plans");
-    let mut ops = Addrs { next: 0x1000, log: Vec::new() };
+    let mut ops = Addrs {
+        next: 0x1000,
+        log: Vec::new(),
+    };
     let cache = KvCache::<NoPool>::materialize(layout, &mut ops).expect("materializes");
 
     let owner = cache.layer_view(1);

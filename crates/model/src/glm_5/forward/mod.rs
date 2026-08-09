@@ -27,8 +27,7 @@
 pub mod facts;
 
 use self::facts::Glm5Facts;
-use model_compiler::dsl::{
-    WeightRepr,self, matmul, MatW, NormW};
+use model_compiler::dsl::{self, MatW, NormW, WeightRepr, matmul};
 use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
 
 /// One glm5 layer's weight handles, under the tree-wide
@@ -131,15 +130,21 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
                 facts.dsa.index_n_heads * facts.dsa.index_head_dim,
             );
             let idx_k = dsl::cuda::gemm_xwt(&x, &w.idx_wk.name, facts.dsa.index_head_dim);
-            let idx_w =
-                dsl::cuda::gemm_xwt(&q_a_n, &w.idx_weights.name, facts.dsa.index_n_heads);
+            let idx_w = dsl::cuda::gemm_xwt(&q_a_n, &w.idx_weights.name, facts.dsa.index_n_heads);
             let idx_k = dsl::cuda::dsa_index_knorm_rope(&idx_k, facts.dsa.index_head_dim);
             let idx_q = dsl::cuda::dsa_index_q_rope(
                 &idx_q,
                 facts.dsa.index_n_heads,
                 facts.dsa.index_head_dim,
             );
-            dsl::cuda::dsa_index_topk_mask(&idx_q, &idx_k, &idx_w, facts.dsa.index_n_heads, facts.dsa.index_head_dim, facts.dsa.index_topk);
+            dsl::cuda::dsa_index_topk_mask(
+                &idx_q,
+                &idx_k,
+                &idx_w,
+                facts.dsa.index_n_heads,
+                facts.dsa.index_head_dim,
+                facts.dsa.index_topk,
+            );
 
             // ── MLA ──────────────────────────────────────────────────
             let (_kv_c, _k_pe, q_nope, q_pe) = dsl::cuda::mla_prepare(
@@ -209,8 +214,7 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
                 &experts,
                 facts.moe.top_k,
             );
-            let routed =
-                dsl::cuda::weighted_sum(&weights, &route_out, facts.hidden, None);
+            let routed = dsl::cuda::weighted_sum(&weights, &route_out, facts.hidden, None);
 
             // The shared expert lands on the routed sum, and the SUM
             // lands on the residual — two explicit adds, because glm5's

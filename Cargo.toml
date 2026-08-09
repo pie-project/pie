@@ -79,6 +79,12 @@ members = [
     # splicer and the tuning table, which are the two parts with logic worth
     # testing and no reason to need a GPU.
     "crates/driver-metal",
+    # The Vulkan execution shell. Unlike the Metal one, its DEVICE half builds
+    # and tests on the same Linux hosts the rest of the workspace is developed
+    # on -- Vulkan is not a platform, it is a loader -- so the portable/device
+    # split here is about what needs a GPU present, not about what a compiler
+    # will accept.
+    "crates/driver-vulkan",
     "crates/driver-dummy",
 
     # -- model-*: what a model IS, and how it gets onto a device ------------
@@ -92,10 +98,9 @@ members = [
     # at model-load time; the traced form is what a driver executes.
     "crates/model-compiler",
     # Weight loader: checkpoints -> verified device-memory layouts. Consumed by
-    # drivers at cold start, not by the serving runtime. `model-loader` is the
-    # compiler alone; `-capi` is its C ABI — the repr(C) marshalling, the extern
-    # entry points, the committed pie_loader.h and the `pie-loader` CLI — which
-    # is what the drivers actually link.
+    # drivers at cold start, not by the serving runtime. One crate: the drivers
+    # link the rlib and pass Rust types, and a device's arena crosses as an
+    # `ArenaBacking` rather than as a second executor inside each driver.
     "crates/model-loader",
 
     # -- kernels-*: the device kernels, and the words their tables use ------

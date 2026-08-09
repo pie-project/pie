@@ -151,8 +151,7 @@ pub fn observed(
 /// row either refuses in its own words or traces `llama_like.metal.*` — and
 /// this is deliberately the driver's sentence rather than the row's, because
 /// reaching it means a row said something about Metal that was not true.
-const NOT_A_METAL_TEXT: &str =
-    "this row answered a Metal load with another backend's text; the text \
+const NOT_A_METAL_TEXT: &str = "this row answered a Metal load with another backend's text; the text \
      exists but it was written for other kernels, so a fire would lower \
      symbols no Metal shader exports";
 
@@ -168,12 +167,18 @@ const NOT_A_METAL_TEXT: &str =
 /// # The one thing it checks, and why it is not a second list
 ///
 /// `Deployed::backend` is a REQUEST, and the answer is checked against it.
-/// Every generation now states its own Metal answer: eight trace one
+/// Every generation now states its own Metal answer: NINE trace one
 /// (`llama_3`, `qwen_2`, `qwen_3`, `mistral_3`, `phi_3`, `olmo_2`, `olmo_3`,
-/// `gemma_3`) and the rest refuse by name, each with a `Refusal::Unsupported`
-/// literal that names the generation and the CUDA text it has instead. So
-/// this check does not currently fire for any row, and that is the state it
-/// is meant to hold.
+/// `gemma_3`, `gemma_4`) and the rest refuse by name, each with a
+/// `Refusal::Unsupported` literal that names the generation and the CUDA text
+/// it has instead. So this check does not currently fire for any row, and
+/// that is the state it is meant to hold.
+///
+/// The count is not kept in step by hand: `catalog_backends`'s
+/// `the_rows_that_serve_metal_are_the_llama_like_ones` walks the catalog and
+/// names the nine, so a generation that grows or loses a Metal text fails
+/// there before this sentence can go stale. It HAD gone stale — gemma-4 grew
+/// its text while this still said eight.
 ///
 /// What it is FOR is the way a Metal arm goes wrong. `gemma_3`'s is a
 /// `match` on `load.backend` whose two arms differ by one call —
@@ -250,7 +255,13 @@ mod tests {
     /// split four ways to hold one.
     #[test]
     fn the_binding_carries_the_checkpoints_own_affine_point() {
-        let b = observed(AffineFormat { bits: 8, group: 128 }, |_| false);
+        let b = observed(
+            AffineFormat {
+                bits: 8,
+                group: 128,
+            },
+            |_| false,
+        );
         assert_eq!(b.quant_bits, 8);
         assert_eq!(b.quant_group, 128);
 
@@ -280,7 +291,10 @@ mod tests {
             "the load's only question of the tensors is what format the \
              expert bank arrived in"
         );
-        assert!(b.moe_mxfp4, "the bank answered mxfp4, so the binding says so");
+        assert!(
+            b.moe_mxfp4,
+            "the bank answered mxfp4, so the binding says so"
+        );
 
         let dense = observed(AffineFormat { bits: 4, group: 64 }, |_| false);
         assert!(
@@ -410,7 +424,10 @@ mod tests {
                 .trace(class, model::catalog::Deployed::metal(&b))
                 .expect("the row's own answer");
             assert_eq!(mine, theirs, "the door adds nothing to the row's text");
-            assert!(!mine.ops.is_empty(), "a text of no operations is not a text");
+            assert!(
+                !mine.ops.is_empty(),
+                "a text of no operations is not a text"
+            );
             assert_eq!(
                 Backend::of_family(&mine.family),
                 Some(Backend::Metal),
@@ -431,15 +448,19 @@ mod tests {
     /// is served, and every row that does not is refused. The driver holds no
     /// list, so this is the only thing that can be checked — and it is
     /// exactly the thing the deleted `LLAMA_LIKE` got wrong in both
-    /// directions at once. It listed `gemma4`, which no Metal text has ever
-    /// existed for, and omitted `gemma3`, which `llama_like_metal` serves
-    /// today: sandwich norms, the `(1+w)` weight fold, the scaled gather, two
-    /// rope bases and the per-layer window are all in that text. A hand-kept
-    /// table drifts in whichever direction nobody is looking.
+    /// directions at once. It listed `gpt_oss`, which no publication of
+    /// reaches a Metal device here at all, and omitted `gemma3`, which
+    /// `llama_like_metal` serves today: sandwich norms, the `(1+w)` weight
+    /// fold, the scaled gather, two rope bases and the per-layer window are
+    /// all in that text. A hand-kept table drifts in whichever direction
+    /// nobody is looking — and so does a per-row refusal nobody re-measures,
+    /// which is how `gemma_4` spent a merge refusing a text that states every
+    /// width it needs.
     ///
-    /// Eleven generations refuse in their own words — `qwen_3_5` because its
-    /// linear-attention interleave is a different shape, `gpt_oss` and
-    /// `gemma_4` because their texts are `gpt_oss_cuda` and `gemma4_cuda` —
+    /// Ten generations refuse in their own words — `qwen_3_5` because its
+    /// linear-attention interleave is a different shape, `gpt_oss` because
+    /// the bank its manifest pins and the bank `resolve` names are two
+    /// different publications —
     /// and `serve/control.rs`'s `copy_state` refusal still rests on the first
     /// of those: no model this backend serves has recurrent state to copy.
     /// That sentence is true only while this passes.
@@ -450,7 +471,10 @@ mod tests {
         let mut served = 0usize;
         let mut refused = 0usize;
         for row in model::catalog::catalog() {
-            let raw = row.trace(FireClass::Decode, model::catalog::Deployed::metal(&ANY_ENCODING));
+            let raw = row.trace(
+                FireClass::Decode,
+                model::catalog::Deployed::metal(&ANY_ENCODING),
+            );
             let ours = serves(*row).is_ok();
             match raw {
                 Ok(plan) if Backend::of_family(&plan.family) == Some(Backend::Metal) => {
@@ -479,11 +503,18 @@ mod tests {
                 }
                 Err(_) => {
                     refused += 1;
-                    assert!(!ours, "`{}` refused `trace` and was served anyway", row.id());
+                    assert!(
+                        !ours,
+                        "`{}` refused `trace` and was served anyway",
+                        row.id()
+                    );
                 }
             }
         }
-        assert!(served > 0, "no row in the catalog states a Metal text at all");
+        assert!(
+            served > 0,
+            "no row in the catalog states a Metal text at all"
+        );
         assert!(
             refused > 0,
             "every row in the catalog states a Metal text, so the pre-staging \
@@ -514,7 +545,13 @@ mod tests {
     fn two_encodings_of_one_row_state_the_same_program() {
         let row = model::catalog::find("qwen3-0.6b").expect("a row the device gates open");
         let four = observed(AffineFormat { bits: 4, group: 64 }, |_| false);
-        let eight = observed(AffineFormat { bits: 8, group: 128 }, |_| false);
+        let eight = observed(
+            AffineFormat {
+                bits: 8,
+                group: 128,
+            },
+            |_| false,
+        );
         let (a, b) = (
             text(row, FireClass::Decode, &four).expect("a metal text"),
             text(row, FireClass::Decode, &eight).expect("a metal text"),

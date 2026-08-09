@@ -220,7 +220,9 @@ fn no_entry_point_lets_a_panic_out() {
 
     let mut entries = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        let Some(rest) = line.strip_prefix("pub fn pie_cuda_") else { continue };
+        let Some(rest) = line.strip_prefix("pub fn pie_cuda_") else {
+            continue;
+        };
         let name = rest.split('(').next().unwrap_or("").to_string();
         // The signature runs to the brace; the body starts after it.
         let body_at = (i..lines.len().min(i + 30))
@@ -241,8 +243,11 @@ fn no_entry_point_lets_a_panic_out() {
         entries.len()
     );
 
-    let naked: Vec<&str> =
-        entries.iter().filter(|(_, g)| !*g).map(|(n, _)| n.as_str()).collect();
+    let naked: Vec<&str> = entries
+        .iter()
+        .filter(|(_, g)| !*g)
+        .map(|(n, _)| n.as_str())
+        .collect();
     assert!(
         naked.is_empty(),
         "these entry points let a panic reach the caller: {naked:?}. \

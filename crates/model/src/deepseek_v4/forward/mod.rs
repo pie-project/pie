@@ -26,8 +26,7 @@
 pub mod facts;
 
 use self::facts::Dsv4Facts;
-use model_compiler::dsl::{
-    WeightRepr,self, matmul, MatW, NormW};
+use model_compiler::dsl::{self, MatW, NormW, WeightRepr, matmul};
 use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct Dsv4LayerW {
@@ -102,8 +101,7 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
         // The compressed pass needs the block boundaries this fire's
         // positions imply, and they are a FIRE fact — one statement,
         // outside the layer loop, exactly as the hand-written pass has it.
-        let (boundary_pos, _meta, _counts) =
-            dsl::cuda::dsv4_boundary_meta(&embedded, class);
+        let (boundary_pos, _meta, _counts) = dsl::cuda::dsv4_boundary_meta(&embedded, class);
 
         for l in 0..facts.layers {
             let w = Dsv4LayerW::new(l, facts);
@@ -112,8 +110,7 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
             // input and the two mixes `hc_post` will need to write back.
             let normed_f32 =
                 dsl::cuda::hc_rmsnorm_to_f32(&streams, &w.attn_norm.name, facts.hidden);
-            let (x, post_mix, comb_mix) =
-                dsl::cuda::hc_pre(&normed_f32, &streams, k, facts.hidden);
+            let (x, post_mix, comb_mix) = dsl::cuda::hc_pre(&normed_f32, &streams, k, facts.hidden);
 
             // Q through its latent, then a per-head norm with NO gamma —
             // the reference's `q *= rsqrt(...)`, which is a different
@@ -133,7 +130,8 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
             dsl::cuda::write_kv_to_pages(&kv, &kv, &kvh);
 
             // The window pass, uncompressed.
-            let (o_win, lse_win) = dsl::cuda::attention_flashinfer_prefill_lse(&q, &kvh, a.q_width());
+            let (o_win, lse_win) =
+                dsl::cuda::attention_flashinfer_prefill_lse(&q, &kvh, a.q_width());
             let lse_win = dsl::cuda::lse_log2_to_ln(&lse_win, a.heads);
 
             // The compressed pass: gather this layer's block entries,
@@ -146,12 +144,7 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
 
             // One output, weighted by the two LSEs.
             let (o, lse) = dsl::cuda::combine_attn_outputs(
-                &o_win,
-                &lse_win,
-                &o_comp,
-                &lse_comp,
-                a.heads,
-                a.head_dim,
+                &o_win, &lse_win, &o_comp, &lse_comp, a.heads, a.head_dim,
             );
             let o = dsl::cuda::attn_sink_correction(
                 &o,
@@ -169,10 +162,8 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
             streams = dsl::cuda::hc_post(&o, &streams, &post_mix, &comb_mix, k, facts.hidden);
 
             // ── MLP / MoE, over the same rank-K residual ─────────────
-            let normed_f32 =
-                dsl::cuda::hc_rmsnorm_to_f32(&streams, &w.mlp_norm.name, facts.hidden);
-            let (m, post_mix, comb_mix) =
-                dsl::cuda::hc_pre(&normed_f32, &streams, k, facts.hidden);
+            let normed_f32 = dsl::cuda::hc_rmsnorm_to_f32(&streams, &w.mlp_norm.name, facts.hidden);
+            let (m, post_mix, comb_mix) = dsl::cuda::hc_pre(&normed_f32, &streams, k, facts.hidden);
 
             let out = if !facts.is_moe_layer(l) {
                 dsl::dense_gated_mlp(

@@ -120,8 +120,10 @@ pub fn manifest(f: &KimiK3Facts, tied_embeddings: bool) -> Manifest {
         has_kda.then_some(kda_width),
     );
     let o_width = shared_width(has_mla.then_some(v_width), has_kda.then_some(kda_width));
-    let g_width =
-        shared_width((has_mla && a.output_gate).then_some(v_width), has_kda.then_some(kda_width));
+    let g_width = shared_width(
+        (has_mla && a.output_gate).then_some(v_width),
+        has_kda.then_some(kda_width),
+    );
 
     Manifest::new(f.layers)
         .with(TensorSpec::required("embed_tokens", [vocab, hidden]))
@@ -130,10 +132,21 @@ pub fn manifest(f: &KimiK3Facts, tied_embeddings: bool) -> Manifest {
         // can tell them apart: every extent agrees.
         .either(!tied_embeddings, "lm_head", [vocab, hidden])
         .with(TensorSpec::required("layer.{}.input_layernorm", [hidden]))
-        .with(TensorSpec::required("layer.{}.post_attention_layernorm", [hidden]))
+        .with(TensorSpec::required(
+            "layer.{}.post_attention_layernorm",
+            [hidden],
+        ))
         // ── The MLA third ────────────────────────────────────────────
-        .either(has_mla && latent_q, "layer.{}.self_attn.q_a_proj", [q_lora, hidden])
-        .either(has_mla && latent_q, "layer.{}.self_attn.q_b_proj", [q_b_width, q_lora])
+        .either(
+            has_mla && latent_q,
+            "layer.{}.self_attn.q_a_proj",
+            [q_lora, hidden],
+        )
+        .either(
+            has_mla && latent_q,
+            "layer.{}.self_attn.q_b_proj",
+            [q_b_width, q_lora],
+        )
         // The straight-projection alternative, forbidden when there is a
         // rank: the two cannot both be published. Claimed as an ABSENCE
         // only where the KDA half is not publishing the same name — in a
@@ -160,7 +173,11 @@ pub fn manifest(f: &KimiK3Facts, tied_embeddings: bool) -> Manifest {
             [kv_a_width, hidden],
         )
         .either(has_mla, "layer.{}.self_attn.kv_a_layernorm", [kv_lora])
-        .either(has_mla, "layer.{}.self_attn.kv_b_proj", [kv_b_width, kv_lora])
+        .either(
+            has_mla,
+            "layer.{}.self_attn.kv_b_proj",
+            [kv_b_width, kv_lora],
+        )
         // `o_proj` reads the VALUE width and not the query width, which
         // is where MLA stops looking like GQA: for this row they differ
         // by 64 per head. Both halves land through this name, so the row
@@ -203,7 +220,11 @@ pub fn manifest(f: &KimiK3Facts, tied_embeddings: bool) -> Manifest {
         // the two tensors that make the decay per-CHANNEL rather than
         // qwen3_5's per-head scalar. `f_a_proj` is replicated under TP
         // for the same reason it is small: every head reads all of it.
-        .either(has_kda, "layer.{}.self_attn.f_a_proj", [u64::from(k.value_head_dim), hidden])
+        .either(
+            has_kda,
+            "layer.{}.self_attn.f_a_proj",
+            [u64::from(k.value_head_dim), hidden],
+        )
         .either(
             has_kda,
             "layer.{}.self_attn.f_b_proj",
@@ -214,11 +235,19 @@ pub fn manifest(f: &KimiK3Facts, tied_embeddings: bool) -> Manifest {
         // q_lora_rank]`. The contract reads its head count off exactly
         // this tensor, because that is the only place the real (unpadded)
         // head count is written down.
-        .either(has_kda, "layer.{}.self_attn.b_proj", [u64::from(k.value_heads), hidden])
+        .either(
+            has_kda,
+            "layer.{}.self_attn.b_proj",
+            [u64::from(k.value_heads), hidden],
+        )
         // Per-head-channel, inside a head: this is the norm the gated
         // output passes through, and its width is the head's and not the
         // stack's.
-        .either(has_kda, "layer.{}.self_attn.o_norm", [u64::from(k.value_head_dim)])
+        .either(
+            has_kda,
+            "layer.{}.self_attn.o_norm",
+            [u64::from(k.value_head_dim)],
+        )
         // The gate bank ships PADDED — see the module doc — so its
         // extent is the checkpoint's allocation rounding and not the
         // row's arithmetic. Stated as presence at the row's own head
@@ -237,8 +266,16 @@ pub fn manifest(f: &KimiK3Facts, tied_embeddings: bool) -> Manifest {
         // over the stack, so both appear. A mixture with no prefix ships
         // no dense MLP at all, and one that is dense all the way ships no
         // router — the same statement read from its two ends.
-        .either(has_dense_prefix, "layer.{}.mlp.gate_proj", [dense_inter, hidden])
-        .either(has_dense_prefix, "layer.{}.mlp.down_proj", [hidden, dense_inter])
+        .either(
+            has_dense_prefix,
+            "layer.{}.mlp.gate_proj",
+            [dense_inter, hidden],
+        )
+        .either(
+            has_dense_prefix,
+            "layer.{}.mlp.down_proj",
+            [hidden, dense_inter],
+        )
         .either(
             !all_dense,
             "layer.{}.block_sparse_moe.gate",
@@ -261,7 +298,11 @@ pub fn manifest(f: &KimiK3Facts, tied_embeddings: bool) -> Manifest {
             "layer.{}.self_attention_res_proj",
             [1, hidden],
         )
-        .either(f.attn_res_block > 0, "layer.{}.self_attention_res_norm", [hidden])
+        .either(
+            f.attn_res_block > 0,
+            "layer.{}.self_attention_res_norm",
+            [hidden],
+        )
 }
 
 /// This row's deployment, or a refusal at the DOOR.
@@ -373,12 +414,18 @@ fn plan(f: &KimiK3Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
         prefill: PrefillStyle::Planned,
         attn_output: AttnOutput::DriverPinned,
         logit_softcap: 0.0,
+        // No ATTENTION cap: gemma-2's `attn_logit_softcapping` is
+        // gemma-2's alone, and a zero here is "no cap" rather than a
+        // cap at zero — which would flatten every score to `tanh(inf)`.
+        attn_logit_softcap: 0.0,
         ple_dim: 0,
         norm: NormPlacement::Pre,
         // Not a gemma: the gain is the multiplier, stored directly.
         norm_unit_offset: false,
         v_norm: false,
         k_eq_v: false,
+        norm_topk_prob: f.moe.norm_topk_prob,
+        routed_scaling: f.moe.routed_scaling,
         mlp_gate: crate::deployment::MlpGate::Silu,
         scales: std::collections::BTreeMap::new(),
         // DEFAULT, and the row writes over it. None of the three
@@ -432,6 +479,8 @@ fn kda_shape(f: &KimiK3Facts) -> RecurrentShape {
         // their own short convolution, and the slab holds all three.
         conv_dim: (3 * k.width()) as i32,
         conv_k: k.conv_kernel as i32,
+        // A KDA stack has no B/C groups; mamba's alone.
+        n_groups: 0,
     }
 }
 
@@ -455,8 +504,8 @@ fn kda_shape(f: &KimiK3Facts) -> RecurrentShape {
 /// `LLAMA_LIKE` — an eleven-entry table of architecture STRINGS,
 /// reduced by a punctuation-stripping `canonical()`, consulted before
 /// any text was traced and free to disagree with what the tracer would
-/// actually do. It listed `gemma4`, which the load path refused on
-/// other grounds, and omitted `gemma3`, whose text it models. A row
+/// actually do. It listed `gpt_oss`, which no publication of reaches a
+/// Metal device here, and omitted `gemma3`, whose text it models. A row
 /// that answers for itself cannot disagree with a list, because there
 /// is no list.
 pub const NO_METAL: &str = "kimi-k3 has no Metal text in this build: its forward is `kimi_k3_cuda` — \
@@ -564,7 +613,11 @@ mod tests {
         let f = k3();
         let m = manifest(&f, false);
         assert_eq!(extents(&m, "layer.{}.self_attn.o_proj"), vec![2048, 2048]);
-        assert_ne!(f.attn.v_width(), f.attn.q_b_width(), "the fixture must keep them apart");
+        assert_ne!(
+            f.attn.v_width(),
+            f.attn.q_b_width(),
+            "the fixture must keep them apart"
+        );
     }
 
     /// The KDA half's tensors are named at the KDA width, which is NOT
@@ -644,19 +697,28 @@ mod tests {
         let f = k3();
         let m = manifest(&f, false);
         assert_eq!(presence(&m, "layer.{}.mlp.gate_proj"), Presence::Required);
-        assert_eq!(presence(&m, "layer.{}.block_sparse_moe.gate"), Presence::Required);
+        assert_eq!(
+            presence(&m, "layer.{}.block_sparse_moe.gate"),
+            Presence::Required
+        );
 
         let mut no_prefix = f.clone();
         no_prefix.dense_layers = 0;
         let m = manifest(&no_prefix, false);
         assert_eq!(presence(&m, "layer.{}.mlp.gate_proj"), Presence::Absent);
-        assert_eq!(presence(&m, "layer.{}.block_sparse_moe.gate"), Presence::Required);
+        assert_eq!(
+            presence(&m, "layer.{}.block_sparse_moe.gate"),
+            Presence::Required
+        );
 
         let mut all_dense = f.clone();
         all_dense.dense_layers = all_dense.layers;
         let m = manifest(&all_dense, false);
         assert_eq!(presence(&m, "layer.{}.mlp.gate_proj"), Presence::Required);
-        assert_eq!(presence(&m, "layer.{}.block_sparse_moe.gate"), Presence::Absent);
+        assert_eq!(
+            presence(&m, "layer.{}.block_sparse_moe.gate"),
+            Presence::Absent
+        );
     }
 
     /// A stack with no full-attention layer publishes no MLA tensors,
@@ -668,20 +730,38 @@ mod tests {
     fn the_union_covers_only_the_layer_kinds_this_row_schedules() {
         let f = k3();
         let m = manifest(&f, false);
-        assert_eq!(presence(&m, "layer.{}.self_attn.kv_b_proj"), Presence::Required);
-        assert_eq!(presence(&m, "layer.{}.self_attn.f_a_proj"), Presence::Required);
+        assert_eq!(
+            presence(&m, "layer.{}.self_attn.kv_b_proj"),
+            Presence::Required
+        );
+        assert_eq!(
+            presence(&m, "layer.{}.self_attn.f_a_proj"),
+            Presence::Required
+        );
 
         let mut kda_only = f.clone();
         kda_only.full_attn_interval = 0;
         let m = manifest(&kda_only, false);
-        assert_eq!(presence(&m, "layer.{}.self_attn.kv_b_proj"), Presence::Absent);
-        assert_eq!(presence(&m, "layer.{}.self_attn.f_a_proj"), Presence::Required);
+        assert_eq!(
+            presence(&m, "layer.{}.self_attn.kv_b_proj"),
+            Presence::Absent
+        );
+        assert_eq!(
+            presence(&m, "layer.{}.self_attn.f_a_proj"),
+            Presence::Required
+        );
 
         let mut mla_only = f.clone();
         mla_only.full_attn_interval = 1;
         let m = manifest(&mla_only, false);
-        assert_eq!(presence(&m, "layer.{}.self_attn.kv_b_proj"), Presence::Required);
-        assert_eq!(presence(&m, "layer.{}.self_attn.f_a_proj"), Presence::Absent);
+        assert_eq!(
+            presence(&m, "layer.{}.self_attn.kv_b_proj"),
+            Presence::Required
+        );
+        assert_eq!(
+            presence(&m, "layer.{}.self_attn.f_a_proj"),
+            Presence::Absent
+        );
     }
 
     /// The gate this generation ships and its text cannot state is still
@@ -712,7 +792,10 @@ mod tests {
         // The hybrid states it as the KDA half's, which is the only
         // width both halves can be held to.
         let m = manifest(&k3(), false);
-        assert_eq!(presence(&m, "layer.{}.self_attn.g_proj"), Presence::Required);
+        assert_eq!(
+            presence(&m, "layer.{}.self_attn.g_proj"),
+            Presence::Required
+        );
     }
 
     /// Where the two halves disagree about a shared name's width there
@@ -728,10 +811,19 @@ mod tests {
         // so both shared names disagree.
         lopsided.kda.value_heads = 8;
         lopsided.attn.output_gate = true;
-        assert_ne!(u64::from(lopsided.kda.width()), u64::from(lopsided.attn.v_width()));
+        assert_ne!(
+            u64::from(lopsided.kda.width()),
+            u64::from(lopsided.attn.v_width())
+        );
         let m = manifest(&lopsided, false);
-        assert!(!named(&m, "layer.{}.self_attn.o_proj"), "two widths, no row");
-        assert!(!named(&m, "layer.{}.self_attn.g_proj"), "two widths, no row");
+        assert!(
+            !named(&m, "layer.{}.self_attn.o_proj"),
+            "two widths, no row"
+        );
+        assert!(
+            !named(&m, "layer.{}.self_attn.g_proj"),
+            "two widths, no row"
+        );
         // The names only ONE half publishes are unaffected — they still
         // have exactly one width apiece.
         assert_eq!(
@@ -739,7 +831,10 @@ mod tests {
             vec![1024, 2048],
             "a KDA-only name keeps the KDA width",
         );
-        assert_eq!(presence(&m, "layer.{}.self_attn.kv_b_proj"), Presence::Required);
+        assert_eq!(
+            presence(&m, "layer.{}.self_attn.kv_b_proj"),
+            Presence::Required
+        );
     }
 
     /// The straight query projection is FORBIDDEN where a latent rank
@@ -774,7 +869,10 @@ mod tests {
             extents(&m, "layer.{}.self_attn.q_proj"),
             vec![u64::from(unranked.attn.q_b_width()), 2048],
         );
-        assert_eq!(presence(&m, "layer.{}.self_attn.q_a_proj"), Presence::Absent);
+        assert_eq!(
+            presence(&m, "layer.{}.self_attn.q_a_proj"),
+            Presence::Absent
+        );
     }
 
     /// The blend's tensors exist only where a block opens, and they are
@@ -784,22 +882,37 @@ mod tests {
     fn the_attention_residual_tensors_follow_the_block_size() {
         let f = k3();
         let m = manifest(&f, false);
-        assert_eq!(presence(&m, "layer.{}.self_attention_res_proj"), Presence::Required);
+        assert_eq!(
+            presence(&m, "layer.{}.self_attention_res_proj"),
+            Presence::Required
+        );
         assert_eq!(extents(&m, "layer.{}.self_attention_res_norm"), vec![2048]);
 
         let mut unblended = f.clone();
         unblended.attn_res_block = 0;
         let m = manifest(&unblended, false);
-        assert_eq!(presence(&m, "layer.{}.self_attention_res_proj"), Presence::Absent);
+        assert_eq!(
+            presence(&m, "layer.{}.self_attention_res_proj"),
+            Presence::Absent
+        );
     }
 
     /// A tied head publishes no `lm_head`, and the only way a manifest
     /// can tell the two apart is presence: every extent agrees.
     #[test]
     fn a_tied_head_publishes_no_output_table() {
-        assert_eq!(presence(&manifest(&k3(), false), "lm_head"), Presence::Required);
-        assert_eq!(presence(&manifest(&k3(), true), "lm_head"), Presence::Absent);
-        assert_eq!(extents(&manifest(&k3(), false), "lm_head"), vec![163_840, 2048]);
+        assert_eq!(
+            presence(&manifest(&k3(), false), "lm_head"),
+            Presence::Required
+        );
+        assert_eq!(
+            presence(&manifest(&k3(), true), "lm_head"),
+            Presence::Absent
+        );
+        assert_eq!(
+            extents(&manifest(&k3(), false), "lm_head"),
+            vec![163_840, 2048]
+        );
     }
 
     /// A manifest that would match a SIBLING generation is a bug, and
@@ -838,6 +951,8 @@ mod tests {
             moe: super::super::spec::KimiK3MoeFacts {
                 num_experts: 384,
                 top_k: 8,
+                norm_topk_prob: false,
+                routed_scaling: 2.0,
                 moe_intermediate: 2048,
                 shared_intermediate: 2048,
             },
@@ -870,7 +985,10 @@ mod tests {
         let d = plan(&k3(), 10_000.0, 1e-5);
         assert_eq!(d.layers, 8);
         assert_eq!(d.attention.len(), 8);
-        assert!((d.norm_eps - 1e-5).abs() < f32::EPSILON, "epsilon is stated, not defaulted");
+        assert!(
+            (d.norm_eps - 1e-5).abs() < f32::EPSILON,
+            "epsilon is stated, not defaulted"
+        );
     }
 
     /// The geometry, field by field. `head_dim` and `head_dim_kernel`
@@ -894,7 +1012,11 @@ mod tests {
             "the workspace is one buffer both layer kinds share, so it is \
              sized from the wider",
         );
-        assert_eq!(g.gqa_group(), 16, "what an MLA decode would have to instantiate");
+        assert_eq!(
+            g.gqa_group(),
+            16,
+            "what an MLA decode would have to instantiate"
+        );
     }
 
     /// The per-layer table: no window anywhere, every layer owns its
@@ -908,7 +1030,10 @@ mod tests {
             assert_eq!(a.window, -1, "layer {l} must not window a recurrence");
             assert_eq!(a.kv_source, l as u32);
             assert_eq!(a.head_dim, 320);
-            assert!((a.sm_scale - expected).abs() < 1e-6, "layer {l} scales by the stored row");
+            assert!(
+                (a.sm_scale - expected).abs() < 1e-6,
+                "layer {l} scales by the stored row"
+            );
         }
         assert!(
             (d.attention[0].sm_scale - 1.0 / (320.0_f32).sqrt()).abs() > 1e-6,
@@ -926,7 +1051,10 @@ mod tests {
         for (l, a) in d.attention.iter().enumerate() {
             assert_eq!(a.rotary_dim, 0, "layer {l} rotates nothing");
             if f.is_full_attn(l as u32) {
-                assert!(a.rope_theta.abs() < f32::EPSILON, "layer {l} is MLA and carries no rope");
+                assert!(
+                    a.rope_theta.abs() < f32::EPSILON,
+                    "layer {l} is MLA and carries no rope"
+                );
             } else {
                 assert!(
                     (a.rope_theta - 10_000.0).abs() < f32::EPSILON,
@@ -942,7 +1070,13 @@ mod tests {
     #[test]
     fn the_kv_style_is_mla_with_the_rows_own_ranks() {
         let d = plan(&k3(), 10_000.0, 1e-5);
-        assert_eq!(d.kv, KvStyle::Mla { kv_lora_rank: 256, qk_rope_head_dim: 64 });
+        assert_eq!(
+            d.kv,
+            KvStyle::Mla {
+                kv_lora_rank: 256,
+                qk_rope_head_dim: 64
+            }
+        );
     }
 
     /// The recurrent slabs the KDA layers need, which the vtable this
@@ -951,7 +1085,10 @@ mod tests {
     fn the_linear_layers_get_slabs_and_the_full_attention_layers_do_not() {
         let f = k3();
         let d = plan(&f, 10_000.0, 1e-5);
-        let r = d.recurrent.as_ref().expect("two thirds of this stack is a recurrence");
+        let r = d
+            .recurrent
+            .as_ref()
+            .expect("two thirds of this stack is a recurrence");
         assert_eq!(r.linear_layers, vec![0, 1, 2, 4, 5, 6]);
         assert!(
             r.linear_layers.iter().all(|l| !f.is_full_attn(*l)),
@@ -962,10 +1099,17 @@ mod tests {
         assert_eq!(r.k_d, 128);
         assert_eq!(r.v_d, 128);
         assert_eq!(r.state_stride, 16 * 128 * 128, "a square state per head");
-        assert_eq!(r.conv_dim, 3 * 2048, "one conv per projection, three projections");
+        assert_eq!(
+            r.conv_dim,
+            3 * 2048,
+            "one conv per projection, three projections"
+        );
         assert_eq!(r.conv_k, 4);
         assert_eq!(r.conv_stride, 4 * 2048);
-        assert_eq!(r.state_elem, 2, "bf16 is the only recurrent allocator a driver has");
+        assert_eq!(
+            r.state_elem, 2,
+            "bf16 is the only recurrent allocator a driver has"
+        );
     }
 
     /// A stack scheduled as all-MLA has no linear layers at all, and the
@@ -990,7 +1134,10 @@ mod tests {
             Advertised::default(),
             "a projection that fills this in has derived a family name from a shape",
         );
-        assert!(d.advertised.arch.is_empty(), "an empty label is a row that has not spoken yet");
+        assert!(
+            d.advertised.arch.is_empty(),
+            "an empty label is a row that has not spoken yet"
+        );
         assert_eq!(d.advertised.max_model_len, 0);
         assert!(!d.advertised.media_encode);
     }
@@ -1004,7 +1151,10 @@ mod tests {
     #[test]
     fn the_rope_ladder_is_unscaled_and_no_tower_ships() {
         let d = plan(&k3(), 10_000.0, 1e-5);
-        assert!(d.rope_scaling.is_none(), "no committed config states a rescaling to read");
+        assert!(
+            d.rope_scaling.is_none(),
+            "no committed config states a rescaling to read"
+        );
         assert_eq!(
             d.towers,
             crate::deployment::Towers::default(),
@@ -1054,7 +1204,10 @@ mod tests {
     fn the_text_traces_for_both_fire_classes() {
         use model_compiler::trace::FireClass;
         let f = k3();
-        for (class, suffix) in [(FireClass::Decode, "decode"), (FireClass::Prefill, "prefill")] {
+        for (class, suffix) in [
+            (FireClass::Decode, "decode"),
+            (FireClass::Prefill, "prefill"),
+        ] {
             let plan = trace(&f, class).expect("the fixture states the shape the text declares");
             assert_eq!(plan.family, format!("kimi_k3.cuda.{suffix}"));
             assert!(!plan.ops.is_empty(), "a traced plan states ops");

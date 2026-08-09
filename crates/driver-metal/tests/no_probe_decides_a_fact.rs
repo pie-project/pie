@@ -160,7 +160,11 @@ fn the_load_paths_one_tensor_question_feeds_a_binding() {
          what `facts_from_with` called to decide a model fact:\n  {}",
         path.display(),
         probes.len(),
-        probes.iter().map(|(i, l)| format!("{i}: {l}")).collect::<Vec<_>>().join("\n  ")
+        probes
+            .iter()
+            .map(|(i, l)| format!("{i}: {l}"))
+            .collect::<Vec<_>>()
+            .join("\n  ")
     );
     let (line, src) = probes[0];
     assert!(
@@ -209,7 +213,11 @@ fn the_no_text_refusal_precedes_the_staging_call() {
     let (path, text) = load_path();
     let lines = code(&text);
     let at = |needle: &str| -> Vec<usize> {
-        lines.iter().filter(|(_, l)| l.contains(needle)).map(|(i, _)| *i).collect()
+        lines
+            .iter()
+            .filter(|(_, l)| l.contains(needle))
+            .map(|(i, _)| *i)
+            .collect()
     };
 
     let refusals = at("binding::serves(");

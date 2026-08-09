@@ -191,7 +191,11 @@ fn walk_move(
 /// runs this crate is one -- the saturation is so the cast is not silently
 /// wrapping on a hypothetical 32-bit build.
 const fn usize_of(v: u64) -> usize {
-    if v > usize::MAX as u64 { usize::MAX } else { v as usize }
+    if v > usize::MAX as u64 {
+        usize::MAX
+    } else {
+        v as usize
+    }
 }
 
 /// What the OS says about memory, as a level rather than an event.
@@ -1430,6 +1434,9 @@ mod tests {
             Ok(())
         })
         .expect("walk");
-        assert_eq!(pieces, 0, "a move to where the bytes already are is not a move");
+        assert_eq!(
+            pieces, 0,
+            "a move to where the bytes already are is not a move"
+        );
     }
 }

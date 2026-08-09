@@ -11,7 +11,7 @@
 //! feature is what it always was — `half`, `ztensor`, `serde` — and
 //! `pie model convert` on a machine with no toolkit builds it unchanged. The
 //! feature is the only `#[cfg]` this adds: [`ArenaBacking`] was already the
-//! seam, so nothing in `executor/host.rs` learns that a GPU exists.
+//! seam, so nothing in `executor/walk.rs` learns that a GPU exists.
 //!
 //! # What the caller still owns, and why
 //!
@@ -52,7 +52,6 @@ use crate::plan::passes::tile::{
     CUDA_CAST_FP32_TO_BF16, CUDA_QUANTIZE_BF16_TO_FP8, CUDA_QUANTIZE_BF16_TO_MXFP4,
     CUDA_SCALE_ROWS_BF16,
 };
-use crate::plan::{TILE_MAP_CAST, TILE_MAP_ENCODE, TILE_MAP_SCALE};
 
 /// How much pinned host memory one staging slot holds, when the caller states
 /// no budget of its own.
@@ -207,22 +206,6 @@ impl CudaArena {
         self
     }
 
-    /// Wait for every copy this arena enqueued.
-    ///
-    /// A load is not finished when `execute_plan_into_backing` returns — the
-    /// last writes are still in flight — so a caller that reads the arena
-    /// without this reads a partly written model.
-    ///
-    /// # Errors
-    ///
-    /// The stream faulted while draining the writes.
-    pub fn finish(&self) -> Result<(), Error> {
-        // SAFETY: `stream` is the caller's live stream.
-        check("cudaStreamSynchronize", unsafe {
-            rt::cudaStreamSynchronize(self.stream)
-        })
-    }
-
     /// The device address `bytes` into the arena.
     fn at(&self, offset: usize) -> *mut c_void {
         // SAFETY: every span the executor hands over was resolved against
@@ -241,6 +224,40 @@ impl CudaArena {
             )));
         }
         Ok(())
+    }
+}
+
+/// Drain the stream before the pinned staging goes away.
+///
+/// [`Self::write`] leaves its copy IN FLIGHT by design — that is what the
+/// slots buy — so the source of a live `cudaMemcpyAsync` is a [`PinnedBuf`]
+/// this arena owns. On the happy path [`ArenaBacking::finish`] has already
+/// drained; on the path out of a failed load nothing had, and
+/// `PinnedBuf::drop` reached `cudaFreeHost` on a buffer the copy engine was
+/// still reading. That is undefined, and the fault it eventually produces
+/// does not name this site.
+///
+/// Unconditional rather than a flag, because the question "is a copy still
+/// running" is the stream's to answer and it answers it for free when the
+/// answer is no. The error is dropped: a drop cannot report, and a stream that
+/// faulted here has already recorded it for the next call on the context.
+/// Drain the stream before the pinned staging goes away.
+///
+/// [`ArenaBacking::finish`] is the ordinary path and the executor calls it, so
+/// this is the extraordinary one: a load that failed mid-schedule returns
+/// through `?` without reaching it. [`Self::write`] leaves its copy IN FLIGHT
+/// by design — that is what the slots buy — so the source of a live
+/// `cudaMemcpyAsync` is a [`PinnedBuf`] this arena owns, and `PinnedBuf::drop`
+/// reaches `cudaFreeHost` on a buffer the copy engine is still reading. That
+/// is undefined, and the fault it eventually produces does not name this site.
+///
+/// Unconditional rather than a flag, because "is a copy still running" is the
+/// stream's question and it answers it for free when the answer is no. The
+/// error is dropped: a drop cannot report, and a stream that faulted here has
+/// already recorded it against the context.
+impl Drop for CudaArena {
+    fn drop(&mut self) {
+        let _ = ArenaBacking::finish(self);
     }
 }
 
@@ -366,22 +383,41 @@ impl ArenaBacking for CudaArena {
         })
     }
 
-    /// Whichever transforms the PLAN named a kernel for.
+    /// Wait for every copy this arena enqueued.
     ///
-    /// The kinds are still the unit the executor asks about, so this is still
-    /// a mask; what it no longer is, is a guess. The plan named a row per
-    /// instruction (`plan::passes::tile::cuda_kernel`), so claiming a kind
-    /// here costs nothing — an instruction the table does not cover carries no
-    /// kernel and never reaches [`Self::run_tile_map`].
-    fn tile_map_caps(&self) -> u32 {
-        if self.device_transforms {
-            TILE_MAP_CAST | TILE_MAP_SCALE | TILE_MAP_ENCODE
-        } else {
-            0
-        }
+    /// The backing that needs this verb, and the reason it is on the trait.
+    /// [`Self::write`] returns while its `cudaMemcpyAsync` is still crossing —
+    /// a slot is waited on only when it is REUSED — so the arena holds a
+    /// partly written model until the stream drains. The executor calls this
+    /// once, after the last instruction, which is where the overlap has
+    /// already been paid for and there is nothing left to overlap with.
+    ///
+    /// # Errors
+    ///
+    /// The stream faulted while draining the writes. This is where a copy that
+    /// failed long ago is finally reported, because it is the first point at
+    /// which it has certainly either happened or not.
+    fn finish(&mut self) -> Result<(), Error> {
+        // SAFETY: `stream` is the caller's live stream.
+        check("cudaStreamSynchronize", unsafe {
+            rt::cudaStreamSynchronize(self.stream)
+        })
     }
 
-    /// Launch the row the plan named, or hand the instruction back.
+    /// Yes, unless device transforms were turned off.
+    ///
+    /// One bit, and it is the only one this backing has to offer: WHICH
+    /// transforms run on the device is the plan's answer, named per
+    /// instruction by `plan::passes::tile::cuda_kernel` with the tensor's name
+    /// still in hand. This used to be a `u32` returning `CAST | SCALE |
+    /// ENCODE` unconditionally — a constant wearing a bitmask's clothes,
+    /// which could only ever claim more kinds than the plan had named rows
+    /// for.
+    fn runs_named_kernels(&self) -> bool {
+        self.device_transforms
+    }
+
+    /// Launch the row the plan named.
     ///
     /// **No decision is made here.** This used to be ~120 lines of dtype
     /// matching, shape derivation and block-size arithmetic, ending in
@@ -390,28 +426,21 @@ impl ArenaBacking for CudaArena {
     /// finished, the bytes were right, and the transform had quietly run on
     /// the host at a fraction of the speed.
     ///
-    /// Those rules are in the compiler now, where the tensor's name is still
-    /// in hand. What is left is a lookup: a `kernel` the plan states is a row
-    /// this backing must be able to launch, and `None` is the plan saying the
-    /// host runs this one.
-    ///
-    /// So the three answers are two. `Ok(false)` survives only for `None`,
-    /// which is not a decline but a plan read correctly, and an unknown symbol
-    /// is an `Err`: it means the compiler named a row this build does not
-    /// have, and falling back would hide the drift behind a slower answer.
-    fn run_tile_map(&mut self, op: &TileMapOp<'_>) -> Result<bool, Error> {
-        let Some(kernel) = op.transform.kernel.as_deref() else {
-            return Ok(false);
-        };
-        match kernel {
+    /// Those rules are in the compiler now. What is left is a lookup, and it
+    /// has no second answer: the executor offers an op only for an instruction
+    /// the plan named a row for, so an unknown symbol here means the compiler
+    /// named a row this build does not have. That is drift between two halves
+    /// of one tree, and falling back to the host would hide it behind an
+    /// answer that looks fine and is slower.
+    fn run_tile_map(&mut self, op: &TileMapOp<'_>) -> Result<(), Error> {
+        match op.kernel {
             CUDA_CAST_FP32_TO_BF16 => self.cast(op),
             CUDA_SCALE_ROWS_BF16 => self.scale(op),
             CUDA_QUANTIZE_BF16_TO_MXFP4 => self.encode_mxfp4(op),
             CUDA_QUANTIZE_BF16_TO_FP8 => self.encode_fp8(op),
             other => Err(Error::Contract(format!(
-                "the plan names kernel `{other}` for a {:?}, which this build \
-                 has no launcher for",
-                op.kind
+                "the plan names kernel `{other}`, which this build has no \
+                 launcher for"
             ))),
         }
     }
@@ -423,7 +452,7 @@ impl CudaArena {
     /// The element count is the one arithmetic fact left here, and it is
     /// addressing rather than selection: the row takes a count, and the spans
     /// are bytes.
-    fn cast(&mut self, op: &TileMapOp<'_>) -> Result<bool, Error> {
+    fn cast(&mut self, op: &TileMapOp<'_>) -> Result<(), Error> {
         self.bounds(op.src.offset, op.src.len)?;
         self.bounds(op.dst.offset, op.dst.len)?;
         // SAFETY: both spans are in bounds, and the plan chose this row for an
@@ -436,11 +465,11 @@ impl CudaArena {
                 self.stream.cast(),
             );
         }
-        Ok(true)
+        Ok(())
     }
 
     /// `quant::scale_rows_bf16`, the per-row multiply, in place.
-    fn scale(&mut self, op: &TileMapOp<'_>) -> Result<bool, Error> {
+    fn scale(&mut self, op: &TileMapOp<'_>) -> Result<(), Error> {
         let (rows, cols) = self.extent_2d(op)?;
         let factors = op
             .factors
@@ -458,11 +487,11 @@ impl CudaArena {
                 self.stream.cast(),
             );
         }
-        Ok(true)
+        Ok(())
     }
 
     /// `quant::quantize_bf16_to_mxfp4_e2m1_per_block`.
-    fn encode_mxfp4(&mut self, op: &TileMapOp<'_>) -> Result<bool, Error> {
+    fn encode_mxfp4(&mut self, op: &TileMapOp<'_>) -> Result<(), Error> {
         let (rows, cols) = self.extent_2d(op)?;
         let scales = self.encode_scales(op)?;
         // SAFETY: every span is bounds-checked by `encode_scales`; the row
@@ -477,11 +506,11 @@ impl CudaArena {
                 self.stream.cast(),
             );
         }
-        Ok(true)
+        Ok(())
     }
 
     /// `quant::quantize_bf16_to_fp8_e4m3_per_channel`.
-    fn encode_fp8(&mut self, op: &TileMapOp<'_>) -> Result<bool, Error> {
+    fn encode_fp8(&mut self, op: &TileMapOp<'_>) -> Result<(), Error> {
         let (rows, cols) = self.extent_2d(op)?;
         let scales = self.encode_scales(op)?;
         // SAFETY: as above; the scales are `f32` for this row.
@@ -495,7 +524,7 @@ impl CudaArena {
                 self.stream.cast(),
             );
         }
-        Ok(true)
+        Ok(())
     }
 
     /// The 2-D extent every row above takes, as the `int`s they take it in.
@@ -514,7 +543,10 @@ impl CudaArena {
     }
 
     /// `Encode`'s second destination, bounds-checked along with the first.
-    fn encode_scales(&self, op: &TileMapOp<'_>) -> Result<crate::executor::arena::ArenaSpan, Error> {
+    fn encode_scales(
+        &self,
+        op: &TileMapOp<'_>,
+    ) -> Result<crate::executor::arena::ArenaSpan, Error> {
         let scales = op
             .dst_scales
             .ok_or_else(|| plan_disagrees("an Encode publishes payload AND scales"))?;
@@ -531,9 +563,7 @@ impl CudaArena {
 /// exactly why it must not run: it would hide a compiler that chose wrongly
 /// behind an answer that looks fine and is slower.
 fn plan_disagrees(what: &str) -> Error {
-    Error::Contract(format!(
-        "cuda arena: the plan named a kernel but {what}"
-    ))
+    Error::Contract(format!("cuda arena: the plan named a kernel but {what}"))
 }
 
 #[cfg(test)]

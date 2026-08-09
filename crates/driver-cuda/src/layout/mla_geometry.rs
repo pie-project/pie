@@ -73,7 +73,14 @@ impl MlaGeometry {
                 "mla_cache: only bf16/fp16 storage is supported",
             ));
         }
-        Ok(Self { num_layers, num_pages, page_size, kv_lora_rank, qk_rope_head_dim, dtype })
+        Ok(Self {
+            num_layers,
+            num_pages,
+            page_size,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            dtype,
+        })
     }
 
     /// Transformer layers this cache covers.
@@ -184,7 +191,10 @@ mod tests {
     #[test]
     fn page_buffers_are_ordered_ckv_then_kpe() {
         let g = geo();
-        assert_eq!(g.page_buffer_bytes(), [g.ckv_page_bytes(), g.kpe_page_bytes()]);
+        assert_eq!(
+            g.page_buffer_bytes(),
+            [g.ckv_page_bytes(), g.kpe_page_bytes()]
+        );
     }
 
     #[test]
@@ -194,16 +204,26 @@ mod tests {
             g.total_bytes(),
             u64::from(g.num_layers()) * (g.ckv_layer_bytes() + g.kpe_layer_bytes())
         );
-        assert_eq!(g.total_bytes(), g.bytes_per_token() * u64::from(g.num_pages() * g.page_size()));
+        assert_eq!(
+            g.total_bytes(),
+            g.bytes_per_token() * u64::from(g.num_pages() * g.page_size())
+        );
     }
 
     #[test]
     fn every_zero_dimension_is_rejected() {
-        for (l, p, ps, r, q) in
-            [(0, 1, 1, 1, 1), (1, 0, 1, 1, 1), (1, 1, 0, 1, 1), (1, 1, 1, 0, 1), (1, 1, 1, 1, 0)]
-        {
+        for (l, p, ps, r, q) in [
+            (0, 1, 1, 1, 1),
+            (1, 0, 1, 1, 1),
+            (1, 1, 0, 1, 1),
+            (1, 1, 1, 0, 1),
+            (1, 1, 1, 1, 0),
+        ] {
             let e = MlaGeometry::new(l, p, ps, r, q, DType::Bf16).unwrap_err();
-            assert!(e.to_string().contains("invalid allocation dimensions"), "{e}");
+            assert!(
+                e.to_string().contains("invalid allocation dimensions"),
+                "{e}"
+            );
         }
     }
 

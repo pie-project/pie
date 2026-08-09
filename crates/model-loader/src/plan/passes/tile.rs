@@ -6,10 +6,12 @@
 //! split LLVM draws between target features and `TargetLowering`.
 //!
 //! Everything here answers a question the C++ driver used to answer at run
-//! time. That mattered less for being wrong than for being *unrecorded*:
-//! `crates/driver-cuda/csrc/src/loader/transcode_engine.hpp` chose a tile size and a fusion
-//! strategy while executing, so one plan could run two different kernel
-//! sequences and nothing in the plan said which (`architecture.md` §8.1).
+//! time. That mattered less for being wrong than for being *unrecorded*: the
+//! C++ transcode engine (`driver-cuda/csrc/src/loader/transcode_engine.hpp`,
+//! deleted in `2cc4e5e4d` — cited as provenance, not as a path to open) chose a
+//! tile size and a fusion strategy while executing, so one plan could run two
+//! different kernel sequences and nothing in the plan said which
+//! (`architecture.md` §8.1).
 //! Deciding here puts the answer in the plan, which puts it in the plan hash,
 //! which makes "the plan determines execution" true rather than aspirational.
 //!
@@ -21,8 +23,8 @@
 use crate::plan::index::PlanIndex;
 use crate::plan::{
     FUSION_FP8_TO_MXFP4, LoadPlan, SourceExtent, StorageInstr, StorageTarget, TILE_MAP_CAST,
-    TILE_MAP_DECODE, TILE_MAP_ENCODE, TILE_MAP_REBLOCK, TILE_MAP_SCALE,
-    TileMapKind, TransformFusion,
+    TILE_MAP_DECODE, TILE_MAP_ENCODE, TILE_MAP_REBLOCK, TILE_MAP_SCALE, TileMapKind,
+    TransformFusion,
 };
 use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme, TensorDecl};
 
@@ -59,16 +61,30 @@ pub const CUDA_QUANTIZE_BF16_TO_FP8: &str = "quant::quantize_bf16_to_fp8_e4m3_pe
 /// The driver used to restate a narrower mask of its own and a test compared
 /// the two. There is nothing to compare now: this is the one statement, and
 /// `StorageTarget::for_backend` is how a driver gets it.
+///
+/// What a CUDA arena actually launches is narrower still and is not a mask:
+/// the plan names a kernel per instruction, and the backing looks it up.
 pub const CUDA_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE;
 
-/// The transforms `driver/metal`'s load-time kernels implement. Mirrored in C++
-/// as `kMetalTileMapMask`, which is defined in terms of the generated bits
-/// rather than restated, so the two cannot drift.
+/// The transforms a plan for a Metal target may CARRY.
 ///
 /// `SCALE` decodes a block-scaled scheme to values and `CAST` re-encodes them as
 /// the affine-U4 that driver's matvecs read, which is what lets it load the
-/// published MXFP4 gpt-oss checkpoint directly. It has no repacking or
-/// reblocking kernels, so those bits stay clear.
+/// published MXFP4 gpt-oss checkpoint directly. There is no repacking or
+/// reblocking, so those bits stay clear.
+///
+/// It said "the transforms `driver/metal`'s load-time kernels implement,
+/// mirrored in C++ as `kMetalTileMapMask`". Three things were wrong with that.
+/// The C++ was deleted in `2cc4e5e4d` and `kMetalTileMapMask` appears nowhere
+/// but in the sentence claiming to mirror it. `driver-metal`'s backing
+/// implements neither [`ArenaBacking::runs_named_kernels`] nor `run_tile_map`,
+/// so it takes the default — no — and EVERY transform in a Metal plan runs on
+/// the host. And this is the compile-time question anyway: what a device
+/// actually runs is a property of the backing you were handed, which is what
+/// `runs_named_kernels` is. This constant is the first, and no longer wears
+/// the name of the second.
+///
+/// [`ArenaBacking::runs_named_kernels`]: crate::executor::arena::ArenaBacking::runs_named_kernels
 pub const METAL_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE;
 
 /// The transforms `host_executor` implements. Not a device capability, so it is
@@ -93,19 +109,28 @@ pub const HOST_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_REBLOCK | TILE_MAP_
 /// point of conversion.
 pub const CONVERT_TILE_MAP_MASK: u32 = HOST_TILE_MAP_MASK | TILE_MAP_ENCODE | TILE_MAP_DECODE;
 
-/// The loader's own model of what a backend's kernels do.
+/// Which transforms a plan compiled for `backend` may CARRY.
 ///
-/// The driver states the same thing independently in
-/// `PieLoaderTargetSpec::tile_map_mask`, and `storage_target` cross-checks the
-/// two, which makes this load-bearing rather than descriptive: a driver
-/// claiming a transform the loader has no model of is rejected at compile time
-/// instead of surfacing as a failed kernel dispatch.
+/// A compile-time property, and the only statement of it: `StorageTarget::for_backend`
+/// is how a driver gets this, and the lowering below refuses an instruction
+/// whose kind falls outside it with the TENSOR named rather than leaving it to
+/// fail at dispatch with nothing but a kind.
 ///
-/// The comparison is deliberately one-sided. `architecture.md` §9 makes the
-/// driver the authority on what its kernels do, so a *narrower* driver mask is
-/// fine — it implements fewer transforms than the loader can lower. A *wider*
-/// one is a claim about kernels the loader cannot reason about, and is refused.
-pub fn tile_map_mask(backend: BackendKind) -> u32 {
+/// It is deliberately not "what the device runs". That is a property of the
+/// [`ArenaBacking`](crate::executor::arena::ArenaBacking) the caller handed
+/// over — `runs_named_kernels`, one bit — and it can be narrower than this on
+/// any given load: device transforms turned off, a build without the `cuda`
+/// feature, a driver that supplied a plain `&mut [u8]`. Every transform this
+/// admits also has a host implementation, which is the property
+/// `mask_tests::every_device_transform_has_a_host_implementation` pins, and it
+/// is what makes the narrower case a slower load rather than a failed one.
+///
+/// A paragraph here used to specify a cross-check against
+/// `PieLoaderTargetSpec::tile_map_mask` in `storage_target`, calling it
+/// load-bearing, thirty-five lines below a paragraph saying there was nothing
+/// left to compare. Neither name exists anywhere in the tree. The paragraph
+/// above was the true one.
+pub fn compilable_tile_maps(backend: BackendKind) -> u32 {
     match backend {
         BackendKind::Cuda => CUDA_TILE_MAP_MASK,
         BackendKind::Metal => METAL_TILE_MAP_MASK,
@@ -134,7 +159,7 @@ mod mask_tests {
     fn every_transform_a_backend_may_lower_has_a_host_implementation() {
         for backend in [BackendKind::Cuda, BackendKind::Metal, BackendKind::Unknown] {
             assert_eq!(
-                tile_map_mask(backend) & !crate::plan::CONVERT_TILE_MAP_MASK,
+                compilable_tile_maps(backend) & !crate::plan::CONVERT_TILE_MAP_MASK,
                 0,
                 "{backend:?} may lower a transform with no host implementation, \
                  which leaves the load with no fallback and no reference to \
@@ -342,11 +367,13 @@ fn cuda_kernel(facts: &TileMapFacts) -> Option<&'static str> {
     }
 }
 
-/// CUDA's one rule, ported from `transcode_engine.hpp`.
+/// CUDA's one rule, ported from the deleted C++ `transcode_engine.hpp`.
 ///
 /// The behaviour is deliberately unchanged from the C++ it replaces — this
-/// moves *where* the decision happens, not *what* it decides, so the existing
-/// kernel parity tests stay valid as the safety net (`architecture.md` §8.1).
+/// moved *where* the decision happens, not *what* it decides, so the existing
+/// kernel parity tests stayed valid as the safety net (`architecture.md` §8.1).
+/// The citation is provenance for a rule ported verbatim; the file is gone, and
+/// this is now the only statement of it.
 fn cuda_encode(facts: &TileMapFacts, target: &StorageTarget) -> TileLowering {
     if facts.kind != TileMapKind::Encode {
         return TileLowering::default();

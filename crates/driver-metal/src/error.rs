@@ -369,13 +369,11 @@ mod tests {
     /// geometry: decode geometry: ...`, which is why this takes the field.
     #[test]
     fn a_geometry_refusal_is_stamped_once() {
-        let refused = crate::batch::GeometryRefused(
-            "linear k_d 96 is not a multiple of 32".to_string(),
-        );
+        let refused =
+            crate::batch::GeometryRefused("linear k_d 96 is not a multiple of 32".to_string());
         let e: Error = refused.into();
         let text = e.to_string();
         assert_eq!(text.matches("decode geometry").count(), 1, "{text}");
         assert!(text.contains("not a multiple of 32"), "{text}");
     }
 }
-

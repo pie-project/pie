@@ -2,16 +2,9 @@
 
 pub mod facts;
 
-use self::facts::{
-    Gemma4CudaFacts, Gemma4Facts,
-};
-use model_compiler::dsl::{
-    WeightRepr,
-    self, matmul, MatW, NormW,
-};
-use model_compiler::trace::{
-    FireClass, ForwardPlan, NormVariant, RopeKind,
-};
+use self::facts::{Gemma4CudaFacts, Gemma4Facts};
+use model_compiler::dsl::{self, MatW, NormW, WeightRepr, matmul};
+use model_compiler::trace::{FireClass, ForwardPlan, NormVariant, RopeKind};
 
 // ── gemma-4 ──────────────────────────────────────────────────────────
 
@@ -119,13 +112,8 @@ impl Gemma4LayerW {
 /// Prefill and the service classes are not stated yet: this is the
 /// decode reading, and the class parameter is here so the next rung adds
 /// them where llama_like's does.
-pub fn gemma4_cuda(
-    facts: &Gemma4Facts,
-    cuda: &Gemma4CudaFacts,
-    class: FireClass,
-) -> ForwardPlan {
-    let family = format!(
-        "gemma4.cuda.{}", class.suffix());
+pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass) -> ForwardPlan {
+    let family = format!("gemma4.cuda.{}", class.suffix());
     let hidden = facts.hidden;
     dsl::trace_named(&family, |t| {
         // The entry boundary. A `Put` attachment lands device embeds or
@@ -193,8 +181,7 @@ pub fn gemma4_cuda(
             // THIS LAYER's sliding window, `-1` for none — a
             // load-time fact the dispatch statements carry, where four
             // executors used to re-derive it per launch.
-            let window_left =
-                model_compiler::facts::window_left_at(&cuda.window_left, l);
+            let window_left = model_compiler::facts::window_left_at(&cuda.window_left, l);
             let w = Gemma4LayerW::new(l, facts);
             let full = facts.is_full_attn(l);
             let d = facts.head_dim_of(l);
@@ -274,7 +261,9 @@ pub fn gemma4_cuda(
             // lands.
             dsl::seam(attn_in.trace(), &dsl::seam::ATTN_Q, &[&attn_in], Some(l));
             let a = match class {
-                FireClass::Decode => dsl::cuda::attention_flashinfer_decode(&attn_in, &kv, window_left),
+                FireClass::Decode => {
+                    dsl::cuda::attention_flashinfer_decode(&attn_in, &kv, window_left)
+                }
                 FireClass::Prefill if d == 512 => {
                     dsl::cuda::attention_naive_paged(&attn_in, &kv, window_left)
                 }

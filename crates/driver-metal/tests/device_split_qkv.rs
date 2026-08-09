@@ -5,14 +5,13 @@
 //! operands and the scalars. If the numbers come out right, the scalar channel
 //! works end to end — which is what every `_strided` kernel needs too.
 
-
 use std::path::PathBuf;
 
-use driver_metal::device::{Allocation, ArgumentTable, Context, Stepper};
-use driver_metal::program::Compiler;
-use driver_metal::lowering::dispatch::Dispatch;
 use driver_metal::bind::encode::{Params, Pipelines, encode};
+use driver_metal::device::{Allocation, ArgumentTable, Context, Stepper};
 use driver_metal::layout::region::Region as _;
+use driver_metal::lowering::dispatch::Dispatch;
+use driver_metal::program::Compiler;
 
 fn kernels_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -92,7 +91,15 @@ fn the_split_puts_every_channel_where_its_width_says() {
 
     let mut stepper = Stepper::new(&context).expect("a stepper");
     stepper
-        .run(|encoder| encode(encoder, &table, &pipelines, &staged, std::slice::from_ref(&dispatch)))
+        .run(|encoder| {
+            encode(
+                encoder,
+                &table,
+                &pipelines,
+                &staged,
+                std::slice::from_ref(&dispatch),
+            )
+        })
         .expect("the fire runs");
 
     let read = |region: &driver_metal::device::Handle, n: u32| -> Vec<f32> {

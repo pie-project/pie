@@ -35,9 +35,9 @@ pub mod contract;
 use std::sync::{Arc, OnceLock};
 
 use crate::catalog::{Deployed, LoadShape, Variant};
+use crate::manifest::Manifest;
 use crate::shared::llama_like::project;
 use crate::shared::llama_like::spec::LlamaLikeFacts;
-use crate::manifest::Manifest;
 
 use model_compiler::facts::{NormPlacement, QkNorm};
 use model_compiler::trace::{NormVariant, RopeKind};
@@ -167,6 +167,25 @@ pub fn rows() -> &'static [&'static dyn Variant] {
     ROWS.get_or_init(|| VARIANTS.iter().map(|v| v as &'static dyn Variant).collect())
 }
 
+impl Phi3 {
+    /// The scalars this row states, read ONCE.
+    ///
+    /// Both [`Variant::deployment`] and [`Variant::trace`] take it. They
+    /// used to read `rope_theta`, `norm_eps` and `window` off `self`
+    /// separately — the same three fields, spelled twice, with nothing
+    /// holding the two spellings together.
+    fn row(&self) -> project::RowScalars {
+        project::RowScalars {
+            rope_theta: self.rope_theta,
+            norm_eps: self.norm_eps,
+            window: self.window,
+            rope_rescaled: false,
+            // Unread: this generation is dense, so no router is stated.
+            norm_topk_prob: true,
+        }
+    }
+}
+
 impl Variant for Phi3 {
     fn id(&self) -> &'static str {
         self.id
@@ -181,7 +200,11 @@ impl Variant for Phi3 {
     /// mid-head and produces a contract that compiles and a model that
     /// is wrong.
     fn load_shape(&self) -> LoadShape {
-        LoadShape::dense(self.shape.layers, self.shape.head_dim, self.shape.tied_embeddings)
+        LoadShape::dense(
+            self.shape.layers,
+            self.shape.head_dim,
+            self.shape.tied_embeddings,
+        )
     }
 
     fn deployment(
@@ -189,8 +212,7 @@ impl Variant for Phi3 {
         load: Deployed<'_>,
     ) -> Result<crate::deployment::Deployment, crate::deployment::Refusal> {
         let _ = load;
-        let mut deployment =
-            project::deployment(&self.shape, self.rope_theta, self.norm_eps, self.window);
+        let mut deployment = project::deployment(&self.shape, self.row());
         deployment.advertised = crate::deployment::Advertised {
             arch: ARCH,
             max_model_len: MAX_MODEL_LEN,
@@ -229,17 +251,7 @@ impl Variant for Phi3 {
         class: model_compiler::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
-        project::trace(
-            &self.shape,
-            project::MetalRow {
-                rope_theta: self.rope_theta,
-                norm_eps: self.norm_eps,
-                window: self.window,
-                rope_rescaled: false,
-            },
-            class,
-            load,
-        )
+        project::trace(&self.shape, self.row(), class, load)
     }
 
     /// Phi-3's own markers: `<|user|>\n … <|end|>\n`. Close enough to
@@ -272,8 +284,15 @@ mod tests {
     #[test]
     fn the_row_answers_what_the_driver_advertises() {
         for v in VARIANTS {
-            let a = v.deployment(Deployed::single()).expect("dense phi-3 is servable").advertised;
-            assert_eq!(a.arch, "phi3", "{}: the family label a guest program sees", v.id);
+            let a = v
+                .deployment(Deployed::single())
+                .expect("dense phi-3 is servable")
+                .advertised;
+            assert_eq!(
+                a.arch, "phi3",
+                "{}: the family label a guest program sees",
+                v.id
+            );
             assert_eq!(a.max_model_len, 4_096, "{}: a 4k release states 4096", v.id);
             assert_ne!(a.max_model_len, 0, "{}: 0 is 'the row does not say'", v.id);
             assert!(!a.media_encode, "{}: no Phi-3 row carries a tower", v.id);
@@ -305,7 +324,11 @@ mod tests {
                 v.id
             );
         }
-        assert_eq!(VARIANTS.len(), 2, "two 4k rows, and the 128k pair deliberately absent");
+        assert_eq!(
+            VARIANTS.len(),
+            2,
+            "two 4k rows, and the 128k pair deliberately absent"
+        );
     }
 
     /// The label is what `architectures[0]` reduces to under the
@@ -321,8 +344,15 @@ mod tests {
             .expect("the suffix the worker strips")
             .to_string();
         assert_eq!(stem, ARCH);
-        assert!(!ARCH.contains('-') && !ARCH.contains('_'), "no separator survives it");
-        assert_eq!(ARCH, ARCH.to_lowercase(), "the worker compares against a lowercased stem");
+        assert!(
+            !ARCH.contains('-') && !ARCH.contains('_'),
+            "no separator survives it"
+        );
+        assert_eq!(
+            ARCH,
+            ARCH.to_lowercase(),
+            "the worker compares against a lowercased stem"
+        );
     }
 
     /// The fixture and the row are the same measurement — including the
@@ -336,7 +366,9 @@ mod tests {
     #[test]
     fn every_row_projects() {
         for v in VARIANTS {
-            let d = v.deployment(Deployed::single()).expect("dense phi3 is servable");
+            let d = v
+                .deployment(Deployed::single())
+                .expect("dense phi3 is servable");
             assert_eq!(d.layers, v.shape.layers);
             assert_eq!(d.attention.len() as u32, v.shape.layers);
             assert_eq!(d.shape.hidden, v.shape.hidden);
@@ -347,7 +379,10 @@ mod tests {
 
             let ls = v.load_shape();
             assert_eq!(ls.layers, v.shape.layers);
-            assert_eq!(ls.head_dim, v.shape.head_dim, "the TRUE head dim, never a padded one");
+            assert_eq!(
+                ls.head_dim, v.shape.head_dim,
+                "the TRUE head dim, never a padded one"
+            );
             assert!(!ls.tied_embeddings, "no Phi-3 row ties its head");
             assert_eq!(ls.n_experts, 0);
             assert_eq!(ls.mamba_groups, 0);
@@ -377,12 +412,23 @@ mod tests {
     #[test]
     fn the_mini_head_is_ninety_six_and_pads_to_one_twenty_eight() {
         let mini = row("phi-3-mini-4k");
-        assert_eq!(mini.shape.hidden / mini.shape.q_heads, 96, "96 is the checkpoint's own");
-        assert_eq!(mini.load_shape().head_dim, 96, "the contract gets the true width");
+        assert_eq!(
+            mini.shape.hidden / mini.shape.q_heads,
+            96,
+            "96 is the checkpoint's own"
+        );
+        assert_eq!(
+            mini.load_shape().head_dim,
+            96,
+            "the contract gets the true width"
+        );
 
         let d = mini.deployment(Deployed::single()).expect("servable");
         assert_eq!(d.shape.head_dim, 96, "the geometry still states the truth");
-        assert_eq!(d.shape.head_dim_kernel, 128, "the kernel gets the instantiated width");
+        assert_eq!(
+            d.shape.head_dim_kernel, 128,
+            "the kernel gets the instantiated width"
+        );
         assert_eq!(d.attention[0].head_dim, 128);
         assert_eq!(
             d.attention[0].sm_scale,
@@ -390,7 +436,9 @@ mod tests {
             "the scale follows the width the kernel reduces over"
         );
 
-        let medium = row("phi-3-medium-4k").deployment(Deployed::single()).expect("servable");
+        let medium = row("phi-3-medium-4k")
+            .deployment(Deployed::single())
+            .expect("servable");
         assert_eq!(medium.shape.head_dim, 128);
         assert_eq!(medium.shape.head_dim_kernel, 128, "nothing to pad");
         assert_eq!(medium.attention[0].head_dim, 128);
@@ -406,10 +454,19 @@ mod tests {
         let mini = row("phi-3-mini-4k");
         let m = mini.manifest();
         let extent = |name: &str| -> Vec<u64> {
-            m.tensors.iter().find(|t| t.name == name).expect("stated").extents.clone()
+            m.tensors
+                .iter()
+                .find(|t| t.name == name)
+                .expect("stated")
+                .extents
+                .clone()
         };
         assert_eq!(mini.shape.q_width(), 3072);
-        assert_eq!(mini.shape.kv_width(), 3072, "MHA: as many KV heads as query heads");
+        assert_eq!(
+            mini.shape.kv_width(),
+            3072,
+            "MHA: as many KV heads as query heads"
+        );
         assert_eq!(extent("layer.{}.self_attn.q_proj"), vec![3072, 3072]);
         assert_eq!(extent("layer.{}.self_attn.k_proj"), vec![3072, 3072]);
         assert_eq!(extent("layer.{}.self_attn.o_proj"), vec![3072, 3072]);
@@ -434,7 +491,12 @@ mod tests {
                 "layer.{}.self_attn.v_proj",
             ] {
                 let spec = m.tensors.iter().find(|t| t.name == name).expect("stated");
-                assert_eq!(spec.presence, crate::manifest::Presence::Required, "{} {name}", v.id);
+                assert_eq!(
+                    spec.presence,
+                    crate::manifest::Presence::Required,
+                    "{} {name}",
+                    v.id
+                );
             }
         }
     }
@@ -463,10 +525,24 @@ mod tests {
 
         for v in VARIANTS {
             let inst = v.chat(tok.clone());
-            assert_eq!(tok.decode(&inst.user("Hi"), false), "<|user|>\nHi<|end|>\n", "{}", v.id);
-            assert_eq!(tok.decode(&inst.cue(), false), "<|assistant|>\n", "{}", v.id);
+            assert_eq!(
+                tok.decode(&inst.user("Hi"), false),
+                "<|user|>\nHi<|end|>\n",
+                "{}",
+                v.id
+            );
+            assert_eq!(
+                tok.decode(&inst.cue(), false),
+                "<|assistant|>\n",
+                "{}",
+                v.id
+            );
             let stops = inst.seal();
-            assert!(!stops.is_empty(), "{}: <|end|> is in the vocabulary above", v.id);
+            assert!(
+                !stops.is_empty(),
+                "{}: <|end|> is in the vocabulary above",
+                v.id
+            );
             assert!(
                 !tok.decode(&stops, false).contains("<|im_end|>"),
                 "{}: the ChatML fallback's stop set was the wrong one",
@@ -483,7 +559,10 @@ mod tests {
         use model_loader::checkpoint::CheckpointMetadata;
         use model_loader::plan::StorageTarget;
 
-        let metadata = CheckpointMetadata { files: Vec::new(), tensors: Vec::new() };
+        let metadata = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: Vec::new(),
+        };
         let encoding = crate::encoding::Encoding::dense();
         let target = StorageTarget::default();
         let policy = crate::shared::policy::Policy::default();
@@ -497,7 +576,8 @@ mod tests {
                 &target,
                 &policy,
             );
-            v.author(&mut builder).unwrap_or_else(|e| panic!("{} refused to author: {e:?}", v.id));
+            v.author(&mut builder)
+                .unwrap_or_else(|e| panic!("{} refused to author: {e:?}", v.id));
         }
     }
 
@@ -508,8 +588,15 @@ mod tests {
 
         for v in VARIANTS {
             for class in [FireClass::Decode, FireClass::Prefill] {
-                let plan = v.trace(class, Deployed::single()).expect("llama-like traces");
-                assert!(plan.family.contains("llama_like"), "{}: {}", v.id, plan.family);
+                let plan = v
+                    .trace(class, Deployed::single())
+                    .expect("llama-like traces");
+                assert!(
+                    plan.family.contains("llama_like"),
+                    "{}: {}",
+                    v.id,
+                    plan.family
+                );
                 assert!(!plan.ops.is_empty(), "{}", v.id);
             }
         }

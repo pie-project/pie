@@ -1,8 +1,8 @@
 //! The plan: what the loader emits, and the passes that shape it.
 //!
-//! `build` turns a checked contract into instructions; `passes` rewrites them
-//! into the form the executor wants; `mod.rs` is only the vocabulary the two
-//! share.
+//! `plan/build.rs` turns a checked contract into instructions; `plan/passes/`
+//! rewrites them into the form the executor wants; this file is only the
+//! vocabulary the two share.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,12 +27,12 @@ pub use passes::tile::{
 
 /// Which tile-map transforms a target's kernels implement.
 ///
-/// Defined here, not in `ffi/`: the plan is the thing that has transforms, and
-/// the ABI is a view of the plan. The arrow used to point the other way — the
-/// compiler imported `crate::ffi::types::PIE_LOADER_TILE_MAP_*` — which
-/// made the core depend on its own serialization format. `ffi/types.rs` now
-/// restates these under the C names and a `const` assertion pins the two
-/// together, because cbindgen emits literals and cannot follow a path.
+/// Defined here because the plan is the thing that has transforms. The arrow
+/// used to point the other way — the compiler imported
+/// `crate::ffi::types::PIE_LOADER_TILE_MAP_*`, which made the core depend on
+/// its own serialization format. The C ABI that justified that dependency has
+/// since gone, and these are now simply where they belong: beside the target
+/// that advertises them.
 pub const TILE_MAP_CAST: u32 = 1 << 0;
 pub const TILE_MAP_DECODE: u32 = 1 << 1;
 pub const TILE_MAP_ENCODE: u32 = 1 << 2;
@@ -152,7 +152,7 @@ impl StorageTarget {
             preferred_alignment: 256,
             // How much host staging one load-time transform may take at once.
             max_tile_bytes: 64 * 1024 * 1024,
-            tile_map_mask: passes::tile::tile_map_mask(backend),
+            tile_map_mask: passes::tile::compilable_tile_maps(backend),
             // FALSE, and the name is the trap. `native_mxfp4_moe` does not mean
             // "reads MXFP4"; it means "has a native MXFP4 *GEMM*", which in
             // gpt-oss's contract selects a Marlin REPACK of the expert banks —

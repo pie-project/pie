@@ -17,7 +17,7 @@
 //!
 //! Skipped without a device, like every other `gpu_*` binary here.
 
-use driver_cuda::program::{Disk, Module, disk_key, compile};
+use driver_cuda::program::{Disk, Module, compile, disk_key};
 
 mod common;
 use common::{device_or_skip, gpu_guard};
@@ -225,9 +225,9 @@ fn the_control_kernels_compile_and_both_entry_points_resolve() {
 /// about a value the device wrote.
 #[test]
 fn the_control_kernels_gate_and_advance_the_device_ring() {
-    use driver_cuda::device::{Allocator, OwnedStream};
-    use driver_cuda::program::{ChannelShape, Control, Rings, run, launch_control};
     use driver::tensor_ir::DType;
+    use driver_cuda::device::{Allocator, OwnedStream};
+    use driver_cuda::program::{ChannelShape, Control, Rings, launch_control, run};
 
     let _gpu = gpu_guard();
     let Some(device) = device_or_skip("PTIR device ring") else {

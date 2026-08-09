@@ -7,8 +7,8 @@
 #![cfg(all(feature = "_cuda", feature = "abi"))]
 
 use driver_api::local::{
-    PIE_DRIVER_ABI_VERSION, PIE_STATUS_INVALID_ARGUMENT, PIE_STATUS_OK, PIE_STATUS_UNSUPPORTED, PieDriverCaps,
-    PieDriverCreateDesc,
+    PIE_DRIVER_ABI_VERSION, PIE_STATUS_INVALID_ARGUMENT, PIE_STATUS_OK, PIE_STATUS_UNSUPPORTED,
+    PieDriverCaps, PieDriverCreateDesc,
 };
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,7 +18,6 @@ use driver_api::local::{PieCompletion, PieFrameDesc, PieRuntimeCallbacks};
 mod common;
 #[allow(unused_imports)] // abi tests take only the guard
 use common::gpu_guard;
-
 
 // ── FIRING A FRAME AND WAITING FOR IT ────────────────────────────────
 //
@@ -67,10 +66,8 @@ fn engine_runtime() -> PieRuntimeCallbacks {
 /// working, and a test that silently stops running is worse than one that
 /// fails.
 fn qwen3_snapshot() -> Option<std::path::PathBuf> {
-    let root = std::path::PathBuf::from(
-        std::env::var("HOME").unwrap_or_else(|_| "/root".into()),
-    )
-    .join(".cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots");
+    let root = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
+        .join(".cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots");
     std::fs::read_dir(root).ok().and_then(|rd| {
         rd.filter_map(std::result::Result::ok).find_map(|e| {
             let p = e.path();
@@ -116,14 +113,14 @@ fn fire_and_wait(
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while fires.load(Ordering::Acquire) == before {
-        assert!(std::time::Instant::now() < deadline, "the fire never completed");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fire never completed"
+        );
         std::thread::yield_now();
     }
     status
 }
-
-
-
 
 /// A tensor-parallel group of more than one is REFUSED, not served wrongly.
 ///
@@ -144,20 +141,29 @@ fn a_tensor_parallel_group_is_refused_rather_than_answered_wrongly() {
     let boot = "[driver]\ntp_size = 2\n";
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: engine_runtime(),
         ..Default::default()
     };
     let mut caps = driver_api::local::PieDriverCaps::default();
     let d = unsafe { driver_cuda::serve::pie_cuda_create(&desc, &mut caps) };
-    assert!(d.is_null(), "tp_size = 2 must refuse; there is no all-reduce to serve it");
+    assert!(
+        d.is_null(),
+        "tp_size = 2 must refuse; there is no all-reduce to serve it"
+    );
 
     // And one rank still boots, so the refusal is about the GROUP and not
     // about the keys being present.
     let solo = "[driver]\ntp_size = 1\n";
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: solo.as_ptr(), len: solo.len() },
+        config_bytes: PieBytes {
+            ptr: solo.as_ptr(),
+            len: solo.len(),
+        },
         runtime: engine_runtime(),
         ..Default::default()
     };
@@ -166,7 +172,6 @@ fn a_tensor_parallel_group_is_refused_rather_than_answered_wrongly() {
     assert!(!d.is_null(), "one rank is the served configuration");
     unsafe { driver_cuda::serve::pie_cuda_destroy(d) };
 }
-
 
 /// A panic inside a driver entry point fails the REQUEST, not the process.
 ///
@@ -187,7 +192,10 @@ fn a_panicking_request_does_not_take_the_process_down() {
     let boot = "[driver]\ntp_size = 1\n";
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: engine_runtime(),
         ..Default::default()
     };
@@ -199,10 +207,17 @@ fn a_panicking_request_does_not_take_the_process_down() {
     // the point of running it: the guard must not change the ordinary answer.
     let frame = PieFrameDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        steps: PieStepDescSlice { ptr: std::ptr::null(), len: 0 },
+        steps: PieStepDescSlice {
+            ptr: std::ptr::null(),
+            len: 0,
+        },
         ..Default::default()
     };
-    let completion = PieCompletion { wait_id: 1, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
+    let completion = PieCompletion {
+        wait_id: 1,
+        target_epoch: 1,
+        terminal_cell: std::ptr::null_mut(),
+    };
     let status = unsafe { driver_cuda::serve::pie_cuda_launch(d, &frame, completion) };
     assert_ne!(status, PIE_STATUS_OK, "a frame with no steps is refused");
 
@@ -257,7 +272,10 @@ fn load_model_answers_capabilities_an_engine_can_parse() {
     let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: engine_runtime(),
         ..Default::default()
     };
@@ -266,7 +284,10 @@ fn load_model_answers_capabilities_an_engine_can_parse() {
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
     let mut caps = driver_api::local::PieDriverCaps::default();
@@ -274,7 +295,10 @@ fn load_model_answers_capabilities_an_engine_can_parse() {
         unsafe { driver_cuda::serve::pie_cuda_load_model(d, &load, &mut caps) },
         PIE_STATUS_OK
     );
-    assert!(!caps.json_bytes.is_null(), "load_model published no capabilities");
+    assert!(
+        !caps.json_bytes.is_null(),
+        "load_model published no capabilities"
+    );
     let bytes = unsafe { std::slice::from_raw_parts(caps.json_bytes, caps.json_len) };
     let parsed: driver_api::DriverCapabilities = serde_json::from_slice(bytes)
         .expect("the engine deserializes this exact payload into this exact type");
@@ -284,13 +308,19 @@ fn load_model_answers_capabilities_an_engine_can_parse() {
     // no context, which is indistinguishable from a driver that did not
     // answer — and was the state before this.
     assert!(parsed.total_pages > 0, "the device holds no KV pages");
-    assert_eq!(parsed.kv_page_size, 16, "the page size the fire path builds");
+    assert_eq!(
+        parsed.kv_page_size, 16,
+        "the page size the fire path builds"
+    );
     // THE LATTICE ANSWERED THESE, and that is the point of running it. A
     // stated ceiling would be the same on every device; these are what the
     // planner's search chose for this card and this checkpoint, and the arena
     // it sized is sized for exactly this rectangle.
     assert!(parsed.max_forward_tokens > 0, "a fire may carry no tokens");
-    assert!(parsed.max_forward_requests > 0, "a fire may carry no requests");
+    assert!(
+        parsed.max_forward_requests > 0,
+        "a fire may carry no requests"
+    );
     assert!(
         parsed.max_page_refs >= parsed.total_pages,
         "a fire cannot reference fewer pages than the pool holds"
@@ -353,7 +383,10 @@ fn the_shell_answers_the_engines_own_declarations() {
         driver_cuda::serve::pie_cuda_destroy as *const (),
     ];
     // A wrong version is refused with null, before any state exists.
-    let bad = PieDriverCreateDesc { abi_version: 1, ..Default::default() };
+    let bad = PieDriverCreateDesc {
+        abi_version: 1,
+        ..Default::default()
+    };
     let d = unsafe { driver_cuda::serve::pie_cuda_create(&bad, std::ptr::null_mut()) };
     assert!(d.is_null(), "a mismatched ABI version must refuse");
 
@@ -363,17 +396,26 @@ fn the_shell_answers_the_engines_own_declarations() {
         runtime: engine_runtime(),
         ..Default::default()
     };
-    let mut caps = PieDriverCaps { json_bytes: std::ptr::null(), json_len: 0 };
+    let mut caps = PieDriverCaps {
+        json_bytes: std::ptr::null(),
+        json_len: 0,
+    };
     let d = unsafe { driver_cuda::serve::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null(), "create with the pinned ABI version");
     assert!(caps.json_len > 0, "caps came back");
     let json = unsafe { std::slice::from_raw_parts(caps.json_bytes, caps.json_len) };
-    assert!(std::str::from_utf8(json).expect("utf8").contains("driver-cuda"));
+    assert!(
+        std::str::from_utf8(json)
+            .expect("utf8")
+            .contains("driver-cuda")
+    );
 
     // The stated refusals refuse with the stated code, and the closes
     // close.
     assert_eq!(
-        unsafe { driver_cuda::serve::pie_cuda_load_model(d, std::ptr::null(), std::ptr::null_mut()) },
+        unsafe {
+            driver_cuda::serve::pie_cuda_load_model(d, std::ptr::null(), std::ptr::null_mut())
+        },
         PIE_STATUS_INVALID_ARGUMENT,
         "a null load desc is an argument error, not a refusal"
     );
@@ -401,8 +443,8 @@ fn load_model_loads_a_real_snapshot_through_the_abi() {
     use driver_api::local::{PieBytes, PieModelLoadDesc};
 
     let home = std::env::var("HOME").expect("HOME");
-    let snaps =
-        std::path::PathBuf::from(&home).join(".cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots");
+    let snaps = std::path::PathBuf::from(&home)
+        .join(".cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots");
     let Some(snap) = std::fs::read_dir(&snaps).ok().and_then(|mut d| {
         d.find_map(|e| {
             let p = e.ok()?.path();
@@ -424,7 +466,10 @@ fn load_model_loads_a_real_snapshot_through_the_abi() {
     let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: engine_runtime(),
         ..Default::default()
     };
@@ -434,10 +479,16 @@ fn load_model_loads_a_real_snapshot_through_the_abi() {
 
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
-    let mut caps = PieDriverCaps { json_bytes: std::ptr::null(), json_len: 0 };
+    let mut caps = PieDriverCaps {
+        json_bytes: std::ptr::null(),
+        json_len: 0,
+    };
     let status = unsafe { driver_cuda::serve::pie_cuda_load_model(d, &load, &mut caps) };
     assert_eq!(status, PIE_STATUS_OK, "the real snapshot loads");
     // The payload is a `DriverCapabilities`, which is what the engine
@@ -470,7 +521,10 @@ fn the_registries_run_the_id_lifecycle() {
     let d = unsafe { driver_cuda::serve::pie_cuda_create(&desc, &mut caps) };
     assert!(!d.is_null());
 
-    let prog = PieProgramDesc { program_hash: 0xC3C3, ..Default::default() };
+    let prog = PieProgramDesc {
+        program_hash: 0xC3C3,
+        ..Default::default()
+    };
     let mut id1 = 0u64;
     let mut id2 = 0u64;
     assert_eq!(
@@ -483,7 +537,10 @@ fn the_registries_run_the_id_lifecycle() {
     );
     assert_eq!(id1, id2, "the hash is the dedup key");
 
-    let unbound = PieInstanceDesc { program_id: 999, ..Default::default() };
+    let unbound = PieInstanceDesc {
+        program_id: 999,
+        ..Default::default()
+    };
     let mut binding = PieInstanceBinding::default();
     assert_eq!(
         unsafe { driver_cuda::serve::pie_cuda_bind_instance(d, &unbound, &mut binding) },
@@ -517,7 +574,10 @@ fn the_registries_run_the_id_lifecycle() {
         PIE_STATUS_INVALID_ARGUMENT,
         "an id in use refuses"
     );
-    assert_eq!(unsafe { driver_cuda::serve::pie_cuda_close_instance(d, 42) }, PIE_STATUS_OK);
+    assert_eq!(
+        unsafe { driver_cuda::serve::pie_cuda_close_instance(d, 42) },
+        PIE_STATUS_OK
+    );
     assert_eq!(
         unsafe { driver_cuda::serve::pie_cuda_bind_instance(d, &inst, &mut binding) },
         PIE_STATUS_OK,
@@ -544,8 +604,8 @@ fn load_and_fire(repo: &str, descriptor_name: &str, what: &str) -> bool {
     use driver_api::local::{
         PIE_TERMINAL_OUTCOME_PENDING, PIE_TERMINAL_OUTCOME_SUCCESS, PieBytes, PieCompletion,
         PieFrameDesc, PieInstanceBinding, PieInstanceDesc, PieModelLoadDesc, PieProgramDesc,
-        PieRuntimeCallbacks, PieStepDesc, PieTerminalCell, PieTerminalCellPtrSlice,
-        PieU32Slice, PieU64Slice,
+        PieRuntimeCallbacks, PieStepDesc, PieTerminalCell, PieTerminalCellPtrSlice, PieU32Slice,
+        PieU64Slice,
     };
 
     let home = std::env::var("HOME").expect("HOME");
@@ -590,7 +650,10 @@ fn load_and_fire(repo: &str, descriptor_name: &str, what: &str) -> bool {
     let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: PieRuntimeCallbacks {
             abi_version: PIE_DRIVER_ABI_VERSION,
             reserved0: 0,
@@ -605,7 +668,10 @@ fn load_and_fire(repo: &str, descriptor_name: &str, what: &str) -> bool {
 
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
     assert_eq!(
@@ -614,20 +680,29 @@ fn load_and_fire(repo: &str, descriptor_name: &str, what: &str) -> bool {
         "{what}: the snapshot loads"
     );
 
-    let prog = PieProgramDesc { program_hash: 0x0102, ..Default::default() };
+    let prog = PieProgramDesc {
+        program_hash: 0x0102,
+        ..Default::default()
+    };
     let mut program_id = 0u64;
     assert_eq!(
         unsafe { driver_cuda::serve::pie_cuda_register_program(d, &prog, &mut program_id) },
         PIE_STATUS_OK
     );
-    let inst = PieInstanceDesc { program_id, ..Default::default() };
+    let inst = PieInstanceDesc {
+        program_id,
+        ..Default::default()
+    };
     let mut binding = PieInstanceBinding::default();
     assert_eq!(
         unsafe { driver_cuda::serve::pie_cuda_bind_instance(d, &inst, &mut binding) },
         PIE_STATUS_OK
     );
 
-    let mut cell = PieTerminalCell { outcome: PIE_TERMINAL_OUTCOME_PENDING, reserved0: 0 };
+    let mut cell = PieTerminalCell {
+        outcome: PIE_TERMINAL_OUTCOME_PENDING,
+        reserved0: 0,
+    };
     let cell_ptr: *mut PieTerminalCell = &mut cell;
     let roster_rows: [u32; 1] = [0];
     let sub_batch_indptr: [u32; 2] = [0, 1];
@@ -638,12 +713,18 @@ fn load_and_fire(repo: &str, descriptor_name: &str, what: &str) -> bool {
     let kv_page_indptr: [u32; 2] = [0, 1];
     let kv_last_page_lens: [u32; 1] = [1];
     let qo_indptr: [u32; 2] = [0, 1];
-    let u32s = |v: &[u32]| PieU32Slice { ptr: v.as_ptr(), len: v.len() };
+    let u32s = |v: &[u32]| PieU32Slice {
+        ptr: v.as_ptr(),
+        len: v.len(),
+    };
     let step = PieStepDesc {
         roster_rows: u32s(&roster_rows),
         sub_batch_indptr: u32s(&sub_batch_indptr),
         sub_batch_class: u32s(&sub_batch_class),
-        terminal_cells: PieTerminalCellPtrSlice { ptr: &cell_ptr, len: 1 },
+        terminal_cells: PieTerminalCellPtrSlice {
+            ptr: &cell_ptr,
+            len: 1,
+        },
         token_ids: u32s(&token_ids),
         position_ids: u32s(&position_ids),
         kv_page_indices: u32s(&kv_page_indices),
@@ -655,13 +736,19 @@ fn load_and_fire(repo: &str, descriptor_name: &str, what: &str) -> bool {
     let instance_ids: [u64; 1] = [binding.instance_id];
     let frame = PieFrameDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        instance_ids: PieU64Slice { ptr: instance_ids.as_ptr(), len: 1 },
+        instance_ids: PieU64Slice {
+            ptr: instance_ids.as_ptr(),
+            len: 1,
+        },
         required_kv_pages: 1,
         steps: driver_api::local::PieStepDescSlice { ptr: &step, len: 1 },
         ..Default::default()
     };
-    let completion =
-        PieCompletion { wait_id: 0x0102, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
+    let completion = PieCompletion {
+        wait_id: 0x0102,
+        target_epoch: 1,
+        terminal_cell: std::ptr::null_mut(),
+    };
     assert_eq!(
         unsafe { driver_cuda::serve::pie_cuda_launch(d, &frame, completion) },
         PIE_STATUS_OK,
@@ -672,10 +759,16 @@ fn load_and_fire(repo: &str, descriptor_name: &str, what: &str) -> bool {
     // wedged, and hanging the suite would say less than failing it.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while FIRED.load(std::sync::atomic::Ordering::Acquire) == 0 {
-        assert!(std::time::Instant::now() < deadline, "{what}: the fire never completed");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: the fire never completed"
+        );
         std::thread::yield_now();
     }
-    assert_eq!(cell.outcome, PIE_TERMINAL_OUTCOME_SUCCESS, "{what}: the terminal cell published");
+    assert_eq!(
+        cell.outcome, PIE_TERMINAL_OUTCOME_SUCCESS,
+        "{what}: the terminal cell published"
+    );
 
     unsafe { driver_cuda::serve::pie_cuda_destroy(d) };
     true
@@ -694,7 +787,11 @@ fn load_and_fire(repo: &str, descriptor_name: &str, what: &str) -> bool {
 #[test]
 fn olmo2_loads_and_fires_post_norm_through_the_abi() {
     let _gpu = gpu_guard();
-    load_and_fire("models--allenai--OLMo-2-0425-1B-Instruct", "olmo2_descriptor.json", "OLMo-2-1B");
+    load_and_fire(
+        "models--allenai--OLMo-2-0425-1B-Instruct",
+        "olmo2_descriptor.json",
+        "OLMo-2-1B",
+    );
 }
 
 /// Phi-3: the deployment that ships its projections ALREADY FUSED.
@@ -712,7 +809,11 @@ fn olmo2_loads_and_fires_post_norm_through_the_abi() {
 #[test]
 fn phi3_loads_and_fires_prefused_through_the_abi() {
     let _gpu = gpu_guard();
-    load_and_fire("models--microsoft--Phi-3-mini-4k-instruct", "phi3_descriptor.json", "Phi-3-mini");
+    load_and_fire(
+        "models--microsoft--Phi-3-mini-4k-instruct",
+        "phi3_descriptor.json",
+        "Phi-3-mini",
+    );
 }
 
 /// Mistral-7B: the plain GQA member, at a size where nothing else about
@@ -787,7 +888,10 @@ fn an_unserveable_gqa_ratio_is_refused_at_load() {
     let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: PieRuntimeCallbacks {
             abi_version: PIE_DRIVER_ABI_VERSION,
             reserved0: 0,
@@ -801,7 +905,10 @@ fn an_unserveable_gqa_ratio_is_refused_at_load() {
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
     // The load itself may succeed — the refusal is the shell's, and it
@@ -814,7 +921,6 @@ fn an_unserveable_gqa_ratio_is_refused_at_load() {
     unsafe { driver_cuda::serve::pie_cuda_destroy(d) };
 }
 
-
 /// engine's own call sequence, driven through the engine's own
 /// declarations.
 #[test]
@@ -825,8 +931,8 @@ fn a_real_decode_frame_launches_through_the_abi() {
     use driver_api::local::{
         PIE_TERMINAL_OUTCOME_PENDING, PIE_TERMINAL_OUTCOME_SUCCESS, PieBytes, PieCompletion,
         PieFrameDesc, PieInstanceBinding, PieInstanceDesc, PieModelLoadDesc, PieProgramDesc,
-        PieRuntimeCallbacks, PieStepDesc, PieTerminalCell, PieTerminalCellPtrSlice,
-        PieU32Slice, PieU64Slice,
+        PieRuntimeCallbacks, PieStepDesc, PieTerminalCell, PieTerminalCellPtrSlice, PieU32Slice,
+        PieU64Slice,
     };
 
     let home = std::env::var("HOME").expect("HOME");
@@ -858,7 +964,10 @@ fn a_real_decode_frame_launches_through_the_abi() {
     let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: PieRuntimeCallbacks {
             abi_version: PIE_DRIVER_ABI_VERSION,
             reserved0: 0,
@@ -873,7 +982,10 @@ fn a_real_decode_frame_launches_through_the_abi() {
 
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
     assert_eq!(
@@ -881,13 +993,19 @@ fn a_real_decode_frame_launches_through_the_abi() {
         PIE_STATUS_OK
     );
 
-    let prog = PieProgramDesc { program_hash: 0xF12E, ..Default::default() };
+    let prog = PieProgramDesc {
+        program_hash: 0xF12E,
+        ..Default::default()
+    };
     let mut program_id = 0u64;
     assert_eq!(
         unsafe { driver_cuda::serve::pie_cuda_register_program(d, &prog, &mut program_id) },
         PIE_STATUS_OK
     );
-    let inst = PieInstanceDesc { program_id, ..Default::default() };
+    let inst = PieInstanceDesc {
+        program_id,
+        ..Default::default()
+    };
     let mut binding = PieInstanceBinding::default();
     assert_eq!(
         unsafe { driver_cuda::serve::pie_cuda_bind_instance(d, &inst, &mut binding) },
@@ -896,7 +1014,10 @@ fn a_real_decode_frame_launches_through_the_abi() {
 
     // One decode step: instance's first token (id 7) at position 0, one
     // KV page, appended at offset 0.
-    let mut cell = PieTerminalCell { outcome: PIE_TERMINAL_OUTCOME_PENDING, reserved0: 0 };
+    let mut cell = PieTerminalCell {
+        outcome: PIE_TERMINAL_OUTCOME_PENDING,
+        reserved0: 0,
+    };
     let cell_ptr: *mut PieTerminalCell = &mut cell;
     let roster_rows: [u32; 1] = [0];
     let sub_batch_indptr: [u32; 2] = [0, 1];
@@ -907,12 +1028,18 @@ fn a_real_decode_frame_launches_through_the_abi() {
     let kv_page_indptr: [u32; 2] = [0, 1];
     let kv_last_page_lens: [u32; 1] = [1];
     let qo_indptr: [u32; 2] = [0, 1];
-    let u32s = |v: &[u32]| PieU32Slice { ptr: v.as_ptr(), len: v.len() };
+    let u32s = |v: &[u32]| PieU32Slice {
+        ptr: v.as_ptr(),
+        len: v.len(),
+    };
     let step = PieStepDesc {
         roster_rows: u32s(&roster_rows),
         sub_batch_indptr: u32s(&sub_batch_indptr),
         sub_batch_class: u32s(&sub_batch_class),
-        terminal_cells: PieTerminalCellPtrSlice { ptr: &cell_ptr, len: 1 },
+        terminal_cells: PieTerminalCellPtrSlice {
+            ptr: &cell_ptr,
+            len: 1,
+        },
         token_ids: u32s(&token_ids),
         position_ids: u32s(&position_ids),
         kv_page_indices: u32s(&kv_page_indices),
@@ -924,7 +1051,10 @@ fn a_real_decode_frame_launches_through_the_abi() {
     let instance_ids: [u64; 1] = [binding.instance_id];
     let frame = PieFrameDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        instance_ids: PieU64Slice { ptr: instance_ids.as_ptr(), len: 1 },
+        instance_ids: PieU64Slice {
+            ptr: instance_ids.as_ptr(),
+            len: 1,
+        },
         required_kv_pages: 1,
         steps: driver_api::local::PieStepDescSlice { ptr: &step, len: 1 },
         ..Default::default()
@@ -942,10 +1072,16 @@ fn a_real_decode_frame_launches_through_the_abi() {
     // assertions after it about the fire rather than about the call.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while NOTIFIED.load(Ordering::SeqCst) != 0xBEEF {
-        assert!(std::time::Instant::now() < deadline, "the runtime was never notified");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the runtime was never notified"
+        );
         std::thread::yield_now();
     }
-    assert_eq!(cell.outcome, PIE_TERMINAL_OUTCOME_SUCCESS, "the terminal cell published");
+    assert_eq!(
+        cell.outcome, PIE_TERMINAL_OUTCOME_SUCCESS,
+        "the terminal cell published"
+    );
 
     unsafe { driver_cuda::serve::pie_cuda_destroy(d) };
 }
@@ -975,7 +1111,10 @@ fn channels_bind_the_ring_contract() {
         channel_id: 5,
         reader_wait_id: 11,
         writer_wait_id: 12,
-        shape: PieU32Slice { ptr: shape.as_ptr(), len: 2 },
+        shape: PieU32Slice {
+            ptr: shape.as_ptr(),
+            len: 2,
+        },
         capacity: 7,
         ..Default::default()
     };
@@ -984,14 +1123,26 @@ fn channels_bind_the_ring_contract() {
         unsafe { driver_cuda::serve::pie_cuda_register_channel(d, &ch, &mut b) },
         PIE_STATUS_OK
     );
-    assert_eq!(b.cell_bytes, 32 * 4, "f32 wire cells are four bytes per element");
-    assert_eq!(b.mirror_bytes, u64::from(b.cell_bytes) * 8, "capacity + 1 cells");
     assert_eq!(
-        (b.head_word_index, b.tail_word_index, b.poison_word_index, b.closed_word_index),
+        b.cell_bytes,
+        32 * 4,
+        "f32 wire cells are four bytes per element"
+    );
+    assert_eq!(
+        b.mirror_bytes,
+        u64::from(b.cell_bytes) * 8,
+        "capacity + 1 cells"
+    );
+    assert_eq!(
+        (
+            b.head_word_index,
+            b.tail_word_index,
+            b.poison_word_index,
+            b.closed_word_index
+        ),
         (0, 1, 2, 3)
     );
-    let words =
-        unsafe { std::slice::from_raw_parts(b.word_base as *const u64, 4) };
+    let words = unsafe { std::slice::from_raw_parts(b.word_base as *const u64, 4) };
     assert_eq!(words, &[0, 0, 0, 0], "control words start zeroed");
 
     // Duplicate id refuses; a bool channel bit-packs.
@@ -1003,7 +1154,10 @@ fn channels_bind_the_ring_contract() {
         channel_id: 6,
         reader_wait_id: 13,
         writer_wait_id: 14,
-        shape: PieU32Slice { ptr: shape.as_ptr(), len: 2 },
+        shape: PieU32Slice {
+            ptr: shape.as_ptr(),
+            len: 2,
+        },
         dtype: PIE_CHANNEL_DTYPE_BOOL,
         capacity: 1,
         ..Default::default()
@@ -1015,15 +1169,28 @@ fn channels_bind_the_ring_contract() {
     assert_eq!(b.cell_bytes, 4, "32 bools bit-pack to four bytes");
 
     // An oversized ring refuses; closes are real and idempotent.
-    let big = PieChannelDesc { channel_id: 9, capacity: 64, ..ch };
+    let big = PieChannelDesc {
+        channel_id: 9,
+        capacity: 64,
+        ..ch
+    };
     assert_eq!(
         unsafe { driver_cuda::serve::pie_cuda_register_channel(d, &big, &mut b) },
         PIE_STATUS_INVALID_ARGUMENT,
         "capacity + 1 must stay within the ring maximum"
     );
-    assert_eq!(unsafe { driver_cuda::serve::pie_cuda_close_channel(d, 5) }, PIE_STATUS_OK);
-    assert_eq!(unsafe { driver_cuda::serve::pie_cuda_close_channel(d, 5) }, PIE_STATUS_OK);
-    let again = PieChannelDesc { channel_id: 5, ..ch };
+    assert_eq!(
+        unsafe { driver_cuda::serve::pie_cuda_close_channel(d, 5) },
+        PIE_STATUS_OK
+    );
+    assert_eq!(
+        unsafe { driver_cuda::serve::pie_cuda_close_channel(d, 5) },
+        PIE_STATUS_OK
+    );
+    let again = PieChannelDesc {
+        channel_id: 5,
+        ..ch
+    };
     assert_eq!(
         unsafe { driver_cuda::serve::pie_cuda_register_channel(d, &again, &mut b) },
         PIE_STATUS_OK,
@@ -1070,15 +1237,16 @@ fn logits_come_back_through_the_ring() {
         eprintln!("skipped: no generated descriptor");
         return;
     }
-    let reference: serde_json::Value = serde_json::from_str(include_str!(
-        "oracle/real_decode/reference.json"
-    ))
-    .expect("reference");
+    let reference: serde_json::Value =
+        serde_json::from_str(include_str!("oracle/real_decode/reference.json")).expect("reference");
 
     let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: runtime_for(&fires),
         ..Default::default()
     };
@@ -1087,7 +1255,10 @@ fn logits_come_back_through_the_ring() {
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
     assert_eq!(
@@ -1101,7 +1272,10 @@ fn logits_come_back_through_the_ring() {
         channel_id: 77,
         reader_wait_id: 155,
         writer_wait_id: 156,
-        shape: PieU32Slice { ptr: shape.as_ptr(), len: 1 },
+        shape: PieU32Slice {
+            ptr: shape.as_ptr(),
+            len: 1,
+        },
         host_role: PIE_CHANNEL_HOST_ROLE_READER,
         capacity: 3,
         ..Default::default()
@@ -1112,7 +1286,10 @@ fn logits_come_back_through_the_ring() {
         PIE_STATUS_OK
     );
 
-    let prog = PieProgramDesc { program_hash: 0xF13E, ..Default::default() };
+    let prog = PieProgramDesc {
+        program_hash: 0xF13E,
+        ..Default::default()
+    };
     let mut program_id = 0u64;
     assert_eq!(
         unsafe { driver_cuda::serve::pie_cuda_register_program(d, &prog, &mut program_id) },
@@ -1121,7 +1298,10 @@ fn logits_come_back_through_the_ring() {
     let channel_ids: [u64; 1] = [77];
     let inst = PieInstanceDesc {
         program_id,
-        channel_ids: PieU64Slice { ptr: channel_ids.as_ptr(), len: 1 },
+        channel_ids: PieU64Slice {
+            ptr: channel_ids.as_ptr(),
+            len: 1,
+        },
         ..Default::default()
     };
     let mut binding = PieInstanceBinding::default();
@@ -1132,8 +1312,11 @@ fn logits_come_back_through_the_ring() {
 
     // The reference prompt as one prefill request over one page.
     let prompt: Vec<u32> = reference["prompt_ids"]
-        .as_array().expect("ids").iter()
-        .map(|v| v.as_u64().expect("id") as u32).collect();
+        .as_array()
+        .expect("ids")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as u32)
+        .collect();
     let tokens = prompt.len();
     let positions: Vec<u32> = (0..tokens as u32).collect();
     // ONE ROSTER ROW PER REQUEST, not per token. These said `vec![0;
@@ -1164,7 +1347,10 @@ fn logits_come_back_through_the_ring() {
     let kv_page_indptr: [u32; 2] = [0, 1];
     let kv_last_page_lens: [u32; 1] = [tokens as u32];
     let qo_indptr: [u32; 2] = [0, tokens as u32];
-    let u32s = |v: &[u32]| PieU32Slice { ptr: v.as_ptr(), len: v.len() };
+    let u32s = |v: &[u32]| PieU32Slice {
+        ptr: v.as_ptr(),
+        len: v.len(),
+    };
     let step = PieStepDesc {
         roster_rows: u32s(&roster_rows),
         sub_batch_indptr: u32s(&sub_batch_indptr),
@@ -1184,25 +1370,26 @@ fn logits_come_back_through_the_ring() {
     let instance_ids: [u64; 1] = [binding.instance_id];
     let frame = PieFrameDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        instance_ids: PieU64Slice { ptr: instance_ids.as_ptr(), len: 1 },
+        instance_ids: PieU64Slice {
+            ptr: instance_ids.as_ptr(),
+            len: 1,
+        },
         required_kv_pages: 1,
         steps: driver_api::local::PieStepDescSlice { ptr: &step, len: 1 },
         ..Default::default()
     };
-    let completion =
-        PieCompletion { wait_id: 1, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
-    assert_eq!(
-        fire_and_wait(d, &frame, completion, &fires),
-        PIE_STATUS_OK
-    );
+    let completion = PieCompletion {
+        wait_id: 1,
+        target_epoch: 1,
+        terminal_cell: std::ptr::null_mut(),
+    };
+    assert_eq!(fire_and_wait(d, &frame, completion, &fires), PIE_STATUS_OK);
 
     // The ring advanced once, and cell 0 holds the last row's logits.
     let words = unsafe { std::slice::from_raw_parts(chb.word_base as *const u64, 4) };
     assert_eq!(words[1], 1, "the tail advanced exactly once");
     assert_eq!(words[0], 0, "the head is the engine's to move");
-    let cell = unsafe {
-        std::slice::from_raw_parts(chb.mirror_base as *const f32, VOCAB)
-    };
+    let cell = unsafe { std::slice::from_raw_parts(chb.mirror_base as *const f32, VOCAB) };
     let hf_argmax = reference["argmax"].as_u64().expect("argmax") as usize;
     let (mut best_t, mut best_v) = (0usize, f32::NEG_INFINITY);
     for (t, &v) in cell.iter().enumerate() {
@@ -1210,10 +1397,17 @@ fn logits_come_back_through_the_ring() {
             (best_t, best_v) = (t, v);
         }
     }
-    assert_eq!(best_t, hf_argmax, "the ring carried the right logits (top {best_v})");
+    assert_eq!(
+        best_t, hf_argmax,
+        "the ring carried the right logits (top {best_v})"
+    );
     let hf_top1 = reference["top5_logits"].as_array().expect("top5")[0]
-        .as_f64().expect("v") as f32;
-    assert!((best_v - hf_top1).abs() < 0.25, "top-1 {best_v} vs HF {hf_top1}");
+        .as_f64()
+        .expect("v") as f32;
+    assert!(
+        (best_v - hf_top1).abs() < 0.25,
+        "top-1 {best_v} vs HF {hf_top1}"
+    );
 
     unsafe { driver_cuda::serve::pie_cuda_destroy(d) };
 }
@@ -1232,8 +1426,7 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
     use driver_api::local::{
         PIE_CHANNEL_HOST_ROLE_READER, PieBytes, PieChannelDesc, PieChannelEndpointBinding,
         PieCompletion, PieFrameDesc, PieInstanceBinding, PieInstanceDesc, PieKvCopyDesc,
-        PieModelLoadDesc, PiePoolResizeDesc, PieProgramDesc, PieStepDesc, PieU32Slice,
-        PieU64Slice,
+        PieModelLoadDesc, PiePoolResizeDesc, PieProgramDesc, PieStepDesc, PieU32Slice, PieU64Slice,
     };
 
     let home = std::env::var("HOME").expect("HOME");
@@ -1256,15 +1449,16 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
         eprintln!("skipped: no generated descriptor");
         return;
     }
-    let reference: serde_json::Value = serde_json::from_str(include_str!(
-        "oracle/real_decode/reference.json"
-    ))
-    .expect("reference");
+    let reference: serde_json::Value =
+        serde_json::from_str(include_str!("oracle/real_decode/reference.json")).expect("reference");
 
     let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: runtime_for(&fires),
         ..Default::default()
     };
@@ -1273,7 +1467,10 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
     assert_eq!(
@@ -1286,7 +1483,10 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
         channel_id: 9,
         reader_wait_id: 19,
         writer_wait_id: 20,
-        shape: PieU32Slice { ptr: shape.as_ptr(), len: 1 },
+        shape: PieU32Slice {
+            ptr: shape.as_ptr(),
+            len: 1,
+        },
         host_role: PIE_CHANNEL_HOST_ROLE_READER,
         capacity: 7,
         ..Default::default()
@@ -1296,25 +1496,37 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
         unsafe { driver_cuda::serve::pie_cuda_register_channel(d, &ch, &mut chb) },
         PIE_STATUS_OK
     );
-    let prog = PieProgramDesc { program_hash: 0xF14E, ..Default::default() };
+    let prog = PieProgramDesc {
+        program_hash: 0xF14E,
+        ..Default::default()
+    };
     let mut program_id = 0u64;
     unsafe { driver_cuda::serve::pie_cuda_register_program(d, &prog, &mut program_id) };
     let channel_ids: [u64; 1] = [9];
     let inst = PieInstanceDesc {
         program_id,
-        channel_ids: PieU64Slice { ptr: channel_ids.as_ptr(), len: 1 },
+        channel_ids: PieU64Slice {
+            ptr: channel_ids.as_ptr(),
+            len: 1,
+        },
         ..Default::default()
     };
     let mut binding = PieInstanceBinding::default();
     unsafe { driver_cuda::serve::pie_cuda_bind_instance(d, &inst, &mut binding) };
 
     let prompt: Vec<u32> = reference["prompt_ids"]
-        .as_array().expect("ids").iter()
-        .map(|v| v.as_u64().expect("id") as u32).collect();
+        .as_array()
+        .expect("ids")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as u32)
+        .collect();
     let n = prompt.len();
     let hf_argmax = reference["argmax"].as_u64().expect("argmax") as u32;
 
-    let u32s = |v: &[u32]| PieU32Slice { ptr: v.as_ptr(), len: v.len() };
+    let u32s = |v: &[u32]| PieU32Slice {
+        ptr: v.as_ptr(),
+        len: v.len(),
+    };
     // Step 1: prefill the prompt. Step 2: decode the argmax token at
     // position n against the same page.
     let positions1: Vec<u32> = (0..n as u32).collect();
@@ -1340,8 +1552,14 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
     let (first, second) = ms_cells.split_at_mut(1);
     let ms_ptr1: *mut driver_api::local::PieTerminalCell = &mut first[0];
     let ms_ptr2: *mut driver_api::local::PieTerminalCell = &mut second[0];
-    let cells1 = driver_api::local::PieTerminalCellPtrSlice { ptr: &ms_ptr1, len: 1 };
-    let cells2 = driver_api::local::PieTerminalCellPtrSlice { ptr: &ms_ptr2, len: 1 };
+    let cells1 = driver_api::local::PieTerminalCellPtrSlice {
+        ptr: &ms_ptr1,
+        len: 1,
+    };
+    let cells2 = driver_api::local::PieTerminalCellPtrSlice {
+        ptr: &ms_ptr2,
+        len: 1,
+    };
     let pages: [u32; 1] = [0];
     let indptr: [u32; 2] = [0, 1];
     let lens1: [u32; 1] = [n as u32];
@@ -1382,13 +1600,22 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
     let instance_ids: [u64; 1] = [binding.instance_id];
     let frame = PieFrameDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        instance_ids: PieU64Slice { ptr: instance_ids.as_ptr(), len: 1 },
+        instance_ids: PieU64Slice {
+            ptr: instance_ids.as_ptr(),
+            len: 1,
+        },
         required_kv_pages: 1,
-        steps: driver_api::local::PieStepDescSlice { ptr: steps.as_ptr(), len: 2 },
+        steps: driver_api::local::PieStepDescSlice {
+            ptr: steps.as_ptr(),
+            len: 2,
+        },
         ..Default::default()
     };
-    let completion =
-        PieCompletion { wait_id: 2, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
+    let completion = PieCompletion {
+        wait_id: 2,
+        target_epoch: 1,
+        terminal_cell: std::ptr::null_mut(),
+    };
     assert_eq!(
         fire_and_wait(d, &frame, completion, &fires),
         PIE_STATUS_OK,
@@ -1396,20 +1623,22 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
     );
     let words = unsafe { std::slice::from_raw_parts(chb.word_base as *const u64, 4) };
     assert_eq!(words[1], 2, "both steps delivered");
-    let cell1 = unsafe {
-        std::slice::from_raw_parts(
-            (chb.mirror_base as *const f32).add(VOCAB),
-            VOCAB,
-        )
-    };
+    let cell1 =
+        unsafe { std::slice::from_raw_parts((chb.mirror_base as *const f32).add(VOCAB), VOCAB) };
     let decode_logits: Vec<f32> = cell1.to_vec();
     let best1 = decode_logits
-        .iter().enumerate()
-        .max_by(|a, b| a.1.total_cmp(b.1)).map(|(t, _)| t).unwrap();
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(t, _)| t)
+        .unwrap();
 
     // Resize larger (migrates page 0), copy page 0 → page 2, then decode
     // AGAINST PAGE 2: same context bytes, so the same logits cell.
-    let resize = PiePoolResizeDesc { target_pages: 4, ..Default::default() };
+    let resize = PiePoolResizeDesc {
+        target_pages: 4,
+        ..Default::default()
+    };
     assert_eq!(
         unsafe { driver_cuda::serve::pie_cuda_resize_pool(d, &resize, completion) },
         PIE_STATUS_OK
@@ -1428,28 +1657,34 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
         PIE_STATUS_OK
     );
     let pages2: [u32; 1] = [2];
-    let step3 = PieStepDesc { kv_page_indices: u32s(&pages2), ..step2 };
+    let step3 = PieStepDesc {
+        kv_page_indices: u32s(&pages2),
+        ..step2
+    };
     let steps3 = [step3];
     let frame3 = PieFrameDesc {
-        steps: driver_api::local::PieStepDescSlice { ptr: steps3.as_ptr(), len: 1 },
+        steps: driver_api::local::PieStepDescSlice {
+            ptr: steps3.as_ptr(),
+            len: 1,
+        },
         required_kv_pages: 4,
         ..frame
     };
-    assert_eq!(
-        fire_and_wait(d, &frame3, completion, &fires),
-        PIE_STATUS_OK
-    );
+    assert_eq!(fire_and_wait(d, &frame3, completion, &fires), PIE_STATUS_OK);
     assert_eq!(words[1], 3, "the third fire delivered");
     let cell2 = unsafe {
-        std::slice::from_raw_parts(
-            (chb.mirror_base as *const f32).add(2 * VOCAB),
-            VOCAB,
-        )
+        std::slice::from_raw_parts((chb.mirror_base as *const f32).add(2 * VOCAB), VOCAB)
     };
     let best2 = cell2
-        .iter().enumerate()
-        .max_by(|a, b| a.1.total_cmp(b.1)).map(|(t, _)| t).unwrap();
-    assert_eq!(best2, best1, "the migrated + copied page carries the same context");
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(t, _)| t)
+        .unwrap();
+    assert_eq!(
+        best2, best1,
+        "the migrated + copied page carries the same context"
+    );
     for t in [best1, 0, 1000] {
         assert!(
             (cell2[t] - decode_logits[t]).abs() < 1e-3,
@@ -1501,10 +1736,16 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
         "and restores into page 3"
     );
     let pages3: [u32; 1] = [3];
-    let step4 = PieStepDesc { kv_page_indices: u32s(&pages3), ..step2 };
+    let step4 = PieStepDesc {
+        kv_page_indices: u32s(&pages3),
+        ..step2
+    };
     let steps4 = [step4];
     let frame4 = PieFrameDesc {
-        steps: driver_api::local::PieStepDescSlice { ptr: steps4.as_ptr(), len: 1 },
+        steps: driver_api::local::PieStepDescSlice {
+            ptr: steps4.as_ptr(),
+            len: 1,
+        },
         required_kv_pages: 4,
         ..frame
     };
@@ -1514,9 +1755,15 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
         std::slice::from_raw_parts((chb.mirror_base as *const f32).add(3 * VOCAB), VOCAB)
     };
     let best3 = cell3
-        .iter().enumerate()
-        .max_by(|a, b| a.1.total_cmp(b.1)).map(|(t, _)| t).unwrap();
-    assert_eq!(best3, best1, "a page that went to host and back carries its context");
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(t, _)| t)
+        .unwrap();
+    assert_eq!(
+        best3, best1,
+        "a page that went to host and back carries its context"
+    );
     for t in [best1, 0, 1000] {
         assert!(
             (cell3[t] - decode_logits[t]).abs() < 1e-3,
@@ -1567,13 +1814,14 @@ fn a_fifty_step_greedy_chain_is_deterministic_and_leak_free() {
         eprintln!("skipped: no generated descriptor");
         return;
     }
-    let reference: serde_json::Value = serde_json::from_str(include_str!(
-        "oracle/real_decode/reference.json"
-    ))
-    .expect("reference");
+    let reference: serde_json::Value =
+        serde_json::from_str(include_str!("oracle/real_decode/reference.json")).expect("reference");
     let prompt: Vec<u32> = reference["prompt_ids"]
-        .as_array().expect("ids").iter()
-        .map(|v| v.as_u64().expect("id") as u32).collect();
+        .as_array()
+        .expect("ids")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as u32)
+        .collect();
     let hf_argmax = reference["argmax"].as_u64().expect("argmax") as u32;
 
     const VOCAB: usize = 151_936;
@@ -1584,7 +1832,10 @@ fn a_fifty_step_greedy_chain_is_deterministic_and_leak_free() {
         let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
         let desc = PieDriverCreateDesc {
             abi_version: PIE_DRIVER_ABI_VERSION,
-            config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+            config_bytes: PieBytes {
+                ptr: boot.as_ptr(),
+                len: boot.len(),
+            },
             runtime: runtime_for(&fires),
             ..Default::default()
         };
@@ -1593,7 +1844,10 @@ fn a_fifty_step_greedy_chain_is_deterministic_and_leak_free() {
         assert!(!d.is_null());
         let snap_str = snap.to_string_lossy().into_owned();
         let load = PieModelLoadDesc {
-            snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+            snapshot_dir: PieBytes {
+                ptr: snap_str.as_ptr(),
+                len: snap_str.len(),
+            },
             ..Default::default()
         };
         assert_eq!(
@@ -1605,7 +1859,10 @@ fn a_fifty_step_greedy_chain_is_deterministic_and_leak_free() {
             channel_id: 1,
             reader_wait_id: 3,
             writer_wait_id: 4,
-            shape: PieU32Slice { ptr: shape.as_ptr(), len: 1 },
+            shape: PieU32Slice {
+                ptr: shape.as_ptr(),
+                len: 1,
+            },
             host_role: PIE_CHANNEL_HOST_ROLE_READER,
             capacity: 3,
             ..Default::default()
@@ -1615,22 +1872,34 @@ fn a_fifty_step_greedy_chain_is_deterministic_and_leak_free() {
             unsafe { driver_cuda::serve::pie_cuda_register_channel(d, &ch, &mut chb) },
             PIE_STATUS_OK
         );
-        let prog = PieProgramDesc { program_hash: run_tag, ..Default::default() };
+        let prog = PieProgramDesc {
+            program_hash: run_tag,
+            ..Default::default()
+        };
         let mut program_id = 0u64;
         unsafe { driver_cuda::serve::pie_cuda_register_program(d, &prog, &mut program_id) };
         let channel_ids: [u64; 1] = [1];
         let inst = PieInstanceDesc {
             program_id,
-            channel_ids: PieU64Slice { ptr: channel_ids.as_ptr(), len: 1 },
+            channel_ids: PieU64Slice {
+                ptr: channel_ids.as_ptr(),
+                len: 1,
+            },
             ..Default::default()
         };
         let mut binding = PieInstanceBinding::default();
         unsafe { driver_cuda::serve::pie_cuda_bind_instance(d, &inst, &mut binding) };
         let instance_ids: [u64; 1] = [binding.instance_id];
-        let completion =
-            PieCompletion { wait_id: 1, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
+        let completion = PieCompletion {
+            wait_id: 1,
+            target_epoch: 1,
+            terminal_cell: std::ptr::null_mut(),
+        };
 
-        let u32s = |v: &[u32]| PieU32Slice { ptr: v.as_ptr(), len: v.len() };
+        let u32s = |v: &[u32]| PieU32Slice {
+            ptr: v.as_ptr(),
+            len: v.len(),
+        };
         let total_pages = ((prompt.len() + STEPS) as u32).div_ceil(PAGE);
         let all_pages: Vec<u32> = (0..total_pages).collect();
         let read_cell = |i: u64| -> usize {
@@ -1640,7 +1909,11 @@ fn a_fifty_step_greedy_chain_is_deterministic_and_leak_free() {
                     VOCAB,
                 )
             };
-            cell.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(t, _)| t).unwrap()
+            cell.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(t, _)| t)
+                .unwrap()
         };
         let fire = |kv_len: u32, tokens: &[u32], positions: &[u32], qo_end: u32| {
             let pages_used = kv_len.div_ceil(PAGE).max(1);
@@ -1678,21 +1951,29 @@ fn a_fifty_step_greedy_chain_is_deterministic_and_leak_free() {
             let steps_arr = [step];
             let frame = PieFrameDesc {
                 abi_version: PIE_DRIVER_ABI_VERSION,
-                instance_ids: PieU64Slice { ptr: instance_ids.as_ptr(), len: 1 },
+                instance_ids: PieU64Slice {
+                    ptr: instance_ids.as_ptr(),
+                    len: 1,
+                },
                 required_kv_pages: total_pages,
-                steps: driver_api::local::PieStepDescSlice { ptr: steps_arr.as_ptr(), len: 1 },
+                steps: driver_api::local::PieStepDescSlice {
+                    ptr: steps_arr.as_ptr(),
+                    len: 1,
+                },
                 ..Default::default()
             };
-            assert_eq!(
-                fire_and_wait(d, &frame, completion, &fires),
-                PIE_STATUS_OK
-            );
+            assert_eq!(fire_and_wait(d, &frame, completion, &fires), PIE_STATUS_OK);
         };
 
         // Prefill, then the greedy chain. The engine's half of the ring:
         // advance the head as each cell is consumed.
         let positions: Vec<u32> = (0..prompt.len() as u32).collect();
-        fire(prompt.len() as u32, &prompt, &positions, prompt.len() as u32);
+        fire(
+            prompt.len() as u32,
+            &prompt,
+            &positions,
+            prompt.len() as u32,
+        );
         let words = chb.word_base as *mut u64;
         let mut consumed = 0u64;
         let mut next = read_cell(consumed) as u32;
@@ -1722,8 +2003,14 @@ fn a_fifty_step_greedy_chain_is_deterministic_and_leak_free() {
     let (run1, held_one, held_all) = chain(0xA);
     let (run2, _, _) = chain(0xB);
 
-    assert_eq!(run1[0], hf_argmax, "the chain starts where the reference points");
-    assert_eq!(run1, run2, "greedy generation is deterministic across drivers");
+    assert_eq!(
+        run1[0], hf_argmax,
+        "the chain starts where the reference points"
+    );
+    assert_eq!(
+        run1, run2,
+        "greedy generation is deterministic across drivers"
+    );
     assert!(
         run1.iter().skip(1).any(|&t| t != run1[0]),
         "fifty steps that repeat one token would be a broken chain: {run1:?}"
@@ -1804,13 +2091,14 @@ fn the_711_fire_soak_holds_steady() {
         eprintln!("skipped: no generated descriptor");
         return;
     }
-    let reference: serde_json::Value = serde_json::from_str(include_str!(
-        "oracle/real_decode/reference.json"
-    ))
-    .expect("reference");
+    let reference: serde_json::Value =
+        serde_json::from_str(include_str!("oracle/real_decode/reference.json")).expect("reference");
     let prompt: Vec<u32> = reference["prompt_ids"]
-        .as_array().expect("ids").iter()
-        .map(|v| v.as_u64().expect("id") as u32).collect();
+        .as_array()
+        .expect("ids")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as u32)
+        .collect();
 
     const VOCAB: usize = 151_936;
     const CHAINS: usize = 14;
@@ -1820,7 +2108,10 @@ fn the_711_fire_soak_holds_steady() {
     let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: engine_runtime(),
         ..Default::default()
     };
@@ -1829,7 +2120,10 @@ fn the_711_fire_soak_holds_steady() {
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
     assert_eq!(
@@ -1841,30 +2135,45 @@ fn the_711_fire_soak_holds_steady() {
         channel_id: 1,
         reader_wait_id: 3,
         writer_wait_id: 4,
-        shape: PieU32Slice { ptr: shape.as_ptr(), len: 1 },
+        shape: PieU32Slice {
+            ptr: shape.as_ptr(),
+            len: 1,
+        },
         host_role: PIE_CHANNEL_HOST_ROLE_READER,
         capacity: 3,
         ..Default::default()
     };
     let mut chb = PieChannelEndpointBinding::default();
     unsafe { driver_cuda::serve::pie_cuda_register_channel(d, &ch, &mut chb) };
-    let prog = PieProgramDesc { program_hash: 0x50AC, ..Default::default() };
+    let prog = PieProgramDesc {
+        program_hash: 0x50AC,
+        ..Default::default()
+    };
     let mut program_id = 0u64;
     unsafe { driver_cuda::serve::pie_cuda_register_program(d, &prog, &mut program_id) };
     let channel_ids: [u64; 1] = [1];
     let inst = PieInstanceDesc {
         program_id,
-        channel_ids: PieU64Slice { ptr: channel_ids.as_ptr(), len: 1 },
+        channel_ids: PieU64Slice {
+            ptr: channel_ids.as_ptr(),
+            len: 1,
+        },
         ..Default::default()
     };
     let mut binding = PieInstanceBinding::default();
     unsafe { driver_cuda::serve::pie_cuda_bind_instance(d, &inst, &mut binding) };
     let instance_ids: [u64; 1] = [binding.instance_id];
-    let completion =
-        PieCompletion { wait_id: 1, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
+    let completion = PieCompletion {
+        wait_id: 1,
+        target_epoch: 1,
+        terminal_cell: std::ptr::null_mut(),
+    };
     let words = chb.word_base as *mut u64;
 
-    let u32s = |v: &[u32]| PieU32Slice { ptr: v.as_ptr(), len: v.len() };
+    let u32s = |v: &[u32]| PieU32Slice {
+        ptr: v.as_ptr(),
+        len: v.len(),
+    };
     let total_pages = ((prompt.len() + DECODES) as u32).div_ceil(PAGE);
     let all_pages: Vec<u32> = (0..total_pages).collect();
     let mut fires = 0usize;
@@ -1908,7 +2217,10 @@ fn the_711_fire_soak_holds_steady() {
             let steps_arr = [step];
             let frame = PieFrameDesc {
                 abi_version: PIE_DRIVER_ABI_VERSION,
-                instance_ids: PieU64Slice { ptr: instance_ids.as_ptr(), len: 1 },
+                instance_ids: PieU64Slice {
+                    ptr: instance_ids.as_ptr(),
+                    len: 1,
+                },
                 required_kv_pages: total_pages,
                 steps: driver_api::local::PieStepDescSlice {
                     ptr: steps_arr.as_ptr(),
@@ -2011,8 +2323,8 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
     use driver_api::local::{
         PIE_CHANNEL_HOST_ROLE_READER, PIE_RS_FLAG_RESET, PieBytes, PieChannelDesc,
         PieChannelEndpointBinding, PieCompletion, PieFrameDesc, PieInstanceBinding,
-        PieInstanceDesc, PieModelLoadDesc, PieProgramDesc, PieStateCopyDesc,
-        PieStateCopyRange, PieStepDesc, PieU32Slice, PieU64Slice,
+        PieInstanceDesc, PieModelLoadDesc, PieProgramDesc, PieStateCopyDesc, PieStateCopyRange,
+        PieStepDesc, PieU32Slice, PieU64Slice,
     };
 
     let home = std::env::var("HOME").expect("HOME");
@@ -2044,7 +2356,10 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
     let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
     let desc = driver_api::local::PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: runtime_for(&fires),
         ..Default::default()
     };
@@ -2053,7 +2368,10 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
     assert_eq!(
@@ -2068,7 +2386,10 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
         channel_id: 88,
         reader_wait_id: 177,
         writer_wait_id: 178,
-        shape: PieU32Slice { ptr: shape.as_ptr(), len: 1 },
+        shape: PieU32Slice {
+            ptr: shape.as_ptr(),
+            len: 1,
+        },
         host_role: PIE_CHANNEL_HOST_ROLE_READER,
         capacity: 3,
         ..Default::default()
@@ -2078,7 +2399,10 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
         unsafe { driver_cuda::serve::pie_cuda_register_channel(d, &ch, &mut chb) },
         PIE_STATUS_OK
     );
-    let prog = PieProgramDesc { program_hash: 0x35B, ..Default::default() };
+    let prog = PieProgramDesc {
+        program_hash: 0x35B,
+        ..Default::default()
+    };
     let mut program_id = 0u64;
     assert_eq!(
         unsafe { driver_cuda::serve::pie_cuda_register_program(d, &prog, &mut program_id) },
@@ -2087,7 +2411,10 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
     let channel_ids: [u64; 1] = [88];
     let inst = PieInstanceDesc {
         program_id,
-        channel_ids: PieU64Slice { ptr: channel_ids.as_ptr(), len: 1 },
+        channel_ids: PieU64Slice {
+            ptr: channel_ids.as_ptr(),
+            len: 1,
+        },
         ..Default::default()
     };
     let mut binding = PieInstanceBinding::default();
@@ -2096,25 +2423,37 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
         PIE_STATUS_OK
     );
 
-    let u32s = |v: &[u32]| PieU32Slice { ptr: v.as_ptr(), len: v.len() };
+    let u32s = |v: &[u32]| PieU32Slice {
+        ptr: v.as_ptr(),
+        len: v.len(),
+    };
     let instance_ids: [u64; 1] = [binding.instance_id];
     let fire = |step: &PieStepDesc, wait: u64| {
         let frame = PieFrameDesc {
             abi_version: PIE_DRIVER_ABI_VERSION,
-            instance_ids: PieU64Slice { ptr: instance_ids.as_ptr(), len: 1 },
+            instance_ids: PieU64Slice {
+                ptr: instance_ids.as_ptr(),
+                len: 1,
+            },
             required_kv_pages: 1,
             steps: driver_api::local::PieStepDescSlice { ptr: step, len: 1 },
             ..Default::default()
         };
-        let completion =
-            PieCompletion { wait_id: wait, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
+        let completion = PieCompletion {
+            wait_id: wait,
+            target_epoch: 1,
+            terminal_cell: std::ptr::null_mut(),
+        };
         fire_and_wait(d, &frame, completion, &fires)
     };
 
     // ── Prefill on slot 0 (RESET — a fresh sequence). ──
     let prompt: Vec<u32> = reference["prompt_ids"]
-        .as_array().expect("ids").iter()
-        .map(|v| v.as_u64().expect("id") as u32).collect();
+        .as_array()
+        .expect("ids")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as u32)
+        .collect();
     let tokens = prompt.len();
     let positions: Vec<u32> = (0..tokens as u32).collect();
     // ONE ROSTER ROW PER REQUEST, not per token. These said `vec![0;
@@ -2184,8 +2523,11 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
     };
     let (best_t, best_v) = argmax_of(cell0);
     let ids5: Vec<usize> = reference["top5_ids"]
-        .as_array().expect("top5").iter()
-        .map(|v| v.as_u64().expect("id") as usize).collect();
+        .as_array()
+        .expect("top5")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as usize)
+        .collect();
     assert!(
         ids5.contains(&best_t),
         "prefill argmax {best_t} ({best_v}) outside HF's top-5 {ids5:?}"
@@ -2195,8 +2537,16 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
     // ── The state fork: slot 0 → slots 1 AND 2 (two identical copies,
     // so the comparison below is copy vs copy — no live-slot asymmetry).
     let ranges = [
-        PieStateCopyRange { src_slot_id: 0, dst_slot_id: 1, ..Default::default() },
-        PieStateCopyRange { src_slot_id: 0, dst_slot_id: 2, ..Default::default() },
+        PieStateCopyRange {
+            src_slot_id: 0,
+            dst_slot_id: 1,
+            ..Default::default()
+        },
+        PieStateCopyRange {
+            src_slot_id: 0,
+            dst_slot_id: 2,
+            ..Default::default()
+        },
     ];
     let copy = PieStateCopyDesc {
         slot_ranges: driver_api::local::PieStateCopyRangeSlice {
@@ -2205,8 +2555,11 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
         },
         ..Default::default()
     };
-    let completion =
-        PieCompletion { wait_id: 2, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
+    let completion = PieCompletion {
+        wait_id: 2,
+        target_epoch: 1,
+        terminal_cell: std::ptr::null_mut(),
+    };
     assert_eq!(
         unsafe { driver_cuda::serve::pie_cuda_copy_state(d, &copy, completion) },
         PIE_STATUS_OK,
@@ -2248,22 +2601,28 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
             },
             ..Default::default()
         };
-        assert_eq!(fire(&step, wait), PIE_STATUS_OK, "the decode fires (slot {slot})");
+        assert_eq!(
+            fire(&step, wait),
+            PIE_STATUS_OK,
+            "the decode fires (slot {slot})"
+        );
     };
     decode_on(1, 3);
     decode_on(2, 4);
     assert_eq!(words[1], 3, "three cells published");
     let ring = 4usize; // capacity 3 + 1
     let _ = ring;
-    let cell1 = unsafe {
-        std::slice::from_raw_parts((chb.mirror_base as *const f32).add(VOCAB), VOCAB)
-    };
+    let cell1 =
+        unsafe { std::slice::from_raw_parts((chb.mirror_base as *const f32).add(VOCAB), VOCAB) };
     let cell2 = unsafe {
         std::slice::from_raw_parts((chb.mirror_base as *const f32).add(2 * VOCAB), VOCAB)
     };
     let (t1, v1) = argmax_of(cell1);
     let (t2, v2) = argmax_of(cell2);
-    assert_eq!(t1, t2, "decode from the COPIED slot flips the argmax ({v1} vs {v2})");
+    assert_eq!(
+        t1, t2,
+        "decode from the COPIED slot flips the argmax ({v1} vs {v2})"
+    );
     let (mut max_d, mut at, mut n_diff) = (0f32, 0usize, 0usize);
     for t in 0..VOCAB {
         let d = (cell1[t] - cell2[t]).abs();
@@ -2335,7 +2694,10 @@ fn gemma4_loads_and_fires_both_classes_through_the_abi() {
     let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
     let desc = driver_api::local::PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: runtime_for(&fires),
         ..Default::default()
     };
@@ -2344,7 +2706,10 @@ fn gemma4_loads_and_fires_both_classes_through_the_abi() {
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
     assert_eq!(
@@ -2359,7 +2724,10 @@ fn gemma4_loads_and_fires_both_classes_through_the_abi() {
         channel_id: 44,
         reader_wait_id: 89,
         writer_wait_id: 90,
-        shape: PieU32Slice { ptr: shape.as_ptr(), len: 1 },
+        shape: PieU32Slice {
+            ptr: shape.as_ptr(),
+            len: 1,
+        },
         host_role: PIE_CHANNEL_HOST_ROLE_READER,
         capacity: 3,
         ..Default::default()
@@ -2369,7 +2737,10 @@ fn gemma4_loads_and_fires_both_classes_through_the_abi() {
         unsafe { driver_cuda::serve::pie_cuda_register_channel(d, &ch, &mut chb) },
         PIE_STATUS_OK
     );
-    let prog = PieProgramDesc { program_hash: 0x6E44, ..Default::default() };
+    let prog = PieProgramDesc {
+        program_hash: 0x6E44,
+        ..Default::default()
+    };
     let mut program_id = 0u64;
     assert_eq!(
         unsafe { driver_cuda::serve::pie_cuda_register_program(d, &prog, &mut program_id) },
@@ -2378,7 +2749,10 @@ fn gemma4_loads_and_fires_both_classes_through_the_abi() {
     let channel_ids: [u64; 1] = [44];
     let inst = PieInstanceDesc {
         program_id,
-        channel_ids: PieU64Slice { ptr: channel_ids.as_ptr(), len: 1 },
+        channel_ids: PieU64Slice {
+            ptr: channel_ids.as_ptr(),
+            len: 1,
+        },
         ..Default::default()
     };
     let mut binding = PieInstanceBinding::default();
@@ -2387,25 +2761,37 @@ fn gemma4_loads_and_fires_both_classes_through_the_abi() {
         PIE_STATUS_OK
     );
 
-    let u32s = |v: &[u32]| PieU32Slice { ptr: v.as_ptr(), len: v.len() };
+    let u32s = |v: &[u32]| PieU32Slice {
+        ptr: v.as_ptr(),
+        len: v.len(),
+    };
     let instance_ids: [u64; 1] = [binding.instance_id];
     let fire = |step: &PieStepDesc, wait: u64| {
         let frame = PieFrameDesc {
             abi_version: PIE_DRIVER_ABI_VERSION,
-            instance_ids: PieU64Slice { ptr: instance_ids.as_ptr(), len: 1 },
+            instance_ids: PieU64Slice {
+                ptr: instance_ids.as_ptr(),
+                len: 1,
+            },
             required_kv_pages: 1,
             steps: driver_api::local::PieStepDescSlice { ptr: step, len: 1 },
             ..Default::default()
         };
-        let completion =
-            PieCompletion { wait_id: wait, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
+        let completion = PieCompletion {
+            wait_id: wait,
+            target_epoch: 1,
+            terminal_cell: std::ptr::null_mut(),
+        };
         fire_and_wait(d, &frame, completion, &fires)
     };
 
     // ── Prefill: the A/B's prompt, the A/B's exact argmax. ──
     let prompt: Vec<u32> = reference["prompt_ids"]
-        .as_array().expect("ids").iter()
-        .map(|v| v.as_u64().expect("id") as u32).collect();
+        .as_array()
+        .expect("ids")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as u32)
+        .collect();
     let tokens = prompt.len();
     let positions: Vec<u32> = (0..tokens as u32).collect();
     // ONE ROSTER ROW PER REQUEST, not per token. These said `vec![0;
@@ -2498,9 +2884,8 @@ fn gemma4_loads_and_fires_both_classes_through_the_abi() {
     };
     assert_eq!(fire(&step, 2), PIE_STATUS_OK, "the gemma-4 decode fires");
     assert_eq!(words[1], 2, "two cells published");
-    let cell1 = unsafe {
-        std::slice::from_raw_parts((chb.mirror_base as *const f32).add(VOCAB), VOCAB)
-    };
+    let cell1 =
+        unsafe { std::slice::from_raw_parts((chb.mirror_base as *const f32).add(VOCAB), VOCAB) };
     let (dt, dv) = argmax_of(cell1);
     assert!(dv.is_finite(), "the decode's top logit is finite");
     // The final softcap bounds EVERY logit at ±30; a wrong plan or a
@@ -2524,7 +2909,7 @@ fn gemma4_loads_and_fires_both_classes_through_the_abi() {
 #[test]
 fn gemma4_vision_encodes_real_weights_through_the_abi() {
     let _gpu = gpu_guard();
-    use driver_api::local::{PieBytes, PieEncodeDesc, PieCompletion};
+    use driver_api::local::{PieBytes, PieCompletion, PieEncodeDesc};
 
     let home = std::env::var("HOME").expect("HOME");
     let snaps = std::path::PathBuf::from(&home)
@@ -2550,7 +2935,10 @@ fn gemma4_vision_encodes_real_weights_through_the_abi() {
     let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
     let desc = driver_api::local::PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: engine_runtime(),
         ..Default::default()
     };
@@ -2559,7 +2947,10 @@ fn gemma4_vision_encodes_real_weights_through_the_abi() {
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = driver_api::local::PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
     let mut load_caps = driver_api::local::PieDriverCaps::default();
@@ -2574,9 +2965,11 @@ fn gemma4_vision_encodes_real_weights_through_the_abi() {
     // was unreachable through the engine while it was hardwired false —
     // and no test could see that, because every one of them calls
     // `pie_cuda_encode` directly.
-    assert!(!load_caps.json_bytes.is_null(), "load_model published no capabilities");
-    let bytes =
-        unsafe { std::slice::from_raw_parts(load_caps.json_bytes, load_caps.json_len) };
+    assert!(
+        !load_caps.json_bytes.is_null(),
+        "load_model published no capabilities"
+    );
+    let bytes = unsafe { std::slice::from_raw_parts(load_caps.json_bytes, load_caps.json_len) };
     let parsed: driver_api::DriverCapabilities =
         serde_json::from_slice(bytes).expect("the caps parse");
     assert!(
@@ -2589,11 +2982,11 @@ fn gemma4_vision_encodes_real_weights_through_the_abi() {
     const OUT_LEN: usize = 1;
     const PIXEL_DIM: usize = 3 * 16 * 16;
     // Deterministic nonzero pixels in [0, 1].
-    let pixels: Vec<f32> =
-        (0..N_PATCH * PIXEL_DIM).map(|i| (i % 97) as f32 / 96.0).collect();
+    let pixels: Vec<f32> = (0..N_PATCH * PIXEL_DIM)
+        .map(|i| (i % 97) as f32 / 96.0)
+        .collect();
     let pixel_indptr: [u32; 2] = [0, (pixels.len() * 4) as u32];
-    let patch_positions: [u32; 18] =
-        [0, 0, 1, 0, 2, 0, 0, 1, 1, 1, 2, 1, 0, 2, 1, 2, 2, 2];
+    let patch_positions: [u32; 18] = [0, 0, 1, 0, 2, 0, 0, 1, 1, 1, 2, 1, 0, 2, 1, 2, 2, 2];
     let anchors: [u32; 1] = [0];
     // The PATCH-UNIT grid `(t, h, w)`, three per image, which is what the
     // engine sends (`engine/src/driver/abi.rs:323`) and what
@@ -2617,8 +3010,11 @@ fn gemma4_vision_encodes_real_weights_through_the_abi() {
                 ptr: patch_positions.as_ptr(),
                 len: 18,
             },
-            image_grids: driver_api::local::PieU32Slice { ptr: grids.as_ptr(), len: 3 },
-        image_anchor_rows: driver_api::local::PieU32Slice {
+            image_grids: driver_api::local::PieU32Slice {
+                ptr: grids.as_ptr(),
+                len: 3,
+            },
+            image_anchor_rows: driver_api::local::PieU32Slice {
                 ptr: anchors.as_ptr(),
                 len: 1,
             },
@@ -2643,7 +3039,10 @@ fn gemma4_vision_encodes_real_weights_through_the_abi() {
             "{tag}: the vision encode fires"
         );
         assert_eq!(out_indptr[0], 0, "{tag}: CSR starts at zero");
-        assert_eq!(out_indptr[1], OUT_LEN as u32, "{tag}: one image, one soft token");
+        assert_eq!(
+            out_indptr[1], OUT_LEN as u32,
+            "{tag}: one image, one soft token"
+        );
         out_rows
     };
 
@@ -2702,7 +3101,10 @@ fn gemma4_audio_encodes_real_weights_through_the_abi() {
     let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
     let desc = driver_api::local::PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: engine_runtime(),
         ..Default::default()
     };
@@ -2711,7 +3113,10 @@ fn gemma4_audio_encodes_real_weights_through_the_abi() {
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = driver_api::local::PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
     assert_eq!(
@@ -2722,8 +3127,9 @@ fn gemma4_audio_encodes_real_weights_through_the_abi() {
     const TEXT_HIDDEN: usize = 1536;
     const N_MEL: usize = 128;
     const N_FRAMES: usize = 32; // subsamples 4× → 8 audio soft tokens
-    let features: Vec<f32> =
-        (0..N_FRAMES * N_MEL).map(|i| ((i % 89) as f32 / 88.0) - 0.5).collect();
+    let features: Vec<f32> = (0..N_FRAMES * N_MEL)
+        .map(|i| ((i % 89) as f32 / 88.0) - 0.5)
+        .collect();
     let feat_indptr: [u32; 2] = [0, (features.len() * 4) as u32];
     let anchors: [u32; 1] = [0];
     // The PATCH-UNIT grid `(t, h, w)`, three per image, which is what the
@@ -2834,7 +3240,10 @@ fn gemma4_mixed_media_encodes_through_one_call() {
     let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
     let desc = driver_api::local::PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: engine_runtime(),
         ..Default::default()
     };
@@ -2843,7 +3252,10 @@ fn gemma4_mixed_media_encodes_through_one_call() {
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = driver_api::local::PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
     assert_eq!(
@@ -2856,15 +3268,16 @@ fn gemma4_mixed_media_encodes_through_one_call() {
     const N_PATCH: usize = 9;
     const N_MEL: usize = 128;
     const N_FRAMES: usize = 32;
-    let pixels: Vec<f32> =
-        (0..N_PATCH * PIXEL_DIM).map(|i| (i % 97) as f32 / 96.0).collect();
+    let pixels: Vec<f32> = (0..N_PATCH * PIXEL_DIM)
+        .map(|i| (i % 97) as f32 / 96.0)
+        .collect();
     let pixel_indptr: [u32; 2] = [0, (pixels.len() * 4) as u32];
-    let patch_positions: [u32; 18] =
-        [0, 0, 1, 0, 2, 0, 0, 1, 1, 1, 2, 1, 0, 2, 1, 2, 2, 2];
+    let patch_positions: [u32; 18] = [0, 0, 1, 0, 2, 0, 0, 1, 1, 1, 2, 1, 0, 2, 1, 2, 2, 2];
     let img_anchors: [u32; 1] = [0];
     let grids: [u32; 3] = [1, 3, 3];
-    let features: Vec<f32> =
-        (0..N_FRAMES * N_MEL).map(|i| ((i % 89) as f32 / 88.0) - 0.5).collect();
+    let features: Vec<f32> = (0..N_FRAMES * N_MEL)
+        .map(|i| ((i % 89) as f32 / 88.0) - 0.5)
+        .collect();
     let feat_indptr: [u32; 2] = [0, (features.len() * 4) as u32];
     let clip_anchors: [u32; 1] = [1];
 
@@ -2872,7 +3285,10 @@ fn gemma4_mixed_media_encodes_through_one_call() {
     let mut out_rows = vec![0x7777u16; MAX_ROWS * TEXT_HIDDEN];
     let mut out_indptr = [u32::MAX; 3];
     let e = PieEncodeDesc {
-        image_pixels: PieBytes { ptr: pixels.as_ptr().cast(), len: pixels.len() * 4 },
+        image_pixels: PieBytes {
+            ptr: pixels.as_ptr().cast(),
+            len: pixels.len() * 4,
+        },
         image_pixel_indptr: driver_api::local::PieU32Slice {
             ptr: pixel_indptr.as_ptr(),
             len: 2,
@@ -2881,7 +3297,10 @@ fn gemma4_mixed_media_encodes_through_one_call() {
             ptr: patch_positions.as_ptr(),
             len: 18,
         },
-        image_grids: driver_api::local::PieU32Slice { ptr: grids.as_ptr(), len: 3 },
+        image_grids: driver_api::local::PieU32Slice {
+            ptr: grids.as_ptr(),
+            len: 3,
+        },
         image_anchor_rows: driver_api::local::PieU32Slice {
             ptr: img_anchors.as_ptr(),
             len: 1,
@@ -2908,14 +3327,21 @@ fn gemma4_mixed_media_encodes_through_one_call() {
         },
         ..Default::default()
     };
-    let completion =
-        PieCompletion { wait_id: 11, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
+    let completion = PieCompletion {
+        wait_id: 11,
+        target_epoch: 1,
+        terminal_cell: std::ptr::null_mut(),
+    };
     assert_eq!(
         unsafe { driver_cuda::serve::pie_cuda_encode(d, &e, completion) },
         PIE_STATUS_OK,
         "the mixed encode fires"
     );
-    assert_eq!(out_indptr, [0, 1, 9], "one vision token, then eight audio tokens");
+    assert_eq!(
+        out_indptr,
+        [0, 1, 9],
+        "one vision token, then eight audio tokens"
+    );
     let bf = |bits: u16| f32::from_bits(u32::from(bits) << 16);
     let mut nonzero = 0usize;
     for &v in &out_rows[..9 * TEXT_HIDDEN] {
@@ -2924,7 +3350,10 @@ fn gemma4_mixed_media_encodes_through_one_call() {
             nonzero += 1;
         }
     }
-    assert!(nonzero > 9 * TEXT_HIDDEN / 4, "near-zero mixed encode ({nonzero})");
+    assert!(
+        nonzero > 9 * TEXT_HIDDEN / 4,
+        "near-zero mixed encode ({nonzero})"
+    );
     for &v in &out_rows[9 * TEXT_HIDDEN..] {
         assert_eq!(v, 0x7777, "rows beyond the CSR must stay untouched");
     }
@@ -2970,7 +3399,13 @@ fn gemma4_vision_encode_matches_hf_cosine() {
         let raw = std::fs::read(p).expect("npy");
         let hlen = u16::from_le_bytes([raw[8], raw[9]]) as usize;
         let header = std::str::from_utf8(&raw[10..10 + hlen]).expect("header");
-        let shape_s = header.split("'shape': (").nth(1).expect("shape").split(')').next().expect("shape");
+        let shape_s = header
+            .split("'shape': (")
+            .nth(1)
+            .expect("shape")
+            .split(')')
+            .next()
+            .expect("shape");
         let shape: Vec<usize> = shape_s
             .split(',')
             .filter_map(|t| t.trim().parse().ok())
@@ -2994,7 +3429,10 @@ fn gemma4_vision_encode_matches_hf_cosine() {
     let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
     let desc = driver_api::local::PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: engine_runtime(),
         ..Default::default()
     };
@@ -3003,7 +3441,10 @@ fn gemma4_vision_encode_matches_hf_cosine() {
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = driver_api::local::PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
     assert_eq!(
@@ -3021,7 +3462,10 @@ fn gemma4_vision_encode_matches_hf_cosine() {
     let mut out_rows = vec![0u16; out_len * text_hidden];
     let mut out_indptr = [u32::MAX; 2];
     let e = PieEncodeDesc {
-        image_pixels: PieBytes { ptr: pixels.as_ptr().cast(), len: pixels.len() * 4 },
+        image_pixels: PieBytes {
+            ptr: pixels.as_ptr().cast(),
+            len: pixels.len() * 4,
+        },
         image_pixel_indptr: driver_api::local::PieU32Slice {
             ptr: pixel_indptr.as_ptr(),
             len: 2,
@@ -3030,8 +3474,14 @@ fn gemma4_vision_encode_matches_hf_cosine() {
             ptr: positions.as_ptr(),
             len: positions.len(),
         },
-        image_grids: driver_api::local::PieU32Slice { ptr: grids.as_ptr(), len: 3 },
-        image_anchor_rows: driver_api::local::PieU32Slice { ptr: anchors.as_ptr(), len: 1 },
+        image_grids: driver_api::local::PieU32Slice {
+            ptr: grids.as_ptr(),
+            len: 3,
+        },
+        image_anchor_rows: driver_api::local::PieU32Slice {
+            ptr: anchors.as_ptr(),
+            len: 1,
+        },
         output_rows: driver_api::local::PieMutBytes {
             ptr: out_rows.as_mut_ptr().cast(),
             len: out_rows.len() * 2,
@@ -3042,8 +3492,11 @@ fn gemma4_vision_encode_matches_hf_cosine() {
         },
         ..Default::default()
     };
-    let completion =
-        PieCompletion { wait_id: 12, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
+    let completion = PieCompletion {
+        wait_id: 12,
+        target_epoch: 1,
+        terminal_cell: std::ptr::null_mut(),
+    };
     assert_eq!(
         unsafe { driver_cuda::serve::pie_cuda_encode(d, &e, completion) },
         PIE_STATUS_OK,
@@ -3069,7 +3522,10 @@ fn gemma4_vision_encode_matches_hf_cosine() {
     let mean = cos_sum / out_len as f64;
     eprintln!("vision HF-cosine: mean {mean:.6}, min {cos_min:.6} over {out_len} tokens");
     assert!(mean > 0.999, "mean cosine {mean} below the gate");
-    assert!(cos_min > 0.995, "worst token cosine {cos_min} below the gate");
+    assert!(
+        cos_min > 0.995,
+        "worst token cosine {cos_min} below the gate"
+    );
 
     unsafe { driver_cuda::serve::pie_cuda_destroy(d) };
 }
@@ -3109,7 +3565,13 @@ fn gemma4_audio_encode_matches_hf_cosine() {
         let raw = std::fs::read(p).expect("npy");
         let hlen = u16::from_le_bytes([raw[8], raw[9]]) as usize;
         let header = std::str::from_utf8(&raw[10..10 + hlen]).expect("header");
-        let shape_s = header.split("'shape': (").nth(1).expect("shape").split(')').next().expect("shape");
+        let shape_s = header
+            .split("'shape': (")
+            .nth(1)
+            .expect("shape")
+            .split(')')
+            .next()
+            .expect("shape");
         let shape: Vec<usize> = shape_s
             .split(',')
             .filter_map(|t| t.trim().parse().ok())
@@ -3129,7 +3591,10 @@ fn gemma4_audio_encode_matches_hf_cosine() {
     let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
     let desc = driver_api::local::PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: engine_runtime(),
         ..Default::default()
     };
@@ -3138,7 +3603,10 @@ fn gemma4_audio_encode_matches_hf_cosine() {
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = driver_api::local::PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
     assert_eq!(
@@ -3164,7 +3632,10 @@ fn gemma4_audio_encode_matches_hf_cosine() {
             ptr: feat_indptr.as_ptr(),
             len: 2,
         },
-        audio_anchor_rows: driver_api::local::PieU32Slice { ptr: anchors.as_ptr(), len: 1 },
+        audio_anchor_rows: driver_api::local::PieU32Slice {
+            ptr: anchors.as_ptr(),
+            len: 1,
+        },
         output_rows: driver_api::local::PieMutBytes {
             ptr: out_rows.as_mut_ptr().cast(),
             len: out_rows.len() * 2,
@@ -3175,8 +3646,11 @@ fn gemma4_audio_encode_matches_hf_cosine() {
         },
         ..Default::default()
     };
-    let completion =
-        PieCompletion { wait_id: 13, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
+    let completion = PieCompletion {
+        wait_id: 13,
+        target_epoch: 1,
+        terminal_cell: std::ptr::null_mut(),
+    };
     assert_eq!(
         unsafe { driver_cuda::serve::pie_cuda_encode(d, &e, completion) },
         PIE_STATUS_OK,
@@ -3202,7 +3676,10 @@ fn gemma4_audio_encode_matches_hf_cosine() {
     let mean = cos_sum / out_len as f64;
     eprintln!("audio HF-cosine: mean {mean:.6}, min {cos_min:.6} over {out_len} tokens");
     assert!(mean > 0.999, "mean cosine {mean} below the gate");
-    assert!(cos_min > 0.995, "worst token cosine {cos_min} below the gate");
+    assert!(
+        cos_min > 0.995,
+        "worst token cosine {cos_min} below the gate"
+    );
 
     unsafe { driver_cuda::serve::pie_cuda_destroy(d) };
 }
@@ -3250,13 +3727,12 @@ fn a_quantized_checkpoint_loads_through_the_abi() {
         eprintln!("skipped: no cached gpt-oss-20b");
         return;
     };
-    let Some(config) = std::fs::read_dir(&snap)
-        .ok()
-        .and_then(|mut d| d.find_map(|e| {
+    let Some(config) = std::fs::read_dir(&snap).ok().and_then(|mut d| {
+        d.find_map(|e| {
             let p = e.ok()?.path();
             (p.file_name()? == "config.json").then_some(p)
-        }))
-    else {
+        })
+    }) else {
         eprintln!("skipped: gpt-oss snapshot has no config.json");
         return;
     };
@@ -3280,7 +3756,10 @@ fn a_quantized_checkpoint_loads_through_the_abi() {
     let boot = format!("[model]\ndescriptor = \"{}\"\n", dpath.display());
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: PieRuntimeCallbacks {
             abi_version: PIE_DRIVER_ABI_VERSION,
             reserved0: 0,
@@ -3294,7 +3773,10 @@ fn a_quantized_checkpoint_loads_through_the_abi() {
     assert!(!d.is_null(), "create");
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
     let loaded = unsafe { driver_cuda::serve::pie_cuda_load_model(d, &load, std::ptr::null_mut()) };
@@ -3368,7 +3850,9 @@ fn a_launch_returns_before_its_fire_retires() {
     unsafe extern "C" fn notify(_ctx: *mut std::ffi::c_void, _wait_id: u64, _epoch: u64) {
         // The thread the completion ran on, as a number we can compare.
         let id = format!("{:?}", std::thread::current().id());
-        let n = id.bytes().fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(b)));
+        let n = id
+            .bytes()
+            .fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(b)));
         WHERE.store(n, Ordering::Release);
         DONE.store(true, Ordering::Release);
     }
@@ -3384,7 +3868,10 @@ fn a_launch_returns_before_its_fire_retires() {
     );
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: PieRuntimeCallbacks {
             abi_version: PIE_DRIVER_ABI_VERSION,
             reserved0: 0,
@@ -3398,7 +3885,10 @@ fn a_launch_returns_before_its_fire_retires() {
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
     assert_eq!(
@@ -3406,7 +3896,10 @@ fn a_launch_returns_before_its_fire_retires() {
         PIE_STATUS_OK
     );
 
-    let prog = PieProgramDesc { abi_version: PIE_DRIVER_ABI_VERSION, ..Default::default() };
+    let prog = PieProgramDesc {
+        abi_version: PIE_DRIVER_ABI_VERSION,
+        ..Default::default()
+    };
     let mut program_id = 0u64;
     unsafe { driver_cuda::serve::pie_cuda_register_program(d, &prog, &mut program_id) };
     let inst = PieInstanceDesc {
@@ -3425,7 +3918,10 @@ fn a_launch_returns_before_its_fire_retires() {
     // finished before the call could return", and the first is the claim.
     let prompt: Vec<u32> = (0..128).map(|i| 1 + i % 97).collect();
     let positions: Vec<u32> = (0..prompt.len() as u32).collect();
-    let u32s = |v: &[u32]| PieU32Slice { ptr: v.as_ptr(), len: v.len() };
+    let u32s = |v: &[u32]| PieU32Slice {
+        ptr: v.as_ptr(),
+        len: v.len(),
+    };
     let roster = [0u32];
     let sub = [0u32, 1];
     let class = [driver_api::local::PIE_GEOMETRY_CLASS_HOST];
@@ -3454,16 +3950,24 @@ fn a_launch_returns_before_its_fire_retires() {
     let instance_ids: [u64; 1] = [binding.instance_id];
     let frame = PieFrameDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        instance_ids: PieU64Slice { ptr: instance_ids.as_ptr(), len: 1 },
+        instance_ids: PieU64Slice {
+            ptr: instance_ids.as_ptr(),
+            len: 1,
+        },
         required_kv_pages: pages.len() as u32,
         steps: driver_api::local::PieStepDescSlice { ptr: &step, len: 1 },
         ..Default::default()
     };
-    let completion =
-        PieCompletion { wait_id: 7, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
+    let completion = PieCompletion {
+        wait_id: 7,
+        target_epoch: 1,
+        terminal_cell: std::ptr::null_mut(),
+    };
 
     let caller = format!("{:?}", std::thread::current().id());
-    let caller_n = caller.bytes().fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(b)));
+    let caller_n = caller
+        .bytes()
+        .fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(b)));
 
     // ONE WARM FIRE FIRST, and it is not ceremony. A driver's first fire
     // pays for the KV pool, the attention workspace, the plan caches and
@@ -3478,7 +3982,10 @@ fn a_launch_returns_before_its_fire_retires() {
     );
     let warm = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !DONE.load(Ordering::Acquire) {
-        assert!(std::time::Instant::now() < warm, "the warm-up never completed");
+        assert!(
+            std::time::Instant::now() < warm,
+            "the warm-up never completed"
+        );
         std::thread::yield_now();
     }
     DONE.store(false, Ordering::Release);
@@ -3492,7 +3999,10 @@ fn a_launch_returns_before_its_fire_retires() {
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !DONE.load(Ordering::Acquire) {
-        assert!(std::time::Instant::now() < deadline, "the fire never completed");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fire never completed"
+        );
         std::thread::yield_now();
     }
     let retired_after = t0.elapsed();
@@ -3532,9 +4042,15 @@ fn a_launch_returns_before_its_fire_retires() {
     };
     let dec_frame = PieFrameDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        instance_ids: PieU64Slice { ptr: instance_ids.as_ptr(), len: 1 },
+        instance_ids: PieU64Slice {
+            ptr: instance_ids.as_ptr(),
+            len: 1,
+        },
         required_kv_pages: dec_pages.len() as u32,
-        steps: driver_api::local::PieStepDescSlice { ptr: &decode, len: 1 },
+        steps: driver_api::local::PieStepDescSlice {
+            ptr: &decode,
+            len: 1,
+        },
         ..Default::default()
     };
     for round in 0..3 {
@@ -3636,7 +4152,10 @@ fn a_kv_cache_dtype_is_read_and_an_unreadable_one_is_refused() {
     let create = |boot: &str| {
         let desc = PieDriverCreateDesc {
             abi_version: PIE_DRIVER_ABI_VERSION,
-            config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+            config_bytes: PieBytes {
+                ptr: boot.as_ptr(),
+                len: boot.len(),
+            },
             runtime: engine_runtime(),
             ..Default::default()
         };
@@ -3709,13 +4228,15 @@ fn every_request_in_a_frame_gets_its_own_logits() {
         return;
     };
     let reference: serde_json::Value =
-        serde_json::from_str(include_str!("oracle/real_decode/reference.json"))
-            .expect("reference");
+        serde_json::from_str(include_str!("oracle/real_decode/reference.json")).expect("reference");
 
     let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: runtime_for(&fires),
         ..Default::default()
     };
@@ -3724,7 +4245,10 @@ fn every_request_in_a_frame_gets_its_own_logits() {
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
     assert_eq!(
@@ -3734,7 +4258,10 @@ fn every_request_in_a_frame_gets_its_own_logits() {
 
     const VOCAB: usize = 151_936;
     let shape: [u32; 1] = [VOCAB as u32];
-    let prog = PieProgramDesc { program_hash: 0xF13F, ..Default::default() };
+    let prog = PieProgramDesc {
+        program_hash: 0xF13F,
+        ..Default::default()
+    };
     let mut program_id = 0u64;
     assert_eq!(
         unsafe { driver_cuda::serve::pie_cuda_register_program(d, &prog, &mut program_id) },
@@ -3749,7 +4276,10 @@ fn every_request_in_a_frame_gets_its_own_logits() {
             channel_id: 880 + r,
             reader_wait_id: 900 + r * 2,
             writer_wait_id: 901 + r * 2,
-            shape: PieU32Slice { ptr: shape.as_ptr(), len: 1 },
+            shape: PieU32Slice {
+                ptr: shape.as_ptr(),
+                len: 1,
+            },
             host_role: PIE_CHANNEL_HOST_ROLE_READER,
             capacity: 3,
             ..Default::default()
@@ -3762,7 +4292,10 @@ fn every_request_in_a_frame_gets_its_own_logits() {
         let ids: [u64; 1] = [880 + r];
         let inst = PieInstanceDesc {
             program_id,
-            channel_ids: PieU64Slice { ptr: ids.as_ptr(), len: 1 },
+            channel_ids: PieU64Slice {
+                ptr: ids.as_ptr(),
+                len: 1,
+            },
             ..Default::default()
         };
         let mut binding = PieInstanceBinding::default();
@@ -3805,14 +4338,16 @@ fn every_request_in_a_frame_gets_its_own_logits() {
             reserved0: 0,
         },
     ];
-    let cell_ptrs: [*mut driver_api::local::PieTerminalCell; 2] =
-        [&mut cells[0], &mut cells[1]];
+    let cell_ptrs: [*mut driver_api::local::PieTerminalCell; 2] = [&mut cells[0], &mut cells[1]];
     // A page each.
     let kv_page_indices: [u32; 2] = [0, 1];
     let kv_page_indptr: [u32; 3] = [0, 1, 2];
     let kv_last_page_lens: [u32; 2] = [first.len() as u32, reference_prompt.len() as u32];
     let qo_indptr: [u32; 3] = [0, first.len() as u32, tokens.len() as u32];
-    let u32s = |v: &[u32]| PieU32Slice { ptr: v.as_ptr(), len: v.len() };
+    let u32s = |v: &[u32]| PieU32Slice {
+        ptr: v.as_ptr(),
+        len: v.len(),
+    };
     let step = PieStepDesc {
         roster_rows: u32s(&roster_rows),
         sub_batch_indptr: u32s(&sub_batch_indptr),
@@ -3831,13 +4366,19 @@ fn every_request_in_a_frame_gets_its_own_logits() {
     };
     let frame = PieFrameDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        instance_ids: PieU64Slice { ptr: instance_ids.as_ptr(), len: 2 },
+        instance_ids: PieU64Slice {
+            ptr: instance_ids.as_ptr(),
+            len: 2,
+        },
         required_kv_pages: 2,
         steps: driver_api::local::PieStepDescSlice { ptr: &step, len: 1 },
         ..Default::default()
     };
-    let completion =
-        PieCompletion { wait_id: 2, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
+    let completion = PieCompletion {
+        wait_id: 2,
+        target_epoch: 1,
+        terminal_cell: std::ptr::null_mut(),
+    };
     assert_eq!(fire_and_wait(d, &frame, completion, &fires), PIE_STATUS_OK);
 
     // BOTH rings advanced. The one that used to stay at zero is request 1's.
@@ -3860,7 +4401,10 @@ fn every_request_in_a_frame_gets_its_own_logits() {
             (best_t, best_v) = (t, v);
         }
     }
-    assert_eq!(best_t, hf_argmax, "request 1 got ITS OWN logits (top {best_v})");
+    assert_eq!(
+        best_t, hf_argmax,
+        "request 1 got ITS OWN logits (top {best_v})"
+    );
 
     // Request 0 prefilled two tokens of the same prompt, so its answer is
     // a different distribution. Same argmax would mean one answer went to
@@ -3915,7 +4459,10 @@ fn a_region_table_that_does_not_describe_its_rows_is_refused() {
     let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
     let desc = PieDriverCreateDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         runtime: runtime_for(&fires),
         ..Default::default()
     };
@@ -3924,7 +4471,10 @@ fn a_region_table_that_does_not_describe_its_rows_is_refused() {
     assert!(!d.is_null());
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
     assert_eq!(
@@ -3938,7 +4488,10 @@ fn a_region_table_that_does_not_describe_its_rows_is_refused() {
         channel_id: 991,
         reader_wait_id: 1001,
         writer_wait_id: 1002,
-        shape: PieU32Slice { ptr: shape.as_ptr(), len: 1 },
+        shape: PieU32Slice {
+            ptr: shape.as_ptr(),
+            len: 1,
+        },
         host_role: PIE_CHANNEL_HOST_ROLE_READER,
         capacity: 3,
         ..Default::default()
@@ -3948,7 +4501,10 @@ fn a_region_table_that_does_not_describe_its_rows_is_refused() {
         unsafe { driver_cuda::serve::pie_cuda_register_channel(d, &ch, &mut chb) },
         PIE_STATUS_OK
     );
-    let prog = PieProgramDesc { program_hash: 0xF140, ..Default::default() };
+    let prog = PieProgramDesc {
+        program_hash: 0xF140,
+        ..Default::default()
+    };
     let mut program_id = 0u64;
     assert_eq!(
         unsafe { driver_cuda::serve::pie_cuda_register_program(d, &prog, &mut program_id) },
@@ -3957,7 +4513,10 @@ fn a_region_table_that_does_not_describe_its_rows_is_refused() {
     let ids: [u64; 1] = [991];
     let inst = PieInstanceDesc {
         program_id,
-        channel_ids: PieU64Slice { ptr: ids.as_ptr(), len: 1 },
+        channel_ids: PieU64Slice {
+            ptr: ids.as_ptr(),
+            len: 1,
+        },
         ..Default::default()
     };
     let mut binding = PieInstanceBinding::default();
@@ -3981,10 +4540,16 @@ fn a_region_table_that_does_not_describe_its_rows_is_refused() {
     let kv_page_indptr: [u32; 2] = [0, 1];
     let kv_last_page_lens: [u32; 1] = [4];
     let qo_indptr: [u32; 2] = [0, 4];
-    let u32s = |v: &[u32]| PieU32Slice { ptr: v.as_ptr(), len: v.len() };
+    let u32s = |v: &[u32]| PieU32Slice {
+        ptr: v.as_ptr(),
+        len: v.len(),
+    };
     let instance_ids: [u64; 1] = [binding.instance_id];
-    let completion =
-        PieCompletion { wait_id: 3, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
+    let completion = PieCompletion {
+        wait_id: 3,
+        target_epoch: 1,
+        terminal_cell: std::ptr::null_mut(),
+    };
 
     // A table whose one region covers rows 0..2 and leaves 2..4 to
     // nobody. Every other field is a valid four-token prefill, so the
@@ -3996,7 +4561,10 @@ fn a_region_table_that_does_not_describe_its_rows_is_refused() {
         roster_rows: u32s(&roster_rows),
         sub_batch_indptr: u32s(&sub_batch_indptr),
         sub_batch_class: u32s(&sub_batch_class),
-        terminal_cells: driver_api::local::PieTerminalCellPtrSlice { ptr: &cell_ptr, len: 1 },
+        terminal_cells: driver_api::local::PieTerminalCellPtrSlice {
+            ptr: &cell_ptr,
+            len: 1,
+        },
         token_ids: u32s(&tokens),
         position_ids: u32s(&positions),
         kv_page_indices: u32s(&kv_page_indices),
@@ -4010,7 +4578,10 @@ fn a_region_table_that_does_not_describe_its_rows_is_refused() {
     };
     let frame = PieFrameDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        instance_ids: PieU64Slice { ptr: instance_ids.as_ptr(), len: 1 },
+        instance_ids: PieU64Slice {
+            ptr: instance_ids.as_ptr(),
+            len: 1,
+        },
         required_kv_pages: 1,
         steps: driver_api::local::PieStepDescSlice { ptr: &step, len: 1 },
         ..Default::default()
@@ -4051,7 +4622,10 @@ fn a_region_table_that_does_not_describe_its_rows_is_refused() {
     step.region_sig = u32s(&lora_sig);
     let frame = PieFrameDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        instance_ids: PieU64Slice { ptr: instance_ids.as_ptr(), len: 1 },
+        instance_ids: PieU64Slice {
+            ptr: instance_ids.as_ptr(),
+            len: 1,
+        },
         required_kv_pages: 1,
         steps: driver_api::local::PieStepDescSlice { ptr: &step, len: 1 },
         ..Default::default()
@@ -4068,7 +4642,10 @@ fn a_region_table_that_does_not_describe_its_rows_is_refused() {
     step.region_sig = u32s(&bad_sig);
     let frame = PieFrameDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        instance_ids: PieU64Slice { ptr: instance_ids.as_ptr(), len: 1 },
+        instance_ids: PieU64Slice {
+            ptr: instance_ids.as_ptr(),
+            len: 1,
+        },
         required_kv_pages: 1,
         steps: driver_api::local::PieStepDescSlice { ptr: &step, len: 1 },
         ..Default::default()
@@ -4116,10 +4693,16 @@ fn an_extern_channel_registers_and_refuses_to_attach() {
         channel_id: 21,
         reader_wait_id: 31,
         writer_wait_id: 32,
-        shape: PieU32Slice { ptr: shape.as_ptr(), len: 1 },
+        shape: PieU32Slice {
+            ptr: shape.as_ptr(),
+            len: 1,
+        },
         capacity: 2,
         extern_dir: PIE_CHANNEL_EXTERN_IMPORT,
-        extern_name: PieBytes { ptr: name.as_ptr(), len: name.len() },
+        extern_name: PieBytes {
+            ptr: name.as_ptr(),
+            len: name.len(),
+        },
         ..Default::default()
     };
     let mut b = PieChannelEndpointBinding::default();
@@ -4129,7 +4712,10 @@ fn an_extern_channel_registers_and_refuses_to_attach() {
         "registering an extern channel is harmless -- the host endpoint is real"
     );
 
-    let prog = PieProgramDesc { program_hash: 0x2121, ..Default::default() };
+    let prog = PieProgramDesc {
+        program_hash: 0x2121,
+        ..Default::default()
+    };
     let mut program_id = 0u64;
     assert_eq!(
         unsafe { driver_cuda::serve::pie_cuda_register_program(d, &prog, &mut program_id) },
@@ -4138,7 +4724,10 @@ fn an_extern_channel_registers_and_refuses_to_attach() {
     let ids: [u64; 1] = [21];
     let inst = PieInstanceDesc {
         program_id,
-        channel_ids: PieU64Slice { ptr: ids.as_ptr(), len: 1 },
+        channel_ids: PieU64Slice {
+            ptr: ids.as_ptr(),
+            len: 1,
+        },
         ..Default::default()
     };
     let mut binding = PieInstanceBinding::default();
@@ -4155,7 +4744,10 @@ fn an_extern_channel_registers_and_refuses_to_attach() {
         reader_wait_id: 33,
         writer_wait_id: 34,
         extern_dir: driver_api::local::PIE_CHANNEL_EXTERN_NONE,
-        extern_name: PieBytes { ptr: std::ptr::null(), len: 0 },
+        extern_name: PieBytes {
+            ptr: std::ptr::null(),
+            len: 0,
+        },
         ..ch
     };
     assert_eq!(
@@ -4165,7 +4757,10 @@ fn an_extern_channel_registers_and_refuses_to_attach() {
     let ids2: [u64; 1] = [22];
     let inst2 = PieInstanceDesc {
         program_id,
-        channel_ids: PieU64Slice { ptr: ids2.as_ptr(), len: 1 },
+        channel_ids: PieU64Slice {
+            ptr: ids2.as_ptr(),
+            len: 1,
+        },
         ..Default::default()
     };
     assert_eq!(

@@ -93,7 +93,15 @@ const GOLDEN_ROWS: usize = 14_519;
 // branch of each one. That behaviour is load-bearing for anyone who typos a
 // profile in config, and it is exactly the kind of thing a rewrite drops by
 // pattern-matching on an enum with an error arm.
-const PROFILES: [&str; 7] = ["auto", "latency", "balanced", "throughput", "capacity", "weird", ""];
+const PROFILES: [&str; 7] = [
+    "auto",
+    "latency",
+    "balanced",
+    "throughput",
+    "capacity",
+    "weird",
+    "",
+];
 const TPS: [i32; 7] = [0, 1, 2, 3, 4, 8, 16];
 const SMS: [i32; 12] = [0, 1, 16, 32, 60, 78, 80, 108, 114, 132, 148, 256];
 const MAJORS: [i32; 7] = [7, 8, 9, 10, 11, 12, 13];
@@ -125,7 +133,11 @@ fn render() -> String {
         }
         o.push('\n');
         for tp in TPS {
-            let _ = writeln!(o, "PAGEPROF\t{p}\t{tp}\t{}", kv_page_size_for_profile(p, tp));
+            let _ = writeln!(
+                o,
+                "PAGEPROF\t{p}\t{tp}\t{}",
+                kv_page_size_for_profile(p, tp)
+            );
         }
     }
 
@@ -169,7 +181,11 @@ fn render() -> String {
     while val <= 4096 {
         for tgt in [1, 2, 64, 256, 2048, 8192] {
             let _ = writeln!(o, "LOG2R\t{val}\t{tgt}\t{}", dtoh(log2_ratio(val, tgt)));
-            let _ = writeln!(o, "SAT\t{val}\t{tgt}\t{}", dtoh(target_saturation_score(val, tgt)));
+            let _ = writeln!(
+                o,
+                "SAT\t{val}\t{tgt}\t{}",
+                dtoh(target_saturation_score(val, tgt))
+            );
         }
         val += 61;
     }
@@ -233,16 +249,41 @@ fn rust_policy_layer_is_byte_identical_to_the_cpp_original() {
 fn the_grid_still_covers_what_it_claims_to() {
     let out = render();
     let rows = out.lines().count();
-    assert_eq!(rows, GOLDEN_ROWS, "the sweep changed size; the hash above is for {GOLDEN_ROWS}");
+    assert_eq!(
+        rows, GOLDEN_ROWS,
+        "the sweep changed size; the hash above is for {GOLDEN_ROWS}"
+    );
 
-    let count = |k: &str| out.lines().filter(|l| l.starts_with(&format!("{k}\t"))).count();
+    let count = |k: &str| {
+        out.lines()
+            .filter(|l| l.starts_with(&format!("{k}\t")))
+            .count()
+    };
     for kind in [
-        "CLAMP", "CLAMP2", "FAMILIES", "PAGEPROF", "PAGECAND", "PAGEDERIVE", "DECODE", "PREFILL",
-        "PCAP", "LOG2R", "SAT", "UNIQ", "FLOOR", "ALIGN",
+        "CLAMP",
+        "CLAMP2",
+        "FAMILIES",
+        "PAGEPROF",
+        "PAGECAND",
+        "PAGEDERIVE",
+        "DECODE",
+        "PREFILL",
+        "PCAP",
+        "LOG2R",
+        "SAT",
+        "UNIQ",
+        "FLOOR",
+        "ALIGN",
     ] {
-        assert!(count(kind) > 0, "no {kind} rows: a whole function stopped being exercised");
+        assert!(
+            count(kind) > 0,
+            "no {kind} rows: a whole function stopped being exercised"
+        );
     }
-    assert_eq!(count("DECODE"), PROFILES.len() * TPS.len() * SMS.len() * MAJORS.len());
+    assert_eq!(
+        count("DECODE"),
+        PROFILES.len() * TPS.len() * SMS.len() * MAJORS.len()
+    );
     assert_eq!(count("PAGECAND"), PROFILES.len() * TPS.len() * PINNED.len());
 }
 
@@ -261,11 +302,18 @@ fn the_float_columns_carry_distinct_finite_values() {
     for kind in ["LOG2R", "SAT"] {
         let vs = bits(kind);
         assert!(vs.len() > 100, "{kind} barely sampled");
-        assert!(vs.iter().all(|&b| f64::from_bits(b).is_finite()), "{kind} produced a non-finite");
+        assert!(
+            vs.iter().all(|&b| f64::from_bits(b).is_finite()),
+            "{kind} produced a non-finite"
+        );
         let mut uniq = vs.clone();
         uniq.sort_unstable();
         uniq.dedup();
-        assert!(uniq.len() > 50, "{kind} is nearly constant across the sweep ({})", uniq.len());
+        assert!(
+            uniq.len() > 50,
+            "{kind} is nearly constant across the sweep ({})",
+            uniq.len()
+        );
     }
 }
 

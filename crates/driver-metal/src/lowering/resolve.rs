@@ -32,8 +32,7 @@ use std::collections::HashMap;
 use crate::lowering::executor::{Resolver, Slice};
 
 /// The scales sidecar, which no checkpoint spells two ways.
-static SCALES: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| ".scales".to_string());
+static SCALES: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| ".scales".to_string());
 use model_compiler::trace::ValueId;
 
 /// How a checkpoint spells what a text names.
@@ -209,9 +208,7 @@ impl Names {
             ("post_mlp_norm", "post_feedforward_layernorm"),
         ]
         .into_iter()
-        .map(|(a, b): (&str, &str)| {
-            (a.to_string(), b.split('|').map(str::to_string).collect())
-        })
+        .map(|(a, b): (&str, &str)| (a.to_string(), b.split('|').map(str::to_string).collect()))
         .collect();
         let globals = [
             // Tied: one table serves both ends, which is why the readout and
@@ -230,9 +227,7 @@ impl Names {
             ("final_norm", "final_norm"),
         ]
         .into_iter()
-        .map(|(a, b): (&str, &str)| {
-            (a.to_string(), b.split('|').map(str::to_string).collect())
-        })
+        .map(|(a, b): (&str, &str)| (a.to_string(), b.split('|').map(str::to_string).collect()))
         .collect();
         Self {
             layer_prefix: "layers.".to_string(),
@@ -540,10 +535,13 @@ mod tests {
         // A fire that cannot bind is diagnosed by the whole list; stopping at
         // the first turns one debugging session into as many as are missing.
         let mut tensors = HashMap::new();
-        tensors.insert("layers.0.self_attn.qkv_proj.fused.weight".to_string(), Slice {
-            address: 0x100,
-            bytes: 64,
-        });
+        tensors.insert(
+            "layers.0.self_attn.qkv_proj.fused.weight".to_string(),
+            Slice {
+                address: 0x100,
+                bytes: 64,
+            },
+        );
         let n = HashMap::new();
         let mut s = store(&tensors, &n);
         assert_eq!(s.weight("layer.0.qkv").map(|x| x.address), Some(0x100));

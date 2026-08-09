@@ -522,8 +522,12 @@ mod tests {
         for (i, (a_name, a)) in rows.iter().enumerate() {
             for (b_name, b) in rows.iter().skip(i + 1) {
                 assert_ne!(
-                    (a.hidden, a.layers, a.q_heads, a.kv_heads, a.head_dim, a.vocab),
-                    (b.hidden, b.layers, b.q_heads, b.kv_heads, b.head_dim, b.vocab),
+                    (
+                        a.hidden, a.layers, a.q_heads, a.kv_heads, a.head_dim, a.vocab
+                    ),
+                    (
+                        b.hidden, b.layers, b.q_heads, b.kv_heads, b.head_dim, b.vocab
+                    ),
                     "{a_name} and {b_name} state the same stack"
                 );
             }
@@ -557,10 +561,16 @@ mod tests {
             QkNorm::PerHead,
             "the derivation asked `elems_of(q_norm) == head_dim`"
         );
-        assert!(qwen3.tied_embeddings, "a tie is an ABSENCE, so it must be stated");
+        assert!(
+            qwen3.tied_embeddings,
+            "a tie is an ABSENCE, so it must be stated"
+        );
 
         let qwen2 = LlamaLikeFacts::qwen2_5_1_5b();
-        assert!(qwen2.qkv_bias, "qwen2.5 is the generation that ships qkv biases");
+        assert!(
+            qwen2.qkv_bias,
+            "qwen2.5 is the generation that ships qkv biases"
+        );
         assert_eq!(qwen2.qk_norm, QkNorm::Off);
     }
 }

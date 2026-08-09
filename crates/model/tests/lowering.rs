@@ -5,12 +5,12 @@
 //! cycle back onto `model` gives the test a second, incompatible copy of the
 //! toolchain's types.
 
-use model_compiler::lower::*;
-use model_compiler::trace::{ForwardPlan, OpKind, PeelWindow, ValueId};
-use std::ops::Range;
 use model::shared::llama_like::forward::facts::LlamaLikeCudaFacts;
 use model::shared::llama_like::forward::facts::LlamaLikeFacts;
+use model_compiler::lower::*;
 use model_compiler::trace::FireClass;
+use model_compiler::trace::{ForwardPlan, OpKind, PeelWindow, ValueId};
+use std::ops::Range;
 
 /// A fire whose rows are all plain AND all sampled — the ordinary
 /// decode shape, and the one every row-axis test wants.
@@ -85,18 +85,12 @@ fn the_qwen3_5_residue_ledger() {
     let out = lower(&plan, &sampled(4), Fire::default()).expect("the plan lowers");
     let mut ledger: std::collections::BTreeMap<String, usize> = Default::default();
     for u in &out.residue {
-        *ledger
-            .entry(format!("{}: {}", u.kind, u.why))
-            .or_default() += 1;
+        *ledger.entry(format!("{}: {}", u.kind, u.why)).or_default() += 1;
     }
-    let seen: Vec<String> = ledger
-        .iter()
-        .map(|(k, n)| format!("{n:>4}  {k}"))
-        .collect();
+    let seen: Vec<String> = ledger.iter().map(|(k, n)| format!("{n:>4}  {k}")).collect();
     let expected: Vec<String> = LEDGER_QWEN35_DECODE.iter().map(|s| s.to_string()).collect();
     assert_eq!(
-        seen,
-        expected,
+        seen, expected,
         "the qwen3_5 residue ledger moved.\n\
          Every line here is a statement the flat list does not carry. \
          If a rung removed one, update the constant and say which \
@@ -157,8 +151,14 @@ fn the_aligned_moe_leg_lowers() {
 fn the_qwen3_5_flat_list_covers_every_statement() {
     let cuda = model::qwen_3_5::forward::facts::Qwen35CudaFacts::qwen3_5_0_8b_synthetic();
     let geometries = [
-        ("0.8b", model::qwen_3_5::forward::facts::Qwen35HybridFacts::qwen3_5_0_8b()),
-        ("27b", model::qwen_3_5::forward::facts::Qwen35HybridFacts::qwen3_6_27b()),
+        (
+            "0.8b",
+            model::qwen_3_5::forward::facts::Qwen35HybridFacts::qwen3_5_0_8b(),
+        ),
+        (
+            "27b",
+            model::qwen_3_5::forward::facts::Qwen35HybridFacts::qwen3_6_27b(),
+        ),
     ];
     for (name, facts) in geometries {
         for class in [FireClass::Decode, FireClass::Prefill] {
@@ -205,14 +205,9 @@ fn the_gemma4_residue_ledger() {
         let out = lower(&plan, &sampled(4), Fire::default()).expect("the plan lowers");
         let mut ledger: std::collections::BTreeMap<String, usize> = Default::default();
         for u in &out.residue {
-            *ledger
-                .entry(format!("{}: {}", u.kind, u.why))
-                .or_default() += 1;
+            *ledger.entry(format!("{}: {}", u.kind, u.why)).or_default() += 1;
         }
-        let seen: Vec<String> = ledger
-            .iter()
-            .map(|(k, n)| format!("{n:>4}  {k}"))
-            .collect();
+        let seen: Vec<String> = ledger.iter().map(|(k, n)| format!("{n:>4}  {k}")).collect();
         let want: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
         assert_eq!(seen, want, "the gemma-4 {class:?} residue ledger moved");
         assert!(
@@ -255,15 +250,13 @@ fn the_gpt_oss_residue_ledger() {
     let out = lower(&plan, &sampled(4), Fire::default()).expect("the plan lowers");
     let mut ledger: std::collections::BTreeMap<String, usize> = Default::default();
     for u in &out.residue {
-        *ledger
-            .entry(format!("{}: {}", u.kind, u.why))
-            .or_default() += 1;
+        *ledger.entry(format!("{}: {}", u.kind, u.why)).or_default() += 1;
     }
-    let seen: Vec<String> = ledger
+    let seen: Vec<String> = ledger.iter().map(|(k, n)| format!("{n:>4}  {k}")).collect();
+    let expected: Vec<String> = LEDGER_GPT_OSS_DECODE
         .iter()
-        .map(|(k, n)| format!("{n:>4}  {k}"))
+        .map(|s| s.to_string())
         .collect();
-    let expected: Vec<String> = LEDGER_GPT_OSS_DECODE.iter().map(|s| s.to_string()).collect();
     assert_eq!(
         seen, expected,
         "the gpt-oss residue ledger moved.\n\
@@ -293,29 +286,35 @@ fn the_gemma4_flat_list_covers_every_statement() {
     // arm — three things E4B cannot say anything about. It found
     // three real gaps the day it was first booted.
     for (name, facts) in [
-        ("e4b", model::gemma_4::forward::facts::Gemma4Facts::gemma_4_e4b()),
-        ("e2b", model::gemma_4::forward::facts::Gemma4Facts::gemma_4_e2b()),
+        (
+            "e4b",
+            model::gemma_4::forward::facts::Gemma4Facts::gemma_4_e4b(),
+        ),
+        (
+            "e2b",
+            model::gemma_4::forward::facts::Gemma4Facts::gemma_4_e2b(),
+        ),
     ] {
-    let _ = name;
-    let cuda = model::gemma_4::forward::facts::Gemma4CudaFacts::gemma_4_e4b_synthetic();
-    for class in [FireClass::Decode, FireClass::Prefill] {
-        let plan = model::gemma_4::forward::gemma4_cuda(&facts, &cuda, class);
-        for (shape, rows) in [("all-sampled", sampled(4)), ("gathered", gathered(4))] {
-            let out = lower(&plan, &rows, Fire::default())
-                .unwrap_or_else(|e| panic!("{class:?}/{shape}: {e:?}"));
-            assert!(
-                out.residue.is_empty(),
-                "{class:?}/{shape}: {} statements still owe a declaration: {:#?}",
-                out.residue.len(),
-                out.residue
-            );
-            assert_eq!(out.coverage(), 1.0, "{class:?}/{shape}");
-            assert!(
-                !out.launches.is_empty(),
-                "{class:?}/{shape}: a fire that executes nothing is not a fire"
-            );
+        let _ = name;
+        let cuda = model::gemma_4::forward::facts::Gemma4CudaFacts::gemma_4_e4b_synthetic();
+        for class in [FireClass::Decode, FireClass::Prefill] {
+            let plan = model::gemma_4::forward::gemma4_cuda(&facts, &cuda, class);
+            for (shape, rows) in [("all-sampled", sampled(4)), ("gathered", gathered(4))] {
+                let out = lower(&plan, &rows, Fire::default())
+                    .unwrap_or_else(|e| panic!("{class:?}/{shape}: {e:?}"));
+                assert!(
+                    out.residue.is_empty(),
+                    "{class:?}/{shape}: {} statements still owe a declaration: {:#?}",
+                    out.residue.len(),
+                    out.residue
+                );
+                assert_eq!(out.coverage(), 1.0, "{class:?}/{shape}");
+                assert!(
+                    !out.launches.is_empty(),
+                    "{class:?}/{shape}: a fire that executes nothing is not a fire"
+                );
+            }
         }
-    }
     }
 }
 
@@ -373,7 +372,8 @@ fn the_flat_list_covers_every_statement() {
         // Both epilogue shapes: a decode fire samples every row, a
         // prefill fire samples one row per request and gathers.
         for (shape, rows) in [("all-sampled", sampled(4)), ("gathered", gathered(4))] {
-            let out = lower(&plan, &rows, Fire::default()).unwrap_or_else(|e| panic!("{name}/{shape}: {e:?}"));
+            let out = lower(&plan, &rows, Fire::default())
+                .unwrap_or_else(|e| panic!("{name}/{shape}: {e:?}"));
             assert!(
                 out.residue.is_empty(),
                 "{name}/{shape}: {} statements still owe a declaration: {:#?}",
@@ -403,7 +403,10 @@ fn the_live_sites_are_named_and_the_dead_ones_are_not() {
         .filter(|(_, op)| matches!(op.kind, OpKind::HookSite { .. }))
         .map(|(i, _)| i)
         .collect();
-    assert!(!sites.is_empty(), "the class trace carries observation sites");
+    assert!(
+        !sites.is_empty(),
+        "the class trace carries observation sites"
+    );
 
     // A plain fire takes the else arm; a MASKED fire takes the mask
     // arm. Both bracket their layers, and they are DIFFERENT sites —
@@ -416,7 +419,10 @@ fn the_live_sites_are_named_and_the_dead_ones_are_not() {
     let masked_out = lower(&plan, &masked, Fire::default()).unwrap();
 
     for out in [&plain_out, &masked_out] {
-        assert!(!out.structural.is_empty(), "a live fire brackets its layers");
+        assert!(
+            !out.structural.is_empty(),
+            "a live fire brackets its layers"
+        );
         assert!(
             out.structural
                 .iter()
@@ -424,10 +430,7 @@ fn the_live_sites_are_named_and_the_dead_ones_are_not() {
             "only sites are structural"
         );
         // Ordered, because a bracket opens before it closes.
-        assert!(out
-            .structural
-            .windows(2)
-            .all(|w| w[0].at_op < w[1].at_op));
+        assert!(out.structural.windows(2).all(|w| w[0].at_op < w[1].at_op));
         // And every site brackets a NON-EMPTY window — an empty one
         // would be a retired layer's, which does not fire at all.
         assert!(out.structural.iter().all(|s| !s.rows.is_empty()));
@@ -459,7 +462,11 @@ fn a_captured_fire_emits_both_peel_regions() {
         r.hooked = true;
     }
     let host = lower(&plan, &rows, Fire::default()).expect("coverable");
-    assert!(host.launches.iter().all(|l| l.peel.is_none_or(|p| !p.rows_device)));
+    assert!(
+        host.launches
+            .iter()
+            .all(|l| l.peel.is_none_or(|p| !p.rows_device))
+    );
     assert!(
         !host
             .launches
@@ -484,10 +491,10 @@ fn a_captured_fire_emits_both_peel_regions() {
         .filter(|l| l.kernel_is(&captured, "attn::qkv_decode_qk_norm_rope_write_kv_bf16"))
         .collect();
     assert!(!fused.is_empty(), "the captured graph carries the prefix");
-    assert!(fused
-        .iter()
-        .all(|l| l.peel.is_some_and(|p| p.axis == PeelWindow::HookFreePrefix
-            && p.rows_device)));
+    assert!(fused.iter().all(|l| {
+        l.peel
+            .is_some_and(|p| p.axis == PeelWindow::HookFreePrefix && p.rows_device)
+    }));
     // And its rows are the WHOLE window, not the empty prefix half:
     // a captured region launches a full-window grid and reads the
     // split off the device word. Naming the half would describe a
@@ -504,12 +511,14 @@ fn a_captured_fire_emits_both_peel_regions() {
 
     // And ONLY the peel's regions are marked: everything outside is
     // still a plain count, which is what keeps the list readable.
-    assert!(captured
-        .launches
-        .iter()
-        .filter(|l| l.peel.is_some_and(|p| p.rows_device))
-        .count()
-        < captured.launches.len());
+    assert!(
+        captured
+            .launches
+            .iter()
+            .filter(|l| l.peel.is_some_and(|p| p.rows_device))
+            .count()
+            < captured.launches.len()
+    );
 }
 
 /// The epilogue is three statements over a ROW COUNT, and the two
@@ -565,7 +574,12 @@ fn the_epilogue_is_a_row_count_not_a_branch() {
     // nobody reads): no rectangle at all, while the body still runs.
     let none = vec![Row::default(); 4];
     assert!(epilogue(&none).is_empty());
-    assert!(!lower(&plan, &none, Fire::default()).unwrap().launches.is_empty());
+    assert!(
+        !lower(&plan, &none, Fire::default())
+            .unwrap()
+            .launches
+            .is_empty()
+    );
 }
 
 /// A plain fire lowers, and every launch covers every row — the
@@ -578,9 +592,16 @@ fn a_plain_fire_is_one_rectangle_per_statement() {
     assert!(out.rectangles > 0);
     assert!(out.launches.iter().all(|l| l.rows == (0..8)));
     // The frame's kernel table is what the driver would index.
-    assert!(out.kernels.contains(&"attn::dispatch_attention_flashinfer_decode".to_string()));
+    assert!(
+        out.kernels
+            .contains(&"attn::dispatch_attention_flashinfer_decode".to_string())
+    );
     // Every launch names a layer the trace tagged.
-    assert!(out.launches.iter().all(|l| l.layers.end == l.layers.start + 1));
+    assert!(
+        out.launches
+            .iter()
+            .all(|l| l.layers.end == l.layers.start + 1)
+    );
 }
 
 /// The MASK arm selects only the masked rows, and the rest take the
@@ -595,11 +616,7 @@ fn a_masked_suffix_splits_the_rectangle() {
         r.custom_mask = true;
     }
     let out = lower(&plan, &rows, Fire::default()).expect("mask + plain is coverable");
-    let masked = out
-        .launches
-        .iter()
-        .filter(|l| l.rows == (6..8))
-        .count();
+    let masked = out.launches.iter().filter(|l| l.rows == (6..8)).count();
     let plain_rows = out.launches.iter().filter(|l| l.rows == (0..6)).count();
     assert!(masked > 0, "the masked rows got their own rectangles");
     assert!(plain_rows > 0, "and the plain rows theirs");
@@ -635,7 +652,8 @@ fn a_whole_kernel_refuses_a_row_window() {
         decode_fused_post: false,
         ..LlamaLikeCudaFacts::qwen3_0_6b_l40s()
     };
-    let plan = model::shared::llama_like::forward::llama_like_cuda(&facts, &cuda, FireClass::Decode);
+    let plan =
+        model::shared::llama_like::forward::llama_like_cuda(&facts, &cuda, FireClass::Decode);
     assert!(
         plan.ops.iter().any(|op| matches!(
             &op.kind,
@@ -680,10 +698,12 @@ fn the_arena_reuses_across_layers() {
         buffers.bytes
     );
     // Pinned values are the backend's to bind, not the arena's.
-    assert!(buffers
-        .pinned
-        .iter()
-        .all(|&v| buffers.offset[v as usize] == Buffers::NAMED));
+    assert!(
+        buffers
+            .pinned
+            .iter()
+            .all(|&v| buffers.offset[v as usize] == Buffers::NAMED)
+    );
     // Pins come off the seam statements, not a per-family table.
     assert!(
         !buffers.pinned.is_empty(),
@@ -742,9 +762,11 @@ fn a_uniform_truncation_skips_the_tail() {
         4
     ];
     let out = lower(&plan, &rows, Fire::default()).unwrap();
-    assert!(out.launches.iter().all(|l| l.layers.start < 12
-        || l.layers.start >= 28
-        || l.rows.is_empty()));
+    assert!(
+        out.launches
+            .iter()
+            .all(|l| l.layers.start < 12 || l.layers.start >= 28 || l.rows.is_empty())
+    );
     let full = lower(&plan, &plain(4), Fire::default()).unwrap();
     assert!(out.rectangles < full.rectangles, "truncation costs less");
 }
@@ -1154,7 +1176,6 @@ fn the_buffer_table_crosses_and_agrees_with_the_operands() {
     }
 }
 
-
 /// The epilogue's launches all bind ONE op's two operands, which is what
 /// the gather still needs and what killed the norm.
 ///
@@ -1261,7 +1282,13 @@ fn the_epilogue_binds_one_ops_two_operands_to_the_launches() {
 
     // Every row sampling: no compaction is needed, so none is stated, and
     // the head reads the stream directly.
-    let all = vec![Row { samples: true, ..Default::default() }; 4];
+    let all = vec![
+        Row {
+            samples: true,
+            ..Default::default()
+        };
+        4
+    ];
     let got = args_of(&all);
     assert_eq!(
         got.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
@@ -1296,7 +1323,13 @@ fn a_lora_row_states_the_correction_and_a_plain_one_does_not() {
             .collect()
     };
 
-    let plain = vec![Row { samples: true, ..Row::default() }; 4];
+    let plain = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        4
+    ];
     assert!(
         !launches(&plain).iter().any(|k| k.contains("lora")),
         "a fire with no adapter states no correction"

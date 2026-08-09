@@ -22,10 +22,10 @@ use driver_api::plan::{
     EmittedKernel, LaunchChannel, LaunchOp, LaunchPackage, LaunchPlanValue, LaunchRegion,
     LaunchStage, LaunchStagePlan,
 };
+use driver_metal::Error;
 use driver_metal::channel::{
     ExecPlan, Reason, StatusOutcome, Ticket, Versions, adopt_launch_package,
 };
-use driver_metal::Error;
 use driver_metal::device::{Archives, Context, Externals, Pool, Ring, Stepper, Tables};
 use driver_metal::program::{DeviceInputs, Mode, Prepare, Runtime};
 use tensor_ir::DType;

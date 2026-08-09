@@ -16,12 +16,12 @@
 //! `<｜end▁of▁sentence｜>` are different tokens, and a model sealed with
 //! the wrong one generates past the end of its turn.
 
-use crate::shared::decoders::{GenericChatDecoder, ThinkingDecoder};
 use crate::instruct::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
 };
-use tokenizer::{Tokenizer, TokenizerDecoder};
+use crate::shared::decoders::{GenericChatDecoder, ThinkingDecoder};
 use std::sync::Arc;
+use tokenizer::{Tokenizer, TokenizerDecoder};
 
 // The implementation below mirrors the published DeepSeek-R1 jinja chat
 // template; the verbatim copy that used to sit here as a static was never
@@ -306,8 +306,8 @@ impl ToolDecoder for R1ToolDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokenizer::Tokenizer;
     use std::sync::Arc;
+    use tokenizer::Tokenizer;
 
     fn make_tok(vocab: &[&str]) -> Arc<Tokenizer> {
         let v: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();

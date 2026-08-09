@@ -328,11 +328,8 @@ pub mod ffi {
         pub unsafe fn pie_x_destroy_decode_plan(cache: *mut ::core::ffi::c_void);
         /// `set_decode_plan_int_base` — where the plan's int arrays sit
         /// inside the workspace's `int_buffer`.
-        pub unsafe fn pie_x_set_decode_plan_int_base(
-            cache: *mut ::core::ffi::c_void,
-            bytes: usize,
-        );
-/// The prefill factory, `release()`d like the decode one.
+        pub unsafe fn pie_x_set_decode_plan_int_base(cache: *mut ::core::ffi::c_void, bytes: usize);
+        /// The prefill factory, `release()`d like the decode one.
         pub unsafe fn pie_x_make_prefill_plan() -> *mut ::core::ffi::c_void;
         /// Its deleter.
         pub unsafe fn pie_x_destroy_prefill_plan(cache: *mut ::core::ffi::c_void);
@@ -413,7 +410,6 @@ pub fn seed_envelopes_empty(
         );
     }
 }
-
 
 #[cfg(test)]
 mod tests {

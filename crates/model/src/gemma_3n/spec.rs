@@ -127,8 +127,15 @@ impl Gemma3nFacts {
             laurel_rank: 64,
             ple_width: 256,
             sparsity_layers: 3,
-            altup: Gemma3nAltUpFacts { num_streams: 4, active: 0 },
-            attn: Gemma3nAttnFacts { heads: 8, kv_heads: 2, head_dim: 256 },
+            altup: Gemma3nAltUpFacts {
+                num_streams: 4,
+                active: 0,
+            },
+            attn: Gemma3nAttnFacts {
+                heads: 8,
+                kv_heads: 2,
+                head_dim: 256,
+            },
         }
     }
 }

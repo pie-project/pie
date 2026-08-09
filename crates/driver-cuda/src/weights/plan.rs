@@ -3,7 +3,7 @@
 //! The C++ (`loader/load_plan.hpp`) reached the Rust loader through the C ABI:
 //! open a checkpoint handle, marshal a request, get a marshalled plan back,
 //! then run it with `load_plan_executor.hpp`. In-process there is no wire, and
-//! the executor is `model_loader::executor::host` driven through a
+//! the executor is `model_loader::executor::Execution` driven through a
 //! [`DeviceArena`](super::arena::DeviceArena) — so what is left here is only
 //! what the driver alone knows.
 //!

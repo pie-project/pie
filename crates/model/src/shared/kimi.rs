@@ -15,8 +15,8 @@
 //! prompted in plain ChatML still answers, which is exactly why the
 //! `_ =>` fallback that produced one was invisible.
 
-use crate::shared::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
 use crate::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder};
+use crate::shared::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
 use std::sync::Arc;
 use tokenizer::Tokenizer;
 
@@ -193,8 +193,14 @@ mod tests {
     fn the_seal_is_the_stop_tokens_the_tokenizer_knows() {
         let tok = vocab();
         let k = KimiInstruct::new(tok.clone());
-        assert_eq!(k.seal(), vec![tok.token_to_id("<|im_end|>").expect("in vocab")]);
-        assert!(k.equip(&["tool".to_string()]).is_empty(), "no tool protocol here");
+        assert_eq!(
+            k.seal(),
+            vec![tok.token_to_id("<|im_end|>").expect("in vocab")]
+        );
+        assert!(
+            k.equip(&["tool".to_string()]).is_empty(),
+            "no tool protocol here"
+        );
         assert!(k.answer("tool", "{}").is_empty());
     }
 }

@@ -247,7 +247,8 @@ fn cached_power_for_binary_exponent(e: i32) -> CachedPower {
     // log10(2) and the `+1` supplying the ceiling for positive f.
     let f = ALPHA - e - 1;
     let k = (f * 78913) / (1 << 18) + i32::from(f > 0);
-    let index = (-CACHED_POWERS_MIN_DEC_EXP + k + (CACHED_POWERS_DEC_STEP - 1)) / CACHED_POWERS_DEC_STEP;
+    let index =
+        (-CACHED_POWERS_MIN_DEC_EXP + k + (CACHED_POWERS_DEC_STEP - 1)) / CACHED_POWERS_DEC_STEP;
     #[expect(
         clippy::cast_sign_loss,
         reason = "the binary exponent of a finite f64 keeps this in 0..79"
@@ -551,7 +552,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::excessive_precision, reason = "the extra digits are the subject")]
+    #[expect(
+        clippy::excessive_precision,
+        reason = "the extra digits are the subject"
+    )]
     fn grisu2_is_reproduced_where_it_differs_from_shortest() {
         // The four values from the module docs. These are the whole reason
         // this file exists: Rust's own formatter gets each of them "right"
@@ -574,7 +578,9 @@ mod tests {
         // digits it picks are one valid choice among several.
         let mut x = 1u64;
         for _ in 0..20000 {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let v = f64::from_bits(x);
             if !v.is_finite() {
                 continue;

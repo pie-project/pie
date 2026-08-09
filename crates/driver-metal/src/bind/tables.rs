@@ -11,10 +11,10 @@
 //! One builder, and the resolver's index map beside it. What a caller supplies
 //! is the FRAME's data; what this owns is the order.
 
-use crate::error::Result;
 use crate::device::{Allocation, Context};
-use crate::lowering::executor::{FireTable, Slice};
+use crate::error::Result;
 use crate::layout::region::Region as _;
+use crate::lowering::executor::{FireTable, Slice};
 
 /// The tables a fire states, in the order [`Staged::at`] indexes them.
 ///
@@ -187,13 +187,16 @@ mod tests {
         let enable = staged
             .at(FireTable::AttentionMaskEnabled)
             .expect("the enable flag is always staged, or the shader reads address zero");
-        assert!(enable.bytes >= ids.len() as u64, "one flag per token at least");
+        assert!(
+            enable.bytes >= ids.len() as u64,
+            "one flag per token at least"
+        );
         // SAFETY: the region is host-addressable and nothing is encoded
         // against it.
         let bytes = unsafe {
             core::slice::from_raw_parts(
-                (enable.address - staged.region.gpu_address() + staged.region.contents().as_ptr() as u64)
-                    as *const u8,
+                (enable.address - staged.region.gpu_address()
+                    + staged.region.contents().as_ptr() as u64) as *const u8,
                 enable.bytes as usize,
             )
         };

@@ -85,7 +85,11 @@ impl Gemma2Facts {
     /// the value the driver used to read out of the vector.
     #[must_use]
     pub fn window_left_at(&self, l: u32) -> i32 {
-        if self.is_global(l) { -1 } else { self.sliding_window }
+        if self.is_global(l) {
+            -1
+        } else {
+            self.sliding_window
+        }
     }
 
     /// The whole schedule, materialised.
@@ -148,7 +152,9 @@ mod tests {
     #[test]
     fn the_rule_is_the_vector_the_fixture_used_to_carry() {
         let f = Gemma2Facts::gemma_2_9b();
-        let longhand: Vec<i32> = (0..42).map(|l| if l % 2 == 1 { -1 } else { 4096 }).collect();
+        let longhand: Vec<i32> = (0..42)
+            .map(|l| if l % 2 == 1 { -1 } else { 4096 })
+            .collect();
         assert_eq!(f.window_by_layer(), longhand);
         assert_eq!(f.window_left_at(0), 4096, "layer 0 is local");
         assert_eq!(f.window_left_at(1), -1, "layer 1 is global");
@@ -161,7 +167,11 @@ mod tests {
     fn the_rule_answers_for_every_index_a_caller_can_ask() {
         let f = Gemma2Facts::gemma_2_9b();
         assert_eq!(f.window_left_at(41), -1);
-        assert_eq!(f.window_left_at(9999), -1, "odd, so global; no bounds to run past");
+        assert_eq!(
+            f.window_left_at(9999),
+            -1,
+            "odd, so global; no bounds to run past"
+        );
     }
 
     /// The projection widths are the row's own arithmetic — 16 heads of

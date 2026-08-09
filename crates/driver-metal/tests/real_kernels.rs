@@ -74,7 +74,10 @@ fn splicing_brings_the_header_body_in() {
     if let Some(marker) = marker {
         assert!(out.contains(marker), "spliced text lost `{marker}`");
     }
-    assert!(out.len() > header.len(), "spliced text is smaller than the header it pulled in");
+    assert!(
+        out.len() > header.len(),
+        "spliced text is smaller than the header it pulled in"
+    );
 }
 
 /// Angle-bracket includes are Metal's own headers and must survive: dropping

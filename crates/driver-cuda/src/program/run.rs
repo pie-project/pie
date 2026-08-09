@@ -65,8 +65,8 @@ use driver::{
 use crate::device::{Allocator, DeviceBuffer, StreamRef};
 use crate::error::{Error, Result};
 
-use super::params::{CudaOpParams, params_bytes};
 use super::channel::Rings;
+use super::params::{CudaOpParams, params_bytes};
 use super::runtime::Region;
 
 /// How many intrinsic slots the side tables carry per lane.
@@ -363,8 +363,7 @@ impl Prepared {
         //
         // Descriptors are LANE-MAJOR: the kernel reads
         // `all_descriptors + lane * value_count`.
-        let descriptor_bytes: Vec<u8> =
-            per_lane.iter().flatten().flat_map(as_bytes).collect();
+        let descriptor_bytes: Vec<u8> = per_lane.iter().flatten().flat_map(as_bytes).collect();
         let mut descriptor_buffer = alloc.alloc(descriptor_bytes.len().max(1))?;
         descriptor_buffer.copy_from_host(&descriptor_bytes, stream)?;
 
@@ -502,10 +501,16 @@ impl Prepared {
             )?;
             self.intrinsic_widths
                 .write_at(at * size_of::<u32>(), &width.to_le_bytes(), stream)?;
-            self.intrinsic_strides
-                .write_at(at * size_of::<u32>(), &row_stride.to_le_bytes(), stream)?;
-            self.intrinsic_offsets
-                .write_at(at * size_of::<u32>(), &row_of(lane).to_le_bytes(), stream)?;
+            self.intrinsic_strides.write_at(
+                at * size_of::<u32>(),
+                &row_stride.to_le_bytes(),
+                stream,
+            )?;
+            self.intrinsic_offsets.write_at(
+                at * size_of::<u32>(),
+                &row_of(lane).to_le_bytes(),
+                stream,
+            )?;
         }
         Ok(())
     }
@@ -532,7 +537,8 @@ impl Prepared {
         }
         let at = lane as usize * INTRINSIC_SLOTS + slot;
         let mut base = [0u8; 8];
-        self.intrinsic_bases.read_at(at * size_of::<u64>(), &mut base, stream)?;
+        self.intrinsic_bases
+            .read_at(at * size_of::<u64>(), &mut base, stream)?;
         let mut word = |buf: &DeviceBuffer| -> Result<u32> {
             let mut b = [0u8; 4];
             buf.read_at(at * size_of::<u32>(), &mut b, stream)?;
@@ -782,7 +788,6 @@ mod tests {
 // smaller than the lane count silently drops the tail lanes.
 
 use cudarc::driver::sys as dr;
-
 
 use super::compile::Module;
 
@@ -1158,7 +1163,7 @@ use std::sync::Arc;
 use driver::Failure;
 
 use super::cache::{Disk, disk_key};
-use super::compile::{FailureKind};
+use super::compile::FailureKind;
 
 /// The ring's fixed row pitch in the `full` array.
 ///
@@ -1279,7 +1284,11 @@ impl Control {
     /// [`Failure::Deterministic`] if the source above does not compile, which
     /// can only mean this file and the NVRTC in use disagree about the
     /// language; [`Failure::Retryable`] for anything the machine refused.
-    pub fn compile(disk: &Disk, architecture: &str, identity: &str) -> std::result::Result<Self, Failure> {
+    pub fn compile(
+        disk: &Disk,
+        architecture: &str,
+        identity: &str,
+    ) -> std::result::Result<Self, Failure> {
         let source = source();
         let key = disk_key(identity, &source);
         // The pair is ONE cubin with two entry points, so one cache slot holds
@@ -1290,14 +1299,16 @@ impl Control {
             Some(cubin) => cubin,
             None => {
                 let cubin =
-                    super::compile::compile(&source, architecture).map_err(|error| match error.kind {
-                        FailureKind::Deterministic => Failure::Deterministic {
-                            reason: error.message,
+                    super::compile::compile(&source, architecture).map_err(
+                        |error| match error.kind {
+                            FailureKind::Deterministic => Failure::Deterministic {
+                                reason: error.message,
+                            },
+                            FailureKind::Retryable => Failure::Retryable {
+                                reason: error.message,
+                            },
                         },
-                        FailureKind::Retryable => Failure::Retryable {
-                            reason: error.message,
-                        },
-                    })?;
+                    )?;
                 disk.store(&key, CONTROL_REGION, READINESS_ENTRY, &cubin);
                 cubin
             }

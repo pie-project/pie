@@ -18,10 +18,10 @@
 //! Verified by `tokenizer.apply_chat_template` on
 //! `allenai/OLMo-2-1124-7B-Instruct`.
 
-use crate::shared::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
 use crate::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder};
-use tokenizer::Tokenizer;
+use crate::shared::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
 use std::sync::Arc;
+use tokenizer::Tokenizer;
 
 pub struct Olmo2Instruct {
     tokenizer: Arc<Tokenizer>,

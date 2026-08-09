@@ -1,37 +1,39 @@
 //! What a backing that runs its own transforms is promised, and what it owes.
 //!
-//! `ArenaBacking::tile_map_caps` / `run_tile_map` let a device do a `TileMap`
-//! on operands that are already in its arena, instead of the host staging
-//! them back, computing, and sending them across again. That is a delegation
-//! with three moving parts and every one of them is checkable with no GPU in
-//! the build:
+//! `ArenaBacking::runs_named_kernels` / `run_tile_map` let a device do a
+//! `TileMap` on operands that are already in its arena, instead of the host
+//! staging them back, computing, and sending them across again. That is a
+//! delegation with four moving parts and every one of them is checkable with
+//! no GPU in the build:
 //!
 //! * the executor only OFFERS a transform whose operands it has resolved to
-//!   arena spans, and offers nothing when the backing claims nothing;
-//! * a backing may DECLINE one it cannot run, and the host then produces the
-//!   bytes it always did;
+//!   arena spans, and offers nothing when the backing runs no kernels;
+//! * a backing that is offered one is offered it because the *plan* named a
+//!   kernel for it, so failing to run it fails the load — there is no decline;
 //! * the operands it is handed describe the same transform the host path
-//!   would have run.
+//!   would have run; and
+//! * the arena is released either way.
 //!
-//! The last one is why this is a file rather than a unit test beside the
-//! trait. A recording backing that runs nothing and declines everything must
-//! leave the arena holding exactly what a backing that was never asked
-//! leaves — which is what makes the delegation a *route* rather than a second
-//! implementation that could disagree.
+//! The third is why this is a file rather than a unit test beside the trait. A
+//! backing that runs nothing must leave the arena holding exactly what a
+//! backing that was never asked leaves — which is what makes the delegation a
+//! *route* rather than a second implementation that could disagree. The same
+//! sentence is what lets [`Chunked`] be checked here: a segmented arena is
+//! another way to hold the same bytes, so it must hold the same bytes.
 
 use std::borrow::Cow;
+use std::ptr::NonNull;
 
 use model_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
 use model_loader::contract::{Expr, ModelContract, TensorContract, TensorType};
 use model_loader::error::Error;
+use model_loader::executor::Execution;
 use model_loader::executor::arena::{ArenaBacking, TileMapOp};
-use model_loader::executor::host::execute_plan_into_backing;
+use model_loader::executor::chunked::{Chunk, Chunked};
 use model_loader::executor::sink::MemorySink;
 use model_loader::plan::compile as compile_load_plan;
-use model_loader::plan::{
-    CUDA_TILE_MAP_MASK, LoadPlan, StorageInstr, StorageTarget, TILE_MAP_ENCODE, TILE_MAP_SCALE,
-    TileMapKind,
-};
+use model_loader::plan::passes::tile::{CUDA_QUANTIZE_BF16_TO_FP8, CUDA_SCALE_ROWS_BF16};
+use model_loader::plan::{CUDA_TILE_MAP_MASK, LoadPlan, StorageInstr, StorageTarget, TileMapKind};
 use model_loader::types::{
     Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec, TensorId,
 };
@@ -39,12 +41,28 @@ use model_loader::types::{
 // ── The fixture
 //
 // One MXFP4 payload with per-row exponents, dequantized to bf16 and then
-// re-encoded to int8. It is `storage_compiler.rs`'s
+// re-encoded to FP8. It is `storage_compiler.rs`'s
 // `a_quantized_tensor_is_re_encoded_through_a_decoded_intermediate` reduced
 // to its operands: the smallest contract that produces BOTH kinds a device
 // claims, a `Scale` (the dequant's multiply) and an `Encode`.
+//
+// The two are here because they land on opposite sides of the delegation
+// question, and the file is about where that line falls:
+//
+// * the `Scale` reads the checkpoint. Its bytes are on disk, not in the
+//   arena, so no backing can be handed it and `cuda_kernel` names no row.
+// * the `Encode` reads `w`, which the contract publishes. Published means
+//   placed, placed means arena-resident, and a bf16 -> FP8 quantize over a
+//   2-D shape is a row the CUDA table has. It is the offer.
 
-fn raw(id: u32, name: &str, offset: u64, span_bytes: u64, shape: &[i64], dtype: DType) -> RawTensor {
+fn raw(
+    id: u32,
+    name: &str,
+    offset: u64,
+    span_bytes: u64,
+    shape: &[i64],
+    dtype: DType,
+) -> RawTensor {
     RawTensor {
         id: TensorId(id),
         name: name.to_string(),
@@ -81,9 +99,9 @@ fn mxfp4() -> QuantSpec {
     }
 }
 
-fn int8() -> QuantSpec {
+fn fp8() -> QuantSpec {
     QuantSpec {
-        scheme: QuantScheme::Int8Symmetric,
+        scheme: QuantScheme::Fp8E4M3,
         logical_dtype: DType::BF16,
         bits_per_element: 8,
         group_size: 32,
@@ -92,7 +110,7 @@ fn int8() -> QuantSpec {
 }
 
 fn contract() -> ModelContract {
-    let int8_encoding = Encoding::Quant(int8());
+    let fp8_encoding = Encoding::Quant(fp8());
     ModelContract {
         alignment: 256,
         tensors: vec![
@@ -105,8 +123,12 @@ fn contract() -> ModelContract {
                 vec![4, 1],
                 Encoding::Raw(DType::E8M0),
             ),
-            // The decoded intermediate: internal, so the re-encode below
-            // reads what this wrote rather than going back to the file.
+            // The decoded weight. PUBLISHED, not internal, and that is the
+            // point of the fixture: a published tensor is placed in the
+            // arena, so the re-encode below reads arena bytes and is a
+            // candidate for delegation. An internal intermediate is a host
+            // scratch buffer, and a transform reading one can never be
+            // offered to a backing that cannot see it.
             TensorContract::new(
                 "w",
                 Expr::src("w")
@@ -117,13 +139,12 @@ fn contract() -> ModelContract {
                     .scale_per_block(Expr::out("scales")),
                 vec![4, 32],
                 Encoding::Raw(DType::BF16),
-            )
-            .internal(),
+            ),
             TensorContract::new(
-                "w_int8",
-                Expr::out("w").cast(int8_encoding.clone()),
+                "w_fp8",
+                Expr::out("w").cast(fp8_encoding.clone()),
                 vec![4, 32],
-                int8_encoding,
+                fp8_encoding,
             ),
         ],
         groups: Vec::new(),
@@ -153,31 +174,38 @@ fn kinds(plan: &LoadPlan) -> Vec<TileMapKind> {
 
 // ── A backing that records what it is offered and runs none of it.
 
-/// One offer, flattened to the facts a device would branch on.
+/// One offer, flattened to the facts it carries.
 ///
 /// Recorded rather than the borrowed op, because the op borrows the
-/// executor's transform and outlives nothing.
+/// executor's plan and outlives nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Offer {
-    kind: TileMapKind,
+    kernel: String,
     has_dst_scales: bool,
     has_factors: bool,
     shape: Option<(u32, u32)>,
-    dst_encoding: Encoding,
 }
 
 struct Recording {
     bytes: Vec<u8>,
-    caps: u32,
+    runs_kernels: bool,
     offers: Vec<Offer>,
+    /// How many times the executor said the arena was finished.
+    finished: usize,
+    /// Whether the load finished, and why not. The delegation tests below turn
+    /// on this: a backing that is offered an op it cannot run must fail the
+    /// load rather than let the host quietly produce the bytes.
+    outcome: Result<(), String>,
 }
 
 impl Recording {
-    fn new(len: usize, caps: u32) -> Self {
+    fn new(len: usize, runs_kernels: bool) -> Self {
         Self {
             bytes: vec![0; len],
-            caps,
+            runs_kernels,
             offers: Vec::new(),
+            finished: 0,
+            outcome: Ok(()),
         }
     }
 }
@@ -200,7 +228,9 @@ impl ArenaBacking for Recording {
     }
 
     fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Error> {
-        let end = offset.checked_add(bytes.len()).ok_or_else(|| oob("write"))?;
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or_else(|| oob("write"))?;
         self.bytes
             .get_mut(offset..end)
             .ok_or_else(|| oob("write"))?
@@ -217,37 +247,83 @@ impl ArenaBacking for Recording {
         Ok(())
     }
 
-    fn tile_map_caps(&self) -> u32 {
-        self.caps
+    fn finish(&mut self) -> Result<(), Error> {
+        self.finished += 1;
+        Ok(())
     }
 
-    fn run_tile_map(&mut self, op: &TileMapOp<'_>) -> Result<bool, Error> {
+    fn runs_named_kernels(&self) -> bool {
+        self.runs_kernels
+    }
+
+    fn run_tile_map(&mut self, op: &TileMapOp<'_>) -> Result<(), Error> {
         self.offers.push(Offer {
-            kind: op.kind,
+            kernel: op.kernel.to_string(),
             has_dst_scales: op.dst_scales.is_some(),
             has_factors: op.factors.is_some(),
             shape: op.shape,
-            dst_encoding: op.dst_encoding.clone(),
         });
-        // Declines everything: the point is that the host still finishes.
-        Ok(false)
+        // Records and refuses. There is no decline any more -- an op that gets
+        // here is one the compiler named a row for, so a backing that cannot
+        // run it is a backing that disagrees with the plan, and the load must
+        // say so instead of finishing on the host at a fraction of the speed.
+        Err(Error::Contract(format!(
+            "the recording backing launches nothing, including `{}`",
+            op.kernel
+        )))
     }
 }
 
-/// Execute the fixture against a backing claiming `caps`.
+/// The checkpoint the fixture names, on disk.
 ///
-/// The checkpoint the fixture names is not on disk, so the execution fails at
-/// its first read — and that is fine for every question below, because the
-/// executor decides what to OFFER from the plan alone. The byte comparison
-/// is between two runs of the same execution, so it is a comparison of two
-/// identical prefixes rather than of two completed loads.
-fn run(caps: u32) -> Recording {
+/// THE REASON THIS FUNCTION EXISTS. It did not, and the whole file was
+/// vacuous: the execution died at its first read, so `offers` was empty in
+/// every test and each one passed on nothing. `all()` over an empty vector is
+/// true, `is_empty()` on an empty vector is true, an early `return` when the
+/// offer is missing returns, and comparing the bytes of two runs that both
+/// failed at the same instruction compares two identical prefixes. Five tests
+/// asserting a delegation that never happened.
+///
+/// The bytes are raw at the offsets `metadata()` declares — the executor
+/// reads `file_offset..file_offset + span_bytes` from the plan and does not
+/// re-parse a safetensors header — so the payload is anything, as long as it
+/// is there. `w` is 64 bytes of MXFP4 at 0 and `s` is 4 E8M0 exponents at 64.
+/// The exponents are 127 (2^0) so the dequantized values stay small enough to
+/// re-encode without saturating, which keeps the int8 output a function of the
+/// input rather than of the clamp.
+fn checkpoint() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "pie_arena_transforms_{}_{}",
+        std::process::id(),
+        std::thread::current()
+            .name()
+            .unwrap_or("test")
+            .replace("::", "_")
+    ));
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    let mut bytes = vec![0u8; 256];
+    for (i, byte) in bytes[..64].iter_mut().enumerate() {
+        *byte = (i as u8).wrapping_mul(17);
+    }
+    bytes[64..68].fill(127);
+    std::fs::write(dir.join("model.safetensors"), bytes).expect("fixture file");
+    dir
+}
+
+/// Execute the fixture against a backing that does or does not run kernels.
+fn run(runs_kernels: bool) -> Recording {
     let plan = plan();
     let len = usize::try_from(plan.memory.persistent_bytes).expect("fits");
-    let mut arena = Recording::new(len.max(1), caps);
+    let mut arena = Recording::new(len.max(1), runs_kernels);
     let mut sink = MemorySink::default();
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let _ = execute_plan_into_backing(&plan, &dir, &mut arena, &mut sink, &mut |_| {});
+    let dir = checkpoint();
+    arena.outcome = Execution::new(&plan, &dir)
+        .arena(&mut arena)
+        .sink(&mut sink)
+        .run()
+        .map(|_| ())
+        .map_err(|err| err.to_string());
+    std::fs::remove_dir_all(&dir).ok();
     arena
 }
 
@@ -260,91 +336,343 @@ fn the_fixture_produces_the_two_kinds_a_device_claims() {
     );
 }
 
+/// The fixture LOADS. Everything below reads from a completed execution.
+///
+/// First, because it is the assumption the rest of the file used to make and
+/// did not check: the checkpoint was never written, every run died at its
+/// first read, and five tests passed over an empty `offers`. A vacuous test
+/// costs more than no test, because it also reports that the property holds.
 #[test]
-fn a_backing_that_claims_nothing_is_offered_nothing() {
-    let arena = run(0);
+fn the_fixture_actually_runs() {
+    let arena = run(false);
+    assert_eq!(
+        arena.outcome,
+        Ok(()),
+        "the host path must complete this fixture with no backing help; \
+         every other test here reads the state it leaves"
+    );
+    assert!(
+        arena.bytes.iter().any(|&b| b != 0),
+        "a completed load writes the arena"
+    );
+}
+
+#[test]
+fn a_backing_that_runs_no_kernels_is_offered_nothing() {
+    let arena = run(false);
     assert!(
         arena.offers.is_empty(),
         "host mode is the default, and the default must not reach the \
          backing: {:?}",
         arena.offers
     );
+    assert_eq!(arena.outcome, Ok(()), "and the load still finishes");
 }
 
+/// Only an instruction the PLAN named a kernel for is offered.
+///
+/// This replaces `a_claim_is_per_kind_and_only_that_kind_is_offered`, which
+/// asked whether the executor respected a per-kind capability mask. There is
+/// no such mask: the compiler names a row per instruction with the tensor's
+/// name in hand, and that answer is strictly better than a kind. So the
+/// property is now about the plan rather than about the claim.
 #[test]
-fn a_claim_is_per_kind_and_only_that_kind_is_offered() {
-    let arena = run(TILE_MAP_SCALE);
+fn only_an_instruction_the_plan_named_a_row_for_is_offered() {
+    let arena = run(true);
     assert!(
-        arena.offers.iter().all(|o| o.kind == TileMapKind::Scale),
-        "claiming Scale must not offer Encode: {:?}",
-        arena.offers
+        !arena.offers.is_empty(),
+        "the fixture's Encode is a row `cuda_kernel` names; if this is empty \
+         the delegation stopped happening and the tests below are vacuous"
+    );
+    for offer in &arena.offers {
+        assert!(
+            named_kernels(&plan()).contains(&offer.kernel),
+            "the backing was offered `{}`, which the plan names nowhere",
+            offer.kernel
+        );
+    }
+}
+
+/// The one delegable instruction is the `Encode`, and the `Scale` is not.
+///
+/// Both halves matter. The `Encode` is offered because every operand is a
+/// span of the arena and the compiler named a row for it. The `Scale` is not
+/// offered because its input is the CHECKPOINT — bytes on disk, which a
+/// backing handed nothing but offsets cannot read — and `cuda_kernel` agrees,
+/// naming no row for it.
+///
+/// This replaces `a_transform_reading_a_host_scratch_buffer_is_not_offered`,
+/// which asserted the same exclusion for the wrong reason: it read the old
+/// fixture, whose decoded intermediate was `.internal()` and therefore host
+/// scratch, and concluded that no `Encode` can ever be delegated. What that
+/// test had actually found was a property of ITS CONTRACT. Publish the
+/// intermediate and the same `Encode` is delegable, which is what the fixture
+/// now does.
+#[test]
+fn the_offer_is_the_transform_whose_operands_are_all_in_the_arena() {
+    let arena = run(true);
+    let kernels: Vec<&str> = arena.offers.iter().map(|o| o.kernel.as_str()).collect();
+    assert_eq!(
+        kernels,
+        vec![CUDA_QUANTIZE_BF16_TO_FP8],
+        "exactly the re-encode, which reads the published `w` and writes two \
+         placed tensors"
+    );
+    assert!(
+        !arena
+            .offers
+            .iter()
+            .any(|o| o.kernel == CUDA_SCALE_ROWS_BF16),
+        "the dequantizing Scale reads the checkpoint; offering it would hand \
+         a backing an arena offset for bytes that are still on disk"
     );
 }
 
+/// An `Encode` offer carries the second destination it writes.
+///
+/// A quantizing row produces two tensors — the payload and its scale factors
+/// — and a backing that got only the payload span would write half the
+/// result and leave the other half zero. Nothing downstream detects that: the
+/// bytes are present, the shapes are right, and the weights are wrong.
 #[test]
-fn a_scale_offer_carries_the_factors_it_multiplies_by() {
-    let arena = run(TILE_MAP_SCALE);
-    let Some(scale) = arena.offers.iter().find(|o| o.kind == TileMapKind::Scale) else {
-        return;
-    };
-    assert!(
-        scale.has_factors,
-        "a blocked Scale reads per-group factors from a second operand; \
-         without them a backing has nothing to multiply by"
-    );
-    assert!(
-        !scale.has_dst_scales,
-        "and it publishes one tensor, so the Encode-only second destination \
-         must stay empty"
-    );
-}
-
-#[test]
-fn a_transform_reading_a_host_scratch_buffer_is_not_offered() {
-    // THE LIMIT THIS TEST FOUND, and it is a property of the design rather
-    // than of the fixture.
-    //
-    // Delegation needs every operand to be a span of the arena, because the
-    // backing is handed offsets and nothing else. The re-encode in this
-    // fixture reads what the dequantizing `Scale` wrote, and the compiler
-    // gives that intermediate a buffer with no `persistent_offset` — it is
-    // scratch, materialized on the host, because nothing outside the load
-    // ever names it.
-    //
-    // So an `Encode` whose input is an internal tensor cannot be delegated as
-    // things stand, and the runtime-quantization path is exactly that shape:
-    // read a checkpoint weight, decode it, re-encode the result. What CAN be
-    // delegated today is a transform over tensors the plan keeps — which is
-    // the `Cast` and `Scale` case the CUDA arena claims.
-    //
-    // Closing this means giving the plan a way to place a transform's
-    // intermediate in the arena when the backing could run both halves there.
-    // That is a compiler change and not a backing's, which is why it is
-    // written down here rather than worked around in `DeviceArena`.
-    let arena = run(TILE_MAP_SCALE | TILE_MAP_ENCODE);
-    let scratch_bound: Vec<_> = arena
+fn an_encode_offer_carries_both_destinations_and_its_shape() {
+    let arena = run(true);
+    let encode = arena
         .offers
         .iter()
-        .filter(|o| o.kind == TileMapKind::Encode)
-        .collect();
+        .find(|o| o.kernel == CUDA_QUANTIZE_BF16_TO_FP8)
+        .expect("the fixture's re-encode is delegable and must be offered");
     assert!(
-        scratch_bound.is_empty(),
-        "an Encode reading host scratch cannot be addressed in arena offsets, \
-         so offering it would hand the backing a span that is not there: {:?}",
-        scratch_bound
+        encode.has_dst_scales,
+        "an FP8 encode publishes a scale tensor beside its payload"
     );
-}
-
-#[test]
-fn declining_leaves_the_host_to_produce_the_same_bytes() {
-    // The property the whole design rests on: a backing is a ROUTE, not a
-    // second implementation. An arena whose backing ran nothing must end up
-    // holding what an arena that was never asked holds.
-    let declining = run(TILE_MAP_SCALE | TILE_MAP_ENCODE);
-    let never_asked = run(0);
+    assert!(
+        !encode.has_factors,
+        "and it READS no factors; `factors` is the blocked-Scale operand, and \
+         a row that reads what it should write is the confusion the shrunken \
+         `TileMapOp` exists to prevent"
+    );
     assert_eq!(
-        declining.bytes, never_asked.bytes,
-        "a declined transform must fall back to the identical host path"
+        encode.shape,
+        Some((4, 32)),
+        "the row takes a 2-D extent, read from the tensor's declaration and \
+         not recomputed from the extent's dims"
     );
 }
 
+/// A backing that cannot run what it was offered FAILS the load.
+///
+/// This replaces `declining_leaves_the_host_to_produce_the_same_bytes`, and
+/// the replacement is the point of the change rather than a casualty of it.
+/// The old property was that a backing could hand an op back and the host
+/// would quietly produce the bytes — correct, and unobservable: the load
+/// finished, the bytes were right, and a transform the device was supposed to
+/// run had gone to the host at a fraction of the speed. Nothing anywhere
+/// reported it.
+///
+/// An op reaches a backing only because the compiler named a row for it. A
+/// backing that then cannot run it is a backing that disagrees with the plan
+/// it is executing, and that is drift between two halves of one tree.
+#[test]
+fn a_backing_that_cannot_run_its_offer_fails_the_load() {
+    let refusing = run(true);
+    assert!(
+        !refusing.offers.is_empty(),
+        "nothing was offered, so this test is about nothing"
+    );
+    let err = refusing
+        .outcome
+        .as_ref()
+        .expect_err("a refused kernel must not be silently rerun on the host");
+    assert!(
+        err.contains("launches nothing"),
+        "the backing's own refusal must reach the caller, not be replaced by \
+         a later failure: {err}"
+    );
+}
+
+/// The host still produces the whole load when no backing helps.
+///
+/// The property the whole design rests on: a backing is a ROUTE, not a second
+/// implementation. `run(false)` is the reference — every transform on the host
+/// path — and it must be a complete, correct load rather than the thing that
+/// happens when delegation is unavailable.
+#[test]
+fn the_host_path_alone_completes_the_load() {
+    let host_only = run(false);
+    assert_eq!(host_only.outcome, Ok(()));
+    let again = run(false);
+    assert_eq!(
+        host_only.bytes, again.bytes,
+        "and it is deterministic, which is what makes it an oracle"
+    );
+}
+
+/// Every kernel symbol the plan names, for the fixture's target.
+fn named_kernels(plan: &LoadPlan) -> Vec<String> {
+    plan.instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::TileMap { transform, .. } => transform.kernel.clone(),
+            _ => None,
+        })
+        .collect()
+}
+
+// ── The arena is released either way
+
+/// A load that completes says so, once.
+///
+/// `.wiki/fix/weight-loader.md` §8.1: release belongs to the seam, not to the
+/// caller. Before it did, `driver-cuda/src/weights/stage.rs` called
+/// `arena.finish()?` itself after `run()?` returned — which is the same
+/// sentence with a `?` in the middle of it, and the `?` is the bug. Every
+/// caller had to remember, and on the path where it mattered most none of
+/// them could: `run()` returning `Err` skipped the line.
+#[test]
+fn a_completed_load_finishes_the_arena_exactly_once() {
+    let recording = run(false);
+    assert_eq!(recording.outcome, Ok(()));
+    assert_eq!(
+        recording.finished, 1,
+        "the executor owes the backing exactly one `finish` on the path where \
+         the bytes are all there"
+    );
+}
+
+/// A load that fails does not.
+///
+/// This is the half that reads backwards, so it is worth being explicit about
+/// what it means. `finish` is "the arena is complete, publish it" — a failed
+/// load has nothing to publish, and calling it would hand the driver a
+/// half-written arena that reported success. What must happen instead is
+/// RELEASE, and release is `Drop`, which is why §8.1 added one to `CudaArena`
+/// rather than making the executor call `finish` on both paths.
+///
+/// The device half of that — that the freed allocation was not still in use —
+/// is what §11 wants `compute-sanitizer` for, and it is the one check in this
+/// file that needs a GPU. What is checkable here is the seam's side of the
+/// contract: the executor does not claim completion for a load that failed.
+#[test]
+fn a_failed_load_does_not_finish_the_arena() {
+    let refused = run(true);
+    assert!(refused.outcome.is_err(), "the fixture's backing refuses");
+    assert_eq!(
+        refused.finished, 0,
+        "a load that stopped part-way has no complete arena to hand over; \
+         releasing it is `Drop`'s job, not `finish`'s"
+    );
+}
+
+// ── The same arena, in pieces
+
+/// A chunk backed by a host allocation, standing in for a device buffer.
+///
+/// `driver-metal` passes its `Allocation`s, whose `base` is an `MTLBuffer`'s
+/// `contents()`. A `Box<[u8]>` has the property that matters — a stable,
+/// uniquely-owned, host-addressable span — so the arithmetic under test is
+/// the same arithmetic.
+struct HostChunk(Box<[u8]>);
+
+// SAFETY: each `HostChunk` owns its box, so no two overlap, and the box lives
+// as long as the `HostChunk` that is holding it.
+unsafe impl Chunk for HostChunk {
+    fn base(&self) -> NonNull<u8> {
+        NonNull::new(self.0.as_ptr().cast_mut()).expect("a box is never null")
+    }
+    fn len(&self) -> u64 {
+        self.0.len() as u64
+    }
+}
+
+/// Execute the fixture into an arena cut into `pieces` allocations.
+fn run_chunked(pieces: &[usize]) -> Vec<u8> {
+    let plan = plan();
+    let total = usize::try_from(plan.memory.persistent_bytes).expect("fits");
+    assert_eq!(
+        pieces.iter().sum::<usize>(),
+        total,
+        "the pieces must cover the arena the plan asked for"
+    );
+    let chunks: Vec<HostChunk> = pieces
+        .iter()
+        .map(|&n| HostChunk(vec![0u8; n].into_boxed_slice()))
+        .collect();
+    // One more cut than there are chunks: every chunk's start, then the total.
+    let mut cuts = vec![0u64];
+    for &n in pieces {
+        cuts.push(cuts.last().expect("seeded") + n as u64);
+    }
+
+    let mut arena = Chunked::new(&chunks, &cuts).expect("a covering set of cuts");
+    let mut sink = MemorySink::default();
+    let dir = checkpoint();
+    let outcome = Execution::new(&plan, &dir)
+        .arena(&mut arena)
+        .sink(&mut sink)
+        .run()
+        .map(|_| ());
+    std::fs::remove_dir_all(&dir).ok();
+    outcome.expect("a segmented arena runs the same plan");
+
+    chunks.iter().flat_map(|c| c.0.iter().copied()).collect()
+}
+
+/// A segmented arena holds what a flat one holds.
+///
+/// §11's last row, and the reason [`Chunked`] moved out of `driver-metal`:
+/// once the chunk arithmetic is an [`ArenaBacking`] over a plain trait, it is
+/// checkable against the flat backing with no GPU in the build. The plan does
+/// not change, the bytes do not change, and the only thing that differs is how
+/// many allocations the address space is spread over.
+///
+/// The cuts are deliberately awkward. Metal's real ones fall on tensor
+/// boundaries at 4 GiB, but a cut chosen to land where nothing crosses it is
+/// a cut that proves nothing — the split at `total / 2` is picked to fall in
+/// the middle of the fixture's writes, which is the case the arithmetic
+/// exists for.
+#[test]
+fn a_segmented_arena_lands_the_same_bytes_as_a_flat_one() {
+    let flat = run(false);
+    assert_eq!(flat.outcome, Ok(()));
+    let total = flat.bytes.len();
+
+    for pieces in [
+        vec![total],
+        vec![total / 2, total - total / 2],
+        vec![1, total - 1],
+        vec![total - 1, 1],
+        vec![total / 4, total / 4, total - 2 * (total / 4)],
+    ] {
+        assert_eq!(
+            run_chunked(&pieces),
+            flat.bytes,
+            "an arena in {} piece(s) {pieces:?} disagreed with the flat one",
+            pieces.len()
+        );
+    }
+}
+
+/// A cut in the middle of a write is a write that is split.
+///
+/// The differential above would still pass if every one of the fixture's
+/// accesses happened to sit inside one chunk: the arithmetic would never be
+/// exercised and the test would be measuring nothing, which is the failure
+/// this whole file was rewritten out of. So state the premise separately —
+/// with a cut at `total / 2` at least one access must cross it.
+#[test]
+fn the_fixture_actually_writes_across_a_cut() {
+    let plan = plan();
+    let total = usize::try_from(plan.memory.persistent_bytes).expect("fits");
+    let cut = (total / 2) as u64;
+    let crosses = plan.buffers.iter().any(|buffer| {
+        buffer
+            .persistent_offset
+            .is_some_and(|at| at < cut && at + buffer.bytes > cut)
+    });
+    assert!(
+        crosses,
+        "no buffer in the fixture spans the cut at {cut}, so the chunked \
+         differential is comparing arithmetic that never ran"
+    );
+}

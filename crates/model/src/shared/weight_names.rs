@@ -73,8 +73,7 @@ impl<'a> Wiring<'a> {
 
     /// Has `trace` already been answered?
     fn named(&self, trace: &str) -> bool {
-        self.aliases.iter().any(|(t, _)| t == trace)
-            || self.joins.iter().any(|(t, _)| t == trace)
+        self.aliases.iter().any(|(t, _)| t == trace) || self.joins.iter().any(|(t, _)| t == trace)
     }
 
     /// Record `trace` as the concatenation of `parts`, if all exist.
@@ -124,8 +123,14 @@ fn llama_like(w: &mut Wiring<'_>) {
         // the GEMM wants — so the trace name is a RENAME, where the
         // driver used to read three tensors back off the device and
         // upload their concatenation.
-        w.alias(format!("layer.{i}.qkv"), n("self_attn.qkv_proj.fused.weight"));
-        w.alias(format!("layer.{i}.gate_up"), n("mlp.gate_up_proj.fused.weight"));
+        w.alias(
+            format!("layer.{i}.qkv"),
+            n("self_attn.qkv_proj.fused.weight"),
+        );
+        w.alias(
+            format!("layer.{i}.gate_up"),
+            n("mlp.gate_up_proj.fused.weight"),
+        );
         // Some checkpoints ship the fused projections ALREADY (phi3's
         // `qkv_proj` and `gate_up_proj`), in the same concatenation order
         // the fuse above builds. Those want an alias, not a copy -- and
@@ -136,17 +141,20 @@ fn llama_like(w: &mut Wiring<'_>) {
         // …and the third case: the parts abut in the arena but were never
         // given a joined name. See `name_contiguous_join`.
         if !w.named(&format!("layer.{i}.qkv")) {
-            w.join(format!("layer.{i}.qkv"), &[
-                n("self_attn.q_proj.weight"),
-                n("self_attn.k_proj.weight"),
-                n("self_attn.v_proj.weight"),
-            ]);
+            w.join(
+                format!("layer.{i}.qkv"),
+                &[
+                    n("self_attn.q_proj.weight"),
+                    n("self_attn.k_proj.weight"),
+                    n("self_attn.v_proj.weight"),
+                ],
+            );
         }
         if !w.named(&format!("layer.{i}.gate_up")) {
-            w.join(format!("layer.{i}.gate_up"), &[
-                n("mlp.gate_proj.weight"),
-                n("mlp.up_proj.weight"),
-            ]);
+            w.join(
+                format!("layer.{i}.gate_up"),
+                &[n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")],
+            );
         }
         // THREE placements, and the discriminant is not what it looks
         // like. `input_layernorm`'s presence tells pre-norm from post-norm
@@ -173,15 +181,33 @@ fn llama_like(w: &mut Wiring<'_>) {
         //              the bind_olmo3 convention the A/B verified)
         if w.has(&n("pre_feedforward_layernorm.weight")) {
             w.alias(format!("layer.{i}.attn_norm"), n("input_layernorm.weight"));
-            w.alias(format!("layer.{i}.post_attn_norm"), n("post_attention_layernorm.weight"));
-            w.alias(format!("layer.{i}.mlp_norm"), n("pre_feedforward_layernorm.weight"));
-            w.alias(format!("layer.{i}.post_mlp_norm"), n("post_feedforward_layernorm.weight"));
+            w.alias(
+                format!("layer.{i}.post_attn_norm"),
+                n("post_attention_layernorm.weight"),
+            );
+            w.alias(
+                format!("layer.{i}.mlp_norm"),
+                n("pre_feedforward_layernorm.weight"),
+            );
+            w.alias(
+                format!("layer.{i}.post_mlp_norm"),
+                n("post_feedforward_layernorm.weight"),
+            );
         } else if w.has(&n("input_layernorm.weight")) {
             w.alias(format!("layer.{i}.attn_norm"), n("input_layernorm.weight"));
-            w.alias(format!("layer.{i}.mlp_norm"), n("post_attention_layernorm.weight"));
+            w.alias(
+                format!("layer.{i}.mlp_norm"),
+                n("post_attention_layernorm.weight"),
+            );
         } else {
-            w.alias(format!("layer.{i}.attn_norm"), n("post_attention_layernorm.weight"));
-            w.alias(format!("layer.{i}.mlp_norm"), n("post_feedforward_layernorm.weight"));
+            w.alias(
+                format!("layer.{i}.attn_norm"),
+                n("post_attention_layernorm.weight"),
+            );
+            w.alias(
+                format!("layer.{i}.mlp_norm"),
+                n("post_feedforward_layernorm.weight"),
+            );
         }
         for (trace, ckpt) in [
             ("q_norm", "self_attn.q_norm.weight"),
@@ -198,7 +224,6 @@ fn llama_like(w: &mut Wiring<'_>) {
             w.alias(format!("layer.{i}.{trace}"), n(ckpt));
         }
     }
-
 }
 
 /// Build the gpt-oss trace names that [`llama_like`] does not reach.
@@ -250,13 +275,25 @@ fn gpt_oss(w: &mut Wiring<'_>) {
         let gate_up = format!("layer.{i}.expert_gate_up_bank");
         let experts = n("mlp.experts");
         w.alias(gate_up.clone(), format!("{experts}.gate_up_proj.weight"));
-        w.alias(format!("{gate_up}_scales"), format!("{experts}.gate_up_proj.weight_scale"));
-        w.alias(format!("{gate_up}_gate_bias"), format!("{experts}.gate_proj.bias"));
-        w.alias(format!("{gate_up}_up_bias"), format!("{experts}.up_proj.bias"));
+        w.alias(
+            format!("{gate_up}_scales"),
+            format!("{experts}.gate_up_proj.weight_scale"),
+        );
+        w.alias(
+            format!("{gate_up}_gate_bias"),
+            format!("{experts}.gate_proj.bias"),
+        );
+        w.alias(
+            format!("{gate_up}_up_bias"),
+            format!("{experts}.up_proj.bias"),
+        );
 
         let down = format!("layer.{i}.expert_down_bank");
         w.alias(down.clone(), format!("{experts}.down_proj.weight"));
-        w.alias(format!("{down}_scales"), format!("{experts}.down_proj.weight_scale"));
+        w.alias(
+            format!("{down}_scales"),
+            format!("{experts}.down_proj.weight_scale"),
+        );
         w.alias(format!("{down}_bias"), format!("{experts}.down_proj.bias"));
     }
 }
@@ -278,33 +315,65 @@ fn gemma4(w: &mut Wiring<'_>) {
         return; // the PLE table IS the family's signature
     }
     w.alias("embed".into(), format!("{p}.embed_tokens.weight"));
-    w.alias("embed_per_layer".into(), format!("{p}.embed_tokens_per_layer.weight"));
-    w.alias("ple_model_proj".into(), format!("{p}.per_layer_model_projection.weight"));
-    w.alias("ple_model_norm".into(), format!("{p}.per_layer_projection_norm.weight"));
+    w.alias(
+        "embed_per_layer".into(),
+        format!("{p}.embed_tokens_per_layer.weight"),
+    );
+    w.alias(
+        "ple_model_proj".into(),
+        format!("{p}.per_layer_model_projection.weight"),
+    );
+    w.alias(
+        "ple_model_norm".into(),
+        format!("{p}.per_layer_projection_norm.weight"),
+    );
     w.alias("final_norm".into(), format!("{p}.norm.weight"));
     let layers = w.shape.layers as usize;
-    let first_shared =
-        layers.saturating_sub(w.shape.kv_shared_layers as usize);
+    let first_shared = layers.saturating_sub(w.shape.kv_shared_layers as usize);
     for i in 0..layers {
         let n = |sfx: &str| format!("{p}.layers.{i}.{sfx}");
         w.alias(format!("layer.{i}.attn_norm"), n("input_layernorm.weight"));
-        w.alias(format!("layer.{i}.post_attn_norm"), n("post_attention_layernorm.weight"));
-        w.alias(format!("layer.{i}.pre_ffw_norm"), n("pre_feedforward_layernorm.weight"));
-        w.alias(format!("layer.{i}.post_ffw_norm"), n("post_feedforward_layernorm.weight"));
+        w.alias(
+            format!("layer.{i}.post_attn_norm"),
+            n("post_attention_layernorm.weight"),
+        );
+        w.alias(
+            format!("layer.{i}.pre_ffw_norm"),
+            n("pre_feedforward_layernorm.weight"),
+        );
+        w.alias(
+            format!("layer.{i}.post_ffw_norm"),
+            n("post_feedforward_layernorm.weight"),
+        );
         w.alias(format!("layer.{i}.q_norm"), n("self_attn.q_norm.weight"));
         w.alias(format!("layer.{i}.o_proj"), n("self_attn.o_proj.weight"));
         w.alias(format!("layer.{i}.down"), n("mlp.down_proj.weight"));
-        w.alias(format!("layer.{i}.ple_gate"), n("per_layer_input_gate.weight"));
-        w.alias(format!("layer.{i}.ple_proj"), n("per_layer_projection.weight"));
-        w.alias(format!("layer.{i}.ple_norm"), n("post_per_layer_input_norm.weight"));
+        w.alias(
+            format!("layer.{i}.ple_gate"),
+            n("per_layer_input_gate.weight"),
+        );
+        w.alias(
+            format!("layer.{i}.ple_proj"),
+            n("per_layer_projection.weight"),
+        );
+        w.alias(
+            format!("layer.{i}.ple_norm"),
+            n("post_per_layer_input_norm.weight"),
+        );
         if i >= first_shared {
             // A KV-shared layer states only the Q leg.
             w.alias(format!("layer.{i}.q_proj"), n("self_attn.q_proj.weight"));
         } else {
             w.alias(format!("layer.{i}.k_norm"), n("self_attn.k_norm.weight"));
-            w.alias(format!("layer.{i}.qkv"), n("self_attn.qkv_proj.fused.weight"));
+            w.alias(
+                format!("layer.{i}.qkv"),
+                n("self_attn.qkv_proj.fused.weight"),
+            );
         }
-        w.alias(format!("layer.{i}.gate_up"), n("mlp.gate_up_proj.fused.weight"));
+        w.alias(
+            format!("layer.{i}.gate_up"),
+            n("mlp.gate_up_proj.fused.weight"),
+        );
         // The per-layer `layer_scalar` [1] tensors the fused sandwich norm
         // multiplies the whole stream by. NAMED here and READ by the caller:
         // a host read of a device tensor is the driver's business, and which
@@ -327,7 +396,10 @@ fn qwen3_5(w: &mut Wiring<'_>) {
     for i in 0..layers {
         let n = |sfx: &str| format!("{p}.layers.{i}.{sfx}");
         w.alias(format!("layer.{i}.attn_norm"), n("input_layernorm.weight"));
-        w.alias(format!("layer.{i}.mlp_norm"), n("post_attention_layernorm.weight"));
+        w.alias(
+            format!("layer.{i}.mlp_norm"),
+            n("post_attention_layernorm.weight"),
+        );
         w.alias(format!("layer.{i}.down"), n("mlp.down_proj.weight"));
         // FULL ATTENTION OR LINEAR, asked of the checkpoint.
         //
@@ -339,25 +411,36 @@ fn qwen3_5(w: &mut Wiring<'_>) {
         let full = w.has(&n("self_attn.q_proj.weight"));
         if full {
             for f in ["q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm"] {
-                w.alias(format!("layer.{i}.{f}"), n(&format!("self_attn.{f}.weight")));
+                w.alias(
+                    format!("layer.{i}.{f}"),
+                    n(&format!("self_attn.{f}.weight")),
+                );
             }
         } else {
             for f in ["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b"] {
-                w.alias(format!("layer.{i}.{f}"), n(&format!("linear_attn.{f}.weight")));
+                w.alias(
+                    format!("layer.{i}.{f}"),
+                    n(&format!("linear_attn.{f}.weight")),
+                );
             }
             w.alias(format!("layer.{i}.conv"), n("linear_attn.conv1d.weight"));
             w.alias(format!("layer.{i}.conv_bias"), n("linear_attn.conv1d.bias"));
             w.alias(format!("layer.{i}.a_log"), n("linear_attn.A_log"));
             w.alias(format!("layer.{i}.dt_bias"), n("linear_attn.dt_bias"));
             w.alias(format!("layer.{i}.gate_norm"), n("linear_attn.norm.weight"));
-            w.alias(format!("layer.{i}.o_proj"), n("linear_attn.out_proj.weight"));
+            w.alias(
+                format!("layer.{i}.o_proj"),
+                n("linear_attn.out_proj.weight"),
+            );
         }
         // The fused gate‖up bank, gate first — the dense MLP's binding,
         // laid out by the plan.
-        w.alias(format!("layer.{i}.gate_up"), n("mlp.gate_up_proj.fused.weight"));
+        w.alias(
+            format!("layer.{i}.gate_up"),
+            n("mlp.gate_up_proj.fused.weight"),
+        );
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -370,7 +453,10 @@ mod tests {
             published.iter().map(|s| (*s).to_string()).collect();
         let has = |n: &str| set.contains(n);
         let w = wire(shape, &has);
-        w.aliases.iter().find(|(t, _)| t == trace).map(|(_, c)| c.clone())
+        w.aliases
+            .iter()
+            .find(|(t, _)| t == trace)
+            .map(|(_, c)| c.clone())
     }
 
     fn base() -> Vec<&'static str> {
@@ -407,7 +493,10 @@ mod tests {
             "model.layers.0.post_feedforward_layernorm.weight",
         ]);
         let at = |t: &str| bound(&p, t);
-        assert_eq!(at("layer.0.attn_norm").as_deref(), Some("model.layers.0.input_layernorm.weight"));
+        assert_eq!(
+            at("layer.0.attn_norm").as_deref(),
+            Some("model.layers.0.input_layernorm.weight")
+        );
         assert_eq!(
             at("layer.0.post_attn_norm").as_deref(),
             Some("model.layers.0.post_attention_layernorm.weight")

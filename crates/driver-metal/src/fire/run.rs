@@ -19,13 +19,13 @@
 //! frame's device half and they belong with the module that owns the buffers —
 //! this one owns only the arena, which is the lowering's own number.
 
-use crate::error::Result;
 use crate::bind::encode::{Params, Pipelines, encode};
 use crate::device::{Allocation, ArgumentTable, Context, Stepper, Timing};
-use crate::program::Compiler;
+use crate::error::Result;
 use crate::layout::region::Region as _;
 use crate::lowering::dispatch::{Dispatch, Geometry, Undispatchable, plan, table, table_width};
 use crate::lowering::executor::{Frame, Resolver, Slice};
+use crate::program::Compiler;
 use model_compiler::lower::Lowered;
 
 /// One fire's device state: the arena, the scalars, the pipelines, the table.
@@ -62,7 +62,11 @@ pub struct Prepared {
 /// # Errors
 ///
 /// The arena allocation, the scalar staging, or the table.
-pub fn prepare(context: &Context, lowered: &Lowered, dispatches: &[Dispatch<'_>]) -> Result<Prepared> {
+pub fn prepare(
+    context: &Context,
+    lowered: &Lowered,
+    dispatches: &[Dispatch<'_>],
+) -> Result<Prepared> {
     // `.max(1)`: a fire whose values all live in named buffers needs no arena,
     // and a zero-length allocation has no address to bind.
     let arena = Allocation::new(
@@ -256,8 +260,6 @@ pub struct Machine<'c, 's> {
     pub recordings: Option<&'c mut crate::fire::Recordings>,
 }
 
-
-
 /// Plan, encode and COMMIT one fire, without waiting for it.
 ///
 /// [`run`] and [`run_keeping_arena`] wrap this and end in a wait, so those
@@ -368,8 +370,12 @@ pub fn submit<R: Resolver>(
         }
     };
     let value = match recorded {
-        Some((icb, commands)) => stepper.submit(|encoder| encoder.execute_commands(&icb, 0..commands))?,
-        None => stepper.submit(|encoder| encode(encoder, &table, pipelines, &params, &dispatches))?,
+        Some((icb, commands)) => {
+            stepper.submit(|encoder| encoder.execute_commands(&icb, 0..commands))?
+        }
+        None => {
+            stepper.submit(|encoder| encode(encoder, &table, pipelines, &params, &dispatches))?
+        }
     };
     Ok(InFlight {
         value,

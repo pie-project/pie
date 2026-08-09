@@ -20,10 +20,10 @@
 use std::marker::PhantomData;
 
 use cudarc::runtime::sys::{
-    cudaEvent_t, cudaEventCreateWithFlags, cudaEventDestroy, cudaEventDisableTiming,
-    cudaEventElapsedTime, cudaEventQuery, cudaEventRecord, cudaEventSynchronize, cudaError,
-    cudaStreamCreateWithPriority, cudaStreamDestroy, cudaStreamNonBlocking, cudaStreamQuery,
-    cudaLaunchHostFunc, cudaStreamSynchronize, cudaStreamWaitEvent, cudaStream_t,
+    cudaError, cudaEvent_t, cudaEventCreateWithFlags, cudaEventDestroy, cudaEventDisableTiming,
+    cudaEventElapsedTime, cudaEventQuery, cudaEventRecord, cudaEventSynchronize,
+    cudaLaunchHostFunc, cudaStream_t, cudaStreamCreateWithPriority, cudaStreamDestroy,
+    cudaStreamNonBlocking, cudaStreamQuery, cudaStreamSynchronize, cudaStreamWaitEvent,
 };
 
 use crate::error::{Result, check_rt, ignore_in_drop};
@@ -60,7 +60,10 @@ impl<'a> StreamRef<'a> {
     /// `unsafe fn` in the module: everything downstream takes a `StreamRef`
     /// and is safe because this call was made correctly once.
     pub const unsafe fn from_raw(raw: cudaStream_t) -> Self {
-        Self { raw, _owner: PhantomData }
+        Self {
+            raw,
+            _owner: PhantomData,
+        }
     }
 
     /// The default (`NULL`) stream.
@@ -69,7 +72,10 @@ impl<'a> StreamRef<'a> {
     /// anything that could hold it. The C++ `DeviceBuffer` uses exactly this
     /// stream for every copy it makes.
     pub const fn null() -> StreamRef<'static> {
-        StreamRef { raw: std::ptr::null_mut(), _owner: PhantomData }
+        StreamRef {
+            raw: std::ptr::null_mut(),
+            _owner: PhantomData,
+        }
     }
 
     /// The raw handle, for a launcher's last argument.
@@ -83,7 +89,10 @@ impl<'a> StreamRef<'a> {
     /// Illegal while a capture is open on this stream, which is why it is not
     /// reachable from inside a [`crate::device::CaptureScope`].
     pub fn synchronize(self) -> Result<()> {
-        check_rt(unsafe { cudaStreamSynchronize(self.raw) }, "cudaStreamSynchronize")
+        check_rt(
+            unsafe { cudaStreamSynchronize(self.raw) },
+            "cudaStreamSynchronize",
+        )
     }
 
     /// Has everything submitted so far finished? Does not block.
@@ -91,7 +100,10 @@ impl<'a> StreamRef<'a> {
         match unsafe { cudaStreamQuery(self.raw) } {
             cudaError::cudaSuccess => Ok(true),
             cudaError::cudaErrorNotReady => Ok(false),
-            code => Err(crate::Error::Runtime { call: "cudaStreamQuery", code }),
+            code => Err(crate::Error::Runtime {
+                call: "cudaStreamQuery",
+                code,
+            }),
         }
     }
 
@@ -132,7 +144,10 @@ impl<'a> StreamRef<'a> {
 
     /// Record `event` at this point in this stream's order.
     pub fn record(self, event: &Event) -> Result<()> {
-        check_rt(unsafe { cudaEventRecord(event.raw, self.raw) }, "cudaEventRecord")
+        check_rt(
+            unsafe { cudaEventRecord(event.raw, self.raw) },
+            "cudaEventRecord",
+        )
     }
 }
 
@@ -166,7 +181,10 @@ impl OwnedStream {
 
     /// Borrow this stream. The returned reference cannot outlive `self`.
     pub fn as_ref(&self) -> StreamRef<'_> {
-        StreamRef { raw: self.raw, _owner: PhantomData }
+        StreamRef {
+            raw: self.raw,
+            _owner: PhantomData,
+        }
     }
 
     /// Give up ownership, returning the raw handle.
@@ -232,7 +250,10 @@ impl Event {
 
     /// Block until this event has been reached.
     pub fn synchronize(&self) -> Result<()> {
-        check_rt(unsafe { cudaEventSynchronize(self.raw) }, "cudaEventSynchronize")
+        check_rt(
+            unsafe { cudaEventSynchronize(self.raw) },
+            "cudaEventSynchronize",
+        )
     }
 
     /// Has this event been reached? Does not block.
@@ -240,7 +261,10 @@ impl Event {
         match unsafe { cudaEventQuery(self.raw) } {
             cudaError::cudaSuccess => Ok(true),
             cudaError::cudaErrorNotReady => Ok(false),
-            code => Err(crate::Error::Runtime { call: "cudaEventQuery", code }),
+            code => Err(crate::Error::Runtime {
+                call: "cudaEventQuery",
+                code,
+            }),
         }
     }
 
@@ -310,8 +334,14 @@ mod tests {
         // `cudaEventElapsedTime` is reached. `ManuallyDrop` for the same
         // reason -- these are not real events, so their destructors must not
         // reach `cudaEventDestroy` either.
-        let a = std::mem::ManuallyDrop::new(Event { raw: std::ptr::null_mut(), timing: false });
-        let b = std::mem::ManuallyDrop::new(Event { raw: std::ptr::null_mut(), timing: true });
+        let a = std::mem::ManuallyDrop::new(Event {
+            raw: std::ptr::null_mut(),
+            timing: false,
+        });
+        let b = std::mem::ManuallyDrop::new(Event {
+            raw: std::ptr::null_mut(),
+            timing: true,
+        });
         let err = a.elapsed_ms(&b).unwrap_err();
         assert_eq!(err.call(), "cudaEventElapsedTime");
     }
@@ -345,8 +375,14 @@ impl PinnedBuf {
     pub fn new(len: usize) -> Result<Self> {
         use cudarc::runtime::sys::cudaMallocHost;
         let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
-        check_rt(unsafe { cudaMallocHost(&mut p, len.max(1)) }, "cudaMallocHost")?;
-        Ok(Self { ptr: p.cast::<u8>(), len })
+        check_rt(
+            unsafe { cudaMallocHost(&mut p, len.max(1)) },
+            "cudaMallocHost",
+        )?;
+        Ok(Self {
+            ptr: p.cast::<u8>(),
+            len,
+        })
     }
 
     /// How many bytes are pinned.

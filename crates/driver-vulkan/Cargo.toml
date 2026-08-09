@@ -1,0 +1,97 @@
+[package]
+name = "driver-vulkan"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "The Vulkan execution shell, in Rust: instance and device objects, descriptor sets, SPIR-V pipelines and command recording. Grows beside driver-metal, sharing its launch vocabulary."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+publish = false
+
+[lib]
+name = "driver_vulkan"
+path = "src/lib.rs"
+
+# NOT `[lints] workspace = true`, for the reason `driver-metal/Cargo.toml`
+# gives: that table sets `unsafe_code = "forbid"`, and every `ash` entry point
+# is unsafe by construction. The rest of it -- `missing_docs`, the clippy
+# ratchets -- is worth having and is set in `lib.rs`, where `unsafe_code` can be
+# left out of the list rather than forbidden and then overruled.
+
+[features]
+# No default, for the reason `driver-metal/Cargo.toml` states at length: a
+# default has to be turned OFF to reach the portable half, and a check that can
+# be skipped will be.
+#
+# The split is NOT the same one, though, and the difference is worth stating
+# because it changes what each half is for. `driver-metal` splits on what a
+# COMPILER will accept -- no Linux box can build an `objc2` message send -- so
+# its portable half exists to be buildable at all. Vulkan is a loader, not a
+# platform: every line of this crate compiles anywhere. `native` gates what
+# needs a GPU to be PRESENT, so the portable half here is about what can be
+# proved without one.
+default = []
+
+# The device half: `ash`, an instance, a queue, real pipelines.
+native = ["dep:ash"]
+
+[dependencies]
+# The launch vocabulary. `LaunchRule` is the same enum `driver-metal` matches
+# on, and that sharing is load-bearing rather than tidy: the two shells
+# disagree about the GRID and must not disagree about which rule a row names.
+kernels = { path = "../kernels" }
+
+# The Vulkan signature table, and the SPIR-V it builds. `default-features =
+# false` keeps this to the table -- host-portable, no `glslc` -- and the
+# `native` feature does not turn the shader build on here either, because a
+# driver consumes modules rather than producing them.
+kernels-vulkan = { path = "../kernels-vulkan", default-features = false }
+
+# The plan a driver executes: `Lowered`, `Launch`, `Arg`. `src/binding.rs`
+# turns those into descriptor ranges, so this is a real dependency and not a
+# testing one -- the same shape `driver-metal` has, for the same reason.
+model-compiler = { path = "../model-compiler" }
+
+ash = { version = "0.38", default-features = false, features = [
+    "loaded",
+    "std",
+], optional = true }
+
+[dev-dependencies]
+# `tests/arena.rs` only: a real model to lower, so the offsets under test are
+# the ones a compiler actually assigns rather than ones a test invented.
+model = { path = "../model", default-features = false, features = ["forward"] }
+
+# `tests/pure.rs` only: reading what `cargo metadata` says the resolver did,
+# so that "this crate is pure Rust" is asked of the closure rather than of a
+# reading of the manifests.
+serde_json = "1.0"
+
+# The device tests read the modules `kernels-vulkan` compiles, so the test
+# build is the one that needs `glslc`.
+kernels-vulkan = { path = "../kernels-vulkan", default-features = false, features = [
+    "native",
+] }
+
+# The device tests need a GPU to be present, so they are the one target the
+# `native` feature gates.
+[[test]]
+name = "device"
+required-features = ["native"]
+
+# The rule cross-check reads `.spv` FILES. That needs `glslc` to have run, and
+# it does not need a GPU -- so it is not gated on `native`, and a machine with
+# no Vulkan device at all still gets the check that carries the defects.
+[[test]]
+name = "rules"
+
+# GPU-free: it lowers a text and looks at byte offsets. Not gated on `native`,
+# so the machines that change a placement are the ones that run it.
+[[test]]
+name = "arena"
+
+# Neither a GPU nor a shader compiler: it asks the resolver what this crate
+# depends on. Ungated on purpose -- the constraint it checks is about the
+# builds that DO NOT have a toolchain.
+[[test]]
+name = "pure"

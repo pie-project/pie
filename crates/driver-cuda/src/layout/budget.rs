@@ -7,7 +7,6 @@
 //! `store/memory_planner.hpp` and the `min_into` / `tp_min_plan` pair in
 //! `store/memory_planner.cpp`.
 
-
 /// Upper bounds on per-fire shapes.
 ///
 /// Sized once by the planner so persistent device buffers can be reserved
@@ -80,12 +79,13 @@ impl CudaMemoryPlan {
         self.max_workspace_tokens = self.max_workspace_tokens.min(src.max_workspace_tokens);
         self.max_requests = self.max_requests.min(src.max_requests);
         self.max_page_refs = self.max_page_refs.min(src.max_page_refs);
-        self.attn_float_workspace_bytes =
-            self.attn_float_workspace_bytes.max(src.attn_float_workspace_bytes);
-        self.runtime_quant_scratch_bytes =
-            self.runtime_quant_scratch_bytes.max(src.runtime_quant_scratch_bytes);
-        self.persistent_input_bytes =
-            self.persistent_input_bytes.max(src.persistent_input_bytes);
+        self.attn_float_workspace_bytes = self
+            .attn_float_workspace_bytes
+            .max(src.attn_float_workspace_bytes);
+        self.runtime_quant_scratch_bytes = self
+            .runtime_quant_scratch_bytes
+            .max(src.runtime_quant_scratch_bytes);
+        self.persistent_input_bytes = self.persistent_input_bytes.max(src.persistent_input_bytes);
 
         let (d, s) = (&mut self.capacity, &src.capacity);
         d.max_forward_tokens = d.max_forward_tokens.min(s.max_forward_tokens);
@@ -98,4 +98,3 @@ impl CudaMemoryPlan {
         d.max_logprob_labels = d.max_logprob_labels.min(s.max_logprob_labels);
     }
 }
-

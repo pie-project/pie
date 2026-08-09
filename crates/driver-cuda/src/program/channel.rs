@@ -136,7 +136,10 @@ impl Rings {
     pub fn new(alloc: &Allocator, shapes: &[ChannelShape], stream: StreamRef<'_>) -> Result<Self> {
         let count = shapes.len();
         if count == 0 {
-            return Err(Error::invalid("program::channel", "an instance with no channels"));
+            return Err(Error::invalid(
+                "program::channel",
+                "an instance with no channels",
+            ));
         }
 
         let mut offsets = Vec::with_capacity(count);
@@ -152,9 +155,9 @@ impl Rings {
                 ));
             }
             offsets.push(total);
-            total = total
-                .checked_add(cell * ring as usize)
-                .ok_or_else(|| Error::invalid("program::channel", "the rings do not fit in memory"))?;
+            total = total.checked_add(cell * ring as usize).ok_or_else(|| {
+                Error::invalid("program::channel", "the rings do not fit in memory")
+            })?;
         }
 
         // Zeroed, all five. A fresh allocation is not promised zero, and a
@@ -488,8 +491,6 @@ mod tests {
 // reads. Neither side stores anything in the padding bits of the last
 // byte, so the round trip is exact rather than merely lossless.
 
-
-
 /// Bytes one cell occupies in the HOST mirror, for `numel` lanes.
 ///
 /// The counterpart of [`native_cell_bytes`], and deliberately in the same
@@ -511,7 +512,11 @@ pub fn wire_cell_bytes(dtype: DType, numel: usize) -> usize {
 /// If `wire` is not exactly one wire cell. A short cell is not a smaller
 /// value — it is a value whose tail the caller would read out of whatever
 /// the allocation last held.
-pub fn wire_to_native(dtype: DType, numel: usize, wire: &[u8]) -> std::result::Result<Vec<u8>, String> {
+pub fn wire_to_native(
+    dtype: DType,
+    numel: usize,
+    wire: &[u8],
+) -> std::result::Result<Vec<u8>, String> {
     let want = wire_cell_bytes(dtype, numel);
     if wire.len() != want {
         return Err(format!(
@@ -538,7 +543,11 @@ pub fn wire_to_native(dtype: DType, numel: usize, wire: &[u8]) -> std::result::R
 /// # Errors
 ///
 /// If `native` is not exactly one native cell.
-pub fn native_to_wire(dtype: DType, numel: usize, native: &[u8]) -> std::result::Result<Vec<u8>, String> {
+pub fn native_to_wire(
+    dtype: DType,
+    numel: usize,
+    native: &[u8],
+) -> std::result::Result<Vec<u8>, String> {
     let want = native_cell_bytes(dtype, numel);
     if native.len() != want {
         return Err(format!(
@@ -603,7 +612,12 @@ impl HostChannel {
         cell_bytes: usize,
         ring: u32,
     ) -> Self {
-        Self { mirror: mirror.cast(), words: words.cast(), cell_bytes, ring }
+        Self {
+            mirror: mirror.cast(),
+            words: words.cast(),
+            cell_bytes,
+            ring,
+        }
     }
 
     fn word(&self, i: usize) -> u64 {
@@ -771,7 +785,11 @@ mod tests_2 {
     use driver::tensor_ir::op::tags;
 
     fn op(code: u8, channel: u32) -> LaunchOp {
-        LaunchOp { code: u16::from(code), channel, ..LaunchOp::default() }
+        LaunchOp {
+            code: u16::from(code),
+            channel,
+            ..LaunchOp::default()
+        }
     }
 
     /// A take consumes and a read does not, which is the distinction the

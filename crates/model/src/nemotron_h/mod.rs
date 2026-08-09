@@ -272,13 +272,22 @@ mod tests {
         let mut seen = std::collections::BTreeSet::new();
         for v in VARIANTS {
             assert!(!v.id.is_empty(), "a row with no name cannot be asked for");
-            assert!(seen.insert(v.id), "'{}' names two rows, and a lookup would pick one", v.id);
             assert!(
-                v.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                seen.insert(v.id),
+                "'{}' names two rows, and a lookup would pick one",
+                v.id
+            );
+            assert!(
+                v.id.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
                 "'{}' is not a name a URL or a CLI flag carries unescaped",
                 v.id
             );
-            assert!(v.id.starts_with("nemotron-h-"), "'{}' does not name its generation", v.id);
+            assert!(
+                v.id.starts_with("nemotron-h-"),
+                "'{}' does not name its generation",
+                v.id
+            );
         }
     }
 
@@ -288,14 +297,19 @@ mod tests {
         assert_eq!(rows().len(), VARIANTS.len());
         let ids: Vec<&str> = rows().iter().map(|r| r.id()).collect();
         let table: Vec<&str> = VARIANTS.iter().map(|v| v.id).collect();
-        assert_eq!(ids, table, "the widening must preserve order, not just count");
+        assert_eq!(
+            ids, table,
+            "the widening must preserve order, not just count"
+        );
     }
 
     /// Every row deploys, and its deployment is the row's own numbers.
     #[test]
     fn every_row_deploys_at_the_depth_it_states() {
         for v in VARIANTS {
-            let d = v.deployment(Deployed::single()).expect("both legs are traced");
+            let d = v
+                .deployment(Deployed::single())
+                .expect("both legs are traced");
             assert_eq!(d.layers, v.shape.layers());
             assert_eq!(d.attention.len() as u32, v.shape.layers());
             assert_eq!(d.norm_eps, NORM_EPS);
@@ -303,8 +317,14 @@ mod tests {
             assert!(d.attention.iter().all(|a| a.rope_theta == ROPE_THETA));
             assert_eq!(d.advertised.arch, ARCH);
             assert_eq!(d.advertised.max_model_len, 8192);
-            assert!(!d.advertised.media_encode, "no tower ships with this generation");
-            assert!(d.recurrent.is_some(), "a stack with scans carries recurrent state");
+            assert!(
+                !d.advertised.media_encode,
+                "no tower ships with this generation"
+            );
+            assert!(
+                d.recurrent.is_some(),
+                "a stack with scans carries recurrent state"
+            );
         }
     }
 
@@ -319,14 +339,22 @@ mod tests {
     fn one_family_label_covers_three_distinct_rows() {
         let labels: std::collections::BTreeSet<&str> = VARIANTS
             .iter()
-            .map(|v| v.deployment(Deployed::single()).expect("deploys").advertised.arch)
+            .map(|v| {
+                v.deployment(Deployed::single())
+                    .expect("deploys")
+                    .advertised
+                    .arch
+            })
             .collect();
         assert_eq!(labels.len(), 1, "one generation, one label");
         assert_eq!(labels.into_iter().next(), Some(ARCH));
 
         let ids: std::collections::BTreeSet<&str> = VARIANTS.iter().map(|v| v.id).collect();
         assert_eq!(ids.len(), VARIANTS.len(), "three ids");
-        assert!(ids.len() > 1, "the label cannot be the dispatch key it used to be");
+        assert!(
+            ids.len() > 1,
+            "the label cannot be the dispatch key it used to be"
+        );
 
         // The ceiling IS shared, and the const says so. All three
         // published checkpoints are the 8K releases — the name carries
@@ -334,9 +362,7 @@ mod tests {
         // and this assertion is what would catch a 128K variant being
         // added as a fourth row without one.
         assert!(
-            VARIANTS
-                .iter()
-                .all(|v| v.max_model_len == 8192),
+            VARIANTS.iter().all(|v| v.max_model_len == 8192),
             "a Nemotron-H row that is not an 8K release needs its own ceiling stated"
         );
     }
@@ -354,7 +380,9 @@ mod tests {
             let r = d.recurrent.expect("a hybrid carries recurrent state");
             assert_eq!(r.linear_layers, v.shape.mamba_layers());
             assert!(
-                r.linear_layers.iter().all(|&l| v.shape.kind(l) == NemotronLayerKind::Mamba),
+                r.linear_layers
+                    .iter()
+                    .all(|&l| v.shape.kind(l) == NemotronLayerKind::Mamba),
                 "'{}' provisioned a slab for a layer that does not scan",
                 v.id
             );
@@ -381,7 +409,11 @@ mod tests {
 
         for v in VARIANTS {
             let s = v.load_shape();
-            assert_eq!(s.mamba_groups, 8, "'{}' states a group count of its own", v.id);
+            assert_eq!(
+                s.mamba_groups, 8,
+                "'{}' states a group count of its own",
+                v.id
+            );
             assert_eq!(s.layers, v.shape.layers());
             assert_eq!(s.head_dim, v.shape.attn.head_dim);
             assert_eq!(s.n_experts, 0);
@@ -395,7 +427,12 @@ mod tests {
             let m = v.manifest();
             assert!(m.layers > 0, "'{}' claims a stack of no layers", v.id);
             let seen = implied(v);
-            assert!(m.check(&seen).is_ok(), "'{}': {}", v.id, m.check(&seen).unwrap_err());
+            assert!(
+                m.check(&seen).is_ok(),
+                "'{}': {}",
+                v.id,
+                m.check(&seen).unwrap_err()
+            );
         }
     }
 
@@ -409,7 +446,11 @@ mod tests {
     fn the_two_52_layer_rows_do_not_claim_one_another() {
         let four = row("nemotron-h-4b");
         let eight = row("nemotron-h-8b");
-        assert_eq!(four.shape.layers(), eight.shape.layers(), "one schedule, two widths");
+        assert_eq!(
+            four.shape.layers(),
+            eight.shape.layers(),
+            "one schedule, two widths"
+        );
         assert!(
             four.manifest().check(&implied(eight)).is_err(),
             "the 4B row claims an 8B checkpoint, and a stack of the wrong width would load"
@@ -461,11 +502,17 @@ mod tests {
         // `Tokenizer::from_vocab` is a raw-char table and a fixture that
         // spelled `<think>` and `\n` separately would encode the suffix
         // to nothing and pass this test by dropping the thing it checks.
-        let vocab: Vec<String> =
-            ["<|im_start|>", "<|im_end|>", "<think>\n", "\n", "assistant", "user"]
-                .iter()
-                .map(ToString::to_string)
-                .collect();
+        let vocab: Vec<String> = [
+            "<|im_start|>",
+            "<|im_end|>",
+            "<think>\n",
+            "\n",
+            "assistant",
+            "user",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
         let tok = Arc::new(tokenizer::Tokenizer::from_vocab(&vocab));
         let cue = row("nemotron-h-8b").chat(tok.clone()).cue();
         assert_eq!(tok.decode(&cue, false), "<|im_start|>assistant\n<think>\n");
@@ -476,9 +523,10 @@ mod tests {
     /// The guard that replaces `driver-metal`'s `LLAMA_LIKE` table. That
     /// table answered "does this build serve you" from an architecture
     /// STRING reduced by `canonical()`, in a driver, before any text was
-    /// traced — so it could say yes to a row whose text does not exist
-    /// (it listed `gemma4`) and no to one whose text does (it omitted
-    /// `gemma3`). The row answers now, and what it answers with is a
+    /// traced — so it could say yes to a row this build cannot resolve
+    /// (it listed `gpt_oss`, whose every publication either fails this
+    /// crate's manifest or names tensors `driver-metal` has no handle
+    /// for) and no to one whose text it models (it omitted `gemma3`). The row answers now, and what it answers with is a
     /// sentence naming what is missing.
     ///
     /// The comparison is against [`project::NO_METAL`] itself and not a

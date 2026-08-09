@@ -310,10 +310,7 @@ mod tests {
     fn the_fold_is_the_same_fnv1a_the_rest_of_the_workspace_uses() {
         assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a64(b"a"), driver::tensor_ir::fnv1a64(b"a"));
-        assert_eq!(
-            fnv1a64(b"ptir"),
-            driver::tensor_ir::fnv1a64(b"ptir")
-        );
+        assert_eq!(fnv1a64(b"ptir"), driver::tensor_ir::fnv1a64(b"ptir"));
     }
 
     /// The whole point of the disk key: an edit to the emitted source must

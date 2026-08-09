@@ -10,10 +10,10 @@
 //! removed, and no job in the tree compiled the configuration that would have
 //! said so.
 
-use crate::error::Result;
 use crate::device::{Allocation, Arena, Context, Elastic, Regions, create_elastic};
-use crate::layout::region::Region as _;
+use crate::error::Result;
 use crate::layout::kv_move::CellMovePlan;
+use crate::layout::region::Region as _;
 
 use std::ptr::NonNull;
 

@@ -47,20 +47,19 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
 use objc2_metal::{
     MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
-    MTLIndirectCommandBuffer,
     MTL4CommandEncoder, MTL4CommandQueue, MTL4ComputeCommandEncoder,
     MTL4UpdateSparseBufferMappingOperation, MTL4VisibilityOptions, MTLBuffer,
-    MTLComputePipelineState, MTLDevice, MTLHeap, MTLSharedEvent, MTLSize,
+    MTLComputePipelineState, MTLDevice, MTLHeap, MTLIndirectCommandBuffer, MTLSharedEvent, MTLSize,
     MTLSparseTextureMappingMode, MTLStages,
 };
 
+use crate::device::argtable::Tables;
 use crate::device::context::{Context, describe};
 use crate::device::elastic::{self, Arena, Elastic, Mappings, Need, Pressure};
 use crate::device::feedback::Feedbacks;
 use crate::device::heap::Slot;
-use crate::device::argtable::Tables;
-use crate::device::timestamp::{Granularity, Timestamps};
 use crate::device::step_cost::Timing;
+use crate::device::timestamp::{Granularity, Timestamps};
 use crate::error::{Error, Result};
 
 /// How long one probe of the completion wait lasts.
@@ -373,9 +372,7 @@ pub struct Stepper<'ctx> {
 }
 
 /// This device's shared event, which is the timeline a stepper signals.
-fn new_shared_event(
-    context: &Context,
-) -> Result<Retained<ProtocolObject<dyn MTLSharedEvent>>> {
+fn new_shared_event(context: &Context) -> Result<Retained<ProtocolObject<dyn MTLSharedEvent>>> {
     context.device().newSharedEvent().ok_or(Error::Create {
         what: "MTLSharedEvent",
         message: String::new(),

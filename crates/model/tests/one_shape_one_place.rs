@@ -78,7 +78,8 @@ fn declaring_files() -> Vec<PathBuf> {
     // by one — and any threshold loose enough to survive a new
     // generation is loose enough to miss it.
     assert!(
-        out.iter().any(|p| p.components().any(|c| c.as_os_str() == "llama_like")),
+        out.iter()
+            .any(|p| p.components().any(|c| c.as_os_str() == "llama_like")),
         "the shared half of the crate contributed no shapes; found {out:?}"
     );
     assert!(out.len() >= 10, "found only {} declaring files", out.len());
@@ -134,7 +135,8 @@ fn shapes() -> Vec<(String, Vec<String>)> {
             if name.is_some()
                 && let Some(rest) = t.strip_prefix("pub ")
                 && let Some((f, _)) = rest.split_once(':')
-                && f.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+                && f.chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
                 && !f.is_empty()
             {
                 fields.push(f.to_string());

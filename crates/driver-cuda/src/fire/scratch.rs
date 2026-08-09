@@ -7,7 +7,6 @@
 //! same as the last fire's"*. Those are one design named twice, and
 //! `Scratch` is the name both crates now use.
 
-
 /// The per-fire device arrays, POOLED across fires.
 ///
 /// They used to be allocated and dropped every launch — `step_impl`'s own
@@ -86,7 +85,6 @@ pub(crate) mod slot {
 }
 
 impl Scratch {
-
     /// Grow a pooled slot if it is too small, and bump the generation IF
     /// it moved.
     ///
@@ -117,7 +115,9 @@ impl Scratch {
             // `Error::Exhausted` carries it precisely so this does not
             // become "something ran out".
             *slot = Some(
-                alloc.alloc(bytes).map_err(|_| crate::Error::exhausted(what, bytes))?,
+                alloc
+                    .alloc(bytes)
+                    .map_err(|_| crate::Error::exhausted(what, bytes))?,
             );
             epoch.bump();
         }
@@ -147,14 +147,19 @@ impl Scratch {
         plan: &crate::fire::attn_score::ScoreSinkPlan,
         stream: crate::device::StreamRef<'_>,
     ) -> crate::Result<*mut std::ffi::c_void> {
-        Self::grow(&mut self.score, &mut self.epoch, alloc, "attention score sink", plan.bytes)?;
+        Self::grow(
+            &mut self.score,
+            &mut self.epoch,
+            alloc,
+            "attention score sink",
+            plan.bytes,
+        )?;
         let b = self.score.as_mut().expect("just grown");
         let mut csr = Vec::with_capacity(plan.indptr.len() * 4);
         for v in &plan.indptr {
             csr.extend_from_slice(&v.to_le_bytes());
         }
-        b.write_at(plan.indptr_offset, &csr, stream)
-            ?;
+        b.write_at(plan.indptr_offset, &csr, stream)?;
         Ok(b.as_ptr())
     }
 
@@ -170,7 +175,13 @@ impl Scratch {
         bytes: usize,
     ) -> crate::Result<*mut std::ffi::c_void> {
         let bytes = bytes.max(64);
-        Self::grow(&mut self.attn_out, &mut self.epoch, alloc, "attention landing", bytes)?;
+        Self::grow(
+            &mut self.attn_out,
+            &mut self.epoch,
+            alloc,
+            "attention landing",
+            bytes,
+        )?;
         Ok(self.attn_out.as_ref().expect("just grown").as_ptr())
     }
 
@@ -193,7 +204,13 @@ impl Scratch {
         alloc: &crate::device::Allocator,
         bytes: usize,
     ) -> crate::Result<*mut std::ffi::c_void> {
-        Self::grow(&mut self.lse, &mut self.epoch, alloc, "attention lse", bytes.max(64))?;
+        Self::grow(
+            &mut self.lse,
+            &mut self.epoch,
+            alloc,
+            "attention lse",
+            bytes.max(64),
+        )?;
         Ok(self.lse.as_ref().expect("just grown").as_ptr())
     }
 
@@ -205,7 +222,13 @@ impl Scratch {
         rows: usize,
         stream: crate::device::StreamRef<'_>,
     ) -> crate::Result<*mut std::ffi::c_void> {
-        Self::grow(&mut self.row_valid, &mut self.epoch, alloc, "row valid", rows.max(64))?;
+        Self::grow(
+            &mut self.row_valid,
+            &mut self.epoch,
+            alloc,
+            "row valid",
+            rows.max(64),
+        )?;
         let b = self.row_valid.as_mut().expect("just grown");
         b.memset(1, stream)?;
         Ok(b.as_ptr())
@@ -219,15 +242,20 @@ impl Scratch {
         plan: &crate::fire::page_mask::element_mask::ElementMaskPlan,
         stream: crate::device::StreamRef<'_>,
     ) -> crate::Result<*mut std::ffi::c_void> {
-        Self::grow(&mut self.mask, &mut self.epoch, alloc, "attention mask", plan.bytes)?;
+        Self::grow(
+            &mut self.mask,
+            &mut self.epoch,
+            alloc,
+            "attention mask",
+            plan.bytes,
+        )?;
         let b = self.mask.as_mut().expect("just grown");
         b.write_at(0, &plan.mask, stream)?;
         let mut csr = Vec::with_capacity(plan.indptr.len() * 4);
         for v in &plan.indptr {
             csr.extend_from_slice(&v.to_le_bytes());
         }
-        b.write_at(plan.indptr_offset, &csr, stream)
-            ?;
+        b.write_at(plan.indptr_offset, &csr, stream)?;
         Ok(b.as_ptr())
     }
 
@@ -269,7 +297,13 @@ impl Scratch {
         for (dst, v) in pin.as_mut_slice()[..live].chunks_exact_mut(4).zip(vals) {
             dst.copy_from_slice(&v.to_le_bytes());
         }
-        Self::grow(&mut self.slots[slot], &mut self.epoch, alloc, "fire descriptor array", need)?;
+        Self::grow(
+            &mut self.slots[slot],
+            &mut self.epoch,
+            alloc,
+            "fire descriptor array",
+            need,
+        )?;
         let src = &self.staging[slot].as_ref().expect("just sized").as_slice()[..live];
         let b = self.slots[slot].as_mut().expect("just grown");
         b.copy_from_host(src, stream)?;
@@ -306,7 +340,13 @@ impl Scratch {
         // old buffer exactly where it was; this is the only one that
         // removes first, so it is the only one that had to say so.
         let mut held = self.named.remove(&v);
-        let grown = Self::grow(&mut held, &mut self.epoch, alloc, "named seam buffer", bytes);
+        let grown = Self::grow(
+            &mut held,
+            &mut self.epoch,
+            alloc,
+            "named seam buffer",
+            bytes,
+        );
         if let Some(back) = held {
             self.named.insert(v, back);
         }

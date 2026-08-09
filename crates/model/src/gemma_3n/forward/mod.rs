@@ -31,8 +31,7 @@
 pub mod facts;
 
 use self::facts::Gemma3nFacts;
-use model_compiler::dsl::{
-    WeightRepr,self, matmul, MatW, NormW, Val};
+use model_compiler::dsl::{self, MatW, NormW, Val, WeightRepr, matmul};
 use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct G3nLayerW {
@@ -135,8 +134,7 @@ pub fn gemma3n_cuda(facts: &Gemma3nFacts, class: FireClass) -> ForwardPlan {
     // panicked, on the first prefill a serving deployment sends. The
     // class-dependent sites in this text number exactly one, the
     // attention op, which `dsl::cuda::attention_for` now holds.
-    let family = format!(
-        "gemma3n.cuda.{}", class.suffix());
+    let family = format!("gemma3n.cuda.{}", class.suffix());
     let k = facts.altup.num_streams;
     let active = facts.altup.active;
     dsl::trace_named(&family, |t| {
@@ -148,8 +146,7 @@ pub fn gemma3n_cuda(facts: &Gemma3nFacts, class: FireClass) -> ForwardPlan {
             // THIS LAYER's sliding window, `-1` for none — a
             // load-time fact the dispatch statements carry, where four
             // executors used to re-derive it per launch.
-            let window_left =
-                model_compiler::facts::window_left_at(facts.window_left, l);
+            let window_left = model_compiler::facts::window_left_at(facts.window_left, l);
             let w = G3nLayerW::new(l, facts);
             let active_in = dsl::select(&streams, active);
 
@@ -218,16 +215,14 @@ pub fn gemma3n_cuda(facts: &Gemma3nFacts, class: FireClass) -> ForwardPlan {
                 &format!("layer.{l}.altup_correct_scale"),
             );
             let ccoefs = dsl::cuda::altup_unpack_correct_coefs(&packed, k);
-            streams =
-                dsl::cuda::altup_correct(&predictions, &activated, &ccoefs, k, facts.hidden);
+            streams = dsl::cuda::altup_correct(&predictions, &activated, &ccoefs, k, facts.hidden);
 
             // ── PLE: gated, added into every stream but the active ───
             // K-1 in-place adds, each through its own window — the
             // driver's `for (k) if (k != act_idx) residual_add(...)`,
             // launch for launch. `in_place` is what makes each land in
             // the window it read instead of in a value nothing reads.
-            let ple =
-                dsl::embed_with(t, &format!("layer.{l}.embed_per_layer"), facts.ple_width);
+            let ple = dsl::embed_with(t, &format!("layer.{l}.embed_per_layer"), facts.ple_width);
             let g = matmul(&x, &w.ple_gate);
             let ple = dsl::sigmoid_gate_mul(&ple, &g);
             let ple = matmul(&ple, &w.ple_proj);

@@ -44,10 +44,14 @@ fn reachable(src: &Path) -> BTreeSet<PathBuf> {
         };
         // A module's children live beside it: `foo.rs` looks in `foo/`, and
         // `foo/mod.rs` looks in `foo/`.
-        let dir = if file.file_name().is_some_and(|n| n == "lib.rs" || n == "mod.rs") {
+        let dir = if file
+            .file_name()
+            .is_some_and(|n| n == "lib.rs" || n == "mod.rs")
+        {
             file.parent().map(Path::to_path_buf)
         } else {
-            file.parent().map(|p| p.join(file.file_stem().unwrap_or_default()))
+            file.parent()
+                .map(|p| p.join(file.file_stem().unwrap_or_default()))
         };
         let Some(dir) = dir else { continue };
         for line in text.lines() {
@@ -70,7 +74,10 @@ fn reachable(src: &Path) -> BTreeSet<PathBuf> {
             if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
                 continue;
             }
-            for candidate in [dir.join(format!("{name}.rs")), dir.join(name).join("mod.rs")] {
+            for candidate in [
+                dir.join(format!("{name}.rs")),
+                dir.join(name).join("mod.rs"),
+            ] {
                 if candidate.is_file() {
                     queue.push(candidate);
                 }

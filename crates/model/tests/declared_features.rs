@@ -95,18 +95,18 @@ fn module_gates(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
         ("crates/model/src/lib.rs", ""),
         ("crates/model/src/shared/mod.rs", "shared::"),
     ] {
-        read_gates_into(&mut gates, &std::fs::read_to_string(root.join(file))
-            .unwrap_or_else(|e| panic!("{file} is readable: {e}")), prefix);
+        read_gates_into(
+            &mut gates,
+            &std::fs::read_to_string(root.join(file))
+                .unwrap_or_else(|e| panic!("{file} is readable: {e}")),
+            prefix,
+        );
     }
     gates
 }
 
 /// One file's `pub mod` lines, folded into the map under `prefix`.
-fn read_gates_into(
-    gates: &mut BTreeMap<String, BTreeSet<String>>,
-    src: &str,
-    prefix: &str,
-) {
+fn read_gates_into(gates: &mut BTreeMap<String, BTreeSet<String>>, src: &str, prefix: &str) {
     let mut pending: Option<String> = None;
     for line in src.lines() {
         let line = line.trim();

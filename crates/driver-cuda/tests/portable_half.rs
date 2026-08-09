@@ -109,8 +109,16 @@ fn the_memory_planner_plans() {
         head_dim_kernel: 64,
         model_type: "llama".to_owned(),
     };
-    let props = mp::DeviceProps { name: String::new(), major: 8, minor: 9, sm_count: 142 };
-    let memory = mp::DeviceMemory { free_bytes: 40 << 30, total_bytes: 48 << 30 };
+    let props = mp::DeviceProps {
+        name: String::new(),
+        major: 8,
+        minor: 9,
+        sm_count: 142,
+    };
+    let memory = mp::DeviceMemory {
+        free_bytes: 40 << 30,
+        total_bytes: 48 << 30,
+    };
 
     let planned = mp::plan(
         &cfg,
@@ -196,5 +204,8 @@ fn the_kv_format_counts_its_planes() {
 fn the_json_writer_is_text() {
     let mut out = String::new();
     driver_cuda::layout::dtoa::write_f64(&mut out, 0.1);
-    assert_eq!(out, "0.1", "the shortest round-tripping form, not 0.1000000000000000055");
+    assert_eq!(
+        out, "0.1",
+        "the shortest round-tripping form, not 0.1000000000000000055"
+    );
 }

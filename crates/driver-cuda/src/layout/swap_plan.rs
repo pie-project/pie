@@ -104,7 +104,11 @@ pub struct PageCountMismatch {
 impl std::fmt::Display for PageCountMismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Same text the C++ throws, so a log grep spans the migration.
-        write!(f, "swap_pool: src/dst page count mismatch ({} vs {})", self.src, self.dst)
+        write!(
+            f,
+            "swap_pool: src/dst page count mismatch ({} vs {})",
+            self.src, self.dst
+        )
     }
 }
 
@@ -121,7 +125,10 @@ impl PoolGeometry {
     /// width. This is the standard KV cache's shape (K and V, equal size).
     #[must_use]
     pub fn uniform(num_layers: u32, buffers: u32, page_bytes: u64) -> Self {
-        Self::new(vec![vec![page_bytes; buffers as usize]; num_layers as usize])
+        Self::new(vec![
+            vec![page_bytes; buffers as usize];
+            num_layers as usize
+        ])
     }
 
     /// Number of layers this geometry describes.
@@ -133,7 +140,9 @@ impl PoolGeometry {
     /// The page widths of one layer's buffers.
     #[must_use]
     pub fn buffers(&self, layer: u32) -> &[u64] {
-        self.page_bytes.get(layer as usize).map_or(&[], Vec::as_slice)
+        self.page_bytes
+            .get(layer as usize)
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Bytes moved for one page across every layer and buffer -- what the C++
@@ -171,7 +180,10 @@ impl SwapPlan {
         dst_pages: &[u32],
     ) -> Result<Self, PageCountMismatch> {
         if src_pages.len() != dst_pages.len() {
-            return Err(PageCountMismatch { src: src_pages.len(), dst: dst_pages.len() });
+            return Err(PageCountMismatch {
+                src: src_pages.len(),
+                dst: dst_pages.len(),
+            });
         }
         let mut ops = Vec::with_capacity(
             geometry.page_bytes.iter().map(Vec::len).sum::<usize>() * src_pages.len(),
@@ -181,18 +193,22 @@ impl SwapPlan {
                 for (b, &bytes) in geometry.buffers(layer).iter().enumerate() {
                     let b = b as u32;
                     let (dst, src) = match direction {
-                        Direction::DeviceToHost => {
-                            (Pool::Host { layer, buffer: b }, Pool::Device { layer, buffer: b })
-                        }
-                        Direction::HostToDevice => {
-                            (Pool::Device { layer, buffer: b }, Pool::Host { layer, buffer: b })
-                        }
-                        Direction::DeviceToDevice => {
-                            (Pool::Device { layer, buffer: b }, Pool::Device { layer, buffer: b })
-                        }
-                        Direction::HostToHost => {
-                            (Pool::Host { layer, buffer: b }, Pool::Host { layer, buffer: b })
-                        }
+                        Direction::DeviceToHost => (
+                            Pool::Host { layer, buffer: b },
+                            Pool::Device { layer, buffer: b },
+                        ),
+                        Direction::HostToDevice => (
+                            Pool::Device { layer, buffer: b },
+                            Pool::Host { layer, buffer: b },
+                        ),
+                        Direction::DeviceToDevice => (
+                            Pool::Device { layer, buffer: b },
+                            Pool::Device { layer, buffer: b },
+                        ),
+                        Direction::HostToHost => (
+                            Pool::Host { layer, buffer: b },
+                            Pool::Host { layer, buffer: b },
+                        ),
                     };
                     ops.push(CopyOp {
                         dst,
@@ -276,10 +292,33 @@ mod tests {
     fn iteration_is_layer_then_page_then_buffer() {
         let p = SwapPlan::build(&geo(), Direction::DeviceToHost, &[1, 2], &[5, 6]).unwrap();
         let ops = p.ops();
-        assert_eq!(ops[0].src, Pool::Device { layer: 0, buffer: 0 });
-        assert_eq!(ops[1].src, Pool::Device { layer: 0, buffer: 1 });
-        assert_eq!(ops[2].src_offset, 2 * 1024, "second page pair, back to buffer 0");
-        assert_eq!(ops[4].src, Pool::Device { layer: 1, buffer: 0 }, "then the next layer");
+        assert_eq!(
+            ops[0].src,
+            Pool::Device {
+                layer: 0,
+                buffer: 0
+            }
+        );
+        assert_eq!(
+            ops[1].src,
+            Pool::Device {
+                layer: 0,
+                buffer: 1
+            }
+        );
+        assert_eq!(
+            ops[2].src_offset,
+            2 * 1024,
+            "second page pair, back to buffer 0"
+        );
+        assert_eq!(
+            ops[4].src,
+            Pool::Device {
+                layer: 1,
+                buffer: 0
+            },
+            "then the next layer"
+        );
     }
 
     #[test]
@@ -331,7 +370,10 @@ mod tests {
     fn mismatched_page_counts_are_refused_with_the_cpp_message() {
         let e = SwapPlan::build(&geo(), Direction::DeviceToHost, &[1, 2], &[1]).unwrap_err();
         assert_eq!(e, PageCountMismatch { src: 2, dst: 1 });
-        assert_eq!(e.to_string(), "swap_pool: src/dst page count mismatch (2 vs 1)");
+        assert_eq!(
+            e.to_string(),
+            "swap_pool: src/dst page count mismatch (2 vs 1)"
+        );
     }
 
     #[test]
@@ -343,8 +385,15 @@ mod tests {
 
     #[test]
     fn restores_are_the_only_traffic_on_the_second_stream() {
-        assert_eq!(SwapPlan::stream_for(Direction::HostToDevice), SwapStream::Restore);
-        for d in [Direction::DeviceToHost, Direction::DeviceToDevice, Direction::HostToHost] {
+        assert_eq!(
+            SwapPlan::stream_for(Direction::HostToDevice),
+            SwapStream::Restore
+        );
+        for d in [
+            Direction::DeviceToHost,
+            Direction::DeviceToDevice,
+            Direction::HostToHost,
+        ] {
             assert_eq!(SwapPlan::stream_for(d), SwapStream::Evict, "{d:?}");
         }
     }

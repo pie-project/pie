@@ -39,8 +39,6 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-
-
 // THE CUDA CLAIM IS STRUCTURAL NOW. `the_cuda_driver_has_no_config_json_parser`
 // walked `crates/driver-cuda/csrc/src` asking whether the C++ shell had
 // grown its own `config.json` parser. That tree is deleted, so the answer
@@ -142,4 +140,3 @@ fn the_runtime_does_not_read_config_json() {
         found.join("\n")
     );
 }
-

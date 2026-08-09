@@ -54,10 +54,21 @@ use std::path::{Path, PathBuf};
 /// nothing rotates either, with `k_pe` dropped into `_`. The fact is not
 /// forgotten, the pass is unwritten.
 ///
-/// `gemma_2` and `gemma_4` are the OTHER kind, and they are the reason
-/// this list is a test rather than a note: both trace a complete plan and
-/// silently ignore one axis, which is exactly the defect the file is
-/// named for. They are listed because a listed defect is a known one.
+/// `gemma_2` was the OTHER kind, and it is the reason this list is a
+/// test rather than a note: it traced a complete plan and silently
+/// ignored one axis, which is exactly the defect the file is named for.
+/// `gemma_4` was the second of that kind and left when its Metal
+/// projection started stating the top-k its text routes on.
+///
+/// Both are gone now. `gemma_2: attn_logit_softcap` left last, and it
+/// took four moves rather than one, which is what that kind costs: the
+/// fact was a real measurement, its doc correctly said the attention
+/// kernel takes the cap as a dispatch parameter, the kernel really does
+/// take it — and `AttnCtx::logits_soft_cap` was the literal `0.0`. So
+/// `Deployment` gained `attn_logit_softcap`, gemma-2's projection states
+/// `50.0` beside the readout's `30.0`, the launch reads it, and
+/// `launch_context_is_stated` widened from `Source::Ctx` to `Source::
+/// Attn` because that is the scan the defect had been hiding behind.
 ///
 /// A line LEAVES when the text starts reading the fact. A line JOINS only
 /// with a commit that says which unfinished pass it belongs to.
@@ -82,23 +93,21 @@ const DECLARED_BUT_UNREAD: &[(&str, &[&str])] = &[
     // arrived: the deployment's per-layer `window_left` is stated from
     // it, so a V4 with a window and one without now differ before any
     // fire — which is the shape every line here is meant to leave by.
-    ("deepseek_v4", &["hash_routed", "o_groups", "swiglu_limit_milli"]),
-    // The ATTENTION cap, not the final one. gemma-2's text reads
-    // `final_logit_softcap` and launches it; the attention cap is
-    // documented as riding "as a dispatch parameter", but
-    // `dsl::cuda::attention_for(class, &q, &kv, window_left)` takes no
-    // cap and nothing branches on the flag. So a gemma-2 with the cap and
-    // one without trace IDENTICALLY today. This line is the honest
-    // statement of that, and it was invisible while the scan counted the
-    // field's own doc comment as a reader.
-    ("gemma_2", &["attn_logit_softcap"]),
+    (
+        "deepseek_v4",
+        &["hash_routed", "o_groups", "swiglu_limit_milli"],
+    ),
     // The routed MLP's top-k. `gemma_4/forward/mod.rs` contains no
     // routing pass at all — no gate, no top-k, no expert dispatch — so
-    // the A4B's mixture is declared and untraced. `moe_intermediate`
-    // LEFT this list because the projection carries it to a planner for
-    // sizing; the top-k has no such second reader, which is exactly the
-    // asymmetry that makes it worth stating.
-    ("gemma_4", &["experts_per_token"]),
+    // for as long as CUDA was the only text, the A4B's mixture was
+    // declared and untraced. `moe_intermediate` LEFT this list because
+    // the projection carries it to a planner for sizing, and
+    // `experts_per_token` left the same way: `gemma_4::project::
+    // metal_shape` states it on the `LlamaLikeFacts` that
+    // `llama_like_metal` routes on, so the Metal text dispatches experts
+    // by this number. The CUDA text still does not, and `Gemma4::
+    // untraced` refuses the A4B row on both backends until it does —
+    // which is a refusal a reader can find, and not a silent axis.
     // MLA's aligned MoE block. `index_topk` LEFT this list when the
     // indexer's statement started carrying it on the param channel —
     // which is the shape every line here is meant to leave by.
@@ -184,7 +193,9 @@ fn declared_fields(src: &str) -> BTreeSet<String> {
         // `pub name: Type,` — the field, not a doc comment or attribute.
         if let Some(rest) = t.strip_prefix("pub ")
             && let Some((name, _)) = rest.split_once(':')
-            && name.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
             && !name.is_empty()
         {
             out.insert(name.to_string());
@@ -212,7 +223,9 @@ fn read_fields(dir: &Path) -> BTreeSet<String> {
     let mut text = String::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for e in entries.flatten() {
             let p = e.path();
             if p.is_dir() {
@@ -314,14 +327,16 @@ fn every_declared_fact_is_read_by_its_family() {
     let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (fam, dir) in &families {
         let files = declaring_files(dir);
-        assert!(!files.is_empty(), "{fam} qualified on a file that then vanished");
+        assert!(
+            !files.is_empty(),
+            "{fam} qualified on a file that then vanished"
+        );
         let mut declared = BTreeSet::new();
         for f in files {
             let src = std::fs::read_to_string(&f).expect("the family's declaration");
             declared.extend(declared_fields(&src));
         }
-        let unread: BTreeSet<String> =
-            declared.difference(&read_fields(dir)).cloned().collect();
+        let unread: BTreeSet<String> = declared.difference(&read_fields(dir)).cloned().collect();
         if !unread.is_empty() {
             found.insert(fam.clone(), unread);
         }
@@ -371,7 +386,10 @@ fn the_scan_finds_a_shape_in_every_family_it_counts() {
              scan — or the shape moved to a file this scan does not read, \
              which is how this test disarmed itself once already.",
             declared.len(),
-            files.iter().map(|p| p.file_name().unwrap()).collect::<Vec<_>>()
+            files
+                .iter()
+                .map(|p| p.file_name().unwrap())
+                .collect::<Vec<_>>()
         );
     }
 }
@@ -399,7 +417,10 @@ fn tail(f: &F) -> u32 { f.after_the_test }
 ";
     let kept = without_tests_or_prose(src);
     assert!(kept.contains("f.traced"), "the tracer's read survives");
-    assert!(kept.contains("f.after_the_test"), "code AFTER the test block survives");
+    assert!(
+        kept.contains("f.after_the_test"),
+        "code AFTER the test block survives"
+    );
     assert!(
         !kept.contains("only_asserted"),
         "an assertion inside #[cfg(test)] is not a read"

@@ -17,9 +17,9 @@
 
 #![allow(clippy::print_stdout)]
 
-use driver_metal::{Error, Region};
 use driver_metal::device::{Context, Pool, Stepper, Tables};
 use driver_metal::program::Compiler;
+use driver_metal::{Error, Region};
 
 /// Copies one value into a span, so what a buffer holds says which chunk
 /// wrote it and when.
@@ -299,9 +299,7 @@ fn a_second_step_is_queued_while_the_first_is_still_outstanding() {
         .compile(&context, SPREAD, "spread")
         .expect("spread");
     let pool = Pool::new(1 << 20);
-    let out = pool
-        .acquire(&context, (PER_CHUNK * 4) as u64)
-        .expect("out");
+    let out = pool.acquire(&context, (PER_CHUNK * 4) as u64).expect("out");
     let tags = pool.acquire(&context, 4).expect("tags");
     // SAFETY: nothing is in flight and the slice is exactly the region.
     unsafe { tags.write(0, &7u32.to_le_bytes()) }.expect("tags");
@@ -339,7 +337,9 @@ fn a_second_step_is_queued_while_the_first_is_still_outstanding() {
     );
 
     // Both retire, and the query that says so does not block.
-    stepper.wait_for(second).expect("the GPU reaches the second");
+    stepper
+        .wait_for(second)
+        .expect("the GPU reaches the second");
     assert!(
         stepper.has_passed(first) && stepper.has_passed(second),
         "the event passed {second} but reports otherwise"

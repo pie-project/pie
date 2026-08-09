@@ -23,8 +23,8 @@ pub mod project;
 use std::sync::{Arc, OnceLock};
 
 use crate::catalog::{Deployed, LoadShape, Variant};
-use crate::shared::llama_like::spec::LlamaLikeFacts;
 use crate::manifest::Manifest;
+use crate::shared::llama_like::spec::LlamaLikeFacts;
 
 use self::project::Schedule;
 
@@ -224,7 +224,11 @@ impl Variant for Gemma3 {
     /// The stated head dim: gemma-3-1b is 1152 over 4 heads and its
     /// heads are 256 wide, not 288.
     fn load_shape(&self) -> LoadShape {
-        LoadShape::dense(self.shape.layers, self.shape.head_dim, self.shape.tied_embeddings)
+        LoadShape::dense(
+            self.shape.layers,
+            self.shape.head_dim,
+            self.shape.tied_embeddings,
+        )
     }
 
     fn deployment(
@@ -259,7 +263,9 @@ impl Variant for Gemma3 {
         builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
         match builder.naming() {
-            crate::shared::policy::Naming::Hf => crate::shared::llama_like::contract::author_dense(builder),
+            crate::shared::policy::Naming::Hf => {
+                crate::shared::llama_like::contract::author_dense(builder)
+            }
             // The registry this replaced held NO MLX row for gemma-3, and
             // the absence was a silence the caller read as "no
             // contract". Stated as the refusal it always was.
@@ -314,8 +320,14 @@ mod tests {
             ("gemma-3-27b", 131_072),
             ("embeddinggemma-300m", 2_048),
         ] {
-            let a = row(id).deployment(Deployed::single()).expect("gemma-3 deploys").advertised;
-            assert_eq!(a.arch, "gemma3", "{id}: the family label a guest program sees");
+            let a = row(id)
+                .deployment(Deployed::single())
+                .expect("gemma-3 deploys")
+                .advertised;
+            assert_eq!(
+                a.arch, "gemma3",
+                "{id}: the family label a guest program sees"
+            );
             assert_eq!(a.max_model_len, want, "{id}: its own config states {want}");
             assert!(
                 !a.media_encode,
@@ -325,7 +337,11 @@ mod tests {
         // And no row is left at the field's word for "does not say",
         // which is what `Default::default()` would have given all five.
         for v in VARIANTS {
-            assert_ne!(v.max_model_len, 0, "{}: an unstated ceiling is not a ceiling", v.id);
+            assert_ne!(
+                v.max_model_len, 0,
+                "{}: an unstated ceiling is not a ceiling",
+                v.id
+            );
         }
     }
 
@@ -340,10 +356,21 @@ mod tests {
     #[test]
     fn the_ceilings_differ_by_row_and_that_is_not_a_transcription_slip() {
         let len = |id: &str| {
-            row(id).deployment(Deployed::single()).expect("deploys").advertised.max_model_len
+            row(id)
+                .deployment(Deployed::single())
+                .expect("deploys")
+                .advertised
+                .max_model_len
         };
-        assert!(len("gemma-3-1b") < len("gemma-3-4b"), "the 1B publishes the shorter ceiling");
-        assert_eq!(len("gemma-3-1b") * 4, len("gemma-3-4b"), "32 768 against 131 072");
+        assert!(
+            len("gemma-3-1b") < len("gemma-3-4b"),
+            "the 1B publishes the shorter ceiling"
+        );
+        assert_eq!(
+            len("gemma-3-1b") * 4,
+            len("gemma-3-4b"),
+            "32 768 against 131 072"
+        );
         assert!(
             len("embeddinggemma-300m") < len("gemma-3-1b"),
             "an embedding tower is trained on documents that fit"
@@ -377,11 +404,19 @@ mod tests {
                 .strip_suffix("forconditionalgeneration")
                 .or_else(|| lower.strip_suffix("forcausallm"))
                 .expect("one of the two suffixes the worker strips");
-            assert_eq!(stem, ARCH, "{name} must reduce to the label the row hands out");
+            assert_eq!(
+                stem, ARCH,
+                "{name} must reduce to the label the row hands out"
+            );
         }
         let labels: std::collections::BTreeSet<&str> = VARIANTS
             .iter()
-            .map(|v| v.deployment(Deployed::single()).expect("deploys").advertised.arch)
+            .map(|v| {
+                v.deployment(Deployed::single())
+                    .expect("deploys")
+                    .advertised
+                    .arch
+            })
             .collect();
         assert_eq!(labels.len(), 1, "a label is a FAMILY: {labels:?}");
         assert_eq!(VARIANTS.len(), 5, "and five rows share it");
@@ -391,7 +426,9 @@ mod tests {
     #[test]
     fn every_row_projects() {
         for v in VARIANTS {
-            let d = v.deployment(Deployed::single()).expect("gemma-3 is servable");
+            let d = v
+                .deployment(Deployed::single())
+                .expect("gemma-3 is servable");
             assert_eq!(d.layers, v.shape.layers);
             assert_eq!(d.attention.len() as u32, v.shape.layers);
             assert_eq!(d.shape.hidden, v.shape.hidden);
@@ -402,7 +439,11 @@ mod tests {
 
             let m = v.manifest();
             assert_eq!(m.layers, v.shape.layers);
-            assert!(m.tensors.iter().any(|t| t.name == "layer.{}.post_feedforward_layernorm"));
+            assert!(
+                m.tensors
+                    .iter()
+                    .any(|t| t.name == "layer.{}.post_feedforward_layernorm")
+            );
 
             let ls = v.load_shape();
             assert_eq!(ls.layers, v.shape.layers);
@@ -459,7 +500,11 @@ mod tests {
         // Every other row states a scalar that happens to equal its head
         // dim, which is why this one is the test.
         for other in VARIANTS.iter().filter(|o| o.id != "gemma-3-27b") {
-            assert_eq!(other.schedule.query_pre_attn_scalar, other.shape.head_dim, "{}", other.id);
+            assert_eq!(
+                other.schedule.query_pre_attn_scalar, other.shape.head_dim,
+                "{}",
+                other.id
+            );
         }
     }
 
@@ -498,17 +543,37 @@ mod tests {
     #[cfg(feature = "chat")]
     #[test]
     fn the_template_is_gemmas_own_and_not_chatml() {
-        let vocab: Vec<String> =
-            ["<start_of_turn>", "<end_of_turn>", "<eos>", "<bos>", "user", "model", "\n", "Hi"]
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect();
+        let vocab: Vec<String> = [
+            "<start_of_turn>",
+            "<end_of_turn>",
+            "<eos>",
+            "<bos>",
+            "user",
+            "model",
+            "\n",
+            "Hi",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
         let tok = Arc::new(tokenizer::Tokenizer::from_vocab(&vocab));
         for v in VARIANTS {
             let chat = v.chat(tok.clone());
-            assert!(chat.seal().contains(&1), "{} does not seal with <end_of_turn>", v.id);
-            assert!(chat.seal().contains(&2), "{} does not seal with <eos>", v.id);
-            assert!(chat.cue().starts_with(&[0]), "{} cues with <start_of_turn>", v.id);
+            assert!(
+                chat.seal().contains(&1),
+                "{} does not seal with <end_of_turn>",
+                v.id
+            );
+            assert!(
+                chat.seal().contains(&2),
+                "{} does not seal with <eos>",
+                v.id
+            );
+            assert!(
+                chat.cue().starts_with(&[0]),
+                "{} cues with <start_of_turn>",
+                v.id
+            );
         }
     }
 
@@ -518,7 +583,13 @@ mod tests {
         let ids: Vec<&str> = VARIANTS.iter().map(|v| v.id).collect();
         assert_eq!(
             ids,
-            vec!["gemma-3-1b", "gemma-3-4b", "gemma-3-12b", "gemma-3-27b", "embeddinggemma-300m"],
+            vec![
+                "gemma-3-1b",
+                "gemma-3-4b",
+                "gemma-3-12b",
+                "gemma-3-27b",
+                "embeddinggemma-300m"
+            ],
         );
     }
 }

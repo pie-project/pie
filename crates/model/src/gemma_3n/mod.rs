@@ -32,7 +32,7 @@ use std::sync::{Arc, OnceLock};
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::manifest::Manifest;
 
-use self::spec::{window_schedule, Gemma3nAltUpFacts, Gemma3nAttnFacts, Gemma3nFacts};
+use self::spec::{Gemma3nAltUpFacts, Gemma3nAttnFacts, Gemma3nFacts, window_schedule};
 
 /// RMSNorm epsilon, shared by the whole generation.
 ///
@@ -135,8 +135,15 @@ pub const VARIANTS: &[Gemma3n] = &[
             // checkpoints — a leading run, which is what
             // `is_sparse(l) = l < sparsity_layers` encodes.
             sparsity_layers: 10,
-            altup: Gemma3nAltUpFacts { num_streams: 4, active: 0 },
-            attn: Gemma3nAttnFacts { heads: 8, kv_heads: 2, head_dim: 256 },
+            altup: Gemma3nAltUpFacts {
+                num_streams: 4,
+                active: 0,
+            },
+            attn: Gemma3nAttnFacts {
+                heads: 8,
+                kv_heads: 2,
+                head_dim: 256,
+            },
             window_left: &E2B_WINDOWS,
         },
         rope_theta_global: 1_000_000.0,
@@ -157,8 +164,15 @@ pub const VARIANTS: &[Gemma3n] = &[
             // Ten again, and not a fraction of the depth: the leading
             // run is the same length in a stack five layers deeper.
             sparsity_layers: 10,
-            altup: Gemma3nAltUpFacts { num_streams: 4, active: 0 },
-            attn: Gemma3nAttnFacts { heads: 8, kv_heads: 2, head_dim: 256 },
+            altup: Gemma3nAltUpFacts {
+                num_streams: 4,
+                active: 0,
+            },
+            attn: Gemma3nAttnFacts {
+                heads: 8,
+                kv_heads: 2,
+                head_dim: 256,
+            },
             window_left: &E4B_WINDOWS,
         },
         rope_theta_global: 1_000_000.0,
@@ -255,7 +269,9 @@ impl Variant for Gemma3n {
         builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
         match builder.naming() {
-            crate::shared::policy::Naming::Hf => crate::shared::llama_like::contract::author_dense(builder),
+            crate::shared::policy::Naming::Hf => {
+                crate::shared::llama_like::contract::author_dense(builder)
+            }
             // The registry this replaced held NO MLX row for gemma-3n, and
             // the absence was a silence the caller read as "no
             // contract". Stated as the refusal it always was.
@@ -328,10 +344,16 @@ mod tests {
         assert_eq!(row("gemma-3n-e2b").shape.layers(), 30);
         assert_eq!(row("gemma-3n-e4b").shape.layers(), 35);
         for v in VARIANTS {
-            assert_eq!(v.shape.per_layer_intermediate.len(), v.shape.window_left.len());
+            assert_eq!(
+                v.shape.per_layer_intermediate.len(),
+                v.shape.window_left.len()
+            );
             assert_eq!(v.manifest().layers, v.shape.layers());
             assert_eq!(v.load_shape().layers, v.shape.layers());
-            assert_eq!(v.deployment(Deployed::single()).expect("deploys").layers, v.shape.layers());
+            assert_eq!(
+                v.deployment(Deployed::single()).expect("deploys").layers,
+                v.shape.layers()
+            );
         }
     }
 
@@ -340,7 +362,9 @@ mod tests {
     #[test]
     fn the_window_schedule_is_the_published_one() {
         let full = |v: &Gemma3n| -> Vec<usize> {
-            (0..v.shape.window_left.len()).filter(|&l| v.shape.window_left[l] == -1).collect()
+            (0..v.shape.window_left.len())
+                .filter(|&l| v.shape.window_left[l] == -1)
+                .collect()
         };
         assert_eq!(full(row("gemma-3n-e2b")), vec![4, 9, 14, 19, 24, 29]);
         assert_eq!(full(row("gemma-3n-e4b")), vec![4, 9, 14, 19, 24, 29, 34]);
@@ -359,14 +383,25 @@ mod tests {
     #[test]
     fn the_row_answers_what_the_driver_advertises() {
         for v in VARIANTS {
-            let a = v.deployment(Deployed::single()).expect("deploys").advertised;
-            assert_eq!(a.arch, "gemma3n", "{}: the family label a guest program sees", v.id);
+            let a = v
+                .deployment(Deployed::single())
+                .expect("deploys")
+                .advertised;
+            assert_eq!(
+                a.arch, "gemma3n",
+                "{}: the family label a guest program sees",
+                v.id
+            );
             assert_eq!(
                 a.max_model_len, 32_768,
                 "{}: both corpus configs state it under `text_config`",
                 v.id
             );
-            assert_ne!(a.max_model_len, 0, "{}: a ceiling of 0 is 'the row does not say'", v.id);
+            assert_ne!(
+                a.max_model_len, 0,
+                "{}: a ceiling of 0 is 'the row does not say'",
+                v.id
+            );
         }
     }
 
@@ -386,8 +421,16 @@ mod tests {
     fn no_row_advertises_an_encoder_the_encode_entry_cannot_serve() {
         for v in VARIANTS {
             let d = v.deployment(Deployed::single()).expect("deploys");
-            assert!(d.towers.audio.is_none(), "{}: no audio tower is stated here", v.id);
-            assert!(d.towers.vision.is_none(), "{}: no vision tower is stated here", v.id);
+            assert!(
+                d.towers.audio.is_none(),
+                "{}: no audio tower is stated here",
+                v.id
+            );
+            assert!(
+                d.towers.vision.is_none(),
+                "{}: no vision tower is stated here",
+                v.id
+            );
             assert_eq!(
                 d.advertised.media_encode,
                 d.towers.audio.is_some() || d.towers.vision.is_some(),
@@ -449,7 +492,10 @@ mod tests {
             assert_eq!(ls.head_dim, 256);
             assert_eq!(ls.n_experts, 0, "gemma-3n is dense");
             assert_eq!(ls.mamba_groups, 0);
-            assert_eq!(ls.kv_shared_layers, 0, "stated where it is implemented, which is gemma-4");
+            assert_eq!(
+                ls.kv_shared_layers, 0,
+                "stated where it is implemented, which is gemma-4"
+            );
             assert!(ls.tied_embeddings);
             let d = v.deployment(Deployed::single()).expect("deploys");
             assert_eq!(d.attention.len() as u32, d.layers);
@@ -464,11 +510,23 @@ mod tests {
     #[test]
     fn the_two_rows_are_told_apart_by_their_tensors() {
         let ext = |v: &Gemma3n, n: &str| {
-            v.manifest().tensors.iter().find(|t| t.name == n).expect("stated").extents.clone()
+            v.manifest()
+                .tensors
+                .iter()
+                .find(|t| t.name == n)
+                .expect("stated")
+                .extents
+                .clone()
         };
         let (a, b) = (row("gemma-3n-e2b"), row("gemma-3n-e4b"));
-        assert_ne!(ext(a, "layer.{}.mlp.gate_proj"), ext(b, "layer.{}.mlp.gate_proj"));
-        assert_ne!(ext(a, "embed_tokens_per_layer"), ext(b, "embed_tokens_per_layer"));
+        assert_ne!(
+            ext(a, "layer.{}.mlp.gate_proj"),
+            ext(b, "layer.{}.mlp.gate_proj")
+        );
+        assert_ne!(
+            ext(a, "embed_tokens_per_layer"),
+            ext(b, "embed_tokens_per_layer")
+        );
         assert_eq!(ext(a, "embed_tokens"), ext(b, "embed_tokens"));
     }
 
@@ -479,17 +537,37 @@ mod tests {
     #[cfg(feature = "chat")]
     #[test]
     fn the_template_is_gemmas_own_and_not_chatml() {
-        let vocab: Vec<String> =
-            ["<start_of_turn>", "<end_of_turn>", "<eos>", "<bos>", "user", "model", "\n", "Hi"]
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect();
+        let vocab: Vec<String> = [
+            "<start_of_turn>",
+            "<end_of_turn>",
+            "<eos>",
+            "<bos>",
+            "user",
+            "model",
+            "\n",
+            "Hi",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
         let tok = Arc::new(tokenizer::Tokenizer::from_vocab(&vocab));
         for v in VARIANTS {
             let chat = v.chat(tok.clone());
-            assert!(chat.seal().contains(&1), "{} does not seal with <end_of_turn>", v.id);
-            assert!(chat.seal().contains(&2), "{} does not seal with <eos>", v.id);
-            assert!(chat.cue().starts_with(&[0]), "{} cues with <start_of_turn>", v.id);
+            assert!(
+                chat.seal().contains(&1),
+                "{} does not seal with <end_of_turn>",
+                v.id
+            );
+            assert!(
+                chat.seal().contains(&2),
+                "{} does not seal with <eos>",
+                v.id
+            );
+            assert!(
+                chat.cue().starts_with(&[0]),
+                "{} cues with <start_of_turn>",
+                v.id
+            );
         }
     }
 
@@ -498,9 +576,10 @@ mod tests {
     /// The guard that replaces `driver-metal`'s `LLAMA_LIKE` table. That
     /// table answered "does this build serve you" from an architecture
     /// STRING reduced by `canonical()`, in a driver, before any text was
-    /// traced — so it could say yes to a row whose text does not exist
-    /// (it listed `gemma4`) and no to one whose text does (it omitted
-    /// `gemma3`). The row answers now, and what it answers with is a
+    /// traced — so it could say yes to a row this build cannot resolve
+    /// (it listed `gpt_oss`, whose every publication either fails this
+    /// crate's manifest or names tensors `driver-metal` has no handle
+    /// for) and no to one whose text it models (it omitted `gemma3`). The row answers now, and what it answers with is a
     /// sentence naming what is missing.
     ///
     /// The comparison is against [`project::NO_METAL`] itself and not a

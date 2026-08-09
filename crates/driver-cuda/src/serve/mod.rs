@@ -35,7 +35,6 @@
 // the behaviour being replaced (`abi.cpp` writes `[pie-driver-cuda]` to
 // cerr), and an ABI boundary has no tracing subscriber to rely on.
 #![allow(clippy::print_stderr)]
-
 // Every export takes raw pointers by C-ABI necessity and null-checks them
 // before the deref — the same defensive shape the C++ shell has. The
 // caller-side contract is `driver_api::local`'s `unsafe extern` block;
@@ -43,24 +42,11 @@
 // fact the boundary already states.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 use driver_api::local::{
-    PIE_DRIVER_ABI_VERSION,
-    PIE_STATUS_DRIVER_ERROR,
-    PIE_STATUS_EXHAUSTED,
-    PIE_STATUS_INVALID_ARGUMENT,
-    PIE_STATUS_OK,
-    PieChannelDesc,
-    PieChannelEndpointBinding,
-    PieCompletion,
-    PieDriver,
-    PieDriverCaps,
-    PieDriverCreateDesc,
-    PieFrameDesc,
-    PieInstanceBinding,
-    PieInstanceDesc,
-    PieModelLoadDesc,
-    PieProgramDesc,
+    PIE_DRIVER_ABI_VERSION, PIE_STATUS_DRIVER_ERROR, PIE_STATUS_EXHAUSTED,
+    PIE_STATUS_INVALID_ARGUMENT, PIE_STATUS_OK, PieChannelDesc, PieChannelEndpointBinding,
+    PieCompletion, PieDriver, PieDriverCaps, PieDriverCreateDesc, PieFrameDesc, PieInstanceBinding,
+    PieInstanceDesc, PieModelLoadDesc, PieProgramDesc,
 };
-
 
 pub(crate) mod encode;
 pub(crate) mod load;
@@ -73,14 +59,7 @@ pub use transfer::{pie_cuda_copy_kv, pie_cuda_copy_state, pie_cuda_resize_pool};
 
 use crate::fire::launch::launch_impl;
 use load::{adopt_and_compile, create_impl, destroy_impl, load_impl};
-use state::{
-    ChannelState,
-    InstanceEntry,
-    ProgramEntry,
-    channel_dtype,
-    shell,
-    slice_of,
-};
+use state::{ChannelState, InstanceEntry, ProgramEntry, channel_dtype, shell, slice_of};
 
 /// A descriptor pointer, dereferenced ONLY through its validator.
 ///
@@ -205,7 +184,10 @@ pub fn live_device_bytes(driver: *mut PieDriver) -> usize {
     let Some(shell) = (unsafe { driver.cast::<state::Shell>().as_ref() }) else {
         return 0;
     };
-    shell.fire_alloc.as_ref().map_or(0, crate::device::Allocator::live_bytes)
+    shell
+        .fire_alloc
+        .as_ref()
+        .map_or(0, crate::device::Allocator::live_bytes)
 }
 
 /// Tear the driver down. Null is a no-op, as everywhere in the ABI.
@@ -230,7 +212,11 @@ pub fn pie_cuda_load_model(
         let Some(state) = shell(driver) else {
             return PIE_STATUS_INVALID_ARGUMENT;
         };
-        let load = match checked(load, driver_api::local::validate_model_load_desc, "load_model") {
+        let load = match checked(
+            load,
+            driver_api::local::validate_model_load_desc,
+            "load_model",
+        ) {
             Ok(d) => d,
             Err(status) => return status,
         };
@@ -292,68 +278,75 @@ pub fn pie_cuda_register_program(
     program: *const PieProgramDesc,
     program_id: *mut u64,
 ) -> i32 {
-    guard("pie_cuda_register_program", PIE_STATUS_DRIVER_ERROR, move || {
-        let Some(state) = shell(driver) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        };
-        let desc =
-            match checked(program, driver_api::local::validate_program_desc, "register_program") {
+    guard(
+        "pie_cuda_register_program",
+        PIE_STATUS_DRIVER_ERROR,
+        move || {
+            let Some(state) = shell(driver) else {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            };
+            let desc = match checked(
+                program,
+                driver_api::local::validate_program_desc,
+                "register_program",
+            ) {
                 Ok(d) => d,
                 Err(status) => return status,
             };
-        if desc.abi_version != PIE_DRIVER_ABI_VERSION {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        }
-        if let Some(id) = state
-            .programs
-            .iter()
-            .find(|(_, p)| p.program_hash == desc.program_hash)
-            .map(|(&id, _)| id)
-        {
+            if desc.abi_version != PIE_DRIVER_ABI_VERSION {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            if let Some(id) = state
+                .programs
+                .iter()
+                .find(|(_, p)| p.program_hash == desc.program_hash)
+                .map(|(&id, _)| id)
+            {
+                if let Some(out) = unsafe { program_id.as_mut() } {
+                    *out = id;
+                }
+                return PIE_STATUS_OK;
+            }
+
+            // SAFETY: the engine's contract for `register_program` is that every
+            // array reachable from the descriptor is live for the duration of the
+            // call. Adoption COPIES, so nothing here outlives that window --
+            // which is the reason it is done now rather than by holding the
+            // descriptor: `PieProgramDesc` is the caller's transient memory.
+            let package = unsafe { driver_api::adopt_package(&desc.launch) };
+            let kernels = unsafe { driver_api::adopt_emitted_kernels(desc.emitted_kernels) };
+
+            let id = state.next_id;
+            state.next_id += 1;
+
+            // A package with NO STAGES is not a malformed program; it is the
+            // absence of one. The engine registers such a descriptor for a
+            // forward-only deployment — the model runs, the logits come back
+            // through the instance's reader channel, and no user program sits
+            // around the fire. `adopt_launch_package` refuses an empty stage list
+            // because an ExecPlan with nothing to execute is not a plan, and it is
+            // right to; the judgement that this is not an ERROR belongs here,
+            // where the difference between "the host sent a broken program" and
+            // "the host sent no program" is visible.
+            if !package.stages.is_empty() {
+                if let Err(code) = adopt_and_compile(state, id, desc, package, &kernels) {
+                    return code;
+                }
+            }
+
+            state.programs.insert(
+                id,
+                ProgramEntry {
+                    program_hash: desc.program_hash,
+                    emitter_version: desc.emitter_version,
+                },
+            );
             if let Some(out) = unsafe { program_id.as_mut() } {
                 *out = id;
             }
-            return PIE_STATUS_OK;
-        }
-
-        // SAFETY: the engine's contract for `register_program` is that every
-        // array reachable from the descriptor is live for the duration of the
-        // call. Adoption COPIES, so nothing here outlives that window --
-        // which is the reason it is done now rather than by holding the
-        // descriptor: `PieProgramDesc` is the caller's transient memory.
-        let package = unsafe { driver_api::adopt_package(&desc.launch) };
-        let kernels = unsafe { driver_api::adopt_emitted_kernels(desc.emitted_kernels) };
-
-        let id = state.next_id;
-        state.next_id += 1;
-
-        // A package with NO STAGES is not a malformed program; it is the
-        // absence of one. The engine registers such a descriptor for a
-        // forward-only deployment — the model runs, the logits come back
-        // through the instance's reader channel, and no user program sits
-        // around the fire. `adopt_launch_package` refuses an empty stage list
-        // because an ExecPlan with nothing to execute is not a plan, and it is
-        // right to; the judgement that this is not an ERROR belongs here,
-        // where the difference between "the host sent a broken program" and
-        // "the host sent no program" is visible.
-        if !package.stages.is_empty() {
-            if let Err(code) = adopt_and_compile(state, id, desc, package, &kernels) {
-                return code;
-            }
-        }
-
-        state.programs.insert(
-            id,
-            ProgramEntry {
-                program_hash: desc.program_hash,
-                emitter_version: desc.emitter_version,
-            },
-        );
-        if let Some(out) = unsafe { program_id.as_mut() } {
-            *out = id;
-        }
-        PIE_STATUS_OK
-    })
+            PIE_STATUS_OK
+        },
+    )
 }
 
 /// Register a channel endpoint: the C++ registry's binding contract —
@@ -367,103 +360,107 @@ pub fn pie_cuda_register_channel(
     channel: *const PieChannelDesc,
     binding: *mut PieChannelEndpointBinding,
 ) -> i32 {
-    guard("pie_cuda_register_channel", PIE_STATUS_DRIVER_ERROR, move || {
-        use crate::fire::attention_workspace::{LiveStagingOps, StagingOps};
+    guard(
+        "pie_cuda_register_channel",
+        PIE_STATUS_DRIVER_ERROR,
+        move || {
+            use crate::fire::attention_workspace::{LiveStagingOps, StagingOps};
 
-        const MAX_RING: u64 = 64;
-        let Some(state) = shell(driver) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        };
-        let desc = match checked(
-            channel,
-            |d| unsafe { driver_api::local::validate_channel_desc(d) },
-            "register_channel",
-        ) {
-            Ok(d) => d,
-            Err(status) => return status,
-        };
-        if desc.abi_version != PIE_DRIVER_ABI_VERSION
-            || state.channels.contains_key(&desc.channel_id)
-            || desc.dtype > driver_api::local::PIE_CHANNEL_DTYPE_ACT
-        {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        }
-        let shape = slice_of(desc.shape.ptr, desc.shape.len);
-        let mut numel: u64 = 1;
-        for &d in shape {
-            let Some(next) = numel.checked_mul(u64::from(d)) else {
+            const MAX_RING: u64 = 64;
+            let Some(state) = shell(driver) else {
                 return PIE_STATUS_INVALID_ARGUMENT;
             };
-            numel = next;
-        }
-        let wire_bytes: u64 = if desc.dtype == driver_api::local::PIE_CHANNEL_DTYPE_BOOL {
-            numel.div_ceil(8)
-        } else {
-            match numel.checked_mul(4) {
-                Some(b) => b,
-                None => return PIE_STATUS_INVALID_ARGUMENT,
-            }
-        };
-        let ring = u64::from(desc.capacity) + 1;
-        if wire_bytes == 0 || ring > MAX_RING {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        }
-        let Some(mirror_bytes) = wire_bytes.checked_mul(ring) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        };
-        let Ok(mirror_bytes) = usize::try_from(mirror_bytes) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        };
-
-        let mut ops = LiveStagingOps;
-        let Some(mirror) = ops.malloc_host(mirror_bytes) else {
-            return PIE_STATUS_EXHAUSTED;
-        };
-        let word_bytes = 4 * std::mem::size_of::<u64>();
-        let Some(words) = ops.malloc_host(word_bytes) else {
-            ops.free_host(mirror);
-            return PIE_STATUS_EXHAUSTED;
-        };
-        unsafe {
-            std::ptr::write_bytes(mirror.cast::<u8>(), 0, mirror_bytes);
-            std::ptr::write_bytes(words.cast::<u8>(), 0, word_bytes);
-        }
-        state.channels.insert(
-            desc.channel_id,
-            ChannelState {
-                mirror,
-                words,
-                mirror_bytes,
-                cell_bytes: usize::try_from(wire_bytes).unwrap_or(usize::MAX),
-                ring: u32::try_from(ring).expect("ring fits u32"),
-                host_role: desc.host_role,
-                numel: usize::try_from(numel).unwrap_or(usize::MAX),
-                dtype: channel_dtype(desc.dtype),
-                // RECORDED AT REGISTRATION, refused at bind. Registering
-                // an extern channel is harmless — the endpoint binding
-                // below is the same either way, and the host mirror is
-                // real. What cannot be served is ATTACHING two programs
-                // to it, which is what `bind_instance` turns away.
-                extern_dir: desc.extern_dir,
-            },
-        );
-        if let Some(out) = unsafe { binding.as_mut() } {
-            *out = PieChannelEndpointBinding {
-                channel_id: desc.channel_id,
-                mirror_base: mirror as u64,
-                word_base: words as u64,
-                mirror_bytes: mirror_bytes as u64,
-                word_bytes: word_bytes as u64,
-                cell_bytes: u32::try_from(wire_bytes).unwrap_or(u32::MAX),
-                capacity: desc.capacity,
-                head_word_index: 0,
-                tail_word_index: 1,
-                poison_word_index: 2,
-                closed_word_index: 3,
+            let desc = match checked(
+                channel,
+                |d| unsafe { driver_api::local::validate_channel_desc(d) },
+                "register_channel",
+            ) {
+                Ok(d) => d,
+                Err(status) => return status,
             };
-        }
-        PIE_STATUS_OK
-    })
+            if desc.abi_version != PIE_DRIVER_ABI_VERSION
+                || state.channels.contains_key(&desc.channel_id)
+                || desc.dtype > driver_api::local::PIE_CHANNEL_DTYPE_ACT
+            {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            let shape = slice_of(desc.shape.ptr, desc.shape.len);
+            let mut numel: u64 = 1;
+            for &d in shape {
+                let Some(next) = numel.checked_mul(u64::from(d)) else {
+                    return PIE_STATUS_INVALID_ARGUMENT;
+                };
+                numel = next;
+            }
+            let wire_bytes: u64 = if desc.dtype == driver_api::local::PIE_CHANNEL_DTYPE_BOOL {
+                numel.div_ceil(8)
+            } else {
+                match numel.checked_mul(4) {
+                    Some(b) => b,
+                    None => return PIE_STATUS_INVALID_ARGUMENT,
+                }
+            };
+            let ring = u64::from(desc.capacity) + 1;
+            if wire_bytes == 0 || ring > MAX_RING {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            let Some(mirror_bytes) = wire_bytes.checked_mul(ring) else {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            };
+            let Ok(mirror_bytes) = usize::try_from(mirror_bytes) else {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            };
+
+            let mut ops = LiveStagingOps;
+            let Some(mirror) = ops.malloc_host(mirror_bytes) else {
+                return PIE_STATUS_EXHAUSTED;
+            };
+            let word_bytes = 4 * std::mem::size_of::<u64>();
+            let Some(words) = ops.malloc_host(word_bytes) else {
+                ops.free_host(mirror);
+                return PIE_STATUS_EXHAUSTED;
+            };
+            unsafe {
+                std::ptr::write_bytes(mirror.cast::<u8>(), 0, mirror_bytes);
+                std::ptr::write_bytes(words.cast::<u8>(), 0, word_bytes);
+            }
+            state.channels.insert(
+                desc.channel_id,
+                ChannelState {
+                    mirror,
+                    words,
+                    mirror_bytes,
+                    cell_bytes: usize::try_from(wire_bytes).unwrap_or(usize::MAX),
+                    ring: u32::try_from(ring).expect("ring fits u32"),
+                    host_role: desc.host_role,
+                    numel: usize::try_from(numel).unwrap_or(usize::MAX),
+                    dtype: channel_dtype(desc.dtype),
+                    // RECORDED AT REGISTRATION, refused at bind. Registering
+                    // an extern channel is harmless — the endpoint binding
+                    // below is the same either way, and the host mirror is
+                    // real. What cannot be served is ATTACHING two programs
+                    // to it, which is what `bind_instance` turns away.
+                    extern_dir: desc.extern_dir,
+                },
+            );
+            if let Some(out) = unsafe { binding.as_mut() } {
+                *out = PieChannelEndpointBinding {
+                    channel_id: desc.channel_id,
+                    mirror_base: mirror as u64,
+                    word_base: words as u64,
+                    mirror_bytes: mirror_bytes as u64,
+                    word_bytes: word_bytes as u64,
+                    cell_bytes: u32::try_from(wire_bytes).unwrap_or(u32::MAX),
+                    capacity: desc.capacity,
+                    head_word_index: 0,
+                    tail_word_index: 1,
+                    poison_word_index: 2,
+                    closed_word_index: 3,
+                };
+            }
+            PIE_STATUS_OK
+        },
+    )
 }
 
 /// Bind an instance to a registered program: the id lifecycle, honoring
@@ -474,68 +471,72 @@ pub fn pie_cuda_bind_instance(
     instance: *const PieInstanceDesc,
     binding: *mut PieInstanceBinding,
 ) -> i32 {
-    guard("pie_cuda_bind_instance", PIE_STATUS_DRIVER_ERROR, move || {
-        let Some(state) = shell(driver) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        };
-        let desc = match checked(
-            instance,
-            |d| unsafe { driver_api::local::validate_instance_desc(d) },
-            "bind_instance",
-        ) {
-            Ok(d) => d,
-            Err(status) => return status,
-        };
-        if desc.abi_version != PIE_DRIVER_ABI_VERSION
-            || !state.programs.contains_key(&desc.program_id)
-        {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        }
-        // AN EXTERN CHANNEL IS NOT SERVABLE HERE, and the reason is on
-        // `ChannelState::is_extern`: it needs ONE ring shared between the
-        // exporting and the importing program, and this driver builds a
-        // ring per session. Binding anyway gives the importer a private
-        // ring that no one ever fills — a program that blocks forever, or
-        // reads a zeroed cell and treats it as a value. Refusing at the
-        // attach is the only point where the driver can still say so.
-        let attached = slice_of(desc.channel_ids.ptr, desc.channel_ids.len);
-        if let Some(&cid) = attached
-            .iter()
-            .find(|c| state.channels.get(c).is_some_and(ChannelState::is_extern))
-        {
-            eprintln!(
-                "[driver-cuda] bind_instance: channel {cid} is declared extern \
+    guard(
+        "pie_cuda_bind_instance",
+        PIE_STATUS_DRIVER_ERROR,
+        move || {
+            let Some(state) = shell(driver) else {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            };
+            let desc = match checked(
+                instance,
+                |d| unsafe { driver_api::local::validate_instance_desc(d) },
+                "bind_instance",
+            ) {
+                Ok(d) => d,
+                Err(status) => return status,
+            };
+            if desc.abi_version != PIE_DRIVER_ABI_VERSION
+                || !state.programs.contains_key(&desc.program_id)
+            {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            // AN EXTERN CHANNEL IS NOT SERVABLE HERE, and the reason is on
+            // `ChannelState::is_extern`: it needs ONE ring shared between the
+            // exporting and the importing program, and this driver builds a
+            // ring per session. Binding anyway gives the importer a private
+            // ring that no one ever fills — a program that blocks forever, or
+            // reads a zeroed cell and treats it as a value. Refusing at the
+            // attach is the only point where the driver can still say so.
+            let attached = slice_of(desc.channel_ids.ptr, desc.channel_ids.len);
+            if let Some(&cid) = attached
+                .iter()
+                .find(|c| state.channels.get(c).is_some_and(ChannelState::is_extern))
+            {
+                eprintln!(
+                    "[driver-cuda] bind_instance: channel {cid} is declared extern \
                  and this driver allocates one ring per session, so the two \
                  programs sharing it would not share cells or cursors. \
                  Refusing rather than binding a ring nobody fills."
+                );
+                return driver_api::PIE_STATUS_UNSUPPORTED;
+            }
+            let id = if desc.requested_instance_id != 0 {
+                desc.requested_instance_id
+            } else {
+                let id = state.next_id;
+                state.next_id += 1;
+                id
+            };
+            if state.instances.contains_key(&id) {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            state.instances.insert(
+                id,
+                InstanceEntry {
+                    program_id: desc.program_id,
+                    geometry_class: desc.geometry_class,
+                    channel_ids: slice_of(desc.channel_ids.ptr, desc.channel_ids.len).to_vec(),
+                },
             );
-            return driver_api::PIE_STATUS_UNSUPPORTED;
-        }
-        let id = if desc.requested_instance_id != 0 {
-            desc.requested_instance_id
-        } else {
-            let id = state.next_id;
-            state.next_id += 1;
-            id
-        };
-        if state.instances.contains_key(&id) {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        }
-        state.instances.insert(
-            id,
-            InstanceEntry {
-                program_id: desc.program_id,
-                geometry_class: desc.geometry_class,
-                channel_ids: slice_of(desc.channel_ids.ptr, desc.channel_ids.len).to_vec(),
-            },
-        );
-        if let Some(out) = unsafe { binding.as_mut() } {
-            out.instance_id = id;
-            out.geometry_class = desc.geometry_class;
-            out.reserved0 = 0;
-        }
-        PIE_STATUS_OK
-    })
+            if let Some(out) = unsafe { binding.as_mut() } {
+                out.instance_id = id;
+                out.geometry_class = desc.geometry_class;
+                out.reserved0 = 0;
+            }
+            PIE_STATUS_OK
+        },
+    )
 }
 
 /// Launch a frame: the executor's fire assembly, promoted from the
@@ -597,40 +598,48 @@ pub fn pie_cuda_launch(
 /// Close an instance — idempotently, the C++'s reading: closing what is
 /// not open is not an error.
 pub fn pie_cuda_close_instance(driver: *mut PieDriver, instance_id: u64) -> i32 {
-    guard("pie_cuda_close_instance", PIE_STATUS_DRIVER_ERROR, move || {
-        let Some(state) = shell(driver) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        };
-        state.instances.remove(&instance_id);
-        // The rings go with it. They are the instance's, and holding them
-        // past its close is a device allocation nothing can reach — the
-        // channel ids that named it are gone with the entry above.
-        state.ptir_sessions.remove(&instance_id);
-        PIE_STATUS_OK
-    })
+    guard(
+        "pie_cuda_close_instance",
+        PIE_STATUS_DRIVER_ERROR,
+        move || {
+            let Some(state) = shell(driver) else {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            };
+            state.instances.remove(&instance_id);
+            // The rings go with it. They are the instance's, and holding them
+            // past its close is a device allocation nothing can reach — the
+            // channel ids that named it are gone with the entry above.
+            state.ptir_sessions.remove(&instance_id);
+            PIE_STATUS_OK
+        },
+    )
 }
 
 /// Close a channel — idempotently, freeing its pinned endpoint.
 pub fn pie_cuda_close_channel(driver: *mut PieDriver, channel_id: u64) -> i32 {
-    guard("pie_cuda_close_channel", PIE_STATUS_DRIVER_ERROR, move || {
-        let Some(state) = shell(driver) else {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        };
-        if let Some(ch) = state.channels.remove(&channel_id) {
-            // UNREGISTERED NOW, FREED LATER. See `InFlight::closed_channels`:
-            // a queued fire's debt holds a copy of this state and will publish
-            // into it from a stream callback, so the mirror cannot go back to
-            // the allocator until every fire that could name it has retired.
-            //
-            // No fire in flight means nothing can be holding it, and the free
-            // happens here as it always did.
-            match state.in_flight.back_mut() {
-                Some(last) => last.closed_channels.push(ch),
-                None => ch.free(),
+    guard(
+        "pie_cuda_close_channel",
+        PIE_STATUS_DRIVER_ERROR,
+        move || {
+            let Some(state) = shell(driver) else {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            };
+            if let Some(ch) = state.channels.remove(&channel_id) {
+                // UNREGISTERED NOW, FREED LATER. See `InFlight::closed_channels`:
+                // a queued fire's debt holds a copy of this state and will publish
+                // into it from a stream callback, so the mirror cannot go back to
+                // the allocator until every fire that could name it has retired.
+                //
+                // No fire in flight means nothing can be holding it, and the free
+                // happens here as it always did.
+                match state.in_flight.back_mut() {
+                    Some(last) => last.closed_channels.push(ch),
+                    None => ch.free(),
+                }
             }
-        }
-        PIE_STATUS_OK
-    })
+            PIE_STATUS_OK
+        },
+    )
 }
 
 #[cfg(test)]
@@ -667,7 +676,11 @@ mod tests {
         let eight = chan(8, DType::Bool, 1);
         assert_eq!(one.cell_bytes, eight.cell_bytes, "one wire byte either way");
         assert_eq!(one.shape().numel, 1);
-        assert_eq!(eight.shape().numel, 8, "the shape knows what the width cannot");
+        assert_eq!(
+            eight.shape().numel,
+            8,
+            "the shape knows what the width cannot"
+        );
         assert_eq!(eight.shape().cell_bytes(), 8, "native is a byte per lane");
 
         // And the capacity survives the `ring = capacity + 1` round trip,
@@ -689,17 +702,20 @@ mod tests {
 
         let mut channels = std::collections::BTreeMap::new();
         for (id, numel) in [(10u64, 4usize), (20, 9)] {
-            channels.insert(id, ChannelState {
-                mirror: std::ptr::null_mut(),
-                words: std::ptr::null_mut(),
-                mirror_bytes: 0,
-                cell_bytes: numel * 4,
-                extern_dir: driver_api::local::PIE_CHANNEL_EXTERN_NONE,
-                ring: 2,
-                host_role: 0,
-                numel,
-                dtype: DType::F32,
-            });
+            channels.insert(
+                id,
+                ChannelState {
+                    mirror: std::ptr::null_mut(),
+                    words: std::ptr::null_mut(),
+                    mirror_bytes: 0,
+                    cell_bytes: numel * 4,
+                    extern_dir: driver_api::local::PIE_CHANNEL_EXTERN_NONE,
+                    ring: 2,
+                    host_role: 0,
+                    numel,
+                    dtype: DType::F32,
+                },
+            );
         }
         let inst = |ids: Vec<u64>| InstanceEntry {
             program_id: 1,
@@ -710,7 +726,10 @@ mod tests {
         // The list is the INSTANCE's order, not the map's.
         let shapes = instance_ring_shapes(&inst(vec![20, 10]), &channels).expect("all present");
         assert_eq!(shapes.len(), 2);
-        assert_eq!(shapes[0].numel, 9, "channel 20 is index 0 because it is listed first");
+        assert_eq!(
+            shapes[0].numel, 9,
+            "channel 20 is index 0 because it is listed first"
+        );
         assert_eq!(shapes[1].numel, 4);
 
         assert!(

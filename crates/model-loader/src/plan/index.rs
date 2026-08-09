@@ -99,6 +99,8 @@ fn dense(found: u32, wanted: u32, what: &str) -> Result<()> {
 pub struct PlanIndex {
     tensor: HashMap<TensorId, u32>,
     source: HashMap<TensorId, u32>,
+    /// What each `CreateView` output looks at. See [`PlanIndex::buffer_tensor`].
+    view_input: HashMap<BufferId, BufferId>,
 }
 
 impl PlanIndex {
@@ -106,6 +108,14 @@ impl PlanIndex {
         Self {
             tensor: position_by_id(plan.tensors.iter().map(|decl| decl.id)),
             source: position_by_id(plan.sources.iter().map(|decl| decl.id)),
+            view_input: plan
+                .instrs
+                .iter()
+                .filter_map(|instr| match instr {
+                    StorageInstr::CreateView { input, output, .. } => Some((*output, *input)),
+                    _ => None,
+                })
+                .collect(),
         }
     }
 
@@ -117,9 +127,26 @@ impl PlanIndex {
         plan.sources.get(*self.source.get(&id)? as usize)
     }
 
-    /// The declaration behind a buffer, if the buffer names one.
+    /// The declaration behind a buffer, chasing views.
+    ///
+    /// A `CreateView` output declares no tensor: it is a window onto one, and a
+    /// window has the elements of what it looks at. The executor already
+    /// chases the chain for BYTES — `resolve` walks `BufferLoc::View` to a
+    /// root — and the type has to follow the same links or the two answers
+    /// disagree: a transform reading a view gets its bytes and is then refused
+    /// for having no type, from a plan the compiler accepted.
+    ///
+    /// The chain terminates because `CreateView` names an input that is
+    /// already allocated, so the links only ever point backwards in the
+    /// schedule.
     pub fn buffer_tensor<'a>(&self, plan: &'a LoadPlan, id: BufferId) -> Option<&'a TensorDecl> {
-        self.tensor(plan, plan.buffer(id).ok()?.tensor?)
+        let mut at = id;
+        loop {
+            if let Some(tensor) = plan.buffer(at).ok()?.tensor {
+                return self.tensor(plan, tensor);
+            }
+            at = *self.view_input.get(&at)?;
+        }
     }
 }
 

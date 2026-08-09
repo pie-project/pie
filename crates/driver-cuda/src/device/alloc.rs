@@ -231,7 +231,11 @@ impl Allocator {
     /// number that says a deferral was never drained.
     #[must_use]
     pub fn live_bytes(&self) -> usize {
-        self.inner.state.lock().unwrap_or_else(|e| e.into_inner()).live
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .live
     }
 
     /// Bytes freed during an open capture and not yet reclaimed.
@@ -240,7 +244,11 @@ impl Allocator {
     /// capture open is a drain that never ran.
     #[must_use]
     pub fn deferred_bytes(&self) -> usize {
-        self.inner.state.lock().unwrap_or_else(|e| e.into_inner()).deferred
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .deferred
     }
 
     /// Begin capturing `stream` into a graph.

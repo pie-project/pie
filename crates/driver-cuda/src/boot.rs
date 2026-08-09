@@ -41,7 +41,10 @@
 /// `0`, `false`, `off`, `no` and empty are off; anything else present is
 /// on. The three hand-rolled versions this replaces disagreed.
 fn truthy(v: &str) -> bool {
-    !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no" | "")
+    !matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no" | ""
+    )
 }
 
 /// A positive integer knob, clamped to a stated ceiling.
@@ -122,9 +125,8 @@ impl Boot {
     /// reason `layout::profile_cache::cache_path` takes one.
     pub fn parse(boot: Option<&toml::Table>, env: impl Fn(&str) -> Option<String>) -> Self {
         let mut cfg = Self::default();
-        let table = |section: &str, key: &str| -> Option<&toml::Value> {
-            boot?.get(section)?.get(key)
-        };
+        let table =
+            |section: &str, key: &str| -> Option<&toml::Value> { boot?.get(section)?.get(key) };
         let flag = |slot: &mut bool, section: &str, key: &str, var: &str| {
             if let Some(v) = table(section, key) {
                 if let Some(b) = v.as_bool() {
@@ -141,13 +143,36 @@ impl Boot {
             }
         };
         flag(&mut cfg.runahead, "driver", "runahead", "PIE_CUDA_RUNAHEAD");
-        flag(&mut cfg.supergraph, "driver", "supergraph", "PIE_CUDA_SUPERGRAPH");
-        flag(&mut cfg.trace_supergraph, "driver", "trace_supergraph",
-             "PIE_CUDA_TRACE_SUPERGRAPH");
-        flag(&mut cfg.device_transforms, "driver", "device_transforms",
-             "PIE_LOADER_DEVICE_TRANSFORMS");
-        flag(&mut cfg.kv_envelopes, "driver", "kv_envelopes", "PIE_CUDA_KV_ENVELOPES");
-        flag(&mut cfg.calibrating, "batching", "calibrate_planner", "PIE_CUDA_CALIBRATE");
+        flag(
+            &mut cfg.supergraph,
+            "driver",
+            "supergraph",
+            "PIE_CUDA_SUPERGRAPH",
+        );
+        flag(
+            &mut cfg.trace_supergraph,
+            "driver",
+            "trace_supergraph",
+            "PIE_CUDA_TRACE_SUPERGRAPH",
+        );
+        flag(
+            &mut cfg.device_transforms,
+            "driver",
+            "device_transforms",
+            "PIE_LOADER_DEVICE_TRANSFORMS",
+        );
+        flag(
+            &mut cfg.kv_envelopes,
+            "driver",
+            "kv_envelopes",
+            "PIE_CUDA_KV_ENVELOPES",
+        );
+        flag(
+            &mut cfg.calibrating,
+            "batching",
+            "calibrate_planner",
+            "PIE_CUDA_CALIBRATE",
+        );
 
         if let Some(n) = table("driver", "attn_score_window")
             .and_then(toml::Value::as_integer)
@@ -188,7 +213,10 @@ mod tests {
         assert!(cfg.runahead, "run-ahead is the point of the fire path");
         assert!(cfg.supergraph);
         assert!(cfg.device_transforms);
-        assert!(!cfg.kv_envelopes, "envelopes are opt-in; nothing binds them");
+        assert!(
+            !cfg.kv_envelopes,
+            "envelopes are opt-in; nothing binds them"
+        );
         assert_eq!(cfg.attn_score_window, 32);
         assert_eq!(cfg.rs_stash_tokens, None, "uncapped");
     }
@@ -219,7 +247,10 @@ mod tests {
     fn the_boot_config_outranks_the_environment() {
         let boot: toml::Table = "[driver]\nrunahead = false\n".parse().expect("parses");
         let cfg = Boot::parse(Some(&boot), |_| Some("1".to_owned()));
-        assert!(!cfg.runahead, "the file said off; the environment does not overrule it");
+        assert!(
+            !cfg.runahead,
+            "the file said off; the environment does not overrule it"
+        );
     }
 
     /// An unreadable override leaves the default rather than refusing.
@@ -231,7 +262,9 @@ mod tests {
             });
             assert_eq!(cfg.attn_score_window, 32, "{junk:?} leaves the default");
         }
-        let cfg = Boot::parse(None, |k| (k == "PIE_ATTN_SCORE_WINDOW").then(|| "64".to_owned()));
+        let cfg = Boot::parse(None, |k| {
+            (k == "PIE_ATTN_SCORE_WINDOW").then(|| "64".to_owned())
+        });
         assert_eq!(cfg.attn_score_window, 64);
     }
 }

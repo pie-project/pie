@@ -18,18 +18,18 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use objc2::runtime::ProtocolObject;
 use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLComputePipelineState;
 
 use crate::device::recording::{Bind, Command};
 
-use crate::error::{Error, Result};
 use crate::device::Context;
 use crate::device::{ArgumentTable, StepEncoder};
-use crate::program::Compiler;
+use crate::error::{Error, Result};
 use crate::layout::region::Region as _;
 use crate::layout::shader::Request;
+use crate::program::Compiler;
 
 use crate::lowering::dispatch::{Dispatch, pipelines_needed};
 
@@ -409,10 +409,12 @@ pub fn commands<'a>(
         .iter()
         .enumerate()
         .map(|(index, dispatch)| {
-            let pipeline = pipelines.get(dispatch.symbol).ok_or_else(|| Error::Create {
-                what: "recording",
-                message: format!("`{}` has no compiled pipeline", dispatch.symbol),
-            })?;
+            let pipeline = pipelines
+                .get(dispatch.symbol)
+                .ok_or_else(|| Error::Create {
+                    what: "recording",
+                    message: format!("`{}` has no compiled pipeline", dispatch.symbol),
+                })?;
             let mut binds: Vec<Bind> = dispatch
                 .args
                 .iter()

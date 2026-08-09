@@ -13,8 +13,7 @@
 #![cfg(feature = "_cuda")]
 
 use driver_cuda::pools::recurrent_state_cache::{
-    Buffer, PoolDims, RecurrentStateCache, StateOp, recurrent_state_bf16_default,
-    stash_tokens_cap,
+    Buffer, PoolDims, RecurrentStateCache, StateOp, recurrent_state_bf16_default, stash_tokens_cap,
 };
 
 const GOLDEN_FNV1A64: u64 = 0x96718f7ba4005865;
@@ -150,7 +149,8 @@ impl Sweep {
     }
 
     fn fields(&mut self, id: &str, fields: &[String]) {
-        self.rows.push(format!("{id}|{}", fields.join(&US.to_string())));
+        self.rows
+            .push(format!("{id}|{}", fields.join(&US.to_string())));
     }
 }
 
@@ -448,11 +448,9 @@ fn run_tiers(
     let mut rows = Vec::new();
     for i in -1..=nl {
         for s in -1..=pool_slots {
-            let off = u32::try_from(i).ok().and_then(|i| {
-                u32::try_from(s)
-                    .ok()
-                    .and_then(|s| c.rs_buffer_slab(i, s))
-            });
+            let off = u32::try_from(i)
+                .ok()
+                .and_then(|i| u32::try_from(s).ok().and_then(|s| c.rs_buffer_slab(i, s)));
             rows.push(format!(
                 "p{i}/{s}={}",
                 off.and_then(|o| pool_buf.map(|n| format!("buf{n}+{o}")))
@@ -546,7 +544,17 @@ fn the_recurrent_state_cache_matches_the_cpp_byte_for_byte() {
         for conv_kernel in [0, 1, 4] {
             let id = format!("geo/c{conv_dim}x{conv_kernel}");
             run_case(
-                &mut sw, &id, &mixed, conv_dim, conv_kernel, 3, 8, 16, 32, 3, false,
+                &mut sw,
+                &id,
+                &mixed,
+                conv_dim,
+                conv_kernel,
+                3,
+                8,
+                16,
+                32,
+                3,
+                false,
             );
         }
     }

@@ -40,8 +40,8 @@
 use std::sync::Arc;
 use tokenizer::Tokenizer;
 
-use crate::shared::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
 use crate::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder};
+use crate::shared::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
 
 /// The speaker a user's turn is attributed to.
 pub const SPEAKER_USER: u32 = 0;
@@ -74,7 +74,12 @@ impl CsmInstruct {
             .iter()
             .filter_map(|s| tokenizer.token_to_id(s))
             .collect();
-        Self { tokenizer, bos, eos, stop_ids }
+        Self {
+            tokenizer,
+            bos,
+            eos,
+            stop_ids,
+        }
     }
 
     /// One turn: `<bos>[speaker]text<eos>`.
@@ -143,7 +148,10 @@ impl Instruct for CsmInstruct {
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
-        Box::new(GenericChatDecoder::new(self.tokenizer.clone(), self.stop_ids.clone()))
+        Box::new(GenericChatDecoder::new(
+            self.tokenizer.clone(),
+            self.stop_ids.clone(),
+        ))
     }
 
     /// No reasoning block: this model's continuation is speech.
@@ -190,15 +198,24 @@ mod tests {
     #[test]
     fn a_user_turn_names_speaker_zero() {
         let inst = csm();
-        assert_eq!(text(&inst, &inst.user("Hello")), "<|begin_of_text|>[0]Hello<|end_of_text|>");
+        assert_eq!(
+            text(&inst, &inst.user("Hello")),
+            "<|begin_of_text|>[0]Hello<|end_of_text|>"
+        );
     }
 
     /// And the model's turn names speaker 1.
     #[test]
     fn the_models_turn_names_speaker_one() {
         let inst = csm();
-        assert_eq!(text(&inst, &inst.assistant("Hi")), "<|begin_of_text|>[1]Hi<|end_of_text|>");
-        assert_ne!(SPEAKER_USER, SPEAKER_ASSISTANT, "one speaker is not a conversation");
+        assert_eq!(
+            text(&inst, &inst.assistant("Hi")),
+            "<|begin_of_text|>[1]Hi<|end_of_text|>"
+        );
+        assert_ne!(
+            SPEAKER_USER, SPEAKER_ASSISTANT,
+            "one speaker is not a conversation"
+        );
     }
 
     /// EVERY turn carries `<|begin_of_text|>`, including the later ones.

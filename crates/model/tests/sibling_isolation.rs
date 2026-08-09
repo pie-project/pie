@@ -121,12 +121,24 @@ fn no_generation_names_a_sibling() {
 ///
 /// Without this, a rename of the generation modules would turn the test above
 /// into an assertion about strings nothing contains, passing forever.
+///
+/// It looked in `contract.rs` and `instruct.rs`, and both stopped naming a
+/// generation when the catalog became the one registry — the guard went
+/// vacuous exactly as its own doc predicted, and said so. `catalog.rs` is
+/// where the paths are now, so that is where it looks; the fallbacks stay
+/// because the point is to find A registry, not a particular file.
 #[test]
 fn the_sibling_path_shape_is_real() {
     let generations = generations();
-    let registry = std::fs::read_to_string(src().join("contract.rs"))
-        .or_else(|_| std::fs::read_to_string(src().join("instruct.rs")))
-        .expect("at least one registry exists");
+    let registry = ["catalog.rs", "contract.rs", "instruct.rs"]
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(src().join(f)).ok())
+        .find(|text| {
+            generations
+                .iter()
+                .any(|g| text.contains(&format!("crate::{g}::")))
+        })
+        .expect("a registry naming its generations exists");
     let hits = generations
         .iter()
         .filter(|g| registry.contains(&format!("crate::{g}::")))

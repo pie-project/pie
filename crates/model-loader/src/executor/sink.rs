@@ -22,7 +22,7 @@ pub trait TensorSink {
 
 /// The collecting sink: every tensor, resident.
 ///
-/// What [`execute_plan`](crate::executor::host::execute_plan) uses to keep
+/// What [`Execution`](crate::executor::Execution) uses by default to keep
 /// its shape — tests and the differential oracle want the whole output in
 /// hand. Production callers with large outputs want a streaming sink
 /// instead.

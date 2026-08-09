@@ -3,12 +3,12 @@
 //! Uses <|start_header_id|>role<|end_header_id|> delimiters.
 //! Tool responses use the `ipython` role.
 
-use crate::shared::decoders::{GenericChatDecoder, ThinkingDecoder};
 use crate::instruct::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
 };
-use tokenizer::{Tokenizer, TokenizerDecoder};
+use crate::shared::decoders::{GenericChatDecoder, ThinkingDecoder};
 use std::sync::Arc;
+use tokenizer::{Tokenizer, TokenizerDecoder};
 
 // The implementation below mirrors the published Llama-3 jinja chat
 // template; the verbatim copy that used to sit here as a static was never
@@ -224,8 +224,8 @@ impl ToolDecoder for LlamaToolDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokenizer::Tokenizer;
     use std::sync::Arc;
+    use tokenizer::Tokenizer;
 
     fn make_tok(vocab: &[&str]) -> Arc<Tokenizer> {
         let v: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();

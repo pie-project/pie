@@ -123,6 +123,8 @@ pub const VARIANTS: &[Dsv4] = &[Dsv4 {
         moe: spec::Dsv4MoeFacts {
             num_experts: 64,
             top_k: 6,
+            norm_topk_prob: false,
+            routed_scaling: 2.5,
             moe_intermediate: 1024,
             swiglu_limit_milli: 7000,
             hash_routed: false,
@@ -327,10 +329,19 @@ mod tests {
     fn the_row_states_the_stack_the_old_derivation_flattened() {
         let s = &row("deepseek-v4").shape;
         assert!(s.hc.mult > 1, "the derivation read 1: an ordinary residual");
-        assert!(s.attn.o_lora_rank > 0, "the derivation read 0: an ungrouped output");
+        assert!(
+            s.attn.o_lora_rank > 0,
+            "the derivation read 0: an ungrouped output"
+        );
         assert!(s.attn.o_groups > 1, "the derivation read 1: a single group");
-        assert!(s.moe.swiglu_limit_milli > 0, "the derivation read 0: no clamp");
-        assert!(!s.ratios.is_empty(), "the derivation passed no schedule at all");
+        assert!(
+            s.moe.swiglu_limit_milli > 0,
+            "the derivation read 0: no clamp"
+        );
+        assert!(
+            !s.ratios.is_empty(),
+            "the derivation passed no schedule at all"
+        );
     }
 
     /// One row, one id, and the id is unique and non-empty. A duplicate
@@ -340,7 +351,10 @@ mod tests {
     fn the_ids_are_unique_and_non_empty() {
         let mut seen = std::collections::BTreeSet::new();
         for v in VARIANTS {
-            assert!(!v.id.is_empty(), "a row with no id cannot be asked for by name");
+            assert!(
+                !v.id.is_empty(),
+                "a row with no id cannot be asked for by name"
+            );
             assert!(seen.insert(v.id), "{} is stated twice", v.id);
         }
     }
@@ -353,11 +367,16 @@ mod tests {
     fn the_ids_are_lowercase_and_hyphenated() {
         for v in VARIANTS {
             assert!(
-                v.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                v.id.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
                 "{} is not the shape an id is written in",
                 v.id,
             );
-            assert!(!v.id.contains('_'), "{}: `_` is a model_type's spelling", v.id);
+            assert!(
+                !v.id.contains('_'),
+                "{}: `_` is a model_type's spelling",
+                v.id
+            );
             assert_ne!(v.id, ARCH, "an id names a MODEL and an arch names a family");
         }
     }
@@ -400,7 +419,10 @@ mod tests {
         let v = row("deepseek-v4");
         let m = v.manifest();
         assert_eq!(m.layers, v.shape.layers);
-        assert!(m.tensors.len() > 10, "a stack this deep names more than a handful");
+        assert!(
+            m.tensors.len() > 10,
+            "a stack this deep names more than a handful"
+        );
         assert_eq!(v.id(), "deepseek-v4");
         assert!(matches!(
             v.deployment(Deployed::single()),
@@ -430,7 +452,10 @@ mod tests {
             v.deployment(Deployed::single()).is_err(),
             "this test is about a row this build refuses; that is the premise",
         );
-        for (class, suffix) in [(FireClass::Decode, "decode"), (FireClass::Prefill, "prefill")] {
+        for (class, suffix) in [
+            (FireClass::Decode, "decode"),
+            (FireClass::Prefill, "prefill"),
+        ] {
             let plan = project::trace(&v.shape, class);
             assert_eq!(plan.family, format!("deepseek_v4.cuda.{suffix}"));
             assert!(
@@ -454,13 +479,25 @@ mod tests {
         use model_loader::plan::StorageTarget;
 
         let v = row("deepseek-v4");
-        let meta = CheckpointMetadata { files: Vec::new(), tensors: Vec::new() };
+        let meta = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: Vec::new(),
+        };
         let target = StorageTarget::default();
         let encoding = StoredEncoding::dense();
 
-        let mlx = Policy { naming: Naming::Mlx, ..Policy::default() };
-        let mut b =
-            crate::shared::builder::Builder::new(&meta, v.id, v.load_shape(), &encoding, &target, &mlx);
+        let mlx = Policy {
+            naming: Naming::Mlx,
+            ..Policy::default()
+        };
+        let mut b = crate::shared::builder::Builder::new(
+            &meta,
+            v.id,
+            v.load_shape(),
+            &encoding,
+            &target,
+            &mlx,
+        );
         assert_eq!(b.naming(), Naming::Mlx);
         assert!(
             v.author(&mut b).is_err(),
@@ -471,10 +508,19 @@ mod tests {
         // And the naming that DOES have a pass reaches it: an empty
         // checkpoint authors an empty contract without refusing.
         let hf = Policy::default();
-        let mut b =
-            crate::shared::builder::Builder::new(&meta, v.id, v.load_shape(), &encoding, &target, &hf);
+        let mut b = crate::shared::builder::Builder::new(
+            &meta,
+            v.id,
+            v.load_shape(),
+            &encoding,
+            &target,
+            &hf,
+        );
         assert_eq!(b.naming(), Naming::Hf);
-        assert!(v.author(&mut b).is_ok(), "the HF pass is the one this row has");
+        assert!(
+            v.author(&mut b).is_ok(),
+            "the HF pass is the one this row has"
+        );
     }
 
     /// The chat answer is DeepSeek's own and not ChatML. The `_ =>` arm
@@ -514,7 +560,11 @@ mod tests {
             let chat = v.chat(tok.clone());
             let turn = tok.decode(&chat.user("Hi"), false);
             assert_eq!(turn, "<｜User｜>Hi", "{}", v.id);
-            assert!(!turn.contains("<|im_start|>"), "{}: the ChatML fallback is gone", v.id);
+            assert!(
+                !turn.contains("<|im_start|>"),
+                "{}: the ChatML fallback is gone",
+                v.id
+            );
             assert_eq!(
                 tok.decode(&chat.cue(), false),
                 "<｜Assistant｜>",
@@ -541,8 +591,16 @@ mod tests {
     fn the_row_answers_what_the_driver_advertises() {
         for v in VARIANTS {
             let a = v.advertised();
-            assert_eq!(a.arch, "deepseek_v4", "{}: the family label a guest program sees", v.id);
-            assert!(!a.arch.is_empty(), "{}: an empty label matches no guest predicate", v.id);
+            assert_eq!(
+                a.arch, "deepseek_v4",
+                "{}: the family label a guest program sees",
+                v.id
+            );
+            assert!(
+                !a.arch.is_empty(),
+                "{}: an empty label matches no guest predicate",
+                v.id
+            );
             assert_eq!(
                 a.max_model_len, 0,
                 "{}: state a ceiling only from a published config — the only DeepSeek-V4 \
@@ -579,9 +637,10 @@ mod tests {
     /// The guard that replaces `driver-metal`'s `LLAMA_LIKE` table. That
     /// table answered "does this build serve you" from an architecture
     /// STRING reduced by `canonical()`, in a driver, before any text was
-    /// traced — so it could say yes to a row whose text does not exist
-    /// (it listed `gemma4`) and no to one whose text does (it omitted
-    /// `gemma3`). The row answers now, and what it answers with is a
+    /// traced — so it could say yes to a row this build cannot resolve
+    /// (it listed `gpt_oss`, whose every publication either fails this
+    /// crate's manifest or names tensors `driver-metal` has no handle
+    /// for) and no to one whose text it models (it omitted `gemma3`). The row answers now, and what it answers with is a
     /// sentence naming what is missing.
     ///
     /// The comparison is against [`project::NO_METAL`] itself and not a

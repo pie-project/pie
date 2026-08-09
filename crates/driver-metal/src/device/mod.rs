@@ -30,7 +30,6 @@ pub mod allocator;
 pub mod archive;
 pub mod argtable;
 pub mod context;
-pub mod probe;
 pub mod elastic;
 pub mod encoder;
 pub mod external;
@@ -39,17 +38,18 @@ pub mod handle;
 pub mod heap;
 pub mod keepalive;
 pub mod memory;
+pub mod probe;
 pub mod recording;
 pub mod regions;
 pub mod ring;
 pub mod step_cost;
 pub mod timestamp;
 
+pub use allocation::Allocation;
 pub use allocator::{DEFAULT_CAPACITY, Pool, PoolStats, SMALLEST_CLASS, Transient};
 pub use archive::{Archives, CACHE_ENV, EXTENSION, MAX_AGE};
 pub use argtable::{MAX_BINDINGS, Tables};
 pub use context::{ALLOCATOR_COUNT, Context};
-pub use probe::DeviceInfo;
 pub use elastic::{
     Arena, Budget, CHUNK, Elastic, Need, PAGE, Pressure, TILE, create as create_elastic,
     pages_for_bytes,
@@ -61,9 +61,9 @@ pub use handle::Handle;
 pub use heap::{Heap, Slot};
 pub use keepalive::{Keepalive, MIN_DEPTH, MIN_THREADGROUPS, THREADS_PER_THREADGROUP};
 pub use memory::{Memory, Pages, reclaimable_pages};
+pub use probe::DeviceInfo;
 pub use recording::{Bind, Command, Recording, record};
 pub use regions::Regions;
-pub use allocation::Allocation;
 pub use ring::Ring;
 pub use step_cost::Timing;
 pub use timestamp::{Granularity, Timestamps};

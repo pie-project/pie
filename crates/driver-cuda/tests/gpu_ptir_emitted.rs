@@ -26,8 +26,8 @@
 //! launched a kernel without them would be asserting against uninitialised
 //! device memory.
 
-use driver_cuda::program::{Disk, Runtime, Target};
 use driver::{Versions, adopt_launch_package};
+use driver_cuda::program::{Disk, Runtime, Target};
 use tensor_compiler::codegen::program::{Backend, emit_program};
 use tensor_compiler::plan::compile_bound;
 use tensor_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};

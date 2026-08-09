@@ -187,12 +187,24 @@ mod tests {
     /// equality and one by substring — so it is asked once here.
     #[test]
     fn mxfp4_is_one_question_with_one_answer() {
-        let e = Encoding { method: "mxfp4".into(), bits: 4, group_size: 32 };
+        let e = Encoding {
+            method: "mxfp4".into(),
+            bits: 4,
+            group_size: 32,
+        };
         assert!(e.is_mxfp4());
         assert!(!e.is_none());
-        let upper = Encoding { method: "MXFP4".into(), bits: 4, group_size: 32 };
+        let upper = Encoding {
+            method: "MXFP4".into(),
+            bits: 4,
+            group_size: 32,
+        };
         assert!(upper.is_mxfp4(), "a method name is not case-significant");
-        let awq = Encoding { method: "awq".into(), bits: 4, group_size: 128 };
+        let awq = Encoding {
+            method: "awq".into(),
+            bits: 4,
+            group_size: 128,
+        };
         assert!(!awq.is_mxfp4());
         assert!(!awq.is_none());
     }
@@ -200,7 +212,11 @@ mod tests {
     /// Zero bits is a value a reader must not treat as "4".
     #[test]
     fn an_undeclared_width_is_zero_and_says_so() {
-        let e = Encoding { method: "awq".into(), bits: 0, group_size: 0 };
+        let e = Encoding {
+            method: "awq".into(),
+            bits: 0,
+            group_size: 0,
+        };
         assert!(!e.is_none(), "a method with no width is still quantized");
         assert_eq!(e.bits, 0);
     }
@@ -254,15 +270,16 @@ mod tests {
     #[cfg(feature = "contract")]
     #[test]
     fn the_mlx_spelling_is_read_so_an_eight_bit_checkpoint_is_not_authored_as_four() {
-        let e = Encoding::from_config_json(
-            r#"{"quantization":{"group_size":64,"bits":8}}"#,
-        )
-        .expect("valid json");
-        assert_eq!(e.bits, 8, "not 4, which is what an undeclared width becomes");
+        let e = Encoding::from_config_json(r#"{"quantization":{"group_size":64,"bits":8}}"#)
+            .expect("valid json");
+        assert_eq!(
+            e.bits, 8,
+            "not 4, which is what an undeclared width becomes"
+        );
         assert_eq!(e.group_size, 64);
         assert!(
             e.method.is_empty(),
-            "mlx declares a width without naming a method, and inventing one              would route the authoring pass somewhere it was not asked to go"
+            "mlx declares a width without naming a method, and inventing one would route the authoring pass somewhere it was not asked to go"
         );
     }
 

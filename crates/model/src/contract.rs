@@ -151,11 +151,17 @@ mod tests {
                 raw
             })
             .collect();
-        CheckpointMetadata { files: Vec::new(), tensors }
+        CheckpointMetadata {
+            files: Vec::new(),
+            tensors,
+        }
     }
 
     fn target() -> StorageTarget {
-        StorageTarget { preferred_alignment: 256, ..StorageTarget::default() }
+        StorageTarget {
+            preferred_alignment: 256,
+            ..StorageTarget::default()
+        }
     }
 
     /// The row authors, and what comes back is the row's contract.
@@ -235,14 +241,9 @@ mod tests {
                 native_mxfp4_moe: native,
                 ..StorageTarget::default()
             };
-            let (_, resolved) = author_with_policy(
-                row(),
-                &StoredEncoding::dense(),
-                &meta,
-                &target,
-                &policy,
-            )
-            .expect("a one-tensor contract");
+            let (_, resolved) =
+                author_with_policy(row(), &StoredEncoding::dense(), &meta, &target, &policy)
+                    .expect("a one-tensor contract");
             assert_eq!(resolved, expected, "native_mxfp4_moe={native}");
         }
     }
@@ -264,8 +265,14 @@ mod tests {
 
         assert_eq!(one.alignment, two.alignment);
         assert_eq!(
-            one.tensors.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
-            two.tensors.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+            one.tensors
+                .iter()
+                .map(|t| t.name.clone())
+                .collect::<Vec<_>>(),
+            two.tensors
+                .iter()
+                .map(|t| t.name.clone())
+                .collect::<Vec<_>>(),
         );
     }
 

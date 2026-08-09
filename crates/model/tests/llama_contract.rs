@@ -34,12 +34,12 @@ use model_loader::plan::compile as compile_load_plan;
 use model_loader::types::{BackendKind, CheckpointFormat, DType, Encoding, FileId, TensorId};
 use model_loader::verify::ContractView;
 
-use model::shared::builder::Builder;
 use model::catalog::{Deployed, LoadShape, Variant};
+use model::contract::author;
 use model::deployment::{Deployment, Refusal};
 use model::encoding::Encoding as StoredEncoding;
+use model::shared::builder::Builder;
 use model::shared::policy::Policy;
-use model::contract::author;
 
 // ── the fixture checkpoint ──────────────────────────────────────────
 
@@ -204,7 +204,7 @@ impl Variant for LlamaFixture {
     }
 
     fn author(&self, b: &mut Builder<'_>) -> Result<(), model_loader::error::Error> {
-        model::llama_3::contract::author_llama_like(b)
+        model::shared::llama_like::contract::author_llama_like(b)
     }
 
     #[cfg(feature = "forward")]
@@ -253,8 +253,14 @@ fn check(name: &str, target: &StorageTarget) {
     // `model_type` no row claimed, so every caller carried a second
     // unwrap for a case that meant "the table is incomplete". A caller
     // holding a row cannot be in that case.
-    let contract = author(&LlamaFixture, &StoredEncoding::dense(), &metadata, target, &policy)
-        .expect("authoring failed");
+    let contract = author(
+        &LlamaFixture,
+        &StoredEncoding::dense(),
+        &metadata,
+        target,
+        &policy,
+    )
+    .expect("authoring failed");
 
     let mut fresh = serde_json::to_string_pretty(&contract).expect("serialize contract");
     fresh.push('\n');
@@ -281,12 +287,10 @@ fn check(name: &str, target: &StorageTarget) {
     // driver boot runs.
     let plan = compile_load_plan(&metadata, &contract, target.clone())
         .unwrap_or_else(|err| panic!("{name}: compiling failed: {err}"));
-    if let Err(violations) =
-        model_loader::verify::verify(
-            &model_loader::verify::view_of(&plan),
-            Some(&ContractView::of(&contract)),
-        )
-    {
+    if let Err(violations) = model_loader::verify::verify(
+        &model_loader::verify::view_of(&plan),
+        Some(&ContractView::of(&contract)),
+    ) {
         let listed: Vec<String> = violations.iter().map(ToString::to_string).collect();
         panic!(
             "{name}: the plan does not honour its contract:\n  {}",

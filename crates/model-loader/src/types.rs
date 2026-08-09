@@ -243,8 +243,10 @@ impl QuantSpec {
     /// GGUF blocks carry their scales *inside* the payload — Q4_0 is one F16
     /// scale and sixteen packed bytes per 32 elements — so their size is not
     /// `elements × bits / 8` and a span computed that way reads short. These
-    /// are the GGML reference layouts, and `gguf.rs` states the same Q4_0
-    /// numbers when it types a checkpoint.
+    /// are the GGML reference layouts, and this table is the only place in
+    /// the crate that states them — `checkpoint/zt.rs` and
+    /// `checkpoint/write.rs` carry the `gguf.q4_0/1` encoding *name* and ask
+    /// here for its size.
     pub fn block_layout(&self) -> Option<(u64, u64)> {
         match self.scheme {
             QuantScheme::GgufQ4_0 => Some((32, 18)),

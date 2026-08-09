@@ -358,7 +358,10 @@ fn compute_decode_score_csr(
     scratch.raw_offsets.resize(requests + 1, 0);
     scratch.folded_offsets.clear();
     scratch.folded_offsets.resize(requests + 1, 0);
-    let mut totals = DecodeScoreCsrTotals { raw_total: 0, folded_total: 0 };
+    let mut totals = DecodeScoreCsrTotals {
+        raw_total: 0,
+        folded_total: 0,
+    };
     for r in 0..requests {
         let pages = kvpp[r + 1] - kvpp[r];
         let kv_len = if pages == 0 {
@@ -455,7 +458,9 @@ pub fn default_attn_score_window_from(value: Option<&std::ffi::OsStr>) -> u32 {
     }
     let mut parsed: i64 = 0;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
-        parsed = parsed.saturating_mul(10).saturating_add(i64::from(bytes[i] - b'0'));
+        parsed = parsed
+            .saturating_mul(10)
+            .saturating_add(i64::from(bytes[i] - b'0'));
         i += 1;
     }
     let parsed = sign * parsed;
@@ -530,8 +535,7 @@ pub fn prepare_decode_score_capture<M: DeviceMemory>(
 
     let raw_bytes = usize::try_from(totals.raw_total).unwrap_or(usize::MAX) * 4;
     let folded_bytes = usize::try_from(totals.folded_total).unwrap_or(usize::MAX) * 4;
-    let indptr_bytes =
-        (usize::try_from(observation.num_requests.max(0)).unwrap_or(0) + 1) * 4;
+    let indptr_bytes = (usize::try_from(observation.num_requests.max(0)).unwrap_or(0) + 1) * 4;
     let layout = score_slot_layout(raw_bytes, folded_bytes, indptr_bytes);
     // Acquire-and-release: growth is pulled to HERE, outside any captured
     // region; the capture-time constructor then finds sufficient capacity.
@@ -607,7 +611,9 @@ impl LayerScoreCapture {
             );
             return me;
         }
-        let Some(obs) = hooks.observation else { return me };
+        let Some(obs) = hooks.observation else {
+            return me;
+        };
         if !obs.usable() {
             return me;
         }
@@ -710,7 +716,11 @@ impl LayerScoreCapture {
     /// until [`Self::publish`] ran.
     #[must_use]
     pub const fn scores(&self) -> Option<&AttentionScores> {
-        if self.published { self.payload.as_ref() } else { None }
+        if self.published {
+            self.payload.as_ref()
+        } else {
+            None
+        }
     }
 
     /// The C++ destructor: hand the slot back and drop the depth.
@@ -726,7 +736,10 @@ impl LayerScoreCapture {
 
 impl Drop for LayerScoreCapture {
     fn drop(&mut self) {
-        debug_assert!(!self.buf.held, "LayerScoreCapture dropped without release()");
+        debug_assert!(
+            !self.buf.held,
+            "LayerScoreCapture dropped without release()"
+        );
     }
 }
 
@@ -791,7 +804,9 @@ impl LayerPrefillScoreCapture {
             );
             return me;
         }
-        let Some(obs) = hooks.observation else { return me };
+        let Some(obs) = hooks.observation else {
+            return me;
+        };
         if !obs.usable() {
             return me;
         }
@@ -822,10 +837,7 @@ impl LayerPrefillScoreCapture {
         // The int32 CSR is what the kernels index with, so the total has to
         // fit a signed 32-bit element offset — and the byte ceiling bites
         // first anyway.
-        if raw_total == 0
-            || raw_total > 0x7fff_ffff
-            || raw_total * 4 > MAX_SCORE_BYTES
-        {
+        if raw_total == 0 || raw_total > 0x7fff_ffff || raw_total * 4 > MAX_SCORE_BYTES {
             if raw_total != 0 {
                 eprintln!(
                     "[pie-driver-cuda] prefill score capture needs {} MiB \
@@ -909,7 +921,11 @@ impl LayerPrefillScoreCapture {
     /// The published payload; `None` until [`Self::publish`] ran.
     #[must_use]
     pub const fn scores(&self) -> Option<&AttentionScores> {
-        if self.published { self.payload.as_ref() } else { None }
+        if self.published {
+            self.payload.as_ref()
+        } else {
+            None
+        }
     }
 
     /// The C++ destructor.

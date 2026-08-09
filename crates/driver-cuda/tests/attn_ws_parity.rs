@@ -19,9 +19,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 
-use driver_cuda::fire::attention_workspace::{
-    AttentionWorkspace, StagingError, StagingOps,
-};
+use driver_cuda::fire::attention_workspace::{AttentionWorkspace, StagingError, StagingOps};
 
 /// FNV-1a 64 of the C++ oracle's transcript.
 const GOLDEN_FNV1A64: u64 = 0xddbd891048ef7a23;
@@ -76,14 +74,20 @@ impl FakeOps {
         if s.is_null() {
             return "s0".into();
         }
-        self.streams.get(&(s as usize)).cloned().unwrap_or_else(|| "unknown".into())
+        self.streams
+            .get(&(s as usize))
+            .cloned()
+            .unwrap_or_else(|| "unknown".into())
     }
 
     fn pin_name(&self, p: *mut c_void) -> String {
         if p.is_null() {
             return "null".into();
         }
-        self.pins.get(&(p as usize)).cloned().unwrap_or_else(|| "unknown".into())
+        self.pins
+            .get(&(p as usize))
+            .cloned()
+            .unwrap_or_else(|| "unknown".into())
     }
 }
 
@@ -159,7 +163,11 @@ type Ws = AttentionWorkspace<usize>;
 
 impl Harness {
     fn new() -> Self {
-        Self { out: String::new(), script: String::new(), dev_names: HashMap::new() }
+        Self {
+            out: String::new(),
+            script: String::new(),
+            dev_names: HashMap::new(),
+        }
     }
 
     fn begin_script(&mut self, ops: &mut FakeOps, name: &str) {
@@ -193,7 +201,8 @@ impl Harness {
     }
 
     fn name_buffers(&mut self, ws: &Ws) {
-        self.dev_names.insert(ws.float_buffer() as usize, "dev#float");
+        self.dev_names
+            .insert(ws.float_buffer() as usize, "dev#float");
         self.dev_names.insert(ws.int_buffer() as usize, "dev#int");
     }
 
@@ -201,7 +210,9 @@ impl Harness {
         if p.is_null() {
             return "null".into();
         }
-        self.dev_names.get(&(p as usize)).map_or_else(|| "unknown".into(), |s| (*s).into())
+        self.dev_names
+            .get(&(p as usize))
+            .map_or_else(|| "unknown".into(), |s| (*s).into())
     }
 
     fn view_row(&mut self, ops: &mut FakeOps, ws: &Ws) {
@@ -219,8 +230,11 @@ impl Harness {
     }
 
     fn note_result(&mut self, ops: &mut FakeOps, r: Result<(), StagingError>) {
-        ops.cuda_log
-            .push(if r.is_ok() { "no-throw".into() } else { "threw".into() });
+        ops.cuda_log.push(if r.is_ok() {
+            "no-throw".into()
+        } else {
+            "threw".into()
+        });
         self.flush(ops);
     }
 }
@@ -271,9 +285,7 @@ fn transcript() -> String {
     h.call(&mut ops, "allocate(64,32,3)");
     let mut ws = Ws::allocate(&mut ops, 64, 32, 3).unwrap();
     h.name_buffers(&ws);
-    for (end_label, stream) in
-        [("end(sA)", s_a), ("end(sB)", s_b), ("end(sA)", s_a)]
-    {
+    for (end_label, stream) in [("end(sA)", s_a), ("end(sB)", s_b), ("end(sA)", s_a)] {
         h.call(&mut ops, "begin");
         ws.begin_plan_update(&mut ops).unwrap();
         h.view_row(&mut ops, &ws);
@@ -403,7 +415,10 @@ fn fnv1a64(data: &[u8]) -> u64 {
 fn the_port_reproduces_the_cpp_transcript() {
     let text = transcript();
     let rows = text.lines().count();
-    assert_eq!(rows, GOLDEN_ROWS, "row count diverged — script shape changed");
+    assert_eq!(
+        rows, GOLDEN_ROWS,
+        "row count diverged — script shape changed"
+    );
     let hash = fnv1a64(text.as_bytes());
     if hash != GOLDEN_FNV1A64 {
         let path = std::env::temp_dir().join("attn_ws_rust_transcript.txt");

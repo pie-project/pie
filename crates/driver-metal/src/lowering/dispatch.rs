@@ -660,7 +660,6 @@ pub fn pipelines_needed<'a>(dispatches: &[Dispatch<'a>]) -> Vec<(&'static str, &
     out
 }
 
-
 // -- The vocabulary and the width it implies ---------------------------------
 //
 // Both were in `model/run.rs` until the gate became a feature and a portable

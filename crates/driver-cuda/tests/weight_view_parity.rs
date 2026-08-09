@@ -22,8 +22,8 @@
 //! checked, on this compiler, for this target.
 
 use std::ffi::c_void;
-use std::mem::offset_of;
 use std::fmt::Write as _;
+use std::mem::offset_of;
 
 use driver_cuda::dtype::DType;
 use driver_cuda::weights::weight_view::{
@@ -87,7 +87,11 @@ fn script_abi(out: &mut String) {
     writeln!(out, "abi{SEP}trivially_copyable{SEP}1").unwrap();
 
     let fields: [(&str, usize, usize); 10] = [
-        ("data", offset_of!(WeightView, data), size_of::<*const c_void>()),
+        (
+            "data",
+            offset_of!(WeightView, data),
+            size_of::<*const c_void>(),
+        ),
         ("dtype", offset_of!(WeightView, dtype), size_of::<DType>()),
         ("nbytes", offset_of!(WeightView, nbytes), size_of::<usize>()),
         (
@@ -115,7 +119,11 @@ fn script_abi(out: &mut String) {
             offset_of!(WeightView, zero_point_data),
             size_of::<*const c_void>(),
         ),
-        ("group_size", offset_of!(WeightView, group_size), size_of::<i32>()),
+        (
+            "group_size",
+            offset_of!(WeightView, group_size),
+            size_of::<i32>(),
+        ),
         (
             "channel_axis",
             offset_of!(WeightView, channel_axis),
@@ -129,7 +137,12 @@ fn script_abi(out: &mut String) {
     // The C++ prints 1 for a signed underlying type. `DType` is
     // `enum class : std::uint8_t`, `QuantMeta::Kind` has no fixed underlying
     // type and gets `int`.
-    writeln!(out, "abi{SEP}enum{SEP}DType{SEP}{}{SEP}0", size_of::<DType>()).unwrap();
+    writeln!(
+        out,
+        "abi{SEP}enum{SEP}DType{SEP}{}{SEP}0",
+        size_of::<DType>()
+    )
+    .unwrap();
     writeln!(
         out,
         "abi{SEP}enum{SEP}QuantKind{SEP}{}{SEP}1",
@@ -324,7 +337,11 @@ fn every_field_lands_where_the_cpp_launchers_expect_it() {
         ("scale_dtype", offset_of!(WeightView, scale_dtype), 32),
         ("scale_numel", offset_of!(WeightView, scale_numel), 40),
         ("quant_kind", offset_of!(WeightView, quant_kind), 48),
-        ("zero_point_data", offset_of!(WeightView, zero_point_data), 56),
+        (
+            "zero_point_data",
+            offset_of!(WeightView, zero_point_data),
+            56,
+        ),
         ("group_size", offset_of!(WeightView, group_size), 64),
         ("channel_axis", offset_of!(WeightView, channel_axis), 68),
     ] {

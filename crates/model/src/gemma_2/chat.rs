@@ -5,10 +5,10 @@
 //! trailing newline; the caller should prepend it to the first user turn.
 //! No thinking or tool-use support.
 
-use crate::shared::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
 use crate::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder};
-use tokenizer::Tokenizer;
+use crate::shared::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
 use std::sync::Arc;
+use tokenizer::Tokenizer;
 
 pub struct GemmaInstruct {
     tokenizer: Arc<Tokenizer>,
@@ -111,8 +111,8 @@ impl Instruct for GemmaInstruct {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokenizer::Tokenizer;
     use std::sync::Arc;
+    use tokenizer::Tokenizer;
 
     fn make_tok(vocab: &[&str]) -> Arc<Tokenizer> {
         let v: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();

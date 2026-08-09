@@ -38,6 +38,6 @@ pub mod resolve;
 
 pub use dispatch::{Dispatch, Geometry, Undispatchable, plan as plan_dispatches};
 pub use executor::{BindRefusal, BoundArg, BoundLaunch, Frame, Resolver, Slice, bind, resolve_arg};
-pub use frame::{Step, Unbridged, Unbridgeable, fire_class, lower_step, rows_of};
+pub use frame::{Step, Unbridgeable, Unbridged, fire_class, lower_step, rows_of};
 pub use launch::{Dims, Rule, Ungeometric, eval as eval_launch};
 pub use resolve::{Names, Store};

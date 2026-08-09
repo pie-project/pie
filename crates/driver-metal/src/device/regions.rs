@@ -154,7 +154,10 @@ mod tests {
         let (buffer, offset) = regions
             .resolve(a.gpu_address() + 128)
             .expect("an address inside a registered span resolves");
-        assert_eq!(offset, 128, "the offset is into the allocation, not absolute");
+        assert_eq!(
+            offset, 128,
+            "the offset is into the allocation, not absolute"
+        );
         assert!(
             std::ptr::eq(buffer, a.buffer()),
             "and it names the right one -- binding an operand to the wrong \
@@ -210,9 +213,7 @@ mod tests {
         // tables are another, and equal sizes would hide an arithmetic error
         // that a stride would not.
         let handles: Vec<_> = (0..48u64)
-            .map(|i| {
-                Allocation::new(&context, 4096 + i * 256, "many").expect("a region")
-            })
+            .map(|i| Allocation::new(&context, 4096 + i * 256, "many").expect("a region"))
             .collect();
         let mut regions = Regions::new();
         for h in &handles {

@@ -46,9 +46,13 @@ fn plan(class: FireClass) -> model_compiler::trace::ForwardPlan {
 }
 
 fn fire(class: FireClass, rows: &[Row]) -> Result<Lowered, Uncovered> {
-    lower(&plan(class), rows, Fire {
-        captures_across_splits: false,
-    })
+    lower(
+        &plan(class),
+        rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
 }
 
 /// `n` rows, all the same point — the monomorphic fire.
@@ -92,7 +96,8 @@ fn the_metal_text_splits_on_depth_so_a_shared_prefix_executes_once() {
     // eight; layers 4.. serve only the four that survive. If the text stated
     // no depth axis, every rectangle would cover all eight rows and the four
     // truncated ones would compute 20 layers nobody reads.
-    let low = fire(FireClass::Prefill, &seriated_by_depth(8, 4, 4)).expect("a seriated fire lowers");
+    let low =
+        fire(FireClass::Prefill, &seriated_by_depth(8, 4, 4)).expect("a seriated fire lowers");
     let ranges = ranges(&low);
     assert!(
         ranges.len() > 1,

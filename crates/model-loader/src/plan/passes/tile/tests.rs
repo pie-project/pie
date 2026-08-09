@@ -236,9 +236,15 @@ fn the_reference_backend_declines_every_optimization() {
 
 #[test]
 fn each_backend_resolves_to_its_own_rules() {
-    assert_eq!(tile_map_mask(BackendKind::Cuda), CUDA_TILE_MAP_MASK);
-    assert_eq!(tile_map_mask(BackendKind::Metal), METAL_TILE_MAP_MASK);
-    assert_eq!(tile_map_mask(BackendKind::Unknown), HOST_TILE_MAP_MASK);
+    assert_eq!(compilable_tile_maps(BackendKind::Cuda), CUDA_TILE_MAP_MASK);
+    assert_eq!(
+        compilable_tile_maps(BackendKind::Metal),
+        METAL_TILE_MAP_MASK
+    );
+    assert_eq!(
+        compilable_tile_maps(BackendKind::Unknown),
+        HOST_TILE_MAP_MASK
+    );
 }
 
 // ---------------------------------------------------------------------------

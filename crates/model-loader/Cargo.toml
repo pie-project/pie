@@ -12,10 +12,11 @@ name = "model_loader"
 crate-type = ["rlib"]
 path = "src/lib.rs"
 
-# The C ABI — repr(C) marshalling, extern entry points, the committed
-# `pie_loader.h`, and the `pie-loader` CLI — is the sibling crate
-# `model-loader-capi`. This crate is the compiler alone and knows nothing of
-# C; the split makes that a dependency arrow instead of a module convention.
+# This crate is the compiler alone. There is no C ABI and no sibling
+# `-capi` crate: the drivers link the rlib and pass Rust types, and executing a
+# plan is `executor`'s — see `src/executor/arena.rs` for why the device half is
+# an `ArenaBacking` the consumer supplies rather than a second executor inside
+# each driver.
 
 [features]
 default = ["testkit"]

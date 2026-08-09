@@ -85,7 +85,6 @@ fn frame(lowered: &Lowered) -> Frame {
     }
 }
 
-
 /// Plan every launch, returning the dispatches and the refusals separately.
 fn planned(low: &Lowered) -> (Vec<Dispatch<'_>>, Vec<Undispatchable>) {
     let frame = frame(low);
@@ -110,11 +109,11 @@ fn planned(low: &Lowered) -> (Vec<Dispatch<'_>>, Vec<Undispatchable>) {
 
 #[test]
 fn every_launch_whose_symbol_has_a_row_becomes_a_grid() {
-// SIXTEEN rows for a prefill, not eight, and it is a precondition rather than
-// a round number: `qmm_t.metal` has no `M` argument -- its header says the
-// driver only selects it when `M % BM == 0`, so the row count lives in the
-// grid -- and `QMM_BMS` starts at sixteen. `Rule::Qmm` refuses anything else
-// with `Ungeometric::PartialTile`.
+    // SIXTEEN rows for a prefill, not eight, and it is a precondition rather than
+    // a round number: `qmm_t.metal` has no `M` argument -- its header says the
+    // driver only selects it when `M % BM == 0`, so the row count lives in the
+    // grid -- and `QMM_BMS` starts at sixteen. `Rule::Qmm` refuses anything else
+    // with `Ungeometric::PartialTile`.
     for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 16)] {
         let low = lowered(class, rows);
         let (dispatches, refused) = planned(&low);
@@ -226,7 +225,9 @@ fn a_statement_that_states_scalars_carries_them_to_its_dispatch() {
         .into_iter()
         // `silu_mul` takes none and its row names none — a kernel with no
         // scalars is not a statement missing them.
-        .filter(|s| !s.starts_with("kv_append") && !s.starts_with("sdpa_") && *s != "silu_mul_bfloat16")
+        .filter(|s| {
+            !s.starts_with("kv_append") && !s.starts_with("sdpa_") && *s != "silu_mul_bfloat16"
+        })
         .collect();
     assert!(
         unexpected.is_empty(),
@@ -298,7 +299,10 @@ fn the_batched_lane_is_the_row_count_and_not_a_second_vocabulary() {
     // where the lanes differ they are DIFFERENT SYMBOLS, each stating its own
     // row, and the rest is `dims.rows`.
     let decode: BTreeSet<String> = lowered(FireClass::Decode, 1).kernels.into_iter().collect();
-    let prefill: BTreeSet<String> = lowered(FireClass::Prefill, 16).kernels.into_iter().collect();
+    let prefill: BTreeSet<String> = lowered(FireClass::Prefill, 16)
+        .kernels
+        .into_iter()
+        .collect();
     let only_batched: Vec<&String> = prefill.difference(&decode).collect();
     assert!(
         !only_batched.is_empty(),
@@ -360,7 +364,10 @@ mod from_a_frame {
                 Err(other) => panic!("a frame-driven launch refused: {other:?}"),
             }
         }
-        assert!(grids > 300, "only {grids} grids came out of a 24-layer fire");
+        assert!(
+            grids > 300,
+            "only {grids} grids came out of a 24-layer fire"
+        );
     }
 
     #[test]
@@ -555,7 +562,10 @@ mod state {
             );
             checked += 1;
         }
-        assert!(checked >= 24, "only {checked} kv writes; a 24-layer text has one a layer");
+        assert!(
+            checked >= 24,
+            "only {checked} kv writes; a 24-layer text has one a layer"
+        );
     }
 
     #[test]
@@ -657,13 +667,22 @@ fn a_row_can_say_its_grid_extent_comes_from_the_statement() {
         global_head_dim: 512,
         global_kv_heads: 4,
         full_partial_rotary: 0.25,
-        window_left: (0..12).map(|l| if (l + 1) % 6 == 0 { -1 } else { 1024 }).collect(),
+        window_left: (0..12)
+            .map(|l| if (l + 1) % 6 == 0 { -1 } else { 1024 })
+            .collect(),
         ..LlamaLikeMetalFacts::synthetic()
     };
     let plan = llama_like_metal(&facts, &metal, FireClass::Decode);
-    let low = lower(&plan, &[Row { samples: true, ..Row::default() }], Fire {
-        captures_across_splits: false,
-    })
+    let low = lower(
+        &plan,
+        &[Row {
+            samples: true,
+            ..Row::default()
+        }],
+        Fire {
+            captures_across_splits: false,
+        },
+    )
     .expect("the gemma-shaped text lowers");
 
     let table = driver_metal::lowering::dispatch::table();

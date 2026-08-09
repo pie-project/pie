@@ -268,7 +268,8 @@ mod tests {
             "a sweep cannot run a shape the arena was not built for"
         );
         assert!(
-            l.iter().all(|p| p.max_forward_requests <= p.max_forward_tokens),
+            l.iter()
+                .all(|p| p.max_forward_requests <= p.max_forward_tokens),
             "more requests than tokens is not a distinguishable batch"
         );
     }
@@ -284,7 +285,11 @@ mod tests {
             v.dedup();
             v
         };
-        assert_eq!(tokens, vec![256, 128, 64, 32], "powers of two down to the floor");
+        assert_eq!(
+            tokens,
+            vec![256, 128, 64, 32],
+            "powers of two down to the floor"
+        );
         let requests: Vec<i32> = {
             let mut v: Vec<i32> = l
                 .iter()
@@ -348,7 +353,10 @@ mod tests {
         )
         .expect("measured");
         assert!((s.step_ms - 10.0).abs() < 1e-9);
-        assert!((s.step_ms_stddev - 2.0).abs() < 1e-9, "population, not sample");
+        assert!(
+            (s.step_ms_stddev - 2.0).abs() < 1e-9,
+            "population, not sample"
+        );
     }
 
     #[test]
@@ -370,9 +378,16 @@ mod tests {
             cal.shape.max_forward_tokens, 128,
             "the peak, not the ceiling"
         );
-        assert_eq!(cal.shape.policy_profile, "balanced", "the template carries through");
+        assert_eq!(
+            cal.shape.policy_profile, "balanced",
+            "the template carries through"
+        );
         assert_eq!(cal.shape.kv_page_size, 16);
-        assert_eq!(cal.samples.len(), ladder(c).len(), "every point is kept for the audit");
+        assert_eq!(
+            cal.samples.len(),
+            ladder(c).len(),
+            "every point is kept for the audit"
+        );
     }
 
     #[test]

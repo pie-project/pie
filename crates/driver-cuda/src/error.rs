@@ -86,7 +86,10 @@ pub enum Error {
 impl Error {
     /// An `Invalid` for a precondition this crate enforces itself.
     pub fn invalid(call: &'static str, reason: impl Into<String>) -> Self {
-        Self::Invalid { call, reason: reason.into() }
+        Self::Invalid {
+            call,
+            reason: reason.into(),
+        }
     }
 
     /// A refusal that names the operation and the reason, for the shape
@@ -97,7 +100,9 @@ impl Error {
     /// the status or the status without the message — which is the whole
     /// of §3.4. `call` is the operation a reader would grep for.
     pub fn unsupported(call: &str, reason: impl std::fmt::Display) -> Self {
-        Self::Unsupported { what: format!("{call}: {reason}") }
+        Self::Unsupported {
+            what: format!("{call}: {reason}"),
+        }
     }
 
     /// An allocation that could not be made, carrying its size.
@@ -148,14 +153,22 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[cfg(feature = "_cuda")]
 #[inline]
 pub(crate) fn check_rt(code: cudaError, call: &'static str) -> Result<()> {
-    if code == cudaError::cudaSuccess { Ok(()) } else { Err(Error::Runtime { call, code }) }
+    if code == cudaError::cudaSuccess {
+        Ok(())
+    } else {
+        Err(Error::Runtime { call, code })
+    }
 }
 
 /// `check_cu`: turn a driver-API code into a [`Result`].
 #[cfg(feature = "_cuda")]
 #[inline]
 pub(crate) fn check_cu(code: CUresult, call: &'static str) -> Result<()> {
-    if code == CUresult::CUDA_SUCCESS { Ok(()) } else { Err(Error::Driver { call, code }) }
+    if code == CUresult::CUDA_SUCCESS {
+        Ok(())
+    } else {
+        Err(Error::Driver { call, code })
+    }
 }
 
 /// The `noexcept` destructor's version: a failure in a `Drop` has nowhere to
@@ -253,13 +266,17 @@ impl From<model_loader::error::Error> for Error {
     fn from(e: model_loader::error::Error) -> Self {
         use model_loader::error::Error as L;
         match &e {
-            L::Unsupported(_) => Self::Unsupported { what: e.to_string() },
-            L::Contract(_) | L::Shard(_) | L::Checkpoint(_) => {
-                Self::Invalid { call: "load", reason: e.to_string() }
-            }
-            L::Overflow(_) | L::Internal(_) => {
-                Self::Invalid { call: "load", reason: e.to_string() }
-            }
+            L::Unsupported(_) => Self::Unsupported {
+                what: e.to_string(),
+            },
+            L::Contract(_) | L::Shard(_) | L::Checkpoint(_) => Self::Invalid {
+                call: "load",
+                reason: e.to_string(),
+            },
+            L::Overflow(_) | L::Internal(_) => Self::Invalid {
+                call: "load",
+                reason: e.to_string(),
+            },
         }
     }
 }
@@ -317,7 +334,6 @@ impl From<crate::device::cublas::CublasError> for i32 {
     }
 }
 
-
 /// A checkpoint `crates/model` will not derive a deployment for.
 ///
 /// THE CONVERSION IS THE BOUNDARY. `facts_from_hf` used to return
@@ -330,12 +346,10 @@ impl From<model::deployment::Refusal> for Error {
         match e {
             // A SHAPE, not a bad argument. The engine did nothing
             // wrong; this driver has no path for the checkpoint.
-            model::deployment::Refusal::Unsupported(_) => {
-                Self::Unsupported { what: e.to_string() }
-            }
-            model::deployment::Refusal::Malformed(_) => {
-                Self::invalid("deployment", e.to_string())
-            }
+            model::deployment::Refusal::Unsupported(_) => Self::Unsupported {
+                what: e.to_string(),
+            },
+            model::deployment::Refusal::Malformed(_) => Self::invalid("deployment", e.to_string()),
         }
     }
 }

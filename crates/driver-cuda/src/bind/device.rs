@@ -125,14 +125,30 @@ pub enum ArgError {
 impl std::fmt::Display for ArgError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ArgError::Arity { symbol, expected, got } => {
-                write!(f, "{symbol} declares {expected} operands and {got} were bound")
+            ArgError::Arity {
+                symbol,
+                expected,
+                got,
+            } => {
+                write!(
+                    f,
+                    "{symbol} declares {expected} operands and {got} were bound"
+                )
             }
-            ArgError::Kind { symbol, operand, expected, got } => write!(
+            ArgError::Kind {
+                symbol,
+                operand,
+                expected,
+                got,
+            } => write!(
                 f,
                 "{symbol}: operand `{operand}` is declared {expected:?} and was bound {got}"
             ),
-            ArgError::Unsupported { symbol, operand, ty } => write!(
+            ArgError::Unsupported {
+                symbol,
+                operand,
+                ty,
+            } => write!(
                 f,
                 "{symbol}: operand `{operand}` is {ty:?}, which a device entry point \
                  cannot take{}",
@@ -207,7 +223,10 @@ impl Args {
                 got: values.len(),
             });
         }
-        let mut out = Self { storage: Vec::with_capacity(values.len()), slots: Vec::new() };
+        let mut out = Self {
+            storage: Vec::with_capacity(values.len()),
+            slots: Vec::new(),
+        };
         for (operand, value) in sig.operands.iter().zip(values) {
             let ok = match operand.ty {
                 t if is_pointer(t) => matches!(value, ArgValue::Ptr(_)),
@@ -336,7 +355,10 @@ impl KernelModule {
         // past.
         let code = unsafe { dr::cuModuleLoadData(&raw mut module, image.as_ptr().cast()) };
         if code != dr::CUresult::CUDA_SUCCESS {
-            return Err(Error::Driver { call: "cuModuleLoadData", code });
+            return Err(Error::Driver {
+                call: "cuModuleLoadData",
+                code,
+            });
         }
         let mut entries = Vec::with_capacity(table.len());
         for sig in table {
@@ -345,7 +367,9 @@ impl KernelModule {
                 // SAFETY: `module` loaded successfully just above and nothing
                 // has used it.
                 unsafe { dr::cuModuleUnload(module) };
-                return Err(Error::Invalid(format!("entry name `{entry}` contains a NUL")));
+                return Err(Error::Invalid(format!(
+                    "entry name `{entry}` contains a NUL"
+                )));
             };
             let mut function: dr::CUfunction = std::ptr::null_mut();
             // SAFETY: `module` is loaded; `c_name` outlives the call.
@@ -355,7 +379,10 @@ impl KernelModule {
                 // SAFETY: as above. Unload before returning, or a stale image
                 // leaks a module per failed startup.
                 unsafe { dr::cuModuleUnload(module) };
-                return Err(Error::NoEntry { symbol: sig.symbol, entry });
+                return Err(Error::NoEntry {
+                    symbol: sig.symbol,
+                    entry,
+                });
             }
             entries.push((sig.symbol, function));
         }
@@ -365,7 +392,10 @@ impl KernelModule {
     /// The entry point for a row, by symbol.
     #[must_use]
     pub fn entry(&self, symbol: &str) -> Option<dr::CUfunction> {
-        self.entries.iter().find(|(s, _)| *s == symbol).map(|(_, f)| *f)
+        self.entries
+            .iter()
+            .find(|(s, _)| *s == symbol)
+            .map(|(_, f)| *f)
     }
 
     /// How many entry points were resolved.
@@ -435,7 +465,10 @@ impl KernelModule {
         if code == dr::CUresult::CUDA_SUCCESS {
             Ok(())
         } else {
-            Err(Error::Driver { call: "cuLaunchKernel", code })
+            Err(Error::Driver {
+                call: "cuLaunchKernel",
+                code,
+            })
         }
     }
 }
@@ -457,7 +490,10 @@ mod tests {
     use kernels_cuda::norm_device::ENTRIES;
 
     fn row(symbol: &str) -> &'static kernels::KernelSig {
-        ENTRIES.iter().find(|k| k.symbol == symbol).expect("the pilot states this row")
+        ENTRIES
+            .iter()
+            .find(|k| k.symbol == symbol)
+            .expect("the pilot states this row")
     }
 
     /// The happy path: `tanh_bf16` takes a buffer and a count.
@@ -475,7 +511,14 @@ mod tests {
     fn a_short_list_is_refused() {
         let sig = row("norm::tanh_bf16");
         let refusal = Args::bind(sig, &[ArgValue::Ptr(std::ptr::null_mut())]).unwrap_err();
-        assert_eq!(refusal, ArgError::Arity { symbol: "norm::tanh_bf16", expected: 2, got: 1 });
+        assert_eq!(
+            refusal,
+            ArgError::Arity {
+                symbol: "norm::tanh_bf16",
+                expected: 2,
+                got: 1
+            }
+        );
     }
 
     /// A scalar where the row declares a pointer is refused — the check the

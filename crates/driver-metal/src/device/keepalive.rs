@@ -91,8 +91,8 @@ use objc2_metal::{
 
 use crate::device::archive::Archives;
 use crate::device::context::{Context, describe};
-use crate::program::compile::Compiler;
 use crate::error::{Error, Result};
+use crate::program::compile::Compiler;
 
 /// The smallest in-flight depth the keepalive will run at.
 ///

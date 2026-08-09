@@ -25,12 +25,12 @@
 
 use crate::catalog::{Backend, Deployed, MetalBinding};
 use crate::deployment::{
-    Advertised,
-    AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement, PrefillStyle,
+    Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,
+    PrefillStyle,
 };
+use crate::manifest::{Manifest, TensorSpec};
 use crate::shared::llama_like::project as family;
 use crate::shared::llama_like::spec::LlamaLikeFacts;
-use crate::manifest::{Manifest, TensorSpec};
 
 /// What gemma-3 states about its layers that the family shape cannot.
 ///
@@ -70,13 +70,21 @@ impl Schedule {
     /// The window layer `l` attends over, `-1` for the whole context.
     #[must_use]
     pub fn window_at(&self, l: u32) -> i32 {
-        if self.is_full_attn(l) { -1 } else { self.sliding_window }
+        if self.is_full_attn(l) {
+            -1
+        } else {
+            self.sliding_window
+        }
     }
 
     /// The rope base layer `l` rotates at.
     #[must_use]
     pub fn rope_theta_at(&self, l: u32) -> f32 {
-        if self.is_full_attn(l) { self.rope_theta_global } else { self.rope_theta_local }
+        if self.is_full_attn(l) {
+            self.rope_theta_global
+        } else {
+            self.rope_theta_local
+        }
     }
 }
 
@@ -117,14 +125,26 @@ pub fn manifest(f: &LlamaLikeFacts) -> Manifest {
         out = out.with(spec);
     }
     out.with(TensorSpec::required("layer.{}.input_layernorm", [hidden]))
-        .with(TensorSpec::required("layer.{}.post_attention_layernorm", [hidden]))
-        .with(TensorSpec::required("layer.{}.pre_feedforward_layernorm", [hidden]))
-        .with(TensorSpec::required("layer.{}.post_feedforward_layernorm", [hidden]))
+        .with(TensorSpec::required(
+            "layer.{}.post_attention_layernorm",
+            [hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.pre_feedforward_layernorm",
+            [hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.post_feedforward_layernorm",
+            [hidden],
+        ))
         // Gemma-3 norms K as well as Q, and both are per head. The
         // family states only `q_norm`, because that is the one whose
         // EXTENT answers the three-way question; stating k_norm here
         // costs nothing and is a fact about every gemma-3.
-        .with(TensorSpec::required("layer.{}.self_attn.k_norm", [head_dim]))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.k_norm",
+            [head_dim],
+        ))
 }
 
 /// This row's deployment: the family's shape, on gemma's schedule.
@@ -177,6 +197,10 @@ pub fn deployment(f: &LlamaLikeFacts, s: &Schedule, norm_eps: f32) -> Deployment
         // Gemma 3 dropped gemma-2's caps: `final_logit_softcapping` is
         // null in every published gemma-3 config, and null means NO cap.
         logit_softcap: 0.0,
+        // No ATTENTION cap: gemma-2's `attn_logit_softcapping` is
+        // gemma-2's alone, and a zero here is "no cap" rather than a
+        // cap at zero — which would flatten every score to `tanh(inf)`.
+        attn_logit_softcap: 0.0,
         // Per-layer embeddings are gemma-3n's and gemma-4's.
         ple_dim: 0,
         // The four-norm block is still a PRE placement as far as a
@@ -191,6 +215,10 @@ pub fn deployment(f: &LlamaLikeFacts, s: &Schedule, norm_eps: f32) -> Deployment
         // are separate facts, and this row is where that is said.
         v_norm: false,
         k_eq_v: false,
+        // Dense: no router reads this.
+        norm_topk_prob: true,
+        // No router of this family states a scaling factor.
+        routed_scaling: 1.0,
         mlp_gate: crate::deployment::MlpGate::GeluTanh,
         scales: std::collections::BTreeMap::new(),
         // Filled by the ROW, not by the shape: a family label and a
@@ -243,12 +271,13 @@ pub fn metal_facts(
     // then contradicts, and a reader would have to compare two literals to
     // learn which won.
     let base = family::metal_facts(
-        f,
-        family::MetalRow {
+        family::RowScalars {
             rope_theta: s.rope_theta_global,
             norm_eps,
             window: -1,
             rope_rescaled: false,
+            // Unread: gemma-3 is dense at every published size.
+            norm_topk_prob: true,
         },
         load,
         bind,
@@ -327,9 +356,9 @@ pub fn metal_facts(
 /// llama-like one would trace a different model under this row's name.
 ///
 /// The string table this replaces got exactly this wrong in both
-/// directions: `driver-metal`'s `LLAMA_LIKE` listed `gemma4`, which the
-/// load path refused on other grounds, and did NOT list `gemma3`, whose
-/// text it models. A row answering for itself cannot disagree with a
+/// directions: `driver-metal`'s `LLAMA_LIKE` listed `gpt_oss`, which no
+/// publication of reaches a Metal device here, and did NOT list
+/// `gemma3`, whose text it models. A row answering for itself cannot disagree with a
 /// list, because there is no list.
 ///
 /// # Errors
@@ -350,22 +379,25 @@ pub fn trace(
     // build it from the same expression rather than from two literals,
     // so a base that moved on the row cannot reach one text and not the
     // other.
-    let row = family::MetalRow {
+    let row = family::RowScalars {
         rope_theta: s.rope_theta_global,
         norm_eps,
         window: -1,
         rope_rescaled: false,
+        // Unread: gemma-3 is dense at every published size.
+        norm_topk_prob: true,
     };
     match load.backend {
         Backend::Cuda => family::trace(f, row, class, load),
         Backend::Metal(bind) => {
-            if load.tp_size > 1 {
-                return Err(crate::deployment::Refusal::Unsupported(family::NO_METAL_SHARD));
-            }
+            // The kernel set's refusals, asked through the ONE door that
+            // holds them. This arm used to ask the shard question alone,
+            // which left a gemma at an uninstantiated head width to
+            // panic in `model-compiler` rather than be refused by name.
+            let m = metal_facts(f, s, norm_eps, load, bind);
+            family::metal_kernel_refusal(f, &m, load, bind)?;
             Ok(crate::shared::llama_like::forward::llama_like_metal(
-                f,
-                &metal_facts(f, s, norm_eps, load, bind),
-                class,
+                f, &m, class,
             ))
         }
     }
@@ -443,7 +475,11 @@ mod tests {
     fn each_layer_rotates_at_its_own_base() {
         let d = deployment(&shape(), &schedule(), NORM_EPS);
         for (l, a) in d.attention.iter().enumerate() {
-            let expected = if (l + 1) % 6 == 0 { 1_000_000.0 } else { 10_000.0 };
+            let expected = if (l + 1) % 6 == 0 {
+                1_000_000.0
+            } else {
+                10_000.0
+            };
             assert_eq!(a.rope_theta, expected, "layer {l}");
         }
         assert_ne!(d.attention[0].rope_theta, d.attention[5].rope_theta);
@@ -457,11 +493,17 @@ mod tests {
     #[test]
     fn the_softmax_scale_is_the_configs_scalar_and_not_the_head_dim() {
         let d = deployment(&shape(), &schedule(), NORM_EPS);
-        assert!((d.attention[0].sm_scale - 1.0 / 16.0).abs() < 1e-6, "1/sqrt(256)");
+        assert!(
+            (d.attention[0].sm_scale - 1.0 / 16.0).abs() < 1e-6,
+            "1/sqrt(256)"
+        );
 
         let mut wide = shape();
         wide.head_dim = 128;
-        let s = Schedule { query_pre_attn_scalar: 168, ..schedule() };
+        let s = Schedule {
+            query_pre_attn_scalar: 168,
+            ..schedule()
+        };
         let d = deployment(&wide, &s, 1e-6);
         assert!((d.attention[0].sm_scale - 1.0 / 168f32.sqrt()).abs() < 1e-6);
         assert!(
@@ -489,8 +531,15 @@ mod tests {
         // And the family's own version of those two rows is gone, not
         // shadowed: a manifest with the same name twice would check
         // both, and one of them says Absent.
-        for name in ["layer.{}.input_layernorm", "layer.{}.post_attention_layernorm"] {
-            assert_eq!(m.tensors.iter().filter(|t| t.name == name).count(), 1, "{name}");
+        for name in [
+            "layer.{}.input_layernorm",
+            "layer.{}.post_attention_layernorm",
+        ] {
+            assert_eq!(
+                m.tensors.iter().filter(|t| t.name == name).count(),
+                1,
+                "{name}"
+            );
         }
     }
 
@@ -511,12 +560,23 @@ mod tests {
     #[test]
     fn the_familys_rows_are_kept() {
         let m = manifest(&shape());
-        let ext = |n: &str| m.tensors.iter().find(|t| t.name == n).expect("stated").extents.clone();
+        let ext = |n: &str| {
+            m.tensors
+                .iter()
+                .find(|t| t.name == n)
+                .expect("stated")
+                .extents
+                .clone()
+        };
         assert_eq!(ext("embed_tokens"), vec![262_208, 2560]);
         assert_eq!(ext("layer.{}.self_attn.q_proj"), vec![2048, 2560]);
         assert_eq!(ext("layer.{}.self_attn.k_proj"), vec![1024, 2560]);
         assert_eq!(ext("layer.{}.mlp.gate_proj"), vec![10_240, 2560]);
-        let head = m.tensors.iter().find(|t| t.name == "lm_head").expect("stated");
+        let head = m
+            .tensors
+            .iter()
+            .find(|t| t.name == "lm_head")
+            .expect("stated");
         assert_eq!(head.presence, Presence::Absent, "gemma-3 ties");
     }
 
@@ -588,7 +648,7 @@ mod tests {
     /// The 5:1 schedule reaches the METAL text per layer, both the
     /// window and the base that goes with it.
     ///
-    /// This is the bug the family's single-window `MetalRow` cannot
+    /// This is the bug the family's single-window `RowScalars` cannot
     /// hold and the reason gemma-3 has a projection of its own: a row
     /// that stated one width here would attend 1024 tokens on the layer
     /// trained to see everything, or the whole context on five layers
@@ -600,10 +660,18 @@ mod tests {
         let b = binding();
         let m = metal_facts(&f, &schedule(), NORM_EPS, Deployed::metal(&b), &b);
 
-        assert_eq!(m.window_left.len(), f.layers as usize, "one entry per layer");
+        assert_eq!(
+            m.window_left.len(),
+            f.layers as usize,
+            "one entry per layer"
+        );
         for l in 0..f.layers {
             let full = (l + 1) % 6 == 0;
-            assert_eq!(m.window_left_at(l), if full { -1 } else { 1024 }, "layer {l}");
+            assert_eq!(
+                m.window_left_at(l),
+                if full { -1 } else { 1024 },
+                "layer {l}"
+            );
             assert_eq!(m.is_full_attention(l), full, "layer {l}");
             // And the base the accessor reads for that layer is the one
             // the schedule states for it — the pairing is the point,
@@ -643,10 +711,16 @@ mod tests {
         // The 27B is the row the head dim would have got wrong: 168
         // against 128-wide heads, which is a factor of sqrt(168/128) —
         // a sharper softmax, not a crash.
-        let big = Schedule { query_pre_attn_scalar: 168, ..schedule() };
+        let big = Schedule {
+            query_pre_attn_scalar: 168,
+            ..schedule()
+        };
         let m27 = metal_facts(&f, &big, NORM_EPS, Deployed::metal(&b), &b);
         assert_eq!(m27.attn_scale, 1.0 / 168f32.sqrt());
-        assert_ne!(m27.attn_scale, m.attn_scale, "the head dim's answer is a different number");
+        assert_ne!(
+            m27.attn_scale, m.attn_scale,
+            "the head dim's answer is a different number"
+        );
     }
 
     /// The binding half is the family's, unchanged — gemma-3 overrides
@@ -655,15 +729,20 @@ mod tests {
     #[test]
     fn the_binding_half_is_still_the_familys() {
         let f = shape();
-        let b = MetalBinding { quant_group: 128, quant_bits: 8, ..binding() };
+        let b = MetalBinding {
+            quant_group: 128,
+            quant_bits: 8,
+            ..binding()
+        };
         let mine = metal_facts(&f, &schedule(), NORM_EPS, Deployed::metal(&b), &b);
         let family_answer = family::metal_facts(
-            &f,
-            family::MetalRow {
+            family::RowScalars {
                 rope_theta: 1_000_000.0,
                 norm_eps: NORM_EPS,
                 window: -1,
                 rope_rescaled: false,
+                // Unread: gemma-3 is dense at every published size.
+                norm_topk_prob: true,
             },
             Deployed::metal(&b),
             &b,
@@ -687,8 +766,9 @@ mod tests {
     /// gemma-3 SERVES Metal, and says so on both fire classes.
     ///
     /// The claim the deleted string table got backwards in both
-    /// directions: `LLAMA_LIKE` listed `gemma4`, which the load path
-    /// refused, and did not list `gemma3`, whose text it models.
+    /// directions: `LLAMA_LIKE` listed `gpt_oss`, which no publication of
+    /// reaches a Metal device here, and did not list `gemma3`, whose text
+    /// it models.
     #[cfg(feature = "forward")]
     #[test]
     fn gemma_3_answers_a_metal_load_with_a_metal_text() {
@@ -698,10 +778,18 @@ mod tests {
         for class in [FireClass::Prefill, FireClass::Decode] {
             let metal = trace(&f, &schedule(), NORM_EPS, class, Deployed::metal(&b))
                 .expect("gemma-3's forward IS llama-like");
-            assert!(metal.family.starts_with("llama_like.metal."), "{}", metal.family);
+            assert!(
+                metal.family.starts_with("llama_like.metal."),
+                "{}",
+                metal.family
+            );
             let cuda = trace(&f, &schedule(), NORM_EPS, class, Deployed::single())
                 .expect("and the CUDA text is the one it always was");
-            assert!(cuda.family.starts_with("llama_like.cuda."), "{}", cuda.family);
+            assert!(
+                cuda.family.starts_with("llama_like.cuda."),
+                "{}",
+                cuda.family
+            );
         }
     }
 
@@ -717,7 +805,11 @@ mod tests {
         use crate::deployment::Refusal;
         use model_compiler::trace::FireClass;
         let b = binding();
-        let sharded = Deployed { backend: Backend::Metal(&b), tp_size: 2, layer_scalars: &[] };
+        let sharded = Deployed {
+            backend: Backend::Metal(&b),
+            tp_size: 2,
+            layer_scalars: &[],
+        };
         let err = trace(&shape(), &schedule(), NORM_EPS, FireClass::Decode, sharded)
             .expect_err("two ranks and no shard vocabulary");
         assert_eq!(err, Refusal::Unsupported(family::NO_METAL_SHARD));

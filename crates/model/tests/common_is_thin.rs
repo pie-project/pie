@@ -63,14 +63,30 @@ fn family_names() -> Vec<String> {
     // registry row dispatches on go in for the same reason.
     names.extend(
         [
-            "llama", "qwen", "gemma", "olmo", "mistral", "ministral", "mixtral",
-            "phi", "phi3", "deepseek", "kimi", "nemotron", "glm", "gpt_oss",
-            "gptoss", "csm",
+            "llama",
+            "qwen",
+            "gemma",
+            "olmo",
+            "mistral",
+            "ministral",
+            "mixtral",
+            "phi",
+            "phi3",
+            "deepseek",
+            "kimi",
+            "nemotron",
+            "glm",
+            "gpt_oss",
+            "gptoss",
+            "csm",
         ]
         .into_iter()
         .map(str::to_string),
     );
-    assert!(names.len() > 10, "the family list came back suspiciously short");
+    assert!(
+        names.len() > 10,
+        "the family list came back suspiciously short"
+    );
     names.sort();
     names
 }
@@ -122,7 +138,10 @@ const SHARED: &[&str] = &[
 ];
 /// Files that name families ON PURPOSE, with the reason each does.
 const NOT_SHARED: &[(&str, &str)] = &[
-    ("lib.rs", "the crate doc, which names the generations it declares"),
+    (
+        "lib.rs",
+        "the crate doc, which names the generations it declares",
+    ),
     (
         "catalog.rs",
         "THE REGISTRY, and the only one. It names every generation because \
@@ -131,7 +150,10 @@ const NOT_SHARED: &[(&str, &str)] = &[
          difference between this and the three `model_type` tables it \
          replaced",
     ),
-    ("multimodal.rs", "family-aware by design -- it dispatches on a VisionArch"),
+    (
+        "multimodal.rs",
+        "family-aware by design -- it dispatches on a VisionArch",
+    ),
     (
         "emissions.rs",
         "a DEPLOYMENT LIST: which families' static forms are committed, from \
@@ -172,7 +194,10 @@ const NOT_SHARED: &[(&str, &str)] = &[
         "shared/deepseek.rs",
         "deepseek's shared pieces, bound by more than one deepseek generation",
     ),
-    ("shared/kimi.rs", "kimi's shared pieces, bound by kimi-k2 and kimi-k3"),
+    (
+        "shared/kimi.rs",
+        "kimi's shared pieces, bound by kimi-k2 and kimi-k3",
+    ),
 ];
 
 /// `instruct.rs` is half vocabulary and half registry, in that order, split by
@@ -204,9 +229,7 @@ fn common_sources() -> Vec<(String, String)> {
 
     let mut unclassified: Vec<&String> = on_disk
         .iter()
-        .filter(|f| {
-            !SHARED.contains(&f.as_str()) && !NOT_SHARED.iter().any(|(n, _)| n == f)
-        })
+        .filter(|f| !SHARED.contains(&f.as_str()) && !NOT_SHARED.iter().any(|(n, _)| n == f))
         .collect();
     unclassified.sort();
     assert!(
@@ -270,9 +293,8 @@ fn common_writes_down_no_family_name() {
                 if let Some(at) = lower.find(family.as_str()) {
                     let before = lower[..at].chars().next_back();
                     let after = lower[at + family.len()..].chars().next();
-                    let boundary = |c: Option<char>| {
-                        c.is_none_or(|c| !c.is_alphanumeric() && c != '_')
-                    };
+                    let boundary =
+                        |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric() && c != '_');
                     if boundary(before) && boundary(after) {
                         found.push(format!("{label}:{}: {} ({family})", i + 1, line.trim()));
                     }

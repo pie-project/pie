@@ -93,8 +93,7 @@ impl CublasOps for LiveCublas {
 
     fn set_math_mode_tensor_op(&mut self, handle: &Self::Handle) -> Result<(), i32> {
         use cudarc::cublas::sys::{cublasMath_t, cublasSetMathMode, cublasStatus_t};
-        let status =
-            unsafe { cublasSetMathMode(*handle, cublasMath_t::CUBLAS_TENSOR_OP_MATH) };
+        let status = unsafe { cublasSetMathMode(*handle, cublasMath_t::CUBLAS_TENSOR_OP_MATH) };
         if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             Ok(())
         } else {
@@ -136,18 +135,27 @@ impl<H> CublasHandle<H> {
         ops: &mut O,
         stream: *mut c_void,
     ) -> Result<Self, CublasError> {
-        let handle = ops
-            .create()
-            .map_err(|status| CublasError { status, expr: "cublasCreate" })?;
+        let handle = ops.create().map_err(|status| CublasError {
+            status,
+            expr: "cublasCreate",
+        })?;
         if !stream.is_null()
             && let Err(status) = ops.set_stream(&handle, stream)
         {
-            return Err(CublasError { status, expr: "cublasSetStream" });
+            return Err(CublasError {
+                status,
+                expr: "cublasSetStream",
+            });
         }
         if let Err(status) = ops.set_math_mode_tensor_op(&handle) {
-            return Err(CublasError { status, expr: "cublasSetMathMode" });
+            return Err(CublasError {
+                status,
+                expr: "cublasSetMathMode",
+            });
         }
-        Ok(Self { handle: Some(handle) })
+        Ok(Self {
+            handle: Some(handle),
+        })
     }
 
     /// The raw handle the gemm launchers take.
@@ -163,8 +171,10 @@ impl<H> CublasHandle<H> {
         stream: *mut c_void,
     ) -> Result<(), CublasError> {
         let h = self.handle.as_ref().expect("a created handle");
-        ops.set_stream(h, stream)
-            .map_err(|status| CublasError { status, expr: "cublasSetStream" })
+        ops.set_stream(h, stream).map_err(|status| CublasError {
+            status,
+            expr: "cublasSetStream",
+        })
     }
 
     /// The stream currently bound — what keeps a body's loose kernel
@@ -184,6 +194,9 @@ impl<H> CublasHandle<H> {
 
 impl<H> Drop for CublasHandle<H> {
     fn drop(&mut self) {
-        debug_assert!(self.handle.is_none(), "CublasHandle dropped without release()");
+        debug_assert!(
+            self.handle.is_none(),
+            "CublasHandle dropped without release()"
+        );
     }
 }

@@ -41,8 +41,7 @@ fn a_checkpoint_stages_into_device_memory_through_its_plan() {
     let meta = model_loader::checkpoint::read::parse_checkpoint_metadata(&snap)
         .expect("the checkpoint parses");
     let target = cuda_storage_target(0, 1);
-    let (plan, _moe) =
-        compile_load_plan(&snap, &meta, &target, &desc).expect("the plan compiles");
+    let (plan, _moe) = compile_load_plan(&snap, &meta, &target, &desc).expect("the plan compiles");
 
     // THE JOINS ARE IN THE PLAN. `Projections::Fused` is what the CUDA
     // GEMMs want, and the shell used to satisfy it by reading q/k/v back

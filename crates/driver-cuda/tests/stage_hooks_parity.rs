@@ -97,14 +97,25 @@ impl StageHookExecute for Recorder {
             if stream.is_null() { "s0" } else { "s?" },
             u8::from(query_is_f32),
             who_obs(sideband.observation),
-            if sideband.scores.is_some() { "unknown" } else { "null" },
-            if sideband.mask_sink.is_null() { "null" } else { "unknown" },
+            if sideband.scores.is_some() {
+                "unknown"
+            } else {
+                "null"
+            },
+            if sideband.mask_sink.is_null() {
+                "null"
+            } else {
+                "unknown"
+            },
         ));
     }
 }
 
 fn transcript() -> String {
-    let r = Recorder { out: RefCell::new(String::new()), case: RefCell::new(String::new()) };
+    let r = Recorder {
+        out: RefCell::new(String::new()),
+        case: RefCell::new(String::new()),
+    };
     let query = 0x200 as *const c_void;
     let obs_a = obs_at(0x300);
     let obs_b = obs_at(0x400);
@@ -114,31 +125,59 @@ fn transcript() -> String {
     *r.case.borrow_mut() = "a-defaults".into();
     {
         let h = default_hooks();
-        r.note(&format!("context={}", if h.execute.is_none() { "null" } else { "set" }));
-        r.note(&format!("wants_attn_score={}", u8::from(h.wants_attn_score)));
+        r.note(&format!(
+            "context={}",
+            if h.execute.is_none() { "null" } else { "set" }
+        ));
+        r.note(&format!(
+            "wants_attn_score={}",
+            u8::from(h.wants_attn_score)
+        ));
         r.note(&format!("attn_score_window={}", h.attn_score_window));
         r.note(&format!("wants_page_mask={}", u8::from(h.wants_page_mask)));
-        r.note(&format!("hook_free_prefix_rows={}", h.hook_free_prefix_rows));
+        r.note(&format!(
+            "hook_free_prefix_rows={}",
+            h.hook_free_prefix_rows
+        ));
         r.note(&format!("hook_rows_k={}", h.hook_rows_k));
         // The arena travels beside the hooks in the port; a fresh hook set
         // has none wired either way.
         r.note("sideband_arena=null");
         r.note(&format!("observation={}", who_obs(h.observation)));
-        r.note(&format!("execute={}", if h.execute.is_none() { "null" } else { "set" }));
+        r.note(&format!(
+            "execute={}",
+            if h.execute.is_none() { "null" } else { "set" }
+        ));
         r.note(&format!(
             "prepare_replay={}",
-            if h.prepare_replay.is_none() { "null" } else { "set" }
+            if h.prepare_replay.is_none() {
+                "null"
+            } else {
+                "set"
+            }
         ));
         r.note(&format!(
             "verify_replay_capture={}",
-            if h.prepare_replay.is_none() { "null" } else { "set" }
+            if h.prepare_replay.is_none() {
+                "null"
+            } else {
+                "set"
+            }
         ));
         let s = StageHookSideband::default();
         r.note(&format!(
             "sideband obs={} scores={} sink={}",
             who_obs(s.observation),
-            if s.scores.is_some() { "unknown" } else { "null" },
-            if s.mask_sink.is_null() { "null" } else { "unknown" },
+            if s.scores.is_some() {
+                "unknown"
+            } else {
+                "null"
+            },
+            if s.mask_sink.is_null() {
+                "null"
+            } else {
+                "unknown"
+            },
         ));
     }
 
@@ -199,7 +238,10 @@ fn transcript() -> String {
             9,
             std::ptr::null_mut(),
             true,
-            StageHookSideband { observation: Some(&obs_b), ..StageHookSideband::default() },
+            StageHookSideband {
+                observation: Some(&obs_b),
+                ..StageHookSideband::default()
+            },
         );
         invoke_stage_hook(
             Some(&h),
@@ -268,7 +310,10 @@ fn fnv1a64(data: &[u8]) -> u64 {
 fn the_port_reproduces_the_cpp_transcript() {
     let text = transcript();
     let rows = text.lines().count();
-    assert_eq!(rows, GOLDEN_ROWS, "row count diverged — script shape changed");
+    assert_eq!(
+        rows, GOLDEN_ROWS,
+        "row count diverged — script shape changed"
+    );
     let hash = fnv1a64(text.as_bytes());
     if hash != GOLDEN_FNV1A64 {
         let path = std::env::temp_dir().join("stage_hooks_rust_transcript.txt");

@@ -160,15 +160,10 @@ fn the_crate_root_exposes_the_portable_half_and_one_door() {
     // question no GPU changes, and it answered it for the second time in the
     // workspace. It is deleted, not moved: `model::catalog` answers it once,
     // for every driver.
-    const PORTABLE_ROOT: &[&str] = &[
-        "error::{Error, Result}",
-        "layout::{Batch, Region, Request}",
-    ];
+    const PORTABLE_ROOT: &[&str] = &["error::{Error, Result}", "layout::{Batch, Region, Request}"];
 
-    let source = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"),
-    )
-    .expect("lib.rs is beside this test");
+    let source = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"))
+        .expect("lib.rs is beside this test");
 
     let found: Vec<String> = source
         .lines()

@@ -35,19 +35,19 @@ use std::rc::Rc;
 
 use tensor_ir::op::tags;
 
-use crate::device::context::Context;
-use crate::device::encoder::{StepEncoder, Visibility};
-use crate::device::external::{External, Externals};
-use crate::program::single::{DeviceInputs, PreparedFire};
-use crate::device::handle::Handle;
-use crate::device::allocator::{Pool, Transient};
-use crate::program::executable::Pso;
-use crate::program::cache::Runtime;
-use crate::device::argtable::Tables;
 use crate::channel::{
     OpParams, OpRuntime, STATUS_BYTES, StatusOutcome, ValueDesc, describe, layout, report_status,
 };
+use crate::device::allocator::{Pool, Transient};
+use crate::device::argtable::Tables;
+use crate::device::context::Context;
+use crate::device::encoder::{StepEncoder, Visibility};
+use crate::device::external::{External, Externals};
+use crate::device::handle::Handle;
 use crate::layout::region::Region as _;
+use crate::program::cache::Runtime;
+use crate::program::executable::Pso;
+use crate::program::single::{DeviceInputs, PreparedFire};
 use crate::{Error, Result};
 
 /// `PTIR_OP_CHAN_PUT`.

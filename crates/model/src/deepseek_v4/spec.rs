@@ -73,10 +73,21 @@ pub struct Dsv4HcFacts {
 }
 
 /// The MoE block. `topk_sqrtsoftplus` scoring and a CLAMPED swiglu.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Dsv4MoeFacts {
     pub num_experts: u32,
     pub top_k: u32,
+    /// Whether the router renormalizes over the SELECTED experts.
+    ///
+    /// `deepseek-ai/DeepSeek-V3` publishes `"norm_topk_prob": false`, and
+    /// its `routed_scaling_factor` of 2.5 is what pays for weights that
+    /// sum to less than one. No V4 config is out; this is the lineage's
+    /// value, stated so the day one is, this is the line that changes.
+    pub norm_topk_prob: bool,
+    /// `routed_scaling_factor`, 2.5 on `deepseek-ai/DeepSeek-V3`. It is
+    /// what pays for weights that sum to less than one; the pair is only
+    /// meaningful together.
+    pub routed_scaling: f32,
     pub moe_intermediate: u32,
     /// `cfg.swiglu_limit`, the clamp the activation applies.
     pub swiglu_limit_milli: u32,
@@ -93,7 +104,7 @@ pub struct Dsv4MoeFacts {
 /// owner for a deserializer to hand one back. Nothing loses anything —
 /// no facts struct in this crate is ever built from JSON. They are
 /// written down, which is the whole premise of a catalog.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Dsv4Facts {
     pub layers: u32,
     pub vocab: u32,
@@ -173,6 +184,8 @@ impl Dsv4Facts {
             moe: Dsv4MoeFacts {
                 num_experts: 64,
                 top_k: 6,
+                norm_topk_prob: false,
+                routed_scaling: 2.5,
                 moe_intermediate: 1024,
                 swiglu_limit_milli: 7000,
                 hash_routed: false,
@@ -268,10 +281,16 @@ mod tests {
     #[test]
     fn a_short_schedule_leaves_the_trailing_layers_uncompressed() {
         let f = f();
-        assert!(f.ratios.len() < f.layers as usize, "the fixture is the short case");
+        assert!(
+            f.ratios.len() < f.layers as usize,
+            "the fixture is the short case"
+        );
         for l in f.ratios.len() as u32..f.layers {
             assert_eq!(f.compress_ratio_at(l), 0);
-            assert!(!f.compresses(l), "layer {l} is past the end of the schedule");
+            assert!(
+                !f.compresses(l),
+                "layer {l} is past the end of the schedule"
+            );
         }
     }
 
@@ -280,9 +299,15 @@ mod tests {
     /// checkpoint spells "these two layers keep every token".
     #[test]
     fn a_zero_or_negative_ratio_is_a_layer_that_keeps_every_token() {
-        let f = Dsv4Facts { ratios: &[0, -1, 4], ..Dsv4Facts::dsv4_synthetic() };
+        let f = Dsv4Facts {
+            ratios: &[0, -1, 4],
+            ..Dsv4Facts::dsv4_synthetic()
+        };
         assert!(!f.compresses(0), "zero is not a ratio");
-        assert!(!f.compresses(1), "a negative ratio is the C++'s `ratio <= 0`");
+        assert!(
+            !f.compresses(1),
+            "a negative ratio is the C++'s `ratio <= 0`"
+        );
         assert!(f.compresses(2));
     }
 

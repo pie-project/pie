@@ -22,12 +22,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::error::{Error, Result};
-use crate::loader::{compile_load_plan_for, metal_storage_target};
 use crate::device::{Allocation, Context};
-use crate::weights::stage_plan_weights;
-use crate::lowering::executor::Slice;
+use crate::error::{Error, Result};
 use crate::layout::region::Region as _;
+use crate::loader::{compile_load_plan_for, metal_storage_target};
+use crate::lowering::executor::Slice;
+use crate::weights::stage_plan_weights;
 
 /// A checkpoint on the device: the region that holds it, and where each
 /// tensor sits in it.
@@ -108,24 +108,28 @@ pub fn load(
     encoding: &model::encoding::Encoding,
 ) -> Result<Loaded> {
     let target = metal_storage_target();
-    let (plan, _moe) = compile_load_plan_for(snapshot_dir, &target, row, encoding).map_err(
-        |err| Error::Create {
-            what: "load plan",
-            // `{err}`, not `{err:?}`. `LoadPlanError`'s Display quotes the
-            // compiler's own words and names the tensor it refused over; its
-            // Debug prints `Plan(Compile("..."))`. An operator reads this
-            // message.
-            message: err.to_string(),
-        },
-    )?;
+    let (plan, _moe) =
+        compile_load_plan_for(snapshot_dir, &target, row, encoding).map_err(|err| {
+            Error::Create {
+                what: "load plan",
+                // `{err}`, not `{err:?}`. `LoadPlanError`'s Display quotes the
+                // compiler's own words and names the tensor it refused over; its
+                // Debug prints `Plan(Compile("..."))`. An operator reads this
+                // message.
+                message: err.to_string(),
+            }
+        })?;
     let (regions, staged) = stage_plan_weights(context, &plan, snapshot_dir)?;
     let tensors = staged
         .into_iter()
         .map(|(name, handle)| {
-            (name, Slice {
-                address: handle.gpu_address(),
-                bytes: handle.len(),
-            })
+            (
+                name,
+                Slice {
+                    address: handle.gpu_address(),
+                    bytes: handle.len(),
+                },
+            )
         })
         .collect();
     let mxfp4 = plan.mxfp4_tensor_names();

@@ -23,8 +23,8 @@
     reason = "the golden hash is one opaque token; grouping it invites a typo"
 )]
 
-use driver_cuda::layout::memory_planner as mp;
 use driver_cuda::layout::budget::CudaMemoryPlan;
+use driver_cuda::layout::memory_planner as mp;
 use driver_cuda::layout::profile_key::{ProfileKey, ProfileShape};
 use std::fmt::Write as _;
 
@@ -104,13 +104,10 @@ impl mp::ModelCosts for Case {
         let head_dim = u64::try_from(self.hf.head_dim_kernel.max(0)).unwrap_or(0);
         match self.fam {
             Fam::Dsv4 => {
-                layers * (u64::try_from(self.head_dim.max(0)).unwrap_or(0) * 2)
-                    + layers * 512
+                layers * (u64::try_from(self.head_dim.max(0)).unwrap_or(0) * 2) + layers * 512
             }
             Fam::Kimi | Fam::Glm5 | Fam::KimiK3 => {
-                layers
-                    * (u64::from(Self::KV_LORA_RANK) + u64::from(Self::QK_ROPE_HEAD_DIM))
-                    * 2
+                layers * (u64::from(Self::KV_LORA_RANK) + u64::from(Self::QK_ROPE_HEAD_DIM)) * 2
                     + layers * 2
             }
             // The per-layer path sums identical layers here, so it lands on
@@ -126,8 +123,7 @@ impl mp::ModelCosts for Case {
         if self.envelopes {
             2 * 2
                 * self.layers()
-                * u64::try_from((self.hf.num_key_value_heads / self.tp.max(1)).max(1))
-                    .unwrap_or(1)
+                * u64::try_from((self.hf.num_key_value_heads / self.tp.max(1)).max(1)).unwrap_or(1)
                 * u64::try_from(self.hf.head_dim_kernel.max(0)).unwrap_or(0)
         } else {
             0
@@ -149,8 +145,11 @@ impl mp::ModelCosts for Case {
         let v_dim = u64::try_from((self.hf_linear_value_heads() / tp).max(0)).unwrap_or(0) * 128;
         let conv_dim = 2 * k_dim + v_dim;
         let elem = if self.rs_bf16 { 2 } else { 4 };
-        let per_slot_recurrent =
-            u64::try_from((self.hf_linear_value_heads() / tp).max(0)).unwrap_or(0) * 128 * 128 * elem;
+        let per_slot_recurrent = u64::try_from((self.hf_linear_value_heads() / tp).max(0))
+            .unwrap_or(0)
+            * 128
+            * 128
+            * elem;
         let per_slot_conv = 4 * conv_dim * 2;
         u64::try_from(self.linear_layers().max(0)).unwrap_or(0)
             * (per_slot_recurrent + per_slot_conv)
@@ -187,7 +186,11 @@ impl mp::ModelCosts for Case {
     fn attn_float_workspace_bytes(&self, n: i32, r: i32) -> u64 {
         let base = u64::try_from(n.max(0)).unwrap_or(0) * 512
             + u64::try_from(r.max(0)).unwrap_or(0) * 1024;
-        if self.prefill_graph_capable { base * 2 } else { base }
+        if self.prefill_graph_capable {
+            base * 2
+        } else {
+            base
+        }
     }
 
     fn persistent_input_bytes(
@@ -271,14 +274,70 @@ struct DeviceCase {
 
 fn devices() -> Vec<DeviceCase> {
     vec![
-        DeviceCase { label: "l40s", name: "NVIDIA L40S", major: 8, minor: 9, sms: 142, total_gib: 45 },
-        DeviceCase { label: "a100", name: "NVIDIA A100-SXM4-80GB", major: 8, minor: 0, sms: 108, total_gib: 80 },
-        DeviceCase { label: "h100", name: "NVIDIA H100 80GB HBM3", major: 9, minor: 0, sms: 132, total_gib: 80 },
-        DeviceCase { label: "b200", name: "NVIDIA B200", major: 10, minor: 0, sms: 148, total_gib: 180 },
-        DeviceCase { label: "rtx5090", name: "NVIDIA GeForce RTX 5090", major: 12, minor: 0, sms: 170, total_gib: 32 },
-        DeviceCase { label: "l4", name: "NVIDIA L4", major: 8, minor: 9, sms: 58, total_gib: 24 },
-        DeviceCase { label: "t4", name: "Tesla T4", major: 7, minor: 5, sms: 40, total_gib: 16 },
-        DeviceCase { label: "ada6000", name: "NVIDIA RTX 6000 Ada", major: 8, minor: 9, sms: 142, total_gib: 48 },
+        DeviceCase {
+            label: "l40s",
+            name: "NVIDIA L40S",
+            major: 8,
+            minor: 9,
+            sms: 142,
+            total_gib: 45,
+        },
+        DeviceCase {
+            label: "a100",
+            name: "NVIDIA A100-SXM4-80GB",
+            major: 8,
+            minor: 0,
+            sms: 108,
+            total_gib: 80,
+        },
+        DeviceCase {
+            label: "h100",
+            name: "NVIDIA H100 80GB HBM3",
+            major: 9,
+            minor: 0,
+            sms: 132,
+            total_gib: 80,
+        },
+        DeviceCase {
+            label: "b200",
+            name: "NVIDIA B200",
+            major: 10,
+            minor: 0,
+            sms: 148,
+            total_gib: 180,
+        },
+        DeviceCase {
+            label: "rtx5090",
+            name: "NVIDIA GeForce RTX 5090",
+            major: 12,
+            minor: 0,
+            sms: 170,
+            total_gib: 32,
+        },
+        DeviceCase {
+            label: "l4",
+            name: "NVIDIA L4",
+            major: 8,
+            minor: 9,
+            sms: 58,
+            total_gib: 24,
+        },
+        DeviceCase {
+            label: "t4",
+            name: "Tesla T4",
+            major: 7,
+            minor: 5,
+            sms: 40,
+            total_gib: 16,
+        },
+        DeviceCase {
+            label: "ada6000",
+            name: "NVIDIA RTX 6000 Ada",
+            major: 8,
+            minor: 9,
+            sms: 142,
+            total_gib: 48,
+        },
     ]
 }
 
@@ -294,19 +353,123 @@ struct ModelCase {
 
 fn models() -> Vec<ModelCase> {
     vec![
-        ModelCase { label: "qwen3-8b", fam: Fam::Dense, model_type: "qwen3", hidden: 4096, layers: 36, kv_heads: 8, head_dim: 128 },
-        ModelCase { label: "qwen3-0.6b", fam: Fam::Dense, model_type: "qwen3", hidden: 1024, layers: 28, kv_heads: 8, head_dim: 128 },
-        ModelCase { label: "llama3-70b", fam: Fam::Dense, model_type: "llama", hidden: 8192, layers: 80, kv_heads: 8, head_dim: 128 },
-        ModelCase { label: "narrow", fam: Fam::Dense, model_type: "llama", hidden: 2048, layers: 24, kv_heads: 4, head_dim: 64 },
-        ModelCase { label: "qwen35", fam: Fam::Qwen35, model_type: "qwen3_next", hidden: 4096, layers: 48, kv_heads: 4, head_dim: 128 },
-        ModelCase { label: "qwen35moe", fam: Fam::Qwen35Moe, model_type: "qwen3_next_moe", hidden: 2048, layers: 48, kv_heads: 2, head_dim: 128 },
-        ModelCase { label: "nemotron", fam: Fam::NemotronH, model_type: "nemotron_h", hidden: 4480, layers: 62, kv_heads: 8, head_dim: 128 },
-        ModelCase { label: "gemma4", fam: Fam::Gemma4, model_type: "gemma4", hidden: 3840, layers: 60, kv_heads: 4, head_dim: 256 },
-        ModelCase { label: "dsv4", fam: Fam::Dsv4, model_type: "deepseek_v4", hidden: 7168, layers: 61, kv_heads: 1, head_dim: 576 },
-        ModelCase { label: "kimi", fam: Fam::Kimi, model_type: "kimi", hidden: 7168, layers: 61, kv_heads: 1, head_dim: 576 },
-        ModelCase { label: "glm5", fam: Fam::Glm5, model_type: "glm5", hidden: 5120, layers: 92, kv_heads: 1, head_dim: 576 },
-        ModelCase { label: "kimik3", fam: Fam::KimiK3, model_type: "kimi_k3", hidden: 7168, layers: 61, kv_heads: 1, head_dim: 576 },
-        ModelCase { label: "kvheavy", fam: Fam::Dense, model_type: "llama", hidden: 8192, layers: 96, kv_heads: 64, head_dim: 128 },
+        ModelCase {
+            label: "qwen3-8b",
+            fam: Fam::Dense,
+            model_type: "qwen3",
+            hidden: 4096,
+            layers: 36,
+            kv_heads: 8,
+            head_dim: 128,
+        },
+        ModelCase {
+            label: "qwen3-0.6b",
+            fam: Fam::Dense,
+            model_type: "qwen3",
+            hidden: 1024,
+            layers: 28,
+            kv_heads: 8,
+            head_dim: 128,
+        },
+        ModelCase {
+            label: "llama3-70b",
+            fam: Fam::Dense,
+            model_type: "llama",
+            hidden: 8192,
+            layers: 80,
+            kv_heads: 8,
+            head_dim: 128,
+        },
+        ModelCase {
+            label: "narrow",
+            fam: Fam::Dense,
+            model_type: "llama",
+            hidden: 2048,
+            layers: 24,
+            kv_heads: 4,
+            head_dim: 64,
+        },
+        ModelCase {
+            label: "qwen35",
+            fam: Fam::Qwen35,
+            model_type: "qwen3_next",
+            hidden: 4096,
+            layers: 48,
+            kv_heads: 4,
+            head_dim: 128,
+        },
+        ModelCase {
+            label: "qwen35moe",
+            fam: Fam::Qwen35Moe,
+            model_type: "qwen3_next_moe",
+            hidden: 2048,
+            layers: 48,
+            kv_heads: 2,
+            head_dim: 128,
+        },
+        ModelCase {
+            label: "nemotron",
+            fam: Fam::NemotronH,
+            model_type: "nemotron_h",
+            hidden: 4480,
+            layers: 62,
+            kv_heads: 8,
+            head_dim: 128,
+        },
+        ModelCase {
+            label: "gemma4",
+            fam: Fam::Gemma4,
+            model_type: "gemma4",
+            hidden: 3840,
+            layers: 60,
+            kv_heads: 4,
+            head_dim: 256,
+        },
+        ModelCase {
+            label: "dsv4",
+            fam: Fam::Dsv4,
+            model_type: "deepseek_v4",
+            hidden: 7168,
+            layers: 61,
+            kv_heads: 1,
+            head_dim: 576,
+        },
+        ModelCase {
+            label: "kimi",
+            fam: Fam::Kimi,
+            model_type: "kimi",
+            hidden: 7168,
+            layers: 61,
+            kv_heads: 1,
+            head_dim: 576,
+        },
+        ModelCase {
+            label: "glm5",
+            fam: Fam::Glm5,
+            model_type: "glm5",
+            hidden: 5120,
+            layers: 92,
+            kv_heads: 1,
+            head_dim: 576,
+        },
+        ModelCase {
+            label: "kimik3",
+            fam: Fam::KimiK3,
+            model_type: "kimi_k3",
+            hidden: 7168,
+            layers: 61,
+            kv_heads: 1,
+            head_dim: 576,
+        },
+        ModelCase {
+            label: "kvheavy",
+            fam: Fam::Dense,
+            model_type: "llama",
+            hidden: 8192,
+            layers: 96,
+            kv_heads: 64,
+            head_dim: 128,
+        },
     ]
 }
 
@@ -436,8 +599,7 @@ impl Sweep {
             complaint: self.complaint.clone(),
         };
 
-        let ranks = i32::from(cfg.tp_size > 1 && !cfg.nccl_unique_id_hex.is_empty())
-            * cfg.tp_size;
+        let ranks = i32::from(cfg.tp_size > 1 && !cfg.nccl_unique_id_hex.is_empty()) * cfg.tp_size;
         let multirank = ranks > 1;
 
         let (envelopes, rs_bf16) = (self.envelopes, self.rs_bf16);
@@ -462,7 +624,10 @@ impl Sweep {
                         })
                     })
                     .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect::<Vec<_>>()
             })
         } else {
             let hf = case.hf.clone();
@@ -555,7 +720,14 @@ fn the_rust_planner_reproduces_the_cpp_transcript_byte_for_byte() {
         }
     }
 
-    for profile in ["auto", "latency", "balanced", "throughput", "capacity", "bogus"] {
+    for profile in [
+        "auto",
+        "latency",
+        "balanced",
+        "throughput",
+        "capacity",
+        "bogus",
+    ] {
         for d in &devs {
             for m in [&mods[0], &mods[3], &mods[5], &mods[8], &mods[12]] {
                 let mut c = base_config();
@@ -661,8 +833,11 @@ fn the_rust_planner_reproduces_the_cpp_transcript_byte_for_byte() {
                 clippy::cast_sign_loss,
                 reason = "mirrors the oracle's double round-trip"
             )]
-            let budget_bytes =
-                if scale == 0.0 { 0 } else { (real_budget as f64 / scale) as u64 };
+            let budget_bytes = if scale == 0.0 {
+                0
+            } else {
+                (real_budget as f64 / scale) as u64
+            };
             sw.profile = Some(ProfileShape {
                 policy_profile: profile.to_owned(),
                 kv_page_size: page,
@@ -696,7 +871,12 @@ fn the_rust_planner_reproduces_the_cpp_transcript_byte_for_byte() {
         });
         let mut named = base_config();
         named.memory_profile = "latency".to_owned();
-        sw.run("prof/named-profile-ignores-cache", &devs[0], &mods[0], &named);
+        sw.run(
+            "prof/named-profile-ignores-cache",
+            &devs[0],
+            &mods[0],
+            &named,
+        );
         sw.calibrating = true;
         sw.run("prof/calibrating-ignores-cache", &devs[0], &mods[0], &c);
         sw.calibrating = false;
@@ -855,7 +1035,10 @@ fn the_rust_planner_reproduces_the_cpp_transcript_byte_for_byte() {
     if let Ok(path) = std::env::var("MP_RUST_OUT") {
         std::fs::write(path, &sw.out).expect("write transcript");
     }
-    assert_eq!(rows, GOLDEN_ROWS, "row count moved: the sweep itself changed");
+    assert_eq!(
+        rows, GOLDEN_ROWS,
+        "row count moved: the sweep itself changed"
+    );
     assert_eq!(
         fnv1a64(sw.out.as_bytes()),
         GOLDEN_FNV1A64,

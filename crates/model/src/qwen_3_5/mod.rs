@@ -235,7 +235,9 @@ pub const VARIANTS: &[Qwen35] = &[
             norm_variant: NormVariant::Gemma,
             attn: attn(4096, 16, 4),
             gdn: gdn(4096, 16, 32),
-            mlp: Qwen35MlpKind::Dense { intermediate: 12_288 },
+            mlp: Qwen35MlpKind::Dense {
+                intermediate: 12_288,
+            },
         },
         rope_theta: 1e7,
         norm_eps: 1e-6,
@@ -289,7 +291,9 @@ pub const VARIANTS: &[Qwen35] = &[
             norm_variant: NormVariant::Gemma,
             attn: attn(5120, 24, 4),
             gdn: gdn(5120, 16, 48),
-            mlp: Qwen35MlpKind::Dense { intermediate: 17_408 },
+            mlp: Qwen35MlpKind::Dense {
+                intermediate: 17_408,
+            },
         },
         rope_theta: 1e7,
         norm_eps: 1e-6,
@@ -438,8 +442,15 @@ mod tests {
     #[test]
     fn the_row_answers_what_the_driver_advertises() {
         for v in VARIANTS {
-            let a = v.deployment(Deployed::single()).expect("the hybrid deploys").advertised;
-            assert_eq!(a.arch, "qwen3_5", "{}: the family label a guest program sees", v.id);
+            let a = v
+                .deployment(Deployed::single())
+                .expect("the hybrid deploys")
+                .advertised;
+            assert_eq!(
+                a.arch, "qwen3_5",
+                "{}: the family label a guest program sees",
+                v.id
+            );
             assert_eq!(
                 a.max_model_len, 262_144,
                 "{}: every committed corpus config states it under `text_config`",
@@ -452,7 +463,11 @@ mod tests {
                 v.id
             );
             assert!(
-                v.deployment(Deployed::single()).expect("deploys").towers.vision.is_none(),
+                v.deployment(Deployed::single())
+                    .expect("deploys")
+                    .towers
+                    .vision
+                    .is_none(),
                 "{}: a row that advertised no encoder must not carry one",
                 v.id
             );
@@ -480,7 +495,10 @@ mod tests {
             .strip_suffix("forconditionalgeneration")
             .expect("the suffix the worker strips")
             .to_string();
-        assert_eq!(stem, ARCH, "the worker would refuse a real Qwen3.5 checkpoint");
+        assert_eq!(
+            stem, ARCH,
+            "the worker would refuse a real Qwen3.5 checkpoint"
+        );
         assert_eq!(
             crate::multimodal::VisionArch::from_arch_name(ARCH),
             Some(crate::multimodal::VisionArch::Qwen36),
@@ -495,12 +513,22 @@ mod tests {
     /// and by family, and only its id says 3.6.
     #[test]
     fn the_three_point_six_row_advertises_the_three_point_five_family() {
-        let d = row("qwen3.6-27b").deployment(Deployed::single()).expect("deploys");
+        let d = row("qwen3.6-27b")
+            .deployment(Deployed::single())
+            .expect("deploys");
         assert_eq!(d.advertised.arch, ARCH);
-        assert_eq!(d.advertised.max_model_len, 262_144, "its corpus config states it too");
+        assert_eq!(
+            d.advertised.max_model_len, 262_144,
+            "its corpus config states it too"
+        );
         let labels: std::collections::BTreeSet<&str> = VARIANTS
             .iter()
-            .map(|v| v.deployment(Deployed::single()).expect("deploys").advertised.arch)
+            .map(|v| {
+                v.deployment(Deployed::single())
+                    .expect("deploys")
+                    .advertised
+                    .arch
+            })
             .collect();
         assert_eq!(labels.len(), 1, "one family over five rows: {labels:?}");
     }
@@ -510,7 +538,10 @@ mod tests {
     /// have a row here.
     #[test]
     fn the_rows_agree_with_the_committed_fixtures() {
-        assert_eq!(row("qwen3.5-0.8b-base").shape, Qwen35HybridFacts::qwen3_5_0_8b());
+        assert_eq!(
+            row("qwen3.5-0.8b-base").shape,
+            Qwen35HybridFacts::qwen3_5_0_8b()
+        );
         assert_eq!(row("qwen3.6-27b").shape, Qwen35HybridFacts::qwen3_6_27b());
         // The MoE block is stated inline in the row because a `const`
         // cannot call a fixture, so the two are held together here.
@@ -555,7 +586,11 @@ mod tests {
                     assert_eq!(d.shape.moe_intermediate, 0, "{}: no experts", v.id);
                 }
             }
-            assert_eq!(d.norm_eps, v.norm_eps, "{}: stated once, projected once", v.id);
+            assert_eq!(
+                d.norm_eps, v.norm_eps,
+                "{}: stated once, projected once",
+                v.id
+            );
         }
     }
 
@@ -563,12 +598,21 @@ mod tests {
     /// checkpoint `author_qwen3_5_moe` was written for.
     #[test]
     fn the_mixture_row_is_a_mixture_in_the_only_place_it_is_stated() {
-        let moe: Vec<&str> = VARIANTS.iter().filter(|v| v.is_mixture()).map(|v| v.id).collect();
+        let moe: Vec<&str> = VARIANTS
+            .iter()
+            .filter(|v| v.is_mixture())
+            .map(|v| v.id)
+            .collect();
         assert_eq!(moe, vec!["qwen3.5-35b-a3b"]);
         let m = row("qwen3.5-35b-a3b");
         assert_eq!(m.experts(), 256);
         assert_eq!(m.load_shape().n_experts, 256);
-        let names: Vec<String> = m.manifest().tensors.iter().map(|t| t.name.clone()).collect();
+        let names: Vec<String> = m
+            .manifest()
+            .tensors
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
         assert!(names.iter().any(|n| n.ends_with("mlp.gate")), "{names:?}");
         // And the dense rows state the absence, so a dense checkpoint
         // cannot match the mixture row by accident.
@@ -584,7 +628,12 @@ mod tests {
     fn an_fp8_build_and_a_bf16_build_are_one_row() {
         let ids: Vec<&str> = VARIANTS.iter().map(|v| v.id).collect();
         assert!(ids.contains(&"qwen3.6-27b"));
-        assert_eq!(ids.iter().filter(|id| id.starts_with("qwen3.6-27b")).count(), 1);
+        assert_eq!(
+            ids.iter()
+                .filter(|id| id.starts_with("qwen3.6-27b"))
+                .count(),
+            1
+        );
         for id in &ids {
             assert!(!id.contains("fp8"), "'{id}' names an encoding");
         }
@@ -604,7 +653,10 @@ mod tests {
     fn the_instruct_tune_and_the_base_share_a_row() {
         let ids: Vec<&str> = VARIANTS.iter().map(|v| v.id).collect();
         assert!(ids.contains(&"qwen3.5-0.8b-base"));
-        assert!(!ids.contains(&"qwen3.5-0.8b"), "a second row nothing could tell apart");
+        assert!(
+            !ids.contains(&"qwen3.5-0.8b"),
+            "a second row nothing could tell apart"
+        );
     }
 
     /// The ids an operator types, and nothing in them about how a
@@ -629,7 +681,9 @@ mod tests {
     #[test]
     fn every_row_projects() {
         for v in VARIANTS {
-            let d = v.deployment(Deployed::single()).expect("the GDN store is built");
+            let d = v
+                .deployment(Deployed::single())
+                .expect("the GDN store is built");
             assert_eq!(d.layers, v.shape.layers);
             assert_eq!(d.attention.len() as u32, v.shape.layers);
             assert_eq!(v.manifest().layers, v.shape.layers);
@@ -652,7 +706,10 @@ mod tests {
     fn every_row_carries_recurrent_state() {
         for v in VARIANTS {
             let d = v.deployment(Deployed::single()).expect("servable");
-            let r = d.recurrent.as_ref().expect("a gated-delta-net stack carries state");
+            let r = d
+                .recurrent
+                .as_ref()
+                .expect("a gated-delta-net stack carries state");
             assert!(!r.linear_layers.is_empty(), "{}", v.id);
             assert_eq!(
                 r.linear_layers.len() as u32,
@@ -672,7 +729,12 @@ mod tests {
     fn every_row_states_its_partial_rotation() {
         for v in VARIANTS {
             let d = v.deployment(Deployed::single()).expect("servable");
-            assert_eq!(d.rotary_by_layer(), vec![64; v.shape.layers as usize], "{}", v.id);
+            assert_eq!(
+                d.rotary_by_layer(),
+                vec![64; v.shape.layers as usize],
+                "{}",
+                v.id
+            );
             assert!(d.theta_by_layer().is_empty(), "one theta, so no table");
             assert_eq!(v.rope_theta, 1e7);
         }
@@ -712,8 +774,16 @@ mod tests {
         let tok = Arc::new(tokenizer::Tokenizer::from_vocab(&vocab));
         for v in VARIANTS {
             let chat = v.chat(tok.clone());
-            assert!(chat.user("Hi").starts_with(&[0]), "{} opens a turn wrong", v.id);
-            assert!(chat.seal().contains(&1), "{} does not seal with <|im_end|>", v.id);
+            assert!(
+                chat.user("Hi").starts_with(&[0]),
+                "{} opens a turn wrong",
+                v.id
+            );
+            assert!(
+                chat.seal().contains(&1),
+                "{} does not seal with <|im_end|>",
+                v.id
+            );
         }
     }
 
@@ -722,9 +792,10 @@ mod tests {
     /// The guard that replaces `driver-metal`'s `LLAMA_LIKE` table. That
     /// table answered "does this build serve you" from an architecture
     /// STRING reduced by `canonical()`, in a driver, before any text was
-    /// traced — so it could say yes to a row whose text does not exist
-    /// (it listed `gemma4`) and no to one whose text does (it omitted
-    /// `gemma3`). The row answers now, and what it answers with is a
+    /// traced — so it could say yes to a row this build cannot resolve
+    /// (it listed `gpt_oss`, whose every publication either fails this
+    /// crate's manifest or names tensors `driver-metal` has no handle
+    /// for) and no to one whose text it models (it omitted `gemma3`). The row answers now, and what it answers with is a
     /// sentence naming what is missing.
     ///
     /// The comparison is against [`project::NO_METAL`] itself and not a

@@ -82,8 +82,11 @@ fn names_a_family(line: &str) -> bool {
     // and punctuation are not the identity. Matching raw text saw
     // `gemma_facts` and missed `GemmaFacts`, which is where family names
     // actually appear in Rust.
-    let flat: String =
-        line.chars().filter(|c| *c != '_' && *c != '-').flat_map(char::to_lowercase).collect();
+    let flat: String = line
+        .chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect();
     if FAMILIES.iter().any(|f| {
         let f: String = f.chars().filter(|c| *c != '_').collect();
         flat.contains(&f)
@@ -98,8 +101,9 @@ fn names_a_family(line: &str) -> bool {
 ///
 /// The same list `driver-cuda` uses, so the two backends are held to one
 /// standard rather than to whichever names each happened to notice.
-const FAMILIES: &[&str] =
-    &["gemma", "qwen", "llama", "deepseek", "kimi", "nemotron", "glm", "gpt_oss"];
+const FAMILIES: &[&str] = &[
+    "gemma", "qwen", "llama", "deepseek", "kimi", "nemotron", "glm", "gpt_oss",
+];
 
 /// Non-comment lines naming a family, per file, as of this test's writing.
 ///
@@ -363,7 +367,13 @@ fn no_model_type_table_remains_in_the_driver() {
             if t.starts_with("//") {
                 continue;
             }
-            for banned in ["FACTS_ROWS", "HF_ROWS", "MLX_ROWS", "ModelFamily", "arch_stem"] {
+            for banned in [
+                "FACTS_ROWS",
+                "HF_ROWS",
+                "MLX_ROWS",
+                "ModelFamily",
+                "arch_stem",
+            ] {
                 assert!(
                     !t.contains(banned),
                     "{}:{} names `{banned}`, which is a table — or the \

@@ -14,7 +14,9 @@ use common::{device_or_skip, gpu_guard};
 
 #[test]
 fn a_device_can_be_bound_and_described() {
-    let Some(dev) = device_or_skip("device query") else { return };
+    let Some(dev) = device_or_skip("device query") else {
+        return;
+    };
     let (major, minor) = dev.compute_capability().expect("compute capability");
     let sms = dev.sm_count().expect("sm count");
     let (free, total) = dev.memory_info().expect("memory info");
@@ -33,7 +35,9 @@ fn a_device_can_be_bound_and_described() {
 #[test]
 fn a_round_trip_through_device_memory_returns_what_went_in() {
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("memcpy round trip") else { return };
+    let Some(_dev) = device_or_skip("memcpy round trip") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let alloc = Allocator::new();
 
@@ -51,7 +55,9 @@ fn a_round_trip_through_device_memory_returns_what_went_in() {
 #[test]
 fn memset_reaches_the_device() {
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("memset") else { return };
+    let Some(_dev) = device_or_skip("memset") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let alloc = Allocator::new();
 
@@ -67,7 +73,9 @@ fn memset_reaches_the_device() {
 #[test]
 fn an_event_orders_work_across_two_streams() {
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("cross-stream event") else { return };
+    let Some(_dev) = device_or_skip("cross-stream event") else {
+        return;
+    };
     let a = OwnedStream::new(0).expect("stream a");
     let b = OwnedStream::new(0).expect("stream b");
     let alloc = Allocator::new();
@@ -84,13 +92,18 @@ fn an_event_orders_work_across_two_streams() {
     buf.copy_to_host(&mut back, b.as_ref()).expect("d2h on b");
     b.as_ref().synchronize().expect("sync b");
 
-    assert_eq!(back, payload, "stream b read before stream a's write landed");
+    assert_eq!(
+        back, payload,
+        "stream b read before stream a's write landed"
+    );
 }
 
 #[test]
 fn a_timing_event_pair_measures_something_nonnegative() {
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("event timing") else { return };
+    let Some(_dev) = device_or_skip("event timing") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let alloc = Allocator::new();
     let start = Event::with_timing().expect("start");
@@ -103,7 +116,10 @@ fn a_timing_event_pair_measures_something_nonnegative() {
     end.synchronize().expect("sync");
 
     let ms = start.elapsed_ms(&end).expect("elapsed");
-    assert!((0.0..10_000.0).contains(&ms), "implausible elapsed time {ms}ms");
+    assert!(
+        (0.0..10_000.0).contains(&ms),
+        "implausible elapsed time {ms}ms"
+    );
 }
 
 /// The live `DeviceMemory` behind the sideband arena (retirement plan
@@ -114,23 +130,34 @@ fn a_timing_event_pair_measures_something_nonnegative() {
 /// growth returns fresh usable memory.
 #[test]
 fn the_live_arena_carves_grows_and_frees_on_the_device() {
-    use driver_cuda::fire::sideband_arena::{
-        LiveDeviceMemory, Region, SidebandArena,
-    };
+    use driver_cuda::fire::sideband_arena::{LiveDeviceMemory, Region, SidebandArena};
 
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("live sideband arena") else { return };
+    let Some(_dev) = device_or_skip("live sideband arena") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let mut mem = LiveDeviceMemory::new(stream.as_ref());
     let mut arena = SidebandArena::new();
 
-    let base = arena.acquire(&mut mem, Region::Mask, 1024).expect("first acquire");
+    let base = arena
+        .acquire(&mut mem, Region::Mask, 1024)
+        .expect("first acquire");
     assert!(!base.is_null());
-    assert_eq!(arena.generation(), 1, "capacity 0 -> the first acquire grows");
+    assert_eq!(
+        arena.generation(),
+        1,
+        "capacity 0 -> the first acquire grows"
+    );
 
     arena.release(Region::Mask);
-    let again = arena.acquire(&mut mem, Region::Mask, 512).expect("re-acquire");
-    assert_eq!(again, base, "while capacity suffices, the address is stable");
+    let again = arena
+        .acquire(&mut mem, Region::Mask, 512)
+        .expect("re-acquire");
+    assert_eq!(
+        again, base,
+        "while capacity suffices, the address is stable"
+    );
 
     arena.release(Region::Mask);
     let grown = arena
@@ -153,7 +180,9 @@ fn the_live_cublas_handle_binds_and_rebinds_its_stream() {
     use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
 
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("live cublas handle") else { return };
+    let Some(_dev) = device_or_skip("live cublas handle") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let raw = stream.as_ref().as_raw().cast::<std::ffi::c_void>();
 
@@ -161,7 +190,8 @@ fn the_live_cublas_handle_binds_and_rebinds_its_stream() {
     let mut h = CublasHandle::create(&mut ops, raw).expect("create");
     assert_eq!(h.stream(&mut ops), raw, "the bound stream reads back");
 
-    h.set_stream(&mut ops, std::ptr::null_mut()).expect("rebind");
+    h.set_stream(&mut ops, std::ptr::null_mut())
+        .expect("rebind");
     assert!(h.stream(&mut ops).is_null(), "a null rebind lands");
 
     h.release(&mut ops);
@@ -178,13 +208,14 @@ fn the_live_workspace_pins_stages_and_fences_on_the_device() {
     use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
 
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("live attention workspace") else { return };
+    let Some(_dev) = device_or_skip("live attention workspace") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let raw = stream.as_ref().as_raw().cast::<std::ffi::c_void>();
 
     let mut ops = LiveStagingOps;
-    let mut ws =
-        AttentionWorkspace::allocate(&mut ops, 4096, 1024, 2).expect("allocate");
+    let mut ws = AttentionWorkspace::allocate(&mut ops, 4096, 1024, 2).expect("allocate");
     let view = ws.view();
     assert!(!view.float_buffer.is_null() && !view.int_buffer.is_null());
     assert_eq!(view.float_bytes, 4096);

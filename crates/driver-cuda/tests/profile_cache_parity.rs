@@ -21,8 +21,7 @@
 //! exactly.
 
 use driver_cuda::layout::profile_cache::{
-    Lookup, ProfileCache, ShapeSample, cache_path, planner_budget_bytes,
-    set_planner_budget_bytes,
+    Lookup, ProfileCache, ShapeSample, cache_path, planner_budget_bytes, set_planner_budget_bytes,
 };
 use driver_cuda::layout::profile_key::{ProfileKey, ProfileShape};
 use std::fmt::Write as _;
@@ -163,7 +162,10 @@ impl Scribe {
     clippy::too_many_lines,
     reason = "one statement per oracle case; splitting it would hide the correspondence"
 )]
-#[expect(clippy::excessive_precision, reason = "the extra digits are the subject")]
+#[expect(
+    clippy::excessive_precision,
+    reason = "the extra digits are the subject"
+)]
 fn transcript(dir: &Path) -> String {
     let mut s = Scribe {
         out: String::with_capacity(16 << 10),
@@ -204,14 +206,18 @@ fn transcript(dir: &Path) -> String {
         "xdg_empty",
         cache_path("", env(Some(""), Some("/home/u"))),
     );
-    show_path(&mut s.out, "home", cache_path("", env(None, Some("/home/u"))));
-    show_path(&mut s.out, "home_empty", cache_path("", env(None, Some(""))));
-    let none = cache_path("", env(None, None));
-    let _ = writeln!(
-        s.out,
-        "path|none||empty={}",
-        i32::from(none.is_none())
+    show_path(
+        &mut s.out,
+        "home",
+        cache_path("", env(None, Some("/home/u"))),
     );
+    show_path(
+        &mut s.out,
+        "home_empty",
+        cache_path("", env(None, Some(""))),
+    );
+    let none = cache_path("", env(None, None));
+    let _ = writeln!(s.out, "path|none||empty={}", i32::from(none.is_none()));
 
     // --- make_planner_profile_key -----------------------------------------
     // Field-for-field copy in the C++; reproduced here so a reordering would
@@ -253,11 +259,7 @@ fn transcript(dir: &Path) -> String {
     let _ = writeln!(s.out, "budget|initial|{}", planner_budget_bytes());
     for b in [0u64, 1, 42 * 1024 * 1024 * 1024] {
         set_planner_budget_bytes(b);
-        let _ = writeln!(
-            s.out,
-            "budget|set|{b}|{}",
-            planner_budget_bytes()
-        );
+        let _ = writeln!(s.out, "budget|set|{b}|{}", planner_budget_bytes());
     }
 
     let k = key_a();
@@ -346,7 +348,9 @@ fn transcript(dir: &Path) -> String {
         s.show_lookup("lookup|key|sm_count_missing", &k);
     }
 
-    s.put(r#"{"version":2,"entries":[1,2,"x",null,{},{"key":{}},{"plan":{}},{"key":[],"plan":{}}]}"#);
+    s.put(
+        r#"{"version":2,"entries":[1,2,"x",null,{},{"key":{}},{"plan":{}},{"key":[],"plan":{}}]}"#,
+    );
     s.show_lookup("lookup|entries_junk", &k);
 
     {
@@ -383,11 +387,7 @@ fn transcript(dir: &Path) -> String {
                 } else {
                     1.0 / f64::from(i + 3)
                 },
-                step_ms_stddev: if i == 1 {
-                    0.0
-                } else {
-                    1e-7 * f64::from(i + 1)
-                },
+                step_ms_stddev: if i == 1 { 0.0 } else { 1e-7 * f64::from(i + 1) },
                 tokens_per_s: if i == 2 {
                     1e21
                 } else {
@@ -495,9 +495,14 @@ fn temp_dir(tag: &str) -> TempDir {
 /// would look like a parity bug rather than a harness bug.
 fn normalised_transcript(dir: &Path) -> String {
     static LOCK: Mutex<()> = Mutex::new(());
-    let _held = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _held = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     set_planner_budget_bytes(0);
-    transcript(dir).lines().map(|l| normalise(l) + "\n").collect()
+    transcript(dir)
+        .lines()
+        .map(|l| normalise(l) + "\n")
+        .collect()
 }
 
 #[test]
@@ -525,10 +530,22 @@ fn the_golden_actually_discriminates() {
     let dir = temp_dir("mutate");
     let text = normalised_transcript(&dir.0);
     for (what, mutated) in [
-        ("a plan field read leniently", text.replacen("|hit||1|0|0|0|", "|REFUSED", 1)),
-        ("the wrapped negative budget", text.replacen("18446744073709551615", "0", 1)),
-        ("key order in the written file", text.replacen("\"budget_bytes\"", "\"zudget_bytes\"", 1)),
-        ("a float in the measured array", text.replacen("46934.815584012416", "46934.81558401242", 1)),
+        (
+            "a plan field read leniently",
+            text.replacen("|hit||1|0|0|0|", "|REFUSED", 1),
+        ),
+        (
+            "the wrapped negative budget",
+            text.replacen("18446744073709551615", "0", 1),
+        ),
+        (
+            "key order in the written file",
+            text.replacen("\"budget_bytes\"", "\"zudget_bytes\"", 1),
+        ),
+        (
+            "a float in the measured array",
+            text.replacen("46934.815584012416", "46934.81558401242", 1),
+        ),
     ] {
         assert_ne!(
             fnv1a64(mutated.as_bytes()),

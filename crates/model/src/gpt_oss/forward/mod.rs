@@ -2,16 +2,9 @@
 
 pub mod facts;
 
-use self::facts::{
-    GptOssCudaFacts, GptOssFacts,
-};
-use model_compiler::dsl::{
-    WeightRepr,
-    self, matmul, MatW, NormW, Val,
-};
-use model_compiler::trace::{
-    FireClass, ForwardPlan, NormVariant, RopeKind,
-};
+use self::facts::{GptOssCudaFacts, GptOssFacts};
+use model_compiler::dsl::{self, MatW, NormW, Val, WeightRepr, matmul};
+use model_compiler::trace::{FireClass, ForwardPlan, NormVariant, RopeKind};
 
 // ── gpt-oss ────────────────────────────────────────────────────────────
 
@@ -111,11 +104,7 @@ impl GptOssLayerW {
 /// fix went to that line instead, and the fact followed it — which is the
 /// order that keeps a declaration honest about a driver bug rather than
 /// laundering one.
-pub fn gpt_oss_cuda(
-    facts: &GptOssFacts,
-    cuda: &GptOssCudaFacts,
-    class: FireClass,
-) -> ForwardPlan {
+pub fn gpt_oss_cuda(facts: &GptOssFacts, cuda: &GptOssCudaFacts, class: FireClass) -> ForwardPlan {
     assert!(
         cuda.mxfp4_decode_gemv,
         "gpt_oss states the fused MXFP4 decode leg; a deployment without \
@@ -127,8 +116,7 @@ pub fn gpt_oss_cuda(
         "gpt_oss states the resident bank; a streamed one reaches the same \
          kernels only after a host round-trip that decides what to page in"
     );
-    let family = format!(
-        "gpt_oss.cuda.{}", class.suffix());
+    let family = format!("gpt_oss.cuda.{}", class.suffix());
     let hidden = facts.hidden;
     dsl::trace_named(&family, |t| {
         // The entry boundary, where device puts and channel reads attach.
@@ -139,8 +127,7 @@ pub fn gpt_oss_cuda(
             // THIS LAYER's sliding window, `-1` for none — a
             // load-time fact the dispatch statements carry, where four
             // executors used to re-derive it per launch.
-            let window_left =
-                model_compiler::facts::window_left_at(&cuda.window_left, l);
+            let window_left = model_compiler::facts::window_left_at(&cuda.window_left, l);
             let w = GptOssLayerW::new(l, facts);
             let kv = dsl::Kv::at(t, l);
             let normed = dsl::cuda::rmsnorm(&y, &w.attn_norm);
@@ -248,8 +235,7 @@ pub fn gpt_oss_cuda(
                 facts.swiglu_limit > 0.0,
                 "gpt_oss without a swiglu limit states no activation yet"
             );
-            let routed =
-                dsl::cuda::gpt_oss_glu(
+            let routed = dsl::cuda::gpt_oss_glu(
                 &gate,
                 &up,
                 facts.top_k,

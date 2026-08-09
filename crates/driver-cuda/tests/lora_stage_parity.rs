@@ -21,7 +21,7 @@ use std::ffi::c_void;
 use std::fmt::Write as _;
 
 use driver_cuda::fire::lora::{
-    LORA_SITE_K, LORA_SITE_Q, LORA_SITE_V, LoraForm, LoraFireState, LoraLaneView, LoraOps,
+    LORA_SITE_K, LORA_SITE_Q, LORA_SITE_V, LoraFireState, LoraForm, LoraLaneView, LoraOps,
     LoraStageArena, LoraStageRows, LoraTable, stage_qkv_adapters,
 };
 use driver_cuda::fire::sideband_arena::DeviceMemory;
@@ -84,7 +84,10 @@ impl DeviceMemory for Recorder {
         let p = 0x1000_0000usize + self.next_dev * 0x0100_0000;
         self.name_region(p, bytes, format!("dev#{}", self.next_dev));
         self.next_dev += 1;
-        self.note(&format!("dev-alloc dev#{} bytes={bytes}", self.next_dev - 1));
+        self.note(&format!(
+            "dev-alloc dev#{} bytes={bytes}",
+            self.next_dev - 1
+        ));
         Some(p as *mut c_void)
     }
 
@@ -106,7 +109,10 @@ impl LoraOps for Recorder {
     }
 
     fn upload_slab(&mut self, dst: *mut c_void, slots: &[*const c_void]) {
-        let mut body = format!("slab dst={} kind=1 slots=[", self.where_of(dst.cast_const()));
+        let mut body = format!(
+            "slab dst={} kind=1 slots=[",
+            self.where_of(dst.cast_const())
+        );
         for (i, &p) in slots.iter().enumerate() {
             if i > 0 {
                 body.push(',');
@@ -146,7 +152,13 @@ impl Fixture {
         let v = view("ws.v", kv_width);
         let gate = view("ws.gate", K_I);
         Self {
-            rows: LoraStageRows { y: y.cast_const(), norm_x: norm_x.cast_const(), q, v, gate },
+            rows: LoraStageRows {
+                y: y.cast_const(),
+                norm_x: norm_x.cast_const(),
+                q,
+                v,
+                gate,
+            },
             arena: LoraStageArena::default(),
             staged: None,
             hk: kv_width,
@@ -374,9 +386,15 @@ fn sweep(r: &mut Recorder, grouped: bool) {
         let mut f = Fixture::new(r, 16, K_HK);
         let (a0, b0) = (adapter(r, "A0", 0), adapter(r, "B0", 1));
         let cases: [(&str, LoraLaneView); 9] = [
-            ("g1-null-adapter", lane(std::ptr::null(), b0, q, 0, 8, 2, 2, 8, 12, lr)),
+            (
+                "g1-null-adapter",
+                lane(std::ptr::null(), b0, q, 0, 8, 2, 2, 8, 12, lr),
+            ),
             ("g2-no-sites", lane(a0, b0, 0, 0, 8, 2, 2, 8, 12, lr)),
-            ("g3-unknown-bits", lane(a0, b0, 1 << 9, 0, 8, 2, 2, 8, 12, lr)),
+            (
+                "g3-unknown-bits",
+                lane(a0, b0, 1 << 9, 0, 8, 2, 2, 8, 12, lr),
+            ),
             ("g4-reserved-site", lane(a0, b0, k, 0, 8, 2, 2, 8, 12, lr)),
             ("g5-layers", lane(a0, b0, q, 0, 8, 7, 2, 8, 12, lr)),
             ("g6-d-in", lane(a0, b0, q, 0, 8, 2, 2, 5, 12, lr)),
@@ -415,7 +433,10 @@ fn fnv1a64(data: &[u8]) -> u64 {
 fn the_port_reproduces_the_cpp_transcript() {
     let text = transcript();
     let rows = text.lines().count();
-    assert_eq!(rows, GOLDEN_ROWS, "row count diverged — sweep shape changed");
+    assert_eq!(
+        rows, GOLDEN_ROWS,
+        "row count diverged — sweep shape changed"
+    );
     let hash = fnv1a64(text.as_bytes());
     if hash != GOLDEN_FNV1A64 {
         let path = std::env::temp_dir().join("lora_stage_rust_transcript.txt");

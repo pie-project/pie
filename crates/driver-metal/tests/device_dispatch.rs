@@ -12,7 +12,6 @@
 //!
 //! Requires a Metal 4 GPU, and skips without one.
 
-
 use driver_metal::Error;
 use driver_metal::device::{ArgumentTable, Context, Heap, Stepper, Visibility};
 use driver_metal::program::Compiler;

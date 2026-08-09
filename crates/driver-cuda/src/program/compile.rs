@@ -153,7 +153,10 @@ pub fn compile(source: &str, architecture: &str) -> std::result::Result<Vec<u8>,
 }
 
 /// The compile proper, with `program` guaranteed destroyed by the caller.
-fn compile_into(program: nvrtc::nvrtcProgram, architecture: &str) -> std::result::Result<Vec<u8>, CompileError> {
+fn compile_into(
+    program: nvrtc::nvrtcProgram,
+    architecture: &str,
+) -> std::result::Result<Vec<u8>, CompileError> {
     let retryable = |message: String| CompileError {
         kind: FailureKind::Retryable,
         message,

@@ -43,11 +43,20 @@ pub struct Glm5DsaFacts {
 /// it reads `Lw.is_moe` per layer — but the schedule it encodes is a
 /// prefix of dense layers, so the declaration states the prefix length
 /// and a layer asks whether it is past it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Glm5MoeFacts {
     pub hidden: u32,
     pub num_experts: u32,
     pub top_k: u32,
+    /// Whether the router renormalizes over the SELECTED experts.
+    ///
+    /// `zai-org/GLM-4.5` publishes `"norm_topk_prob": true`, which is the
+    /// half of the catalog the `DeepseekV3Config` class default gets
+    /// wrong -- DeepSeek-V3 and Kimi-K2 publish `false` from the same
+    /// sigmoid-plus-bias router. Stated per family for that reason.
+    pub norm_topk_prob: bool,
+    /// `routed_scaling_factor`, 2.5 on `zai-org/GLM-4.5`.
+    pub routed_scaling: f32,
     pub moe_intermediate: u32,
     /// `n_shared_experts * moe_intermediate`; zero means no shared expert.
     pub shared_intermediate: u32,
@@ -75,7 +84,7 @@ impl Glm5MoeFacts {
 /// dense MLP — is a RULE (`dense_layers`, a prefix length) and was never
 /// a table. A stack that wrote the prefix out longhand would be stating
 /// 46 booleans where `first_k_dense_replace` states one number.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Glm5Facts {
     pub layers: u32,
     pub vocab: u32,
@@ -127,6 +136,8 @@ impl Glm5Facts {
                 hidden: 4096,
                 num_experts: 128,
                 top_k: 8,
+                norm_topk_prob: true,
+                routed_scaling: 2.5,
                 moe_intermediate: 1408,
                 shared_intermediate: 1408,
                 aligned_block: 16,

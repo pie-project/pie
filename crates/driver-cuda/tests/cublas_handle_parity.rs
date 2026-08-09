@@ -171,7 +171,10 @@ fn fnv1a64(data: &[u8]) -> u64 {
 fn the_port_reproduces_the_cpp_transcript() {
     let text = transcript();
     let rows = text.lines().count();
-    assert_eq!(rows, GOLDEN_ROWS, "row count diverged — script shape changed");
+    assert_eq!(
+        rows, GOLDEN_ROWS,
+        "row count diverged — script shape changed"
+    );
     let hash = fnv1a64(text.as_bytes());
     if hash != GOLDEN_FNV1A64 {
         let path = std::env::temp_dir().join("cublas_handle_rust_transcript.txt");

@@ -141,7 +141,10 @@ fn an_ordinary_row_projects_a_geometry_and_an_extraordinary_one_may_refuse() {
                 assert_eq!(g.vocab, d.shape.vocab, "{id}: vocab");
                 assert_eq!(g.eps, d.norm_eps, "{id}: norm eps");
                 assert!(g.head_dim > 0, "{id}: a served geometry with no head dim");
-                assert_eq!(g.quant, AT, "{id}: the affine point is the caller's, not the row's");
+                assert_eq!(
+                    g.quant, AT,
+                    "{id}: the affine point is the caller's, not the row's"
+                );
             }
             Err(why) => {
                 refused += 1;
@@ -343,7 +346,10 @@ fn the_pre_staging_question_is_answered_the_same_at_every_fire_class() {
         for class in [FireClass::Decode, FireClass::Prefill] {
             let here = driver_metal::model::binding::text(row, class, &AT_METAL).is_ok();
             if here != door {
-                disagree.push(format!("{}: {class:?} says {here}, the door says {door}", row.id()));
+                disagree.push(format!(
+                    "{}: {class:?} says {here}, the door says {door}",
+                    row.id()
+                ));
             }
         }
     }
@@ -381,7 +387,14 @@ fn the_pre_staging_question_is_answered_the_same_at_every_fire_class() {
 /// models.
 #[test]
 fn the_text_this_driver_runs_is_the_text_the_row_states() {
-    let bindings = [AT_METAL, MetalBinding { quant_group: 128, quant_bits: 8, ..AT_METAL }];
+    let bindings = [
+        AT_METAL,
+        MetalBinding {
+            quant_group: 128,
+            quant_bits: 8,
+            ..AT_METAL
+        },
+    ];
     let mut rows = 0usize;
     let mut passed_through = 0usize;
     for (row, _) in deployable() {
@@ -427,6 +440,12 @@ fn the_text_this_driver_runs_is_the_text_the_row_states() {
             }
         }
     }
-    assert!(rows > 10, "only {rows} rows deployed; this gate is not reading the catalog");
-    assert!(passed_through > 0, "no row's text reached a fire; the door is shut for everything");
+    assert!(
+        rows > 10,
+        "only {rows} rows deployed; this gate is not reading the catalog"
+    );
+    assert!(
+        passed_through > 0,
+        "no row's text reached a fire; the door is shut for everything"
+    );
 }

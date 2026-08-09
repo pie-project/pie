@@ -89,7 +89,11 @@ impl TensorSpec {
     /// A tensor that must exist at these extents.
     #[must_use]
     pub fn required(name: impl Into<String>, extents: impl Into<Vec<u64>>) -> Self {
-        Self { name: name.into(), extents: extents.into(), presence: Presence::Required }
+        Self {
+            name: name.into(),
+            extents: extents.into(),
+            presence: Presence::Required,
+        }
     }
 
     /// A tensor that must exist, whatever shape it is.
@@ -98,19 +102,31 @@ impl TensorSpec {
     /// no business restating — an MXFP4 expert bank's scale plane, say.
     #[must_use]
     pub fn present(name: impl Into<String>) -> Self {
-        Self { name: name.into(), extents: Vec::new(), presence: Presence::Required }
+        Self {
+            name: name.into(),
+            extents: Vec::new(),
+            presence: Presence::Required,
+        }
     }
 
     /// A tensor whose ABSENCE is the fact.
     #[must_use]
     pub fn absent(name: impl Into<String>) -> Self {
-        Self { name: name.into(), extents: Vec::new(), presence: Presence::Absent }
+        Self {
+            name: name.into(),
+            extents: Vec::new(),
+            presence: Presence::Absent,
+        }
     }
 
     /// A tensor whose presence neither confirms nor denies the variant.
     #[must_use]
     pub fn optional(name: impl Into<String>, extents: impl Into<Vec<u64>>) -> Self {
-        Self { name: name.into(), extents: extents.into(), presence: Presence::Optional }
+        Self {
+            name: name.into(),
+            extents: extents.into(),
+            presence: Presence::Optional,
+        }
     }
 }
 
@@ -132,7 +148,10 @@ impl Manifest {
     /// An empty manifest for a stack of `layers` layers.
     #[must_use]
     pub fn new(layers: u32) -> Self {
-        Self { layers, tensors: Vec::new() }
+        Self {
+            layers,
+            tensors: Vec::new(),
+        }
     }
 
     /// Add a spec, returning self — so a projection reads as a list.
@@ -177,7 +196,9 @@ impl Manifest {
     /// a real checkpoint, while the crate's own round-trip tests passed
     /// because they expanded `{}` the same wrong way on both sides.
     fn rows(&self) -> impl Iterator<Item = (String, &TensorSpec)> {
-        self.tensors.iter().map(|spec| (Observed::logical(&spec.name), spec))
+        self.tensors
+            .iter()
+            .map(|spec| (Observed::logical(&spec.name), spec))
     }
 
     /// Hold a checkpoint to this manifest.
@@ -211,7 +232,11 @@ impl Manifest {
                 _ => {}
             }
         }
-        if faults.is_empty() { Ok(()) } else { Err(Mismatch { faults }) }
+        if faults.is_empty() {
+            Ok(())
+        } else {
+            Err(Mismatch { faults })
+        }
     }
 }
 
@@ -276,7 +301,11 @@ pub enum Fault {
     /// The spec forbids this name and the checkpoint publishes it.
     Unexpected(String),
     /// The name is there at extents the spec's numbers do not imply.
-    Extent { name: String, want: Vec<u64>, got: Vec<u64> },
+    Extent {
+        name: String,
+        want: Vec<u64>,
+        got: Vec<u64>,
+    },
 }
 
 impl fmt::Display for Fault {
@@ -293,7 +322,12 @@ impl fmt::Display for Fault {
 
 impl fmt::Display for Mismatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let listed: Vec<String> = self.faults.iter().take(4).map(ToString::to_string).collect();
+        let listed: Vec<String> = self
+            .faults
+            .iter()
+            .take(4)
+            .map(ToString::to_string)
+            .collect();
         write!(f, "{}", listed.join("; "))?;
         if self.faults.len() > listed.len() {
             write!(f, " (+{} more)", self.faults.len() - listed.len())?;
@@ -408,7 +442,9 @@ impl Observed {
         {
             out.push_str(&rest[..at]);
             let tail = &rest[at + token.len()..];
-            let digits = tail.find(|c: char| !c.is_ascii_digit()).unwrap_or(tail.len());
+            let digits = tail
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(tail.len());
             if digits == 0 {
                 out.push_str(token);
                 rest = tail;
@@ -459,8 +495,10 @@ mod from_checkpoint {
     /// (the GGUF blocks) answers through `block_layout`, which is why
     /// this asks `QuantSpec` for the count instead of dividing bits.
     fn logical_extents(shape: &[i64], encoding: &Encoding, span_bytes: u64) -> Vec<u64> {
-        let mut stored: Vec<u64> =
-            shape.iter().map(|&d| u64::try_from(d).unwrap_or(0)).collect();
+        let mut stored: Vec<u64> = shape
+            .iter()
+            .map(|&d| u64::try_from(d).unwrap_or(0))
+            .collect();
         let Encoding::Quant(spec) = encoding else {
             return stored;
         };
@@ -479,7 +517,11 @@ mod from_checkpoint {
     fn logical_element_count(spec: &model_loader::types::QuantSpec, span_bytes: u64) -> u64 {
         let spec = spec.clone().normalized();
         if let Some((elems, bytes)) = spec.block_layout() {
-            return if bytes == 0 { 0 } else { span_bytes / bytes * elems };
+            return if bytes == 0 {
+                0
+            } else {
+                span_bytes / bytes * elems
+            };
         }
         let bits = u64::from(spec.normalized_bits());
         if bits == 0 { 0 } else { span_bytes * 8 / bits }
@@ -776,9 +818,24 @@ mod from_checkpoint {
             let metadata = CheckpointMetadata {
                 files: Vec::new(),
                 tensors: vec![
-                    raw("model.embed_tokens.weight", &[151_936, 1024], 0, Encoding::Raw(DType::BF16)),
-                    raw(&meta_name(crate::encoding::CONFIG_OBJECT), &[64], 64, Encoding::Raw(DType::U8)),
-                    raw(&meta_name("tokenizer/vocab_bytes"), &[9], 9, Encoding::Raw(DType::U8)),
+                    raw(
+                        "model.embed_tokens.weight",
+                        &[151_936, 1024],
+                        0,
+                        Encoding::Raw(DType::BF16),
+                    ),
+                    raw(
+                        &meta_name(crate::encoding::CONFIG_OBJECT),
+                        &[64],
+                        64,
+                        Encoding::Raw(DType::U8),
+                    ),
+                    raw(
+                        &meta_name("tokenizer/vocab_bytes"),
+                        &[9],
+                        9,
+                        Encoding::Raw(DType::U8),
+                    ),
                     raw(
                         "model.layers.0.self_attn.q_proj.weight",
                         &[2048, 128],
@@ -790,12 +847,16 @@ mod from_checkpoint {
             let observed = Observed::of(&metadata);
             assert!(observed.has("embed_tokens"), "a weight is seen");
             assert!(
-                !observed.names().any(|n| n.contains("config") || n.contains("tokenizer")),
+                !observed
+                    .names()
+                    .any(|n| n.contains("config") || n.contains("tokenizer")),
                 "an artifact object is not; saw {:?}",
                 observed.names().collect::<Vec<_>>()
             );
             assert_eq!(
-                observed.extents("layer.{}.self_attn.q_proj").map(<[u64]>::to_vec),
+                observed
+                    .extents("layer.{}.self_attn.q_proj")
+                    .map(<[u64]>::to_vec),
                 Some(vec![2048, 1024]),
                 "and the weight that IS seen arrives unpacked"
             );
@@ -893,7 +954,10 @@ mod tests {
         assert!(tied.check(&without).is_ok());
         assert!(untied.check(&without).is_err());
 
-        let with = seen(&[("model.embed_tokens.weight", &[32, 16]), ("lm_head.weight", &[32, 16])]);
+        let with = seen(&[
+            ("model.embed_tokens.weight", &[32, 16]),
+            ("lm_head.weight", &[32, 16]),
+        ]);
         assert!(tied.check(&with).is_err());
         assert!(untied.check(&with).is_ok());
     }
@@ -935,7 +999,10 @@ mod tests {
     #[test]
     fn a_degenerate_axis_is_not_a_disagreement() {
         let spec = Manifest::new(1).with(TensorSpec::required("norm", [1024u64]));
-        assert!(spec.check(&seen(&[("model.norm.weight", &[1024, 1])])).is_ok());
+        assert!(
+            spec.check(&seen(&[("model.norm.weight", &[1024, 1])]))
+                .is_ok()
+        );
         assert!(spec.check(&seen(&[("model.norm.weight", &[1024])])).is_ok());
     }
 }

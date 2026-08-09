@@ -133,21 +133,20 @@
 //! error), and the expert bank's row count after the sort pads each group up
 //! to a tile.
 
-
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use driver_metal::device::{Allocation, Context};
-use driver_metal::program::Compiler;
-use driver_metal::lowering::dispatch::Geometry;
 use driver_metal::bind::encode::Pipelines;
+use driver_metal::device::{Allocation, Context};
+use driver_metal::layout::kv::Shape;
+use driver_metal::layout::region::Region as _;
+use driver_metal::lowering::dispatch::Geometry;
 use driver_metal::lowering::executor::{FireTable, Resolver, Slice};
 use driver_metal::lowering::frame::{Step, lower_step};
-use driver_metal::pools::kv::Pool;
-use driver_metal::layout::kv::Shape;
-use driver_metal::weights::load::load;
 use driver_metal::lowering::resolve::{Names, Store};
-use driver_metal::layout::region::Region as _;
+use driver_metal::pools::kv::Pool;
+use driver_metal::program::Compiler;
+use driver_metal::weights::load::load;
 use model::catalog::MetalBinding;
 use model_compiler::trace::{FireClass, ForwardPlan};
 
@@ -368,14 +367,12 @@ fn served(
             row.id()
         )
     });
-    let config = match model_loader::checkpoint::read::read_meta(
-        &meta,
-        model::encoding::CONFIG_OBJECT,
-    ) {
-        Ok(Some(bytes)) => String::from_utf8(bytes).expect("the embedded config is utf8"),
-        _ => std::fs::read_to_string(snapshot.join("config.json"))
-            .unwrap_or_else(|e| panic!("{}/config.json: {e}", snapshot.display())),
-    };
+    let config =
+        match model_loader::checkpoint::read::read_meta(&meta, model::encoding::CONFIG_OBJECT) {
+            Ok(Some(bytes)) => String::from_utf8(bytes).expect("the embedded config is utf8"),
+            _ => std::fs::read_to_string(snapshot.join("config.json"))
+                .unwrap_or_else(|e| panic!("{}/config.json: {e}", snapshot.display())),
+        };
     let encoding = model::encoding::Encoding::from_config_json(&config)
         .unwrap_or_else(|e| panic!("{}: no encoding in the config: {e}", snapshot.display()));
     let deployment = row
@@ -437,7 +434,11 @@ fn arena_regions(
     let starts: Vec<usize> = by_start.keys().copied().collect();
     let mut out = Vec::with_capacity(starts.len());
     for (i, at) in starts.iter().enumerate() {
-        let end = starts.get(i + 1).copied().unwrap_or(arena_len).min(arena_len);
+        let end = starts
+            .get(i + 1)
+            .copied()
+            .unwrap_or(arena_len)
+            .min(arena_len);
         if *at >= end || skip.contains(at) {
             continue;
         }
@@ -819,7 +820,8 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
         let (k, v) = unsafe {
             (
                 core::slice::from_raw_parts(
-                    layer.k
+                    layer
+                        .k
                         .host_span(0, n as u64)
                         .expect("the pages are addressable")
                         .as_ptr()
@@ -827,7 +829,8 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
                     n,
                 ),
                 core::slice::from_raw_parts(
-                    layer.v
+                    layer
+                        .v
                         .host_span(0, n as u64)
                         .expect("the pages are addressable")
                         .as_ptr()
@@ -1553,7 +1556,8 @@ fn bisect(class: FireClass) {
         let (k, v) = unsafe {
             (
                 core::slice::from_raw_parts(
-                    layer.k
+                    layer
+                        .k
                         .host_span(0, n as u64)
                         .expect("the pages are addressable")
                         .as_ptr()
@@ -1561,7 +1565,8 @@ fn bisect(class: FireClass) {
                     n,
                 ),
                 core::slice::from_raw_parts(
-                    layer.v
+                    layer
+                        .v
                         .host_span(0, n as u64)
                         .expect("the pages are addressable")
                         .as_ptr()
@@ -1851,7 +1856,7 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
         // lives and dies inside one stride. Say so rather than bisect a
         // predicate already known to be false at both ends of every interval.
         eprintln!(
-            "the full fire holds a NaN but none of the {STEPS} probes every              {stride} statements does -- it is written and overwritten inside              one stride, which a prefix search cannot narrow further"
+            "the full fire holds a NaN but none of the {STEPS} probes every {stride} statements does -- it is written and overwritten inside one stride, which a prefix search cannot narrow further"
         );
         return;
     }

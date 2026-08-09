@@ -9,8 +9,8 @@
 //! statement of the numbers.
 
 use crate::deployment::{
-    Advertised,
-    AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement, PrefillStyle, Refusal,
+    Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,
+    PrefillStyle, Refusal,
 };
 use crate::manifest::{Manifest, TensorSpec};
 
@@ -75,7 +75,10 @@ pub fn manifest(f: &KimiFacts, tied_embeddings: bool) -> Manifest {
         // can tell them apart: every extent agrees.
         .either(!tied_embeddings, "lm_head", [vocab, hidden])
         .with(TensorSpec::required("layer.{}.input_layernorm", [hidden]))
-        .with(TensorSpec::required("layer.{}.post_attention_layernorm", [hidden]))
+        .with(TensorSpec::required(
+            "layer.{}.post_attention_layernorm",
+            [hidden],
+        ))
         // ── The latent attention, as arithmetic ──────────────────────
         .either(latent_q, "layer.{}.self_attn.q_a_proj", [q_lora, hidden])
         .either(latent_q, "layer.{}.self_attn.q_b_proj", [q_b_width, q_lora])
@@ -91,12 +94,21 @@ pub fn manifest(f: &KimiFacts, tied_embeddings: bool) -> Manifest {
             "layer.{}.self_attn.kv_a_proj_with_mqa",
             [kv_a_width, hidden],
         ))
-        .with(TensorSpec::required("layer.{}.self_attn.kv_a_layernorm", [kv_lora]))
-        .with(TensorSpec::required("layer.{}.self_attn.kv_b_proj", [kv_b_width, kv_lora]))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.kv_a_layernorm",
+            [kv_lora],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.kv_b_proj",
+            [kv_b_width, kv_lora],
+        ))
         // `o_proj` reads the VALUE width and not the query width, which
         // is where MLA stops looking like GQA: the two differ whenever
         // `v_head_dim != qk_nope_head_dim + qk_rope_head_dim`.
-        .with(TensorSpec::required("layer.{}.self_attn.o_proj", [hidden, v_width]))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.o_proj",
+            [hidden, v_width],
+        ))
         // ── The dense prefix, as tensors ─────────────────────────────
         //
         // `first_k_dense_replace` is a fact a checkpoint publishes: a
@@ -106,8 +118,16 @@ pub fn manifest(f: &KimiFacts, tied_embeddings: bool) -> Manifest {
         // prefix ships no dense MLP at all, and one that is dense all
         // the way ships no router — which is the same statement read
         // from its two ends.
-        .either(has_dense_prefix, "layer.{}.mlp.gate_proj", [dense_inter, hidden])
-        .either(has_dense_prefix, "layer.{}.mlp.down_proj", [hidden, dense_inter])
+        .either(
+            has_dense_prefix,
+            "layer.{}.mlp.gate_proj",
+            [dense_inter, hidden],
+        )
+        .either(
+            has_dense_prefix,
+            "layer.{}.mlp.down_proj",
+            [hidden, dense_inter],
+        )
         // The ROUTER is the mixture's identity, and it is the row that
         // can be measured: `[num_experts, hidden]`, never quantized,
         // always spelled `.weight`. The routed BANK is deliberately not
@@ -251,12 +271,18 @@ fn plan(f: &KimiFacts, rope_theta: f32, norm_eps: f32, advertised: Advertised) -
         prefill: PrefillStyle::Planned,
         attn_output: AttnOutput::DriverPinned,
         logit_softcap: 0.0,
+        // No ATTENTION cap: gemma-2's `attn_logit_softcapping` is
+        // gemma-2's alone, and a zero here is "no cap" rather than a
+        // cap at zero — which would flatten every score to `tanh(inf)`.
+        attn_logit_softcap: 0.0,
         ple_dim: 0,
         norm: NormPlacement::Pre,
         // Not a gemma: the gain is the multiplier, stored directly.
         norm_unit_offset: false,
         v_norm: false,
         k_eq_v: false,
+        norm_topk_prob: f.moe.norm_topk_prob,
+        routed_scaling: f.moe.routed_scaling,
         mlp_gate: crate::deployment::MlpGate::Silu,
         scales: std::collections::BTreeMap::new(),
         // From the ROW, not from the shape: a family label and a
@@ -280,7 +306,10 @@ fn plan(f: &KimiFacts, rope_theta: f32, norm_eps: f32, advertised: Advertised) -
 #[cfg(feature = "forward")]
 #[must_use]
 pub fn cuda_facts(rope_yarn_original: bool) -> super::forward::facts::KimiCudaFacts {
-    super::forward::facts::KimiCudaFacts { q_kv_a_fused: true, rope_yarn_original }
+    super::forward::facts::KimiCudaFacts {
+        q_kv_a_fused: true,
+        rope_yarn_original,
+    }
 }
 
 /// Why this build has no Metal text for a kimi-k2 row.
@@ -304,8 +333,8 @@ pub fn cuda_facts(rope_yarn_original: bool) -> super::forward::facts::KimiCudaFa
 /// `LLAMA_LIKE` — an eleven-entry table of architecture STRINGS,
 /// reduced by a punctuation-stripping `canonical()`, consulted before
 /// any text was traced and free to disagree with what the tracer would
-/// actually do. It listed `gemma4`, which the load path refused on
-/// other grounds, and omitted `gemma3`, whose text it models. A row
+/// actually do. It listed `gpt_oss`, which no publication of reaches a
+/// Metal device here, and omitted `gemma3`, whose text it models. A row
 /// that answers for itself cannot disagree with a list, because there
 /// is no list.
 pub const NO_METAL: &str = "kimi-k2 has no Metal text in this build: its forward is `kimi_cuda` — latent \
@@ -344,9 +373,16 @@ mod tests {
     /// geometry.
     #[test]
     fn the_rows_advertised_label_is_carried_and_not_rewritten() {
-        let stated = Advertised { arch: "kimi_k2", max_model_len: 131_072, media_encode: false };
+        let stated = Advertised {
+            arch: "kimi_k2",
+            max_model_len: 131_072,
+            media_encode: false,
+        };
         let d = plan(&k2(), 50_000.0, 1e-6, stated.clone());
-        assert_eq!(d.advertised, stated, "a projection that edits the label is inventing one");
+        assert_eq!(
+            d.advertised, stated,
+            "a projection that edits the label is inventing one"
+        );
     }
 
     fn spec(m: &Manifest, name: &str) -> TensorSpec {
@@ -369,12 +405,18 @@ mod tests {
         assert_eq!(a.kv_lora_rank, 512);
 
         // The query's rank: hidden -> 1536 -> every head's nope+rope.
-        assert_eq!(spec(&m, "layer.{}.self_attn.q_a_proj").extents, vec![1536, 7168]);
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.q_a_proj").extents,
+            vec![1536, 7168]
+        );
         assert_eq!(
             spec(&m, "layer.{}.self_attn.q_b_proj").extents,
             vec![64 * (128 + 64), 1536],
         );
-        assert_eq!(spec(&m, "layer.{}.self_attn.q_a_layernorm").extents, vec![1536]);
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.q_a_layernorm").extents,
+            vec![1536]
+        );
 
         // The KV's rank: hidden -> 512 latent + 64 shared rope, then the
         // latent alone back out to every head's nope half and value.
@@ -382,14 +424,20 @@ mod tests {
             spec(&m, "layer.{}.self_attn.kv_a_proj_with_mqa").extents,
             vec![512 + 64, 7168],
         );
-        assert_eq!(spec(&m, "layer.{}.self_attn.kv_a_layernorm").extents, vec![512]);
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.kv_a_layernorm").extents,
+            vec![512]
+        );
         assert_eq!(
             spec(&m, "layer.{}.self_attn.kv_b_proj").extents,
             vec![64 * (128 + 128), 512],
         );
         // And the output reads the VALUE width, which is where MLA
         // stops looking like GQA.
-        assert_eq!(spec(&m, "layer.{}.self_attn.o_proj").extents, vec![7168, 64 * 128]);
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.o_proj").extents,
+            vec![7168, 64 * 128]
+        );
     }
 
     /// A query rank is not a branch, it is a DISCRIMINATOR: the two
@@ -398,15 +446,30 @@ mod tests {
     #[test]
     fn a_query_latent_forbids_the_straight_projection() {
         let m = manifest(&k2(), false);
-        assert_eq!(spec(&m, "layer.{}.self_attn.q_a_proj").presence, Presence::Required);
-        assert_eq!(spec(&m, "layer.{}.self_attn.q_proj").presence, Presence::Absent);
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.q_a_proj").presence,
+            Presence::Required
+        );
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.q_proj").presence,
+            Presence::Absent
+        );
 
         let mut lite = k2();
         lite.attn.q_lora_rank = 0;
         let m = manifest(&lite, false);
-        assert_eq!(spec(&m, "layer.{}.self_attn.q_proj").presence, Presence::Required);
-        assert_eq!(spec(&m, "layer.{}.self_attn.q_a_proj").presence, Presence::Absent);
-        assert_eq!(spec(&m, "layer.{}.self_attn.q_b_proj").presence, Presence::Absent);
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.q_proj").presence,
+            Presence::Required
+        );
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.q_a_proj").presence,
+            Presence::Absent
+        );
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.q_b_proj").presence,
+            Presence::Absent
+        );
         assert!(
             !m.tensors.iter().any(|t| t.name.ends_with("q_a_layernorm")),
             "there is no rank to norm",
@@ -420,25 +483,40 @@ mod tests {
     #[test]
     fn the_dense_prefix_shows_up_as_both_kinds_of_block() {
         let with_prefix = manifest(&k2(), false);
-        assert_eq!(spec(&with_prefix, "layer.{}.mlp.gate_proj").presence, Presence::Required);
+        assert_eq!(
+            spec(&with_prefix, "layer.{}.mlp.gate_proj").presence,
+            Presence::Required
+        );
         assert_eq!(
             spec(&with_prefix, "layer.{}.mlp.gate_proj").extents,
             vec![18_432, 7168],
             "the DENSE inner width, which the mixture's 2048 is not",
         );
-        assert_eq!(spec(&with_prefix, "layer.{}.mlp.gate").presence, Presence::Required);
-        assert_eq!(spec(&with_prefix, "layer.{}.mlp.gate").extents, vec![384, 7168]);
+        assert_eq!(
+            spec(&with_prefix, "layer.{}.mlp.gate").presence,
+            Presence::Required
+        );
+        assert_eq!(
+            spec(&with_prefix, "layer.{}.mlp.gate").extents,
+            vec![384, 7168]
+        );
 
         let mut no_prefix = k2();
         no_prefix.dense_layers = 0;
         let m = manifest(&no_prefix, false);
-        assert_eq!(spec(&m, "layer.{}.mlp.gate_proj").presence, Presence::Absent);
+        assert_eq!(
+            spec(&m, "layer.{}.mlp.gate_proj").presence,
+            Presence::Absent
+        );
         assert_eq!(spec(&m, "layer.{}.mlp.gate").presence, Presence::Required);
 
         let mut all_dense = k2();
         all_dense.dense_layers = all_dense.layers;
         let m = manifest(&all_dense, false);
-        assert_eq!(spec(&m, "layer.{}.mlp.gate_proj").presence, Presence::Required);
+        assert_eq!(
+            spec(&m, "layer.{}.mlp.gate_proj").presence,
+            Presence::Required
+        );
         assert_eq!(spec(&m, "layer.{}.mlp.gate").presence, Presence::Absent);
     }
 
@@ -449,7 +527,9 @@ mod tests {
     fn the_mixture_is_stated_by_the_router_and_not_by_an_encoding() {
         let m = manifest(&k2(), false);
         assert!(
-            !m.tensors.iter().any(|t| t.name.contains("packed") || t.name.contains("experts.0")),
+            !m.tensors
+                .iter()
+                .any(|t| t.name.contains("packed") || t.name.contains("experts.0")),
             "a manifest that named the bank would be keying identity on a packing",
         );
         assert_eq!(spec(&m, "layer.{}.mlp.gate").extents, vec![384, 7168]);
@@ -463,8 +543,14 @@ mod tests {
     /// tied row from an untied one when every extent agrees.
     #[test]
     fn a_tie_is_an_absence_the_manifest_expects() {
-        assert_eq!(spec(&manifest(&k2(), true), "lm_head").presence, Presence::Absent);
-        assert_eq!(spec(&manifest(&k2(), false), "lm_head").presence, Presence::Required);
+        assert_eq!(
+            spec(&manifest(&k2(), true), "lm_head").presence,
+            Presence::Absent
+        );
+        assert_eq!(
+            spec(&manifest(&k2(), false), "lm_head").presence,
+            Presence::Required
+        );
     }
 
     /// The KV shape is STATED by the row. The derivation this replaces
@@ -474,8 +560,17 @@ mod tests {
     #[test]
     fn the_kv_style_is_stated_rather_than_matched_on_a_substring() {
         let d = plan(&k2(), 50_000.0, 1e-6, Advertised::default());
-        assert_eq!(d.kv, KvStyle::Mla { kv_lora_rank: 512, qk_rope_head_dim: 64 });
-        assert!(!kv_store_is_built(&d.kv), "no executor arm names an MLA dispatch");
+        assert_eq!(
+            d.kv,
+            KvStyle::Mla {
+                kv_lora_rank: 512,
+                qk_rope_head_dim: 64
+            }
+        );
+        assert!(
+            !kv_store_is_built(&d.kv),
+            "no executor arm names an MLA dispatch"
+        );
         assert!(kv_store_is_built(&KvStyle::Paged));
         assert!(!kv_store_is_built(&KvStyle::Dsv4 { ratios: vec![1] }));
     }
@@ -495,7 +590,10 @@ mod tests {
         );
         // And the refusal is about the BUILD, not about the row: the
         // projection is total and still says what the model needs.
-        assert_eq!(plan(&k2(), 50_000.0, 1e-6, Advertised::default()).layers, 61);
+        assert_eq!(
+            plan(&k2(), 50_000.0, 1e-6, Advertised::default()).layers,
+            61
+        );
     }
 
     /// The launch geometry is the row's own numbers, and the two that
@@ -513,10 +611,18 @@ mod tests {
         assert_eq!(d.shape.kv_heads, 1);
         assert_eq!(d.shape.head_dim, 512 + 64);
         assert_eq!(d.shape.head_dim_alloc(), 512 + 64);
-        assert_eq!(d.shape.gqa_group(), 64, "every head reads the one latent plane");
+        assert_eq!(
+            d.shape.gqa_group(),
+            64,
+            "every head reads the one latent plane"
+        );
         assert_eq!(d.shape.intermediate, 18_432);
         assert_eq!(d.shape.moe_intermediate, 2048);
-        assert_eq!(d.shape.widest_mlp(), 18_432, "the dense prefix is the wider block here");
+        assert_eq!(
+            d.shape.widest_mlp(),
+            18_432,
+            "the dense prefix is the wider block here"
+        );
         assert_eq!(d.shape.vocab, 163_840);
         assert_eq!(d.decode_head_dims(), None, "one kind of layer");
         assert!(!d.shares_kv());
@@ -553,7 +659,10 @@ mod tests {
     #[test]
     fn the_binding_facts_say_what_the_contract_staged() {
         let cuda = cuda_facts(true);
-        assert!(cuda.q_kv_a_fused, "the authoring pass joins the two latents");
+        assert!(
+            cuda.q_kv_a_fused,
+            "the authoring pass joins the two latents"
+        );
         assert!(cuda.rope_yarn_original);
         assert!(!cuda_facts(false).rope_yarn_original);
     }

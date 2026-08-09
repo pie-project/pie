@@ -46,7 +46,10 @@ struct Recorder {
 
 impl Recorder {
     fn new() -> Self {
-        Self { next_addr: 0x1000_0000, ..Self::default() }
+        Self {
+            next_addr: 0x1000_0000,
+            ..Self::default()
+        }
     }
 
     fn note(&mut self, body: &str) {
@@ -105,7 +108,11 @@ impl ScoreOps for Recorder {
 
     fn upload_csr(&mut self, dst: *mut i32, src: &[i32]) {
         let w = self.where_of(dst.cast_const().cast());
-        let csr = src.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
+        let csr = src
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         self.note(&format!("upload dst={w} kind=1 csr=[{csr}]"));
     }
 
@@ -143,7 +150,11 @@ struct Fire {
 impl Fire {
     fn new(kvpp: Vec<u32>, lens: Vec<u32>) -> Self {
         let requests = u32::try_from(kvpp.len() - 1).unwrap();
-        Self { kvpp_h: kvpp, lens_h: lens, qo_h: (0..=requests).collect() }
+        Self {
+            kvpp_h: kvpp,
+            lens_h: lens,
+            qo_h: (0..=requests).collect(),
+        }
     }
 
     fn obs(&self, page_size: i32) -> AttentionObservation<'_> {
@@ -162,7 +173,10 @@ impl Fire {
 }
 
 fn hooks<'a>(obs: &'a AttentionObservation<'a>) -> ScoreHookView<'a> {
-    ScoreHookView { wants_attn_score: true, observation: Some(obs) }
+    ScoreHookView {
+        wants_attn_score: true,
+        observation: Some(obs),
+    }
 }
 
 fn payload_row(r: &mut Recorder, label: &str, s: Option<&AttentionScores>, expect: u32) {
@@ -174,7 +188,11 @@ fn payload_row(r: &mut Recorder, label: &str, s: Option<&AttentionScores>, expec
     let offs = unsafe {
         std::slice::from_raw_parts(s.offsets_h, usize::try_from(s.num_requests).unwrap() + 1)
     };
-    let joined = offs.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
+    let joined = offs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     let body = format!(
         "{label} payload values={} offsets=[{joined}] R={} layer={} usable={} expectR={expect}",
         r.where_of(s.values.cast()),
@@ -218,11 +236,23 @@ fn transcript() -> String {
             );
             r.note(&body);
             payload_row(&mut r, "pre-publish", cap.scores(), 3);
-            cap.publish(&mut r, Some(&h), obs.kv_page_indptr_d, obs.kv_last_page_lens_d, 16)
-                .unwrap();
+            cap.publish(
+                &mut r,
+                Some(&h),
+                obs.kv_page_indptr_d,
+                obs.kv_last_page_lens_d,
+                16,
+            )
+            .unwrap();
             payload_row(&mut r, "published", cap.scores(), 3);
-            cap.publish(&mut r, Some(&h), obs.kv_page_indptr_d, obs.kv_last_page_lens_d, 16)
-                .unwrap();
+            cap.publish(
+                &mut r,
+                Some(&h),
+                obs.kv_page_indptr_d,
+                obs.kv_last_page_lens_d,
+                16,
+            )
+            .unwrap();
             cap.release(&mut arena, &mut scratch);
         }
     }
@@ -234,29 +264,82 @@ fn transcript() -> String {
         let f = Fire::new(vec![0, 2], vec![3]);
         let obs = f.obs(16);
         let refuse = |r: &mut Recorder,
-                          scratch: &mut ScoreScratch,
-                          arena: &mut SidebandArena,
-                          label: &str,
-                          h: Option<&ScoreHookView<'_>>,
-                          heads: u32,
-                          capturable: bool| {
-            let mut cap =
-                LayerScoreCapture::new(r, Some(arena), scratch, h, 0, heads, capturable);
+                      scratch: &mut ScoreScratch,
+                      arena: &mut SidebandArena,
+                      label: &str,
+                      h: Option<&ScoreHookView<'_>>,
+                      heads: u32,
+                      capturable: bool| {
+            let mut cap = LayerScoreCapture::new(r, Some(arena), scratch, h, 0, heads, capturable);
             r.note(&format!("{label} active={}", u8::from(cap.active())));
             cap.release(arena, scratch);
         };
-        refuse(&mut r, &mut scratch, &mut arena, "null-hooks", None, 4, true);
-        let unwanted = ScoreHookView { wants_attn_score: false, observation: Some(&obs) };
-        refuse(&mut r, &mut scratch, &mut arena, "unwanted", Some(&unwanted), 4, true);
+        refuse(
+            &mut r,
+            &mut scratch,
+            &mut arena,
+            "null-hooks",
+            None,
+            4,
+            true,
+        );
+        let unwanted = ScoreHookView {
+            wants_attn_score: false,
+            observation: Some(&obs),
+        };
+        refuse(
+            &mut r,
+            &mut scratch,
+            &mut arena,
+            "unwanted",
+            Some(&unwanted),
+            4,
+            true,
+        );
         let h = hooks(&obs);
-        refuse(&mut r, &mut scratch, &mut arena, "uncapturable", Some(&h), 4, false);
-        refuse(&mut r, &mut scratch, &mut arena, "zero-heads", Some(&h), 0, true);
-        let no_obs = ScoreHookView { wants_attn_score: true, observation: None };
-        refuse(&mut r, &mut scratch, &mut arena, "no-obs", Some(&no_obs), 4, true);
+        refuse(
+            &mut r,
+            &mut scratch,
+            &mut arena,
+            "uncapturable",
+            Some(&h),
+            4,
+            false,
+        );
+        refuse(
+            &mut r,
+            &mut scratch,
+            &mut arena,
+            "zero-heads",
+            Some(&h),
+            0,
+            true,
+        );
+        let no_obs = ScoreHookView {
+            wants_attn_score: true,
+            observation: None,
+        };
+        refuse(
+            &mut r,
+            &mut scratch,
+            &mut arena,
+            "no-obs",
+            Some(&no_obs),
+            4,
+            true,
+        );
         let empty = Fire::new(vec![0, 0, 0], vec![0, 0]);
         let empty_obs = empty.obs(16);
         let eh = hooks(&empty_obs);
-        refuse(&mut r, &mut scratch, &mut arena, "all-empty", Some(&eh), 4, true);
+        refuse(
+            &mut r,
+            &mut scratch,
+            &mut arena,
+            "all-empty",
+            Some(&eh),
+            4,
+            true,
+        );
     }
 
     // c. Nested captures: the inner one stands down.
@@ -292,8 +375,15 @@ fn transcript() -> String {
         let obs_b = fb.obs(16);
         let ha = hooks(&obs_a);
         let hb = hooks(&obs_b);
-        let mut outer =
-            LayerScoreCapture::new(&mut r, Some(&mut arena), &mut scratch, Some(&ha), 0, 2, true);
+        let mut outer = LayerScoreCapture::new(
+            &mut r,
+            Some(&mut arena),
+            &mut scratch,
+            Some(&ha),
+            0,
+            2,
+            true,
+        );
         {
             let mut inner = LayerScoreCapture::new(
                 &mut r,
@@ -308,7 +398,13 @@ fn transcript() -> String {
             inner.release(&mut arena, &mut scratch);
         }
         outer
-            .publish(&mut r, Some(&ha), obs_a.kv_page_indptr_d, obs_a.kv_last_page_lens_d, 16)
+            .publish(
+                &mut r,
+                Some(&ha),
+                obs_a.kv_page_indptr_d,
+                obs_a.kv_last_page_lens_d,
+                16,
+            )
             .unwrap();
         payload_row(&mut r, "outer", outer.scores(), 3);
         outer.release(&mut arena, &mut scratch);
@@ -323,9 +419,17 @@ fn transcript() -> String {
         let h = hooks(&obs);
         let mut cap =
             LayerScoreCapture::new(&mut r, Some(&mut arena), &mut scratch, Some(&h), 3, 2, true);
-        let gone = ScoreHookView { wants_attn_score: true, observation: None };
-        match cap.publish(&mut r, Some(&gone), obs.kv_page_indptr_d, obs.kv_last_page_lens_d, 16)
-        {
+        let gone = ScoreHookView {
+            wants_attn_score: true,
+            observation: None,
+        };
+        match cap.publish(
+            &mut r,
+            Some(&gone),
+            obs.kv_page_indptr_d,
+            obs.kv_last_page_lens_d,
+            16,
+        ) {
             Ok(()) => r.note("no-throw"),
             Err(_) => r.note("threw"),
         }
@@ -361,10 +465,18 @@ fn transcript() -> String {
                 std::slice::from_raw_parts(plan.folded_offsets_h, n),
             )
         };
-        let join_i =
-            |v: &[i32]| v.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
-        let join_u =
-            |v: &[u32]| v.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
+        let join_i = |v: &[i32]| {
+            v.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let join_u = |v: &[u32]| {
+            v.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         let body = format!(
             "plan ok={} folded={} indptr={} csr_h=[{}] folded_h=[{}] R={}",
             u8::from(plan.ok),
@@ -377,7 +489,8 @@ fn transcript() -> String {
         r.note(&body);
         let refused = prepare_decode_score_capture(&mut r, None, &mut scratch, &obs, 4);
         r.note(&format!("null-arena ok={}", u8::from(refused.ok)));
-        let no_heads = prepare_decode_score_capture(&mut r, Some(&mut arena), &mut scratch, &obs, 0);
+        let no_heads =
+            prepare_decode_score_capture(&mut r, Some(&mut arena), &mut scratch, &obs, 0);
         r.note(&format!("zero-heads ok={}", u8::from(no_heads.ok)));
     }
 
@@ -537,7 +650,10 @@ fn fnv1a64(data: &[u8]) -> u64 {
 fn the_port_reproduces_the_cpp_transcript() {
     let text = transcript();
     let rows = text.lines().count();
-    assert_eq!(rows, GOLDEN_ROWS, "row count diverged — script shape changed");
+    assert_eq!(
+        rows, GOLDEN_ROWS,
+        "row count diverged — script shape changed"
+    );
     let hash = fnv1a64(text.as_bytes());
     if hash != GOLDEN_FNV1A64 {
         let path = std::env::temp_dir().join("attn_score_rust_transcript.txt");

@@ -43,21 +43,21 @@ use std::time::Instant;
 use objc2_metal::MTLComputePipelineState;
 use tensor_ir::op::tags;
 
-use crate::device::context::Context;
-use crate::device::encoder::{StepEncoder, Visibility};
-use crate::device::external::{External, Externals};
-use crate::program::single::{DeviceInputs, PreparedFire, pod_bytes, write_pod};
-use crate::device::allocator::{Pool, Transient};
-use crate::program::executable::{GroupedExecutable, Pso};
-use crate::program::cache::Runtime;
-use crate::device::argtable::Tables;
 use crate::channel::{
     ChannelMeta, GroupKey, GroupLayout, LANE_ABI_VERSION, LANE_FLAG_RAGGED, LaneChannelSlot,
     LaneHeader, LaneRecord, LaneShape, MAX_SCRATCH_BYTES, OpParams, OpRuntime, Readiness, RowMeta,
     SCRATCH_ALIGN, STATUS_BYTES, Status, StatusOutcome, ValueDesc, Words, channel_flags,
     check_words, describe, report_status, used_channel_slots,
 };
+use crate::device::allocator::{Pool, Transient};
+use crate::device::argtable::Tables;
+use crate::device::context::Context;
+use crate::device::encoder::{StepEncoder, Visibility};
+use crate::device::external::{External, Externals};
 use crate::layout::region::Region as _;
+use crate::program::cache::Runtime;
+use crate::program::executable::{GroupedExecutable, Pso};
+use crate::program::single::{DeviceInputs, PreparedFire, pod_bytes, write_pod};
 use crate::{Error, Result};
 
 /// `PTIR_OP_CHAN_PUT`.

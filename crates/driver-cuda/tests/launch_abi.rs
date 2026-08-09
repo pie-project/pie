@@ -204,8 +204,7 @@ fn every_norm_row_states_its_launcher_exactly() {
     );
     let hs = norm_headers();
     let refs: Vec<&str> = hs.iter().map(String::as_str).collect();
-    let shim = kernels_cuda::abi::emit_c_shim(&[table], &refs)
-        .expect("no entry-point collisions");
+    let shim = kernels_cuda::abi::emit_c_shim(&[table], &refs).expect("no entry-point collisions");
     if let Err(err) = compile(&shim) {
         panic!(
             "the generated shim does not compile, so a row misstates its \
@@ -297,8 +296,8 @@ fn the_stated_quant_layout_gemm_and_moe_rows_describe_their_launchers() {
         "moe/topk_sigmoid.hpp",
         "moe/topk_softmax.hpp",
     ];
-    let shim = kernels_cuda::abi::emit_c_shim(&tables, &headers)
-        .expect("no entry-point collisions");
+    let shim =
+        kernels_cuda::abi::emit_c_shim(&tables, &headers).expect("no entry-point collisions");
     if let Err(err) = compile(&shim) {
         panic!(
             "the generated shim does not compile, so a row misstates its \
@@ -353,8 +352,6 @@ fn every_ssm_row_states_its_launcher_exactly() {
         );
     }
 }
-
-
 
 /// The pilot itself: every stated `rope` row describes its launcher exactly.
 #[test]
@@ -427,7 +424,10 @@ fn every_launcher_the_header_declares_has_a_row() {
                 .any(|k| k.symbol == format!("rope::{d}"))
         })
         .collect();
-    assert!(missing.is_empty(), "declared but not in the table: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "declared but not in the table: {missing:?}"
+    );
 }
 
 /// Why a launcher `attn`'s headers declare is allowed to have no row.
@@ -524,7 +524,10 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
         .map(|(n, _)| *n)
         .filter(|n| !declared.iter().any(|d| d == n))
         .collect();
-    assert!(stale.is_empty(), "exception for a launcher no header declares: {stale:?}");
+    assert!(
+        stale.is_empty(),
+        "exception for a launcher no header declares: {stale:?}"
+    );
 
     // The `KernelsInternal` claim, checked against the driver's sources.
     // THE DRIVER IS THIS CRATE NOW. This used to read
@@ -564,8 +567,12 @@ fn declared_launchers() -> Vec<String> {
         }
         let text = std::fs::read_to_string(&path).expect("header");
         for line in text.lines() {
-            let Some(rest) = line.strip_prefix("void ") else { continue };
-            let Some((name, _)) = rest.split_once('(') else { continue };
+            let Some(rest) = line.strip_prefix("void ") else {
+                continue;
+            };
+            let Some((name, _)) = rest.split_once('(') else {
+                continue;
+            };
             if name.chars().all(|c| c.is_alphanumeric() || c == '_') && !name.is_empty() {
                 out.push(name.to_string());
             }
@@ -577,7 +584,9 @@ fn declared_launchers() -> Vec<String> {
 }
 
 fn collect_sources(dir: &Path, out: &mut String) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         let p = entry.path();
         if p.is_dir() {
@@ -604,7 +613,10 @@ fn mentions_word(hay: &str, needle: &str) -> bool {
     let ident = |c: char| c.is_alphanumeric() || c == '_';
     hay.match_indices(needle).any(|(i, _)| {
         let before = hay[..i].chars().next_back().is_none_or(|c| !ident(c));
-        let after = hay[i + needle.len()..].chars().next().is_none_or(|c| !ident(c));
+        let after = hay[i + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !ident(c));
         before && after
     })
 }
@@ -626,8 +638,10 @@ fn an_unstated_row_is_skipped_rather_than_called_with_nothing() {
         .iter()
         .find(|k| !k.operands.is_empty())
         .expect("some rope row is stated");
-    let row: &'static [KernelSig] =
-        Vec::leak(vec![KernelSig { operands: &[], ..*stated }]);
+    let row: &'static [KernelSig] = Vec::leak(vec![KernelSig {
+        operands: &[],
+        ..*stated
+    }]);
     let shim = rope_shim(row);
     assert!(
         !shim.contains("extern \"C\""),
@@ -665,15 +679,29 @@ fn a_wrong_row_does_not_compile() {
     };
 
     let cases: Vec<(&str, Vec<Operand>)> = vec![
-        ("a written buffer is claimed to be read-only", retype(0, Ty::Buf)),
-        ("a read-only weight is claimed to be written", retype(2, Ty::BufMut)),
+        (
+            "a written buffer is claimed to be read-only",
+            retype(0, Ty::Buf),
+        ),
+        (
+            "a read-only weight is claimed to be written",
+            retype(2, Ty::BufMut),
+        ),
         ("positions loses its element type", retype(4, Ty::Buf)),
         ("an extent is widened to a float", retype(5, Ty::F32)),
         ("a rate is narrowed to an int", retype(9, Ty::I32)),
         ("the stream is dropped", ops[..ops.len() - 1].to_vec()),
         ("an operand is invented", {
             let mut v = ops.to_vec();
-            v.insert(5, Operand { name: "extra", ty: Ty::I32, nullable: false, source: kernels::Source::Unbound });
+            v.insert(
+                5,
+                Operand {
+                    name: "extra",
+                    ty: Ty::I32,
+                    nullable: false,
+                    source: kernels::Source::Unbound,
+                },
+            );
             v
         }),
         ("q and k_weight trade places", swap(0, 3)),
@@ -763,7 +791,10 @@ fn the_rust_bindings_name_the_symbols_the_shim_defines() {
     let rs = kernels_cuda::abi::emit_rust_bindings(&[kernels_cuda::rope::KERNELS]);
     for k in kernels_cuda::rope::KERNELS {
         let entry = kernels_cuda::abi::entry_name(k.symbol);
-        assert!(shim.contains(&format!("void {entry}(")), "{entry} not defined");
+        assert!(
+            shim.contains(&format!("void {entry}(")),
+            "{entry} not defined"
+        );
         assert!(rs.contains(&format!("fn {entry}(")), "{entry} not declared");
     }
 }
@@ -795,7 +826,9 @@ fn the_whole_bridge_generates_for_both_sides() {
         .expect("csrc/src")
         .filter_map(|e| {
             let e = e.ok()?;
-            e.path().is_dir().then(|| e.file_name().into_string().ok())?
+            e.path()
+                .is_dir()
+                .then(|| e.file_name().into_string().ok())?
         })
         .collect();
     dirs.sort();
@@ -809,8 +842,10 @@ fn the_whole_bridge_generates_for_both_sides() {
          would pass vacuously: {dirs:?}"
     );
 
-    let tables: &[&'static [kernels::KernelSig]] =
-        &[kernels_cuda::KERNELS, kernels_cuda::driver_internal::DRIVER_KERNELS];
+    let tables: &[&'static [kernels::KernelSig]] = &[
+        kernels_cuda::KERNELS,
+        kernels_cuda::driver_internal::DRIVER_KERNELS,
+    ];
     let refs: Vec<&str> = headers.iter().map(String::as_str).collect();
     let shim = kernels_cuda::abi::emit_c_shim(tables, &refs).expect("no entry-point collisions");
 
@@ -953,8 +988,14 @@ fn a_wrong_mirror_does_not_compile() {
     };
 
     let cases: Vec<(&str, Mutation)> = vec![
-        ("the record is one byte bigger", Box::new(|r: &mut Record| r.size += 1)),
-        ("the record is over-aligned", Box::new(|r: &mut Record| r.align *= 2)),
+        (
+            "the record is one byte bigger",
+            Box::new(|r: &mut Record| r.size += 1),
+        ),
+        (
+            "the record is over-aligned",
+            Box::new(|r: &mut Record| r.align *= 2),
+        ),
         (
             "a field moves by one byte",
             Box::new(|r: &mut Record| r.fields[3].1 += 1),
@@ -1094,7 +1135,11 @@ fn prove_family(family: &str, table: &'static [KernelSig], headers: &[String]) {
 /// scales.
 #[test]
 fn every_sample_row_states_its_launcher_exactly() {
-    prove_family("sample", kernels_cuda::sample::KERNELS, &headers_in("sample"));
+    prove_family(
+        "sample",
+        kernels_cuda::sample::KERNELS,
+        &headers_in("sample"),
+    );
 }
 
 /// Across EVERY table, the rows without operands are exactly the ones with
@@ -1214,8 +1259,12 @@ fn declared_in(dir: &str, returns: &[&str]) -> Vec<String> {
         }
         let text = std::fs::read_to_string(&path).expect("header");
         for line in text.lines() {
-            let Some(rest) = returns.iter().find_map(|r| line.strip_prefix(r)) else { continue };
-            let Some((name, _)) = rest.split_once('(') else { continue };
+            let Some(rest) = returns.iter().find_map(|r| line.strip_prefix(r)) else {
+                continue;
+            };
+            let Some((name, _)) = rest.split_once('(') else {
+                continue;
+            };
             if name.chars().all(|c| c.is_alphanumeric() || c == '_') && !name.is_empty() {
                 out.push(name.to_string());
             }
@@ -1293,7 +1342,10 @@ fn every_norm_launcher_is_a_row_or_a_stated_exception() {
         .map(|(n, _)| *n)
         .filter(|n| !declared.iter().any(|d| d == n))
         .collect();
-    assert!(stale.is_empty(), "exception for a launcher no header declares: {stale:?}");
+    assert!(
+        stale.is_empty(),
+        "exception for a launcher no header declares: {stale:?}"
+    );
 
     // The `EmitterChosen` claim, checked against the emitter's sources.
     // The file set is `scripts/kernel-vocabulary-audit.py`'s `emitted`
@@ -1358,7 +1410,10 @@ fn every_norm_launcher_is_a_row_or_a_stated_exception() {
         "only {} bytes of driver source found, so the check is vacuous",
         driver_text.len()
     );
-    let called: Vec<&&str> = probes.iter().filter(|n| mentions_word(&driver_text, n)).collect();
+    let called: Vec<&&str> = probes
+        .iter()
+        .filter(|n| mentions_word(&driver_text, n))
+        .collect();
     assert!(
         called.is_empty(),
         "called `AutotunerProbe` but the driver mentions it, so its \"zero \
@@ -1372,7 +1427,9 @@ fn every_norm_launcher_is_a_row_or_a_stated_exception() {
 /// name, because "the emitter sources" is a claim about which FILES choose
 /// kernels, not about a language.
 fn collect_files_named(dir: &Path, name: &str, out: &mut String) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         let p = entry.path();
         if p.is_dir() {
@@ -1423,4 +1480,3 @@ fn the_enum_mirrors_carry_the_cpp_discriminants() {
         panic!("an enum mirror disagrees with the C++:\n{err}");
     }
 }
-

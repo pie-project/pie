@@ -19,8 +19,8 @@ use driver_api::plan::{
     EmittedKernel, LaunchChannel, LaunchOp, LaunchPackage, LaunchPlanValue, LaunchRegion,
     LaunchStage, LaunchStagePlan, LaunchValue,
 };
-use driver_metal::channel::{ExecPlan, Failure, Versions, adopt_launch_package};
 use driver_metal::Error;
+use driver_metal::channel::{ExecPlan, Failure, Versions, adopt_launch_package};
 use driver_metal::device::{Archives, Context};
 use driver_metal::program::{ORDINAL_BASE, Runtime};
 use tensor_ir::op::{intrinsic_tags, tags};

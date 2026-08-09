@@ -385,7 +385,11 @@ mod tests {
         assert_eq!(f.depth.kv_width(), 256);
         let s = CsmFacts::csm_synthetic();
         assert_eq!(s.backbone.q_width(), 128);
-        assert_eq!(s.backbone.kv_width(), 128, "the synthetic states no GQA at all");
+        assert_eq!(
+            s.backbone.kv_width(),
+            128,
+            "the synthetic states no GQA at all"
+        );
         assert_eq!(s.depth.q_width(), 64);
         assert_eq!(s.depth.kv_width(), 32);
     }

@@ -291,9 +291,16 @@ mod tests {
         for dropped in KEY_FIELDS {
             let base = exact(&k);
             let lookup = |name: &str| {
-                if name == dropped { StoredField::Missing } else { base(name) }
+                if name == dropped {
+                    StoredField::Missing
+                } else {
+                    base(name)
+                }
             };
-            assert!(!k.matches(lookup), "{dropped} is missing and the key still matched");
+            assert!(
+                !k.matches(lookup),
+                "{dropped} is missing and the key still matched"
+            );
         }
     }
 
@@ -302,8 +309,13 @@ mod tests {
         // nlohmann's is_number_integer() is type-strict, so "132" != 132.
         let k = key();
         let base = exact(&k);
-        let lookup =
-            |n: &str| if n == "sm_count" { StoredField::Str("132".into()) } else { base(n) };
+        let lookup = |n: &str| {
+            if n == "sm_count" {
+                StoredField::Str("132".into())
+            } else {
+                base(n)
+            }
+        };
         assert!(!k.matches(lookup));
     }
 
@@ -311,8 +323,13 @@ mod tests {
     fn a_number_stored_as_a_float_does_not_match() {
         let k = key();
         let base = exact(&k);
-        let lookup =
-            |n: &str| if n == "sm_count" { StoredField::Float(132.0) } else { base(n) };
+        let lookup = |n: &str| {
+            if n == "sm_count" {
+                StoredField::Float(132.0)
+            } else {
+                base(n)
+            }
+        };
         assert!(!k.matches(lookup), "132.0 is not is_number_integer()");
     }
 
@@ -320,10 +337,13 @@ mod tests {
     fn nulls_and_bools_never_match_anything() {
         let k = key();
         for field in KEY_FIELDS {
-            for bad in [StoredField::Null, StoredField::Bool(true), StoredField::Bool(false)] {
+            for bad in [
+                StoredField::Null,
+                StoredField::Bool(true),
+                StoredField::Bool(false),
+            ] {
                 let base = exact(&k);
-                let lookup =
-                    |n: &str| if n == field { bad.clone() } else { base(n) };
+                let lookup = |n: &str| if n == field { bad.clone() } else { base(n) };
                 assert!(!k.matches(lookup), "{field} as {bad:?} matched");
             }
         }
@@ -333,7 +353,13 @@ mod tests {
     fn a_string_stored_as_a_number_does_not_match() {
         let k = key();
         let base = exact(&k);
-        let lookup = |n: &str| if n == "model_type" { StoredField::Int(0) } else { base(n) };
+        let lookup = |n: &str| {
+            if n == "model_type" {
+                StoredField::Int(0)
+            } else {
+                base(n)
+            }
+        };
         assert!(!k.matches(lookup));
     }
 
@@ -364,9 +390,15 @@ mod tests {
 
     #[test]
     fn strings_are_escaped_the_way_nlohmann_escapes_them() {
-        let k = ProfileKey { gpu_name: "a\"b\\c\nd\te\u{1}f".into(), ..Default::default() };
+        let k = ProfileKey {
+            gpu_name: "a\"b\\c\nd\te\u{1}f".into(),
+            ..Default::default()
+        };
         let json = k.to_json();
-        assert!(json.contains(r#""gpu_name":"a\"b\\c\nd\te\u0001f""#), "{json}");
+        assert!(
+            json.contains(r#""gpu_name":"a\"b\\c\nd\te\u0001f""#),
+            "{json}"
+        );
     }
 
     #[test]
@@ -385,7 +417,10 @@ mod tests {
 
     #[test]
     fn negative_numbers_round_trip() {
-        let k = ProfileKey { compute_major: -1, ..Default::default() };
+        let k = ProfileKey {
+            compute_major: -1,
+            ..Default::default()
+        };
         assert!(k.to_json().contains(r#""compute_major":-1"#));
     }
 

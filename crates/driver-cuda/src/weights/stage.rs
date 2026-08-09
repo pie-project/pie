@@ -30,7 +30,7 @@ use std::path::Path;
 
 use model_loader::error::Error;
 use model_loader::executor::cuda::CudaArena;
-use model_loader::executor::host::execute_plan_into_backing;
+use model_loader::executor::Execution;
 use model_loader::executor::sink::TensorSink;
 use model_loader::plan::LoadPlan;
 use model_loader::plan::spans::{Span, publish_spans};
@@ -111,39 +111,36 @@ pub fn stage_plan_weights(
     {
         // SAFETY: `buf` is a live allocation of `arena_len` bytes that outlives
         // this scope, and `stream` outlives it too.
-        let mut arena = unsafe {
-            CudaArena::new(base, arena_len, max_write, stream.as_ref().as_raw().cast())?
-        };
+        let mut arena =
+            unsafe { CudaArena::new(base, arena_len, max_write, stream.as_ref().as_raw().cast())? };
         let mut sink = Outside {
             in_arena: &published.in_arena,
             tensors: Vec::new(),
         };
-        execute_plan_into_backing(plan, snapshot_dir, &mut arena, &mut sink, &mut |_| {})?;
-        // The writes are still in flight until this returns.
-        arena.finish()?;
+        Execution::new(plan, snapshot_dir)
+            .arena(&mut arena)
+            .sink(&mut sink)
+            .run()?;
 
         let mut spans = BTreeMap::new();
         for (name, span) in &published.in_arena {
             let offset = usize::try_from(span.offset).unwrap_or(usize::MAX);
-            spans.insert(
-                name.clone(),
-                {
-                    let bytes = usize::try_from(span.bytes).unwrap_or(0);
-                    // CHECKED, not argued. The SAFETY comment here read
-                    // "the offset is the plan's own and the arena was
-                    // sized from `persistent_bytes`, which the executor
-                    // already refused to exceed" — true, and unavailable
-                    // to the compiler. The buffer knows its own length.
-                    let ptr = buf.ptr_at(offset, bytes).ok_or_else(|| {
-                        Error::Internal(format!(
-                            "{name}: span {offset}..{} leaves an arena of \
+            spans.insert(name.clone(), {
+                let bytes = usize::try_from(span.bytes).unwrap_or(0);
+                // CHECKED, not argued. The SAFETY comment here read
+                // "the offset is the plan's own and the arena was
+                // sized from `persistent_bytes`, which the executor
+                // already refused to exceed" — true, and unavailable
+                // to the compiler. The buffer knows its own length.
+                let ptr = buf.ptr_at(offset, bytes).ok_or_else(|| {
+                    Error::Internal(format!(
+                        "{name}: span {offset}..{} leaves an arena of \
                              {arena_len}",
-                            offset + bytes
-                        ))
-                    })?;
-                    WeightSpan { ptr, bytes }
-                },
-            );
+                        offset + bytes
+                    ))
+                })?;
+                WeightSpan { ptr, bytes }
+            });
         }
 
         let mut owned = vec![buf];
@@ -183,8 +180,7 @@ pub fn read_span(span: WeightSpan) -> Result<Vec<u8>, Error> {
     // SAFETY: `span` names a live device allocation of `bytes` bytes —
     // `stage_plan_weights` bounds-checked it against the arena — and
     // `stream` outlives the copy.
-    unsafe { crate::device::read_raw_span(span.ptr, &mut out, stream.as_ref()) }
-        .map_err(cuda)?;
+    unsafe { crate::device::read_raw_span(span.ptr, &mut out, stream.as_ref()) }.map_err(cuda)?;
     stream.as_ref().synchronize().map_err(cuda)?;
     Ok(out)
 }

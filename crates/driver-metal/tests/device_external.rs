@@ -12,9 +12,9 @@ use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ptr::NonNull;
 
 use driver_metal::device::page_size;
-use driver_metal::{Error, Region};
 use driver_metal::device::{Context, Externals, Mapped, Pool, Stepper, Tables};
 use driver_metal::program::Compiler;
+use driver_metal::{Error, Region};
 
 const FILL: &str = r"
 #include <metal_stdlib>

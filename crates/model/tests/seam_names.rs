@@ -91,14 +91,49 @@ impl Scheme {
     /// nothing another scheme's gate would recognise.
     fn published(self) -> fn(&str) -> bool {
         match self {
-            Self::LlamaLike => |n: &str| {
-                !n.starts_with("model.language_model.") && !n.ends_with("self_attn.sinks")
-            },
+            Self::LlamaLike => {
+                |n: &str| !n.starts_with("model.language_model.") && !n.ends_with("self_attn.sinks")
+            }
             Self::GptOss => |n: &str| !n.starts_with("model.language_model."),
             Self::Gemma4 => |n: &str| n.starts_with("model.language_model."),
             Self::Qwen35 => |n: &str| {
-                n.starts_with("model.language_model.")
-                    && n != "model.language_model.embed_tokens_per_layer.weight"
+                if !n.starts_with("model.language_model.")
+                    || n == "model.language_model.embed_tokens_per_layer.weight"
+                {
+                    return false;
+                }
+                // A HYBRID stack, because that is what qwen3.5 is: three
+                // gated-delta-net layers then one full-attention layer,
+                // measured on `Qwen3.6-35B-A3B-4bit`, and each layer
+                // ships one kind's tensors and not the other's.
+                //
+                // This predicate used to answer yes to every name, which
+                // was harmless while `wire()` read a `layer_types` list
+                // off the config. It stopped being harmless when that
+                // branch started asking the CHECKPOINT — `w.has(q_proj)`
+                // is then true at every layer, the linear-attention arm
+                // never runs, and `conv`, `a_log`, `dt_bias`,
+                // `gate_norm` and the four `in_proj`s all became
+                // unreachable at once. The test reported the first of
+                // them as a seam gap; there is no gap, there was no
+                // hybrid checkpoint to ask.
+                let Some(rest) = n.strip_prefix("model.language_model.layers.") else {
+                    return true;
+                };
+                let Some((index, _)) = rest.split_once('.') else {
+                    return true;
+                };
+                let Ok(layer) = index.parse::<u32>() else {
+                    return true;
+                };
+                let full = layer % 4 == 3;
+                if n.contains(".self_attn.") {
+                    full
+                } else if n.contains(".linear_attn.") {
+                    !full
+                } else {
+                    true
+                }
             },
         }
     }
@@ -158,9 +193,21 @@ fn normalise(name: &str) -> String {
 /// trace records an `Arg::Weight("")` for the slot it does not fill.
 /// Nothing resolves it because nothing needs to.
 fn stems(plan: &ForwardPlan) -> BTreeSet<String> {
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; 4];
-    let l = lower(plan, &rows, Fire { captures_across_splits: false })
-        .expect("the corpus lowers");
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        4
+    ];
+    let l = lower(
+        plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("the corpus lowers");
     l.args
         .iter()
         .filter_map(|a| match a {
@@ -178,10 +225,10 @@ fn stems(plan: &ForwardPlan) -> BTreeSet<String> {
 /// family that has a golden and no row here is a family whose seam nobody
 /// is checking, and the two lists diverging is itself the bug.
 fn corpus() -> Vec<(&'static str, Scheme, ForwardPlan)> {
-    use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
     use model::gemma_4::forward::facts::{Gemma4CudaFacts, Gemma4Facts};
     use model::gpt_oss::forward::facts::{GptOssCudaFacts, GptOssFacts};
     use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
+    use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
 
     vec![
         (
@@ -403,8 +450,10 @@ fn every_traced_weight_is_a_name_wire_can_emit() {
     let mut actual: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     for (family, scheme, plan) in corpus() {
         let can = answerable(scheme);
-        let missing: BTreeSet<String> =
-            stems(&plan).into_iter().filter(|s| !can.contains(s)).collect();
+        let missing: BTreeSet<String> = stems(&plan)
+            .into_iter()
+            .filter(|s| !can.contains(s))
+            .collect();
         actual.insert(family, missing);
     }
 
@@ -417,8 +466,7 @@ fn every_traced_weight_is_a_name_wire_can_emit() {
 
     let mut report = String::new();
     for (family, missing) in &actual {
-        let want: BTreeSet<String> =
-            expected[family].iter().map(|s| (*s).to_string()).collect();
+        let want: BTreeSet<String> = expected[family].iter().map(|s| (*s).to_string()).collect();
         for joined in missing.difference(&want) {
             report.push_str(&format!(
                 "  {family}: `{joined}` is named by the forward pass and \

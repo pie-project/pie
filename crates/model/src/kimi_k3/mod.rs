@@ -123,6 +123,9 @@ pub const VARIANTS: &[KimiK3] = &[KimiK3 {
         moe: spec::KimiK3MoeFacts {
             num_experts: 64,
             top_k: 6,
+            // As `spec.rs` -- inherited from K2.
+            norm_topk_prob: false,
+            routed_scaling: 2.0,
             moe_intermediate: 1024,
             shared_intermediate: 1024,
         },
@@ -321,7 +324,10 @@ mod tests {
     fn the_rows_ids_are_unique_and_non_empty() {
         let mut seen = std::collections::BTreeSet::new();
         for v in VARIANTS {
-            assert!(!v.id.is_empty(), "a row with no id is a row nothing can ask for");
+            assert!(
+                !v.id.is_empty(),
+                "a row with no id is a row nothing can ask for"
+            );
             assert!(seen.insert(v.id), "{} is stated twice", v.id);
         }
         assert_eq!(rows().len(), VARIANTS.len(), "one dyn entry per row");
@@ -338,7 +344,8 @@ mod tests {
         for v in VARIANTS {
             assert_eq!(v.id(), v.id);
             assert!(
-                v.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                v.id.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
                 "{} is not lowercase-hyphenated",
                 v.id,
             );
@@ -397,7 +404,10 @@ mod tests {
     #[test]
     fn the_row_is_complete_where_it_is_unservable() {
         let v = row("kimi-k3");
-        assert!(v.manifest().tensors.len() > 10, "identity does not depend on serving");
+        assert!(
+            v.manifest().tensors.len() > 10,
+            "identity does not depend on serving"
+        );
         assert_eq!(v.load_shape().layers, v.shape.layers);
         assert!(matches!(
             v.deployment(Deployed::single()),
@@ -441,7 +451,10 @@ mod tests {
         for v in VARIANTS {
             let turn = tok.decode(&v.chat(tok.clone()).user("Hi"), false);
             assert_eq!(turn, "<|im_user|>user<|im_middle|>Hi<|im_end|>", "{}", v.id);
-            assert!(!turn.contains("<|im_start|>"), "the `_ =>` ChatML arm is gone");
+            assert!(
+                !turn.contains("<|im_start|>"),
+                "the `_ =>` ChatML arm is gone"
+            );
         }
     }
 
@@ -456,20 +469,41 @@ mod tests {
         use model_loader::checkpoint::CheckpointMetadata;
         use model_loader::plan::StorageTarget;
 
-        let meta = CheckpointMetadata { files: Vec::new(), tensors: Vec::new() };
+        let meta = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: Vec::new(),
+        };
         let target = StorageTarget::default();
         let encoding = StoredEncoding::dense();
         let v = row("kimi-k3");
 
-        let mlx = Policy { naming: Naming::Mlx, ..Policy::default() };
-        let mut builder =
-            crate::shared::builder::Builder::new(&meta, v.id, v.load_shape(), &encoding, &target, &mlx);
+        let mlx = Policy {
+            naming: Naming::Mlx,
+            ..Policy::default()
+        };
+        let mut builder = crate::shared::builder::Builder::new(
+            &meta,
+            v.id,
+            v.load_shape(),
+            &encoding,
+            &target,
+            &mlx,
+        );
         assert_eq!(builder.naming(), Naming::Mlx);
-        assert!(v.author(&mut builder).is_err(), "no MLX layout exists to author against");
+        assert!(
+            v.author(&mut builder).is_err(),
+            "no MLX layout exists to author against"
+        );
 
         let hf = Policy::default();
-        let mut builder =
-            crate::shared::builder::Builder::new(&meta, v.id, v.load_shape(), &encoding, &target, &hf);
+        let mut builder = crate::shared::builder::Builder::new(
+            &meta,
+            v.id,
+            v.load_shape(),
+            &encoding,
+            &target,
+            &hf,
+        );
         assert_eq!(builder.naming(), Naming::Hf);
         // An empty checkpoint has no expert stacks and no gate banks to
         // band, so the HF pass runs to its `publish_remaining` and
@@ -498,8 +532,16 @@ mod tests {
     fn the_row_answers_what_the_driver_advertises() {
         for v in VARIANTS {
             let a = v.advertised();
-            assert_eq!(a.arch, "kimi_k3", "{}: the family label a guest program sees", v.id);
-            assert!(!a.arch.is_empty(), "{}: an empty label matches no guest predicate", v.id);
+            assert_eq!(
+                a.arch, "kimi_k3",
+                "{}: the family label a guest program sees",
+                v.id
+            );
+            assert!(
+                !a.arch.is_empty(),
+                "{}: an empty label matches no guest predicate",
+                v.id
+            );
             assert_eq!(
                 a.max_model_len, 0,
                 "{}: state a ceiling only from a published config — the only Kimi-K3 \
@@ -536,9 +578,10 @@ mod tests {
     /// The guard that replaces `driver-metal`'s `LLAMA_LIKE` table. That
     /// table answered "does this build serve you" from an architecture
     /// STRING reduced by `canonical()`, in a driver, before any text was
-    /// traced — so it could say yes to a row whose text does not exist
-    /// (it listed `gemma4`) and no to one whose text does (it omitted
-    /// `gemma3`). The row answers now, and what it answers with is a
+    /// traced — so it could say yes to a row this build cannot resolve
+    /// (it listed `gpt_oss`, whose every publication either fails this
+    /// crate's manifest or names tensors `driver-metal` has no handle
+    /// for) and no to one whose text it models (it omitted `gemma3`). The row answers now, and what it answers with is a
     /// sentence naming what is missing.
     ///
     /// The comparison is against [`project::NO_METAL`] itself and not a

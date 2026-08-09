@@ -169,7 +169,8 @@ fn row_of(sig: u32, k: u32, samples: bool) -> Row {
 /// [`Unbridgeable`] naming which structural fact did not hold. Every variant is
 /// drift between the scheduler's tables and the step they describe, not a
 /// runtime condition.
-pub fn rows_of(step: &Step<'_>) -> Result<Vec<Row>, Unbridgeable> {    let n = step.token_ids.len();
+pub fn rows_of(step: &Step<'_>) -> Result<Vec<Row>, Unbridgeable> {
+    let n = step.token_ids.len();
     if n == 0 {
         return Err(Unbridgeable::NoRows);
     }
@@ -193,7 +194,9 @@ pub fn rows_of(step: &Step<'_>) -> Result<Vec<Row>, Unbridgeable> {    let n = s
     if step.region_row_indptr.is_empty() {
         // The legacy discipline: no seriation ran, so the fire is one region
         // of the default point. Not a refusal — this is the monomorphic case.
-        return Ok((0..n).map(|i| row_of(0, MAX_LAYERS_FULL, samples[i])).collect());
+        return Ok((0..n)
+            .map(|i| row_of(0, MAX_LAYERS_FULL, samples[i]))
+            .collect());
     }
     if segments != step.region_sig.len() || segments != step.region_k.len() {
         return Err(Unbridgeable::RaggedRegionTable {
@@ -258,12 +261,16 @@ pub fn lower_step(
     step: &Step<'_>,
 ) -> Result<model_compiler::lower::Lowered, Unbridged> {
     let rows = rows_of(step).map_err(Unbridged::Step)?;
-    model_compiler::lower::lower(plan, &rows, model_compiler::lower::Fire {
-        // Metal captures nothing: `Stepper` re-encodes every step, so no fire
-        // is replayed across a different row split. The CUDA side sets this
-        // when a captured graph outlives the split it was captured at.
-        captures_across_splits: false,
-    })
+    model_compiler::lower::lower(
+        plan,
+        &rows,
+        model_compiler::lower::Fire {
+            // Metal captures nothing: `Stepper` re-encodes every step, so no fire
+            // is replayed across a different row split. The CUDA side sets this
+            // when a captured graph outlives the split it was captured at.
+            captures_across_splits: false,
+        },
+    )
     .map_err(|why| Unbridged::Uncovered(format!("{why:?}")))
 }
 
@@ -315,7 +322,11 @@ mod tests {
             sampling_indices: &[3],
         };
         let rows = rows_of(&s).expect("a fire");
-        assert_eq!(rows[0].depth_k, Some(4), "the truncated region carries its k");
+        assert_eq!(
+            rows[0].depth_k,
+            Some(4),
+            "the truncated region carries its k"
+        );
         assert!(!rows[0].lora);
         assert_eq!(rows[2].depth_k, None);
         assert!(rows[2].lora && rows[2].custom_mask);

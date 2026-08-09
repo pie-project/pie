@@ -1029,7 +1029,9 @@ mod tests {
     #[test]
     fn a_text_only_family_has_no_vision_front_end() {
         let advertised = crate::catalog::arches();
-        for arch in ["qwen3", "qwen2", "llama", "mistral", "gemma2", "gemma3", "phi3", "olmo2"] {
+        for arch in [
+            "qwen3", "qwen2", "llama", "mistral", "gemma2", "gemma3", "phi3", "olmo2",
+        ] {
             assert!(
                 advertised.contains(&arch),
                 "`{arch}` is in this test because a row advertises it; no row does \
@@ -1052,8 +1054,14 @@ mod tests {
     #[test]
     fn the_two_multimodal_families_still_reach_their_front_ends() {
         let advertised = crate::catalog::arches();
-        for (arch, want) in [("gemma4", VisionArch::Gemma4), ("qwen3_5", VisionArch::Qwen36)] {
-            assert!(advertised.contains(&arch), "`{arch}` is advertised by a row");
+        for (arch, want) in [
+            ("gemma4", VisionArch::Gemma4),
+            ("qwen3_5", VisionArch::Qwen36),
+        ] {
+            assert!(
+                advertised.contains(&arch),
+                "`{arch}` is advertised by a row"
+            );
             assert_eq!(VisionArch::from_arch_name(arch), Some(want));
         }
         // Gemma-4 alone ships the USM/Conformer audio tower; the Qwen3-VL
@@ -1071,7 +1079,10 @@ mod tests {
     #[test]
     fn a_label_that_merely_contains_a_multimodal_one_is_refused() {
         assert_eq!(VisionArch::from_arch_name("qwen3"), None);
-        assert_eq!(VisionArch::from_arch_name("qwen3_5"), Some(VisionArch::Qwen36));
+        assert_eq!(
+            VisionArch::from_arch_name("qwen3_5"),
+            Some(VisionArch::Qwen36)
+        );
         // Neither direction of containment leaks.
         assert_eq!(VisionArch::from_arch_name("qwen3_5_moe"), None);
         assert_eq!(VisionArch::from_arch_name("gemma4x"), None);
@@ -1079,7 +1090,10 @@ mod tests {
         assert!(!audio_arch_supported("gemma4-audio"));
         // Case is still forgiven — a driver that upper-cases its label is
         // spelling the same family.
-        assert_eq!(VisionArch::from_arch_name("GEMMA4"), Some(VisionArch::Gemma4));
+        assert_eq!(
+            VisionArch::from_arch_name("GEMMA4"),
+            Some(VisionArch::Gemma4)
+        );
         assert!(audio_arch_supported("Gemma4"));
         // And an empty label, which is what a row that refuses to deploy
         // advertises, selects nothing rather than panicking.

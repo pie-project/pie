@@ -168,12 +168,12 @@ pub mod catalog;
 /// one row and four downloads.
 pub mod encoding;
 
-#[cfg(feature = "contract")]
-pub mod contract;
 /// The load path itself: a row in, a plan out, stated once for every
 /// driver. Sits with `contract` because it is that registry's caller.
 #[cfg(feature = "contract")]
 pub mod boot;
+#[cfg(feature = "contract")]
+pub mod contract;
 #[cfg(feature = "chat")]
 pub mod multimodal;
 

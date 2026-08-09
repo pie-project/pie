@@ -11,13 +11,13 @@
 //! Being an integration test costs nothing here: `check_plan`, `Backend` and
 //! `sig_in` are all public, because a driver-side consumer reads them too.
 
-use model_compiler::kernels::*;
-use model_compiler::trace::ForwardPlan;
-use model::shared::llama_like::forward::facts::LlamaLikeCudaFacts;
-use model::shared::llama_like::forward::facts::LlamaLikeFacts;
 use model::qwen_3_5::forward::facts::Qwen35CudaFacts;
 use model::qwen_3_5::forward::facts::Qwen35HybridFacts;
+use model::shared::llama_like::forward::facts::LlamaLikeCudaFacts;
+use model::shared::llama_like::forward::facts::LlamaLikeFacts;
+use model_compiler::kernels::*;
 use model_compiler::trace::FireClass;
+use model_compiler::trace::ForwardPlan;
 
 use model_compiler::trace::{Op, OpKind};
 
@@ -84,12 +84,18 @@ fn the_check_is_not_vacuous() {
 /// A family name says whose kernels a text states.
 #[test]
 fn the_backend_is_read_off_the_family() {
-    assert_eq!(Backend::of_family("llama_like.cuda.decode"), Some(Backend::Cuda));
+    assert_eq!(
+        Backend::of_family("llama_like.cuda.decode"),
+        Some(Backend::Cuda)
+    );
     assert_eq!(
         Backend::of_family("qwen3_5_hybrid.cuda.commit_advance"),
         Some(Backend::Cuda)
     );
-    assert_eq!(Backend::of_family("llama_like.metal.decode"), Some(Backend::Metal));
+    assert_eq!(
+        Backend::of_family("llama_like.metal.decode"),
+        Some(Backend::Metal)
+    );
     // Semantic traces state no kernels, so no table applies.
     assert_eq!(Backend::of_family("llama_like"), None);
     assert_eq!(Backend::of_family("qwen3_5_moe_mlp_block"), None);
@@ -253,8 +259,8 @@ fn the_table_covers_the_dsl_surface() {
                 "dist::",
                 "comm::",
             ]
-                .iter()
-                .any(|p| s.starts_with(p))
+            .iter()
+            .any(|p| s.starts_with(p))
         })
         .collect();
     stated.sort_unstable();
@@ -318,14 +324,21 @@ fn the_depth_axis_derives_from_the_layer_tag() {
     // Three planned-decode dispatches per layer take the swap: the
     // mask arm's unmasked-prefix rows, and the plain body's
     // score-capturing and plain arms.
-    let swaps = plan.ops.iter().filter(|op| plan.depth_prefix_plan(op)).count();
+    let swaps = plan
+        .ops
+        .iter()
+        .filter(|op| plan.depth_prefix_plan(op))
+        .count();
     assert_eq!(swaps, 3 * facts.layers as usize);
     assert!(
-        plan.ops.iter().filter(|op| plan.depth_prefix_plan(op)).all(|op| matches!(
-            &op.kind,
-            OpKind::Launch { kernel, .. }
-                if kernel == "attn::dispatch_attention_flashinfer_decode"
-        )),
+        plan.ops
+            .iter()
+            .filter(|op| plan.depth_prefix_plan(op))
+            .all(|op| matches!(
+                &op.kind,
+                OpKind::Launch { kernel, .. }
+                    if kernel == "attn::dispatch_attention_flashinfer_decode"
+            )),
         "only the planned decode dispatch swaps"
     );
 
@@ -343,10 +356,7 @@ fn the_depth_axis_derives_from_the_layer_tag() {
         FireClass::Prefill,
     );
     assert!(prefill.depth_window);
-    assert!(prefill
-        .ops
-        .iter()
-        .any(|op| prefill.depth_windowed(op)));
+    assert!(prefill.ops.iter().any(|op| prefill.depth_windowed(op)));
     // Asked of the LOWERED form, not the traced one, and that is the
     // window-class merge (`.wiki/driver/graph.md` §4.1): the trace now
     // carries BOTH window classes as arms of a `GuardPred::WindowOne`
@@ -354,7 +364,10 @@ fn the_depth_axis_derives_from_the_layer_tag() {
     // dispatch — it is the arm this fire will not take. Which arm runs
     // is a lowering answer, and `Resolve` is where it is given.
     let prefill_rows = vec![
-        model_compiler::lower::Row { multi_token: true, ..Default::default() };
+        model_compiler::lower::Row {
+            multi_token: true,
+            ..Default::default()
+        };
         7
     ];
     let lowered = model_compiler::lower::lower_with(
@@ -441,10 +454,7 @@ fn live_traces_satisfy_the_table() {
             class,
         ));
     }
-    for class in [
-        FireClass::Decode,
-        FireClass::Prefill,
-    ] {
+    for class in [FireClass::Decode, FireClass::Prefill] {
         plans.push(model::qwen_3_5::forward::qwen3_5_hybrid_cuda(
             &Qwen35HybridFacts::qwen3_5_0_8b(),
             &Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
@@ -555,7 +565,10 @@ fn a_weight_representation_states_its_kernel() {
 fn the_kernels_a_semantic_kind_fans_to_are_declared() {
     // (kind, the symbols its driver arms pick between)
     const FANS: &[(&str, &[&str])] = &[
-        ("Rmsnorm", &["norm::rmsnorm_bf16", "norm::rmsnorm_gemma_bf16"]),
+        (
+            "Rmsnorm",
+            &["norm::rmsnorm_bf16", "norm::rmsnorm_gemma_bf16"],
+        ),
         (
             "RmsnormPerHead",
             &["norm::rmsnorm_bf16", "norm::rmsnorm_gemma_bf16"],

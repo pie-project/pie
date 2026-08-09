@@ -84,14 +84,21 @@ pub fn manifest(f: &CsmFacts) -> Manifest {
         //
         // Its TEXT table only. The audio table is the depth decoder's,
         // shared, and the absence of a second copy is stated below.
-        .with(TensorSpec::required("embed_text_tokens", [u64::from(b.text_vocab), hidden]))
+        .with(TensorSpec::required(
+            "embed_text_tokens",
+            [u64::from(b.text_vocab), hidden],
+        ))
         .with(TensorSpec::required("backbone_model.norm", [hidden]))
         // `tie_word_embeddings: false`, so the head is shipped — over
         // ONE codebook's alphabet, not the text vocabulary. That is the
         // extent that says "this stack emits audio codes": a 2051-wide
         // head on a 128 256-entry embedding table is a shape no text
         // model has.
-        .either(!f.tied_embeddings, "lm_head", [u64::from(b.audio_vocab), hidden])
+        .either(
+            !f.tied_embeddings,
+            "lm_head",
+            [u64::from(b.audio_vocab), hidden],
+        )
         .with(TensorSpec::required(
             "backbone_model.layer.{}.self_attn.q_proj",
             [u64::from(b.q_width()), hidden],
@@ -108,11 +115,26 @@ pub fn manifest(f: &CsmFacts) -> Manifest {
             "backbone_model.layer.{}.self_attn.o_proj",
             [hidden, u64::from(b.q_width())],
         ))
-        .with(TensorSpec::required("backbone_model.layer.{}.mlp.gate_proj", [inter, hidden]))
-        .with(TensorSpec::required("backbone_model.layer.{}.mlp.up_proj", [inter, hidden]))
-        .with(TensorSpec::required("backbone_model.layer.{}.mlp.down_proj", [hidden, inter]))
-        .with(TensorSpec::required("backbone_model.layer.{}.input_layernorm", [hidden]))
-        .with(TensorSpec::required("backbone_model.layer.{}.post_attention_layernorm", [hidden]))
+        .with(TensorSpec::required(
+            "backbone_model.layer.{}.mlp.gate_proj",
+            [inter, hidden],
+        ))
+        .with(TensorSpec::required(
+            "backbone_model.layer.{}.mlp.up_proj",
+            [inter, hidden],
+        ))
+        .with(TensorSpec::required(
+            "backbone_model.layer.{}.mlp.down_proj",
+            [hidden, inter],
+        ))
+        .with(TensorSpec::required(
+            "backbone_model.layer.{}.input_layernorm",
+            [hidden],
+        ))
+        .with(TensorSpec::required(
+            "backbone_model.layer.{}.post_attention_layernorm",
+            [hidden],
+        ))
         // THE TIE, as an absence. `tie_codebooks_embeddings: true`
         // means the backbone reads its audio codes out of the depth
         // decoder's table, so it ships no table of its own — and a
@@ -162,11 +184,26 @@ pub fn manifest(f: &CsmFacts) -> Manifest {
             "depth_decoder.model.layer.{}.self_attn.o_proj",
             [dh, u64::from(d.q_width())],
         ))
-        .with(TensorSpec::required("depth_decoder.model.layer.{}.mlp.gate_proj", [dinter, dh]))
-        .with(TensorSpec::required("depth_decoder.model.layer.{}.mlp.up_proj", [dinter, dh]))
-        .with(TensorSpec::required("depth_decoder.model.layer.{}.mlp.down_proj", [dh, dinter]))
-        .with(TensorSpec::required("depth_decoder.model.layer.{}.input_layernorm", [dh]))
-        .with(TensorSpec::required("depth_decoder.model.layer.{}.post_attention_layernorm", [dh]))
+        .with(TensorSpec::required(
+            "depth_decoder.model.layer.{}.mlp.gate_proj",
+            [dinter, dh],
+        ))
+        .with(TensorSpec::required(
+            "depth_decoder.model.layer.{}.mlp.up_proj",
+            [dinter, dh],
+        ))
+        .with(TensorSpec::required(
+            "depth_decoder.model.layer.{}.mlp.down_proj",
+            [dh, dinter],
+        ))
+        .with(TensorSpec::required(
+            "depth_decoder.model.layer.{}.input_layernorm",
+            [dh],
+        ))
+        .with(TensorSpec::required(
+            "depth_decoder.model.layer.{}.post_attention_layernorm",
+            [dh],
+        ))
         // ── The Mimi codec.
         //
         // The two quantizers, whose codebooks are the one part of the
@@ -302,9 +339,18 @@ mod tests {
     fn the_manifest_asks_for_the_depth_decoder_and_the_codec_too() {
         let binding = manifest(&CsmFacts::csm_1b());
         let names: Vec<&str> = binding.tensors.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.iter().any(|n| n.starts_with("backbone_model.")), "no backbone");
-        assert!(names.iter().any(|n| n.starts_with("depth_decoder.")), "no depth decoder");
-        assert!(names.iter().any(|n| n.starts_with("codec_model.")), "no codec");
+        assert!(
+            names.iter().any(|n| n.starts_with("backbone_model.")),
+            "no backbone"
+        );
+        assert!(
+            names.iter().any(|n| n.starts_with("depth_decoder.")),
+            "no depth decoder"
+        );
+        assert!(
+            names.iter().any(|n| n.starts_with("codec_model.")),
+            "no codec"
+        );
         assert!(
             names.contains(&"depth_decoder.codebooks_head"),
             "without the codebook head this row matches a llama that emits one code per frame"
@@ -330,11 +376,13 @@ mod tests {
                 .filter(|t| !t.name.starts_with("depth_decoder."))
                 .map(|t| (t.name.replace("{}", "0"), t.extents.clone())),
         );
-        let err = full.check(&backbone_only).expect_err("a mute backbone must not match");
+        let err = full
+            .check(&backbone_only)
+            .expect_err("a mute backbone must not match");
         assert!(
-            err.faults.iter().any(
-                |fault| matches!(fault, Fault::Missing(n) if n.starts_with("depth_decoder."))
-            ),
+            err.faults
+                .iter()
+                .any(|fault| matches!(fault, Fault::Missing(n) if n.starts_with("depth_decoder."))),
             "the mismatch must name the missing stack, not a width: {err}"
         );
     }
@@ -359,7 +407,10 @@ mod tests {
 
         // And the other leg of `either`: an untied CSM would REQUIRE it,
         // at the shared table's extents.
-        let untied = CsmFacts { tied_codebooks: false, ..CsmFacts::csm_1b() };
+        let untied = CsmFacts {
+            tied_codebooks: false,
+            ..CsmFacts::csm_1b()
+        };
         let row = manifest(&untied)
             .tensors
             .into_iter()
@@ -382,7 +433,10 @@ mod tests {
         assert_eq!(spec_extents(&f, "lm_head"), vec![2051, 2048]);
         assert_eq!(spec_extents(&f, "embed_text_tokens"), vec![128_256, 2048]);
         // And a tied build would state its absence instead.
-        let tied = CsmFacts { tied_embeddings: true, ..f };
+        let tied = CsmFacts {
+            tied_embeddings: true,
+            ..f
+        };
         let row = manifest(&tied)
             .tensors
             .into_iter()
@@ -409,10 +463,19 @@ mod tests {
             ("backbone_model.layer.{}.mlp.down_proj", vec![2048, 8192]),
             ("backbone_model.norm", vec![2048]),
             ("depth_decoder.model.embed_tokens", vec![65_632, 2048]),
-            ("depth_decoder.model.inputs_embeds_projector", vec![1024, 2048]),
+            (
+                "depth_decoder.model.inputs_embeds_projector",
+                vec![1024, 2048],
+            ),
             ("depth_decoder.codebooks_head", vec![31, 1024, 2051]),
-            ("depth_decoder.model.layer.{}.self_attn.k_proj", vec![256, 1024]),
-            ("depth_decoder.model.layer.{}.mlp.down_proj", vec![1024, 8192]),
+            (
+                "depth_decoder.model.layer.{}.self_attn.k_proj",
+                vec![256, 1024],
+            ),
+            (
+                "depth_decoder.model.layer.{}.mlp.down_proj",
+                vec![1024, 8192],
+            ),
             (
                 "codec_model.quantizer.acoustic_residual_vector_quantizer.layer.{}.codebook.embed_sum",
                 vec![2048, 256],
@@ -421,9 +484,16 @@ mod tests {
                 "codec_model.quantizer.semantic_residual_vector_quantizer.input_proj",
                 vec![256, 512, 1],
             ),
-            ("codec_model.decoder_transformer.layer.{}.self_attn.q_proj", vec![512, 512]),
+            (
+                "codec_model.decoder_transformer.layer.{}.self_attn.q_proj",
+                vec![512, 512],
+            ),
         ] {
-            assert_eq!(spec_extents(&f, name), want, "{name} is not the extent the file ships");
+            assert_eq!(
+                spec_extents(&f, name),
+                want,
+                "{name} is not the extent the file ships"
+            );
         }
     }
 
@@ -445,7 +515,10 @@ mod tests {
         ] {
             let row = m.tensors.iter().find(|t| t.name == name).expect("named");
             assert_eq!(row.presence, Presence::Required);
-            assert!(row.extents.is_empty(), "{name} states an extent it cannot have");
+            assert!(
+                row.extents.is_empty(),
+                "{name} states an extent it cannot have"
+            );
         }
     }
 
@@ -473,7 +546,10 @@ mod tests {
         assert_eq!(err, Refusal::Unsupported(NO_DEPLOYMENT));
         let said = err.to_string();
         for named in ["depth decoder", "codec", "backbone"] {
-            assert!(said.contains(named), "the refusal does not name the {named}: {said}");
+            assert!(
+                said.contains(named),
+                "the refusal does not name the {named}: {said}"
+            );
         }
         assert!(
             said.contains("this build cannot serve it"),
@@ -492,8 +568,14 @@ mod tests {
         let err = trace(&CsmFacts::csm_1b()).expect_err("there is no text to trace");
         assert_eq!(err, Refusal::Unsupported(NO_TRACE));
         let said = err.to_string();
-        assert!(said.contains("csm/forward"), "the refusal must name the missing module: {said}");
-        assert!(said.contains("depth decoder"), "and both passes that are missing: {said}");
+        assert!(
+            said.contains("csm/forward"),
+            "the refusal must name the missing module: {said}"
+        );
+        assert!(
+            said.contains("depth decoder"),
+            "and both passes that are missing: {said}"
+        );
     }
 
     /// Both refusals are `Unsupported` and neither is `Malformed`.
@@ -523,11 +605,23 @@ mod tests {
         let s = CsmFacts::csm_synthetic();
         assert_eq!(spec_extents(&s, "embed_text_tokens"), vec![1000, 128]);
         assert_eq!(spec_extents(&s, "lm_head"), vec![1000, 128]);
-        assert_eq!(spec_extents(&s, "depth_decoder.model.embed_tokens"), vec![8 * 2048, 128]);
-        assert_eq!(spec_extents(&s, "depth_decoder.model.inputs_embeds_projector"), vec![64, 128]);
-        assert_eq!(spec_extents(&s, "depth_decoder.codebooks_head"), vec![7, 64, 2048]);
         assert_eq!(
-            spec_extents(&s, "codec_model.quantizer.acoustic_residual_vector_quantizer.layer.{}.codebook.embed_sum"),
+            spec_extents(&s, "depth_decoder.model.embed_tokens"),
+            vec![8 * 2048, 128]
+        );
+        assert_eq!(
+            spec_extents(&s, "depth_decoder.model.inputs_embeds_projector"),
+            vec![64, 128]
+        );
+        assert_eq!(
+            spec_extents(&s, "depth_decoder.codebooks_head"),
+            vec![7, 64, 2048]
+        );
+        assert_eq!(
+            spec_extents(
+                &s,
+                "codec_model.quantizer.acoustic_residual_vector_quantizer.layer.{}.codebook.embed_sum"
+            ),
             vec![1024, 32]
         );
     }

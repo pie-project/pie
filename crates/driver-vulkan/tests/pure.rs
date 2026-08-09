@@ -1,0 +1,298 @@
+//! Is this crate reachable without a C toolchain?
+//!
+//! `driver-vulkan` is meant to be pure Rust, and that is a property of the
+//! whole dependency closure rather than of this crate's own source. One
+//! `-sys` crate anywhere below it brings back everything the constraint exists
+//! to avoid: a C compiler on every build machine, a vendored library to keep
+//! current, a cross-compile that needs a sysroot, and a build that fails for
+//! reasons no Rust error message explains.
+//!
+//! It is easy to hold and easy to lose. Adding a dependency is one line, its
+//! own dependencies are not read, and nothing in a passing test suite would
+//! notice -- the machine that added it already had the toolchain. So this
+//! asks the resolver rather than trusting a reading of the manifests.
+//!
+//! # How the question is asked
+//!
+//! Three signals, because no single one is sufficient:
+//!
+//! * a `links` key, which is how a crate declares it owns a native library;
+//! * a build script among the closure's members, which is where C gets
+//!   compiled and is worth naming even when it is innocent;
+//! * a `-sys` suffix, which is a convention rather than a rule but catches
+//!   the ones that predate `links` being required.
+//!
+//! # Why Vulkan does not need one
+//!
+//! It would be reasonable to assume a GPU API needs a C library, and Vulkan
+//! is where that assumption is least true. `ash` is a pure-Rust binding whose
+//! `loaded` feature opens the loader with `libloading` at run time rather than
+//! linking it, so nothing is compiled and nothing is required at build time --
+//! a machine with no Vulkan at all still builds this crate, and only running
+//! it needs a driver. That is why `tests/device.rs` is behind a feature and
+//! the rest of the suite is not.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+/// The crate whose closure is under test.
+const ROOT: &str = "driver-vulkan";
+
+/// The crates a build script reaches for when it is going to compile or find
+/// a native library.
+///
+/// Not exhaustive and does not need to be: a crate that compiles C without any
+/// of these is doing it by hand, and it will still have declared `links` or be
+/// named `-sys`, both of which are checked separately.
+const COMPILES_C: &[&str] = &["cc", "cmake", "bindgen", "pkg-config", "autotools"];
+
+/// Every crate `driver-vulkan` needs to build, and none of them compiles C.
+///
+/// Dev-dependencies are excluded on purpose. They are what this suite needs
+/// to ASK its questions -- a real model to lower, a JSON parser to read the
+/// resolver's answer -- and none of them is linked into anything a user
+/// builds. The constraint is about what shipping this crate costs.
+#[test]
+fn nothing_this_crate_needs_to_build_compiles_c() {
+    let meta = metadata().expect("cargo resolved the workspace");
+    let packages = packages(&meta);
+    let closure = closure(&meta, &packages);
+
+    let mut suspect = Vec::new();
+    let mut declares_links = BTreeSet::new();
+    for id in &closure {
+        let Some(p) = packages.get(id) else { continue };
+        // Workspace members are held to the second claim below, not this one.
+        // Their build scripts are ours and are gated; a crates.io dependency's
+        // is not, and is the thing a careless `cargo add` brings in.
+        if p.workspace {
+            if p.links.is_some() || p.build_script {
+                declares_links.insert(p.name);
+            }
+            continue;
+        }
+        if let Some(links) = p.links {
+            suspect.push(format!("`{}` owns the native library `{links}`", p.name));
+        }
+        // NOT "has a build script". Six crates in this closure have one and
+        // none of them compiles anything -- `serde` and `proc-macro2` and
+        // friends use theirs to probe the compiler version. Treating a build
+        // script as the signal made this test fail on a closure that is
+        // entirely pure Rust, which would have taught the next reader to
+        // delete it. What a build script needs in order to compile C is one of
+        // these, so that is what is asked for instead.
+        for driver in &p.build_deps {
+            if COMPILES_C.contains(driver) {
+                suspect.push(format!("`{}` builds with `{driver}`", p.name));
+            }
+        }
+        if p.name.ends_with("-sys") {
+            suspect.push(format!("`{}` is a -sys crate by its name", p.name));
+        }
+    }
+
+    assert!(
+        suspect.is_empty(),
+        "{} of the {} crates `{ROOT}` needs would want a C toolchain:\n  {}",
+        suspect.len(),
+        closure.len(),
+        suspect.join("\n  ")
+    );
+
+    // The second claim, and the reason the first one is not the whole test.
+    //
+    // Five workspace crates do have build scripts, and three of them declare
+    // a native library -- which is exactly what a driver depending on
+    // `kernels-cuda` would need. `driver-vulkan` depends on all three and
+    // enables the feature on none, and each script does nothing without it.
+    //
+    // The evidence is not this list. It is that this suite RUNS on a machine
+    // with no CUDA and no Metal and no `glslc` in the default builds: if any
+    // of those scripts compiled anything, none of it would build here at all.
+    // The list is here so that a fourth appearing is a decision somebody makes
+    // rather than one that happens.
+    let want: BTreeSet<&str> = [
+        // Reads `DEP_PIE_KERNELS_VULKAN_SPV_DIR`. No compiler, no C.
+        "driver-vulkan",
+        // nvcc, behind `native`, which nothing here turns on.
+        "kernels-cuda",
+        // The Metal shader build, behind `native`, and macOS-only besides.
+        "kernels-metal",
+        // glslc over the shader tree, behind `native`. This crate depends on
+        // it with `default-features = false` precisely so a driver consumes
+        // modules rather than producing them.
+        "kernels-vulkan",
+        // Content-hashes its own `.rs` files to fingerprint the tracer. No
+        // compiler and no library -- it declares no `links` and appears here
+        // only because it has a script at all.
+        "model-compiler",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        declares_links, want,
+        "a different set of workspace crates in `{ROOT}`'s closure has a build \
+         script or a native library"
+    );
+
+    // A closure that came out empty would satisfy all of the above for the
+    // wrong reason, and so would one that had lost `ash` -- at which point the
+    // crate would be pure Rust by not talking to Vulkan at all.
+    assert!(
+        closure.iter().any(|id| packages[id].name == "ash"),
+        "the closure holds {} crates and `ash` is not among them, so this is \
+         not measuring a Vulkan driver",
+        closure.len()
+    );
+}
+
+/// What the resolver said about one package.
+struct Package<'a> {
+    name: &'a str,
+    /// The native library it declares ownership of, if any.
+    links: Option<&'a str>,
+    /// Does it have a `build.rs`?
+    build_script: bool,
+    /// What its build script depends on, by name.
+    build_deps: BTreeSet<&'a str>,
+    /// Is it one of this repository's own crates?
+    workspace: bool,
+}
+
+/// Ask cargo to resolve the workspace.
+///
+/// Every failure below here is loud. A check that cannot be made is not a
+/// check that passed, and this one spent its first run reporting success
+/// because the command it ran was rejected.
+fn metadata() -> Option<serde_json::Value> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let out = std::process::Command::new(cargo)
+        // No `--filter-platform`: unfiltered is every target, so a `-sys`
+        // crate that only appears on one is still reported here. Passing the
+        // flag with an empty value looks like it means that and does not --
+        // cargo exits with "target was empty", which the first version of this
+        // test turned into a silent skip. Adding a real `-sys` dependency then
+        // did not fail it, which is how the skip was found.
+        // `native` on, because `ash` is optional behind it and the closure
+        // without it is not the one anybody ships. The features that stay OFF
+        // are the ones that matter: this does not enable `native` on
+        // `kernels-vulkan`, `kernels-cuda` or `kernels-metal`, which is what
+        // keeps glslc and nvcc out of the answer. `--all-features` would turn
+        // all of those on and measure a build nothing performs.
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--features",
+            "native",
+            "--manifest-path",
+        ])
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+        .output()
+        .expect("cargo is what is running this test");
+    assert!(
+        out.status.success(),
+        "cargo metadata failed, so nothing below was checked: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(serde_json::from_slice(&out.stdout).expect("cargo metadata emits json"))
+}
+
+/// Every package the resolver knows, by id.
+fn packages(meta: &serde_json::Value) -> BTreeMap<&str, Package<'_>> {
+    let members: BTreeSet<&str> = meta["workspace_members"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    meta["packages"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| {
+            Some((
+                p["id"].as_str()?,
+                Package {
+                    name: p["name"].as_str()?,
+                    links: p["links"].as_str(),
+                    // `targets` names a `custom-build` kind when and only when
+                    // the package has a build script.
+                    build_script: p["targets"].as_array().is_some_and(|ts| {
+                        ts.iter().any(|t| {
+                            t["kind"]
+                                .as_array()
+                                .is_some_and(|ks| ks.iter().any(|k| k == "custom-build"))
+                        })
+                    }),
+                    // From the package's own manifest rather than the resolve
+                    // graph, because the graph collapses a build-dependency
+                    // into the same node and the kind is what matters here.
+                    build_deps: p["dependencies"]
+                        .as_array()
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
+                        .iter()
+                        .filter(|d| d["kind"].as_str() == Some("build"))
+                        .filter_map(|d| d["name"].as_str())
+                        .collect(),
+                    workspace: members.contains(p["id"].as_str()?),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Every package [`ROOT`] needs in order to build, by id.
+///
+/// Walked from the resolver's graph rather than read off manifests, because a
+/// manifest states its own dependencies and the question is about all of them.
+fn closure<'a>(
+    meta: &'a serde_json::Value,
+    packages: &BTreeMap<&'a str, Package<'a>>,
+) -> BTreeSet<&'a str> {
+    let nodes: BTreeMap<&str, &serde_json::Value> = meta["resolve"]["nodes"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|n| Some((n["id"].as_str()?, n)))
+        .collect();
+
+    let root = packages
+        .iter()
+        .find(|(_, p)| p.name == ROOT)
+        .map(|(id, _)| *id)
+        .expect("the crate under test is in its own workspace");
+
+    let mut seen = BTreeSet::new();
+    let mut queue = vec![root];
+    while let Some(id) = queue.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(node) = nodes.get(id) else { continue };
+        for dep in node["deps"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            // Dev and build kinds are dropped. A dev-dependency is not part of
+            // what shipping this crate costs, and a build-dependency of some
+            // OTHER crate is that crate's business -- what matters here is
+            // whether the crate itself runs a build script, which is checked
+            // per package above.
+            let normal = dep["dep_kinds"]
+                .as_array()
+                .is_some_and(|ks| ks.iter().any(|k| k["kind"].is_null()));
+            if !normal {
+                continue;
+            }
+            if let Some(next) = dep["pkg"].as_str() {
+                queue.push(next);
+            }
+        }
+    }
+    seen
+}

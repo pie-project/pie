@@ -58,7 +58,9 @@ pub fn tp_min_plan(
     }
 
     let shared = {
-        let mut reg = registry().lock().expect("planner rendezvous registry poisoned");
+        let mut reg = registry()
+            .lock()
+            .expect("planner rendezvous registry poisoned");
         Arc::clone(reg.entry(nccl_unique_id_hex.to_owned()).or_insert_with(|| {
             Arc::new(Rendezvous {
                 inner: Mutex::new(RendezvousState {
@@ -146,12 +148,18 @@ mod tests {
         let mut a = plan(32, 9000, 4096, 256);
         a.min_into(&plan(16, 4096, 4096, 256));
         assert_eq!(a.kv_page_size, 16);
-        assert_eq!(a.kv_page_bytes, 4096, "page bytes must follow the page size down");
+        assert_eq!(
+            a.kv_page_bytes, 4096,
+            "page bytes must follow the page size down"
+        );
 
         let mut b = plan(16, 4096, 4096, 256);
         b.min_into(&plan(32, 9000, 4096, 256));
         assert_eq!(b.kv_page_size, 16);
-        assert_eq!(b.kv_page_bytes, 4096, "a larger page must not raise the byte count");
+        assert_eq!(
+            b.kv_page_bytes, 4096,
+            "a larger page must not raise the byte count"
+        );
     }
 
     #[test]
@@ -163,8 +171,16 @@ mod tests {
 
     #[test]
     fn every_rank_leaves_the_rendezvous_with_the_same_plan() {
-        let key = format!("test-{}-{:?}", std::process::id(), std::thread::current().id());
-        let shapes = [(16, 4096, 8192, 512), (32, 9000, 4096, 256), (16, 5000, 16384, 1024)];
+        let key = format!(
+            "test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let shapes = [
+            (16, 4096, 8192, 512),
+            (32, 9000, 4096, 256),
+            (16, 5000, 16384, 1024),
+        ];
         let handles: Vec<_> = shapes
             .iter()
             .map(|&(pg, pb, n, r)| {
@@ -172,7 +188,10 @@ mod tests {
                 std::thread::spawn(move || tp_min_plan(3, &key, &plan(pg, pb, n, r)))
             })
             .collect();
-        let results: Vec<_> = handles.into_iter().map(|h| h.join().expect("rank")).collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("rank"))
+            .collect();
         assert!(
             results.windows(2).all(|w| w[0] == w[1]),
             "ranks disagreed, which deadlocks at the first collective"
@@ -186,4 +205,3 @@ mod tests {
         assert_eq!(got.attn_float_workspace_bytes, 16384 * 16);
     }
 }
-

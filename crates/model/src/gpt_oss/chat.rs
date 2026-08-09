@@ -3,10 +3,10 @@
 //! Uses channel-based formatting with analysis/final channels.
 //! Reasoning uses the `analysis` channel, not XML tags.
 
-use crate::shared::decoders::{GenericChatDecoder, NoopToolDecoder, ThinkingDecoder};
 use crate::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder};
-use tokenizer::Tokenizer;
+use crate::shared::decoders::{GenericChatDecoder, NoopToolDecoder, ThinkingDecoder};
 use std::sync::Arc;
+use tokenizer::Tokenizer;
 
 // The implementation below mirrors the published gpt-oss (Harmony) jinja
 // chat template; the verbatim copy that used to sit here as a static was
@@ -268,8 +268,8 @@ impl Instruct for GptOssInstruct {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokenizer::Tokenizer;
     use std::sync::Arc;
+    use tokenizer::Tokenizer;
 
     fn make_tok(vocab: &[&str]) -> Arc<Tokenizer> {
         let v: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();

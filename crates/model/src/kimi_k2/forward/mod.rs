@@ -23,8 +23,7 @@
 pub mod facts;
 
 use self::facts::{KimiCudaFacts, KimiFacts};
-use model_compiler::dsl::{
-    WeightRepr,self, matmul, MatW, NormW};
+use model_compiler::dsl::{self, MatW, NormW, WeightRepr, matmul};
 use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct KimiLayerW {
@@ -168,13 +167,12 @@ pub fn kimi_cuda(facts: &KimiFacts, cuda: &KimiCudaFacts, class: FireClass) -> F
             let _ = up;
             let act = dsl::cuda::swiglu(&gate, facts.moe.moe_intermediate, false);
             let act_fp16 = dsl::cuda::bf16_to_fp16(&act);
-            let route_out =
-                dsl::cuda::wna16_down_decode(
-                    &act_fp16,
-                    &experts,
-                    facts.hidden,
-                    &format!("layer.{l}.experts"),
-                );
+            let route_out = dsl::cuda::wna16_down_decode(
+                &act_fp16,
+                &experts,
+                facts.hidden,
+                &format!("layer.{l}.experts"),
+            );
             let routed = dsl::cuda::weighted_sum(&weights, &route_out, facts.hidden, None);
 
             let moe_out = if facts.moe.shared_intermediate > 0 {

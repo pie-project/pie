@@ -26,7 +26,7 @@
 pub mod facts;
 
 use self::facts::KimiK3Facts;
-use model_compiler::dsl::{self, matmul, MatW, NormW, WeightRepr};
+use model_compiler::dsl::{self, MatW, NormW, WeightRepr, matmul};
 use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct K3LayerW {
@@ -37,7 +37,6 @@ struct K3LayerW {
     q_a_norm: NormW,
     q_b_proj: MatW,
     kv_a_proj: MatW,
-    mla_g_proj: MatW,
     o_proj: MatW,
     // KDA
     kda_q: MatW,
@@ -83,7 +82,6 @@ impl K3LayerW {
             q_a_norm: n("q_a_norm"),
             q_b_proj: m("q_b_proj", a.q_b_width()),
             kv_a_proj: m("kv_a_proj_with_mqa", a.kv_a_width()),
-            mla_g_proj: m("mla_g_proj", a.v_width()),
             o_proj: m("o_proj", a.hidden),
             kda_q: m("kda_q_proj", k.width()),
             kda_k: m("kda_k_proj", k.width()),
@@ -191,6 +189,16 @@ pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
                 // model. gpt-oss's `attn.qv` sets the precedent: a
                 // binding a text cannot state honestly is refused, out
                 // loud, at the boundary.
+                //
+                // The WEIGHT for it is gone from `K3LayerW` too, and its
+                // removal is the same point one level down: it was never
+                // read — nothing below this assert could reach it — and
+                // it named `layer.{}.mla_g_proj`, which no checkpoint
+                // publishes. The manifest's gate is
+                // `layer.{}.self_attn.g_proj`. A bound name no arm reads
+                // and no publication carries is a claim that this text
+                // has a gate, standing directly above the refusal that
+                // says it does not.
                 assert!(
                     !a.output_gate,
                     "kimi_k3: `mla_output_gate` is not stated yet — the \

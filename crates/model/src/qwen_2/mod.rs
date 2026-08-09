@@ -32,9 +32,9 @@ pub mod chat;
 use std::sync::{Arc, OnceLock};
 
 use crate::catalog::{Deployed, LoadShape, Variant};
+use crate::manifest::Manifest;
 use crate::shared::llama_like::project;
 use crate::shared::llama_like::spec::LlamaLikeFacts;
-use crate::manifest::Manifest;
 
 use model_compiler::facts::{NormPlacement, QkNorm};
 use model_compiler::trace::{NormVariant, RopeKind};
@@ -306,6 +306,27 @@ pub fn rows() -> &'static [&'static dyn Variant] {
     ROWS.get_or_init(|| VARIANTS.iter().map(|v| v as &'static dyn Variant).collect())
 }
 
+impl Qwen2 {
+    /// The scalars this row states, read ONCE.
+    ///
+    /// Both [`Variant::deployment`] and [`Variant::trace`] take it. They
+    /// used to read `rope_theta`, `norm_eps` and `window` off `self`
+    /// separately — the same three fields, spelled twice, with nothing
+    /// holding the two spellings together.
+    fn row(&self) -> project::RowScalars {
+        project::RowScalars {
+            rope_theta: self.rope_theta,
+            norm_eps: self.norm_eps,
+            window: self.window,
+            rope_rescaled: false,
+            // TRUE, and unread: every qwen2 row here is DENSE, so no
+            // `router_topk` is stated. qwen2-MOE is the generation that
+            // ships it false, and it has no row in this catalog.
+            norm_topk_prob: true,
+        }
+    }
+}
+
 impl Variant for Qwen2 {
     fn id(&self) -> &'static str {
         self.id
@@ -318,7 +339,11 @@ impl Variant for Qwen2 {
     /// Dense throughout — the Qwen mixtures are `qwen_3`'s and their own
     /// generations', not this one's.
     fn load_shape(&self) -> LoadShape {
-        LoadShape::dense(self.shape.layers, self.shape.head_dim, self.shape.tied_embeddings)
+        LoadShape::dense(
+            self.shape.layers,
+            self.shape.head_dim,
+            self.shape.tied_embeddings,
+        )
     }
 
     fn deployment(
@@ -326,8 +351,7 @@ impl Variant for Qwen2 {
         load: Deployed<'_>,
     ) -> Result<crate::deployment::Deployment, crate::deployment::Refusal> {
         let _ = load;
-        let mut deployment =
-            project::deployment(&self.shape, self.rope_theta, self.norm_eps, self.window);
+        let mut deployment = project::deployment(&self.shape, self.row());
         deployment.advertised = crate::deployment::Advertised {
             arch: ARCH,
             max_model_len: MAX_MODEL_LEN,
@@ -348,12 +372,16 @@ impl Variant for Qwen2 {
         builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
         match builder.naming() {
-            crate::shared::policy::Naming::Hf => crate::shared::llama_like::contract::author_llama_like(builder),
+            crate::shared::policy::Naming::Hf => {
+                crate::shared::llama_like::contract::author_llama_like(builder)
+            }
             // The registry this replaced held an MLX row for `qwen2` and `qwen2_moe`,
             // and a row that states only the HF author hands Metal the
             // checkpoint's own names and its own dtype. See
             // `llama_3::mod`'s `author`.
-            crate::shared::policy::Naming::Mlx => crate::shared::llama_like::contract::author_llama_mlx(builder),
+            crate::shared::policy::Naming::Mlx => {
+                crate::shared::llama_like::contract::author_llama_mlx(builder)
+            }
         }
     }
 
@@ -378,17 +406,7 @@ impl Variant for Qwen2 {
         class: model_compiler::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
-        project::trace(
-            &self.shape,
-            project::MetalRow {
-                rope_theta: self.rope_theta,
-                norm_eps: self.norm_eps,
-                window: self.window,
-                rope_rescaled: false,
-            },
-            class,
-            load,
-        )
+        project::trace(&self.shape, self.row(), class, load)
     }
 
     /// ChatML with tools and WITHOUT thinking, which is why this names
@@ -423,7 +441,9 @@ mod tests {
     #[test]
     fn every_row_projects() {
         for v in VARIANTS {
-            let d = v.deployment(Deployed::single()).expect("dense qwen2 is servable");
+            let d = v
+                .deployment(Deployed::single())
+                .expect("dense qwen2 is servable");
             assert_eq!(d.layers, v.shape.layers);
             assert_eq!(d.attention.len() as u32, v.shape.layers);
             assert_eq!(d.shape.hidden, v.shape.hidden);
@@ -434,7 +454,10 @@ mod tests {
 
             let ls = v.load_shape();
             assert_eq!(ls.layers, v.shape.layers);
-            assert_eq!(ls.head_dim, v.shape.head_dim, "the TRUE head dim, never a padded one");
+            assert_eq!(
+                ls.head_dim, v.shape.head_dim,
+                "the TRUE head dim, never a padded one"
+            );
             assert_eq!(ls.tied_embeddings, v.shape.tied_embeddings);
             assert_eq!(ls.n_experts, 0);
             assert_eq!(ls.mamba_groups, 0);
@@ -477,14 +500,25 @@ mod tests {
     #[test]
     fn the_row_answers_what_the_driver_advertises() {
         for v in VARIANTS {
-            let a = v.deployment(Deployed::single()).expect("dense qwen2 deploys").advertised;
-            assert_eq!(a.arch, "qwen2", "{}: the family label a guest program sees", v.id);
+            let a = v
+                .deployment(Deployed::single())
+                .expect("dense qwen2 deploys")
+                .advertised;
+            assert_eq!(
+                a.arch, "qwen2",
+                "{}: the family label a guest program sees",
+                v.id
+            );
             assert_eq!(
                 a.max_model_len, 32_768,
                 "{}: every Qwen2.5 Instruct config states it, 0.5B through 72B",
                 v.id
             );
-            assert!(!a.media_encode, "{}: the VL releases are other checkpoints", v.id);
+            assert!(
+                !a.media_encode,
+                "{}: the VL releases are other checkpoints",
+                v.id
+            );
         }
     }
 
@@ -502,9 +536,16 @@ mod tests {
             .expect("the suffix the worker strips")
             .to_string();
         assert_eq!(stem, ARCH);
-        assert!(!ARCH.contains("2.5"), "the release rides in the id, not in the family label");
+        assert!(
+            !ARCH.contains("2.5"),
+            "the release rides in the id, not in the family label"
+        );
         for v in VARIANTS {
-            assert!(v.id.starts_with("qwen2.5-"), "{}: the id is where the release is", v.id);
+            assert!(
+                v.id.starts_with("qwen2.5-"),
+                "{}: the id is where the release is",
+                v.id
+            );
         }
     }
 
@@ -521,7 +562,12 @@ mod tests {
                 .iter()
                 .find(|t| t.name == "layer.{}.self_attn.q_proj.bias")
                 .unwrap_or_else(|| panic!("{} requires the bias it ships", v.id));
-            assert_eq!(bias.presence, crate::manifest::Presence::Required, "{}", v.id);
+            assert_eq!(
+                bias.presence,
+                crate::manifest::Presence::Required,
+                "{}",
+                v.id
+            );
             assert_eq!(bias.extents, vec![u64::from(v.shape.q_width())], "{}", v.id);
         }
     }
@@ -558,15 +604,27 @@ mod tests {
             assert_eq!(v.shape.vocab, vocab, "{id}");
 
             let m = v.manifest();
-            let head = m.tensors.iter().find(|t| t.name == "lm_head").expect("stated either way");
+            let head = m
+                .tensors
+                .iter()
+                .find(|t| t.name == "lm_head")
+                .expect("stated either way");
             let want = if tied {
                 crate::manifest::Presence::Absent
             } else {
                 crate::manifest::Presence::Required
             };
             assert_eq!(head.presence, want, "{id}");
-            let embed = m.tensors.iter().find(|t| t.name == "embed_tokens").expect("stated");
-            assert_eq!(embed.extents, vec![u64::from(vocab), u64::from(v.shape.hidden)], "{id}");
+            let embed = m
+                .tensors
+                .iter()
+                .find(|t| t.name == "embed_tokens")
+                .expect("stated");
+            assert_eq!(
+                embed.extents,
+                vec![u64::from(vocab), u64::from(v.shape.hidden)],
+                "{id}"
+            );
         }
     }
 
@@ -583,7 +641,12 @@ mod tests {
                 .iter()
                 .find(|t| t.name == "layer.{}.self_attn.q_norm")
                 .expect("stated as an absence");
-            assert_eq!(q_norm.presence, crate::manifest::Presence::Absent, "{}", v.id);
+            assert_eq!(
+                q_norm.presence,
+                crate::manifest::Presence::Absent,
+                "{}",
+                v.id
+            );
         }
     }
 
@@ -616,7 +679,10 @@ mod tests {
         let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let inst = row("qwen2.5-7b").chat(tok.clone());
-        assert_eq!(tok.decode(&inst.user("Hi"), false), "<|im_start|>user\nHi<|im_end|>\n");
+        assert_eq!(
+            tok.decode(&inst.user("Hi"), false),
+            "<|im_start|>user\nHi<|im_end|>\n"
+        );
         assert_eq!(tok.decode(&inst.cue(), false), "<|im_start|>assistant\n");
 
         let replayed = tok.decode(&inst.assistant("<think>Hi</think>Bye"), false);
@@ -651,7 +717,10 @@ mod tests {
         use model_loader::checkpoint::CheckpointMetadata;
         use model_loader::plan::StorageTarget;
 
-        let metadata = CheckpointMetadata { files: Vec::new(), tensors: Vec::new() };
+        let metadata = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: Vec::new(),
+        };
         let encoding = crate::encoding::Encoding::dense();
         let target = StorageTarget::default();
         let policy = crate::shared::policy::Policy::default();
@@ -665,7 +734,8 @@ mod tests {
                 &target,
                 &policy,
             );
-            v.author(&mut builder).unwrap_or_else(|e| panic!("{} refused to author: {e:?}", v.id));
+            v.author(&mut builder)
+                .unwrap_or_else(|e| panic!("{} refused to author: {e:?}", v.id));
         }
     }
 
@@ -676,8 +746,15 @@ mod tests {
 
         for v in VARIANTS {
             for class in [FireClass::Decode, FireClass::Prefill] {
-                let plan = v.trace(class, Deployed::single()).expect("llama-like traces");
-                assert!(plan.family.contains("llama_like"), "{}: {}", v.id, plan.family);
+                let plan = v
+                    .trace(class, Deployed::single())
+                    .expect("llama-like traces");
+                assert!(
+                    plan.family.contains("llama_like"),
+                    "{}: {}",
+                    v.id,
+                    plan.family
+                );
                 assert!(!plan.ops.is_empty(), "{}", v.id);
             }
         }

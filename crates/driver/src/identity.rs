@@ -451,7 +451,7 @@ mod tests {
         assert_ne!(
             cache_identity(Backend::Cuda, 0, 0, Versions::mirrored(41)),
             cache_identity(Backend::Cuda, 0, 0, Versions::mirrored(42)),
-            "a host-side emitter bump must miss the cache, which is the whole              reason the number crosses the ABI instead of being written here"
+            "a host-side emitter bump must miss the cache, which is the whole reason the number crosses the ABI instead of being written here"
         );
     }
 

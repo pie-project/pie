@@ -171,7 +171,11 @@ pub fn cache_path(configured_dir: &str, env: impl Fn(&str) -> Option<String>) ->
     }
     // An empty string counts as unset, matching the C++'s `xdg[0] != '\0'`.
     if let Some(xdg) = env("XDG_CACHE_HOME").filter(|s| !s.is_empty()) {
-        return Some(Path::new(&xdg).join("pie").join("cuda_memory_profiles.json"));
+        return Some(
+            Path::new(&xdg)
+                .join("pie")
+                .join("cuda_memory_profiles.json"),
+        );
     }
     if let Some(home) = env("HOME").filter(|s| !s.is_empty()) {
         return Some(
@@ -592,7 +596,9 @@ fn read_shape(plan: &Map<String, Value>) -> Result<ProfileShape, String> {
                     clippy::cast_possible_truncation,
                     reason = "deliberately mirrors nlohmann's narrowing static_cast"
                 )]
-                let wide = n.as_i64().unwrap_or_else(|| n.as_f64().unwrap_or(0.0) as i64);
+                let wide = n
+                    .as_i64()
+                    .unwrap_or_else(|| n.as_f64().unwrap_or(0.0) as i64);
                 #[expect(
                     clippy::cast_possible_truncation,
                     reason = "deliberately mirrors nlohmann's narrowing static_cast"

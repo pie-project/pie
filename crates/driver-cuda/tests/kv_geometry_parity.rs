@@ -92,7 +92,11 @@ const P_HDIMS: [u32; 3] = [16, 128, 576];
 /// echoing them whole would multiply the transcript without adding coverage.
 /// Length and sum still catch a port that builds different inputs.
 fn vec_fp(v: &[u32]) -> String {
-    format!("{}:{}", v.len(), v.iter().map(|&x| u64::from(x)).sum::<u64>())
+    format!(
+        "{}:{}",
+        v.len(),
+        v.iter().map(|&x| u64::from(x)).sum::<u64>()
+    )
 }
 
 /// The six shape patterns, built exactly as the oracle builds them.
@@ -105,13 +109,25 @@ fn pattern(p: u32, layers: u32, head_dim: u32, kv_heads: u32) -> (Vec<u32>, Vec<
     let mut pkv = Vec::new();
     let mut src = Vec::new();
     if matches!(p, 1 | 4 | 5) {
-        phd = (0..layers).map(|i| if i % 2 == 1 { head_dim } else { (head_dim / 2).max(1) }).collect();
+        phd = (0..layers)
+            .map(|i| {
+                if i % 2 == 1 {
+                    head_dim
+                } else {
+                    (head_dim / 2).max(1)
+                }
+            })
+            .collect();
     }
     if matches!(p, 2 | 4 | 5) {
-        pkv = (0..layers).map(|i| if i % 4 == 0 { kv_heads * 4 } else { kv_heads }).collect();
+        pkv = (0..layers)
+            .map(|i| if i % 4 == 0 { kv_heads * 4 } else { kv_heads })
+            .collect();
     }
     if matches!(p, 3 | 5) {
-        src = (0..layers).map(|i| if i % 2 == 1 { i - 1 } else { i }).collect();
+        src = (0..layers)
+            .map(|i| if i % 2 == 1 { i - 1 } else { i })
+            .collect();
     }
     (phd, pkv, src)
 }
@@ -212,9 +228,19 @@ fn rust_geometry_is_byte_identical_to_the_cpp_original() {
 fn the_grid_still_covers_what_it_claims_to() {
     let out = render();
     assert_eq!(out.lines().count(), GOLDEN_ROWS);
-    let count = |k: &str| out.lines().filter(|l| l.starts_with(&format!("{k}\t"))).count();
-    assert_eq!(count("PAGE"), NAMES.len() * PAGES.len() * HEADS.len() * DIMS.len());
-    assert_eq!(count("HOMO"), NAMES.len() * TPS.len() * LAYERS.len() * HEADS.len() * HDIMS.len());
+    let count = |k: &str| {
+        out.lines()
+            .filter(|l| l.starts_with(&format!("{k}\t")))
+            .count()
+    };
+    assert_eq!(
+        count("PAGE"),
+        NAMES.len() * PAGES.len() * HEADS.len() * DIMS.len()
+    );
+    assert_eq!(
+        count("HOMO"),
+        NAMES.len() * TPS.len() * LAYERS.len() * HEADS.len() * HDIMS.len()
+    );
     assert_eq!(
         count("PERLAYER"),
         NAMES.len() * P_TPS.len() * P_LAYERS.len() * P_HEADS.len() * P_HDIMS.len() * 6
@@ -228,10 +254,17 @@ fn the_grid_still_covers_what_it_claims_to() {
 fn the_sweep_actually_distinguishes_formats_and_shapes() {
     let out = render();
     let page: Vec<&str> = out.lines().filter(|l| l.starts_with("PAGE\t")).collect();
-    let mut sizes: Vec<&str> = page.iter().map(|l| l.rsplit('\t').next().unwrap()).collect();
+    let mut sizes: Vec<&str> = page
+        .iter()
+        .map(|l| l.rsplit('\t').next().unwrap())
+        .collect();
     sizes.sort_unstable();
     sizes.dedup();
-    assert!(sizes.len() > 200, "PAGE is nearly constant across the sweep ({})", sizes.len());
+    assert!(
+        sizes.len() > 200,
+        "PAGE is nearly constant across the sweep ({})",
+        sizes.len()
+    );
 
     // A quantised format must not cost the same as bf16 at the same shape.
     let at = |n: &str| -> &str {
@@ -255,7 +288,11 @@ fn the_sweep_actually_distinguishes_formats_and_shapes() {
     per.sort_unstable();
     per.dedup();
     assert_eq!(total, 6);
-    assert!(per.len() >= 5, "the shape patterns are not being distinguished ({})", per.len());
+    assert!(
+        per.len() >= 5,
+        "the shape patterns are not being distinguished ({})",
+        per.len()
+    );
 }
 
 /// Ignored by default; run with `--ignored --nocapture` to regenerate the Rust

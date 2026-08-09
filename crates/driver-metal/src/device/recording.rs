@@ -41,9 +41,9 @@ use objc2_metal::{
     MTLResidencySet, MTLResourceOptions, MTLSize,
 };
 
-use crate::error::{Error, Result};
 use crate::device::context::Context;
 use crate::device::regions::Regions;
+use crate::error::{Error, Result};
 
 /// One address bound to one kernel slot.
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
@@ -143,11 +143,7 @@ const FOUR_GIB: u64 = 1 << 32;
 /// or whose operand address falls in no registered allocation. Each is drift
 /// between the plan and what the caller set up, and each would otherwise be a
 /// command reading somebody else's bytes.
-pub fn record(
-    context: &Context,
-    regions: &Regions,
-    commands: &[Command<'_>],
-) -> Result<Recording> {
+pub fn record(context: &Context, regions: &Regions, commands: &[Command<'_>]) -> Result<Recording> {
     // The INDEX SPACE, not the count. `maxKernelBufferBindCount` bounds the
     // largest `[[buffer(n)]]` a recorded command may address, and a bind past
     // it is not an error -- Metal drops it and the kernel reads address zero.

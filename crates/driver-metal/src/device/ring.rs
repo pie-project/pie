@@ -48,12 +48,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use tensor_ir::DType;
 
+use crate::Result;
+use crate::channel::{Words, wire_cell_bytes};
 use crate::device::allocation::Allocation;
 use crate::device::context::Context;
 use crate::device::handle::Handle;
-use crate::channel::{Words, wire_cell_bytes};
 use crate::layout::region::Region;
-use crate::Result;
 
 /// Index of the head word in the words buffer.
 const HEAD: usize = 0;

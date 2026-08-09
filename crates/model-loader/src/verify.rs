@@ -12,9 +12,9 @@
 //! covered count against a demanded one, which was `if (x != x)` twice over:
 //! first because both were assigned from `view.tensors.len`, and then, once the
 //! contract gave them separate origins, because `check_contract` below throws
-//! on the only way they could differ. A driver that calls `verify` has already
-//! been told; counting again on the far side of the FFI only looked like a
-//! check.
+//! on the only way they could differ. Counting again on the far side of a
+//! boundary only looked like a check, and there is no far side now — that
+//! driver was deleted, and its callers call this.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -23,11 +23,13 @@ use crate::types::{Encoding, Visibility};
 
 /// The plan, reduced to what verification can read.
 ///
-/// Both callers build one: the CLI from a Rust [`LoadPlan`](crate::plan::LoadPlan), and the FFI
-/// boundary from the `PieLoaderPlan` the C++ driver is holding. The FFI case is
-/// the one that matters — verifying the *marshalled* view means a bug in the
-/// marshalling is in scope, which it would not be if verification re-read the
-/// Rust plan the driver never sees.
+/// A view rather than the [`LoadPlan`](crate::plan::LoadPlan) itself, because
+/// verification must be able to read a plan it did not build: `view_of` makes
+/// one from a compiled plan, and the same struct is what a stored dump or a
+/// plan that crossed a process boundary reduces to. Verifying the reduced form
+/// keeps the reduction in scope — a bug that loses a tensor on the way through
+/// is a bug this catches, which it would not be if verification re-read the
+/// full plan beside it.
 pub struct PlanView<'a> {
     pub compiler_version: u64,
     pub files: Vec<FileView<'a>>,
@@ -503,8 +505,10 @@ fn encoding_matches(planned: &Encoding, demanded: &Encoding) -> bool {
     }
 }
 
-// The verifier's tests live in `capi/tests/verify_marshalled.rs`: every one
-// checks the verdict through the marshalled view, which is the ABI crate's.
+// The verifier's tests live in `tests/golden_plans.rs` and `tests/groups.rs`,
+// which check the verdict on the plan itself. They used to check it through a
+// marshalled POD view instead, because that was the only form a C++ caller
+// could see; verifying the plan directly became possible when the caller left.
 
 /// The verification view of a compiled plan, read straight off it.
 ///
@@ -607,7 +611,7 @@ pub fn view_of(plan: &crate::plan::LoadPlan) -> PlanView<'_> {
 /// instance stays inside its file", and it reuses the check rather than
 /// restating it.
 ///
-/// Ported from `model-loader-capi`'s `verify_marshalled`, which is where this
+/// Ported from the deleted ABI crate's verify_marshalled, which is where this
 /// lived while a plan had to cross a C boundary to be verified.
 ///
 /// # Errors
@@ -640,8 +644,7 @@ fn verify_group(group: &crate::plan::GroupPlan, found: &mut Vec<Violation>) {
         return;
     }
     let per = template.reads.len();
-    if group.bindings.len() != group.arity as usize
-        || group.bindings.iter().any(|b| b.len() != per)
+    if group.bindings.len() != group.arity as usize || group.bindings.iter().any(|b| b.len() != per)
     {
         found.push(Violation::plan(format!(
             "group '{name}': {} binding sets for {} instances of a plan with {per} reads",

@@ -187,7 +187,10 @@ impl RecurrentStateLayout {
     /// The dense index of a layer among the linear ones.
     #[must_use]
     pub fn linear_index(&self, layer: u32) -> Option<u32> {
-        self.linear_layer_index.get(layer as usize).copied().flatten()
+        self.linear_layer_index
+            .get(layer as usize)
+            .copied()
+            .flatten()
     }
 
     /// Bytes between consecutive slots of `conv_state`. Always `u16`.
@@ -258,12 +261,19 @@ impl RecurrentStateLayout {
     /// If `slot` is out of range.
     #[must_use]
     pub fn mtp_pending_hidden(&self, slot: u32) -> Option<SlotAddr> {
-        assert!(slot < self.max_slots, "slot {slot} of {} slots", self.max_slots);
+        assert!(
+            slot < self.max_slots,
+            "slot {slot} of {} slots",
+            self.max_slots
+        );
         if self.hidden_size == 0 {
             return None;
         }
         let stride = u64::from(self.hidden_size) * 2;
-        Some(SlotAddr { offset: u64::from(slot) * stride, len: stride })
+        Some(SlotAddr {
+            offset: u64::from(slot) * stride,
+            len: stride,
+        })
     }
 
     /// Total bytes of the pooled `conv_state` allocation.
@@ -302,7 +312,11 @@ impl RecurrentStateLayout {
     /// Bounds-check, then resolve. Panics where the C++ throws; returns
     /// `None` only where the C++ returns `nullptr`.
     fn checked_index(&self, layer: u32, slot: u32) -> Option<u32> {
-        assert!(slot < self.max_slots, "slot {slot} of {} slots", self.max_slots);
+        assert!(
+            slot < self.max_slots,
+            "slot {slot} of {} slots",
+            self.max_slots
+        );
         assert!(
             (layer as usize) < self.linear_layer_index.len(),
             "layer {layer} of {} layers",
@@ -320,7 +334,19 @@ mod tests {
     /// number disagree everywhere they can.
     fn hybrid() -> RecurrentStateLayout {
         let linear = [true, false, false, true, false, false, false, true];
-        RecurrentStateLayout::new(&linear, RecurrentShape { conv_dim: 4096, conv_kernel: 4, v_heads: 32, head_k_dim: 128, head_v_dim: 128, hidden_size: 2048, max_slots: 16, recurrent_is_bf16: false })
+        RecurrentStateLayout::new(
+            &linear,
+            RecurrentShape {
+                conv_dim: 4096,
+                conv_kernel: 4,
+                v_heads: 32,
+                head_k_dim: 128,
+                head_v_dim: 128,
+                hidden_size: 2048,
+                max_slots: 16,
+                recurrent_is_bf16: false,
+            },
+        )
     }
 
     #[test]
@@ -352,10 +378,16 @@ mod tests {
         for layer in 0..l.num_layers() {
             for slot in 0..l.max_slots() {
                 if let Some(a) = l.conv_state(layer, slot) {
-                    assert!(a.offset + a.len <= l.conv_total_bytes(), "conv {layer}/{slot}");
+                    assert!(
+                        a.offset + a.len <= l.conv_total_bytes(),
+                        "conv {layer}/{slot}"
+                    );
                 }
                 if let Some(a) = l.recurrent_state(layer, slot) {
-                    assert!(a.offset + a.len <= l.recurrent_total_bytes(), "rec {layer}/{slot}");
+                    assert!(
+                        a.offset + a.len <= l.recurrent_total_bytes(),
+                        "rec {layer}/{slot}"
+                    );
                 }
             }
         }
@@ -382,17 +414,47 @@ mod tests {
     #[test]
     fn the_recurrent_stride_follows_the_dtype_switch() {
         let linear = [true, true];
-        let f32_layout = RecurrentStateLayout::new(&linear, RecurrentShape { conv_dim: 4096, conv_kernel: 4, v_heads: 32, head_k_dim: 128, head_v_dim: 128, hidden_size: 0, max_slots: 4, recurrent_is_bf16: false });
-        let bf16_layout = RecurrentStateLayout::new(&linear, RecurrentShape { conv_dim: 4096, conv_kernel: 4, v_heads: 32, head_k_dim: 128, head_v_dim: 128, hidden_size: 0, max_slots: 4, recurrent_is_bf16: true });
+        let f32_layout = RecurrentStateLayout::new(
+            &linear,
+            RecurrentShape {
+                conv_dim: 4096,
+                conv_kernel: 4,
+                v_heads: 32,
+                head_k_dim: 128,
+                head_v_dim: 128,
+                hidden_size: 0,
+                max_slots: 4,
+                recurrent_is_bf16: false,
+            },
+        );
+        let bf16_layout = RecurrentStateLayout::new(
+            &linear,
+            RecurrentShape {
+                conv_dim: 4096,
+                conv_kernel: 4,
+                v_heads: 32,
+                head_k_dim: 128,
+                head_v_dim: 128,
+                hidden_size: 0,
+                max_slots: 4,
+                recurrent_is_bf16: true,
+            },
+        );
         assert_eq!(f32_layout.recurrent_slot_stride_bytes(), 32 * 128 * 128 * 4);
-        assert_eq!(bf16_layout.recurrent_slot_stride_bytes(), 32 * 128 * 128 * 2);
+        assert_eq!(
+            bf16_layout.recurrent_slot_stride_bytes(),
+            32 * 128 * 128 * 2
+        );
         assert_eq!(
             f32_layout.recurrent_slot_stride_elems(),
             bf16_layout.recurrent_slot_stride_elems(),
             "the element count is the same either way; only the width moves"
         );
         // The conv state is u16 regardless, so it must not follow the switch.
-        assert_eq!(f32_layout.conv_slot_stride_bytes(), bf16_layout.conv_slot_stride_bytes());
+        assert_eq!(
+            f32_layout.conv_slot_stride_bytes(),
+            bf16_layout.conv_slot_stride_bytes()
+        );
     }
 
     #[test]
@@ -422,14 +484,38 @@ mod tests {
 
     #[test]
     fn max_slots_of_zero_is_treated_as_one() {
-        let l = RecurrentStateLayout::new(&[true], RecurrentShape { conv_dim: 8, conv_kernel: 4, v_heads: 1, head_k_dim: 8, head_v_dim: 8, hidden_size: 16, max_slots: 0, recurrent_is_bf16: false });
+        let l = RecurrentStateLayout::new(
+            &[true],
+            RecurrentShape {
+                conv_dim: 8,
+                conv_kernel: 4,
+                v_heads: 1,
+                head_k_dim: 8,
+                head_v_dim: 8,
+                hidden_size: 16,
+                max_slots: 0,
+                recurrent_is_bf16: false,
+            },
+        );
         assert_eq!(l.max_slots(), 1);
         assert!(l.conv_state(0, 0).is_some());
     }
 
     #[test]
     fn a_model_with_no_hidden_state_has_no_mtp_pool() {
-        let l = RecurrentStateLayout::new(&[true], RecurrentShape { conv_dim: 8, conv_kernel: 4, v_heads: 1, head_k_dim: 8, head_v_dim: 8, hidden_size: 0, max_slots: 4, recurrent_is_bf16: false });
+        let l = RecurrentStateLayout::new(
+            &[true],
+            RecurrentShape {
+                conv_dim: 8,
+                conv_kernel: 4,
+                v_heads: 1,
+                head_k_dim: 8,
+                head_v_dim: 8,
+                hidden_size: 0,
+                max_slots: 4,
+                recurrent_is_bf16: false,
+            },
+        );
         assert_eq!(l.mtp_pending_hidden(0), None);
         assert_eq!(l.mtp_total_bytes(), 0);
     }
@@ -460,6 +546,9 @@ mod tests {
     #[test]
     fn totals_are_the_per_slot_cost_times_the_slot_count() {
         let l = hybrid();
-        assert_eq!(l.total_bytes(), l.bytes_per_slot() * u64::from(l.max_slots()));
+        assert_eq!(
+            l.total_bytes(),
+            l.bytes_per_slot() * u64::from(l.max_slots())
+        );
     }
 }

@@ -464,7 +464,11 @@ impl FirePageMask {
         let Some(sink) = self.sink.as_mut() else {
             return;
         };
-        ops.memset_async(sink.keep, 1, sink.num_requests as usize * sink.stride as usize);
+        ops.memset_async(
+            sink.keep,
+            1,
+            sink.num_requests as usize * sink.stride as usize,
+        );
         sink.written_layer = None;
     }
 
@@ -716,15 +720,15 @@ mod tests {
             vec![0, 8, 16, 24, 32],
             vec![0, 3, 3, 40, 41, 97],
             vec![0, 0, 7],
-            vec![0, 2, 5, 5, 9, 14, 20, 27, 35, 44, 54, 65, 77, 90, 104, 119, 135],
+            vec![
+                0, 2, 5, 5, 9, 14, 20, 27, 35, 44, 54, 65, 77, 90, 104, 119, 135,
+            ],
         ] {
             let mut mem = Slab::new();
             let mut arena = SidebandArena::new();
-            let plan =
-                prepare_page_mask_capture(&mut arena, &mut mem, geometry(&csr)).unwrap();
+            let plan = prepare_page_mask_capture(&mut arena, &mut mem, geometry(&csr)).unwrap();
             let mut mask =
-                FirePageMask::new(true, Some(geometry(&csr)), Some(&mut arena), &mut mem)
-                    .unwrap();
+                FirePageMask::new(true, Some(geometry(&csr)), Some(&mut arena), &mut mem).unwrap();
             let sink = mask.sink().unwrap();
             assert_eq!(plan.keep, sink.keep, "keep moved for {csr:?}");
             assert_eq!(plan.num_requests, sink.num_requests);
@@ -744,8 +748,7 @@ mod tests {
         let mut arena = SidebandArena::new();
         let mut ops = Ops::default();
         let mut mask =
-            FirePageMask::new(true, Some(geometry(&csr)), Some(&mut arena), &mut mem)
-                .unwrap();
+            FirePageMask::new(true, Some(geometry(&csr)), Some(&mut arena), &mut mem).unwrap();
 
         mask.begin_layer(&mut ops);
         let sink = mask.sink().unwrap();
@@ -772,8 +775,7 @@ mod tests {
         let mut arena = SidebandArena::new();
         let mut ops = Ops::default();
         let mut mask =
-            FirePageMask::new(true, Some(geometry(&csr)), Some(&mut arena), &mut mem)
-                .unwrap();
+            FirePageMask::new(true, Some(geometry(&csr)), Some(&mut arena), &mut mem).unwrap();
 
         mask.begin_layer(&mut ops);
         mask.sink().unwrap().written_layer = Some(1);
@@ -781,13 +783,25 @@ mod tests {
             assert_eq!(mask.written_for(layer), layer == 1);
         }
 
-        mask.compact(&mut ops, core::ptr::null(), core::ptr::null(), core::ptr::null(), 2)
-            .unwrap();
+        mask.compact(
+            &mut ops,
+            core::ptr::null(),
+            core::ptr::null(),
+            core::ptr::null(),
+            2,
+        )
+        .unwrap();
         assert_eq!(ops.compactions, 1);
         assert_eq!(ops.last_stride, 8);
 
         assert_eq!(
-            mask.compact(&mut ops, core::ptr::null(), core::ptr::null(), core::ptr::null(), 3),
+            mask.compact(
+                &mut ops,
+                core::ptr::null(),
+                core::ptr::null(),
+                core::ptr::null(),
+                3
+            ),
             Err(MaskError::RequestCountMismatch),
             "a request-count disagreement must refuse, not launch"
         );
@@ -806,8 +820,14 @@ mod tests {
         assert!(!mask.active());
         assert!(mask.sink().is_none());
         mask.begin_layer(&mut ops);
-        mask.compact(&mut ops, core::ptr::null(), core::ptr::null(), core::ptr::null(), 99)
-            .unwrap();
+        mask.compact(
+            &mut ops,
+            core::ptr::null(),
+            core::ptr::null(),
+            core::ptr::null(),
+            99,
+        )
+        .unwrap();
         assert!(mask.page_indices().is_null());
         assert!(!mask.written_for(0));
         assert_eq!(ops.memsets.len(), 0);
@@ -842,13 +862,8 @@ mod tests {
         let widest = vec![0u32, 8000, 16000, 24000];
         let mut base = None;
 
-        let mut warm = FirePageMask::new(
-            true,
-            Some(geometry(&widest)),
-            Some(&mut arena),
-            &mut mem,
-        )
-        .unwrap();
+        let mut warm =
+            FirePageMask::new(true, Some(geometry(&widest)), Some(&mut arena), &mut mem).unwrap();
         base = base.or_else(|| Some(warm.page_indices()));
         warm.release(&mut arena);
         let allocs_after_warm = mem.allocs;
@@ -861,8 +876,7 @@ mod tests {
             widest.clone(),
         ] {
             let mut mask =
-                FirePageMask::new(true, Some(geometry(&csr)), Some(&mut arena), &mut mem)
-                    .unwrap();
+                FirePageMask::new(true, Some(geometry(&csr)), Some(&mut arena), &mut mem).unwrap();
             assert_eq!(mask.page_indices(), base.unwrap(), "the carve moved");
             mask.release(&mut arena);
             assert!(!mask.still_holds_slot());
@@ -880,19 +894,16 @@ mod tests {
         let mut mem = Slab::new();
         let mut arena = SidebandArena::new();
         let mut first =
-            FirePageMask::new(true, Some(geometry(&csr)), Some(&mut arena), &mut mem)
-                .unwrap();
+            FirePageMask::new(true, Some(geometry(&csr)), Some(&mut arena), &mut mem).unwrap();
         assert!(first.still_holds_slot());
         assert_eq!(
-            FirePageMask::new(true, Some(geometry(&csr)), Some(&mut arena), &mut mem)
-                .unwrap_err(),
+            FirePageMask::new(true, Some(geometry(&csr)), Some(&mut arena), &mut mem).unwrap_err(),
             MaskError::ArenaRefused(Refusal::Busy),
             "an overlapping fire must be refused, not handed the same buffers"
         );
         first.release(&mut arena);
         let mut second =
-            FirePageMask::new(true, Some(geometry(&csr)), Some(&mut arena), &mut mem)
-                .unwrap();
+            FirePageMask::new(true, Some(geometry(&csr)), Some(&mut arena), &mut mem).unwrap();
         second.release(&mut arena);
         arena.destroy(&mut mem);
     }
@@ -1127,8 +1138,13 @@ pub mod element_mask {
         #[test]
         fn each_query_row_brings_its_own_mask() {
             let p = from_words(
-                &[0, 2], &[0, 1], &[3], 16,
-                &[0, 2], &[0, 1, 2], &[0b001, 0b011],
+                &[0, 2],
+                &[0, 1],
+                &[3],
+                16,
+                &[0, 2],
+                &[0, 1, 2],
+                &[0b001, 0b011],
             )
             .expect("decoded");
             assert_eq!(p.mask, vec![1, 0, 0, 1, 1, 0]);

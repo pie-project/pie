@@ -37,7 +37,8 @@ pub fn device_bytes_per_page(
 ) -> u64 {
     let mut bytes = format.total_bytes_per_page(page_size, num_kv_heads, head_dim);
     if !format.is_native_bf16() {
-        bytes += 2 * u64::from(page_size)
+        bytes += 2
+            * u64::from(page_size)
             * u64::from(num_kv_heads)
             * u64::from(head_dim)
             * DType::Bf16.size_bytes() as u64;
@@ -139,7 +140,11 @@ pub fn page_bytes_per_layer(
         if !owns {
             continue;
         }
-        let hd = if shapes.head_dim.is_empty() { head_dim_kernel } else { shapes.head_dim[i] };
+        let hd = if shapes.head_dim.is_empty() {
+            head_dim_kernel
+        } else {
+            shapes.head_dim[i]
+        };
         let kv_heads = if shapes.num_kv_heads.is_empty() {
             uniform_kv_heads
         } else {
@@ -177,7 +182,11 @@ mod tests {
         let f = fmt("fp8_e4m3");
         assert!(!f.is_native_bf16());
         let scratch = device_bytes_per_page(&f, 16, 8, 128) - f.total_bytes_per_page(16, 8, 128);
-        assert_eq!(scratch, 2 * 16 * 8 * 128 * 2, "K and V, at 2 bytes per element");
+        assert_eq!(
+            scratch,
+            2 * 16 * 8 * 128 * 2,
+            "K and V, at 2 bytes per element"
+        );
     }
 
     #[test]
@@ -205,9 +214,15 @@ mod tests {
         let f = fmt("bf16");
         // 3 heads across 2 ranks is 1 per rank, not 2. Truncation matches the
         // C++; a `div_ceil` here would over-reserve on every ragged model.
-        assert_eq!(page_bytes_homogeneous(1, 3, 128, 2, &f), device_bytes_per_page(&f, 1, 1, 128));
+        assert_eq!(
+            page_bytes_homogeneous(1, 3, 128, 2, &f),
+            device_bytes_per_page(&f, 1, 1, 128)
+        );
         // Sharded past the head count, a rank holds nothing.
-        assert_eq!(page_bytes_homogeneous(1, 4, 128, 8, &f), device_bytes_per_page(&f, 1, 0, 128));
+        assert_eq!(
+            page_bytes_homogeneous(1, 4, 128, 8, &f),
+            device_bytes_per_page(&f, 1, 0, 128)
+        );
         // tp of 0 means 1, not a division by zero.
         assert_eq!(
             page_bytes_homogeneous(4, 8, 128, 0, &f),
@@ -232,15 +247,23 @@ mod tests {
         let f = fmt("bf16");
         // Every odd layer points at its even predecessor, so half the stack
         // pays nothing.
-        let src: Vec<u32> = (0..32u32).map(|i| if i % 2 == 1 { i - 1 } else { i }).collect();
-        let shapes = LayerShapes { source_layer: &src, ..Default::default() };
+        let src: Vec<u32> = (0..32u32)
+            .map(|i| if i % 2 == 1 { i - 1 } else { i })
+            .collect();
+        let shapes = LayerShapes {
+            source_layer: &src,
+            ..Default::default()
+        };
         assert_eq!(
             page_bytes_per_layer(32, 8, 128, &shapes, 1, &f),
             page_bytes_homogeneous(16, 8, 128, 1, &f)
         );
         // All layers aliasing layer 0 leaves exactly one charged.
         let all_zero = vec![0u32; 32];
-        let shapes = LayerShapes { source_layer: &all_zero, ..Default::default() };
+        let shapes = LayerShapes {
+            source_layer: &all_zero,
+            ..Default::default()
+        };
         assert_eq!(
             page_bytes_per_layer(32, 8, 128, &shapes, 1, &f),
             device_bytes_per_page(&f, 1, 8, 128)
@@ -255,15 +278,23 @@ mod tests {
         // allocator will actually reserve, not the 4x-everything figure that
         // made the planner give up.
         let f = fmt("bf16");
-        let kv: Vec<u32> = (0..32u32).map(|i| if i % 4 == 0 { 32 } else { 8 }).collect();
-        let shapes = LayerShapes { num_kv_heads: &kv, ..Default::default() };
+        let kv: Vec<u32> = (0..32u32)
+            .map(|i| if i % 4 == 0 { 32 } else { 8 })
+            .collect();
+        let shapes = LayerShapes {
+            num_kv_heads: &kv,
+            ..Default::default()
+        };
         let got = page_bytes_per_layer(32, 8, 128, &shapes, 1, &f);
 
         let wide = device_bytes_per_page(&f, 1, 32, 128);
         let narrow = device_bytes_per_page(&f, 1, 8, 128);
         assert_eq!(got, 8 * wide + 24 * narrow);
 
-        assert!(got > page_bytes_homogeneous(32, 8, 128, 1, &f), "wide layers must cost more");
+        assert!(
+            got > page_bytes_homogeneous(32, 8, 128, 1, &f),
+            "wide layers must cost more"
+        );
         assert!(
             got < 32 * wide,
             "but far less than charging every layer the wide count, which is \
@@ -275,7 +306,10 @@ mod tests {
     fn per_layer_kv_heads_are_unsharded_and_get_divided_here() {
         let f = fmt("bf16");
         let kv = vec![16u32; 4];
-        let shapes = LayerShapes { num_kv_heads: &kv, ..Default::default() };
+        let shapes = LayerShapes {
+            num_kv_heads: &kv,
+            ..Default::default()
+        };
         assert_eq!(
             page_bytes_per_layer(4, 999, 128, &shapes, 4, &f),
             4 * device_bytes_per_page(&f, 1, 4, 128),
@@ -287,7 +321,10 @@ mod tests {
     fn per_layer_head_dim_overrides_the_uniform_one() {
         let f = fmt("bf16");
         let hd = vec![64u32, 256, 64, 256];
-        let shapes = LayerShapes { head_dim: &hd, ..Default::default() };
+        let shapes = LayerShapes {
+            head_dim: &hd,
+            ..Default::default()
+        };
         assert_eq!(
             page_bytes_per_layer(4, 8, 128, &shapes, 1, &f),
             2 * device_bytes_per_page(&f, 1, 8, 64) + 2 * device_bytes_per_page(&f, 1, 8, 256)
@@ -301,8 +338,11 @@ mod tests {
         let kv = vec![32u32, 8, 32, 8];
         // Layers 1 and 3 alias, so their (wide, deep) shapes never register.
         let src = vec![0u32, 0, 2, 2];
-        let shapes =
-            LayerShapes { head_dim: &hd, num_kv_heads: &kv, source_layer: &src };
+        let shapes = LayerShapes {
+            head_dim: &hd,
+            num_kv_heads: &kv,
+            source_layer: &src,
+        };
         assert_eq!(
             page_bytes_per_layer(4, 8, 128, &shapes, 1, &f),
             2 * device_bytes_per_page(&f, 1, 32, 64)
@@ -316,7 +356,10 @@ mod tests {
         // audible instead of silently reading whatever follows the vector.
         let f = fmt("bf16");
         let hd = vec![64u32, 128];
-        let shapes = LayerShapes { head_dim: &hd, ..Default::default() };
+        let shapes = LayerShapes {
+            head_dim: &hd,
+            ..Default::default()
+        };
         let _ = page_bytes_per_layer(32, 8, 128, &shapes, 1, &f);
     }
 }

@@ -200,7 +200,11 @@ impl Variant for Gemma2 {
     /// over 8 heads and its heads are 256 wide, not 288, so a
     /// tensor-parallel row split that divided would cut a head in half.
     fn load_shape(&self) -> LoadShape {
-        LoadShape::dense(self.shape.layers, self.shape.attn.head_dim, self.shape.tied_embeddings)
+        LoadShape::dense(
+            self.shape.layers,
+            self.shape.attn.head_dim,
+            self.shape.tied_embeddings,
+        )
     }
 
     fn deployment(
@@ -235,7 +239,9 @@ impl Variant for Gemma2 {
         builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
         match builder.naming() {
-            crate::shared::policy::Naming::Hf => crate::shared::llama_like::contract::author_dense(builder),
+            crate::shared::policy::Naming::Hf => {
+                crate::shared::llama_like::contract::author_dense(builder)
+            }
             // The registry this replaced held NO MLX row for gemma-2, and
             // the absence was a silence the caller read as "no
             // contract". Stated as the refusal it always was.
@@ -297,18 +303,28 @@ mod tests {
     #[test]
     fn every_row_projects() {
         for v in VARIANTS {
-            let d = v.deployment(Deployed::single()).expect("gemma-2 is servable");
+            let d = v
+                .deployment(Deployed::single())
+                .expect("gemma-2 is servable");
             assert_eq!(d.layers, v.shape.layers);
             assert_eq!(d.attention.len() as u32, v.shape.layers);
             assert_eq!(d.shape.hidden, v.shape.hidden);
             assert_eq!(d.shape.vocab, v.shape.vocab);
             assert_eq!(d.norm, NormPlacement::Pre);
-            assert_eq!(d.attn_output, AttnOutput::DriverPinned, "gemma-4 is the exception");
+            assert_eq!(
+                d.attn_output,
+                AttnOutput::DriverPinned,
+                "gemma-4 is the exception"
+            );
             assert_eq!(d.ple_dim, 0, "per-layer embeddings belong to 3n and 4");
 
             let m = v.manifest();
             assert_eq!(m.layers, v.shape.layers);
-            assert!(m.tensors.iter().any(|t| t.name == "layer.{}.pre_feedforward_layernorm"));
+            assert!(
+                m.tensors
+                    .iter()
+                    .any(|t| t.name == "layer.{}.pre_feedforward_layernorm")
+            );
 
             let ls = v.load_shape();
             assert_eq!(ls.layers, v.shape.layers);
@@ -331,6 +347,27 @@ mod tests {
         }
     }
 
+    /// And the cap on the ATTENTION scores, which is a DIFFERENT number
+    /// in a different place, reaches it too.
+    ///
+    /// Two caps is the whole point: `attn_logit_softcapping: 50.0` runs
+    /// inside the attention kernel over the scores,
+    /// `final_logit_softcapping: 30.0` runs once at the readout. The
+    /// shape had measured both from the start and only one of them had
+    /// anywhere to go — `AttnCtx::logits_soft_cap` was the literal
+    /// `0.0`, so a capped gemma-2 and an uncapped one attended
+    /// identically. Asserting they DIFFER is the point: one field
+    /// carrying both, or a projection that copied the readout's number
+    /// across, would pass a test that only checked for non-zero.
+    #[test]
+    fn the_attention_softcap_reaches_it_too_and_is_not_the_readout_s() {
+        for v in VARIANTS {
+            let d = v.deployment(Deployed::single()).expect("servable");
+            assert_eq!(d.attn_logit_softcap, 50.0, "{}", v.id);
+            assert_ne!(d.attn_logit_softcap, d.logit_softcap, "{}", v.id);
+        }
+    }
+
     /// The alternation is a rule on every row, and it produces the same
     /// per-layer list the shape used to carry as a `Vec`.
     #[test]
@@ -338,8 +375,9 @@ mod tests {
         for v in VARIANTS {
             let d = v.deployment(Deployed::single()).expect("servable");
             let windows: Vec<i32> = d.attention.iter().map(|a| a.window).collect();
-            let longhand: Vec<i32> =
-                (0..v.shape.layers).map(|l| if l % 2 == 1 { -1 } else { 4096 }).collect();
+            let longhand: Vec<i32> = (0..v.shape.layers)
+                .map(|l| if l % 2 == 1 { -1 } else { 4096 })
+                .collect();
             assert_eq!(windows, longhand, "{}", v.id);
         }
     }
@@ -374,17 +412,37 @@ mod tests {
     #[cfg(feature = "chat")]
     #[test]
     fn the_template_is_gemmas_own_and_not_chatml() {
-        let vocab: Vec<String> =
-            ["<start_of_turn>", "<end_of_turn>", "<eos>", "<bos>", "user", "model", "\n", "Hi"]
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect();
+        let vocab: Vec<String> = [
+            "<start_of_turn>",
+            "<end_of_turn>",
+            "<eos>",
+            "<bos>",
+            "user",
+            "model",
+            "\n",
+            "Hi",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
         let tok = Arc::new(tokenizer::Tokenizer::from_vocab(&vocab));
         for v in VARIANTS {
             let chat = v.chat(tok.clone());
-            assert!(chat.seal().contains(&1), "{} does not seal with <end_of_turn>", v.id);
-            assert!(chat.seal().contains(&2), "{} does not seal with <eos>", v.id);
-            assert!(chat.cue().starts_with(&[0]), "{} cues with <start_of_turn>", v.id);
+            assert!(
+                chat.seal().contains(&1),
+                "{} does not seal with <end_of_turn>",
+                v.id
+            );
+            assert!(
+                chat.seal().contains(&2),
+                "{} does not seal with <eos>",
+                v.id
+            );
+            assert!(
+                chat.cue().starts_with(&[0]),
+                "{} cues with <start_of_turn>",
+                v.id
+            );
         }
     }
 
@@ -406,8 +464,15 @@ mod tests {
     #[test]
     fn the_row_answers_what_the_driver_advertises() {
         for v in VARIANTS {
-            let a = v.deployment(Deployed::single()).expect("gemma-2 deploys").advertised;
-            assert_eq!(a.arch, "gemma2", "{}: the family label a guest program sees", v.id);
+            let a = v
+                .deployment(Deployed::single())
+                .expect("gemma-2 deploys")
+                .advertised;
+            assert_eq!(
+                a.arch, "gemma2",
+                "{}: the family label a guest program sees",
+                v.id
+            );
             assert_eq!(
                 a.max_model_len, 8_192,
                 "{}: the 2B, 9B and 27B configs all state 8192",
@@ -429,13 +494,28 @@ mod tests {
     #[test]
     fn the_generation_states_a_shorter_ceiling_than_its_successors_on_purpose() {
         assert_eq!(MAX_MODEL_LEN, 8_192);
-        assert!(MAX_MODEL_LEN < 32_768, "gemma-3's smallest row is four times this");
-        assert_ne!(MAX_MODEL_LEN, 2_048, "the synthetic corpus config is not a checkpoint");
+        assert!(
+            MAX_MODEL_LEN < 32_768,
+            "gemma-3's smallest row is four times this"
+        );
+        assert_ne!(
+            MAX_MODEL_LEN, 2_048,
+            "the synthetic corpus config is not a checkpoint"
+        );
         let ceilings: std::collections::BTreeSet<u32> = VARIANTS
             .iter()
-            .map(|v| v.deployment(Deployed::single()).expect("deploys").advertised.max_model_len)
+            .map(|v| {
+                v.deployment(Deployed::single())
+                    .expect("deploys")
+                    .advertised
+                    .max_model_len
+            })
             .collect();
-        assert_eq!(ceilings.len(), 1, "the generation agrees with itself: {ceilings:?}");
+        assert_eq!(
+            ceilings.len(),
+            1,
+            "the generation agrees with itself: {ceilings:?}"
+        );
     }
 
     /// The label is the stem the WORKER derives, which is what lets the
@@ -451,7 +531,10 @@ mod tests {
             .expect("the suffix the worker strips")
             .to_string();
         assert_eq!(stem, ARCH);
-        assert!(!ARCH.contains('-') && !ARCH.contains('_'), "the stem carries no separator");
+        assert!(
+            !ARCH.contains('-') && !ARCH.contains('_'),
+            "the stem carries no separator"
+        );
     }
 
     /// A METAL load is refused BY NAME rather than traced as a llama.
@@ -459,9 +542,10 @@ mod tests {
     /// The guard that replaces `driver-metal`'s `LLAMA_LIKE` table. That
     /// table answered "does this build serve you" from an architecture
     /// STRING reduced by `canonical()`, in a driver, before any text was
-    /// traced — so it could say yes to a row whose text does not exist
-    /// (it listed `gemma4`) and no to one whose text does (it omitted
-    /// `gemma3`). The row answers now, and what it answers with is a
+    /// traced — so it could say yes to a row this build cannot resolve
+    /// (it listed `gpt_oss`, whose every publication either fails this
+    /// crate's manifest or names tensors `driver-metal` has no handle
+    /// for) and no to one whose text it models (it omitted `gemma3`). The row answers now, and what it answers with is a
     /// sentence naming what is missing.
     ///
     /// The comparison is against [`project::NO_METAL`] itself and not a

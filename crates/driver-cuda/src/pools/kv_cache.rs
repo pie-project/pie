@@ -28,9 +28,9 @@
 //!   length: switching them on later leaves every already-written page at the
 //!   empty seed, which scores `+inf` -- "always keep" -- forever.
 
-use crate::layout::{KvCacheFormat, KvCacheScaleLayout};
 use crate::dtype::DType;
 use crate::error::{Error, Result};
+use crate::layout::{KvCacheFormat, KvCacheScaleLayout};
 use crate::tensor::{DeviceTensor, TensorSpec};
 
 /// Everything one layer slot owns.
@@ -147,8 +147,13 @@ impl PerLayer {
             if s == i {
                 continue;
             }
-            for (what, v) in [("head_dim", &self.head_dim), ("num_kv_heads", &self.num_kv_heads)] {
-                let (Some(&mine), Some(&theirs)) = (v.get(i), v.get(s)) else { continue };
+            for (what, v) in [
+                ("head_dim", &self.head_dim),
+                ("num_kv_heads", &self.num_kv_heads),
+            ] {
+                let (Some(&mine), Some(&theirs)) = (v.get(i), v.get(s)) else {
+                    continue;
+                };
                 if mine != theirs {
                     return Err(Error::invalid(
                         "kv_cache",
@@ -320,7 +325,8 @@ impl KvCacheLayout {
             envelopes: false,
             slots: Vec::new(),
         };
-        me.slots.reserve(usize::try_from(num_layers.max(0)).unwrap_or(0));
+        me.slots
+            .reserve(usize::try_from(num_layers.max(0)).unwrap_or(0));
         for i in 0..num_layers {
             me.slots.push(me.plan_slot(i)?);
         }
@@ -339,9 +345,11 @@ impl KvCacheLayout {
         }
         let hd = self.head_dim_at(layer);
         let kvh = self.num_kv_heads_at(layer);
-        let storage_hd =
-            i64::try_from(self.format.storage_head_dim(u32::try_from(hd.max(0)).unwrap_or(0)))
-                .unwrap_or(0);
+        let storage_hd = i64::try_from(
+            self.format
+                .storage_head_dim(u32::try_from(hd.max(0)).unwrap_or(0)),
+        )
+        .unwrap_or(0);
         let pages = i64::from(self.num_pages);
         let psz = i64::from(self.page_size);
         let heads = i64::from(kvh);

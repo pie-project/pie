@@ -401,8 +401,15 @@ mod tests {
     #[test]
     fn the_row_answers_what_the_driver_advertises() {
         for v in VARIANTS {
-            let a = v.deployment(Deployed::single()).expect("gpt-oss deploys").advertised;
-            assert_eq!(a.arch, "gptoss", "{}: the family label a guest program sees", v.id);
+            let a = v
+                .deployment(Deployed::single())
+                .expect("gpt-oss deploys")
+                .advertised;
+            assert_eq!(
+                a.arch, "gptoss",
+                "{}: the family label a guest program sees",
+                v.id
+            );
             assert_eq!(
                 a.max_model_len, 131_072,
                 "{}: both releases state the same ceiling",
@@ -429,7 +436,10 @@ mod tests {
             .expect("the suffix the worker strips")
             .to_string();
         assert_eq!(stem, ARCH);
-        assert_ne!(ARCH, "gpt_oss", "the `model_type` spelling never survives the reduction");
+        assert_ne!(
+            ARCH, "gpt_oss",
+            "the `model_type` spelling never survives the reduction"
+        );
         assert!(!ARCH.contains('_'), "no underscore survives it either");
     }
 
@@ -445,7 +455,11 @@ mod tests {
         assert_eq!(big.experts, 128);
         assert_eq!(
             *big,
-            GptOssFacts { layers: big.layers, experts: big.experts, ..small.clone() },
+            GptOssFacts {
+                layers: big.layers,
+                experts: big.experts,
+                ..small.clone()
+            },
             "nothing else moved between the two sizes",
         );
     }
@@ -595,7 +609,11 @@ mod tests {
             assert_eq!(v.window, 128);
             let d = v.deployment(Deployed::single()).expect("servable");
             for (l, a) in d.attention.iter().enumerate() {
-                let expected = if v.shape.is_sliding(l as u32) { v.window } else { -1 };
+                let expected = if v.shape.is_sliding(l as u32) {
+                    v.window
+                } else {
+                    -1
+                };
                 assert_eq!(a.window, expected, "{}: layer {l}", v.id);
             }
             assert_eq!(d.attention[0].window, 128, "{}: starts sliding", v.id);
@@ -616,9 +634,10 @@ mod tests {
             assert_ne!(v.load_shape().layers, 0, "{}", v.id());
             assert!(v.deployment(Deployed::single()).is_ok(), "{}", v.id());
             #[cfg(feature = "forward")]
-            for class in
-                [model_compiler::trace::FireClass::Decode, model_compiler::trace::FireClass::Prefill]
-            {
+            for class in [
+                model_compiler::trace::FireClass::Decode,
+                model_compiler::trace::FireClass::Prefill,
+            ] {
                 let plan = v.trace(class, Deployed::single()).expect("traceable");
                 assert!(!plan.ops.is_empty(), "{}: {class:?}", v.id());
             }
@@ -656,9 +675,10 @@ mod tests {
     /// The guard that replaces `driver-metal`'s `LLAMA_LIKE` table. That
     /// table answered "does this build serve you" from an architecture
     /// STRING reduced by `canonical()`, in a driver, before any text was
-    /// traced — so it could say yes to a row whose text does not exist
-    /// (it listed `gemma4`) and no to one whose text does (it omitted
-    /// `gemma3`). The row answers now, and what it answers with is a
+    /// traced — so it could say yes to a row this build cannot resolve
+    /// (it listed `gpt_oss`, whose every publication either fails this
+    /// crate's manifest or names tensors `driver-metal` has no handle
+    /// for) and no to one whose text it models (it omitted `gemma3`). The row answers now, and what it answers with is a
     /// sentence naming what is missing.
     ///
     /// The comparison is against [`project::NO_METAL`] itself and not a

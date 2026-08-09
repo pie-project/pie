@@ -157,7 +157,15 @@ fn elementwise_rows(rows: u32, width: u32) -> Launch {
 fn route_rows(rows: u32, width: u32) -> Launch {
     Launch {
         grid: [rows, 1, 1],
-        block: [width.div_ceil(WARP).max(1).saturating_mul(WARP).min(MAX_BLOCK), 1, 1],
+        block: [
+            width
+                .div_ceil(WARP)
+                .max(1)
+                .saturating_mul(WARP)
+                .min(MAX_BLOCK),
+            1,
+            1,
+        ],
         smem: 0,
     }
 }
@@ -185,7 +193,10 @@ pub fn eval(rule: Rule, dims: Dims) -> Result<Launch, Ungeometric> {
         Rule::Unstated => return Err(Ungeometric::Unstated),
         Rule::Rms => rms(dims.rows),
         Rule::Elementwise => {
-            let n = dims.rows.checked_mul(dims.width).ok_or(Ungeometric::Empty)?;
+            let n = dims
+                .rows
+                .checked_mul(dims.width)
+                .ok_or(Ungeometric::Empty)?;
             if n == 0 {
                 return Err(Ungeometric::Empty);
             }
@@ -217,7 +228,11 @@ mod tests {
     const K: u32 = 4;
 
     fn dims(rows: u32, width: u32) -> Dims {
-        Dims { rows, width, in_width: width }
+        Dims {
+            rows,
+            width,
+            in_width: width,
+        }
     }
 
     /// Every rule the Tier A table states evaluates. The table and the
@@ -247,7 +262,11 @@ mod tests {
     fn rms_reproduces_the_cpp_launcher() {
         assert_eq!(
             eval(Rule::Rms, dims(T, H)),
-            Ok(Launch { grid: [T, 1, 1], block: [256, 1, 1], smem: 32 })
+            Ok(Launch {
+                grid: [T, 1, 1],
+                block: [256, 1, 1],
+                smem: 32
+            })
         );
     }
 
@@ -258,7 +277,11 @@ mod tests {
         let numel = T * H;
         assert_eq!(
             eval(Rule::Elementwise, dims(T, H)),
-            Ok(Launch { grid: [numel.div_ceil(256), 1, 1], block: [256, 1, 1], smem: 0 })
+            Ok(Launch {
+                grid: [numel.div_ceil(256), 1, 1],
+                block: [256, 1, 1],
+                smem: 0
+            })
         );
     }
 
@@ -292,7 +315,11 @@ mod tests {
         let predict = eval(Rule::RouteRows, dims(T, K * K)).expect("rule evaluates");
         assert_eq!(predict.grid, [T, 1, 1]);
         assert!(predict.block[0] >= K * K);
-        assert_eq!(predict.block[0] % 32, 0, "a partial warp is a wasted scheduler slot");
+        assert_eq!(
+            predict.block[0] % 32,
+            0,
+            "a partial warp is a wasted scheduler slot"
+        );
 
         // A row wider than any block still gets a legal launch, because the
         // kernel strides. This is the case the pre-stride kernel could not
@@ -305,7 +332,10 @@ mod tests {
     #[test]
     fn an_empty_extent_is_refused() {
         assert_eq!(eval(Rule::Rms, dims(0, H)), Err(Ungeometric::Empty));
-        assert_eq!(eval(Rule::ElementwiseRows, dims(T, 0)), Err(Ungeometric::Empty));
+        assert_eq!(
+            eval(Rule::ElementwiseRows, dims(T, 0)),
+            Err(Ungeometric::Empty)
+        );
         assert_eq!(eval(Rule::RouteRows, dims(T, 0)), Err(Ungeometric::Empty));
         assert_eq!(eval(Rule::Elementwise, dims(T, 0)), Err(Ungeometric::Empty));
     }
@@ -314,6 +344,9 @@ mod tests {
     #[test]
     fn the_two_refusals_are_different_sentences() {
         assert_eq!(eval(Rule::Unstated, dims(T, H)), Err(Ungeometric::Unstated));
-        assert_eq!(eval(Rule::Qmv, dims(T, H)), Err(Ungeometric::Unported(Rule::Qmv)));
+        assert_eq!(
+            eval(Rule::Qmv, dims(T, H)),
+            Err(Ungeometric::Unported(Rule::Qmv))
+        );
     }
 }

@@ -17,9 +17,9 @@
 use std::sync::{Arc, OnceLock};
 
 use crate::catalog::{Deployed, LoadShape, Variant};
+use crate::manifest::Manifest;
 use crate::shared::llama_like::project;
 use crate::shared::llama_like::spec::LlamaLikeFacts;
-use crate::manifest::Manifest;
 
 use model_compiler::facts::{NormPlacement, QkNorm};
 use model_compiler::trace::{NormVariant, RopeKind};
@@ -323,6 +323,27 @@ pub fn rows() -> &'static [&'static dyn Variant] {
     ROWS.get_or_init(|| VARIANTS.iter().map(|v| v as &'static dyn Variant).collect())
 }
 
+impl Qwen3 {
+    /// The scalars this row states, read ONCE.
+    ///
+    /// Both [`Variant::deployment`] and [`Variant::trace`] take it. They
+    /// used to read `rope_theta`, `norm_eps` and `window` off `self`
+    /// separately — the same three fields, spelled twice, with nothing
+    /// holding the two spellings together.
+    fn row(&self) -> project::RowScalars {
+        project::RowScalars {
+            rope_theta: self.rope_theta,
+            norm_eps: NORM_EPS,
+            window: self.window,
+            rope_rescaled: false,
+            // TRUE for every qwen3 row, dense and routed. `Qwen3-30B-A3B`
+            // and `Qwen3-235B-A22B` both publish `"norm_topk_prob": true`,
+            // against a `Qwen3MoeConfig` class default of false.
+            norm_topk_prob: true,
+        }
+    }
+}
+
 impl Variant for Qwen3 {
     fn id(&self) -> &'static str {
         self.id
@@ -337,7 +358,11 @@ impl Variant for Qwen3 {
     /// contract that compiles and a model that is wrong.
     fn load_shape(&self) -> LoadShape {
         if self.shape.n_experts == 0 {
-            LoadShape::dense(self.shape.layers, self.shape.head_dim, self.shape.tied_embeddings)
+            LoadShape::dense(
+                self.shape.layers,
+                self.shape.head_dim,
+                self.shape.tied_embeddings,
+            )
         } else {
             LoadShape::mixture(
                 self.shape.layers,
@@ -353,8 +378,7 @@ impl Variant for Qwen3 {
         load: Deployed<'_>,
     ) -> Result<crate::deployment::Deployment, crate::deployment::Refusal> {
         let _ = load;
-        let mut deployment =
-            project::deployment(&self.shape, self.rope_theta, NORM_EPS, self.window);
+        let mut deployment = project::deployment(&self.shape, self.row());
         deployment.advertised = crate::deployment::Advertised {
             arch: ARCH,
             max_model_len: MAX_MODEL_LEN,
@@ -373,12 +397,16 @@ impl Variant for Qwen3 {
         builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
         match builder.naming() {
-            crate::shared::policy::Naming::Hf => crate::shared::llama_like::contract::author_llama_like(builder),
+            crate::shared::policy::Naming::Hf => {
+                crate::shared::llama_like::contract::author_llama_like(builder)
+            }
             // The registry this replaced held an MLX row for `qwen3` and `qwen3_moe`,
             // and a row that states only the HF author hands Metal the
             // checkpoint's own names and its own dtype. See
             // `llama_3::mod`'s `author`.
-            crate::shared::policy::Naming::Mlx => crate::shared::llama_like::contract::author_llama_mlx(builder),
+            crate::shared::policy::Naming::Mlx => {
+                crate::shared::llama_like::contract::author_llama_mlx(builder)
+            }
         }
     }
 
@@ -400,17 +428,7 @@ impl Variant for Qwen3 {
         class: model_compiler::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
-        project::trace(
-            &self.shape,
-            project::MetalRow {
-                rope_theta: self.rope_theta,
-                norm_eps: NORM_EPS,
-                window: self.window,
-                rope_rescaled: false,
-            },
-            class,
-            load,
-        )
+        project::trace(&self.shape, self.row(), class, load)
     }
 
     /// ChatML, and stated rather than fallen through to.
@@ -436,7 +454,10 @@ mod tests {
     /// measurement of `Qwen/Qwen3-0.6B`; so is the row.
     #[test]
     fn the_row_agrees_with_the_committed_fixture() {
-        let row = VARIANTS.iter().find(|v| v.id == "qwen3-0.6b").expect("row present");
+        let row = VARIANTS
+            .iter()
+            .find(|v| v.id == "qwen3-0.6b")
+            .expect("row present");
         assert_eq!(row.shape, LlamaLikeFacts::qwen3_0_6b());
     }
 
@@ -446,7 +467,10 @@ mod tests {
     /// produced dense facts.
     #[test]
     fn the_mixture_row_is_a_mixture_in_the_only_place_it_is_stated() {
-        let moe = VARIANTS.iter().find(|v| v.id == "qwen3-30b-a3b").expect("row present");
+        let moe = VARIANTS
+            .iter()
+            .find(|v| v.id == "qwen3-30b-a3b")
+            .expect("row present");
         assert_ne!(moe.shape.n_experts, 0);
         assert_ne!(moe.shape.moe_intermediate, 0);
         // And the manifest agrees, because it is a projection of the
@@ -461,13 +485,18 @@ mod tests {
     #[test]
     fn every_row_projects() {
         for v in VARIANTS {
-            let d = v.deployment(Deployed::single()).expect("dense qwen3 is servable");
+            let d = v
+                .deployment(Deployed::single())
+                .expect("dense qwen3 is servable");
             assert_eq!(d.layers, v.shape.layers);
             assert_eq!(d.attention.len() as u32, v.shape.layers);
             assert_eq!(v.manifest().layers, v.shape.layers);
             let ls = v.load_shape();
             assert_eq!(ls.layers, v.shape.layers);
-            assert_eq!(ls.head_dim, v.shape.head_dim, "the TRUE head dim, never a padded one");
+            assert_eq!(
+                ls.head_dim, v.shape.head_dim,
+                "the TRUE head dim, never a padded one"
+            );
             assert_eq!(ls.tied_embeddings, v.shape.tied_embeddings);
             assert_eq!(ls.mamba_groups, 0);
             assert_eq!(ls.kv_shared_layers, 0);
@@ -480,7 +509,10 @@ mod tests {
     /// stated value and `Deployment` keeps the kernel's.
     #[test]
     fn head_dim_is_the_stated_one_not_the_quotient() {
-        let row = VARIANTS.iter().find(|v| v.id == "qwen3-0.6b").expect("row present");
+        let row = VARIANTS
+            .iter()
+            .find(|v| v.id == "qwen3-0.6b")
+            .expect("row present");
         assert_eq!(row.shape.hidden / row.shape.q_heads, 64);
         assert_eq!(row.load_shape().head_dim, 128);
     }
@@ -495,9 +527,20 @@ mod tests {
     #[test]
     fn the_row_answers_what_the_driver_advertises() {
         for v in VARIANTS {
-            let a = v.deployment(Deployed::single()).expect("qwen3 deploys").advertised;
-            assert_eq!(a.arch, "qwen3", "{}: the family label a guest program sees", v.id);
-            assert_eq!(a.max_model_len, 40_960, "{}: every published Qwen 3 states it", v.id);
+            let a = v
+                .deployment(Deployed::single())
+                .expect("qwen3 deploys")
+                .advertised;
+            assert_eq!(
+                a.arch, "qwen3",
+                "{}: the family label a guest program sees",
+                v.id
+            );
+            assert_eq!(
+                a.max_model_len, 40_960,
+                "{}: every published Qwen 3 states it",
+                v.id
+            );
             assert!(
                 !a.media_encode,
                 "{}: no Qwen 3 ships a tower the encode entry serves",

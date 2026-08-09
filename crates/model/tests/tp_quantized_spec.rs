@@ -21,11 +21,9 @@
 //! Nothing reaches the driver as a descriptor to switch on. A width is
 //! a width; a symbol is a symbol.
 
-use model_compiler::dsl::{
-    self, matmul, rmsnorm, MatW, NormW, ScaleLayout, WeightRepr,
-};
-use model_compiler::lower::{lower, Buffers, Fire, Row};
-use model_compiler::trace::{GuardPred, NormVariant, OpKind, Shape, Dim, DType};
+use model_compiler::dsl::{self, MatW, NormW, ScaleLayout, WeightRepr, matmul, rmsnorm};
+use model_compiler::lower::{Buffers, Fire, Row, lower};
+use model_compiler::trace::{DType, Dim, GuardPred, NormVariant, OpKind, Shape};
 
 /// One deployment's facts, as a load would derive them.
 struct Facts {
@@ -70,8 +68,7 @@ fn spec(f: &Facts) -> model_compiler::trace::ForwardPlan {
         // A projection handle carries BOTH facts: the width is this
         // rank's, the repr is the checkpoint's.
         let proj = |name: &str, width: u32| {
-            MatW::dense(format!("layer.{l}.{name}"), width, Some(l))
-                .with_repr(f.proj_repr.clone())
+            MatW::dense(format!("layer.{l}.{name}"), width, Some(l)).with_repr(f.proj_repr.clone())
         };
 
         let y = dsl::embed_with(t, "embed", f.hidden);
@@ -98,32 +95,19 @@ fn spec(f: &Facts) -> model_compiler::trace::ForwardPlan {
         let mlp_in = dsl::regions(
             t,
             Some(l),
-            Some((
-                Shape(vec![Dim::Tokens, Dim::Const(f.hidden)]),
-                DType::BF16,
-            )),
+            Some((Shape(vec![Dim::Tokens, Dim::Const(f.hidden)]), DType::BF16)),
             |ctx| {
-                ctx.arm(
-                    dsl::Region::Fire(GuardPred::TokensLE(f.fuse_max)),
-                    || {
-                        // One launch: sum the shards, add the residual,
-                        // norm. Two results — the stream in place, and
-                        // the normed activation.
-                        dsl::cuda::all_reduce_residual_rmsnorm(
-                            &partial, &y, &mlp_norm, f.hidden,
-                        );
-                    },
-                );
+                ctx.arm(dsl::Region::Fire(GuardPred::TokensLE(f.fuse_max)), || {
+                    // One launch: sum the shards, add the residual,
+                    // norm. Two results — the stream in place, and
+                    // the normed activation.
+                    dsl::cuda::all_reduce_residual_rmsnorm(&partial, &y, &mlp_norm, f.hidden);
+                });
             },
             || {
                 // The two-step form the fused kernel declines to serve.
                 let summed = dsl::cuda::all_reduce(&partial, f.hidden);
-                dsl::cuda::residual_add_rmsnorm(
-                    &summed,
-                    &y,
-                    &mlp_norm.name,
-                    f.hidden,
-                );
+                dsl::cuda::residual_add_rmsnorm(&summed, &y, &mlp_norm.name, f.hidden);
             },
         )
         .expect("the guarded landing produces the normed activation");
@@ -196,8 +180,10 @@ fn a_sharded_quantized_layer_states_both_axes() {
     let q = plan
         .ops
         .iter()
-        .find(|o| matches!(&o.kind, OpKind::Launch { weights, .. }
-                           if weights[0] == "layer.0.q_proj"))
+        .find(|o| {
+            matches!(&o.kind, OpKind::Launch { weights, .. }
+                           if weights[0] == "layer.0.q_proj")
+        })
         .expect("q_proj is stated");
     let w = plan.values[q.outputs[0] as usize].shape.0.last().unwrap();
     assert_eq!(
@@ -218,7 +204,10 @@ fn a_sharded_quantized_layer_states_both_axes() {
     assert_eq!(arms.len(), 1, "one fused arm");
     assert_eq!(arms[0].pred, GuardPred::TokensLE(512));
     assert_eq!(arms[0].ops, 1, "the fused landing is ONE launch");
-    assert_eq!(*else_ops, 2, "the two-step form is a collective then a norm");
+    assert_eq!(
+        *else_ops, 2,
+        "the two-step form is a collective then a norm"
+    );
     assert!(
         !guard.outputs.is_empty(),
         "the guard OWNS the normed activation — both arms bind it"

@@ -44,8 +44,9 @@
 use std::collections::BTreeMap;
 
 /// The family names a driver must not be branching on.
-const FAMILIES: &[&str] =
-    &["gemma", "qwen", "llama", "deepseek", "kimi", "nemotron", "glm", "gpt_oss"];
+const FAMILIES: &[&str] = &[
+    "gemma", "qwen", "llama", "deepseek", "kimi", "nemotron", "glm", "gpt_oss",
+];
 
 /// Non-comment lines naming a family, per file, as of the move.
 ///
@@ -117,8 +118,11 @@ fn count(path: &std::path::Path) -> usize {
 /// punctuation, then compare -- makes `GptOss`, `gpt_oss` and `gptoss`
 /// one name.
 fn names_a_family(line: &str) -> bool {
-    let flat: String =
-        line.chars().filter(|c| *c != '_' && *c != '-').flat_map(char::to_lowercase).collect();
+    let flat: String = line
+        .chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect();
     FAMILIES.iter().any(|f| {
         let f: String = f.chars().filter(|c| *c != '_').collect();
         flat.contains(&f)
@@ -151,7 +155,11 @@ fn the_driver_does_not_learn_a_new_family() {
     let mut over = Vec::new();
     let mut unlisted = Vec::new();
     for f in &files {
-        let rel = f.strip_prefix(&root).expect("under src").to_string_lossy().into_owned();
+        let rel = f
+            .strip_prefix(&root)
+            .expect("under src")
+            .to_string_lossy()
+            .into_owned();
         let n = count(f);
         // NOT `if n == 0 { continue }`. A budgeted file that fell to
         // zero is the good outcome and it still has to be recorded, or
@@ -179,9 +187,12 @@ fn the_driver_does_not_learn_a_new_family() {
     // two-line diff instead of one. The second line is the record that
     // it happened.
     for (rel, &cap) in &budget {
-        if cap > 0 && !files.iter().any(|f| {
-            f.strip_prefix(&root).is_ok_and(|r| r.to_string_lossy() == *rel)
-        }) {
+        if cap > 0
+            && !files.iter().any(|f| {
+                f.strip_prefix(&root)
+                    .is_ok_and(|r| r.to_string_lossy() == *rel)
+            })
+        {
             over.push(format!("{rel}: budgeted {cap}, and the file is gone"));
         }
     }
@@ -223,7 +234,9 @@ fn no_model_type_table_remains_in_the_driver() {
     let mut files = Vec::new();
     walk(&root, &mut files);
     for f in &files {
-        let Ok(text) = std::fs::read_to_string(f) else { continue };
+        let Ok(text) = std::fs::read_to_string(f) else {
+            continue;
+        };
         for (i, line) in text.lines().enumerate() {
             let t = line.trim_start();
             if t.starts_with("//") {
@@ -263,7 +276,9 @@ fn no_budget_line_outlives_what_it_was_for() {
         }
         let n = count(&path);
         if n < cap {
-            stale.push(format!("{rel}: budgeted {cap}, actually {n} -- lower the ceiling"));
+            stale.push(format!(
+                "{rel}: budgeted {cap}, actually {n} -- lower the ceiling"
+            ));
         }
     }
     assert!(

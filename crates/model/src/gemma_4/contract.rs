@@ -10,7 +10,7 @@
 use model_loader::contract::Expr;
 use model_loader::error::Error;
 
-use crate::shared::builder::{Builder};
+use crate::shared::builder::Builder;
 use crate::shared::mlx;
 
 /// gemma4, gemma4_text.

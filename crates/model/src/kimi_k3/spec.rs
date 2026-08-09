@@ -54,7 +54,7 @@ impl KimiK3KdaFacts {
 pub type KimiK3MoeFacts = model_compiler::facts::MoeFacts;
 
 /// The whole generation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KimiK3Facts {
     pub layers: u32,
     pub vocab: u32,
@@ -126,6 +126,12 @@ impl KimiK3Facts {
             moe: KimiK3MoeFacts {
                 num_experts: 64,
                 top_k: 6,
+                // INHERITED from K2, which publishes `false`; no K3 config is
+                // out to measure. Stated rather than defaulted so the day
+                // one is, this is the line that gets corrected.
+                norm_topk_prob: false,
+                // Inherited from K2, as above.
+                routed_scaling: 2.0,
                 moe_intermediate: 1024,
                 shared_intermediate: 1024,
             },
@@ -216,7 +222,10 @@ mod tests {
         ] {
             assert!(n > 0, "{what} is zero, which is a stack nothing can fire");
         }
-        assert!(f.dense_layers < f.layers, "an all-dense stack is not a mixture");
+        assert!(
+            f.dense_layers < f.layers,
+            "an all-dense stack is not a mixture"
+        );
         assert_eq!(
             f.kda.width() % f.kda.value_heads,
             0,
@@ -236,8 +245,14 @@ mod tests {
             stated.iter().all(|n| *n > 0) || stated.iter().all(|n| *n == 0),
             "a mixture missing one of its three numbers cannot be dispatched",
         );
-        assert!(m.top_k <= m.num_experts, "a row cannot route to more experts than exist");
-        assert!(m.has_shared_expert(), "this generation rides a shared expert beside the routed");
+        assert!(
+            m.top_k <= m.num_experts,
+            "a row cannot route to more experts than exist"
+        );
+        assert!(
+            m.has_shared_expert(),
+            "this generation rides a shared expert beside the routed"
+        );
     }
 
     /// MLA's two widths are independent, and the fixture keeps them so.
@@ -247,7 +262,11 @@ mod tests {
     #[test]
     fn the_stored_row_and_the_multiplied_row_are_different_numbers() {
         let a = &k3().attn;
-        assert_eq!(a.kv_a_width(), 320, "the latent plus the one shared rope half");
+        assert_eq!(
+            a.kv_a_width(),
+            320,
+            "the latent plus the one shared rope half"
+        );
         assert_eq!(a.qk_head_dim(), 192, "the nope half plus the rope half");
         assert_ne!(a.kv_a_width(), a.qk_head_dim());
         assert_eq!(a.q_b_width(), 16 * 192);

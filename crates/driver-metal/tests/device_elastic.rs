@@ -10,7 +10,9 @@
 #![allow(clippy::print_stdout)]
 
 use driver_metal::Error;
-use driver_metal::device::{Arena, Context, Elastic, Need, Pressure, Stepper, TILE, Tables, create_elastic, pages_for_bytes};
+use driver_metal::device::{
+    Arena, Context, Elastic, Need, Pressure, Stepper, TILE, Tables, create_elastic, pages_for_bytes,
+};
 
 /// Writes a known value through the elastic buffer, so a mapping that is not
 /// really there faults rather than passing.
@@ -268,7 +270,13 @@ fn the_host_alias_and_the_gpu_address_name_the_same_memory() {
     let staged = buffer.host_span(0, BYTES).expect("a host address");
     for i in 0..WORDS {
         // SAFETY: the span is `BYTES` long and `i * 4` stays inside it.
-        unsafe { staged.as_ptr().cast::<u32>().add(i).write(0xF00D_0000 + i as u32) };
+        unsafe {
+            staged
+                .as_ptr()
+                .cast::<u32>()
+                .add(i)
+                .write(0xF00D_0000 + i as u32)
+        };
     }
     stepper
         .run(|step| {
@@ -753,8 +761,8 @@ fn a_resized_kv_pool_keeps_every_address_it_handed_out() {
     // took it again must be the SAME pool from every bound address's point of
     // view -- otherwise every argument table staged before the resize is
     // pointing at nothing, and the driver has no way to know which ones.
-    use driver_metal::pools::kv::Pool;
     use driver_metal::layout::kv::Shape;
+    use driver_metal::pools::kv::Pool;
 
     let shape = Shape {
         layers: 2,
@@ -842,8 +850,8 @@ fn a_fixed_pool_says_it_cannot_be_resized_rather_than_pretending() {
         println!("no Metal device; skipped");
         return;
     };
-    use driver_metal::pools::kv::Pool;
     use driver_metal::layout::kv::Shape;
+    use driver_metal::pools::kv::Pool;
 
     let shape = Shape {
         layers: 1,
@@ -888,8 +896,8 @@ fn a_pool_that_gave_memory_back_stops_reserving_it() {
     // budget says it has the same. `declare_mandatory` only ever raises --
     // two callers declaring different floors for one buffer must both be
     // honoured -- so the trim is what has to lower it.
-    use driver_metal::pools::kv::Pool;
     use driver_metal::layout::kv::Shape;
+    use driver_metal::pools::kv::Pool;
 
     let shape = Shape {
         layers: 2,
@@ -914,7 +922,8 @@ fn a_pool_that_gave_memory_back_stops_reserving_it() {
          bound address"
     );
 
-    pool.resize(&mut stepper, 16).expect("give three quarters back");
+    pool.resize(&mut stepper, 16)
+        .expect("give three quarters back");
     let shrunk = arena.budget();
     assert!(
         shrunk.committed < full.committed,

@@ -205,8 +205,8 @@ impl DispatchPlan {
     /// Join `lowered`'s launches with the ops that produced them.
     #[must_use]
     pub fn new(plan: &model_compiler::trace::ForwardPlan, lowered: &Lowered) -> Self {
-        use model_compiler::trace::OpKind;
         use model_compiler::trace::Dim;
+        use model_compiler::trace::OpKind;
         let width_of = |v: ValueId| -> u32 {
             plan.values[v as usize]
                 .shape
@@ -229,7 +229,10 @@ impl DispatchPlan {
                         .get(v as usize)
                         .map_or(2, |i| model_compiler::lower::dtype_bytes(i.dtype)),
                 },
-                _ => Arg::Named { value: v, width: width_of(v) },
+                _ => Arg::Named {
+                    value: v,
+                    width: width_of(v),
+                },
             }
         };
         // A value-producing GUARD's outputs belong to every launch of its
@@ -266,8 +269,7 @@ impl DispatchPlan {
             if let OpKind::Guard { arms, else_ops } = &op.kind
                 && !op.outputs.is_empty()
             {
-                let span = arms.iter().map(|a| a.ops as usize).sum::<usize>()
-                    + *else_ops as usize;
+                let span = arms.iter().map(|a| a.ops as usize).sum::<usize>() + *else_ops as usize;
                 for slot in guard_of.iter_mut().skip(g + 1).take(span) {
                     *slot = Some(g);
                 }
@@ -327,8 +329,7 @@ impl DispatchPlan {
         // to hand it over — the same service `spec.aux` does for the
         // mamba scan and the LoRA correction. The layer's `up`
         // projection is the one whose weight name says so.
-        let mut pair_up: std::collections::BTreeMap<u16, Arg> =
-            std::collections::BTreeMap::new();
+        let mut pair_up: std::collections::BTreeMap<u16, Arg> = std::collections::BTreeMap::new();
         for launch in &lowered.launches {
             let op = &plan.ops[launch.op as usize];
             // The `up` projection names itself, whatever the deployment
@@ -347,7 +348,9 @@ impl DispatchPlan {
                 && names_up(weight)
                 && !op.outputs.is_empty()
             {
-                pair_up.entry(launch.layers.start).or_insert_with(|| out_arg(op.outputs[0]));
+                pair_up
+                    .entry(launch.layers.start)
+                    .or_insert_with(|| out_arg(op.outputs[0]));
             }
         }
         let mamba_aux_of = |layer: u16| -> Vec<Arg> {
@@ -363,8 +366,7 @@ impl DispatchPlan {
             .map(|launch| {
                 let op = &plan.ops[launch.op as usize];
                 let out_values: &[ValueId] = if op.outputs.is_empty() {
-                    guard_of[launch.op as usize]
-                        .map_or(&[], |g| plan.ops[g].outputs.as_slice())
+                    guard_of[launch.op as usize].map_or(&[], |g| plan.ops[g].outputs.as_slice())
                 } else {
                     &op.outputs
                 };
@@ -380,7 +382,9 @@ impl DispatchPlan {
                         weight: Some(weight.clone()),
                         ..LaunchSpec::default()
                     },
-                    OpKind::Matmul { weight, beta_one, .. } => LaunchSpec {
+                    OpKind::Matmul {
+                        weight, beta_one, ..
+                    } => LaunchSpec {
                         weight: Some(weight.clone()),
                         beta_one: *beta_one,
                         ..LaunchSpec::default()
@@ -394,7 +398,9 @@ impl DispatchPlan {
                     // `Arg::Weight`s; the FIRST also rides the spec so
                     // constant-naming arms (`scale.*`) can read the name
                     // the bound pointer lost.
-                    OpKind::Launch { weights, params, .. } => LaunchSpec {
+                    OpKind::Launch {
+                        weights, params, ..
+                    } => LaunchSpec {
                         weight: weights.first().cloned(),
                         weight2: weights.get(1).cloned(),
                         params: params.clone(),
@@ -614,11 +620,9 @@ impl PrefillPlan {
         enable_cuda_graph: bool,
         window_left: i32,
     ) {
-        let num_requests =
-            i32::try_from(qo_indptr_h.len() - 1).expect("request count fits i32");
-        let total_tokens =
-            i32::try_from(*qo_indptr_h.last().expect("a CSR has a last entry"))
-                .expect("token count fits i32");
+        let num_requests = i32::try_from(qo_indptr_h.len() - 1).expect("request count fits i32");
+        let total_tokens = i32::try_from(*qo_indptr_h.last().expect("a CSR has a last entry"))
+            .expect("token count fits i32");
         unsafe {
             crate::bind::abi::ffi::pie_x_plan_attention_flashinfer_prefill_bf16(
                 self.cache,
@@ -824,7 +828,10 @@ impl DispatchCtx {
     /// hand arm REFUSED instead, and refusing is wrong here: a layer
     /// outside the sparse set is the normal case, not a missing fact.
     pub(crate) fn altup_std_mult(&self, layer: usize) -> f32 {
-        self.altup_std_mult_by_layer.get(layer).copied().unwrap_or(0.0)
+        self.altup_std_mult_by_layer
+            .get(layer)
+            .copied()
+            .unwrap_or(0.0)
     }
 }
 
@@ -984,8 +991,16 @@ pub struct GdnCtx {
     pub state_stride_elems: i64,
     /// Device request→slot ids, one per request in the fire.
     pub slot_ids_d: *const i32,
-    /// Whether this fire advances state (true for Decode/Prefill; the
-    /// frozen-verify service classes pass false).
+    /// Whether this fire advances state.
+    ///
+    /// True for every class that exists. This used to read "the
+    /// frozen-verify service classes pass false", and those classes are
+    /// GONE — `FireClass` retired `FrozenVerify`, `CommitAdvance` and
+    /// `StateOnly` when the driver started accepting `PIE_RS_FLAG_FOLD`,
+    /// since a speculative decode writes into a buffer and folds only
+    /// the accepted prefix. The field stays because the kernels take it
+    /// and a class that needs `false` would arrive through here;
+    /// `launch_context_is_stated` argues for the constant by name.
     pub write_state: bool,
 }
 
@@ -1077,7 +1092,9 @@ fn dispatch_generated<R: Resolver>(
     // read past the run does not fault either, it reads the NEXT
     // operand.
     fn width_of(b: &BoundLaunch<'_>, i: usize) -> i32 {
-        b.args.get(i).map_or(0, |a| i32::try_from(a.width).unwrap_or(0))
+        b.args
+            .get(i)
+            .map_or(0, |a| i32::try_from(a.width).unwrap_or(0))
     }
     fn rows_of(b: &BoundLaunch<'_>, i: usize, rows: i32) -> i32 {
         let _ = (b, i);
@@ -1272,7 +1289,10 @@ fn dispatch_generated<R: Resolver>(
     /// The launcher rejects a zero `K`, which is the same outcome the
     /// hand arm's `NoArm` produced and one layer lower.
     fn isqrt_exact_i32(w: i32) -> i32 {
-        u32::try_from(w).ok().and_then(crate::bind::isqrt_exact).unwrap_or(0)
+        u32::try_from(w)
+            .ok()
+            .and_then(crate::bind::isqrt_exact)
+            .unwrap_or(0)
     }
 
     fn join_aux<R: Resolver>(
@@ -1417,7 +1437,6 @@ fn dispatch_generated<R: Resolver>(
     include!(concat!(env!("OUT_DIR"), "/rust_dispatch.rs"))
 }
 
-
 /// Dispatch one bound launch through its `pie_k_*` entry.
 ///
 /// The arms cover the anchor deployment's compute backbone — embed, the
@@ -1459,14 +1478,16 @@ pub fn dispatch<R: Resolver>(
         gdn.ok_or_else(|| DispatchRefusal::NoGdnCtx(bound.kernel.to_string()))
     };
 
-
-
     let rows = i32::try_from(bound.rows.end - bound.rows.start).expect("row count fits i32");
     // The op join's output placements: what a guard-region launch binds
     // for the value the GUARD owns (the recurrence three-way's core out).
     // The join's placements window with the args, or a launch reads its
     // input at the window and writes its output at the base.
-    let win = if bound.kernel.ends_with("_devwin") { 0 } else { bound.rows.start };
+    let win = if bound.kernel.ends_with("_devwin") {
+        0
+    } else {
+        bound.rows.start
+    };
 
     // The spec's FOREIGN values (`LaunchSpec::aux`) — nemotron's mamba
     // wiring — resolved exactly like the outs.
@@ -1490,7 +1511,6 @@ pub fn dispatch<R: Resolver>(
         }
     };
 
-
     match bound.kernel {
         // args: [act, y] with beta 0, or [act, resid_in, y] with beta 1 —
         // the residual fold, where the output aliases the residual's
@@ -1506,10 +1526,10 @@ pub fn dispatch<R: Resolver>(
         // with `WeightView::raw(W, BF16)` — the one view this arm ever
         // built, now assembled inside the launcher where the routing
         // lives, rather than crossing the ABI as a descriptor.
-                // args: [packed, rope_table, q_norm_w, k_norm_w]; the q output is
+        // args: [packed, rope_table, q_norm_w, k_norm_w]; the q output is
         // the observed-query PIN (outs[0], Named); the KV pages, CSRs and
         // write descriptors are the fire's ([`AttnCtx`]).
-                // args: [q (the pin)]; o is the op's arena output; the plan, the
+        // args: [q (the pin)]; o is the op's arena output; the plan, the
         // workspace and the layer view are the fire's.
         // args: as the plain decode dispatch, plus the SCORE outputs.
         // `_capture` is capturing scores, not capturing a graph —
@@ -1519,7 +1539,7 @@ pub fn dispatch<R: Resolver>(
         // they must be arena-STABLE: the predicate is folded, so one exec
         // serves a fire that wants scores and one that does not, and an
         // address recorded now has to still be right when it goes true.
-                        // args: [q]; o is guard-owned ([`AttnCtx::o_out`]); the pages are
+        // args: [q]; o is guard-owned ([`AttnCtx::o_out`]); the pages are
         // the layer's bf16 MIRRORS — the native alias, the decode lesson.
         // The prefill sibling of the score-capturing decode dispatch, and
         // the same story: `WantsAttnScore` selects it, the score buffers
@@ -1532,13 +1552,13 @@ pub fn dispatch<R: Resolver>(
         // zero-length, which is what a fire that wants no scores means,
         // and a fire that does want them needs `DecodeScoreCapturePlan`'s
         // layout for both anyway.
-                        // args: [q] with the output guard-owned, or [q, o] as SSA. The
+        // args: [q] with the output guard-owned, or [q, o] as SSA. The
         // custom-mask arm: `HasCustomMask` selects it, and the mask rides
         // the ctx rather than the statement for the same reason the score
         // sink does — the predicate is folded, so one exec serves the fire
         // that stages a mask and the fire that does not, and the address
         // recorded now has to still be right when it goes true.
-                // ── The MIXTURE's landing pair, both in-place ───────────────
+        // ── The MIXTURE's landing pair, both in-place ───────────────
         // Neither can generate: `emit_rust_dispatch` skips every
         // `in_place` row because a generated branch binds `Out(0)` and
         // calls, with nowhere to stage the copy the aliasing needs. The
@@ -1557,26 +1577,26 @@ pub fn dispatch<R: Resolver>(
         // padded width is the other operand's extent, which no `Source`
         // names. Both fall out of the two widths and the logical head dim
         // the ctx carries, which is what this computes.
-                // args: [packed, q_out, q_norm, k_norm] — gemma-4's fused local
+        // args: [packed, q_out, q_norm, k_norm] — gemma-4's fused local
         // decode post: split the packed projection, norm q/k, rope them
         // (rounded), norm v, write k/v straight to the pages. Only the
         // query survives as a value.
-                // The rounded fused norm+rope, BOTH shapes the driver reaches:
+        // The rounded fused norm+rope, BOTH shapes the driver reaches:
         // [q, k, q_norm, k_norm] — the local pair, in place — and
         // [q_in, q_out, q_norm] — a KV-SHARED layer's Q-ONLY form, which
         // the driver reaches by passing `num_kv_heads = 0`, never by a
         // generic rope.
-                // args: [q, o] — the PLANLESS flashinfer prefill (plans
+        // args: [q, o] — the PLANLESS flashinfer prefill (plans
         // internally per fire; reads the host CSR mirrors).
-                // args: [q, o] — the naive paged prefill, for the head dims
+        // args: [q, o] — the naive paged prefill, for the head dims
         // flashinfer's prefill template refuses (gemma-4's 512).
-                // args: [x, hidden_in, hidden_out, norm_out, w, next_w] — FOUR
+        // args: [x, hidden_in, hidden_out, norm_out, w, next_w] — FOUR
         // statements in one launch: norm x, land on the stream, scale,
         // norm THAT with the next block's weight. The scale is 1 at the
         // attention landing; the PLE landing carries the layer's own
         // scalar, resolved from `DispatchCtx::scales` by the weight's
         // name (the C++ reads `layer_scalar_value` the same way).
-                // args: [dt_raw, a, dt_out, da_out]; dt_bias rides the spec's
+        // args: [dt_raw, a, dt_out, da_out]; dt_bias rides the spec's
         // aux slots (the statement does not carry it — the C++ hand pass
         // wires it through its workspace). `time_step_min` is 0 at both
         // C++ call sites.
@@ -1588,7 +1608,7 @@ pub fn dispatch<R: Resolver>(
         // gate is the SPLIT's contiguous copy, so its stride is its own
         // width (the C++ hand pass reads the gate in place inside the
         // packed projection, stride `projection_dim` — same values).
-                // args: [q, v] in place; qkv_in rides the spec's aux (the same
+        // args: [q, v] in place; qkv_in rides the spec's aux (the same
         // layer's projection input), the staged state + scratch ride the
         // ctx. The LAYER is the op tag's — never `param1`, the bug the
         // C++'s first live A/B caught.
@@ -1634,12 +1654,12 @@ pub fn dispatch<R: Resolver>(
         // ── the pair/chunked activation and router variants ─────────
         // args: [gate, y] + aux[up] — the pair form, whose `up` the
         // statement cannot name (see the join's pre-pass).
-                // args: [logits, idx, w] or [logits, idx, w, W bias] — the two
+        // args: [logits, idx, w] or [logits, idx, w, W bias] — the two
         // bias-capable routers; the bias is null when unstated.
-                // ── gemma's arms ─────────────────────────────────────────────
+        // ── gemma's arms ─────────────────────────────────────────────
         // args: [x_in, x_out, scale-name] — `x *= s`, the constant named
         // in the weight slot, resolved through `DispatchCtx::scales`.
-                // args: [q_in, k_in, q_out, k_out] — in-place pair, staged like
+        // args: [q_in, k_in, q_out, k_out] — in-place pair, staged like
         // `rope::rope_bf16` — or [q_in, q_out], the KV-SHARED layers'
         // Q-ONLY form: gemma-4's shared full layers rotate q through the
         // same launcher with `num_kv_heads = 0` and the q buffer riding
@@ -1648,7 +1668,7 @@ pub fn dispatch<R: Resolver>(
         // statement; the head dim is the LAYER'S (gemma-4's full layers
         // run 512 where the fire-wide `ctx.head_dim` says 256), read off
         // the kv view the layer tag names.
-                other => return Err(DispatchRefusal::NoArm(other.to_string())),
+        other => return Err(DispatchRefusal::NoArm(other.to_string())),
     }
     Ok(())
 }
@@ -1775,7 +1795,10 @@ impl<'a> AttnRegions<'a> {
     /// A peeled fire: the prefix uses the fire's state, the tail its own.
     #[must_use]
     pub const fn split(fire: &'a AttnCtx, tail: &'a AttnCtx) -> Self {
-        Self { fire: Some(fire), tail: Some(tail) }
+        Self {
+            fire: Some(fire),
+            tail: Some(tail),
+        }
     }
 
     /// The state a rectangle executes against.
@@ -1784,7 +1807,11 @@ impl<'a> AttnRegions<'a> {
     /// a tail: a peel's prefix starts at row zero and its tail does not.
     #[must_use]
     pub fn of(&self, rows: &std::ops::Range<u32>) -> Option<&'a AttnCtx> {
-        if rows.start == 0 { self.fire } else { self.tail.or(self.fire) }
+        if rows.start == 0 {
+            self.fire
+        } else {
+            self.tail.or(self.fire)
+        }
     }
 }
 
@@ -1812,9 +1839,19 @@ pub fn run<R: Resolver>(
             kernel: kernel(),
             why: RunRefusalKind::Bind(e),
         })?;
-        dispatch(&bound, dplan.spec(i), frame, resolver, ctx, attn.of(&launch.rows), gdn)
-            .map_err(|e| {
-            RunRefusal { launch: i, kernel: kernel(), why: RunRefusalKind::Dispatch(e) }
+        dispatch(
+            &bound,
+            dplan.spec(i),
+            frame,
+            resolver,
+            ctx,
+            attn.of(&launch.rows),
+            gdn,
+        )
+        .map_err(|e| RunRefusal {
+            launch: i,
+            kernel: kernel(),
+            why: RunRefusalKind::Dispatch(e),
         })?;
     }
     Ok(lowered.launches.len())
@@ -1836,7 +1873,9 @@ fn cond_path(conds: &[model_compiler::lower::CondRegion], cond: u32) -> Vec<u32>
     let mut at = cond;
     while at != Launch::NO_COND {
         path.push(at);
-        let Some(node) = conds.get(at as usize) else { break };
+        let Some(node) = conds.get(at as usize) else {
+            break;
+        };
         at = node.parent;
     }
     path.reverse();
@@ -1921,7 +1960,9 @@ pub fn run_captured<R: Resolver>(
         while stack.len() > close_to {
             builder.end_body().map_err(|e| cuda(i, &kernel, e))?;
             let f = stack.pop().expect("stack is non-empty");
-            builder.close_cond(&f.cond).map_err(|e| cuda(i, &kernel, e))?;
+            builder
+                .close_cond(&f.cond)
+                .map_err(|e| cuda(i, &kernel, e))?;
         }
 
         if let Some(s) = switch_at {
@@ -1953,9 +1994,19 @@ pub fn run_captured<R: Resolver>(
             kernel: kernel.clone(),
             why: RunRefusalKind::Bind(e),
         })?;
-        dispatch(&bound, dplan.spec(i), frame, resolver, &ctx, attn.of(&launch.rows), gdn)
-            .map_err(|e| {
-            RunRefusal { launch: i, kernel: kernel.clone(), why: RunRefusalKind::Dispatch(e) }
+        dispatch(
+            &bound,
+            dplan.spec(i),
+            frame,
+            resolver,
+            &ctx,
+            attn.of(&launch.rows),
+            gdn,
+        )
+        .map_err(|e| RunRefusal {
+            launch: i,
+            kernel: kernel.clone(),
+            why: RunRefusalKind::Dispatch(e),
         })?;
         // RETAIN THE NODE this launch became.
         //
@@ -1979,7 +2030,9 @@ pub fn run_captured<R: Resolver>(
     let last = lowered.launches.len().saturating_sub(1);
     while let Some(f) = stack.pop() {
         builder.end_body().map_err(|e| cuda(last, "<unwind>", e))?;
-        builder.close_cond(&f.cond).map_err(|e| cuda(last, "<unwind>", e))?;
+        builder
+            .close_cond(&f.cond)
+            .map_err(|e| cuda(last, "<unwind>", e))?;
     }
 
     Ok(lowered.launches.len())
@@ -2057,7 +2110,10 @@ pub fn resolve_arg_windowed<R: Resolver>(
             // reaches the arm through `DispatchCtx::scales`; the operand
             // slot binds a dangling sentinel so the launch's arity holds.
             if name.starts_with("scale.") {
-                BoundArg { ptr: std::ptr::NonNull::<c_void>::dangling().as_ptr(), width: 0 }
+                BoundArg {
+                    ptr: std::ptr::NonNull::<c_void>::dangling().as_ptr(),
+                    width: 0,
+                }
             } else {
                 BoundArg {
                     ptr: resolver
@@ -2103,10 +2159,19 @@ pub fn bind<'a, R: Resolver>(
     // BASE pointers — the grid spans every lane and out-of-window rows
     // early-out on a device word — which is what makes them replayable
     // across splits, so windowing them would offset twice.
-    let row = if kernel.ends_with("_devwin") { 0 } else { launch.rows.start };
+    let row = if kernel.ends_with("_devwin") {
+        0
+    } else {
+        launch.rows.start
+    };
     let mut args = Vec::with_capacity(launch.args.len());
     for arg in &lowered.args[launch.args.start as usize..launch.args.end as usize] {
         args.push(resolve_arg_windowed(arg, frame, resolver, row)?);
     }
-    Ok(BoundLaunch { kernel, rows: launch.rows.clone(), layers: launch.layers.clone(), args })
+    Ok(BoundLaunch {
+        kernel,
+        rows: launch.rows.clone(),
+        layers: launch.layers.clone(),
+        args,
+    })
 }

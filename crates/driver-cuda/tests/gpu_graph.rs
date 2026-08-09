@@ -10,8 +10,8 @@
 //! Skipped when no device is present.
 
 mod common;
-use driver_cuda::device::{Allocator, DeviceBuffer, OwnedStream, StreamRef};
 use common::{device_or_skip, gpu_guard};
+use driver_cuda::device::{Allocator, DeviceBuffer, OwnedStream, StreamRef};
 
 const N: usize = 1 << 20;
 
@@ -25,7 +25,9 @@ fn read(buf: &DeviceBuffer, stream: StreamRef<'_>) -> Vec<u8> {
 #[test]
 fn a_captured_graph_replays_the_work_that_was_captured() {
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("graph capture") else { return };
+    let Some(_dev) = device_or_skip("graph capture") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let mut alloc = Allocator::new();
     let mut buf = alloc.alloc(N).expect("alloc");
@@ -34,7 +36,8 @@ fn a_captured_graph_replays_the_work_that_was_captured() {
     stream.as_ref().synchronize().expect("sync");
 
     let scope = alloc.begin_capture(stream.as_ref()).expect("begin capture");
-    buf.memset(0x5a, scope.stream()).expect("memset under capture");
+    buf.memset(0x5a, scope.stream())
+        .expect("memset under capture");
     let graph = scope.end().expect("end capture");
 
     // Capture records work; it does not perform it.
@@ -48,20 +51,29 @@ fn a_captured_graph_replays_the_work_that_was_captured() {
     exec.launch(stream.as_ref()).expect("launch");
     stream.as_ref().synchronize().expect("sync");
 
-    assert!(read(&buf, stream.as_ref()).iter().all(|&b| b == 0x5a), "the graph did not run");
+    assert!(
+        read(&buf, stream.as_ref()).iter().all(|&b| b == 0x5a),
+        "the graph did not run"
+    );
 }
 
 #[test]
 fn an_instantiated_graph_can_be_relaunched() {
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("graph relaunch") else { return };
+    let Some(_dev) = device_or_skip("graph relaunch") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let mut alloc = Allocator::new();
     let mut buf = alloc.alloc(N).expect("alloc");
 
     let scope = alloc.begin_capture(stream.as_ref()).expect("begin capture");
     buf.memset(0x77, scope.stream()).expect("memset");
-    let exec = scope.end().expect("end capture").instantiate().expect("instantiate");
+    let exec = scope
+        .end()
+        .expect("end capture")
+        .instantiate()
+        .expect("instantiate");
 
     for round in 0..8 {
         buf.memset(0, stream.as_ref()).expect("clear");
@@ -85,7 +97,9 @@ fn an_instantiated_graph_can_be_relaunched() {
 #[test]
 fn a_conditional_body_runs_exactly_when_its_default_says_so() {
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("conditional default") else { return };
+    let Some(_dev) = device_or_skip("conditional default") else {
+        return;
+    };
 
     for run_it in [false, true] {
         let stream = OwnedStream::new(0).expect("stream");
@@ -98,7 +112,9 @@ fn a_conditional_body_runs_exactly_when_its_default_says_so() {
         let scope = alloc.begin_capture(stream.as_ref()).expect("begin capture");
         let mut graph = scope.end().expect("end capture");
 
-        let branch = graph.add_conditional_if(&[], Some(run_it)).expect("conditional node");
+        let branch = graph
+            .add_conditional_if(&[], Some(run_it))
+            .expect("conditional node");
         // Populate the body by capturing into it.
         fill_body_with_memset(branch.body(), &buf, 0xc3);
 
@@ -108,9 +124,15 @@ fn a_conditional_body_runs_exactly_when_its_default_says_so() {
 
         let out = read(&buf, stream.as_ref());
         if run_it {
-            assert!(out.iter().all(|&b| b == 0xc3), "default=true did not run the body");
+            assert!(
+                out.iter().all(|&b| b == 0xc3),
+                "default=true did not run the body"
+            );
         } else {
-            assert!(out.iter().all(|&b| b == 0), "default=false ran the body anyway");
+            assert!(
+                out.iter().all(|&b| b == 0),
+                "default=false ran the body anyway"
+            );
         }
     }
 }
@@ -120,7 +142,11 @@ fn a_conditional_body_runs_exactly_when_its_default_says_so() {
 /// The body is a `cudaGraph_t` owned by the parent, so it is filled with the
 /// explicit node API rather than by capture -- there is no stream to capture
 /// into.
-fn fill_body_with_memset(body: driver_cuda::cudarc::runtime::sys::cudaGraph_t, buf: &DeviceBuffer, v: u8) {
+fn fill_body_with_memset(
+    body: driver_cuda::cudarc::runtime::sys::cudaGraph_t,
+    buf: &DeviceBuffer,
+    v: u8,
+) {
     use driver_cuda::cudarc::runtime::sys as rt;
     let mut params: rt::cudaMemsetParams = unsafe { std::mem::zeroed() };
     params.dst = buf.as_ptr();
@@ -133,9 +159,14 @@ fn fill_body_with_memset(body: driver_cuda::cudarc::runtime::sys::cudaGraph_t, b
     let mut node: rt::cudaGraphNode_t = std::ptr::null_mut();
     // SAFETY: `body` is a live graph owned by the parent, and `params`
     // describes a region inside `buf`, which outlives the graph's use here.
-    let code =
-        unsafe { rt::cudaGraphAddMemsetNode(&raw mut node, body, std::ptr::null(), 0, &raw const params) };
-    assert_eq!(code, rt::cudaError::cudaSuccess, "cudaGraphAddMemsetNode: {code:?}");
+    let code = unsafe {
+        rt::cudaGraphAddMemsetNode(&raw mut node, body, std::ptr::null(), 0, &raw const params)
+    };
+    assert_eq!(
+        code,
+        rt::cudaError::cudaSuccess,
+        "cudaGraphAddMemsetNode: {code:?}"
+    );
 }
 
 /// A conditional node with no default is the `supergraph.cu` shape: the host
@@ -146,7 +177,9 @@ fn fill_body_with_memset(body: driver_cuda::cudarc::runtime::sys::cudaGraph_t, b
 #[test]
 fn a_conditional_node_without_a_default_still_builds_and_launches() {
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("conditional without default") else { return };
+    let Some(_dev) = device_or_skip("conditional without default") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let mut alloc = Allocator::new();
     let buf = alloc.alloc(N).expect("alloc");
@@ -154,8 +187,14 @@ fn a_conditional_node_without_a_default_still_builds_and_launches() {
     let scope = alloc.begin_capture(stream.as_ref()).expect("begin capture");
     let mut graph = scope.end().expect("end capture");
 
-    let branch = graph.add_conditional_if(&[], None).expect("conditional node");
-    assert_ne!(branch.handle(), 0, "the handle is what a device kernel writes to");
+    let branch = graph
+        .add_conditional_if(&[], None)
+        .expect("conditional node");
+    assert_ne!(
+        branch.handle(),
+        0,
+        "the handle is what a device kernel writes to"
+    );
     assert!(!branch.body().is_null());
     fill_body_with_memset(branch.body(), &buf, 0x01);
 
@@ -169,7 +208,9 @@ fn a_conditional_node_without_a_default_still_builds_and_launches() {
 #[test]
 fn conditional_handles_are_distinct_per_node() {
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("distinct handles") else { return };
+    let Some(_dev) = device_or_skip("distinct handles") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let mut alloc = Allocator::new();
 
@@ -185,7 +226,9 @@ fn conditional_handles_are_distinct_per_node() {
 #[test]
 fn allocations_made_before_a_capture_are_usable_inside_it() {
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("capture with prior allocation") else { return };
+    let Some(_dev) = device_or_skip("capture with prior allocation") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let mut alloc = Allocator::new();
 
@@ -196,7 +239,11 @@ fn allocations_made_before_a_capture_are_usable_inside_it() {
 
     let scope = alloc.begin_capture(stream.as_ref()).expect("begin capture");
     b.memset(0x22, scope.stream()).expect("memset b");
-    let exec = scope.end().expect("end").instantiate().expect("instantiate");
+    let exec = scope
+        .end()
+        .expect("end")
+        .instantiate()
+        .expect("instantiate");
 
     exec.launch(stream.as_ref()).expect("launch");
     stream.as_ref().synchronize().expect("sync");
@@ -211,7 +258,9 @@ fn allocations_made_before_a_capture_are_usable_inside_it() {
 #[test]
 fn a_buffer_dropped_during_capture_is_freed_after_it_ends() {
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("deferred free") else { return };
+    let Some(_dev) = device_or_skip("deferred free") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let mut alloc = Allocator::new();
 
@@ -231,5 +280,7 @@ fn a_buffer_dropped_during_capture_is_freed_after_it_ends() {
     assert!(!alloc.is_capturing());
 
     // The allocator is still healthy afterwards.
-    let _fresh = alloc.alloc(N).expect("allocator usable after a deferred free");
+    let _fresh = alloc
+        .alloc(N)
+        .expect("allocator usable after a deferred free");
 }

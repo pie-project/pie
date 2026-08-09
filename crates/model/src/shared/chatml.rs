@@ -5,12 +5,12 @@
 //!
 //! Reference: Qwen3 Jinja chat template with tool-calling support.
 
-use crate::shared::decoders::{GenericChatDecoder, NoopReasoningDecoder, ThinkingDecoder};
 use crate::instruct::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
 };
-use tokenizer::{Tokenizer, TokenizerDecoder};
+use crate::shared::decoders::{GenericChatDecoder, NoopReasoningDecoder, ThinkingDecoder};
 use std::sync::Arc;
+use tokenizer::{Tokenizer, TokenizerDecoder};
 
 // =============================================================================
 // Configuration
@@ -328,8 +328,8 @@ impl ToolDecoder for QwenToolDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokenizer::Tokenizer;
     use std::sync::Arc;
+    use tokenizer::Tokenizer;
 
     fn make_tok() -> Arc<Tokenizer> {
         let v: Vec<String> = vec![

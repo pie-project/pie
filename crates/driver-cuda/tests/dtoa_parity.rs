@@ -74,13 +74,46 @@ fn corpus() -> String {
     // the C++ writes them, so the two lists can be diffed by eye; clippy's
     // grouping and precision lints are waived for that reason.
     let edges: [f64; 41] = [
-        0.0, -0.0, 1.0, -1.0, 0.5, 1.5, 0.1, 100.0, 12345.0,
-        1e-4, 1e-5, 1e-6, 1e-7, 1e14, 1e15, 1e16, 1e17, 1e21, 1e-21,
-        1e100, 1e-100, 1.0 / 3.0, 123_456_789.123_456, 3.0e30, 2.5e-30,
-        5e-324, 1.797_693_134_862_315_7e308, 2.225_073_858_507_201_4e-308,
-        999_999_999_999_999.0, 1_000_000_000_000_000.0, 0.000_099_99, 0.0001,
-        2.0, 4.0, 1024.0, 4_503_599_627_370_496.0, 2.0e-308,
-        46934.815_584_012_416, 72972.677_071_267_06, 27453.918_300_648_482,
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        0.5,
+        1.5,
+        0.1,
+        100.0,
+        12345.0,
+        1e-4,
+        1e-5,
+        1e-6,
+        1e-7,
+        1e14,
+        1e15,
+        1e16,
+        1e17,
+        1e21,
+        1e-21,
+        1e100,
+        1e-100,
+        1.0 / 3.0,
+        123_456_789.123_456,
+        3.0e30,
+        2.5e-30,
+        5e-324,
+        1.797_693_134_862_315_7e308,
+        2.225_073_858_507_201_4e-308,
+        999_999_999_999_999.0,
+        1_000_000_000_000_000.0,
+        0.000_099_99,
+        0.0001,
+        2.0,
+        4.0,
+        1024.0,
+        4_503_599_627_370_496.0,
+        2.0e-308,
+        46934.815_584_012_416,
+        72972.677_071_267_06,
+        27453.918_300_648_482,
         3.411_036_675_017_818_7e-295,
     ];
     for v in edges {
@@ -135,7 +168,10 @@ fn the_rust_formatter_reproduces_nlohmanns_output_exactly() {
 }
 
 #[test]
-#[expect(clippy::excessive_precision, reason = "the extra digits are the subject")]
+#[expect(
+    clippy::excessive_precision,
+    reason = "the extra digits are the subject"
+)]
 fn the_golden_actually_discriminates() {
     // A pin nothing can break is not a pin. Perturb one value the way a
     // plausible port mistake would -- using Rust's shortest representation

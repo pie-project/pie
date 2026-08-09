@@ -63,15 +63,23 @@ impl FakeOps {
         if p.is_null() {
             return "null".into();
         }
-        self.names.get(&(p as usize)).cloned().unwrap_or_else(|| "unknown".into())
+        self.names
+            .get(&(p as usize))
+            .cloned()
+            .unwrap_or_else(|| "unknown".into())
     }
 }
 
 impl KvCacheDeviceOps for FakeOps {
     fn alloc_tensor(&mut self, dtype: DType, shape: &[i64]) -> *mut c_void {
         let spec = TensorSpec::new(dtype, shape.to_vec()).expect("oracle shapes are valid");
-        let dims = shape.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
-        self.alloc_log.push(format!("{}[{dims}]={}", dtype.name(), spec.nbytes()));
+        let dims = shape
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        self.alloc_log
+            .push(format!("{}[{dims}]={}", dtype.name(), spec.nbytes()));
         if spec.nbytes() == 0 {
             return std::ptr::null_mut();
         }
@@ -120,12 +128,24 @@ const STUB_BYTES_PER_PAGE: usize = 4096;
 
 impl ElasticPool for FakeElastic {
     fn ensure_fraction(&mut self, used: usize, capacity: usize) {
-        self.log.borrow_mut().push(format!("ensure({used}/{capacity})"));
-        self.committed = if capacity == 0 { 0 } else { used * STUB_BYTES_PER_PAGE };
+        self.log
+            .borrow_mut()
+            .push(format!("ensure({used}/{capacity})"));
+        self.committed = if capacity == 0 {
+            0
+        } else {
+            used * STUB_BYTES_PER_PAGE
+        };
     }
     fn trim_fraction(&mut self, used: usize, capacity: usize) {
-        self.log.borrow_mut().push(format!("trim({used}/{capacity})"));
-        self.committed = if capacity == 0 { 0 } else { used * STUB_BYTES_PER_PAGE };
+        self.log
+            .borrow_mut()
+            .push(format!("trim({used}/{capacity})"));
+        self.committed = if capacity == 0 {
+            0
+        } else {
+            used * STUB_BYTES_PER_PAGE
+        };
     }
     fn committed_bytes(&self) -> usize {
         self.committed
@@ -241,7 +261,10 @@ fn bf16() -> KvCacheFormat {
 }
 
 fn transcript() -> String {
-    let mut h = Harness { out: String::new(), case: String::new() };
+    let mut h = Harness {
+        out: String::new(),
+        case: String::new(),
+    };
     let mut ops = FakeOps::new();
 
     // a. Homogeneous native bf16, envelopes off.
@@ -353,14 +376,22 @@ fn transcript() -> String {
         h.flush(&mut ops);
         h.row(format!(
             "enable-when-on{SEP}{}",
-            if on.enable_envelopes().is_ok() { "ok" } else { "threw" }
+            if on.enable_envelopes().is_ok() {
+                "ok"
+            } else {
+                "threw"
+            }
         ));
         let l = KvCacheLayout::plan(1, 2, 4, 2, 16, bf16(), false).unwrap();
         let off = Cache::materialize(l, &mut ops).unwrap();
         h.flush(&mut ops);
         h.row(format!(
             "enable-when-off{SEP}{}",
-            if off.enable_envelopes().is_ok() { "ok" } else { "threw" }
+            if off.enable_envelopes().is_ok() {
+                "ok"
+            } else {
+                "threw"
+            }
         ));
     }
 

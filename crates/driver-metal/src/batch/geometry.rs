@@ -162,17 +162,11 @@ pub struct DecodeGeometry {
     pub rotary_dims: u32,
     /// The rope base.
     pub rope_theta: f32,
-    /// Whether the FULL-attention layers take V from the K projection.
-    ///
-    /// gemma4's `attention_k_eq_v`. Measured: those layers ship no `v_proj`.
-    pub attention_k_eq_v: bool,
     /// How often a FULL-attention layer appears in a stack that otherwise
     /// slides, or zero for a stack that does not alternate.
     pub full_attn_every: u32,
     /// The window a sliding layer attends, or zero for none.
     pub sliding_window: u32,
-    /// gemma's readout SOFTCAP — `cap * tanh(x / cap)` — or zero for none.
-    pub final_logit_softcap: f32,
     /// The per-head width the FULL-attention layers use, or zero for a stack
     /// whose layers all share [`Self::head_dim`].
     ///
@@ -197,13 +191,6 @@ pub struct DecodeGeometry {
     /// fifty of its sixty layers, so reading one base was wrong on 83% of the
     /// stack — 1e6 where the config says 1e4.
     pub rope_theta_sliding: f32,
-    /// gemma's per-layer embedding width (`hidden_size_per_layer_input`), or
-    /// zero for a deployment with no PLE side network.
-    ///
-    /// Zero for gemma-4-31b, which states `hidden_size_per_layer_input: 0` —
-    /// so "the gemma-shaped fields were populated" and "has a PLE" are NOT
-    /// the same question, which is why this is read rather than implied.
-    pub per_layer_emb_dim: u32,
     /// How many layers share their neighbour's KV pages
     /// (`num_kv_shared_layers`), or zero for a stack where every layer writes
     /// its own. Zero for gemma-4-31b.
@@ -250,15 +237,6 @@ pub struct DecodeGeometry {
     /// -- which is what happened for every gemma checkpoint until the
     /// importer stopped normalizing `hidden_activation` away.
     pub gelu_gate: bool,
-    /// gpt-oss's SwiGLU constants, or zero for a deployment that takes the
-    /// plain gated activation.
-    ///
-    /// A limit of zero is "not gpt-oss" and not a clamp at zero, which would
-    /// zero the gate branch entirely — which is why the pair is read through
-    /// the limit rather than through a separate flag.
-    pub swiglu_limit: f32,
-    /// See [`Self::swiglu_limit`].
-    pub swiglu_alpha: f32,
     /// The rope RESCALING, when the config states one, or zero for a plain
     /// geometric ladder.
     ///
@@ -278,8 +256,6 @@ pub struct DecodeGeometry {
     pub rope_high_freq_factor: f32,
     /// See [`Self::rope_freq_factor`].
     pub rope_original_max_position: u32,
-    /// The multimodal rope section split.
-    pub mrope_section: [u32; 3],
     /// GDN key heads.
     pub gdn_k_heads: u32,
     /// GDN value heads.
@@ -301,10 +277,6 @@ pub struct DecodeGeometry {
     pub n_experts: u32,
     /// Experts each token routes to.
     pub experts_per_token: u32,
-    /// Whether routing weights renormalize over the selected experts.
-    /// False routes with weights from the softmax over ALL experts, which
-    /// sum to less than one.
-    pub norm_topk_prob: bool,
     /// One routed expert's FFN width.
     pub moe_intermediate: u32,
     /// The bank stays in the checkpoint's MXFP4 rather than being
@@ -317,18 +289,6 @@ pub struct DecodeGeometry {
     /// one-scalar-per-token sigmoid gate. Zero only for a routing that has
     /// none.
     pub shared_intermediate: u32,
-    /// The widest fire the pools are sized for.
-    pub max_tokens: u32,
-    /// The most requests one fire may carry.
-    pub max_requests: u32,
-    /// Recurrent-state slots.
-    pub max_slots: u32,
-    /// The KV page size.
-    pub kv_page_size: u32,
-    /// Physical pages in the paged pool.
-    pub total_pages: u32,
-    /// Whether the paged-KV regions exist at all.
-    pub paged_kv_enabled: bool,
     /// Full attention every N layers; an interval of one (or less) makes
     /// every layer qualify. Runtime rather than constant, because the
     /// interval is a property of the checkpoint and this driver is no
@@ -352,26 +312,20 @@ impl Default for DecodeGeometry {
             alt_quant: AffineFormat { bits: 0, group: 0 },
             rotary_dims: 64,
             rope_theta: 1e7,
-            attention_k_eq_v: false,
             full_attn_every: 0,
             sliding_window: 0,
-            final_logit_softcap: 0.0,
             global_head_dim: 0,
             global_kv_heads: 0,
             full_partial_rotary: 0.0,
             rope_theta_sliding: 0.0,
-            per_layer_emb_dim: 0,
             kv_shared_layers: 0,
             norm_unit_offset: true,
             v_norm: false,
             gelu_gate: false,
-            swiglu_limit: 0.0,
-            swiglu_alpha: 0.0,
             rope_freq_factor: 0.0,
             rope_low_freq_factor: 0.0,
             rope_high_freq_factor: 0.0,
             rope_original_max_position: 0,
-            mrope_section: [11, 11, 10],
             gdn_k_heads: 16,
             gdn_v_heads: 16,
             gdn_k_dim: 128,
@@ -382,16 +336,9 @@ impl Default for DecodeGeometry {
             intermediate: 3584,
             n_experts: 0,
             experts_per_token: 0,
-            norm_topk_prob: true,
             moe_intermediate: 0,
             mxfp4_experts: false,
             shared_intermediate: 0,
-            max_tokens: 1,
-            max_requests: 1,
-            max_slots: 1,
-            kv_page_size: 32,
-            total_pages: 1,
-            paged_kv_enabled: false,
             full_attn_interval: 4,
         }
     }
@@ -488,11 +435,23 @@ fn positive(v: i32) -> Option<u32> {
 /// Build the geometry a catalog row's [`Deployment`] describes, or say why
 /// it cannot be built.
 ///
-/// Fills the SHAPE. The caller still sets the capacity fields
-/// (`max_tokens`, `max_requests`, `max_slots`, the paging trio) because
-/// those are the OPERATOR's numbers and no checkpoint states them, and
-/// `alt_quant`/`mxfp4_experts` because those are solved from the staged
-/// tensors rather than from any statement.
+/// Fills the SHAPE — all of it. `geometry_is_stated` holds this function
+/// to the struct, so a field added here without a source is a failing
+/// test rather than a `Default` a kernel reads as a measurement.
+///
+/// This doc used to say the caller set the capacity fields as well
+/// (`max_tokens`, `max_requests`, `max_slots`, a page size, a page
+/// count, a paged-KV flag) "because those are the OPERATOR's numbers".
+/// No caller set them and nothing read them: they were one end of a
+/// contract with no other end, and they are gone. The operator's real
+/// numbers travel as `DriverCapabilities` and the pool's own counts,
+/// which is where a scheduler already reads them.
+///
+/// Two fields DO remain unfilled — `alt_quant` and `mxfp4_experts`,
+/// which are solved from the staged tensors rather than from any
+/// statement, and are not solved yet. `geometry_is_stated` names them
+/// and says so, so the gap is a sentence somebody wrote rather than a
+/// default somebody inherited.
 ///
 /// # Why three arguments and not one
 ///
@@ -511,28 +470,48 @@ fn positive(v: i32) -> Option<u32> {
 ///
 /// # What this refuses that it did not have to
 ///
-/// Three shapes are refused here that `geometry_from_facts` served, and the
-/// reason is the same in each case: **the fact is not in a `Deployment` and
-/// this file will not invent it.**
+/// ONE shape is refused here that `geometry_from_facts` served, and the
+/// reason is the one this file refuses for: **the fact is not in a
+/// `Deployment` and this file will not invent it.**
 ///
-///   * A ROUTED stack. `Deployment` carries `moe_intermediate` and
-///     `LoadShape` carries `n_experts`, and neither carries the top-k. A
-///     mixture fired at a guessed top-k routes each token to almost the
-///     right experts — the same class of failure as reading the router's
-///     8-bit gate as 4-bit, which is documented on
-///     [`DecodeGeometry::alt_quant`] and which produced cosine 0.84 logits
-///     rather than an error.
-///   * A stack with TWO head dims (gemma-4's 256 sliding against 512 full).
-///     `LayerAttention` states a per-layer `head_dim` and no per-layer KV
-///     head count, and gemma-4's full layers run four KV heads against the
-///     sliding layers' sixteen. Serving it with one count reads a quarter
-///     past the end of every full layer's K.
 ///   * An IRREGULAR linear/full interleave. This driver places one full
 ///     layer every fixed interval and will not round an irregular stack to
-///     a regular one.
+///     a regular one. Reachable, and
+///     `an_irregular_interleave_is_refused_rather_than_rounded` fires it.
 ///
-/// Each of the three is reachable, each is tested below, and each names
-/// what would have to be stated to lift it.
+/// # The two that were lifted, and how
+///
+/// This list said THREE until each missing fact got stated. Both lifts
+/// happened the same way and neither is a relaxation — the refusals
+/// named what they were missing, and the named thing arrived:
+///
+///   * A ROUTED stack was refused because "`Deployment` carries
+///     `moe_intermediate` and `LoadShape` carries `n_experts`, and
+///     neither carries the top-k." Every routed row's own facts knew it —
+///     gpt-oss's `top_k`, gemma-4's `experts_per_token`, the `MoeFacts`
+///     five families share. [`Geometry::experts_per_token`] is that
+///     number reaching a driver, and the routed block above READS it,
+///     then bounds it three ways (against zero, against the router's
+///     lanes, against the expert count).
+///   * TWO head dims was refused because `LayerAttention` stated a
+///     per-layer `head_dim` and no per-layer KV head count, so gemma-4's
+///     four-against-sixteen was unreachable. `LayerAttention::kv_heads`
+///     is that count; `full_attention_shape()` reads both halves.
+///
+/// # What lifting the routed refusal exposed
+///
+/// That refusal's own text named the failure it was standing next to —
+/// "the same class of failure as reading the router's 8-bit gate as
+/// 4-bit ... which produced cosine 0.84 logits rather than an error."
+/// The refusal is gone and THAT failure is not: routed stacks now reach
+/// this driver, [`DecodeGeometry::alt_quant`] is the field the second
+/// width would ride, and nothing fills it. `binding::observed` builds
+/// ONE kernel set from `quant.group`/`quant.bits` for the whole
+/// checkpoint, so a row publishing its gate at another width is read at
+/// the stack's. `geometry_is_stated` holds the field NOT WIRED and
+/// `a_routed_row_reads_one_width_for_every_tensor` below is the
+/// measurement, so this is a gap somebody wrote down rather than one
+/// the lifted refusal quietly inherited.
 ///
 /// # Errors
 ///
@@ -585,9 +564,7 @@ pub fn geometry_from_deployment(
         None => {
             let derived = hidden / n_q_heads;
             if derived == 0 {
-                return refuse(
-                    "the row states no head dim and hidden/q_heads is not positive",
-                );
+                return refuse("the row states no head dim and hidden/q_heads is not positive");
             }
             derived
         }
@@ -634,9 +611,12 @@ pub fn geometry_from_deployment(
     // is short.
     let (gdn_k_heads, gdn_v_heads, gdn_k_dim, gdn_v_dim, gdn_conv_k) = match &d.recurrent {
         Some(r) => {
-            let (Some(k_heads), Some(v_heads), Some(k_dim), Some(v_dim)) =
-                (positive(r.k_h), positive(r.v_h), positive(r.k_d), positive(r.v_d))
-            else {
+            let (Some(k_heads), Some(v_heads), Some(k_dim), Some(v_dim)) = (
+                positive(r.k_h),
+                positive(r.v_h),
+                positive(r.k_d),
+                positive(r.v_d),
+            ) else {
                 return refuse(
                     "the recurrent slab needs positive k_h, v_h, k_d and v_d; \
                      the conv and state strides are computed from them and a \
@@ -697,8 +677,7 @@ pub fn geometry_from_deployment(
     let full_attn_interval = match &d.recurrent {
         None => 1,
         Some(r) => {
-            let linear: std::collections::BTreeSet<u32> =
-                r.linear_layers.iter().copied().collect();
+            let linear: std::collections::BTreeSet<u32> = r.linear_layers.iter().copied().collect();
             if linear.is_empty() {
                 return refuse(
                     "the row states a recurrent slab and no linear layers; \
@@ -768,8 +747,10 @@ pub fn geometry_from_deployment(
         // One window, because one number reaches the kernel. A stack whose
         // sliding layers disagree about how far back they see is refused
         // rather than served at the first one's width.
-        let widths: std::collections::BTreeSet<i32> =
-            windowed.iter().map(|&l| d.attention[l as usize].window).collect();
+        let widths: std::collections::BTreeSet<i32> = windowed
+            .iter()
+            .map(|&l| d.attention[l as usize].window)
+            .collect();
         if widths.len() > 1 {
             return Err(GeometryRefused(format!(
                 "the row's sliding layers state {} distinct windows ({widths:?}); \
@@ -884,19 +865,18 @@ pub fn geometry_from_deployment(
     // Zero in both fields means "one shape everywhere", which is what
     // `head_dim_at`/`kv_heads_at` already read them as, so every row whose
     // layers agree passes through unchanged.
-    let (global_head_dim, global_kv_heads, full_partial_rotary) =
-        match d.full_attention_shape() {
-            Some((hd, kv, rot)) if hd > 0 => (
-                hd,
-                kv,
-                // A FRACTION here and an extent there, because the grid
-                // launches half of it. `Rule::Rope`'s own derivation is
-                // `max(2, 2 * int(0.5 * f * d))`, so handing back the ratio
-                // the row spelled as an extent round-trips exactly.
-                rot as f32 / hd as f32,
-            ),
-            _ => (0, 0, 0.0),
-        };
+    let (global_head_dim, global_kv_heads, full_partial_rotary) = match d.full_attention_shape() {
+        Some((hd, kv, rot)) if hd > 0 => (
+            hd,
+            kv,
+            // A FRACTION here and an extent there, because the grid
+            // launches half of it. `Rule::Rope`'s own derivation is
+            // `max(2, 2 * int(0.5 * f * d))`, so handing back the ratio
+            // the row spelled as an extent round-trips exactly.
+            rot as f32 / hd as f32,
+        ),
+        _ => (0, 0, 0.0),
+    };
     if global_kv_heads > 0 && n_q_heads % global_kv_heads != 0 {
         return Err(GeometryRefused(format!(
             "the full-attention layers state {global_kv_heads} kv heads, which does not \
@@ -955,7 +935,12 @@ pub fn geometry_from_deployment(
                 low_freq_factor,
                 high_freq_factor,
                 original_max_position,
-            }) => (factor, low_freq_factor, high_freq_factor, original_max_position),
+            }) => (
+                factor,
+                low_freq_factor,
+                high_freq_factor,
+                original_max_position,
+            ),
             // REFUSED rather than zeroed. The old reader took `kind ==
             // "llama3"` and gave everything else a factor of zero, which is
             // indistinguishable from a model that rescales nothing — so a
@@ -984,7 +969,11 @@ pub fn geometry_from_deployment(
         // Zero means the checkpoint declared no quantization, which is a
         // dense checkpoint; `DecodeGeometry::default`'s G64_B4 stands there
         // rather than a `gs_0_b_0` symbol no shader exports.
-        quant: if quant.is_set() { quant } else { DecodeGeometry::default().quant },
+        quant: if quant.is_set() {
+            quant
+        } else {
+            DecodeGeometry::default().quant
+        },
         // How many leading dims of each head rotate. Zero in a
         // `LayerAttention` means "the whole head", and zero here means the
         // same, so the row's convention passes through unchanged.
@@ -998,7 +987,6 @@ pub fn geometry_from_deployment(
         full_attn_every,
         sliding_window,
         full_attn_interval,
-        final_logit_softcap: d.logit_softcap,
         // STATED by the row, not defaulted. `DecodeGeometry::default`
         // carries `true` — the answer for gemma-1, -2 and -3 — so letting
         // this fall through the struct-update below would have served
@@ -1007,7 +995,6 @@ pub fn geometry_from_deployment(
         // STATED for the same reason and unaskable of the tensors:
         // a weightless norm leaves nothing in the checkpoint.
         v_norm: d.v_norm,
-        per_layer_emb_dim: u32::try_from(d.ple_dim.max(0)).unwrap_or(0),
         kv_shared_layers: load.kv_shared_layers,
         intermediate: d.shape.intermediate,
         gdn_k_heads,
@@ -1039,9 +1026,6 @@ pub fn geometry_from_deployment(
         global_head_dim,
         global_kv_heads,
         full_partial_rotary,
-        // STATED, like `v_norm`: the flag's name says V equals K, and what
-        // the checkpoint does is ship no `v_proj` at all.
-        attention_k_eq_v: d.k_eq_v,
         // The MLP gate, which a `Deployment` did not state and this file
         // therefore left at its default — SiLU, for EVERY checkpoint that
         // reached it. `serve::load` caught the gemma case by asking the
@@ -1049,14 +1033,6 @@ pub fn geometry_from_deployment(
         // the origin. `Deployment::mlp_gate` is the statement that refusal
         // asked for.
         gelu_gate: matches!(d.mlp_gate, model::deployment::MlpGate::GeluTanh),
-        swiglu_limit: match d.mlp_gate {
-            model::deployment::MlpGate::SiluClamped { limit, .. } => limit,
-            _ => 0.0,
-        },
-        swiglu_alpha: match d.mlp_gate {
-            model::deployment::MlpGate::SiluClamped { alpha, .. } => alpha,
-            _ => 0.0,
-        },
         ..DecodeGeometry::default()
     })
 }
@@ -1084,6 +1060,13 @@ mod tests {
             norm_eps: 1e-5,
             k_eq_v: false,
             mlp_gate: model::deployment::MlpGate::Silu,
+            // A dense fixture: no router, so nothing reads it. It is on
+            // the deployment for `driver-cuda`'s launch, which is the
+            // only backend that takes the routing convention through
+            // this struct — a Metal text carries it as a word of its own
+            // `RouterParams`.
+            norm_topk_prob: true,
+            routed_scaling: 1.0,
             shape: Geometry {
                 hidden: 2048,
                 q_heads: 32,
@@ -1112,6 +1095,9 @@ mod tests {
             prefill: PrefillStyle::Planned,
             attn_output: AttnOutput::StatedArgs,
             logit_softcap: 0.0,
+            // Nor an attention cap: gemma-2 is the one family that
+            // states one and no Metal projection serves it.
+            attn_logit_softcap: 0.0,
             ple_dim: 0,
             norm: NormPlacement::Pre,
             norm_unit_offset: false,
@@ -1136,6 +1122,8 @@ mod tests {
             v_d: 128,
             conv_dim: 2 * 16 * 128 + 32 * 128,
             conv_k: 4,
+            // A gated-delta fixture; B/C groups are mamba's.
+            n_groups: 0,
         }
     }
 
@@ -1155,7 +1143,10 @@ mod tests {
             .expect("a llama-shaped row is the ordinary case");
         assert_eq!((g.n_layers, g.hidden, g.vocab), (16, 2048, 128_256));
         assert_eq!((g.n_q_heads, g.n_kv_heads, g.head_dim), (32, 8, 64));
-        assert!(g.tied_embeddings, "`LoadShape` states the tie, not `Deployment`");
+        assert!(
+            g.tied_embeddings,
+            "`LoadShape` states the tie, not `Deployment`"
+        );
         assert_eq!(g.intermediate, 8192);
         // The rope base, which is the number nothing read for the whole life
         // of `DecodeGeometry::default`: a llama-3.2 config says 500000 and
@@ -1213,7 +1204,10 @@ mod tests {
         d.shape.q_heads = 12;
         d.shape.kv_heads = 8;
         let why = why(&d, shape(4));
-        assert!(why.contains("not a multiple") && why.contains("GQA"), "{why}");
+        assert!(
+            why.contains("not a multiple") && why.contains("GQA"),
+            "{why}"
+        );
     }
 
     /// A row that states no head dim at all falls back to `hidden/q_heads`,
@@ -1346,7 +1340,10 @@ mod tests {
         s.conv_dim = 4096;
         d.recurrent = Some(s);
         let why = why(&d, shape(8));
-        assert!(why.contains("conv_dim 4096") && why.contains("plausible one"), "{why}");
+        assert!(
+            why.contains("conv_dim 4096") && why.contains("plausible one"),
+            "{why}"
+        );
     }
 
     #[test]
@@ -1507,6 +1504,53 @@ mod tests {
         assert!(why(&d, load).contains("more experts than it has"));
     }
 
+    /// A routed row is served, and every tensor in it is read at ONE
+    /// width.
+    ///
+    /// The measurement the header promises. Lifting the routed refusal
+    /// let a mixture through, and the refusal's own text had named what
+    /// it was standing next to: an mlx_lm routed checkpoint publishes
+    /// its router gate at 8 bits inside a 4-bit stack, and reading the
+    /// gate at the stack's width produced cosine 0.84 logits — a fluent
+    /// model routing to almost the right experts, not an error.
+    ///
+    /// [`DecodeGeometry::alt_quant`] is the field that second width
+    /// would ride. This asserts it stays UNSET through the routed path,
+    /// which is the honest state: nothing solves it from the staged
+    /// tensors, so `has_alt_quant()` is `false` in production and the
+    /// whole checkpoint is read at `quant`.
+    ///
+    /// # Why an assertion and not a `TODO`
+    ///
+    /// A gap nobody can trip over is a comment. This one is a test, so
+    /// the day a load path DOES solve the second format, this fails and
+    /// says where — rather than the field quietly starting to work
+    /// while three docs still call it NOT WIRED.
+    #[test]
+    fn a_routed_row_reads_one_width_for_every_tensor() {
+        let mut d = dense(4);
+        d.shape.moe_intermediate = 768;
+        d.shape.experts_per_token = 8;
+        let mut load = shape(4);
+        load.n_experts = 128;
+
+        let g = geometry_from_deployment(&d, load, AffineFormat::G64_B4)
+            .expect("the routed refusal is lifted");
+        assert!(g.is_moe(), "the row this is measuring is routed");
+        assert_eq!(
+            g.quant,
+            AffineFormat::G64_B4,
+            "the stack's one point, which every tensor is read at"
+        );
+        assert!(
+            !g.has_alt_quant(),
+            "if a second format now reaches the geometry, the routed path \
+             has a width to choose per tensor and `binding::observed` \
+             still builds one kernel set from `quant` alone — wire the \
+             choice before letting this pass"
+        );
+    }
+
     #[test]
     fn a_dense_stack_with_no_ffn_width_is_refused() {
         let mut d = dense(4);
@@ -1539,7 +1583,11 @@ mod tests {
         }
         let g = geometry_from_deployment(&d, shape(12), AffineFormat::G64_B4)
             .expect("both halves of the second shape are stated");
-        assert_eq!((g.head_dim, g.n_kv_heads), (256, 8), "the sliding shape is the base");
+        assert_eq!(
+            (g.head_dim, g.n_kv_heads),
+            (256, 8),
+            "the sliding shape is the base"
+        );
         assert_eq!(
             (g.global_head_dim, g.global_kv_heads),
             (512, 2),
@@ -1599,13 +1647,14 @@ mod tests {
     /// geometry rather than at the first fire.
     #[test]
     fn an_unreadable_affine_point_is_refused_before_the_weights_are_staged() {
-        let refused = geometry_from_deployment(
-            &dense(4),
-            shape(4),
-            AffineFormat { bits: 3, group: 17 },
-        )
-        .expect_err("no `affine_qmv_fast` is stamped at g17/b3");
-        assert!(refused.0.contains("group_size 17 at 3 bits"), "{}", refused.0);
+        let refused =
+            geometry_from_deployment(&dense(4), shape(4), AffineFormat { bits: 3, group: 17 })
+                .expect_err("no `affine_qmv_fast` is stamped at g17/b3");
+        assert!(
+            refused.0.contains("group_size 17 at 3 bits"),
+            "{}",
+            refused.0
+        );
         // The refusal carries the grid, so the reader is told what IS
         // readable rather than only what is not.
         assert!(refused.0.contains("g64/b4"), "{}", refused.0);
@@ -1663,7 +1712,11 @@ mod tests {
         let g = geometry_from_deployment(&dense(4), shape(4), AffineFormat::default())
             .expect("an unrescaled stack is ordinary");
         assert_eq!(
-            (g.rope_freq_factor, g.rope_low_freq_factor, g.rope_high_freq_factor),
+            (
+                g.rope_freq_factor,
+                g.rope_low_freq_factor,
+                g.rope_high_freq_factor
+            ),
             (0.0, 0.0, 0.0)
         );
         assert_eq!(g.rope_original_max_position, 0);
@@ -1690,7 +1743,11 @@ mod tests {
         let refused = geometry_from_deployment(&d, shape(4), AffineFormat::default())
             .expect_err("this driver derives no YaRN table");
         assert!(refused.0.contains("YaRN"), "{}", refused.0);
-        assert!(refused.0.contains("llama3"), "names what it DOES derive: {}", refused.0);
+        assert!(
+            refused.0.contains("llama3"),
+            "names what it DOES derive: {}",
+            refused.0
+        );
         // And it is not the shape that was objected to: the same stack
         // without the rescaling projects.
         d.rope_scaling = None;
@@ -1717,7 +1774,11 @@ mod tests {
             seen += 1;
             match geometry_from_deployment(&d, row.load_shape(), AffineFormat::G64_B4) {
                 Ok(g) => {
-                    assert!(g.n_layers > 0 && g.hidden > 0, "{} projected a null shape", row.id());
+                    assert!(
+                        g.n_layers > 0 && g.hidden > 0,
+                        "{} projected a null shape",
+                        row.id()
+                    );
                     assert_eq!(g.n_layers, d.layers, "{} lost a layer", row.id());
                 }
                 Err(refused) => assert!(

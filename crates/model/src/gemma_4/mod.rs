@@ -124,8 +124,10 @@ const A4B_VISION: VisionTower = VisionTower {
 };
 
 /// Both E-series encoders, named once for the two rows that carry them.
-const E_SERIES_TOWERS: Towers =
-    Towers { audio: Some(E_SERIES_AUDIO), vision: Some(E_SERIES_VISION) };
+const E_SERIES_TOWERS: Towers = Towers {
+    audio: Some(E_SERIES_AUDIO),
+    vision: Some(E_SERIES_VISION),
+};
 
 /// One Gemma 4 checkpoint.
 ///
@@ -220,7 +222,10 @@ pub const VARIANTS: &[Gemma4] = &[
         // VISION ONLY, and the same tower the 26b ships — 27 layers of
         // 1152 with a 3-wide pooling kernel, read from this row's own
         // `vision_config`. `audio_config` is `null`.
-        towers: Towers { audio: None, vision: Some(A4B_VISION) },
+        towers: Towers {
+            audio: None,
+            vision: Some(A4B_VISION),
+        },
     },
     // google/gemma-4-26B-A4B-it — the row that LOADS and does not SERVE.
     // Its contract authors, its manifest identifies it, and its
@@ -241,7 +246,10 @@ pub const VARIANTS: &[Gemma4] = &[
         // conformer, and a row that copied its sibling's towers would
         // advertise an audio encoder whose weights are not in the
         // package.
-        towers: Towers { audio: None, vision: Some(A4B_VISION) },
+        towers: Towers {
+            audio: None,
+            vision: Some(A4B_VISION),
+        },
     },
 ];
 
@@ -253,6 +261,21 @@ pub fn rows() -> &'static [&'static dyn Variant] {
 }
 
 impl Gemma4 {
+    /// The four numbers this row states that its shape cannot.
+    ///
+    /// Both projections take this — `deployment` and `metal_facts` used
+    /// to take the same four as loose arguments each, and a row read
+    /// twice is a row that can be read differently. Deploying at one
+    /// window and tracing at another compiles.
+    fn row(&self) -> project::RowScalars {
+        project::RowScalars {
+            mixture: self.mixture,
+            sliding_window: self.sliding_window,
+            norm_eps: NORM_EPS,
+            k_eq_v: self.k_eq_v,
+        }
+    }
+
     /// Why this build cannot fire this row, or `None` when it can.
     ///
     /// ONE predicate for two questions, because a row that cannot be
@@ -261,13 +284,21 @@ impl Gemma4 {
     ///
     /// It USED to be the old derivation's whole test —
     /// `gemma4_attention_k_eq_v || gemma4_enable_moe` — and the first
-    /// half stopped being true. This build does have attention text
-    /// that reads V out of the K projection; gemma-4-31b runs it and
-    /// reproduces MLX's logits exactly. A refusal kept past the day its
-    /// reason expired reads exactly like one that was never wrong, and
-    /// it deleted the only gemma-4 in the corpus with real weights to
-    /// check against. The routed bank is still unwritten, and that is
-    /// what this now says.
+    /// half stopped being true OF METAL. `llama_like_metal` does have
+    /// attention text that reads V out of the K projection;
+    /// gemma-4-31b runs it and reproduces MLX's logits exactly. A
+    /// refusal kept past the day its reason expired reads exactly like
+    /// one that was never wrong, and it deleted the only gemma-4 in the
+    /// corpus with real weights to check against.
+    ///
+    /// The first half is still true of CUDA, and lifting it from here
+    /// lifted it from both — `Gemma4LayerW` declares a `v_proj` and
+    /// `layer()` matmuls it with nothing to branch on. That refusal now
+    /// lives in [`Variant::trace`]'s CUDA arm, where it can name one
+    /// backend, which is why this predicate is no longer "one predicate
+    /// for two questions" about `k_eq_v`: deployment is backend-blind
+    /// and Metal deploys these rows. The routed bank is unwritten on
+    /// both, and that is what this still says.
     fn untraced(&self) -> Option<Refusal> {
         if self.mixture.is_some() {
             return Some(Refusal::Unsupported(
@@ -320,14 +351,7 @@ impl Variant for Gemma4 {
         if let Some(refusal) = self.untraced() {
             return Err(refusal);
         }
-        let mut deployment = project::deployment(
-            &self.shape,
-            self.mixture,
-            self.sliding_window,
-            NORM_EPS,
-            self.k_eq_v,
-            load,
-        );
+        let mut deployment = project::deployment(&self.shape, self.row(), load);
         deployment.towers = self.towers.clone();
         deployment.advertised = Advertised {
             arch: ARCH,
@@ -338,8 +362,7 @@ impl Variant for Gemma4 {
             // replaces was a hardwired `false` in `driver-cuda` sitting
             // beside a working encoder: a capability computed from the
             // encoder list cannot drift from the encoder list.
-            media_encode: deployment.towers.audio.is_some()
-                || deployment.towers.vision.is_some(),
+            media_encode: deployment.towers.audio.is_some() || deployment.towers.vision.is_some(),
         };
         Ok(deployment)
     }
@@ -383,22 +406,39 @@ impl Variant for Gemma4 {
         // gemma-4 field, its own comments are measurements taken on
         // gemma-4-31b, and what was actually missing was the projection.
         if let crate::catalog::Backend::Metal(bind) = load.backend {
-            if load.tp_size > 1 {
-                return Err(Refusal::Unsupported(
-                    crate::shared::llama_like::project::NO_METAL_SHARD,
-                ));
-            }
             let shape = project::metal_shape(&self.shape, self.mixture);
-            let facts = project::metal_facts(
-                &self.shape,
-                self.mixture,
-                self.sliding_window,
-                NORM_EPS,
-                self.k_eq_v,
-                bind,
-            );
+            let facts = project::metal_facts(&self.shape, self.row(), bind);
+            // The kernel set's three refusals, not this row's. This arm
+            // asked only the shard question. Neither of the other two
+            // fires for a row published today -- every gemma runs at
+            // head width 256 and 26B-A4B is refused earlier for having
+            // no routed text -- so this is the door being able to SAY
+            // what it cannot run, rather than a mis-serving repaired.
+            // Without it an off-axis width aborts in `model-compiler`
+            // rather than arriving as a sentence.
+            crate::shared::llama_like::project::metal_kernel_refusal(
+                &shape, &facts, load, bind,
+            )?;
             return Ok(crate::shared::llama_like::forward::llama_like_metal(
                 &shape, &facts, class,
+            ));
+        }
+        // CUDA, and the other half of the refusal this comment says
+        // expired. It expired for METAL: `llama_like_metal` reads
+        // `v_from_k` and gemma-4-31b reproduces MLX's logits through it.
+        // The hand-written CUDA text has no such arm — `Gemma4LayerW`
+        // declares `v_proj` and layer() matmuls it unconditionally, and
+        // `project::trace` is not even handed `k_eq_v` to branch on. So
+        // a row whose checkpoint ships no `v_proj` would be traced
+        // against one here.
+        //
+        // `Deployment::k_eq_v` states the measurement and this is the
+        // reader CUDA never grew. Refusing is the whole of what this
+        // file can honestly do about it: the alternative is a plan that
+        // binds a tensor the checkpoint does not contain.
+        if self.k_eq_v {
+            return Err(Refusal::Unsupported(
+                "gemma-4 31B/26B-A4B on CUDA: these rows read V out of the K projection (`attention_k_eq_v`) and ship no `v_proj`; the hand-written text projects one. The Metal text reads it (`LlamaLikeMetalFacts::v_from_k`) and serves these rows",
             ));
         }
         Ok(project::trace(&self.shape, self.sliding_window, class))
@@ -438,7 +478,10 @@ mod tests {
         assert_eq!(row("gemma-4-e2b").shape, Gemma4Facts::gemma_4_e2b());
         assert_eq!(row("gemma-4-e4b").shape, Gemma4Facts::gemma_4_e4b());
         assert_eq!(row("gemma-4-26b-a4b").shape, Gemma4Facts::gemma_4_26b_a4b());
-        assert_eq!(row("gemma-4-26b-a4b").mixture, Some(Gemma4Mixture::gemma_4_26b_a4b()));
+        assert_eq!(
+            row("gemma-4-26b-a4b").mixture,
+            Some(Gemma4Mixture::gemma_4_26b_a4b())
+        );
     }
 
     /// The table is reachable through the trait, one entry per row, in
@@ -447,7 +490,15 @@ mod tests {
     fn the_rows_are_the_variants() {
         assert_eq!(rows().len(), VARIANTS.len());
         let ids: Vec<&str> = rows().iter().map(|r| r.id()).collect();
-        assert_eq!(ids, vec!["gemma-4-e2b", "gemma-4-e4b", "gemma-4-31b", "gemma-4-26b-a4b"]);
+        assert_eq!(
+            ids,
+            vec![
+                "gemma-4-e2b",
+                "gemma-4-e4b",
+                "gemma-4-31b",
+                "gemma-4-26b-a4b"
+            ]
+        );
         assert_eq!(rows().len(), 4);
     }
 
@@ -461,11 +512,16 @@ mod tests {
             assert!(!v.id.is_empty(), "a row with no id cannot be asked for");
             assert!(seen.insert(v.id), "'{}' appears twice", v.id);
             assert!(
-                v.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                v.id.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
                 "'{}' is not lowercase-hyphenated",
                 v.id
             );
-            assert!(v.id.starts_with("gemma-4-"), "'{}' does not name its generation", v.id);
+            assert!(
+                v.id.starts_with("gemma-4-"),
+                "'{}' does not name its generation",
+                v.id
+            );
             for word in ["fp8", "int4", "bf16", "mlx", "awq"] {
                 assert!(!v.id.contains(word), "'{}' names an encoding", v.id);
             }
@@ -490,10 +546,16 @@ mod tests {
     fn the_load_shape_states_the_shared_tail_and_the_unpadded_head() {
         let e4b = row("gemma-4-e4b").load_shape();
         assert_eq!(e4b.layers, 42);
-        assert_eq!(e4b.head_dim, 256, "the checkpoint's own, not the full layers' 512");
+        assert_eq!(
+            e4b.head_dim, 256,
+            "the checkpoint's own, not the full layers' 512"
+        );
         assert_eq!(e4b.n_experts, 0);
         assert_eq!(e4b.mamba_groups, 0, "no mixer in this generation");
-        assert_eq!(e4b.kv_shared_layers, 18, "eighteen layers ship dead k/v projections");
+        assert_eq!(
+            e4b.kv_shared_layers, 18,
+            "eighteen layers ship dead k/v projections"
+        );
         assert!(e4b.tied_embeddings);
 
         let a4b = row("gemma-4-26b-a4b").load_shape();
@@ -514,7 +576,9 @@ mod tests {
     /// Every one of them was a default body in the trait this replaced.
     #[test]
     fn the_deployment_states_all_four_of_this_generations_exceptions() {
-        let d = row("gemma-4-e4b").deployment(Deployed::single()).expect("E4B deploys");
+        let d = row("gemma-4-e4b")
+            .deployment(Deployed::single())
+            .expect("E4B deploys");
         assert_eq!(d.decode_head_dims(), Some((256, 512)));
         assert_eq!(d.attn_output, AttnOutput::StatedArgs);
         assert_eq!(d.prefill, PrefillStyle::Planless);
@@ -529,7 +593,9 @@ mod tests {
     /// generation's towers.
     #[test]
     fn the_row_advertises_its_own_ceiling_and_its_towers() {
-        let d = row("gemma-4-e4b").deployment(Deployed::single()).expect("E4B deploys");
+        let d = row("gemma-4-e4b")
+            .deployment(Deployed::single())
+            .expect("E4B deploys");
         assert_eq!(d.advertised.arch, ARCH);
         assert_eq!(d.advertised.max_model_len, 131_072);
         assert!(
@@ -541,7 +607,9 @@ mod tests {
              keep passing — which is exactly how they were unreachable before this field"
         );
 
-        let e2b = row("gemma-4-e2b").deployment(Deployed::single()).expect("E2B deploys");
+        let e2b = row("gemma-4-e2b")
+            .deployment(Deployed::single())
+            .expect("E2B deploys");
         assert_eq!(e2b.advertised.max_model_len, 131_072);
     }
 
@@ -558,7 +626,9 @@ mod tests {
     #[test]
     fn the_advertised_label_selects_this_generations_front_ends() {
         use crate::multimodal::{VisionArch, audio_arch_supported};
-        let d = row("gemma-4-e4b").deployment(Deployed::single()).expect("E4B deploys");
+        let d = row("gemma-4-e4b")
+            .deployment(Deployed::single())
+            .expect("E4B deploys");
         assert_eq!(
             VisionArch::from_arch_name(d.advertised.arch),
             Some(VisionArch::Gemma4),
@@ -586,7 +656,11 @@ mod tests {
             .iter()
             .filter_map(|v| v.deployment(Deployed::single()).ok().map(|d| (v.id, d)))
             .collect();
-        assert_eq!(deployed.len(), 3, "the A4B refuses, so three rows advertise");
+        assert_eq!(
+            deployed.len(),
+            3,
+            "the A4B refuses, so three rows advertise"
+        );
         let labels: std::collections::BTreeSet<&str> =
             deployed.iter().map(|(_, d)| d.advertised.arch).collect();
         assert_eq!(labels.len(), 1, "one family, one label");
@@ -608,7 +682,10 @@ mod tests {
         let ids: std::collections::BTreeSet<&str> = VARIANTS.iter().map(|v| v.id).collect();
         assert_eq!(ids.len(), VARIANTS.len(), "three ids for one label");
         let a4b = row("gemma-4-26b-a4b");
-        assert_eq!(a4b.max_model_len, 262_144, "`google--gemma-4-26B-A4B-it.json` states it");
+        assert_eq!(
+            a4b.max_model_len, 262_144,
+            "`google--gemma-4-26B-A4B-it.json` states it"
+        );
         assert_ne!(
             a4b.max_model_len,
             row("gemma-4-e4b").max_model_len,
@@ -625,19 +702,33 @@ mod tests {
     /// — which is the `GemmaAudioConfig::default()` defect, restated.
     #[test]
     fn the_two_series_ship_different_encoders() {
-        let d = row("gemma-4-e4b").deployment(Deployed::single()).expect("E4B deploys");
+        let d = row("gemma-4-e4b")
+            .deployment(Deployed::single())
+            .expect("E4B deploys");
         let audio = d.towers.audio.expect("the E-series ships a conformer");
         assert_eq!(audio.layers, 12);
         assert_eq!(audio.feature_size, 128, "128 mel bins in, per frame");
-        assert_eq!((audio.subsample_channels_0, audio.subsample_channels_1), (128, 32));
+        assert_eq!(
+            (audio.subsample_channels_0, audio.subsample_channels_1),
+            (128, 32)
+        );
         assert_eq!(audio.output_dims, 1536);
-        assert_eq!((audio.chunk_size, audio.context_left, audio.context_right), (12, 13, 0));
+        assert_eq!(
+            (audio.chunk_size, audio.context_left, audio.context_right),
+            (12, 13, 0)
+        );
         let vision = d.towers.vision.expect("the E-series ships a vision tower");
         assert_eq!((vision.layers, vision.hidden), (16, 768));
-        assert_eq!(vision.rope_theta, 100.0, "the tower's base is its own, not the decoder's");
+        assert_eq!(
+            vision.rope_theta, 100.0,
+            "the tower's base is its own, not the decoder's"
+        );
 
         let a4b = row("gemma-4-26b-a4b");
-        assert!(a4b.towers.audio.is_none(), "`audio_config` is null in this checkpoint");
+        assert!(
+            a4b.towers.audio.is_none(),
+            "`audio_config` is null in this checkpoint"
+        );
         let a4b_vision = a4b.towers.vision.expect("the A4B ships a vision tower");
         assert_eq!((a4b_vision.layers, a4b_vision.hidden), (27, 1152));
         assert_ne!(
@@ -655,7 +746,10 @@ mod tests {
     fn a_row_advertises_encoding_exactly_when_it_carries_an_encoder() {
         for v in VARIANTS {
             let carries = v.towers.audio.is_some() || v.towers.vision.is_some();
-            assert!(carries, "every gemma-4 package in the corpus ships at least one tower");
+            assert!(
+                carries,
+                "every gemma-4 package in the corpus ships at least one tower"
+            );
         }
         let text_only = Gemma4 {
             id: "gemma-4-hypothetical-text-only",
@@ -666,7 +760,9 @@ mod tests {
             max_model_len: 131_072,
             towers: Towers::default(),
         };
-        let d = text_only.deployment(Deployed::single()).expect("a text-only stack deploys");
+        let d = text_only
+            .deployment(Deployed::single())
+            .expect("a text-only stack deploys");
         assert!(
             !d.advertised.media_encode,
             "a row with no tower must not advertise an encode entry point"
@@ -682,7 +778,9 @@ mod tests {
         let a4b = row("gemma-4-26b-a4b");
         assert!(!a4b.manifest().tensors.is_empty());
         assert_eq!(a4b.load_shape().n_experts, 128);
-        let refusal = a4b.deployment(Deployed::single()).expect_err("the A4B cannot be served");
+        let refusal = a4b
+            .deployment(Deployed::single())
+            .expect_err("the A4B cannot be served");
         assert!(matches!(refusal, Refusal::Unsupported(_)));
         let text = refusal.to_string();
         // The payload is a SENTENCE, not a label: it names the model,
@@ -690,9 +788,18 @@ mod tests {
         // for. `Unsupported` used to be a unit variant and every one of
         // its nine sites reached an operator as "no deployment
         // derivation for this model type".
-        assert!(text.contains("gemma-4"), "the refusal must name the model: {text}");
-        assert!(text.contains("routed-expert"), "the refusal must name what is missing: {text}");
-        assert!(text.contains("gemma4_enable_moe"), "and the config key it is about: {text}");
+        assert!(
+            text.contains("gemma-4"),
+            "the refusal must name the model: {text}"
+        );
+        assert!(
+            text.contains("routed-expert"),
+            "the refusal must name what is missing: {text}"
+        );
+        assert!(
+            text.contains("gemma4_enable_moe"),
+            "and the config key it is about: {text}"
+        );
         // `attention_k_eq_v` USED to be named here as a second missing
         // leg. It is not missing, and a refusal listing a reason that
         // has been implemented sends a reader to fix what already works.
@@ -808,14 +915,7 @@ mod tests {
             // generic llama states ONE `head_dim` and ONE `kv_heads`;
             // this row's full layers are twice as wide per head and
             // carry a quarter the KV heads, and the facts say so.
-            let facts = project::metal_facts(
-                &v.shape,
-                v.mixture,
-                v.sliding_window,
-                NORM_EPS,
-                v.k_eq_v,
-                &bind,
-            );
+            let facts = project::metal_facts(&v.shape, v.row(), &bind);
             if v.shape.global_head_dim > 0 {
                 two_shaped += 1;
                 assert_eq!(facts.global_head_dim, v.shape.global_head_dim);
@@ -837,7 +937,10 @@ mod tests {
             assert_eq!(facts.rope_theta_sliding, project::ROPE_THETA_LOCAL);
             // The three weightless facts no checkpoint could contradict.
             assert!(facts.v_norm, "`{}` dropped the V norm", v.id);
-            assert_eq!(facts.activation, crate::shared::llama_like::forward::facts::Activation::Geglu);
+            assert_eq!(
+                facts.activation,
+                crate::shared::llama_like::forward::facts::Activation::Geglu
+            );
             assert!(facts.embed_scale > 0.0, "gemma scales its embeddings");
         }
         assert!(two_shaped > 0, "no variant exercised the two-shape path");
@@ -845,18 +948,39 @@ mod tests {
         // A SHARDED Metal load is still refused: `LlamaLikeMetalFacts`
         // has no shard vocabulary, so the text would state the whole
         // model's widths against one rank's slice.
-        let sharded = Deployed { backend: Backend::Metal(&bind), tp_size: 4, layer_scalars: &[] };
-        let served = VARIANTS.iter().find(|v| v.untraced().is_none()).expect("one row traces");
+        let sharded = Deployed {
+            backend: Backend::Metal(&bind),
+            tp_size: 4,
+            layer_scalars: &[],
+        };
+        let served = VARIANTS
+            .iter()
+            .find(|v| v.untraced().is_none())
+            .expect("one row traces");
         assert!(served.trace(FireClass::Decode, sharded).is_err());
 
-        // And CUDA is unchanged.
+        // And CUDA traces exactly the rows whose V has its own
+        // projection. The hand-written text declares a `v_proj` and
+        // matmuls it unconditionally, so a `k_eq_v` row would be traced
+        // against a tensor its checkpoint does not ship — the half of
+        // the old `gemma4_attention_k_eq_v || gemma4_enable_moe`
+        // predicate that expired for Metal and not for here.
         for v in VARIANTS {
             if v.untraced().is_some() {
                 continue;
             }
-            let cuda = v.trace(FireClass::Decode, Deployed::single()).expect("CUDA still traces");
+            let cuda = v.trace(FireClass::Decode, Deployed::single());
+            if v.k_eq_v {
+                assert!(cuda.is_err(), "{}: no CUDA text reads V from K", v.id);
+                continue;
+            }
+            let cuda = cuda.expect("CUDA still traces");
             assert!(cuda.family.starts_with("gemma4"), "{}", cuda.family);
         }
+        // Not vacuous in either direction: the catalog holds rows of
+        // both kinds, so this asserts a split rather than a blanket.
+        assert!(VARIANTS.iter().any(|v| v.k_eq_v && v.untraced().is_none()));
+        assert!(VARIANTS.iter().any(|v| !v.k_eq_v && v.untraced().is_none()));
         assert!(matches!(Deployed::single().backend, Backend::Cuda));
     }
 }

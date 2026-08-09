@@ -106,9 +106,15 @@ fn every_row_deploys_or_is_stated_unservable() {
 /// as a typo rather than as a stale line.
 #[test]
 fn the_unservable_list_names_only_real_rows() {
-    let missing: Vec<&str> =
-        NOT_YET_SERVABLE.iter().copied().filter(|id| catalog::find(id).is_none()).collect();
-    assert!(missing.is_empty(), "NOT_YET_SERVABLE names no such row: {missing:?}");
+    let missing: Vec<&str> = NOT_YET_SERVABLE
+        .iter()
+        .copied()
+        .filter(|id| catalog::find(id).is_none())
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "NOT_YET_SERVABLE names no such row: {missing:?}"
+    );
 
     let unique: BTreeSet<&str> = NOT_YET_SERVABLE.iter().copied().collect();
     assert_eq!(unique.len(), NOT_YET_SERVABLE.len(), "a line is duplicated");
@@ -152,7 +158,10 @@ mod fire_class {
     use model_compiler::trace::FireClass;
 
     fn u32s(v: &[u32]) -> PieU32Slice {
-        PieU32Slice { ptr: v.as_ptr(), len: v.len() }
+        PieU32Slice {
+            ptr: v.as_ptr(),
+            len: v.len(),
+        }
     }
 
     /// A step carrying `requests` rows of recurrent state, with the given
@@ -160,7 +169,10 @@ mod fire_class {
     fn step(flags: &[u8], buf_indptr: &[u32], slots: &[u32], sampling: &[u32]) -> PieStepDesc {
         PieStepDesc {
             rs_slot_ids: u32s(slots),
-            rs_slot_flags: PieU8Slice { ptr: flags.as_ptr(), len: flags.len() },
+            rs_slot_flags: PieU8Slice {
+                ptr: flags.as_ptr(),
+                len: flags.len(),
+            },
             rs_buffer_slot_indptr: u32s(buf_indptr),
             sampling_indices: u32s(sampling),
             ..Default::default()
@@ -203,7 +215,6 @@ mod fire_class {
         let mixed = step(&[PIE_RS_FLAG_FOLD, 0], &[0, 3, 3], &[0, 1], &[0]);
         assert_eq!(fire_class_of(&mixed, 9, 2), Ok(FireClass::Prefill));
     }
-
 }
 
 /// The GQA group sizes this build's decode instantiates, and the rows
@@ -257,7 +268,9 @@ fn every_deployable_row_is_servable_by_this_builds_decode_or_is_stated() {
         // Only rows that GET to the question. A row refused for its KV
         // shape never reaches `servable_by`, and listing it here would
         // record one gap as two.
-        let Ok(d) = row.deployment(Deployed::single()) else { continue };
+        let Ok(d) = row.deployment(Deployed::single()) else {
+            continue;
+        };
         checked += 1;
         if d.servable_by(DECODE_GQA_GROUPS).is_err() {
             refused.insert(row.id());
@@ -383,5 +396,8 @@ fn gemma_4_sandwiches_its_norms_without_folding_them() {
         );
         checked += 1;
     }
-    assert!(checked > 0, "the gemma-4 rows are gone; this test is now vacuous");
+    assert!(
+        checked > 0,
+        "the gemma-4 rows are gone; this test is now vacuous"
+    );
 }

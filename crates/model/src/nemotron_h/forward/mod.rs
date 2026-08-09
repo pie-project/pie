@@ -20,8 +20,7 @@
 pub mod facts;
 
 use self::facts::{NemotronHFacts, NemotronLayerKind};
-use model_compiler::dsl::{
-    WeightRepr,self, matmul, MatW, NormW};
+use model_compiler::dsl::{self, MatW, NormW, WeightRepr, matmul};
 use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct NhLayerW {
@@ -85,8 +84,7 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
     // panicked, on the first prefill a serving deployment sends. The
     // class-dependent sites in this text number exactly one, the
     // attention op, which `dsl::cuda::attention_for` now holds.
-    let family = format!(
-        "nemotron_h.cuda.{}", class.suffix());
+    let family = format!("nemotron_h.cuda.{}", class.suffix());
     let mb = facts.mamba;
     let _at = facts.attn.clone();
     dsl::trace_named(&family, |t| {
@@ -96,8 +94,7 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
             // THIS LAYER's sliding window, `-1` for none — a
             // load-time fact the dispatch statements carry, where four
             // executors used to re-derive it per launch.
-            let window_left =
-                model_compiler::facts::window_left_at(facts.window_left, l);
+            let window_left = model_compiler::facts::window_left_at(facts.window_left, l);
             let w = NhLayerW::new(l, facts);
             let x = dsl::cuda::rmsnorm(&y, &w.norm);
 
@@ -135,8 +132,7 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
                     let _ = dt_bias;
                     let (dt, _da) =
                         dsl::cuda::nemotron_prepare_mamba_dt_da(&dt_raw, &a_par, mb.num_heads);
-                    let core =
-                        dsl::cuda::nemotron_mamba_ssm(&conv_out, &dt, l, mb.intermediate());
+                    let core = dsl::cuda::nemotron_mamba_ssm(&conv_out, &dt, l, mb.intermediate());
                     dsl::seam(core.trace(), &dsl::seam::ATTN_OUT, &[&core], Some(l));
                     // A GATED norm, not a plain one: `z` is the gate the
                     // split produced and the norm applies it.

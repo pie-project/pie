@@ -14,7 +14,6 @@
 
 use serde::{Deserialize, Serialize};
 
-
 /// Where each sub-layer's norm sits relative to the residual add.
 ///
 /// `Pre` is the standard Llama shape: norm the residual stream *into* the
@@ -64,7 +63,6 @@ pub enum QkNorm {
     PerHead,
     Global,
 }
-
 
 /// The SLIDING WINDOW layer `l` attends over, `-1` for none.
 ///
@@ -232,12 +230,42 @@ impl MlaFacts {
 /// `aligned_block` is its dispatch's tile, deepseek-v4's `hash_routed`
 /// picks a different router — so they keep their own struct and this is
 /// the part that stopped being written six times.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// `Eq` is not derived, because [`Self::routed_scaling`] is a float. A
+/// mixture is not the kind of thing two of which are bit-identical or
+/// not — the scaling factor is a trained constant, and `PartialEq` is
+/// the honest relation over it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MoeFacts {
     /// Experts in this deployment's mixture.
     pub num_experts: u32,
     /// How many of them a row goes to — the router's k.
     pub top_k: u32,
+    /// Whether the router renormalizes over the SELECTED experts.
+    ///
+    /// HF's `norm_topk_prob`. True softmaxes the k chosen logits so the
+    /// routing weights sum to one; false softmaxes over ALL the experts
+    /// and then selects, so they sum to less than one and scale the
+    /// routed FFN's whole contribution down with them.
+    ///
+    /// Beside [`Self::top_k`] because it MEASURABLY varies by row and no
+    /// default covers it: DeepSeek-V3 and Kimi-K2 publish `false`, GLM-4.5
+    /// publishes `true`, and the `DeepseekV3Config` class default is
+    /// `false` — so a driver picking either constant is right for some of
+    /// the catalog and quietly wrong for the rest. `driver-cuda` picked
+    /// one: its launch hardcoded `moe_norm_topk: false` beside a dozen
+    /// fields it read off the deployment.
+    pub norm_topk_prob: bool,
+    /// `routed_scaling_factor` — what the routing weights are multiplied
+    /// by after the router has produced them.
+    ///
+    /// The other half of [`Self::norm_topk_prob`], and stated for the same
+    /// reason: DeepSeek-V3 publishes 2.5, Kimi-K2 2.0, GLM-4.5 2.5, and the
+    /// families with no such key want 1.0. `driver-cuda` launched every one
+    /// of them at 1.0, so the three routers that read it off the context
+    /// (`topk_sqrtsoftplus`, `topk_sigmoid_bias`, `topk_sigmoid`) scaled a
+    /// DeepSeek row's whole routed contribution to two-fifths of what it
+    /// was trained to be. Finite, plausible, never faulting.
+    pub routed_scaling: f32,
     /// One expert's inner width.
     pub moe_intermediate: u32,
     /// The shared expert's inner width; 0 for a mixture without one,
@@ -296,7 +324,11 @@ impl GqaFacts {
     /// `refuse_unservable_gqa`.
     #[must_use]
     pub const fn group_size(&self) -> u32 {
-        if self.kv_heads == 0 { 0 } else { self.heads / self.kv_heads }
+        if self.kv_heads == 0 {
+            0
+        } else {
+            self.heads / self.kv_heads
+        }
     }
 }
 

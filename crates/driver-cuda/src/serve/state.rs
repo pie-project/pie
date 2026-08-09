@@ -6,11 +6,7 @@
 //! read first. The types are the driver's nouns; the verbs are next door.
 
 use crate::fire::scratch::Scratch;
-use driver_api::local::{
-    PIE_STATUS_DRIVER_ERROR,
-    PieCompletion,
-    PieDriver,
-};
+use driver_api::local::{PIE_STATUS_DRIVER_ERROR, PieCompletion, PieDriver};
 
 /// The shell's state — what `PieDriver` points at.
 pub(crate) struct Shell {
@@ -266,9 +262,8 @@ pub(crate) struct Shell {
 
 /// Driver-lifetime fire scratch.
 pub(crate) struct FireScratch {
-    pub(crate) ws: crate::fire::attention_workspace::AttentionWorkspace<
-        cudarc::runtime::sys::cudaEvent_t,
-    >,
+    pub(crate) ws:
+        crate::fire::attention_workspace::AttentionWorkspace<cudarc::runtime::sys::cudaEvent_t>,
     /// The PREFILL plan's own workspace, and it has to be its own.
     ///
     /// A FlashInfer plan writes its schedule into the workspace it was
@@ -281,9 +276,8 @@ pub(crate) struct FireScratch {
     /// raised, so that a union capture can walk an arm this fire does not
     /// take. That is a memory cost, not a correctness one — as long as the
     /// plans stop sharing storage. This is that separation.
-    pub(crate) prefill_ws: crate::fire::attention_workspace::AttentionWorkspace<
-        cudarc::runtime::sys::cudaEvent_t,
-    >,
+    pub(crate) prefill_ws:
+        crate::fire::attention_workspace::AttentionWorkspace<cudarc::runtime::sys::cudaEvent_t>,
     pub(crate) decode_plan: crate::bind::DecodePlan,
     /// gemma-4's SECOND decode plan — the FULL layers' 512-wide
     /// geometry; single-kind families never plan it.
@@ -300,9 +294,8 @@ pub(crate) struct FireScratch {
     /// rectangle's ROW COUNT". A tail serves `[split, N)`, which is a
     /// different request count and therefore a different schedule.
     pub(crate) tail_plan: crate::bind::DecodePlan,
-    pub(crate) tail_ws: crate::fire::attention_workspace::AttentionWorkspace<
-        cudarc::runtime::sys::cudaEvent_t,
-    >,
+    pub(crate) tail_ws:
+        crate::fire::attention_workspace::AttentionWorkspace<cudarc::runtime::sys::cudaEvent_t>,
 }
 
 /// The pinned swap pool: `layers × [pages × page_bytes]` per plane.
@@ -623,14 +616,11 @@ pub(crate) unsafe extern "C" fn retire_fire(data: *mut std::ffi::c_void) {
                 let off = (row * debt.vocab + t) * 2;
                 if off + 1 < staged.len() {
                     let bits = u16::from_le_bytes([staged[off], staged[off + 1]]);
-                    cell[t * 4..t * 4 + 4]
-                        .copy_from_slice(&(u32::from(bits) << 16).to_le_bytes());
+                    cell[t * 4..t * 4 + 4].copy_from_slice(&(u32::from(bits) << 16).to_le_bytes());
                 }
             }
             if !ch.publish(&cell) {
-                eprintln!(
-                    "[driver-cuda] launch: logits ring full; a request dropped its output"
-                );
+                eprintln!("[driver-cuda] launch: logits ring full; a request dropped its output");
             }
         }
     }
@@ -648,7 +638,13 @@ pub(crate) unsafe extern "C" fn retire_fire(data: *mut std::ffi::c_void) {
     }
     std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
     if let Some(notify) = debt.notify {
-        unsafe { notify(debt.notify_ctx, debt.completion.wait_id, debt.completion.target_epoch) };
+        unsafe {
+            notify(
+                debt.notify_ctx,
+                debt.completion.wait_id,
+                debt.completion.target_epoch,
+            )
+        };
     }
 }
 
@@ -728,7 +724,10 @@ pub(crate) struct KvState {
 
 impl KvState {
     /// The pages `layer` owns, or `None` if it reads through another's.
-    pub(crate) fn owned(&self, layer: usize) -> Option<(*mut core::ffi::c_void, *mut core::ffi::c_void)> {
+    pub(crate) fn owned(
+        &self,
+        layer: usize,
+    ) -> Option<(*mut core::ffi::c_void, *mut core::ffi::c_void)> {
         let l = i32::try_from(layer).ok()?;
         let slot = self.cache.layout().slots().get(layer)?;
         if slot.is_alias() {
@@ -874,11 +873,21 @@ impl GdnState {
         let n = |v: u64| usize::try_from(v).unwrap_or(0);
         for op in ops {
             let code = match *op {
-                StateOp::Memset { buffer, offset, len } => {
+                StateOp::Memset {
+                    buffer,
+                    offset,
+                    len,
+                } => {
                     let Some(p) = base(buffer) else { continue };
                     unsafe { cudaMemsetAsync(at(p, offset).cast(), 0, n(len), stream.as_raw()) }
                 }
-                StateOp::Memset2D { buffer, offset, pitch, width, rows } => {
+                StateOp::Memset2D {
+                    buffer,
+                    offset,
+                    pitch,
+                    width,
+                    rows,
+                } => {
                     let Some(p) = base(buffer) else { continue };
                     unsafe {
                         cudaMemset2DAsync(
@@ -891,7 +900,12 @@ impl GdnState {
                         )
                     }
                 }
-                StateOp::Memcpy { buffer, dst, src, len } => {
+                StateOp::Memcpy {
+                    buffer,
+                    dst,
+                    src,
+                    len,
+                } => {
                     let Some(p) = base(buffer) else { continue };
                     unsafe {
                         cudaMemcpyAsync(
@@ -903,7 +917,14 @@ impl GdnState {
                         )
                     }
                 }
-                StateOp::Memcpy2D { buffer, dst, src, pitch, width, rows } => {
+                StateOp::Memcpy2D {
+                    buffer,
+                    dst,
+                    src,
+                    pitch,
+                    width,
+                    rows,
+                } => {
                     let Some(p) = base(buffer) else { continue };
                     unsafe {
                         cudaMemcpy2DAsync(
@@ -963,18 +984,23 @@ impl GdnState {
         if self.num_slots >= need {
             return Ok(false);
         }
-        let grown = crate::pools::recurrent_state_cache::RecurrentStateCache::allocate_bf16_recurrent(
-            &self.is_linear,
-            self.cache.conv_dim(),
-            self.cache.conv_kernel(),
-            self.cache.v_heads(),
-            self.cache.head_k_dim(),
-            self.cache.head_v_dim(),
-            i32::try_from(need).unwrap_or(i32::MAX),
-        );
+        let grown =
+            crate::pools::recurrent_state_cache::RecurrentStateCache::allocate_bf16_recurrent(
+                &self.is_linear,
+                self.cache.conv_dim(),
+                self.cache.conv_kernel(),
+                self.cache.v_heads(),
+                self.cache.head_k_dim(),
+                self.cache.head_v_dim(),
+                i32::try_from(need).unwrap_or(i32::MAX),
+            );
         let (conv_n, rec_n) = (
-            usize::try_from(grown.layout().conv_total_bytes()).unwrap_or(0).max(1),
-            usize::try_from(grown.layout().recurrent_total_bytes()).unwrap_or(0).max(1),
+            usize::try_from(grown.layout().conv_total_bytes())
+                .unwrap_or(0)
+                .max(1),
+            usize::try_from(grown.layout().recurrent_total_bytes())
+                .unwrap_or(0)
+                .max(1),
         );
         let mut conv = alloc.alloc(conv_n)?;
         let mut recurrent = alloc.alloc(rec_n)?;
@@ -996,24 +1022,34 @@ impl GdnState {
                         stream.as_ref().as_raw(),
                     )
                 };
-                (code == cudaError::cudaSuccess).then_some(()).ok_or(PIE_STATUS_DRIVER_ERROR)
+                (code == cudaError::cudaSuccess)
+                    .then_some(())
+                    .ok_or(PIE_STATUS_DRIVER_ERROR)
             };
             for l in 0..self.is_linear.len() {
                 let lu = u32::try_from(l).unwrap_or(0);
                 for conv_side in [true, false] {
                     let (old_a, new_a) = if conv_side {
-                        (self.cache.layout().conv_state(lu, 0), grown.layout().conv_state(lu, 0))
+                        (
+                            self.cache.layout().conv_state(lu, 0),
+                            grown.layout().conv_state(lu, 0),
+                        )
                     } else {
                         (
                             self.cache.layout().recurrent_state(lu, 0),
                             grown.layout().recurrent_state(lu, 0),
                         )
                     };
-                    let (Some(old_a), Some(new_a)) = (old_a, new_a) else { continue };
+                    let (Some(old_a), Some(new_a)) = (old_a, new_a) else {
+                        continue;
+                    };
                     let (old_pool, new_pool) = if conv_side {
                         (self.conv.as_ptr().cast::<u8>(), conv.as_ptr().cast::<u8>())
                     } else {
-                        (self.recurrent.as_ptr().cast::<u8>(), recurrent.as_ptr().cast::<u8>())
+                        (
+                            self.recurrent.as_ptr().cast::<u8>(),
+                            recurrent.as_ptr().cast::<u8>(),
+                        )
                     };
                     copy(
                         unsafe { new_pool.add(usize::try_from(new_a.offset).unwrap_or(0)) },
@@ -1145,8 +1181,7 @@ impl LoadedModel {
 }
 
 /// The capabilities this shell can honestly claim today.
-pub(crate) const CAPS_JSON: &str =
-    r#"{"driver":"driver-cuda","status":"phase-d-shell","abi":24}"#;
+pub(crate) const CAPS_JSON: &str = r#"{"driver":"driver-cuda","status":"phase-d-shell","abi":24}"#;
 
 /// The device-ring shapes of one instance's channels, in the order the
 /// program indexes them.
@@ -1205,4 +1240,3 @@ pub(crate) fn slice_of<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
         unsafe { std::slice::from_raw_parts(ptr, len) }
     }
 }
-

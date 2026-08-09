@@ -117,7 +117,10 @@ mod tests {
     #[test]
     fn the_first_layer_slides_and_the_second_does_not() {
         let f = GptOssFacts::gpt_oss_20b();
-        assert!(f.is_sliding(0), "gpt-oss's `layer_types` opens with sliding");
+        assert!(
+            f.is_sliding(0),
+            "gpt-oss's `layer_types` opens with sliding"
+        );
         assert!(!f.is_sliding(1), "and the second layer is the full one");
     }
 
@@ -193,7 +196,10 @@ mod tests {
     #[test]
     fn the_router_selects_fewer_experts_than_it_has() {
         let f = GptOssFacts::gpt_oss_20b();
-        assert!(f.top_k > 0, "a router selecting nothing produces no MLP at all");
+        assert!(
+            f.top_k > 0,
+            "a router selecting nothing produces no MLP at all"
+        );
         assert!(
             f.top_k < f.experts,
             "selecting every expert is a dense MLP wearing a router's cost"
@@ -225,13 +231,19 @@ mod tests {
     fn the_branching_booleans_are_the_ones_the_checkpoint_states() {
         let f = GptOssFacts::gpt_oss_20b();
         assert!(f.attn_sinks, "every gpt-oss layer carries `attn_sinks`");
-        assert!(f.attention_bias, "gpt-oss biases q/k/v/o, the router, and the experts");
+        assert!(
+            f.attention_bias,
+            "gpt-oss biases q/k/v/o, the router, and the experts"
+        );
         assert!(
             !f.tied_embeddings,
             "gpt-oss ships a separate `lm_head`; tying it would read the \
              unembedding out of the token table"
         );
-        assert!(f.rope_yarn_original, "the row rescales rope by the YaRN paper's rule");
+        assert!(
+            f.rope_yarn_original,
+            "the row rescales rope by the YaRN paper's rule"
+        );
     }
 
     /// `intermediate == hidden` is a COINCIDENCE of this checkpoint, and

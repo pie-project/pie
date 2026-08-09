@@ -25,8 +25,8 @@ mod common;
 
 use common::{device_or_skip, gpu_guard};
 use driver_cuda::device::{
-    Allocator, DeviceBuffer, OwnedStream, PredicateWord, StreamRef, SupergraphBuilder,
-    SLOT_HAS_LORA,
+    Allocator, DeviceBuffer, OwnedStream, PredicateWord, SLOT_HAS_LORA, StreamRef,
+    SupergraphBuilder,
 };
 
 const N: usize = 256;
@@ -44,7 +44,9 @@ fn read(buf: &DeviceBuffer, stream: StreamRef<'_>) -> Vec<u8> {
 #[test]
 fn one_exec_runs_two_programs_chosen_from_device_memory() {
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("supergraph conditional") else { return };
+    let Some(_dev) = device_or_skip("supergraph conditional") else {
+        return;
+    };
 
     let stream = OwnedStream::new(0).expect("stream");
     let mut alloc = Allocator::new();
@@ -66,7 +68,8 @@ fn one_exec_runs_two_programs_chosen_from_device_memory() {
         out.memset(IF_BYTE, body).expect("if arm");
         b.end_body().expect("end if");
 
-        b.begin_body(cond.else_body().expect("else body")).expect("begin else");
+        b.begin_body(cond.else_body().expect("else body"))
+            .expect("begin else");
         let body = b.stream();
         out.memset(ELSE_BYTE, body).expect("else arm");
         b.end_body().expect("end else");
@@ -119,7 +122,9 @@ fn an_arm_that_is_not_taken_writes_nothing() {
     // an "the arms differ" check if the second write happened to land
     // last.
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("supergraph conditional") else { return };
+    let Some(_dev) = device_or_skip("supergraph conditional") else {
+        return;
+    };
 
     let stream = OwnedStream::new(0).expect("stream");
     let mut alloc = Allocator::new();
@@ -139,7 +144,11 @@ fn an_arm_that_is_not_taken_writes_nothing() {
         b.end_body().expect("end if");
         b.close_cond(&cond).expect("close_cond");
         drop(b);
-        scope.end().expect("end capture").instantiate().expect("instantiate")
+        scope
+            .end()
+            .expect("end capture")
+            .instantiate()
+            .expect("instantiate")
     };
 
     out.memset(NEITHER, stream.as_ref()).expect("prime");
@@ -164,7 +173,9 @@ fn nesting_holds_to_the_depth_a_guard_chain_needs() {
     // enough to prove the pool indexes by depth rather than reusing one
     // stream.
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("supergraph nesting") else { return };
+    let Some(_dev) = device_or_skip("supergraph nesting") else {
+        return;
+    };
 
     let stream = OwnedStream::new(0).expect("stream");
     let mut alloc = Allocator::new();
@@ -190,7 +201,8 @@ fn nesting_holds_to_the_depth_a_guard_chain_needs() {
         out.memset(IF_BYTE, body).expect("inner if arm");
         b.end_body().expect("end inner if");
 
-        b.begin_body(inner.else_body().expect("inner else")).expect("begin inner else");
+        b.begin_body(inner.else_body().expect("inner else"))
+            .expect("begin inner else");
         let body = b.stream();
         out.memset(ELSE_BYTE, body).expect("inner else arm");
         b.end_body().expect("end inner else");
@@ -201,7 +213,11 @@ fn nesting_holds_to_the_depth_a_guard_chain_needs() {
         b.close_cond(&outer).expect("close outer");
         drop(b);
 
-        scope.end().expect("end capture").instantiate().expect("instantiate")
+        scope
+            .end()
+            .expect("end capture")
+            .instantiate()
+            .expect("instantiate")
     };
 
     // outer on, inner on  -> IF_BYTE

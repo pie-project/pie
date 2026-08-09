@@ -24,16 +24,16 @@
 
 use std::time::Instant;
 
-use model::gemma_4::forward::gemma4_cuda;
-use model::gpt_oss::forward::gpt_oss_cuda;
-use model::shared::llama_like::forward::llama_like_cuda;
-use model::qwen_3_5::forward::qwen3_5_hybrid_cuda;
-use model_compiler::lower::{lower, Fire, Row};
-use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
 use model::gemma_4::forward::facts::{Gemma4CudaFacts, Gemma4Facts};
+use model::gemma_4::forward::gemma4_cuda;
 use model::gpt_oss::forward::facts::{GptOssCudaFacts, GptOssFacts};
+use model::gpt_oss::forward::gpt_oss_cuda;
 use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
-use model_compiler::{FireClass};
+use model::qwen_3_5::forward::qwen3_5_hybrid_cuda;
+use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
+use model::shared::llama_like::forward::llama_like_cuda;
+use model_compiler::FireClass;
+use model_compiler::lower::{Fire, Row, lower};
 
 fn rows(n: usize) -> Vec<Row> {
     (0..n)

@@ -397,7 +397,7 @@ pub fn author_gpt_oss_mlx(b: &mut Builder<'_>) -> Result<(), Error> {
             let bits = packed_cols / (2 * groups);
             if bits != 4 && bits != 8 {
                 return fail(format!(
-                    "Metal GptOss: '{}' is {bits}-bit, and only 4 and 8 are                      described here",
+                    "Metal GptOss: '{}' is {bits}-bit, and only 4 and 8 are described here",
                     raw.name
                 ));
             }

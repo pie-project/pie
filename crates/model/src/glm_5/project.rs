@@ -86,7 +86,10 @@ pub fn manifest(f: &Glm5Facts, tied_embeddings: bool) -> Manifest {
         // can tell them apart: every extent agrees.
         .either(!tied_embeddings, "lm_head", [vocab, hidden])
         .with(TensorSpec::required("layer.{}.input_layernorm", [hidden]))
-        .with(TensorSpec::required("layer.{}.post_attention_layernorm", [hidden]))
+        .with(TensorSpec::required(
+            "layer.{}.post_attention_layernorm",
+            [hidden],
+        ))
         // ── The latent attention, as arithmetic ──────────────────────
         .either(latent_q, "layer.{}.self_attn.q_a_proj", [q_lora, hidden])
         .either(latent_q, "layer.{}.self_attn.q_b_proj", [q_b_width, q_lora])
@@ -102,17 +105,26 @@ pub fn manifest(f: &Glm5Facts, tied_embeddings: bool) -> Manifest {
             "layer.{}.self_attn.kv_a_proj_with_mqa",
             [kv_a_width, hidden],
         ))
-        .with(TensorSpec::required("layer.{}.self_attn.kv_a_layernorm", [kv_lora]))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.kv_a_layernorm",
+            [kv_lora],
+        ))
         // The one tensor this generation's contract DEQUANTIZES: it
         // ships FP8 and `kimi_mla` reads bf16. The extents are the same
         // either way, which is the point — a manifest states the model
         // and not the encoding it arrived in.
-        .with(TensorSpec::required("layer.{}.self_attn.kv_b_proj", [kv_b_width, kv_lora]))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.kv_b_proj",
+            [kv_b_width, kv_lora],
+        ))
         // `o_proj` reads the VALUE width and not the query width, which
         // is where MLA stops looking like GQA: the two differ whenever
         // `v_head_dim != qk_nope_head_dim + qk_rope_head_dim`, and for
         // this row they differ by 64 per head.
-        .with(TensorSpec::required("layer.{}.self_attn.o_proj", [hidden, v_width]))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.o_proj",
+            [hidden, v_width],
+        ))
         // ── The dense prefix, as tensors ─────────────────────────────
         //
         // `first_k_dense_replace` is a fact a checkpoint publishes: a
@@ -122,8 +134,16 @@ pub fn manifest(f: &Glm5Facts, tied_embeddings: bool) -> Manifest {
         // no prefix ships no dense MLP at all, and one that is dense all
         // the way ships no router — the same statement read from its two
         // ends.
-        .either(has_dense_prefix, "layer.{}.mlp.gate_proj", [dense_inter, hidden])
-        .either(has_dense_prefix, "layer.{}.mlp.down_proj", [hidden, dense_inter])
+        .either(
+            has_dense_prefix,
+            "layer.{}.mlp.gate_proj",
+            [dense_inter, hidden],
+        )
+        .either(
+            has_dense_prefix,
+            "layer.{}.mlp.down_proj",
+            [hidden, dense_inter],
+        )
         // The ROUTER is the mixture's identity, and it is the row that
         // can be measured: `[num_experts, hidden]`, never quantized,
         // always spelled `.weight`. The routed BANK is deliberately not
@@ -265,12 +285,20 @@ fn plan(f: &Glm5Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
         prefill: PrefillStyle::Planned,
         attn_output: AttnOutput::DriverPinned,
         logit_softcap: 0.0,
+        // No ATTENTION cap: gemma-2's `attn_logit_softcapping` is
+        // gemma-2's alone, and a zero here is "no cap" rather than a
+        // cap at zero — which would flatten every score to `tanh(inf)`.
+        attn_logit_softcap: 0.0,
         ple_dim: 0,
         norm: NormPlacement::Pre,
         // Not a gemma: the gain is the multiplier, stored directly.
         norm_unit_offset: false,
         v_norm: false,
         k_eq_v: false,
+        // GLM publishes `true` where its DeepSeek-shaped siblings
+        // publish `false` -- see `Glm5MoeFacts`.
+        norm_topk_prob: f.moe.norm_topk_prob,
+        routed_scaling: f.moe.routed_scaling,
         mlp_gate: crate::deployment::MlpGate::Silu,
         scales: std::collections::BTreeMap::new(),
         // DEFAULT, and the row writes over it. None of the three
@@ -313,8 +341,8 @@ fn plan(f: &Glm5Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
 /// `LLAMA_LIKE` — an eleven-entry table of architecture STRINGS,
 /// reduced by a punctuation-stripping `canonical()`, consulted before
 /// any text was traced and free to disagree with what the tracer would
-/// actually do. It listed `gemma4`, which the load path refused on
-/// other grounds, and omitted `gemma3`, whose text it models. A row
+/// actually do. It listed `gpt_oss`, which no publication of reaches a
+/// Metal device here, and omitted `gemma3`, whose text it models. A row
 /// that answers for itself cannot disagree with a list, because there
 /// is no list.
 pub const NO_METAL: &str = "glm-5 has no Metal text in this build: its forward is `glm5_cuda` — latent \
@@ -363,12 +391,18 @@ mod tests {
         let m = manifest(&f, false);
 
         // The query's rank: hidden -> 1536 -> every head's nope+rope.
-        assert_eq!(spec(&m, "layer.{}.self_attn.q_a_proj").extents, vec![1536, 4096]);
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.q_a_proj").extents,
+            vec![1536, 4096]
+        );
         assert_eq!(
             spec(&m, "layer.{}.self_attn.q_b_proj").extents,
             vec![96 * (128 + 64), 1536],
         );
-        assert_eq!(spec(&m, "layer.{}.self_attn.q_a_layernorm").extents, vec![1536]);
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.q_a_layernorm").extents,
+            vec![1536]
+        );
 
         // The KV's rank: hidden -> 512 latent + 64 shared rope, then the
         // latent alone back out to every head's nope half and value.
@@ -376,14 +410,20 @@ mod tests {
             spec(&m, "layer.{}.self_attn.kv_a_proj_with_mqa").extents,
             vec![512 + 64, 4096],
         );
-        assert_eq!(spec(&m, "layer.{}.self_attn.kv_a_layernorm").extents, vec![512]);
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.kv_a_layernorm").extents,
+            vec![512]
+        );
         assert_eq!(
             spec(&m, "layer.{}.self_attn.kv_b_proj").extents,
             vec![96 * (128 + 128), 512],
         );
         // And the output reads the VALUE width, which is where MLA
         // stops looking like GQA.
-        assert_eq!(spec(&m, "layer.{}.self_attn.o_proj").extents, vec![4096, 96 * 128]);
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.o_proj").extents,
+            vec![4096, 96 * 128]
+        );
     }
 
     /// A query rank is not a branch, it is a DISCRIMINATOR: the two
@@ -392,14 +432,26 @@ mod tests {
     #[test]
     fn a_query_latent_forbids_the_straight_projection() {
         let m = manifest(&glm5(), false);
-        assert_eq!(spec(&m, "layer.{}.self_attn.q_a_proj").presence, Presence::Required);
-        assert_eq!(spec(&m, "layer.{}.self_attn.q_proj").presence, Presence::Absent);
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.q_a_proj").presence,
+            Presence::Required
+        );
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.q_proj").presence,
+            Presence::Absent
+        );
 
         let mut straight = glm5();
         straight.attn.q_lora_rank = 0;
         let m = manifest(&straight, false);
-        assert_eq!(spec(&m, "layer.{}.self_attn.q_proj").presence, Presence::Required);
-        assert_eq!(spec(&m, "layer.{}.self_attn.q_a_proj").presence, Presence::Absent);
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.q_proj").presence,
+            Presence::Required
+        );
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.q_a_proj").presence,
+            Presence::Absent
+        );
         assert_eq!(
             spec(&m, "layer.{}.self_attn.q_a_layernorm").presence,
             Presence::Absent,
@@ -428,8 +480,14 @@ mod tests {
     fn a_dense_prefix_publishes_both_an_mlp_and_a_router() {
         let f = glm5();
         let m = manifest(&f, false);
-        assert_eq!(spec(&m, "layer.{}.mlp.gate_proj").extents, vec![10_944, 4096]);
-        assert_eq!(spec(&m, "layer.{}.mlp.down_proj").extents, vec![4096, 10_944]);
+        assert_eq!(
+            spec(&m, "layer.{}.mlp.gate_proj").extents,
+            vec![10_944, 4096]
+        );
+        assert_eq!(
+            spec(&m, "layer.{}.mlp.down_proj").extents,
+            vec![4096, 10_944]
+        );
         assert_eq!(spec(&m, "layer.{}.mlp.gate").presence, Presence::Required);
         assert_eq!(spec(&m, "layer.{}.mlp.gate").extents, vec![128, 4096]);
         assert_eq!(
@@ -446,14 +504,23 @@ mod tests {
         let mut no_prefix = glm5();
         no_prefix.dense_layers = 0;
         let m = manifest(&no_prefix, false);
-        assert_eq!(spec(&m, "layer.{}.mlp.gate_proj").presence, Presence::Absent);
-        assert_eq!(spec(&m, "layer.{}.mlp.down_proj").presence, Presence::Absent);
+        assert_eq!(
+            spec(&m, "layer.{}.mlp.gate_proj").presence,
+            Presence::Absent
+        );
+        assert_eq!(
+            spec(&m, "layer.{}.mlp.down_proj").presence,
+            Presence::Absent
+        );
         assert_eq!(spec(&m, "layer.{}.mlp.gate").presence, Presence::Required);
 
         let mut all_dense = glm5();
         all_dense.dense_layers = all_dense.layers;
         let m = manifest(&all_dense, false);
-        assert_eq!(spec(&m, "layer.{}.mlp.gate_proj").presence, Presence::Required);
+        assert_eq!(
+            spec(&m, "layer.{}.mlp.gate_proj").presence,
+            Presence::Required
+        );
         assert_eq!(
             spec(&m, "layer.{}.mlp.gate").presence,
             Presence::Absent,
@@ -511,6 +578,8 @@ mod tests {
                 hidden: 7168,
                 num_experts: 384,
                 top_k: 8,
+                norm_topk_prob: true,
+                routed_scaling: 2.5,
                 moe_intermediate: 2048,
                 shared_intermediate: 2048,
                 aligned_block: 16,
@@ -548,7 +617,10 @@ mod tests {
             ("norm", vec![h]),
             ("layer.{}.input_layernorm", vec![h]),
             ("layer.{}.post_attention_layernorm", vec![h]),
-            ("layer.{}.self_attn.q_a_proj", vec![u64::from(a.q_lora_rank), h]),
+            (
+                "layer.{}.self_attn.q_a_proj",
+                vec![u64::from(a.q_lora_rank), h],
+            ),
             (
                 "layer.{}.self_attn.q_b_proj",
                 vec![u64::from(a.q_b_width()), u64::from(a.q_lora_rank)],
@@ -557,7 +629,10 @@ mod tests {
                 "layer.{}.self_attn.kv_a_proj_with_mqa",
                 vec![u64::from(a.kv_a_width()), h],
             ),
-            ("layer.{}.self_attn.kv_a_layernorm", vec![u64::from(a.kv_lora_rank)]),
+            (
+                "layer.{}.self_attn.kv_a_layernorm",
+                vec![u64::from(a.kv_lora_rank)],
+            ),
             (
                 "layer.{}.self_attn.kv_b_proj",
                 vec![
@@ -572,9 +647,16 @@ mod tests {
                 vec![u64::from(f.moe.shared_intermediate), h],
             ),
         ] {
-            assert_eq!(spec(&m, name).extents, want, "{name} is not the row's own arithmetic");
+            assert_eq!(
+                spec(&m, name).extents,
+                want,
+                "{name} is not the row's own arithmetic"
+            );
         }
-        assert_eq!(m.layers, f.layers, "the manifest covers the row's own stack");
+        assert_eq!(
+            m.layers, f.layers,
+            "the manifest covers the row's own stack"
+        );
     }
 
     /// The mixture is stated by its ROUTER and never by its bank: this
@@ -601,7 +683,9 @@ mod tests {
     fn the_indexer_is_left_unnamed_rather_than_guessed_at() {
         let m = manifest(&glm5(), false);
         assert!(
-            !m.tensors.iter().any(|t| t.name.contains("idx") || t.name.contains("indexer")),
+            !m.tensors
+                .iter()
+                .any(|t| t.name.contains("idx") || t.name.contains("indexer")),
             "the manifest names an indexer tensor whose spelling this tree \
              does not state; a checkpoint that has one under another name \
              would be refused for a name nobody wrote down",
@@ -619,7 +703,10 @@ mod tests {
         assert_eq!(d.attention.len(), 46);
         assert_eq!(d.shape.hidden, 4096);
         assert_eq!(d.shape.q_heads, 96);
-        assert_eq!(d.shape.kv_heads, 1, "one latent plane, shared by every head");
+        assert_eq!(
+            d.shape.kv_heads, 1,
+            "one latent plane, shared by every head"
+        );
         assert_eq!(d.shape.head_dim, 576);
         assert_eq!(d.shape.head_dim_kernel, 576, "a latent row is never padded");
         assert_eq!(d.shape.intermediate, 10_944);
@@ -683,7 +770,10 @@ mod tests {
     fn the_kv_style_carries_the_rows_own_ranks() {
         let d = plan(&glm5(), 10_000.0, 1e-5);
         match d.kv {
-            KvStyle::Mla { kv_lora_rank, qk_rope_head_dim } => {
+            KvStyle::Mla {
+                kv_lora_rank,
+                qk_rope_head_dim,
+            } => {
                 assert_eq!(kv_lora_rank, 512);
                 assert_eq!(qk_rope_head_dim, 64);
             }
@@ -695,9 +785,8 @@ mod tests {
     /// at the first fire inside a walk.
     #[test]
     fn a_build_with_no_mla_store_refuses_the_row() {
-        let err = deployment(&glm5(), 10_000.0, 1e-5).expect_err(
-            "no MLA store is built in this tree, so the row cannot be served",
-        );
+        let err = deployment(&glm5(), 10_000.0, 1e-5)
+            .expect_err("no MLA store is built in this tree, so the row cannot be served");
         assert!(matches!(err, Refusal::Unsupported(_)));
     }
 
@@ -715,7 +804,10 @@ mod tests {
             Advertised::default(),
             "a projection that fills this in has derived a family name from a shape",
         );
-        assert!(d.advertised.arch.is_empty(), "an empty label is a row that has not spoken yet");
+        assert!(
+            d.advertised.arch.is_empty(),
+            "an empty label is a row that has not spoken yet"
+        );
         assert_eq!(d.advertised.max_model_len, 0);
         assert!(!d.advertised.media_encode);
     }
@@ -729,7 +821,10 @@ mod tests {
     #[test]
     fn the_rope_ladder_is_unscaled_and_no_tower_ships() {
         let d = plan(&glm5(), 10_000.0, 1e-5);
-        assert!(d.rope_scaling.is_none(), "no committed config states a rescaling to read");
+        assert!(
+            d.rope_scaling.is_none(),
+            "no committed config states a rescaling to read"
+        );
         assert_eq!(
             d.towers,
             crate::deployment::Towers::default(),
@@ -757,9 +852,10 @@ mod tests {
     fn the_text_traces_for_both_fire_classes() {
         use model_compiler::trace::FireClass;
         let f = glm5();
-        for (class, suffix) in
-            [(FireClass::Decode, "decode"), (FireClass::Prefill, "prefill")]
-        {
+        for (class, suffix) in [
+            (FireClass::Decode, "decode"),
+            (FireClass::Prefill, "prefill"),
+        ] {
             let plan = trace(&f, class);
             assert_eq!(plan.family, format!("glm5.cuda.{suffix}"));
             assert!(!plan.ops.is_empty(), "a traced plan states ops");

@@ -61,5 +61,7 @@ pub use trace::{
 /// environment of the crate being compiled, and the crate that needs the
 /// number is no longer this one.
 pub fn compiler_version() -> u64 {
-    env!("PIE_FORWARD_COMPILER_HASH").parse::<u64>().unwrap_or(0)
+    env!("PIE_FORWARD_COMPILER_HASH")
+        .parse::<u64>()
+        .unwrap_or(0)
 }

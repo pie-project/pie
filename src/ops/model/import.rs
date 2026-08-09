@@ -40,7 +40,7 @@ use model_loader::checkpoint::read::parse_checkpoint_metadata;
 use model_loader::checkpoint::write::CheckpointWriter;
 use model_loader::checkpoint::{CheckpointMetadata, RawTensor};
 use model_loader::contract::materialize::materialize_contract;
-use model_loader::executor::host::Progress;
+use model_loader::executor::Progress;
 use model_loader::executor::sink::TensorSink;
 use model_loader::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 use model_loader::types::{CheckpointFormat, TensorDecl, Visibility};
@@ -289,20 +289,19 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
         let plan = model_loader::plan::compile(&metadata, &materialization.contract, target)
             .map_err(|err| anyhow!("cannot compile the decode: {err}"))?;
         let mut spool = Spool::create(&out_file)?;
-        model_loader::executor::host::execute_plan_into(
-            &plan,
-            &source.base(),
-            &mut spool,
-            &mut |progress| {
+        model_loader::executor::Execution::new(&plan, &source.base())
+            .streaming()
+            .sink(&mut spool)
+            .progress(&mut |progress| {
                 decode_read_bytes = progress.total_read_bytes;
                 bar.render(&Progress {
                     read_bytes: progress.read_bytes,
                     total_read_bytes: progress.total_read_bytes + copy_bytes,
                     finalized: progress.finalized,
                 });
-            },
-        )
-        .map_err(|err| anyhow!("decoding failed: {err}"))?;
+            })
+            .run()
+            .map_err(|err| anyhow!("decoding failed: {err}"))?;
         Some((plan, spool))
     };
 

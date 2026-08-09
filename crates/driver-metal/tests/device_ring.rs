@@ -10,9 +10,9 @@
 #![allow(clippy::print_stdout)]
 
 use driver_metal::channel::{Effect, Readiness, Reason, Ticket, check_words};
-use driver_metal::{Error, Region};
 use driver_metal::device::{Context, Ring, Stepper, Tables};
 use driver_metal::program::Compiler;
+use driver_metal::{Error, Region};
 use objc2::Message;
 use objc2::rc::{Weak, autoreleasepool};
 use tensor_ir::DType;

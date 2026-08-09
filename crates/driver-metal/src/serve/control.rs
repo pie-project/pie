@@ -57,12 +57,11 @@ impl Shell {
                 ),
             });
         };
-        let work = super::transfer::plan_kv_copy(desc, caps, grid).map_err(|why| {
-            Error::Unserved {
+        let work =
+            super::transfer::plan_kv_copy(desc, caps, grid).map_err(|why| Error::Unserved {
                 what: "copy_kv",
                 message: format!("{why:?}"),
-            }
-        })?;
+            })?;
 
         // Whole-page moves first, as page pairs; then the row cells. Both run
         // over every layer's K and V, which the stride check above is what

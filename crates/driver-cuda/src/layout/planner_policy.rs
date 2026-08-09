@@ -76,7 +76,11 @@ pub fn clamp_pow2_nearest(value: i32, lo: i32, hi: i32) -> i32 {
     if upper <= lower {
         return lower;
     }
-    if value - lower <= upper - value { lower } else { upper }
+    if value - lower <= upper - value {
+        lower
+    } else {
+        upper
+    }
 }
 
 /// Is this the `auto` profile?
@@ -132,8 +136,10 @@ pub fn kv_page_size_candidates(pinned: u32, profile: &str, tp_size: i32) -> Vec<
         return vec![pinned as i32];
     }
     let tp = tp_size.max(1);
-    let mut xs: Vec<i32> =
-        policy_profiles(profile).iter().map(|p| kv_page_size_for_profile(p, tp)).collect();
+    let mut xs: Vec<i32> = policy_profiles(profile)
+        .iter()
+        .map(|p| kv_page_size_for_profile(p, tp))
+        .collect();
     xs.push(16);
     xs.push(32);
     xs.sort_unstable();
@@ -147,8 +153,11 @@ pub fn kv_page_size_candidates(pinned: u32, profile: &str, tp_size: i32) -> Vec<
 /// sweeps [`kv_page_size_candidates`].
 #[must_use]
 pub fn kv_page_size(pinned_profile: &str, tp_size: i32) -> i32 {
-    let profile =
-        if is_auto_profile(pinned_profile) { AUTO_REPRESENTATIVE } else { pinned_profile };
+    let profile = if is_auto_profile(pinned_profile) {
+        AUTO_REPRESENTATIVE
+    } else {
+        pinned_profile
+    };
     kv_page_size_for_profile(profile, tp_size.max(1))
 }
 
@@ -190,14 +199,22 @@ pub fn target_saturation_score(value: i32, target: i32) -> f64 {
 /// than no parameter.
 #[must_use]
 pub fn decode_target_for_profile(profile: &str, sm_count: i32) -> i32 {
-    let sm_factor = if matches!(profile, "latency" | "capacity") { 4 } else { 6 };
+    let sm_factor = if matches!(profile, "latency" | "capacity") {
+        4
+    } else {
+        6
+    };
     clamp_pow2_nearest(sm_count * sm_factor, 64, 2048)
 }
 
 /// [`decode_target_for_profile`] with `auto` resolved.
 #[must_use]
 pub fn decode_target(profile: &str, sm_count: i32) -> i32 {
-    let profile = if is_auto_profile(profile) { AUTO_REPRESENTATIVE } else { profile };
+    let profile = if is_auto_profile(profile) {
+        AUTO_REPRESENTATIVE
+    } else {
+        profile
+    };
     decode_target_for_profile(profile, sm_count)
 }
 
@@ -230,13 +247,21 @@ pub fn prefill_target_for_profile(profile: &str, sm_count: i32, major: i32, tp_s
         8192
     };
     let target = clamp_pow2_nearest(sm_count * sm_factor * tp_factor, 512, max_target);
-    if matches!(profile, "latency" | "capacity") { 512.max(target / 2) } else { target }
+    if matches!(profile, "latency" | "capacity") {
+        512.max(target / 2)
+    } else {
+        target
+    }
 }
 
 /// [`prefill_target_for_profile`] with `auto` resolved.
 #[must_use]
 pub fn prefill_target(profile: &str, sm_count: i32, major: i32, tp_size: i32) -> i32 {
-    let profile = if is_auto_profile(profile) { AUTO_REPRESENTATIVE } else { profile };
+    let profile = if is_auto_profile(profile) {
+        AUTO_REPRESENTATIVE
+    } else {
+        profile
+    };
     prefill_target_for_profile(profile, sm_count, major, tp_size)
 }
 
@@ -281,7 +306,11 @@ mod tests {
         // down -- and an SM count landing on a midpoint is not exotic.
         assert_eq!(clamp_pow2_nearest(96, 64, 2048), 64);
         assert_eq!(clamp_pow2_nearest(192, 64, 2048), 128);
-        assert_eq!(clamp_pow2_nearest(97, 64, 2048), 128, "one past the tie goes up");
+        assert_eq!(
+            clamp_pow2_nearest(97, 64, 2048),
+            128,
+            "one past the tie goes up"
+        );
         assert_eq!(clamp_pow2_nearest(95, 64, 2048), 64);
     }
 
@@ -296,7 +325,10 @@ mod tests {
 
     #[test]
     fn auto_expands_to_four_families_and_anything_else_to_itself() {
-        assert_eq!(policy_profiles("auto"), ["latency", "balanced", "throughput", "capacity"]);
+        assert_eq!(
+            policy_profiles("auto"),
+            ["latency", "balanced", "throughput", "capacity"]
+        );
         assert_eq!(policy_profiles("latency"), ["latency"]);
         // An unknown profile is searched as itself rather than rejected, which
         // is how it ends up scoring on the `else` branch of every predicate.
@@ -317,7 +349,11 @@ mod tests {
     fn any_tensor_parallel_deployment_takes_the_coarser_page() {
         for profile in ["latency", "balanced", "throughput", "capacity"] {
             for tp in [0, 2, 3, 8] {
-                assert_eq!(kv_page_size_for_profile(profile, tp), 32, "{profile} at tp={tp}");
+                assert_eq!(
+                    kv_page_size_for_profile(profile, tp),
+                    32,
+                    "{profile} at tp={tp}"
+                );
             }
         }
     }
@@ -343,7 +379,10 @@ mod tests {
         // The property that stops the search paying for occupancy it cannot
         // use: past the knee, more scores exactly the same.
         let at = target_saturation_score(256, 256);
-        assert!((at - 1.0).abs() < 1e-12, "hitting the target scores 1, got {at}");
+        assert!(
+            (at - 1.0).abs() < 1e-12,
+            "hitting the target scores 1, got {at}"
+        );
         assert_eq!(target_saturation_score(512, 256), at);
         assert_eq!(target_saturation_score(i32::MAX, 256), at);
     }
@@ -383,7 +422,10 @@ mod tests {
         // Reads like a typo in the original and is not: `throughput` on a
         // pre-12 device is capped at 4096 while `balanced` is capped at 8192.
         let narrow = 11;
-        assert_eq!(prefill_target_for_profile("throughput", 512, narrow, 1), 4096);
+        assert_eq!(
+            prefill_target_for_profile("throughput", 512, narrow, 1),
+            4096
+        );
         assert_eq!(prefill_target_for_profile("balanced", 512, narrow, 1), 8192);
         // On a wide device the cap rises and the ordering inverts.
         assert_eq!(prefill_target_for_profile("throughput", 512, 12, 1), 8192);
@@ -404,7 +446,11 @@ mod tests {
     fn tensor_parallelism_stops_helping_prefill_past_two_ranks() {
         let at2 = prefill_target_for_profile("balanced", 16, 9, 2);
         for tp in [2, 3, 4, 8, 64] {
-            assert_eq!(prefill_target_for_profile("balanced", 16, 9, tp), at2, "tp={tp}");
+            assert_eq!(
+                prefill_target_for_profile("balanced", 16, 9, tp),
+                at2,
+                "tp={tp}"
+            );
         }
         // tp of 0 is treated as 1, not as 0.
         assert_eq!(
@@ -415,16 +461,20 @@ mod tests {
 
     #[test]
     fn uniq_clip_desc_clamps_deduplicates_and_orders_largest_first() {
-        assert_eq!(uniq_clip_desc(&[4000, 2048, 1024, 1024, 1, 0, -7], 8192), [
-            4000, 2048, 1024, 1
-        ]);
+        assert_eq!(
+            uniq_clip_desc(&[4000, 2048, 1024, 1024, 1, 0, -7], 8192),
+            [4000, 2048, 1024, 1]
+        );
         // The clamp collapses everything above the cap into one entry.
         assert_eq!(uniq_clip_desc(&[8192, 16384, 300], 512), [512, 300]);
         assert_eq!(uniq_clip_desc(&[], 512), [] as [i32; 0]);
         assert_eq!(uniq_clip_desc(&[5, 5, 5], 512), [5]);
         // Descending is what lets the search stop at the first fit.
         let out = uniq_clip_desc(&[1, 9, 3, 7], 512);
-        assert!(out.windows(2).all(|w| w[0] > w[1]), "{out:?} is not strictly descending");
+        assert!(
+            out.windows(2).all(|w| w[0] > w[1]),
+            "{out:?} is not strictly descending"
+        );
     }
 
     #[test]

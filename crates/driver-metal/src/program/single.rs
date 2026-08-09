@@ -41,22 +41,22 @@ use std::rc::Rc;
 
 use tensor_ir::op::tags;
 
-use crate::device::context::Context;
-use crate::device::encoder::{Stepper, Visibility};
-use crate::device::external::Externals;
-use crate::device::handle::Handle;
-use crate::device::allocator::{Pool, Transient};
-use crate::program::executable::ProgramExecutable;
-use crate::device::ring::Ring;
-use crate::program::cache::Runtime;
-use crate::device::argtable::Tables;
-use crate::device::step_cost::Timing;
 use crate::channel::{
     DUMMY_BYTES, Extents, LANE_ABI_VERSION, LaneChannelSlot, LaneHeader, LaneRecord, LaneShape,
     NO_TICKET, OpParams, OpRuntime, Readiness, Reason, STATUS_BYTES, Status, StatusOutcome, Ticket,
     ValueDesc, Words, check_words, describe, layout, report_status,
 };
+use crate::device::allocator::{Pool, Transient};
+use crate::device::argtable::Tables;
+use crate::device::context::Context;
+use crate::device::encoder::{Stepper, Visibility};
+use crate::device::external::Externals;
+use crate::device::handle::Handle;
+use crate::device::ring::Ring;
+use crate::device::step_cost::Timing;
 use crate::layout::region::Region;
+use crate::program::cache::Runtime;
+use crate::program::executable::ProgramExecutable;
 use crate::{Error, Result};
 
 /// `PTIR_OP_CHAN_TAKE`.

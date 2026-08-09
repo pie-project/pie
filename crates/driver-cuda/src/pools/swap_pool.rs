@@ -127,13 +127,19 @@ impl SwapPoolLayout {
             head_dim,
             bytes_per_page,
             buffers: Vec::new(),
-            streams: StreamPlan { evict: false, restore: false },
+            streams: StreamPlan {
+                evict: false,
+                restore: false,
+            },
             geometry: PoolGeometry::new(Vec::new()),
         };
         if num_pages <= 0 || num_layers <= 0 {
             return out;
         }
-        out.streams = StreamPlan { evict: true, restore: true };
+        out.streams = StreamPlan {
+            evict: true,
+            restore: true,
+        };
         let np = as_size_t(num_pages);
         for layer in 0..num_layers as u32 {
             for buffer in 0..2 {
@@ -173,13 +179,19 @@ impl SwapPoolLayout {
             head_dim,
             bytes_per_page: 0,
             buffers: Vec::new(),
-            streams: StreamPlan { evict: false, restore: false },
+            streams: StreamPlan {
+                evict: false,
+                restore: false,
+            },
             geometry: PoolGeometry::new(Vec::new()),
         };
         if num_pages <= 0 || num_layers <= 0 {
             return out;
         }
-        out.streams = StreamPlan { evict: true, restore: true };
+        out.streams = StreamPlan {
+            evict: true,
+            restore: true,
+        };
         let np = as_size_t(num_pages);
         for (layer, widths) in device_buffers.iter().enumerate() {
             for (buffer, &page_bytes) in widths.iter().enumerate() {
@@ -358,7 +370,13 @@ mod tests {
         let p = SwapPoolLayout::uniform(3, 0, 16, 4, 128, DType::Bf16);
         assert_eq!(p.buffers().len(), 0);
         assert_eq!(p.bytes_per_page(), 2 * 3 * 16 * 4 * 128 * 2);
-        assert_eq!(p.streams(), StreamPlan { evict: false, restore: false });
+        assert_eq!(
+            p.streams(),
+            StreamPlan {
+                evict: false,
+                restore: false
+            }
+        );
     }
 
     #[test]
@@ -374,7 +392,10 @@ mod tests {
         let p = SwapPoolLayout::uniform(-2, 8, 16, 4, 128, DType::Bf16);
         assert!(p.buffers().is_empty());
         assert_eq!(p.num_layers(), -2);
-        assert_eq!(p.bytes_per_page(), 0u64.wrapping_sub(2 * 2 * 16 * 4 * 128 * 2));
+        assert_eq!(
+            p.bytes_per_page(),
+            0u64.wrapping_sub(2 * 2 * 16 * 4 * 128 * 2)
+        );
     }
 
     #[test]
@@ -386,8 +407,16 @@ mod tests {
 
     #[test]
     fn a_zero_layer_stack_allocates_nothing_either_way() {
-        assert!(SwapPoolLayout::uniform(0, 8, 16, 4, 128, DType::Bf16).buffers().is_empty());
-        assert!(SwapPoolLayout::for_cache(&[], 8, 16, 4, 128).buffers().is_empty());
+        assert!(
+            SwapPoolLayout::uniform(0, 8, 16, 4, 128, DType::Bf16)
+                .buffers()
+                .is_empty()
+        );
+        assert!(
+            SwapPoolLayout::for_cache(&[], 8, 16, 4, 128)
+                .buffers()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -406,7 +435,10 @@ mod tests {
         let m = p.check_against(&dev).expect("must be rejected");
         assert_eq!(m.layer, 0);
         assert_eq!((m.host_buffers, m.device_buffers), (2, 4));
-        assert!(m.to_string().contains("4 device buffers but 2 host buffers"));
+        assert!(
+            m.to_string()
+                .contains("4 device buffers but 2 host buffers")
+        );
     }
 
     #[test]

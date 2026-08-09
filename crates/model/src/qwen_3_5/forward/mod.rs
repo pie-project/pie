@@ -20,15 +20,14 @@ const MOE_ALIGNED_BLOCK: u32 = 16;
 const MOE_MAX_BLOCKS: u32 = 1024;
 
 use self::facts::{
-    Qwen35CudaFacts,
-    Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts,
+    Qwen35CudaFacts, Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MlpKind,
+    Qwen35MoeMlpFacts,
 };
 use model_compiler::dsl::{
-    WeightRepr,
-    self, attention, causal_conv1d, cuda, gated_delta, gdn_prep, matmul, matmul_per_token,
-    rmsnorm, rmsnorm_gated, rope_partial, sigmoid_gate_add, sigmoid_gate_mul, split_gdn,
-    split_q_gate, split_qkv, swiglu, topk, weighted_sum, ConvW, GdnPrepW, Kv, MatW, NormW, Rs,
-    Trace, Val,
+    self, ConvW, GdnPrepW, Kv, MatW, NormW, Rs, Trace, Val, WeightRepr, attention, causal_conv1d,
+    cuda, gated_delta, gdn_prep, matmul, matmul_per_token, rmsnorm, rmsnorm_gated, rope_partial,
+    sigmoid_gate_add, sigmoid_gate_mul, split_gdn, split_q_gate, split_qkv, swiglu, topk,
+    weighted_sum,
 };
 use model_compiler::trace::{
     DType, Dim, FireClass, ForwardPlan, GuardPred, NormVariant, RopeKind, Shape,
@@ -150,12 +149,7 @@ impl MoeLayerW {
 /// so the text states it: a deployment that folds the residual takes the
 /// token-batched aligned form, one that does not takes the per-expert
 /// scatter-add.
-fn moe_mlp_body_aligned_cuda(
-    l: u32,
-    facts: &Qwen35MoeMlpFacts,
-    y: &Val,
-    repr: WeightRepr,
-) -> Val {
+fn moe_mlp_body_aligned_cuda(l: u32, facts: &Qwen35MoeMlpFacts, y: &Val, repr: WeightRepr) -> Val {
     let w = MoeLayerW::new(l, facts, repr);
     let y = y.clone();
     let m = dsl::cuda::rmsnorm(&y, &w.mlp_norm);
@@ -179,7 +173,8 @@ fn moe_mlp_body_aligned_cuda(
         facts.top_k,
         facts.num_experts,
     );
-    let aligned_in = dsl::cuda::gather_moe_aligned_inputs(&m, &sorted, aligned, facts.hidden, facts.top_k);
+    let aligned_in =
+        dsl::cuda::gather_moe_aligned_inputs(&m, &sorted, aligned, facts.hidden, facts.top_k);
     // The pointer build DECLARES the aligned staging, because it bakes
     // those buffers' base addresses into the device pointer arrays the
     // batched-cuBLAS fallback dereferences. Everything below fills a
@@ -212,8 +207,7 @@ fn moe_mlp_body_aligned_cuda(
         MOE_ALIGNED_BLOCK,
         MOE_MAX_BLOCKS,
     );
-    let act =
-        dsl::cuda::swiglu_aligned(&gate_up, &act_stage, aligned, facts.moe_intermediate);
+    let act = dsl::cuda::swiglu_aligned(&gate_up, &act_stage, aligned, facts.moe_intermediate);
     let down = dsl::cuda::moe_grouped_gemm(
         &act,
         &expert_ids,
@@ -637,9 +631,7 @@ fn gdn_attn_body_cuda(
     // (the retired commit-advance pass), not a variant of the layer loop.
     let qkv = match class {
         FireClass::Decode => cuda::gdn_conv_update_batched(&qkv, &w.conv, &w.rs),
-        FireClass::Prefill => {
-            cuda::gdn_conv_prefill_batched(&qkv, &w.conv, &w.rs)
-        }
+        FireClass::Prefill => cuda::gdn_conv_prefill_batched(&qkv, &w.conv, &w.rs),
     };
     let (q, k, v, g, beta) = gdn_prep(
         &qkv,
@@ -701,7 +693,13 @@ fn gdn_attn_body_cuda(
                             dsl::Region::Fire(GuardPred::TokensLE(c.warp_tiled_max)),
                             || {
                                 cuda::gdn_prefill_warp_tiled(
-                                    &q, &k, &v, &g, &beta, &w.rs, c.state_bf16,
+                                    &q,
+                                    &k,
+                                    &v,
+                                    &g,
+                                    &beta,
+                                    &w.rs,
+                                    c.state_bf16,
                                 );
                             },
                         );
@@ -722,13 +720,9 @@ fn gdn_attn_body_cuda(
                                 facts.value_heads,
                                 facts.key_head_dim,
                             );
-                            cuda::gdn_prefill_cached(
-                                &qr, &kr, &v, &g, &beta, &w.rs, c.state_bf16,
-                            );
+                            cuda::gdn_prefill_cached(&qr, &kr, &v, &g, &beta, &w.rs, c.state_bf16);
                         } else {
-                            cuda::gdn_prefill_cached(
-                                &q, &k, &v, &g, &beta, &w.rs, c.state_bf16,
-                            );
+                            cuda::gdn_prefill_cached(&q, &k, &v, &g, &beta, &w.rs, c.state_bf16);
                         }
                     });
                 },
@@ -1037,13 +1031,7 @@ fn full_attn_body_cuda(
 /// fused-vs-unfused gate/up banks are emitter dispatch on the single traced
 /// `gate_up` matmul, not a fact — the same call llama_like's olmo2 comment
 /// records for its unfused gate/up binding.
-fn dense_mlp_body(
-    l: u32,
-    hidden: u32,
-    intermediate: u32,
-    variant: NormVariant,
-    y: &Val,
-) -> Val {
+fn dense_mlp_body(l: u32, hidden: u32, intermediate: u32, variant: NormVariant, y: &Val) -> Val {
     let w = |name: &str| format!("layer.{l}.{name}");
     let mlp_norm = NormW {
         name: w("mlp_norm"),
@@ -1188,7 +1176,7 @@ pub fn qwen3_5_hybrid(facts: &Qwen35HybridFacts) -> ForwardPlan {
             };
         }
 
-        hybrid_epilogue(t, facts, &y, /*stated=*/false);
+        hybrid_epilogue(t, facts, &y, /*stated=*/ false);
     })
 }
 
@@ -1239,7 +1227,7 @@ pub fn qwen3_5_hybrid_cuda(
             };
         }
 
-        hybrid_epilogue(t, facts, &y, /*stated=*/true);
+        hybrid_epilogue(t, facts, &y, /*stated=*/ true);
     })
 }
 
@@ -1314,7 +1302,9 @@ mod tests {
             .layer_ops(0)
             .map(|op| match &op.kind {
                 OpKind::Rmsnorm { .. } => "rmsnorm",
-                OpKind::Matmul { selector: Some(_), .. } => "matmul_per_token",
+                OpKind::Matmul {
+                    selector: Some(_), ..
+                } => "matmul_per_token",
                 OpKind::Matmul { .. } => "matmul",
                 OpKind::TopK { .. } => "topk",
                 OpKind::Swiglu { .. } => "swiglu",
@@ -1327,19 +1317,19 @@ mod tests {
         assert_eq!(
             kinds,
             [
-                "rmsnorm",           // mlp_norm (gemma fold)
-                "matmul",            // router logits [Tokens, E]
-                "topk",              // launch_topk_softmax: idx + renormed weights
-                "matmul_per_token",  // grouped gate_up over the selected experts
-                "swiglu",            // chunked swiglu over [Tokens, k, Im]
-                "matmul_per_token",  // grouped down
-                "weighted_sum",      // [Tokens, k, H] -> [Tokens, H]
-                "matmul",            // shared_expert.gate_up
+                "rmsnorm",          // mlp_norm (gemma fold)
+                "matmul",           // router logits [Tokens, E]
+                "topk",             // launch_topk_softmax: idx + renormed weights
+                "matmul_per_token", // grouped gate_up over the selected experts
+                "swiglu",           // chunked swiglu over [Tokens, k, Im]
+                "matmul_per_token", // grouped down
+                "weighted_sum",     // [Tokens, k, H] -> [Tokens, H]
+                "matmul",           // shared_expert.gate_up
                 "swiglu",
-                "matmul",            // shared_expert.down
-                "matmul",            // shared_expert_gate: [Tokens, 1] logit
-                "sigmoid_gate_add",  // routed + sigmoid(gate) * shared
-                "residual_add",      // y += moe_out
+                "matmul",           // shared_expert.down
+                "matmul",           // shared_expert_gate: [Tokens, 1] logit
+                "sigmoid_gate_add", // routed + sigmoid(gate) * shared
+                "residual_add",     // y += moe_out
             ]
         );
     }
@@ -1401,11 +1391,22 @@ mod tests {
         let grouped: Vec<_> = plan
             .ops
             .iter()
-            .filter(|op| matches!(&op.kind, OpKind::Matmul { selector: Some(_), .. }))
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Matmul {
+                        selector: Some(_),
+                        ..
+                    }
+                )
+            })
             .collect();
         assert_eq!(grouped.len(), 2);
         for op in &grouped {
-            let OpKind::Matmul { weight, selector, .. } = &op.kind else {
+            let OpKind::Matmul {
+                weight, selector, ..
+            } = &op.kind
+            else {
                 unreachable!()
             };
             assert_eq!(*selector, Some(idx));
@@ -1437,7 +1438,15 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let grouped = by_kind(|k| matches!(k, OpKind::Matmul { selector: Some(_), .. }));
+        let grouped = by_kind(|k| {
+            matches!(
+                k,
+                OpKind::Matmul {
+                    selector: Some(_),
+                    ..
+                }
+            )
+        });
         assert_eq!(
             plan.values[grouped[0].outputs[0] as usize].shape.0,
             vec![Dim::Tokens, k, Dim::Const(2 * facts.moe_intermediate)]
@@ -1456,16 +1465,11 @@ mod tests {
         );
         assert_eq!(
             plan.values[swiglus[1].outputs[0] as usize].shape.0,
-            vec![
-                Dim::Tokens,
-                Dim::Const(facts.shared_expert_intermediate)
-            ]
+            vec![Dim::Tokens, Dim::Const(facts.shared_expert_intermediate)]
         );
 
         let combine = by_kind(|k| matches!(k, OpKind::WeightedSum { .. }));
-        assert!(
-            matches!(combine[0].kind, OpKind::WeightedSum { k } if k == facts.top_k)
-        );
+        assert!(matches!(combine[0].kind, OpKind::WeightedSum { k } if k == facts.top_k));
         assert_eq!(
             plan.values[combine[0].outputs[0] as usize].shape.0,
             vec![Dim::Tokens, Dim::Const(facts.hidden)]
@@ -1527,7 +1531,9 @@ mod tests {
             .layer_ops(0)
             .map(|op| match &op.kind {
                 OpKind::Rmsnorm { .. } => "rmsnorm",
-                OpKind::Matmul { beta_one: false, .. } => "matmul",
+                OpKind::Matmul {
+                    beta_one: false, ..
+                } => "matmul",
                 OpKind::Matmul { beta_one: true, .. } => "matmul+res",
                 OpKind::SplitGdn { .. } => "split_gdn",
                 OpKind::CausalConv1d { .. } => "causal_conv1d",
@@ -1711,8 +1717,14 @@ mod tests {
         assert_eq!(
             marks,
             vec![
-                StateRef { store: StateStore::RecurrentState, layer: 0 },
-                StateRef { store: StateStore::RecurrentState, layer: 0 },
+                StateRef {
+                    store: StateStore::RecurrentState,
+                    layer: 0
+                },
+                StateRef {
+                    store: StateStore::RecurrentState,
+                    layer: 0
+                },
             ]
         );
 
@@ -1723,8 +1735,14 @@ mod tests {
         assert_eq!(
             kv_marks,
             vec![
-                StateRef { store: StateStore::KvCache, layer: 3 },
-                StateRef { store: StateStore::KvCache, layer: 3 },
+                StateRef {
+                    store: StateStore::KvCache,
+                    layer: 3
+                },
+                StateRef {
+                    store: StateStore::KvCache,
+                    layer: 3
+                },
             ]
         );
 
@@ -1755,7 +1773,9 @@ mod tests {
             .layer_ops(0)
             .map(|op| match &op.kind {
                 OpKind::Rmsnorm { .. } => "rmsnorm",
-                OpKind::Matmul { beta_one: false, .. } => "matmul",
+                OpKind::Matmul {
+                    beta_one: false, ..
+                } => "matmul",
                 OpKind::Matmul { beta_one: true, .. } => "matmul+res",
                 OpKind::SplitQkv { .. } => "split_qkv",
                 OpKind::SplitQGate { .. } => "split_q_gate",
@@ -1857,7 +1877,10 @@ mod tests {
             .unwrap();
         assert!(matches!(
             qg_split.kind,
-            OpKind::SplitQGate { heads: 8, head_dim: 256 }
+            OpKind::SplitQGate {
+                heads: 8,
+                head_dim: 256
+            }
         ));
         let q_proj = &plan.ops[1];
         assert!(matches!(
@@ -1895,7 +1918,10 @@ mod tests {
             .unwrap();
         assert!(matches!(
             rope.kind,
-            OpKind::Rope { kind: RopeKind::Standard, partial: Some(64) }
+            OpKind::Rope {
+                kind: RopeKind::Standard,
+                partial: Some(64)
+            }
         ));
 
         // The output gate: attention's output times the GATE leg — the
@@ -1934,8 +1960,14 @@ mod tests {
         assert_eq!(
             marks,
             vec![
-                StateRef { store: StateStore::KvCache, layer: 0 },
-                StateRef { store: StateStore::KvCache, layer: 0 },
+                StateRef {
+                    store: StateStore::KvCache,
+                    layer: 0
+                },
+                StateRef {
+                    store: StateStore::KvCache,
+                    layer: 0
+                },
             ]
         );
     }
@@ -2005,7 +2037,11 @@ mod tests {
             let mapped_in: Vec<u32> = f.inputs.iter().map(|&i| map(i)).collect();
             let mapped_out: Vec<u32> = f.outputs.iter().map(|&i| map(i)).collect();
             assert_eq!(h.inputs, mapped_in, "inputs of {:?} at layer {l}", f.kind);
-            assert_eq!(h.outputs, mapped_out, "outputs of {:?} at layer {l}", f.kind);
+            assert_eq!(
+                h.outputs, mapped_out,
+                "outputs of {:?} at layer {l}",
+                f.kind
+            );
         }
     }
 
@@ -2227,14 +2263,15 @@ mod tests {
         for old in [
             serde_json::to_string(&llama_like(&LlamaLikeFacts::qwen3_0_6b())).unwrap(),
             serde_json::to_string(&llama_like(&LlamaLikeFacts::olmo2_1b())).unwrap(),
-            serde_json::to_string(&qwen3_5_moe_mlp_block(
-                &Qwen35MoeMlpFacts::qwen3_5_35b_a3b(),
-            ))
-            .unwrap(),
+            serde_json::to_string(&qwen3_5_moe_mlp_block(&Qwen35MoeMlpFacts::qwen3_5_35b_a3b()))
+                .unwrap(),
             serde_json::to_string(&qwen3_5_gdn_block(&Qwen35GdnFacts::qwen3_5_0_8b())).unwrap(),
         ] {
             for token in ["SplitQGate", "SigmoidGateMul", "partial"] {
-                assert!(!old.contains(token), "{token} leaked into a pre-hybrid plan");
+                assert!(
+                    !old.contains(token),
+                    "{token} leaked into a pre-hybrid plan"
+                );
             }
             // RmsnormPerHead's variant field is serde-skipped at its Plain
             // default, so pre-variant serializations carry no per-head
@@ -2256,12 +2293,16 @@ mod tests {
 
         for dense in [
             serde_json::to_string(&llama_like(&LlamaLikeFacts::qwen3_0_6b())).unwrap(),
-            serde_json::to_string(&qwen3_5_moe_mlp_block(
-                &Qwen35MoeMlpFacts::qwen3_5_35b_a3b(),
-            ))
-            .unwrap(),
+            serde_json::to_string(&qwen3_5_moe_mlp_block(&Qwen35MoeMlpFacts::qwen3_5_35b_a3b()))
+                .unwrap(),
         ] {
-            for token in ["SplitGdn", "CausalConv1d", "GdnPrep", "GatedDelta", "RmsnormGated"] {
+            for token in [
+                "SplitGdn",
+                "CausalConv1d",
+                "GdnPrep",
+                "GatedDelta",
+                "RmsnormGated",
+            ] {
                 assert!(!dense.contains(token), "{token} leaked into a pre-GDN plan");
             }
         }

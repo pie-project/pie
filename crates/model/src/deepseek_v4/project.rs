@@ -145,9 +145,21 @@ pub fn manifest(f: &Dsv4Facts, tied_embeddings: bool) -> Manifest {
         // router (from the rest) and both rows appear. A stack that is
         // dense all the way ships no router; one with no prefix ships no
         // dense MLP. The same statement read from its two ends.
-        .either(has_dense_prefix, "layer.{}.mlp.gate_proj", [dense_inter, hidden])
-        .either(has_dense_prefix, "layer.{}.mlp.up_proj", [dense_inter, hidden])
-        .either(has_dense_prefix, "layer.{}.mlp.down_proj", [hidden, dense_inter])
+        .either(
+            has_dense_prefix,
+            "layer.{}.mlp.gate_proj",
+            [dense_inter, hidden],
+        )
+        .either(
+            has_dense_prefix,
+            "layer.{}.mlp.up_proj",
+            [dense_inter, hidden],
+        )
+        .either(
+            has_dense_prefix,
+            "layer.{}.mlp.down_proj",
+            [hidden, dense_inter],
+        )
         .either(
             !all_dense,
             "layer.{}.ffn.gate",
@@ -274,7 +286,9 @@ fn plan(f: &Dsv4Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
         // compressing layer that have to survive across fires, was
         // charged at zero bytes per token and came out of whatever the
         // KV pool did not use.
-        kv: KvStyle::Dsv4 { ratios: f.ratios.to_vec() },
+        kv: KvStyle::Dsv4 {
+            ratios: f.ratios.to_vec(),
+        },
         // No recurrence: the compressed history is a CACHE keyed by
         // position, not a state carried per request.
         recurrent: None,
@@ -285,12 +299,19 @@ fn plan(f: &Dsv4Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
         // taking whichever one the compiler read.
         attn_output: AttnOutput::DriverPinned,
         logit_softcap: 0.0,
+        // No ATTENTION cap: gemma-2's `attn_logit_softcapping` is
+        // gemma-2's alone, and a zero here is "no cap" rather than a
+        // cap at zero — which would flatten every score to `tanh(inf)`.
+        attn_logit_softcap: 0.0,
         ple_dim: 0,
         norm: NormPlacement::Pre,
         // Not a gemma: the gain is the multiplier, stored directly.
         norm_unit_offset: false,
         v_norm: false,
         k_eq_v: false,
+        // The row's own, not a class default -- see `Dsv4MoeFacts`.
+        norm_topk_prob: f.moe.norm_topk_prob,
+        routed_scaling: f.moe.routed_scaling,
         mlp_gate: crate::deployment::MlpGate::Silu,
         scales: std::collections::BTreeMap::new(),
         // DEFAULT, and the row writes over it. None of the three
@@ -336,8 +357,8 @@ fn plan(f: &Dsv4Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
 /// `LLAMA_LIKE` — an eleven-entry table of architecture STRINGS,
 /// reduced by a punctuation-stripping `canonical()`, consulted before
 /// any text was traced and free to disagree with what the tracer would
-/// actually do. It listed `gemma4`, which the load path refused on
-/// other grounds, and omitted `gemma3`, whose text it models. A row
+/// actually do. It listed `gpt_oss`, which no publication of reaches a
+/// Metal device here, and omitted `gemma3`, whose text it models. A row
 /// that answers for itself cannot disagree with a list, because there
 /// is no list.
 pub const NO_METAL: &str = "deepseek-v4 has no Metal text in this build: its forward is `dsv4_cuda` — \
@@ -364,9 +385,9 @@ pub fn trace(
 
 #[cfg(test)]
 mod tests {
+    use super::super::spec::Dsv4AttnFacts;
     use super::*;
     use crate::manifest::Presence;
-    use super::super::spec::Dsv4AttnFacts;
 
     fn f() -> Dsv4Facts {
         Dsv4Facts::dsv4_synthetic()
@@ -399,9 +420,14 @@ mod tests {
     #[test]
     fn only_the_paged_store_is_built() {
         assert!(kv_store_is_built(&KvStyle::Paged));
-        assert!(!kv_store_is_built(&KvStyle::Dsv4 { ratios: vec![1, 2, 4] }));
+        assert!(!kv_store_is_built(&KvStyle::Dsv4 {
+            ratios: vec![1, 2, 4]
+        }));
         assert!(!kv_store_is_built(&KvStyle::Dsv4 { ratios: Vec::new() }));
-        assert!(!kv_store_is_built(&KvStyle::Mla { kv_lora_rank: 512, qk_rope_head_dim: 64 }));
+        assert!(!kv_store_is_built(&KvStyle::Mla {
+            kv_lora_rank: 512,
+            qk_rope_head_dim: 64
+        }));
     }
 
     /// The two ends of the stack, which every row in the catalog states
@@ -411,7 +437,10 @@ mod tests {
         let m = manifest(&f(), false);
         assert_eq!(extents(&m, "embed_tokens"), vec![129_280, 2048]);
         assert_eq!(extents(&m, "norm"), vec![2048]);
-        assert_eq!(m.layers, 6, "a manifest carries the stack it was written for");
+        assert_eq!(
+            m.layers, 6,
+            "a manifest carries the stack it was written for"
+        );
     }
 
     /// Tied and untied differ by PRESENCE and not by extent, so the row
@@ -419,7 +448,10 @@ mod tests {
     /// an unmentioned name is one a checkpoint may ship freely.
     #[test]
     fn a_tied_head_forbids_the_name_an_untied_one_requires() {
-        assert_eq!(presence(&manifest(&f(), false), "lm_head"), Presence::Required);
+        assert_eq!(
+            presence(&manifest(&f(), false), "lm_head"),
+            Presence::Required
+        );
         assert_eq!(presence(&manifest(&f(), true), "lm_head"), Presence::Absent);
         assert_eq!(
             extents(&manifest(&f(), false), "lm_head"),
@@ -450,7 +482,13 @@ mod tests {
     /// fixture ships (`layers.0.attn.wq.weight`).
     #[test]
     fn a_straight_query_is_one_projection_and_forbids_the_pair() {
-        let no_lora = Dsv4Facts { attn: Dsv4AttnFacts { q_lora_rank: 0, ..f().attn }, ..f() };
+        let no_lora = Dsv4Facts {
+            attn: Dsv4AttnFacts {
+                q_lora_rank: 0,
+                ..f().attn
+            },
+            ..f()
+        };
         let m = manifest(&no_lora, false);
         assert_eq!(extents(&m, "layer.{}.attn.wq"), vec![2048, 2048]);
         assert_eq!(presence(&m, "layer.{}.attn.wq_a"), Presence::Absent);
@@ -492,7 +530,13 @@ mod tests {
         assert_eq!(presence(&m, "layer.{}.attn.wo"), Presence::Absent);
 
         let flat = manifest(
-            &Dsv4Facts { attn: Dsv4AttnFacts { o_lora_rank: 0, ..f().attn }, ..f() },
+            &Dsv4Facts {
+                attn: Dsv4AttnFacts {
+                    o_lora_rank: 0,
+                    ..f().attn
+                },
+                ..f()
+            },
             false,
         );
         assert_eq!(extents(&flat, "layer.{}.attn.wo"), vec![2048, 2048]);
@@ -516,12 +560,33 @@ mod tests {
     /// with no dense layers and a stack with nothing but them take.
     #[test]
     fn a_stack_with_no_prefix_ships_no_dense_mlp_and_an_all_dense_one_no_router() {
-        let no_prefix = manifest(&Dsv4Facts { dense_layers: 0, ..f() }, false);
-        assert_eq!(presence(&no_prefix, "layer.{}.mlp.gate_proj"), Presence::Absent);
-        assert_eq!(presence(&no_prefix, "layer.{}.ffn.gate"), Presence::Required);
+        let no_prefix = manifest(
+            &Dsv4Facts {
+                dense_layers: 0,
+                ..f()
+            },
+            false,
+        );
+        assert_eq!(
+            presence(&no_prefix, "layer.{}.mlp.gate_proj"),
+            Presence::Absent
+        );
+        assert_eq!(
+            presence(&no_prefix, "layer.{}.ffn.gate"),
+            Presence::Required
+        );
 
-        let all_dense = manifest(&Dsv4Facts { dense_layers: 6, ..f() }, false);
-        assert_eq!(presence(&all_dense, "layer.{}.mlp.gate_proj"), Presence::Required);
+        let all_dense = manifest(
+            &Dsv4Facts {
+                dense_layers: 6,
+                ..f()
+            },
+            false,
+        );
+        assert_eq!(
+            presence(&all_dense, "layer.{}.mlp.gate_proj"),
+            Presence::Required
+        );
         assert_eq!(
             presence(&all_dense, "layer.{}.ffn.gate"),
             Presence::Absent,
@@ -558,7 +623,10 @@ mod tests {
             "layer.{}.self_attn.q_proj",
             "layer.{}.block_sparse_moe.gate",
         ] {
-            assert!(!named(&m, sibling), "{sibling} belongs to another generation");
+            assert!(
+                !named(&m, sibling),
+                "{sibling} belongs to another generation"
+            );
         }
         assert!(named(&m, "layer.{}.attn.wkv"));
     }
@@ -583,7 +651,10 @@ mod tests {
         let d = plan(&f(), 10_000.0, 1e-5);
         assert_eq!(d.layers, 6);
         assert_eq!(d.attention.len(), 6);
-        assert_eq!(d.norm_eps, 1e-5, "an epsilon no tensor carries has to be stated");
+        assert_eq!(
+            d.norm_eps, 1e-5,
+            "an epsilon no tensor carries has to be stated"
+        );
     }
 
     /// The geometry, field by field. Every one of these was read off a
@@ -613,7 +684,10 @@ mod tests {
     fn the_widest_mlp_is_the_dense_prefixs_and_not_the_mixtures() {
         let g = plan(&f(), 10_000.0, 1e-5).shape;
         assert_eq!(g.widest_mlp(), 5632);
-        assert!(g.moe_intermediate > 0, "a mixture states one expert's width");
+        assert!(
+            g.moe_intermediate > 0,
+            "a mixture states one expert's width"
+        );
     }
 
     /// The per-layer attention table: one window, one scale, every layer
@@ -643,7 +717,13 @@ mod tests {
     #[test]
     fn no_window_means_the_whole_context_and_not_none_of_it() {
         let d = plan(
-            &Dsv4Facts { attn: Dsv4AttnFacts { sliding_window: 0, ..f().attn }, ..f() },
+            &Dsv4Facts {
+                attn: Dsv4AttnFacts {
+                    sliding_window: 0,
+                    ..f().attn
+                },
+                ..f()
+            },
             10_000.0,
             1e-5,
         );
@@ -659,7 +739,10 @@ mod tests {
         match &d.kv {
             KvStyle::Dsv4 { ratios } => {
                 assert_eq!(ratios.as_slice(), &[1, 2, 4]);
-                assert!(!ratios.is_empty(), "an empty schedule is a cache sized at zero");
+                assert!(
+                    !ratios.is_empty(),
+                    "an empty schedule is a cache sized at zero"
+                );
             }
             other => panic!("a V4 attends through compressed entries, not {other:?}"),
         }
@@ -698,7 +781,10 @@ mod tests {
             Advertised::default(),
             "a projection that fills this in has derived a family name from a shape",
         );
-        assert!(d.advertised.arch.is_empty(), "an empty label is a row that has not spoken yet");
+        assert!(
+            d.advertised.arch.is_empty(),
+            "an empty label is a row that has not spoken yet"
+        );
         assert_eq!(d.advertised.max_model_len, 0);
         assert!(!d.advertised.media_encode);
     }
@@ -715,7 +801,10 @@ mod tests {
     #[test]
     fn the_rope_ladder_is_unscaled_and_no_tower_ships() {
         let d = plan(&f(), 10_000.0, 1e-5);
-        assert!(d.rope_scaling.is_none(), "no committed config states a rescaling to read");
+        assert!(
+            d.rope_scaling.is_none(),
+            "no committed config states a rescaling to read"
+        );
         assert_eq!(
             d.towers,
             crate::deployment::Towers::default(),

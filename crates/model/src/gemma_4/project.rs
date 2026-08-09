@@ -96,21 +96,45 @@ pub fn manifest(f: &Gemma4Facts, mixture: Option<Gemma4Mixture>) -> Manifest {
         // gemma-4" and nothing else. The A4B mixture drops it
         // (`hidden_size_per_layer_input: 0`), so it is conditional here
         // and its absence is stated rather than merely unlisted.
-        .with_if(has_ple, TensorSpec::required("embed_tokens_per_layer", [vocab, layers * ple]))
+        .with_if(
+            has_ple,
+            TensorSpec::required("embed_tokens_per_layer", [vocab, layers * ple]),
+        )
         .with_if(
             has_ple,
             TensorSpec::required("per_layer_model_projection", [layers * ple, hidden]),
         )
-        .with_if(has_ple, TensorSpec::required("per_layer_projection_norm", [ple]))
+        .with_if(
+            has_ple,
+            TensorSpec::required("per_layer_projection_norm", [ple]),
+        )
         .with_if(!has_ple, TensorSpec::absent("embed_tokens_per_layer"))
-        .with(TensorSpec::required("layer.{}.self_attn.q_proj", [q, hidden]))
-        .with(TensorSpec::required("layer.{}.self_attn.k_proj", [kv, hidden]))
-        .with(TensorSpec::required("layer.{}.self_attn.v_proj", [kv, hidden]))
-        .with(TensorSpec::required("layer.{}.self_attn.o_proj", [hidden, q]))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.q_proj",
+            [q, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.k_proj",
+            [kv, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.v_proj",
+            [kv, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.o_proj",
+            [hidden, q],
+        ))
         // Per-HEAD q/k norms: the extent is one head's width, not the
         // projection's, and on layer 0 that is the sliding head dim.
-        .with(TensorSpec::required("layer.{}.self_attn.q_norm", [head_dim]))
-        .with(TensorSpec::required("layer.{}.self_attn.k_norm", [head_dim]))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.q_norm",
+            [head_dim],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.k_norm",
+            [head_dim],
+        ))
         // gemma-3n norms V as well. This generation does not, and the
         // absence is what keeps a gemma-3n from matching here.
         .with(TensorSpec::absent("layer.{}.self_attn.v_norm"))
@@ -118,23 +142,79 @@ pub fn manifest(f: &Gemma4Facts, mixture: Option<Gemma4Mixture>) -> Manifest {
         .with(TensorSpec::absent("layer.{}.laurel.linear_left"))
         // The four gemma norms.
         .with(TensorSpec::required("layer.{}.input_layernorm", [hidden]))
-        .with(TensorSpec::required("layer.{}.post_attention_layernorm", [hidden]))
-        .with(TensorSpec::required("layer.{}.pre_feedforward_layernorm", [hidden]))
-        .with(TensorSpec::required("layer.{}.post_feedforward_layernorm", [hidden]))
-        .with(TensorSpec::required("layer.{}.mlp.gate_proj", [inter, hidden]))
-        .with(TensorSpec::required("layer.{}.mlp.up_proj", [inter, hidden]))
-        .with(TensorSpec::required("layer.{}.mlp.down_proj", [hidden, inter]))
+        .with(TensorSpec::required(
+            "layer.{}.post_attention_layernorm",
+            [hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.pre_feedforward_layernorm",
+            [hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.post_feedforward_layernorm",
+            [hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.mlp.gate_proj",
+            [inter, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.mlp.up_proj",
+            [inter, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.mlp.down_proj",
+            [hidden, inter],
+        ))
         // The PLE epilogue's own weights, present exactly when the table
         // they read is.
-        .with_if(has_ple, TensorSpec::required("layer.{}.per_layer_input_gate", [ple, hidden]))
-        .with_if(has_ple, TensorSpec::required("layer.{}.per_layer_projection", [hidden, ple]))
-        .with_if(has_ple, TensorSpec::required("layer.{}.post_per_layer_input_norm", [hidden]))
+        .with_if(
+            has_ple,
+            TensorSpec::required("layer.{}.per_layer_input_gate", [ple, hidden]),
+        )
+        .with_if(
+            has_ple,
+            TensorSpec::required("layer.{}.per_layer_projection", [hidden, ple]),
+        )
+        .with_if(
+            has_ple,
+            TensorSpec::required("layer.{}.post_per_layer_input_norm", [hidden]),
+        )
         // The router's `[hidden]` scale, which `contract::author_gemma4`
         // folds `1/sqrt(hidden)` into at load — it reads the width off
         // this tensor, so this row states the width that fold assumes.
         // A dense gemma-4 forbids it, which is how the A4B is told from
         // an E4B whose other extents somehow agreed.
         .either(mixture.is_some(), "layer.{}.router.scale", [hidden])
+}
+
+/// The four numbers a gemma-4 ROW states and its shape cannot.
+///
+/// One struct because a row is read once. `deployment` and
+/// `metal_facts` used to take these four as loose arguments each — the
+/// same four, off the same `Gemma4`, in the same order — and two
+/// argument lists spelling one reading is two chances to spell it
+/// differently. A deployment paged at a 512-token window and a fire
+/// traced at 1024 compile; nothing in the types objects, and the
+/// disagreement surfaces as attention that reads the wrong distance
+/// back.
+///
+/// This is the same merge `llama_like::project::RowScalars` is, made
+/// for the same reason, and gemma-4 needs its own because two of the
+/// four are gemma-4's alone: a mixture the catalog attaches per row,
+/// and the `attention_k_eq_v` that decides whether V has a projection
+/// at all.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RowScalars {
+    /// The routed bank, or `None` for a dense row.
+    pub mixture: Option<Gemma4Mixture>,
+    /// What a SLIDING layer attends. Not a tensor extent.
+    pub sliding_window: i32,
+    /// RMSNorm epsilon. Not a tensor extent either.
+    pub norm_eps: f32,
+    /// Whether the full layers read V out of the K projection, so the
+    /// checkpoint ships no `v_proj`.
+    pub k_eq_v: bool,
 }
 
 /// This row's deployment.
@@ -153,15 +233,16 @@ pub fn manifest(f: &Gemma4Facts, mixture: Option<Gemma4Mixture>) -> Manifest {
 /// full-attention layer came to be deployed with the sliding layers'
 /// 512-token window: not a wrong answer, an unasked question.
 #[must_use]
-pub fn deployment(
-    f: &Gemma4Facts,
-    mixture: Option<Gemma4Mixture>,
-    sliding_window: i32,
-    norm_eps: f32,
-    k_eq_v: bool,
-    load: Deployed<'_>,
-) -> Deployment {
-    let attention = (0..f.layers).map(|l| layer_attention(f, sliding_window, l)).collect();
+pub fn deployment(f: &Gemma4Facts, row: RowScalars, load: Deployed<'_>) -> Deployment {
+    let RowScalars {
+        mixture,
+        sliding_window,
+        norm_eps,
+        k_eq_v,
+    } = row;
+    let attention = (0..f.layers)
+        .map(|l| layer_attention(f, sliding_window, l))
+        .collect();
     Deployment {
         layers: f.layers,
         norm_eps,
@@ -193,6 +274,10 @@ pub fn deployment(
         prefill: PrefillStyle::Planless,
         attn_output: AttnOutput::StatedArgs,
         logit_softcap: f.logit_softcap,
+        // No ATTENTION cap: gemma-2's `attn_logit_softcapping` is
+        // gemma-2's alone, and a zero here is "no cap" rather than a
+        // cap at zero — which would flatten every score to `tanh(inf)`.
+        attn_logit_softcap: 0.0,
         ple_dim: i32::try_from(f.ple_dim).unwrap_or(0),
         norm: NormPlacement::Pre,
         // THE EXCEPTION, and the reason this is a field rather than a
@@ -207,6 +292,11 @@ pub fn deployment(
         // The ROW's, not the shape's: two gemma-4 checkpoints of one
         // geometry disagree about it.
         k_eq_v,
+        // As `metal_facts` records: gemma-4-26b-a4b ships no
+        // `norm_topk_prob` key, and its router normalizes.
+        norm_topk_prob: true,
+        // No router of this family states a scaling factor.
+        routed_scaling: 1.0,
         mlp_gate: crate::deployment::MlpGate::GeluTanh,
         scales: scales(f, load),
         // The ROW's, not the shape's: a family label and a context
@@ -250,7 +340,11 @@ fn layer_attention(f: &Gemma4Facts, sliding_window: i32, l: u32) -> LayerAttenti
         // is: the q and k norms have already applied the scaling, so a
         // `1/sqrt(head_dim)` here would apply it a second time.
         sm_scale: 1.0,
-        rope_theta: if full { ROPE_THETA_GLOBAL } else { ROPE_THETA_LOCAL },
+        rope_theta: if full {
+            ROPE_THETA_GLOBAL
+        } else {
+            ROPE_THETA_LOCAL
+        },
         // The full layers rotate PARTIALLY (128 of 512, from
         // `partial_rotary_factor: 0.25`); the sliding ones rotate fully.
         // A full rotation is spelled as the head dim rather than as the
@@ -258,7 +352,11 @@ fn layer_attention(f: &Gemma4Facts, sliding_window: i32, l: u32) -> LayerAttenti
         // driver's own derivation emits `max(2, 2*int(0.5*f*d))` for
         // every layer and a deployment that differed from it by a
         // sentinel would compare unequal to one that did not.
-        rotary_dim: if full { f.global_rotary_dim } else { f.head_dim },
+        rotary_dim: if full {
+            f.global_rotary_dim
+        } else {
+            f.head_dim
+        },
     }
 }
 
@@ -370,24 +468,34 @@ pub fn metal_shape(
 /// `driver-metal`'s `LLAMA_LIKE` — an eleven-entry table of
 /// architecture STRINGS, reduced by a punctuation-stripping
 /// `canonical()`, consulted before any text was traced and free to
-/// disagree with what the tracer would actually do. It listed `gemma4`
-/// and omitted `gemma3`, whose text it models. A row that projects
-/// itself cannot disagree with a list, because there is no list; the
-/// refusal that briefly stood in its place could, and did.
+/// disagree with what the tracer would actually do. It listed
+/// `gpt_oss`, which no publication of reaches a Metal device here, and
+/// omitted `gemma3`, whose text it models. A row that projects itself
+/// cannot disagree with a list, because there is no list; the refusal
+/// that briefly stood in its place could, and did.
 #[cfg(feature = "forward")]
 #[must_use]
 pub fn metal_facts(
     f: &Gemma4Facts,
-    mixture: Option<Gemma4Mixture>,
-    sliding_window: i32,
-    norm_eps: f32,
-    k_eq_v: bool,
+    row: RowScalars,
     bind: &crate::catalog::MetalBinding,
 ) -> crate::shared::llama_like::forward::facts::LlamaLikeMetalFacts {
+    let RowScalars {
+        mixture,
+        sliding_window,
+        norm_eps,
+        k_eq_v,
+    } = row;
     use crate::shared::llama_like::forward::facts::{Activation, LlamaLikeMetalFacts};
     use model_compiler::dsl::{ScaleLayout, WeightRepr};
 
     LlamaLikeMetalFacts {
+        // TRUE and unread: the row this projection serves is gemma-4's DENSE
+        // stack. `gemma-4-26b-a4b` is the generation's mixture and it is
+        // untraced on every backend, and its config states `top_k_experts`
+        // with no `norm_topk_prob` at all -- so the day it is traced, this
+        // is a measurement it has to make rather than inherit.
+        norm_topk_prob: true,
         // ── the LOAD's six, identical to the llama-like projection's ──
         fuse_residual_gemv: bind.fuse_residual_gemv,
         paged_multi_batch: bind.paged_multi_batch,
@@ -466,7 +574,13 @@ pub fn metal_facts(
         // layers are full. Built from `is_full_attn`, the same helper
         // `layer_attention` uses, so the two cannot disagree.
         window_left: (0..f.layers)
-            .map(|l| if f.is_full_attn(l) { -1 } else { sliding_window.max(0) })
+            .map(|l| {
+                if f.is_full_attn(l) {
+                    -1
+                } else {
+                    sliding_window.max(0)
+                }
+            })
             .collect(),
     }
 }
@@ -492,7 +606,13 @@ pub fn trace(
         gate_up_fused: true,
         kv_native_bf16: true,
         window_left: (0..f.layers)
-            .map(|l| if f.is_full_attn(l) { -1 } else { sliding_window.max(0) })
+            .map(|l| {
+                if f.is_full_attn(l) {
+                    -1
+                } else {
+                    sliding_window.max(0)
+                }
+            })
             .collect(),
     };
     super::forward::gemma4_cuda(f, &cuda, class)
@@ -502,7 +622,7 @@ pub fn trace(
 mod tests {
     use super::{
         Advertised, AttnOutput, Deployed, Gemma4Facts, Gemma4Mixture, KvStyle, NormPlacement,
-        PrefillStyle, ROPE_THETA_GLOBAL, ROPE_THETA_LOCAL, deployment, manifest,
+        PrefillStyle, ROPE_THETA_GLOBAL, ROPE_THETA_LOCAL, RowScalars, deployment, manifest,
     };
     use crate::manifest::{Observed, Presence};
 
@@ -510,11 +630,24 @@ mod tests {
     const NORM_EPS: f32 = 1e-6;
 
     fn e4b() -> crate::deployment::Deployment {
-        deployment(&Gemma4Facts::gemma_4_e4b(), None, E4B_WINDOW, NORM_EPS, false, Deployed::single())
+        deployment(
+            &Gemma4Facts::gemma_4_e4b(),
+            RowScalars {
+                mixture: None,
+                sliding_window: E4B_WINDOW,
+                norm_eps: NORM_EPS,
+                k_eq_v: false,
+            },
+            Deployed::single(),
+        )
     }
 
     fn spec(m: &crate::manifest::Manifest, name: &str) -> crate::manifest::TensorSpec {
-        m.tensors.iter().find(|t| t.name == name).unwrap_or_else(|| panic!("{name} is stated")).clone()
+        m.tensors
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} is stated"))
+            .clone()
     }
 
     /// The manifest names layer 0's widths, and layer 0 is a SLIDING
@@ -524,13 +657,28 @@ mod tests {
     #[test]
     fn the_projection_widths_are_the_sliding_layers_because_layer_zero_is_one() {
         let f = Gemma4Facts::gemma_4_e4b();
-        assert!(!f.is_full_attn(0), "layer 0 is full, and the manifest below assumes otherwise");
+        assert!(
+            !f.is_full_attn(0),
+            "layer 0 is full, and the manifest below assumes otherwise"
+        );
         let m = manifest(&f, None);
         assert_eq!(m.layers, 42);
-        assert_eq!(spec(&m, "layer.{}.self_attn.q_proj").extents, vec![2048, 2560]);
-        assert_eq!(spec(&m, "layer.{}.self_attn.k_proj").extents, vec![512, 2560]);
-        assert_eq!(spec(&m, "layer.{}.self_attn.v_proj").extents, vec![512, 2560]);
-        assert_eq!(spec(&m, "layer.{}.self_attn.o_proj").extents, vec![2560, 2048]);
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.q_proj").extents,
+            vec![2048, 2560]
+        );
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.k_proj").extents,
+            vec![512, 2560]
+        );
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.v_proj").extents,
+            vec![512, 2560]
+        );
+        assert_eq!(
+            spec(&m, "layer.{}.self_attn.o_proj").extents,
+            vec![2560, 2048]
+        );
         assert_eq!(spec(&m, "layer.{}.self_attn.q_norm").extents, vec![256]);
         assert_eq!(spec(&m, "layer.{}.self_attn.k_norm").extents, vec![256]);
     }
@@ -543,7 +691,11 @@ mod tests {
         let m = manifest(&Gemma4Facts::gemma_4_e4b(), None);
         assert_eq!(spec(&m, "embed_tokens").extents, vec![262_144, 2560]);
         assert_eq!(spec(&m, "norm").extents, vec![2560]);
-        assert_eq!(spec(&m, "lm_head").presence, Presence::Absent, "a tie is an absence");
+        assert_eq!(
+            spec(&m, "lm_head").presence,
+            Presence::Absent,
+            "a tie is an absence"
+        );
         for norm in [
             "layer.{}.input_layernorm",
             "layer.{}.post_attention_layernorm",
@@ -552,9 +704,15 @@ mod tests {
         ] {
             assert_eq!(spec(&m, norm).extents, vec![2560], "{norm}");
         }
-        assert_eq!(spec(&m, "layer.{}.mlp.gate_proj").extents, vec![10_240, 2560]);
+        assert_eq!(
+            spec(&m, "layer.{}.mlp.gate_proj").extents,
+            vec![10_240, 2560]
+        );
         assert_eq!(spec(&m, "layer.{}.mlp.up_proj").extents, vec![10_240, 2560]);
-        assert_eq!(spec(&m, "layer.{}.mlp.down_proj").extents, vec![2560, 10_240]);
+        assert_eq!(
+            spec(&m, "layer.{}.mlp.down_proj").extents,
+            vec![2560, 10_240]
+        );
     }
 
     /// The PLE table's second axis is `layers * ple_dim` — the one
@@ -563,12 +721,27 @@ mod tests {
     #[test]
     fn the_per_layer_embedding_table_multiplies_the_layer_count() {
         let m = manifest(&Gemma4Facts::gemma_4_e4b(), None);
-        assert_eq!(spec(&m, "embed_tokens_per_layer").extents, vec![262_144, 42 * 256]);
-        assert_eq!(spec(&m, "per_layer_model_projection").extents, vec![42 * 256, 2560]);
+        assert_eq!(
+            spec(&m, "embed_tokens_per_layer").extents,
+            vec![262_144, 42 * 256]
+        );
+        assert_eq!(
+            spec(&m, "per_layer_model_projection").extents,
+            vec![42 * 256, 2560]
+        );
         assert_eq!(spec(&m, "per_layer_projection_norm").extents, vec![256]);
-        assert_eq!(spec(&m, "layer.{}.per_layer_input_gate").extents, vec![256, 2560]);
-        assert_eq!(spec(&m, "layer.{}.per_layer_projection").extents, vec![2560, 256]);
-        assert_eq!(spec(&m, "layer.{}.post_per_layer_input_norm").extents, vec![2560]);
+        assert_eq!(
+            spec(&m, "layer.{}.per_layer_input_gate").extents,
+            vec![256, 2560]
+        );
+        assert_eq!(
+            spec(&m, "layer.{}.per_layer_projection").extents,
+            vec![2560, 256]
+        );
+        assert_eq!(
+            spec(&m, "layer.{}.post_per_layer_input_norm").extents,
+            vec![2560]
+        );
     }
 
     /// The three absences that separate this generation from gemma-3n,
@@ -598,13 +771,28 @@ mod tests {
             &Gemma4Facts::gemma_4_26b_a4b(),
             Some(Gemma4Mixture::gemma_4_26b_a4b()),
         );
-        assert_eq!(spec(&dense, "layer.{}.router.scale").presence, Presence::Absent);
-        assert_eq!(spec(&routed, "layer.{}.router.scale").presence, Presence::Required);
+        assert_eq!(
+            spec(&dense, "layer.{}.router.scale").presence,
+            Presence::Absent
+        );
+        assert_eq!(
+            spec(&routed, "layer.{}.router.scale").presence,
+            Presence::Required
+        );
         assert_eq!(spec(&routed, "layer.{}.router.scale").extents, vec![2816]);
-        assert_eq!(spec(&dense, "embed_tokens_per_layer").presence, Presence::Required);
-        assert_eq!(spec(&routed, "embed_tokens_per_layer").presence, Presence::Absent);
+        assert_eq!(
+            spec(&dense, "embed_tokens_per_layer").presence,
+            Presence::Required
+        );
+        assert_eq!(
+            spec(&routed, "embed_tokens_per_layer").presence,
+            Presence::Absent
+        );
         assert!(
-            !routed.tensors.iter().any(|t| t.name == "layer.{}.per_layer_input_gate"),
+            !routed
+                .tensors
+                .iter()
+                .any(|t| t.name == "layer.{}.per_layer_input_gate"),
             "a stack with no per-layer table cannot gate one into its residual"
         );
     }
@@ -615,7 +803,10 @@ mod tests {
     /// fixtures do not.
     #[test]
     fn an_untied_head_is_required_rather_than_forbidden() {
-        let f = Gemma4Facts { tied_embeddings: false, ..Gemma4Facts::gemma_4_e4b() };
+        let f = Gemma4Facts {
+            tied_embeddings: false,
+            ..Gemma4Facts::gemma_4_e4b()
+        };
         let m = manifest(&f, None);
         assert_eq!(spec(&m, "lm_head").presence, Presence::Required);
         assert_eq!(spec(&m, "lm_head").extents, vec![262_144, 2560]);
@@ -641,7 +832,10 @@ mod tests {
                     .filter(|t| t.presence != Presence::Absent)
                     .map(|t| (t.name.replace("{}", "0"), t.extents.clone())),
             );
-            assert!(m.check(&implied).is_ok(), "{name}: manifest does not describe itself");
+            assert!(
+                m.check(&implied).is_ok(),
+                "{name}: manifest does not describe itself"
+            );
         }
     }
 
@@ -650,7 +844,11 @@ mod tests {
     fn the_geometry_is_the_rows_own_numbers() {
         let d = e4b();
         assert_eq!(d.layers, 42);
-        assert_eq!(d.attention.len(), 42, "one entry per layer, unconditionally");
+        assert_eq!(
+            d.attention.len(),
+            42,
+            "one entry per layer, unconditionally"
+        );
         assert_eq!(d.shape.hidden, 2560);
         assert_eq!(d.shape.q_heads, 8);
         assert_eq!(d.shape.kv_heads, 2);
@@ -666,7 +864,11 @@ mod tests {
         assert_eq!(d.norm, NormPlacement::Pre);
         assert_eq!(d.kv, KvStyle::Paged);
         assert!(d.recurrent.is_none(), "every gemma-4 layer attends");
-        assert_eq!(d.advertised, Advertised::default(), "the row fills this, not the projection");
+        assert_eq!(
+            d.advertised,
+            Advertised::default(),
+            "the row fills this, not the projection"
+        );
         assert_eq!(
             d.towers,
             crate::deployment::Towers::default(),
@@ -687,13 +889,18 @@ mod tests {
 
         let routed = deployment(
             &Gemma4Facts::gemma_4_26b_a4b(),
-            Some(Gemma4Mixture::gemma_4_26b_a4b()),
-            1024,
-            NORM_EPS,
-            false,
+            RowScalars {
+                mixture: Some(Gemma4Mixture::gemma_4_26b_a4b()),
+                sliding_window: 1024,
+                norm_eps: NORM_EPS,
+                k_eq_v: false,
+            },
             Deployed::single(),
         );
-        assert_eq!(routed.shape.intermediate, 2112, "the DENSE width stays in `intermediate`");
+        assert_eq!(
+            routed.shape.intermediate, 2112,
+            "the DENSE width stays in `intermediate`"
+        );
         assert_eq!(routed.shape.moe_intermediate, 704);
         assert_eq!(
             routed.shape.widest_mlp(),
@@ -739,7 +946,10 @@ mod tests {
         let d = e4b();
         assert_eq!(d.decode_head_dims(), Some((256, 512)));
         assert_eq!(d.attention[0].head_dim, 256, "layer 0 slides");
-        assert_eq!(d.attention[5].head_dim, 512, "layer 5 is the first full one");
+        assert_eq!(
+            d.attention[5].head_dim, 512,
+            "layer 5 is the first full one"
+        );
     }
 
     /// The window schedule: full layers see everything, sliding layers
@@ -762,9 +972,24 @@ mod tests {
     /// `max(0)` turns "unstated" into "zero" rather than into garbage.
     #[test]
     fn an_unstated_window_clamps_to_zero_rather_than_reaching_a_kernel_negative() {
-        let d = deployment(&Gemma4Facts::gemma_4_e4b(), None, -1, NORM_EPS, false, Deployed::single());
-        assert_eq!(d.attention[0].window, 0, "a sliding layer with no stated window");
-        assert_eq!(d.attention[5].window, -1, "a full layer still sees everything");
+        let d = deployment(
+            &Gemma4Facts::gemma_4_e4b(),
+            RowScalars {
+                mixture: None,
+                sliding_window: -1,
+                norm_eps: NORM_EPS,
+                k_eq_v: false,
+            },
+            Deployed::single(),
+        );
+        assert_eq!(
+            d.attention[0].window, 0,
+            "a sliding layer with no stated window"
+        );
+        assert_eq!(
+            d.attention[5].window, -1,
+            "a full layer still sees everything"
+        );
     }
 
     /// THE KV-SHARING TABLE, which is the reason `kv_source` is a field
@@ -777,11 +1002,17 @@ mod tests {
         let d = e4b();
         assert!(d.shares_kv());
         for l in 0..24 {
-            assert_eq!(d.attention[l as usize].kv_source, l, "layer {l} owns its pages");
+            assert_eq!(
+                d.attention[l as usize].kv_source, l,
+                "layer {l} owns its pages"
+            );
         }
         for l in 24..42 {
             let src = d.attention[l as usize].kv_source;
-            assert!(src < 24, "layer {l} sources from {src}, which owns no pages itself");
+            assert!(
+                src < 24,
+                "layer {l} sources from {src}, which owns no pages itself"
+            );
             assert_eq!(
                 f.is_full_attn(src),
                 f.is_full_attn(l),
@@ -789,8 +1020,7 @@ mod tests {
                  different width"
             );
             assert_eq!(
-                d.attention[l as usize].head_dim,
-                d.attention[src as usize].head_dim,
+                d.attention[l as usize].head_dim, d.attention[src as usize].head_dim,
                 "layer {l} reads pages laid out for a different head width"
             );
         }
@@ -817,7 +1047,7 @@ mod tests {
             logit_softcap: 0.0,
             ..Gemma4Facts::gemma_4_e4b()
         };
-        let d = deployment(&f, None, 512, NORM_EPS, false, Deployed::single());
+        let d = deployment(&f, RowScalars { mixture: None, sliding_window: 512, norm_eps: NORM_EPS, k_eq_v: false }, Deployed::single());
         assert!(!d.shares_kv());
         for l in 0..4u32 {
             assert_eq!(d.attention[l as usize].kv_source, l);
@@ -832,11 +1062,18 @@ mod tests {
         let f = Gemma4Facts::gemma_4_e4b();
         let d = e4b();
         for l in 0..f.layers {
-            let want =
-                if f.is_full_attn(l) { ROPE_THETA_GLOBAL } else { ROPE_THETA_LOCAL };
+            let want = if f.is_full_attn(l) {
+                ROPE_THETA_GLOBAL
+            } else {
+                ROPE_THETA_LOCAL
+            };
             assert_eq!(d.attention[l as usize].rope_theta, want, "layer {l}");
         }
-        assert_eq!(d.theta_by_layer().len(), 42, "the two bases differ, so the table is real");
+        assert_eq!(
+            d.theta_by_layer().len(),
+            42,
+            "the two bases differ, so the table is real"
+        );
     }
 
     /// The full layers rotate 128 of their 512 (`partial_rotary_factor
@@ -861,7 +1098,11 @@ mod tests {
     #[test]
     fn the_host_scalars_reach_the_trace_by_name() {
         let bare = e4b();
-        assert_eq!(bare.scales.len(), 4, "no layer scalars were handed to this load");
+        assert_eq!(
+            bare.scales.len(),
+            4,
+            "no layer scalars were handed to this load"
+        );
         assert_eq!(bare.scales["sqrt_hidden"], 2560f32.sqrt());
         assert_eq!(bare.scales["sqrt_ple_dim"], 256f32.sqrt());
         assert_eq!(bare.scales["rsqrt_hidden"], 1.0 / 2560f32.sqrt());
@@ -870,10 +1111,12 @@ mod tests {
         let scalars = [0.5f32, 0.25, 0.125];
         let loaded = deployment(
             &Gemma4Facts::gemma_4_e4b(),
-            None,
-            E4B_WINDOW,
-            NORM_EPS,
-            false,
+            RowScalars {
+                mixture: None,
+                sliding_window: E4B_WINDOW,
+                norm_eps: NORM_EPS,
+                k_eq_v: false,
+            },
             Deployed {
                 // Stated, not defaulted: this build's gemma-4 text is
                 // CUDA-only, and a row that fell through to a default
@@ -896,10 +1139,12 @@ mod tests {
     fn a_stack_with_no_per_layer_table_states_a_zero_width() {
         let d = deployment(
             &Gemma4Facts::gemma_4_26b_a4b(),
-            Some(Gemma4Mixture::gemma_4_26b_a4b()),
-            1024,
-            NORM_EPS,
-            false,
+            RowScalars {
+                mixture: Some(Gemma4Mixture::gemma_4_26b_a4b()),
+                sliding_window: 1024,
+                norm_eps: NORM_EPS,
+                k_eq_v: false,
+            },
             Deployed::single(),
         );
         assert_eq!(d.ple_dim, 0);
@@ -912,7 +1157,7 @@ mod tests {
     #[test]
     fn the_second_geometry_schedules_its_last_layer_full() {
         let f = Gemma4Facts::gemma_4_e2b();
-        let d = deployment(&f, None, 512, NORM_EPS, false, Deployed::single());
+        let d = deployment(&f, RowScalars { mixture: None, sliding_window: 512, norm_eps: NORM_EPS, k_eq_v: false }, Deployed::single());
         assert_eq!(d.attention.len(), 35);
         assert_eq!(d.attention[34].head_dim, 512, "layer 34 is a full layer");
         assert_eq!(d.attention[34].window, -1);
@@ -921,7 +1166,10 @@ mod tests {
         for l in 0..15u32 {
             assert_eq!(d.attention[l as usize].kv_source, l);
         }
-        assert_eq!(d.attention[15].kv_source, 13, "the last earlier sliding layer");
+        assert_eq!(
+            d.attention[15].kv_source, 13,
+            "the last earlier sliding layer"
+        );
         assert_eq!(d.attention[34].kv_source, 14, "the last earlier full layer");
     }
 
@@ -935,7 +1183,19 @@ mod tests {
     /// ones were off by a third.
     #[test]
     fn the_sandwich_does_not_imply_the_fold() {
-        for d in [e4b(), deployment(&Gemma4Facts::gemma_4_e2b(), None, 512, NORM_EPS, false, Deployed::single())] {
+        for d in [
+            e4b(),
+            deployment(
+                &Gemma4Facts::gemma_4_e2b(),
+                RowScalars {
+                    mixture: None,
+                    sliding_window: 512,
+                    norm_eps: NORM_EPS,
+                    k_eq_v: false,
+                },
+                Deployed::single(),
+            ),
+        ] {
             assert!(
                 !d.norm_unit_offset,
                 "gemma-4 stores the multiplier; `forward/mod.rs` fires \

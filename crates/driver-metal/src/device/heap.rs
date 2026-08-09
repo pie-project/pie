@@ -36,8 +36,8 @@ use objc2_metal::{
 };
 
 use crate::device::context::Context;
-use crate::layout::bump::Bump;
 use crate::error::{Error, Result};
+use crate::layout::bump::Bump;
 
 /// How every buffer in this heap is created.
 ///

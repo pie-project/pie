@@ -31,7 +31,7 @@
 use std::sync::Mutex;
 
 use cudarc::driver::sys::{
-    CUdeviceptr, CUmemAccessDesc, CUmemAccess_flags, CUmemAllocationGranularity_flags,
+    CUdeviceptr, CUmemAccess_flags, CUmemAccessDesc, CUmemAllocationGranularity_flags,
     CUmemAllocationProp, CUmemAllocationType, CUmemGenericAllocationHandle, CUmemLocationType,
     cuMemAddressFree, cuMemAddressReserve, cuMemCreate, cuMemGetAllocationGranularity, cuMemMap,
     cuMemRelease, cuMemSetAccess, cuMemUnmap,
@@ -62,7 +62,11 @@ pub const fn pages_for_bytes(bytes: usize, page_bytes: usize) -> usize {
 }
 
 const fn align_up(value: usize, alignment: usize) -> usize {
-    if value == 0 || alignment == 0 { 0 } else { value.div_ceil(alignment) * alignment }
+    if value == 0 || alignment == 0 {
+        0
+    } else {
+        value.div_ceil(alignment) * alignment
+    }
 }
 
 /// The shared page budget, with no CUDA in it.
@@ -166,7 +170,11 @@ impl PoolBudget {
     /// unwinding and from `Drop`, and over-releasing there should not be a
     /// second failure on top of the first.
     pub const fn unreserve(&mut self, pages: usize) {
-        let released = if pages < self.held_pages { pages } else { self.held_pages };
+        let released = if pages < self.held_pages {
+            pages
+        } else {
+            self.held_pages
+        };
         self.held_pages -= released;
         if released != 0 {
             self.generation += 1;
@@ -182,7 +190,10 @@ impl PoolBudget {
         if pages > self.held_pages {
             return Err(Error::invalid(
                 "PoolBudget::mark_committed",
-                format!("committing {pages} pages but only {} are held", self.held_pages),
+                format!(
+                    "committing {pages} pages but only {} are held",
+                    self.held_pages
+                ),
             ));
         }
         self.held_pages -= pages;
@@ -192,8 +203,11 @@ impl PoolBudget {
 
     /// Give back pages that were mapped and have now been unmapped.
     pub const fn mark_uncommitted(&mut self, pages: usize) {
-        let released =
-            if pages < self.committed_pages { pages } else { self.committed_pages };
+        let released = if pages < self.committed_pages {
+            pages
+        } else {
+            self.committed_pages
+        };
         self.committed_pages -= released;
         if released != 0 {
             self.generation += 1;
@@ -216,7 +230,9 @@ impl PoolBudget {
     ) {
         let charged = self.charged_pages();
         let usable = available_bytes.saturating_sub(safety_floor_bytes);
-        let next_budget = charged.saturating_add(usable / LOGICAL_PAGE_BYTES).max(charged);
+        let next_budget = charged
+            .saturating_add(usable / LOGICAL_PAGE_BYTES)
+            .max(charged);
         let next_hard = if reset_hard_ceiling {
             next_budget
         } else {
@@ -300,7 +316,10 @@ impl PhysicalPool {
 
     /// A snapshot of the accounting.
     pub fn budget(&self) -> PoolBudget {
-        self.budget.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.budget
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Run `f` against the live budget under the pool's lock.
@@ -335,7 +354,9 @@ impl PhysicalPool {
         safety_floor_bytes: usize,
         reset_hard_ceiling: bool,
     ) {
-        self.with_budget(|b| b.recalibrate(available_bytes, safety_floor_bytes, reset_hard_ceiling));
+        self.with_budget(|b| {
+            b.recalibrate(available_bytes, safety_floor_bytes, reset_hard_ceiling)
+        });
     }
 
     /// Name the peers that may read this pool's pages directly.
@@ -356,9 +377,7 @@ impl PhysicalPool {
                 continue;
             }
             let mut accessible: i32 = 0;
-            let ok = unsafe {
-                cudaDeviceCanAccessPeer(&mut accessible, self.device_ordinal, peer)
-            };
+            let ok = unsafe { cudaDeviceCanAccessPeer(&mut accessible, self.device_ordinal, peer) };
             if ok != cudarc::runtime::sys::cudaError::cudaSuccess || accessible == 0 {
                 tracing::warn!(
                     device = self.device_ordinal,
@@ -392,7 +411,10 @@ impl PhysicalPool {
     fn acquire_handle(&self, bytes: usize) -> Result<CUmemGenericAllocationHandle> {
         let prop = allocation_prop(self.device_ordinal);
         let mut handle: CUmemGenericAllocationHandle = 0;
-        check_cu(unsafe { cuMemCreate(&mut handle, bytes, &prop, 0) }, "cuMemCreate")?;
+        check_cu(
+            unsafe { cuMemCreate(&mut handle, bytes, &prop, 0) },
+            "cuMemCreate",
+        )?;
         Ok(handle)
     }
 
@@ -456,19 +478,26 @@ impl<'p> Arena<'p> {
     pub fn new(pool: &'p PhysicalPool, max_bytes: usize, label: impl Into<String>) -> Result<Self> {
         let label = label.into();
         if max_bytes == 0 {
-            return Err(Error::invalid("Arena::new", "an arena needs a non-zero size"));
+            return Err(Error::invalid(
+                "Arena::new",
+                "an arena needs a non-zero size",
+            ));
         }
         let granularity = pool.allocation_granularity();
-        let map_unit_bytes =
-            pool.handle_bytes().min(align_up(max_bytes, granularity)).max(granularity);
+        let map_unit_bytes = pool
+            .handle_bytes()
+            .min(align_up(max_bytes, granularity))
+            .max(granularity);
         // Twice the capacity, in address space only -- but `checked_mul`
         // rather than `saturating_mul`, because saturating would ask for a
         // `usize::MAX` reservation on overflow where the C++ falls back to the
         // plain size. Unreachable either way; the point is that the failure
         // mode of an absurd `max_bytes` is "no headroom", not "reserve the
         // entire address space".
-        let virtual_bytes =
-            align_up(max_bytes.checked_mul(2).unwrap_or(max_bytes), map_unit_bytes);
+        let virtual_bytes = align_up(
+            max_bytes.checked_mul(2).unwrap_or(max_bytes),
+            map_unit_bytes,
+        );
 
         let mut base: CUdeviceptr = 0;
         check_cu(
@@ -522,7 +551,10 @@ impl<'p> Arena<'p> {
         if bytes > self.max_bytes {
             return Err(Error::invalid(
                 "Arena::ensure_committed",
-                format!("{}: commit of {bytes} exceeds capacity {}", self.label, self.max_bytes),
+                format!(
+                    "{}: commit of {bytes} exceeds capacity {}",
+                    self.label, self.max_bytes
+                ),
             ));
         }
         Ok(align_up(bytes, self.map_unit_bytes))
@@ -541,7 +573,10 @@ impl<'p> Arena<'p> {
         }
         let needed_handles = (target - committed) / self.map_unit_bytes;
         let new_handles = needed_handles.saturating_sub(self.cached.len());
-        Ok(pages_for_bytes(new_handles * self.map_unit_bytes, LOGICAL_PAGE_BYTES))
+        Ok(pages_for_bytes(
+            new_handles * self.map_unit_bytes,
+            LOGICAL_PAGE_BYTES,
+        ))
     }
 
     /// Back at least `bytes` with physical memory.
@@ -563,7 +598,10 @@ impl<'p> Arena<'p> {
                 format!("{}: shared physical pool budget exhausted", self.label),
             ));
         }
-        match self.grow(bytes).and_then(|()| self.pool.mark_committed(pages)) {
+        match self
+            .grow(bytes)
+            .and_then(|()| self.pool.mark_committed(pages))
+        {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.rollback(before, cached_before);
@@ -615,7 +653,9 @@ impl<'p> Arena<'p> {
             let index = self.mapped.len() - 1;
             let address = self.base + (index * self.map_unit_bytes) as CUdeviceptr;
             ignore_in_drop(unsafe { cuMemUnmap(address, self.map_unit_bytes) });
-            let Some(handle) = self.mapped.pop() else { break };
+            let Some(handle) = self.mapped.pop() else {
+                break;
+            };
             if self.cached.len() < goal {
                 self.cached.push(handle);
             } else {
@@ -627,12 +667,15 @@ impl<'p> Arena<'p> {
         // A trim also shrinks a cache left over from a larger arena, so the
         // hysteresis buffer cannot grow across successive trims.
         while self.cached.len() > goal {
-            let Some(handle) = self.cached.pop() else { break };
+            let Some(handle) = self.cached.pop() else {
+                break;
+            };
             self.pool.release_handle(handle);
             released_bytes += self.map_unit_bytes;
         }
 
-        self.pool.mark_uncommitted(pages_for_bytes(released_bytes, LOGICAL_PAGE_BYTES));
+        self.pool
+            .mark_uncommitted(pages_for_bytes(released_bytes, LOGICAL_PAGE_BYTES));
     }
 
     fn grow(&mut self, bytes: usize) -> Result<()> {
@@ -646,17 +689,14 @@ impl<'p> Arena<'p> {
             };
             let address = self.base + (self.mapped.len() * self.map_unit_bytes) as CUdeviceptr;
 
-            let mapped =
-                check_cu(unsafe { cuMemMap(address, self.map_unit_bytes, 0, handle, 0) }, "cuMemMap");
+            let mapped = check_cu(
+                unsafe { cuMemMap(address, self.map_unit_bytes, 0, handle, 0) },
+                "cuMemMap",
+            );
             let outcome = mapped.and_then(|()| {
                 check_cu(
                     unsafe {
-                        cuMemSetAccess(
-                            address,
-                            self.map_unit_bytes,
-                            access.as_ptr(),
-                            access.len(),
-                        )
+                        cuMemSetAccess(address, self.map_unit_bytes, access.as_ptr(), access.len())
                     },
                     "cuMemSetAccess",
                 )
@@ -698,7 +738,9 @@ impl<'p> Arena<'p> {
             let index = self.mapped.len() - 1;
             let address = self.base + (index * self.map_unit_bytes) as CUdeviceptr;
             ignore_in_drop(unsafe { cuMemUnmap(address, self.map_unit_bytes) });
-            let Some(handle) = self.mapped.pop() else { break };
+            let Some(handle) = self.mapped.pop() else {
+                break;
+            };
             if self.cached.len() < cached_handle_count {
                 self.cached.push(handle);
             } else {
@@ -739,7 +781,10 @@ mod tests {
         assert_eq!(pages_for_bytes(0, LOGICAL_PAGE_BYTES), 0);
         assert_eq!(pages_for_bytes(1, LOGICAL_PAGE_BYTES), 1);
         assert_eq!(pages_for_bytes(LOGICAL_PAGE_BYTES, LOGICAL_PAGE_BYTES), 1);
-        assert_eq!(pages_for_bytes(LOGICAL_PAGE_BYTES + 1, LOGICAL_PAGE_BYTES), 2);
+        assert_eq!(
+            pages_for_bytes(LOGICAL_PAGE_BYTES + 1, LOGICAL_PAGE_BYTES),
+            2
+        );
     }
 
     #[test]
@@ -749,7 +794,10 @@ mod tests {
         let mut b = PoolBudget::new(4 * LOGICAL_PAGE_BYTES);
         assert!(b.try_reserve(3));
         assert_eq!(b.free_pages(), 1, "held pages are charged immediately");
-        assert!(!b.try_reserve(2), "must not hand out pages already promised");
+        assert!(
+            !b.try_reserve(2),
+            "must not hand out pages already promised"
+        );
         assert!(b.try_reserve(1));
         assert_eq!(b.free_pages(), 0);
     }
@@ -760,7 +808,11 @@ mod tests {
         assert!(b.try_reserve(3));
         let charged = b.charged_pages();
         b.mark_committed(2).unwrap();
-        assert_eq!(b.charged_pages(), charged, "a commit is a move, not a new charge");
+        assert_eq!(
+            b.charged_pages(),
+            charged,
+            "a commit is a move, not a new charge"
+        );
         assert_eq!(b.held_pages(), 1);
         assert_eq!(b.committed_pages(), 2);
     }
@@ -795,7 +847,10 @@ mod tests {
         assert!(!b.try_reserve(1), "full");
         assert_eq!(b.generation(), g, "a refusal is not a change");
         b.unreserve(4);
-        assert!(b.generation() > g, "space came back; a cached refusal is now stale");
+        assert!(
+            b.generation() > g,
+            "space came back; a cached refusal is now stale"
+        );
     }
 
     #[test]
@@ -819,7 +874,11 @@ mod tests {
         assert!(b.try_reserve(10));
         b.mark_committed(10).unwrap();
         b.recalibrate(0, 0, false);
-        assert_eq!(b.budget_pages(), 10, "cannot un-commit pages by recalibrating");
+        assert_eq!(
+            b.budget_pages(),
+            10,
+            "cannot un-commit pages by recalibrating"
+        );
         assert_eq!(b.free_pages(), 0);
     }
 
@@ -869,7 +928,11 @@ mod tests {
         // of hysteresis for an oscillating arena; none for one being emptied,
         // which is what makes `Drop`'s `release_tail(0)` give everything back.
         assert_eq!(Arena::cache_goal(0), 0, "teardown keeps nothing");
-        assert_eq!(Arena::cache_goal(1), 0, "an arena down to one unit is not oscillating");
+        assert_eq!(
+            Arena::cache_goal(1),
+            0,
+            "an arena down to one unit is not oscillating"
+        );
         assert_eq!(Arena::cache_goal(2), 1);
         assert_eq!(Arena::cache_goal(1000), 1, "capped, not proportional");
     }

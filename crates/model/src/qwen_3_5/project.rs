@@ -17,12 +17,11 @@
 
 use crate::catalog::Deployed;
 use crate::deployment::{
-    Advertised,
-    AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement, PrefillStyle,
-    RecurrentShape,
+    Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,
+    PrefillStyle, RecurrentShape,
 };
-use crate::shared::llama_like::project::round_up_attn_head_dim;
 use crate::manifest::{Manifest, TensorSpec};
+use crate::shared::llama_like::project::round_up_attn_head_dim;
 
 use super::spec::{Qwen35HybridFacts, Qwen35MlpKind};
 
@@ -61,23 +60,53 @@ pub fn manifest(f: &Qwen35HybridFacts) -> Manifest {
         .with(TensorSpec::required("norm", [hidden]))
         .either(!f.tied_embeddings, "lm_head", [vocab, hidden])
         // The full-attention block.
-        .with(TensorSpec::required("layer.{}.self_attn.q_proj", [q2, hidden]))
-        .with(TensorSpec::required("layer.{}.self_attn.k_proj", [kv, hidden]))
-        .with(TensorSpec::required("layer.{}.self_attn.v_proj", [kv, hidden]))
-        .with(TensorSpec::required("layer.{}.self_attn.o_proj", [hidden, u64::from(a.q_width())]))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.q_proj",
+            [q2, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.k_proj",
+            [kv, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.v_proj",
+            [kv, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.o_proj",
+            [hidden, u64::from(a.q_width())],
+        ))
         // Per-head q/k norms, which is what `head_dim` MEANS here: the
         // llama-like derivation divided a byte count to find this out.
-        .with(TensorSpec::required("layer.{}.self_attn.q_norm", [head_dim]))
-        .with(TensorSpec::required("layer.{}.self_attn.k_norm", [head_dim]))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.q_norm",
+            [head_dim],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.k_norm",
+            [head_dim],
+        ))
         // The GDN block. Four unfused projections: the checkpoint ships
         // `in_proj_{qkv,z,b,a}` and the fused `qkvz`/`ba` banks are a
         // JOIN the loader performs behind an env gate, which is why
         // `Qwen35GdnFacts::fused_in_proj` is a binding fact and gets no
         // row here.
-        .with(TensorSpec::required("layer.{}.linear_attn.in_proj_qkv", [conv_dim, hidden]))
-        .with(TensorSpec::required("layer.{}.linear_attn.in_proj_z", [v_width, hidden]))
-        .with(TensorSpec::required("layer.{}.linear_attn.in_proj_b", [v_heads, hidden]))
-        .with(TensorSpec::required("layer.{}.linear_attn.in_proj_a", [v_heads, hidden]))
+        .with(TensorSpec::required(
+            "layer.{}.linear_attn.in_proj_qkv",
+            [conv_dim, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.linear_attn.in_proj_z",
+            [v_width, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.linear_attn.in_proj_b",
+            [v_heads, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.linear_attn.in_proj_a",
+            [v_heads, hidden],
+        ))
         // `[conv_dim, 1, kernel]` as HF stores it; `extents_agree`
         // squeezes the degenerate axis, so a converter that wrote
         // `[conv_dim, kernel]` still matches.
@@ -85,16 +114,34 @@ pub fn manifest(f: &Qwen35HybridFacts) -> Manifest {
             "layer.{}.linear_attn.conv1d",
             [conv_dim, 1, u64::from(g.conv_kernel)],
         ))
-        .with(TensorSpec::required("layer.{}.linear_attn.conv1d.bias", [conv_dim]))
+        .with(TensorSpec::required(
+            "layer.{}.linear_attn.conv1d.bias",
+            [conv_dim],
+        ))
         // One decay parameter and one step bias per VALUE head — the
         // scan is per head, and this is the extent that says so.
-        .with(TensorSpec::required("layer.{}.linear_attn.A_log", [v_heads]))
-        .with(TensorSpec::required("layer.{}.linear_attn.dt_bias", [v_heads]))
+        .with(TensorSpec::required(
+            "layer.{}.linear_attn.A_log",
+            [v_heads],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.linear_attn.dt_bias",
+            [v_heads],
+        ))
         // The gated norm folds per value-head CHANNEL, not per head.
-        .with(TensorSpec::required("layer.{}.linear_attn.norm", [u64::from(g.value_head_dim)]))
-        .with(TensorSpec::required("layer.{}.linear_attn.out_proj", [hidden, v_width]))
+        .with(TensorSpec::required(
+            "layer.{}.linear_attn.norm",
+            [u64::from(g.value_head_dim)],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.linear_attn.out_proj",
+            [hidden, v_width],
+        ))
         .with(TensorSpec::required("layer.{}.input_layernorm", [hidden]))
-        .with(TensorSpec::required("layer.{}.post_attention_layernorm", [hidden]));
+        .with(TensorSpec::required(
+            "layer.{}.post_attention_layernorm",
+            [hidden],
+        ));
 
     match &f.mlp {
         Qwen35MlpKind::Dense { intermediate } => {
@@ -109,17 +156,24 @@ pub fn manifest(f: &Qwen35HybridFacts) -> Manifest {
         }
         Qwen35MlpKind::Moe(moe) => {
             let shared = u64::from(moe.shared_expert_intermediate);
-            m.with(TensorSpec::required("layer.{}.mlp.gate", [u64::from(moe.num_experts), hidden]))
-                // The expert bank's extents are a PACKING decision — a
-                // stacked `[experts, 2 * moe_intermediate, hidden]` slab
-                // or one tensor per expert, quantized or not — so the
-                // spec asks that it exist and says nothing about its
-                // shape. This is the same rule that keeps an FP8 build
-                // and a bf16 build on one row.
-                .with(TensorSpec::present("layer.{}.mlp.experts.0.gate_proj"))
-                .with(TensorSpec::present("layer.{}.mlp.experts.0.down_proj"))
-                .either(shared != 0, "layer.{}.mlp.shared_expert.gate_proj", [shared, hidden])
-                .with(TensorSpec::absent("layer.{}.mlp.gate_proj"))
+            m.with(TensorSpec::required(
+                "layer.{}.mlp.gate",
+                [u64::from(moe.num_experts), hidden],
+            ))
+            // The expert bank's extents are a PACKING decision — a
+            // stacked `[experts, 2 * moe_intermediate, hidden]` slab
+            // or one tensor per expert, quantized or not — so the
+            // spec asks that it exist and says nothing about its
+            // shape. This is the same rule that keeps an FP8 build
+            // and a bf16 build on one row.
+            .with(TensorSpec::present("layer.{}.mlp.experts.0.gate_proj"))
+            .with(TensorSpec::present("layer.{}.mlp.experts.0.down_proj"))
+            .either(
+                shared != 0,
+                "layer.{}.mlp.shared_expert.gate_proj",
+                [shared, hidden],
+            )
+            .with(TensorSpec::absent("layer.{}.mlp.gate_proj"))
         }
     }
 }
@@ -195,12 +249,22 @@ pub fn deployment(f: &Qwen35HybridFacts, rope_theta: f32, norm_eps: f32) -> Depl
         prefill: PrefillStyle::Planned,
         attn_output: AttnOutput::DriverPinned,
         logit_softcap: 0.0,
+        // No ATTENTION cap: gemma-2's `attn_logit_softcapping` is
+        // gemma-2's alone, and a zero here is "no cap" rather than a
+        // cap at zero — which would flatten every score to `tanh(inf)`.
+        attn_logit_softcap: 0.0,
         ple_dim: 0,
         norm: NormPlacement::Pre,
         // Not a gemma: the gain is the multiplier, stored directly.
         norm_unit_offset: false,
         v_norm: false,
         k_eq_v: false,
+        // `Qwen3-30B-A3B` publishes `true` while the `Qwen3MoeConfig`
+        // class default is `False`; the row wins. A dense qwen3.5 states
+        // it too and nothing reads it.
+        norm_topk_prob: true,
+        // No router of this family states a scaling factor.
+        routed_scaling: 1.0,
         mlp_gate: crate::deployment::MlpGate::Silu,
         scales: std::collections::BTreeMap::new(),
         // Filled by the ROW, not by the shape: a family label and a
@@ -238,6 +302,8 @@ fn gdn_shape(f: &Qwen35HybridFacts) -> RecurrentShape {
         v_d: g.value_head_dim as i32,
         conv_dim: g.conv_dim() as i32,
         conv_k: g.conv_kernel as i32,
+        // A gated delta stack has no B/C groups; mamba's alone.
+        n_groups: 0,
     }
 }
 
@@ -252,7 +318,10 @@ fn gdn_shape(f: &Qwen35HybridFacts) -> RecurrentShape {
 /// scratch and an allreduce follows.
 #[cfg(feature = "forward")]
 #[must_use]
-pub fn cuda_facts(f: &Qwen35HybridFacts, load: Deployed<'_>) -> super::forward::facts::Qwen35CudaFacts {
+pub fn cuda_facts(
+    f: &Qwen35HybridFacts,
+    load: Deployed<'_>,
+) -> super::forward::facts::Qwen35CudaFacts {
     let moe = matches!(f.mlp, Qwen35MlpKind::Moe(_));
     let shared_gate = match &f.mlp {
         Qwen35MlpKind::Moe(m) => m.shared_expert_intermediate != 0,
@@ -305,8 +374,8 @@ pub fn cuda_facts(f: &Qwen35HybridFacts, load: Deployed<'_>) -> super::forward::
 /// `LLAMA_LIKE` — an eleven-entry table of architecture STRINGS,
 /// reduced by a punctuation-stripping `canonical()`, consulted before
 /// any text was traced and free to disagree with what the tracer would
-/// actually do. It listed `gemma4`, which the load path refused on
-/// other grounds, and omitted `gemma3`, whose text it models. A row
+/// actually do. It listed `gpt_oss`, which no publication of reaches a
+/// Metal device here, and omitted `gemma3`, whose text it models. A row
 /// that answers for itself cannot disagree with a list, because there
 /// is no list.
 pub const NO_METAL: &str = "qwen-3.5 has no Metal text in this build: its forward is \
@@ -355,10 +424,24 @@ mod tests {
     fn the_attention_rows_are_the_rows_own_arithmetic() {
         let f = dense();
         let m = manifest(&f);
-        let q = m.tensors.iter().find(|t| t.name.ends_with("q_proj")).expect("stated");
-        assert_eq!(q.extents, vec![u64::from(2 * f.attn.q_width()), u64::from(f.hidden())]);
-        let o = m.tensors.iter().find(|t| t.name.ends_with("o_proj")).expect("stated");
-        assert_eq!(o.extents, vec![u64::from(f.hidden()), u64::from(f.attn.q_width())]);
+        let q = m
+            .tensors
+            .iter()
+            .find(|t| t.name.ends_with("q_proj"))
+            .expect("stated");
+        assert_eq!(
+            q.extents,
+            vec![u64::from(2 * f.attn.q_width()), u64::from(f.hidden())]
+        );
+        let o = m
+            .tensors
+            .iter()
+            .find(|t| t.name.ends_with("o_proj"))
+            .expect("stated");
+        assert_eq!(
+            o.extents,
+            vec![u64::from(f.hidden()), u64::from(f.attn.q_width())]
+        );
     }
 
     /// The GDN block's tensors sit beside the attention block's under
@@ -368,7 +451,10 @@ mod tests {
     fn a_hybrids_layer_rows_are_the_union_of_its_layer_kinds() {
         let m = manifest(&dense());
         let names: Vec<&str> = m.tensors.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"layer.{}.linear_attn.in_proj_qkv"), "{names:?}");
+        assert!(
+            names.contains(&"layer.{}.linear_attn.in_proj_qkv"),
+            "{names:?}"
+        );
         assert!(names.contains(&"layer.{}.self_attn.q_proj"), "{names:?}");
     }
 
@@ -388,7 +474,10 @@ mod tests {
             conv.extents,
             vec![u64::from(f.gdn.conv_dim()), 1, u64::from(f.gdn.conv_kernel)],
         );
-        assert_eq!(f.gdn.conv_dim(), 2 * f.gdn.key_width() + f.gdn.value_width());
+        assert_eq!(
+            f.gdn.conv_dim(),
+            2 * f.gdn.key_width() + f.gdn.value_width()
+        );
     }
 
     /// A tie is an ABSENCE the manifest expects — the only way tied and
@@ -396,10 +485,21 @@ mod tests {
     #[test]
     fn a_tie_is_an_absence() {
         let tied = manifest(&dense());
-        let head = tied.tensors.iter().find(|t| t.name == "lm_head").expect("stated");
+        let head = tied
+            .tensors
+            .iter()
+            .find(|t| t.name == "lm_head")
+            .expect("stated");
         assert_eq!(head.presence, Presence::Absent);
-        let untied = manifest(&Qwen35HybridFacts { tied_embeddings: false, ..dense() });
-        let head = untied.tensors.iter().find(|t| t.name == "lm_head").expect("stated");
+        let untied = manifest(&Qwen35HybridFacts {
+            tied_embeddings: false,
+            ..dense()
+        });
+        let head = untied
+            .tensors
+            .iter()
+            .find(|t| t.name == "lm_head")
+            .expect("stated");
         assert_eq!(head.presence, Presence::Required);
     }
 
@@ -408,14 +508,25 @@ mod tests {
     #[test]
     fn the_mixture_ships_a_router_and_the_dense_row_forbids_one() {
         let d = manifest(&dense());
-        let router = d.tensors.iter().find(|t| t.name.ends_with("mlp.gate")).expect("stated");
+        let router = d
+            .tensors
+            .iter()
+            .find(|t| t.name.ends_with("mlp.gate"))
+            .expect("stated");
         assert_eq!(router.presence, Presence::Absent);
 
         let m = manifest(&mixture());
-        let router = m.tensors.iter().find(|t| t.name.ends_with("mlp.gate")).expect("stated");
+        let router = m
+            .tensors
+            .iter()
+            .find(|t| t.name.ends_with("mlp.gate"))
+            .expect("stated");
         assert_eq!(router.presence, Presence::Required);
-        let dense_mlp =
-            m.tensors.iter().find(|t| t.name.ends_with("mlp.gate_proj")).expect("stated");
+        let dense_mlp = m
+            .tensors
+            .iter()
+            .find(|t| t.name.ends_with("mlp.gate_proj"))
+            .expect("stated");
         assert_eq!(dense_mlp.presence, Presence::Absent);
     }
 
@@ -447,7 +558,11 @@ mod tests {
                     .filter(|t| t.presence != Presence::Absent)
                     .map(|t| (t.name.replace("{}", "0"), t.extents.clone())),
             );
-            assert!(m.check(&implied).is_ok(), "{}", m.check(&implied).unwrap_err());
+            assert!(
+                m.check(&implied).is_ok(),
+                "{}",
+                m.check(&implied).unwrap_err()
+            );
         }
     }
 
@@ -460,9 +575,21 @@ mod tests {
         let f = dense();
         let d = deployment(&f, 1e7, 1e-6);
         let r = d.recurrent.as_ref().expect("a GDN hybrid carries state");
-        assert_eq!(r.linear_layers, vec![0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18, 20, 21, 22]);
-        assert_eq!(r.linear_layers.len(), 18, "24 layers, 6 of them full attention");
-        assert_eq!(r.conv_stride, (f.gdn.conv_kernel * f.gdn.conv_dim()) as usize);
+        assert_eq!(
+            r.linear_layers,
+            vec![
+                0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18, 20, 21, 22
+            ]
+        );
+        assert_eq!(
+            r.linear_layers.len(),
+            18,
+            "24 layers, 6 of them full attention"
+        );
+        assert_eq!(
+            r.conv_stride,
+            (f.gdn.conv_kernel * f.gdn.conv_dim()) as usize
+        );
         assert_eq!(
             r.state_stride,
             (f.gdn.value_heads * f.gdn.key_head_dim * f.gdn.value_head_dim) as usize,
@@ -480,8 +607,15 @@ mod tests {
         let f = dense();
         let r = deployment(&f, 1e7, 1e-6).recurrent.expect("stated");
         for l in 0..f.layers {
-            assert_eq!(!r.linear_layers.contains(&l), f.is_full_attn(l), "layer {l}");
-            assert_eq!(f.is_full_attn(l), l % f.full_attn_interval == f.full_attn_interval - 1);
+            assert_eq!(
+                !r.linear_layers.contains(&l),
+                f.is_full_attn(l),
+                "layer {l}"
+            );
+            assert_eq!(
+                f.is_full_attn(l),
+                l % f.full_attn_interval == f.full_attn_interval - 1
+            );
         }
     }
 
@@ -501,7 +635,11 @@ mod tests {
             assert_eq!(a.head_dim, 256);
             assert_eq!(a.sm_scale, 1.0 / 16.0, "1/sqrt(256)");
         }
-        assert_eq!(d.rotary_by_layer().len(), f.layers as usize, "a real table, not empty");
+        assert_eq!(
+            d.rotary_by_layer().len(),
+            f.layers as usize,
+            "a real table, not empty"
+        );
     }
 
     /// The launch geometry is the row's own numbers, and the mixture's
@@ -515,18 +653,34 @@ mod tests {
         assert_eq!(d.shape.q_heads, f.attn.q_heads);
         assert_eq!(d.shape.kv_heads, f.attn.kv_heads);
         assert_eq!(d.shape.head_dim, 256);
-        assert_eq!(d.shape.head_dim_kernel, 256, "256 is instantiated; nothing pads");
+        assert_eq!(
+            d.shape.head_dim_kernel, 256,
+            "256 is instantiated; nothing pads"
+        );
         assert_eq!(d.shape.head_dim_alloc(), 256);
         assert_eq!(d.shape.gqa_group(), 4, "8 q over 2 kv");
         assert_eq!(d.shape.vocab, f.vocab);
         assert_eq!(d.shape.intermediate, 3584);
-        assert_eq!(d.shape.moe_intermediate, 0, "a dense row has no experts to be wide");
+        assert_eq!(
+            d.shape.moe_intermediate, 0,
+            "a dense row has no experts to be wide"
+        );
         assert_eq!(d.shape.widest_mlp(), 3584);
-        assert_eq!(d.norm_eps, 1e-6, "stated by the row; no tensor extent carries it");
+        assert_eq!(
+            d.norm_eps, 1e-6,
+            "stated by the row; no tensor extent carries it"
+        );
         let moe = deployment(&mixture(), 1e7, 1e-6);
         assert_eq!(moe.shape.moe_intermediate, 512, "the per-expert width");
-        assert_eq!(moe.shape.intermediate, 0, "no layer in this stack runs a dense block");
-        assert_eq!(moe.shape.widest_mlp(), 512, "what the one shared workspace must hold");
+        assert_eq!(
+            moe.shape.intermediate, 0,
+            "no layer in this stack runs a dense block"
+        );
+        assert_eq!(
+            moe.shape.widest_mlp(),
+            512,
+            "what the one shared workspace must hold"
+        );
     }
 
     /// The paged store, the pre-norm placement and the empty epilogue —
@@ -552,17 +706,29 @@ mod tests {
     fn the_binding_facts_are_the_live_defaults() {
         let dense_facts = cuda_facts(&dense(), Deployed::single());
         assert!(dense_facts.state_bf16);
-        assert!(!dense_facts.warp_tiled, "the state-persist env is off by default");
+        assert!(
+            !dense_facts.warp_tiled,
+            "the state-persist env is off by default"
+        );
         assert_eq!(dense_facts.cached_max, 0);
         assert!(dense_facts.prefill_decode);
         assert!(dense_facts.gate_up_fused);
-        assert!(!dense_facts.moe_residual_fold, "a dense row reaches no MoE op");
+        assert!(
+            !dense_facts.moe_residual_fold,
+            "a dense row reaches no MoE op"
+        );
         assert!(!dense_facts.moe_shared_gate_dot);
         assert!(dense_facts.window_left.is_empty());
 
         let moe_facts = cuda_facts(&mixture(), Deployed::single());
-        assert!(moe_facts.moe_residual_fold, "tp == 1 folds into the residual");
-        assert!(moe_facts.moe_shared_gate_dot, "35B-A3B binds a shared expert");
+        assert!(
+            moe_facts.moe_residual_fold,
+            "tp == 1 folds into the residual"
+        );
+        assert!(
+            moe_facts.moe_shared_gate_dot,
+            "35B-A3B binds a shared expert"
+        );
         let sharded = cuda_facts(
             &mixture(),
             Deployed {
@@ -571,7 +737,10 @@ mod tests {
                 layer_scalars: &[],
             },
         );
-        assert!(!sharded.moe_residual_fold, "tp > 1 writes scratch and allreduces");
+        assert!(
+            !sharded.moe_residual_fold,
+            "tp > 1 writes scratch and allreduces"
+        );
     }
 
     /// The trace is the row's, for every class a fire can carry.

@@ -215,7 +215,11 @@ impl<E> AttentionWorkspace<E> {
         int_workspace_bytes: usize,
         plan_staging_slots: usize,
     ) -> Result<Self, StagingError> {
-        let slots = if plan_staging_slots == 0 { 1 } else { plan_staging_slots };
+        let slots = if plan_staging_slots == 0 {
+            1
+        } else {
+            plan_staging_slots
+        };
         let mut ws = Self {
             float_buf: std::ptr::null_mut(),
             float_bytes: 0,
@@ -407,7 +411,9 @@ fn ensure_plan_slot<O: StagingOps>(
     slot: &mut PlanStaging<O::Event>,
 ) -> Result<(), StagingError> {
     if slot.host.is_null() && staging_bytes > 0 {
-        slot.host = ops.malloc_host(staging_bytes).ok_or(StagingError::PinFailed)?;
+        slot.host = ops
+            .malloc_host(staging_bytes)
+            .ok_or(StagingError::PinFailed)?;
     }
     if slot.upload_done.is_none() {
         slot.upload_done = Some(ops.event_create().ok_or(StagingError::EventCreateFailed)?);

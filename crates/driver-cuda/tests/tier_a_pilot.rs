@@ -64,11 +64,15 @@ fn bytes_of_u16(v: &[u16]) -> Vec<u8> {
 }
 
 fn u16s_of_bytes(v: &[u8]) -> Vec<u16> {
-    v.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+    v.chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect()
 }
 
 fn f32s_of_bytes(v: &[u8]) -> Vec<f32> {
-    v.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    v.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 /// A deterministic input with a wide dynamic range, so a wrong stride shows
@@ -79,7 +83,10 @@ fn sample(i: usize) -> f32 {
 }
 
 fn row(symbol: &str) -> &'static KernelSig {
-    ENTRIES.iter().find(|k| k.symbol == symbol).expect("the pilot states this row")
+    ENTRIES
+        .iter()
+        .find(|k| k.symbol == symbol)
+        .expect("the pilot states this row")
 }
 
 /// `nvcc`, wherever this machine keeps it.
@@ -101,8 +108,8 @@ fn nvcc() -> Option<PathBuf> {
 /// Compiling it IS the proof that every row matches its entry point, so a
 /// failure here is a table defect and the test says so rather than skipping.
 fn build_fatbin(arch: &str) -> Vec<u8> {
-    let text = kernels_cuda::abi::emit_device_typecheck(&[ENTRIES])
-        .expect("the rows emit a typecheck TU");
+    let text =
+        kernels_cuda::abi::emit_device_typecheck(&[ENTRIES]).expect("the rows emit a typecheck TU");
     let dir = std::env::temp_dir().join(format!("pie-tier-a-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let source = dir.join("device_typecheck.cu");
@@ -152,7 +159,10 @@ fn the_tier_a_entries_run_and_answer() {
     };
     let (major, minor) = device.compute_capability().expect("compute capability");
     let image = build_fatbin(&format!("sm_{major}{minor}"));
-    eprintln!("tier A: {} bytes of fatbin for sm_{major}{minor}", image.len());
+    eprintln!(
+        "tier A: {} bytes of fatbin for sm_{major}{minor}",
+        image.len()
+    );
 
     let module = KernelModule::load(&image, ENTRIES).expect("every row's entry resolves");
     assert_eq!(module.len(), ENTRIES.len());
@@ -168,7 +178,8 @@ fn the_tier_a_entries_run_and_answer() {
     let correct_host: Vec<u16> = (0..T * K).map(|i| to_bf16(sample(i * 11 + 3))).collect();
 
     let mut x = alloc.alloc(x_host.len() * 2).expect("x");
-    x.copy_from_host(&bytes_of_u16(&x_host), s).expect("upload x");
+    x.copy_from_host(&bytes_of_u16(&x_host), s)
+        .expect("upload x");
     let mut rms = alloc.alloc(T * 4).expect("rms");
     rms.memset(0, s).expect("clear rms");
 
@@ -176,7 +187,11 @@ fn the_tier_a_entries_run_and_answer() {
     let sig = row("norm::compute_rms_bf16");
     let geometry = eval(
         sig.launch,
-        Dims { rows: T as u32, width: H as u32, in_width: H as u32 },
+        Dims {
+            rows: T as u32,
+            width: H as u32,
+            in_width: H as u32,
+        },
     )
     .expect("the row's rule evaluates");
     let mut args = Args::bind(
@@ -189,15 +204,19 @@ fn the_tier_a_entries_run_and_answer() {
         ],
     )
     .expect("the values match the row");
-    module.fire(sig, geometry, &mut args, s).expect("compute_rms fires");
+    module
+        .fire(sig, geometry, &mut args, s)
+        .expect("compute_rms fires");
     s.synchronize().expect("sync");
 
     let mut got = vec![0u8; T * 4];
     rms.copy_to_host(&mut got, s).expect("download rms");
     let got_rms = f32s_of_bytes(&got);
     for t in 0..T {
-        let mean_sq: f32 =
-            (0..H).map(|h| from_bf16(x_host[t * H + h]).powi(2)).sum::<f32>() / H as f32;
+        let mean_sq: f32 = (0..H)
+            .map(|h| from_bf16(x_host[t * H + h]).powi(2))
+            .sum::<f32>()
+            / H as f32;
         let want = mean_sq.max(1e-5).sqrt();
         assert!(
             (got_rms[t] - want).abs() <= want * 1e-4,
@@ -213,12 +232,25 @@ fn the_tier_a_entries_run_and_answer() {
     let target: Vec<f32> = got_rms.iter().map(|v| v * 2.0).collect();
     let mut targets = alloc.alloc(T * 4).expect("target");
     targets
-        .copy_from_host(&target.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(), s)
+        .copy_from_host(
+            &target
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+            s,
+        )
         .expect("upload target");
 
     let sig = row("norm::magnitude_rescale_bf16");
-    let geometry = eval(sig.launch, Dims { rows: T as u32, width: H as u32, in_width: H as u32 })
-        .expect("the row's rule evaluates");
+    let geometry = eval(
+        sig.launch,
+        Dims {
+            rows: T as u32,
+            width: H as u32,
+            in_width: H as u32,
+        },
+    )
+    .expect("the row's rule evaluates");
     let mut args = Args::bind(
         sig,
         &[
@@ -229,7 +261,9 @@ fn the_tier_a_entries_run_and_answer() {
         ],
     )
     .expect("the values match the row");
-    module.fire(sig, geometry, &mut args, s).expect("magnitude_rescale fires");
+    module
+        .fire(sig, geometry, &mut args, s)
+        .expect("magnitude_rescale fires");
     s.synchronize().expect("sync");
 
     let mut got = vec![0u8; x_host.len() * 2];
@@ -246,17 +280,30 @@ fn the_tier_a_entries_run_and_answer() {
 
     // ---- mean_streams ---------------------------------------------------
     let mut streams = alloc.alloc(streams_host.len() * 2).expect("streams");
-    streams.copy_from_host(&bytes_of_u16(&streams_host), s).expect("upload streams");
+    streams
+        .copy_from_host(&bytes_of_u16(&streams_host), s)
+        .expect("upload streams");
     let mut mean = alloc.alloc(T * H * 2).expect("mean");
     mean.memset(0, s).expect("clear mean");
 
     let sig = row("norm::mean_streams_bf16");
-    let geometry = eval(sig.launch, Dims { rows: T as u32, width: H as u32, in_width: H as u32 })
-        .expect("the row's rule evaluates");
+    let geometry = eval(
+        sig.launch,
+        Dims {
+            rows: T as u32,
+            width: H as u32,
+            in_width: H as u32,
+        },
+    )
+    .expect("the row's rule evaluates");
     let mut args = Args::bind(
         sig,
         &[
-            ArgValue::Ptr(streams.ptr_at(0, streams_host.len() * 2).expect("streams is live")),
+            ArgValue::Ptr(
+                streams
+                    .ptr_at(0, streams_host.len() * 2)
+                    .expect("streams is live"),
+            ),
             ArgValue::Ptr(mean.ptr_at(0, T * H * 2).expect("mean is live")),
             ArgValue::I32(K as i32),
             ArgValue::I32(T as i32),
@@ -264,7 +311,9 @@ fn the_tier_a_entries_run_and_answer() {
         ],
     )
     .expect("the values match the row");
-    module.fire(sig, geometry, &mut args, s).expect("mean_streams fires");
+    module
+        .fire(sig, geometry, &mut args, s)
+        .expect("mean_streams fires");
     s.synchronize().expect("sync");
 
     let mut got = vec![0u8; T * H * 2];
@@ -286,14 +335,20 @@ fn the_tier_a_entries_run_and_answer() {
 
     // ---- the two coefficient unpacks ------------------------------------
     let mut packed = alloc.alloc(predict_host.len() * 2).expect("predict in");
-    packed.copy_from_host(&bytes_of_u16(&predict_host), s).expect("upload predict");
+    packed
+        .copy_from_host(&bytes_of_u16(&predict_host), s)
+        .expect("upload predict");
     let mut coefs = alloc.alloc(T * K * K * 4).expect("predict out");
     coefs.memset(0, s).expect("clear predict out");
 
     let sig = row("norm::altup_unpack_predict_coefs");
     let geometry = eval(
         sig.launch,
-        Dims { rows: T as u32, width: (K * K) as u32, in_width: (K * K) as u32 },
+        Dims {
+            rows: T as u32,
+            width: (K * K) as u32,
+            in_width: (K * K) as u32,
+        },
     )
     .expect("the row's rule evaluates");
     let mut args = Args::bind(
@@ -305,11 +360,15 @@ fn the_tier_a_entries_run_and_answer() {
         ],
     )
     .expect("the values match the row");
-    module.fire(sig, geometry, &mut args, s).expect("unpack_predict fires");
+    module
+        .fire(sig, geometry, &mut args, s)
+        .expect("unpack_predict fires");
     s.synchronize().expect("sync");
 
     let mut got = vec![0u8; T * K * K * 4];
-    coefs.copy_to_host(&mut got, s).expect("download predict out");
+    coefs
+        .copy_to_host(&mut got, s)
+        .expect("download predict out");
     let got_coefs = f32s_of_bytes(&got);
     for t in 0..T {
         for k in 0..K {
@@ -325,14 +384,22 @@ fn the_tier_a_entries_run_and_answer() {
     }
 
     let mut packed = alloc.alloc(correct_host.len() * 2).expect("correct in");
-    packed.copy_from_host(&bytes_of_u16(&correct_host), s).expect("upload correct");
+    packed
+        .copy_from_host(&bytes_of_u16(&correct_host), s)
+        .expect("upload correct");
     let mut coefs = alloc.alloc(T * K * 4).expect("correct out");
     coefs.memset(0, s).expect("clear correct out");
 
     let sig = row("norm::altup_unpack_correct_coefs");
-    let geometry =
-        eval(sig.launch, Dims { rows: T as u32, width: K as u32, in_width: K as u32 })
-            .expect("the row's rule evaluates");
+    let geometry = eval(
+        sig.launch,
+        Dims {
+            rows: T as u32,
+            width: K as u32,
+            in_width: K as u32,
+        },
+    )
+    .expect("the row's rule evaluates");
     let mut args = Args::bind(
         sig,
         &[
@@ -342,11 +409,15 @@ fn the_tier_a_entries_run_and_answer() {
         ],
     )
     .expect("the values match the row");
-    module.fire(sig, geometry, &mut args, s).expect("unpack_correct fires");
+    module
+        .fire(sig, geometry, &mut args, s)
+        .expect("unpack_correct fires");
     s.synchronize().expect("sync");
 
     let mut got = vec![0u8; T * K * 4];
-    coefs.copy_to_host(&mut got, s).expect("download correct out");
+    coefs
+        .copy_to_host(&mut got, s)
+        .expect("download correct out");
     let got_coefs = f32s_of_bytes(&got);
     for i in 0..T * K {
         assert_eq!(
@@ -358,11 +429,19 @@ fn the_tier_a_entries_run_and_answer() {
 
     // ---- tanh, the flat one ---------------------------------------------
     let mut y = alloc.alloc(x_host.len() * 2).expect("y");
-    y.copy_from_host(&bytes_of_u16(&x_host), s).expect("upload y");
+    y.copy_from_host(&bytes_of_u16(&x_host), s)
+        .expect("upload y");
 
     let sig = row("norm::tanh_bf16");
-    let geometry = eval(sig.launch, Dims { rows: T as u32, width: H as u32, in_width: H as u32 })
-        .expect("the row's rule evaluates");
+    let geometry = eval(
+        sig.launch,
+        Dims {
+            rows: T as u32,
+            width: H as u32,
+            in_width: H as u32,
+        },
+    )
+    .expect("the row's rule evaluates");
     let mut args = Args::bind(
         sig,
         &[
@@ -371,7 +450,9 @@ fn the_tier_a_entries_run_and_answer() {
         ],
     )
     .expect("the values match the row");
-    module.fire(sig, geometry, &mut args, s).expect("tanh fires");
+    module
+        .fire(sig, geometry, &mut args, s)
+        .expect("tanh fires");
     s.synchronize().expect("sync");
 
     let mut got = vec![0u8; x_host.len() * 2];
@@ -414,7 +495,11 @@ fn the_issue_cost_of_a_stated_launch() {
     y.memset(0, s).expect("clear");
 
     let sig = row("norm::tanh_bf16");
-    let dims = Dims { rows: T as u32, width: H as u32, in_width: H as u32 };
+    let dims = Dims {
+        rows: T as u32,
+        width: H as u32,
+        in_width: H as u32,
+    };
     const N: usize = 2000;
 
     // Warm the driver: the first launch of a kernel pays for its module's

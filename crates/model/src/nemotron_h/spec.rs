@@ -159,8 +159,8 @@ pub struct NemotronHFacts {
 pub const SCHEDULE_52: &[NemotronLayerKind] = &{
     use NemotronLayerKind::{Attention as A, Mamba as M, Mlp as F};
     [
-        M, F, M, F, M, F, M, A, F, M, F, M, F, M, F, M, F, M, A, F, M, F, M, F, M, F, M, F, M,
-        A, F, M, F, M, F, M, F, M, F, M, A, F, M, F, M, F, M, F, M, F, M, F,
+        M, F, M, F, M, F, M, A, F, M, F, M, F, M, F, M, F, M, A, F, M, F, M, F, M, F, M, F, M, A,
+        F, M, F, M, F, M, F, M, F, M, A, F, M, F, M, F, M, F, M, F, M, F,
     ]
 };
 
@@ -173,10 +173,10 @@ pub const SCHEDULE_52: &[NemotronLayerKind] = &{
 pub const SCHEDULE_98: &[NemotronLayerKind] = &{
     use NemotronLayerKind::{Attention as A, Mamba as M, Mlp as F};
     [
-        M, F, M, F, M, F, M, F, M, F, M, F, M, F, M, F, M, A, F, M, F, M, F, M, F, M, F, M, F,
-        M, F, M, F, M, F, M, F, M, A, F, M, F, M, F, M, F, M, F, M, A, F, M, F, M, F, M, F, M,
-        F, M, A, F, M, F, M, F, M, F, M, F, M, F, M, F, M, F, F, F, M, M, F, F, F, M, F, M, A,
-        F, M, F, M, F, M, F, M, F, M, F,
+        M, F, M, F, M, F, M, F, M, F, M, F, M, F, M, F, M, A, F, M, F, M, F, M, F, M, F, M, F, M,
+        F, M, F, M, F, M, F, M, A, F, M, F, M, F, M, F, M, F, M, A, F, M, F, M, F, M, F, M, F, M,
+        A, F, M, F, M, F, M, F, M, F, M, F, M, F, M, F, F, F, M, M, F, F, F, M, F, M, A, F, M, F,
+        M, F, M, F, M, F, M, F,
     ]
 };
 
@@ -203,7 +203,9 @@ impl NemotronHFacts {
     /// slabs the MLP layers never touch on the 4B, and 48 on the 47B.
     #[must_use]
     pub fn mamba_layers(&self) -> Vec<u32> {
-        (0..self.layers()).filter(|&l| self.kind(l) == NemotronLayerKind::Mamba).collect()
+        (0..self.layers())
+            .filter(|&l| self.kind(l) == NemotronLayerKind::Mamba)
+            .collect()
     }
 
     /// Whether the MLP block is routed.
@@ -232,7 +234,11 @@ impl NemotronHFacts {
             // published checkpoint and the config states the field
             // separately anyway, so it is transcribed rather than
             // derived.
-            attn: NemotronAttnFacts { heads: 32, kv_heads: 8, head_dim: 128 },
+            attn: NemotronAttnFacts {
+                heads: 32,
+                kv_heads: 8,
+                head_dim: 128,
+            },
             moe: dense(21_504),
             tied_embeddings: false,
             window_left: &[],
@@ -261,7 +267,11 @@ impl NemotronHFacts {
                 n_groups: 8,
                 conv_kernel: 4,
             },
-            attn: NemotronAttnFacts { heads: 32, kv_heads: 8, head_dim: 128 },
+            attn: NemotronAttnFacts {
+                heads: 32,
+                kv_heads: 8,
+                head_dim: 128,
+            },
             moe: dense(12_288),
             tied_embeddings: false,
             window_left: &[],
@@ -289,7 +299,11 @@ impl NemotronHFacts {
                 n_groups: 8,
                 conv_kernel: 4,
             },
-            attn: NemotronAttnFacts { heads: 64, kv_heads: 8, head_dim: 128 },
+            attn: NemotronAttnFacts {
+                heads: 64,
+                kv_heads: 8,
+                head_dim: 128,
+            },
             moe: dense(30_720),
             tied_embeddings: false,
             window_left: &[],
@@ -319,10 +333,18 @@ impl NemotronHFacts {
                 n_groups: 8,
                 conv_kernel: 4,
             },
-            attn: NemotronAttnFacts { heads: 16, kv_heads: 4, head_dim: 128 },
+            attn: NemotronAttnFacts {
+                heads: 16,
+                kv_heads: 4,
+                head_dim: 128,
+            },
             moe: NemotronMoeFacts {
                 num_experts: 32,
                 top_k: 4,
+                // nemotron-h's router normalizes over the chosen experts.
+                norm_topk_prob: true,
+                // No nemotron-h config states the key.
+                routed_scaling: 1.0,
                 moe_intermediate: 1024,
                 shared_intermediate: 1024,
             },
@@ -344,6 +366,9 @@ const fn dense(intermediate: u32) -> NemotronMoeFacts {
     NemotronMoeFacts {
         num_experts: 0,
         top_k: 0,
+        // A dense row: no router reads this.
+        norm_topk_prob: true,
+        routed_scaling: 1.0,
         moe_intermediate: intermediate,
         shared_intermediate: 0,
     }
@@ -352,8 +377,9 @@ const fn dense(intermediate: u32) -> NemotronMoeFacts {
 #[cfg(test)]
 mod tests {
     use super::{
-        NemotronHFacts, NemotronLayerKind, SCHEDULE_52, SCHEDULE_98,
+        NemotronHFacts, NemotronLayerKind,
         NemotronLayerKind::{Attention, Mamba, Mlp},
+        SCHEDULE_52, SCHEDULE_98,
     };
 
     /// The 4B's and 8B's `hybrid_override_pattern`, verbatim.
@@ -381,7 +407,10 @@ mod tests {
                 pattern.len()
             );
             let spelled: String = schedule.iter().map(|k| k.glyph()).collect();
-            assert_eq!(spelled, pattern, "the transcribed schedule is not the published one");
+            assert_eq!(
+                spelled, pattern,
+                "the transcribed schedule is not the published one"
+            );
         }
     }
 
@@ -393,7 +422,11 @@ mod tests {
     #[test]
     fn attention_lands_on_the_published_indices() {
         let attn = |s: &[NemotronLayerKind]| -> Vec<usize> {
-            s.iter().enumerate().filter(|(_, k)| **k == Attention).map(|(i, _)| i).collect()
+            s.iter()
+                .enumerate()
+                .filter(|(_, k)| **k == Attention)
+                .map(|(i, _)| i)
+                .collect()
         };
         assert_eq!(attn(SCHEDULE_52), vec![7, 18, 29, 40]);
         assert_eq!(attn(SCHEDULE_98), vec![17, 38, 49, 60, 86]);
@@ -418,7 +451,11 @@ mod tests {
             Some(75),
             "three consecutive mixerless layers, which no alternation produces"
         );
-        assert_eq!(run_of(Mamba, 2), Some(78), "and two consecutive scans right after them");
+        assert_eq!(
+            run_of(Mamba, 2),
+            Some(78),
+            "and two consecutive scans right after them"
+        );
 
         // The check the run above stands in for: the ONE rule that fits
         // the first three quarters of this stack gets the last quarter
@@ -446,7 +483,10 @@ mod tests {
             NemotronHFacts::nemotron_h_47b(),
             NemotronHFacts::nemotron_h_synthetic(),
         ] {
-            assert!(f.hidden > 0 && f.vocab > 0, "a stack of zero width has nothing to mix");
+            assert!(
+                f.hidden > 0 && f.vocab > 0,
+                "a stack of zero width has nothing to mix"
+            );
             assert_eq!(f.layers(), f.layer_types.len() as u32);
             assert!(f.layers() > 0);
             assert!(
@@ -457,7 +497,10 @@ mod tests {
             );
             let m = &f.mamba;
             assert!(m.num_heads > 0 && m.head_dim > 0 && m.state_size > 0);
-            assert!(m.conv_kernel > 0, "a convolution of width zero reads nothing");
+            assert!(
+                m.conv_kernel > 0,
+                "a convolution of width zero reads nothing"
+            );
             assert!(
                 m.n_groups > 0 && m.intermediate() % m.n_groups == 0,
                 "B and C are shared across {} groups, which must divide the scan's width",
@@ -471,11 +514,20 @@ mod tests {
                 assert!(f.moe.top_k > 0 && f.moe.top_k <= f.moe.num_experts);
                 assert!(f.moe.moe_intermediate > 0);
             } else {
-                assert_eq!(f.moe.top_k, 0, "a dense stack has no router to take a k from");
+                assert_eq!(
+                    f.moe.top_k, 0,
+                    "a dense stack has no router to take a k from"
+                );
                 assert_eq!(f.moe.shared_intermediate, 0);
-                assert!(f.moe.moe_intermediate > 0, "the dense MLP's width lives here");
+                assert!(
+                    f.moe.moe_intermediate > 0,
+                    "the dense MLP's width lives here"
+                );
             }
-            assert!(f.window_left.is_empty(), "no Nemotron-H config states a sliding window");
+            assert!(
+                f.window_left.is_empty(),
+                "no Nemotron-H config states a sliding window"
+            );
         }
     }
 
@@ -483,7 +535,10 @@ mod tests {
     /// this family alone has.
     #[test]
     fn the_fixtures_carry_every_layer_kind() {
-        for f in &[NemotronHFacts::nemotron_h_8b(), NemotronHFacts::nemotron_h_synthetic()] {
+        for f in &[
+            NemotronHFacts::nemotron_h_8b(),
+            NemotronHFacts::nemotron_h_synthetic(),
+        ] {
             for k in [Mamba, Attention, Mlp] {
                 assert!(
                     (0..f.layers()).any(|l| f.kind(l) == k),
@@ -500,7 +555,10 @@ mod tests {
         let m = NemotronHFacts::nemotron_h_8b().mamba;
         assert_eq!(m.intermediate(), 128 * 64);
         assert_eq!(m.conv_dim(), m.intermediate() + 2 * 8 * 128);
-        assert_eq!(m.in_proj_width(), m.intermediate() + m.conv_dim() + m.num_heads);
+        assert_eq!(
+            m.in_proj_width(),
+            m.intermediate() + m.conv_dim() + m.num_heads
+        );
         assert!(
             m.conv_dim() > m.intermediate(),
             "B and C ride the same buffer as the scan's input"
@@ -546,8 +604,14 @@ mod tests {
     /// second 8B under a 4B's name.
     #[test]
     fn the_narrower_siblings_inherit_only_what_they_share() {
-        let (small, big) = (NemotronHFacts::nemotron_h_4b(), NemotronHFacts::nemotron_h_8b());
-        assert_eq!(small.layer_types, big.layer_types, "one schedule, two widths");
+        let (small, big) = (
+            NemotronHFacts::nemotron_h_4b(),
+            NemotronHFacts::nemotron_h_8b(),
+        );
+        assert_eq!(
+            small.layer_types, big.layer_types,
+            "one schedule, two widths"
+        );
         assert_eq!(small.attn, big.attn, "32 over 8 heads of 128 in both");
         assert_eq!(small.vocab, big.vocab);
         assert_ne!(small.hidden, big.hidden);
@@ -555,7 +619,10 @@ mod tests {
         assert_ne!(small.moe.moe_intermediate, big.moe.moe_intermediate);
 
         let huge = NemotronHFacts::nemotron_h_47b();
-        assert_eq!(huge.mamba.state_size, 256, "the 47B doubles the scan's state");
+        assert_eq!(
+            huge.mamba.state_size, 256,
+            "the 47B doubles the scan's state"
+        );
         assert_eq!(huge.attn.heads, 64);
         assert_eq!(huge.layers(), 98);
     }
@@ -568,7 +635,11 @@ mod tests {
         let mut sorted = glyphs.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), glyphs.len(), "two kinds spelled the same are one kind");
+        assert_eq!(
+            sorted.len(),
+            glyphs.len(),
+            "two kinds spelled the same are one kind"
+        );
     }
 
     /// Nothing here is tied.

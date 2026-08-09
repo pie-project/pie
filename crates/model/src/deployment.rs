@@ -191,6 +191,25 @@ pub struct RecurrentShape {
     pub conv_dim: i32,
     /// Conv kernel width.
     pub conv_k: i32,
+    /// mamba's B/C group count, or `0` for a gated-delta stack.
+    ///
+    /// The one number of a mamba mixer that NO tensor extent carries:
+    /// the checkpoint ships `2 * n_groups * state_size` rows of B and C
+    /// fused into one bank, so a loader holding the tensors knows only
+    /// their PRODUCT. `NemotronMambaFacts::n_groups` says exactly that,
+    /// and says it because a wrong factorization cuts a group in half.
+    ///
+    /// It gets its own field because it had been travelling as
+    /// [`Self::k_h`] — nemotron's projection wrote `k_h: m.n_groups`,
+    /// and every kernel that reads `k_h` is a GATED-DELTA kernel that no
+    /// mamba row dispatches, so the name was free and the value rode it.
+    /// The launch then filled `GdnCtx::n_groups` with the literal `0`
+    /// beside the `k_h` holding the real count. Two statements of one
+    /// quantity with the live reader on the empty one:
+    /// `selective_scan_update` scanned at zero groups, and the grouped
+    /// gated norm computed its `group_size` as
+    /// `Source::Div(Width(In(0)), Gdn("n_groups"))` — a divide by zero.
+    pub n_groups: i32,
 }
 
 /// Whether the prefill path can be planned ahead of the fire.
@@ -332,14 +351,22 @@ impl Geometry {
     /// [`Self::EMPTY`] must be askable.
     #[must_use]
     pub const fn gqa_group(&self) -> u32 {
-        if self.kv_heads == 0 { 0 } else { self.q_heads / self.kv_heads }
+        if self.kv_heads == 0 {
+            0
+        } else {
+            self.q_heads / self.kv_heads
+        }
     }
 
     /// The width to ALLOCATE for one head: the kernel's, when one was
     /// instantiated wider than the checkpoint's.
     #[must_use]
     pub const fn head_dim_alloc(&self) -> u32 {
-        if self.head_dim_kernel > self.head_dim { self.head_dim_kernel } else { self.head_dim }
+        if self.head_dim_kernel > self.head_dim {
+            self.head_dim_kernel
+        } else {
+            self.head_dim
+        }
     }
 
     /// The widest MLP any layer in the stack asks for.
@@ -349,7 +376,11 @@ impl Geometry {
     /// with its dense ones.
     #[must_use]
     pub const fn widest_mlp(&self) -> u32 {
-        if self.moe_intermediate > self.intermediate { self.moe_intermediate } else { self.intermediate }
+        if self.moe_intermediate > self.intermediate {
+            self.moe_intermediate
+        } else {
+            self.intermediate
+        }
     }
 }
 
@@ -470,6 +501,33 @@ pub struct Deployment {
     pub attn_output: AttnOutput,
     /// Final-logit softcap, `0.0` for none.
     pub logit_softcap: f32,
+    /// ATTENTION-logit softcap — `cap * tanh(score / cap)` applied to
+    /// the scores, not to the readout — or `0.0` for none.
+    ///
+    /// gemma-2's `attn_logit_softcapping`, which every published row
+    /// states as `50.0` against the readout's `30.0`. Two caps, two
+    /// numbers, two places in the fire, and the shape said so all
+    /// along: [`Gemma2AttnFacts::attn_logit_softcap`] carried the
+    /// measurement and its doc explained that this one rides "as a
+    /// DISPATCH parameter, not a launch: the attention kernel takes
+    /// it".
+    ///
+    /// The kernel does take it —
+    /// `logits_soft_cap: F32 <- Source::Attn("logits_soft_cap")` on
+    /// every flashinfer entry point. What no one had written was the
+    /// other end: `AttnCtx::logits_soft_cap` was the literal `0.0`, so
+    /// a gemma-2 with the cap and a gemma-2 without it attended
+    /// IDENTICALLY. `facts_are_read` had the field on its unread list
+    /// and called it "exactly the defect the file is named for".
+    ///
+    /// It is a `Deployment` field rather than an argument to
+    /// `attention_for` because the cap is one number for the whole
+    /// fire, like `sm_scale` and the window beside it in `AttnCtx` —
+    /// and because a trace that had to pass it at every layer is a
+    /// trace that can forget it at one.
+    ///
+    /// [`Gemma2AttnFacts::attn_logit_softcap`]: crate::gemma_2::spec::Gemma2AttnFacts::attn_logit_softcap
+    pub attn_logit_softcap: f32,
     /// Per-layer-embedding width, `0` for a stack without one.
     pub ple_dim: i32,
     /// Where the norm sits — read by anything that needs to name the
@@ -519,6 +577,44 @@ pub struct Deployment {
     pub k_eq_v: bool,
     /// Which gate this stack's MLP applies. See [`MlpGate`].
     pub mlp_gate: MlpGate,
+    /// Whether the router renormalizes over the SELECTED experts.
+    ///
+    /// HF's `norm_topk_prob`. True softmaxes the k chosen logits so the
+    /// routing weights sum to one; false softmaxes over ALL the experts
+    /// and then selects, so they sum to less than one and scale the
+    /// routed FFN's whole contribution down with them. Both produce
+    /// weights, neither faults, and the difference is a few percent of
+    /// every routed token.
+    ///
+    /// Here rather than on [`Geometry`] for [`Self::mlp_gate`]'s reason:
+    /// it is a CONVENTION the stack was trained under, not a size. And
+    /// here at all because `driver-cuda`'s launch hardcoded
+    /// `moe_norm_topk: false` beside a dozen fields it read off this
+    /// struct — `kernels-cuda`'s `topk_sigmoid_bias` and its two
+    /// siblings take it as `Source::Ctx`, so every routed CUDA fire in
+    /// the workspace routed on unnormalized weights whatever its row
+    /// said.
+    ///
+    /// A DENSE stack states `true` and nothing reads it, the same way a
+    /// dense row states it for the Metal text: "this one has no router"
+    /// is part of the measurement, and a row added later should have to
+    /// answer.
+    pub norm_topk_prob: bool,
+    /// `routed_scaling_factor` — what the routing weights are multiplied
+    /// by once the router has produced them.
+    ///
+    /// The other half of [`Self::norm_topk_prob`]; the pair is only
+    /// meaningful together, because the scaling is what pays for weights
+    /// that were never renormalized. DeepSeek-V3 publishes 2.5 against a
+    /// `norm_topk_prob` of false, GLM-4.5 publishes 2.5 against true, and
+    /// the families with neither key want 1.0.
+    ///
+    /// `driver-cuda` launched every mixture at 1.0. Three routers read it
+    /// off the launch context — `topk_sqrtsoftplus`, `topk_sigmoid_bias`
+    /// and `topk_sigmoid`, which is deepseek-v4, nemotron-h, and glm5
+    /// with both kimis — so a DeepSeek row's routed contribution arrived
+    /// at two-fifths of its trained size.
+    pub routed_scaling: f32,
     /// Named scalar constants the forward refers to by name.
     pub scales: BTreeMap<String, f32>,
     /// What a driver ADVERTISES about this model, as distinct from what
@@ -694,6 +790,13 @@ impl Deployment {
         Self {
             layers: 0,
             norm_eps: 0.0,
+            // The routing convention of a stack with no layers. False,
+            // not true, so this is not the value any real row wants:
+            // `empty()` exists to be refused, and a driver that served
+            // off it would route on unnormalized weights rather than on
+            // the convention half the catalog happens to use.
+            norm_topk_prob: false,
+            routed_scaling: 1.0,
             shape: Geometry::EMPTY,
             attention: Vec::new(),
             kv: KvStyle::Paged,
@@ -701,6 +804,10 @@ impl Deployment {
             prefill: PrefillStyle::Planned,
             attn_output: AttnOutput::StatedArgs,
             logit_softcap: 0.0,
+            // No attention cap either. A stack with no layers has
+            // nothing to cap, and `0.0` reads as "none" both here and
+            // at `AttnCtx`.
+            attn_logit_softcap: 0.0,
             ple_dim: 0,
             norm: NormPlacement::Pre,
             norm_unit_offset: false,
@@ -723,7 +830,11 @@ impl Deployment {
     #[must_use]
     pub fn decode_head_dims(&self) -> Option<(u32, u32)> {
         let first = self.attention.first()?.head_dim;
-        let other = self.attention.iter().find(|a| a.head_dim != first)?.head_dim;
+        let other = self
+            .attention
+            .iter()
+            .find(|a| a.head_dim != first)?
+            .head_dim;
         Some((first, other))
     }
 
@@ -752,7 +863,10 @@ impl Deployment {
     /// Does any layer read another's KV pages?
     #[must_use]
     pub fn shares_kv(&self) -> bool {
-        self.attention.iter().enumerate().any(|(l, a)| a.kv_source as usize != l)
+        self.attention
+            .iter()
+            .enumerate()
+            .any(|(l, a)| a.kv_source as usize != l)
     }
 
     /// CAN THIS BUILD SERVE THIS STACK — asked at load, not at launch.
@@ -855,17 +969,23 @@ mod tests {
             // than defaulted so a `stack()` is a whole `Deployment` and
             // the tests below exercise the same value a driver holds.
             norm_eps: 1e-5,
+            norm_topk_prob: true,
+            routed_scaling: 1.0,
             shape: Geometry::EMPTY,
             attention: dims
                 .iter()
                 .enumerate()
-                .map(|(l, &d)| LayerAttention { kv_source: l as u32, ..layer(d) })
+                .map(|(l, &d)| LayerAttention {
+                    kv_source: l as u32,
+                    ..layer(d)
+                })
                 .collect(),
             kv: KvStyle::Paged,
             recurrent: None,
             prefill: PrefillStyle::Planned,
             attn_output: AttnOutput::DriverPinned,
             logit_softcap: 0.0,
+            attn_logit_softcap: 0.0,
             ple_dim: 0,
             norm: NormPlacement::Pre,
             norm_unit_offset: false,
@@ -916,7 +1036,10 @@ mod tests {
     #[test]
     fn an_unservable_kv_shape_is_a_variant_rather_than_a_registry_row() {
         let mut d = stack(&[128]);
-        d.kv = KvStyle::Mla { kv_lora_rank: 512, qk_rope_head_dim: 64 };
+        d.kv = KvStyle::Mla {
+            kv_lora_rank: 512,
+            qk_rope_head_dim: 64,
+        };
         assert!(matches!(d.kv, KvStyle::Mla { .. }));
     }
 
@@ -947,7 +1070,9 @@ mod tests {
         let mut d = stack(&[128]);
         d.shape.q_heads = 24;
         d.shape.kv_heads = 4;
-        let why = d.servable_by(&[1, 2, 3, 4, 8]).expect_err("six is unservable");
+        let why = d
+            .servable_by(&[1, 2, 3, 4, 8])
+            .expect_err("six is unservable");
         assert!(
             matches!(why, Refusal::Unsupported(_)),
             "a build limit is Unsupported, not Malformed — the checkpoint is fine"
@@ -1012,7 +1137,10 @@ mod tests {
         d.shape.kv_heads = 0;
         assert_eq!(d.shape.gqa_group(), 0, "askable, not a panic");
         assert!(d.servable_by(&[1, 2, 3, 4, 8]).is_err());
-        assert!(d.servable_by(&[0, 1, 2, 3, 4, 8]).is_err(), "not fixable by widening");
+        assert!(
+            d.servable_by(&[0, 1, 2, 3, 4, 8]).is_err(),
+            "not fixable by widening"
+        );
     }
 
     /// An empty set serves nothing, which is the honest answer for a

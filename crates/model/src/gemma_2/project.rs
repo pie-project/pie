@@ -12,8 +12,8 @@
 
 use crate::catalog::Deployed;
 use crate::deployment::{
-    Advertised,
-    AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement, PrefillStyle,
+    Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,
+    PrefillStyle,
 };
 use crate::manifest::{Manifest, TensorSpec};
 
@@ -30,6 +30,16 @@ use super::spec::Gemma2Facts;
 /// panic. A `bool` on the shape and a constant here cannot express the
 /// third thing.
 pub const FINAL_LOGIT_SOFTCAP: f32 = 30.0;
+
+/// The ATTENTION cap gemma-2 applies, when it applies one.
+///
+/// `cap * tanh(score / cap)` over the attention scores, which is a
+/// DIFFERENT cap in a different place from the readout's: every
+/// published gemma-2 states `attn_logit_softcapping: 50.0` against
+/// `final_logit_softcapping: 30.0`. A constant here for the reason the
+/// one above is a constant, and `synthetic--gemma-null-softcap.json`
+/// covers the third case for both.
+pub const ATTN_LOGIT_SOFTCAP: f32 = 50.0;
 
 /// This row's tensors.
 ///
@@ -57,21 +67,55 @@ pub fn manifest(f: &Gemma2Facts) -> Manifest {
         // Gemma-2 ties, and a tie is an ABSENCE: it is the only thing
         // that tells tied from untied when every extent agrees.
         .either(!f.tied_embeddings, "lm_head", [vocab, hidden])
-        .with(TensorSpec::required("layer.{}.self_attn.q_proj", [q, hidden]))
-        .with(TensorSpec::required("layer.{}.self_attn.k_proj", [kv, hidden]))
-        .with(TensorSpec::required("layer.{}.self_attn.v_proj", [kv, hidden]))
-        .with(TensorSpec::required("layer.{}.self_attn.o_proj", [hidden, q]))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.q_proj",
+            [q, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.k_proj",
+            [kv, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.v_proj",
+            [kv, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.o_proj",
+            [hidden, q],
+        ))
         // gemma-2 proper has no q/k norm. Stated as an ABSENCE rather
         // than left unsaid, because a later gemma that does ship one
         // must not match this row.
-        .either(f.attn.qk_norm, "layer.{}.self_attn.q_norm", [u64::from(f.attn.head_dim)])
+        .either(
+            f.attn.qk_norm,
+            "layer.{}.self_attn.q_norm",
+            [u64::from(f.attn.head_dim)],
+        )
         .with(TensorSpec::required("layer.{}.input_layernorm", [hidden]))
-        .with(TensorSpec::required("layer.{}.post_attention_layernorm", [hidden]))
-        .with(TensorSpec::required("layer.{}.pre_feedforward_layernorm", [hidden]))
-        .with(TensorSpec::required("layer.{}.post_feedforward_layernorm", [hidden]))
-        .with(TensorSpec::required("layer.{}.mlp.gate_proj", [inter, hidden]))
-        .with(TensorSpec::required("layer.{}.mlp.up_proj", [inter, hidden]))
-        .with(TensorSpec::required("layer.{}.mlp.down_proj", [hidden, inter]))
+        .with(TensorSpec::required(
+            "layer.{}.post_attention_layernorm",
+            [hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.pre_feedforward_layernorm",
+            [hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.post_feedforward_layernorm",
+            [hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.mlp.gate_proj",
+            [inter, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.mlp.up_proj",
+            [inter, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.mlp.down_proj",
+            [hidden, inter],
+        ))
 }
 
 /// This row's deployment.
@@ -127,7 +171,25 @@ pub fn deployment(f: &Gemma2Facts, rope_theta: f32, norm_eps: f32) -> Deployment
         // driver owns the landing buffer. Gemma-4 is the exception and
         // its own row says so.
         attn_output: AttnOutput::DriverPinned,
-        logit_softcap: if f.final_logit_softcap { FINAL_LOGIT_SOFTCAP } else { 0.0 },
+        logit_softcap: if f.final_logit_softcap {
+            FINAL_LOGIT_SOFTCAP
+        } else {
+            0.0
+        },
+        // The ATTENTION cap, which the shape has measured all along and
+        // nothing carried. `Gemma2AttnFacts::attn_logit_softcap`'s doc
+        // said it rides "as a DISPATCH parameter, not a launch: the
+        // attention kernel takes it, so nothing states it separately" —
+        // and the kernel does take it, `Source::Attn("logits_soft_cap")`
+        // on every flashinfer entry point. What nothing did was FILL it:
+        // `AttnCtx::logits_soft_cap` was the literal `0.0`, so a gemma-2
+        // with the cap and one without attended identically. A constant
+        // for the same reason `FINAL_LOGIT_SOFTCAP` is one.
+        attn_logit_softcap: if f.attn.attn_logit_softcap {
+            ATTN_LOGIT_SOFTCAP
+        } else {
+            0.0
+        },
         // No per-layer embeddings; that is gemma-3n and gemma-4.
         ple_dim: 0,
         // PRE, and gemma's second norm of each pair does not change
@@ -143,6 +205,10 @@ pub fn deployment(f: &Gemma2Facts, rope_theta: f32, norm_eps: f32) -> Deployment
         // are separate facts, and this row is where that is said.
         v_norm: false,
         k_eq_v: false,
+        // Dense: no router reads this.
+        norm_topk_prob: true,
+        // No router of this family states a scaling factor.
+        routed_scaling: 1.0,
         mlp_gate: crate::deployment::MlpGate::GeluTanh,
         // No named constants: the `sqrt(hidden)` embedding scale is
         // stated inside the trace, not looked up by name.
@@ -179,8 +245,8 @@ pub fn deployment(f: &Gemma2Facts, rope_theta: f32, norm_eps: f32) -> Deployment
 /// `LLAMA_LIKE` — an eleven-entry table of architecture STRINGS,
 /// reduced by a punctuation-stripping `canonical()`, consulted before
 /// any text was traced and free to disagree with what the tracer would
-/// actually do. It listed `gemma4`, which the load path refused on
-/// other grounds, and omitted `gemma3`, whose text it models. A row
+/// actually do. It listed `gpt_oss`, which no publication of reaches a
+/// Metal device here, and omitted `gemma3`, whose text it models. A row
 /// that answers for itself cannot disagree with a list, because there
 /// is no list.
 pub const NO_METAL: &str = "gemma-2 has no Metal text in this build: its forward is `gemma2_cuda`, whose \
@@ -237,7 +303,14 @@ mod tests {
     #[test]
     fn the_extents_are_the_rows_own_arithmetic() {
         let m = manifest(&f());
-        let ext = |n: &str| m.tensors.iter().find(|t| t.name == n).expect("stated").extents.clone();
+        let ext = |n: &str| {
+            m.tensors
+                .iter()
+                .find(|t| t.name == n)
+                .expect("stated")
+                .extents
+                .clone()
+        };
         assert_eq!(ext("layer.{}.self_attn.q_proj"), vec![4096, 3584]);
         assert_eq!(ext("layer.{}.self_attn.k_proj"), vec![2048, 3584]);
         assert_eq!(ext("layer.{}.self_attn.o_proj"), vec![3584, 4096]);
@@ -251,7 +324,11 @@ mod tests {
     #[test]
     fn the_tied_head_is_an_absence_the_manifest_expects() {
         let m = manifest(&f());
-        let head = m.tensors.iter().find(|t| t.name == "lm_head").expect("stated");
+        let head = m
+            .tensors
+            .iter()
+            .find(|t| t.name == "lm_head")
+            .expect("stated");
         assert_eq!(head.presence, Presence::Absent);
     }
 
@@ -294,7 +371,10 @@ mod tests {
         assert_eq!(d.shape.q_heads, 16);
         assert_eq!(d.shape.kv_heads, 8);
         assert_eq!(d.shape.head_dim, 256);
-        assert_eq!(d.shape.head_dim_kernel, 256, "256 is instantiated; nothing pads");
+        assert_eq!(
+            d.shape.head_dim_kernel, 256,
+            "256 is instantiated; nothing pads"
+        );
         assert_eq!(d.shape.intermediate, 14336);
         assert_eq!(d.shape.vocab, 256_000);
         assert_eq!(d.shape.gqa_group(), 2);
@@ -312,7 +392,10 @@ mod tests {
         assert!(d.recurrent.is_none());
         assert_eq!(d.prefill, PrefillStyle::Planned);
         assert_eq!(d.attn_output, AttnOutput::DriverPinned);
-        assert_eq!(d.ple_dim, 0, "per-layer embeddings are gemma-3n's and gemma-4's");
+        assert_eq!(
+            d.ple_dim, 0,
+            "per-layer embeddings are gemma-3n's and gemma-4's"
+        );
         assert_eq!(d.norm, NormPlacement::Pre);
         assert!(d.scales.is_empty());
         for (l, a) in d.attention.iter().enumerate() {

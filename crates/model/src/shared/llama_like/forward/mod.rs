@@ -8,16 +8,12 @@ pub mod emit;
 pub mod facts;
 
 use self::facts::{
-    Activation,
-    LlamaLikeCudaFacts, LlamaLikeFacts, LlamaLikeMetalFacts, NormPlacement, QkNorm,
+    Activation, LlamaLikeCudaFacts, LlamaLikeFacts, LlamaLikeMetalFacts, NormPlacement, QkNorm,
 };
 use model_compiler::dsl::{
-    self, add_bias, attention, cuda, matmul,
-    rmsnorm, rope, split_qkv, swiglu, MatW, Val,
+    self, MatW, Val, add_bias, attention, cuda, matmul, rmsnorm, rope, split_qkv, swiglu,
 };
-use model_compiler::trace::{
-    DType, Dim, FireClass, ForwardPlan, GuardPred, RopeKind, Shape,
-};
+use model_compiler::trace::{DType, Dim, FireClass, ForwardPlan, GuardPred, RopeKind, Shape};
 
 /// The llama_like body — SEMANTIC form: no structural divergence, one
 /// trace serves every fire shape, kernel choice stays with the consumer
@@ -143,10 +139,7 @@ fn all_reduce(
     if cuda.all_reduce_p2p_max_rows == 0 {
         return cuda::all_reduce_out(x, hidden);
     }
-    let shape = (
-        Shape(vec![Dim::Tokens, Dim::Const(hidden)]),
-        DType::BF16,
-    );
+    let shape = (Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16);
     let (g, v) = dsl::guarded_value(t, x.layer(), shape);
     g.arm(GuardPred::TokensLE(cuda.all_reduce_p2p_max_rows), || {
         cuda::all_reduce_p2p(x, hidden);
@@ -163,10 +156,7 @@ fn all_reduce(
 /// a shard width that does not divide is a trace whose every projection
 /// is quietly wrong, and a `ForwardPlan` has no later place to notice.
 fn shard_divides(f: &LlamaLikeFacts, tp: u32) -> bool {
-    tp > 0
-        && f.q_heads % tp == 0
-        && f.kv_heads % tp == 0
-        && f.intermediate % tp == 0
+    tp > 0 && f.q_heads % tp == 0 && f.kv_heads % tp == 0 && f.intermediate % tp == 0
 }
 
 /// The MLP's projection-and-activation pair, in the spelling this
@@ -183,12 +173,7 @@ fn shard_divides(f: &LlamaLikeFacts, tp: u32) -> bool {
 /// traced value did not describe, and then cross-checked the activation
 /// against the fact on every launch to catch the drift it had created.
 /// Two statements say it instead.
-fn mlp(
-    x: &Val,
-    w: &dsl::Layer,
-    intermediate: u32,
-    packed: bool,
-) -> Val {
+fn mlp(x: &Val, w: &dsl::Layer, intermediate: u32, packed: bool) -> Val {
     if packed {
         cuda::swiglu(&matmul(x, &w.gate_up), intermediate, true)
     } else {
@@ -468,27 +453,22 @@ fn llama_like_metal_text(
                 Activation::Geglu => dsl::metal::geglu(gate, up, width),
             };
             if f.n_experts == 0 {
-                return activate(
-                    &gemm(x, &w.gate_proj),
-                    &gemm(x, &w.up_proj),
-                    f.intermediate,
-                );
+                return activate(&gemm(x, &w.gate_proj), &gemm(x, &w.up_proj), f.intermediate);
             }
             let k = f.experts_per_token.max(1);
             // Rows after the sort pads each expert's group up to a tile. The
             // gather writes this many and the matmuls read them, so the number
             // is stated once and threaded rather than recomputed.
             let padded = (f.n_experts * k).max(1);
-            let (ids, weights) =
-                dsl::metal::router_topk(&gemm(x, &w.router), f.n_experts, k, false);
-            let (perm, _row_expert, _tile_expert, inv) = dsl::metal::route_sort(
-                &ids,
+            let (ids, weights) = dsl::metal::router_topk(
+                &gemm(x, &w.router),
                 f.n_experts,
                 k,
-                metal.qmm_tile.0,
-                padded,
-                f.hidden,
+                false,
+                metal.norm_topk_prob,
             );
+            let (perm, _row_expert, _tile_expert, inv) =
+                dsl::metal::route_sort(&ids, f.n_experts, k, metal.qmm_tile.0, padded, f.hidden);
             let rows = dsl::metal::route_gather(
                 x,
                 &perm,
@@ -563,7 +543,14 @@ fn llama_like_metal_text(
                 metal.embed_scale,
             )
         } else {
-            dsl::metal::embed_gather(m.trace(), "embed", f.hidden, multi_batch, metal.proj_repr, &point)
+            dsl::metal::embed_gather(
+                m.trace(),
+                "embed",
+                f.hidden,
+                multi_batch,
+                metal.proj_repr,
+                &point,
+            )
         };
 
         // ── gemma's PLE prologue, once per step and layer-less. ──
@@ -675,10 +662,7 @@ fn llama_like_metal_text(
             // the numbers this needs are the two lines above -- already
             // derived, from the one question (`window < 0`) both per-layer
             // facts are keyed on.
-            let at_w = |m: &dsl::MatW, width: u32| dsl::MatW {
-                width,
-                ..m.clone()
-            };
+            let at_w = |m: &dsl::MatW, width: u32| dsl::MatW { width, ..m.clone() };
             let (q_proj, k_proj, v_proj) = (
                 at_w(&w.q_proj, q_w),
                 at_w(&w.k_proj, kv_w),
@@ -704,11 +688,7 @@ fn llama_like_metal_text(
                 let k = gemm(&x, &k_proj);
                 (q, k.clone(), k)
             } else {
-                (
-                    gemm(&x, &q_proj),
-                    gemm(&x, &k_proj),
-                    gemm(&x, &v_proj),
-                )
+                (gemm(&x, &q_proj), gemm(&x, &k_proj), gemm(&x, &v_proj))
             };
             let (q, k) = if f.qk_norm == QkNorm::Off {
                 (q, k)
@@ -774,10 +754,15 @@ fn llama_like_metal_text(
                 sink.as_deref(),
                 metal.attn_scale,
             )
-                .expect("a plain attention statement produces its value");
+            .expect("a plain attention statement produces its value");
 
             if post_norm {
-                let o = dsl::metal::rms_norm(&gemm(&a, &w.o_proj), &w.attn_norm, f.hidden, metal.rms_eps);
+                let o = dsl::metal::rms_norm(
+                    &gemm(&a, &w.o_proj),
+                    &w.attn_norm,
+                    f.hidden,
+                    metal.rms_eps,
+                );
                 y = dsl::metal::residual_add(&o, &y);
                 let h = gated(&y, &w);
                 let ffn = if owes_down { gemm(&h, &w.down) } else { h };
@@ -902,7 +887,11 @@ fn llama_like_metal_text(
         // asked. A decode of one token per request is unaffected, which is why
         // the decode gate agreed with MLX over it for as long as it did.
         let sampled = dsl::metal::sample_rows(&normed, f.hidden);
-        let head = if f.tied_embeddings { "embed" } else { "lm_head" };
+        let head = if f.tied_embeddings {
+            "embed"
+        } else {
+            "lm_head"
+        };
         let logits = dsl::metal::lm_head(&sampled, head, f.vocab, metal.proj_repr, &point);
         // The readout's softcap, for a deployment that has one. Named or not
         // named -- a cap large enough to do nothing is still a kernel run per
@@ -1119,15 +1108,17 @@ fn llama_like_cuda_text(
                 // from the triple, so parity requires the same launch);
                 // the Global and Off conventions state the separate
                 // kernels, whose semantic ops are 1:1.
-                let per_head_fused =
-                    f.qk_norm == QkNorm::PerHead && f.rope == RopeKind::Standard;
+                let per_head_fused = f.qk_norm == QkNorm::PerHead && f.rope == RopeKind::Standard;
                 let (q, k) = if per_head_fused {
                     cuda::qk_rmsnorm_rope(&q, &k, &w.q_norm, &w.k_norm)
                 } else {
                     let (q, k) = if f.qk_norm == QkNorm::Off {
                         (q, k)
                     } else {
-                        (dsl::cuda::rmsnorm(&q, &w.q_norm), dsl::cuda::rmsnorm(&k, &w.k_norm))
+                        (
+                            dsl::cuda::rmsnorm(&q, &w.q_norm),
+                            dsl::cuda::rmsnorm(&k, &w.k_norm),
+                        )
                     };
                     // STATED (2a). The build gate admits only Standard
                     // rope, and the executor's arm asked whether a
@@ -1263,8 +1254,7 @@ fn llama_like_cuda_text(
                     // goldens now pin this structure). The fused-post
                     // deployment (window-one only by its predicate) is
                     // the one QKV-inside-the-arms shape.
-                    let hoisted_q =
-                        (!fused_post).then(|| general_qkv());
+                    let hoisted_q = (!fused_post).then(|| general_qkv());
                     // NOT migrated to `regions`, deliberately. The other
                     // three sites in the tree are, and the goldens prove
                     // the surface changes no traced byte — but this one
@@ -1275,8 +1265,7 @@ fn llama_like_cuda_text(
                     // A restructure whose only gate is a golden it also
                     // rewrites is not gated; do this one where the
                     // three-model battery can run.
-                    let (g, a) =
-                        dsl::guarded_value(m.trace(), Some(l), attn_out_shape.clone());
+                    let (g, a) = dsl::guarded_value(m.trace(), Some(l), attn_out_shape.clone());
                     // The masked attention states its SPATIAL SPLIT as
                     // vocabulary (NS-4 landed in the IR): a Peel on the
                     // unmasked-prefix axis — the deployment's CAUSAL
@@ -1311,46 +1300,54 @@ fn llama_like_cuda_text(
                                     // plain-decode requests, ragged qo.
                                     if c.force_prefill_path {
                                         cuda::dequant_only(&w.kv);
-                                        cuda::attention_flashinfer_prefill(
-                                            q, &w.kv, window_left,
-                                        );
+                                        cuda::attention_flashinfer_prefill(q, &w.kv, window_left);
                                     } else {
                                         dsl::guarded(m.trace())
                                             .arm(GuardPred::WindowOne, || {
-                                        // hook×mask: the prefix decode IS
-                                        // the paged decode path and the
-                                        // hooked rows live in it (the
-                                        // seriation puts masked rows in
-                                        // the suffix, so the prefix
-                                        // starts at row 0 and the request
-                                        // ordinals are the unsplit ones).
-                                        // So the score capture rides here
-                                        // exactly as in the unsplit arm —
-                                        // the hand-written body's
-                                        // `if (score_capture.active())`
-                                        // on this same branch.
-                                        dsl::guarded(m.trace())
-                                            .arm(GuardPred::WantsAttnScore, || {
-                                                cuda::attention_flashinfer_decode_capture(
-                                                    q, &w.kv, window_left,
-                                                );
-                                            })
-                                            .otherwise(|| {
-                                                cuda::attention_flashinfer_decode(
-                                                    q, &w.kv, window_left,
-                                                );
-                                            });
+                                                // hook×mask: the prefix decode IS
+                                                // the paged decode path and the
+                                                // hooked rows live in it (the
+                                                // seriation puts masked rows in
+                                                // the suffix, so the prefix
+                                                // starts at row 0 and the request
+                                                // ordinals are the unsplit ones).
+                                                // So the score capture rides here
+                                                // exactly as in the unsplit arm —
+                                                // the hand-written body's
+                                                // `if (score_capture.active())`
+                                                // on this same branch.
+                                                dsl::guarded(m.trace())
+                                                    .arm(GuardPred::WantsAttnScore, || {
+                                                        cuda::attention_flashinfer_decode_capture(
+                                                            q,
+                                                            &w.kv,
+                                                            window_left,
+                                                        );
+                                                    })
+                                                    .otherwise(|| {
+                                                        cuda::attention_flashinfer_decode(
+                                                            q,
+                                                            &w.kv,
+                                                            window_left,
+                                                        );
+                                                    });
                                             })
                                             .otherwise(|| {
                                                 cuda::dequant_only(&w.kv);
                                                 cuda::attention_flashinfer_prefill(
-                                                    q, &w.kv, window_left,
+                                                    q,
+                                                    &w.kv,
+                                                    window_left,
                                                 );
                                             });
                                     }
                                 });
                                 r.rest(|| {
-                                    cuda::attention_flashinfer_prefill_custom(q, &w.kv, window_left);
+                                    cuda::attention_flashinfer_prefill_custom(
+                                        q,
+                                        &w.kv,
+                                        window_left,
+                                    );
                                 });
                             });
                         };
@@ -1368,7 +1365,9 @@ fn llama_like_cuda_text(
                                 GuardPred::WindowOne,
                                 || {
                                     cuda::attention_flashinfer_prefill_custom(
-                                        q, &w.kv, window_left,
+                                        q,
+                                        &w.kv,
+                                        window_left,
                                     );
                                 },
                                 || peeled(q),
@@ -1398,12 +1397,16 @@ fn llama_like_cuda_text(
                                     dsl::guarded(m.trace())
                                         .arm(GuardPred::WantsAttnScore, || {
                                             cuda::attention_flashinfer_decode_capture(
-                                                q, &w.kv, window_left,
+                                                q,
+                                                &w.kv,
+                                                window_left,
                                             );
                                         })
                                         .otherwise(|| {
                                             cuda::attention_flashinfer_decode(
-                                                q, &w.kv, window_left,
+                                                q,
+                                                &w.kv,
+                                                window_left,
                                             );
                                         });
                                 })
@@ -1415,12 +1418,16 @@ fn llama_like_cuda_text(
                                     dsl::guarded(m.trace())
                                         .arm(GuardPred::WantsAttnScore, || {
                                             cuda::attention_flashinfer_prefill_capture(
-                                                q, &w.kv, window_left,
+                                                q,
+                                                &w.kv,
+                                                window_left,
                                             );
                                         })
                                         .otherwise(|| {
                                             cuda::attention_flashinfer_prefill(
-                                                q, &w.kv, window_left,
+                                                q,
+                                                &w.kv,
+                                                window_left,
                                             );
                                         });
                                 });
@@ -1584,9 +1591,7 @@ fn llama_like_cuda_text(
                 // match.
                 let partial = matmul(&a, &w.o_proj);
                 let summed = all_reduce(m.trace(), &partial, f.hidden, cuda);
-                let x = cuda::residual_add_rmsnorm(
-                    &y, &summed, &w.mlp_norm.name, f.hidden,
-                );
+                let x = cuda::residual_add_rmsnorm(&y, &summed, &w.mlp_norm.name, f.hidden);
                 let act = mlp(&x, &w, f.intermediate, cuda.gate_up_fused);
                 // The MLP is COLUMN-parallel through `gate_up` and
                 // row-parallel through `down`, so its output is a
@@ -1638,7 +1643,9 @@ mod tests {
             .layer_ops(0)
             .map(|op| match op.kind {
                 OpKind::Rmsnorm { .. } => "rmsnorm",
-                OpKind::Matmul { beta_one: false, .. } => "matmul",
+                OpKind::Matmul {
+                    beta_one: false, ..
+                } => "matmul",
                 OpKind::Matmul { beta_one: true, .. } => "matmul+res",
                 OpKind::SplitQkv { .. } => "split_qkv",
                 OpKind::RmsnormPerHead { .. } => "rmsnorm_per_head",
@@ -1722,7 +1729,9 @@ mod tests {
             .layer_ops(0)
             .map(|op| match op.kind {
                 OpKind::Rmsnorm { .. } => "rmsnorm",
-                OpKind::Matmul { beta_one: false, .. } => "matmul",
+                OpKind::Matmul {
+                    beta_one: false, ..
+                } => "matmul",
                 OpKind::Matmul { beta_one: true, .. } => "matmul+res",
                 OpKind::SplitQkv { .. } => "split_qkv",
                 OpKind::RmsnormPerHead { .. } => "rmsnorm_per_head",
@@ -1787,7 +1796,9 @@ mod tests {
             .layer_ops(0)
             .map(|op| match op.kind {
                 OpKind::Rmsnorm { .. } => "rmsnorm",
-                OpKind::Matmul { beta_one: false, .. } => "matmul",
+                OpKind::Matmul {
+                    beta_one: false, ..
+                } => "matmul",
                 OpKind::Matmul { beta_one: true, .. } => "matmul+res",
                 OpKind::SplitQkv { .. } => "split_qkv",
                 OpKind::RmsnormPerHead { .. } => "rmsnorm_per_head",
@@ -1850,7 +1861,9 @@ mod tests {
             .layer_ops(0)
             .map(|op| match op.kind {
                 OpKind::Rmsnorm { .. } => "rmsnorm",
-                OpKind::Matmul { beta_one: false, .. } => "matmul",
+                OpKind::Matmul {
+                    beta_one: false, ..
+                } => "matmul",
                 OpKind::Matmul { beta_one: true, .. } => "matmul+res",
                 OpKind::SplitQkv { .. } => "split_qkv",
                 OpKind::RmsnormPerHead { .. } => "rmsnorm_per_head",
@@ -1865,22 +1878,22 @@ mod tests {
         assert_eq!(
             kinds,
             [
-                "matmul",        // q_proj — reads y raw: no attn pre-norm
-                "matmul",        // k_proj
-                "matmul",        // v_proj
-                "rmsnorm",       // q_norm (global: row norm over [N, Hq])
-                "rmsnorm",       // k_norm
+                "matmul",  // q_proj — reads y raw: no attn pre-norm
+                "matmul",  // k_proj
+                "matmul",  // v_proj
+                "rmsnorm", // q_norm (global: row norm over [N, Hq])
+                "rmsnorm", // k_norm
                 "rope",
                 "kv_append",
                 "attention",
-                "matmul",        // o_proj, beta=0 — scratch, not the stream
-                "rmsnorm",       // attn_norm on the o_proj OUTPUT
-                "residual_add",  // y += norm(o_proj(attn))
-                "matmul",        // gate_up — reads y raw: no mlp pre-norm
+                "matmul",       // o_proj, beta=0 — scratch, not the stream
+                "rmsnorm",      // attn_norm on the o_proj OUTPUT
+                "residual_add", // y += norm(o_proj(attn))
+                "matmul",       // gate_up — reads y raw: no mlp pre-norm
                 "swiglu",
-                "matmul",        // down, beta=0
-                "rmsnorm",       // mlp_norm on the down OUTPUT
-                "residual_add",  // y += norm(down(act))
+                "matmul",       // down, beta=0
+                "rmsnorm",      // mlp_norm on the down OUTPUT
+                "residual_add", // y += norm(down(act))
             ]
         );
     }
@@ -1993,13 +2006,12 @@ mod tests {
         let back: ForwardPlan = serde_json::from_str(&json).unwrap();
         assert_eq!(plan, back);
     }
-
 }
 
 #[cfg(test)]
 mod metal_tests {
-    use super::*;
     use self::facts::LlamaLikeMetalFacts;
+    use super::*;
     use model_compiler::trace::OpKind;
 
     /// The Metal text TRACES, and every kernel it states is declared in
@@ -2066,11 +2078,7 @@ mod metal_tests {
     #[test]
     fn the_metal_facts_resolve_at_trace_time() {
         let facts = LlamaLikeFacts::qwen3_0_6b();
-        let fold = llama_like_metal(
-            &facts,
-            &LlamaLikeMetalFacts::synthetic(),
-            FireClass::Decode,
-        );
+        let fold = llama_like_metal(&facts, &LlamaLikeMetalFacts::synthetic(), FireClass::Decode);
         let no_fold = llama_like_metal(
             &facts,
             &LlamaLikeMetalFacts {
@@ -2138,7 +2146,10 @@ mod metal_tests {
         // the key count. One statement cannot supply both, which is a second
         // reason the choice cannot be per-lane.
         assert!(count(&mb, &paged) > 0, "the M>1 lane must take {paged}");
-        assert!(count(&fold, &paged) > 0, "the M=1 lane must take {paged} too");
+        assert!(
+            count(&fold, &paged) > 0,
+            "the M=1 lane must take {paged} too"
+        );
         assert_eq!(
             count(&fold, &vector),
             0,

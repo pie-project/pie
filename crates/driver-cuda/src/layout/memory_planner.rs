@@ -209,9 +209,15 @@ pub struct ProfileRead {
 impl From<Lookup> for ProfileRead {
     fn from(l: Lookup) -> Self {
         match l {
-            Lookup::Hit(shape) => Self { shape: Some(shape), complaint: None },
+            Lookup::Hit(shape) => Self {
+                shape: Some(shape),
+                complaint: None,
+            },
             Lookup::Miss => Self::default(),
-            Lookup::Unusable(why) => Self { shape: None, complaint: Some(why) },
+            Lookup::Unusable(why) => Self {
+                shape: None,
+                complaint: Some(why),
+            },
         }
     }
 }
@@ -268,7 +274,11 @@ impl std::fmt::Display for PlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         const MIB: u64 = 1024 * 1024;
         match self {
-            Self::NoBudget { usable, used, safety } => write!(
+            Self::NoBudget {
+                usable,
+                used,
+                safety,
+            } => write!(
                 f,
                 "cuda memory planner: no budget left after weights. usable={} MiB, \
                  used={} MiB, safety={} MiB",
@@ -276,9 +286,7 @@ impl std::fmt::Display for PlanError {
                 used / MIB,
                 safety / MIB
             ),
-            Self::ZeroKvBytes => {
-                f.write_str("cuda memory planner: computed zero KV page bytes")
-            }
+            Self::ZeroKvBytes => f.write_str("cuda memory planner: computed zero KV page bytes"),
             Self::NoViableLayout(why) => f.write_str(why),
         }
     }
@@ -418,7 +426,11 @@ pub fn budget_for(cfg: &PlannerConfig, mem: DeviceMemory) -> Result<u64, PlanErr
     )]
     let usable = (mem.total_bytes as f64 * cfg.gpu_mem_utilization) as u64;
     if usable <= current_used + safety {
-        return Err(PlanError::NoBudget { usable, used: current_used, safety });
+        return Err(PlanError::NoBudget {
+            usable,
+            used: current_used,
+            safety,
+        });
     }
     Ok(usable - current_used - safety)
 }
@@ -589,10 +601,16 @@ impl ScoreTerms {
     /// The `auto` objective: a different shape of formula, not a reweighting.
     fn auto(&self, tp_size: i32, prefer_qwen3_8b_prefill: bool) -> f64 {
         let cohort_score = policy::target_saturation_score(self.r, self.score_decode_target);
-        #[expect(clippy::cast_precision_loss, reason = "token counts stay far below 2^53")]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "token counts stay far below 2^53"
+        )]
         let kv_residency_score =
             self.kv_headroom.ln_1p() + (self.kv_tokens as f64 / 131_072.0).ln_1p();
-        #[expect(clippy::cast_precision_loss, reason = "byte counts stay far below 2^53")]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "byte counts stay far below 2^53"
+        )]
         let arena_mib = self.arena as f64 / (1024.0 * 1024.0);
         let enough = self.kv_headroom >= self.min_headroom;
         let arena_penalty = if enough {
@@ -635,7 +653,10 @@ impl ScoreTerms {
 
     /// The four named-profile objectives.
     fn named(&self, profile: &str) -> f64 {
-        #[expect(clippy::cast_precision_loss, reason = "byte counts stay far below 2^53")]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "byte counts stay far below 2^53"
+        )]
         let arena = self.arena as f64;
         match profile {
             "capacity" => {
@@ -785,7 +806,8 @@ pub fn plan(
     if per_kv_token_bytes == 0 {
         return Err(PlanError::ZeroKvBytes);
     }
-    let global_per_kv_token_bytes = per_kv_token_bytes * u64::try_from(cfg.tp_size.max(0)).unwrap_or(0);
+    let global_per_kv_token_bytes =
+        per_kv_token_bytes * u64::try_from(cfg.tp_size.max(0)).unwrap_or(0);
 
     let auto_profile = policy::is_auto_profile(&cfg.memory_profile);
     // A small, narrow device has no throughput regime to trade into: with
@@ -799,8 +821,10 @@ pub fn plan(
     let score_as_auto = auto_profile && !narrow_latency_auto;
     let throughput_decode_target = policy::decode_target("throughput", prop.sm_count);
     let kv_heavy_auto_model = global_per_kv_token_bytes >= 192 * 1024;
-    let auto_decode_target =
-        i32::min(if kv_heavy_auto_model { 256 } else { 512 }, throughput_decode_target);
+    let auto_decode_target = i32::min(
+        if kv_heavy_auto_model { 256 } else { 512 },
+        throughput_decode_target,
+    );
 
     let prefs = ShapePreferences::detect(cfg, hf, prop, auto_profile, family);
     let base_prefill_cap = policy::prefill_candidate_cap(prop.major);
@@ -816,7 +840,8 @@ pub fn plan(
     } else if prefs.qwen3_8b_prefill {
         prefill_cap
     } else {
-        prefill_cap.min(2 * policy::prefill_target("throughput", prop.sm_count, prop.major, cfg.tp_size))
+        prefill_cap
+            .min(2 * policy::prefill_target("throughput", prop.sm_count, prop.major, cfg.tp_size))
     };
 
     let state_slot_bytes = costs.state_slot_bytes();
@@ -839,7 +864,8 @@ pub fn plan(
     let mut candidates: Vec<Candidate> = Vec::new();
     for policy_profile in profiles_to_search {
         let decode_target = policy::decode_target(policy_profile, prop.sm_count);
-        let prefill_target = policy::prefill_target(policy_profile, prop.sm_count, prop.major, cfg.tp_size);
+        let prefill_target =
+            policy::prefill_target(policy_profile, prop.sm_count, prop.major, cfg.tp_size);
 
         let mut ns = token_ladder(
             policy_profile,
@@ -849,7 +875,12 @@ pub fn plan(
             cfg.calibrating,
             prefill_cap,
         );
-        let mut rs = request_ladder(policy_profile, decode_target, score_as_auto, cfg.calibrating);
+        let mut rs = request_ladder(
+            policy_profile,
+            decode_target,
+            score_as_auto,
+            cfg.calibrating,
+        );
 
         // A pinned axis is a single-candidate lattice. This is the point of
         // `pie config tune` writing what it measured: with the shape pinned,
@@ -867,8 +898,7 @@ pub fn plan(
         }
 
         for &kv_page_size in &kv_page_sizes {
-            let per_page_bytes = per_kv_token_bytes
-                * u64::try_from(kv_page_size).unwrap_or(0)
+            let per_page_bytes = per_kv_token_bytes * u64::try_from(kv_page_size).unwrap_or(0)
                 + envelope_bytes_per_page;
             if per_page_bytes == 0 {
                 continue;
@@ -879,12 +909,14 @@ pub fn plan(
                         continue;
                     }
                     let max_page_refs = 262_144.max(r0.wrapping_mul(512));
-                    let max_custom_mask_bytes = (8 * 1024 * 1024).max((128 * 1024 * 1024).min(
-                        i32::try_from(
-                            (i64::from(n) * i64::from(1024.max(r0.wrapping_mul(64))) + 7) / 8,
-                        )
-                        .unwrap_or(i32::MAX),
-                    ));
+                    let max_custom_mask_bytes = (8 * 1024 * 1024).max(
+                        (128 * 1024 * 1024).min(
+                            i32::try_from(
+                                (i64::from(n) * i64::from(1024.max(r0.wrapping_mul(64))) + 7) / 8,
+                            )
+                            .unwrap_or(i32::MAX),
+                        ),
+                    );
                     let output_rows = r0;
                     let mtp_rows = if matches!(family, Family::Qwen35 | Family::Qwen35Moe) {
                         r0.wrapping_mul(cfg.mtp_num_drafts.clamp(0, 32))
@@ -906,16 +938,15 @@ pub fn plan(
                     }
 
                     let r = r0;
-                    let state_slots =
-                        if state_slot_bytes > 0 { r.wrapping_mul(slot_mult) } else { 0 };
-                    let state_bytes =
-                        u64::try_from(state_slots).unwrap_or(0) * state_slot_bytes;
-                    let minimum_wave_kv_bytes =
-                        u64::try_from(r).unwrap_or(0) * per_page_bytes;
+                    let state_slots = if state_slot_bytes > 0 {
+                        r.wrapping_mul(slot_mult)
+                    } else {
+                        0
+                    };
+                    let state_bytes = u64::try_from(state_slots).unwrap_or(0) * state_slot_bytes;
+                    let minimum_wave_kv_bytes = u64::try_from(r).unwrap_or(0) * per_page_bytes;
                     let remaining = budget - arena - persistent_bytes;
-                    if state_bytes > remaining
-                        || minimum_wave_kv_bytes > remaining - state_bytes
-                    {
+                    if state_bytes > remaining || minimum_wave_kv_bytes > remaining - state_bytes {
                         continue;
                     }
                     // Deliberately the FULL budget, not what is left after the
@@ -923,15 +954,15 @@ pub fn plan(
                     // freed between fires, while the KV pool is the resident
                     // one. Sizing pages against the remainder would leave the
                     // pool permanently smaller than the device can hold.
-                    let kv_pages = i32::try_from((budget / per_page_bytes).min(
-                        u64::try_from(i32::MAX).unwrap_or(u64::MAX),
-                    ))
+                    let kv_pages = i32::try_from(
+                        (budget / per_page_bytes).min(u64::try_from(i32::MAX).unwrap_or(u64::MAX)),
+                    )
                     .unwrap_or(i32::MAX);
                     if kv_pages <= 0 {
                         continue;
                     }
-                    let kv_tokens =
-                        u64::try_from(kv_pages).unwrap_or(0) * u64::try_from(kv_page_size).unwrap_or(0);
+                    let kv_tokens = u64::try_from(kv_pages).unwrap_or(0)
+                        * u64::try_from(kv_page_size).unwrap_or(0);
 
                     // A candidate only needs enough KV to be viable for early
                     // decode; admission and eviction handle longer tails.
@@ -1000,10 +1031,16 @@ pub fn plan(
                         },
                     };
 
-                    let score_decode_target =
-                        if score_as_auto { auto_decode_target } else { decode_target };
-                    let score_prefill_target =
-                        if score_as_auto { auto_prefill_target } else { prefill_target };
+                    let score_decode_target = if score_as_auto {
+                        auto_decode_target
+                    } else {
+                        decode_target
+                    };
+                    let score_prefill_target = if score_as_auto {
+                        auto_prefill_target
+                    } else {
+                        prefill_target
+                    };
                     #[expect(clippy::cast_precision_loss, reason = "counts stay below 2^53")]
                     let kv_tokens_f = kv_tokens as f64;
                     let kv_headroom = kv_tokens_f / f64::max(1.0, f64::from(r) * score_kv_horizon);
@@ -1089,7 +1126,19 @@ pub fn plan(
         }
     }
 
-    select(cfg, hf, prop, mem, budget, candidates, auto_profile, &prefs, costs, profiles, &mut notes)
+    select(
+        cfg,
+        hf,
+        prop,
+        mem,
+        budget,
+        candidates,
+        auto_profile,
+        &prefs,
+        costs,
+        profiles,
+        &mut notes,
+    )
 }
 
 /// The operator-facing diagnosis for an empty lattice.
@@ -1107,8 +1156,7 @@ fn no_viable_layout(
         "cuda memory planner: no viable forward/KV layout fits budget {} MiB",
         budget / MIB
     );
-    let kv_tokens_at_budget =
-        budget.checked_div(per_kv_token_bytes).unwrap_or(0);
+    let kv_tokens_at_budget = budget.checked_div(per_kv_token_bytes).unwrap_or(0);
     why += &format!(
         " (per-token KV {} KiB \u{2014} at most {kv_tokens_at_budget} KV tokens in this budget)",
         per_kv_token_bytes / 1024
@@ -1200,7 +1248,12 @@ fn select(
 ) -> Result<Planned, PlanError> {
     const MIB: u64 = 1024 * 1024;
     if candidates.is_empty() {
-        return Err(no_viable_layout(cfg, mem, budget, costs.per_kv_token_bytes()));
+        return Err(no_viable_layout(
+            cfg,
+            mem,
+            budget,
+            costs.per_kv_token_bytes(),
+        ));
     }
 
     // A measured shape beats a scored one. `calibrate_memory_planner` times
@@ -1324,9 +1377,8 @@ fn select(
     // the box it can cover is the product. This is one point on a frontier,
     // not the frontier -- a taller box is a narrower one.
     if cfg.calibrating {
-        let area = |c: &Candidate| {
-            i64::from(c.plan.max_workspace_tokens) * i64::from(c.plan.max_requests)
-        };
+        let area =
+            |c: &Candidate| i64::from(c.plan.max_workspace_tokens) * i64::from(c.plan.max_requests);
         let pick = max_by_key_first(&candidates, area);
         let scored = max_by_score(&candidates);
         notes.push(format!(
@@ -1466,7 +1518,11 @@ fn format_g6(x: f64) -> String {
     // rounding at the same precision so the two agree at a rounding boundary
     // (9.9999995 is 1e+01 to six digits, not 9.99999e+00).
     let sci = format!("{:.*e}", (P - 1) as usize, x);
-    let exp: i32 = sci.split('e').nth(1).and_then(|e| e.parse().ok()).unwrap_or(0);
+    let exp: i32 = sci
+        .split('e')
+        .nth(1)
+        .and_then(|e| e.parse().ok())
+        .unwrap_or(0);
 
     let strip = |s: String| -> String {
         if s.contains('.') {
@@ -1498,11 +1554,20 @@ impl Planned {
     /// Note `selector` here is two-valued: an override that moved the choice
     /// still reports `rule`. That is the C++'s behaviour, not an omission.
     #[must_use]
-    pub fn verbose_summary(&self, cfg: &PlannerConfig, prop: &DeviceProps, mem: DeviceMemory) -> String {
+    pub fn verbose_summary(
+        &self,
+        cfg: &PlannerConfig,
+        prop: &DeviceProps,
+        mem: DeviceMemory,
+    ) -> String {
         const MIB: u64 = 1024 * 1024;
         let p = &self.plan;
         let pages = self.budget.checked_div(p.kv_page_bytes).unwrap_or(0);
-        let slots = if self.state_slot_bytes == 0 { 0 } else { p.max_requests };
+        let slots = if self.state_slot_bytes == 0 {
+            0
+        } else {
+            p.max_requests
+        };
         format!(
             "memory planner: profile={} resolved_profile={} selector={} util={} \
              total={} MiB sm={} tp={} decode_target={} prefill_target={} page_size={} \

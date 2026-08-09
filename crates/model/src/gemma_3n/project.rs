@@ -29,8 +29,8 @@
 
 use crate::catalog::Deployed;
 use crate::deployment::{
-    Advertised,
-    AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement, PrefillStyle,
+    Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,
+    PrefillStyle,
 };
 use crate::manifest::{Manifest, TensorSpec};
 
@@ -81,35 +81,89 @@ pub fn manifest(f: &Gemma3nFacts) -> Manifest {
         // no other family in this catalog publishes a tensor whose shape
         // multiplies the layer count, and a checkpoint holding one is a
         // gemma-3n or a gemma-4 and nothing else.
-        .with(TensorSpec::required("embed_tokens_per_layer", [vocab, layers * ple]))
-        .with(TensorSpec::required("per_layer_model_projection", [layers * ple, hidden]))
+        .with(TensorSpec::required(
+            "embed_tokens_per_layer",
+            [vocab, layers * ple],
+        ))
+        .with(TensorSpec::required(
+            "per_layer_model_projection",
+            [layers * ple, hidden],
+        ))
         .with(TensorSpec::required("per_layer_projection_norm", [ple]))
-        .with(TensorSpec::required("layer.{}.self_attn.q_proj", [q, hidden]))
-        .with(TensorSpec::required("layer.{}.self_attn.k_proj", [kv, hidden]))
-        .with(TensorSpec::required("layer.{}.self_attn.v_proj", [kv, hidden]))
-        .with(TensorSpec::required("layer.{}.self_attn.o_proj", [hidden, q]))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.q_proj",
+            [q, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.k_proj",
+            [kv, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.v_proj",
+            [kv, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.o_proj",
+            [hidden, q],
+        ))
         // Per-head q/k norms — gemma-3n normalises inside the head, so
         // the extent is the head dim and not the projection width. The
         // old derivation had a special case that measured
         // `elems_of("layer.0.q_norm")` to tell those two apart; the
         // measurement is this row.
-        .with(TensorSpec::required("layer.{}.self_attn.q_norm", [head_dim]))
-        .with(TensorSpec::required("layer.{}.self_attn.k_norm", [head_dim]))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.q_norm",
+            [head_dim],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.k_norm",
+            [head_dim],
+        ))
         // gemma-3n normalises V as well, which gemma-2 and gemma-3 do
         // not, and it is the cheapest single row that separates this
         // generation from those.
-        .with(TensorSpec::required("layer.{}.self_attn.v_norm", [head_dim]))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.v_norm",
+            [head_dim],
+        ))
         .with(TensorSpec::required("layer.{}.input_layernorm", [hidden]))
-        .with(TensorSpec::required("layer.{}.post_attention_layernorm", [hidden]))
-        .with(TensorSpec::required("layer.{}.pre_feedforward_layernorm", [hidden]))
-        .with(TensorSpec::required("layer.{}.post_feedforward_layernorm", [hidden]))
-        .with(TensorSpec::required("layer.{}.mlp.gate_proj", [inter, hidden]))
-        .with(TensorSpec::required("layer.{}.mlp.up_proj", [inter, hidden]))
-        .with(TensorSpec::required("layer.{}.mlp.down_proj", [hidden, inter]))
+        .with(TensorSpec::required(
+            "layer.{}.post_attention_layernorm",
+            [hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.pre_feedforward_layernorm",
+            [hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.post_feedforward_layernorm",
+            [hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.mlp.gate_proj",
+            [inter, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.mlp.up_proj",
+            [inter, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.mlp.down_proj",
+            [hidden, inter],
+        ))
         // The laurel branch: down to `laurel_rank` and back.
-        .with(TensorSpec::required("layer.{}.laurel.linear_left", [u64::from(f.laurel_rank), hidden]))
-        .with(TensorSpec::required("layer.{}.laurel.linear_right", [hidden, u64::from(f.laurel_rank)]))
-        .with(TensorSpec::required("layer.{}.laurel.post_laurel_norm", [hidden]))
+        .with(TensorSpec::required(
+            "layer.{}.laurel.linear_left",
+            [u64::from(f.laurel_rank), hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.laurel.linear_right",
+            [hidden, u64::from(f.laurel_rank)],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.laurel.post_laurel_norm",
+            [hidden],
+        ))
         // AltUp's router picks which stream the block body runs on, so
         // its width IS the stream count.
         .with(TensorSpec::required(
@@ -118,9 +172,18 @@ pub fn manifest(f: &Gemma3nFacts) -> Manifest {
         ))
         .with(TensorSpec::required("layer.{}.altup.router_norm", [hidden]))
         // Where the per-layer embedding gates in.
-        .with(TensorSpec::required("layer.{}.per_layer_input_gate", [ple, hidden]))
-        .with(TensorSpec::required("layer.{}.per_layer_projection", [hidden, ple]))
-        .with(TensorSpec::required("layer.{}.post_per_layer_input_norm", [hidden]))
+        .with(TensorSpec::required(
+            "layer.{}.per_layer_input_gate",
+            [ple, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.per_layer_projection",
+            [hidden, ple],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.post_per_layer_input_norm",
+            [hidden],
+        ))
 }
 
 /// This row's deployment.
@@ -157,7 +220,11 @@ pub fn deployment(
                 kv_source: l,
                 sm_scale: 1.0 / (head_dim as f32).sqrt(),
                 // A window and a rope base are one decision seen twice.
-                rope_theta: if window < 0 { rope_theta_global } else { rope_theta_local },
+                rope_theta: if window < 0 {
+                    rope_theta_global
+                } else {
+                    rope_theta_local
+                },
                 // Full rotation at the head dim.
                 rotary_dim: 0,
             }
@@ -193,6 +260,10 @@ pub fn deployment(
         prefill: PrefillStyle::Planned,
         attn_output: AttnOutput::DriverPinned,
         logit_softcap: FINAL_LOGIT_SOFTCAP,
+        // No ATTENTION cap: gemma-2's `attn_logit_softcapping` is
+        // gemma-2's alone, and a zero here is "no cap" rather than a
+        // cap at zero — which would flatten every score to `tanh(inf)`.
+        attn_logit_softcap: 0.0,
         // THE FIELD THIS GENERATION EXISTS FOR. Nonzero here and zero in
         // every other row of the catalog: the driver sizes the per-layer
         // embedding gather from it, and the old derivation left it at
@@ -206,6 +277,10 @@ pub fn deployment(
         // are separate facts, and this row is where that is said.
         v_norm: false,
         k_eq_v: false,
+        // Dense: no router reads this.
+        norm_topk_prob: true,
+        // No router of this family states a scaling factor.
+        routed_scaling: 1.0,
         mlp_gate: crate::deployment::MlpGate::GeluTanh,
         // No named host scalars: gemma-3n's `sqrt(hidden)` embedding
         // scale and its AltUp coefficient clip are stated inside the
@@ -244,8 +319,8 @@ pub fn deployment(
 /// `LLAMA_LIKE` — an eleven-entry table of architecture STRINGS,
 /// reduced by a punctuation-stripping `canonical()`, consulted before
 /// any text was traced and free to disagree with what the tracer would
-/// actually do. It listed `gemma4`, which the load path refused on
-/// other grounds, and omitted `gemma3`, whose text it models. A row
+/// actually do. It listed `gpt_oss`, which no publication of reaches a
+/// Metal device here, and omitted `gemma3`, whose text it models. A row
 /// that answers for itself cannot disagree with a list, because there
 /// is no list.
 pub const NO_METAL: &str = "gemma-3n has no Metal text in this build: its forward is `gemma3n_cuda` — \
@@ -273,8 +348,8 @@ pub fn trace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gemma_3n::spec::{Gemma3nAltUpFacts, Gemma3nAttnFacts, window_schedule};
     use crate::manifest::Presence;
-    use crate::gemma_3n::spec::{window_schedule, Gemma3nAltUpFacts, Gemma3nAttnFacts};
 
     /// E2B, as the published config states it — built here rather than
     /// imported from the row so this file's tests fail on this file's
@@ -288,8 +363,15 @@ mod tests {
             laurel_rank: 64,
             ple_width: 256,
             sparsity_layers: 10,
-            altup: Gemma3nAltUpFacts { num_streams: 4, active: 0 },
-            attn: Gemma3nAttnFacts { heads: 8, kv_heads: 2, head_dim: 256 },
+            altup: Gemma3nAltUpFacts {
+                num_streams: 4,
+                active: 0,
+            },
+            attn: Gemma3nAttnFacts {
+                heads: 8,
+                kv_heads: 2,
+                head_dim: 256,
+            },
             window_left: &W,
         }
     }
@@ -299,7 +381,14 @@ mod tests {
     #[test]
     fn the_ple_table_is_sized_by_the_layer_count() {
         let m = manifest(&e2b());
-        let ext = |n: &str| m.tensors.iter().find(|t| t.name == n).expect("stated").extents.clone();
+        let ext = |n: &str| {
+            m.tensors
+                .iter()
+                .find(|t| t.name == n)
+                .expect("stated")
+                .extents
+                .clone()
+        };
         assert_eq!(ext("embed_tokens_per_layer"), vec![262_400, 30 * 256]);
         assert_eq!(ext("per_layer_model_projection"), vec![30 * 256, 2048]);
         assert_eq!(ext("per_layer_projection_norm"), vec![256]);
@@ -310,7 +399,14 @@ mod tests {
     #[test]
     fn the_extents_are_the_rows_own_arithmetic() {
         let m = manifest(&e2b());
-        let ext = |n: &str| m.tensors.iter().find(|t| t.name == n).expect("stated").extents.clone();
+        let ext = |n: &str| {
+            m.tensors
+                .iter()
+                .find(|t| t.name == n)
+                .expect("stated")
+                .extents
+                .clone()
+        };
         assert_eq!(ext("layer.{}.self_attn.q_proj"), vec![2048, 2048]);
         assert_eq!(ext("layer.{}.self_attn.k_proj"), vec![512, 2048]);
         assert_eq!(ext("layer.{}.self_attn.o_proj"), vec![2048, 2048]);
@@ -342,7 +438,11 @@ mod tests {
     #[test]
     fn the_tied_head_is_an_absence_the_manifest_expects() {
         let m = manifest(&e2b());
-        let head = m.tensors.iter().find(|t| t.name == "lm_head").expect("stated");
+        let head = m
+            .tensors
+            .iter()
+            .find(|t| t.name == "lm_head")
+            .expect("stated");
         assert_eq!(head.presence, Presence::Absent);
     }
 
@@ -361,7 +461,10 @@ mod tests {
     /// states 30.0 and the deployment carried 0.0.
     #[test]
     fn the_final_softcap_reaches_the_deployment() {
-        assert_eq!(deployment(&e2b(), 1_000_000.0, 10_000.0, 1e-6).logit_softcap, 30.0);
+        assert_eq!(
+            deployment(&e2b(), 1_000_000.0, 10_000.0, 1e-6).logit_softcap,
+            30.0
+        );
     }
 
     /// The window schedule the shape holds is the schedule every layer
@@ -414,7 +517,10 @@ mod tests {
         assert_eq!(d.shape.q_heads, 8);
         assert_eq!(d.shape.kv_heads, 2);
         assert_eq!(d.shape.head_dim, 256);
-        assert_eq!(d.shape.head_dim_kernel, 256, "256 is instantiated; nothing pads");
+        assert_eq!(
+            d.shape.head_dim_kernel, 256,
+            "256 is instantiated; nothing pads"
+        );
         assert_eq!(d.shape.intermediate, 8192);
         assert_eq!(d.shape.vocab, 262_400);
         assert_eq!(d.shape.gqa_group(), 4);
@@ -431,7 +537,11 @@ mod tests {
         assert_eq!(d.kv, KvStyle::Paged);
         assert!(d.recurrent.is_none());
         assert_eq!(d.prefill, PrefillStyle::Planned);
-        assert_eq!(d.attn_output, AttnOutput::DriverPinned, "SSA args are gemma-4's");
+        assert_eq!(
+            d.attn_output,
+            AttnOutput::DriverPinned,
+            "SSA args are gemma-4's"
+        );
         assert_eq!(d.norm, NormPlacement::Pre);
         assert!(d.scales.is_empty());
         for a in &d.attention {
@@ -450,7 +560,14 @@ mod tests {
         f.per_layer_intermediate = &[16384; 35];
         f.window_left = &W;
         let m = manifest(&f);
-        let ext = |n: &str| m.tensors.iter().find(|t| t.name == n).expect("stated").extents.clone();
+        let ext = |n: &str| {
+            m.tensors
+                .iter()
+                .find(|t| t.name == n)
+                .expect("stated")
+                .extents
+                .clone()
+        };
         assert_eq!(ext("layer.{}.mlp.gate_proj"), vec![16384, 2048]);
         assert_eq!(ext("embed_tokens_per_layer"), vec![262_400, 35 * 256]);
         assert_eq!(m.layers, 35);

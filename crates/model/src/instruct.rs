@@ -99,8 +99,8 @@ pub trait Instruct: Send + Sync {
 
 // ── The registry ─────────────────────────────────────────────────────
 
-use tokenizer::Tokenizer;
 use std::sync::Arc;
+use tokenizer::Tokenizer;
 
 /// The chat template that speaks for a model.
 ///
@@ -127,7 +127,10 @@ use std::sync::Arc;
 /// cause is a typo in an `--as` override.
 ///
 /// [`Unmatched::NoSuchId`]: crate::catalog::Unmatched::NoSuchId
-pub fn create(id: &str, tokenizer: Arc<Tokenizer>) -> Result<Arc<dyn Instruct>, crate::catalog::Unmatched> {
+pub fn create(
+    id: &str,
+    tokenizer: Arc<Tokenizer>,
+) -> Result<Arc<dyn Instruct>, crate::catalog::Unmatched> {
     let row = crate::catalog::find(id).ok_or_else(|| crate::catalog::Unmatched::NoSuchId {
         id: id.to_string(),
         nearest: crate::catalog::nearest_ids(id, 3),

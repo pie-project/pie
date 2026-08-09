@@ -288,7 +288,10 @@ mod tests {
             err.to_string().contains("no-such-model-9000"),
             "the refusal must name the id it could not place: {err}"
         );
-        assert!(matches!(err, LoadPlanError::Unidentified(Unmatched::NoSuchId { .. })));
+        assert!(matches!(
+            err,
+            LoadPlanError::Unidentified(Unmatched::NoSuchId { .. })
+        ));
     }
 
     /// An override that names a REAL row still gets its manifest
@@ -313,7 +316,10 @@ mod tests {
             Binding::MLX_IN_PLACE,
         )
         .expect_err("an empty checkpoint is not that row either");
-        assert!(matches!(err, LoadPlanError::Unidentified(Unmatched::NoRow { .. })));
+        assert!(matches!(
+            err,
+            LoadPlanError::Unidentified(Unmatched::NoRow { .. })
+        ));
         assert!(
             err.to_string().contains(known),
             "the diff names the row that was asked for: {err}"
@@ -324,7 +330,9 @@ mod tests {
     /// `?`.
     #[test]
     fn an_unmatched_converts_without_losing_its_message() {
-        let u = Unmatched::Ambiguous { ids: vec!["a", "b"] };
+        let u = Unmatched::Ambiguous {
+            ids: vec!["a", "b"],
+        };
         let e: LoadPlanError = u.clone().into();
         assert_eq!(e, LoadPlanError::Unidentified(u.clone()));
         assert_eq!(e.to_string(), u.to_string());

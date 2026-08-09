@@ -45,7 +45,7 @@ use clap::Args;
 use model_loader::checkpoint::meta::{SOURCE_KEY, VERSION_KEY, meta_name};
 use model_loader::checkpoint::read::parse_checkpoint_metadata;
 use model_loader::checkpoint::write::CheckpointWriter;
-use model_loader::executor::host::Progress;
+use model_loader::executor::Progress;
 use model_loader::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 use model_loader::types::Visibility;
 use model::facts::ModelFacts;
@@ -289,19 +289,18 @@ pub fn run(args: BuildArgs) -> Result<crate::ui::Answer> {
 
     let mut bar = ProgressLine::new();
     let mut spool = Spool::create(&out_file)?;
-    model_loader::executor::host::execute_plan_into(
-        &plan,
-        &source.base(),
-        &mut spool,
-        &mut |progress| {
+    model_loader::executor::Execution::new(&plan, &source.base())
+        .streaming()
+        .sink(&mut spool)
+        .progress(&mut |progress| {
             bar.render(&Progress {
                 read_bytes: progress.read_bytes,
                 total_read_bytes: progress.total_read_bytes,
                 finalized: progress.finalized,
             });
-        },
-    )
-    .map_err(|err| anyhow!("materializing failed: {err}"))?;
+        })
+        .run()
+        .map_err(|err| anyhow!("materializing failed: {err}"))?;
 
     let provenance = BTreeMap::from([
         (VERSION_KEY.to_string(), pie_version().to_string()),

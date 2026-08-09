@@ -6,8 +6,8 @@
 
 #![allow(clippy::print_stdout)]
 
-use driver_metal::device::SMALLEST_CLASS;
 use driver_metal::Error;
+use driver_metal::device::SMALLEST_CLASS;
 use driver_metal::device::{Context, Pool, Stepper, Tables};
 use driver_metal::program::Compiler;
 

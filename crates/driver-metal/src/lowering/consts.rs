@@ -13,8 +13,8 @@
 //! ssm/gdn_params.h}`), with size asserts standing in for the C++
 //! `static_assert`s.
 
-use crate::lowering::abi::Kernel;
 use crate::batch::geometry::DecodeGeometry;
+use crate::lowering::abi::Kernel;
 
 /// A projection's in/out vector lengths, from geometry — matching the
 /// staged weight shapes. The split-K rule needs K, not just the output
@@ -246,10 +246,7 @@ mod tests {
             moe_intermediate: 768,
             ..DecodeGeometry::default()
         };
-        assert_eq!(
-            qmv_kn(Kernel::ExpertGate, &routed),
-            KN { k: 1024, n: 768 }
-        );
+        assert_eq!(qmv_kn(Kernel::ExpertGate, &routed), KN { k: 1024, n: 768 });
         assert!(is_routed(Kernel::ExpertDown));
         assert!(!is_routed(Kernel::Router));
     }

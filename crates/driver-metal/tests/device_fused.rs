@@ -18,8 +18,8 @@ use driver_api::plan::{
     EmittedKernel, LaunchOp, LaunchPackage, LaunchPlanValue, LaunchRegion, LaunchStage,
     LaunchStagePlan,
 };
-use driver_metal::channel::{ExecPlan, StatusOutcome, Versions, adopt_launch_package};
 use driver_metal::Error;
+use driver_metal::channel::{ExecPlan, StatusOutcome, Versions, adopt_launch_package};
 use driver_metal::device::{Archives, Context, Externals, Pool, Stepper, Tables};
 use driver_metal::program::{DeviceInputs, Prepare, Runtime};
 use tensor_ir::op::tags;

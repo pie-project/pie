@@ -250,13 +250,21 @@ impl<'a> Deployed<'a> {
     /// One rank, no host scalars — what a single-GPU boot passes.
     #[must_use]
     pub fn single() -> Self {
-        Self { backend: Backend::Cuda, tp_size: 1, layer_scalars: &[] }
+        Self {
+            backend: Backend::Cuda,
+            tp_size: 1,
+            layer_scalars: &[],
+        }
     }
 
     /// One rank on Metal, with what that load observed.
     #[must_use]
     pub fn metal(binding: &'a MetalBinding) -> Self {
-        Self { backend: Backend::Metal(binding), tp_size: 1, layer_scalars: &[] }
+        Self {
+            backend: Backend::Metal(binding),
+            tp_size: 1,
+            layer_scalars: &[],
+        }
     }
 }
 
@@ -461,8 +469,10 @@ pub fn arches() -> Vec<&'static str> {
 /// requirement is that `qwen3-0.6` puts `qwen3-0.6b` first.
 #[must_use]
 pub fn nearest_ids(id: &str, take: usize) -> Vec<&'static str> {
-    let mut scored: Vec<(usize, &'static str)> =
-        ids().into_iter().map(|k| (edit_distance(id, k), k)).collect();
+    let mut scored: Vec<(usize, &'static str)> = ids()
+        .into_iter()
+        .map(|k| (edit_distance(id, k), k))
+        .collect();
     scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
     scored.into_iter().take(take).map(|(_, k)| k).collect()
 }
@@ -490,7 +500,9 @@ pub enum Unmatched {
     ///
     /// The DIFF rather than a bare "unsupported", because the useful
     /// question after a refusal is which row was close and by how much.
-    NoRow { nearest: Vec<(&'static str, String)> },
+    NoRow {
+        nearest: Vec<(&'static str, String)>,
+    },
     /// More than one row matched, which is a defect in the TABLE — two
     /// variants that no checkpoint can tell apart are one variant.
     Ambiguous { ids: Vec<&'static str> },
@@ -501,7 +513,10 @@ pub enum Unmatched {
     /// is a typo — `qwen3-0.6` for `qwen3-0.6b` — and a refusal that
     /// makes the operator go and read a list is a refusal that could
     /// have just told them.
-    NoSuchId { id: String, nearest: Vec<&'static str> },
+    NoSuchId {
+        id: String,
+        nearest: Vec<&'static str>,
+    },
 }
 
 impl std::fmt::Display for Unmatched {
@@ -583,9 +598,9 @@ pub const GEOMETRIC_TWINS: &[&[&str]] = &[&["llama-3.1-70b", "llama-3.3-70b"]];
 /// declaration is now stale.
 #[must_use]
 pub fn are_declared_twins(ids: &[&str]) -> bool {
-    GEOMETRIC_TWINS.iter().any(|set| {
-        set.len() == ids.len() && set.iter().all(|id| ids.contains(id))
-    })
+    GEOMETRIC_TWINS
+        .iter()
+        .any(|set| set.len() == ids.len() && set.iter().all(|id| ids.contains(id)))
 }
 
 #[cfg(feature = "contract")]
@@ -627,7 +642,9 @@ mod identify {
                 .manifest()
                 .check(&observed)
                 .map(|()| row)
-                .map_err(|why| Unmatched::NoRow { nearest: vec![(row.id(), why.to_string())] });
+                .map_err(|why| Unmatched::NoRow {
+                    nearest: vec![(row.id(), why.to_string())],
+                });
         }
 
         let mut matched: Vec<&'static dyn Variant> = Vec::new();
@@ -696,13 +713,19 @@ mod tests {
             // `LlamaInstruct` is a DIFFERENT type with the same name,
             // which is exactly why this one cannot just be deleted and
             // pointed at that.
-            ("llama_2", "the [INST] template; no Llama 2 row is transcribed"),
+            (
+                "llama_2",
+                "the [INST] template; no Llama 2 row is transcribed",
+            ),
             // R1's `<think>` turn, which now lives in
             // `shared::deepseek` — `deepseek_v4` adopted it, so the
             // template is reachable and this directory is not. What is
             // left here is a re-export and no row: R1's own geometry is
             // still untranscribed.
-            ("deepseek_r1", "the <think> template; no R1 row is transcribed"),
+            (
+                "deepseek_r1",
+                "the <think> template; no R1 row is transcribed",
+            ),
         ];
 
         let lib = std::fs::read_to_string(
@@ -736,8 +759,7 @@ mod tests {
             declared.len()
         );
 
-        let stated: std::collections::BTreeMap<&str, &str> =
-            NO_ROWS_YET.iter().copied().collect();
+        let stated: std::collections::BTreeMap<&str, &str> = NO_ROWS_YET.iter().copied().collect();
         let mut rowless = Vec::new();
         for m in &declared {
             if gathered.contains(&format!("crate::{m}::rows")) {
@@ -749,8 +771,10 @@ mod tests {
                 rowless.push(*m);
             }
         }
-        let unexplained: Vec<&&str> =
-            rowless.iter().filter(|m| !stated.contains_key(**m)).collect();
+        let unexplained: Vec<&&str> = rowless
+            .iter()
+            .filter(|m| !stated.contains_key(**m))
+            .collect();
         assert!(
             unexplained.is_empty(),
             "{unexplained:?} declare a generation module that `GENERATIONS` does \
@@ -758,8 +782,7 @@ mod tests {
              is a row id. Add `rows()` and an entry in GENERATIONS, or say in \
              NO_ROWS_YET why the generation has none yet."
         );
-        let vanished: Vec<&&str> =
-            stated.keys().filter(|m| !rowless.contains(*m)).collect();
+        let vanished: Vec<&&str> = stated.keys().filter(|m| !rowless.contains(*m)).collect();
         assert!(
             vanished.is_empty(),
             "{vanished:?} are listed as having no rows but declare no module — \
@@ -798,10 +821,14 @@ mod tests {
     fn ids_are_lowercase_and_hyphenated() {
         for id in ids() {
             assert!(
-                id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.'),
+                id.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.'),
                 "'{id}' is not lowercase-hyphenated",
             );
-            assert!(!id.is_empty() && !id.starts_with('-') && !id.ends_with('-'), "'{id}'");
+            assert!(
+                !id.is_empty() && !id.starts_with('-') && !id.ends_with('-'),
+                "'{id}'"
+            );
         }
     }
 
@@ -816,9 +843,11 @@ mod tests {
         for row in catalog() {
             let manifest = row.manifest();
             let implied = crate::manifest::Observed::from_pairs(
-                manifest.tensors.iter().filter(|t| t.presence != crate::manifest::Presence::Absent).map(
-                    |t| (t.name.replace("{}", "0"), t.extents.clone()),
-                ),
+                manifest
+                    .tensors
+                    .iter()
+                    .filter(|t| t.presence != crate::manifest::Presence::Absent)
+                    .map(|t| (t.name.replace("{}", "0"), t.extents.clone())),
             );
             assert!(
                 manifest.check(&implied).is_ok(),
@@ -854,7 +883,10 @@ mod tests {
         assert!(near.len() <= 3);
         assert_eq!(near, nearest_ids("qwen3-0.6", 3), "two calls, one answer");
         if !ids().is_empty() {
-            assert!(!near.is_empty(), "a non-empty table always has a nearest row");
+            assert!(
+                !near.is_empty(),
+                "a non-empty table always has a nearest row"
+            );
         }
     }
 
@@ -870,7 +902,10 @@ mod tests {
         assert!(text.contains("qwen3-0.6b"), "{text}");
         assert!(text.contains("did you mean"), "{text}");
 
-        let bare = Unmatched::NoSuchId { id: "nothing".into(), nearest: vec![] };
+        let bare = Unmatched::NoSuchId {
+            id: "nothing".into(),
+            nearest: vec![],
+        };
         assert!(bare.to_string().contains("pie model list"), "{bare}");
     }
 
@@ -884,9 +919,14 @@ mod tests {
         };
         let text = no_row.to_string();
         assert!(text.contains("matches no model"), "{text}");
-        assert!(text.contains("q_proj"), "the diff is the useful part: {text}");
+        assert!(
+            text.contains("q_proj"),
+            "the diff is the useful part: {text}"
+        );
 
-        let ambiguous = Unmatched::Ambiguous { ids: vec!["a", "b"] };
+        let ambiguous = Unmatched::Ambiguous {
+            ids: vec!["a", "b"],
+        };
         let text = ambiguous.to_string();
         assert!(text.contains("two rows"), "{text}");
         assert!(text.contains('a') && text.contains('b'), "{text}");
@@ -1043,7 +1083,11 @@ mod identify_tests {
             .filter(|t| t.presence != Presence::Absent)
             .enumerate()
             .map(|(i, t)| {
-                let extents = if t.extents.is_empty() { vec![1] } else { t.extents.clone() };
+                let extents = if t.extents.is_empty() {
+                    vec![1]
+                } else {
+                    t.extents.clone()
+                };
                 let elems: u64 = extents.iter().product();
                 RawTensor {
                     id: TensorId(u32::try_from(i).unwrap_or(0)),
@@ -1054,12 +1098,18 @@ mod identify_tests {
                     file_id: FileId(0),
                     file_offset: 0,
                     span_bytes: elems * 2,
-                    shape: extents.iter().map(|&e| i64::try_from(e).unwrap_or(0)).collect(),
+                    shape: extents
+                        .iter()
+                        .map(|&e| i64::try_from(e).unwrap_or(0))
+                        .collect(),
                     encoding: Encoding::Raw(DType::BF16),
                 }
             })
             .collect();
-        CheckpointMetadata { files: Vec::new(), tensors }
+        CheckpointMetadata {
+            files: Vec::new(),
+            tensors,
+        }
     }
 
     /// NO TWO ROWS ARE INDISTINGUISHABLE BY TENSORS, except where the
@@ -1087,8 +1137,7 @@ mod identify_tests {
             let metadata = checkpoint_of(*row);
             match identify(&metadata, &Override::None) {
                 Ok(found) if found.id() == row.id() => {}
-                Ok(found) => collisions
-                    .push(format!("{} identified as {}", row.id(), found.id())),
+                Ok(found) => collisions.push(format!("{} identified as {}", row.id(), found.id())),
                 Err(Unmatched::Ambiguous { ids }) if are_declared_twins(&ids) => {
                     twinned.push(row.id());
                 }
@@ -1130,7 +1179,8 @@ mod identify_tests {
     fn a_declared_twin_still_loads_when_the_caller_names_it() {
         for set in GEOMETRIC_TWINS {
             for id in *set {
-                let row = find(id).unwrap_or_else(|| panic!("{id} is declared but not in the catalog"));
+                let row =
+                    find(id).unwrap_or_else(|| panic!("{id} is declared but not in the catalog"));
                 let metadata = checkpoint_of(row);
                 let found = identify(&metadata, &Override::Id((*id).to_string()))
                     .unwrap_or_else(|e| panic!("{id} named explicitly and still refused: {e}"));
@@ -1162,7 +1212,10 @@ mod identify_tests {
         let Err(Unmatched::NoRow { nearest }) = identify(&metadata, &Override::None) else {
             panic!("a two-by-two embedding is no model in this catalog");
         };
-        assert!(!nearest.is_empty(), "a refusal with no near miss is not a diagnosis");
+        assert!(
+            !nearest.is_empty(),
+            "a refusal with no near miss is not a diagnosis"
+        );
         assert!(nearest.len() <= 3, "the three closest, not the whole table");
         for (id, why) in &nearest {
             assert!(!id.is_empty() && !why.is_empty(), "{id}: {why}");
@@ -1183,13 +1236,18 @@ mod identify_tests {
 
         let matching = checkpoint_of(row);
         assert_eq!(
-            identify(&matching, &chosen).map(|r| r.id()).unwrap_or("<refused>"),
+            identify(&matching, &chosen)
+                .map(|r| r.id())
+                .unwrap_or("<refused>"),
             row.id(),
             "the named row accepts the checkpoint it describes",
         );
 
         // The same request against a checkpoint that is plainly not it.
-        let empty = CheckpointMetadata { files: Vec::new(), tensors: Vec::new() };
+        let empty = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: Vec::new(),
+        };
         let refused = identify(&empty, &chosen);
         assert!(
             matches!(refused, Err(Unmatched::NoRow { .. })),
@@ -1204,7 +1262,10 @@ mod identify_tests {
     fn an_override_with_an_unknown_id_suggests_rather_than_guesses() {
         let real = catalog().first().expect("the catalog is not empty").id();
         let typo = format!("{real}x");
-        let metadata = CheckpointMetadata { files: Vec::new(), tensors: Vec::new() };
+        let metadata = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: Vec::new(),
+        };
         let Err(Unmatched::NoSuchId { id, nearest }) =
             identify(&metadata, &Override::Id(typo.clone()))
         else {

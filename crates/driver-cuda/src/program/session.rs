@@ -42,11 +42,11 @@ use driver::driver_api::plan::LaunchStagePlan;
 use driver::tensor_ir::DType;
 use driver::tensor_ir::op::IntrinsicId;
 
+use super::channel::{ChannelShape, Rings};
 use super::channel::{HostChannel, StageChannels};
+use super::launch_control;
 use super::run::Control;
 use super::run::Prepared;
-use super::launch_control;
-use super::channel::{ChannelShape, Rings};
 use super::runtime::Compiled;
 use crate::device::{Allocator, StreamRef};
 use crate::error::{Error, Result};
@@ -90,11 +90,7 @@ impl Session {
     /// # Errors
     ///
     /// If the shapes are empty or the device refuses the allocation.
-    pub fn new(
-        alloc: &Allocator,
-        shapes: &[ChannelShape],
-        stream: StreamRef<'_>,
-    ) -> Result<Self> {
+    pub fn new(alloc: &Allocator, shapes: &[ChannelShape], stream: StreamRef<'_>) -> Result<Self> {
         Ok(Self {
             rings: Rings::new(alloc, shapes, stream)?,
             shapes: shapes.to_vec(),
@@ -275,8 +271,13 @@ impl Session {
         // would be each member's. The fire takes the pairing rather
         // than one ring set, so the caller cannot group instances and
         // silently have them share channels.
-        let members: Vec<Lane<'_>> =
-            lane_extents.iter().map(|&extents| Lane { rings: &self.rings, extents }).collect();
+        let members: Vec<Lane<'_>> = lane_extents
+            .iter()
+            .map(|&extents| Lane {
+                rings: &self.rings,
+                extents,
+            })
+            .collect();
         let mut prepared = Prepared::build(alloc, plan, &members, stream)?;
         let (base, vocab, row_stride) = logits;
         if base != 0 {
@@ -359,7 +360,10 @@ mod tests {
     /// every device call in `fire`, which is the property being asserted.
     #[test]
     fn a_two_stage_program_is_refused_rather_than_run_against_one_prepared() {
-        let stage = || Stage { signature_hash: 0, regions: Arc::new(Vec::new()) };
+        let stage = || Stage {
+            signature_hash: 0,
+            regions: Arc::new(Vec::new()),
+        };
         let two = Compiled {
             stages: Arc::new(vec![stage(), stage()]),
             plans: Arc::new(vec![

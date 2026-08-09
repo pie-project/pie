@@ -33,7 +33,7 @@ pub type KimiMoeFacts = model_compiler::facts::MoeFacts;
 /// the dense MLP — is a RULE (`dense_layers`, a prefix length) and was
 /// never a table. A stack that wrote the prefix out longhand would be
 /// stating 61 booleans where `first_k_dense_replace` states one number.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KimiFacts {
     pub layers: u32,
     pub vocab: u32,
@@ -73,6 +73,13 @@ impl KimiFacts {
             moe: KimiMoeFacts {
                 num_experts: 384,
                 top_k: 8,
+                // `moonshotai/Kimi-K2-Instruct` publishes `"norm_topk_prob":
+                // false` -- this lineage routes on weights that sum to
+                // less than one, and its `routed_scaling_factor` of 2.0
+                // is the compensation.
+                norm_topk_prob: false,
+                // K2 publishes 2.0.
+                routed_scaling: 2.0,
                 moe_intermediate: 2048,
                 shared_intermediate: 2048,
             },

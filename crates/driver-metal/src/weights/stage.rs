@@ -4,7 +4,7 @@
 //! The C++ (`loader/heap_bind.cpp::stage_decode_storage`) allocates each
 //! region and stages the load plan's weights with its own transform loops.
 //! This port allocates the same regions, but the weights come from
-//! `model_loader::executor::host::execute_plan` — the engine `transcode.hpp`
+//! `model_loader::executor::Execution` — the engine `transcode.hpp`
 //! was a mirror of (see `.wiki/driver/progress-metal.md`) — so every TileMap the plan
 //! carries (MXFP4 decode, affine encode, casts) has already run by the time
 //! a byte reaches the device buffer.
@@ -26,21 +26,22 @@
 //! * elastic sizing of KV/scratch (`alloc_zeroed`'s initial-commit
 //!   parameter) — regions allocate at full size for now.
 
-use std::borrow::Cow;
+use std::ptr::NonNull;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use model_loader::error::Error as LoaderError;
-use model_loader::executor::host::execute_plan_into_backing;
+use model_loader::executor::Execution;
+use model_loader::executor::chunked::{Chunk, Chunked, chunk_of};
 use model_loader::plan::LoadPlan;
 use model_loader::plan::spans::{Span, publish_spans};
 
-use crate::layout::region::Region as _;
+use crate::layout::region::Region;
 use crate::{Error, Result};
 
+use crate::device::allocation::Allocation;
 use crate::device::context::Context;
 use crate::device::handle::Handle;
-use crate::device::allocation::Allocation;
 
 /// Whether a model of `bytes` may be staged on this device, and why not.
 ///
@@ -175,7 +176,11 @@ pub fn stage_plan_weights(
     let mut chunks = Vec::with_capacity(cuts.len());
     for (i, span) in cuts.windows(2).enumerate() {
         let _ = i;
-        chunks.push(Allocation::new(context, span[1] - span[0], "weights region")?);
+        chunks.push(Allocation::new(
+            context,
+            span[1] - span[0],
+            "weights region",
+        )?);
     }
 
     let mut sink = Outside {
@@ -183,12 +188,14 @@ pub fn stage_plan_weights(
         tensors: Vec::new(),
     };
     {
-                let mut backing = Chunked {
-            chunks: &chunks,
-            cuts: &cuts,
-            len: usize::try_from(arena_len).unwrap_or(usize::MAX),
-        };
-        execute_plan_into_backing(plan, snapshot_dir, &mut backing, &mut sink, &mut |_| {})
+        let mut backing = Chunked::new(&chunks, &cuts).map_err(|err| Error::Create {
+            what: "staged weights",
+            message: err.to_string(),
+        })?;
+        Execution::new(plan, snapshot_dir)
+            .arena(&mut backing)
+            .sink(&mut sink)
+            .run()
             .map_err(|err| Error::Create {
                 what: "staged weights",
                 message: err.to_string(),
@@ -272,123 +279,27 @@ fn cut_at_tensor_boundaries(
     cuts
 }
 
-/// Which chunk holds `offset`.
-fn chunk_of(cuts: &[u64], offset: u64) -> usize {
-    cuts.partition_point(|&c| c <= offset).saturating_sub(1)
-}
-
-/// The staged weights as one address space, over the chunks they live in.
+/// `Allocation` as a span the loader may address.
 ///
-/// The executor writes by arena offset and knows nothing about buffers; this
-/// turns each offset into a chunk and an offset inside it, splitting any
-/// access that crosses a cut. Reads that stay inside one chunk are lent, not
-/// copied — the trait's `Cow` is for exactly this.
-struct Chunked<'a> {
-    chunks: &'a [Allocation],
-    cuts: &'a [u64],
-    len: usize,
-}
+/// The whole of what `model_loader::executor::chunked` needs from this
+/// driver: a host-visible pointer and a length. The arithmetic over them is
+/// the loader's, because the arena is the loader's — see that module for why
+/// it is not `executor::metal`.
+///
+/// # Safety
+///
+/// `Allocation` owns its `MTLBuffer`, so distinct allocations cannot overlap,
+/// and `contents` stays valid for `len` bytes for as long as the allocation
+/// is held.
+unsafe impl Chunk for Allocation {
+    fn base(&self) -> NonNull<u8> {
+        self.contents().cast::<u8>()
+    }
 
-impl Chunked<'_> {
-    /// Call `f(chunk, offset_in_chunk, len)` for each piece of `offset..offset + len`.
-    fn pieces(&self, offset: u64, len: u64, mut f: impl FnMut(usize, u64, u64)) {
-        let (mut at, end) = (offset, offset + len);
-        while at < end {
-            let i = chunk_of(self.cuts, at);
-            let stop = end.min(self.cuts[i + 1]);
-            f(i, at - self.cuts[i], stop - at);
-            at = stop;
-        }
+    fn len(&self) -> u64 {
+        Region::len(self)
     }
 }
-
-impl model_loader::executor::arena::ArenaBacking for Chunked<'_> {
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn read(&self, offset: usize, len: usize) -> std::result::Result<Cow<'_, [u8]>, LoaderError> {
-        let (offset, len) = (offset as u64, len as u64);
-        self.bounds(offset, len)?;
-        let i = chunk_of(self.cuts, offset);
-        if offset + len <= self.cuts[i + 1] {
-            // SAFETY: inside the chunk, and the executor is the only writer.
-            return Ok(Cow::Borrowed(unsafe {
-                std::slice::from_raw_parts(
-                    self.chunks[i]
-                        .contents()
-                        .cast::<u8>()
-                        .as_ptr()
-                        .add((offset - self.cuts[i]) as usize),
-                    len as usize,
-                )
-            }));
-        }
-        let mut out = Vec::with_capacity(len as usize);
-        self.pieces(offset, len, |i, at, n| {
-            // SAFETY: as above.
-            out.extend_from_slice(unsafe {
-                std::slice::from_raw_parts(
-                    self.chunks[i].contents().cast::<u8>().as_ptr().add(at as usize),
-                    n as usize,
-                )
-            });
-        });
-        Ok(Cow::Owned(out))
-    }
-
-    fn write(&mut self, offset: usize, bytes: &[u8]) -> std::result::Result<(), LoaderError> {
-        let offset = offset as u64;
-        self.bounds(offset, bytes.len() as u64)?;
-        let mut taken = 0usize;
-        let mut failed = None;
-        self.pieces(offset, bytes.len() as u64, |i, at, n| {
-            let n = n as usize;
-            // SAFETY: `pieces` keeps every span inside its chunk, and no GPU
-            // work references these buffers until staging returns.
-            if let Err(err) = unsafe { self.chunks[i].write(at, &bytes[taken..taken + n]) } {
-                failed = Some(err);
-            }
-            taken += n;
-        });
-        match failed {
-            None => Ok(()),
-            Some(err) => Err(LoaderError::Internal(err.to_string())),
-        }
-    }
-
-    fn fill(&mut self, offset: usize, len: usize, byte: u8) -> std::result::Result<(), LoaderError> {
-        let (offset, len) = (offset as u64, len as u64);
-        self.bounds(offset, len)?;
-        self.pieces(offset, len, |i, at, n| {
-            // SAFETY: as `write`.
-            let dst = unsafe {
-                std::slice::from_raw_parts_mut(
-                    self.chunks[i].contents().cast::<u8>().as_ptr().add(at as usize),
-                    n as usize,
-                )
-            };
-            dst.fill(byte);
-        });
-        Ok(())
-    }
-}
-
-impl Chunked<'_> {
-    /// The range is inside the arena.
-    fn bounds(&self, offset: u64, len: u64) -> std::result::Result<(), LoaderError> {
-        if offset + len > *self.cuts.last().unwrap_or(&0) {
-            return Err(LoaderError::Overflow(format!(
-                "{len} bytes at {offset} leaves a {}-byte arena",
-                self.len
-            )));
-        }
-        Ok(())
-    }
-}
-
-
-
 
 #[cfg(test)]
 mod tests {
@@ -442,17 +353,23 @@ mod tests {
         let mut spans = std::collections::BTreeMap::new();
         let mut at = 0u64;
         for i in 0..6 {
-            spans.insert(format!("t{i}"), model_loader::plan::spans::Span {
-                offset: at,
-                bytes: big,
-            });
+            spans.insert(
+                format!("t{i}"),
+                model_loader::plan::spans::Span {
+                    offset: at,
+                    bytes: big,
+                },
+            );
             at += big;
         }
         let huge = 3 * (1u64 << 30);
-        spans.insert("straddler".to_string(), model_loader::plan::spans::Span {
-            offset: at,
-            bytes: huge,
-        });
+        spans.insert(
+            "straddler".to_string(),
+            model_loader::plan::spans::Span {
+                offset: at,
+                bytes: huge,
+            },
+        );
         at += huge;
 
         let published = model_loader::plan::spans::Published {
@@ -461,7 +378,10 @@ mod tests {
         };
         let cuts = cut_at_tensor_boundaries(&published, at, at);
 
-        assert!(cuts.len() > 2, "7.1 GiB of weights does not fit one chunk: {cuts:?}");
+        assert!(
+            cuts.len() > 2,
+            "7.1 GiB of weights does not fit one chunk: {cuts:?}"
+        );
         for span in spans.values() {
             let start = chunk_of(&cuts, span.offset);
             let last = chunk_of(&cuts, span.offset + span.bytes - 1);

@@ -49,8 +49,8 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use driver_metal::device::{Allocation, Context};
-use driver_metal::program::Compiler;
 use driver_metal::layout::region::Region as _;
+use driver_metal::program::Compiler;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLDevice, MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor,
@@ -115,7 +115,11 @@ fn a_fire_can_be_recorded_once_and_replayed() {
                 encoder.dispatch([16, 1, 1], [16, 1, 1])
             })
             .expect("the control fires");
-        assert_eq!(read(&a), vec![7u32; 16], "the control fires, so the probe is sound");
+        assert_eq!(
+            read(&a),
+            vec![7u32; 16],
+            "the control fires, so the probe is sound"
+        );
         // SAFETY: retired.
         unsafe { a.zero(0, a.len()).expect("re-zero for the ICB run") };
     }
@@ -154,7 +158,9 @@ fn a_fire_can_be_recorded_once_and_replayed() {
     // its commands out of, and this context tracks nothing automatically
     // (`HazardTrackingModeUntracked`, one residency set). Without this the
     // execute below faults -- measured, SIGSEGV.
-    context.residency().addAllocation(ProtocolObject::from_ref(&*icb));
+    context
+        .residency()
+        .addAllocation(ProtocolObject::from_ref(&*icb));
     context.residency().commit();
     context.residency().requestResidency();
 
@@ -202,24 +208,17 @@ fn a_fire_can_be_recorded_once_and_replayed() {
 }
 
 /// Run `count` commands of `icb` and wait.
-fn execute(
-    context: &Context,
-    icb: &ProtocolObject<dyn MTLIndirectCommandBuffer>,
-    count: usize,
-) {
+fn execute(context: &Context, icb: &ProtocolObject<dyn MTLIndirectCommandBuffer>, count: usize) {
     let mut stepper = driver_metal::device::Stepper::new(context).expect("a stepper");
     stepper
-        .run(|encoder| {
-            encoder.execute_commands(icb, 0..count)
-        })
+        .run(|encoder| encoder.execute_commands(icb, 0..count))
         .expect("the ICB executes");
 }
 
 fn read(handle: &driver_metal::device::Handle) -> Vec<u32> {
     // SAFETY: the fire has retired, so the host owns the bytes.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(handle.contents().as_ptr().cast::<u8>(), 16 * 4)
-    };
+    let bytes =
+        unsafe { std::slice::from_raw_parts(handle.contents().as_ptr().cast::<u8>(), 16 * 4) };
     bytes
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -235,11 +234,11 @@ fn read(handle: &driver_metal::device::Handle) -> Vec<u32> {
 /// The number it prints is the one `.wiki/driver/graph-metal.md` is about.
 #[test]
 fn a_whole_fire_records_and_replays_faster_than_it_encodes() {
+    use driver_metal::bind::encode::{Params, Pipelines, commands, encode};
     use driver_metal::device::{Regions, Stepper, record};
     use driver_metal::lowering::dispatch::{Geometry, plan};
-    use driver_metal::bind::encode::{Params, Pipelines, commands, encode};
-    use driver_metal::lowering::executor::{Frame, Slice};
     use driver_metal::lowering::dispatch::{table, table_width};
+    use driver_metal::lowering::executor::{Frame, Slice};
     use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
     use model::shared::llama_like::forward::llama_like_metal;
     use model_compiler::lower::{Fire, Row, lower};
@@ -276,7 +275,8 @@ fn a_whole_fire_records_and_replays_faster_than_it_encodes() {
     // One big region answers every name, and it is REGISTERED so the
     // recording can turn an address back into a buffer.
     let backing = Allocation::new(&context, 256 << 20, "sentinels").expect("a region");
-    let arena = Allocation::new(&context, (lowered.arena_bytes as u64).max(1), "arena").expect("arena");
+    let arena =
+        Allocation::new(&context, (lowered.arena_bytes as u64).max(1), "arena").expect("arena");
     let zeros = Allocation::new(&context, 1 << 20, "fire tables").expect("a region");
     // SAFETY: freshly allocated, nothing encoded against it.
     unsafe { zeros.zero(0, zeros.len()).expect("zeroes") };
@@ -304,12 +304,10 @@ fn a_whole_fire_records_and_replays_faster_than_it_encodes() {
         n_experts: 0,
         experts_per_token: 0,
     };
-    let dispatches =
-        plan(&lowered, table(), frame, geometry, &mut store).expect("the fire plans");
+    let dispatches = plan(&lowered, table(), frame, geometry, &mut store).expect("the fire plans");
     let params = Params::stage(&context, &dispatches).expect("scalars stage");
-    let argtable =
-        driver_metal::device::ArgumentTable::new(&context, table_width(&dispatches))
-            .expect("an argument table");
+    let argtable = driver_metal::device::ArgumentTable::new(&context, table_width(&dispatches))
+        .expect("an argument table");
     pipelines
         .ensure(&context, &compiler, &dispatches)
         .expect("every symbol compiles");
@@ -535,7 +533,9 @@ fn a_recorded_commands_buffer_offset_is_truncated_to_thirty_two_bits() {
     {
         let table = driver_metal::device::ArgumentTable::new(&context, 2).expect("a table");
         table.bind_address(0, out.gpu_address()).expect("binds");
-        table.bind_address(1, big.gpu_address() + AT).expect("binds");
+        table
+            .bind_address(1, big.gpu_address() + AT)
+            .expect("binds");
         let mut stepper = driver_metal::device::Stepper::new(&context).expect("a stepper");
         stepper
             .run(|encoder| {
@@ -573,8 +573,12 @@ fn a_recorded_commands_buffer_offset_is_truncated_to_thirty_two_bits() {
             )
     }
     .expect("the device makes an indirect command buffer for compute");
-    context.residency().addAllocation(ProtocolObject::from_ref(&*icb));
-    context.residency().addAllocation(ProtocolObject::from_ref(big.buffer()));
+    context
+        .residency()
+        .addAllocation(ProtocolObject::from_ref(&*icb));
+    context
+        .residency()
+        .addAllocation(ProtocolObject::from_ref(big.buffer()));
     context.residency().commit();
     context.residency().requestResidency();
 
@@ -588,8 +592,16 @@ fn a_recorded_commands_buffer_offset_is_truncated_to_thirty_two_bits() {
         command.setKernelBuffer_offset_atIndex(big.buffer(), AT as usize, 1);
     }
     command.concurrentDispatchThreads_threadsPerThreadgroup(
-        MTLSize { width: 16, height: 1, depth: 1 },
-        MTLSize { width: 16, height: 1, depth: 1 },
+        MTLSize {
+            width: 16,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 16,
+            height: 1,
+            depth: 1,
+        },
     );
 
     execute(&context, &icb, 1);

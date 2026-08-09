@@ -24,11 +24,11 @@
 
 use std::ffi::c_void;
 
-use super::kv_cache::KvCacheLayout;
 use super::kv_cache;
-use crate::layout::KvCacheFormat;
+use super::kv_cache::KvCacheLayout;
 use crate::dtype::DType;
 use crate::error::Result;
+use crate::layout::KvCacheFormat;
 
 /// What the live cache asks of the device.
 pub trait KvCacheDeviceOps {
@@ -105,7 +105,11 @@ impl<'a> LiveKvCacheOps<'a> {
         stream: crate::device::StreamRef<'a>,
         alloc: &'a crate::device::Allocator,
     ) -> Self {
-        Self { stream, alloc, held: Vec::new() }
+        Self {
+            stream,
+            alloc,
+            held: Vec::new(),
+        }
     }
 
     /// Bytes this object has allocated.
@@ -220,7 +224,9 @@ struct Tier {
 
 impl Tier {
     fn with_capacity(n: usize) -> Self {
-        Self { ptrs: Vec::with_capacity(n) }
+        Self {
+            ptrs: Vec::with_capacity(n),
+        }
     }
     fn at(&self, idx: usize) -> *mut c_void {
         self.ptrs[idx]
@@ -257,10 +263,7 @@ impl<E: ElasticPool> KvCache<E> {
     /// the storage pair, the scale pair, the mirror pair; then the envelope
     /// tier behind the arena escape, seeding each owning slot as its pair
     /// lands, then one stream sync for all of them.
-    pub fn materialize<O: KvCacheDeviceOps>(
-        layout: KvCacheLayout,
-        ops: &mut O,
-    ) -> Result<Self> {
+    pub fn materialize<O: KvCacheDeviceOps>(layout: KvCacheLayout, ops: &mut O) -> Result<Self> {
         let n = layout.slots().len();
         let mut k = Tier::with_capacity(n);
         let mut v = Tier::with_capacity(n);
@@ -350,10 +353,26 @@ impl<E: ElasticPool> KvCache<E> {
             v_pages: self.v.at(s),
             k_scales: self.k_scale.at(s),
             v_scales: self.v_scale.at(s),
-            k_bf16_pages: if native { self.k.at(s) } else { self.k_bf16.at(s) },
-            v_bf16_pages: if native { self.v.at(s) } else { self.v_bf16.at(s) },
-            k_env_min: if env { self.k_env_min.at(s).cast() } else { std::ptr::null_mut() },
-            k_env_max: if env { self.k_env_max.at(s).cast() } else { std::ptr::null_mut() },
+            k_bf16_pages: if native {
+                self.k.at(s)
+            } else {
+                self.k_bf16.at(s)
+            },
+            v_bf16_pages: if native {
+                self.v.at(s)
+            } else {
+                self.v_bf16.at(s)
+            },
+            k_env_min: if env {
+                self.k_env_min.at(s).cast()
+            } else {
+                std::ptr::null_mut()
+            },
+            k_env_max: if env {
+                self.k_env_max.at(s).cast()
+            } else {
+                std::ptr::null_mut()
+            },
             hnd_layout: self.layout.page_order() == kv_cache::PageOrder::Hnd,
             native_bf16: native,
         }
@@ -388,14 +407,22 @@ impl<E: ElasticPool> KvCache<E> {
     #[must_use]
     pub fn k_for_attention(&self, layer: i32) -> *mut c_void {
         let s = self.src(layer);
-        if self.layout.format().is_native_bf16() { self.k.at(s) } else { self.k_bf16.at(s) }
+        if self.layout.format().is_native_bf16() {
+            self.k.at(s)
+        } else {
+            self.k_bf16.at(s)
+        }
     }
 
     /// The V side likewise.
     #[must_use]
     pub fn v_for_attention(&self, layer: i32) -> *mut c_void {
         let s = self.src(layer);
-        if self.layout.format().is_native_bf16() { self.v.at(s) } else { self.v_bf16.at(s) }
+        if self.layout.format().is_native_bf16() {
+            self.v.at(s)
+        } else {
+            self.v_bf16.at(s)
+        }
     }
 
     /// The buffers the swap path copies for `layer`, in the C++'s order:
@@ -410,13 +437,25 @@ impl<E: ElasticPool> KvCache<E> {
         let hd = u32::try_from(self.layout.head_dim_at(src).max(0)).unwrap_or(0);
         let kv = f.kv_bytes_per_page(psz, kvh, hd);
         let mut out = vec![
-            PageBuffer { data: self.k.at(s), page_bytes: kv },
-            PageBuffer { data: self.v.at(s), page_bytes: kv },
+            PageBuffer {
+                data: self.k.at(s),
+                page_bytes: kv,
+            },
+            PageBuffer {
+                data: self.v.at(s),
+                page_bytes: kv,
+            },
         ];
         let scale = f.scale_bytes_per_page(psz, kvh, hd);
         if scale > 0 {
-            out.push(PageBuffer { data: self.k_scale.at(s), page_bytes: scale });
-            out.push(PageBuffer { data: self.v_scale.at(s), page_bytes: scale });
+            out.push(PageBuffer {
+                data: self.k_scale.at(s),
+                page_bytes: scale,
+            });
+            out.push(PageBuffer {
+                data: self.v_scale.at(s),
+                page_bytes: scale,
+            });
         }
         out
     }
@@ -455,7 +494,9 @@ impl<E: ElasticPool> KvCache<E> {
     /// Bytes the pool currently backs; `0` with no pool attached.
     #[must_use]
     pub fn committed_bytes(&self) -> usize {
-        self.elastic.as_ref().map_or(0, ElasticPool::committed_bytes)
+        self.elastic
+            .as_ref()
+            .map_or(0, ElasticPool::committed_bytes)
     }
 
     /// Whether the envelope tier exists on this cache.

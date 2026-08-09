@@ -42,7 +42,6 @@ pub fn author_dense(b: &mut Builder<'_>) -> Result<(), Error> {
     b.publish_remaining()
 }
 
-
 /// The Metal lowering of the llama-shaped families: rename for MLX's binder,
 /// bind in place. Ported from
 /// `crates/driver-metal/csrc/src/model/llama/llama_contract.hpp` — what is

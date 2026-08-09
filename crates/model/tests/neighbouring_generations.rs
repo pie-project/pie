@@ -94,7 +94,12 @@ fn the_olmo_generations_advertise_different_labels() {
             .deployment(Deployed::single())
             .expect("servable")
             .advertised;
-        assert_ne!(a.arch, newer.arch, "{}: the label must separate them", v.id());
+        assert_ne!(
+            a.arch,
+            newer.arch,
+            "{}: the label must separate them",
+            v.id()
+        );
     }
 }
 

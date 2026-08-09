@@ -573,19 +573,9 @@ impl RecurrentStateCache {
     /// # Errors
     ///
     /// [`Error::OutOfRange`] when either slot id is invalid.
-    pub fn copy_linear_state_slot_d2d(
-        &self,
-        src_slot: i32,
-        dst_slot: i32,
-    ) -> Result<Vec<StateOp>> {
-        self.check_slot(
-            src_slot,
-            "RecurrentStateCache::copy_linear_state_slot_d2d",
-        )?;
-        self.check_slot(
-            dst_slot,
-            "RecurrentStateCache::copy_linear_state_slot_d2d",
-        )?;
+    pub fn copy_linear_state_slot_d2d(&self, src_slot: i32, dst_slot: i32) -> Result<Vec<StateOp>> {
+        self.check_slot(src_slot, "RecurrentStateCache::copy_linear_state_slot_d2d")?;
+        self.check_slot(dst_slot, "RecurrentStateCache::copy_linear_state_slot_d2d")?;
         Ok(self.slot_copy_ops(src_slot, dst_slot))
     }
 
@@ -695,7 +685,10 @@ impl RecurrentStateCache {
             return None;
         }
         let per_slot = u64::from(dims.page_tokens) * u64::from(dims.hidden) * U16;
-        Some(u64::from(linear_idx) * per_slot * u64::from(dims.num_slots) + u64::from(slot) * per_slot)
+        Some(
+            u64::from(linear_idx) * per_slot * u64::from(dims.num_slots)
+                + u64::from(slot) * per_slot,
+        )
     }
 
     /// Total bytes of the buffered-activation pool.
@@ -987,11 +980,7 @@ mod tests {
                 .reset_slots_if_fresh(None, Some(&fresh), 5)
                 .is_empty()
         );
-        assert!(
-            cache()
-                .reset_slots_if_fresh(Some(&ids), None, 5)
-                .is_empty()
-        );
+        assert!(cache().reset_slots_if_fresh(Some(&ids), None, 5).is_empty());
         assert_eq!(
             cache()
                 .reset_slots_if_fresh(Some(&ids), Some(&fresh), 5)

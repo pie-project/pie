@@ -7,12 +7,12 @@
 //! `driver-cuda`'s `SupergraphCache`. `.wiki/driver/real-metal-north-star.md`
 //! §5 names them one concept under two names and asks for this one.
 
-use crate::error::{Error, Result};
+use crate::bind::encode::{Params, Pipelines, commands};
 use crate::device::context::Context;
 use crate::device::recording::{Recording, record};
 use crate::device::regions::Regions;
+use crate::error::{Error, Result};
 use crate::lowering::dispatch::Dispatch;
-use crate::bind::encode::{Params, Pipelines, commands};
 
 /// Recordings, kept by what they are valid for.
 ///

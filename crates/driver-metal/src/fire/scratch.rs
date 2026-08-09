@@ -43,9 +43,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::device::allocation::Allocation;
 use crate::device::context::Context;
 use crate::device::handle::Handle;
-use crate::device::allocation::Allocation;
 use crate::error::Result;
 
 /// The pool's own state, shared by every outstanding [`Lease`].
@@ -93,7 +93,12 @@ impl Scratch {
     pub fn take(&self, context: &Context, len: u64, what: &'static str) -> Result<Lease> {
         let len = len.max(1);
         let key = (what, len);
-        let existing = self.free.borrow_mut().by_shape.get_mut(&key).and_then(Vec::pop);
+        let existing = self
+            .free
+            .borrow_mut()
+            .by_shape
+            .get_mut(&key)
+            .and_then(Vec::pop);
         let handle = match existing {
             Some(handle) => handle,
             None => {
@@ -221,7 +226,11 @@ mod tests {
             let lease = scratch.take(&context, 1 << 16, "pooled").expect("a region");
             addresses.insert(lease.gpu_address());
         }
-        assert_eq!(scratch.allocated(), 1, "eight takes of one shape, one allocation");
+        assert_eq!(
+            scratch.allocated(),
+            1,
+            "eight takes of one shape, one allocation"
+        );
         assert_eq!(addresses.len(), 1, "and one address, which is the point");
 
         // Two live at once is two regions: a lease still held cannot be

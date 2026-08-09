@@ -167,9 +167,7 @@ pub fn semantic_in_place(kind: &OpKind) -> &'static [(u32, u32)] {
         //
         // Only when it folded: a plain matmul writes its output and
         // reads nothing of it.
-        OpKind::Matmul {
-            beta_one: true, ..
-        } => &[(0, 1)],
+        OpKind::Matmul { beta_one: true, .. } => &[(0, 1)],
         // `attn_out *= sigmoid(gate)`. The full-attention output gate,
         // and the kernel qwen3.5 states for it is spelled
         // `sigmoid_gate_inplace_bf16` -- the gate is read-only, the

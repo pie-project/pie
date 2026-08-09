@@ -8,13 +8,12 @@
 use serde::{Deserialize, Serialize};
 // The shared vocabulary stayed with the toolchain -- more than one family
 // is written in these words.
-pub use model_compiler::facts::{NormPlacement, QkNorm};
 use model_compiler::dsl::WeightRepr;
+pub use model_compiler::facts::{NormPlacement, QkNorm};
 
 /// The shape, re-exported so a declaration reaches its facts and the
 /// words they are stated in from one place.
 pub use super::super::spec::LlamaLikeFacts;
-
 
 /// CUDA backend facts for a LOWERED llama_like trace
 /// (`family::llama_like_cuda`; north-star-dsl.md).
@@ -413,6 +412,21 @@ pub struct LlamaLikeMetalFacts {
     /// and not the shape of the walk.
     #[serde(default)]
     pub dense_beside_moe: bool,
+    /// Whether the router renormalizes over the SELECTED experts.
+    ///
+    /// HF's `norm_topk_prob`, and a routed row's alone. True softmaxes the k
+    /// chosen logits so the weights sum to one; false softmaxes over ALL the
+    /// experts and then selects, so they sum to less than one and scale the
+    /// routed FFN's whole contribution down with them. qwen3-moe ships true
+    /// and qwen2-moe ships false, so it is neither a family constant nor
+    /// something the load can observe — the bank is identical either way.
+    ///
+    /// Stated here rather than defaulted for the reason the rest of this
+    /// struct is, and with one extra: it is a WORD of `RouterParams`, and a
+    /// text that did not state it left `moe/route.metal` reading that word
+    /// out of the next dispatch's staged scalars.
+    #[serde(default)]
+    pub norm_topk_prob: bool,
     /// Whether each layer scales the stream by a learned SCALAR.
     ///
     /// gemma's, for a deployment with no per-layer embeddings: one number per
@@ -661,7 +675,11 @@ impl LlamaLikeMetalFacts {
         if self.full_partial_rotary <= 0.0 || !self.is_full_attention(l) {
             return dim;
         }
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
         let want = (f64::from(dim) * f64::from(self.full_partial_rotary)) as u32;
         (want.min(dim) / 2 * 2).max(2)
     }
@@ -673,6 +691,10 @@ impl LlamaLikeMetalFacts {
             fuse_residual_gemv: true,
             paged_multi_batch: true,
             qmm_multi_batch: true,
+            // The value every routed row in this catalog publishes, and the
+            // opposite of `Qwen3MoeConfig`'s class default -- see
+            // `RowScalars::norm_topk_prob`.
+            norm_topk_prob: true,
             // No Metal deployment publishes a fused bank; see the field.
             qkv_fused: false,
             // The symbols this text names are the affine ones
@@ -790,4 +812,3 @@ impl LlamaLikeCudaFacts {
         }
     }
 }
-

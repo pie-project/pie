@@ -4,17 +4,12 @@
 //! embeddings. It is its own entry point because it is its own pass — no
 //! KV, no sampling, no logits.
 
-use driver_api::local::{
-    PIE_STATUS_DRIVER_ERROR,
-    PIE_STATUS_INVALID_ARGUMENT,
-    PIE_STATUS_OK,
-    PIE_STATUS_UNSUPPORTED,
-    PieCompletion,
-    PieDriver,
-    PieEncodeDesc,
-};
-use super::{checked, guard};
 use super::state::{LoadedModel, Shell, shell};
+use super::{checked, guard};
+use driver_api::local::{
+    PIE_STATUS_DRIVER_ERROR, PIE_STATUS_INVALID_ARGUMENT, PIE_STATUS_OK, PIE_STATUS_UNSUPPORTED,
+    PieCompletion, PieDriver, PieEncodeDesc,
+};
 
 /// Awaits: the MULTIMODAL encoders — image/audio features to embedding
 /// rows (the vision/audio towers, which stayed hand-written C++). The
@@ -37,13 +32,20 @@ fn encode_gemma4_audio_arm(
         return PIE_STATUS_UNSUPPORTED;
     };
     let need = |n: &str| -> Result<*const std::ffi::c_void, i32> {
-        model.weights.get(n).map(|b| b.ptr.cast_const()).ok_or_else(|| {
-            eprintln!("[driver-cuda] encode: missing audio weight {n}");
-            PIE_STATUS_UNSUPPORTED
-        })
+        model
+            .weights
+            .get(n)
+            .map(|b| b.ptr.cast_const())
+            .ok_or_else(|| {
+                eprintln!("[driver-cuda] encode: missing audio weight {n}");
+                PIE_STATUS_UNSUPPORTED
+            })
     };
     let opt = |n: String| -> *const std::ffi::c_void {
-        model.weights.get(&n).map_or(core::ptr::null(), |b| b.ptr.cast_const())
+        model
+            .weights
+            .get(&n)
+            .map_or(core::ptr::null(), |b| b.ptr.cast_const())
     };
     let ap = "model.audio_tower";
     let g = |n: &str| need(&format!("{ap}.{n}"));
@@ -184,7 +186,13 @@ pub fn pie_cuda_encode(
         let notify_done = |state: &Shell| {
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
             if let Some(notify) = state.notify {
-                unsafe { notify(state.notify_ctx, completion.wait_id, completion.target_epoch) };
+                unsafe {
+                    notify(
+                        state.notify_ctx,
+                        completion.wait_id,
+                        completion.target_epoch,
+                    )
+                };
             }
         };
         if num_images == 0 {
@@ -210,13 +218,20 @@ pub fn pie_cuda_encode(
         // built per call from the loaded weights — name lookups, no stored
         // pointers. The binder mapping is `bind_gemma4_vision`'s.
         let need = |n: &str| -> Result<*const std::ffi::c_void, i32> {
-            model.weights.get(n).map(|b| b.ptr.cast_const()).ok_or_else(|| {
-                eprintln!("[driver-cuda] encode: missing vision weight {n}");
-                PIE_STATUS_UNSUPPORTED
-            })
+            model
+                .weights
+                .get(n)
+                .map(|b| b.ptr.cast_const())
+                .ok_or_else(|| {
+                    eprintln!("[driver-cuda] encode: missing vision weight {n}");
+                    PIE_STATUS_UNSUPPORTED
+                })
         };
         let opt = |n: String| -> *const std::ffi::c_void {
-            model.weights.get(&n).map_or(core::ptr::null(), |b| b.ptr.cast_const())
+            model
+                .weights
+                .get(&n)
+                .map_or(core::ptr::null(), |b| b.ptr.cast_const())
         };
         let vp = "model.vision_tower";
         let patch_w = match need(&format!("{vp}.patch_embedder.input_proj.weight")) {
@@ -352,4 +367,3 @@ pub fn pie_cuda_encode(
         PIE_STATUS_OK
     })
 }
-

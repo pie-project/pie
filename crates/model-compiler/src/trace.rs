@@ -634,10 +634,7 @@ pub enum OpKind {
     /// record no SSA outputs of their own, so dataflow sees one producer
     /// whichever arm ran. A side-effect-only guard (the KV write) simply
     /// has no outputs.
-    Guard {
-        arms: Vec<GuardArm>,
-        else_ops: u32,
-    },
+    Guard { arms: Vec<GuardArm>, else_ops: u32 },
     /// A hook site ([`HookStage`]; the HookSite slice): the point where
     /// the fire's attached PTIR programs run against this layer. The op
     /// observes its input (q — the value `invoke_stage_hook` passes) and
@@ -1131,10 +1128,7 @@ impl TraceBuilder {
                 weight: weight.to_string(),
             },
             vec![],
-            vec![(
-                Shape(vec![Dim::Tokens, Dim::Const(hidden)]),
-                DType::BF16,
-            )],
+            vec![(Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)],
         )[0]
     }
 
@@ -1217,10 +1211,7 @@ impl TraceBuilder {
             // The selector is an input too — its content is consumed — and
             // by convention the last one, like matmul_add's residual.
             vec![x, selector],
-            vec![(
-                Shape(vec![rows, k, Dim::Const(out_width)]),
-                DType::BF16,
-            )],
+            vec![(Shape(vec![rows, k, Dim::Const(out_width)]), DType::BF16)],
         )[0]
     }
 
@@ -1329,10 +1320,7 @@ impl TraceBuilder {
         self.push(
             OpKind::Attention { layer },
             vec![q],
-            vec![(
-                Shape(vec![Dim::Tokens, Dim::Const(q_width)]),
-                DType::BF16,
-            )],
+            vec![(Shape(vec![Dim::Tokens, Dim::Const(q_width)]), DType::BF16)],
         )[0]
     }
 
@@ -1385,7 +1373,11 @@ impl TraceBuilder {
     pub fn swiglu(&mut self, packed: ValueId, inter: u32) -> ValueId {
         let mut shape = self.values[packed as usize].shape.clone();
         *shape.0.last_mut().expect("swiglu input has a trailing dim") = Dim::Const(inter);
-        self.push(OpKind::Swiglu { inter }, vec![packed], vec![(shape, DType::BF16)])[0]
+        self.push(
+            OpKind::Swiglu { inter },
+            vec![packed],
+            vec![(shape, DType::BF16)],
+        )[0]
     }
 
     /// Router top-k: `(indices, weights)`, both `[Tokens, k]`. The indices
@@ -1438,12 +1430,7 @@ impl TraceBuilder {
 
     /// The two-way GDN split: packed `[rows, w0 + w1]` into `[rows, w0]`
     /// and `[rows, w1]` at `w0`.
-    pub fn split_gdn(
-        &mut self,
-        packed: ValueId,
-        width0: u32,
-        width1: u32,
-    ) -> (ValueId, ValueId) {
+    pub fn split_gdn(&mut self, packed: ValueId, width0: u32, width1: u32) -> (ValueId, ValueId) {
         let rows = self.values[packed as usize].shape.0[0];
         let out = self.push(
             OpKind::SplitGdn { width0, width1 },
@@ -1469,9 +1456,7 @@ impl TraceBuilder {
         let rows = self.values[packed as usize].shape.0[0];
         match self.values[packed as usize].shape.0[1] {
             Dim::Const(w) if w == 2 * heads * head_dim => {}
-            other => panic!(
-                "split_q_gate input width {other:?} must be 2 * {heads} * {head_dim}"
-            ),
+            other => panic!("split_q_gate input width {other:?} must be 2 * {heads} * {head_dim}"),
         }
         let half = Shape(vec![rows, Dim::Const(heads * head_dim)]);
         let out = self.push(
@@ -1591,7 +1576,9 @@ impl TraceBuilder {
         let gate_shape = self.values[gate as usize].shape.clone();
         match gate_shape.0[1] {
             Dim::Const(w) if w == x_elems => {}
-            other => panic!("rmsnorm_gated gate width {other:?} must equal x's flattened {x_elems}"),
+            other => {
+                panic!("rmsnorm_gated gate width {other:?} must equal x's flattened {x_elems}")
+            }
         }
         self.push(
             OpKind::RmsnormGated {
@@ -1646,10 +1633,7 @@ impl TraceBuilder {
                 weight: weight.to_string(),
             },
             vec![hidden],
-            vec![(
-                Shape(vec![Dim::Requests, Dim::Const(vocab)]),
-                DType::F32,
-            )],
+            vec![(Shape(vec![Dim::Requests, Dim::Const(vocab)]), DType::F32)],
         )[0]
     }
 

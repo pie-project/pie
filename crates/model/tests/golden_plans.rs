@@ -21,20 +21,22 @@
 
 use std::path::PathBuf;
 
-use model::shared::llama_like::forward::llama_like;
-use model::shared::llama_like::forward::llama_like_cuda;
+use model::gemma_4::forward::facts::{Gemma4CudaFacts, Gemma4Facts};
+use model::gemma_4::forward::gemma4_cuda;
+use model::gpt_oss::forward::facts::{GptOssCudaFacts, GptOssFacts};
+use model::gpt_oss::forward::gpt_oss_cuda;
+use model::qwen_3_5::forward::facts::{
+    Qwen35CudaFacts, Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MoeMlpFacts,
+};
 use model::qwen_3_5::forward::qwen3_5_full_attn_block;
 use model::qwen_3_5::forward::qwen3_5_gdn_block;
 use model::qwen_3_5::forward::qwen3_5_hybrid;
-use model::gemma_4::forward::gemma4_cuda;
-use model::gpt_oss::forward::gpt_oss_cuda;
 use model::qwen_3_5::forward::qwen3_5_hybrid_cuda;
 use model::qwen_3_5::forward::qwen3_5_moe_mlp_block;
 use model::qwen_3_5::forward::qwen3_5_moe_mlp_block_cuda;
 use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
-use model::gemma_4::forward::facts::{Gemma4CudaFacts, Gemma4Facts};
-use model::gpt_oss::forward::facts::{GptOssCudaFacts, GptOssFacts};
-use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MoeMlpFacts};
+use model::shared::llama_like::forward::llama_like;
+use model::shared::llama_like::forward::llama_like_cuda;
 use model_compiler::dsl::WeightRepr;
 use model_compiler::{FireClass, ForwardPlan, HookStage, OpKind};
 
@@ -55,8 +57,12 @@ fn check(name: &str, facts: &LlamaLikeFacts) {
 /// comparison mean "these two files describe the same launches".
 fn plan_multiset(json: &str) -> std::collections::BTreeMap<String, usize> {
     let mut out = std::collections::BTreeMap::new();
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return out };
-    let Some(ops) = v.get("ops").and_then(|o| o.as_array()) else { return out };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return out;
+    };
+    let Some(ops) = v.get("ops").and_then(|o| o.as_array()) else {
+        return out;
+    };
     for op in ops {
         let Some(kind) = op.get("kind") else { continue };
         let name = match kind {
@@ -520,8 +526,6 @@ fn qwen3_5_hybrid_0_8b_cuda_prefill() {
     );
 }
 
-
-
 /// The first LOWERED goldens (north-star-dsl.md): the SAME llama_like
 /// text, traced with the CUDA backend facts and a fire class in hand, so
 /// the class arms run and the traced form states kernels. Decode, since
@@ -568,7 +572,6 @@ fn qwen3_0_6b_cuda_prefill() {
 // guard arm INSIDE the decode/prefill goldens above, which pin the
 // arm's op-list delta — the general QKV sequence in the fused
 // deployment's mask arm, the custom dispatch, no dequant.)
-
 
 // (The three SERVICE-class goldens are gone with the classes:
 // `.wiki/driver/graph.md` §4.2 retired CommitAdvance, StateOnly and

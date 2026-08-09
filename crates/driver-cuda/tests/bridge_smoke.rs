@@ -11,8 +11,8 @@
 //!
 //! Skipped without a device, like every GPU test here.
 
-use driver_cuda::device::{Allocator, OwnedStream};
 use driver_cuda::bind::abi::ffi;
+use driver_cuda::device::{Allocator, OwnedStream};
 
 mod common;
 use common::{device_or_skip, gpu_guard};
@@ -38,7 +38,11 @@ fn attention_landing(
     use model_compiler::lower::Arg;
     match dplan.spec(fi).outs.first() {
         Some(&Arg::Arena { at, .. }) => Some(at),
-        _ => match l.launches.get(fi + 1).map(|n| &l.args[n.args.start as usize]) {
+        _ => match l
+            .launches
+            .get(fi + 1)
+            .map(|n| &l.args[n.args.start as usize])
+        {
             Some(Arg::Arena { at, .. }) => Some(*at),
             _ => None,
         },
@@ -48,7 +52,9 @@ fn attention_landing(
 #[test]
 fn a_generated_binding_reaches_a_real_kernel() {
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("bridge smoke") else { return };
+    let Some(_dev) = device_or_skip("bridge smoke") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let alloc = Allocator::new();
 
@@ -58,7 +64,9 @@ fn a_generated_binding_reaches_a_real_kernel() {
     let src_bytes: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
 
     let mut d_src = alloc.alloc(src_bytes.len()).expect("src alloc");
-    d_src.copy_from_host(&src_bytes, stream.as_ref()).expect("h2d");
+    d_src
+        .copy_from_host(&src_bytes, stream.as_ref())
+        .expect("h2d");
     let d_dst = alloc.alloc(src.len() * 2).expect("dst alloc");
 
     unsafe {
@@ -94,7 +102,9 @@ fn a_driver_internal_binding_seeds_the_envelope_tier() {
     use driver_cuda::pools::kv_cache_live::{KvCacheDeviceOps, LiveKvCacheOps};
 
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("driver-internal envelope seed") else { return };
+    let Some(_dev) = device_or_skip("driver-internal envelope seed") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let alloc = Allocator::new();
 
@@ -112,8 +122,12 @@ fn a_driver_internal_binding_seeds_the_envelope_tier() {
 
     let mut min_back = vec![0u8; elems * 2];
     let mut max_back = vec![0u8; elems * 2];
-    d_min.copy_to_host(&mut min_back, stream.as_ref()).expect("d2h min");
-    d_max.copy_to_host(&mut max_back, stream.as_ref()).expect("d2h max");
+    d_min
+        .copy_to_host(&mut min_back, stream.as_ref())
+        .expect("d2h min");
+    d_max
+        .copy_to_host(&mut max_back, stream.as_ref())
+        .expect("d2h max");
     stream.as_ref().synchronize().expect("sync");
 
     for i in 0..elems {
@@ -134,7 +148,9 @@ fn the_live_score_ops_upload_memset_and_fold() {
     use driver_cuda::fire::attn_score::{LiveScoreOps, ScoreOps};
 
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("live score ops") else { return };
+    let Some(_dev) = device_or_skip("live score ops") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let alloc = Allocator::new();
     let mut ops = LiveScoreOps::new(stream.as_ref().as_raw().cast());
@@ -143,7 +159,9 @@ fn the_live_score_ops_upload_memset_and_fold() {
     let scratch = alloc.alloc(64).expect("scratch");
     ops.memset_async(scratch.as_ptr().cast(), 0xa5, 64);
     let mut back = vec![0u8; 64];
-    scratch.copy_to_host(&mut back, stream.as_ref()).expect("d2h");
+    scratch
+        .copy_to_host(&mut back, stream.as_ref())
+        .expect("d2h");
     stream.as_ref().synchronize().expect("sync");
     assert!(back.iter().all(|&b| b == 0xa5));
 
@@ -156,13 +174,19 @@ fn the_live_score_ops_upload_memset_and_fold() {
     let raw: Vec<f32> = vec![0.25, 0.5, 0.125, 1.0];
     let raw_bytes: Vec<u8> = raw.iter().flat_map(|v| v.to_le_bytes()).collect();
     let mut d_raw = alloc.alloc(raw_bytes.len()).expect("raw");
-    d_raw.copy_from_host(&raw_bytes, stream.as_ref()).expect("h2d raw");
+    d_raw
+        .copy_from_host(&raw_bytes, stream.as_ref())
+        .expect("h2d raw");
     let page_indptr: Vec<u8> = [0u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect();
     let mut d_pages = alloc.alloc(page_indptr.len()).expect("pages");
-    d_pages.copy_from_host(&page_indptr, stream.as_ref()).expect("h2d pages");
+    d_pages
+        .copy_from_host(&page_indptr, stream.as_ref())
+        .expect("h2d pages");
     let last_lens: Vec<u8> = [4u32].iter().flat_map(|v| v.to_le_bytes()).collect();
     let mut d_lens = alloc.alloc(last_lens.len()).expect("lens");
-    d_lens.copy_from_host(&last_lens, stream.as_ref()).expect("h2d lens");
+    d_lens
+        .copy_from_host(&last_lens, stream.as_ref())
+        .expect("h2d lens");
     let d_folded = alloc.alloc(raw_bytes.len()).expect("folded");
 
     ops.fold_heads(
@@ -177,7 +201,9 @@ fn the_live_score_ops_upload_memset_and_fold() {
     );
 
     let mut folded_back = vec![0u8; raw_bytes.len()];
-    d_folded.copy_to_host(&mut folded_back, stream.as_ref()).expect("d2h folded");
+    d_folded
+        .copy_to_host(&mut folded_back, stream.as_ref())
+        .expect("d2h folded");
     stream.as_ref().synchronize().expect("sync");
     for (i, v) in raw.iter().enumerate() {
         let got = f32::from_le_bytes(folded_back[i * 4..i * 4 + 4].try_into().unwrap());
@@ -192,7 +218,9 @@ fn the_live_lora_ops_cast_and_upload_the_slab() {
     use driver_cuda::fire::lora::{LiveLoraOps, LoraOps};
 
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("live lora ops") else { return };
+    let Some(_dev) = device_or_skip("live lora ops") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let alloc = Allocator::new();
     let mut ops = LiveLoraOps::new(stream.as_ref().as_raw().cast());
@@ -201,7 +229,9 @@ fn the_live_lora_ops_cast_and_upload_the_slab() {
     let src: Vec<f32> = (0..16).map(|i| (i as f32) * 0.5).collect();
     let src_bytes: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
     let mut d_src = alloc.alloc(src_bytes.len()).expect("src");
-    d_src.copy_from_host(&src_bytes, stream.as_ref()).expect("h2d");
+    d_src
+        .copy_from_host(&src_bytes, stream.as_ref())
+        .expect("h2d");
     let d_dst = alloc.alloc(src.len() * 2).expect("dst");
     ops.cast_fp32_to_bf16(d_src.as_ptr(), d_dst.as_ptr(), src.len());
     let mut back = vec![0u8; src.len() * 2];
@@ -214,12 +244,16 @@ fn the_live_lora_ops_cast_and_upload_the_slab() {
     }
 
     // Slab: four sentinel pointers, round-tripped.
-    let slots: Vec<*const std::ffi::c_void> =
-        [0x1000usize, 0x2000, 0x3000, 0x4000].iter().map(|&a| a as _).collect();
+    let slots: Vec<*const std::ffi::c_void> = [0x1000usize, 0x2000, 0x3000, 0x4000]
+        .iter()
+        .map(|&a| a as _)
+        .collect();
     let d_slab = alloc.alloc(slots.len() * 8).expect("slab");
     ops.upload_slab(d_slab.as_ptr(), &slots);
     let mut slab_back = vec![0u8; slots.len() * 8];
-    d_slab.copy_to_host(&mut slab_back, stream.as_ref()).expect("d2h slab");
+    d_slab
+        .copy_to_host(&mut slab_back, stream.as_ref())
+        .expect("d2h slab");
     stream.as_ref().synchronize().expect("sync");
     for (i, &p) in slots.iter().enumerate() {
         let got = u64::from_le_bytes(slab_back[i * 8..i * 8 + 8].try_into().unwrap());
@@ -237,17 +271,19 @@ fn the_live_lora_ops_cast_and_upload_the_slab() {
 fn the_executor_prefix_runs_the_anchor_decode_on_device() {
     use std::collections::BTreeMap;
 
-    use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
     use driver_cuda::bind::{
         DispatchCtx, DispatchPlan, DispatchRefusal, Frame, Resolver, bind, dispatch,
     };
+    use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
     use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
     use model::shared::llama_like::forward::llama_like_cuda;
     use model_compiler::lower::{Fire, Row, lower};
     use model_compiler::trace::{FireClass, ValueId};
 
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("executor prefix") else { return };
+    let Some(_dev) = device_or_skip("executor prefix") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let raw_stream = stream.as_ref().as_raw().cast::<std::ffi::c_void>();
     let alloc = Allocator::new();
@@ -258,11 +294,27 @@ fn the_executor_prefix_runs_the_anchor_decode_on_device() {
         &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
         FireClass::Decode,
     );
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; 4];
-    let l = lower(&plan, &rows, Fire { captures_across_splits: false }).expect("lowers");
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        4
+    ];
+    let l = lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("lowers");
 
     let arena = alloc.alloc(l.arena_bytes).expect("arena");
-    let frame = Frame { arena: arena.as_ptr(), arena_bytes: l.arena_bytes };
+    let frame = Frame {
+        arena: arena.as_ptr(),
+        arena_bytes: l.arena_bytes,
+    };
 
     // Sixty-four fake vocabulary rows: token t's embedding alternates
     // +a(t), -a(t) with a(t) = 0.5 + 0.25 t, so rmsnorm collapses every
@@ -276,7 +328,11 @@ fn the_executor_prefix_runs_the_anchor_decode_on_device() {
     let mut embed_host = vec![0u8; VOCAB * HIDDEN * 2];
     for t in 0..VOCAB {
         for c in 0..HIDDEN {
-            let v = if c % 2 == 0 { amp(t as i32) } else { -amp(t as i32) };
+            let v = if c % 2 == 0 {
+                amp(t as i32)
+            } else {
+                -amp(t as i32)
+            };
             let b = bf16(v).to_le_bytes();
             embed_host[(t * HIDDEN + c) * 2] = b[0];
             embed_host[(t * HIDDEN + c) * 2 + 1] = b[1];
@@ -312,13 +368,19 @@ fn the_executor_prefix_runs_the_anchor_decode_on_device() {
     }
 
     let mut embed_dev = alloc.alloc(embed_host.len()).expect("embed w");
-    embed_dev.copy_from_host(&embed_host, stream.as_ref()).expect("h2d embed");
+    embed_dev
+        .copy_from_host(&embed_host, stream.as_ref())
+        .expect("h2d embed");
     let mut ones_dev = alloc.alloc(ones_host.len()).expect("ones");
-    ones_dev.copy_from_host(&ones_host, stream.as_ref()).expect("h2d ones");
+    ones_dev
+        .copy_from_host(&ones_host, stream.as_ref())
+        .expect("h2d ones");
     let mut zeros_dev = alloc.alloc(16 << 20).expect("zeros");
     zeros_dev.memset(0, stream.as_ref()).expect("zero");
     let mut ids_dev = alloc.alloc(ids_host.len()).expect("ids");
-    ids_dev.copy_from_host(&ids_host, stream.as_ref()).expect("h2d ids");
+    ids_dev
+        .copy_from_host(&ids_host, stream.as_ref())
+        .expect("h2d ids");
     let mut resolver = Live {
         embed: embed_dev,
         ones: ones_dev,
@@ -378,7 +440,15 @@ fn the_executor_prefix_runs_the_anchor_decode_on_device() {
     for (i, launch) in l.launches.iter().enumerate() {
         let bound = bind(&l, launch, frame, &mut resolver).expect("binds");
         let offset_of = |p: *mut std::ffi::c_void| p as usize - frame.arena as usize;
-        match dispatch(&bound, dplan.spec(i), frame, &mut resolver, &ctx, None, None) {
+        match dispatch(
+            &bound,
+            dplan.spec(i),
+            frame,
+            &mut resolver,
+            &ctx,
+            None,
+            None,
+        ) {
             Ok(()) => {
                 if bound.kernel == "layout::embed_bf16" {
                     embed_out.get_or_insert(offset_of(bound.args[0].ptr));
@@ -397,14 +467,19 @@ fn the_executor_prefix_runs_the_anchor_decode_on_device() {
         }
     }
     stream.as_ref().synchronize().expect("sync");
-    assert!(dispatched >= 4, "only {dispatched} launches ran before the stop");
+    assert!(
+        dispatched >= 4,
+        "only {dispatched} launches ran before the stop"
+    );
     assert_eq!(
         stopped_at, "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
         "the walk should stop at the fused attention step"
     );
 
     let mut arena_back = vec![0u8; l.arena_bytes];
-    arena.copy_to_host(&mut arena_back, stream.as_ref()).expect("d2h arena");
+    arena
+        .copy_to_host(&mut arena_back, stream.as_ref())
+        .expect("d2h arena");
     stream.as_ref().synchronize().expect("sync");
     let bf16_at = |off: usize, i: usize| {
         u16::from_le_bytes([arena_back[off + i * 2], arena_back[off + i * 2 + 1]])
@@ -443,17 +518,18 @@ fn the_executor_prefix_runs_the_anchor_decode_on_device() {
 /// own smoke before any attention arm consumes the plan.
 #[test]
 fn the_decode_planner_plans_a_real_geometry() {
-    use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
     use driver_cuda::bind::DecodePlan;
+    use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
 
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("decode planner") else { return };
+    let Some(_dev) = device_or_skip("decode planner") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let raw = stream.as_ref().as_raw().cast::<std::ffi::c_void>();
 
     let mut ops = LiveStagingOps;
-    let mut ws = AttentionWorkspace::allocate(&mut ops, 32 << 20, 16 << 20, 2)
-        .expect("workspace");
+    let mut ws = AttentionWorkspace::allocate(&mut ops, 32 << 20, 16 << 20, 2).expect("workspace");
 
     // Four decode requests, one 16-token page each — qwen3-0.6b geometry.
     let indptr: [u32; 5] = [0, 1, 2, 3, 4];
@@ -461,7 +537,10 @@ fn the_decode_planner_plans_a_real_geometry() {
     ws.begin_plan_update(&mut ops).expect("begin");
     plan.plan_decode(&indptr, 16, 8, 128, 16, ws.view(), raw, false, -1);
     ws.end_plan_update(&mut ops, raw);
-    stream.as_ref().synchronize().expect("the staged upload retires");
+    stream
+        .as_ref()
+        .synchronize()
+        .expect("the staged upload retires");
 
     // Plan again with different geometry — the cache is reusable per
     // fire, which is how the driver holds it.
@@ -469,7 +548,10 @@ fn the_decode_planner_plans_a_real_geometry() {
     ws.begin_plan_update(&mut ops).expect("begin 2");
     plan.plan_decode(&indptr2, 16, 8, 128, 16, ws.view(), raw, false, -1);
     ws.end_plan_update(&mut ops, raw);
-    stream.as_ref().synchronize().expect("second upload retires");
+    stream
+        .as_ref()
+        .synchronize()
+        .expect("second upload retires");
 
     ws.release(&mut ops);
 }
@@ -684,20 +766,23 @@ enum Leg {
 fn zero_weight_decode(leg: Leg) {
     use std::collections::BTreeMap;
 
+    use driver_cuda::bind::abi::{KvCacheLayerView, KvCacheScheme};
+    use driver_cuda::bind::{
+        AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, PrefillPlan, Resolver,
+        run, run_captured,
+    };
     use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
     use driver_cuda::dtype::DType;
-    use driver_cuda::bind::abi::{KvCacheLayerView, KvCacheScheme};
     use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
-    use driver_cuda::bind::{
-        AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, PrefillPlan, Resolver, run, run_captured,
-    };
     use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
     use model::shared::llama_like::forward::llama_like_cuda;
     use model_compiler::lower::{Arg, Fire, GuardMode, Row, lower_with};
     use model_compiler::trace::{FireClass, ValueId};
 
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("full zero-weight decode") else { return };
+    let Some(_dev) = device_or_skip("full zero-weight decode") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let raw_stream = stream.as_ref().as_raw().cast::<std::ffi::c_void>();
     let mut alloc = Allocator::new();
@@ -721,7 +806,13 @@ fn zero_weight_decode(leg: Leg) {
         &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
         FireClass::Decode,
     );
-    let mut rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; ROWS];
+    let mut rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        ROWS
+    ];
     if leg == Leg::Hooked {
         // A contiguous SUFFIX; `lower.rs::split_at` refuses anything else.
         for r in rows.iter_mut().skip(ROWS - 2) {
@@ -730,13 +821,27 @@ fn zero_weight_decode(leg: Leg) {
     }
     // The captured leg KEEPS every guard: that is what makes one capture
     // able to serve fires that differ in their variant bits.
-    let mode = if leg == Leg::CapturedUnion { GuardMode::Union } else { GuardMode::Resolve };
-    let l = lower_with(&plan, &rows, Fire { captures_across_splits: false }, mode)
-        .expect("lowers");
+    let mode = if leg == Leg::CapturedUnion {
+        GuardMode::Union
+    } else {
+        GuardMode::Resolve
+    };
+    let l = lower_with(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+        mode,
+    )
+    .expect("lowers");
     let dplan = DispatchPlan::new(&plan, &l);
 
     let mut arena = alloc.alloc(l.arena_bytes).expect("arena");
-    let frame = Frame { arena: arena.as_ptr(), arena_bytes: l.arena_bytes };
+    let frame = Frame {
+        arena: arena.as_ptr(),
+        arena_bytes: l.arena_bytes,
+    };
 
     // ── Weights: embed pattern, norm ones, everything else zero. ──
     let bf16 = |v: f32| (v.to_bits() >> 16) as u16;
@@ -745,18 +850,27 @@ fn zero_weight_decode(leg: Leg) {
     let mut embed_host = vec![0u8; VOCAB * HIDDEN * 2];
     for t in 0..PATTERNED {
         for c in 0..HIDDEN {
-            let v = if c % 2 == 0 { amp(t as i32) } else { -amp(t as i32) };
+            let v = if c % 2 == 0 {
+                amp(t as i32)
+            } else {
+                -amp(t as i32)
+            };
             let b = bf16(v).to_le_bytes();
             embed_host[(t * HIDDEN + c) * 2] = b[0];
             embed_host[(t * HIDDEN + c) * 2 + 1] = b[1];
         }
     }
     let mut embed_dev = alloc.alloc(embed_host.len()).expect("embed");
-    embed_dev.copy_from_host(&embed_host, stream.as_ref()).expect("h2d");
-    let ones_host: Vec<u8> =
-        std::iter::repeat_n(bf16(1.0).to_le_bytes(), HIDDEN).flatten().collect();
+    embed_dev
+        .copy_from_host(&embed_host, stream.as_ref())
+        .expect("h2d");
+    let ones_host: Vec<u8> = std::iter::repeat_n(bf16(1.0).to_le_bytes(), HIDDEN)
+        .flatten()
+        .collect();
     let mut ones_dev = alloc.alloc(ones_host.len()).expect("ones");
-    ones_dev.copy_from_host(&ones_host, stream.as_ref()).expect("h2d");
+    ones_dev
+        .copy_from_host(&ones_host, stream.as_ref())
+        .expect("h2d");
     let mut zeros_dev = alloc.alloc(8 * 3072 * HIDDEN * 2).expect("zeros");
     zeros_dev.memset(0, stream.as_ref()).expect("zero");
 
@@ -792,7 +906,11 @@ fn zero_weight_decode(leg: Leg) {
     impl Resolver for Live<'_> {
         fn weight(&mut self, name: &str) -> Option<*const std::ffi::c_void> {
             Some(if name.contains("embed") || name.contains("lm_head") {
-                if name.contains("lm_head") { self.zeros } else { self.embed }
+                if name.contains("lm_head") {
+                    self.zeros
+                } else {
+                    self.embed
+                }
             } else if name.contains("norm") {
                 self.ones
             } else {
@@ -806,16 +924,18 @@ fn zero_weight_decode(leg: Leg) {
 
     // ── The fire's KV side: pools, views, CSRs, write descriptors. ──
     let plane = (4 * PAGE * KV_HEADS * HEAD_DIM) as usize * 2;
-    let pools: Vec<(driver_cuda::device::DeviceBuffer, driver_cuda::device::DeviceBuffer)> =
-        (0..LAYERS)
-            .map(|_| {
-                let mut k = alloc.alloc(plane).expect("k pool");
-                let mut v = alloc.alloc(plane).expect("v pool");
-                k.memset(0, stream.as_ref()).expect("zk");
-                v.memset(0, stream.as_ref()).expect("zv");
-                (k, v)
-            })
-            .collect();
+    let pools: Vec<(
+        driver_cuda::device::DeviceBuffer,
+        driver_cuda::device::DeviceBuffer,
+    )> = (0..LAYERS)
+        .map(|_| {
+            let mut k = alloc.alloc(plane).expect("k pool");
+            let mut v = alloc.alloc(plane).expect("v pool");
+            k.memset(0, stream.as_ref()).expect("zk");
+            v.memset(0, stream.as_ref()).expect("zv");
+            (k, v)
+        })
+        .collect();
     let layers: Vec<KvCacheLayerView> = pools
         .iter()
         .enumerate()
@@ -857,8 +977,14 @@ fn zero_weight_decode(leg: Leg) {
     let w_page = up(&u32s(&[0, 1, 2, 3]));
     let w_off = up(&u32s(&[0, 0, 0, 0]));
     let row_valid = up(&[1u8, 1, 1, 1]);
-    let mut ids = up(&tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>());
-    let positions = up(&[0i32, 0, 0, 0].iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>());
+    let mut ids = up(&tokens
+        .iter()
+        .flat_map(|t| t.to_le_bytes())
+        .collect::<Vec<u8>>());
+    let positions = up(&[0i32, 0, 0, 0]
+        .iter()
+        .flat_map(|p| p.to_le_bytes())
+        .collect::<Vec<u8>>());
     let lse = alloc.alloc(ROWS * Q_HEADS as usize * 4).expect("lse");
 
     // ── Workspace + the planned decode cache. ──
@@ -866,7 +992,17 @@ fn zero_weight_decode(leg: Leg) {
     let mut ws = AttentionWorkspace::allocate(&mut sops, 32 << 20, 16 << 20, 2).expect("ws");
     let mut dplan_cache = DecodePlan::new();
     ws.begin_plan_update(&mut sops).expect("begin");
-    dplan_cache.plan_decode(&[0, 1, 2, 3, 4], Q_HEADS, KV_HEADS, HEAD_DIM, PAGE, ws.view(), raw_stream, false, -1);
+    dplan_cache.plan_decode(
+        &[0, 1, 2, 3, 4],
+        Q_HEADS,
+        KV_HEADS,
+        HEAD_DIM,
+        PAGE,
+        ws.view(),
+        raw_stream,
+        false,
+        -1,
+    );
     ws.end_plan_update(&mut sops, raw_stream);
 
     // THE PREFILL PLAN, on a decode fixture, in ITS OWN WORKSPACE.
@@ -886,7 +1022,9 @@ fn zero_weight_decode(leg: Leg) {
     let mut prefill_ws =
         AttentionWorkspace::allocate(&mut sops, 32 << 20, 16 << 20, 2).expect("prefill ws");
     let mut pplan_cache = PrefillPlan::new();
-    prefill_ws.begin_plan_update(&mut sops).expect("begin prefill");
+    prefill_ws
+        .begin_plan_update(&mut sops)
+        .expect("begin prefill");
     pplan_cache.plan_prefill(
         &[0, 1, 2, 3, 4],
         &[0, 1, 2, 3, 4],
@@ -913,7 +1051,8 @@ fn zero_weight_decode(leg: Leg) {
         Arg::Named { value, .. } => *value,
         other => panic!("the dispatch's q is a pin, got {other:?}"),
     };
-    let o_off = attention_landing(&l, &dplan, fi).expect("the join or the neighbour names the attention slot");
+    let o_off = attention_landing(&l, &dplan, fi)
+        .expect("the join or the neighbour names the attention slot");
 
     // THE BUCKET'S PREPARED STATE, published exactly as `serve::launch`
     // publishes it (`.wiki/driver/graph.md` §5 (1)).
@@ -936,11 +1075,17 @@ fn zero_weight_decode(leg: Leg) {
     )
     .expect("a causal mask for this geometry");
     let mut mask_buf = alloc.alloc(mask_plan.bytes).expect("mask");
-    mask_buf.write_at(0, &mask_plan.mask, stream.as_ref()).expect("mask bytes");
+    mask_buf
+        .write_at(0, &mask_plan.mask, stream.as_ref())
+        .expect("mask bytes");
     mask_buf
         .write_at(
             mask_plan.indptr_offset,
-            &mask_plan.indptr.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+            &mask_plan
+                .indptr
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
             stream.as_ref(),
         )
         .expect("mask csr");
@@ -956,7 +1101,11 @@ fn zero_weight_decode(leg: Leg) {
     sink_buf
         .write_at(
             sink_plan.indptr_offset,
-            &sink_plan.indptr.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+            &sink_plan
+                .indptr
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
             stream.as_ref(),
         )
         .expect("sink csr");
@@ -991,7 +1140,6 @@ fn zero_weight_decode(leg: Leg) {
         -1,
     );
     ws.end_plan_update(&mut sops, raw_stream);
-
 
     // SCORE buffers: valid, stable, and EMPTY.
     //
@@ -1075,14 +1223,8 @@ fn zero_weight_decode(leg: Leg) {
         folded_out: core::ptr::null_mut(),
         mask_d: core::ptr::null(),
         mask_indptr_d: core::ptr::null(),
-        o_out: unsafe {
-            arena.as_ptr().cast::<u8>().add(o_off + split * HIDDEN * 2)
-        }
-        .cast(),
-        lse_out_d: unsafe {
-            lse.as_ptr().cast::<u8>().add(split * Q_HEADS as usize * 4)
-        }
-        .cast(),
+        o_out: unsafe { arena.as_ptr().cast::<u8>().add(o_off + split * HIDDEN * 2) }.cast(),
+        lse_out_d: unsafe { lse.as_ptr().cast::<u8>().add(split * Q_HEADS as usize * 4) }.cast(),
         ..attn.clone()
     };
     let regions = if leg == Leg::Hooked {
@@ -1091,11 +1233,9 @@ fn zero_weight_decode(leg: Leg) {
         AttnRegions::whole(Some(&attn))
     };
 
-
     let mut cublas_ops = LiveCublas;
     let mut cublas = CublasHandle::create(&mut cublas_ops, raw_stream).expect("cublas");
-    let mut peel_win =
-        driver_cuda::device::PeelWindowWord::new(&alloc).expect("peel window word");
+    let mut peel_win = driver_cuda::device::PeelWindowWord::new(&alloc).expect("peel window word");
     // The window is the TAIL's, not the fire's. `_devwin` statements only
     // occur in a peel's tail region, and the word is what tells them which
     // absolute rows are theirs — publishing the whole fire makes the tail
@@ -1103,7 +1243,9 @@ fn zero_weight_decode(leg: Leg) {
     // buffers the lowering sized for the region.
     let split = rows.iter().position(|r| r.hooked).unwrap_or(0) as u32;
     peel_win.set(split, ROWS as u32 - split);
-    peel_win.upload(stream.as_ref()).expect("publish the peel window");
+    peel_win
+        .upload(stream.as_ref())
+        .expect("publish the peel window");
     stream.as_ref().synchronize().expect("the window lands");
 
     let ctx = DispatchCtx {
@@ -1183,7 +1325,10 @@ fn zero_weight_decode(leg: Leg) {
         // `fire_predicates` reading the tree rather than a fire's flags.
         fire_predicates(&rows, &l.conds, &mut preds).expect("the fire's bits");
         preds.upload(stream.as_ref()).expect("upload");
-        stream.as_ref().synchronize().expect("the word lands before the capture");
+        stream
+            .as_ref()
+            .synchronize()
+            .expect("the word lands before the capture");
 
         // DUAL-PREPARE: warm each VARIANT, not just this fire.
         //
@@ -1202,21 +1347,42 @@ fn zero_weight_decode(leg: Leg) {
         // allocation each launcher did on its first call. This is what the
         // C++ arc calls dual-prepare.
         for marks in [
-            Row { samples: true, ..Row::default() },
-            Row { samples: true, wants_scores: true, ..Row::default() },
-            Row { samples: true, write_desc: true, ..Row::default() },
+            Row {
+                samples: true,
+                ..Row::default()
+            },
+            Row {
+                samples: true,
+                wants_scores: true,
+                ..Row::default()
+            },
+            Row {
+                samples: true,
+                write_desc: true,
+                ..Row::default()
+            },
         ] {
             let warm_rows: Vec<Row> = vec![marks; ROWS];
             let warm = lower_with(
                 &plan,
                 &warm_rows,
-                Fire { captures_across_splits: false },
+                Fire {
+                    captures_across_splits: false,
+                },
                 GuardMode::Resolve,
             )
             .expect("the warm-up lowers");
             let warm_dplan = DispatchPlan::new(&plan, &warm);
-            run(&warm, &warm_dplan, frame, &mut resolver, &ctx, regions, None)
-                .unwrap_or_else(|e| panic!("the warm-up walk refused: {e:?}"));
+            run(
+                &warm,
+                &warm_dplan,
+                frame,
+                &mut resolver,
+                &ctx,
+                regions,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("the warm-up walk refused: {e:?}"));
             stream.as_ref().synchronize().expect("the warm-up retires");
         }
         stream.as_ref().synchronize().expect("the warm-up retires");
@@ -1230,7 +1396,14 @@ fn zero_weight_decode(leg: Leg) {
             let scope = alloc.begin_capture(stream.as_ref()).expect("begin capture");
             let mut b = SupergraphBuilder::new(scope.stream(), &preds);
             let ran = run_captured(
-                &l, &dplan, frame, &mut resolver, &ctx, AttnRegions::whole(Some(&attn)), None, &mut b,
+                &l,
+                &dplan,
+                frame,
+                &mut resolver,
+                &ctx,
+                AttnRegions::whole(Some(&attn)),
+                None,
+                &mut b,
             )
             .unwrap_or_else(|e| panic!("the captured walk refused: {e:?}"));
             drop(b);
@@ -1258,7 +1431,9 @@ fn zero_weight_decode(leg: Leg) {
         let lv = logits_value.expect("the last launch writes a named pin");
         let mut lanes: Vec<Vec<u8>> = Vec::new();
         for has_write_desc in [false, true] {
-            arena.memset(0, stream.as_ref()).expect("wipe between lanes");
+            arena
+                .memset(0, stream.as_ref())
+                .expect("wipe between lanes");
             preds
                 .set(driver_cuda::device::SLOT_HAS_WRITE_DESC, has_write_desc)
                 .expect("slot");
@@ -1297,17 +1472,23 @@ fn zero_weight_decode(leg: Leg) {
         // Had the capture baked contents, this replay returns the first
         // fire's rows.
         if leg == Leg::Reused {
-            let bytes: Vec<u8> =
-                SECOND_FIRE.iter().flat_map(|t| t.to_le_bytes()).collect();
-            ids.copy_from_host(&bytes, stream.as_ref()).expect("the next fire's tokens");
-            arena.memset(0, stream.as_ref()).expect("wipe before the second fire");
+            let bytes: Vec<u8> = SECOND_FIRE.iter().flat_map(|t| t.to_le_bytes()).collect();
+            ids.copy_from_host(&bytes, stream.as_ref())
+                .expect("the next fire's tokens");
+            arena
+                .memset(0, stream.as_ref())
+                .expect("wipe before the second fire");
             preds
                 .set(driver_cuda::device::SLOT_HAS_WRITE_DESC, false)
                 .expect("slot");
             preds.upload(stream.as_ref()).expect("upload");
             stream.as_ref().synchronize().expect("the tokens land");
-            exec.launch(stream.as_ref()).expect("the second fire replays");
-            stream.as_ref().synchronize().expect("the second fire retires");
+            exec.launch(stream.as_ref())
+                .expect("the second fire replays");
+            stream
+                .as_ref()
+                .synchronize()
+                .expect("the second fire retires");
         }
         ran
     } else {
@@ -1315,15 +1496,24 @@ fn zero_weight_decode(leg: Leg) {
             .unwrap_or_else(|e| panic!("the walk refused: {e:?}"))
     };
     assert_eq!(ran, l.launches.len(), "every launch ran");
-    stream.as_ref().synchronize().expect("the whole decode retires");
+    stream
+        .as_ref()
+        .synchronize()
+        .expect("the whole decode retires");
 
     // ── Invariant 1: the residual equals the embed rows, bit-exactly. ──
     let mut arena_back = vec![0u8; l.arena_bytes];
-    arena.copy_to_host(&mut arena_back, stream.as_ref()).expect("d2h");
+    arena
+        .copy_to_host(&mut arena_back, stream.as_ref())
+        .expect("d2h");
     stream.as_ref().synchronize().expect("sync");
     let e = embed_out.expect("embed ran");
     // Whichever fire ran LAST is the one the arena holds.
-    let fired: &[i32] = if leg == Leg::Reused { &SECOND_FIRE } else { &tokens };
+    let fired: &[i32] = if leg == Leg::Reused {
+        &SECOND_FIRE
+    } else {
+        &tokens
+    };
     for (r, t) in fired.iter().enumerate() {
         for c in [0usize, 1, 700, 1023] {
             let want = bf16(if c % 2 == 0 { amp(*t) } else { -amp(*t) });
@@ -1343,7 +1533,9 @@ fn zero_weight_decode(leg: Leg) {
     let lv = logits_value.expect("the last launch writes a named pin (the logits)");
     let logits = &named_bufs[&lv];
     let mut back = vec![0u8; logits.len()];
-    logits.copy_to_host(&mut back, stream.as_ref()).expect("d2h logits");
+    logits
+        .copy_to_host(&mut back, stream.as_ref())
+        .expect("d2h logits");
     stream.as_ref().synchronize().expect("sync");
     let logit = |r: usize, t: usize| {
         let off = (r * VOCAB + t) * 2;
@@ -1377,20 +1569,22 @@ fn zero_weight_decode(leg: Leg) {
 fn the_full_zero_weight_prefill_walks_every_launch() {
     use std::collections::BTreeMap;
 
-    use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
-    use driver_cuda::dtype::DType;
     use driver_cuda::bind::abi::{KvCacheLayerView, KvCacheScheme};
-    use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
     use driver_cuda::bind::{
         AttnCtx, AttnRegions, DispatchCtx, DispatchPlan, Frame, PrefillPlan, Resolver, run,
     };
+    use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
+    use driver_cuda::dtype::DType;
+    use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
     use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
     use model::shared::llama_like::forward::llama_like_cuda;
     use model_compiler::lower::{Arg, Fire, Row, lower};
     use model_compiler::trace::{FireClass, ValueId};
 
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("full zero-weight prefill") else { return };
+    let Some(_dev) = device_or_skip("full zero-weight prefill") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let raw_stream = stream.as_ref().as_raw().cast::<std::ffi::c_void>();
     let alloc = Allocator::new();
@@ -1414,12 +1608,29 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
     // multi-token. `GuardPred::WindowOne` reads that bit -- the window
     // class is a row property now (`.wiki/driver/graph.md` §4.1) -- and a
     // fixture that leaves it false asks for the DECODE dispatch.
-    let rows: Vec<Row> = vec![Row { samples: true, multi_token: true, ..Row::default() }; TOKENS];
-    let l = lower(&plan, &rows, Fire { captures_across_splits: false }).expect("lowers");
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            multi_token: true,
+            ..Row::default()
+        };
+        TOKENS
+    ];
+    let l = lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("lowers");
     let dplan = DispatchPlan::new(&plan, &l);
 
     let arena = alloc.alloc(l.arena_bytes).expect("arena");
-    let frame = Frame { arena: arena.as_ptr(), arena_bytes: l.arena_bytes };
+    let frame = Frame {
+        arena: arena.as_ptr(),
+        arena_bytes: l.arena_bytes,
+    };
 
     let bf16 = |v: f32| (v.to_bits() >> 16) as u16;
     let amp = |t: i32| 0.5 + 0.25 * t as f32;
@@ -1427,18 +1638,27 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
     let mut embed_host = vec![0u8; VOCAB * HIDDEN * 2];
     for t in 0..PATTERNED {
         for c in 0..HIDDEN {
-            let v = if c % 2 == 0 { amp(t as i32) } else { -amp(t as i32) };
+            let v = if c % 2 == 0 {
+                amp(t as i32)
+            } else {
+                -amp(t as i32)
+            };
             let b = bf16(v).to_le_bytes();
             embed_host[(t * HIDDEN + c) * 2] = b[0];
             embed_host[(t * HIDDEN + c) * 2 + 1] = b[1];
         }
     }
     let mut embed_dev = alloc.alloc(embed_host.len()).expect("embed");
-    embed_dev.copy_from_host(&embed_host, stream.as_ref()).expect("h2d");
-    let ones_host: Vec<u8> =
-        std::iter::repeat_n(bf16(1.0).to_le_bytes(), HIDDEN).flatten().collect();
+    embed_dev
+        .copy_from_host(&embed_host, stream.as_ref())
+        .expect("h2d");
+    let ones_host: Vec<u8> = std::iter::repeat_n(bf16(1.0).to_le_bytes(), HIDDEN)
+        .flatten()
+        .collect();
     let mut ones_dev = alloc.alloc(ones_host.len()).expect("ones");
-    ones_dev.copy_from_host(&ones_host, stream.as_ref()).expect("h2d");
+    ones_dev
+        .copy_from_host(&ones_host, stream.as_ref())
+        .expect("h2d");
     let mut zeros_dev = alloc.alloc(8 * 3072 * HIDDEN * 2).expect("zeros");
     zeros_dev.memset(0, stream.as_ref()).expect("zero");
 
@@ -1487,16 +1707,18 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
 
     // Two requests: tokens [0,3) and [3,7), one page each.
     let plane = (2 * PAGE * KV_HEADS * HEAD_DIM) as usize * 2;
-    let pools: Vec<(driver_cuda::device::DeviceBuffer, driver_cuda::device::DeviceBuffer)> =
-        (0..LAYERS)
-            .map(|_| {
-                let mut k = alloc.alloc(plane).expect("k pool");
-                let mut v = alloc.alloc(plane).expect("v pool");
-                k.memset(0, stream.as_ref()).expect("zk");
-                v.memset(0, stream.as_ref()).expect("zv");
-                (k, v)
-            })
-            .collect();
+    let pools: Vec<(
+        driver_cuda::device::DeviceBuffer,
+        driver_cuda::device::DeviceBuffer,
+    )> = (0..LAYERS)
+        .map(|_| {
+            let mut k = alloc.alloc(plane).expect("k pool");
+            let mut v = alloc.alloc(plane).expect("v pool");
+            k.memset(0, stream.as_ref()).expect("zk");
+            v.memset(0, stream.as_ref()).expect("zv");
+            (k, v)
+        })
+        .collect();
     let layers: Vec<KvCacheLayerView> = pools
         .iter()
         .enumerate()
@@ -1537,9 +1759,14 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
     let csr_lens = up(&u32s(&last_lens_h));
     let qo_indptr = up(&u32s(&qo_indptr_h));
     let row_valid = up(&[1u8; TOKENS]);
-    let ids = up(&tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>());
-    let positions =
-        up(&[0i32, 1, 2, 0, 1, 2, 3].iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>());
+    let ids = up(&tokens
+        .iter()
+        .flat_map(|t| t.to_le_bytes())
+        .collect::<Vec<u8>>());
+    let positions = up(&[0i32, 1, 2, 0, 1, 2, 3]
+        .iter()
+        .flat_map(|p| p.to_le_bytes())
+        .collect::<Vec<u8>>());
     let lse = alloc.alloc(TOKENS * Q_HEADS as usize * 4).expect("lse");
 
     let mut sops = LiveStagingOps;
@@ -1547,8 +1774,17 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
     let mut pplan = PrefillPlan::new();
     ws.begin_plan_update(&mut sops).expect("begin");
     pplan.plan_prefill(
-        &qo_indptr_h, &page_indptr_h, &last_lens_h,
-        Q_HEADS, KV_HEADS, HEAD_DIM, PAGE, ws.view(), raw_stream, false, -1,
+        &qo_indptr_h,
+        &page_indptr_h,
+        &last_lens_h,
+        Q_HEADS,
+        KV_HEADS,
+        HEAD_DIM,
+        PAGE,
+        ws.view(),
+        raw_stream,
+        false,
+        -1,
     );
     ws.end_plan_update(&mut sops, raw_stream);
 
@@ -1559,8 +1795,8 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
             l.kernels[x.kernel as usize] == "attn::dispatch_attention_flashinfer_prefill_bf16"
         })
         .expect("a prefill fire dispatches attention");
-    let o_off = attention_landing(&l, &dplan, fi).expect("the join or the neighbour names the attention slot");
-
+    let o_off = attention_landing(&l, &dplan, fi)
+        .expect("the join or the neighbour names the attention slot");
 
     let attn = AttnCtx {
         decode_plan: core::ptr::null_mut(),
@@ -1658,13 +1894,26 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
         zeros: zeros_dev.as_ptr(),
         named: &named_bufs,
     };
-    let ran = run(&l, &dplan, frame, &mut resolver, &ctx, AttnRegions::whole(Some(&attn)), None)
-        .unwrap_or_else(|e| panic!("the walk refused: {e:?}"));
+    let ran = run(
+        &l,
+        &dplan,
+        frame,
+        &mut resolver,
+        &ctx,
+        AttnRegions::whole(Some(&attn)),
+        None,
+    )
+    .unwrap_or_else(|e| panic!("the walk refused: {e:?}"));
     assert_eq!(ran, l.launches.len(), "every launch ran");
-    stream.as_ref().synchronize().expect("the whole prefill retires");
+    stream
+        .as_ref()
+        .synchronize()
+        .expect("the whole prefill retires");
 
     let mut arena_back = vec![0u8; l.arena_bytes];
-    arena.copy_to_host(&mut arena_back, stream.as_ref()).expect("d2h");
+    arena
+        .copy_to_host(&mut arena_back, stream.as_ref())
+        .expect("d2h");
     stream.as_ref().synchronize().expect("sync");
     let e = embed_out.expect("embed ran");
     for (r, t) in tokens.iter().enumerate() {
@@ -1679,7 +1928,9 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
     let lv = logits_value.expect("the last launch writes the logits pin");
     let logits = &named_bufs[&lv];
     let mut back = vec![0u8; logits.len()];
-    logits.copy_to_host(&mut back, stream.as_ref()).expect("d2h logits");
+    logits
+        .copy_to_host(&mut back, stream.as_ref())
+        .expect("d2h logits");
     stream.as_ref().synchronize().expect("sync");
     let logit = |r: usize, t: usize| {
         let off = (r * VOCAB + t) * 2;
@@ -1718,20 +1969,22 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
 fn the_hybrid_zero_weight_decode_walks_every_launch() {
     use std::collections::BTreeMap;
 
-    use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
-    use driver_cuda::dtype::DType;
     use driver_cuda::bind::abi::{KvCacheLayerView, KvCacheScheme};
-    use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
     use driver_cuda::bind::{
         AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, GdnCtx, Resolver, run,
     };
+    use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
+    use driver_cuda::dtype::DType;
+    use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
     use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
     use model::qwen_3_5::forward::qwen3_5_hybrid_cuda;
     use model_compiler::lower::{Arg, Fire, Row, lower};
     use model_compiler::trace::{FireClass, ValueId};
 
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("hybrid zero-weight decode") else { return };
+    let Some(_dev) = device_or_skip("hybrid zero-weight decode") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let raw_stream = stream.as_ref().as_raw().cast::<std::ffi::c_void>();
     let alloc = Allocator::new();
@@ -1774,12 +2027,28 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
         window_left: Vec::new(),
     };
     let plan = qwen3_5_hybrid_cuda(&hybrid, &cuda, FireClass::Decode);
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; ROWS];
-    let l = lower(&plan, &rows, Fire { captures_across_splits: false }).expect("lowers");
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        ROWS
+    ];
+    let l = lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("lowers");
     let dplan = DispatchPlan::new(&plan, &l);
 
     let arena = alloc.alloc(l.arena_bytes).expect("arena");
-    let frame = Frame { arena: arena.as_ptr(), arena_bytes: l.arena_bytes };
+    let frame = Frame {
+        arena: arena.as_ptr(),
+        arena_bytes: l.arena_bytes,
+    };
 
     // ── Weights. Embed: the pattern rows. In-projections: even-only
     // small. Landings: zero. Norms: ones (bf16 or fp32 as consumed). ──
@@ -1789,14 +2058,20 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
     let mut embed_host = vec![0u8; VOCAB * HIDDEN * 2];
     for t in 0..PATTERNED {
         for c in 0..HIDDEN {
-            let v = if c % 2 == 0 { amp(t as i32) } else { -amp(t as i32) };
+            let v = if c % 2 == 0 {
+                amp(t as i32)
+            } else {
+                -amp(t as i32)
+            };
             let b = bf16(v).to_le_bytes();
             embed_host[(t * HIDDEN + c) * 2] = b[0];
             embed_host[(t * HIDDEN + c) * 2 + 1] = b[1];
         }
     }
     let mut embed_dev = alloc.alloc(embed_host.len()).expect("embed");
-    embed_dev.copy_from_host(&embed_host, stream.as_ref()).expect("h2d");
+    embed_dev
+        .copy_from_host(&embed_host, stream.as_ref())
+        .expect("h2d");
     // Even-channel-only in-projection bank, big enough for the widest
     // ([CONV_DIM, HIDDEN]) and reused by every in-proj and the conv (whose
     // [CONV_DIM, 1, K] flat layout just reads a prefix).
@@ -1810,15 +2085,23 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
         }
     }
     let mut inproj_dev = alloc.alloc(inproj_host.len()).expect("inproj");
-    inproj_dev.copy_from_host(&inproj_host, stream.as_ref()).expect("h2d");
-    let ones_host: Vec<u8> =
-        std::iter::repeat_n(bf16(1.0).to_le_bytes(), HIDDEN).flatten().collect();
+    inproj_dev
+        .copy_from_host(&inproj_host, stream.as_ref())
+        .expect("h2d");
+    let ones_host: Vec<u8> = std::iter::repeat_n(bf16(1.0).to_le_bytes(), HIDDEN)
+        .flatten()
+        .collect();
     let mut ones_dev = alloc.alloc(ones_host.len()).expect("ones");
-    ones_dev.copy_from_host(&ones_host, stream.as_ref()).expect("h2d");
-    let ones_f32: Vec<u8> =
-        std::iter::repeat_n(1.0f32.to_le_bytes(), V_D as usize).flatten().collect();
+    ones_dev
+        .copy_from_host(&ones_host, stream.as_ref())
+        .expect("h2d");
+    let ones_f32: Vec<u8> = std::iter::repeat_n(1.0f32.to_le_bytes(), V_D as usize)
+        .flatten()
+        .collect();
     let mut ones_f32_dev = alloc.alloc(ones_f32.len()).expect("ones f32");
-    ones_f32_dev.copy_from_host(&ones_f32, stream.as_ref()).expect("h2d");
+    ones_f32_dev
+        .copy_from_host(&ones_f32, stream.as_ref())
+        .expect("h2d");
     let mut zeros_f32_dev = alloc.alloc(V_H as usize * 4).expect("zeros f32");
     zeros_f32_dev.memset(0, stream.as_ref()).expect("zero");
     let mut zeros_dev = alloc.alloc(2 * 3584 * HIDDEN * 2).expect("zeros");
@@ -1893,27 +2176,32 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
     // ── KV pools for the SIX full-attention layers; placeholder views
     // (never dereferenced) at the GDN indices. ──
     let plane = (4 * PAGE * KV_HEADS * HEAD_DIM) as usize * 2;
-    let pools: Vec<Option<(driver_cuda::device::DeviceBuffer, driver_cuda::device::DeviceBuffer)>> =
-        (0..LAYERS)
-            .map(|i| {
-                if !hybrid.is_full_attn(u32::try_from(i).expect("layer")) {
-                    return None;
-                }
-                let mut k = alloc.alloc(plane).expect("k pool");
-                let mut v = alloc.alloc(plane).expect("v pool");
-                k.memset(0, stream.as_ref()).expect("zk");
-                v.memset(0, stream.as_ref()).expect("zv");
-                Some((k, v))
-            })
-            .collect();
+    let pools: Vec<
+        Option<(
+            driver_cuda::device::DeviceBuffer,
+            driver_cuda::device::DeviceBuffer,
+        )>,
+    > = (0..LAYERS)
+        .map(|i| {
+            if !hybrid.is_full_attn(u32::try_from(i).expect("layer")) {
+                return None;
+            }
+            let mut k = alloc.alloc(plane).expect("k pool");
+            let mut v = alloc.alloc(plane).expect("v pool");
+            k.memset(0, stream.as_ref()).expect("zk");
+            v.memset(0, stream.as_ref()).expect("zv");
+            Some((k, v))
+        })
+        .collect();
     let layers: Vec<KvCacheLayerView> = pools
         .iter()
         .enumerate()
         .map(|(i, kv)| {
-            let (k, v) = kv.as_ref().map_or(
-                (core::ptr::null_mut(), core::ptr::null_mut()),
-                |(k, v)| (k.as_ptr(), v.as_ptr()),
-            );
+            let (k, v) = kv
+                .as_ref()
+                .map_or((core::ptr::null_mut(), core::ptr::null_mut()), |(k, v)| {
+                    (k.as_ptr(), v.as_ptr())
+                });
             KvCacheLayerView {
                 layer: i32::try_from(i).expect("layer"),
                 source_layer: i32::try_from(i).expect("layer"),
@@ -1942,26 +2230,32 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
     // layers, slot-indirected. ──
     let conv_stride = (CONV_K * CONV_DIM) as usize;
     let state_stride = (V_H * K_D * V_D) as usize;
-    let gdn_slabs: Vec<Option<(driver_cuda::device::DeviceBuffer, driver_cuda::device::DeviceBuffer)>> =
-        (0..LAYERS)
-            .map(|i| {
-                if hybrid.is_full_attn(u32::try_from(i).expect("layer")) {
-                    return None;
-                }
-                let mut c = alloc.alloc(SLOTS * conv_stride * 2).expect("conv slab");
-                let mut s = alloc.alloc(SLOTS * state_stride * 2).expect("state slab");
-                c.memset(0, stream.as_ref()).expect("zc");
-                s.memset(0, stream.as_ref()).expect("zs");
-                Some((c, s))
-            })
-            .collect();
+    let gdn_slabs: Vec<
+        Option<(
+            driver_cuda::device::DeviceBuffer,
+            driver_cuda::device::DeviceBuffer,
+        )>,
+    > = (0..LAYERS)
+        .map(|i| {
+            if hybrid.is_full_attn(u32::try_from(i).expect("layer")) {
+                return None;
+            }
+            let mut c = alloc.alloc(SLOTS * conv_stride * 2).expect("conv slab");
+            let mut s = alloc.alloc(SLOTS * state_stride * 2).expect("state slab");
+            c.memset(0, stream.as_ref()).expect("zc");
+            s.memset(0, stream.as_ref()).expect("zs");
+            Some((c, s))
+        })
+        .collect();
     let up = |data: &[u8]| {
         let mut b = alloc.alloc(data.len()).expect("upload");
         b.copy_from_host(data, stream.as_ref()).expect("h2d");
         b
     };
-    let slot_ids =
-        up(&[0i32, 1, 2, 3].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+    let slot_ids = up(&[0i32, 1, 2, 3]
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect::<Vec<u8>>());
     let gdn = GdnCtx {
         k_h: K_H,
         v_h: V_H,
@@ -1992,9 +2286,14 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
     let w_page = up(&u32s(&[0, 1, 2, 3]));
     let w_off = up(&u32s(&[0, 0, 0, 0]));
     let row_valid = up(&[1u8, 1, 1, 1]);
-    let ids = up(&tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>());
-    let positions =
-        up(&[0i32, 0, 0, 0].iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>());
+    let ids = up(&tokens
+        .iter()
+        .flat_map(|t| t.to_le_bytes())
+        .collect::<Vec<u8>>());
+    let positions = up(&[0i32, 0, 0, 0]
+        .iter()
+        .flat_map(|p| p.to_le_bytes())
+        .collect::<Vec<u8>>());
     let lse = alloc.alloc(ROWS * Q_HEADS as usize * 4).expect("lse");
 
     let mut sops = LiveStagingOps;
@@ -2017,9 +2316,7 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
     let fi = l
         .launches
         .iter()
-        .position(|x| {
-            l.kernels[x.kernel as usize] == "attn::dispatch_attention_flashinfer_decode"
-        })
+        .position(|x| l.kernels[x.kernel as usize] == "attn::dispatch_attention_flashinfer_decode")
         .expect("the hybrid decode dispatches attention");
     let q_pin_value = match &l.args[l.launches[fi].args.start as usize] {
         Arg::Named { value, .. } => *value,
@@ -2028,12 +2325,11 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
     // The attention output is guard-owned (the dispatch launch records no
     // SSA outputs); the launch AFTER the dispatch reads it first — the
     // sigmoid output gate's `x`.
-    let o_out: *mut std::ffi::c_void =
-        match &l.args[l.launches[fi + 1].args.start as usize] {
-            Arg::Arena { at, .. } => unsafe { arena.as_ptr().cast::<u8>().add(*at) }.cast(),
-            Arg::Named { value, .. } => named_bufs[value].as_ptr(),
-            other => panic!("the gate reads the attention slot, got {other:?}"),
-        };
+    let o_out: *mut std::ffi::c_void = match &l.args[l.launches[fi + 1].args.start as usize] {
+        Arg::Arena { at, .. } => unsafe { arena.as_ptr().cast::<u8>().add(*at) }.cast(),
+        Arg::Named { value, .. } => named_bufs[value].as_ptr(),
+        other => panic!("the gate reads the attention slot, got {other:?}"),
+    };
 
     let attn = AttnCtx {
         decode_plan: dplan_cache.as_ptr(),
@@ -2143,8 +2439,16 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
             let kernel = l.kernels[launch.kernel as usize].clone();
             let bound = bind(&l, launch, frame, &mut resolver)
                 .unwrap_or_else(|e| panic!("launch {i} {kernel}: bind {e:?}"));
-            dispatch(&bound, dplan.spec(i), frame, &mut resolver, &ctx, Some(&attn), Some(&gdn))
-                .unwrap_or_else(|e| panic!("launch {i} {kernel}: dispatch {e:?}"));
+            dispatch(
+                &bound,
+                dplan.spec(i),
+                frame,
+                &mut resolver,
+                &ctx,
+                Some(&attn),
+                Some(&gdn),
+            )
+            .unwrap_or_else(|e| panic!("launch {i} {kernel}: dispatch {e:?}"));
             stream
                 .as_ref()
                 .synchronize()
@@ -2152,16 +2456,29 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
         }
         l.launches.len()
     } else {
-        run(&l, &dplan, frame, &mut resolver, &ctx, AttnRegions::whole(Some(&attn)), Some(&gdn))
-            .unwrap_or_else(|e| panic!("the hybrid walk refused: {e:?}"))
+        run(
+            &l,
+            &dplan,
+            frame,
+            &mut resolver,
+            &ctx,
+            AttnRegions::whole(Some(&attn)),
+            Some(&gdn),
+        )
+        .unwrap_or_else(|e| panic!("the hybrid walk refused: {e:?}"))
     };
     assert_eq!(ran, l.launches.len(), "every launch ran");
-    stream.as_ref().synchronize().expect("the whole hybrid decode retires");
+    stream
+        .as_ref()
+        .synchronize()
+        .expect("the whole hybrid decode retires");
 
     // ── Invariant 1: the residual equals the embed rows, bit-exactly —
     // 18 GDN and 6 attention landings all through zero projections. ──
     let mut arena_back = vec![0u8; l.arena_bytes];
-    arena.copy_to_host(&mut arena_back, stream.as_ref()).expect("d2h");
+    arena
+        .copy_to_host(&mut arena_back, stream.as_ref())
+        .expect("d2h");
     stream.as_ref().synchronize().expect("sync");
     let e = embed_out.expect("embed ran");
     for (r, t) in tokens.iter().enumerate() {
@@ -2179,7 +2496,9 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
     let lv = logits_value.expect("the last launch writes the logits pin");
     let logits = &named_bufs[&lv];
     let mut back = vec![0u8; logits.len()];
-    logits.copy_to_host(&mut back, stream.as_ref()).expect("d2h logits");
+    logits
+        .copy_to_host(&mut back, stream.as_ref())
+        .expect("d2h logits");
     stream.as_ref().synchronize().expect("sync");
     let logit = |r: usize, t: usize| {
         let off = (r * VOCAB + t) * 2;
@@ -2208,20 +2527,22 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
 fn the_hybrid_zero_weight_prefill_walks_every_launch() {
     use std::collections::BTreeMap;
 
-    use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
-    use driver_cuda::dtype::DType;
     use driver_cuda::bind::abi::{KvCacheLayerView, KvCacheScheme};
-    use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
     use driver_cuda::bind::{
         AttnCtx, AttnRegions, DispatchCtx, DispatchPlan, Frame, GdnCtx, PrefillPlan, Resolver, run,
     };
+    use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
+    use driver_cuda::dtype::DType;
+    use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
     use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
     use model::qwen_3_5::forward::qwen3_5_hybrid_cuda;
     use model_compiler::lower::{Arg, Fire, Row, lower};
     use model_compiler::trace::{FireClass, ValueId};
 
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("hybrid zero-weight prefill") else { return };
+    let Some(_dev) = device_or_skip("hybrid zero-weight prefill") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let raw_stream = stream.as_ref().as_raw().cast::<std::ffi::c_void>();
     let alloc = Allocator::new();
@@ -2267,12 +2588,29 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
     // multi-token. `GuardPred::WindowOne` reads that bit -- the window
     // class is a row property now (`.wiki/driver/graph.md` §4.1) -- and a
     // fixture that leaves it false asks for the DECODE dispatch.
-    let rows: Vec<Row> = vec![Row { samples: true, multi_token: true, ..Row::default() }; TOKENS];
-    let l = lower(&plan, &rows, Fire { captures_across_splits: false }).expect("lowers");
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            multi_token: true,
+            ..Row::default()
+        };
+        TOKENS
+    ];
+    let l = lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("lowers");
     let dplan = DispatchPlan::new(&plan, &l);
 
     let arena = alloc.alloc(l.arena_bytes).expect("arena");
-    let frame = Frame { arena: arena.as_ptr(), arena_bytes: l.arena_bytes };
+    let frame = Frame {
+        arena: arena.as_ptr(),
+        arena_bytes: l.arena_bytes,
+    };
 
     let bf16 = |v: f32| (v.to_bits() >> 16) as u16;
     let amp = |t: i32| 0.5 + 0.25 * t as f32;
@@ -2280,14 +2618,20 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
     let mut embed_host = vec![0u8; VOCAB * HIDDEN * 2];
     for t in 0..PATTERNED {
         for c in 0..HIDDEN {
-            let v = if c % 2 == 0 { amp(t as i32) } else { -amp(t as i32) };
+            let v = if c % 2 == 0 {
+                amp(t as i32)
+            } else {
+                -amp(t as i32)
+            };
             let b = bf16(v).to_le_bytes();
             embed_host[(t * HIDDEN + c) * 2] = b[0];
             embed_host[(t * HIDDEN + c) * 2 + 1] = b[1];
         }
     }
     let mut embed_dev = alloc.alloc(embed_host.len()).expect("embed");
-    embed_dev.copy_from_host(&embed_host, stream.as_ref()).expect("h2d");
+    embed_dev
+        .copy_from_host(&embed_host, stream.as_ref())
+        .expect("h2d");
     let inproj_elems = CONV_DIM as usize * HIDDEN;
     let mut inproj_host = vec![0u8; inproj_elems * 2];
     let small = bf16(1.0 / 1024.0).to_le_bytes();
@@ -2298,15 +2642,23 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
         }
     }
     let mut inproj_dev = alloc.alloc(inproj_host.len()).expect("inproj");
-    inproj_dev.copy_from_host(&inproj_host, stream.as_ref()).expect("h2d");
-    let ones_host: Vec<u8> =
-        std::iter::repeat_n(bf16(1.0).to_le_bytes(), HIDDEN).flatten().collect();
+    inproj_dev
+        .copy_from_host(&inproj_host, stream.as_ref())
+        .expect("h2d");
+    let ones_host: Vec<u8> = std::iter::repeat_n(bf16(1.0).to_le_bytes(), HIDDEN)
+        .flatten()
+        .collect();
     let mut ones_dev = alloc.alloc(ones_host.len()).expect("ones");
-    ones_dev.copy_from_host(&ones_host, stream.as_ref()).expect("h2d");
-    let ones_f32: Vec<u8> =
-        std::iter::repeat_n(1.0f32.to_le_bytes(), V_D as usize).flatten().collect();
+    ones_dev
+        .copy_from_host(&ones_host, stream.as_ref())
+        .expect("h2d");
+    let ones_f32: Vec<u8> = std::iter::repeat_n(1.0f32.to_le_bytes(), V_D as usize)
+        .flatten()
+        .collect();
     let mut ones_f32_dev = alloc.alloc(ones_f32.len()).expect("ones f32");
-    ones_f32_dev.copy_from_host(&ones_f32, stream.as_ref()).expect("h2d");
+    ones_f32_dev
+        .copy_from_host(&ones_f32, stream.as_ref())
+        .expect("h2d");
     let mut zeros_f32_dev = alloc.alloc(V_H as usize * 4).expect("zeros f32");
     zeros_f32_dev.memset(0, stream.as_ref()).expect("zero");
     let mut zeros_dev = alloc.alloc(2 * 3584 * HIDDEN * 2).expect("zeros");
@@ -2375,27 +2727,32 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
     }
 
     let plane = (2 * PAGE * KV_HEADS * HEAD_DIM) as usize * 2;
-    let pools: Vec<Option<(driver_cuda::device::DeviceBuffer, driver_cuda::device::DeviceBuffer)>> =
-        (0..LAYERS)
-            .map(|i| {
-                if !hybrid.is_full_attn(u32::try_from(i).expect("layer")) {
-                    return None;
-                }
-                let mut k = alloc.alloc(plane).expect("k pool");
-                let mut v = alloc.alloc(plane).expect("v pool");
-                k.memset(0, stream.as_ref()).expect("zk");
-                v.memset(0, stream.as_ref()).expect("zv");
-                Some((k, v))
-            })
-            .collect();
+    let pools: Vec<
+        Option<(
+            driver_cuda::device::DeviceBuffer,
+            driver_cuda::device::DeviceBuffer,
+        )>,
+    > = (0..LAYERS)
+        .map(|i| {
+            if !hybrid.is_full_attn(u32::try_from(i).expect("layer")) {
+                return None;
+            }
+            let mut k = alloc.alloc(plane).expect("k pool");
+            let mut v = alloc.alloc(plane).expect("v pool");
+            k.memset(0, stream.as_ref()).expect("zk");
+            v.memset(0, stream.as_ref()).expect("zv");
+            Some((k, v))
+        })
+        .collect();
     let layers: Vec<KvCacheLayerView> = pools
         .iter()
         .enumerate()
         .map(|(i, kv)| {
-            let (k, v) = kv.as_ref().map_or(
-                (core::ptr::null_mut(), core::ptr::null_mut()),
-                |(k, v)| (k.as_ptr(), v.as_ptr()),
-            );
+            let (k, v) = kv
+                .as_ref()
+                .map_or((core::ptr::null_mut(), core::ptr::null_mut()), |(k, v)| {
+                    (k.as_ptr(), v.as_ptr())
+                });
             KvCacheLayerView {
                 layer: i32::try_from(i).expect("layer"),
                 source_layer: i32::try_from(i).expect("layer"),
@@ -2422,25 +2779,32 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
 
     let conv_stride = (CONV_K * CONV_DIM) as usize;
     let state_stride = (V_H * K_D * V_D) as usize;
-    let gdn_slabs: Vec<Option<(driver_cuda::device::DeviceBuffer, driver_cuda::device::DeviceBuffer)>> =
-        (0..LAYERS)
-            .map(|i| {
-                if hybrid.is_full_attn(u32::try_from(i).expect("layer")) {
-                    return None;
-                }
-                let mut c = alloc.alloc(SLOTS * conv_stride * 2).expect("conv slab");
-                let mut s = alloc.alloc(SLOTS * state_stride * 2).expect("state slab");
-                c.memset(0, stream.as_ref()).expect("zc");
-                s.memset(0, stream.as_ref()).expect("zs");
-                Some((c, s))
-            })
-            .collect();
+    let gdn_slabs: Vec<
+        Option<(
+            driver_cuda::device::DeviceBuffer,
+            driver_cuda::device::DeviceBuffer,
+        )>,
+    > = (0..LAYERS)
+        .map(|i| {
+            if hybrid.is_full_attn(u32::try_from(i).expect("layer")) {
+                return None;
+            }
+            let mut c = alloc.alloc(SLOTS * conv_stride * 2).expect("conv slab");
+            let mut s = alloc.alloc(SLOTS * state_stride * 2).expect("state slab");
+            c.memset(0, stream.as_ref()).expect("zc");
+            s.memset(0, stream.as_ref()).expect("zs");
+            Some((c, s))
+        })
+        .collect();
     let up = |data: &[u8]| {
         let mut b = alloc.alloc(data.len()).expect("upload");
         b.copy_from_host(data, stream.as_ref()).expect("h2d");
         b
     };
-    let slot_ids = up(&[0i32, 1].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+    let slot_ids = up(&[0i32, 1]
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect::<Vec<u8>>());
     let gdn = GdnCtx {
         k_h: K_H,
         v_h: V_H,
@@ -2472,9 +2836,14 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
     let csr_lens = up(&u32s(&last_lens_h));
     let qo_indptr = up(&u32s(&qo_indptr_h));
     let row_valid = up(&[1u8; TOKENS]);
-    let ids = up(&tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>());
-    let positions =
-        up(&[0i32, 1, 2, 0, 1, 2, 3].iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>());
+    let ids = up(&tokens
+        .iter()
+        .flat_map(|t| t.to_le_bytes())
+        .collect::<Vec<u8>>());
+    let positions = up(&[0i32, 1, 2, 0, 1, 2, 3]
+        .iter()
+        .flat_map(|p| p.to_le_bytes())
+        .collect::<Vec<u8>>());
     let lse = alloc.alloc(TOKENS * Q_HEADS as usize * 4).expect("lse");
 
     let mut sops = LiveStagingOps;
@@ -2482,8 +2851,17 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
     let mut pplan = PrefillPlan::new();
     ws.begin_plan_update(&mut sops).expect("begin");
     pplan.plan_prefill(
-        &qo_indptr_h, &page_indptr_h, &last_lens_h,
-        Q_HEADS, KV_HEADS, HEAD_DIM, PAGE, ws.view(), raw_stream, false, -1,
+        &qo_indptr_h,
+        &page_indptr_h,
+        &last_lens_h,
+        Q_HEADS,
+        KV_HEADS,
+        HEAD_DIM,
+        PAGE,
+        ws.view(),
+        raw_stream,
+        false,
+        -1,
     );
     ws.end_plan_update(&mut sops, raw_stream);
 
@@ -2498,12 +2876,11 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
         Arg::Named { value, .. } => *value,
         other => panic!("the dispatch's q is a pin, got {other:?}"),
     };
-    let o_out: *mut std::ffi::c_void =
-        match &l.args[l.launches[fi + 1].args.start as usize] {
-            Arg::Arena { at, .. } => unsafe { arena.as_ptr().cast::<u8>().add(*at) }.cast(),
-            Arg::Named { value, .. } => named_bufs[value].as_ptr(),
-            other => panic!("the gate reads the attention slot, got {other:?}"),
-        };
+    let o_out: *mut std::ffi::c_void = match &l.args[l.launches[fi + 1].args.start as usize] {
+        Arg::Arena { at, .. } => unsafe { arena.as_ptr().cast::<u8>().add(*at) }.cast(),
+        Arg::Named { value, .. } => named_bufs[value].as_ptr(),
+        other => panic!("the gate reads the attention slot, got {other:?}"),
+    };
 
     let attn = AttnCtx {
         decode_plan: core::ptr::null_mut(),
@@ -2603,13 +2980,26 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
             logits_value = Some(*value);
         }
     }
-    let ran = run(&l, &dplan, frame, &mut resolver, &ctx, AttnRegions::whole(Some(&attn)), Some(&gdn))
-        .unwrap_or_else(|e| panic!("the hybrid prefill walk refused: {e:?}"));
+    let ran = run(
+        &l,
+        &dplan,
+        frame,
+        &mut resolver,
+        &ctx,
+        AttnRegions::whole(Some(&attn)),
+        Some(&gdn),
+    )
+    .unwrap_or_else(|e| panic!("the hybrid prefill walk refused: {e:?}"));
     assert_eq!(ran, l.launches.len(), "every launch ran");
-    stream.as_ref().synchronize().expect("the whole hybrid prefill retires");
+    stream
+        .as_ref()
+        .synchronize()
+        .expect("the whole hybrid prefill retires");
 
     let mut arena_back = vec![0u8; l.arena_bytes];
-    arena.copy_to_host(&mut arena_back, stream.as_ref()).expect("d2h");
+    arena
+        .copy_to_host(&mut arena_back, stream.as_ref())
+        .expect("d2h");
     stream.as_ref().synchronize().expect("sync");
     let e = embed_out.expect("embed ran");
     for (r, t) in tokens.iter().enumerate() {
@@ -2624,7 +3014,9 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
     let lv = logits_value.expect("the last launch writes the logits pin");
     let logits = &named_bufs[&lv];
     let mut back = vec![0u8; logits.len()];
-    logits.copy_to_host(&mut back, stream.as_ref()).expect("d2h logits");
+    logits
+        .copy_to_host(&mut back, stream.as_ref())
+        .expect("d2h logits");
     stream.as_ref().synchronize().expect("sync");
     let logit = |r: usize, t: usize| {
         let off = (r * VOCAB + t) * 2;
@@ -2664,20 +3056,22 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
 fn the_nemotron_zero_weight_decode_walks_every_launch() {
     use std::collections::BTreeMap;
 
-    use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
-    use driver_cuda::dtype::DType;
     use driver_cuda::bind::abi::{KvCacheLayerView, KvCacheScheme};
-    use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
     use driver_cuda::bind::{
         AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, GdnCtx, Resolver, run,
     };
+    use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
+    use driver_cuda::dtype::DType;
+    use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
     use model::nemotron_h::forward::facts::NemotronHFacts;
     use model::nemotron_h::forward::nemotron_h_cuda;
     use model_compiler::lower::{Arg, Fire, Row, lower};
     use model_compiler::trace::{FireClass, ValueId};
 
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("nemotron zero-weight decode") else { return };
+    let Some(_dev) = device_or_skip("nemotron zero-weight decode") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let raw_stream = stream.as_ref().as_raw().cast::<std::ffi::c_void>();
     let alloc = Allocator::new();
@@ -2701,12 +3095,28 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
 
     let facts = NemotronHFacts::nemotron_h_synthetic();
     let plan = nemotron_h_cuda(&facts, FireClass::Decode);
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; ROWS];
-    let l = lower(&plan, &rows, Fire { captures_across_splits: false }).expect("lowers");
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        ROWS
+    ];
+    let l = lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("lowers");
     let dplan = DispatchPlan::new(&plan, &l);
 
     let arena = alloc.alloc(l.arena_bytes).expect("arena");
-    let frame = Frame { arena: arena.as_ptr(), arena_bytes: l.arena_bytes };
+    let frame = Frame {
+        arena: arena.as_ptr(),
+        arena_bytes: l.arena_bytes,
+    };
 
     // ── Weights: embed pattern (also the lm_head), norm ones, zeros. ──
     let bf16 = |v: f32| (v.to_bits() >> 16) as u16;
@@ -2715,18 +3125,27 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
     let mut embed_host = vec![0u8; VOCAB * HIDDEN * 2];
     for t in 0..PATTERNED {
         for c in 0..HIDDEN {
-            let v = if c % 2 == 0 { amp(t as i32) } else { -amp(t as i32) };
+            let v = if c % 2 == 0 {
+                amp(t as i32)
+            } else {
+                -amp(t as i32)
+            };
             let b = bf16(v).to_le_bytes();
             embed_host[(t * HIDDEN + c) * 2] = b[0];
             embed_host[(t * HIDDEN + c) * 2 + 1] = b[1];
         }
     }
     let mut embed_dev = alloc.alloc(embed_host.len()).expect("embed");
-    embed_dev.copy_from_host(&embed_host, stream.as_ref()).expect("h2d");
-    let ones_host: Vec<u8> =
-        std::iter::repeat_n(bf16(1.0).to_le_bytes(), HIDDEN).flatten().collect();
+    embed_dev
+        .copy_from_host(&embed_host, stream.as_ref())
+        .expect("h2d");
+    let ones_host: Vec<u8> = std::iter::repeat_n(bf16(1.0).to_le_bytes(), HIDDEN)
+        .flatten()
+        .collect();
     let mut ones_dev = alloc.alloc(ones_host.len()).expect("ones");
-    ones_dev.copy_from_host(&ones_host, stream.as_ref()).expect("h2d");
+    ones_dev
+        .copy_from_host(&ones_host, stream.as_ref())
+        .expect("h2d");
     // Big enough for the widest zero bank: the stacked expert banks
     // ([E=32, i=1024, h=2048]) and the in-projection ([4112, 2048]).
     let mut zeros_dev = alloc.alloc(32 * 1024 * HIDDEN * 2).expect("zeros");
@@ -2778,16 +3197,18 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
 
     // ── KV pools (uniform; only the attention layer reads its own). ──
     let plane = (4 * PAGE * KV_HEADS * HEAD_DIM) as usize * 2;
-    let pools: Vec<(driver_cuda::device::DeviceBuffer, driver_cuda::device::DeviceBuffer)> =
-        (0..LAYERS)
-            .map(|_| {
-                let mut k = alloc.alloc(plane).expect("k pool");
-                let mut v = alloc.alloc(plane).expect("v pool");
-                k.memset(0, stream.as_ref()).expect("zk");
-                v.memset(0, stream.as_ref()).expect("zv");
-                (k, v)
-            })
-            .collect();
+    let pools: Vec<(
+        driver_cuda::device::DeviceBuffer,
+        driver_cuda::device::DeviceBuffer,
+    )> = (0..LAYERS)
+        .map(|_| {
+            let mut k = alloc.alloc(plane).expect("k pool");
+            let mut v = alloc.alloc(plane).expect("v pool");
+            k.memset(0, stream.as_ref()).expect("zk");
+            v.memset(0, stream.as_ref()).expect("zv");
+            (k, v)
+        })
+        .collect();
     let layers: Vec<KvCacheLayerView> = pools
         .iter()
         .enumerate()
@@ -2817,26 +3238,33 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
     // ── The mamba slabs: one slot per request on layers 0/2/4. ──
     let conv_stride = (CONV_K * CONV_DIM) as usize;
     let state_stride = (M_HEADS * STATE * M_HEAD_DIM) as usize;
-    let slabs: Vec<Option<(driver_cuda::device::DeviceBuffer, driver_cuda::device::DeviceBuffer)>> =
-        (0..LAYERS as u32)
-            .map(|i| {
-                use model::nemotron_h::forward::facts::NemotronLayerKind;
-                if facts.kind(i) != NemotronLayerKind::Mamba {
-                    return None;
-                }
-                let mut c = alloc.alloc(ROWS * conv_stride * 2).expect("conv slab");
-                let mut s = alloc.alloc(ROWS * state_stride * 2).expect("state slab");
-                c.memset(0, stream.as_ref()).expect("zc");
-                s.memset(0, stream.as_ref()).expect("zs");
-                Some((c, s))
-            })
-            .collect();
+    let slabs: Vec<
+        Option<(
+            driver_cuda::device::DeviceBuffer,
+            driver_cuda::device::DeviceBuffer,
+        )>,
+    > = (0..LAYERS as u32)
+        .map(|i| {
+            use model::nemotron_h::forward::facts::NemotronLayerKind;
+            if facts.kind(i) != NemotronLayerKind::Mamba {
+                return None;
+            }
+            let mut c = alloc.alloc(ROWS * conv_stride * 2).expect("conv slab");
+            let mut s = alloc.alloc(ROWS * state_stride * 2).expect("state slab");
+            c.memset(0, stream.as_ref()).expect("zc");
+            s.memset(0, stream.as_ref()).expect("zs");
+            Some((c, s))
+        })
+        .collect();
     let up = |data: &[u8]| {
         let mut b = alloc.alloc(data.len()).expect("upload");
         b.copy_from_host(data, stream.as_ref()).expect("h2d");
         b
     };
-    let slot_ids = up(&[0i32, 1, 2, 3].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+    let slot_ids = up(&[0i32, 1, 2, 3]
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect::<Vec<u8>>());
     let gdn = GdnCtx {
         k_h: GROUPS,
         v_h: M_HEADS,
@@ -2867,9 +3295,14 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
     let w_page = up(&u32s(&[0, 1, 2, 3]));
     let w_off = up(&u32s(&[0, 0, 0, 0]));
     let row_valid = up(&[1u8, 1, 1, 1]);
-    let ids = up(&tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>());
-    let positions =
-        up(&[0i32, 0, 0, 0].iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>());
+    let ids = up(&tokens
+        .iter()
+        .flat_map(|t| t.to_le_bytes())
+        .collect::<Vec<u8>>());
+    let positions = up(&[0i32, 0, 0, 0]
+        .iter()
+        .flat_map(|p| p.to_le_bytes())
+        .collect::<Vec<u8>>());
     let lse = alloc.alloc(ROWS * Q_HEADS as usize * 4).expect("lse");
 
     let mut sops = LiveStagingOps;
@@ -2877,7 +3310,15 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
     let mut dplan_cache = DecodePlan::new();
     ws.begin_plan_update(&mut sops).expect("begin");
     dplan_cache.plan_decode(
-        &[0, 1, 2, 3, 4], Q_HEADS, KV_HEADS, HEAD_DIM, PAGE, ws.view(), raw_stream, false, -1,
+        &[0, 1, 2, 3, 4],
+        Q_HEADS,
+        KV_HEADS,
+        HEAD_DIM,
+        PAGE,
+        ws.view(),
+        raw_stream,
+        false,
+        -1,
     );
     ws.end_plan_update(&mut sops, raw_stream);
 
@@ -2886,9 +3327,7 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
     let fi = l
         .launches
         .iter()
-        .position(|x| {
-            l.kernels[x.kernel as usize] == "attn::dispatch_attention_flashinfer_decode"
-        })
+        .position(|x| l.kernels[x.kernel as usize] == "attn::dispatch_attention_flashinfer_decode")
         .expect("the decode dispatches attention");
     let dispatch_args = l.launches[fi].args.end - l.launches[fi].args.start;
     let (q_out, o_out) = if dispatch_args >= 2 {
@@ -3009,8 +3448,16 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
             let kernel = l.kernels[launch.kernel as usize].clone();
             let bound = bind(&l, launch, frame, &mut resolver)
                 .unwrap_or_else(|e| panic!("launch {i} {kernel}: bind {e:?}"));
-            dispatch(&bound, dplan.spec(i), frame, &mut resolver, &ctx, Some(&attn), Some(&gdn))
-                .unwrap_or_else(|e| panic!("launch {i} {kernel}: dispatch {e:?}"));
+            dispatch(
+                &bound,
+                dplan.spec(i),
+                frame,
+                &mut resolver,
+                &ctx,
+                Some(&attn),
+                Some(&gdn),
+            )
+            .unwrap_or_else(|e| panic!("launch {i} {kernel}: dispatch {e:?}"));
             stream
                 .as_ref()
                 .synchronize()
@@ -3018,15 +3465,28 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
         }
         l.launches.len()
     } else {
-        run(&l, &dplan, frame, &mut resolver, &ctx, AttnRegions::whole(Some(&attn)), Some(&gdn))
-            .unwrap_or_else(|e| panic!("the nemotron walk refused: {e:?}"))
+        run(
+            &l,
+            &dplan,
+            frame,
+            &mut resolver,
+            &ctx,
+            AttnRegions::whole(Some(&attn)),
+            Some(&gdn),
+        )
+        .unwrap_or_else(|e| panic!("the nemotron walk refused: {e:?}"))
     };
     assert_eq!(ran, l.launches.len(), "every launch ran");
-    stream.as_ref().synchronize().expect("the whole decode retires");
+    stream
+        .as_ref()
+        .synchronize()
+        .expect("the whole decode retires");
 
     // ── Invariant 1: the residual equals the embed rows, bit-exactly. ──
     let mut arena_back = vec![0u8; l.arena_bytes];
-    arena.copy_to_host(&mut arena_back, stream.as_ref()).expect("d2h");
+    arena
+        .copy_to_host(&mut arena_back, stream.as_ref())
+        .expect("d2h");
     stream.as_ref().synchronize().expect("sync");
     let e = embed_out.expect("embed ran");
     for (r, t) in tokens.iter().enumerate() {
@@ -3042,7 +3502,9 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
     let lv = logits_value.expect("the last launch writes the logits pin");
     let logits = &named_bufs[&lv];
     let mut back = vec![0u8; logits.len()];
-    logits.copy_to_host(&mut back, stream.as_ref()).expect("d2h logits");
+    logits
+        .copy_to_host(&mut back, stream.as_ref())
+        .expect("d2h logits");
     stream.as_ref().synchronize().expect("sync");
     let logit = |r: usize, t: usize| {
         let off = (r * VOCAB + t) * 2;
@@ -3077,7 +3539,9 @@ fn the_qwen3vl_tower_fires_through_the_bridge() {
     use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
 
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("qwen3_vl tower fire") else { return };
+    let Some(_dev) = device_or_skip("qwen3_vl tower fire") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let raw_stream = stream.as_ref().as_raw().cast::<std::ffi::c_void>();
     let alloc = Allocator::new();
@@ -3100,7 +3564,9 @@ fn the_qwen3vl_tower_fires_through_the_bridge() {
     let mut zeros = alloc.alloc(512 * 512 * 2).expect("zeros");
     zeros.memset(0, stream.as_ref()).expect("z");
     // The pos-embed table [2304, hidden] — zeros too.
-    let mut pos_tbl = alloc.alloc(NUM_POS as usize * HIDDEN as usize * 2).expect("pos");
+    let mut pos_tbl = alloc
+        .alloc(NUM_POS as usize * HIDDEN as usize * 2)
+        .expect("pos");
     pos_tbl.memset(0, stream.as_ref()).expect("z");
 
     let z = zeros.as_ptr().cast_const();
@@ -3120,11 +3586,14 @@ fn the_qwen3vl_tower_fires_through_the_bridge() {
 
     // The hidden rows, pre-filled with a nonzero pattern.
     let bf16 = |v: f32| (v.to_bits() >> 16) as u16;
-    let pattern: Vec<u8> = std::iter::repeat_n(bf16(3.0).to_le_bytes(), N_ROWS * OUT_HIDDEN as usize)
-        .flatten()
-        .collect();
+    let pattern: Vec<u8> =
+        std::iter::repeat_n(bf16(3.0).to_le_bytes(), N_ROWS * OUT_HIDDEN as usize)
+            .flatten()
+            .collect();
     let mut hidden_rows = alloc.alloc(pattern.len()).expect("hidden");
-    hidden_rows.copy_from_host(&pattern, stream.as_ref()).expect("h2d");
+    hidden_rows
+        .copy_from_host(&pattern, stream.as_ref())
+        .expect("h2d");
     // The deepstack scratch `[3, n_rows, out_hidden]`, pattern-filled:
     // the scatter memsets it whole and adds the (zero) merger outputs,
     // so EVERY byte must come back zero — the proof the deepstack leg
@@ -3134,7 +3603,9 @@ fn the_qwen3vl_tower_fires_through_the_bridge() {
             .flatten()
             .collect();
     let mut ds_scratch = alloc.alloc(ds_pattern.len()).expect("ds");
-    ds_scratch.copy_from_host(&ds_pattern, stream.as_ref()).expect("h2d");
+    ds_scratch
+        .copy_from_host(&ds_pattern, stream.as_ref())
+        .expect("h2d");
     stream.as_ref().synchronize().expect("sync");
 
     let mut cublas_ops = LiveCublas;
@@ -3176,7 +3647,9 @@ fn the_qwen3vl_tower_fires_through_the_bridge() {
     stream.as_ref().synchronize().expect("the tower retires");
 
     let mut ds_back = vec![0u8; ds_pattern.len()];
-    ds_scratch.copy_to_host(&mut ds_back, stream.as_ref()).expect("d2h ds");
+    ds_scratch
+        .copy_to_host(&mut ds_back, stream.as_ref())
+        .expect("d2h ds");
     stream.as_ref().synchronize().expect("sync");
     assert!(
         ds_back.iter().all(|&b| b == 0),
@@ -3184,14 +3657,20 @@ fn the_qwen3vl_tower_fires_through_the_bridge() {
     );
 
     let mut back = vec![0u8; pattern.len()];
-    hidden_rows.copy_to_host(&mut back, stream.as_ref()).expect("d2h");
+    hidden_rows
+        .copy_to_host(&mut back, stream.as_ref())
+        .expect("d2h");
     stream.as_ref().synchronize().expect("sync");
     let at = |r: usize, c: usize| {
         let off = (r * OUT_HIDDEN as usize + c) * 2;
         u16::from_le_bytes([back[off], back[off + 1]])
     };
     for c in [0usize, 1, 47, 95] {
-        assert_eq!(at(0, c), 0, "anchor row col {c}: the zero tower must land zero");
+        assert_eq!(
+            at(0, c),
+            0,
+            "anchor row col {c}: the zero tower must land zero"
+        );
         assert_eq!(at(1, c), bf16(3.0), "guard row col {c} must stay untouched");
     }
 
@@ -3207,7 +3686,9 @@ fn the_qwen3vl_tower_fires_through_the_bridge() {
 #[test]
 fn the_gemma4_vision_tower_encodes_through_the_bridge() {
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("gemma4 vision encode") else { return };
+    let Some(_dev) = device_or_skip("gemma4 vision encode") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let raw_stream = stream.as_ref().as_raw().cast::<std::ffi::c_void>();
     let alloc = Allocator::new();
@@ -3233,9 +3714,7 @@ fn the_gemma4_vision_tower_encodes_through_the_bridge() {
     let pixels = vec![0.5f32; N_PATCH * pixel_dim];
     let pixel_indptr: [u32; 2] = [0, (N_PATCH * pixel_dim * 4) as u32];
     // (x, y) per patch, the 3×3 grid.
-    let patch_positions: [u32; 18] = [
-        0, 0, 1, 0, 2, 0, 0, 1, 1, 1, 2, 1, 0, 2, 1, 2, 2, 2,
-    ];
+    let patch_positions: [u32; 18] = [0, 0, 1, 0, 2, 0, 0, 1, 1, 1, 2, 1, 0, 2, 1, 2, 2, 2];
     let anchors: [u32; 1] = [0];
 
     let bf16 = |v: f32| (v.to_bits() >> 16) as u16;
@@ -3307,13 +3786,15 @@ fn the_gemma4_vision_tower_encodes_through_the_bridge() {
 fn the_lora_apply_lands_its_deltas_on_device() {
     use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
     use driver_cuda::fire::lora::{
-        LORA_SITE_Q, LORA_SITE_V, LiveLoraOps, LoraFireState, LoraForm, LoraLaneView,
-        LoraOps, LoraStageArena, LoraStageRows, LoraTable,
+        LORA_SITE_Q, LORA_SITE_V, LiveLoraOps, LoraFireState, LoraForm, LoraLaneView, LoraOps,
+        LoraStageArena, LoraStageRows, LoraTable,
     };
     use driver_cuda::fire::sideband_arena::{DeviceMemory, LiveDeviceMemory};
 
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("lora apply") else { return };
+    let Some(_dev) = device_or_skip("lora apply") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let raw_stream = stream.as_ref().as_raw().cast::<std::ffi::c_void>();
     let alloc = Allocator::new();
@@ -3370,7 +3851,9 @@ fn the_lora_apply_lands_its_deltas_on_device() {
     };
     let bf16 = |v: f32| (v.to_bits() >> 16) as u16;
     let up_bf16 = |v: f32, n: usize| {
-        let bytes: Vec<u8> = std::iter::repeat_n(bf16(v).to_le_bytes(), n).flatten().collect();
+        let bytes: Vec<u8> = std::iter::repeat_n(bf16(v).to_le_bytes(), n)
+            .flatten()
+            .collect();
         let mut b = alloc.alloc(bytes.len()).expect("bf16 up");
         b.copy_from_host(&bytes, stream.as_ref()).expect("h2d");
         b
@@ -3432,8 +3915,20 @@ fn the_lora_apply_lands_its_deltas_on_device() {
         form: LoraForm::Scale,
     };
     let lanes = [
-        low_rank(a_zero_b.as_ptr().cast_const(), b_zero.as_ptr().cast_const(), 0, LORA_SITE_Q, DQ),
-        low_rank(a_one.as_ptr().cast_const(), b_one.as_ptr().cast_const(), 1, LORA_SITE_Q, DQ),
+        low_rank(
+            a_zero_b.as_ptr().cast_const(),
+            b_zero.as_ptr().cast_const(),
+            0,
+            LORA_SITE_Q,
+            DQ,
+        ),
+        low_rank(
+            a_one.as_ptr().cast_const(),
+            b_one.as_ptr().cast_const(),
+            1,
+            LORA_SITE_Q,
+            DQ,
+        ),
         scale(scale_two.as_ptr().cast_const(), 2, LORA_SITE_V, DV),
         scale(scale_one.as_ptr().cast_const(), 3, LORA_SITE_Q, DQ),
     ];
@@ -3488,7 +3983,10 @@ fn the_lora_apply_lands_its_deltas_on_device() {
         scratch.as_ptr(),
         raw_stream,
     );
-    stream.as_ref().synchronize().expect("the corrections retire");
+    stream
+        .as_ref()
+        .synchronize()
+        .expect("the corrections retire");
 
     let read = |buf: &driver_cuda::device::DeviceBuffer| {
         let mut back = vec![0u8; buf.len()];
@@ -3505,7 +4003,11 @@ fn the_lora_apply_lands_its_deltas_on_device() {
 
     // Row 0: B is zero at every layer — the launches ran and added nothing.
     for c in [0usize, 3, 31] {
-        assert_eq!(at(&q_back, 0, HQ, c), bf16(1.0), "row 0 col {c}: zero B must not move q");
+        assert_eq!(
+            at(&q_back, 0, HQ, c),
+            bf16(1.0),
+            "row 0 col {c}: zero B must not move q"
+        );
     }
     // Row 1: xAᵀ = H per rank slot, (xAᵀ)Bᵀ = R*H = 128, folded β=1 onto 1.0.
     // Layer 0's slice is ZERO — 129 here is also the layer-tag proof.
@@ -3525,7 +4027,11 @@ fn the_lora_apply_lands_its_deltas_on_device() {
     }
     // Row 3: a scale of one at layer 1 (layer 0 would be ×8).
     for c in [0usize, 31] {
-        assert_eq!(at(&q_back, 3, HQ, c), bf16(1.0), "row 3 col {c}: identity scale");
+        assert_eq!(
+            at(&q_back, 3, HQ, c),
+            bf16(1.0),
+            "row 3 col {c}: identity scale"
+        );
     }
     // Every row no lane names stays put.
     for r in [0usize, 1, 3] {
@@ -3548,13 +4054,15 @@ fn the_lora_apply_lands_its_deltas_on_device() {
 fn the_lora_grouped_path_lands_its_deltas_on_device() {
     use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
     use driver_cuda::fire::lora::{
-        LORA_SITE_Q, LiveLoraOps, LoraFireState, LoraForm, LoraLaneView, LoraOps,
-        LoraStageArena, LoraStageRows, LoraTable,
+        LORA_SITE_Q, LiveLoraOps, LoraFireState, LoraForm, LoraLaneView, LoraOps, LoraStageArena,
+        LoraStageRows, LoraTable,
     };
     use driver_cuda::fire::sideband_arena::{DeviceMemory, LiveDeviceMemory};
 
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("lora grouped apply") else { return };
+    let Some(_dev) = device_or_skip("lora grouped apply") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let raw_stream = stream.as_ref().as_raw().cast::<std::ffi::c_void>();
     let alloc = Allocator::new();
@@ -3604,7 +4112,9 @@ fn the_lora_grouped_path_lands_its_deltas_on_device() {
     };
     let bf16 = |v: f32| (v.to_bits() >> 16) as u16;
     let up_bf16 = |v: f32, n: usize| {
-        let bytes: Vec<u8> = std::iter::repeat_n(bf16(v).to_le_bytes(), n).flatten().collect();
+        let bytes: Vec<u8> = std::iter::repeat_n(bf16(v).to_le_bytes(), n)
+            .flatten()
+            .collect();
         let mut b = alloc.alloc(bytes.len()).expect("bf16 up");
         b.copy_from_host(&bytes, stream.as_ref()).expect("h2d");
         b
@@ -3634,7 +4144,10 @@ fn the_lora_grouped_path_lands_its_deltas_on_device() {
         d_out: HQ as u32,
         form: LoraForm::LowRank,
     };
-    let lanes = [lane(b_one.as_ptr().cast_const(), 0), lane(b_half.as_ptr().cast_const(), 1)];
+    let lanes = [
+        lane(b_one.as_ptr().cast_const(), 0),
+        lane(b_half.as_ptr().cast_const(), 1),
+    ];
     let table = LoraTable { lanes: &lanes };
 
     let x = up_bf16(1.0, ROWS * H as usize);
@@ -3655,7 +4168,17 @@ fn the_lora_grouped_path_lands_its_deltas_on_device() {
         gate: scratch.as_ptr(),
     };
     let state = LoraFireState::stage(
-        &mut ops, &mut arena, &table, LAYERS, ROWS as i32, H, HQ, HK, 128, 1, &rows_view,
+        &mut ops,
+        &mut arena,
+        &table,
+        LAYERS,
+        ROWS as i32,
+        H,
+        HQ,
+        HK,
+        128,
+        1,
+        &rows_view,
         /*grouped_enabled=*/ true,
     )
     .expect("the lane table stages");
@@ -3681,7 +4204,10 @@ fn the_lora_grouped_path_lands_its_deltas_on_device() {
         scratch.as_ptr(),
         raw_stream,
     );
-    stream.as_ref().synchronize().expect("the grouped corrections retire");
+    stream
+        .as_ref()
+        .synchronize()
+        .expect("the grouped corrections retire");
 
     let mut back = vec![0u8; q.len()];
     q.copy_to_host(&mut back, stream.as_ref()).expect("d2h");
@@ -3691,8 +4217,16 @@ fn the_lora_grouped_path_lands_its_deltas_on_device() {
         u16::from_le_bytes([back[off], back[off + 1]])
     };
     for c in [0usize, 5, 31] {
-        assert_eq!(at(0, c), bf16(129.0), "grouped row 0 col {c}: B = 1 gives R*H");
-        assert_eq!(at(1, c), bf16(65.0), "grouped row 1 col {c}: B = 0.5 gives R*H/2");
+        assert_eq!(
+            at(0, c),
+            bf16(129.0),
+            "grouped row 0 col {c}: B = 1 gives R*H"
+        );
+        assert_eq!(
+            at(1, c),
+            bf16(65.0),
+            "grouped row 1 col {c}: B = 0.5 gives R*H/2"
+        );
     }
     for r in [2usize, 3] {
         assert_eq!(at(r, 0), bf16(1.0), "row {r} is in no group");
@@ -3722,20 +4256,23 @@ fn the_lora_grouped_path_lands_its_deltas_on_device() {
 fn the_gemma3n_zero_weight_decode_walks_every_launch() {
     use std::collections::BTreeMap;
 
+    use driver_cuda::bind::abi::{KvCacheLayerView, KvCacheScheme};
+    use driver_cuda::bind::{
+        AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, Resolver, bind,
+        dispatch,
+    };
     use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
     use driver_cuda::dtype::DType;
-    use driver_cuda::bind::abi::{KvCacheLayerView, KvCacheScheme};
     use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
-    use driver_cuda::bind::{
-        AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, Resolver, bind, dispatch,
-    };
     use model::gemma_3n::forward::facts::{Gemma3nAltUpFacts, Gemma3nAttnFacts, Gemma3nFacts};
     use model::gemma_3n::forward::gemma3n_cuda;
     use model_compiler::lower::{Arg, Fire, Row, lower};
     use model_compiler::trace::{FireClass, ValueId};
 
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("gemma3n zero-weight decode") else { return };
+    let Some(_dev) = device_or_skip("gemma3n zero-weight decode") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let raw_stream = stream.as_ref().as_raw().cast::<std::ffi::c_void>();
     let alloc = Allocator::new();
@@ -3757,7 +4294,10 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
         laurel_rank: 32,
         ple_width: 64,
         sparsity_layers: 2,
-        altup: Gemma3nAltUpFacts { num_streams: STREAMS as u32, active: 0 },
+        altup: Gemma3nAltUpFacts {
+            num_streams: STREAMS as u32,
+            active: 0,
+        },
         attn: Gemma3nAttnFacts {
             heads: Q_HEADS as u32,
             kv_heads: KV_HEADS as u32,
@@ -3768,12 +4308,28 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
         window_left: Vec::new(),
     };
     let plan = gemma3n_cuda(&facts, FireClass::Decode);
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; ROWS];
-    let l = lower(&plan, &rows, Fire { captures_across_splits: false }).expect("lowers");
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        ROWS
+    ];
+    let l = lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("lowers");
     let dplan = DispatchPlan::new(&plan, &l);
 
     let arena = alloc.alloc(l.arena_bytes).expect("arena");
-    let frame = Frame { arena: arena.as_ptr(), arena_bytes: l.arena_bytes };
+    let frame = Frame {
+        arena: arena.as_ptr(),
+        arena_bytes: l.arena_bytes,
+    };
 
     let bf16 = |v: f32| (v.to_bits() >> 16) as u16;
     let tokens: [i32; ROWS] = [1, 2];
@@ -3787,11 +4343,16 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
         }
     }
     let mut embed_dev = alloc.alloc(embed_host.len()).expect("embed");
-    embed_dev.copy_from_host(&embed_host, stream.as_ref()).expect("h2d");
-    let ones_host: Vec<u8> =
-        std::iter::repeat_n(bf16(1.0).to_le_bytes(), 4096).flatten().collect();
+    embed_dev
+        .copy_from_host(&embed_host, stream.as_ref())
+        .expect("h2d");
+    let ones_host: Vec<u8> = std::iter::repeat_n(bf16(1.0).to_le_bytes(), 4096)
+        .flatten()
+        .collect();
     let mut ones_dev = alloc.alloc(ones_host.len()).expect("ones");
-    ones_dev.copy_from_host(&ones_host, stream.as_ref()).expect("h2d");
+    ones_dev
+        .copy_from_host(&ones_host, stream.as_ref())
+        .expect("h2d");
     // Every projection is zero; the widest is [512, 256].
     let mut zeros_dev = alloc.alloc(4 << 20).expect("zeros");
     zeros_dev.memset(0, stream.as_ref()).expect("zero");
@@ -3840,16 +4401,18 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
     }
 
     let plane = (4 * PAGE * KV_HEADS * HEAD_DIM) as usize * 2;
-    let pools: Vec<(driver_cuda::device::DeviceBuffer, driver_cuda::device::DeviceBuffer)> =
-        (0..LAYERS)
-            .map(|_| {
-                let mut k = alloc.alloc(plane).expect("k pool");
-                let mut v = alloc.alloc(plane).expect("v pool");
-                k.memset(0, stream.as_ref()).expect("zk");
-                v.memset(0, stream.as_ref()).expect("zv");
-                (k, v)
-            })
-            .collect();
+    let pools: Vec<(
+        driver_cuda::device::DeviceBuffer,
+        driver_cuda::device::DeviceBuffer,
+    )> = (0..LAYERS)
+        .map(|_| {
+            let mut k = alloc.alloc(plane).expect("k pool");
+            let mut v = alloc.alloc(plane).expect("v pool");
+            k.memset(0, stream.as_ref()).expect("zk");
+            v.memset(0, stream.as_ref()).expect("zv");
+            (k, v)
+        })
+        .collect();
     let layers: Vec<KvCacheLayerView> = pools
         .iter()
         .enumerate()
@@ -3889,8 +4452,14 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
     let w_page = up(&u32s(&[0, 1]));
     let w_off = up(&u32s(&[0, 0]));
     let row_valid = up(&[1u8, 1]);
-    let ids = up(&tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>());
-    let positions = up(&[0i32, 0].iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>());
+    let ids = up(&tokens
+        .iter()
+        .flat_map(|t| t.to_le_bytes())
+        .collect::<Vec<u8>>());
+    let positions = up(&[0i32, 0]
+        .iter()
+        .flat_map(|p| p.to_le_bytes())
+        .collect::<Vec<u8>>());
     let lse = alloc.alloc(ROWS * Q_HEADS as usize * 4).expect("lse");
 
     let mut sops = LiveStagingOps;
@@ -3898,7 +4467,15 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
     let mut dplan_cache = DecodePlan::new();
     ws.begin_plan_update(&mut sops).expect("begin");
     dplan_cache.plan_decode(
-        &[0, 1, 2], Q_HEADS, KV_HEADS, HEAD_DIM, PAGE, ws.view(), raw_stream, false, -1,
+        &[0, 1, 2],
+        Q_HEADS,
+        KV_HEADS,
+        HEAD_DIM,
+        PAGE,
+        ws.view(),
+        raw_stream,
+        false,
+        -1,
     );
     ws.end_plan_update(&mut sops, raw_stream);
 
@@ -4015,8 +4592,16 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
         let kernel = l.kernels[launch.kernel as usize].clone();
         let bound = bind(&l, launch, frame, &mut resolver)
             .unwrap_or_else(|e| panic!("launch {i} {kernel}: bind {e:?}"));
-        dispatch(&bound, dplan.spec(i), frame, &mut resolver, &ctx, Some(&attn), None)
-            .unwrap_or_else(|e| panic!("launch {i} {kernel}: dispatch {e:?}"));
+        dispatch(
+            &bound,
+            dplan.spec(i),
+            frame,
+            &mut resolver,
+            &ctx,
+            Some(&attn),
+            None,
+        )
+        .unwrap_or_else(|e| panic!("launch {i} {kernel}: dispatch {e:?}"));
         stream
             .as_ref()
             .synchronize()
@@ -4034,7 +4619,10 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
             bad += 1;
         }
     }
-    assert_eq!(bad, 0, "the AltUp walk left {bad} non-finite bf16 words in the arena");
+    assert_eq!(
+        bad, 0,
+        "the AltUp walk left {bad} non-finite bf16 words in the arena"
+    );
 
     ws.release(&mut sops);
     cublas.release(&mut cublas_ops);
@@ -4057,20 +4645,23 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
 fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
     use std::collections::BTreeMap;
 
+    use driver_cuda::bind::abi::{KvCacheLayerView, KvCacheScheme};
+    use driver_cuda::bind::{
+        AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, Resolver, bind,
+        dispatch,
+    };
     use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
     use driver_cuda::dtype::DType;
-    use driver_cuda::bind::abi::{KvCacheLayerView, KvCacheScheme};
     use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
-    use driver_cuda::bind::{
-        AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, Resolver, bind, dispatch,
-    };
     use model::gpt_oss::forward::facts::{GptOssCudaFacts, GptOssFacts};
     use model::gpt_oss::forward::gpt_oss_cuda;
     use model_compiler::lower::{Arg, Fire, Row, lower};
     use model_compiler::trace::{FireClass, ValueId};
 
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("gpt_oss zero-weight decode") else { return };
+    let Some(_dev) = device_or_skip("gpt_oss zero-weight decode") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let raw_stream = stream.as_ref().as_raw().cast::<std::ffi::c_void>();
     let alloc = Allocator::new();
@@ -4103,13 +4694,33 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
         rope_yarn_original: true,
         attn_sinks: true,
     };
-    let plan = gpt_oss_cuda(&facts, &GptOssCudaFacts::gpt_oss_20b_synthetic(), FireClass::Decode);
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; ROWS];
-    let l = lower(&plan, &rows, Fire { captures_across_splits: false }).expect("lowers");
+    let plan = gpt_oss_cuda(
+        &facts,
+        &GptOssCudaFacts::gpt_oss_20b_synthetic(),
+        FireClass::Decode,
+    );
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        ROWS
+    ];
+    let l = lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("lowers");
     let dplan = DispatchPlan::new(&plan, &l);
 
     let arena = alloc.alloc(l.arena_bytes).expect("arena");
-    let frame = Frame { arena: arena.as_ptr(), arena_bytes: l.arena_bytes };
+    let frame = Frame {
+        arena: arena.as_ptr(),
+        arena_bytes: l.arena_bytes,
+    };
 
     let bf16 = |v: f32| (v.to_bits() >> 16) as u16;
     let tokens: [i32; ROWS] = [1, 2];
@@ -4122,11 +4733,16 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
         }
     }
     let mut embed_dev = alloc.alloc(embed_host.len()).expect("embed");
-    embed_dev.copy_from_host(&embed_host, stream.as_ref()).expect("h2d");
-    let ones_host: Vec<u8> =
-        std::iter::repeat_n(bf16(1.0).to_le_bytes(), 4096).flatten().collect();
+    embed_dev
+        .copy_from_host(&embed_host, stream.as_ref())
+        .expect("h2d");
+    let ones_host: Vec<u8> = std::iter::repeat_n(bf16(1.0).to_le_bytes(), 4096)
+        .flatten()
+        .collect();
     let mut ones_dev = alloc.alloc(ones_host.len()).expect("ones");
-    ones_dev.copy_from_host(&ones_host, stream.as_ref()).expect("h2d");
+    ones_dev
+        .copy_from_host(&ones_host, stream.as_ref())
+        .expect("h2d");
     let mut zeros_dev = alloc.alloc(8 << 20).expect("zeros");
     zeros_dev.memset(0, stream.as_ref()).expect("zero");
     // The per-expert POINTER TABLE: E pointers, every one into the zero
@@ -4135,7 +4751,9 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
         .flat_map(u64::to_le_bytes)
         .collect();
     let mut bank_table = alloc.alloc(table_host.len()).expect("bank table");
-    bank_table.copy_from_host(&table_host, stream.as_ref()).expect("h2d table");
+    bank_table
+        .copy_from_host(&table_host, stream.as_ref())
+        .expect("h2d table");
     stream.as_ref().synchronize().expect("uploads retire");
 
     let mut named_widths: BTreeMap<ValueId, u32> = BTreeMap::new();
@@ -4173,7 +4791,11 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
             // per-expert biases are genuinely absent on this deployment,
             // and the row says they may be null.
             if name.contains("bank") {
-                return if name.ends_with("_bias") { None } else { Some(self.table) };
+                return if name.ends_with("_bias") {
+                    None
+                } else {
+                    Some(self.table)
+                };
             }
             Some(if name.contains("embed") || name.contains("lm_head") {
                 self.embed
@@ -4189,16 +4811,18 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
     }
 
     let plane = (4 * PAGE * KV_HEADS * HEAD_DIM) as usize * 2;
-    let pools: Vec<(driver_cuda::device::DeviceBuffer, driver_cuda::device::DeviceBuffer)> =
-        (0..LAYERS)
-            .map(|_| {
-                let mut k = alloc.alloc(plane).expect("k pool");
-                let mut v = alloc.alloc(plane).expect("v pool");
-                k.memset(0, stream.as_ref()).expect("zk");
-                v.memset(0, stream.as_ref()).expect("zv");
-                (k, v)
-            })
-            .collect();
+    let pools: Vec<(
+        driver_cuda::device::DeviceBuffer,
+        driver_cuda::device::DeviceBuffer,
+    )> = (0..LAYERS)
+        .map(|_| {
+            let mut k = alloc.alloc(plane).expect("k pool");
+            let mut v = alloc.alloc(plane).expect("v pool");
+            k.memset(0, stream.as_ref()).expect("zk");
+            v.memset(0, stream.as_ref()).expect("zv");
+            (k, v)
+        })
+        .collect();
     let layers: Vec<KvCacheLayerView> = pools
         .iter()
         .enumerate()
@@ -4238,8 +4862,14 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
     let w_page = up(&u32s(&[0, 1]));
     let w_off = up(&u32s(&[0, 0]));
     let row_valid = up(&[1u8, 1]);
-    let ids = up(&tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>());
-    let positions = up(&[0i32, 0].iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>());
+    let ids = up(&tokens
+        .iter()
+        .flat_map(|t| t.to_le_bytes())
+        .collect::<Vec<u8>>());
+    let positions = up(&[0i32, 0]
+        .iter()
+        .flat_map(|p| p.to_le_bytes())
+        .collect::<Vec<u8>>());
     let lse = alloc.alloc(ROWS * Q_HEADS as usize * 4).expect("lse");
 
     let mut sops = LiveStagingOps;
@@ -4247,7 +4877,15 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
     let mut dplan_cache = DecodePlan::new();
     ws.begin_plan_update(&mut sops).expect("begin");
     dplan_cache.plan_decode(
-        &[0, 1, 2], Q_HEADS, KV_HEADS, HEAD_DIM, PAGE, ws.view(), raw_stream, false, -1,
+        &[0, 1, 2],
+        Q_HEADS,
+        KV_HEADS,
+        HEAD_DIM,
+        PAGE,
+        ws.view(),
+        raw_stream,
+        false,
+        -1,
     );
     ws.end_plan_update(&mut sops, raw_stream);
 
@@ -4338,8 +4976,16 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
         let kernel = l.kernels[launch.kernel as usize].clone();
         let bound = bind(&l, launch, frame, &mut resolver)
             .unwrap_or_else(|e| panic!("launch {i} {kernel}: bind {e:?}"));
-        dispatch(&bound, dplan.spec(i), frame, &mut resolver, &ctx, Some(&attn), None)
-            .unwrap_or_else(|e| panic!("launch {i} {kernel}: dispatch {e:?}"));
+        dispatch(
+            &bound,
+            dplan.spec(i),
+            frame,
+            &mut resolver,
+            &ctx,
+            Some(&attn),
+            None,
+        )
+        .unwrap_or_else(|e| panic!("launch {i} {kernel}: dispatch {e:?}"));
         stream
             .as_ref()
             .synchronize()
@@ -4356,7 +5002,10 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
             f.is_nan() || f.is_infinite()
         })
         .count();
-    assert_eq!(bad, 0, "the gpt-oss walk left {bad} non-finite bf16 words in the arena");
+    assert_eq!(
+        bad, 0,
+        "the gpt-oss walk left {bad} non-finite bf16 words in the arena"
+    );
 
     ws.release(&mut sops);
     cublas.release(&mut cublas_ops);

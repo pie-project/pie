@@ -35,12 +35,8 @@ pub const LORA_SITE_GATE_UP: u64 = 1 << 4;
 /// `down_proj` — reserved.
 pub const LORA_SITE_DOWN: u64 = 1 << 5;
 /// Every bit the vocabulary defines.
-pub const LORA_SITES_KNOWN: u64 = LORA_SITE_Q
-    | LORA_SITE_K
-    | LORA_SITE_V
-    | LORA_SITE_O
-    | LORA_SITE_GATE_UP
-    | LORA_SITE_DOWN;
+pub const LORA_SITES_KNOWN: u64 =
+    LORA_SITE_Q | LORA_SITE_K | LORA_SITE_V | LORA_SITE_O | LORA_SITE_GATE_UP | LORA_SITE_DOWN;
 /// The bits v0 actually applies. A lane naming any other known bit binds
 /// fine and is refused loudly at first use — a silently ignored site
 /// would be a request whose adapter never applied while every sample
@@ -444,8 +440,7 @@ impl LoraFireState {
             require_width(LORA_SITE_V, hk, "v")?;
             if scale_lane {
                 if i64::from(lane.token_start) > i64::from(n)
-                    || i64::from(lane.token_count)
-                        > i64::from(n) - i64::from(lane.token_start)
+                    || i64::from(lane.token_count) > i64::from(n) - i64::from(lane.token_start)
                 {
                     return Err(LoraStageError(
                         "lora scale lane token span exceeds the fire".into(),
@@ -507,9 +502,7 @@ impl LoraFireState {
                     continue;
                 }
                 let pos = me.groups.iter().position(|g| {
-                    g.rank == v.rank as i32
-                        && g.d_in == v.d_in as i32
-                        && g.d_out == v.d_out as i32
+                    g.rank == v.rank as i32 && g.d_in == v.d_in as i32 && g.d_out == v.d_out as i32
                 });
                 let g = match pos {
                     Some(p) => &mut me.groups[p],
@@ -533,8 +526,8 @@ impl LoraFireState {
                     let idx = me.groups[gi].members[mi];
                     me.lanes[idx].grouped = true;
                     me.lanes[idx].xa_offset = xa_total;
-                    xa_total += me.lanes[idx].view.token_count as usize
-                        * me.lanes[idx].view.rank as usize;
+                    xa_total +=
+                        me.lanes[idx].view.token_count as usize * me.lanes[idx].view.rank as usize;
                 }
             }
             let bound = usize::try_from(n.max(0)).unwrap_or(0)
@@ -580,10 +573,8 @@ impl LoraFireState {
                         let mut staged = Vec::new();
                         let mut a_run = Vec::new();
                         let mut xa_run = Vec::new();
-                        let (mut q_act, mut q_w, mut q_y) =
-                            (Vec::new(), Vec::new(), Vec::new());
-                        let (mut v_act, mut v_w, mut v_y) =
-                            (Vec::new(), Vec::new(), Vec::new());
+                        let (mut q_act, mut q_w, mut q_y) = (Vec::new(), Vec::new(), Vec::new());
+                        let (mut v_act, mut v_w, mut v_y) = (Vec::new(), Vec::new(), Vec::new());
                         if layer == 0 {
                             let g = &mut me.groups[gi];
                             g.m.clear();
@@ -605,25 +596,23 @@ impl LoraFireState {
                                     .cast::<u16>()
                                     .add(layer * g_d_out as usize * g_rank as usize)
                             };
-                            let xa = unsafe {
-                                rows.gate.cast::<u16>().add(lane.xa_offset)
-                            };
+                            let xa = unsafe { rows.gate.cast::<u16>().add(lane.xa_offset) };
                             staged.push(bf16_row(rows.norm_x, v.token_start, h));
                             a_run.push(a_l.cast_const().cast::<c_void>());
                             xa_run.push(xa.cast_const().cast::<c_void>());
                             if layer == 0 {
-                                me.groups[gi].m.push(
-                                    i32::try_from(v.token_count).unwrap_or(0),
-                                );
+                                me.groups[gi]
+                                    .m
+                                    .push(i32::try_from(v.token_count).unwrap_or(0));
                             }
                             if v.sites_bits & LORA_SITE_Q != 0 {
                                 q_act.push(xa.cast_const().cast::<c_void>());
                                 q_w.push(b_l.cast_const().cast::<c_void>());
                                 q_y.push(bf16_row(rows.q.cast_const(), v.token_start, hq));
                                 if layer == 0 {
-                                    me.groups[gi].mq.push(
-                                        i32::try_from(v.token_count).unwrap_or(0),
-                                    );
+                                    me.groups[gi]
+                                        .mq
+                                        .push(i32::try_from(v.token_count).unwrap_or(0));
                                 }
                             }
                             if v.sites_bits & LORA_SITE_V != 0 {
@@ -631,16 +620,15 @@ impl LoraFireState {
                                 v_w.push(b_l.cast_const().cast::<c_void>());
                                 v_y.push(bf16_row(rows.v.cast_const(), v.token_start, hk));
                                 if layer == 0 {
-                                    me.groups[gi].mv.push(
-                                        i32::try_from(v.token_count).unwrap_or(0),
-                                    );
+                                    me.groups[gi]
+                                        .mv
+                                        .push(i32::try_from(v.token_count).unwrap_or(0));
                                 }
                             }
                         }
                         let mut slot = layer * me.slab_stride + me.groups[gi].slab_off;
                         for run in [
-                            &staged, &a_run, &xa_run, &q_act, &q_w, &q_y, &v_act, &v_w,
-                            &v_y,
+                            &staged, &a_run, &xa_run, &q_act, &q_w, &q_y, &v_act, &v_w, &v_y,
                         ] {
                             for &p in run {
                                 slab_host[slot] = p;
@@ -941,7 +929,10 @@ pub fn stage_qkv_adapters<O: DeviceMemory + LoraOps>(
         hk,
         i_width,
         tp_size,
-        &LoraStageRows { norm_x: qkv_in, ..*rows },
+        &LoraStageRows {
+            norm_x: qkv_in,
+            ..*rows
+        },
         grouped_enabled,
     )?;
 
@@ -963,7 +954,10 @@ pub fn stage_qkv_adapters<O: DeviceMemory + LoraOps>(
     // CARRIED, not merely returned. The bucket key needs it and the call
     // site used to drop it; a value that travels beside the thing it
     // describes cannot be dropped without dropping both.
-    let staged = LoraFireState { capture_fingerprint: h64, ..staged };
+    let staged = LoraFireState {
+        capture_fingerprint: h64,
+        ..staged
+    };
     Ok((h64, Some(staged)))
 }
 
@@ -1056,7 +1050,11 @@ pub fn read_lora_sink(
     let form = match op.args.len() {
         3 => LoraForm::LowRank,
         2 => LoraForm::Scale,
-        _ => return Err(SinkRefusal::Malformed("a lora sink takes two or three args")),
+        _ => {
+            return Err(SinkRefusal::Malformed(
+                "a lora sink takes two or three args",
+            ));
+        }
     };
     // The SITES literal is the last arg either way, and it is a constant
     // the trace knew: `lit_bits` on the op that defined it. That op is a
@@ -1070,7 +1068,9 @@ pub fn read_lora_sink(
         .find_map(|(i, o)| (i as u32 == sites_value).then_some(u64::from(o.lit_bits)))
         .ok_or(SinkRefusal::Malformed("the sites operand names no op"))?;
     if sites_bits & !LORA_SITES_KNOWN != 0 {
-        return Err(SinkRefusal::Malformed("the sites mask names a site this driver has no arm for"));
+        return Err(SinkRefusal::Malformed(
+            "the sites mask names a site this driver has no arm for",
+        ));
     }
 
     let channel_of = |value: u32| -> Option<u32> {
@@ -1082,14 +1082,18 @@ pub fn read_lora_sink(
         plan.channel_bindings.get(local as usize).copied()
     };
     let dims_of = |value: u32| -> Option<&[u32]> {
-        plan.value_types.get(value as usize).map(|v| v.dims.as_slice())
+        plan.value_types
+            .get(value as usize)
+            .map(|v| v.dims.as_slice())
     };
 
     let a_value = op.args[0];
-    let a_channel = channel_of(a_value)
-        .ok_or(SinkRefusal::Malformed("the adapter's first operand is not a channel"))?;
-    let a_dims = dims_of(a_value)
-        .ok_or(SinkRefusal::Malformed("the adapter's first operand has no type"))?;
+    let a_channel = channel_of(a_value).ok_or(SinkRefusal::Malformed(
+        "the adapter's first operand is not a channel",
+    ))?;
+    let a_dims = dims_of(a_value).ok_or(SinkRefusal::Malformed(
+        "the adapter's first operand has no type",
+    ))?;
 
     match form {
         // `a` is [layers, R, d_in] and `b` is [layers, d_out, R].
@@ -1098,10 +1102,12 @@ pub fn read_lora_sink(
                 return Err(SinkRefusal::Malformed("a low-rank A is [layers, R, d_in]"));
             };
             let b_value = op.args[1];
-            let b_channel = channel_of(b_value)
-                .ok_or(SinkRefusal::Malformed("the adapter's B operand is not a channel"))?;
-            let b_dims = dims_of(b_value)
-                .ok_or(SinkRefusal::Malformed("the adapter's B operand has no type"))?;
+            let b_channel = channel_of(b_value).ok_or(SinkRefusal::Malformed(
+                "the adapter's B operand is not a channel",
+            ))?;
+            let b_dims = dims_of(b_value).ok_or(SinkRefusal::Malformed(
+                "the adapter's B operand has no type",
+            ))?;
             let &[b_layers, d_out, b_rank] = b_dims else {
                 return Err(SinkRefusal::Malformed("a low-rank B is [layers, d_out, R]"));
             };
@@ -1111,7 +1117,9 @@ pub fn read_lora_sink(
             // get a GEMM over mismatched inner dimensions, which is a
             // wrong answer and not a fault.
             if b_layers != layers || b_rank != rank {
-                return Err(SinkRefusal::Malformed("the adapter's A and B disagree on layers or rank"));
+                return Err(SinkRefusal::Malformed(
+                    "the adapter's A and B disagree on layers or rank",
+                ));
             }
             Ok(LoraSink {
                 a_channel,
@@ -1177,22 +1185,33 @@ impl LoraSink {
 #[cfg(test)]
 mod sink_tests {
     use super::*;
-    use driver::driver_api::plan::{
-        LaunchChannelRule, LaunchOp, LaunchPlanValue, LaunchStagePlan,
-    };
+    use driver::driver_api::plan::{LaunchChannelRule, LaunchOp, LaunchPlanValue, LaunchStagePlan};
 
     /// Value ids are op INDICES here, which is what the plan's stage-local
     /// numbering makes them for a straight-line stage.
     fn value(dims: &[u32]) -> LaunchPlanValue {
-        LaunchPlanValue { dtype: 0, extents: vec![0; dims.len()], dims: dims.to_vec() }
+        LaunchPlanValue {
+            dtype: 0,
+            extents: vec![0; dims.len()],
+            dims: dims.to_vec(),
+        }
     }
 
     fn const_op(bits: u32) -> LaunchOp {
-        LaunchOp { code: 0x81, lit_bits: bits, ..LaunchOp::default() }
+        LaunchOp {
+            code: 0x81,
+            lit_bits: bits,
+            ..LaunchOp::default()
+        }
     }
 
     fn sink(args: Vec<u32>) -> LaunchOp {
-        LaunchOp { code: SINK_CALL, name_index: 0, args, ..LaunchOp::default() }
+        LaunchOp {
+            code: SINK_CALL,
+            name_index: 0,
+            args,
+            ..LaunchOp::default()
+        }
     }
 
     /// A prologue whose sink is the low-rank form: A on channel slot 0,
@@ -1226,7 +1245,11 @@ mod sink_tests {
     #[test]
     fn a_low_rank_sink_names_its_channels_its_sites_and_its_geometry() {
         let read = read_lora_sink(&low_rank_plan()).expect("the sink resolves");
-        assert_eq!(read.form, LoraForm::LowRank, "three args is the low-rank form");
+        assert_eq!(
+            read.form,
+            LoraForm::LowRank,
+            "three args is the low-rank form"
+        );
         assert_eq!(
             (read.a_channel, read.b_channel),
             (5, Some(9)),
@@ -1251,7 +1274,11 @@ mod sink_tests {
         let read = read_lora_sink(&plan).expect("the scale sink resolves");
         assert_eq!(read.form, LoraForm::Scale);
         assert_eq!(read.b_channel, None, "a scale has no B");
-        assert_eq!((read.rank, read.d_in), (0, 0), "and neither a rank nor an input width");
+        assert_eq!(
+            (read.rank, read.d_in),
+            (0, 0),
+            "and neither a rank nor an input width"
+        );
         assert_eq!(read.d_out, 128);
     }
 
@@ -1259,7 +1286,10 @@ mod sink_tests {
     /// as stating a broken one.
     #[test]
     fn a_stage_with_no_sink_is_absent_rather_than_malformed() {
-        let plan = LaunchStagePlan { ops: vec![LaunchOp::default()], ..LaunchStagePlan::default() };
+        let plan = LaunchStagePlan {
+            ops: vec![LaunchOp::default()],
+            ..LaunchStagePlan::default()
+        };
         assert_eq!(read_lora_sink(&plan), Err(SinkRefusal::Absent));
     }
 
@@ -1283,7 +1313,10 @@ mod sink_tests {
     fn an_unknown_site_is_refused_rather_than_masked_off() {
         let mut plan = low_rank_plan();
         plan.ops[2] = const_op(1 << 20);
-        assert!(matches!(read_lora_sink(&plan), Err(SinkRefusal::Malformed(_))));
+        assert!(matches!(
+            read_lora_sink(&plan),
+            Err(SinkRefusal::Malformed(_))
+        ));
     }
 
     /// An operand that is not a channel cannot be an adapter tensor: the
@@ -1293,7 +1326,10 @@ mod sink_tests {
     fn an_operand_off_no_channel_is_refused() {
         let mut plan = low_rank_plan();
         plan.channel_rules.clear();
-        assert!(matches!(read_lora_sink(&plan), Err(SinkRefusal::Malformed(_))));
+        assert!(matches!(
+            read_lora_sink(&plan),
+            Err(SinkRefusal::Malformed(_))
+        ));
     }
 }
 

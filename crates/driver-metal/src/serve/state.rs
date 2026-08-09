@@ -165,8 +165,10 @@ pub struct Shell {
     /// gone: staging consumed them. The row is the load's answer, carried.
     ///
     /// [`MetalBinding`]: model::catalog::MetalBinding
-    pub(crate) text_row:
-        Option<(&'static dyn model::catalog::Variant, model::catalog::MetalBinding)>,
+    pub(crate) text_row: Option<(
+        &'static dyn model::catalog::Variant,
+        model::catalog::MetalBinding,
+    )>,
     /// The runtime shader compiler, and the pipelines a fire's symbols have
     /// compiled to. Held across fires: a model's symbol set is bounded by its
     /// text, so a driver that recompiled per fire would spend more time in the

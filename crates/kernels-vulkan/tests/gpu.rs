@@ -250,9 +250,16 @@ fn spv_words(path: &std::path::Path) -> Vec<u32> {
 /// How many descriptors a layout must have for this module to be legal.
 ///
 /// The highest `binding = N` the module decorates, plus one -- not the COUNT of
-/// them, because several shaders leave holes on purpose (`kv_append_paged`
+/// them, because the set is often not contiguous. 79 of the 292 unstated
+/// modules have holes, and the holes are benign: they are `glslc` eliminating
+/// a buffer the variant does not read. `affine_qmm_t_fp16_precast` declares
+/// 0, 1, 2, 4, 7 because under that macro `load_x` reads `half_in` at 7 and
+/// never touches `x` at 3, so the declaration is dropped from the SPIR-V. The
+/// layout still needs a descriptor at 3; the shader simply ignores it.
+///
+/// A few shaders hole their bindings on purpose as well -- `kv_append_paged`
 /// declares 0..3 and then 10 and 11, since the row keeps Metal's ring-ABI
-/// placeholder slots). A layout has to cover the highest number, holes and all.
+/// placeholder slots. Either way, a layout has to cover the highest number.
 fn declared_binding_count(words: &[u32]) -> u32 {
     // `OpDecorate` is opcode 71 and `Binding` is decoration 33; the literal
     // follows. Walking every instruction rather than stopping at the first

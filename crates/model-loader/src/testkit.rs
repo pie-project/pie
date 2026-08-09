@@ -9,8 +9,8 @@
 //!
 //! Two things used to sit beside it and left for opposite reasons. The host
 //! executor was *promoted*: `pie model convert` made it a production caller,
-//! so it lives ungated at [`crate::executor::host`]. The POD contract fixture
-//! builder followed the ABI into `model-loader-capi` and then out of existence:
+//! so it lives ungated at [`crate::executor`]. The POD contract fixture
+//! builder followed the ABI out of the workspace and then out of existence:
 //! contracts stopped crossing the ABI when the last C++ author was harvested
 //! (`plan/model-in-rust.md` §8-5), so there is no POD graph left to write.
 

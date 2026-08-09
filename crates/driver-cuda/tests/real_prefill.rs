@@ -18,13 +18,13 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use driver_cuda::device::{Allocator, DeviceBuffer, OwnedStream};
-use driver_cuda::dtype::DType;
 use driver_cuda::bind::abi::{KvCacheLayerView, KvCacheScheme};
-use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
 use driver_cuda::bind::{
     AttnCtx, AttnRegions, DispatchCtx, DispatchPlan, Frame, MapResolver, PrefillPlan, run,
 };
+use driver_cuda::device::{Allocator, DeviceBuffer, OwnedStream};
+use driver_cuda::dtype::DType;
+use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
 use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
 use model::shared::llama_like::forward::llama_like_cuda;
 use model_compiler::lower::{Arg, Fire, Row, lower};
@@ -50,14 +50,17 @@ impl Checkpoint {
     /// `model.safetensors.index.json` form 7B-class checkpoints ship).
     fn open(cache_dir: &str) -> Option<Self> {
         let home = std::env::var_os("HOME")?;
-        let snaps = PathBuf::from(home)
-            .join(format!(".cache/huggingface/hub/{cache_dir}/snapshots"));
-        let snap = std::fs::read_dir(&snaps).ok()?.filter_map(Result::ok).find_map(|e| {
-            let d = e.path();
-            (d.join("model.safetensors").is_file()
-                || d.join("model.safetensors.index.json").is_file())
-            .then_some(d)
-        })?;
+        let snaps =
+            PathBuf::from(home).join(format!(".cache/huggingface/hub/{cache_dir}/snapshots"));
+        let snap = std::fs::read_dir(&snaps)
+            .ok()?
+            .filter_map(Result::ok)
+            .find_map(|e| {
+                let d = e.path();
+                (d.join("model.safetensors").is_file()
+                    || d.join("model.safetensors.index.json").is_file())
+                .then_some(d)
+            })?;
         let files: Vec<PathBuf> = if snap.join("model.safetensors").is_file() {
             vec![snap.join("model.safetensors")]
         } else {
@@ -79,14 +82,16 @@ impl Checkpoint {
         for (fi, f) in files.iter().enumerate() {
             let raw = std::fs::read(f).ok()?;
             let header_len = u64::from_le_bytes(raw[..8].try_into().ok()?) as usize;
-            let header: serde_json::Value =
-                serde_json::from_slice(&raw[8..8 + header_len]).ok()?;
+            let header: serde_json::Value = serde_json::from_slice(&raw[8..8 + header_len]).ok()?;
             let payload = 8 + header_len;
             for (name, meta) in header.as_object()? {
                 if name == "__metadata__" {
                     continue;
                 }
-                assert_eq!(meta["dtype"], "BF16", "{name}: this loader speaks bf16 only");
+                assert_eq!(
+                    meta["dtype"], "BF16",
+                    "{name}: this loader speaks bf16 only"
+                );
                 let offs = meta["data_offsets"].as_array()?;
                 let shape = meta["shape"].as_array()?;
                 let _ = shape;
@@ -109,7 +114,9 @@ impl Checkpoint {
             .index
             .get(name)
             .unwrap_or_else(|| panic!("checkpoint lacks {name}"));
-        View { bytes: &self.raws[f][b..e] }
+        View {
+            bytes: &self.raws[f][b..e],
+        }
     }
 }
 
@@ -146,7 +153,9 @@ struct Spec {
 #[allow(clippy::too_many_lines)]
 fn ab(spec: &Spec) {
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip(spec.name) else { return };
+    let Some(_dev) = device_or_skip(spec.name) else {
+        return;
+    };
     let Some(ckpt) = Checkpoint::open(spec.cache_dir) else {
         eprintln!("skipped: {} not in the HF cache", spec.cache_dir);
         return;
@@ -195,12 +204,28 @@ fn ab(spec: &Spec) {
     // multi-token. `GuardPred::WindowOne` reads that bit -- the window class
     // is a row property now (`.wiki/driver/graph.md` §4.1) -- and a fixture
     // that leaves it false asks for the DECODE dispatch.
-    let rows: Vec<Row> =
-        vec![Row { samples: true, multi_token: true, ..Row::default() }; tokens];
-    let l = lower(&plan, &rows, Fire { captures_across_splits: false }).expect("lowers");
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            multi_token: true,
+            ..Row::default()
+        };
+        tokens
+    ];
+    let l = lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("lowers");
     let dplan = DispatchPlan::new(&plan, &l);
     let arena = alloc.alloc(l.arena_bytes).expect("arena");
-    let frame = Frame { arena: arena.as_ptr(), arena_bytes: l.arena_bytes };
+    let frame = Frame {
+        arena: arena.as_ptr(),
+        arena_bytes: l.arena_bytes,
+    };
 
     let mut named_widths: BTreeMap<ValueId, u32> = BTreeMap::new();
     for a in &l.args {
@@ -272,10 +297,21 @@ fn ab(spec: &Spec) {
     let csr_lens = up(&alloc, &stream, &u32s(&last_lens_h));
     let qo_indptr = up(&alloc, &stream, &u32s(&qo_indptr_h));
     let row_valid = up(&alloc, &stream, &vec![1u8; tokens]);
-    let ids = up(&alloc, &stream,
-        &prompt.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>());
-    let positions = up(&alloc, &stream,
-        &(0..tokens as i32).flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>());
+    let ids = up(
+        &alloc,
+        &stream,
+        &prompt
+            .iter()
+            .flat_map(|t| t.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
+    let positions = up(
+        &alloc,
+        &stream,
+        &(0..tokens as i32)
+            .flat_map(|p| p.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
     let lse = alloc.alloc(tokens * q_heads as usize * 4).expect("lse");
 
     let mut sops = LiveStagingOps;
@@ -283,8 +319,17 @@ fn ab(spec: &Spec) {
     let mut pplan = PrefillPlan::new();
     ws.begin_plan_update(&mut sops).expect("begin");
     pplan.plan_prefill(
-        &qo_indptr_h, &page_indptr_h, &last_lens_h,
-        q_heads, kv_heads, head_dim, PAGE, ws.view(), raw_stream, false, -1,
+        &qo_indptr_h,
+        &page_indptr_h,
+        &last_lens_h,
+        q_heads,
+        kv_heads,
+        head_dim,
+        PAGE,
+        ws.view(),
+        raw_stream,
+        false,
+        -1,
     );
     ws.end_plan_update(&mut sops, raw_stream);
 
@@ -335,9 +380,8 @@ fn ab(spec: &Spec) {
     };
 
     let mut cublas_ops = driver_cuda::device::cublas::LiveCublas;
-    let mut cublas =
-        driver_cuda::device::cublas::CublasHandle::create(&mut cublas_ops, raw_stream)
-            .expect("cublas");
+    let mut cublas = driver_cuda::device::cublas::CublasHandle::create(&mut cublas_ops, raw_stream)
+        .expect("cublas");
     let ctx = DispatchCtx {
         // Every row sampled, so no compaction is stated and the gather
         // has no index list to read.
@@ -386,8 +430,16 @@ fn ab(spec: &Spec) {
         }
     }
 
-    let ran = run(&l, &dplan, frame, &mut resolver, &ctx, AttnRegions::whole(Some(&attn)), None)
-        .unwrap_or_else(|e| panic!("the walk refused: {e:?}"));
+    let ran = run(
+        &l,
+        &dplan,
+        frame,
+        &mut resolver,
+        &ctx,
+        AttnRegions::whole(Some(&attn)),
+        None,
+    )
+    .unwrap_or_else(|e| panic!("the walk refused: {e:?}"));
     assert_eq!(ran, l.launches.len());
     stream.as_ref().synchronize().expect("the fire retires");
 
@@ -395,7 +447,9 @@ fn ab(spec: &Spec) {
     let lv = logits_value.expect("the logits pin");
     let logits = &named_bufs[&lv];
     let mut back = vec![0u8; logits.len()];
-    logits.copy_to_host(&mut back, stream.as_ref()).expect("d2h logits");
+    logits
+        .copy_to_host(&mut back, stream.as_ref())
+        .expect("d2h logits");
     stream.as_ref().synchronize().expect("sync");
     let last = tokens - 1;
     let logit = |t: usize| {
@@ -412,14 +466,23 @@ fn ab(spec: &Spec) {
             (best_t, best_v) = (t, v);
         }
     }
-    assert_eq!(best_t, hf_argmax, "argmax drifted (ours {best_v} at {best_t})");
+    assert_eq!(
+        best_t, hf_argmax,
+        "argmax drifted (ours {best_v} at {best_t})"
+    );
 
     let ids5: Vec<usize> = reference["top5_ids"]
-        .as_array().expect("top5").iter()
-        .map(|v| v.as_u64().expect("id") as usize).collect();
+        .as_array()
+        .expect("top5")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as usize)
+        .collect();
     let vals5: Vec<f32> = reference["top5_logits"]
-        .as_array().expect("top5").iter()
-        .map(|v| v.as_f64().expect("v") as f32).collect();
+        .as_array()
+        .expect("top5")
+        .iter()
+        .map(|v| v.as_f64().expect("v") as f32)
+        .collect();
     for (t, hf) in ids5.iter().zip(&vals5) {
         let ours = logit(*t);
         assert!(
@@ -428,25 +491,30 @@ fn ab(spec: &Spec) {
         );
     }
     let probes: Vec<usize> = reference["probe_ids"]
-        .as_array().expect("probes").iter()
-        .map(|v| v.as_u64().expect("id") as usize).collect();
+        .as_array()
+        .expect("probes")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as usize)
+        .collect();
     let probe_vals: Vec<f32> = reference["probe_logits"]
-        .as_array().expect("probes").iter()
-        .map(|v| v.as_f64().expect("v") as f32).collect();
+        .as_array()
+        .expect("probes")
+        .iter()
+        .map(|v| v.as_f64().expect("v") as f32)
+        .collect();
     for (t, hf) in probes.iter().zip(&probe_vals) {
         let ours = logit(*t);
-        assert!((ours - hf).abs() < 0.25, "probe token {t}: ours {ours} vs HF {hf}");
+        assert!(
+            (ours - hf).abs() < 0.25,
+            "probe token {t}: ours {ours} vs HF {hf}"
+        );
     }
 
     ws.release(&mut sops);
     cublas.release(&mut cublas_ops);
 }
 
-fn cuda_facts(
-    dfp: bool,
-    force_prefill: bool,
-    padded: bool,
-) -> LlamaLikeCudaFacts {
+fn cuda_facts(dfp: bool, force_prefill: bool, padded: bool) -> LlamaLikeCudaFacts {
     LlamaLikeCudaFacts {
         xqa_decode: false,
         decode_fused_post: dfp,
@@ -468,7 +536,10 @@ fn cuda_facts(
 
 /// Concatenate checkpoint tensors into one fused host buffer.
 fn fuse(ckpt: &Checkpoint, parts: &[String]) -> Vec<u8> {
-    parts.iter().flat_map(|p| ckpt.view(p).bytes.iter().copied()).collect()
+    parts
+        .iter()
+        .flat_map(|p| ckpt.view(p).bytes.iter().copied())
+        .collect()
 }
 
 #[test]
@@ -487,26 +558,55 @@ fn qwen3_0_6b_reproduces_the_hf_logits() {
         eps: 1e-6,
         theta: 1e6,
         bind: |ckpt, sink| {
-            sink("embed".into(), fuse(ckpt, &["model.embed_tokens.weight".into()]));
-            sink("final_norm".into(), fuse(ckpt, &["model.norm.weight".into()]));
+            sink(
+                "embed".into(),
+                fuse(ckpt, &["model.embed_tokens.weight".into()]),
+            );
+            sink(
+                "final_norm".into(),
+                fuse(ckpt, &["model.norm.weight".into()]),
+            );
             for i in 0..28 {
                 let n = |s: &str| format!("model.layers.{i}.{s}");
-                sink(format!("layer.{i}.attn_norm"), fuse(ckpt, &[n("input_layernorm.weight")]));
-                sink(format!("layer.{i}.qkv"), fuse(ckpt, &[
-                    n("self_attn.q_proj.weight"),
-                    n("self_attn.k_proj.weight"),
-                    n("self_attn.v_proj.weight"),
-                ]));
-                sink(format!("layer.{i}.q_norm"), fuse(ckpt, &[n("self_attn.q_norm.weight")]));
-                sink(format!("layer.{i}.k_norm"), fuse(ckpt, &[n("self_attn.k_norm.weight")]));
-                sink(format!("layer.{i}.o_proj"), fuse(ckpt, &[n("self_attn.o_proj.weight")]));
-                sink(format!("layer.{i}.mlp_norm"),
-                    fuse(ckpt, &[n("post_attention_layernorm.weight")]));
-                sink(format!("layer.{i}.gate_up"), fuse(ckpt, &[
-                    n("mlp.gate_proj.weight"),
-                    n("mlp.up_proj.weight"),
-                ]));
-                sink(format!("layer.{i}.down"), fuse(ckpt, &[n("mlp.down_proj.weight")]));
+                sink(
+                    format!("layer.{i}.attn_norm"),
+                    fuse(ckpt, &[n("input_layernorm.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.qkv"),
+                    fuse(
+                        ckpt,
+                        &[
+                            n("self_attn.q_proj.weight"),
+                            n("self_attn.k_proj.weight"),
+                            n("self_attn.v_proj.weight"),
+                        ],
+                    ),
+                );
+                sink(
+                    format!("layer.{i}.q_norm"),
+                    fuse(ckpt, &[n("self_attn.q_norm.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.k_norm"),
+                    fuse(ckpt, &[n("self_attn.k_norm.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.o_proj"),
+                    fuse(ckpt, &[n("self_attn.o_proj.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.mlp_norm"),
+                    fuse(ckpt, &[n("post_attention_layernorm.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.gate_up"),
+                    fuse(ckpt, &[n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.down"),
+                    fuse(ckpt, &[n("mlp.down_proj.weight")]),
+                );
             }
         },
     });
@@ -531,26 +631,57 @@ fn olmo2_1b_reproduces_the_hf_logits() {
         eps: 1e-6,
         theta: 5e5,
         bind: |ckpt, sink| {
-            sink("embed".into(), fuse(ckpt, &["model.embed_tokens.weight".into()]));
-            sink("final_norm".into(), fuse(ckpt, &["model.norm.weight".into()]));
+            sink(
+                "embed".into(),
+                fuse(ckpt, &["model.embed_tokens.weight".into()]),
+            );
+            sink(
+                "final_norm".into(),
+                fuse(ckpt, &["model.norm.weight".into()]),
+            );
             sink("lm_head".into(), fuse(ckpt, &["lm_head.weight".into()]));
             for i in 0..16 {
                 let n = |s: &str| format!("model.layers.{i}.{s}");
-                sink(format!("layer.{i}.attn_norm"),
-                    fuse(ckpt, &[n("post_attention_layernorm.weight")]));
-                sink(format!("layer.{i}.mlp_norm"),
-                    fuse(ckpt, &[n("post_feedforward_layernorm.weight")]));
-                sink(format!("layer.{i}.q_proj"), fuse(ckpt, &[n("self_attn.q_proj.weight")]));
-                sink(format!("layer.{i}.k_proj"), fuse(ckpt, &[n("self_attn.k_proj.weight")]));
-                sink(format!("layer.{i}.v_proj"), fuse(ckpt, &[n("self_attn.v_proj.weight")]));
-                sink(format!("layer.{i}.q_norm"), fuse(ckpt, &[n("self_attn.q_norm.weight")]));
-                sink(format!("layer.{i}.k_norm"), fuse(ckpt, &[n("self_attn.k_norm.weight")]));
-                sink(format!("layer.{i}.o_proj"), fuse(ckpt, &[n("self_attn.o_proj.weight")]));
-                sink(format!("layer.{i}.gate_up"), fuse(ckpt, &[
-                    n("mlp.gate_proj.weight"),
-                    n("mlp.up_proj.weight"),
-                ]));
-                sink(format!("layer.{i}.down"), fuse(ckpt, &[n("mlp.down_proj.weight")]));
+                sink(
+                    format!("layer.{i}.attn_norm"),
+                    fuse(ckpt, &[n("post_attention_layernorm.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.mlp_norm"),
+                    fuse(ckpt, &[n("post_feedforward_layernorm.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.q_proj"),
+                    fuse(ckpt, &[n("self_attn.q_proj.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.k_proj"),
+                    fuse(ckpt, &[n("self_attn.k_proj.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.v_proj"),
+                    fuse(ckpt, &[n("self_attn.v_proj.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.q_norm"),
+                    fuse(ckpt, &[n("self_attn.q_norm.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.k_norm"),
+                    fuse(ckpt, &[n("self_attn.k_norm.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.o_proj"),
+                    fuse(ckpt, &[n("self_attn.o_proj.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.gate_up"),
+                    fuse(ckpt, &[n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.down"),
+                    fuse(ckpt, &[n("mlp.down_proj.weight")]),
+                );
             }
         },
     });
@@ -574,27 +705,59 @@ fn qwen2_5_1_5b_reproduces_the_hf_logits() {
         eps: 1e-6,
         theta: 1e6,
         bind: |ckpt, sink| {
-            sink("embed".into(), fuse(ckpt, &["model.embed_tokens.weight".into()]));
-            sink("final_norm".into(), fuse(ckpt, &["model.norm.weight".into()]));
+            sink(
+                "embed".into(),
+                fuse(ckpt, &["model.embed_tokens.weight".into()]),
+            );
+            sink(
+                "final_norm".into(),
+                fuse(ckpt, &["model.norm.weight".into()]),
+            );
             for i in 0..28 {
                 let n = |s: &str| format!("model.layers.{i}.{s}");
-                sink(format!("layer.{i}.attn_norm"), fuse(ckpt, &[n("input_layernorm.weight")]));
-                sink(format!("layer.{i}.qkv"), fuse(ckpt, &[
-                    n("self_attn.q_proj.weight"),
-                    n("self_attn.k_proj.weight"),
-                    n("self_attn.v_proj.weight"),
-                ]));
-                sink(format!("layer.{i}.q_bias"), fuse(ckpt, &[n("self_attn.q_proj.bias")]));
-                sink(format!("layer.{i}.k_bias"), fuse(ckpt, &[n("self_attn.k_proj.bias")]));
-                sink(format!("layer.{i}.v_bias"), fuse(ckpt, &[n("self_attn.v_proj.bias")]));
-                sink(format!("layer.{i}.o_proj"), fuse(ckpt, &[n("self_attn.o_proj.weight")]));
-                sink(format!("layer.{i}.mlp_norm"),
-                    fuse(ckpt, &[n("post_attention_layernorm.weight")]));
-                sink(format!("layer.{i}.gate_up"), fuse(ckpt, &[
-                    n("mlp.gate_proj.weight"),
-                    n("mlp.up_proj.weight"),
-                ]));
-                sink(format!("layer.{i}.down"), fuse(ckpt, &[n("mlp.down_proj.weight")]));
+                sink(
+                    format!("layer.{i}.attn_norm"),
+                    fuse(ckpt, &[n("input_layernorm.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.qkv"),
+                    fuse(
+                        ckpt,
+                        &[
+                            n("self_attn.q_proj.weight"),
+                            n("self_attn.k_proj.weight"),
+                            n("self_attn.v_proj.weight"),
+                        ],
+                    ),
+                );
+                sink(
+                    format!("layer.{i}.q_bias"),
+                    fuse(ckpt, &[n("self_attn.q_proj.bias")]),
+                );
+                sink(
+                    format!("layer.{i}.k_bias"),
+                    fuse(ckpt, &[n("self_attn.k_proj.bias")]),
+                );
+                sink(
+                    format!("layer.{i}.v_bias"),
+                    fuse(ckpt, &[n("self_attn.v_proj.bias")]),
+                );
+                sink(
+                    format!("layer.{i}.o_proj"),
+                    fuse(ckpt, &[n("self_attn.o_proj.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.mlp_norm"),
+                    fuse(ckpt, &[n("post_attention_layernorm.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.gate_up"),
+                    fuse(ckpt, &[n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.down"),
+                    fuse(ckpt, &[n("mlp.down_proj.weight")]),
+                );
             }
         },
     });
@@ -618,25 +781,48 @@ fn mistral_7b_v03_reproduces_the_hf_logits() {
         eps: 1e-5,
         theta: 1e6,
         bind: |ckpt, sink| {
-            sink("embed".into(), fuse(ckpt, &["model.embed_tokens.weight".into()]));
-            sink("final_norm".into(), fuse(ckpt, &["model.norm.weight".into()]));
+            sink(
+                "embed".into(),
+                fuse(ckpt, &["model.embed_tokens.weight".into()]),
+            );
+            sink(
+                "final_norm".into(),
+                fuse(ckpt, &["model.norm.weight".into()]),
+            );
             sink("lm_head".into(), fuse(ckpt, &["lm_head.weight".into()]));
             for i in 0..32 {
                 let n = |s: &str| format!("model.layers.{i}.{s}");
-                sink(format!("layer.{i}.attn_norm"), fuse(ckpt, &[n("input_layernorm.weight")]));
-                sink(format!("layer.{i}.qkv"), fuse(ckpt, &[
-                    n("self_attn.q_proj.weight"),
-                    n("self_attn.k_proj.weight"),
-                    n("self_attn.v_proj.weight"),
-                ]));
-                sink(format!("layer.{i}.o_proj"), fuse(ckpt, &[n("self_attn.o_proj.weight")]));
-                sink(format!("layer.{i}.mlp_norm"),
-                    fuse(ckpt, &[n("post_attention_layernorm.weight")]));
-                sink(format!("layer.{i}.gate_up"), fuse(ckpt, &[
-                    n("mlp.gate_proj.weight"),
-                    n("mlp.up_proj.weight"),
-                ]));
-                sink(format!("layer.{i}.down"), fuse(ckpt, &[n("mlp.down_proj.weight")]));
+                sink(
+                    format!("layer.{i}.attn_norm"),
+                    fuse(ckpt, &[n("input_layernorm.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.qkv"),
+                    fuse(
+                        ckpt,
+                        &[
+                            n("self_attn.q_proj.weight"),
+                            n("self_attn.k_proj.weight"),
+                            n("self_attn.v_proj.weight"),
+                        ],
+                    ),
+                );
+                sink(
+                    format!("layer.{i}.o_proj"),
+                    fuse(ckpt, &[n("self_attn.o_proj.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.mlp_norm"),
+                    fuse(ckpt, &[n("post_attention_layernorm.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.gate_up"),
+                    fuse(ckpt, &[n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.down"),
+                    fuse(ckpt, &[n("mlp.down_proj.weight")]),
+                );
             }
         },
     });
@@ -665,26 +851,52 @@ fn phi3_mini_reproduces_the_hf_logits() {
         eps: 1e-5,
         theta: 1e4,
         bind: |ckpt, sink| {
-            sink("embed".into(), fuse(ckpt, &["model.embed_tokens.weight".into()]));
-            sink("final_norm".into(), fuse(ckpt, &["model.norm.weight".into()]));
+            sink(
+                "embed".into(),
+                fuse(ckpt, &["model.embed_tokens.weight".into()]),
+            );
+            sink(
+                "final_norm".into(),
+                fuse(ckpt, &["model.norm.weight".into()]),
+            );
             sink("lm_head".into(), fuse(ckpt, &["lm_head.weight".into()]));
             const HIDDEN: usize = 3072;
             for i in 0..32 {
                 let n = |s: &str| format!("model.layers.{i}.{s}");
-                sink(format!("layer.{i}.attn_norm"), fuse(ckpt, &[n("input_layernorm.weight")]));
+                sink(
+                    format!("layer.{i}.attn_norm"),
+                    fuse(ckpt, &[n("input_layernorm.weight")]),
+                );
                 let qkv = ckpt.view(&n("self_attn.qkv_proj.weight"));
                 let row_bytes = HIDDEN * 2;
-                sink(format!("layer.{i}.q_proj"), qkv.bytes[..3072 * row_bytes].to_vec());
+                sink(
+                    format!("layer.{i}.q_proj"),
+                    qkv.bytes[..3072 * row_bytes].to_vec(),
+                );
                 sink(
                     format!("layer.{i}.k_proj"),
                     qkv.bytes[3072 * row_bytes..6144 * row_bytes].to_vec(),
                 );
-                sink(format!("layer.{i}.v_proj"), qkv.bytes[6144 * row_bytes..].to_vec());
-                sink(format!("layer.{i}.o_proj"), fuse(ckpt, &[n("self_attn.o_proj.weight")]));
-                sink(format!("layer.{i}.mlp_norm"),
-                    fuse(ckpt, &[n("post_attention_layernorm.weight")]));
-                sink(format!("layer.{i}.gate_up"), fuse(ckpt, &[n("mlp.gate_up_proj.weight")]));
-                sink(format!("layer.{i}.down"), fuse(ckpt, &[n("mlp.down_proj.weight")]));
+                sink(
+                    format!("layer.{i}.v_proj"),
+                    qkv.bytes[6144 * row_bytes..].to_vec(),
+                );
+                sink(
+                    format!("layer.{i}.o_proj"),
+                    fuse(ckpt, &[n("self_attn.o_proj.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.mlp_norm"),
+                    fuse(ckpt, &[n("post_attention_layernorm.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.gate_up"),
+                    fuse(ckpt, &[n("mlp.gate_up_proj.weight")]),
+                );
+                sink(
+                    format!("layer.{i}.down"),
+                    fuse(ckpt, &[n("mlp.down_proj.weight")]),
+                );
             }
         },
     });

@@ -50,10 +50,10 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLDevice, MTLResidencySet, MTLResourceOptions};
 
-use crate::error::{Error, Result};
 use crate::device::context::Context;
 use crate::device::external::{add, remove};
 use crate::device::handle::Handle;
+use crate::error::{Error, Result};
 use crate::layout::region::Region;
 
 /// One shared-storage buffer, resident for exactly as long as this value.

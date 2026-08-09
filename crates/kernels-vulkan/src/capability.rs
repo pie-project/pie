@@ -38,7 +38,11 @@
 /// is what `model-compiler` reads, and the compiler must not learn which device
 /// it is compiling for — a plan that named a tier would stop being portable
 /// between two machines running the same build.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+// `Hash` because a driver's pipeline cache is keyed by entrypoint AND tier:
+// one entrypoint has up to three modules, compiled from different bodies with
+// different extensions, and a cache keyed by the name alone would hand a
+// caller the first one built whatever tier it asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Capability {
     /// Core Vulkan 1.3 plus the 8/16-bit storage extensions the whole tree
     /// already requires. Always present, and the fallback for everything.

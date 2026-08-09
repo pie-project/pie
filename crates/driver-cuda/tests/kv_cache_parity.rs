@@ -15,9 +15,9 @@
 use std::fmt::Write as _;
 
 use driver_cuda::dtype::DType;
-use driver_cuda::pools::kv_cache::{self, KvCacheLayout, LayerSlot, PerLayer};
 use driver_cuda::layout::kv_geometry::{self, LayerShapes};
 use driver_cuda::layout::{KvCacheFormat, KvCacheScaleLayout, KvCacheScheme};
+use driver_cuda::pools::kv_cache::{self, KvCacheLayout, LayerSlot, PerLayer};
 use driver_cuda::tensor::TensorSpec;
 
 /// FNV-1a 64 of the C++ oracle's transcript.
@@ -137,9 +137,16 @@ fn spec_row(s: &TensorSpec) -> String {
 /// C++ pushes K then V for the storage tier, then the scale pair, then the
 /// mirror pair, and the envelope tier only after every slot is built.
 fn slot_rows(slot: &LayerSlot, out: &mut Vec<String>) {
-    for spec in [&slot.k, &slot.v, &slot.k_scale, &slot.v_scale, &slot.k_bf16, &slot.v_bf16]
-        .into_iter()
-        .flatten()
+    for spec in [
+        &slot.k,
+        &slot.v,
+        &slot.k_scale,
+        &slot.v_scale,
+        &slot.k_bf16,
+        &slot.v_bf16,
+    ]
+    .into_iter()
+    .flatten()
     {
         {
             out.push(spec_row(spec));
@@ -289,7 +296,17 @@ fn cxx_message(e: &driver_cuda::Error) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn homogeneous(sw: &mut Sweep, id: &str, l: i32, p: i32, ps: i32, kvh: i32, hd: i32, f: &FormatCase, env: bool) {
+fn homogeneous(
+    sw: &mut Sweep,
+    id: &str,
+    l: i32,
+    p: i32,
+    ps: i32,
+    kvh: i32,
+    hd: i32,
+    f: &FormatCase,
+    env: bool,
+) {
     let r = KvCacheLayout::plan(l, p, ps, kvh, hd, make_format(f), env);
     sw.report(id, r);
 }
@@ -326,7 +343,13 @@ fn the_kv_cache_allocation_matches_the_cpp_byte_for_byte() {
         }
     }
 
-    for d in [DType::Bf16, DType::Fp16, DType::Fp8E4M3, DType::Int8, DType::Fp32] {
+    for d in [
+        DType::Bf16,
+        DType::Fp16,
+        DType::Fp8E4M3,
+        DType::Int8,
+        DType::Fp32,
+    ] {
         let fmt = KvCacheFormat::for_storage_dtype(d);
         let id = format!("dtype/{}", d as u8);
         match KvCacheLayout::plan(2, 64, 16, 4, 128, fmt, false) {
@@ -350,10 +373,7 @@ fn the_kv_cache_allocation_matches_the_cpp_byte_for_byte() {
                     0 => (vec![], vec![]),
                     1 => (vec![64, 128, 64, 128, 64, 128], vec![]),
                     2 => (vec![], vec![1, 2, 4, 8, 4, 2]),
-                    _ => (
-                        vec![576, 64, 128, 256, 128, 64],
-                        vec![1, 8, 4, 2, 4, 8],
-                    ),
+                    _ => (vec![576, 64, 128, 256, 128, 64], vec![1, 8, 4, 2, 4, 8]),
                 };
                 let per = PerLayer {
                     head_dim: hd,
@@ -361,8 +381,7 @@ fn the_kv_cache_allocation_matches_the_cpp_byte_for_byte() {
                     num_kv_heads: kvh,
                 };
                 let id = format!("perlayer/{}/{share_label}/v{variant}", f.label);
-                let r =
-                    KvCacheLayout::plan_per_layer(6, 128, 16, 4, per, make_format(f), false);
+                let r = KvCacheLayout::plan_per_layer(6, 128, 16, 4, per, make_format(f), false);
                 sw.report(&id, r);
             }
         }
@@ -415,8 +434,7 @@ fn the_kv_cache_allocation_matches_the_cpp_byte_for_byte() {
         for page_size in [1_u32, 16, 32] {
             for kv_heads in [1_u32, 4, 8] {
                 for head_dim in [64_u32, 128, 576] {
-                    let v =
-                        kv_geometry::device_bytes_per_page(&fmt, page_size, kv_heads, head_dim);
+                    let v = kv_geometry::device_bytes_per_page(&fmt, page_size, kv_heads, head_dim);
                     sw.emit(
                         &format!("bytes/{}/{page_size}/{kv_heads}/{head_dim}", f.label),
                         &v.to_string(),
@@ -480,8 +498,7 @@ fn the_kv_cache_allocation_matches_the_cpp_byte_for_byte() {
             for pages in [0, 64] {
                 for kv_heads in [1, 4] {
                     for head_dim in [64, 576] {
-                        let id =
-                            format!("env/{}/{layers}/{pages}/{kv_heads}/{head_dim}", f.label);
+                        let id = format!("env/{}/{layers}/{pages}/{kv_heads}/{head_dim}", f.label);
                         homogeneous(&mut sw, &id, layers, pages, 16, kv_heads, head_dim, f, true);
                     }
                 }
@@ -511,7 +528,9 @@ fn the_kv_cache_allocation_matches_the_cpp_byte_for_byte() {
     // SAFETY-adjacent: this test process is the only reader of the variable,
     // and the sweep is single-threaded, so setting it here cannot race another
     // test. The switch is read on every call in both languages.
-    for v in ["1", "true", "on", "0", "yes", "TRUE", "On", "", "false", "2"] {
+    for v in [
+        "1", "true", "on", "0", "yes", "TRUE", "On", "", "false", "2",
+    ] {
         unsafe { std::env::set_var("PIE_CUDA_KV_ENVELOPES", v) };
         let label = if v.is_empty() { "<empty>" } else { v };
         sw.emit(

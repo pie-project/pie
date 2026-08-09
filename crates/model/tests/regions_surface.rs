@@ -11,88 +11,86 @@
 //! goldens can only say that for families that already migrated; this
 //! says it for the construct.
 
+use model_compiler::dsl::*;
+use model_compiler::trace::{DType, Dim, GuardPred, OpKind, Shape};
 
-    use model_compiler::dsl::*;
-    use model_compiler::trace::{DType, Dim, GuardPred, OpKind, Shape};
+/// A statement the registry knows, so `trace_finish` accepts it, and
+/// one with no operands so the two chains differ in nothing but the
+/// construct around them.
+fn stmt(t: &Trace) {
+    let x = input(t, 8);
+    let _ = cuda::residual_add(&x, &x, 8);
+}
 
-    /// A statement the registry knows, so `trace_finish` accepts it, and
-    /// one with no operands so the two chains differ in nothing but the
-    /// construct around them.
-    fn stmt(t: &Trace) {
-        let x = input(t, 8);
-        let _ = cuda::residual_add(&x, &x, 8);
-    }
-
-    /// The unified surface must trace what the two it replaces traced.
-    /// Not a formality: the whole claim of this step is that the SURFACE
-    /// changed and nothing else did, and the goldens can only pin the
-    /// families that already migrated. This pins the construct itself.
-    #[test]
-    fn a_fire_armed_chain_traces_what_guarded_value_did() {
-        let a = trace_named("regions.cuda.decode", |t| {
-            let (g, _) = guarded_value(t, None, (Shape(vec![Dim::Tokens]), DType::BF16));
-            g.arm(GuardPred::HasLora, || stmt(t)).otherwise(|| stmt(t));
-        });
-        let b = trace_named("regions.cuda.decode", |t| {
-            regions(
-                t,
-                None,
-                Some((Shape(vec![Dim::Tokens]), DType::BF16)),
-                |c| c.arm(Region::Fire(GuardPred::HasLora), || stmt(t)),
-                || stmt(t),
-            );
-        });
-        assert_eq!(a.ops.len(), b.ops.len());
-        assert!(matches!(a.ops[0].kind, OpKind::Guard { .. }));
-        assert_eq!(
-            format!("{:?}", a.ops[0].kind),
-            format!("{:?}", b.ops[0].kind)
+/// The unified surface must trace what the two it replaces traced.
+/// Not a formality: the whole claim of this step is that the SURFACE
+/// changed and nothing else did, and the goldens can only pin the
+/// families that already migrated. This pins the construct itself.
+#[test]
+fn a_fire_armed_chain_traces_what_guarded_value_did() {
+    let a = trace_named("regions.cuda.decode", |t| {
+        let (g, _) = guarded_value(t, None, (Shape(vec![Dim::Tokens]), DType::BF16));
+        g.arm(GuardPred::HasLora, || stmt(t)).otherwise(|| stmt(t));
+    });
+    let b = trace_named("regions.cuda.decode", |t| {
+        regions(
+            t,
+            None,
+            Some((Shape(vec![Dim::Tokens]), DType::BF16)),
+            |c| c.arm(Region::Fire(GuardPred::HasLora), || stmt(t)),
+            || stmt(t),
         );
-    }
+    });
+    assert_eq!(a.ops.len(), b.ops.len());
+    assert!(matches!(a.ops[0].kind, OpKind::Guard { .. }));
+    assert_eq!(
+        format!("{:?}", a.ops[0].kind),
+        format!("{:?}", b.ops[0].kind)
+    );
+}
 
-    #[test]
-    fn a_rows_armed_chain_traces_what_by_rows_did() {
-        let a = trace_named("regions.cuda.decode", |t| {
-            by_rows(t, None, None, |c| {
-                c.arm(RowPred::Unmasked, || stmt(t));
-                c.rest(|| stmt(t));
-            });
+#[test]
+fn a_rows_armed_chain_traces_what_by_rows_did() {
+    let a = trace_named("regions.cuda.decode", |t| {
+        by_rows(t, None, None, |c| {
+            c.arm(RowPred::Unmasked, || stmt(t));
+            c.rest(|| stmt(t));
         });
-        let b = trace_named("regions.cuda.decode", |t| {
-            regions(
-                t,
-                None,
-                None,
-                |c| c.arm(Region::Rows(RowPred::Unmasked), || stmt(t)),
-                || stmt(t),
-            );
-        });
-        assert_eq!(a.ops.len(), b.ops.len());
-        assert!(matches!(a.ops[0].kind, OpKind::Peel { .. }));
-        assert_eq!(
-            format!("{:?}", a.ops[0].kind),
-            format!("{:?}", b.ops[0].kind)
+    });
+    let b = trace_named("regions.cuda.decode", |t| {
+        regions(
+            t,
+            None,
+            None,
+            |c| c.arm(Region::Rows(RowPred::Unmasked), || stmt(t)),
+            || stmt(t),
         );
-    }
+    });
+    assert_eq!(a.ops.len(), b.ops.len());
+    assert!(matches!(a.ops[0].kind, OpKind::Peel { .. }));
+    assert_eq!(
+        format!("{:?}", a.ops[0].kind),
+        format!("{:?}", b.ops[0].kind)
+    );
+}
 
-    /// A mix is REFUSED, not flattened into whichever op opened first.
-    #[test]
-    #[should_panic(expected = "cannot be both disciplines")]
-    fn a_mixed_chain_is_refused() {
-        let _ = trace_named("regions.cuda.decode", |t| {
-            regions(
-                t,
-                None,
-                None,
-                |c| {
-                    c.arm(Region::Rows(RowPred::Unmasked), || stmt(t));
-                    c.arm(Region::Fire(GuardPred::HasLora), || stmt(t));
-                },
-                || stmt(t),
-            );
-        });
-    }
-
+/// A mix is REFUSED, not flattened into whichever op opened first.
+#[test]
+#[should_panic(expected = "cannot be both disciplines")]
+fn a_mixed_chain_is_refused() {
+    let _ = trace_named("regions.cuda.decode", |t| {
+        regions(
+            t,
+            None,
+            None,
+            |c| {
+                c.arm(Region::Rows(RowPred::Unmasked), || stmt(t));
+                c.arm(Region::Fire(GuardPred::HasLora), || stmt(t));
+            },
+            || stmt(t),
+        );
+    });
+}
 
 /// `select` states a WINDOW: no rectangle, and a buffer offset INTO its
 /// operand's. Both halves matter — a `Select` that lowered to a launch
@@ -100,7 +98,7 @@
 /// own allocation would be a copy the model does not make.
 #[test]
 fn a_select_launches_nothing_and_windows_its_operand() {
-    use model_compiler::lower::{lower, Buffers, Fire, Row};
+    use model_compiler::lower::{Buffers, Fire, Row, lower};
 
     let plan = trace_named("sel.cuda.decode", |t| {
         let x = input(t, 8);
@@ -166,8 +164,10 @@ fn an_in_place_add_lands_in_the_window_it_reads() {
     let add = plan
         .ops
         .iter()
-        .find(|o| matches!(&o.kind, OpKind::Launch { kernel, .. }
-                           if kernel == "norm::residual_add_bf16"))
+        .find(|o| {
+            matches!(&o.kind, OpKind::Launch { kernel, .. }
+                           if kernel == "norm::residual_add_bf16")
+        })
         .expect("the plan states the in-place add");
 
     let window = b.offset[sel.outputs[0] as usize];

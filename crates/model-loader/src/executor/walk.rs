@@ -1,18 +1,25 @@
-//! Running a finished plan on the CPU, against the real checkpoint bytes.
+//! Walking a finished plan: one instruction at a time, against the real
+//! checkpoint bytes.
 //!
-//! Two callers, two entry points. `pie model convert` materializes artifacts
-//! through [`execute_plan_into`] — the streaming shape: every buffer is an
-//! owned allocation freed at its last use in the schedule, and each finalized
-//! tensor is handed to a [`TensorSink`] once, so peak memory is the working
-//! set rather than the output. The tests and the differential oracle
-//! (`crate::testkit::reference`) use [`execute_plan`], which keeps the whole
-//! output resident because comparing it is the point.
+//! [`super::Execution`] is how this is reached, and holds the reasons for the
+//! choices a caller makes. What is here is the walk itself.
 //!
-//! It is the one module below `lib.rs` that opens a file, which is why it is
-//! named for what it is rather than sharing a name with the backend whose
-//! plans it accepts: `crate::plan::passes::tile::host` decides how a plan is lowered, and
-//! this executes the result. The compiler is on the other side of that line —
-//! `tests/standalone.rs` pins it.
+//! # It is not the "host" executor
+//!
+//! It was called that for as long as the only arena was a `Vec<u8>`, and the
+//! name became wrong the moment [`ArenaBacking`] existed: hand this walker a
+//! `CudaArena` and the reads are still host reads, but the writes land in
+//! device memory and the transforms run on a GPU. What is fixed is not WHERE
+//! the work happens — it is that the *decisions* happen here, once, for every
+//! backing. A backing that ran a different plan would be a second compiler.
+//!
+//! # It opens files
+//!
+//! The one module below `lib.rs` that does, which is why it is named for what
+//! it is rather than sharing a name with the backend whose plans it accepts:
+//! `crate::plan::passes::tile` decides how a plan is lowered, and this
+//! executes the result. The compiler is on the other side of that line, and
+//! `tests/standalone.rs` pins it — with this file as the one exemption.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -20,26 +27,26 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use half::{bf16, f16};
+use half::bf16;
 
 use std::collections::HashSet;
 
+use super::{Progress, Residency};
+use crate::codec::cast::{decode_values, encode_values};
+use crate::codec::fp8::{decode_fp8_e4m3_elements, f32_to_fp8_e4m3};
+use crate::codec::int4::decode_int4b8_elements;
+use crate::codec::mlx::mlx_affine_group_params;
+use crate::codec::mxfp4::{decode_mxfp4_elements, encode_mxfp4_group};
+use crate::codec::rows::{EncodeOperand, encode_rows};
 use crate::error::Error;
 use crate::executor::arena::{ArenaBacking, ArenaSpan, TileMapOp};
-use crate::executor::sink::{MemorySink, TensorSink};
+use crate::executor::sink::TensorSink;
 use crate::plan::index::{PlanIndex, instr_by_id};
 use crate::plan::{
     CONVERT_TILE_MAP_MASK, DestExtent, Extent, LoadPlan, SourceExtent, StorageInstr, TileMapKind,
     TransformSpec,
 };
 use crate::types::{BufferId, DType, Encoding, QuantScheme};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostStorage {
-    pub arena: Vec<u8>,
-    pub tensors: HashMap<String, Vec<u8>>,
-    pub max_tile_write_bytes: usize,
-}
 
 #[derive(Debug, Clone)]
 enum BufferLoc {
@@ -61,13 +68,6 @@ enum Root {
     Owned(BufferId),
 }
 
-/// Execute a plan against the checkpoint it names.
-///
-/// `snapshot_dir` is only a base for relative paths. The files themselves come
-/// from `plan.files`, which is the rule for every executor: an executor that
-/// rediscovered the checkpoint by scanning a directory could disagree with the
-/// plan about which file id means which file, and every offset in the plan is
-/// expressed against that table.
 /// What a freshly allocated buffer holds before anything writes to it.
 ///
 /// Not zero, and deliberately: `cudaMalloc` does not zero, so an executor that
@@ -78,165 +78,38 @@ enum Root {
 /// difference visible.
 const POISON: u8 = 0xAB;
 
-/// One retired instruction of an executing plan, for a caller rendering
-/// progress.
-///
-/// The smooth axis is bytes, not instructions: one tensor can be half the
-/// model, so an instruction count jerks where the checkpoint bytes consumed
-/// so far advance evenly. The total is the plan's own statement
-/// ([`crate::plan::MemoryPlan::checkpoint_read_bytes`]), known before the
-/// first instruction runs — which is what makes a percentage possible at all.
-pub struct Progress<'a> {
-    /// Checkpoint bytes consumed so far.
-    pub read_bytes: u64,
-    /// What `read_bytes` counts toward.
-    pub total_read_bytes: u64,
-    /// The runtime tensor this instruction published, when it published one.
-    pub finalized: Option<&'a str>,
-}
-
-pub fn execute_plan(plan: &LoadPlan, snapshot_dir: &Path) -> Result<HostStorage, Error> {
-    execute_plan_with_progress(plan, snapshot_dir, &mut |_| {})
-}
-
-/// [`execute_plan`], reporting a [`Progress`] after every retired instruction.
-///
-/// The callback is for rendering, so it can do no harm: it sees each state
-/// once, after the work is done, and returns nothing.
-pub fn execute_plan_with_progress(
+pub(super) fn run(
     plan: &LoadPlan,
     snapshot_dir: &Path,
-    progress: &mut dyn FnMut(Progress<'_>),
-) -> Result<HostStorage, Error> {
-    let mut sink = MemorySink::default();
-    let arena_len = usize::try_from(plan.memory.persistent_bytes)
-        .map_err(|_| invalid("persistent arena does not fit host address space"))?;
-    let mut arena = vec![0u8; arena_len];
-    let max_tile_write_bytes = run(
-        plan,
-        snapshot_dir,
-        &mut &mut arena[..],
-        &mut sink,
-        progress,
-        /*stream=*/ false,
-    )?;
-    Ok(HostStorage {
-        arena,
-        tensors: sink.tensors,
-        max_tile_write_bytes,
-    })
-}
-
-/// Execute a plan, streaming each finalized tensor into `sink`.
-///
-/// The memory shape convert wants: every buffer is an owned allocation
-/// (`persistent_offset` is ignored — there is no arena), freed the moment the
-/// schedule's last reference to it has executed, and the sink receives each
-/// tensor once, in schedule order. Peak memory is the largest working set of
-/// one tensor's chain, not the output.
-///
-/// The one plan shape this refuses is a
-/// [`BulkExtentWrite`](StorageInstr::BulkExtentWrite): that instruction
-/// addresses the persistent arena by offset, and there is no arena here. The
-/// rewrite that emits it serves resident device loads; a caller holding such
-/// a plan wants [`execute_plan`].
-pub fn execute_plan_into(
-    plan: &LoadPlan,
-    snapshot_dir: &Path,
+    residency: Residency<'_>,
     sink: &mut dyn TensorSink,
     progress: &mut dyn FnMut(Progress<'_>),
 ) -> Result<(), Error> {
-    run(plan, snapshot_dir, &mut &mut [][..], sink, progress, /*stream=*/ true)?;
-    Ok(())
-}
-
-/// Execute a plan whose persistent arena the CALLER owns.
-///
-/// The shape a resident DEVICE load wants, and the reason it is different
-/// from both of the above.
-///
-/// [`execute_plan`] allocates the arena as a `Vec<u8>`, fills it, and hands
-/// it back — so a driver staging weights holds the whole model TWICE, once in
-/// that vector and once in the buffer it copies the vector into. On a machine
-/// where the model is a meaningful fraction of RAM that is the difference
-/// between loading and being killed.
-///
-/// [`execute_plan_into`] avoids the arena entirely, which is right for
-/// `convert` and wrong here: a resident plan carries
-/// [`BulkExtentWrite`](StorageInstr::BulkExtentWrite), which addresses the
-/// arena by offset, and streaming refuses it.
-///
-/// This is the third shape: there IS an arena, and it is `arena` — whatever
-/// the caller allocated, including a memory-mapped or unified-memory device
-/// buffer. The executor writes the laid-out weights straight into their final
-/// home and copies nothing. Tensors the plan publishes OUTSIDE the arena
-/// still go to `sink`, because they have no offset to be written at.
-///
-/// `arena` must be at least `plan.memory.persistent_bytes`; a shorter one is
-/// refused rather than truncated. Its contents are overwritten.
-///
-/// Returns the largest single tile write the plan performed, which is what a
-/// caller sizing staging wants to know.
-///
-/// # Errors
-///
-/// As [`execute_plan`], plus an arena shorter than the plan's persistent
-/// bytes.
-pub fn execute_plan_into_arena(
-    plan: &LoadPlan,
-    snapshot_dir: &Path,
-    arena: &mut [u8],
-    sink: &mut dyn TensorSink,
-    progress: &mut dyn FnMut(Progress<'_>),
-) -> Result<usize, Error> {
-    execute_plan_into_backing(plan, snapshot_dir, &mut &mut *arena, sink, progress)
-}
-
-/// [`execute_plan_into_arena`] where the arena is not host memory.
-///
-/// The same execution, with the arena supplied as an [`ArenaBacking`] rather
-/// than as a slice — which is what a DISCRETE device needs, since its arena is
-/// reachable only through a copy. See [`crate::executor::arena`] for why that
-/// is a trait here rather than an executor inside each driver.
-///
-/// # Errors
-///
-/// As [`execute_plan_into_arena`].
-pub fn execute_plan_into_backing(
-    plan: &LoadPlan,
-    snapshot_dir: &Path,
-    arena: &mut dyn ArenaBacking,
-    sink: &mut dyn TensorSink,
-    progress: &mut dyn FnMut(Progress<'_>),
-) -> Result<usize, Error> {
-    run(plan, snapshot_dir, arena, sink, progress, /*stream=*/ false)
-}
-
-fn run(
-    plan: &LoadPlan,
-    snapshot_dir: &Path,
-    arena: &mut dyn ArenaBacking,
-    sink: &mut dyn TensorSink,
-    progress: &mut dyn FnMut(Progress<'_>),
-    stream: bool,
-) -> Result<usize, Error> {
-    // The gate is what this executor *implements* — the convert mask — WIDENED
-    // by whatever the backing runs itself. A CUDA plan that carries an
-    // `Encode` is executable here too; what stays refused is a transform
-    // neither side has an implementation of, `Repack` being the standing
-    // example when the backing declines it.
-    //
-    // Read once, here, rather than per instruction: a backing whose answer
-    // changed mid-plan would leave half a load on each path, and the caps are
-    // a property of the backing rather than of a moment.
-    let arena_tile_map_caps = arena.tile_map_caps();
-    let caps = CONVERT_TILE_MAP_MASK | arena_tile_map_caps;
-    if plan.target.tile_map_mask & !caps != 0 {
+    // The gate is what this executor *implements*, and nothing else. It used
+    // to be widened by the backing's capability mask, which bought nothing:
+    // every mask a target can carry is already a subset of this one, so the
+    // widening never admitted a plan and the second reader was a second thing
+    // to keep in step. `Repack` is the standing example of what stays refused.
+    if plan.target.tile_map_mask & !CONVERT_TILE_MAP_MASK != 0 {
         return Err(invalid(
-            "executor received a plan advertising TileMap transforms neither \
-             the host nor the arena backing implements",
+            "executor received a plan advertising TileMap transforms the host \
+             does not implement",
         ));
     }
+    // `Streaming` has no arena, and used to be spelled by handing the walker
+    // `&mut &mut [][..]` — a zero-length backing standing in for the ABSENCE
+    // of one — beside a `stream: bool` saying to ignore it. Two values for
+    // one fact, and the placeholder was the thing every arena operation below
+    // had to be careful not to touch.
+    let mut nothing: &mut [u8] = &mut [];
+    let (arena, stream): (&mut dyn ArenaBacking, bool) = match residency {
+        Residency::Arena(arena) => (arena, false),
+        Residency::Streaming => (&mut nothing, true),
+    };
+    // Read once, here, rather than per instruction: a backing whose answer
+    // changed mid-plan would leave half a load on each path, and this is a
+    // property of the backing rather than of a moment.
+    let arena_runs_kernels = arena.runs_named_kernels();
     let files = plan
         .files
         .iter()
@@ -274,7 +147,7 @@ fn run(
     } else {
         HashMap::new()
     };
-    let mut executor = HostExecutor {
+    let mut executor = Walk {
         plan,
         index: PlanIndex::new(plan),
         files,
@@ -284,13 +157,16 @@ fn run(
         finalized: HashSet::new(),
         stream,
         last_use,
-        max_tile_write_bytes: 0,
         progress,
         read_bytes: 0,
-        arena_tile_map_caps,
+        arena_runs_kernels,
     };
     executor.execute()?;
-    Ok(executor.max_tile_write_bytes)
+    // The last writes may still be in flight — `CudaArena` leaves them there
+    // on purpose. Draining is the backing's own verb precisely so that no
+    // caller has to know whether the one it handed over is such a backing.
+    executor.arena.finish()?;
+    Ok(())
 }
 
 /// The schedule position of each buffer's last reference, views chased.
@@ -345,7 +221,7 @@ fn last_uses(plan: &LoadPlan) -> Result<HashMap<BufferId, usize>, Error> {
     Ok(last)
 }
 
-struct HostExecutor<'a, 'p> {
+struct Walk<'a, 'p> {
     plan: &'a LoadPlan,
     /// The sparse half of plan lookup. Buffers and instructions are dense, so
     /// they go through [`LoadPlan::buffer`] and [`instr_by_id`] directly; tensor
@@ -362,12 +238,11 @@ struct HostExecutor<'a, 'p> {
     stream: bool,
     /// Filled only when streaming; see [`last_uses`].
     last_use: HashMap<BufferId, usize>,
-    max_tile_write_bytes: usize,
     progress: &'p mut dyn FnMut(Progress<'_>),
     read_bytes: u64,
     /// Which [`TileMapKind`]s the arena backing runs itself, read once at
     /// entry. Zero is host mode and is every backing that says nothing.
-    arena_tile_map_caps: u32,
+    arena_runs_kernels: bool,
 }
 
 /// Decode one GGUF `Q4_0` block: one F16 scale, then sixteen packed bytes whose
@@ -389,7 +264,7 @@ fn decode_gguf_q4_0_block_into(block: &[u8; 18], values: &mut [f32; 32]) {
     }
 }
 
-impl HostExecutor<'_, '_> {
+impl Walk<'_, '_> {
     fn execute(&mut self) -> Result<(), Error> {
         for (position, id) in self.plan.schedule.iter().enumerate() {
             let instr = instr_by_id(&self.plan.instrs, *id)?.clone();
@@ -642,18 +517,17 @@ impl HostExecutor<'_, '_> {
         // on the host either way, so transforming them here saves nothing and
         // the host path is the honest one.
         //
-        // A backing may still DECLINE the operands it is shown — a kind is a
-        // coarser claim than a kernel — and then everything below runs as it
-        // always did. What it may not do is fail quietly; see
-        // `ArenaBacking::run_tile_map`.
-        if self.arena_tile_map_caps & kind.capability_bit() != 0 {
-            if let Some(op) =
+        // One gate, not two. The plan named a kernel per instruction or named
+        // none, and `arena_tile_map_op` reads that answer; a second per-KIND
+        // mask beside it could only ever be wider than the plan's own reply.
+        // What a backing may NOT do is fail quietly: an op it is offered is
+        // one the compiler decided it can run, so it runs it or it errors.
+        if self.arena_runs_kernels
+            && let Some(op) =
                 self.arena_tile_map_op(kind, source, dest, inputs, outputs, &transform)?
-            {
-                if self.arena.run_tile_map(&op)? {
-                    return Ok(());
-                }
-            }
+        {
+            self.arena.run_tile_map(&op)?;
+            return Ok(());
         }
         let input = if let Some(source) = source {
             self.read_extent(source)?
@@ -686,7 +560,6 @@ impl HostExecutor<'_, '_> {
             TileMapKind::Encode if transform.to == Some(QuantScheme::MlxAffineU4) => {
                 let written = self.encode_mlx_affine_u4(&input, outputs, &transform)?;
                 for (buffer, bytes) in written {
-                    self.max_tile_write_bytes = self.max_tile_write_bytes.max(bytes.len());
                     self.write_buffer(buffer, 0, &bytes)?;
                 }
                 return Ok(());
@@ -735,7 +608,6 @@ impl HostExecutor<'_, '_> {
                 .checked_add(checked_usize(dest.stride.base_offset)?)
                 .ok_or_else(|| invalid("destination offset overflow"))?;
             for (offset, chunk) in output.chunks(tile).enumerate() {
-                self.max_tile_write_bytes = self.max_tile_write_bytes.max(chunk.len());
                 self.write_buffer(dest.buffer, base + offset * tile, chunk)?;
             }
             return Ok(());
@@ -752,7 +624,6 @@ impl HostExecutor<'_, '_> {
             )));
         }
         for (offset, chunk) in output.chunks(tile).enumerate() {
-            self.max_tile_write_bytes = self.max_tile_write_bytes.max(chunk.len());
             self.write_buffer(output_id, offset * tile, chunk)?;
         }
         Ok(())
@@ -761,12 +632,19 @@ impl HostExecutor<'_, '_> {
     /// The operands of a `TileMap`, as arena spans — or `None` when this one
     /// is not the device path's business.
     ///
-    /// `None` is the ordinary answer and is never an error: a transform
-    /// reading a checkpoint extent has its bytes on the host already, and one
-    /// writing an owned buffer has no arena address to write to. Both run on
-    /// the host path exactly as before. Only a transform whose input AND
-    /// every output are resident in the arena is handed over, because that is
-    /// the case the host path pays a round trip for.
+    /// `None` is the ordinary answer and is never an error: the plan named no
+    /// kernel for this instruction, or a transform reading a checkpoint
+    /// extent has its bytes on the host already, or one writing an owned
+    /// buffer has no arena address to write to. All run on the host path
+    /// exactly as before. Only a transform the compiler chose a row for, whose
+    /// input AND every output are resident in the arena, is handed over —
+    /// which is the case the host path pays a round trip for.
+    ///
+    /// The kernel question is asked HERE rather than inside the backing,
+    /// because it is the plan's answer and reading it is not a decision. A
+    /// backing that had to unwrap an `Option<&str>` would be a backing that
+    /// could reply "the plan named nothing", which the executor is holding
+    /// the plan and can see.
     fn arena_tile_map_op<'t>(
         &self,
         kind: TileMapKind,
@@ -776,6 +654,10 @@ impl HostExecutor<'_, '_> {
         outputs: &[BufferId],
         transform: &'t TransformSpec,
     ) -> Result<Option<TileMapOp<'t>>, Error> {
+        // No row, no delegation: the plan is saying the host runs this one.
+        let Some(kernel) = transform.kernel.as_deref() else {
+            return Ok(None);
+        };
         // A checkpoint source means host bytes; nothing to delegate.
         if source.is_some() {
             return Ok(None);
@@ -854,15 +736,12 @@ impl HostExecutor<'_, '_> {
             }
         };
         Ok(Some(TileMapOp {
-            kind,
+            kernel,
             src,
             dst,
             dst_scales,
             factors,
             shape: self.buffer_shape_2d(dst_buffer),
-            src_encoding: self.buffer_encoding(input),
-            dst_encoding: self.buffer_encoding(dst_buffer),
-            transform,
         }))
     }
 
@@ -888,21 +767,11 @@ impl HostExecutor<'_, '_> {
         Some((u32::try_from(rows).ok()?, u32::try_from(cols).ok()?))
     }
 
-    /// What a buffer's tensor IS.
-    ///
-    /// A buffer with no tensor behind it is scratch, and scratch has no
-    /// declaration — raw bytes is the honest answer for it, and it is the
-    /// answer a backing will decline on if it needed a real one.
-    fn buffer_encoding(&self, id: BufferId) -> Encoding {
-        self.index
-            .buffer_tensor(self.plan, id)
-            .map_or(Encoding::Raw(DType::U8), |tensor| tensor.encoding.clone())
-    }
-
     /// `Scale` multiplies, and what it multiplies by is the only thing that
     /// varies: a constant every element shares, or one factor per group of
     /// elements read from a second operand.
-    ///    /// The uniform form keeps the type it was handed — `infer` gives it back
+    ///
+    /// The uniform form keeps the type it was handed — `infer` gives it back
     /// unchanged — so there is no output dtype to look up. The per-group form
     /// is the one that also *decodes*, because a quantized tensor's elements
     /// are only numbers once their factors are applied; its output dtype is
@@ -955,18 +824,6 @@ impl HostExecutor<'_, '_> {
         encode_values(&values, dtype)
     }
 
-    /// One factor per block, read from the last input buffer.
-    ///
-    /// The blocking is `transform.scale_blocks`, one entry per axis, so this
-    /// walks the destination's logical shape rather than flattening. Flattening
-    /// was exact while groups were confined to the last axis — there, the runs
-    /// of the row-major layout and the runs of the logical shape are the same —
-    /// but a block that spans rows has its factor at a stride, and chunking
-    /// cannot see it.
-    ///
-    /// The factors' own extents are derived from the two, not read: the shape
-    /// ratio is what defines the blocking, and reading a third statement of it
-    /// would be a third thing to disagree.
     /// The MLX affine-U4 encode: the one scheme that publishes *three*
     /// tensors — a quantized weight is unreadable without the metadata the
     /// same pass computes, and an affine scheme's metadata is scales *and*
@@ -1071,6 +928,18 @@ impl HostExecutor<'_, '_> {
         }
     }
 
+    /// One factor per block, read from the last input buffer.
+    ///
+    /// The blocking is `transform.scale_blocks`, one entry per axis, so this
+    /// walks the destination's logical shape rather than flattening. Flattening
+    /// was exact while groups were confined to the last axis — there, the runs
+    /// of the row-major layout and the runs of the logical shape are the same —
+    /// but a block that spans rows has its factor at a stride, and chunking
+    /// cannot see it.
+    ///
+    /// The factors' own extents are derived from the two, not read: the shape
+    /// ratio is what defines the blocking, and reading a third statement of it
+    /// would be a third thing to disagree.
     fn scale_per_block(
         &self,
         mut values: Vec<f64>,
@@ -1428,7 +1297,6 @@ impl HostExecutor<'_, '_> {
             checked_usize(max_tile_bytes)?.max(1)
         };
         for (offset, chunk) in packed.chunks(tile).enumerate() {
-            self.max_tile_write_bytes = self.max_tile_write_bytes.max(chunk.len());
             self.write_buffer(payload, offset * tile, chunk)?;
         }
         self.write_buffer(scales, 0, &scale_out)?;
@@ -1799,7 +1667,8 @@ fn extent_offset(index: &[usize], dims: &[crate::plan::Dim], source: bool) -> Re
         })
 }
 
-fn extent_bytes(extent: &Extent) -> Result<usize, Error> {    let elements = extent.dims.iter().try_fold(1usize, |n, dim| {
+fn extent_bytes(extent: &Extent) -> Result<usize, Error> {
+    let elements = extent.dims.iter().try_fold(1usize, |n, dim| {
         n.checked_mul(checked_usize_i64(dim.count)?)
             .ok_or_else(|| invalid("extent byte count overflow"))
     })?;
@@ -1838,595 +1707,6 @@ fn physical_bytes(extent: &Extent, source: bool) -> Result<u64, Error> {
         .ok_or_else(|| invalid("extent range overflow"))
 }
 
-/// One `f64` per E2M1 code, low nibble first.
-///
-/// The nibble order and the codepoint table are the OCP MX FP4 spec's, and
-/// have to stay the CUDA kernel's: `kFp4Lut` in `kernels/dequant_fp4.cu` is
-/// the same sixteen values in the same order, and the two executors are
-/// compared element for element.
-/// Unpack `QuantScheme::Int4B8` nibbles, low nibble first.
-///
-/// The nibbles are stored eight to a 32-bit word, but a little-endian word's
-/// nibbles run low-to-high across its bytes in exactly that order, so reading
-/// bytes is reading words. An element is `nibble - 8`.
-fn decode_int4b8_elements(bytes: &[u8]) -> Vec<f64> {
-    let mut values = Vec::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        values.push(f64::from((byte & 0xF) as i8 - 8));
-        values.push(f64::from((byte >> 4) as i8 - 8));
-    }
-    values
-}
-
-/// One `f64` per `Fp8E4M3` byte: sign, four exponent bits, three mantissa
-/// bits, bias 7.
-///
-/// This is the OCP `E4M3` the CUDA side reaches through
-/// `__nv_cvt_fp8_to_halfraw(.., __NV_E4M3)`, which has no infinity: the
-/// all-ones exponent carries ordinary values up to 448 and only `S.1111.111`
-/// is NaN. A subnormal is `mantissa/8 * 2^-6`, which is what makes the two
-/// branches differ by more than the implicit bit.
-fn decode_fp8_e4m3_elements(bytes: &[u8]) -> Vec<f64> {
-    bytes
-        .iter()
-        .map(|&byte| {
-            let sign = if byte & 0x80 != 0 { -1.0f64 } else { 1.0 };
-            let exponent = i32::from((byte >> 3) & 0x0F);
-            let mantissa = f64::from(byte & 0x07);
-            if exponent == 0x0F && mantissa == 7.0 {
-                return f64::NAN;
-            }
-            let magnitude = if exponent == 0 {
-                mantissa / 8.0 * (-6.0f64).exp2()
-            } else {
-                (1.0 + mantissa / 8.0) * f64::from(exponent - 7).exp2()
-            };
-            sign * magnitude
-        })
-        .collect()
-}
-
-fn decode_mxfp4_elements(bytes: &[u8]) -> Vec<f64> {
-    const LUT: [f64; 16] = [
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
-    ];
-    let mut values = Vec::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        values.push(LUT[(byte & 0xF) as usize]);
-        values.push(LUT[(byte >> 4) as usize]);
-    }
-    values
-}
-
-/// How an Encode reads its operand as `BF16` rows.
-///
-/// Resolved once, before the row loop, so the per-row work is indexing and
-/// arithmetic only — which is also what lets the rows run on any thread.
-enum EncodeOperand<'a> {
-    /// A raw operand, narrowed to `BF16` element by element the way the
-    /// device's cast does.
-    Widened { bytes: &'a [u8], dtype: DType },
-    /// An FP8 payload and the `F32` block factors that make it numbers,
-    /// multiplied out per element: `bf16(f32(fp8) · factor)`, the blocked
-    /// dequant kernel's expression.
-    BlockScaledFp8 {
-        bytes: &'a [u8],
-        factors: Vec<f32>,
-        scale_cols: usize,
-        group: usize,
-        scale_row_offset: usize,
-        scale_col_offset: usize,
-    },
-}
-
-impl EncodeOperand<'_> {
-    /// Fill `buf` with row `row` as the `f32` widening of its `BF16` reading.
-    fn row_bf16(&self, row: usize, cols: usize, buf: &mut [f32]) {
-        match self {
-            EncodeOperand::Widened { bytes, dtype } => {
-                let width = dtype.bytes() as usize;
-                let row_bytes = &bytes[row * cols * width..(row + 1) * cols * width];
-                match dtype {
-                    DType::BF16 => {
-                        #[cfg(target_arch = "x86_64")]
-                        if std::arch::is_x86_feature_detected!("avx2") {
-                            // Sound: the feature was just detected, and the
-                            // slices agree on length by the arm's slicing.
-                            unsafe { avx2::decode_bf16_row(row_bytes, buf) };
-                            return;
-                        }
-                        for (le, out) in row_bytes.chunks_exact(2).zip(buf.iter_mut()) {
-                            // BF16 widens by a shift; spelled directly rather
-                            // than through `half` so the decode vectorizes.
-                            let bits = u16::from_le_bytes(le.try_into().unwrap());
-                            *out = f32::from_bits(u32::from(bits) << 16);
-                        }
-                    }
-                    DType::F16 => {
-                        for (le, out) in row_bytes.chunks_exact(2).zip(buf.iter_mut()) {
-                            let wide =
-                                f16::from_bits(u16::from_le_bytes(le.try_into().unwrap())).to_f32();
-                            *out = bf16::from_f32(wide).to_f32();
-                        }
-                    }
-                    DType::F32 => {
-                        for (le, out) in row_bytes.chunks_exact(4).zip(buf.iter_mut()) {
-                            *out =
-                                bf16::from_f32(f32::from_le_bytes(le.try_into().unwrap())).to_f32();
-                        }
-                    }
-                    // `encode_bytes` admitted only the three above.
-                    _ => unreachable!("EncodeOperand::Widened holds a vetted dtype"),
-                }
-            }
-            EncodeOperand::BlockScaledFp8 {
-                bytes,
-                factors,
-                scale_cols,
-                group,
-                scale_row_offset,
-                scale_col_offset,
-            } => {
-                let row_bytes = &bytes[row * cols..(row + 1) * cols];
-                let scale_row = (scale_row_offset + row / group) * scale_cols;
-                for (col, (&code, out)) in row_bytes.iter().zip(buf.iter_mut()).enumerate() {
-                    let factor = factors[scale_row + scale_col_offset + col / group];
-                    *out = bf16::from_f32(fp8_e4m3_to_f32(code) * factor).to_f32();
-                }
-            }
-        }
-    }
-}
-
-/// One row of an encode: `(row, f32 scratch, payload-row out, scale-row out)`.
-type EncodeRowJob<'a> = dyn Fn(usize, &mut [f32], &mut [u8], &mut [u8]) + Sync + 'a;
-
-/// Run `job` over every row of an encode, in parallel when the tensor pays
-/// for it.
-///
-/// The outputs are handed to each worker as disjoint `split_at_mut` slices of
-/// the two flat buffers, so the parallelism needs no synchronisation — and
-/// because every row's bytes depend on that row alone, the worker count
-/// changes wall-clock and nothing else. Each worker keeps one `f32` scratch
-/// row rather than one per call.
-fn encode_rows(
-    rows: usize,
-    cols: usize,
-    out_row_bytes: usize,
-    scale_row_bytes: usize,
-    out: &mut [u8],
-    scales: &mut [u8],
-    job: &EncodeRowJob<'_>,
-) {
-    // Below about a megabyte of input the threads cost more than they carry.
-    let workers = if rows * cols < (1 << 20) {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map_or(1, std::num::NonZero::get)
-            .min(rows.max(1))
-    };
-    if workers <= 1 {
-        let mut buf = vec![0.0f32; cols];
-        for row in 0..rows {
-            let out = &mut out[row * out_row_bytes..(row + 1) * out_row_bytes];
-            let scale = &mut scales[row * scale_row_bytes..(row + 1) * scale_row_bytes];
-            job(row, &mut buf, out, scale);
-        }
-        return;
-    }
-    let rows_per = rows.div_ceil(workers);
-    std::thread::scope(|scope| {
-        let mut out_rest = out;
-        let mut scale_rest = scales;
-        let mut start = 0usize;
-        while start < rows {
-            let count = rows_per.min(rows - start);
-            let (out_chunk, next) =
-                std::mem::take(&mut out_rest).split_at_mut(count * out_row_bytes);
-            out_rest = next;
-            let (scale_chunk, next) =
-                std::mem::take(&mut scale_rest).split_at_mut(count * scale_row_bytes);
-            scale_rest = next;
-            let first = start;
-            scope.spawn(move || {
-                let mut buf = vec![0.0f32; cols];
-                for i in 0..count {
-                    let out = &mut out_chunk[i * out_row_bytes..(i + 1) * out_row_bytes];
-                    let scale = &mut scale_chunk[i * scale_row_bytes..(i + 1) * scale_row_bytes];
-                    job(first + i, &mut buf, out, scale);
-                }
-            });
-            start += count;
-        }
-    });
-}
-
-/// One 32-element MXFP4 group: absmax → E8M0 byte, elements → 16 packed
-/// nibble pairs in `out`. Returns the scale byte.
-///
-/// Dispatches to the AVX2 restatement when the CPU has it; the scalar body
-/// below is the reference the vector path is checked against
-/// (`avx2_group_encode_matches_the_scalar_reference`), and both are the
-/// kernel's arithmetic.
-fn encode_mxfp4_group(group: &[f32], out: &mut [u8]) -> u8 {
-    #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") {
-        // Sound: the feature was just detected, and the slices are checked by
-        // the callee's debug asserts and the caller's slicing.
-        return unsafe { avx2::encode_mxfp4_group(group, out) };
-    }
-    encode_mxfp4_group_scalar(group, out)
-}
-
-fn encode_mxfp4_group_scalar(group: &[f32], out: &mut [u8]) -> u8 {
-    // `f32::max` ignores a NaN operand, which is the kernel's
-    // `if (a > absmax)` by another spelling.
-    let mut absmax = 0.0f32;
-    for &v in group {
-        absmax = absmax.max(v.abs());
-    }
-    let sb = encode_e8m0(absmax);
-    // An exact power of two, so the reciprocal is exact too and multiplying
-    // by it is the kernel's divide.
-    let inv_s = 1.0 / exp2_e8m0(sb);
-    let mut codes = [0u8; 32];
-    for (v, code) in group.iter().zip(codes.iter_mut()) {
-        *code = encode_fp4_e2m1(v * inv_s);
-    }
-    for (k, pair) in codes.chunks_exact(2).enumerate() {
-        out[k] = (pair[1] << 4) | pair[0];
-    }
-    sb
-}
-
-/// The encode hot loops as AVX2 lanes, lane-for-lane the scalar arithmetic.
-///
-/// Nothing here is a different algorithm — every intrinsic was chosen to
-/// reproduce one scalar expression bit for bit, NaN cases included:
-///
-/// * `_CMP_NLT_UQ` is `!(a < t)` — true on NaN — which is the E2M1 ladder's
-///   test and how a NaN element lands on magnitude 7;
-/// * `_mm256_max_ps(x, acc)` returns `acc` when `x` is NaN, which is
-///   `acc.max(x)`'s NaN-ignoring absmax;
-/// * `_CMP_LT_OQ` against zero is `x < 0.0` — false for NaN and `-0.0` — so
-///   the sign bit lands exactly where the scalar puts it.
-///
-/// The multiply is `vmulps`, IEEE round-to-nearest like the scalar's, and the
-/// BF16 widening is the same `<< 16`. Everything is `unsafe` only for the
-/// `target_feature` contract; callers dispatch behind runtime detection.
-#[cfg(target_arch = "x86_64")]
-mod avx2 {
-    use std::arch::x86_64::*;
-
-    /// Widen one BF16 row to `f32`, eight lanes per step.
-    ///
-    /// # Safety
-    /// The caller detected `avx2`. `row` holds `out.len()` little-endian
-    /// BF16 values.
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn decode_bf16_row(row: &[u8], out: &mut [f32]) {
-        debug_assert!(row.len() == out.len() * 2);
-        let n = out.len();
-        let mut at = 0;
-        unsafe {
-            while at + 8 <= n {
-                let half = _mm_loadu_si128(row.as_ptr().add(at * 2).cast());
-                let wide = _mm256_cvtepu16_epi32(half);
-                let bits = _mm256_slli_epi32::<16>(wide);
-                _mm256_storeu_ps(out.as_mut_ptr().add(at), _mm256_castsi256_ps(bits));
-                at += 8;
-            }
-        }
-        for k in at..n {
-            let bits = u16::from_le_bytes([row[2 * k], row[2 * k + 1]]);
-            out[k] = f32::from_bits(u32::from(bits) << 16);
-        }
-    }
-
-    /// One 32-element MXFP4 group; see [`super::encode_mxfp4_group_scalar`]
-    /// for the reference this restates.
-    ///
-    /// # Safety
-    /// The caller detected `avx2`. `group` has 32 elements, `out` has 16.
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn encode_mxfp4_group(group: &[f32], out: &mut [u8]) -> u8 {
-        debug_assert!(group.len() == 32 && out.len() == 16);
-        unsafe {
-            let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF));
-
-            let mut lanes = [_mm256_setzero_ps(); 4];
-            let mut acc = _mm256_setzero_ps();
-            for (i, chunk) in lanes.iter_mut().enumerate() {
-                let v = _mm256_loadu_ps(group.as_ptr().add(i * 8));
-                *chunk = v;
-                // NaN in the first operand yields the second: `acc.max(|v|)`.
-                acc = _mm256_max_ps(_mm256_and_ps(v, abs_mask), acc);
-            }
-            // The accumulator lanes are NaN-free, so the horizontal order is
-            // free to be anything.
-            let quad = _mm_max_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps::<1>(acc));
-            let pair = _mm_max_ps(quad, _mm_movehl_ps(quad, quad));
-            let one = _mm_max_ss(pair, _mm_shuffle_ps::<1>(pair, pair));
-            let absmax = _mm_cvtss_f32(one);
-
-            let sb = super::encode_e8m0(absmax);
-            let inv_s = _mm256_set1_ps(1.0 / super::exp2_e8m0(sb));
-
-            let thresholds = [0.25f32, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0];
-            let zero_ps = _mm256_setzero_ps();
-            let zero_si = _mm256_setzero_si256();
-            let low_bit = _mm256_set1_epi32(1);
-            let mut codes = [0i32; 32];
-            for (i, &chunk) in lanes.iter().enumerate() {
-                let x = _mm256_mul_ps(chunk, inv_s);
-                let a = _mm256_and_ps(x, abs_mask);
-                let mut mag = zero_si;
-                for t in thresholds {
-                    // A true lane is -1; subtracting counts the midpoints
-                    // `a` is not below, NaN counting all seven.
-                    let not_below = _mm256_cmp_ps::<_CMP_NLT_UQ>(a, _mm256_set1_ps(t));
-                    mag = _mm256_sub_epi32(mag, _mm256_castps_si256(not_below));
-                }
-                let negative = _mm256_cmp_ps::<_CMP_LT_OQ>(x, zero_ps);
-                let sign = _mm256_slli_epi32::<3>(_mm256_and_si256(
-                    _mm256_castps_si256(negative),
-                    low_bit,
-                ));
-                let nonzero = _mm256_cmpgt_epi32(mag, zero_si);
-                let code = _mm256_and_si256(_mm256_or_si256(mag, sign), nonzero);
-                _mm256_storeu_si256(codes.as_mut_ptr().add(i * 8).cast(), code);
-            }
-            for (k, pair) in codes.chunks_exact(2).enumerate() {
-                out[k] = ((pair[1] as u8) << 4) | pair[0] as u8;
-            }
-            sb
-        }
-    }
-}
-
-/// `2^e` for a normal-range exponent, built rather than computed.
-fn exp2i(e: i32) -> f32 {
-    f32::from_bits(((e + 127) as u32) << 23)
-}
-
-/// One E4M3 byte as the `f32` it denotes, `__nv_cvt_fp8_to_halfraw` widened:
-/// 1-4-3, bias 7, no infinities, `S.1111.111` the one NaN.
-fn fp8_e4m3_to_f32(byte: u8) -> f32 {
-    let sign = if byte & 0x80 != 0 { -1.0f32 } else { 1.0 };
-    let exp = (byte >> 3) & 0xF;
-    let mant = (byte & 0x7) as f32;
-    if exp == 0xF && byte & 0x7 == 0x7 {
-        return f32::NAN;
-    }
-    let value = if exp == 0 {
-        // Subnormal: units of 2^-9.
-        mant * exp2i(-9)
-    } else {
-        (1.0 + mant / 8.0) * exp2i(i32::from(exp) - 7)
-    };
-    sign * value
-}
-
-/// `__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3)`: round to nearest
-/// even, saturate finite overflow — and infinity — to ±448, NaN to the
-/// scheme's NaN byte with the sign kept.
-fn f32_to_fp8_e4m3(x: f32) -> u8 {
-    let sign = if x.is_sign_negative() { 0x80u8 } else { 0 };
-    if x.is_nan() {
-        return sign | 0x7F;
-    }
-    let a = x.abs();
-    if a >= 448.0 {
-        // Everything past the last code rounds or saturates onto it: the
-        // next magnitude up the grid is the NaN slot, which SATFINITE never
-        // produces.
-        return sign | 0x7E;
-    }
-    if a < 0.015625 {
-        // Subnormal: quantize in units of 2^-9. The multiply is by a power
-        // of two, so it is exact and the tie is the true tie; 8 rolls over
-        // into exactly the first normal code.
-        let q = (a * 512.0).round_ties_even() as u32;
-        return sign | q as u8;
-    }
-    let bits = a.to_bits();
-    let mut e = ((bits >> 23) as i32) - 127;
-    let m = f32::from_bits((bits & 0x007F_FFFF) | 0x3F80_0000);
-    let mut q = (m * 8.0).round_ties_even() as u32;
-    if q == 16 {
-        e += 1;
-        q = 8;
-    }
-    sign | (((e + 7) as u8) << 3) | (q as u8 - 8)
-}
-
-/// One FP4 E2M1 codepoint: `quant_bf16_to_mxfp4.cu::encode_fp4_e2m1`, its
-/// midpoint table verbatim.
-///
-/// Every comparison is false for a NaN operand, which falls through to the
-/// largest magnitude with a positive sign — not a choice here, the port of
-/// the kernel's. A signed zero rounds to `+0`.
-// The negated comparisons are the port: `!(a < t)` is true for NaN where
-// `a >= t` is not, and NaN-rounds-to-the-top-magnitude is the kernel's
-// behaviour.
-#[allow(clippy::neg_cmp_op_on_partial_ord)]
-fn encode_fp4_e2m1(x: f32) -> u8 {
-    let a = x.abs();
-    // Magnitudes 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0; boundaries are the
-    // midpoints between neighbours, so this is round-to-nearest with ties up.
-    //
-    // The kernel's ladder, summed instead of chained: the magnitude is how
-    // many midpoints `a` is *not below*, which is the same arithmetic — a NaN
-    // fails every comparison and lands on 7, exactly as it falls through the
-    // ladder — but branch-free, which is what lets the per-element encode
-    // loop vectorize.
-    let mag = u8::from(!(a < 0.25))
-        + u8::from(!(a < 0.75))
-        + u8::from(!(a < 1.25))
-        + u8::from(!(a < 1.75))
-        + u8::from(!(a < 2.5))
-        + u8::from(!(a < 3.5))
-        + u8::from(!(a < 5.0));
-    // Signed zero keeps rounding to +0: the sign lands only on a non-zero
-    // magnitude.
-    let sign = u8::from(x < 0.0) << 3;
-    (mag | sign) * u8::from(mag != 0)
-}
-
-/// The E8M0 byte for one group: the smallest `b` with `6 · 2^(b-127) ≥ absmax`
-/// (`quant_bf16_to_mxfp4.cu::encode_e8m0`), and `0` for a group of zeros — or
-/// of NaNs, which is what the kernel's `!(absmax > 0)` spelling covers.
-///
-/// The `log2` is the one place this can drift from the device: CUDA's `log2f`
-/// is within 1 ulp, the host's is correctly rounded, and a disagreement flips
-/// the `ceil` only when `absmax / 6` sits within an ulp of a power of two.
-/// The driver-side parity test is the check that it does not happen on real
-/// weights.
-// The negated comparison is the port: `!(absmax > 0.0)` is false for NaN
-// where `absmax <= 0.0` is not, and NaN-means-scale-zero is the kernel's
-// behaviour.
-#[allow(clippy::neg_cmp_op_on_partial_ord)]
-fn encode_e8m0(absmax: f32) -> u8 {
-    if !(absmax > 0.0) {
-        return 0;
-    }
-    // The `+ 127.0` stays in `f32` so an infinite absmax saturates through the
-    // int conversion instead of overflowing after it.
-    let b = ((absmax / 6.0).log2().ceil() + 127.0) as i32;
-    b.clamp(0, 254) as u8
-}
-
-/// `2^(sb - 127)` as the kernel's `ldexpf` builds it: an exact power of two,
-/// subnormal at `sb == 0`.
-fn exp2_e8m0(sb: u8) -> f32 {
-    if sb == 0 {
-        f32::from_bits(1 << 22)
-    } else {
-        f32::from_bits(u32::from(sb) << 23)
-    }
-}
-
-fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, Error> {
-    let width = dtype.bytes() as usize;
-    if !bytes.len().is_multiple_of(width) {
-        return Err(invalid("cast input byte count is not element-aligned"));
-    }
-    bytes
-        .chunks_exact(width)
-        .map(|chunk| {
-            Ok(match dtype {
-                DType::F32 => f32::from_le_bytes(chunk.try_into().unwrap()) as f64,
-                DType::F16 => {
-                    f16::from_bits(u16::from_le_bytes(chunk.try_into().unwrap())).to_f32() as f64
-                }
-                DType::BF16 => {
-                    bf16::from_bits(u16::from_le_bytes(chunk.try_into().unwrap())).to_f32() as f64
-                }
-                DType::I32 => i32::from_le_bytes(chunk.try_into().unwrap()) as f64,
-                DType::I16 => i16::from_le_bytes(chunk.try_into().unwrap()) as f64,
-                DType::I8 => i8::from_le_bytes(chunk.try_into().unwrap()) as f64,
-                DType::U32 => u32::from_le_bytes(chunk.try_into().unwrap()) as f64,
-                DType::U16 => u16::from_le_bytes(chunk.try_into().unwrap()) as f64,
-                DType::U8 | DType::Bool => chunk[0] as f64,
-                DType::E8M0 => (chunk[0] as f64 - 127.0).exp2(),
-                DType::F8E4M3 | DType::F8E5M2 => {
-                    return Err(invalid("host Cast does not implement FP8"));
-                }
-                // A 64-bit integer does not survive the f64 pivot this cast
-                // is written around, and nothing asks it to: `I64`/`U64`
-                // tensors are index tables that move byte-for-byte.
-                DType::I64 | DType::U64 => {
-                    return Err(invalid("host Cast does not implement 64-bit integers"));
-                }
-            })
-        })
-        .collect()
-}
-
-/// One group's affine scale and zero point, by MLX's rule.
-///
-/// Transcribed from `mlx/backend/cpu/quantized.cpp::quantize`, because the
-/// scheme is MLX's and a checkpoint this produces is meant to be
-/// interchangeable with one `mlx_lm convert` produced. Three details are worth
-/// naming, since none is what an independently written affine quantizer would
-/// do:
-///
-///  * **The scale is usually negative.** It is negated unless the group's
-///    minimum is the larger in magnitude, which puts code 0 on whichever end
-///    dominates. Dequantization is `code * scale + zero` either way, so a
-///    consumer never sees the difference -- but a producer that "fixed" the sign
-///    would place the codes on the other end of the group's range.
-///  * **The endpoint is snapped, not the scale.** `scale` is recomputed as
-///    `edge / round(edge / scale)` so that the dominant endpoint lands exactly on
-///    a code, which is what keeps the largest magnitude in the group exact.
-///  * **`w_max` starts at zero**, not at negative infinity, so a group whose
-///    values are all negative is quantized over the range up to zero rather
-///    than up to its own largest element. Nothing about the arithmetic suggests
-///    this; it is simply what MLX does.
-///  * **The rounding is half AWAY FROM ZERO**, not half to even. That one
-///    choice was the whole of an 8.2% disagreement with `mx.quantize` on an
-///    MXFP4-derived expert bank, whose values sit on half-integers by
-///    construction, and it is why every mismatch was by exactly one.
-///  * **`eps` floors the scale** so a constant group -- every expert bias row
-///    that is all zeros, for one -- divides by `1e-7` instead of by zero.
-fn mlx_affine_group_params(values: &[f64]) -> (f32, f32) {
-    const N_BINS: f32 = 15.0;
-    const EPS: f32 = 1e-7;
-    let mut w_min = f32::INFINITY;
-    let mut w_max = 0.0f32;
-    for &value in values {
-        let value = value as f32;
-        w_min = w_min.min(value);
-        w_max = w_max.max(value);
-    }
-    let mask = w_min.abs() > w_max.abs();
-    let mut scale = ((w_max - w_min) / N_BINS).max(EPS);
-    if !mask {
-        scale = -scale;
-    }
-    let edge = if mask { w_min } else { w_max };
-    let q0 = (edge / scale).round();
-    let mut bias = 0.0f32;
-    if q0 != 0.0 {
-        scale = edge / q0;
-        bias = edge;
-    }
-    (scale, bias)
-}
-
-fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, Error> {
-    let mut out = Vec::with_capacity(values.len() * dtype.bytes() as usize);
-    for &value in values {
-        match dtype {
-            DType::F32 => out.extend_from_slice(&(value as f32).to_le_bytes()),
-            DType::F16 => {
-                out.extend_from_slice(&f16::from_f32(value as f32).to_bits().to_le_bytes())
-            }
-            DType::BF16 => {
-                out.extend_from_slice(&bf16::from_f32(value as f32).to_bits().to_le_bytes())
-            }
-            DType::I32 => out.extend_from_slice(&(value as i32).to_le_bytes()),
-            DType::I16 => out.extend_from_slice(&(value as i16).to_le_bytes()),
-            DType::I8 => out.push(value as i8 as u8),
-            DType::U32 => out.extend_from_slice(&(value as u32).to_le_bytes()),
-            DType::U16 => out.extend_from_slice(&(value as u16).to_le_bytes()),
-            DType::U8 => out.push(value as u8),
-            DType::Bool => out.push(u8::from(value != 0.0)),
-            DType::E8M0 => {
-                return Err(invalid("host Cast does not encode to E8M0"));
-            }
-            DType::F8E4M3 | DType::F8E5M2 => {
-                return Err(invalid("host Cast does not implement FP8"));
-            }
-            DType::I64 | DType::U64 => {
-                return Err(invalid("host Cast does not implement 64-bit integers"));
-            }
-        }
-    }
-    Ok(out)
-}
-
 fn checked_usize(value: u64) -> Result<usize, Error> {
     usize::try_from(value).map_err(|_| invalid("value does not fit usize"))
 }
@@ -2441,6 +1721,8 @@ fn invalid(message: impl Into<String>) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use super::super::sink::MemorySink;
+    use super::super::{Execution, HostStorage};
     use super::*;
     use crate::plan::{
         BufferDecl, DestExtent, Dim, MemoryPlan, SourceTensorDecl, StorageTarget, TileSpec,
@@ -2520,7 +1802,7 @@ mod tests {
         };
 
         let plan = crate::plan::compile(&metadata, &contract, StorageTarget::default()).unwrap();
-        let storage = execute_plan(&plan, &dir).unwrap();
+        let storage = Execution::new(&plan, &dir).run().unwrap();
         assert_eq!(
             storage.tensors["padded"],
             vec![0, 1, 2, 3, 0, 0, 4, 5, 6, 0]
@@ -2593,7 +1875,7 @@ mod tests {
             plan.instrs
         );
 
-        let storage = execute_plan(&plan, &dir).unwrap();
+        let storage = Execution::new(&plan, &dir).run().unwrap();
         let expected: Vec<u8> = values
             .iter()
             .flat_map(|value| (value * factor).to_le_bytes())
@@ -2683,7 +1965,7 @@ mod tests {
         };
 
         let plan = crate::plan::compile(&metadata, &contract, target).unwrap();
-        let storage = execute_plan(&plan, &dir).unwrap();
+        let storage = Execution::new(&plan, &dir).run().unwrap();
 
         #[rustfmt::skip]
         let expected_row0: [u8; 16] = [
@@ -2695,38 +1977,6 @@ mod tests {
         assert_eq!(storage.tensors["w"], expected);
         assert_eq!(storage.tensors["w_scale"], vec![127, 128]);
         std::fs::remove_dir_all(dir).ok();
-    }
-
-    /// The two encode primitives at their edges, against values computed by
-    /// hand from the kernel's comments.
-    #[test]
-    fn mxfp4_encode_primitives_match_the_kernel_at_the_edges() {
-        // Signed zero rounds to +0; NaN falls through every comparison to the
-        // top magnitude, positive.
-        assert_eq!(encode_fp4_e2m1(0.0), 0);
-        assert_eq!(encode_fp4_e2m1(-0.0), 0);
-        assert_eq!(encode_fp4_e2m1(f32::NAN), 0x7);
-        assert_eq!(encode_fp4_e2m1(-5.0), 0xF);
-        assert_eq!(encode_fp4_e2m1(f32::INFINITY), 0x7);
-        assert_eq!(encode_fp4_e2m1(f32::NEG_INFINITY), 0xF);
-        // Each boundary is closed on its upper side.
-        assert_eq!(encode_fp4_e2m1(0.25), 1);
-        assert_eq!(encode_fp4_e2m1(-1.75), 0xC);
-
-        // b is the smallest byte with 6·2^(b-127) ≥ absmax.
-        assert_eq!(encode_e8m0(0.0), 0);
-        assert_eq!(encode_e8m0(f32::NAN), 0);
-        assert_eq!(encode_e8m0(6.0), 127);
-        assert_eq!(encode_e8m0(6.1), 128);
-        assert_eq!(encode_e8m0(3.0), 126);
-        assert_eq!(encode_e8m0(12.0), 128);
-        assert_eq!(encode_e8m0(f32::INFINITY), 254);
-        assert_eq!(encode_e8m0(f32::MIN_POSITIVE), 0);
-
-        assert_eq!(exp2_e8m0(127), 1.0);
-        assert_eq!(exp2_e8m0(128), 2.0);
-        assert_eq!(exp2_e8m0(0), f32::from_bits(1 << 22));
-        assert_eq!(exp2_e8m0(254), f32::from_bits(254 << 23));
     }
 
     /// Progress reports bytes monotonically against the plan's own total and
@@ -2776,14 +2026,16 @@ mod tests {
         let plan = crate::plan::compile(&metadata, &contract, StorageTarget::default()).unwrap();
 
         let mut seen = Vec::new();
-        let storage = execute_plan_with_progress(&plan, &dir, &mut |progress| {
-            seen.push((
-                progress.read_bytes,
-                progress.total_read_bytes,
-                progress.finalized.map(str::to_string),
-            ));
-        })
-        .unwrap();
+        let storage = Execution::new(&plan, &dir)
+            .progress(&mut |progress| {
+                seen.push((
+                    progress.read_bytes,
+                    progress.total_read_bytes,
+                    progress.finalized.map(str::to_string),
+                ));
+            })
+            .run()
+            .unwrap();
         assert_eq!(storage.tensors["w"], vec![7u8; 16]);
 
         assert_eq!(seen.len(), plan.schedule.len());
@@ -2796,123 +2048,6 @@ mod tests {
             "no event named the published tensor: {seen:?}"
         );
         std::fs::remove_dir_all(dir).ok();
-    }
-
-    /// The parallel row driver against a plain sequential loop of the same
-    /// job, at a size that engages the worker split.
-    ///
-    /// Determinism is the claim `encode_rows` makes — the worker count changes
-    /// wall-clock and nothing else — and this is the check that the row/slice
-    /// bookkeeping honours it: an off-by-one in the `split_at_mut` arithmetic
-    /// shifts every subsequent row and cannot pass.
-    #[test]
-    fn parallel_row_encoding_is_bit_identical_to_sequential() {
-        let (rows, cols) = (512usize, 2048usize); // 1M elements: the parallel path
-        let job = |row: usize, buf: &mut [f32], out: &mut [u8], scale: &mut [u8]| {
-            for (c, v) in buf.iter_mut().enumerate() {
-                *v = ((row * 31 + c) % 97) as f32;
-            }
-            for (c, o) in out.iter_mut().enumerate() {
-                *o = (buf[c] as u32 % 251) as u8;
-            }
-            scale[0] = (row % 255) as u8;
-        };
-        let mut out_parallel = vec![0u8; rows * cols];
-        let mut scale_parallel = vec![0u8; rows];
-        encode_rows(
-            rows,
-            cols,
-            cols,
-            1,
-            &mut out_parallel,
-            &mut scale_parallel,
-            &job,
-        );
-
-        let mut out_sequential = vec![0u8; rows * cols];
-        let mut scale_sequential = vec![0u8; rows];
-        let mut buf = vec![0.0f32; cols];
-        for row in 0..rows {
-            job(
-                row,
-                &mut buf,
-                &mut out_sequential[row * cols..(row + 1) * cols],
-                &mut scale_sequential[row..row + 1],
-            );
-        }
-        assert_eq!(out_parallel, out_sequential);
-        assert_eq!(scale_parallel, scale_sequential);
-    }
-
-    /// The AVX2 group encode against the scalar reference, over inputs built
-    /// to visit every lane behaviour: all magnitudes both sides of each
-    /// midpoint, both signs, signed zeros, NaN, infinity, subnormals, and a
-    /// spread of group absmaxes — on any machine without AVX2 this reduces to
-    /// scalar-vs-scalar and passes vacuously.
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn avx2_group_encode_matches_the_scalar_reference() {
-        if !std::arch::is_x86_feature_detected!("avx2") {
-            return;
-        }
-        // A deterministic mix: an LCG over interesting bf16-representable
-        // values plus injected specials.
-        let specials = [
-            f32::NAN,
-            -f32::NAN,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-            0.0,
-            -0.0,
-            f32::MIN_POSITIVE,
-            -f32::MIN_POSITIVE,
-        ];
-        let mut state = 0x243F_6A88u32;
-        let mut next = || {
-            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            state
-        };
-        for round in 0..256 {
-            let mut group = [0.0f32; 32];
-            for (at, value) in group.iter_mut().enumerate() {
-                let roll = next();
-                *value = if roll % 11 == 0 {
-                    specials[(roll / 11) as usize % specials.len()]
-                } else {
-                    // A finite bf16 value with a bounded exponent, signed.
-                    let mantissa = (roll >> 8) & 0xFF;
-                    let exponent = 118 + (roll % 21); // 2^-9 .. 2^11
-                    let sign = (roll & 1) << 31;
-                    f32::from_bits(sign | (exponent << 23) | (mantissa << 15))
-                };
-                if round == 0 && at == 0 {
-                    // One all-zero-leading group exercises the dead-group arm.
-                    *value = 0.0;
-                }
-            }
-            let mut scalar_out = [0u8; 16];
-            let mut avx2_out = [0u8; 16];
-            let scalar_sb = encode_mxfp4_group_scalar(&group, &mut scalar_out);
-            let avx2_sb = unsafe { avx2::encode_mxfp4_group(&group, &mut avx2_out) };
-            assert_eq!(scalar_sb, avx2_sb, "scale byte diverged on {group:?}");
-            assert_eq!(scalar_out, avx2_out, "codes diverged on {group:?}");
-        }
-
-        // The decode too, odd tail included.
-        let mut bytes = Vec::new();
-        for _ in 0..77 {
-            bytes.extend_from_slice(&(next() as u16).to_le_bytes());
-        }
-        let mut scalar = vec![0.0f32; 77];
-        for (le, out) in bytes.chunks_exact(2).zip(scalar.iter_mut()) {
-            *out = f32::from_bits(u32::from(u16::from_le_bytes(le.try_into().unwrap())) << 16);
-        }
-        let mut vector = vec![0.0f32; 77];
-        unsafe { avx2::decode_bf16_row(&bytes, &mut vector) };
-        assert_eq!(
-            scalar.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            vector.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-        );
     }
 
     /// A GGUF Q4_0 tensor decoded to BF16 through a `Cast` contract: the
@@ -2988,7 +2123,7 @@ mod tests {
             ..StorageTarget::default()
         };
         let plan = crate::plan::compile(&metadata, &contract, target).unwrap();
-        let storage = execute_plan(&plan, &dir).unwrap();
+        let storage = Execution::new(&plan, &dir).run().unwrap();
 
         let mut expected = Vec::new();
         for value in std::iter::repeat_n(3.0f32, 16)
@@ -3000,36 +2135,6 @@ mod tests {
         }
         assert_eq!(storage.tensors["w"], expected);
         std::fs::remove_dir_all(dir).ok();
-    }
-
-    /// The E4M3 conversion pair against the hardware's conversion, at every
-    /// code and at the edges the SATFINITE mode defines.
-    #[test]
-    fn e4m3_primitives_match_the_hardware_conversion() {
-        // Every non-NaN byte decodes to a value that encodes back to itself —
-        // signed zeros and subnormals included.
-        for byte in 0..=255u8 {
-            if byte & 0x7F == 0x7F {
-                continue;
-            }
-            assert_eq!(
-                f32_to_fp8_e4m3(fp8_e4m3_to_f32(byte)),
-                byte,
-                "byte {byte:#04x}"
-            );
-        }
-        assert_eq!(fp8_e4m3_to_f32(0x7E), 448.0);
-        assert_eq!(fp8_e4m3_to_f32(0x01), 0.001953125); // 2^-9, the smallest subnormal
-        assert!(fp8_e4m3_to_f32(0x7F).is_nan());
-        // SATFINITE: finite overflow and infinity clamp to ±448; NaN stays NaN.
-        assert_eq!(f32_to_fp8_e4m3(1000.0), 0x7E);
-        assert_eq!(f32_to_fp8_e4m3(f32::INFINITY), 0x7E);
-        assert_eq!(f32_to_fp8_e4m3(f32::NEG_INFINITY), 0xFE);
-        assert_eq!(f32_to_fp8_e4m3(f32::NAN), 0x7F);
-        assert_eq!(f32_to_fp8_e4m3(-0.0), 0x80);
-        // Round to nearest, ties to the even mantissa.
-        assert_eq!(f32_to_fp8_e4m3(1.0625), 0x38); // tie 1.0 / 1.125 → 1.0
-        assert_eq!(f32_to_fp8_e4m3(1.1875), 0x3A); // tie 1.125 / 1.25 → 1.25
     }
 
     /// Per-channel FP8: `quant_per_channel_kernel`'s row scale and cast,
@@ -3102,7 +2207,7 @@ mod tests {
         };
 
         let plan = crate::plan::compile(&metadata, &contract, target).unwrap();
-        let storage = execute_plan(&plan, &dir).unwrap();
+        let storage = Execution::new(&plan, &dir).run().unwrap();
         assert_eq!(
             storage.tensors["w"],
             vec![0x7E, 0xF6, 0x38, 0x00, 0x7E, 0x76, 0xEE, 0x66]
@@ -3181,7 +2286,7 @@ mod tests {
         };
 
         let plan = crate::plan::compile(&metadata, &contract, target).unwrap();
-        let storage = execute_plan(&plan, &dir).unwrap();
+        let storage = Execution::new(&plan, &dir).run().unwrap();
         assert_eq!(storage.tensors["w"], vec![127, 2, 4, 0xFC]);
         assert_eq!(storage.tensors["w_scale_inv"], 1.0f32.to_le_bytes());
         std::fs::remove_dir_all(dir).ok();
@@ -3281,7 +2386,7 @@ mod tests {
             "the block-scale tensor did not land on the instruction: {:?}",
             plan.instrs
         );
-        let storage = execute_plan(&plan, &dir).unwrap();
+        let storage = Execution::new(&plan, &dir).run().unwrap();
         assert_eq!(storage.tensors["q"], vec![0x66u8; 64 * 32]);
         assert_eq!(storage.tensors["q_scale"], vec![126u8; 64 * 2]);
         std::fs::remove_dir_all(dir).ok();
@@ -3386,7 +2491,7 @@ mod tests {
         };
 
         let plan = crate::plan::compile(&metadata, &contract, StorageTarget::default()).unwrap();
-        let storage = execute_plan(&plan, &dir).unwrap();
+        let storage = Execution::new(&plan, &dir).run().unwrap();
 
         let mut expected = Vec::new();
         for row_scale in [2.0f32, -0.5] {
@@ -3520,7 +2625,7 @@ mod tests {
             "the blocking is derived at plan time: {:?}",
             plan.instrs
         );
-        let storage = execute_plan(&plan, &dir).unwrap();
+        let storage = Execution::new(&plan, &dir).run().unwrap();
 
         let mut expected = Vec::new();
         for row in 0..4i64 {
@@ -3652,7 +2757,7 @@ mod tests {
         )
         .unwrap();
 
-        let storage = execute_plan(&internal, &dir).unwrap();
+        let storage = Execution::new(&internal, &dir).run().unwrap();
         let mut expected = Vec::new();
         for row_scale in [2.0f32, -0.5] {
             for _ in 0..16 {
@@ -3774,7 +2879,7 @@ mod tests {
         };
 
         let plan = crate::plan::compile(&metadata, &contract, StorageTarget::default()).unwrap();
-        let storage = execute_plan(&plan, &dir).unwrap();
+        let storage = Execution::new(&plan, &dir).run().unwrap();
 
         let mut expected = Vec::new();
         for row_scale in [2.0f32, 0.5] {
@@ -3786,6 +2891,63 @@ mod tests {
             }
         }
         assert_eq!(storage.tensors["w"], expected);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The four shapes `Execution` replaced five functions with still build.
+    ///
+    /// Two of them are `pie model import`'s and `pie model build`'s, whose
+    /// closures capture locals mutably WHILE a `&mut` sink is held by the same
+    /// builder — the one thing about the chain that can fail to borrow-check,
+    /// and the one thing this crate's own tests would otherwise never try. The
+    /// binary that writes them cannot be compiled from here (it does not build
+    /// on this branch, for reasons that predate it), so the shapes are pinned
+    /// where they can be.
+    #[test]
+    fn every_caller_shape_of_the_builder_compiles() {
+        let (dir, plan) = fixture();
+
+        // `execute_plan`: allocate the arena, keep every tensor.
+        let storage = Execution::new(&plan, &dir).run().unwrap();
+        assert!(!storage.arena.is_empty(), "the caller took no arena");
+        assert!(!storage.tensors.is_empty(), "and no sink");
+
+        // `execute_plan_into_arena`: the caller's host arena, the caller's sink.
+        let mut arena = vec![0u8; plan.memory.persistent_bytes as usize];
+        let mut sink = MemorySink::default();
+        let taken = Execution::new(&plan, &dir)
+            .arena(&mut &mut arena[..])
+            .sink(&mut sink)
+            .run()
+            .unwrap();
+        assert_eq!(
+            taken,
+            HostStorage::default(),
+            "a caller who supplied both holds the results already"
+        );
+        assert_eq!(arena, storage.arena, "and gets the same bytes");
+
+        // `execute_plan_into`: streaming, with a progress closure that mutates
+        // two captured locals while `sink` is borrowed by the same builder.
+        let mut streamed = MemorySink::default();
+        let mut seen = 0usize;
+        let mut last = 0u64;
+        Execution::new(&plan, &dir)
+            .streaming()
+            .sink(&mut streamed)
+            .progress(&mut |progress| {
+                seen += 1;
+                last = progress.read_bytes;
+            })
+            .run()
+            .unwrap();
+        assert_eq!(seen, plan.schedule.len());
+        assert_eq!(last, plan.memory.checkpoint_read_bytes);
+        assert_eq!(
+            streamed.tensors, storage.tensors,
+            "streaming publishes the same tensors as the resident path"
+        );
+
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -3919,14 +3081,13 @@ mod tests {
     #[test]
     fn executes_place_strided_cast_and_tiled_writes() {
         let (dir, program) = fixture();
-        let storage = execute_plan(&program, &dir).unwrap();
+        let storage = Execution::new(&program, &dir).run().unwrap();
         let values = storage.tensors["cast"]
             .chunks_exact(2)
             .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
             .collect::<Vec<_>>();
         assert_eq!(values, vec![1, 2, 3, 4]);
         assert_eq!(&storage.arena[..4], &[1, 2, 3, 4]);
-        assert_eq!(storage.max_tile_write_bytes, 2);
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -3937,7 +3098,10 @@ mod tests {
             panic!("fixture instruction changed");
         };
         dest.stride = extent(0, 1, &[(2, 2, 3), (2, 1, 1)]);
-        let error = execute_plan(&program, &dir).unwrap_err().to_string();
+        let error = Execution::new(&program, &dir)
+            .run()
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("non-compact ExtentWrite destination"));
         std::fs::remove_dir_all(dir).ok();
     }
@@ -3958,7 +3122,9 @@ mod tests {
         source.stride = extent(0, 4, &[(1, 1, 1)]);
         assert_eq!(dest.stride.element_bytes, 1);
         assert_eq!(dest.stride.dims.iter().map(|d| d.count).sum::<i64>(), 4);
-        execute_plan(&program, &dir).expect("equal byte counts should be accepted");
+        Execution::new(&program, &dir)
+            .run()
+            .expect("equal byte counts should be accepted");
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -3969,7 +3135,10 @@ mod tests {
             panic!("fixture instruction changed");
         };
         source.stride = extent(0, 1, &[(3, 1, 1)]);
-        let error = execute_plan(&program, &dir).unwrap_err().to_string();
+        let error = Execution::new(&program, &dir)
+            .run()
+            .unwrap_err()
+            .to_string();
         assert!(
             error.contains("bytes but the destination spans"),
             "unexpected error: {error}"
@@ -3993,7 +3162,7 @@ mod tests {
             dtype: DType::U16,
         });
         inputs.clear();
-        let storage = execute_plan(&plan, &dir).unwrap();
+        let storage = Execution::new(&plan, &dir).run().unwrap();
         let values = storage.tensors["cast"]
             .chunks_exact(2)
             .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
@@ -4003,28 +3172,16 @@ mod tests {
     }
 
     #[test]
-    fn half_casts_round_and_overflow_to_infinity() {
-        let f16_bytes = encode_values(&[100_000.0], DType::F16).unwrap();
-        let f16_value = f16::from_bits(u16::from_le_bytes(f16_bytes.try_into().unwrap()));
-        assert!(f16_value.is_infinite() && !f16_value.is_nan());
-
-        let input = f32::from_bits(0x3f80_8001);
-        let bf16_bytes = encode_values(&[f64::from(input)], DType::BF16).unwrap();
-        let actual = u16::from_le_bytes(bf16_bytes.try_into().unwrap());
-        assert_eq!(actual, bf16::from_f32(input).to_bits());
-    }
-
-    #[test]
     fn rejects_unsupported_advertised_transforms() {
-        // The gate is the host's implementation WIDENED by whatever the arena
-        // backing runs itself. `execute_plan` supplies a host arena, which
-        // claims nothing — so the answer here is the host's own set, and a
-        // `Transcode` is outside it either way.
+        // The gate is the host's own implementation, and nothing else. It used
+        // to be widened by the arena backing's capability mask; the widening
+        // never admitted a plan, because every mask a target can carry is a
+        // subset of `CONVERT_TILE_MAP_MASK`. `Transcode` is outside it.
         let (dir, mut plan) = fixture();
         plan.target.tile_map_mask |= crate::plan::TILE_MAP_TRANSCODE;
-        let error = execute_plan(&plan, &dir).unwrap_err().to_string();
+        let error = Execution::new(&plan, &dir).run().unwrap_err().to_string();
         assert!(
-            error.contains("neither the host nor the arena backing implements"),
+            error.contains("TileMap transforms the host does not implement"),
             "{error}"
         );
         std::fs::remove_dir_all(dir).ok();

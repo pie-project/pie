@@ -327,7 +327,11 @@ impl Gemma4Mixture {
     /// live per token — which is where the name's `A4B` comes from.
     #[must_use]
     pub const fn gemma_4_26b_a4b() -> Self {
-        Self { num_experts: 128, experts_per_token: 8, moe_intermediate: 704 }
+        Self {
+            num_experts: 128,
+            experts_per_token: 8,
+            moe_intermediate: 704,
+        }
     }
 }
 
@@ -401,8 +405,15 @@ mod tests {
         let f = Gemma4Facts::gemma_4_26b_a4b();
         assert_eq!(f.kv_shared_layers, 0);
         for l in 0..f.layers {
-            assert!(!f.is_kv_shared(l), "layer {l} shares in a stack that shares nothing");
-            assert_eq!(f.kv_source(l), None, "layer {l} named a source it does not read");
+            assert!(
+                !f.is_kv_shared(l),
+                "layer {l} shares in a stack that shares nothing"
+            );
+            assert_eq!(
+                f.kv_source(l),
+                None,
+                "layer {l} named a source it does not read"
+            );
         }
     }
 
@@ -431,7 +442,11 @@ mod tests {
         };
         for l in 0..f.layers {
             assert!(f.is_kv_shared(l));
-            assert_eq!(f.kv_source(l), None, "layer {l} found a source that cannot exist");
+            assert_eq!(
+                f.kv_source(l),
+                None,
+                "layer {l} found a source that cannot exist"
+            );
         }
     }
 
@@ -457,7 +472,11 @@ mod tests {
         assert!(e2b.double_wide_shared);
         assert_eq!(e2b.intermediate_of(0), 6144);
         assert_eq!(e2b.intermediate_of(14), 6144);
-        assert_eq!(e2b.intermediate_of(15), 12_288, "the first shared layer is not widened");
+        assert_eq!(
+            e2b.intermediate_of(15),
+            12_288,
+            "the first shared layer is not widened"
+        );
         assert_eq!(e2b.intermediate_of(34), 12_288);
 
         let e4b = Gemma4Facts::gemma_4_e4b();
@@ -477,8 +496,14 @@ mod tests {
     #[test]
     fn every_fixture_states_a_stack_that_could_exist() {
         for (name, f) in fixtures() {
-            assert!(f.hidden > 0 && f.layers > 0 && f.vocab > 0, "{name} states a zero extent");
-            assert!(f.q_heads > 0 && f.kv_heads > 0, "{name} states a stack with no heads");
+            assert!(
+                f.hidden > 0 && f.layers > 0 && f.vocab > 0,
+                "{name} states a zero extent"
+            );
+            assert!(
+                f.q_heads > 0 && f.kv_heads > 0,
+                "{name} states a stack with no heads"
+            );
             assert_eq!(
                 f.q_heads % f.kv_heads,
                 0,
@@ -486,7 +511,10 @@ mod tests {
                 f.q_heads,
                 f.kv_heads
             );
-            assert!(f.head_dim > 0 && f.global_head_dim >= f.head_dim, "{name} head dims");
+            assert!(
+                f.head_dim > 0 && f.global_head_dim >= f.head_dim,
+                "{name} head dims"
+            );
             assert!(
                 f.global_rotary_dim > 0 && f.global_rotary_dim <= f.global_head_dim,
                 "{name} rotates {} of a {}-wide head",

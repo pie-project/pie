@@ -55,7 +55,10 @@ impl Device {
         match code {
             rt::cudaError::cudaSuccess => Ok(n),
             rt::cudaError::cudaErrorNoDevice | rt::cudaError::cudaErrorInsufficientDriver => Ok(0),
-            other => Err(Error::Runtime { call: "cudaGetDeviceCount", code: other }),
+            other => Err(Error::Runtime {
+                call: "cudaGetDeviceCount",
+                code: other,
+            }),
         }
     }
 
@@ -70,7 +73,10 @@ impl Device {
         // SAFETY: no pointer arguments; `ordinal` is validated by the driver.
         let code = unsafe { rt::cudaSetDevice(ordinal) };
         if code != rt::cudaError::cudaSuccess {
-            return Err(Error::Runtime { call: "cudaSetDevice", code });
+            return Err(Error::Runtime {
+                call: "cudaSetDevice",
+                code,
+            });
         }
         // `cudaSetDevice` is lazy. Freeing a null pointer is the cheapest
         // runtime call that is defined to succeed, and forcing it here is what
@@ -80,10 +86,16 @@ impl Device {
         // `cudaSuccess`; its only effect is primary-context creation.
         let code = unsafe { rt::cudaFree(std::ptr::null_mut()) };
         if code != rt::cudaError::cudaSuccess {
-            return Err(Error::Runtime { call: "cudaFree(null) [context init]", code });
+            return Err(Error::Runtime {
+                call: "cudaFree(null) [context init]",
+                code,
+            });
         }
         check_runtime_major()?;
-        Ok(Self { ordinal, _not_send: PhantomData })
+        Ok(Self {
+            ordinal,
+            _not_send: PhantomData,
+        })
     }
 
     /// The bound ordinal.
@@ -128,7 +140,10 @@ impl Device {
         // already initialised, because `bind` forced the primary context.
         let code = unsafe { dr::cuDeviceGet(&raw mut dev, self.ordinal) };
         if code != dr::CUresult::CUDA_SUCCESS {
-            return Err(Error::Driver { call: "cuDeviceGet", code });
+            return Err(Error::Driver {
+                call: "cuDeviceGet",
+                code,
+            });
         }
         let mut v = 0;
         // SAFETY: `v` is valid and writable; `dev` came from `cuDeviceGet`.
@@ -140,7 +155,10 @@ impl Device {
             )
         };
         if code != dr::CUresult::CUDA_SUCCESS {
-            return Err(Error::Driver { call: "cuDeviceGetAttribute(VMM_SUPPORTED)", code });
+            return Err(Error::Driver {
+                call: "cuDeviceGetAttribute(VMM_SUPPORTED)",
+                code,
+            });
         }
         Ok(v != 0)
     }
@@ -156,7 +174,10 @@ impl Device {
         // SAFETY: both pointers are valid and writable for the call.
         let code = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
         if code != rt::cudaError::cudaSuccess {
-            return Err(Error::Runtime { call: "cudaMemGetInfo", code });
+            return Err(Error::Runtime {
+                call: "cudaMemGetInfo",
+                code,
+            });
         }
         Ok((free, total))
     }
@@ -188,7 +209,10 @@ impl Device {
         // SAFETY: `v` is a valid, writable `i32`.
         let code = unsafe { rt::cudaRuntimeGetVersion(&raw mut v) };
         if code != rt::cudaError::cudaSuccess {
-            return Err(Error::Runtime { call: "cudaRuntimeGetVersion", code });
+            return Err(Error::Runtime {
+                call: "cudaRuntimeGetVersion",
+                code,
+            });
         }
         Ok(v)
     }
@@ -199,7 +223,10 @@ impl Device {
         // enumerator and `ordinal` was validated by `bind`.
         let code = unsafe { rt::cudaDeviceGetAttribute(&raw mut v, attr, self.ordinal) };
         if code != rt::cudaError::cudaSuccess {
-            return Err(Error::Runtime { call: "cudaDeviceGetAttribute", code });
+            return Err(Error::Runtime {
+                call: "cudaDeviceGetAttribute",
+                code,
+            });
         }
         Ok(v)
     }

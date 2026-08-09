@@ -26,14 +26,14 @@
 //! → `ptir::Runtime::compile` (NVRTC) → `ptir::Prepared::build` → launch.
 //! That is every step the engine takes, with nothing stubbed.
 
+use driver::tensor_ir::DType;
+use driver::{Extents, Versions, adopt_launch_package};
 use driver_cuda::device::{Allocator, OwnedStream};
 use driver_cuda::program;
 use driver_cuda::program::run::Lane;
 use driver_cuda::program::{
-    ChannelShape, Control, Disk, Prepared, Rings, Runtime, Target, launch_control, compile,
+    ChannelShape, Control, Disk, Prepared, Rings, Runtime, Target, compile, launch_control,
 };
-use driver::tensor_ir::DType;
-use driver::{Extents, Versions, adopt_launch_package};
 use tensor_compiler::codegen::program::{Backend, emit_program};
 use tensor_compiler::plan::compile_bound;
 use tensor_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
@@ -172,7 +172,8 @@ fn run_both(container: TraceContainer, seed: &[f32]) -> Option<Answers> {
     // real compiled program: it used to hardcode `&[0]` and `&[1]`, which
     // is right for this two-channel epilogue and says nothing about a
     // program whose local slots and global indices differ.
-    let sets = driver_cuda::program::channel::stage_channels(stage_plan).expect("the plan binds its slots");
+    let sets = driver_cuda::program::channel::stage_channels(stage_plan)
+        .expect("the plan binds its slots");
     assert_eq!(sets.need_full, vec![0], "the seeded input");
     assert_eq!(sets.need_empty, vec![1], "the reader");
     assert_eq!(sets.put, vec![1]);
@@ -204,14 +205,16 @@ fn run_both(container: TraceContainer, seed: &[f32]) -> Option<Answers> {
         sampled_rows: 1,
         ..Extents::default()
     };
-    let prepared =
-        Prepared::build(
-            &alloc,
-            stage_plan,
-            &[Lane { rings: &rings, extents }],
-            stream.as_ref(),
-        )
-        .expect("prepare");
+    let prepared = Prepared::build(
+        &alloc,
+        stage_plan,
+        &[Lane {
+            rings: &rings,
+            extents,
+        }],
+        stream.as_ref(),
+    )
+    .expect("prepare");
     for stage in compiled.stages.iter() {
         for region in stage.regions.iter() {
             prepared
@@ -464,8 +467,16 @@ fn every_lane_binds_its_own_row_of_the_logits() {
     let stage_plan = plan.package.plans.first().expect("one stage");
 
     let shapes = [
-        ChannelShape { numel: LANES as usize, dtype: DType::F32, capacity: 1 },
-        ChannelShape { numel: 1, dtype: DType::F32, capacity: 1 },
+        ChannelShape {
+            numel: LANES as usize,
+            dtype: DType::F32,
+            capacity: 1,
+        },
+        ChannelShape {
+            numel: 1,
+            dtype: DType::F32,
+            capacity: 1,
+        },
     ];
     let rings = Rings::new(&alloc, &shapes, stream.as_ref()).expect("rings");
 
@@ -475,8 +486,18 @@ fn every_lane_binds_its_own_row_of_the_logits() {
     // for one lane has every lane after the first reading the previous
     // lane's tail — with every field a plausible number.
     let lane_extents = [
-        Extents { row_count: 4, token_count: 4, sampled_rows: 4, ..Extents::default() },
-        Extents { row_count: 2, token_count: 2, sampled_rows: 2, ..Extents::default() },
+        Extents {
+            row_count: 4,
+            token_count: 4,
+            sampled_rows: 4,
+            ..Extents::default()
+        },
+        Extents {
+            row_count: 2,
+            token_count: 2,
+            sampled_rows: 2,
+            ..Extents::default()
+        },
     ];
     // TWO MEMBERS, and both name THIS session's rings — which is the
     // single-instance case. A grouped fire across instances would give
@@ -485,11 +506,18 @@ fn every_lane_binds_its_own_row_of_the_logits() {
     let mut prepared = Prepared::build(
         &alloc,
         stage_plan,
-        &lane_extents.map(|extents| Lane { rings: &rings, extents }),
+        &lane_extents.map(|extents| Lane {
+            rings: &rings,
+            extents,
+        }),
         stream.as_ref(),
     )
     .expect("prepare");
-    assert_eq!(prepared.lanes(), 2, "a fire has as many lanes as it was given extents");
+    assert_eq!(
+        prepared.lanes(),
+        2,
+        "a fire has as many lanes as it was given extents"
+    );
 
     // Unbound is address zero, which is the state this test exists to end.
     let (base, ..) = prepared
@@ -498,7 +526,9 @@ fn every_lane_binds_its_own_row_of_the_logits() {
     assert_eq!(base, 0, "an unbound intrinsic points at nothing");
 
     let vocab: u32 = 128;
-    let logits = alloc.alloc(vocab as usize * 4 * 4).expect("a logits buffer");
+    let logits = alloc
+        .alloc(vocab as usize * 4 * 4)
+        .expect("a logits buffer");
     let address = logits.as_ptr() as u64;
     prepared
         .bind_intrinsic(
@@ -623,8 +653,16 @@ fn a_program_fires_from_a_host_mirror_and_publishes_back_into_one() {
 
     // ── The HOST plane, as `register_channel` lays it out. ──
     let shapes = [
-        ChannelShape { numel: LANES as usize, dtype: DType::F32, capacity: 1 },
-        ChannelShape { numel: 1, dtype: DType::I32, capacity: 1 },
+        ChannelShape {
+            numel: LANES as usize,
+            dtype: DType::F32,
+            capacity: 1,
+        },
+        ChannelShape {
+            numel: 1,
+            dtype: DType::I32,
+            capacity: 1,
+        },
     ];
     let mut mirrors: Vec<Vec<u8>> = shapes
         .iter()
@@ -680,13 +718,22 @@ fn a_program_fires_from_a_host_mirror_and_publishes_back_into_one() {
                 // skipped and nothing reads address zero.
                 (0, 0, 0),
                 |lane| lane,
-                &[Extents { row_count: 1, token_count: 1, sampled_rows: 1, ..Extents::default() }],
+                &[Extents {
+                    row_count: 1,
+                    token_count: 1,
+                    sampled_rows: 1,
+                    ..Extents::default()
+                }],
                 &alloc,
                 stream.as_ref(),
             )
             .expect("the fire completes")
     };
-    assert_eq!(outcome, Fired::Committed { published: 1 }, "one cell published");
+    assert_eq!(
+        outcome,
+        Fired::Committed { published: 1 },
+        "one cell published"
+    );
 
     // ── And the engine reads its answer out of the host mirror. ──
     let mut host: Vec<HostChannel> = mirrors
@@ -704,5 +751,8 @@ fn a_program_fires_from_a_host_mirror_and_publishes_back_into_one() {
         .collect();
     let cell = host[1].take().expect("the reader has a value");
     let got = i32::from_le_bytes(cell[..4].try_into().expect("four bytes"));
-    assert_eq!(got, 1, "argmax over a tie takes the FIRST maximum, on both planes");
+    assert_eq!(
+        got, 1,
+        "argmax over a tie takes the FIRST maximum, on both planes"
+    );
 }

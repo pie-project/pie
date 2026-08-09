@@ -131,6 +131,9 @@ pub const VARIANTS: &[KimiK2] = &[
             moe: spec::KimiMoeFacts {
                 num_experts: 384,
                 top_k: 8,
+                // As `spec.rs` -- K2 publishes `false`.
+                norm_topk_prob: false,
+                routed_scaling: 2.0,
                 moe_intermediate: 2048,
                 shared_intermediate: 2048,
             },
@@ -286,7 +289,10 @@ mod tests {
     #[test]
     fn the_row_answers_what_the_driver_advertises() {
         assert_eq!(ARCH, "kimi_k2", "the string three tables used to key on");
-        assert!(!ARCH.is_empty(), "an empty arch is a model no guest predicate can recognise");
+        assert!(
+            !ARCH.is_empty(),
+            "an empty arch is a model no guest predicate can recognise"
+        );
         for v in VARIANTS {
             assert_eq!(
                 v.max_model_len, 131_072,
@@ -321,8 +327,14 @@ mod tests {
             .expect("the suffix the worker strips")
             .to_string();
         assert_eq!(stem, "deepseekv3", "what a published K2 config reduces to");
-        assert_ne!(stem, ARCH, "the heuristic cannot reach this label, and the row says so");
-        assert!(ARCH.starts_with("kimi_"), "the family's own name, spelled as `kimi_k3` is");
+        assert_ne!(
+            stem, ARCH,
+            "the heuristic cannot reach this label, and the row says so"
+        );
+        assert!(
+            ARCH.starts_with("kimi_"),
+            "the family's own name, spelled as `kimi_k3` is"
+        );
     }
 
     /// K2 and K2.5 are ONE row. The two synthetics differ in where the
@@ -335,7 +347,9 @@ mod tests {
         assert_eq!(rows().len(), 1);
         assert_eq!(rows()[0].id(), "kimi-k2");
         assert!(
-            !crate::catalog::ids().iter().any(|id| id.contains("k2.5") || id.contains("k25")),
+            !crate::catalog::ids()
+                .iter()
+                .any(|id| id.contains("k2.5") || id.contains("k25")),
             "a nesting of config keys is not a second model",
         );
     }
@@ -372,7 +386,10 @@ mod tests {
     fn the_id_names_a_model_and_not_a_packing() {
         for v in VARIANTS {
             assert_eq!(v.id(), v.id);
-            assert!(v.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+            assert!(
+                v.id.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            );
             for banned in ["fp8", "int4", "bf16", "awq", "w4a16"] {
                 assert!(!v.id.contains(banned), "{} names a packing", v.id);
             }
@@ -386,7 +403,12 @@ mod tests {
     #[test]
     fn the_row_loads_and_refuses_to_serve_in_this_build() {
         let v = row("kimi-k2");
-        assert!(v.manifest().tensors.iter().any(|t| t.name.contains("kv_b_proj")));
+        assert!(
+            v.manifest()
+                .tensors
+                .iter()
+                .any(|t| t.name.contains("kv_b_proj"))
+        );
         assert_eq!(v.load_shape().layers, 61);
         assert!(
             matches!(
@@ -430,21 +452,18 @@ mod tests {
         use crate::instruct::Instruct;
         use tokenizer::Tokenizer;
 
-        let words: Vec<String> = [
-            "<|im_user|>",
-            "<|im_middle|>",
-            "<|im_end|>",
-            "user",
-            "Hi",
-        ]
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
+        let words: Vec<String> = ["<|im_user|>", "<|im_middle|>", "<|im_end|>", "user", "Hi"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         let tok = Arc::new(Tokenizer::from_vocab(&words));
         for v in VARIANTS {
             let turn = tok.decode(&v.chat(tok.clone()).user("Hi"), false);
             assert_eq!(turn, "<|im_user|>user<|im_middle|>Hi<|im_end|>", "{}", v.id);
-            assert!(!turn.contains("<|im_start|>"), "the `_ =>` ChatML arm is gone");
+            assert!(
+                !turn.contains("<|im_start|>"),
+                "the `_ =>` ChatML arm is gone"
+            );
         }
     }
 
@@ -459,7 +478,10 @@ mod tests {
         use model_loader::checkpoint::CheckpointMetadata;
         use model_loader::plan::StorageTarget;
 
-        let metadata = CheckpointMetadata { files: Vec::new(), tensors: Vec::new() };
+        let metadata = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: Vec::new(),
+        };
         let encoding = crate::encoding::Encoding::dense();
         let target = StorageTarget::default();
         let policy = crate::shared::policy::Policy::default();
@@ -473,7 +495,8 @@ mod tests {
                 &target,
                 &policy,
             );
-            v.author(&mut builder).unwrap_or_else(|e| panic!("{} refused to author: {e:?}", v.id));
+            v.author(&mut builder)
+                .unwrap_or_else(|e| panic!("{} refused to author: {e:?}", v.id));
         }
     }
 
@@ -482,9 +505,10 @@ mod tests {
     /// The guard that replaces `driver-metal`'s `LLAMA_LIKE` table. That
     /// table answered "does this build serve you" from an architecture
     /// STRING reduced by `canonical()`, in a driver, before any text was
-    /// traced — so it could say yes to a row whose text does not exist
-    /// (it listed `gemma4`) and no to one whose text does (it omitted
-    /// `gemma3`). The row answers now, and what it answers with is a
+    /// traced — so it could say yes to a row this build cannot resolve
+    /// (it listed `gpt_oss`, whose every publication either fails this
+    /// crate's manifest or names tensors `driver-metal` has no handle
+    /// for) and no to one whose text it models (it omitted `gemma3`). The row answers now, and what it answers with is a
     /// sentence naming what is missing.
     ///
     /// The comparison is against [`project::NO_METAL`] itself and not a

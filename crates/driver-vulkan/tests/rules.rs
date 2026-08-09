@@ -1,0 +1,769 @@
+//! The geometry, checked against every module's own declared workgroup.
+//!
+//! [`driver_vulkan::geometry`] divides a thread extent by a workgroup size. The
+//! extent comes from the row's [`Rule`]; the workgroup size comes from
+//! `layout(local_size_x = ...)` in the GLSL, which no Rust code can see and
+//! `glslc` bakes into the module. Nothing makes them agree. This file is what
+//! makes them agree, over all 480 entrypoints at once, by reading the size back
+//! out of the SPIR-V and asking the geometry what it would have launched.
+//!
+//! It exists because that disagreement does not report itself. A workgroup
+//! count too small by one launches a dispatch that runs, returns success, and
+//! leaves a slice of the output holding whatever the buffer was allocated with.
+//!
+//! No GPU is involved. The modules are files.
+
+use driver_vulkan::{Declared, Dims, Module, Rule, geometry, spirv};
+
+/// Where a `native` build of `kernels-vulkan` left the modules.
+const SPV_DIR: Option<&str> = option_env!("PIE_KERNELS_VULKAN_SPV_DIR");
+
+/// Skip with a reason when there are no modules, rather than pass silently.
+macro_rules! modules {
+    () => {
+        match SPV_DIR {
+            Some(d) => std::path::Path::new(d),
+            None => {
+                eprintln!(
+                    "no modules: build with `-p driver-vulkan --features native` \
+                     (or any profile that pulls kernels-vulkan/native) and have \
+                     `glslc` on PATH"
+                );
+                return;
+            }
+        }
+    };
+}
+
+/// What a module declares, read through the crate's own loader.
+///
+/// The tests used to carry a second SPIR-V parser. Two parsers of the same
+/// bytes is two things to keep right, and the one under test is the one that
+/// matters -- so this calls it, and a defect in it now fails these sweeps
+/// instead of being masked by a copy that happens to agree.
+fn declared(path: &std::path::Path) -> Option<Declared> {
+    let code = std::fs::read(path).ok()?;
+    let words = spirv::words(&code).expect("a built module is whole words");
+    Some(spirv::declared(&words).expect("a built module is well formed"))
+}
+
+/// The fire a given module could actually serve.
+///
+/// Decode attention is compiled one module per head width and refuses any
+/// other, so a sweep cannot hold `head_dim` fixed and still reach the family:
+/// it has to ask each module for the width that module was built for, which is
+/// its own `local_size_x`. Every other rule ignores the adjustment.
+fn dims_for(rule: Rule, local: [u32; 3]) -> Dims {
+    if rule == Rule::SdpaVector {
+        Dims {
+            head_dim: local[0].max(1),
+            ..dims()
+        }
+    } else {
+        dims()
+    }
+}
+
+/// A plausible fire: a 4096-wide model, 32/8 grouped-query heads.
+///
+/// 64 rows and not four, because 64 is the only row count every compiled GEMM
+/// tile divides -- `Rule::Qmm` refuses the rest, and a sweep in which the
+/// largest family silently refuses is a sweep that proves much less than its
+/// name claims.
+fn dims() -> Dims {
+    Dims {
+        rows: 64,
+        width: 4096,
+        in_width: 12288,
+        q_heads: 32,
+        kv_heads: 8,
+        head_dim: 128,
+        axis: 4096,
+        rotary_dims: 128,
+        n_experts: 64,
+        experts_per_token: 8,
+    }
+}
+
+/// Every entrypoint, its rule, and the workgroup its module declares.
+fn table() -> Vec<(String, Rule, Declared)> {
+    let dir = match SPV_DIR {
+        Some(d) => std::path::Path::new(d),
+        None => return Vec::new(),
+    };
+    kernels_vulkan::entrypoints()
+        .into_iter()
+        .filter_map(|name| {
+            let row = kernels::sig_in(kernels_vulkan::KERNELS, &name)?;
+            let d = declared(&dir.join(format!("{name}.spv")))?;
+            Some((name, row.launch, d))
+        })
+        .collect()
+}
+
+/// Every stated entrypoint gets enough lanes for the extent its rule states.
+///
+/// The check the crate exists for. It is a sweep over the real table rather
+/// than a handful of cases because the rule that gets this wrong is the one
+/// nobody thought to write a case for.
+#[test]
+fn every_entrypoint_is_launched_over_its_whole_extent() {
+    let _ = modules!();
+    let table = table();
+    assert!(
+        table.len() >= 400,
+        "only {} entrypoints resolved to a module",
+        table.len()
+    );
+
+    let mut stated = 0;
+    for (name, rule, d) in &table {
+        if *rule == Rule::Unstated {
+            continue;
+        }
+        let g = geometry::groups(*rule, dims_for(*rule, d.local), Module::loaded(name, d))
+            .unwrap_or_else(|e| panic!("`{name}` ({rule:?}) has no geometry: {e}"));
+        for axis in 0..3 {
+            assert!(
+                g[axis] >= 1,
+                "`{name}` ({rule:?}) launches {g:?} workgroups -- axis {axis} is \
+                 empty, so the dispatch runs nothing and reports success"
+            );
+        }
+        stated += 1;
+    }
+    assert!(stated >= 180, "only {stated} entrypoints state a rule");
+}
+
+/// Where the workgroup COUNT is data, the division must come out exact.
+///
+/// This is the finding that qualifies everything else in this file. The usual
+/// reading is that an over-launch is harmless because every shader guards its
+/// own tail. Thirty-four modules make that false: they read `gl_NumWorkGroups`
+/// and use it as a QUANTITY, so an extra workgroup does not run a guarded lane,
+/// it changes the arithmetic every lane does.
+///
+/// `rope/neox.comp` is the clearest. It takes `gl_NumWorkGroups.x` as the
+/// rotary pair count -- the number it strides the second half of each pair by
+/// and divides the frequency exponent by -- and `gl_NumWorkGroups.y` as the
+/// head count, which sizes the row base. Round its grid up and every pair is
+/// rotated by the wrong angle against the wrong partner. That is why the shader
+/// is `local_size (1, 1, 1)`: it is not a decomposition, it is the grid being
+/// the contract.
+///
+/// So for these modules the round-up must be a no-op, and this checks that it
+/// is rather than trusting that it happens to be.
+#[test]
+fn a_module_that_reads_its_workgroup_count_is_launched_exactly() {
+    let _ = modules!();
+    let mut exact = 0;
+    for (name, rule, d) in table() {
+        if rule == Rule::Unstated || !d.reads_workgroup_count {
+            continue;
+        }
+        let m = Module::loaded(&name, &d);
+        let d = dims_for(rule, d.local);
+        let Ok(g) = geometry::groups(rule, d, m) else {
+            continue;
+        };
+        let want = geometry::lanes(rule, d, m).expect("answered once");
+        for axis in 0..3 {
+            assert_eq!(
+                g[axis] * m.local.at(axis),
+                want[axis],
+                "`{name}` ({rule:?}) reads gl_NumWorkGroups, so its workgroup \
+                 count is a QUANTITY -- but on axis {axis} the geometry rounds \
+                 {} lanes up to {}. The extra workgroup does not run a guarded \
+                 lane; it makes every lane compute against the wrong count.",
+                want[axis],
+                g[axis] * m.local.at(axis)
+            );
+        }
+        exact += 1;
+    }
+    // The rope and SDPA-vector families, and nothing may quietly leave.
+    assert!(
+        exact >= 15,
+        "only {exact} modules that read their workgroup count were checked"
+    );
+}
+
+/// A rule's workgroup size is a property of the RULE, not of the entrypoint —
+/// except where the shader says otherwise, and those exceptions are named.
+///
+/// This is the check that found the two real ones. `SdpaVector` declares
+/// `local_size_x = PIE_HEAD_DIM`, so its four modules are 64, 128, 256 and 512
+/// wide and a geometry that assumed any single number would undershoot three of
+/// them by up to 8x. `Elementwise` is 256 in nineteen modules and `(16, 16, 1)`
+/// in `geglu_tanh_strided`, which is indexed per (channel, row).
+///
+/// Anything ELSE that varies is drift: two shaders under one rule that no
+/// longer agree about their decomposition. The list is closed on purpose, so
+/// adding a variant makes this fail rather than pass quietly.
+#[test]
+fn only_the_rules_that_are_allowed_to_vary_do() {
+    let _ = modules!();
+    // Keyed by the rule's NAME: `LaunchRule` is a shared vocabulary and does
+    // not derive `Ord`, and a driver-side test is not a reason to widen it.
+    let mut by_rule: std::collections::BTreeMap<String, std::collections::BTreeSet<[u32; 3]>> =
+        std::collections::BTreeMap::new();
+    for (_, rule, d) in table() {
+        if rule == Rule::Unstated {
+            continue;
+        }
+        by_rule
+            .entry(format!("{rule:?}"))
+            .or_default()
+            .insert(d.local);
+    }
+    assert!(!by_rule.is_empty(), "no stated rules in the table");
+
+    for (rule, sizes) in &by_rule {
+        let allowed = match rule.as_str() {
+            // One module per head dimension.
+            "SdpaVector" => 4,
+            // `geglu_tanh_strided` is laid out per (channel, row).
+            "Elementwise" => 2,
+            _ => 1,
+        };
+        assert!(
+            sizes.len() <= allowed,
+            "{rule} is compiled at {} different workgroup sizes ({sizes:?}) but \
+             only {allowed} are accounted for -- either a shader's local_size \
+             changed or two kernels under one rule stopped agreeing about their \
+             decomposition. A driver divides by this number.",
+            sizes.len()
+        );
+    }
+}
+
+/// No module asks for more invocations per workgroup than Vulkan's floor.
+///
+/// `maxComputeWorkGroupInvocations` is guaranteed to be at least 128 and no
+/// more; anything above that is a device that happens to allow it. A module
+/// wider than 128 is a deliberate bet on the hardware, so the ones that make it
+/// are counted rather than waved through — if the count moves, someone widened
+/// a shader without deciding to.
+#[test]
+fn a_module_wider_than_the_guaranteed_floor_is_a_deliberate_bet() {
+    let _ = modules!();
+    let mut over = std::collections::BTreeMap::new();
+    for (name, _, d) in table() {
+        let invocations = d.local[0] * d.local[1] * d.local[2];
+        assert!(
+            invocations <= 1024,
+            "`{name}` wants {invocations} invocations per workgroup, past the \
+             1024 that is the most any device in this tree reports"
+        );
+        if invocations > 128 {
+            *over.entry(invocations).or_insert(0usize) += 1;
+        }
+    }
+    // 1024 is the router's lane-per-expert sort; 512 and 256 are the wide
+    // SDPA head dimensions and the pointwise family.
+    assert!(
+        over.keys().all(|n| [256, 512, 1024].contains(n)),
+        "a module is wider than the guaranteed 128 at an unexpected size: {over:?}"
+    );
+}
+
+/// The tail-covering property, at sizes that are NOT multiples of anything.
+///
+/// The round-up only matters when the division is inexact, so a sweep at round
+/// numbers proves nothing — this tree already shipped three tests whose `n =
+/// 512` against a 256-wide workgroup meant the tail branch never ran. Every
+/// dimension here is chosen to be awkward.
+#[test]
+fn an_awkward_shape_still_covers_its_tail() {
+    let _ = modules!();
+    // Two row counts, because a GEMM legitimately refuses a row count its
+    // compiled tile does not divide -- at three rows all 108 of them refuse and
+    // the sweep quietly becomes a sweep of everything EXCEPT the largest
+    // family. Sixteen rows lets the `bm_16` third of them in while every other
+    // dimension stays awkward.
+    let mut checked = 0;
+    let mut gemms = 0;
+    for rows in [3, 16] {
+        let ragged = Dims {
+            rows,
+            width: 4095,
+            in_width: 6141,
+            q_heads: 7,
+            kv_heads: 7,
+            head_dim: 129,
+            axis: 4095,
+            rotary_dims: 130,
+            n_experts: 61,
+            experts_per_token: 5,
+        };
+        for (name, rule, d) in table() {
+            if rule == Rule::Unstated {
+                continue;
+            }
+            // A GEMM refuses a row count no tile divides, which is the point of
+            // `PartialTile` and not a failure here.
+            let m = Module::loaded(&name, &d);
+            let Ok(g) = geometry::groups(rule, ragged, m) else {
+                continue;
+            };
+            // The same rule against a one-lane workgroup: the extent itself, in
+            // lanes. Comparing against THAT rather than recomputing the extent here
+            // keeps this test from restating the arithmetic it is checking.
+            let widest = geometry::groups(
+                rule,
+                ragged,
+                Module {
+                    local: driver_vulkan::Local([1, 1, 1]),
+                    tile: m.tile,
+                },
+            )
+            .expect("answered once");
+            for axis in 0..3 {
+                let launched = g[axis] * m.local.at(axis);
+                assert!(
+                    launched >= widest[axis],
+                    "`{name}` ({rule:?}) launches {launched} lanes on axis {axis} for \
+                 an extent of {} -- the {} that do not run write nothing, and the \
+                 gap reads back as the buffer's zeros",
+                    widest[axis],
+                    widest[axis] - launched
+                );
+            }
+            checked += 1;
+            gemms += u32::from(rule == Rule::Qmm);
+        }
+    }
+    assert!(checked >= 150, "only {checked} entrypoints were checked");
+    // And the GEMMs were not all sitting the sweep out: at sixteen rows the
+    // `bm_16` third of them answers, and a change that made every tile refuse
+    // would otherwise leave this test passing on the remainder.
+    assert!(gemms >= 30, "only {gemms} GEMM entrypoints were checked");
+}
+
+/// No rule puts work on a grid axis its shader never reads.
+///
+/// The check the sweeps above cannot make, because they count LANES. Lanes on
+/// an axis nobody is indexed by are lanes all the same, so a geometry that
+/// spreads rows across the wrong axis passes every one of them: the extent is
+/// covered, the arithmetic is right, and the dispatch computes row 0 and
+/// leaves every other row holding the zeros its buffer was born with.
+///
+/// That is not hypothetical -- it is what `Rule::Rms` did here. It stacked
+/// rows on grid y while `norm/rms.comp` reads `gl_WorkGroupID.x` and never
+/// mentions y. It took a real dispatch on real hardware to see, once. This
+/// asks the module which components of `gl_WorkGroupID` and
+/// `gl_GlobalInvocationID` it is actually indexed by, and answers the same
+/// question for all 480 entrypoints without a GPU.
+///
+/// Stated as "more than one group", not "any group": a grid is a product, so
+/// every axis carries at least one whatever the shader reads, and one is
+/// exactly what an unused axis should have.
+#[test]
+fn no_rule_puts_work_on_an_axis_its_shader_never_reads() {
+    let _ = modules!();
+    let mut checked = 0;
+    let mut bad: Vec<String> = Vec::new();
+    for (name, rule, d) in table() {
+        if rule == Rule::Unstated || DECODE_ONLY.contains(&&*name) {
+            continue;
+        }
+        // Deep enough to make every axis a rule uses non-trivial: at one row a
+        // rule that stacks rows on the wrong axis puts one group there and is
+        // indistinguishable from a rule that stacks them on the right one.
+        let fire = Dims {
+            rows: 64,
+            ..dims_for(rule, d.local)
+        };
+        let Ok(g) = geometry::groups(rule, fire, Module::loaded(&name, &d)) else {
+            continue;
+        };
+        for (axis, (&read, &given)) in d.grid_axes.iter().zip(g.iter()).enumerate() {
+            if !read && given > 1 {
+                bad.push(format!(
+                    "`{name}` ({rule:?}) gets {given} workgroups on axis \
+                     {axis}, which it is never indexed by"
+                ));
+            }
+        }
+        checked += 1;
+    }
+    assert!(
+        bad.is_empty(),
+        "{} entrypoints are given work nobody will do:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
+    assert!(checked >= 180, "only {checked} entrypoints were checked");
+}
+
+/// The entrypoints that are one row by construction, and why each is.
+///
+/// Not a way to quiet the check -- a record of the modules whose row count is
+/// not a grid axis at all, so that asking the check about them at 64 rows asks
+/// a question their caller never asks.
+///
+/// `kv_append_bfloat16` appends at `pos[0]`, a single scalar slot: a second
+/// row would not be a second destination, it would be the same destination
+/// written twice. Its paged sibling takes the slot from a per-row table and
+/// does read z, which is why only one of the two is named here.
+///
+/// The three `neox_*_decode_*` modules are compiled with `PIE_DECODE`, which
+/// is `row = 0u` -- the assignment discards `gl_WorkGroupID.z` and glslc then
+/// drops the read, which is exactly why the check sees no z. Their `_mb_`
+/// siblings keep it and are checked normally.
+///
+/// So every name here is a module that would MISCOMPUTE at 64 rows, not one
+/// that would merely waste them: 64 planes racing to write one destination.
+/// Choosing one of these for a multi-row fire is a caller's error, and it is
+/// recorded here rather than hidden because the geometry cannot see it.
+const DECODE_ONLY: &[&str] = &[
+    "kv_append_bfloat16",
+    "neox_decode_bfloat16",
+    "neox_freqs_decode_bfloat16",
+    "neox_prop_decode_bfloat16",
+];
+
+/// And every axis a shader IS indexed by is given work when there is work.
+///
+/// The mirror image, and the reason the check above is not sufficient alone: a
+/// geometry that answered `[n, 1, 1]` to everything would satisfy it perfectly
+/// while telling a module that reads three axes it has one of each.
+#[test]
+fn a_shader_indexed_by_an_axis_is_given_that_axis() {
+    let _ = modules!();
+    let mut counted = 0;
+    let mut bad: Vec<String> = Vec::new();
+    for (name, rule, d) in table() {
+        if rule == Rule::Unstated || DECODE_ONLY.contains(&&*name) {
+            continue;
+        }
+        let fire = Dims {
+            rows: 64,
+            ..dims_for(rule, d.local)
+        };
+        let Ok(g) = geometry::groups(rule, fire, Module::loaded(&name, &d)) else {
+            continue;
+        };
+        let highest_read = (0..3).filter(|a| d.grid_axes[*a]).max();
+        let highest_given = (0..3).filter(|a| g[*a] > 1).max();
+        if let (Some(read), Some(given)) = (highest_read, highest_given) {
+            if given > read {
+                bad.push(format!(
+                    "`{name}` ({rule:?}) is given work up to axis {given} but \
+                     is only indexed up to axis {read}"
+                ));
+            }
+            counted += 1;
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    assert!(
+        counted >= 100,
+        "only {counted} entrypoints had work to check"
+    );
+}
+
+/// A row never describes FEWER buffers than its module decorates.
+///
+/// The audit `kernels/attn/kv_write.comp` records in prose -- "these read 9
+/// and 10 until a SPIR-V-level audit compared the compiled `OpDecorate
+/// Binding` set against the table: off by one" -- made permanent. That audit
+/// lives in a script, and a script only runs when someone remembers to run it.
+/// The thing it guards against is not a wrong answer: a module reading
+/// `binding = 11` under a layout that stops at 10 is a segmentation fault
+/// inside `vkCreateComputePipelines`, which takes the process down and names
+/// nothing.
+///
+/// Stated as an inequality because the two counts genuinely disagree, and only
+/// one direction is a defect. Of the 188 stated entrypoints 177 agree exactly
+/// and 11 have a module decorating one binding FEWER than the row lists --
+/// glslc drops the decoration of a buffer the shader never reads, so the
+/// row is describing a real operand the shader happens not to touch. A
+/// descriptor declared and never read costs nothing. The other direction has
+/// no benign reading at all.
+#[test]
+fn no_row_declares_fewer_buffers_than_its_module_binds() {
+    let _ = modules!();
+    let mut checked = 0;
+    let mut short: Vec<String> = Vec::new();
+    for name in kernels_vulkan::entrypoints() {
+        let Some(row) = kernels::sig_in(kernels_vulkan::KERNELS, &name) else {
+            continue;
+        };
+        // An unstated row describes nothing rather than nothing-to-bind, so it
+        // has no claim here to be wrong about. `driver-metal`'s dispatch falls
+        // back to the lowered plan's own argument order for exactly these, and
+        // `Pipelines::get` takes the module's count when the caller offers 0.
+        if row.operands.is_empty() {
+            continue;
+        }
+        let Some(dir) = SPV_DIR.map(std::path::Path::new) else {
+            continue;
+        };
+        let Some(d) = declared(&dir.join(format!("{name}.spv"))) else {
+            continue;
+        };
+        let stated = kernels_vulkan::buffer_count(row);
+        if stated < d.bindings {
+            short.push(format!(
+                "`{name}` lists {stated} buffers and its module decorates \
+                 {} -- a layout that short is a SIGSEGV, not an error",
+                d.bindings
+            ));
+        }
+        checked += 1;
+    }
+    assert!(short.is_empty(), "{}", short.join("\n"));
+    assert!(checked >= 150, "only {checked} stated rows were checked");
+}
+
+/// The block the driver writes is the block the shader reads.
+///
+/// The other half of the ABI, and the half with no symptom. A binding count
+/// that is wrong crashes; a push offset that is wrong does not. The dispatch
+/// is legal, the layer is silent, and the shader reads a stride where a head
+/// count belongs -- a number, of the right type, in the right place, that is
+/// simply not the one that was written.
+///
+/// So this compares `kernels_vulkan::push_layout`, which is what a driver
+/// packs from the row, against the `Offset` decorations glslc put on the
+/// module's own push block. All 188 stated entrypoints agree today, which is
+/// the reason to fix it now rather than after the first disagreement: this
+/// check cannot find a defect that already exists, only one that is about to
+/// be introduced, and that is the only kind it could ever have caught.
+///
+/// Two things could make it vacuous, and both are controlled for. Packing the
+/// scalars with no alignment rule at all -- each straight after the last --
+/// disagrees, so the 8-byte members are load-bearing. Reading the offsets off
+/// any `Offset`-decorated struct rather than following a `PushConstant`
+/// variable to its own block picks up an SSBO layout instead, and this tree's
+/// kernels are full of those.
+#[test]
+fn the_push_block_a_row_packs_is_the_one_its_module_declares() {
+    let _ = modules!();
+    let Some(dir) = SPV_DIR.map(std::path::Path::new) else {
+        return;
+    };
+    let mut checked = 0;
+    let mut with_scalars = 0;
+    let mut differ: Vec<String> = Vec::new();
+    for name in kernels_vulkan::entrypoints() {
+        let Some(row) = kernels::sig_in(kernels_vulkan::KERNELS, &name) else {
+            continue;
+        };
+        if row.operands.is_empty() {
+            continue;
+        }
+        let Some(d) = declared(&dir.join(format!("{name}.spv"))) else {
+            continue;
+        };
+        let stated: Vec<u32> = kernels_vulkan::push_layout(row)
+            .iter()
+            .map(|f| f.offset)
+            .collect();
+        if !stated.is_empty() {
+            with_scalars += 1;
+        }
+        if stated != d.push_offsets {
+            differ.push(format!(
+                "`{name}` packs its scalars at {stated:?} and its module reads \
+                 them at {:?}",
+                d.push_offsets
+            ));
+        }
+        checked += 1;
+    }
+    assert!(differ.is_empty(), "{}", differ.join("\n"));
+    assert!(checked >= 150, "only {checked} stated rows were checked");
+    // Agreement between two empty lists is agreement about nothing.
+    assert!(
+        with_scalars >= 100,
+        "only {with_scalars} of the rows checked actually have a push block"
+    );
+}
+
+/// Every parameter block this tree declares, and its size.
+///
+/// A transcribed table rather than a derivation, for the reason
+/// `driver-metal`'s `packed_params_cover_the_struct` gives: a check whose
+/// expectation is computed the same way as the thing it checks agrees with
+/// itself. These numbers were read off the compiled modules by an independent
+/// SPIR-V walk written in another language, and two of them -- `router_topk`
+/// at 16 and `combine_sorted` at 12 -- are the same two blocks the Metal
+/// driver was found packing short.
+const PARAM_BLOCKS: &[(&str, u32, u32)] = &[
+    ("affine_encode_u4_bf16", 4, 8),
+    ("affine_encode_u4_f32", 4, 8),
+    ("argmax_logits_bfloat16", 2, 40),
+    ("combine_sorted", 3, 12),
+    ("gated_rms_bfloat16", 4, 8),
+    ("gated_rms_strided_bfloat16", 4, 8),
+    ("gdn_core_bfloat16", 11, 44),
+    ("gdn_core_recurrent_bfloat16", 10, 44),
+    ("gdn_core_recurrent_prefill_bfloat16_l_16_v_1", 5, 44),
+    ("gdn_core_recurrent_prefill_bfloat16_l_16_v_2", 5, 44),
+    ("gdn_core_recurrent_prefill_bfloat16_l_16_v_4", 5, 44),
+    ("gdn_core_recurrent_prefill_bfloat16_l_32_v_2", 5, 44),
+    ("gdn_core_recurrent_prefill_bfloat16_l_32_v_4", 5, 44),
+    ("gdn_core_recurrent_prefill_bfloat16_l_32_v_8", 5, 44),
+    ("gdn_core_recurrent_prefill_bfloat16_l_4_v_1", 5, 44),
+    ("gdn_core_recurrent_prefill_bfloat16_l_8_v_1", 5, 44),
+    ("gdn_core_recurrent_prefill_bfloat16_l_8_v_2", 5, 44),
+    ("gdn_core_recurrent_slotted_bfloat16", 10, 44),
+    ("gdn_core_slotted_bfloat16", 11, 44),
+    ("gdn_prep_bfloat16", 12, 44),
+    ("gdn_prep_prefill_bfloat16", 12, 44),
+    ("gdn_prep_slotted_bfloat16", 12, 44),
+    ("geglu_tanh_strided_bfloat16", 3, 20),
+    ("gptoss_swiglu_bfloat16", 3, 12),
+    ("logit_softcap_bfloat16", 2, 8),
+    ("mxfp4_dequant_bf16", 3, 8),
+    ("ple_combine_bfloat16", 3, 8),
+    ("rms_residual_bfloat16", 3, 20),
+    ("rms_residual_scaled_bfloat16", 3, 20),
+    ("rms_single_row_bfloat16", 3, 20),
+    ("rms_strided_head_row_bfloat16", 3, 20),
+    ("rms_strided_row_bfloat16", 3, 20),
+    ("route_gather", 3, 28),
+    ("route_sort", 4, 28),
+    ("router_topk_bfloat16", 3, 16),
+    ("router_topk_scaled_bfloat16", 3, 16),
+    ("row_gather_bfloat16", 3, 8),
+    ("split_qkv_bf16", 4, 8),
+    ("vnorm_single_row_bfloat16", 2, 8),
+];
+
+/// The block sizes this crate derives are the ones an independent walk read.
+///
+/// Two claims at once, and the second is the one that would rot. That the 39
+/// sizes agree is the arithmetic being right. That there are exactly 39 -- no
+/// module has grown a parameter block this table does not know about, and none
+/// has lost one -- is what keeps a new kernel from arriving with an unchecked
+/// ABI and this file still passing.
+#[test]
+fn the_parameter_blocks_this_crate_measures_are_the_ones_the_modules_declare() {
+    let dir = modules!();
+    let mut found: Vec<(String, u32, u32)> = Vec::new();
+    let mut disagreed = Vec::new();
+
+    for entry in std::fs::read_dir(dir).expect("the module directory is readable") {
+        let path = entry.expect("a directory entry").path();
+        if path.extension().is_none_or(|e| e != "spv") {
+            continue;
+        }
+        let name = path
+            .file_stem()
+            .expect("a name")
+            .to_string_lossy()
+            .into_owned();
+        let Some(d) = declared(&path) else { continue };
+        for (binding, size) in d.block_bytes.iter().enumerate() {
+            let Some(size) = size else { continue };
+            found.push((name.clone(), binding as u32, *size));
+            let want = PARAM_BLOCKS
+                .iter()
+                .find(|(n, b, _)| *n == name && *b == binding as u32);
+            match want {
+                Some((_, _, bytes)) if bytes == size => {}
+                Some((_, _, bytes)) => disagreed.push(format!(
+                    "{name} binding {binding}: this crate says {size} bytes, the \
+                     transcription says {bytes}"
+                )),
+                None => disagreed.push(format!(
+                    "{name} binding {binding} is a {size}-byte block the table \
+                     does not know about"
+                )),
+            }
+        }
+    }
+
+    for (name, binding, bytes) in PARAM_BLOCKS {
+        if !found.iter().any(|(n, b, _)| n == name && b == binding) {
+            disagreed.push(format!(
+                "{name} binding {binding} is a {bytes}-byte block the table \
+                 states and this crate did not find"
+            ));
+        }
+    }
+
+    assert!(
+        disagreed.is_empty(),
+        "{} of {} parameter blocks disagree:\n  {}",
+        disagreed.len(),
+        PARAM_BLOCKS.len(),
+        disagreed.join("\n  ")
+    );
+}
+
+/// The bindings a module skips are the ones this crate reports as holes.
+///
+/// `Declared::bindings` is one past the highest, so it and the decorated set
+/// disagree wherever `glslc` dropped a binding a variant never reads. On Metal
+/// that costs nothing; on Vulkan the descriptor set still carries a slot there
+/// and something has to decide what goes in it, so the count is load-bearing.
+///
+/// Measured across the whole tree rather than sampled: 165 of 665 modules have
+/// at least one hole and there are 358 in all. Both numbers are stated because
+/// a walk that silently stopped finding holes would otherwise look like a tree
+/// that stopped having them.
+#[test]
+fn the_bindings_a_module_skips_are_the_ones_this_crate_calls_holes() {
+    let dir = modules!();
+    let mut modules = 0u32;
+    let mut holed = 0u32;
+    let mut holes = 0usize;
+    let mut widest = 0usize;
+
+    for entry in std::fs::read_dir(dir).expect("the module directory reads") {
+        let path = entry.expect("an entry").path();
+        if path.extension().is_none_or(|e| e != "spv") {
+            continue;
+        }
+        let Some(d) = declared(&path) else { continue };
+        modules += 1;
+        // The invariant that makes `holes()` meaningful at all: `used` is
+        // indexed by binding number, so it has to be as long as the layout or
+        // a hole at the end would read as an absence instead.
+        assert_eq!(
+            d.used.len(),
+            d.bindings as usize,
+            "{}: {} slots and {} of them accounted for",
+            path.display(),
+            d.bindings,
+            d.used.len()
+        );
+        // One past the HIGHEST means the last slot is always decorated. A walk
+        // that reported a trailing hole would be reporting a `bindings` that
+        // does not mean what it says.
+        if d.bindings > 0 {
+            assert!(
+                *d.used.last().expect("a non-empty set"),
+                "{}: the highest binding is a hole, so `bindings` is not one \
+                 past it",
+                path.display()
+            );
+        }
+        if d.holes() > 0 {
+            holed += 1;
+            holes += d.holes();
+            if d.holes() > widest {
+                widest = d.holes();
+                eprintln!("WIDEST {} {}", path.display(), d.holes());
+            }
+        }
+    }
+
+    assert_eq!(modules, 665, "a different number of modules is built");
+    assert_eq!(holed, 165, "a different number of modules has a hole");
+    assert_eq!(holes, 358, "a different number of holes in all");
+    // `cast_qmm_input_bfloat16_to_float16` is the deepest: it shares a header
+    // with the matmul family it feeds, reads two of the thirteen bindings that
+    // header declares, and `glslc` drops the other eleven. A driver counting
+    // slots would go looking for eleven buffers that do not exist.
+    //
+    // Stated so that a module quietly becoming mostly holes is visible, and
+    // because six -- `kv_append_paged`'s deliberate ring-ABI gap -- was the
+    // guess this replaced. The accidental ones are deeper than the intentional
+    // one.
+    assert_eq!(widest, 11, "the most holes in one module changed");
+}

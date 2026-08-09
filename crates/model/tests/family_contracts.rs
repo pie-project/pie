@@ -30,12 +30,12 @@ use model_loader::plan::{
 use model_loader::types::{BackendKind, CheckpointFormat, DType, Encoding, FileId, TensorId};
 use model_loader::verify::ContractView;
 
-use model::shared::builder::Builder;
 use model::catalog::{Deployed, LoadShape, Variant};
+use model::contract::author;
 use model::deployment::{Deployment, Refusal};
 use model::encoding::Encoding as StoredEncoding;
+use model::shared::builder::Builder;
 use model::shared::policy::{Mxfp4MoeRequest, Naming, Policy, Projections, RuntimeQuant};
-use model::contract::author;
 
 // ── fixture machinery ───────────────────────────────────────────────
 
@@ -260,12 +260,10 @@ fn check(
 
     let plan = compile_load_plan(metadata, &contract, target.clone())
         .unwrap_or_else(|err| panic!("{name}: compiling failed: {err}"));
-    if let Err(violations) =
-        model_loader::verify::verify(
-            &model_loader::verify::view_of(&plan),
-            Some(&ContractView::of(&contract)),
-        )
-    {
+    if let Err(violations) = model_loader::verify::verify(
+        &model_loader::verify::view_of(&plan),
+        Some(&ContractView::of(&contract)),
+    ) {
         let listed: Vec<String> = violations.iter().map(ToString::to_string).collect();
         panic!(
             "{name}: the plan does not honour its contract:\n  {}",
@@ -1091,7 +1089,7 @@ fn llama_mlx_checkpoint() -> CheckpointMetadata {
 static LLAMA3_MLX: Fixture = Fixture {
     id: "llama3-fixture",
     shape: LoadShape::dense(1, 0, true),
-    author: model::llama_3::contract::author_llama_mlx,
+    author: model::shared::llama_like::contract::author_llama_mlx,
 };
 
 #[test]
@@ -1116,16 +1114,32 @@ fn llama_bf16_checkpoint() -> CheckpointMetadata {
     let p = "model.layers.0.";
     ck.push(&format!("{p}input_layernorm.weight"), &[hidden], bf16());
     for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
-        ck.push(&format!("{p}self_attn.{proj}.weight"), &[hidden, hidden], bf16());
+        ck.push(
+            &format!("{p}self_attn.{proj}.weight"),
+            &[hidden, hidden],
+            bf16(),
+        );
     }
     ck.push(
         &format!("{p}post_attention_layernorm.weight"),
         &[hidden],
         bf16(),
     );
-    ck.push(&format!("{p}mlp.gate_proj.weight"), &[intermediate, hidden], bf16());
-    ck.push(&format!("{p}mlp.up_proj.weight"), &[intermediate, hidden], bf16());
-    ck.push(&format!("{p}mlp.down_proj.weight"), &[hidden, intermediate], bf16());
+    ck.push(
+        &format!("{p}mlp.gate_proj.weight"),
+        &[intermediate, hidden],
+        bf16(),
+    );
+    ck.push(
+        &format!("{p}mlp.up_proj.weight"),
+        &[intermediate, hidden],
+        bf16(),
+    );
+    ck.push(
+        &format!("{p}mlp.down_proj.weight"),
+        &[hidden, intermediate],
+        bf16(),
+    );
     ck.push("model.norm.weight", &[hidden], bf16());
     ck.finish("llama_bf16")
 }
@@ -1183,9 +1197,14 @@ fn metal_refuses_a_requantization_it_cannot_encode() {
                     ..mlx_policy()
                 },
             )
-            .expect_err(&format!("{family} runtime_quant={quant:?} should be refused"));
+            .expect_err(&format!(
+                "{family} runtime_quant={quant:?} should be refused"
+            ));
             let text = err.to_string();
-            assert!(text.contains("no encoder here"), "{family} {quant:?}: {text}");
+            assert!(
+                text.contains("no encoder here"),
+                "{family} {quant:?}: {text}"
+            );
             assert!(
                 text.contains("int4"),
                 "{family} {quant:?} refusal names the alternative: {text}"
@@ -1313,7 +1332,10 @@ fn an_mlx_checkpoint_is_not_requantized_by_int4() {
             tensor.encoding
         );
     }
-    assert!(seen >= 7, "fixture should carry every projection, saw {seen}");
+    assert!(
+        seen >= 7,
+        "fixture should carry every projection, saw {seen}"
+    );
 }
 
 fn qwen3_5_mlx_checkpoint() -> CheckpointMetadata {

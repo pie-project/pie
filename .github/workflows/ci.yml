@@ -74,15 +74,23 @@ jobs:
           cargo clippy --no-deps --all-targets \
             -p tensor-ir -p tensor-compiler -p tensor-compiler \
             -p tensor-compiler -p tensor-dsl -p tensor-compiler \
+            -p model-loader \
             -- -D warnings
 
-      # Same scope, same reason: these six crates are rustfmt-clean, the rest
-      # of the workspace is not.
+      # Same scope, same reason: these crates are rustfmt-clean, the rest of
+      # the workspace is not.
+      #
+      # `model-loader` joined the list because it is what a formatter gate is
+      # FOR. Four doc comments in `executor/host.rs` had come apart — one
+      # function's documentation sitting on another, a `///    ///` doubled
+      # prefix, a body on its signature line — and each was one `cargo fmt`
+      # away from visible for however long it stood.
       - name: cargo fmt (compiler crates)
         run: |
           cargo fmt --check \
             -p tensor-ir -p tensor-compiler -p tensor-compiler \
-            -p tensor-compiler -p tensor-dsl -p tensor-compiler
+            -p tensor-compiler -p tensor-dsl -p tensor-compiler \
+            -p model-loader
 
   # Full-workspace verification — the guardrail + anti-bitrot net. Closes the
   # gap that let the runtime benches rot unseen: the dedicated jobs only build a

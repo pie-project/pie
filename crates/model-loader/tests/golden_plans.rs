@@ -29,8 +29,7 @@ use model_loader::contract::ModelContract;
 use model_loader::plan::compile as compile_load_plan;
 use model_loader::plan::{
     CUDA_TILE_MAP_MASK, FUSION_FP8_TO_MXFP4, HOST_TILE_MAP_MASK, LoadPlan, StorageTarget,
-    TILE_MAP_REPACK,
-    compiler_version,
+    TILE_MAP_REPACK, compiler_version,
 };
 use model_loader::types::{
     BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec, TensorId,
@@ -525,15 +524,16 @@ fn check(name: &str, metadata: &CheckpointMetadata, target: StorageTarget) {
 /// while still being unexecutable — the golden records the plan, not what
 /// happens when something tries to follow it. That is not a hypothetical
 /// distinction: the sharded `ExtentWrite` path was rejected outright by
-/// `host.rs` because it compared the source and destination *dimensions*
-/// rather than their byte counts, and nothing here noticed until
+/// `executor/walk.rs` because it compared the source and destination
+/// *dimensions* rather than their byte counts, and nothing here noticed until
 /// `pie-loader replay` was pointed at a real checkpoint at tp 1/2.
 fn replay(name: &str, plan: &LoadPlan, metadata: &CheckpointMetadata) {
     if plan.target.tile_map_mask & !HOST_TILE_MAP_MASK != 0 {
         return;
     }
     let snapshot = PathBuf::from(&metadata.files[0].path);
-    let storage = model_loader::executor::host::execute_plan(plan, snapshot.parent().unwrap())
+    let storage = model_loader::executor::Execution::new(plan, snapshot.parent().unwrap())
+        .run()
         .unwrap_or_else(|err| panic!("{name}: the plan does not execute: {err}"));
     for tensor in &plan.tensors {
         let materialized = storage

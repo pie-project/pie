@@ -1163,11 +1163,17 @@ mod tests {
     /// TOLD, and the tensor table is what the family authors read, not
     /// what `new` decides from.
     fn empty_checkpoint() -> CheckpointMetadata {
-        CheckpointMetadata { files: Vec::new(), tensors: Vec::new() }
+        CheckpointMetadata {
+            files: Vec::new(),
+            tensors: Vec::new(),
+        }
     }
 
     fn target() -> StorageTarget {
-        StorageTarget { preferred_alignment: 256, ..StorageTarget::default() }
+        StorageTarget {
+            preferred_alignment: 256,
+            ..StorageTarget::default()
+        }
     }
 
     #[test]
@@ -1199,7 +1205,10 @@ mod tests {
         let shape = LoadShape::dense(28, 128, true);
 
         for naming in [Naming::Hf, Naming::Mlx] {
-            let policy = Policy { naming, ..Policy::default() };
+            let policy = Policy {
+                naming,
+                ..Policy::default()
+            };
             let b = Builder::new(&meta, "qwen3-0.6b", shape, &enc, &target, &policy);
             assert_eq!(b.naming(), naming);
         }
@@ -1214,11 +1223,17 @@ mod tests {
         let enc = StoredEncoding::dense();
         let shape = LoadShape::dense(1, 64, false);
 
-        let t = StorageTarget { preferred_alignment: 512, ..StorageTarget::default() };
+        let t = StorageTarget {
+            preferred_alignment: 512,
+            ..StorageTarget::default()
+        };
         let b = Builder::new(&meta, "x", shape, &enc, &t, &policy);
         assert_eq!(b.contract.alignment, 512);
 
-        let t = StorageTarget { preferred_alignment: 0, ..StorageTarget::default() };
+        let t = StorageTarget {
+            preferred_alignment: 0,
+            ..StorageTarget::default()
+        };
         let b = Builder::new(&meta, "x", shape, &enc, &t, &policy);
         assert_eq!(b.contract.alignment, 1, "zero would divide by zero later");
     }
@@ -1259,14 +1274,23 @@ mod tests {
         let meta = empty_checkpoint();
         let enc = StoredEncoding::dense();
         let shape = LoadShape::dense(1, 64, false);
-        let policy = Policy { moe_request: Mxfp4MoeRequest::Auto, ..Policy::default() };
+        let policy = Policy {
+            moe_request: Mxfp4MoeRequest::Auto,
+            ..Policy::default()
+        };
 
-        let t = StorageTarget { native_mxfp4_moe: true, ..StorageTarget::default() };
+        let t = StorageTarget {
+            native_mxfp4_moe: true,
+            ..StorageTarget::default()
+        };
         let b = Builder::new(&meta, "gpt-oss-20b", shape, &enc, &t, &policy);
         assert_eq!(b.mxfp4_moe(), Mxfp4MoePolicy::NativeGemm);
         assert_eq!(b.mxfp4_moe(), b.mxfp4_moe());
 
-        let t = StorageTarget { native_mxfp4_moe: false, ..StorageTarget::default() };
+        let t = StorageTarget {
+            native_mxfp4_moe: false,
+            ..StorageTarget::default()
+        };
         let b = Builder::new(&meta, "gpt-oss-20b", shape, &enc, &t, &policy);
         assert_eq!(b.mxfp4_moe(), Mxfp4MoePolicy::RoutedDecode);
     }
@@ -1281,12 +1305,24 @@ mod tests {
         let shape = LoadShape::dense(36, 128, false);
 
         let bf16 = StoredEncoding::dense();
-        let awq = StoredEncoding { method: "awq".into(), bits: 4, group_size: 128 };
-        let mxfp4 = StoredEncoding { method: "mxfp4".into(), bits: 4, group_size: 32 };
+        let awq = StoredEncoding {
+            method: "awq".into(),
+            bits: 4,
+            group_size: 128,
+        };
+        let mxfp4 = StoredEncoding {
+            method: "mxfp4".into(),
+            bits: 4,
+            group_size: 32,
+        };
 
         for enc in [&bf16, &awq, &mxfp4] {
             let b = Builder::new(&meta, "qwen3-8b", shape, enc, &target, &policy);
-            assert_eq!(b.shape(), shape, "the shape does not move with the encoding");
+            assert_eq!(
+                b.shape(),
+                shape,
+                "the shape does not move with the encoding"
+            );
             assert_eq!(b.id(), "qwen3-8b", "nor does the identity");
         }
         assert!(bf16.is_none());
@@ -1302,7 +1338,10 @@ mod tests {
         assert_eq!(align_up(256, 256).expect("already aligned"), 256);
         assert_eq!(align_up(257, 256).expect("rounds up"), 512);
         assert_eq!(align_up(5, 1).expect("everything is 1-aligned"), 5);
-        assert!(align_up(-1, 256).is_err(), "a negative offset is not a rounding question");
+        assert!(
+            align_up(-1, 256).is_err(),
+            "a negative offset is not a rounding question"
+        );
         assert!(align_up(256, 0).is_err(), "and neither is a zero alignment");
         assert!(align_up(256, -8).is_err());
     }

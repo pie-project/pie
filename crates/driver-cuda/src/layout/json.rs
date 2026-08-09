@@ -164,7 +164,10 @@ mod tests {
         // Not insertion order: `nlohmann`'s object is a `std::map`, so a file
         // it writes is sorted and a file this writes must be too.
         let v = json!({"b": 1, "a": 2, "C": 3});
-        assert_eq!(dump_pretty(&v, 2), "{\n  \"C\": 3,\n  \"a\": 2,\n  \"b\": 1\n}\n");
+        assert_eq!(
+            dump_pretty(&v, 2),
+            "{\n  \"C\": 3,\n  \"a\": 2,\n  \"b\": 1\n}\n"
+        );
     }
 
     #[test]
@@ -207,6 +210,9 @@ mod tests {
     #[test]
     fn control_characters_use_lowercase_four_digit_escapes() {
         let v = json!({"k": "a\u{1}b\tc\"d\\e/f"});
-        assert_eq!(dump_pretty(&v, 0), "{\"k\":\"a\\u0001b\\tc\\\"d\\\\e/f\"}\n");
+        assert_eq!(
+            dump_pretty(&v, 0),
+            "{\"k\":\"a\\u0001b\\tc\\\"d\\\\e/f\"}\n"
+        );
     }
 }

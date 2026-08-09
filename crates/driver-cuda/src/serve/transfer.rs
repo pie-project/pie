@@ -6,20 +6,13 @@
 //! §3 rule 3 states as a rule and `store/control.rs` on the Metal side
 //! records the bug it prevents.
 
+use super::state::{KvState, SwapPool, shell, slice_of};
+use super::{checked, guard};
 use driver_api::local::{
-    PIE_STATUS_DRIVER_ERROR,
-    PIE_STATUS_EXHAUSTED,
-    PIE_STATUS_INVALID_ARGUMENT,
-    PIE_STATUS_OK,
-    PIE_STATUS_UNSUPPORTED,
-    PieCompletion,
-    PieDriver,
-    PieKvCopyDesc,
-    PiePoolResizeDesc,
+    PIE_STATUS_DRIVER_ERROR, PIE_STATUS_EXHAUSTED, PIE_STATUS_INVALID_ARGUMENT, PIE_STATUS_OK,
+    PIE_STATUS_UNSUPPORTED, PieCompletion, PieDriver, PieKvCopyDesc, PiePoolResizeDesc,
     PieStateCopyDesc,
 };
-use super::{checked, guard};
-use super::state::{KvState, SwapPool, shell, slice_of};
 
 /// KV copies across all four domains: whole-page moves (`src_page_ids` →
 /// `dst_page_ids`, every layer, every buffer) and beam-repair CELL moves
@@ -127,13 +120,19 @@ pub fn pie_cuda_copy_kv(
                 // call, which is neither.
                 let st = plan.streams();
                 let mk = |want: bool| -> Option<crate::device::OwnedStream> {
-                    want.then(|| crate::device::OwnedStream::new(0).ok()).flatten()
+                    want.then(|| crate::device::OwnedStream::new(0).ok())
+                        .flatten()
                 };
                 let (evict, restore) = (mk(st.evict), mk(st.restore));
                 if let Some(old) = state.swap.take() {
                     old.free();
                 }
-                state.swap = Some(SwapPool { regions, plan, evict, restore });
+                state.swap = Some(SwapPool {
+                    regions,
+                    plan,
+                    evict,
+                    restore,
+                });
             }
         }
 
@@ -147,8 +146,7 @@ pub fn pie_cuda_copy_kv(
         use cudarc::runtime::sys::{cudaError, cudaMemcpyAsync, cudaMemcpyKind};
         let kv_ref = state.kv.as_ref().expect("checked");
         for (s_id, d_id) in src_pages.iter().zip(dst_pages) {
-            if (!host_src && *s_id >= kv_ref.num_pages)
-                || (!host_dst && *d_id >= kv_ref.num_pages)
+            if (!host_src && *s_id >= kv_ref.num_pages) || (!host_dst && *d_id >= kv_ref.num_pages)
             {
                 return PIE_STATUS_INVALID_ARGUMENT;
             }
@@ -217,9 +215,7 @@ pub fn pie_cuda_copy_kv(
                             _ => None,
                         }
                     }
-                    Pool::Host { layer, buffer } => {
-                        state.swap.as_ref()?.region(layer, buffer)
-                    }
+                    Pool::Host { layer, buffer } => state.swap.as_ref()?.region(layer, buffer),
                 }
             };
             let (Some(dst), Some(src)) = (resolve(op.dst), resolve(op.src)) else {
@@ -250,7 +246,9 @@ pub fn pie_cuda_copy_kv(
             let code = unsafe {
                 cudaMemcpyAsync(
                     dst.add(usize::try_from(op.dst_offset).unwrap_or(0)).cast(),
-                    src.add(usize::try_from(op.src_offset).unwrap_or(0)).cast_const().cast(),
+                    src.add(usize::try_from(op.src_offset).unwrap_or(0))
+                        .cast_const()
+                        .cast(),
                     usize::try_from(op.bytes).unwrap_or(0),
                     kind,
                     leg.as_raw(),
@@ -347,7 +345,13 @@ pub fn pie_cuda_copy_kv(
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         if let Some(notify) = state.notify {
-            unsafe { notify(state.notify_ctx, completion.wait_id, completion.target_epoch) };
+            unsafe {
+                notify(
+                    state.notify_ctx,
+                    completion.wait_id,
+                    completion.target_epoch,
+                )
+            };
         }
         PIE_STATUS_OK
     })
@@ -367,11 +371,14 @@ pub fn pie_cuda_copy_state(
         let Some(state) = shell(driver) else {
             return PIE_STATUS_INVALID_ARGUMENT;
         };
-        let desc =
-            match checked(copy, driver_api::local::validate_state_copy_desc, "copy_state") {
-                Ok(d) => d,
-                Err(status) => return status,
-            };
+        let desc = match checked(
+            copy,
+            driver_api::local::validate_state_copy_desc,
+            "copy_state",
+        ) {
+            Ok(d) => d,
+            Err(status) => return status,
+        };
         let Some(gdn) = state.gdn.as_mut() else {
             // No recurrent family is loaded — the C++ shape: state copies
             // only mean something once the rs cache exists.
@@ -438,11 +445,14 @@ pub fn pie_cuda_resize_pool(
         let Some(state) = shell(driver) else {
             return PIE_STATUS_INVALID_ARGUMENT;
         };
-        let desc =
-            match checked(resize, driver_api::local::validate_pool_resize_desc, "resize_pool") {
-                Ok(d) => d,
-                Err(status) => return status,
-            };
+        let desc = match checked(
+            resize,
+            driver_api::local::validate_pool_resize_desc,
+            "resize_pool",
+        ) {
+            Ok(d) => d,
+            Err(status) => return status,
+        };
         let Ok(target) = u32::try_from(desc.target_pages) else {
             return PIE_STATUS_INVALID_ARGUMENT;
         };
@@ -503,7 +513,10 @@ pub fn pie_cuda_resize_pool(
         // existing cache states its own geometry and nothing is
         // re-derived. Before any cache exists there is nothing to ask,
         // and the deployment answers.
-        let layout = match old.as_ref().map(|o| o.cache.layout().with_num_pages(target as i32)) {
+        let layout = match old
+            .as_ref()
+            .map(|o| o.cache.layout().with_num_pages(target as i32))
+        {
             Some(Ok(l)) => l,
             Some(Err(_)) => return PIE_STATUS_INVALID_ARGUMENT,
             None => {
@@ -534,10 +547,7 @@ pub fn pie_cuda_resize_pool(
             }
         };
 
-        let mut ops = crate::pools::kv_cache_live::LiveKvCacheOps::new(
-            stream.as_ref(),
-            &alloc,
-        );
+        let mut ops = crate::pools::kv_cache_live::LiveKvCacheOps::new(stream.as_ref(), &alloc);
         let Ok(cache) = crate::pools::kv_cache_live::KvCache::materialize(layout, &mut ops) else {
             return PIE_STATUS_EXHAUSTED;
         };
@@ -547,7 +557,11 @@ pub fn pie_cuda_resize_pool(
                 return PIE_STATUS_DRIVER_ERROR;
             }
         }
-        let fresh = KvState { cache, _held: held, num_pages: target };
+        let fresh = KvState {
+            cache,
+            _held: held,
+            num_pages: target,
+        };
 
         // Carry over what still fits. A layer that owns no pages has none
         // to carry, and a shrink keeps the low pages.
@@ -587,9 +601,14 @@ pub fn pie_cuda_resize_pool(
         crate::serve::state::install_kv(&mut state.kv, &mut state.fire_arrays.epoch, fresh);
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         if let Some(notify) = state.notify {
-            unsafe { notify(state.notify_ctx, completion.wait_id, completion.target_epoch) };
+            unsafe {
+                notify(
+                    state.notify_ctx,
+                    completion.wait_id,
+                    completion.target_epoch,
+                )
+            };
         }
         PIE_STATUS_OK
     })
 }
-

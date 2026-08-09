@@ -16,8 +16,8 @@
 
 use crate::catalog::{Backend, Deployed, MetalBinding};
 use crate::deployment::{
-    Advertised,
-    AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement, PrefillStyle,
+    Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,
+    PrefillStyle,
 };
 use crate::manifest::{Manifest, TensorSpec};
 
@@ -37,7 +37,12 @@ pub const ATTN_HEAD_DIMS: &[u32] = &[64, 128, 256, 512];
 /// dispatch error rather than silently mis-sizing.
 #[must_use]
 pub fn round_up_attn_head_dim(head_dim: u32) -> u32 {
-    ATTN_HEAD_DIMS.iter().copied().filter(|&d| d >= head_dim).min().unwrap_or(head_dim)
+    ATTN_HEAD_DIMS
+        .iter()
+        .copied()
+        .filter(|&d| d >= head_dim)
+        .min()
+        .unwrap_or(head_dim)
 }
 
 /// The GQA group sizes a CUDA decode instantiates.
@@ -70,10 +75,22 @@ pub fn manifest(f: &LlamaLikeFacts) -> Manifest {
         // TIED vs UNTIED as presence, which is the only way a manifest
         // can tell them apart: every extent agrees.
         .either(!f.tied_embeddings, "lm_head", [vocab, hidden])
-        .with(TensorSpec::required("layer.{}.self_attn.q_proj", [q, hidden]))
-        .with(TensorSpec::required("layer.{}.self_attn.k_proj", [kv, hidden]))
-        .with(TensorSpec::required("layer.{}.self_attn.v_proj", [kv, hidden]))
-        .with(TensorSpec::required("layer.{}.self_attn.o_proj", [hidden, q]))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.q_proj",
+            [q, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.k_proj",
+            [kv, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.v_proj",
+            [kv, hidden],
+        ))
+        .with(TensorSpec::required(
+            "layer.{}.self_attn.o_proj",
+            [hidden, q],
+        ))
         // The q/k-norm question the old derivation answered by dividing
         // a byte count: per-head ships `[head_dim]`, global ships the
         // whole projection width, and off ships nothing.
@@ -100,23 +117,41 @@ pub fn manifest(f: &LlamaLikeFacts) -> Manifest {
             "layer.{}.input_layernorm",
             [hidden],
         )
-        .with(TensorSpec::required("layer.{}.post_attention_layernorm", [hidden]))
+        .with(TensorSpec::required(
+            "layer.{}.post_attention_layernorm",
+            [hidden],
+        ))
         .either(
             f.norm_placement == SpecNorm::Post,
             "layer.{}.post_feedforward_layernorm",
             [hidden],
         )
-        .with_if(f.qkv_bias, TensorSpec::required("layer.{}.self_attn.q_proj.bias", [q]))
         .with_if(
-            dense,
-            TensorSpec::required("layer.{}.mlp.gate_proj", [u64::from(f.intermediate), hidden]),
+            f.qkv_bias,
+            TensorSpec::required("layer.{}.self_attn.q_proj.bias", [q]),
         )
         .with_if(
             dense,
-            TensorSpec::required("layer.{}.mlp.down_proj", [hidden, u64::from(f.intermediate)]),
+            TensorSpec::required(
+                "layer.{}.mlp.gate_proj",
+                [u64::from(f.intermediate), hidden],
+            ),
         )
-        .with_if(!dense, TensorSpec::required("layer.{}.mlp.gate", [u64::from(f.n_experts), hidden]))
-        .with_if(!dense, TensorSpec::present("layer.{}.mlp.experts.0.gate_proj"))
+        .with_if(
+            dense,
+            TensorSpec::required(
+                "layer.{}.mlp.down_proj",
+                [hidden, u64::from(f.intermediate)],
+            ),
+        )
+        .with_if(
+            !dense,
+            TensorSpec::required("layer.{}.mlp.gate", [u64::from(f.n_experts), hidden]),
+        )
+        .with_if(
+            !dense,
+            TensorSpec::present("layer.{}.mlp.experts.0.gate_proj"),
+        )
 }
 
 /// This row's deployment.
@@ -124,13 +159,19 @@ pub fn manifest(f: &LlamaLikeFacts) -> Manifest {
 /// A projection, and a short one: every value below was already in the
 /// row. The eleven-function derivation it replaces read the same numbers
 /// out of a parsed `config.json`, one family at a time.
+///
+/// It takes the same [`RowScalars`] [`trace`] does, rather than the three
+/// loose scalars it used to, so a generation cannot page at one theta and
+/// fire at another. See that struct for why.
 #[must_use]
-pub fn deployment(
-    f: &LlamaLikeFacts,
-    rope_theta: f32,
-    norm_eps: f32,
-    sliding_window: i32,
-) -> Deployment {
+pub fn deployment(f: &LlamaLikeFacts, row: RowScalars) -> Deployment {
+    let RowScalars {
+        rope_theta,
+        norm_eps,
+        window: sliding_window,
+        norm_topk_prob,
+        ..
+    } = row;
     let head_dim = round_up_attn_head_dim(f.head_dim).max(f.head_dim);
     let attention = (0..f.layers)
         .map(|l| LayerAttention {
@@ -178,6 +219,10 @@ pub fn deployment(
         // exception is gemma-4's row, and it says so there.
         attn_output: AttnOutput::DriverPinned,
         logit_softcap: 0.0,
+        // No ATTENTION cap: gemma-2's `attn_logit_softcapping` is
+        // gemma-2's alone, and a zero here is "no cap" rather than a
+        // cap at zero — which would flatten every score to `tanh(inf)`.
+        attn_logit_softcap: 0.0,
         ple_dim: 0,
         norm: match f.norm_placement {
             SpecNorm::Post => NormPlacement::Post,
@@ -191,6 +236,9 @@ pub fn deployment(
         norm_unit_offset: false,
         v_norm: false,
         k_eq_v: false,
+        norm_topk_prob,
+        // No router of this family states a scaling factor.
+        routed_scaling: 1.0,
         mlp_gate: crate::deployment::MlpGate::Silu,
         scales: std::collections::BTreeMap::new(),
         // Filled by the ROW, not by the shape: a family label and a
@@ -311,29 +359,115 @@ pub const NO_METAL_ROUTED_ENCODING: &str = "this row's expert bank reached the d
      wrong offset and answers bf16 garbage, which is NaN more often than \
      not. Refused";
 
-/// The row's four numbers a Metal text reads and [`LlamaLikeFacts`]
-/// does not hold.
+/// What this build's Metal kernels cannot run, asked of the FACTS.
+///
+/// Three refusals, and none of them is about a row: they are about the
+/// KERNEL SET. A width `sdpa_paged.metal` never instantiated, an affine
+/// point `quant/qmv.metal` never stamped the routed matvec at, a shard
+/// count no Metal deployment has — each is a gap in the same one
+/// sentence for every family that lowers this text.
+///
+/// # Why it is a function and not three lines in `trace`
+///
+/// It WAS three lines in [`trace`], and [`trace`] is not the only door
+/// to [`llama_like_metal`]. `gemma_3` and `gemma_4` reach the text
+/// directly, because each overrides part of the projection that builds
+/// its facts, and each carried the shard check alone — so a gemma row
+/// at a width the shader has no symbol for did not get refused by name.
+/// It PANICKED: `model-compiler` validates a declaration against the
+/// kernel rows and aborts on an undeclared launch, which is why
+/// [`NO_METAL_HEAD_DIM`] exists at all rather than being left to fail at
+/// pipeline construction.
+///
+/// What the two doors were missing was LATENT rather than live, and
+/// the measurement is worth keeping because the obvious reading was
+/// wrong. Every gemma row published today runs at head width 256,
+/// which the shader stamps; and gemma-4's only routed row,
+/// `gemma-4-26b-a4b`, is refused EARLIER and in its own words — this
+/// build has no routed-expert text for a gemma-4 block — so the affine
+/// point was never asked of it. Nothing was being mis-served. What was
+/// true is that two doors could not have SAID so, and the first row to
+/// land at an unstamped width would have met `model-compiler`'s abort
+/// instead of a sentence.
+///
+/// One function, three callers, and
+/// `catalog_backends::no_door_serves_a_routed_bank_at_an_unstamped_point`
+/// asserts the property the ladder is for, rather than that each door
+/// holds a copy of it.
+///
+/// # Both head dims, not the first one
+///
+/// [`trace`] asked `f.head_dim` because twelve families have one shape.
+/// gemma-4 has two — 256 sliding against 512 full — and the text names
+/// `sdpa_paged_decode_bfloat16_d_<width>` for EACH, so a stack whose
+/// second shape is off the axis names a symbol nothing exports just as
+/// surely as its first. `global_head_dim` is zero when the stack has one
+/// shape, which is why zero is skipped rather than refused.
+///
+/// # Errors
+///
+/// [`NO_METAL_SHARD`], [`NO_METAL_HEAD_DIM`] or
+/// [`NO_METAL_ROUTED_ENCODING`], in the order a load meets them.
+#[cfg(feature = "forward")]
+pub fn metal_kernel_refusal(
+    f: &LlamaLikeFacts,
+    m: &super::forward::facts::LlamaLikeMetalFacts,
+    load: Deployed<'_>,
+    bind: &MetalBinding,
+) -> Result<(), crate::deployment::Refusal> {
+    if load.tp_size > 1 {
+        return Err(crate::deployment::Refusal::Unsupported(NO_METAL_SHARD));
+    }
+    if !METAL_SDPA_HEAD_DIMS.contains(&f.head_dim) {
+        return Err(crate::deployment::Refusal::Unsupported(NO_METAL_HEAD_DIM));
+    }
+    if m.global_head_dim > 0 && !METAL_SDPA_HEAD_DIMS.contains(&m.global_head_dim) {
+        return Err(crate::deployment::Refusal::Unsupported(NO_METAL_HEAD_DIM));
+    }
+    // MXFP4 banks take their own symbol at group 32, so the affine
+    // point is not asked of them.
+    if f.n_experts > 0
+        && !bind.moe_mxfp4
+        && (bind.quant_group, bind.quant_bits) != METAL_ROUTED_AFFINE
+    {
+        return Err(crate::deployment::Refusal::Unsupported(
+            NO_METAL_ROUTED_ENCODING,
+        ));
+    }
+    Ok(())
+}
+
+/// The row's own numbers, which [`LlamaLikeFacts`] does not hold.
 ///
 /// They are gathered here rather than added to the shape because twelve
 /// generations share that struct and a field on it is a field every one
-/// of them restates. Each generation already holds these four for
-/// [`deployment`] — which is the point: a row that FIRES at one theta
-/// and PAGES at another would be two readings of one checkpoint, and
-/// two readings of one document is the defect the catalog exists to
-/// end.
+/// of them restates.
 ///
-/// # Why the CUDA side needs none of them
+/// # One struct, because a row is read once
 ///
-/// `llama_like_cuda` states no epsilon and no rotary base at all: the
-/// CUDA driver carries both on its own `fwd_cfg` and the text never
-/// names them. `llama_like_metal` names all three — its norms take
-/// `RmsParams`, its rope takes a base, and its attention takes a
-/// window — because a Metal statement carries every scalar its kernel
-/// reads. That asymmetry is not a gap in one of the texts. It is what
-/// "a text is written for a backend" means.
+/// [`deployment`] took `rope_theta`, `norm_eps` and `sliding_window` as
+/// three loose arguments while [`trace`] took the same three off this
+/// struct, and every generation filled both from the same fields of
+/// itself. That is two readings of one document — the defect the
+/// catalog exists to end — and it was live: nothing held the two
+/// call sites together, so a row that FIRED at one theta and PAGED at
+/// another would have compiled. Both now take this, so the row is
+/// stated once and spent twice.
+///
+/// # The Metal text reads more of it than the CUDA one
+///
+/// `llama_like_cuda` names no epsilon and no rotary base: the CUDA
+/// driver carries both on its own `fwd_cfg`. `llama_like_metal` names
+/// all three — its norms take `RmsParams`, its rope takes a base, and
+/// its attention takes a window — because a Metal statement carries
+/// every scalar its kernel reads. That asymmetry is not a gap in one
+/// of the texts; it is what "a text is written for a backend" means.
+/// It is also why this struct was called `MetalRow`, which stopped
+/// being true the moment [`deployment`] read it — the deployment is
+/// what CUDA's launch reads its `moe_norm_topk` off.
 #[cfg(feature = "forward")]
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MetalRow {
+pub struct RowScalars {
     /// `rope_theta`, the rotary base every layer of this row rotates at.
     ///
     /// Stated rather than defaulted for the reason `ModelFacts::rope_theta`
@@ -369,6 +503,28 @@ pub struct MetalRow {
     /// rescaling", so every llama-3 would have attended past its trained
     /// 8192 with the wrong wavelengths — degrading rather than failing.
     pub rope_rescaled: bool,
+    /// Whether the router renormalizes over the SELECTED experts.
+    ///
+    /// HF's `norm_topk_prob`, and the third word of `moe/route.metal`'s
+    /// `RouterParams`. True softmaxes the k chosen logits so the weights sum
+    /// to one; false softmaxes over ALL the experts and then selects, so they
+    /// sum to less than one and scale the routed FFN's whole contribution
+    /// down with them. Both produce weights and neither faults.
+    ///
+    /// Stated by the ROW and not defaulted anywhere, because the default is
+    /// the trap. `Qwen3MoeConfig.norm_topk_prob` is `False` in transformers,
+    /// and `Qwen/Qwen3-30B-A3B`'s published `config.json` says `true` — the
+    /// row this catalog serves disagrees with the class it is loaded by. Of
+    /// the routed checkpoints on this machine (Qwen3.6-35B-A3B,
+    /// gemma-4-26b-a4b, gpt-oss-20b) not one states the key at all, so a
+    /// reader that fell through to a class default would be answering a
+    /// question the checkpoint never asked.
+    ///
+    /// A DENSE row states it too and it is never staged: no `router_topk` is
+    /// in a dense text. `RowScalars` has no `Default` for the reason the facts
+    /// have none — "this one has no router" is part of the measurement, and a
+    /// row added later should have to answer.
+    pub norm_topk_prob: bool,
 }
 
 /// The METAL binding facts for this row.
@@ -401,12 +557,31 @@ pub struct MetalRow {
 /// default body is a claim about every row that has not been written
 /// yet.
 ///
+/// # It takes no [`LlamaLikeFacts`]
+///
+/// The twin above takes them and this does not, and the asymmetry is
+/// the split's, not an omission. `LlamaLikeMetalFacts` has no shape
+/// vocabulary at all — no hidden, no head count, no width — because
+/// the Metal text is handed the row's facts DIRECTLY beside these
+/// (`llama_like_metal(f, &metal_facts(..), class)`) and reads every
+/// extent off them. `cuda_facts` needs its own because its `tp_size`
+/// NARROWS those extents, and the narrowed widths have to be stated
+/// somewhere the text will read instead of the row.
+///
+/// So the four `false`s below are not the row's answers withheld:
+/// each is a claim about what a checkpoint PUBLISHED, and the manifest
+/// is where this family makes that claim. `gate_up_fused` and
+/// `qkv_fused` are the load's binding, `v_from_k` is a manifest
+/// requirement, and `dense_beside_moe` is the routed/dense exclusion
+/// the manifest already enforces — a mixture's SHARED expert is a
+/// different structure, stated by `shared_intermediate` and emitted by
+/// the text off the row's facts without passing through here.
+///
 /// [`LlamaLikeMetalFacts`]: super::forward::facts::LlamaLikeMetalFacts
 #[cfg(feature = "forward")]
 #[must_use]
 pub fn metal_facts(
-    f: &LlamaLikeFacts,
-    row: MetalRow,
+    row: RowScalars,
     load: Deployed<'_>,
     bind: &MetalBinding,
 ) -> super::forward::facts::LlamaLikeMetalFacts {
@@ -487,7 +662,7 @@ pub fn metal_facts(
         // beside `gate_up_fused` and not there.
         qkv_fused: false,
         // The row's epsilon and the row's rotary base, carried on
-        // [`MetalRow`] because `LlamaLikeFacts` states neither — see
+        // [`RowScalars`] because `LlamaLikeFacts` states neither — see
         // that struct for why a shape shared by twelve generations
         // holds no scalar a `Deployment` already carries, and why the
         // Metal text needs both anyway. They are the two numbers the
@@ -535,6 +710,10 @@ pub fn metal_facts(
         // both. gemma-4 runs both branches off the post-attention
         // residual and adds them, which is five norms round one block.
         dense_beside_moe: false,
+        // The ROW's, and the one field of the routed arm that no bank, no
+        // manifest and no load can be asked for: the weights are identical
+        // either way and only their denominator differs.
+        norm_topk_prob: row.norm_topk_prob,
         // FALSE: no row here ships a `layer_scalar`. It is gemma's, for
         // a deployment with no per-layer embeddings, and the driver
         // asked the TENSORS for it because gemma-4-31b states
@@ -596,7 +775,7 @@ pub fn metal_facts(
         activation: super::forward::facts::Activation::SiluMul,
         // Whether the driver hands over a frequency TABLE instead of a
         // base. True for llama-3's piecewise rescaling and OLMo-3's
-        // YaRN, which no `rope_theta` expresses — see [`MetalRow`] for
+        // YaRN, which no `rope_theta` expresses — see [`RowScalars`] for
         // the bug this closes, which is that nothing carried either for
         // the length of this refactor and a zero factor reads as "no
         // rescaling".
@@ -614,7 +793,11 @@ pub fn metal_facts(
         // and Qwen-2 are the rows it is not `-1` for, and a window
         // dropped is a model that attends its whole prefix — fluent, and
         // about a context the checkpoint was never trained to see.
-        window_left: if row.window < 0 { Vec::new() } else { vec![row.window] },
+        window_left: if row.window < 0 {
+            Vec::new()
+        } else {
+            vec![row.window]
+        },
     }
 }
 
@@ -648,29 +831,20 @@ pub fn metal_facts(
 #[cfg(feature = "forward")]
 pub fn trace(
     f: &LlamaLikeFacts,
-    row: MetalRow,
+    row: RowScalars,
     class: model_compiler::trace::FireClass,
     load: Deployed<'_>,
 ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
     match load.backend {
-        Backend::Cuda => Ok(super::forward::llama_like_cuda(f, &cuda_facts(f, load), class)),
+        Backend::Cuda => Ok(super::forward::llama_like_cuda(
+            f,
+            &cuda_facts(f, load),
+            class,
+        )),
         Backend::Metal(bind) => {
-            if load.tp_size > 1 {
-                return Err(crate::deployment::Refusal::Unsupported(NO_METAL_SHARD));
-            }
-            if !METAL_SDPA_HEAD_DIMS.contains(&f.head_dim) {
-                return Err(crate::deployment::Refusal::Unsupported(NO_METAL_HEAD_DIM));
-            }
-            // MXFP4 banks take their own symbol at group 32, so the
-            // affine point is not asked of them.
-            let routed = f.n_experts > 0;
-            if routed
-                && !bind.moe_mxfp4
-                && (bind.quant_group, bind.quant_bits) != METAL_ROUTED_AFFINE
-            {
-                return Err(crate::deployment::Refusal::Unsupported(NO_METAL_ROUTED_ENCODING));
-            }
-            Ok(super::forward::llama_like_metal(f, &metal_facts(f, row, load, bind), class))
+            let m = metal_facts(row, load, bind);
+            metal_kernel_refusal(f, &m, load, bind)?;
+            Ok(super::forward::llama_like_metal(f, &m, class))
         }
     }
 }
@@ -709,7 +883,9 @@ mod tests {
         let per_head = manifest(&LlamaLikeFacts::qwen3_0_6b());
         let global = manifest(&LlamaLikeFacts::olmo2_1b());
         let names = |m: &Manifest| -> Vec<String> {
-            m.tensors.iter().map(|t| format!("{}:{:?}:{:?}", t.name, t.extents, t.presence))
+            m.tensors
+                .iter()
+                .map(|t| format!("{}:{:?}:{:?}", t.name, t.extents, t.presence))
                 .collect()
         };
         assert_ne!(names(&per_head), names(&global));
@@ -720,9 +896,9 @@ mod tests {
     /// test on the identity, for a fact the row states.
     #[test]
     fn norm_placement_is_stated_rather_than_matched_on_a_name() {
-        let olmo = deployment(&LlamaLikeFacts::olmo2_1b(), 500_000.0, NORM_EPS, -1);
+        let olmo = deployment(&LlamaLikeFacts::olmo2_1b(), row(500_000.0, -1));
         assert_eq!(olmo.norm, NormPlacement::Post);
-        let qwen = deployment(&LlamaLikeFacts::qwen3_0_6b(), 1e6, NORM_EPS, -1);
+        let qwen = deployment(&LlamaLikeFacts::qwen3_0_6b(), row(1e6, -1));
         assert_eq!(qwen.norm, NormPlacement::Pre);
     }
 
@@ -731,7 +907,7 @@ mod tests {
     #[test]
     fn the_launch_geometry_is_the_rows_own_numbers() {
         let f = LlamaLikeFacts::qwen3_0_6b();
-        let d = deployment(&f, 1e6, NORM_EPS, -1);
+        let d = deployment(&f, row(1e6, -1));
         assert_eq!(d.shape.hidden, f.hidden);
         assert_eq!(d.shape.q_heads, f.q_heads);
         assert_eq!(d.shape.kv_heads, f.kv_heads);
@@ -739,7 +915,11 @@ mod tests {
         assert_eq!(d.shape.intermediate, f.intermediate);
         assert_eq!(d.shape.vocab, f.vocab);
         assert_eq!(d.shape.gqa_group(), 2, "16 q over 8 kv");
-        assert_eq!(d.shape.head_dim_alloc(), 128, "128 is instantiated; nothing pads");
+        assert_eq!(
+            d.shape.head_dim_alloc(),
+            128,
+            "128 is instantiated; nothing pads"
+        );
     }
 
     /// Phi-3's 96-wide heads run on the 128-wide kernel, and the
@@ -748,7 +928,7 @@ mod tests {
     #[test]
     fn a_padded_head_reaches_the_geometry_as_a_width() {
         let f = LlamaLikeFacts::phi3_mini();
-        let d = deployment(&f, 10_000.0, NORM_EPS, -1);
+        let d = deployment(&f, row(10_000.0, -1));
         assert_eq!(d.shape.head_dim, 96, "the checkpoint's own");
         assert_eq!(d.shape.head_dim_kernel, 128, "the one instantiated");
         assert_eq!(d.shape.head_dim_alloc(), 128, "the one to allocate");
@@ -763,7 +943,9 @@ mod tests {
     #[test]
     fn the_gqa_set_is_the_builds_and_not_the_familys() {
         assert_eq!(DECODE_GQA_GROUPS, &[1, 2, 3, 4, 8]);
-        let g = deployment(&LlamaLikeFacts::qwen3_0_6b(), 1e6, NORM_EPS, -1).shape.gqa_group();
+        let g = deployment(&LlamaLikeFacts::qwen3_0_6b(), row(1e6, -1))
+            .shape
+            .gqa_group();
         assert!(DECODE_GQA_GROUPS.contains(&g), "qwen3-0.6b's 2 is servable");
         assert_eq!(Geometry::EMPTY.gqa_group(), 0, "no division by zero");
     }
@@ -772,9 +954,9 @@ mod tests {
     #[test]
     fn the_window_is_stated_per_layer() {
         let f = LlamaLikeFacts::mistral_7b_v03();
-        let full = deployment(&f, 1e6, NORM_EPS, -1);
+        let full = deployment(&f, row(1e6, -1));
         assert!(full.attention.iter().all(|a| a.window == -1));
-        let windowed = deployment(&f, 1e6, NORM_EPS, 4096);
+        let windowed = deployment(&f, row(1e6, 4096));
         assert!(windowed.attention.iter().all(|a| a.window == 4096));
     }
 
@@ -782,7 +964,7 @@ mod tests {
     /// is a fact about a LAYER there rather than a family here.
     #[test]
     fn every_layer_owns_its_own_pages() {
-        let d = deployment(&LlamaLikeFacts::qwen3_0_6b(), 1e6, NORM_EPS, -1);
+        let d = deployment(&LlamaLikeFacts::qwen3_0_6b(), row(1e6, -1));
         for (l, a) in d.attention.iter().enumerate() {
             assert_eq!(a.kv_source, l as u32);
             assert_eq!(a.rope_theta, 1e6);
@@ -803,11 +985,19 @@ mod tests {
     fn a_tie_is_an_absence_the_manifest_expects() {
         use crate::manifest::Presence;
         let tied = manifest(&LlamaLikeFacts::qwen3_0_6b());
-        let head = tied.tensors.iter().find(|t| t.name == "lm_head").expect("stated");
+        let head = tied
+            .tensors
+            .iter()
+            .find(|t| t.name == "lm_head")
+            .expect("stated");
         assert_eq!(head.presence, Presence::Absent);
 
         let untied = manifest(&LlamaLikeFacts::phi3_mini());
-        let head = untied.tensors.iter().find(|t| t.name == "lm_head").expect("stated");
+        let head = untied
+            .tensors
+            .iter()
+            .find(|t| t.name == "lm_head")
+            .expect("stated");
         assert_eq!(head.presence, Presence::Required);
     }
 
@@ -816,7 +1006,12 @@ mod tests {
     #[test]
     fn a_mixture_ships_a_router() {
         let dense = manifest(&LlamaLikeFacts::qwen3_0_6b());
-        assert!(dense.tensors.iter().any(|t| t.name.contains("mlp.gate_proj")));
+        assert!(
+            dense
+                .tensors
+                .iter()
+                .any(|t| t.name.contains("mlp.gate_proj"))
+        );
         assert!(!dense.tensors.iter().any(|t| t.name.ends_with("mlp.gate")));
 
         let moe = manifest(&LlamaLikeFacts::qwen3_30b_a3b());
@@ -831,7 +1026,12 @@ mod tests {
         let with = manifest(&LlamaLikeFacts::qwen2_5_1_5b());
         assert!(with.tensors.iter().any(|t| t.name.ends_with("q_proj.bias")));
         let without = manifest(&LlamaLikeFacts::qwen3_0_6b());
-        assert!(!without.tensors.iter().any(|t| t.name.ends_with("q_proj.bias")));
+        assert!(
+            !without
+                .tensors
+                .iter()
+                .any(|t| t.name.ends_with("q_proj.bias"))
+        );
     }
 
     /// The q/k-norm question the old derivation answered by dividing a
@@ -875,8 +1075,26 @@ mod tests {
     /// qwen3-0.6b's row, as the generation states it — a full-attention
     /// dense stack on one rope base.
     #[cfg(feature = "forward")]
-    fn qwen3_row() -> MetalRow {
-        MetalRow { rope_theta: 1e6, norm_eps: 1e-6, window: -1, rope_rescaled: false }
+    /// A row for the deployment tests, so they state one the way a
+    /// generation does rather than four loose scalars.
+    fn row(rope_theta: f32, window: i32) -> RowScalars {
+        RowScalars {
+            rope_theta,
+            norm_eps: NORM_EPS,
+            window,
+            rope_rescaled: false,
+            norm_topk_prob: true,
+        }
+    }
+
+    fn qwen3_row() -> RowScalars {
+        RowScalars {
+            rope_theta: 1e6,
+            norm_eps: 1e-6,
+            window: -1,
+            rope_rescaled: false,
+            norm_topk_prob: true,
+        }
     }
 
     /// THE claim this projection makes: the binding is the LOAD's
@@ -895,7 +1113,7 @@ mod tests {
     fn the_metal_binding_is_the_loads_answer_and_the_rest_is_the_rows() {
         let f = LlamaLikeFacts::qwen3_0_6b();
         let bind = binding(64, 4);
-        let m = metal_facts(&f, qwen3_row(), Deployed::metal(&bind), &bind);
+        let m = metal_facts(qwen3_row(), Deployed::metal(&bind), &bind);
 
         // The LOAD's six, field for field.
         assert!(m.fuse_residual_gemv);
@@ -919,8 +1137,14 @@ mod tests {
         assert_eq!(m.rope_theta, 1e6);
         assert!(!m.rope_freq_table, "a plain geometric ladder");
         assert!(m.window_left.is_empty(), "qwen3 attends its whole prefix");
-        assert_eq!(m.activation, super::super::forward::facts::Activation::SiluMul);
-        assert!(!m.gate_up_fused, "the manifest states gate and up as two tensors");
+        assert_eq!(
+            m.activation,
+            super::super::forward::facts::Activation::SiluMul
+        );
+        assert!(
+            !m.gate_up_fused,
+            "the manifest states gate and up as two tensors"
+        );
     }
 
     /// The same row under a DIFFERENT publication of the same weights.
@@ -935,11 +1159,14 @@ mod tests {
         let f = LlamaLikeFacts::qwen3_0_6b();
         let four = binding(64, 4);
         let eight = binding(128, 8);
-        let a = metal_facts(&f, qwen3_row(), Deployed::metal(&four), &four);
-        let b = metal_facts(&f, qwen3_row(), Deployed::metal(&eight), &eight);
+        let a = metal_facts(qwen3_row(), Deployed::metal(&four), &four);
+        let b = metal_facts(qwen3_row(), Deployed::metal(&eight), &eight);
 
         assert_ne!(a.affine_bits, b.affine_bits);
-        assert_ne!(a.proj_repr, b.proj_repr, "g64/b8 and g128/b4 pack identically");
+        assert_ne!(
+            a.proj_repr, b.proj_repr,
+            "g64/b8 and g128/b4 pack identically"
+        );
         // And nothing the ROW states moved, because nothing about the
         // model did.
         assert_eq!(a.rms_eps, b.rms_eps);
@@ -960,8 +1187,14 @@ mod tests {
     fn a_second_row_states_its_own_window_and_its_own_base() {
         let f = LlamaLikeFacts::mistral_7b_v03();
         let bind = binding(64, 4);
-        let row = MetalRow { rope_theta: 1e6, norm_eps: 1e-5, window: 4096, rope_rescaled: false };
-        let m = metal_facts(&f, row, Deployed::metal(&bind), &bind);
+        let row = RowScalars {
+            rope_theta: 1e6,
+            norm_eps: 1e-5,
+            window: 4096,
+            rope_rescaled: false,
+            norm_topk_prob: true,
+        };
+        let m = metal_facts(row, Deployed::metal(&bind), &bind);
 
         assert_eq!(m.rms_eps, 1e-5, "mistral's, not qwen3's");
         assert_eq!(m.window_left, vec![4096]);
@@ -973,7 +1206,7 @@ mod tests {
         }
         // And the row with no window states none, which the accessor
         // reads as the whole context rather than as a zero-width one.
-        let full = metal_facts(&LlamaLikeFacts::qwen3_0_6b(), qwen3_row(), Deployed::metal(&bind), &bind);
+        let full = metal_facts(qwen3_row(), Deployed::metal(&bind), &bind);
         assert_eq!(full.window_left_at(0), -1);
     }
 
@@ -989,7 +1222,7 @@ mod tests {
     #[test]
     fn the_gemma_shaped_facts_are_stated_rather_than_defaulted() {
         let bind = binding(64, 4);
-        let m = metal_facts(&LlamaLikeFacts::qwen3_0_6b(), qwen3_row(), Deployed::metal(&bind), &bind);
+        let m = metal_facts(qwen3_row(), Deployed::metal(&bind), &bind);
         assert_eq!(m.rope_theta_sliding, 0.0, "one base for every layer");
         assert_eq!(m.global_head_dim, 0, "one attention shape");
         assert_eq!(m.global_kv_heads, 0);
@@ -1021,7 +1254,7 @@ mod tests {
     #[test]
     fn the_gemm_tile_is_the_builds_stamp_and_not_the_rows() {
         let bind = binding(64, 4);
-        let m = metal_facts(&LlamaLikeFacts::qwen3_0_6b(), qwen3_row(), Deployed::metal(&bind), &bind);
+        let m = metal_facts(qwen3_row(), Deployed::metal(&bind), &bind);
         assert_eq!(QMM_TILE, (16, 32));
         assert_eq!(m.qmm_tile, QMM_TILE);
         // The narrowest rung `qmm_bm` can pick, and the only column tile
@@ -1042,14 +1275,23 @@ mod tests {
     fn the_expert_bank_names_its_own_format_only_when_the_load_left_one() {
         let f = LlamaLikeFacts::qwen3_30b_a3b();
         let plain = binding(64, 4);
-        let mixed = MetalBinding { moe_mxfp4: true, ..binding(64, 4) };
+        let mixed = MetalBinding {
+            moe_mxfp4: true,
+            ..binding(64, 4)
+        };
 
-        let uniform = metal_facts(&f, qwen3_row(), Deployed::metal(&plain), &plain);
+        let uniform = metal_facts(qwen3_row(), Deployed::metal(&plain), &plain);
         assert_eq!(uniform.moe_repr, None);
 
-        let split = metal_facts(&f, qwen3_row(), Deployed::metal(&mixed), &mixed);
-        assert_eq!(split.moe_repr, Some(model_compiler::dsl::WeightRepr::Mxfp4Marlin));
-        assert_eq!(split.moe_bits, 4, "MXFP4 is four bits by the format's own name");
+        let split = metal_facts(qwen3_row(), Deployed::metal(&mixed), &mixed);
+        assert_eq!(
+            split.moe_repr,
+            Some(model_compiler::dsl::WeightRepr::Mxfp4Marlin)
+        );
+        assert_eq!(
+            split.moe_bits, 4,
+            "MXFP4 is four bits by the format's own name"
+        );
     }
 
     /// A rescaled ladder reaches the text as a TABLE, not as a base.
@@ -1064,11 +1306,14 @@ mod tests {
     fn a_rescaled_ladder_is_a_table_and_a_plain_one_is_a_base() {
         let f = LlamaLikeFacts::qwen3_0_6b();
         let bind = binding(64, 4);
-        let plain = metal_facts(&f, qwen3_row(), Deployed::metal(&bind), &bind);
+        let plain = metal_facts(qwen3_row(), Deployed::metal(&bind), &bind);
         assert!(!plain.rope_freq_table);
 
-        let rescaled = MetalRow { rope_rescaled: true, ..qwen3_row() };
-        let m = metal_facts(&f, rescaled, Deployed::metal(&bind), &bind);
+        let rescaled = RowScalars {
+            rope_rescaled: true,
+            ..qwen3_row()
+        };
+        let m = metal_facts(rescaled, Deployed::metal(&bind), &bind);
         assert!(m.rope_freq_table, "the driver hands over a table instead");
     }
 
@@ -1090,8 +1335,16 @@ mod tests {
                 .expect("the CUDA text is written");
             let metal = trace(&f, qwen3_row(), class, Deployed::metal(&bind))
                 .expect("and so is the Metal one");
-            assert!(cuda.family.starts_with("llama_like.cuda."), "{}", cuda.family);
-            assert!(metal.family.starts_with("llama_like.metal."), "{}", metal.family);
+            assert!(
+                cuda.family.starts_with("llama_like.cuda."),
+                "{}",
+                cuda.family
+            );
+            assert!(
+                metal.family.starts_with("llama_like.metal."),
+                "{}",
+                metal.family
+            );
             assert_ne!(cuda.ops.len(), 0);
             assert_ne!(metal.ops.len(), 0);
         }
@@ -1112,7 +1365,11 @@ mod tests {
         use model_compiler::trace::FireClass;
         let f = LlamaLikeFacts::qwen3_0_6b();
         let bind = binding(64, 4);
-        let sharded = Deployed { backend: Backend::Metal(&bind), tp_size: 4, layer_scalars: &[] };
+        let sharded = Deployed {
+            backend: Backend::Metal(&bind),
+            tp_size: 4,
+            layer_scalars: &[],
+        };
         let err = trace(&f, qwen3_row(), FireClass::Decode, sharded)
             .expect_err("four ranks and no shard vocabulary");
         assert_eq!(err, Refusal::Unsupported(NO_METAL_SHARD));
@@ -1121,7 +1378,11 @@ mod tests {
         assert!(trace(&f, qwen3_row(), FireClass::Decode, Deployed::metal(&bind)).is_ok());
         // The CUDA side shards and keeps tracing: `tp_size` is a fact
         // its own facts carry.
-        let cuda = Deployed { backend: Backend::Cuda, tp_size: 4, layer_scalars: &[] };
+        let cuda = Deployed {
+            backend: Backend::Cuda,
+            tp_size: 4,
+            layer_scalars: &[],
+        };
         assert!(trace(&f, qwen3_row(), FireClass::Decode, cuda).is_ok());
     }
 
@@ -1204,12 +1465,28 @@ mod tests {
         // 32, so the affine point is not asked of it.
         let mut mxfp4 = binding(128, 8);
         mxfp4.moe_mxfp4 = true;
-        assert!(trace(&moe, qwen3_row(), FireClass::Decode, Deployed::metal(&mxfp4)).is_ok());
+        assert!(
+            trace(
+                &moe,
+                qwen3_row(),
+                FireClass::Decode,
+                Deployed::metal(&mxfp4)
+            )
+            .is_ok()
+        );
 
         // A DENSE row is not asked either: the point governs the expert
         // bank, and a row with no bank has no stake in it.
         let dense = LlamaLikeFacts::qwen3_0_6b();
         assert_eq!(dense.n_experts, 0);
-        assert!(trace(&dense, qwen3_row(), FireClass::Decode, Deployed::metal(&bad)).is_ok());
+        assert!(
+            trace(
+                &dense,
+                qwen3_row(),
+                FireClass::Decode,
+                Deployed::metal(&bad)
+            )
+            .is_ok()
+        );
     }
 }

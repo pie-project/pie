@@ -22,8 +22,8 @@
 //! contexts than the card can hold) or too large (an out-of-memory at the
 //! first wide prefill). That is why each one below names its source.
 
-use model::deployment::Deployment;
 use crate::layout::workspace::{WorkspaceLayout, WorkspaceShape};
+use model::deployment::Deployment;
 
 use super::memory_planner::ModelCosts;
 
@@ -61,7 +61,10 @@ impl CheckpointCosts {
     /// `tp_size`.
     #[must_use]
     pub fn new(dep: &Deployment, tp_size: u32) -> Self {
-        Self { dep: dep.clone(), tp_size: i32::try_from(tp_size).unwrap_or(1).max(1) }
+        Self {
+            dep: dep.clone(),
+            tp_size: i32::try_from(tp_size).unwrap_or(1).max(1),
+        }
     }
 
     /// This rank's KV head count, floored at one.
@@ -71,8 +74,7 @@ impl CheckpointCosts {
     /// fraction of a head, and the two have to agree or the pool the planner
     /// sized is not the pool the fire builds.
     fn kv_heads(&self) -> u64 {
-        let per_rank =
-            i32::try_from(self.dep.shape.kv_heads).unwrap_or(0) / self.tp_size.max(1);
+        let per_rank = i32::try_from(self.dep.shape.kv_heads).unwrap_or(0) / self.tp_size.max(1);
         u64::from(per_rank.max(1).unsigned_abs())
     }
 
@@ -91,7 +93,10 @@ impl CheckpointCosts {
     /// question asked of a number that happened to be present rather
     /// than of the answer the row gives.
     fn mla_geometry(&self) -> Option<super::mla_geometry::MlaGeometry> {
-        let model::deployment::KvStyle::Mla { kv_lora_rank, qk_rope_head_dim } = &self.dep.kv
+        let model::deployment::KvStyle::Mla {
+            kv_lora_rank,
+            qk_rope_head_dim,
+        } = &self.dep.kv
         else {
             return None;
         };
@@ -237,7 +242,8 @@ impl ModelCosts for CheckpointCosts {
         // page reference.
         let per_token = 4 * n;
         let per_request = 3 * (r + 1);
-        (per_token + per_request + pages) * 4 + u64::from(max_custom_mask_bytes.max(0).unsigned_abs())
+        (per_token + per_request + pages) * 4
+            + u64::from(max_custom_mask_bytes.max(0).unsigned_abs())
     }
 
     /// Zero: this driver binds quantized weights AS STORED and never
@@ -255,7 +261,10 @@ impl ModelCosts for CheckpointCosts {
     /// spelling correctly in three places. The row answers instead:
     /// `recurrent` is `Some` exactly when there are slabs to allocate.
     fn has_linear_state(&self) -> bool {
-        self.dep.recurrent.as_ref().is_some_and(|r| !r.linear_layers.is_empty())
+        self.dep
+            .recurrent
+            .as_ref()
+            .is_some_and(|r| !r.linear_layers.is_empty())
     }
 }
 
@@ -381,7 +390,10 @@ mod tests {
         d.shape.moe_intermediate = 9216;
         let c = CheckpointCosts::new(&d, 1);
         assert_eq!(c.max_intermediate(), 9216);
-        assert!(c.arena_bytes(4096, 0, 0) > CheckpointCosts::new(&qwen3_0_6b(), 1).arena_bytes(4096, 0, 0));
+        assert!(
+            c.arena_bytes(4096, 0, 0)
+                > CheckpointCosts::new(&qwen3_0_6b(), 1).arena_bytes(4096, 0, 0)
+        );
     }
 
     #[test]
@@ -396,7 +408,10 @@ mod tests {
         d.shape.kv_heads = 128;
         d.shape.head_dim = 192;
         d.shape.head_dim_kernel = 192;
-        d.kv = KvStyle::Mla { kv_lora_rank: 512, qk_rope_head_dim: 64 };
+        d.kv = KvStyle::Mla {
+            kv_lora_rank: 512,
+            qk_rope_head_dim: 64,
+        };
         let c = CheckpointCosts::new(&d, 1);
 
         let latent = 61 * (512 + 64) * 2;
@@ -421,10 +436,22 @@ mod tests {
         // A row cannot state this and the loader will not build it, but
         // dividing by it later would be worse than falling back here.
         let mut d = qwen3_0_6b();
-        d.kv = KvStyle::Mla { kv_lora_rank: 0, qk_rope_head_dim: 64 };
-        assert_eq!(CheckpointCosts::new(&d, 1).per_kv_token_bytes(), 28 * 8 * 128 * 2 * 2);
-        d.kv = KvStyle::Mla { kv_lora_rank: 512, qk_rope_head_dim: 0 };
-        assert_eq!(CheckpointCosts::new(&d, 1).per_kv_token_bytes(), 28 * 8 * 128 * 2 * 2);
+        d.kv = KvStyle::Mla {
+            kv_lora_rank: 0,
+            qk_rope_head_dim: 64,
+        };
+        assert_eq!(
+            CheckpointCosts::new(&d, 1).per_kv_token_bytes(),
+            28 * 8 * 128 * 2 * 2
+        );
+        d.kv = KvStyle::Mla {
+            kv_lora_rank: 512,
+            qk_rope_head_dim: 0,
+        };
+        assert_eq!(
+            CheckpointCosts::new(&d, 1).per_kv_token_bytes(),
+            28 * 8 * 128 * 2 * 2
+        );
     }
 
     #[test]
@@ -432,7 +459,9 @@ mod tests {
         let plain = CheckpointCosts::new(&qwen3_0_6b(), 1).per_kv_token_bytes();
 
         let mut d = qwen3_0_6b();
-        d.kv = KvStyle::Dsv4 { ratios: vec![4, 4, 4] };
+        d.kv = KvStyle::Dsv4 {
+            ratios: vec![4, 4, 4],
+        };
         let with_compressor = CheckpointCosts::new(&d, 1).per_kv_token_bytes();
         assert!(
             with_compressor > plain,
@@ -491,7 +520,10 @@ mod tests {
         // Constants, and asserted so a change to either has to be a
         // change to a test that says why.
         let c = CheckpointCosts::new(&qwen3_0_6b(), 1);
-        assert_eq!(c.attn_float_workspace_bytes(4096, 256), ATTN_FLOAT_WORKSPACE_BYTES);
+        assert_eq!(
+            c.attn_float_workspace_bytes(4096, 256),
+            ATTN_FLOAT_WORKSPACE_BYTES
+        );
         assert_eq!(c.envelope_bytes_per_page(), 0);
         assert_eq!(c.runtime_quant_scratch_bytes(4096), 0);
     }

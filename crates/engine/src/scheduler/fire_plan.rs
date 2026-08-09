@@ -408,7 +408,7 @@ pub(crate) fn plan_fire_with_model(members: &[MemberFacts], model_sites: &[Site]
                 std::sync::atomic::AtomicBool::new(false);
             if !FIRED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!(
-                    "[seriation] window axis fragmented under the Act-2 order                      (mask_ok={mask_ok} hook_ok={hook_ok} trunc_ok={trunc_ok},                      order={member_order:?}) — this combination wants the                      gather fallback"
+                    "[seriation] window axis fragmented under the Act-2 order (mask_ok={mask_ok} hook_ok={hook_ok} trunc_ok={trunc_ok}, order={member_order:?}) — this combination wants the gather fallback"
                 );
             }
         }
@@ -480,7 +480,7 @@ pub(crate) fn plan_fire_with_model(members: &[MemberFacts], model_sites: &[Site]
                 fast_rows: unmasked_rows,
             },
             note: format!(
-                "{mask_members} masked lane(s) seriated to the tail; the                  unmasked prefix keeps the plain attention arm (NS-2                  consumes the split)"
+                "{mask_members} masked lane(s) seriated to the tail; the unmasked prefix keeps the plain attention arm (NS-2 consumes the split)"
             ),
         }
     };

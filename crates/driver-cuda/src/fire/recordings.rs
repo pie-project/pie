@@ -87,11 +87,17 @@ pub fn predicate_of(slot: u32, param: u32, rows: &[Row]) -> Option<bool> {
 /// # Errors
 ///
 /// If two conditionals need one slot to hold different values.
-pub fn fire_predicates(rows: &[Row], conds: &[CondRegion], preds: &mut PredicateWord) -> Result<()> {
+pub fn fire_predicates(
+    rows: &[Row],
+    conds: &[CondRegion],
+    preds: &mut PredicateWord,
+) -> Result<()> {
     preds.clear();
     let mut written: HashMap<u32, bool> = HashMap::new();
     for c in conds {
-        let Some(value) = predicate_of(c.slot, c.param, rows) else { continue };
+        let Some(value) = predicate_of(c.slot, c.param, rows) else {
+            continue;
+        };
         if let Some(&prior) = written.get(&c.slot)
             && prior != value
         {
@@ -165,7 +171,12 @@ impl BucketKey {
         _fire: model_compiler::trace::FireClass,
         model: u64,
     ) -> Self {
-        Self { requests, tokens, model, lora_shape: 0 }
+        Self {
+            requests,
+            tokens,
+            model,
+            lora_shape: 0,
+        }
     }
 
     /// The same key for a fire that staged adapters.
@@ -202,9 +213,7 @@ pub enum Ineligible {
 /// what the fire actually assembled, and the failure mode of getting it
 /// wrong is a replay that runs a stale program rather than an error.
 #[must_use]
-pub fn union_eligibility(
-    lora: Option<&crate::fire::lora::LoraFireState>,
-) -> Option<Ineligible> {
+pub fn union_eligibility(lora: Option<&crate::fire::lora::LoraFireState>) -> Option<Ineligible> {
     match lora {
         Some(l) if !l.union_capture_safe() => Some(Ineligible::UngroupedLora),
         _ => None,
@@ -352,7 +361,15 @@ impl Recordings {
         if let Some(why) = eligibility {
             return Err(why);
         }
-        self.execs.insert(key, Entry { exec, epoch, digest: 0, nodes: Vec::new() });
+        self.execs.insert(
+            key,
+            Entry {
+                exec,
+                epoch,
+                digest: 0,
+                nodes: Vec::new(),
+            },
+        );
         Ok(())
     }
 
@@ -378,7 +395,15 @@ impl Recordings {
         if let Some(why) = eligibility {
             return Err(why);
         }
-        self.execs.insert(key, Entry { exec, epoch, digest, nodes });
+        self.execs.insert(
+            key,
+            Entry {
+                exec,
+                epoch,
+                digest,
+                nodes,
+            },
+        );
         Ok(())
     }
 
@@ -400,7 +425,9 @@ impl Recordings {
         epoch: PlanEpoch,
         grids: &[Option<u32>],
     ) -> Result<bool> {
-        let Some(entry) = self.execs.get(&key) else { return Ok(false) };
+        let Some(entry) = self.execs.get(&key) else {
+            return Ok(false);
+        };
         if entry.epoch != epoch {
             return Ok(false);
         }
@@ -446,7 +473,9 @@ impl Recordings {
             self.execs.remove(&key);
             return Ok(false);
         }
-        let Some(exec) = self.get(key, epoch) else { return Ok(false) };
+        let Some(exec) = self.get(key, epoch) else {
+            return Ok(false);
+        };
         exec.launch(stream)?;
         Ok(true)
     }
@@ -618,7 +647,10 @@ mod tests {
     fn a_miss_is_not_an_error() {
         let mut c = Recordings::new();
         assert!(c.is_empty());
-        assert!(c.get(BucketKey::new(1, 1, FireClass::Decode, 0), PlanEpoch::at(0)).is_none());
+        assert!(
+            c.get(BucketKey::new(1, 1, FireClass::Decode, 0), PlanEpoch::at(0))
+                .is_none()
+        );
         assert_eq!(c.stats(), (0, 1, 0));
     }
 }

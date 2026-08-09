@@ -1,7 +1,7 @@
 //! Loading: the checkpoint's bytes onto the device, through the loader's plan.
 //!
 //! The division the C++ tree did not have. `model-loader` compiles a contract
-//! into a `LoadPlan`, `model_loader::executor::host` runs it, and
+//! into a `LoadPlan`, `model_loader::executor::Execution` runs it, and
 //! `model_loader::executor::cuda` is the arena it runs into; this module is
 //! only what a driver alone can state — what its device is ([`plan`]), and
 //! where the memory comes from ([`stage`]).
@@ -13,8 +13,8 @@
 //! kernel covered — a load-time decision on the wrong side of the boundary,
 //! and one no second consumer could reach.
 
-pub mod weight_view;
-#[cfg(feature = "abi")]
-pub mod stage;
 #[cfg(feature = "abi")]
 pub mod plan;
+#[cfg(feature = "abi")]
+pub mod stage;
+pub mod weight_view;

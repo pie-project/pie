@@ -5,8 +5,8 @@
 //! flattens it, and `run` walks the result.
 
 use crate::error::{Error, Result};
-use crate::serve::state::Shell;
 use crate::layout::region::Region;
+use crate::serve::state::Shell;
 
 /// What a frame did, when it did not fail.
 ///
@@ -508,10 +508,7 @@ fn read_logits(
     // the loop just above this. The wait is what makes the read valid, so a
     // caller that stops waiting has to stop calling this.
     let raw = unsafe {
-        std::slice::from_raw_parts(
-            arena.contents().cast::<u8>().as_ptr().add(r.at),
-            span,
-        )
+        std::slice::from_raw_parts(arena.contents().cast::<u8>().as_ptr().add(r.at), span)
     };
     let values = match r.bytes {
         2 => raw

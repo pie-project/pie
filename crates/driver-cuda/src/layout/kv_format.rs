@@ -158,7 +158,10 @@ impl KvCacheFormat {
     /// that one string. Preserved rather than normalised: the name reaches
     /// logs and the plan, and a rewrite that changes what a log says is a
     /// rewrite that cannot be diffed against the original.
-    pub const NVFP4: Self = Self { name: "nvfp4", ..Self::FP4_E2M1 };
+    pub const NVFP4: Self = Self {
+        name: "nvfp4",
+        ..Self::FP4_E2M1
+    };
 
     /// Build a format from its fields, as the C++'s aggregate initialisation
     /// does.
@@ -238,8 +241,7 @@ impl KvCacheFormat {
     /// Is this the plain bf16 format?
     #[must_use]
     pub const fn is_native_bf16(&self) -> bool {
-        matches!(self.scheme, KvCacheScheme::Native)
-            && matches!(self.storage_dtype, DType::Bf16)
+        matches!(self.scheme, KvCacheScheme::Native) && matches!(self.storage_dtype, DType::Bf16)
     }
 
     /// Does this format allocate a side-scale buffer?
@@ -265,12 +267,7 @@ impl KvCacheFormat {
 
     /// Bytes in one K page, or equivalently one V page.
     #[must_use]
-    pub const fn kv_bytes_per_page(
-        &self,
-        page_size: u32,
-        num_kv_heads: u32,
-        head_dim: u32,
-    ) -> u64 {
+    pub const fn kv_bytes_per_page(&self, page_size: u32, num_kv_heads: u32, head_dim: u32) -> u64 {
         page_size as u64
             * num_kv_heads as u64
             * self.storage_head_dim(head_dim)
@@ -293,15 +290,15 @@ impl KvCacheFormat {
             KvCacheScaleLayout::None => return 0,
             KvCacheScaleLayout::PerTokenHead => 1,
             KvCacheScaleLayout::PerTokenHeadBlock => {
-                let block =
-                    if self.block_size > 0 { self.block_size } else { DEFAULT_SCALE_BLOCK };
+                let block = if self.block_size > 0 {
+                    self.block_size
+                } else {
+                    DEFAULT_SCALE_BLOCK
+                };
                 (head_dim as u64).div_ceil(block as u64)
             }
         };
-        page_size as u64
-            * num_kv_heads as u64
-            * scales_per_head
-            * DType::Fp32.size_bytes() as u64
+        page_size as u64 * num_kv_heads as u64 * scales_per_head * DType::Fp32.size_bytes() as u64
     }
 
     /// Bytes for one whole page: K and V, plus both their scale planes.
@@ -361,7 +358,11 @@ impl KvCacheFormat {
     /// point of the catalogue existing.
     #[must_use]
     pub fn valid_names() -> String {
-        Self::CATALOGUE.iter().map(|(alias, _)| *alias).collect::<Vec<_>>().join(", ")
+        Self::CATALOGUE
+            .iter()
+            .map(|(alias, _)| *alias)
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -387,26 +388,48 @@ mod tests {
         // The property the single table buys: parser and message cannot
         // disagree, because there is nothing for them to disagree about.
         for &(alias, expected) in KvCacheFormat::CATALOGUE {
-            assert_eq!(KvCacheFormat::from_name(alias).unwrap(), expected, "alias {alias}");
+            assert_eq!(
+                KvCacheFormat::from_name(alias).unwrap(),
+                expected,
+                "alias {alias}"
+            );
             assert!(KvCacheFormat::is_valid_name(alias));
         }
     }
 
     #[test]
     fn parsing_is_case_insensitive_and_empty_means_auto() {
-        assert_eq!(KvCacheFormat::from_name("BF16").unwrap(), KvCacheFormat::BF16);
-        assert_eq!(KvCacheFormat::from_name("Fp8_E4M3").unwrap(), KvCacheFormat::FP8_E4M3);
-        assert_eq!(KvCacheFormat::from_name("NVFP4").unwrap(), KvCacheFormat::NVFP4);
+        assert_eq!(
+            KvCacheFormat::from_name("BF16").unwrap(),
+            KvCacheFormat::BF16
+        );
+        assert_eq!(
+            KvCacheFormat::from_name("Fp8_E4M3").unwrap(),
+            KvCacheFormat::FP8_E4M3
+        );
+        assert_eq!(
+            KvCacheFormat::from_name("NVFP4").unwrap(),
+            KvCacheFormat::NVFP4
+        );
         assert_eq!(KvCacheFormat::from_name("").unwrap(), KvCacheFormat::BF16);
-        assert_eq!(KvCacheFormat::from_name("auto").unwrap(), KvCacheFormat::default());
+        assert_eq!(
+            KvCacheFormat::from_name("auto").unwrap(),
+            KvCacheFormat::default()
+        );
     }
 
     #[test]
     fn an_unknown_name_is_refused_and_the_message_lists_the_alternatives() {
         let err = KvCacheFormat::from_name("fp6").unwrap_err();
         let text = err.to_string();
-        assert!(text.contains("fp6"), "the message must quote what was asked for: {text}");
-        assert!(text.contains("nvfp4"), "and list what was available: {text}");
+        assert!(
+            text.contains("fp6"),
+            "the message must quote what was asked for: {text}"
+        );
+        assert!(
+            text.contains("nvfp4"),
+            "and list what was available: {text}"
+        );
         assert!(!KvCacheFormat::is_valid_name("fp6"));
     }
 
@@ -421,7 +444,10 @@ mod tests {
         assert_eq!(a.scale_layout(), b.scale_layout());
         assert_eq!(a.storage_dtype(), b.storage_dtype());
         assert_eq!(a.block_size(), b.block_size());
-        assert_eq!(a.total_bytes_per_page(16, 8, 128), b.total_bytes_per_page(16, 8, 128));
+        assert_eq!(
+            a.total_bytes_per_page(16, 8, 128),
+            b.total_bytes_per_page(16, 8, 128)
+        );
     }
 
     #[test]
@@ -440,7 +466,11 @@ mod tests {
     fn fp4_packs_two_values_per_byte_and_rounds_an_odd_head_dim_up() {
         let f = KvCacheFormat::FP4_E2M1;
         assert_eq!(f.storage_head_dim(128), 64);
-        assert_eq!(f.storage_head_dim(127), 64, "ceil, so the last value keeps a byte");
+        assert_eq!(
+            f.storage_head_dim(127),
+            64,
+            "ceil, so the last value keeps a byte"
+        );
         assert_eq!(f.storage_head_dim(1), 1);
         assert_eq!(f.storage_head_dim(0), 0);
         // Half the bytes of an int8 cache of the same logical shape, which is
@@ -488,7 +518,10 @@ mod tests {
         // Only reachable through a hand-built format; the C++ spells the
         // fallback as a bare literal inside the size computation, so it is
         // pinned here rather than left to be rediscovered.
-        let f = KvCacheFormat { block_size: 0, ..KvCacheFormat::FP4_E2M1 };
+        let f = KvCacheFormat {
+            block_size: 0,
+            ..KvCacheFormat::FP4_E2M1
+        };
         assert_eq!(
             f.scale_bytes_per_page(1, 1, 64),
             KvCacheFormat::FP4_E2M1.scale_bytes_per_page(1, 1, 64)
@@ -503,7 +536,11 @@ mod tests {
         for &(alias, f) in KvCacheFormat::CATALOGUE {
             let kv = f.kv_bytes_per_page(16, 8, 128);
             let scale = f.scale_bytes_per_page(16, 8, 128);
-            assert_eq!(f.total_bytes_per_page(16, 8, 128), 2 * kv + 2 * scale, "{alias}");
+            assert_eq!(
+                f.total_bytes_per_page(16, 8, 128),
+                2 * kv + 2 * scale,
+                "{alias}"
+            );
         }
     }
 

@@ -29,17 +29,16 @@
 //! failure this crate was built to make impossible to miss, arriving in its
 //! own executor.
 
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use driver_metal::device::{Allocation, Context};
-use driver_metal::program::Compiler;
-use driver_metal::lowering::dispatch::Geometry;
 use driver_metal::bind::encode::Pipelines;
+use driver_metal::device::{Allocation, Context};
+use driver_metal::fire::run::run;
+use driver_metal::lowering::dispatch::Geometry;
 use driver_metal::lowering::executor::{Resolver, Slice};
 use driver_metal::lowering::frame::{Step, lower_step};
-use driver_metal::fire::run::run;
+use driver_metal::program::Compiler;
 use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
 use model::shared::llama_like::forward::llama_like_metal;
 use model_compiler::trace::{FireClass, ValueId};
@@ -185,7 +184,8 @@ fn a_mixture_fires_on_the_device_through_the_same_executor() {
         lowered.kernels
     );
 
-    let backing = Allocation::new(&context, 256 << 20, "sentinel weights").expect("a backing region");
+    let backing =
+        Allocation::new(&context, 256 << 20, "sentinel weights").expect("a backing region");
     let zeros = zeroed(&context);
     let mut store = Sentinels {
         slice: Slice {
@@ -266,11 +266,20 @@ fn gpt_oss_fires_on_the_device_through_the_same_executor() {
         .iter()
         .filter(|k| k.contains("_sink"))
         .count();
-    assert!(sinked > 0, "a sinked text names the sink symbol: {:?}", lowered.kernels);
-    let swiglu = lowered.kernels.iter().filter(|k| k.contains("swiglu")).count();
+    assert!(
+        sinked > 0,
+        "a sinked text names the sink symbol: {:?}",
+        lowered.kernels
+    );
+    let swiglu = lowered
+        .kernels
+        .iter()
+        .filter(|k| k.contains("swiglu"))
+        .count();
     assert!(swiglu > 0, "and its own activation: {:?}", lowered.kernels);
 
-    let backing = Allocation::new(&context, 256 << 20, "sentinel weights").expect("a backing region");
+    let backing =
+        Allocation::new(&context, 256 << 20, "sentinel weights").expect("a backing region");
     let zeros = zeroed(&context);
     let mut store = Sentinels {
         slice: Slice {
@@ -349,7 +358,12 @@ fn gemmas_side_network_fires_on_the_device() {
     let plan = llama_like_metal(&facts, &metal, FireClass::Decode);
     let lowered = lower_step(&plan, &step).expect("the step lowers");
 
-    for want in ["ple_combine", "geglu_tanh_strided", "geglu_tanh", "rms_residual_scaled"] {
+    for want in [
+        "ple_combine",
+        "geglu_tanh_strided",
+        "geglu_tanh",
+        "rms_residual_scaled",
+    ] {
         assert!(
             lowered.kernels.iter().any(|k| k.starts_with(want)),
             "a gemma text names {want}: {:?}",
@@ -357,7 +371,8 @@ fn gemmas_side_network_fires_on_the_device() {
         );
     }
 
-    let backing = Allocation::new(&context, 256 << 20, "sentinel weights").expect("a backing region");
+    let backing =
+        Allocation::new(&context, 256 << 20, "sentinel weights").expect("a backing region");
     let zeros = zeroed(&context);
     let mut store = Sentinels {
         slice: Slice {
@@ -428,7 +443,8 @@ fn the_whole_metal_text_fires_on_the_device() {
 
     // 256 MiB: wider than any tensor this text names, so a bound operand is
     // never the reason a dispatch fails.
-    let backing = Allocation::new(&context, 256 << 20, "sentinel weights").expect("a backing region");
+    let backing =
+        Allocation::new(&context, 256 << 20, "sentinel weights").expect("a backing region");
     let zeros = zeroed(&context);
     let mut store = Sentinels {
         slice: Slice {
@@ -519,7 +535,8 @@ fn a_prefill_step_fires_too_so_both_lanes_reach_the_device() {
     );
     let lowered = lower_step(&plan, &step).expect("the step lowers");
 
-    let backing = Allocation::new(&context, 256 << 20, "sentinel weights").expect("a backing region");
+    let backing =
+        Allocation::new(&context, 256 << 20, "sentinel weights").expect("a backing region");
     let zeros = zeroed(&context);
     let mut store = Sentinels {
         slice: Slice {
@@ -551,8 +568,8 @@ fn a_prefill_step_fires_too_so_both_lanes_reach_the_device() {
 /// This is the same allocation with its arguments taken from the frame.
 #[test]
 fn the_kv_pool_allocates_at_the_geometry_the_fire_states() {
-    use driver_metal::pools::kv::{Pool, translate};
     use driver_metal::layout::kv::Shape;
+    use driver_metal::pools::kv::{Pool, translate};
 
     let Ok(context) = Context::new() else {
         eprintln!("SKIP: no Metal 4 device");
@@ -585,7 +602,10 @@ fn the_kv_pool_allocates_at_the_geometry_the_fire_states() {
         "K and V must be distinct regions; one address would make the append \
          to K overwrite V"
     );
-    assert!(pool.layer(24).is_none(), "past the last layer there is none");
+    assert!(
+        pool.layer(24).is_none(),
+        "past the last layer there is none"
+    );
 
     // And the frame's translation reads against it.
     let table = [0u32, 1, 63];
@@ -606,9 +626,9 @@ fn the_kv_pool_allocates_at_the_geometry_the_fire_states() {
 /// rows toward the front, so source and destination overlap.
 #[test]
 fn a_move_plan_slides_rows_without_smearing_them() {
-    use driver_metal::pools::kv::Pool;
     use driver_metal::layout::kv::Shape;
     use driver_metal::layout::{CellCopy, CellMovePlan};
+    use driver_metal::pools::kv::Pool;
 
     let Ok(context) = Context::new() else {
         eprintln!("SKIP: no Metal 4 device");
@@ -650,7 +670,9 @@ fn a_move_plan_slides_rows_without_smearing_them() {
     .expect("the move runs");
 
     let read = |p: &driver_metal::pools::kv::Pages| -> Vec<u8> {
-        let at = p.host_span(0, total as u64).expect("the pages are addressable");
+        let at = p
+            .host_span(0, total as u64)
+            .expect("the pages are addressable");
         unsafe { std::slice::from_raw_parts(at.as_ptr().cast_const(), total) }.to_vec()
     };
     for (name, got) in [("k", read(&layer.k)), ("v", read(&layer.v))] {
@@ -706,7 +728,8 @@ fn two_whole_text_fires_are_in_flight_at_once() {
     );
     let lowered = lower_step(&plan, &step).expect("the step lowers");
 
-    let backing = Allocation::new(&context, 256 << 20, "sentinel weights").expect("a backing region");
+    let backing =
+        Allocation::new(&context, 256 << 20, "sentinel weights").expect("a backing region");
     let zeros = zeroed(&context);
     let mut store = Sentinels {
         slice: Slice {
@@ -744,15 +767,13 @@ fn two_whole_text_fires_are_in_flight_at_once() {
         regions: &mut regions,
         recordings: Some(&mut recordings),
     };
-    let first =
-        driver_metal::fire::run::submit(&mut machine, &lowered, geometry(), &mut store)
-            .expect("the first fire commits");
+    let first = driver_metal::fire::run::submit(&mut machine, &lowered, geometry(), &mut store)
+        .expect("the first fire commits");
 
     // Committed, not waited for. The second is planned, staged, bound and
     // committed with the first still outstanding.
-    let second =
-        driver_metal::fire::run::submit(&mut machine, &lowered, geometry(), &mut store)
-            .expect("the second fire commits while the first is outstanding");
+    let second = driver_metal::fire::run::submit(&mut machine, &lowered, geometry(), &mut store)
+        .expect("the second fire commits while the first is outstanding");
 
     // TWO regions, not one. The pool must not hand the second fire the arena
     // the first is still executing over -- `ALLOCATOR_COUNT = 2` bounds the

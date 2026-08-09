@@ -11,9 +11,9 @@
 //! Skipped when no device is present, or when the device has no VMM support.
 
 mod common;
-use driver_cuda::device::{Allocator, Arena, Device, OwnedStream, PhysicalPool, pages_for_bytes};
-use driver_cuda::device::LOGICAL_PAGE_BYTES;
 use common::{device_or_skip, gpu_guard};
+use driver_cuda::device::LOGICAL_PAGE_BYTES;
+use driver_cuda::device::{Allocator, Arena, Device, OwnedStream, PhysicalPool, pages_for_bytes};
 
 /// A pool sized well under the L40S's 45 GiB so the tests never compete with
 /// whatever else is on the card.
@@ -32,7 +32,11 @@ fn pool_or_skip(what: &str) -> Option<(Device, PhysicalPool)> {
             return None;
         }
     }
-    match PhysicalPool::new(dev.ordinal(), POOL_BYTES, PhysicalPool::DEFAULT_HANDLE_BYTES) {
+    match PhysicalPool::new(
+        dev.ordinal(),
+        POOL_BYTES,
+        PhysicalPool::DEFAULT_HANDLE_BYTES,
+    ) {
         Ok(p) => Some((dev, p)),
         Err(e) => {
             eprintln!("skipping {what}: pool: {e}");
@@ -43,13 +47,13 @@ fn pool_or_skip(what: &str) -> Option<(Device, PhysicalPool)> {
 
 /// Write a recognisable pattern through the arena's mapped range.
 fn fill(arena: &Arena<'_>, bytes: usize, seed: u8, stream: &OwnedStream) {
-    let pattern: Vec<u8> = (0..bytes).map(|i| seed.wrapping_add((i % 251) as u8)).collect();
+    let pattern: Vec<u8> = (0..bytes)
+        .map(|i| seed.wrapping_add((i % 251) as u8))
+        .collect();
     // SAFETY: `base()` is mapped for at least `bytes` -- every caller here has
     // just committed that much -- and the copy is synchronised before the
     // borrow ends.
-    let code = unsafe {
-        cuda_memcpy_h2d(arena.base(), pattern.as_ptr(), bytes)
-    };
+    let code = unsafe { cuda_memcpy_h2d(arena.base(), pattern.as_ptr(), bytes) };
     assert!(code, "h2d into the arena failed");
     stream.as_ref().synchronize().expect("sync");
 }
@@ -64,7 +68,9 @@ fn read_back(arena: &Arena<'_>, bytes: usize, stream: &OwnedStream) -> Vec<u8> {
 }
 
 fn expected(bytes: usize, seed: u8) -> Vec<u8> {
-    (0..bytes).map(|i| seed.wrapping_add((i % 251) as u8)).collect()
+    (0..bytes)
+        .map(|i| seed.wrapping_add((i % 251) as u8))
+        .collect()
 }
 
 // The crate does not expose a raw-address copy: `DeviceBuffer` owns its
@@ -100,7 +106,9 @@ unsafe fn cuda_memcpy_d2h(dst: *mut u8, src: u64, bytes: usize) -> bool {
 #[test]
 fn an_arena_maps_memory_that_can_actually_be_written_and_read() {
     let _gpu = gpu_guard();
-    let Some((_dev, pool)) = pool_or_skip("arena round trip") else { return };
+    let Some((_dev, pool)) = pool_or_skip("arena round trip") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let mut arena = Arena::new(&pool, 64 << 20, "roundtrip").expect("arena");
 
@@ -119,7 +127,9 @@ fn an_arena_maps_memory_that_can_actually_be_written_and_read() {
 #[test]
 fn growth_preserves_everything_already_written() {
     let _gpu = gpu_guard();
-    let Some((_dev, pool)) = pool_or_skip("growth preserves data") else { return };
+    let Some((_dev, pool)) = pool_or_skip("growth preserves data") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let mut arena = Arena::new(&pool, 128 << 20, "growth").expect("arena");
 
@@ -132,7 +142,11 @@ fn growth_preserves_everything_already_written() {
     for step in 1..=4usize {
         let target = first + step * (8 << 20);
         arena.ensure_committed(target).expect("grow");
-        assert_eq!(arena.base(), base_before, "the base address moved on growth");
+        assert_eq!(
+            arena.base(),
+            base_before,
+            "the base address moved on growth"
+        );
         assert_eq!(
             read_back(&arena, first, &stream),
             expected(first, 0x11),
@@ -149,7 +163,9 @@ fn growth_preserves_everything_already_written() {
 #[test]
 fn a_trim_releases_backing_and_a_regrow_reuses_the_cached_handle() {
     let _gpu = gpu_guard();
-    let Some((_dev, pool)) = pool_or_skip("trim and regrow") else { return };
+    let Some((_dev, pool)) = pool_or_skip("trim and regrow") else {
+        return;
+    };
     let mut arena = Arena::new(&pool, 256 << 20, "trim").expect("arena");
     let unit = arena.map_unit_bytes();
 
@@ -163,7 +179,11 @@ fn a_trim_releases_backing_and_a_regrow_reuses_the_cached_handle() {
     // to prevent.
     arena.trim_committed(unit * 2).expect("trim to 2 units");
     assert_eq!(arena.committed_bytes(), unit * 2);
-    assert_eq!(arena.cached_handle_count(), 1, "one handle should be cached against a regrow");
+    assert_eq!(
+        arena.cached_handle_count(),
+        1,
+        "one handle should be cached against a regrow"
+    );
     let charged_after_trim = pool.budget().charged_pages();
     assert!(
         charged_after_trim < charged_at_peak,
@@ -173,16 +193,29 @@ fn a_trim_releases_backing_and_a_regrow_reuses_the_cached_handle() {
     // The cached handle is already charged, so regrowing by exactly one unit
     // must not charge again.
     let before = pool.budget().charged_pages();
-    assert_eq!(arena.physical_growth_pages(unit * 3).expect("growth pages"), 0);
+    assert_eq!(
+        arena.physical_growth_pages(unit * 3).expect("growth pages"),
+        0
+    );
     arena.ensure_committed(unit * 3).expect("regrow");
-    assert_eq!(pool.budget().charged_pages(), before, "regrow double-charged the pool");
-    assert_eq!(arena.cached_handle_count(), 0, "the cached handle was not reused");
+    assert_eq!(
+        pool.budget().charged_pages(),
+        before,
+        "regrow double-charged the pool"
+    );
+    assert_eq!(
+        arena.cached_handle_count(),
+        0,
+        "the cached handle was not reused"
+    );
 }
 
 #[test]
 fn trimming_to_nothing_keeps_no_cache_at_all() {
     let _gpu = gpu_guard();
-    let Some((_dev, pool)) = pool_or_skip("trim to zero") else { return };
+    let Some((_dev, pool)) = pool_or_skip("trim to zero") else {
+        return;
+    };
     let mut arena = Arena::new(&pool, 256 << 20, "empty").expect("arena");
     let unit = arena.map_unit_bytes();
 
@@ -195,32 +228,55 @@ fn trimming_to_nothing_keeps_no_cache_at_all() {
         0,
         "an arena being emptied must not hold physical memory hostage"
     );
-    assert_eq!(pool.budget().charged_pages(), 0, "emptying an arena must return the whole charge");
+    assert_eq!(
+        pool.budget().charged_pages(),
+        0,
+        "emptying an arena must return the whole charge"
+    );
 }
 
 #[test]
 fn the_budget_actually_refuses_an_over_commit() {
     let _gpu = gpu_guard();
-    let Some((_dev, pool)) = pool_or_skip("budget refusal") else { return };
+    let Some((_dev, pool)) = pool_or_skip("budget refusal") else {
+        return;
+    };
     // The arena's capacity is larger than the pool, so the refusal has to come
     // from the budget rather than from `target_committed_bytes`.
     let mut arena = Arena::new(&pool, POOL_BYTES * 4, "greedy").expect("arena");
 
-    let err = arena.ensure_committed(POOL_BYTES * 2).expect_err("must refuse");
-    assert!(format!("{err}").contains("budget"), "unexpected error: {err}");
-    assert_eq!(arena.committed_bytes(), 0, "a refused commit must leave nothing mapped");
-    assert_eq!(pool.budget().charged_pages(), 0, "a refused commit must leave nothing charged");
+    let err = arena
+        .ensure_committed(POOL_BYTES * 2)
+        .expect_err("must refuse");
+    assert!(
+        format!("{err}").contains("budget"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        arena.committed_bytes(),
+        0,
+        "a refused commit must leave nothing mapped"
+    );
+    assert_eq!(
+        pool.budget().charged_pages(),
+        0,
+        "a refused commit must leave nothing charged"
+    );
 
     // And the pool is still usable afterwards -- the failure path returned the
     // reservation rather than leaking it.
-    arena.ensure_committed(4 << 20).expect("pool still usable after a refusal");
+    arena
+        .ensure_committed(4 << 20)
+        .expect("pool still usable after a refusal");
     assert!(arena.committed_bytes() >= (4 << 20));
 }
 
 #[test]
 fn several_arenas_share_one_budget() {
     let _gpu = gpu_guard();
-    let Some((_dev, pool)) = pool_or_skip("shared budget") else { return };
+    let Some((_dev, pool)) = pool_or_skip("shared budget") else {
+        return;
+    };
     let mut a = Arena::new(&pool, POOL_BYTES, "a").expect("arena a");
     let mut b = Arena::new(&pool, POOL_BYTES, "b").expect("arena b");
 
@@ -229,21 +285,29 @@ fn several_arenas_share_one_budget() {
     assert!(after_a > 0);
 
     // b can have the rest...
-    b.ensure_committed(POOL_BYTES / 4).expect("b takes a quarter");
-    assert!(pool.budget().charged_pages() > after_a, "b's commit was not charged");
+    b.ensure_committed(POOL_BYTES / 4)
+        .expect("b takes a quarter");
+    assert!(
+        pool.budget().charged_pages() > after_a,
+        "b's commit was not charged"
+    );
 
     // ...but not more than the rest.
-    b.ensure_committed(POOL_BYTES).expect_err("b must not exceed the shared budget");
+    b.ensure_committed(POOL_BYTES)
+        .expect_err("b must not exceed the shared budget");
 
     // a giving memory back lets b grow.
     a.trim_committed(0).expect("a releases");
-    b.ensure_committed(POOL_BYTES / 2).expect("b grows into a's freed budget");
+    b.ensure_committed(POOL_BYTES / 2)
+        .expect("b grows into a's freed budget");
 }
 
 #[test]
 fn dropping_an_arena_returns_its_charge_to_the_pool() {
     let _gpu = gpu_guard();
-    let Some((_dev, pool)) = pool_or_skip("drop returns budget") else { return };
+    let Some((_dev, pool)) = pool_or_skip("drop returns budget") else {
+        return;
+    };
     {
         let mut arena = Arena::new(&pool, 128 << 20, "temporary").expect("arena");
         arena.ensure_committed(64 << 20).expect("commit");
@@ -257,7 +321,9 @@ fn dropping_an_arena_returns_its_charge_to_the_pool() {
 
     // Prove it is really reusable, not merely accounted as such.
     let mut again = Arena::new(&pool, 128 << 20, "reuse").expect("arena");
-    again.ensure_committed(64 << 20).expect("the freed memory is genuinely available again");
+    again
+        .ensure_committed(64 << 20)
+        .expect("the freed memory is genuinely available again");
 }
 
 /// Repeated grow/trim cycles must not ratchet the charge upward. This is the
@@ -267,7 +333,9 @@ fn dropping_an_arena_returns_its_charge_to_the_pool() {
 #[test]
 fn oscillating_does_not_ratchet_the_budget() {
     let _gpu = gpu_guard();
-    let Some((_dev, pool)) = pool_or_skip("oscillation") else { return };
+    let Some((_dev, pool)) = pool_or_skip("oscillation") else {
+        return;
+    };
     let mut arena = Arena::new(&pool, 256 << 20, "oscillate").expect("arena");
     let unit = arena.map_unit_bytes();
 
@@ -288,7 +356,9 @@ fn oscillating_does_not_ratchet_the_budget() {
 #[test]
 fn recalibrate_never_drops_below_what_is_already_charged() {
     let _gpu = gpu_guard();
-    let Some((_dev, pool)) = pool_or_skip("recalibrate") else { return };
+    let Some((_dev, pool)) = pool_or_skip("recalibrate") else {
+        return;
+    };
     let mut arena = Arena::new(&pool, POOL_BYTES, "recal").expect("arena");
     arena.ensure_committed(POOL_BYTES / 2).expect("commit half");
     let charged = pool.budget().charged_pages();
@@ -312,16 +382,25 @@ fn recalibrate_never_drops_below_what_is_already_charged() {
 #[test]
 fn capacity_is_the_ceiling_not_the_virtual_reservation() {
     let _gpu = gpu_guard();
-    let Some((_dev, pool)) = pool_or_skip("capacity ceiling") else { return };
+    let Some((_dev, pool)) = pool_or_skip("capacity ceiling") else {
+        return;
+    };
     let mut arena = Arena::new(&pool, 16 << 20, "capped").expect("arena");
-    let err = arena.ensure_committed((16 << 20) + 1).expect_err("must refuse");
-    assert!(format!("{err}").contains("exceeds capacity"), "unexpected error: {err}");
+    let err = arena
+        .ensure_committed((16 << 20) + 1)
+        .expect_err("must refuse");
+    assert!(
+        format!("{err}").contains("exceeds capacity"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
 fn pool_granularity_and_pages_agree_with_the_driver() {
     let _gpu = gpu_guard();
-    let Some((_dev, pool)) = pool_or_skip("granularity") else { return };
+    let Some((_dev, pool)) = pool_or_skip("granularity") else {
+        return;
+    };
     let g = pool.allocation_granularity();
     assert!(g > 0 && g.is_power_of_two(), "implausible granularity {g}");
     assert_eq!(
@@ -329,7 +408,10 @@ fn pool_granularity_and_pages_agree_with_the_driver() {
         0,
         "the 2 MiB accounting page must be a whole number of driver granules"
     );
-    assert_eq!(pages_for_bytes(LOGICAL_PAGE_BYTES * 3, LOGICAL_PAGE_BYTES), 3);
+    assert_eq!(
+        pages_for_bytes(LOGICAL_PAGE_BYTES * 3, LOGICAL_PAGE_BYTES),
+        3
+    );
 }
 
 /// An arena and the ordinary caching allocator have to coexist: the store uses
@@ -338,7 +420,9 @@ fn pool_granularity_and_pages_agree_with_the_driver() {
 #[test]
 fn an_arena_coexists_with_ordinary_allocations() {
     let _gpu = gpu_guard();
-    let Some((_dev, pool)) = pool_or_skip("coexistence") else { return };
+    let Some((_dev, pool)) = pool_or_skip("coexistence") else {
+        return;
+    };
     let stream = OwnedStream::new(0).expect("stream");
     let alloc = Allocator::new();
     let mut arena = Arena::new(&pool, 64 << 20, "coexist").expect("arena");

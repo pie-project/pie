@@ -5,21 +5,15 @@
 //! names, answering what this deployment can do, and adopting a program.
 //! All of it happens before any fire; none of it happens again.
 
-use driver_api::local::{
-    PIE_STATUS_DRIVER_ERROR,
-    PIE_STATUS_EXHAUSTED,
-    PIE_STATUS_INVALID_ARGUMENT,
-    PIE_STATUS_UNSUPPORTED,
-    PieDriver,
-    PieDriverCaps,
-    PieDriverCreateDesc,
-    PieProgramDesc,
-    validate_create_out_params,
-};
-use crate::fire::launch::sg_trace;
 use super::checked;
 use super::state::{CAPS_JSON, LoadedModel, Shell, retire};
+use crate::fire::launch::sg_trace;
 use crate::fire::scratch::Scratch;
+use driver_api::local::{
+    PIE_STATUS_DRIVER_ERROR, PIE_STATUS_EXHAUSTED, PIE_STATUS_INVALID_ARGUMENT,
+    PIE_STATUS_UNSUPPORTED, PieDriver, PieDriverCaps, PieDriverCreateDesc, PieProgramDesc,
+    validate_create_out_params,
+};
 
 pub(crate) fn create_impl(
     desc: *const PieDriverCreateDesc,
@@ -31,7 +25,11 @@ pub(crate) fn create_impl(
     // an `abi_version` test: a caller that got a null handle learns WHY
     // from the line `checked` prints rather than from three candidate
     // causes.
-    let Ok(desc) = checked(desc, driver_api::local::validate_driver_create_desc, "create") else {
+    let Ok(desc) = checked(
+        desc,
+        driver_api::local::validate_driver_create_desc,
+        "create",
+    ) else {
         return std::ptr::null_mut();
     };
     if validate_create_out_params(caps).is_err() {
@@ -82,7 +80,9 @@ pub(crate) fn create_impl(
     // giving bf16 to a caller who asked for fp8 is the kind of wrong
     // answer that reads as a slightly worse model.
     let kv_format = match crate::layout::KvCacheFormat::from_name(
-        boot.get("driver").and_then(|d| d.get("kv_cache_dtype")?.as_str()).unwrap_or("auto"),
+        boot.get("driver")
+            .and_then(|d| d.get("kv_cache_dtype")?.as_str())
+            .unwrap_or("auto"),
     ) {
         Ok(f) => f,
         Err(e) => {
@@ -134,9 +134,7 @@ pub(crate) fn create_impl(
     // which is device 0, which is why the hardwiring was invisible. Doing it
     // at create is what makes `[driver] device` mean anything.
     if let Err(e) = crate::device::Device::bind(device_ordinal) {
-        eprintln!(
-            "[driver-cuda] create: cannot bind CUDA device {device_ordinal}: {e}"
-        );
+        eprintln!("[driver-cuda] create: cannot bind CUDA device {device_ordinal}: {e}");
         return std::ptr::null_mut();
     }
 
@@ -282,7 +280,9 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
     // model and four downloads, and a group size is not an extent of
     // any tensor.
     let config_json = match read_meta(&meta, model::encoding::CONFIG_OBJECT) {
-        Ok(Some(bytes)) => String::from_utf8(bytes).map_err(|e| i32::from(crate::Error::from(e)))?,
+        Ok(Some(bytes)) => {
+            String::from_utf8(bytes).map_err(|e| i32::from(crate::Error::from(e)))?
+        }
         Ok(None) => {
             let Some(path) = &state.boot_config else {
                 return Err(crate::Error::unsupported(
@@ -418,7 +418,10 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
              and has no forward path to serve",
         ),
     } {
-        return Err(crate::error::Error::Unsupported { what: what.to_string() }.into());
+        return Err(crate::error::Error::Unsupported {
+            what: what.to_string(),
+        }
+        .into());
     }
 
     // THE GQA RATIO, refused at LOAD rather than discovered at launch.
@@ -500,7 +503,9 @@ fn calibrate_planner(state: &mut Shell) {
     use crate::layout::calibrate::{Ceiling, Point, StepTimer, sweep};
     use crate::serve::state::{InstanceEntry, ProgramEntry};
 
-    let Some(model) = state.model.as_ref() else { return };
+    let Some(model) = state.model.as_ref() else {
+        return;
+    };
     // THE CEILING IS WHAT THE DRIVER JUST ADVERTISED, not what the planner
     // computed. Those differ: `capabilities_json` publishes the lattice's
     // rectangle, and a caller may not exceed it. Sweeping above the
@@ -542,8 +547,13 @@ fn calibrate_planner(state: &mut Shell) {
     impl StepTimer for FireTimer<'_> {
         fn step_ms(&mut self, point: Point) -> Option<f64> {
             let t = std::time::Instant::now();
-            match synthetic_fire(self.state, point, &self.instances, self.page_size, self.total_pages)
-            {
+            match synthetic_fire(
+                self.state,
+                point,
+                &self.instances,
+                self.page_size,
+                self.total_pages,
+            ) {
                 Ok(()) => Some(t.elapsed().as_secs_f64() * 1e3),
                 Err(status) => {
                     eprintln!(
@@ -580,9 +590,13 @@ fn calibrate_planner(state: &mut Shell) {
     // set up front and hand each point a prefix of it.
     let probe_program = state.next_id;
     state.next_id += 1;
-    state
-        .programs
-        .insert(probe_program, ProgramEntry { program_hash: 0, emitter_version: 0 });
+    state.programs.insert(
+        probe_program,
+        ProgramEntry {
+            program_hash: 0,
+            emitter_version: 0,
+        },
+    );
     let mut instances = Vec::with_capacity(ceiling.max_forward_requests as usize);
     for _ in 0..ceiling.max_forward_requests {
         let id = state.next_id;
@@ -598,7 +612,12 @@ fn calibrate_planner(state: &mut Shell) {
         instances.push(id);
     }
 
-    let mut timer = FireTimer { state, instances, page_size, total_pages };
+    let mut timer = FireTimer {
+        state,
+        instances,
+        page_size,
+        total_pages,
+    };
     let outcome = sweep(ceiling, &template, &mut timer);
 
     // THE PROBE LEAVES NOTHING BEHIND. Its instances hold KV pages and its
@@ -619,7 +638,10 @@ fn calibrate_planner(state: &mut Shell) {
     for s in &cal.samples {
         eprintln!(
             "[driver-cuda] calibrate: N={} R={} -> {:.2} ms (+/- {:.2}), {:.0} tok/s",
-            s.max_forward_tokens, s.max_forward_requests, s.step_ms, s.step_ms_stddev,
+            s.max_forward_tokens,
+            s.max_forward_requests,
+            s.step_ms,
+            s.step_ms_stddev,
             s.tokens_per_s
         );
     }
@@ -660,8 +682,12 @@ fn synthetic_fire(
 ) -> Result<(), i32> {
     use driver_api::local::{PieFrameDesc, PieStepDesc, PieU32Slice, PieU64Slice};
 
-    let reqs = usize::try_from(point.max_forward_requests).unwrap_or(0).min(instances.len());
-    let per = usize::try_from(point.tokens_per_request()).unwrap_or(1).max(1);
+    let reqs = usize::try_from(point.max_forward_requests)
+        .unwrap_or(0)
+        .min(instances.len());
+    let per = usize::try_from(point.tokens_per_request())
+        .unwrap_or(1)
+        .max(1);
     if reqs == 0 {
         return Err(PIE_STATUS_INVALID_ARGUMENT);
     }
@@ -715,7 +741,10 @@ fn synthetic_fire(
     let cell_ptrs: Vec<*mut driver_api::local::PieTerminalCell> =
         cells.iter_mut().map(|c| c as *mut _).collect();
 
-    let u32s = |v: &[u32]| PieU32Slice { ptr: v.as_ptr(), len: v.len() };
+    let u32s = |v: &[u32]| PieU32Slice {
+        ptr: v.as_ptr(),
+        len: v.len(),
+    };
     let step = PieStepDesc {
         roster_rows: u32s(&roster_rows),
         sub_batch_indptr: u32s(&sub_batch_indptr),
@@ -734,7 +763,10 @@ fn synthetic_fire(
     };
     let frame = PieFrameDesc {
         abi_version: driver_api::PIE_DRIVER_ABI_VERSION,
-        instance_ids: PieU64Slice { ptr: instances.as_ptr(), len: reqs },
+        instance_ids: PieU64Slice {
+            ptr: instances.as_ptr(),
+            len: reqs,
+        },
         required_kv_pages: u32::try_from(pages_total).unwrap_or(0),
         steps: driver_api::local::PieStepDescSlice { ptr: &step, len: 1 },
         ..Default::default()
@@ -766,8 +798,7 @@ fn wire_trace_names(model: &mut LoadedModel) {
         return; // no row, no names; the load already refused
     };
     let published: Vec<String> = model.weights.keys().cloned().collect();
-    let set: std::collections::BTreeSet<&str> =
-        published.iter().map(String::as_str).collect();
+    let set: std::collections::BTreeSet<&str> = published.iter().map(String::as_str).collect();
     let has = |n: &str| set.contains(n);
     let wiring = model::shared::weight_names::wire(row.load_shape(), &has);
 
@@ -793,24 +824,28 @@ fn wire_trace_names(model: &mut LoadedModel) {
             )
         });
         if abut {
-            model.weights.insert(trace, crate::weights::stage::WeightSpan {
-                ptr: spans[0].ptr,
-                bytes: spans.iter().map(|s| s.bytes).sum(),
-            });
+            model.weights.insert(
+                trace,
+                crate::weights::stage::WeightSpan {
+                    ptr: spans[0].ptr,
+                    bytes: spans.iter().map(|s| s.bytes).sum(),
+                },
+            );
         }
     }
     model.gemma_layer_scalars = wiring
         .scalars
         .iter()
         .map(|n| {
-            model.weights.get(n).map_or(1.0f32, |b| {
-                match crate::weights::stage::read_span(*b) {
+            model
+                .weights
+                .get(n)
+                .map_or(1.0f32, |b| match crate::weights::stage::read_span(*b) {
                     Ok(back) if back.len() == 2 => {
                         f32::from_bits(u32::from(u16::from_le_bytes([back[0], back[1]])) << 16)
                     }
                     _ => 1.0,
-                }
-            })
+                })
         })
         .collect();
 }
@@ -865,8 +900,7 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
     // so this ends the borrow of `state` rather than extending it across
     // the planner below.
     let model_id = model.id;
-    let device =
-        crate::device::Device::bind(state.device_ordinal)?;
+    let device = crate::device::Device::bind(state.device_ordinal)?;
     let (free, total) = device.memory_info()?;
     let (major, minor) = device.compute_capability().unwrap_or((0, 0));
     let cfg = PlannerConfig {
@@ -938,8 +972,8 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
     // stand-in when no cache directory can even be derived.
     let disk = DiskProfiles::discover("").ok();
     let profiles: &dyn ProfileSource = disk.as_ref().map_or(&NoProfiles, |d| d);
-    let planned = plan(&cfg, &shape, &props, mem, Family::Generic, &costs, profiles)
-        .map_err(|e| {
+    let planned =
+        plan(&cfg, &shape, &props, mem, Family::Generic, &costs, profiles).map_err(|e| {
             eprintln!("[driver-cuda] load_model: memory planner: {e:?}");
             PIE_STATUS_EXHAUSTED
         })?;
@@ -1141,5 +1175,3 @@ pub(crate) fn ptir_target(ordinal: i32) -> Result<crate::program::Target, i32> {
         nvrtc,
     })
 }
-
-

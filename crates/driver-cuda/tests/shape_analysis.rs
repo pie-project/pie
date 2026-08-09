@@ -38,11 +38,24 @@ use model_compiler::lower::{Fire, Lowered, Row, lower};
 use model_compiler::trace::FireClass;
 
 fn rows(n: usize) -> Vec<Row> {
-    vec![Row { samples: true, ..Row::default() }; n]
+    vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        n
+    ]
 }
 
 fn lower_plan(plan: &model_compiler::trace::ForwardPlan) -> Lowered {
-    lower(plan, &rows(4), Fire { captures_across_splits: false }).expect("lowers")
+    lower(
+        plan,
+        &rows(4),
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("lowers")
 }
 
 /// The op-kind sequence one layer STATES, as distinct from the kernels it
@@ -192,11 +205,8 @@ fn facts_select_programs_not_only_numbers() {
     let mut by_op: BTreeMap<Vec<String>, Vec<&str>> = BTreeMap::new();
     let mut lowered = Vec::new();
     for (name, facts) in deployments {
-        let plan = model::shared::llama_like::forward::llama_like_cuda(
-            &facts,
-            &cuda,
-            FireClass::Decode,
-        );
+        let plan =
+            model::shared::llama_like::forward::llama_like_cuda(&facts, &cuda, FireClass::Decode);
         let l = lower_plan(&plan);
         lowered.push((name, plan, l));
     }

@@ -126,7 +126,10 @@ fn walk(src: &Path) -> Vec<(PathBuf, bool)> {
             continue;
         };
         out.push((file.clone(), apple));
-        let dir = if file.file_name().is_some_and(|n| n == "lib.rs" || n == "mod.rs") {
+        let dir = if file
+            .file_name()
+            .is_some_and(|n| n == "lib.rs" || n == "mod.rs")
+        {
             file.parent().map(Path::to_path_buf)
         } else {
             file.parent()
@@ -134,7 +137,10 @@ fn walk(src: &Path) -> Vec<(PathBuf, bool)> {
         };
         let Some(dir) = dir else { continue };
         for (name, gated) in declarations(&text) {
-            for candidate in [dir.join(format!("{name}.rs")), dir.join(&name).join("mod.rs")] {
+            for candidate in [
+                dir.join(format!("{name}.rs")),
+                dir.join(&name).join("mod.rs"),
+            ] {
                 if candidate.is_file() {
                     // Gatedness is inherited: everything under `gpu/` is
                     // Apple-only because `gpu` itself is, and no file in it
@@ -227,11 +233,7 @@ fn no_portable_module_names_the_apple_only_half() {
                 .filter(|(_, gated)| *gated)
                 .map(|(name, _)| name)
                 .collect();
-            if named.is_empty() {
-                None
-            } else {
-                Some(named)
-            }
+            if named.is_empty() { None } else { Some(named) }
         })
         .flatten()
         .collect();
@@ -296,7 +298,11 @@ fn no_portable_module_names_the_apple_only_half() {
         let Ok(text) = std::fs::read_to_string(file) else {
             continue;
         };
-        let shown = file.strip_prefix(&src).unwrap_or(file).display().to_string();
+        let shown = file
+            .strip_prefix(&src)
+            .unwrap_or(file)
+            .display()
+            .to_string();
         let lines: Vec<&str> = text.lines().map(str::trim).collect();
         for (n, line) in lines.iter().enumerate() {
             // Doc and comment lines may name the gated half freely: prose

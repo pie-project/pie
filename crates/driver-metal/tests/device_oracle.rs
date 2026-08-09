@@ -67,9 +67,9 @@ use driver_metal::channel::{
     ExecPlan, HostOp, PassInputs, StatusOutcome, StepOutcome, Ticket, Value, adopt_launch_package,
     encode_wire, host_take, make_host_instance, step,
 };
-use driver_metal::{Error, Region};
 use driver_metal::device::{Archives, Context, Externals, Pool, Ring, Stepper, Tables};
 use driver_metal::program::{DeviceInputs, Mode, Prepare, Runtime};
+use driver_metal::{Error, Region};
 use tensor_compiler::codegen::program::{Backend, emit_program};
 use tensor_compiler::plan::compile_bound;
 use tensor_compiler::plan::{COMPILER_VERSION, LANE_TABLE_ABI_VERSION, REGION_PLAN_VERSION};

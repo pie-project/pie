@@ -60,7 +60,8 @@ use serde_json::Value;
 /// The corpus, which lives with `driver-cuda` because it moved there
 /// when the C++ tree was deleted.
 fn corpus_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/driver-cuda/tests/hf_config_dump/corpus")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/driver-cuda/tests/hf_config_dump/corpus")
 }
 
 /// Every `(stem, path)` in the corpus, sorted so a failure names the
@@ -217,7 +218,9 @@ fn decoder_object(doc: &Value) -> &Value {
 /// a config carrying both `n_routed_experts` and a legacy `num_experts`
 /// is read the way its own family reads it.
 fn stated_u32(o: &Value, keys: &[&str]) -> Option<u32> {
-    keys.iter().find_map(|k| o.get(*k).and_then(Value::as_u64)).and_then(|v| u32::try_from(v).ok())
+    keys.iter()
+        .find_map(|k| o.get(*k).and_then(Value::as_u64))
+        .and_then(|v| u32::try_from(v).ok())
 }
 
 /// The same, for a value a config states as a float.
@@ -239,7 +242,11 @@ struct Compare {
 
 impl Compare {
     fn new(stem: &str, id: &'static str) -> Self {
-        Self { stem: stem.to_string(), id, rows: Vec::new() }
+        Self {
+            stem: stem.to_string(),
+            id,
+            rows: Vec::new(),
+        }
     }
 
     /// A number the config states, against the row's answer.
@@ -250,7 +257,8 @@ impl Compare {
         if let Some(want) = stated
             && want != row
         {
-            self.rows.push(format!("  {field}: config={want} row={row}"));
+            self.rows
+                .push(format!("  {field}: config={want} row={row}"));
         }
     }
 
@@ -268,7 +276,8 @@ impl Compare {
         let (want, got) = (want, f64::from(row));
         let scale = want.abs().max(got.abs()).max(f64::MIN_POSITIVE);
         if (want - got).abs() / scale > 1e-5 {
-            self.rows.push(format!("  {field}: config={want} row={got}"));
+            self.rows
+                .push(format!("  {field}: config={want} row={got}"));
         }
     }
 
@@ -277,7 +286,8 @@ impl Compare {
         if let Some(want) = stated
             && want != row
         {
-            self.rows.push(format!("  {field}: config={want} row={row}"));
+            self.rows
+                .push(format!("  {field}: config={want} row={row}"));
         }
     }
 
@@ -377,10 +387,46 @@ fn a_row_states_what_its_checkpoint_states() {
 fn compare_deployment(c: &mut Compare, o: &Value, dep: &Deployment) {
     c.u32("layers", stated_u32(o, &["num_hidden_layers"]), dep.layers);
     c.u32("hidden", stated_u32(o, &["hidden_size"]), dep.shape.hidden);
-    c.u32("q_heads", stated_u32(o, &["num_attention_heads"]), dep.shape.q_heads);
-    c.u32("kv_heads", stated_u32(o, &["num_key_value_heads"]), dep.shape.kv_heads);
+    c.u32(
+        "q_heads",
+        stated_u32(o, &["num_attention_heads"]),
+        dep.shape.q_heads,
+    );
+    c.u32(
+        "kv_heads",
+        stated_u32(o, &["num_key_value_heads"]),
+        dep.shape.kv_heads,
+    );
     c.u32("head_dim", stated_u32(o, &["head_dim"]), dep.shape.head_dim);
-    c.u32("intermediate", stated_u32(o, &["intermediate_size"]), dep.shape.intermediate);
+    // `intermediate_size` is the width of ONE MLP, and which MLP that is
+    // depends on whether the stack has a dense one.
+    //
+    // `Geometry::intermediate` means the DENSE block, which is why
+    // gpt-oss states zero there and 2880 in `moe_intermediate`: every
+    // layer of it is the router's, and `widest_mlp()` takes the max of
+    // the two to size the one buffer. Its config still spells the expert
+    // width `intermediate_size`, because that is the only MLP it has —
+    // there is no `moe_intermediate_size` key in it at all.
+    //
+    // So a row with no dense block is held to the config on the field
+    // the config is describing. Comparing it against `intermediate`
+    // reported `config=2880 row=0` and named neither the row nor the
+    // config as wrong, which is what a mapping from one key to one field
+    // does when a key means two things.
+    let all_routed = dep.shape.intermediate == 0 && dep.shape.moe_intermediate > 0;
+    if all_routed {
+        c.u32(
+            "intermediate",
+            stated_u32(o, &["intermediate_size"]),
+            dep.shape.moe_intermediate,
+        );
+    } else {
+        c.u32(
+            "intermediate",
+            stated_u32(o, &["intermediate_size"]),
+            dep.shape.intermediate,
+        );
+    }
     c.u32("vocab", stated_u32(o, &["vocab_size"]), dep.shape.vocab);
     c.u32(
         "moe_intermediate",
@@ -392,7 +438,11 @@ fn compare_deployment(c: &mut Compare, o: &Value, dep: &Deployment) {
         stated_u32(o, &["max_position_embeddings"]),
         dep.advertised.max_model_len,
     );
-    c.f32("norm_eps", stated_f64(o, &["rms_norm_eps", "layer_norm_eps", "norm_eps"]), dep.norm_eps);
+    c.f32(
+        "norm_eps",
+        stated_f64(o, &["rms_norm_eps", "layer_norm_eps", "norm_eps"]),
+        dep.norm_eps,
+    );
 
     // THE ROTARY BASE, per layer, against the one the config states.
     //
@@ -411,8 +461,11 @@ fn compare_deployment(c: &mut Compare, o: &Value, dep: &Deployment) {
             .iter()
             .any(|a| (f64::from(a.rope_theta) - theta).abs() / theta.abs().max(1.0) <= 1e-5);
         if !matched {
-            let seen: Vec<String> =
-                dep.attention.iter().map(|a| a.rope_theta.to_string()).collect();
+            let seen: Vec<String> = dep
+                .attention
+                .iter()
+                .map(|a| a.rope_theta.to_string())
+                .collect();
             c.rows.push(format!(
                 "  rope_theta: config={theta} and no layer of the row uses it \
                  (row layers use {seen:?})"
@@ -487,12 +540,21 @@ fn compare_rope_scaling(c: &mut Compare, o: &Value, dep: &Deployment) {
             }),
         ) => {
             if kind != "llama3" {
-                c.rows.push(format!("  rope_scaling.kind: config={kind} row=llama3"));
+                c.rows
+                    .push(format!("  rope_scaling.kind: config={kind} row=llama3"));
                 return;
             }
             c.f32("rope_scaling.factor", num(&v, "factor"), factor);
-            c.f32("rope_scaling.low_freq_factor", num(&v, "low_freq_factor"), low_freq_factor);
-            c.f32("rope_scaling.high_freq_factor", num(&v, "high_freq_factor"), high_freq_factor);
+            c.f32(
+                "rope_scaling.low_freq_factor",
+                num(&v, "low_freq_factor"),
+                low_freq_factor,
+            );
+            c.f32(
+                "rope_scaling.high_freq_factor",
+                num(&v, "high_freq_factor"),
+                high_freq_factor,
+            );
             c.u32(
                 "rope_scaling.original_max_position",
                 num(&v, "original_max_position_embeddings").map(|x| x as u32),
@@ -510,7 +572,8 @@ fn compare_rope_scaling(c: &mut Compare, o: &Value, dep: &Deployment) {
             }),
         ) => {
             if kind != "yarn" {
-                c.rows.push(format!("  rope_scaling.kind: config={kind} row=yarn"));
+                c.rows
+                    .push(format!("  rope_scaling.kind: config={kind} row=yarn"));
                 return;
             }
             c.f32("rope_scaling.factor", num(&v, "factor"), factor);
@@ -525,7 +588,11 @@ fn compare_rope_scaling(c: &mut Compare, o: &Value, dep: &Deployment) {
             // the row then carries HF's `0.1 * ln(factor) + 1`; that
             // formula is checked against OLMo 3, which does state its
             // answer, in `olmo_3`'s own tests.
-            c.f32("rope_scaling.attention_factor", num(&v, "attention_factor"), attention_factor);
+            c.f32(
+                "rope_scaling.attention_factor",
+                num(&v, "attention_factor"),
+                attention_factor,
+            );
         }
     }
 }
@@ -549,8 +616,16 @@ fn compare(
     // is the UNPADDED width a TP split cuts on and `Geometry::head_dim`
     // is what a kernel is handed, and a row that lets them drift splits
     // a head in half.
-    c.u32("load_shape.head_dim", stated_u32(o, &["head_dim"]), shape.head_dim);
-    c.u32("load_shape.layers", stated_u32(o, &["num_hidden_layers"]), shape.layers);
+    c.u32(
+        "load_shape.head_dim",
+        stated_u32(o, &["head_dim"]),
+        shape.head_dim,
+    );
+    c.u32(
+        "load_shape.layers",
+        stated_u32(o, &["num_hidden_layers"]),
+        shape.layers,
+    );
     c.u32(
         "load_shape.n_experts",
         stated_u32(o, &["num_experts", "num_local_experts", "n_routed_experts"]),
@@ -598,7 +673,10 @@ fn the_comparison_catches_a_wrong_digit_and_skips_an_absent_one() {
     c.u32("layers", stated_u32(o, &["num_hidden_layers"]), 28);
     c.u32("vocab", stated_u32(o, &["vocab_size"]), 151_936);
     c.f32("norm_eps", stated_f64(o, &["rms_norm_eps"]), 1e-6);
-    assert!(c.finish().is_none(), "a matching row, and an absent key, must not report");
+    assert!(
+        c.finish().is_none(),
+        "a matching row, and an absent key, must not report"
+    );
 
     let mut c = Compare::new("fixture", "row");
     c.u32("layers", stated_u32(o, &["num_hidden_layers"]), 24);
@@ -618,11 +696,17 @@ fn the_epsilon_comparison_separates_1e5_from_1e6() {
     let mut c = Compare::new("fixture", "row");
     c.f32("norm_eps", Some(1e-6), 1e-6);
     c.f32("rope_theta", Some(1_000_000.0), 1e6);
-    assert!(c.finish().is_none(), "a correctly-rounded f32 must match its JSON literal");
+    assert!(
+        c.finish().is_none(),
+        "a correctly-rounded f32 must match its JSON literal"
+    );
 
     let mut c = Compare::new("fixture", "row");
     c.f32("norm_eps", Some(1e-5), 1e-6);
-    assert!(c.finish().is_some(), "1e-5 and 1e-6 are different models, not rounding");
+    assert!(
+        c.finish().is_some(),
+        "1e-5 and 1e-6 are different models, not rounding"
+    );
 }
 
 /// A multimodal config's decoder is read from `text_config`, not from
@@ -638,16 +722,25 @@ fn a_multimodal_config_is_read_at_its_text_tower() {
         r#"{"num_hidden_layers": 16, "text_config": {"num_hidden_layers": 35}}"#,
     )
     .unwrap();
-    assert_eq!(stated_u32(decoder_object(&nested), &["num_hidden_layers"]), Some(35));
+    assert_eq!(
+        stated_u32(decoder_object(&nested), &["num_hidden_layers"]),
+        Some(35)
+    );
 
     // A flat config has no `text_config`, and one that carries a
     // `text_config` with no layer count in it (a tokenizer stub) is not
     // a decoder either.
     let flat: Value = serde_json::from_str(r#"{"num_hidden_layers": 28}"#).unwrap();
-    assert_eq!(stated_u32(decoder_object(&flat), &["num_hidden_layers"]), Some(28));
+    assert_eq!(
+        stated_u32(decoder_object(&flat), &["num_hidden_layers"]),
+        Some(28)
+    );
     let stub: Value =
         serde_json::from_str(r#"{"num_hidden_layers": 28, "text_config": {"eos": 1}}"#).unwrap();
-    assert_eq!(stated_u32(decoder_object(&stub), &["num_hidden_layers"]), Some(28));
+    assert_eq!(
+        stated_u32(decoder_object(&stub), &["num_hidden_layers"]),
+        Some(28)
+    );
 }
 
 /// The spellings are tried in order, and the first present one wins.
@@ -661,7 +754,10 @@ fn an_expert_count_is_read_under_whichever_name_its_family_uses() {
     for (raw, want) in each {
         let doc: Value = serde_json::from_str(raw).unwrap();
         assert_eq!(
-            stated_u32(&doc, &["num_experts", "num_local_experts", "n_routed_experts"]),
+            stated_u32(
+                &doc,
+                &["num_experts", "num_local_experts", "n_routed_experts"]
+            ),
             Some(want),
             "{raw}"
         );
@@ -669,7 +765,13 @@ fn an_expert_count_is_read_under_whichever_name_its_family_uses() {
     // A dense config states none of them, and `None` means "compare
     // nothing" rather than "zero experts".
     let dense: Value = serde_json::from_str(r#"{"hidden_size": 4096}"#).unwrap();
-    assert_eq!(stated_u32(&dense, &["num_experts", "num_local_experts", "n_routed_experts"]), None);
+    assert_eq!(
+        stated_u32(
+            &dense,
+            &["num_experts", "num_local_experts", "n_routed_experts"]
+        ),
+        None
+    );
 }
 
 /// Every id in the map above is a real row.
@@ -730,7 +832,10 @@ fn nothing_is_both_claimed_and_excused() {
         .copied()
         .filter(|stem| claims.contains_key(stem))
         .collect();
-    assert!(both.is_empty(), "claimed by a row AND excused from having one: {both:?}");
+    assert!(
+        both.is_empty(),
+        "claimed by a row AND excused from having one: {both:?}"
+    );
 
     // The unfired list is the opposite shape: every stem in it MUST be
     // claimed, because it names a row's refusal and a stem no row claims
@@ -749,7 +854,10 @@ fn nothing_is_both_claimed_and_excused() {
         .copied()
         .filter(|stem| not_served().contains_key(stem))
         .collect();
-    assert!(excused.is_empty(), "both excused from having a row and named as one: {excused:?}");
+    assert!(
+        excused.is_empty(),
+        "both excused from having a row and named as one: {excused:?}"
+    );
 }
 
 /// A row excused from firing really does refuse.

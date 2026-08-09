@@ -84,9 +84,18 @@ pub fn facts_digest(facts: &LlamaLikeFacts, cuda: &LlamaLikeCudaFacts) -> String
         // bound tensors, not shapes the emitted body is written around.
         match cuda.proj_repr {
             WeightRepr::Bf16 => 0,
-            WeightRepr::Scaled { layout: ScaleLayout::PerTensor, .. } => 1,
-            WeightRepr::Scaled { layout: ScaleLayout::PerChannel, .. } => 2,
-            WeightRepr::Scaled { layout: ScaleLayout::PerGroup, .. } => 3,
+            WeightRepr::Scaled {
+                layout: ScaleLayout::PerTensor,
+                ..
+            } => 1,
+            WeightRepr::Scaled {
+                layout: ScaleLayout::PerChannel,
+                ..
+            } => 2,
+            WeightRepr::Scaled {
+                layout: ScaleLayout::PerGroup,
+                ..
+            } => 3,
             WeightRepr::Mxfp4Marlin => 4,
         },
         // The WIDTH, not just the fact of padding: the emitted body's
@@ -415,9 +424,18 @@ fn emit_class_fn(
         b.line("        cublas.set_stream(stream);");
         b.line("        {");
         emit_range(
-            &mut b, plan, facts, cuda, is_decode,
-            Some(SgValuation { has_custom_mask: true, window_one: is_decode }),
-            0, plan.ops.len(), None,
+            &mut b,
+            plan,
+            facts,
+            cuda,
+            is_decode,
+            Some(SgValuation {
+                has_custom_mask: true,
+                window_one: is_decode,
+            }),
+            0,
+            plan.ops.len(),
+            None,
         );
         b.line("        }");
         b.line("        sg.end_body();");
@@ -426,9 +444,18 @@ fn emit_class_fn(
         b.line("        cublas.set_stream(stream);");
         b.line("        {");
         emit_range(
-            &mut b, plan, facts, cuda, is_decode,
-            Some(SgValuation { has_custom_mask: false, window_one: is_decode }),
-            0, plan.ops.len(), None,
+            &mut b,
+            plan,
+            facts,
+            cuda,
+            is_decode,
+            Some(SgValuation {
+                has_custom_mask: false,
+                window_one: is_decode,
+            }),
+            0,
+            plan.ops.len(),
+            None,
         );
         b.line("        }");
         b.line("        sg.end_body();");
@@ -438,8 +465,16 @@ fn emit_class_fn(
         b.line("    }");
     } else {
         emit_range_scoped(
-            &mut b, plan, facts, cuda, is_decode, None, 0, plan.ops.len(),
-            None, plan.depth_window,
+            &mut b,
+            plan,
+            facts,
+            cuda,
+            is_decode,
+            None,
+            0,
+            plan.ops.len(),
+            None,
+            plan.depth_window,
         );
     }
     b.line("}");
@@ -503,9 +538,7 @@ impl SgValuation {
             // The emitter's C++ target is generated PER CLASS, so it
             // still knows which window class it is emitting.
             GuardPred::WindowOne => self.window_one,
-            other => panic!(
-                "emitter: pred {other:?} outside the supergraph union"
-            ),
+            other => panic!("emitter: pred {other:?} outside the supergraph union"),
         }
     }
 }
@@ -558,9 +591,7 @@ fn emit_range_scoped(
             }
             if let Some(l) = op.layer.filter(|_| plan.depth_windowed(op)) {
                 b.stmt("{");
-                b.stmt(&format!(
-                    "const bool depth_tail = depth_k <= {l};"
-                ));
+                b.stmt(&format!("const bool depth_tail = depth_k <= {l};"));
                 // ④ banded: resolve this static layer's band (deepest
                 // first — the first band whose k the layer reached).
                 b.stmt("int band_j = -1; int band_live = total_tokens;");
@@ -578,9 +609,7 @@ fn emit_range_scoped(
                 b.stmt("    if (band_live == total_tokens) band_j = -1;");
                 b.stmt("}");
                 b.stmt("(void)band_j;");
-                b.stmt(
-                    "if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {",
-                );
+                b.stmt("if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {");
                 b.stmt(
                     "const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);",
                 );
@@ -610,9 +639,7 @@ fn emit_range_scoped(
                 if sg.is_some() {
                     // The retired union's mask arm was the fire-level
                     // custom dispatch: the peel's UNPLANNED endpoint.
-                    emit_range(
-                        b, plan, facts, cuda, is_decode, sg, tail_lo, tail_hi, None,
-                    );
+                    emit_range(b, plan, facts, cuda, is_decode, sg, tail_lo, tail_hi, None);
                     i = tail_hi;
                     continue;
                 }
@@ -641,13 +668,27 @@ fn emit_range_scoped(
                 b.stmt("if (split > 0) {");
                 b.indent += 1;
                 emit_range(
-                    b, plan, facts, cuda, is_decode, sg, region, tail_lo,
+                    b,
+                    plan,
+                    facts,
+                    cuda,
+                    is_decode,
+                    sg,
+                    region,
+                    tail_lo,
                     Some(Win::MaskPrefix),
                 );
                 b.indent -= 1;
                 b.stmt("}");
                 emit_range(
-                    b, plan, facts, cuda, is_decode, sg, tail_lo, tail_hi,
+                    b,
+                    plan,
+                    facts,
+                    cuda,
+                    is_decode,
+                    sg,
+                    tail_lo,
+                    tail_hi,
                     Some(Win::MaskTail),
                 );
                 b.indent -= 1;
@@ -668,8 +709,15 @@ fn emit_range_scoped(
                 // campaign is what would change that.
                 let region = i + 1;
                 emit_range(
-                    b, plan, facts, cuda, is_decode, sg, region,
-                    region + *prefix_ops as usize, None,
+                    b,
+                    plan,
+                    facts,
+                    cuda,
+                    is_decode,
+                    sg,
+                    region,
+                    region + *prefix_ops as usize,
+                    None,
                 );
                 i = region + (*prefix_ops as usize) + (*tail_ops as usize);
                 continue;
@@ -684,11 +732,23 @@ fn emit_range_scoped(
             b.stmt("if (peel_window_d != nullptr) {");
             b.indent += 1;
             emit_range(
-                b, plan, facts, cuda, is_decode, sg, region,
-                region + *prefix_ops as usize, Some(Win::DevPrefix),
+                b,
+                plan,
+                facts,
+                cuda,
+                is_decode,
+                sg,
+                region,
+                region + *prefix_ops as usize,
+                Some(Win::DevPrefix),
             );
             emit_range(
-                b, plan, facts, cuda, is_decode, sg,
+                b,
+                plan,
+                facts,
+                cuda,
+                is_decode,
+                sg,
                 region + *prefix_ops as usize,
                 region + *prefix_ops as usize + *tail_ops as usize,
                 Some(Win::DevTail),
@@ -699,8 +759,18 @@ fn emit_range_scoped(
             b.stmt("if (fast_rows > 0) {");
             b.indent += 1;
             emit_range(
-                b, plan, facts, cuda, is_decode, sg, region, region + *prefix_ops as usize,
-                Some(Win::Host { start: "0", len: "fast_rows" }),
+                b,
+                plan,
+                facts,
+                cuda,
+                is_decode,
+                sg,
+                region,
+                region + *prefix_ops as usize,
+                Some(Win::Host {
+                    start: "0",
+                    len: "fast_rows",
+                }),
             );
             b.indent -= 1;
             b.stmt("}");
@@ -708,8 +778,18 @@ fn emit_range_scoped(
             b.stmt("if (fast_rows < N) {");
             b.indent += 1;
             emit_range(
-                b, plan, facts, cuda, is_decode, sg, region, region + *tail_ops as usize,
-                Some(Win::Host { start: "fast_rows", len: "(N - fast_rows)" }),
+                b,
+                plan,
+                facts,
+                cuda,
+                is_decode,
+                sg,
+                region,
+                region + *tail_ops as usize,
+                Some(Win::Host {
+                    start: "fast_rows",
+                    len: "(N - fast_rows)",
+                }),
             );
             b.indent -= 1;
             b.stmt("}");
@@ -730,8 +810,7 @@ fn emit_range_scoped(
                     }
                     region += arm.ops as usize;
                 }
-                let (lo, hi) = chosen
-                    .unwrap_or((region, region + *else_ops as usize));
+                let (lo, hi) = chosen.unwrap_or((region, region + *else_ops as usize));
                 emit_range(b, plan, facts, cuda, is_decode, sg, lo, hi, win);
                 i = region + *else_ops as usize;
                 continue;
@@ -746,9 +825,7 @@ fn emit_range_scoped(
                 model_compiler::trace::GuardPred::HasCustomMask => {
                     "custom_mask_d != nullptr".to_string()
                 }
-                model_compiler::trace::GuardPred::HasStageHooks => {
-                    "hooks != nullptr".to_string()
-                }
+                model_compiler::trace::GuardPred::HasStageHooks => "hooks != nullptr".to_string(),
                 model_compiler::trace::GuardPred::HasLora => {
                     "lora != nullptr && lora->usable()".to_string()
                 }
@@ -763,20 +840,46 @@ fn emit_range_scoped(
                 let kw = if n == 0 { "if" } else { "} else if" };
                 b.stmt(&format!("{kw} ({}) {{", cond_of(&arm.pred)));
                 b.indent += 1;
-                emit_range(b, plan, facts, cuda, is_decode, sg, region, region + arm.ops as usize, win);
+                emit_range(
+                    b,
+                    plan,
+                    facts,
+                    cuda,
+                    is_decode,
+                    sg,
+                    region,
+                    region + arm.ops as usize,
+                    win,
+                );
                 b.indent -= 1;
                 region += arm.ops as usize;
             }
             b.stmt("} else {");
             b.indent += 1;
-            emit_range(b, plan, facts, cuda, is_decode, sg, region, region + *else_ops as usize, win);
+            emit_range(
+                b,
+                plan,
+                facts,
+                cuda,
+                is_decode,
+                sg,
+                region,
+                region + *else_ops as usize,
+                win,
+            );
             b.indent -= 1;
             b.stmt("}");
             i = region + *else_ops as usize;
             continue;
         }
         emit_op(
-            b, op, plan, facts, cuda, is_decode, win,
+            b,
+            op,
+            plan,
+            facts,
+            cuda,
+            is_decode,
+            win,
             plan.depth_window && sg.is_none(),
         );
         i += 1;
@@ -845,39 +948,35 @@ fn require(layer: u32, member: &str, name: &str) -> String {
 /// text still records the kind. Same buffers, same widths, one body —
 /// which is the point of the migration rather than a side effect of it.
 fn emit_row_norm(b: &mut Body, facts: &LlamaLikeFacts, weight: &str) {
-            if weight == "final_norm" {
-                // Deferred into the LmHead epilogue, exactly the
-                // interpreter's arm (gather-then-norm ≡ norm-then-gather).
-                b.stmt("// final_norm: deferred into the LmHead epilogue below.");
-                return;
-            }
-            let (layer, field) = split_layer_weight(weight)
-                .unwrap_or_else(|| panic!("emitter: unknown norm weight {weight}"));
-            let post = facts.norm_placement == NormPlacement::Post;
-            let (input, output, width) = match field {
-                // Pre-norm: norm the stream INTO the sub-layer's scratch.
-                // Post-norm (olmo2): the sub-layer's OUTPUT (landed in
-                // norm_x by the beta=0 projection) is normed into norm_y;
-                // the following ResidualAdd lands it on the stream — the
-                // interpreter's post-norm arms verbatim.
-                "attn_norm" if post => ("ws.norm_x.data()", "ws.norm_y.data()", "H"),
-                "attn_norm" => ("ws.y.data()", "ws.norm_x.data()", "H"),
-                "mlp_norm" if post => ("ws.norm_x.data()", "ws.norm_y.data()", "H"),
-                "mlp_norm" => ("ws.y.data()", "ws.norm_y.data()", "H"),
-                // Global qk-norm (olmo2): ONE row RMSNorm over the
-                // flattened projection, in place.
-                "q_norm" => ("ws.q.data()", "ws.q.data()", "Hq"),
-                "k_norm" => ("ws.k.data()", "ws.k.data()", "Hk"),
-                other => panic!("emitter: row-norm field {other} out of scope"),
-            };
-            b.stmt(&format!("kernels::norm::rmsnorm_bf16("));
-            b.stmt(&format!(
-                "    {input}, {},",
-                require(layer, field, weight)
-            ));
-            b.stmt(&format!("    {output}, N, {width}, eps, stream);"));
+    if weight == "final_norm" {
+        // Deferred into the LmHead epilogue, exactly the
+        // interpreter's arm (gather-then-norm ≡ norm-then-gather).
+        b.stmt("// final_norm: deferred into the LmHead epilogue below.");
+        return;
+    }
+    let (layer, field) = split_layer_weight(weight)
+        .unwrap_or_else(|| panic!("emitter: unknown norm weight {weight}"));
+    let post = facts.norm_placement == NormPlacement::Post;
+    let (input, output, width) = match field {
+        // Pre-norm: norm the stream INTO the sub-layer's scratch.
+        // Post-norm (olmo2): the sub-layer's OUTPUT (landed in
+        // norm_x by the beta=0 projection) is normed into norm_y;
+        // the following ResidualAdd lands it on the stream — the
+        // interpreter's post-norm arms verbatim.
+        "attn_norm" if post => ("ws.norm_x.data()", "ws.norm_y.data()", "H"),
+        "attn_norm" => ("ws.y.data()", "ws.norm_x.data()", "H"),
+        "mlp_norm" if post => ("ws.norm_x.data()", "ws.norm_y.data()", "H"),
+        "mlp_norm" => ("ws.y.data()", "ws.norm_y.data()", "H"),
+        // Global qk-norm (olmo2): ONE row RMSNorm over the
+        // flattened projection, in place.
+        "q_norm" => ("ws.q.data()", "ws.q.data()", "Hq"),
+        "k_norm" => ("ws.k.data()", "ws.k.data()", "Hk"),
+        other => panic!("emitter: row-norm field {other} out of scope"),
+    };
+    b.stmt(&format!("kernels::norm::rmsnorm_bf16("));
+    b.stmt(&format!("    {input}, {},", require(layer, field, weight)));
+    b.stmt(&format!("    {output}, N, {width}, eps, stream);"));
 }
-
 
 fn emit_op(
     b: &mut Body,
@@ -997,7 +1096,11 @@ fn emit_op(
                 // pre-norm scratch (the interpreter's qkv_in).
                 ("q_proj", false) | ("k_proj", false) | ("v_proj", false) => {
                     let post = facts.norm_placement == NormPlacement::Post;
-                    let input = if post { "ws.y.data()" } else { "ws.norm_x.data()" };
+                    let input = if post {
+                        "ws.y.data()"
+                    } else {
+                        "ws.norm_x.data()"
+                    };
                     let (out, width, member, quant) = match field {
                         "q_proj" => ("ws.q.data()", "Hq", "q_proj", "q_proj_quant"),
                         "k_proj" => ("ws.k.data()", "Hk", "k_proj", "k_proj_quant"),
@@ -1080,9 +1183,7 @@ fn emit_op(
             // per-fire RUNTIME input (Guard's territory, see
             // declared_forward.hpp); both branches are the interpreter's.
             b.stmt(&format!("{{"));
-            b.stmt(&format!(
-                "    auto kv_view = cache.layer_view({layer});"
-            ));
+            b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             b.stmt("    if (has_write_desc) {");
             b.stmt("        kernels::attn::write_kv_explicit_bf16(");
             b.stmt("            kv_view, ws.k.data(), ws.v.data(),");
@@ -1149,8 +1250,17 @@ fn emit_op(
             state,
             params,
         } => emit_launch(
-            b, kernel, weights, state.as_ref(), params, op, facts, cuda,
-            is_decode, win, depth_active,
+            b,
+            kernel,
+            weights,
+            state.as_ref(),
+            params,
+            op,
+            facts,
+            cuda,
+            is_decode,
+            win,
+            depth_active,
         ),
         OpKind::HookSite { stage, layer } => {
             // The interpreter's site handler, transliterated with the
@@ -1164,9 +1274,7 @@ fn emit_op(
                     b.stmt("    attn_last_page_lens = kv_last_page_lens;");
                     b.stmt("    page_mask.begin_layer(stream);");
                     if is_decode {
-                        b.stmt(&format!(
-                            "    score_capture.emplace(hooks, {layer}u,"
-                        ));
+                        b.stmt(&format!("    score_capture.emplace(hooks, {layer}u,"));
                         b.stmt("        static_cast<std::uint32_t>(num_q_heads),");
                         b.stmt("        /*capturable=*/true, stream);");
                     } else {
@@ -1181,7 +1289,9 @@ fn emit_op(
                     b.stmt("        hooks, StageHookPoint::OnAttnProj, ws.q.data(),");
                     b.stmt("        static_cast<std::uint32_t>(N),");
                     b.stmt("        static_cast<std::uint32_t>(Hq),");
-                    b.stmt(&format!("        {layer}u, stream, /*query_is_f32=*/false,"));
+                    b.stmt(&format!(
+                        "        {layer}u, stream, /*query_is_f32=*/false,"
+                    ));
                     b.stmt("        {.mask_sink = page_mask.sink()});");
                 }
                 model_compiler::trace::HookStage::OnAttn => {
@@ -1189,7 +1299,9 @@ fn emit_op(
                     b.stmt("        hooks, StageHookPoint::OnAttn, ws.q.data(),");
                     b.stmt("        static_cast<std::uint32_t>(N),");
                     b.stmt("        static_cast<std::uint32_t>(Hq),");
-                    b.stmt(&format!("        {layer}u, stream, /*query_is_f32=*/false,"));
+                    b.stmt(&format!(
+                        "        {layer}u, stream, /*query_is_f32=*/false,"
+                    ));
                     if is_decode {
                         b.stmt("        {.scores = score_capture ? score_capture->scores()");
                         b.stmt("                                 : nullptr});");
@@ -1205,7 +1317,6 @@ fn emit_op(
         other => panic!("emitter: op kind {other:?} out of scope for the qwen3 classes"),
     }
 }
-
 
 /// The page-mask bracket the interpreter's `resolve_masked_pages` runs
 /// before an attention launch, emitted with the layer constant. A
@@ -1434,9 +1545,7 @@ fn emit_launch(
             };
             if matches!(win, Some(Win::DevTail)) {
                 b.stmt(&format!("{{"));
-                b.stmt(&format!(
-                    "    auto kv_view = cache.layer_view({layer});"
-                ));
+                b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
                 b.stmt("    kernels::attn::write_kv_to_pages_bf16_devwin(");
                 b.stmt(&format!("        {kv_bufs}"));
                 b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
@@ -1498,11 +1607,9 @@ fn emit_launch(
                  no hand-written reference — refuse rather than guess"
             );
             let layer = state.expect("attention addresses kv state").layer;
-            emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/false);
+            emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/ false);
             b.stmt(&format!("{{"));
-            b.stmt(&format!(
-                "    auto kv_view = cache.layer_view({layer});"
-            ));
+            b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             b.stmt("    kernels::attn::attention_xqa_decode_bf16_prepared(");
             b.stmt("        ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,");
             b.stmt("        ws.attn_out.data(),");
@@ -1524,9 +1631,7 @@ fn emit_launch(
                 "kv_page_indptr_h[R]"
             };
             b.stmt(&format!("{{"));
-            b.stmt(&format!(
-                "    auto kv_view = cache.layer_view({layer});"
-            ));
+            b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             b.stmt("    kernels::attn::dequant_kv_cache_layer_to_bf16_active(");
             b.stmt(&format!(
                 "        kv_view, kv_page_indices, {pages}, stream);"
@@ -1548,12 +1653,8 @@ fn emit_launch(
             // not).
             if is_decode {
                 b.stmt(&format!("{{"));
-                b.stmt(&format!(
-                    "    auto kv_view = cache.layer_view({layer});"
-                ));
-                b.stmt(&format!(
-                    "    const int layer_window_left = {window};"
-                ));
+                b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
+                b.stmt(&format!("    const int layer_window_left = {window};"));
                 // A mask peel's prefix region: the plan-free launcher
                 // over the plain rows — pure decode, so tokens == rows
                 // == split, and every CSR's `[0, split]` head is the
@@ -1584,9 +1685,7 @@ fn emit_launch(
             b.stmt("        \"generated forward: prepare built no prefill plan\");");
             b.stmt("}");
             b.stmt(&format!("{{"));
-            b.stmt(&format!(
-                "    auto kv_view = cache.layer_view({layer});"
-            ));
+            b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             b.stmt("    kernels::attn::dispatch_attention_flashinfer_prefill_bf16(");
             b.stmt(&format!("        *{plan_cache},"));
             b.stmt(&format!(
@@ -1613,16 +1712,12 @@ fn emit_launch(
                 b.stmt(&format!(
                     "            bf16_row({q_buf}, mid_row, Hq), kv_view,"
                 ));
-                b.stmt(&format!(
-                    "            bf16_row({out_buf}, mid_row, Hq),"
-                ));
+                b.stmt(&format!("            bf16_row({out_buf}, mid_row, Hq),"));
                 b.stmt("            kv_page_indices,");
                 b.stmt("            kv_page_indptr + mid_P,");
                 b.stmt("            kv_last_page_lens + mid_P,");
                 b.stmt("            attn_ws.view(), stream, mid_wl,");
-                b.stmt(&format!(
-                    "            /*logits_soft_cap=*/0.f, {scale});"
-                ));
+                b.stmt(&format!("            /*logits_soft_cap=*/0.f, {scale});"));
                 b.stmt("    }");
             }
             strip(b);
@@ -1637,33 +1732,27 @@ fn emit_launch(
                 // consumes the ATTN page views (hook-narrowed when
                 // sites ran; raw aliases otherwise) — the bracket is
                 // the interpreter's resolve_masked_pages.
-                emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/true);
+                emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/ true);
                 b.stmt("if (!plan_state.decode_plan) {");
                 b.stmt("    throw std::runtime_error(");
                 b.stmt("        \"spatial mask: split active but prepare built \"");
                 b.stmt("        \"no prefix decode plan\");");
                 b.stmt("}");
                 b.stmt(&format!("{{"));
-                b.stmt(&format!(
-                    "    auto kv_view = cache.layer_view({layer});"
-                ));
-                b.stmt(&format!(
-                    "    const int layer_window_left = {window};"
-                ));
+                b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
+                b.stmt(&format!("    const int layer_window_left = {window};"));
                 b.stmt("    kernels::attn::dispatch_attention_flashinfer_decode(");
                 b.stmt("        *plan_state.decode_plan,");
                 b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
                 b.stmt("        attn_page_indices, attn_page_indptr,");
                 b.stmt("        attn_last_page_lens,");
                 b.stmt("        attn_ws.view(), stream, layer_window_left,");
-                b.stmt(&format!(
-                    "        /*logits_soft_cap=*/0.f, {scale});"
-                ));
+                b.stmt(&format!("        /*logits_soft_cap=*/0.f, {scale});"));
                 strip(b);
                 b.stmt("}");
                 return;
             }
-            emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/true);
+            emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/ true);
             // The window is a CONSTANT of this text now: the statement
             // carries it, so the emitted body spells the number rather
             // than re-reading `fwd_cfg.per_layer_window_left` per launch.
@@ -1692,12 +1781,8 @@ fn emit_launch(
                 b.stmt("}");
             }
             b.stmt(&format!("{{"));
-            b.stmt(&format!(
-                "    auto kv_view = cache.layer_view({layer});"
-            ));
-            b.stmt(&format!(
-                    "    const int layer_window_left = {window};"
-                ));
+            b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
+            b.stmt(&format!("    const int layer_window_left = {window};"));
             if depth_active {
                 b.stmt("    kernels::attn::dispatch_attention_flashinfer_decode(");
                 b.stmt("        *depth_dp,");
@@ -1707,9 +1792,7 @@ fn emit_launch(
                 b.stmt("        (band_j >= 0 ? depth_band_attn_ws_public(band_j)");
                 b.stmt("         : depth_tail ? spatial_suffix_attn_ws() : attn_ws).view(),");
                 b.stmt("        stream, layer_window_left,");
-                b.stmt(&format!(
-                    "        /*logits_soft_cap=*/0.f, {scale});"
-                ));
+                b.stmt(&format!("        /*logits_soft_cap=*/0.f, {scale});"));
             } else {
                 b.stmt("    kernels::attn::dispatch_attention_flashinfer_decode(");
                 b.stmt("        *plan_state.decode_plan,");
@@ -1717,9 +1800,7 @@ fn emit_launch(
                 b.stmt("        attn_page_indices, attn_page_indptr,");
                 b.stmt("        attn_last_page_lens,");
                 b.stmt("        attn_ws.view(), stream, layer_window_left,");
-                b.stmt(&format!(
-                    "        /*logits_soft_cap=*/0.f, {scale});"
-                ));
+                b.stmt(&format!("        /*logits_soft_cap=*/0.f, {scale});"));
             }
             strip(b);
             b.stmt("}");
@@ -1747,9 +1828,7 @@ fn emit_launch(
             b.stmt("        \"generated forward: prepare built no custom-mask plan\");");
             b.stmt("}");
             b.stmt(&format!("{{"));
-            b.stmt(&format!(
-                "    auto kv_view = cache.layer_view({layer});"
-            ));
+            b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             match win {
                 // The UnmaskedPrefix peel's TAIL region (NS-4 in the
                 // IR): the choosing is the TRACE's — this arm spells
@@ -1772,9 +1851,7 @@ fn emit_launch(
                     b.stmt(&format!(
                         "        bf16_row({q_buf}, split_rows, Hq), kv_view,"
                     ));
-                    b.stmt(&format!(
-                        "        bf16_row({out_buf}, split_rows, Hq),"
-                    ));
+                    b.stmt(&format!("        bf16_row({out_buf}, split_rows, Hq),"));
                     b.stmt("        mask_suffix_qo_indptr_d,");
                     b.stmt("        kv_page_indices,");
                     b.stmt("        kv_page_indptr + split,");
@@ -1793,9 +1870,7 @@ fn emit_launch(
                     b.stmt("        kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,");
                     b.stmt("        attn_ws.view(), stream);");
                 }
-                Some(_) => panic!(
-                    "emitter: the custom dispatch in a foreign peel region"
-                ),
+                Some(_) => panic!("emitter: the custom dispatch in a foreign peel region"),
             }
             strip(b);
             b.stmt("}");
@@ -1803,9 +1878,7 @@ fn emit_launch(
         "pie_lora_qkv_correction" => {
             // The §5.1 correction, statically: the layer is the op's own
             // tag (a constant here), the buffers the interpreter's.
-            let layer = op
-                .layer
-                .expect("lora correction carries its layer tag");
+            let layer = op.layer.expect("lora correction carries its layer tag");
             b.stmt("if (lora_staged == nullptr && !lora_state) {");
             b.stmt("    throw std::runtime_error(");
             b.stmt("        \"generated forward: lora correction stated but no \"");
@@ -1834,7 +1907,7 @@ fn emit_launch(
             b.stmt("        \"generated forward: capture decode stated but no \"");
             b.stmt("        \"active score capture (guard/pred drift)\");");
             b.stmt("}");
-            emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/true);
+            emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/ true);
             b.stmt(&format!("{{"));
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             b.stmt("    kernels::attn::dispatch_attention_flashinfer_decode_capture(");
@@ -1845,9 +1918,7 @@ fn emit_launch(
             b.stmt("        attn_ws.view(), stream,");
             b.stmt("        score_capture->raw(), score_capture->indptr_d(),");
             b.stmt("        /*window_left=*/-1,");
-            b.stmt(&format!(
-                "        /*logits_soft_cap=*/0.f, {scale});"
-            ));
+            b.stmt(&format!("        /*logits_soft_cap=*/0.f, {scale});"));
             b.stmt("    score_capture->publish(");
             b.stmt("        attn_page_indptr, attn_last_page_lens,");
             b.stmt("        cache.page_size());");
@@ -1871,7 +1942,7 @@ fn emit_launch(
             b.stmt("        \"generated forward: capture prefill stated but no \"");
             b.stmt("        \"active score capture (guard/pred drift)\");");
             b.stmt("}");
-            emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/false);
+            emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/ false);
             b.stmt(&format!("{{"));
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             b.stmt("    kernels::attn::dispatch_attention_flashinfer_prefill_capture_bf16(");
@@ -1886,9 +1957,7 @@ fn emit_launch(
             b.stmt("        prefill_score_capture->folded(),");
             b.stmt("        prefill_score_capture->indptr_d(),");
             b.stmt("        prefill_score_capture->window(),");
-            b.stmt(&format!(
-                "        /*logits_soft_cap=*/0.f, {scale});"
-            ));
+            b.stmt(&format!("        /*logits_soft_cap=*/0.f, {scale});"));
             b.stmt("    prefill_score_capture->publish();");
             strip(b);
             b.stmt("}");
@@ -1937,9 +2006,7 @@ fn emit_launch(
         // The ROW norms, now that `cuda::rmsnorm` states which fold it
         // runs. Same body as the semantic kind's — see `emit_row_norm`.
         "norm::rmsnorm_bf16" | "norm::rmsnorm_gemma_bf16" => {
-            let weight = weights
-                .first()
-                .expect("a stated row norm names its weight");
+            let weight = weights.first().expect("a stated row norm names its weight");
             emit_row_norm(b, facts, weight);
         }
         // The WEIGHT REPRESENTATION axis. The interpreter binds these

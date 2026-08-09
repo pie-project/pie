@@ -112,6 +112,8 @@ pub const VARIANTS: &[Glm5] = &[
                 hidden: 4096,
                 num_experts: 128,
                 top_k: 8,
+                norm_topk_prob: true,
+                routed_scaling: 2.5,
                 moe_intermediate: 1408,
                 shared_intermediate: 1408,
                 aligned_block: 16,
@@ -309,7 +311,10 @@ mod tests {
     fn the_rows_ids_are_unique_and_non_empty() {
         let mut seen = std::collections::BTreeSet::new();
         for v in VARIANTS {
-            assert!(!v.id.is_empty(), "a row with no id is a row nothing can ask for");
+            assert!(
+                !v.id.is_empty(),
+                "a row with no id is a row nothing can ask for"
+            );
             assert!(seen.insert(v.id), "{} is stated twice", v.id);
         }
         assert_eq!(rows().len(), VARIANTS.len(), "one dyn entry per row");
@@ -326,7 +331,8 @@ mod tests {
         for v in VARIANTS {
             assert_eq!(v.id(), v.id);
             assert!(
-                v.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                v.id.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
                 "{} is not lowercase-hyphenated",
                 v.id,
             );
@@ -361,7 +367,10 @@ mod tests {
     /// a GLM" wants the coarse answer.
     #[test]
     fn the_generation_states_one_family_label() {
-        assert_eq!(ARCH, "glm_moe_dsa", "the string three tables used to key on");
+        assert_eq!(
+            ARCH, "glm_moe_dsa",
+            "the string three tables used to key on"
+        );
         assert!(!ARCH.is_empty());
     }
 
@@ -386,7 +395,12 @@ mod tests {
     #[test]
     fn the_row_loads_and_refuses_to_serve_in_this_build() {
         let v = row("glm-5-106b-a12b");
-        assert!(v.manifest().tensors.iter().any(|t| t.name.contains("kv_b_proj")));
+        assert!(
+            v.manifest()
+                .tensors
+                .iter()
+                .any(|t| t.name.contains("kv_b_proj"))
+        );
         assert!(
             matches!(
                 v.deployment(Deployed::single()),
@@ -433,13 +447,25 @@ mod tests {
         use model_loader::plan::StorageTarget;
 
         let v = row("glm-5-106b-a12b");
-        let meta = CheckpointMetadata { files: Vec::new(), tensors: Vec::new() };
+        let meta = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: Vec::new(),
+        };
         let target = StorageTarget::default();
         let encoding = StoredEncoding::dense();
 
-        let mlx = Policy { naming: Naming::Mlx, ..Policy::default() };
-        let mut b =
-            crate::shared::builder::Builder::new(&meta, v.id, v.load_shape(), &encoding, &target, &mlx);
+        let mlx = Policy {
+            naming: Naming::Mlx,
+            ..Policy::default()
+        };
+        let mut b = crate::shared::builder::Builder::new(
+            &meta,
+            v.id,
+            v.load_shape(),
+            &encoding,
+            &target,
+            &mlx,
+        );
         assert_eq!(b.naming(), Naming::Mlx);
         assert!(
             v.author(&mut b).is_err(),
@@ -450,10 +476,19 @@ mod tests {
         // And the naming that DOES have a pass reaches it: an empty
         // checkpoint authors an empty contract without refusing.
         let hf = Policy::default();
-        let mut b =
-            crate::shared::builder::Builder::new(&meta, v.id, v.load_shape(), &encoding, &target, &hf);
+        let mut b = crate::shared::builder::Builder::new(
+            &meta,
+            v.id,
+            v.load_shape(),
+            &encoding,
+            &target,
+            &hf,
+        );
         assert_eq!(b.naming(), Naming::Hf);
-        assert!(v.author(&mut b).is_ok(), "the HF pass is the one this row has");
+        assert!(
+            v.author(&mut b).is_ok(),
+            "the HF pass is the one this row has"
+        );
     }
 
     /// The chat answer is GLM's own stop set, and the two role markers
@@ -523,8 +558,16 @@ mod tests {
     fn the_row_answers_what_the_driver_advertises() {
         for v in VARIANTS {
             let a = v.advertised();
-            assert_eq!(a.arch, "glm_moe_dsa", "{}: the family label a guest program sees", v.id);
-            assert!(!a.arch.is_empty(), "{}: an empty label matches no guest predicate", v.id);
+            assert_eq!(
+                a.arch, "glm_moe_dsa",
+                "{}: the family label a guest program sees",
+                v.id
+            );
+            assert!(
+                !a.arch.is_empty(),
+                "{}: an empty label matches no guest predicate",
+                v.id
+            );
             assert_eq!(
                 a.max_model_len, 0,
                 "{}: state a ceiling only from a published config — the only GLM-5 \
@@ -561,9 +604,10 @@ mod tests {
     /// The guard that replaces `driver-metal`'s `LLAMA_LIKE` table. That
     /// table answered "does this build serve you" from an architecture
     /// STRING reduced by `canonical()`, in a driver, before any text was
-    /// traced — so it could say yes to a row whose text does not exist
-    /// (it listed `gemma4`) and no to one whose text does (it omitted
-    /// `gemma3`). The row answers now, and what it answers with is a
+    /// traced — so it could say yes to a row this build cannot resolve
+    /// (it listed `gpt_oss`, whose every publication either fails this
+    /// crate's manifest or names tensors `driver-metal` has no handle
+    /// for) and no to one whose text it models (it omitted `gemma3`). The row answers now, and what it answers with is a
     /// sentence naming what is missing.
     ///
     /// The comparison is against [`project::NO_METAL`] itself and not a

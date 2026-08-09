@@ -6,8 +6,8 @@
 //! store's dtype -- is known only when that backend's aspect is compiled,
 //! so it stays here.
 
-use serde::{Deserialize, Serialize};
 use model_compiler::dsl::WeightRepr;
+use serde::{Deserialize, Serialize};
 
 /// The shape, re-exported so a declaration reaches its facts and the
 /// words they are stated in from one place.

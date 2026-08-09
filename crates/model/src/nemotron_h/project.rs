@@ -97,17 +97,32 @@ pub fn manifest(f: &NemotronHFacts) -> Manifest {
         // `use_conv_bias: true` is the config's way of saying. A row
         // that omitted it would still match — the spec would just never
         // ask — so it is stated to keep the comparison total.
-        .with(TensorSpec::required("backbone.layer.{}.mixer.conv1d.bias", [conv_dim]))
+        .with(TensorSpec::required(
+            "backbone.layer.{}.mixer.conv1d.bias",
+            [conv_dim],
+        ))
         // One decay, one skip and one step bias PER HEAD. These three
         // extents are how a reader tells `num_heads` from
         // `intermediate`, which the packed banks above cannot say.
-        .with(TensorSpec::required("backbone.layer.{}.mixer.A_log", [heads]))
+        .with(TensorSpec::required(
+            "backbone.layer.{}.mixer.A_log",
+            [heads],
+        ))
         .with(TensorSpec::required("backbone.layer.{}.mixer.D", [heads]))
-        .with(TensorSpec::required("backbone.layer.{}.mixer.dt_bias", [heads]))
+        .with(TensorSpec::required(
+            "backbone.layer.{}.mixer.dt_bias",
+            [heads],
+        ))
         // The GATED norm folds over the scan's whole width, not per
         // head — `zamba_rmsnorm_gated` reads `z` from the same split.
-        .with(TensorSpec::required("backbone.layer.{}.mixer.norm", [intermediate]))
-        .with(TensorSpec::required("backbone.layer.{}.mixer.out_proj", [hidden, intermediate]))
+        .with(TensorSpec::required(
+            "backbone.layer.{}.mixer.norm",
+            [intermediate],
+        ))
+        .with(TensorSpec::required(
+            "backbone.layer.{}.mixer.out_proj",
+            [hidden, intermediate],
+        ))
         // ── The attention block, under `mixer.` like everything else ─
         .with(TensorSpec::required(
             "backbone.layer.{}.mixer.q_proj",
@@ -135,8 +150,16 @@ pub fn manifest(f: &NemotronHFacts) -> Manifest {
         // ReLU², so ONE projection up and one down; there is no gate
         // half to pair with, and forbidding `gate_proj` is what says so.
         .with(TensorSpec::absent("backbone.layer.{}.mixer.gate_proj"))
-        .either(!f.is_mixture(), "backbone.layer.{}.mixer.up_proj", [mlp, hidden])
-        .either(!f.is_mixture(), "backbone.layer.{}.mixer.down_proj", [hidden, mlp])
+        .either(
+            !f.is_mixture(),
+            "backbone.layer.{}.mixer.up_proj",
+            [mlp, hidden],
+        )
+        .either(
+            !f.is_mixture(),
+            "backbone.layer.{}.mixer.down_proj",
+            [hidden, mlp],
+        )
         // The expert bank's extents are a PACKING decision — one tensor
         // per expert, or the packed slab `contract::packed_expert_views`
         // publishes — so the spec asks that it exist and says nothing
@@ -210,10 +233,22 @@ pub fn deployment(
             // MLP layer is the router's. `widest_mlp()` is the max of
             // the two and is what sizes the forward workspace, so a
             // planner told only one of them under-sizes the other.
-            intermediate: if f.is_mixture() { 0 } else { f.moe.moe_intermediate },
-            moe_intermediate: if f.is_mixture() { f.moe.moe_intermediate } else { 0 },
+            intermediate: if f.is_mixture() {
+                0
+            } else {
+                f.moe.moe_intermediate
+            },
+            moe_intermediate: if f.is_mixture() {
+                f.moe.moe_intermediate
+            } else {
+                0
+            },
             experts_per_token: if f.is_mixture() { f.moe.top_k } else { 0 },
-            shared_intermediate: if f.is_mixture() { f.moe.shared_intermediate } else { 0 },
+            shared_intermediate: if f.is_mixture() {
+                f.moe.shared_intermediate
+            } else {
+                0
+            },
             vocab: f.vocab,
         },
         attention,
@@ -224,12 +259,20 @@ pub fn deployment(
         prefill: PrefillStyle::Planned,
         attn_output: AttnOutput::DriverPinned,
         logit_softcap: 0.0,
+        // No ATTENTION cap: gemma-2's `attn_logit_softcapping` is
+        // gemma-2's alone, and a zero here is "no cap" rather than a
+        // cap at zero — which would flatten every score to `tanh(inf)`.
+        attn_logit_softcap: 0.0,
         ple_dim: 0,
         norm: NormPlacement::Pre,
         // Not a gemma: the gain is the multiplier, stored directly.
         norm_unit_offset: false,
         v_norm: false,
         k_eq_v: false,
+        // The only family whose CUDA text names `topk_sigmoid_bias`,
+        // which is the kernel that reads this off the launch context.
+        norm_topk_prob: f.moe.norm_topk_prob,
+        routed_scaling: f.moe.routed_scaling,
         mlp_gate: crate::deployment::MlpGate::Silu,
         scales: std::collections::BTreeMap::new(),
         // Filled by the ROW: a family label and a published ceiling are
@@ -268,12 +311,18 @@ fn mamba_shape(f: &NemotronHFacts) -> RecurrentShape {
         // The store is bf16, matching `RecurrentStateCache`'s only
         // allocator for it.
         state_elem: 2,
-        k_h: m.n_groups as i32,
+        // NOT the group count. `k_h` is a GATED-DELTA field and every
+        // kernel reading it is a gdn kernel a mamba row never
+        // dispatches — which is why `n_groups` could ride here unnoticed
+        // while `GdnCtx::n_groups` stayed the literal zero the launch
+        // wrote beside it.
+        k_h: 0,
         v_h: m.num_heads as i32,
         k_d: m.state_size as i32,
         v_d: m.head_dim as i32,
         conv_dim: m.conv_dim() as i32,
         conv_k: m.conv_kernel as i32,
+        n_groups: m.n_groups as i32,
     }
 }
 
@@ -298,8 +347,8 @@ fn mamba_shape(f: &NemotronHFacts) -> RecurrentShape {
 /// `LLAMA_LIKE` — an eleven-entry table of architecture STRINGS,
 /// reduced by a punctuation-stripping `canonical()`, consulted before
 /// any text was traced and free to disagree with what the tracer would
-/// actually do. It listed `gemma4`, which the load path refused on
-/// other grounds, and omitted `gemma3`, whose text it models. A row
+/// actually do. It listed `gpt_oss`, which no publication of reaches a
+/// Metal device here, and omitted `gemma3`, whose text it models. A row
 /// that answers for itself cannot disagree with a list, because there
 /// is no list.
 pub const NO_METAL: &str = "nemotron-h has no Metal text in this build: its forward is `nemotron_h_cuda`, \
@@ -321,7 +370,9 @@ pub fn trace(
 #[cfg(test)]
 mod tests {
     use super::super::spec::{NemotronLayerKind, NemotronMoeFacts};
-    use super::{Deployment, KvStyle, NemotronHFacts, NormPlacement, PrefillStyle, deployment, manifest};
+    use super::{
+        Deployment, KvStyle, NemotronHFacts, NormPlacement, PrefillStyle, deployment, manifest,
+    };
     use crate::deployment::{Advertised, AttnOutput, Towers};
     use crate::manifest::{Observed, Presence};
 
@@ -350,7 +401,11 @@ mod tests {
                     .filter(|t| t.presence != Presence::Absent)
                     .map(|t| (t.name.replace("{}", "0"), t.extents.clone())),
             );
-            assert!(m.check(&implied).is_ok(), "{}", m.check(&implied).unwrap_err());
+            assert!(
+                m.check(&implied).is_ok(),
+                "{}",
+                m.check(&implied).unwrap_err()
+            );
         }
     }
 
@@ -387,7 +442,11 @@ mod tests {
             "backbone.layer.{}.mixer.down_proj",
         ] {
             let spec = named(name).unwrap_or_else(|| panic!("no row for '{name}'"));
-            assert_eq!(spec.presence, Presence::Required, "'{name}' is what this generation is");
+            assert_eq!(
+                spec.presence,
+                Presence::Required,
+                "'{name}' is what this generation is"
+            );
         }
         assert_eq!(m.layers, 52);
     }
@@ -399,7 +458,12 @@ mod tests {
         let f = NemotronHFacts::nemotron_h_8b();
         let m = manifest(&f);
         let want = |n: &str| {
-            m.tensors.iter().find(|t| t.name == n).expect("stated above").extents.clone()
+            m.tensors
+                .iter()
+                .find(|t| t.name == n)
+                .expect("stated above")
+                .extents
+                .clone()
         };
         // 128 heads of 64 = 8192 scanning width; B and C add
         // 2 * 8 groups * 128 state = 2048, so the conv sees 10 240; and
@@ -422,7 +486,10 @@ mod tests {
         assert_eq!(want("backbone.layer.{}.mixer.k_proj"), vec![1024, 4096]);
         assert_eq!(want("backbone.layer.{}.mixer.o_proj"), vec![4096, 4096]);
         assert_eq!(want("backbone.layer.{}.mixer.up_proj"), vec![21_504, 4096]);
-        assert_eq!(want("backbone.layer.{}.mixer.down_proj"), vec![4096, 21_504]);
+        assert_eq!(
+            want("backbone.layer.{}.mixer.down_proj"),
+            vec![4096, 21_504]
+        );
     }
 
     /// A dense stack forbids the expert bank and a routed one requires
@@ -430,7 +497,12 @@ mod tests {
     #[test]
     fn dense_and_routed_rows_cannot_claim_one_checkpoint() {
         let presence = |f: &NemotronHFacts, name: &str| {
-            manifest(f).tensors.iter().find(|t| t.name == name).expect("stated").presence
+            manifest(f)
+                .tensors
+                .iter()
+                .find(|t| t.name == name)
+                .expect("stated")
+                .presence
         };
         let dense = NemotronHFacts::nemotron_h_8b();
         // The 8B's own widths with a router bolted on, so the ONLY thing
@@ -441,6 +513,8 @@ mod tests {
             moe: NemotronMoeFacts {
                 num_experts: 8,
                 top_k: 2,
+                norm_topk_prob: true,
+                routed_scaling: 1.0,
                 moe_intermediate: 21_504,
                 shared_intermediate: 0,
             },
@@ -449,8 +523,14 @@ mod tests {
         let bank = "backbone.layer.{}.mixer.experts.0.up_proj";
         assert_eq!(presence(&dense, bank), Presence::Absent);
         assert_eq!(presence(&routed, bank), Presence::Required);
-        assert_eq!(presence(&dense, "backbone.layer.{}.mixer.up_proj"), Presence::Required);
-        assert_eq!(presence(&routed, "backbone.layer.{}.mixer.up_proj"), Presence::Absent);
+        assert_eq!(
+            presence(&dense, "backbone.layer.{}.mixer.up_proj"),
+            Presence::Required
+        );
+        assert_eq!(
+            presence(&routed, "backbone.layer.{}.mixer.up_proj"),
+            Presence::Absent
+        );
 
         // The checkpoint the dense row describes, offered to the routed
         // row: it must be refused, and the refusal must name the bank.
@@ -461,12 +541,18 @@ mod tests {
                 .filter(|t| t.presence != Presence::Absent)
                 .map(|t| (t.name.replace("{}", "0"), t.extents.clone())),
         );
-        let err = manifest(&routed).check(&seen).expect_err("a dense stack is not a mixture");
+        let err = manifest(&routed)
+            .check(&seen)
+            .expect_err("a dense stack is not a mixture");
         assert!(
             err.to_string().contains("experts.0"),
             "the refusal must say what is missing: {err}"
         );
-        assert_eq!(err.faults.len(), 4, "two banks missing and two dense projections present");
+        assert_eq!(
+            err.faults.len(),
+            4,
+            "two banks missing and two dense projections present"
+        );
     }
 
     /// Neither q/k norms nor a gate half, and the row says so.
@@ -493,13 +579,28 @@ mod tests {
     #[test]
     fn an_untied_row_requires_the_output_projection() {
         let m = manifest(&NemotronHFacts::nemotron_h_8b());
-        let head = m.tensors.iter().find(|t| t.name == "lm_head").expect("stated");
+        let head = m
+            .tensors
+            .iter()
+            .find(|t| t.name == "lm_head")
+            .expect("stated");
         assert_eq!(head.presence, Presence::Required);
         assert_eq!(head.extents, vec![131_072, 4096]);
 
-        let tied = NemotronHFacts { tied_embeddings: true, ..NemotronHFacts::nemotron_h_8b() };
-        let head = manifest(&tied).tensors.into_iter().find(|t| t.name == "lm_head").expect("row");
-        assert_eq!(head.presence, Presence::Absent, "a tied stack ships one table, not two");
+        let tied = NemotronHFacts {
+            tied_embeddings: true,
+            ..NemotronHFacts::nemotron_h_8b()
+        };
+        let head = manifest(&tied)
+            .tensors
+            .into_iter()
+            .find(|t| t.name == "lm_head")
+            .expect("row");
+        assert_eq!(
+            head.presence,
+            Presence::Absent,
+            "a tied stack ships one table, not two"
+        );
     }
 
     /// The geometry is the row's own numbers.
@@ -507,15 +608,25 @@ mod tests {
     fn the_geometry_is_the_rows_own_numbers() {
         let d = eight_b();
         assert_eq!(d.layers, 52);
-        assert_eq!(d.attention.len(), 52, "one entry per layer, whether or not it attends");
+        assert_eq!(
+            d.attention.len(),
+            52,
+            "one entry per layer, whether or not it attends"
+        );
         assert_eq!(d.shape.hidden, 4096);
         assert_eq!(d.shape.q_heads, 32);
         assert_eq!(d.shape.kv_heads, 8);
         assert_eq!(d.shape.gqa_group(), 4);
         assert_eq!(d.shape.head_dim, 128);
-        assert_eq!(d.shape.head_dim_kernel, 128, "128 is instantiated; nothing is padded");
+        assert_eq!(
+            d.shape.head_dim_kernel, 128,
+            "128 is instantiated; nothing is padded"
+        );
         assert_eq!(d.shape.intermediate, 21_504);
-        assert_eq!(d.shape.moe_intermediate, 0, "a dense stack has no expert width");
+        assert_eq!(
+            d.shape.moe_intermediate, 0,
+            "a dense stack has no expert width"
+        );
         assert_eq!(d.shape.widest_mlp(), 21_504);
         assert_eq!(d.shape.vocab, 131_072);
         assert_eq!(d.norm_eps, EPS);
@@ -525,7 +636,11 @@ mod tests {
         assert_eq!(d.kv, KvStyle::Paged);
         assert_eq!(d.prefill, PrefillStyle::Planned);
         assert_eq!(d.attn_output, AttnOutput::DriverPinned);
-        assert_eq!(d.advertised, Advertised::default(), "the row fills this, not the projection");
+        assert_eq!(
+            d.advertised,
+            Advertised::default(),
+            "the row fills this, not the projection"
+        );
         assert_eq!(d.towers, Towers::default(), "Nemotron-H is text only");
     }
 
@@ -534,7 +649,10 @@ mod tests {
     fn a_routed_stack_states_the_expert_width_and_not_a_dense_one() {
         let f = NemotronHFacts::nemotron_h_synthetic();
         let d = deployment(&f, ROPE, EPS, 128);
-        assert_eq!(d.shape.intermediate, 0, "no layer of a routed stack runs a dense block");
+        assert_eq!(
+            d.shape.intermediate, 0,
+            "no layer of a routed stack runs a dense block"
+        );
         assert_eq!(d.shape.moe_intermediate, 1024);
         assert_eq!(d.shape.widest_mlp(), 1024);
     }
@@ -545,18 +663,29 @@ mod tests {
     fn every_layer_attends_the_whole_context_at_one_base() {
         let d = eight_b();
         for (l, a) in d.attention.iter().enumerate() {
-            assert_eq!(a.window, -1, "layer {l} states a window and no config here does");
-            assert_eq!(a.kv_source, l as u32, "no layer of this generation shares KV");
+            assert_eq!(
+                a.window, -1,
+                "layer {l} states a window and no config here does"
+            );
+            assert_eq!(
+                a.kv_source, l as u32,
+                "no layer of this generation shares KV"
+            );
             assert_eq!(a.head_dim, 128);
             assert_eq!(a.rope_theta, ROPE);
             assert_eq!(a.rotary_dim, 0, "full rotation at the head width");
         }
         let expected = 1.0 / 128f32.sqrt();
         assert!(
-            d.attention.iter().all(|a| (a.sm_scale - expected).abs() < 1e-9),
+            d.attention
+                .iter()
+                .all(|a| (a.sm_scale - expected).abs() < 1e-9),
             "this generation's q and k carry no norm, so the softmax scale is the ordinary one"
         );
-        assert!(!d.shares_kv(), "a stack whose layers each own their pages does not share");
+        assert!(
+            !d.shares_kv(),
+            "a stack whose layers each own their pages does not share"
+        );
     }
 
     /// The slab list names the SSM layers and nothing else.
@@ -569,22 +698,32 @@ mod tests {
     fn the_recurrent_slabs_are_the_mamba_layers_and_only_those() {
         let f = NemotronHFacts::nemotron_h_8b();
         let d = eight_b();
-        let r = d.recurrent.as_ref().expect("a hybrid carries recurrent state");
+        let r = d
+            .recurrent
+            .as_ref()
+            .expect("a hybrid carries recurrent state");
         assert_eq!(r.linear_layers, f.mamba_layers());
         assert_eq!(r.linear_layers.len(), 24);
         assert!(
-            r.linear_layers.iter().all(|&l| f.kind(l) == NemotronLayerKind::Mamba),
+            r.linear_layers
+                .iter()
+                .all(|&l| f.kind(l) == NemotronLayerKind::Mamba),
             "a slab was provisioned for a layer that has no scan"
         );
         for l in [7, 18, 29, 40] {
-            assert!(!r.linear_layers.contains(&l), "layer {l} attends; it pages instead");
+            assert!(
+                !r.linear_layers.contains(&l),
+                "layer {l} attends; it pages instead"
+            );
         }
     }
 
     /// The two strides, from the two widths they are made of.
     #[test]
     fn the_strides_are_the_scans_working_set() {
-        let r = eight_b().recurrent.expect("a hybrid carries recurrent state");
+        let r = eight_b()
+            .recurrent
+            .expect("a hybrid carries recurrent state");
         // The conv window spans the whole packed in-projection minus z
         // and dt: 10 240 channels, four taps deep.
         assert_eq!(r.conv_dim, 10_240);
@@ -592,9 +731,17 @@ mod tests {
         assert_eq!(r.conv_stride, 4 * 10_240);
         // The state is `[128 heads, 64 wide, 128 deep]`.
         assert_eq!(r.state_stride, 128 * 64 * 128);
-        assert_eq!(r.state_stride, (r.v_h * r.k_d * r.v_d) as usize, "the GDN arithmetic exactly");
+        assert_eq!(
+            r.state_stride,
+            (r.v_h * r.k_d * r.v_d) as usize,
+            "the GDN arithmetic exactly"
+        );
         assert_eq!(r.state_elem, 2, "bf16");
-        assert_eq!((r.v_h, r.v_d, r.k_d, r.k_h), (128, 64, 128, 8));
+        assert_eq!((r.v_h, r.v_d, r.k_d), (128, 64, 128));
+        // The group count under its own name, and `k_h` — a
+        // gated-delta field — left empty rather than carrying it.
+        assert_eq!(r.n_groups, 8);
+        assert_eq!(r.k_h, 0);
     }
 
     /// The 47B's doubled state reaches the allocator.
@@ -607,7 +754,9 @@ mod tests {
         let big = deployment(&NemotronHFacts::nemotron_h_47b(), ROPE, EPS, 128)
             .recurrent
             .expect("a hybrid carries recurrent state");
-        let small = eight_b().recurrent.expect("a hybrid carries recurrent state");
+        let small = eight_b()
+            .recurrent
+            .expect("a hybrid carries recurrent state");
         assert_eq!(big.state_stride, 256 * 64 * 256);
         assert_eq!(big.state_stride, small.state_stride * 4);
         assert_eq!(big.linear_layers.len(), 45);
@@ -619,7 +768,10 @@ mod tests {
     fn a_padded_head_dim_moves_the_kernel_width_and_not_the_checkpoints() {
         let f = NemotronHFacts::nemotron_h_8b();
         let d = deployment(&f, ROPE, EPS, 256);
-        assert_eq!(d.shape.head_dim, 128, "the checkpoint's own width is unchanged");
+        assert_eq!(
+            d.shape.head_dim, 128,
+            "the checkpoint's own width is unchanged"
+        );
         assert_eq!(d.shape.head_dim_kernel, 256);
         assert_eq!(d.shape.head_dim_alloc(), 256);
         assert!(

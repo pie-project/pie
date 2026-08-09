@@ -30,9 +30,9 @@ pub mod chat;
 use std::sync::{Arc, OnceLock};
 
 use crate::catalog::{Deployed, LoadShape, Variant};
+use crate::manifest::Manifest;
 use crate::shared::llama_like::project;
 use crate::shared::llama_like::spec::LlamaLikeFacts;
-use crate::manifest::Manifest;
 
 use model_compiler::facts::{NormPlacement, QkNorm};
 use model_compiler::trace::{NormVariant, RopeKind};
@@ -162,6 +162,25 @@ pub fn rows() -> &'static [&'static dyn Variant] {
     ROWS.get_or_init(|| VARIANTS.iter().map(|v| v as &'static dyn Variant).collect())
 }
 
+impl Mistral3 {
+    /// The scalars this row states, read ONCE.
+    ///
+    /// Both [`Variant::deployment`] and [`Variant::trace`] take it. They
+    /// used to read `rope_theta`, `norm_eps` and `window` off `self`
+    /// separately — the same three fields, spelled twice, with nothing
+    /// holding the two spellings together.
+    fn row(&self) -> project::RowScalars {
+        project::RowScalars {
+            rope_theta: self.rope_theta,
+            norm_eps: self.norm_eps,
+            window: self.window,
+            rope_rescaled: false,
+            // Unread: this generation is dense, so no router is stated.
+            norm_topk_prob: true,
+        }
+    }
+}
+
 impl Variant for Mistral3 {
     fn id(&self) -> &'static str {
         self.id
@@ -172,7 +191,11 @@ impl Variant for Mistral3 {
     }
 
     fn load_shape(&self) -> LoadShape {
-        LoadShape::dense(self.shape.layers, self.shape.head_dim, self.shape.tied_embeddings)
+        LoadShape::dense(
+            self.shape.layers,
+            self.shape.head_dim,
+            self.shape.tied_embeddings,
+        )
     }
 
     fn deployment(
@@ -180,8 +203,7 @@ impl Variant for Mistral3 {
         load: Deployed<'_>,
     ) -> Result<crate::deployment::Deployment, crate::deployment::Refusal> {
         let _ = load;
-        let mut deployment =
-            project::deployment(&self.shape, self.rope_theta, self.norm_eps, self.window);
+        let mut deployment = project::deployment(&self.shape, self.row());
         deployment.advertised = crate::deployment::Advertised {
             arch: ARCH,
             max_model_len: MAX_MODEL_LEN,
@@ -204,12 +226,16 @@ impl Variant for Mistral3 {
         builder: &mut crate::shared::builder::Builder<'_>,
     ) -> Result<(), model_loader::error::Error> {
         match builder.naming() {
-            crate::shared::policy::Naming::Hf => crate::shared::llama_like::contract::author_dense(builder),
+            crate::shared::policy::Naming::Hf => {
+                crate::shared::llama_like::contract::author_dense(builder)
+            }
             // The registry this replaced held an MLX row for `mistral`,
             // and a row that states only the HF author hands Metal the
             // checkpoint's own names and its own dtype. See
             // `llama_3::mod`'s `author`.
-            crate::shared::policy::Naming::Mlx => crate::shared::llama_like::contract::author_llama_mlx(builder),
+            crate::shared::policy::Naming::Mlx => {
+                crate::shared::llama_like::contract::author_llama_mlx(builder)
+            }
         }
     }
 
@@ -230,17 +256,7 @@ impl Variant for Mistral3 {
         class: model_compiler::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
-        project::trace(
-            &self.shape,
-            project::MetalRow {
-                rope_theta: self.rope_theta,
-                norm_eps: self.norm_eps,
-                window: self.window,
-                rope_rescaled: false,
-            },
-            class,
-            load,
-        )
+        project::trace(&self.shape, self.row(), class, load)
     }
 
     /// `[INST] … [/INST]`, whose assistant turn opens with NOTHING — the
@@ -270,11 +286,26 @@ mod tests {
     #[test]
     fn the_row_answers_what_the_driver_advertises() {
         for v in VARIANTS {
-            let a = v.deployment(Deployed::single()).expect("dense mistral is servable").advertised;
-            assert_eq!(a.arch, "mistral", "{}: the family label a guest program sees", v.id);
-            assert_eq!(a.max_model_len, 32_768, "{}: both configs state 32768", v.id);
+            let a = v
+                .deployment(Deployed::single())
+                .expect("dense mistral is servable")
+                .advertised;
+            assert_eq!(
+                a.arch, "mistral",
+                "{}: the family label a guest program sees",
+                v.id
+            );
+            assert_eq!(
+                a.max_model_len, 32_768,
+                "{}: both configs state 32768",
+                v.id
+            );
             assert_ne!(a.max_model_len, 0, "{}: 0 is 'the row does not say'", v.id);
-            assert!(!a.media_encode, "{}: no Mistral row here carries a tower", v.id);
+            assert!(
+                !a.media_encode,
+                "{}: no Mistral row here carries a tower",
+                v.id
+            );
         }
     }
 
@@ -290,9 +321,18 @@ mod tests {
     /// the checkpoint states.
     #[test]
     fn the_ministral_row_states_its_config_rather_than_its_model_card() {
-        let a = row("ministral-8b").deployment(Deployed::single()).expect("servable").advertised;
-        assert_eq!(a.max_model_len, 32_768, "the config's number, not the card's 131072");
-        assert_ne!(a.max_model_len, 131_072, "the card's claim is not the checkpoint's claim");
+        let a = row("ministral-8b")
+            .deployment(Deployed::single())
+            .expect("servable")
+            .advertised;
+        assert_eq!(
+            a.max_model_len, 32_768,
+            "the config's number, not the card's 131072"
+        );
+        assert_ne!(
+            a.max_model_len, 131_072,
+            "the card's claim is not the checkpoint's claim"
+        );
     }
 
     /// The label is the FAMILY and not this module's name.
@@ -310,21 +350,32 @@ mod tests {
             .expect("the suffix the worker strips")
             .to_string();
         assert_eq!(stem, ARCH);
-        assert_ne!(ARCH, "mistral3", "the module's name is not the checkpoint's name");
-        assert!(ARCH.chars().all(|c| c.is_ascii_lowercase()), "letters only, lowercased");
+        assert_ne!(
+            ARCH, "mistral3",
+            "the module's name is not the checkpoint's name"
+        );
+        assert!(
+            ARCH.chars().all(|c| c.is_ascii_lowercase()),
+            "letters only, lowercased"
+        );
     }
 
     /// The fixture and the row are the same measurement.
     #[test]
     fn the_row_agrees_with_the_committed_fixture() {
-        assert_eq!(row("mistral-7b-v0.3").shape, LlamaLikeFacts::mistral_7b_v03());
+        assert_eq!(
+            row("mistral-7b-v0.3").shape,
+            LlamaLikeFacts::mistral_7b_v03()
+        );
     }
 
     /// Every row answers every question.
     #[test]
     fn every_row_projects() {
         for v in VARIANTS {
-            let d = v.deployment(Deployed::single()).expect("dense mistral is servable");
+            let d = v
+                .deployment(Deployed::single())
+                .expect("dense mistral is servable");
             assert_eq!(d.layers, v.shape.layers);
             assert_eq!(d.attention.len() as u32, v.shape.layers);
             assert_eq!(d.shape.hidden, v.shape.hidden);
@@ -336,7 +387,10 @@ mod tests {
             let ls = v.load_shape();
             assert_eq!(ls.layers, v.shape.layers);
             assert_eq!(ls.head_dim, 128, "{}", v.id);
-            assert_eq!(ls.head_dim, v.shape.head_dim, "the TRUE head dim, never a padded one");
+            assert_eq!(
+                ls.head_dim, v.shape.head_dim,
+                "the TRUE head dim, never a padded one"
+            );
             assert!(!ls.tied_embeddings, "no Mistral row ties its head");
             assert_eq!(ls.n_experts, 0);
             assert_eq!(ls.mamba_groups, 0);
@@ -374,7 +428,11 @@ mod tests {
         assert_ne!(seven.shape.vocab, eight.shape.vocab);
         assert_ne!(seven.shape.layers, eight.shape.layers);
         assert_ne!(seven.shape.intermediate, eight.shape.intermediate);
-        assert_ne!(seven.manifest(), eight.manifest(), "no checkpoint matches both");
+        assert_ne!(
+            seven.manifest(),
+            eight.manifest(),
+            "no checkpoint matches both"
+        );
     }
 
     /// Both rows are GQA at eight KV heads, and the manifest's k/v
@@ -385,7 +443,12 @@ mod tests {
             assert_eq!(v.shape.q_heads / v.shape.kv_heads, 4, "{}", v.id);
             let m = v.manifest();
             let extent = |name: &str| -> Vec<u64> {
-                m.tensors.iter().find(|t| t.name == name).expect("stated").extents.clone()
+                m.tensors
+                    .iter()
+                    .find(|t| t.name == name)
+                    .expect("stated")
+                    .extents
+                    .clone()
             };
             let hidden = u64::from(v.shape.hidden);
             assert_eq!(extent("layer.{}.self_attn.q_proj"), vec![4096, hidden]);
@@ -406,8 +469,17 @@ mod tests {
         for v in VARIANTS {
             assert!(!v.shape.tied_embeddings, "{}", v.id);
             let m = v.manifest();
-            let head = m.tensors.iter().find(|t| t.name == "lm_head").expect("stated");
-            assert_eq!(head.presence, crate::manifest::Presence::Required, "{}", v.id);
+            let head = m
+                .tensors
+                .iter()
+                .find(|t| t.name == "lm_head")
+                .expect("stated");
+            assert_eq!(
+                head.presence,
+                crate::manifest::Presence::Required,
+                "{}",
+                v.id
+            );
             assert_eq!(
                 head.extents,
                 vec![u64::from(v.shape.vocab), u64::from(v.shape.hidden)],
@@ -442,14 +514,23 @@ mod tests {
 
         for v in VARIANTS {
             let inst = v.chat(tok.clone());
-            assert_eq!(tok.decode(&inst.user("Hi"), false), "[INST]Hi[/INST]", "{}", v.id);
+            assert_eq!(
+                tok.decode(&inst.user("Hi"), false),
+                "[INST]Hi[/INST]",
+                "{}",
+                v.id
+            );
             assert_eq!(
                 tok.decode(&inst.system("Hi"), false),
                 "[SYSTEM_PROMPT]Hi[/SYSTEM_PROMPT]",
                 "{}",
                 v.id
             );
-            assert!(inst.cue().is_empty(), "{}: the assistant turn opens with nothing", v.id);
+            assert!(
+                inst.cue().is_empty(),
+                "{}: the assistant turn opens with nothing",
+                v.id
+            );
         }
     }
 
@@ -460,7 +541,10 @@ mod tests {
         use model_loader::checkpoint::CheckpointMetadata;
         use model_loader::plan::StorageTarget;
 
-        let metadata = CheckpointMetadata { files: Vec::new(), tensors: Vec::new() };
+        let metadata = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: Vec::new(),
+        };
         let encoding = crate::encoding::Encoding::dense();
         let target = StorageTarget::default();
         let policy = crate::shared::policy::Policy::default();
@@ -474,7 +558,8 @@ mod tests {
                 &target,
                 &policy,
             );
-            v.author(&mut builder).unwrap_or_else(|e| panic!("{} refused to author: {e:?}", v.id));
+            v.author(&mut builder)
+                .unwrap_or_else(|e| panic!("{} refused to author: {e:?}", v.id));
         }
     }
 
@@ -485,8 +570,15 @@ mod tests {
 
         for v in VARIANTS {
             for class in [FireClass::Decode, FireClass::Prefill] {
-                let plan = v.trace(class, Deployed::single()).expect("llama-like traces");
-                assert!(plan.family.contains("llama_like"), "{}: {}", v.id, plan.family);
+                let plan = v
+                    .trace(class, Deployed::single())
+                    .expect("llama-like traces");
+                assert!(
+                    plan.family.contains("llama_like"),
+                    "{}: {}",
+                    v.id,
+                    plan.family
+                );
                 assert!(!plan.ops.is_empty(), "{}", v.id);
             }
         }

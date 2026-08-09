@@ -37,12 +37,12 @@ use std::marker::PhantomData;
 use super::alloc::{Allocator, DeviceBuffer};
 
 use cudarc::runtime::sys::{
-    cudaConditionalNodeParams, cudaGraphConditionalHandle,
-    cudaGraphConditionalHandleCreate, cudaGraphConditionalNodeType, cudaGraphDestroy,
-    cudaGraphExecDestroy, cudaGraphExecKernelNodeSetParams, cudaGraphExec_t,
-    cudaGraphInstantiate, cudaGraphKernelNodeGetParams, cudaGraphLaunch,
-    cudaGraphConditionalHandleFlags, cudaGraphNodeParams, cudaGraphNodeType, cudaGraphNode_t,
-    cudaGraphUpload, cudaGraph_t, cudaKernelNodeParams,
+    cudaConditionalNodeParams, cudaGraph_t, cudaGraphConditionalHandle,
+    cudaGraphConditionalHandleCreate, cudaGraphConditionalHandleFlags,
+    cudaGraphConditionalNodeType, cudaGraphDestroy, cudaGraphExec_t, cudaGraphExecDestroy,
+    cudaGraphExecKernelNodeSetParams, cudaGraphInstantiate, cudaGraphKernelNodeGetParams,
+    cudaGraphLaunch, cudaGraphNode_t, cudaGraphNodeParams, cudaGraphNodeType, cudaGraphUpload,
+    cudaKernelNodeParams,
 };
 
 use crate::device::stream::StreamRef;
@@ -170,7 +170,10 @@ impl Graph {
         default_run: Option<bool>,
     ) -> Result<ConditionalIf<'_>> {
         let (default_value, flags) = match default_run {
-            Some(v) => (u32::from(v), cudaGraphConditionalHandleFlags::cudaGraphCondAssignDefault as u32),
+            Some(v) => (
+                u32::from(v),
+                cudaGraphConditionalHandleFlags::cudaGraphCondAssignDefault as u32,
+            ),
             None => (0, 0),
         };
         let mut handle: cudaGraphConditionalHandle = 0;
@@ -208,7 +211,13 @@ impl Graph {
         let mut node: cudaGraphNode_t = std::ptr::null_mut();
         check_rt(
             unsafe {
-                add_node(&raw mut node, self.raw, deps.as_ptr(), deps.len(), &raw mut params)
+                add_node(
+                    &raw mut node,
+                    self.raw,
+                    deps.as_ptr(),
+                    deps.len(),
+                    &raw mut params,
+                )
             },
             "cudaGraphAddNode",
         )?;
@@ -225,7 +234,12 @@ impl Graph {
         // SAFETY: `out` is non-null and has at least one element.
         let body = unsafe { *out };
 
-        Ok(ConditionalIf { node, body, handle, _parent: PhantomData })
+        Ok(ConditionalIf {
+            node,
+            body,
+            handle,
+            _parent: PhantomData,
+        })
     }
 
     /// A SWITCH node: one conditional that branches on an INTEGER index.
@@ -278,7 +292,13 @@ impl Graph {
         let mut node: cudaGraphNode_t = std::ptr::null_mut();
         check_rt(
             unsafe {
-                add_node(&raw mut node, self.raw, deps.as_ptr(), deps.len(), &raw mut params)
+                add_node(
+                    &raw mut node,
+                    self.raw,
+                    deps.as_ptr(),
+                    deps.len(),
+                    &raw mut params,
+                )
             },
             "cudaGraphAddNode",
         )?;
@@ -292,7 +312,12 @@ impl Graph {
         // SAFETY: on success CUDA has pointed `phGraph_out` at an array of
         // exactly `bodies` graphs, owned by the parent.
         let graphs = unsafe { std::slice::from_raw_parts(out, bodies as usize) }.to_vec();
-        Ok(ConditionalSwitch { node, bodies: graphs, handle, _parent: PhantomData })
+        Ok(ConditionalSwitch {
+            node,
+            bodies: graphs,
+            handle,
+            _parent: PhantomData,
+        })
     }
 
     /// Instantiate into a launchable graph.
@@ -420,12 +445,18 @@ impl GraphExec {
     /// Upload to the device without launching, so the first launch does not
     /// pay for it.
     pub fn upload(&self, stream: StreamRef<'_>) -> Result<()> {
-        check_rt(unsafe { cudaGraphUpload(self.raw, stream.as_raw()) }, "cudaGraphUpload")
+        check_rt(
+            unsafe { cudaGraphUpload(self.raw, stream.as_raw()) },
+            "cudaGraphUpload",
+        )
     }
 
     /// Launch onto `stream`.
     pub fn launch(&self, stream: StreamRef<'_>) -> Result<()> {
-        check_rt(unsafe { cudaGraphLaunch(self.raw, stream.as_raw()) }, "cudaGraphLaunch")
+        check_rt(
+            unsafe { cudaGraphLaunch(self.raw, stream.as_raw()) },
+            "cudaGraphLaunch",
+        )
     }
 
     /// Retune ONE node's launch rectangle on this instantiated graph,
@@ -575,12 +606,12 @@ mod tests {
 // stream pool. Nothing here knows about models.
 
 #[cfg(feature = "bridge")]
-use cudarc::runtime::sys::{
-    cudaStreamCaptureMode, cudaStreamCaptureStatus,
-    cudaStreamUpdateCaptureDependenciesFlags, cudaStream_t,
-};
-#[cfg(feature = "bridge")]
 use super::stream::OwnedStream;
+#[cfg(feature = "bridge")]
+use cudarc::runtime::sys::{
+    cudaStream_t, cudaStreamCaptureMode, cudaStreamCaptureStatus,
+    cudaStreamUpdateCaptureDependenciesFlags,
+};
 
 /// How many predicate slots the device word holds.
 ///
@@ -633,7 +664,10 @@ impl PredicateWord {
     /// If the allocation fails.
     pub fn new(alloc: &Allocator) -> Result<Self> {
         let device = alloc.alloc(PRED_SLOTS)?;
-        Ok(Self { device, host: [0u8; PRED_SLOTS] })
+        Ok(Self {
+            device,
+            host: [0u8; PRED_SLOTS],
+        })
     }
 
     /// Set one slot in the HOST mirror. [`Self::upload`] is what the device
@@ -644,9 +678,10 @@ impl PredicateWord {
     /// If `slot` is outside the word.
     pub fn set(&mut self, slot: u32, on: bool) -> Result<()> {
         let i = usize::try_from(slot).unwrap_or(usize::MAX);
-        let cell = self.host.get_mut(i).ok_or_else(|| {
-            Error::invalid("supergraph", "predicate slot out of range")
-        })?;
+        let cell = self
+            .host
+            .get_mut(i)
+            .ok_or_else(|| Error::invalid("supergraph", "predicate slot out of range"))?;
         *cell = u8::from(on);
         Ok(())
     }
@@ -658,7 +693,10 @@ impl PredicateWord {
 
     /// Read one slot back out of the host mirror.
     pub fn get(&self, slot: u32) -> bool {
-        usize::try_from(slot).ok().and_then(|i| self.host.get(i)).is_some_and(|&v| v != 0)
+        usize::try_from(slot)
+            .ok()
+            .and_then(|i| self.host.get(i))
+            .is_some_and(|&v| v != 0)
     }
 
     /// Push the host mirror to the device, ordered on `stream`.
@@ -709,7 +747,10 @@ impl PeelWindowWord {
     /// If the allocation fails.
     pub fn new(alloc: &Allocator) -> Result<Self> {
         let device = alloc.alloc(std::mem::size_of::<u32>() * 2)?;
-        Ok(Self { device, host: [0, 0] })
+        Ok(Self {
+            device,
+            host: [0, 0],
+        })
     }
 
     /// Set the window in the host mirror. [`Self::upload`] is what the
@@ -801,7 +842,12 @@ unsafe fn capture_info(stream: cudaStream_t) -> Result<CaptureInfo> {
         },
         "cudaStreamGetCaptureInfo",
     )?;
-    Ok(CaptureInfo { status, graph, deps, ndeps })
+    Ok(CaptureInfo {
+        status,
+        graph,
+        deps,
+        ndeps,
+    })
 }
 
 #[cfg(all(feature = "bridge", feature = "cuda-13"))]
@@ -825,7 +871,12 @@ unsafe fn capture_info(stream: cudaStream_t) -> Result<CaptureInfo> {
         },
         "cudaStreamGetCaptureInfo",
     )?;
-    Ok(CaptureInfo { status, graph, deps, ndeps })
+    Ok(CaptureInfo {
+        status,
+        graph,
+        deps,
+        ndeps,
+    })
 }
 
 /// `cudaStreamUpdateCaptureDependencies`, version-routed for the same reason
@@ -982,7 +1033,9 @@ impl<'a> SupergraphBuilder<'a> {
         if self.nodes.len() <= index {
             self.nodes.resize(index + 1, None);
         }
-        let Ok(info) = (unsafe { capture_info(self.raw_stream()) }) else { return };
+        let Ok(info) = (unsafe { capture_info(self.raw_stream()) }) else {
+            return;
+        };
         if info.status != cudaStreamCaptureStatus::cudaStreamCaptureStatusActive
             || info.ndeps != 1
             || info.deps.is_null()
@@ -1016,7 +1069,10 @@ impl<'a> SupergraphBuilder<'a> {
 
     /// The same handle, raw — for the FFI seams that take one.
     fn raw_stream(&self) -> cudaStream_t {
-        self.active.last().copied().unwrap_or_else(|| self.root.as_raw())
+        self.active
+            .last()
+            .copied()
+            .unwrap_or_else(|| self.root.as_raw())
     }
 
     /// How deep the body stack is; zero at the root.
@@ -1062,7 +1118,10 @@ impl<'a> SupergraphBuilder<'a> {
             )
         };
         if rc != 0 {
-            return Err(Error::invalid("pie_supergraph_set_cond", "the set-cond launch failed"));
+            return Err(Error::invalid(
+                "pie_supergraph_set_cond",
+                "the set-cond launch failed",
+            ));
         }
 
         // Re-read: the deps now include the kernel just launched.
@@ -1080,7 +1139,13 @@ impl<'a> SupergraphBuilder<'a> {
         let mut node: cudaGraphNode_t = std::ptr::null_mut();
         check_rt(
             unsafe {
-                add_node(&raw mut node, info.graph, info.deps, info.ndeps, &raw mut params)
+                add_node(
+                    &raw mut node,
+                    info.graph,
+                    info.deps,
+                    info.ndeps,
+                    &raw mut params,
+                )
             },
             "cudaGraphAddNode",
         )?;
@@ -1097,7 +1162,11 @@ impl<'a> SupergraphBuilder<'a> {
         let if_body = unsafe { *out };
         let else_body = with_else.then(|| unsafe { *out.add(1) });
 
-        Ok(Cond { node, if_body, else_body })
+        Ok(Cond {
+            node,
+            if_body,
+            else_body,
+        })
     }
 
     /// Insert a SWITCH keyed on `pred_slot`, with `bodies` arms.
@@ -1128,12 +1197,18 @@ impl<'a> SupergraphBuilder<'a> {
             return Err(Error::invalid("supergraph", "pred slot out of range"));
         }
         if bodies == 0 {
-            return Err(Error::invalid("supergraph", "a switch with no bodies selects nothing"));
+            return Err(Error::invalid(
+                "supergraph",
+                "a switch with no bodies selects nothing",
+            ));
         }
         let s = self.raw_stream();
         let info = unsafe { capture_info(s) }?;
         if info.status != cudaStreamCaptureStatus::cudaStreamCaptureStatusActive {
-            return Err(Error::invalid("supergraph", "open_switch outside a capture"));
+            return Err(Error::invalid(
+                "supergraph",
+                "open_switch outside a capture",
+            ));
         }
         let mut handle: cudaGraphConditionalHandle = 0;
         check_rt(
@@ -1168,7 +1243,13 @@ impl<'a> SupergraphBuilder<'a> {
         let mut node: cudaGraphNode_t = std::ptr::null_mut();
         check_rt(
             unsafe {
-                add_node(&raw mut node, info.graph, info.deps, info.ndeps, &raw mut params)
+                add_node(
+                    &raw mut node,
+                    info.graph,
+                    info.deps,
+                    info.ndeps,
+                    &raw mut params,
+                )
             },
             "cudaGraphAddNode",
         )?;

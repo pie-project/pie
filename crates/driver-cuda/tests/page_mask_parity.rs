@@ -189,7 +189,9 @@ fn shapes() -> Vec<(&'static str, Vec<u32>)> {
         ("trailing_empty", vec![0, 7, 7]),
         (
             "wide_batch_16",
-            vec![0, 2, 5, 5, 9, 14, 20, 27, 35, 44, 54, 65, 77, 90, 104, 119, 135],
+            vec![
+                0, 2, 5, 5, 9, 14, 20, 27, 35, 44, 54, 65, 77, 90, 104, 119, 135,
+            ],
         ),
         ("all_empty", vec![0, 0, 0]),
         ("zero_total", vec![0]),
@@ -205,9 +207,9 @@ fn script_carve(out: &mut String) {
         let mut arena = SidebandArena::new();
         let geometry = FireGeometry::new(&csr);
 
-        let plan: Option<PageMaskCapturePlan> = geometry.ok().and_then(|g| {
-            prepare_page_mask_capture(&mut arena, &mut mem, g).ok()
-        });
+        let plan: Option<PageMaskCapturePlan> = geometry
+            .ok()
+            .and_then(|g| prepare_page_mask_capture(&mut arena, &mut mem, g).ok());
         let mut base = plan.map(|p| p.out_indices as usize);
 
         let (p_ok, p_requests, p_stride, p_idx, p_indptr, p_lens, p_keep) = plan.map_or_else(
@@ -241,8 +243,8 @@ fn script_carve(out: &mut String) {
         )
         .unwrap();
 
-        let built = geometry
-            .and_then(|g| FirePageMask::new(true, Some(g), Some(&mut arena), &mut mem));
+        let built =
+            geometry.and_then(|g| FirePageMask::new(true, Some(g), Some(&mut arena), &mut mem));
         let (active, requests, stride, idx, indptr, lens, keep, result) = match built {
             Ok(mut mask) => {
                 if base.is_none() {
@@ -569,7 +571,11 @@ fn the_two_carve_paths_agree_on_every_geometry_the_oracle_drives() {
             "{name}: last_lens"
         );
         let sink = mask.sink().unwrap();
-        assert_eq!(sink.keep as usize, base + layout.keep_offset, "{name}: keep");
+        assert_eq!(
+            sink.keep as usize,
+            base + layout.keep_offset,
+            "{name}: keep"
+        );
         assert_eq!(plan.keep, sink.keep, "{name}: the two paths disagree");
         assert_eq!(plan.stride, sink.stride, "{name}: stride");
         assert_eq!(plan.num_requests, sink.num_requests, "{name}: requests");

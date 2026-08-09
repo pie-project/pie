@@ -54,8 +54,8 @@ use driver::{
 };
 
 use super::cache::{Disk, disk_key};
+use super::compile::FailureKind;
 use super::compile::Module;
-use super::compile::{FailureKind};
 
 /// `PIE_KERNEL_FUSED` — the only kind the CUDA emitter produces.
 ///
@@ -143,7 +143,10 @@ mod kind_tests {
             stages: Arc::new(
                 kinds
                     .iter()
-                    .map(|_| Stage { signature_hash: 0, regions: Arc::new(Vec::new()) })
+                    .map(|_| Stage {
+                        signature_hash: 0,
+                        regions: Arc::new(Vec::new()),
+                    })
                     .collect(),
             ),
             plans: Arc::new(
@@ -486,14 +489,15 @@ impl Runtime {
             }
         }
 
-        let cubin = super::compile::compile(source, architecture).map_err(|error| match error.kind {
-            FailureKind::Deterministic => Failure::Deterministic {
-                reason: error.message,
-            },
-            FailureKind::Retryable => Failure::Retryable {
-                reason: error.message,
-            },
-        })?;
+        let cubin =
+            super::compile::compile(source, architecture).map_err(|error| match error.kind {
+                FailureKind::Deterministic => Failure::Deterministic {
+                    reason: error.message,
+                },
+                FailureKind::Retryable => Failure::Retryable {
+                    reason: error.message,
+                },
+            })?;
         self.stats.compilations += 1;
         let module = Module::load(&cubin, entry).map_err(|error| Failure::Retryable {
             reason: format!("loading '{entry}': {error}"),
@@ -574,10 +578,7 @@ mod tests {
     #[test]
     fn the_fold_is_fnv1a() {
         assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
-        assert_eq!(
-            fnv1a64(b"ptir"),
-            driver::tensor_ir::fnv1a64(b"ptir")
-        );
+        assert_eq!(fnv1a64(b"ptir"), driver::tensor_ir::fnv1a64(b"ptir"));
     }
 
     /// Folding the tails in must be identical to folding the concatenation,
@@ -604,9 +605,6 @@ mod tests {
     /// renumbering is a build break rather than an empty table at run time.
     #[test]
     fn cuda_compiles_the_fused_kind_the_abi_names() {
-        assert_eq!(
-            KERNEL_FUSED,
-            driver::driver_api::local::PIE_KERNEL_FUSED
-        );
+        assert_eq!(KERNEL_FUSED, driver::driver_api::local::PIE_KERNEL_FUSED);
     }
 }
