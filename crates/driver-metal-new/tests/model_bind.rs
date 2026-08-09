@@ -156,25 +156,22 @@ fn every_symbol_the_lowering_names_has_a_row_in_the_metal_table() {
             }
         }
     }
-    // One known gap, recorded rather than tolerated. `split_qkv` is a DSL
-    // construct both texts state; CUDA carries it as a row in
-    // `driver_internal.rs` — a kernel the driver launches that no text has to
-    // name — and `kernels-metal` has no such module and no such shader. The
-    // Metal driver's handwritten path splits QKV by BINDING OFFSETS rather
-    // than by dispatching anything, so the honest fixes are a Metal row plus
-    // its shader, or a lowering that expresses the split as views. Until one
-    // of those lands, the Metal text cannot run its attention block.
-    let known: BTreeSet<String> = ["attn::split_qkv_bf16".to_string()].into_iter().collect();
-    let news: BTreeSet<&String> = missing.difference(&known).collect();
+    // The known gap CLOSED. `attn::split_qkv_bf16` was the one symbol the
+    // text named that no `kernel!` row declared, and the fix was not the
+    // shader it looked like: the kernel needs `q_width` as a dispatch
+    // constant, and nothing could pass it one. `OpKind::Launch::params` is
+    // the channel the trace already carried for exactly that, so the text now
+    // states the launch and its two widths outright (`dsl::metal::split_qkv`)
+    // and the driver forwards them knowing nothing about what they mean.
+    //
+    // CUDA still carries its split as `driver_internal` — a kernel the driver
+    // launches that no text has to name. Metal has no such category and this
+    // is why it needs none.
     assert!(
-        news.is_empty(),
-        "the metal text names {} NEW symbol(s) with no `kernel!` row: {news:?}\n\
+        missing.is_empty(),
+        "the metal text names {} symbol(s) with no `kernel!` row: {missing:?}\n\
          A row is where the contract lives; add it in the module beside the .metal.",
-        news.len()
-    );
-    assert!(
-        missing.contains("attn::split_qkv_bf16"),
-        "the known gap closed — delete it from `known` and this assertion"
+        missing.len()
     );
 }
 

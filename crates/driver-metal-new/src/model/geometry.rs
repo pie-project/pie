@@ -18,7 +18,7 @@
 //! `source → max → min → divide-rounding-up → multiply`. But writing
 //! `Term { floor: 1, cap: 1024, div_ceil: 32, mul: 32 }` **loses the sentence
 //! that says why**, and in this codebase those sentences are load-bearing:
-//! `dispatch::qmv`'s doc records that its round-up is the difference between
+//! `grid::qmv`'s doc records that its round-up is the difference between
 //! computing every output and silently dropping the last few. A grammar buys
 //! `const` and pays in explanation.
 //!
@@ -47,7 +47,7 @@
 
 pub use kernels::LaunchRule as Rule;
 
-use crate::batch::{self as dispatch, Launch};
+use super::grid::{self as shapes, Launch};
 
 /// The fire-time quantities a launch rule may read.
 ///
@@ -60,8 +60,18 @@ pub struct Dims {
     /// Rows the rectangle covers.
     pub rows: u32,
     /// Elements per row of the operand that sizes the launch — a projection's
-    /// output width, a norm's row width, an MLP's intermediate.
+    /// output width, a norm's row width, an MLP's intermediate. The launch's
+    /// last widthed operand, which is its last OUTPUT.
     pub width: u32,
+    /// Elements per row of the launch's first widthed operand — its first
+    /// INPUT.
+    ///
+    /// Most rules size on the output, because most statements read narrow and
+    /// write wide or the same. A statement that reads ONE packed buffer and
+    /// writes several sizes on the input instead: its outputs are each a
+    /// fraction of the work, so no one of them spells the grid. Both numbers
+    /// are the trace's; neither is derived here.
+    pub in_width: u32,
     /// Query heads.
     pub q_heads: u32,
     /// Key/value heads.
@@ -119,37 +129,38 @@ pub fn eval(rule: Rule, dims: Dims) -> Result<Launch, Ungeometric> {
     let rows = dims.rows.max(1);
     Ok(match rule {
         Rule::Unstated => return Err(Ungeometric::Unstated),
-        Rule::Qmv => dispatch::qmv_mb(dims.width, rows),
+        Rule::Qmv => shapes::qmv_mb(dims.width, rows),
         Rule::Qmm => {
-            let bm = dispatch::qmm_bm(rows);
+            let bm = shapes::qmm_bm(rows);
             let bn = widest_column_tile(dims.width);
             // A tile that does not divide the work is a GEMM computing part of
             // the output. Falling back to the matvec grid computes all of it,
             // slower — which is the failure worth having.
             if bn == 0 || !rows.is_multiple_of(bm) {
-                dispatch::qmv_mb(dims.width, rows)
+                shapes::qmv_mb(dims.width, rows)
             } else {
-                dispatch::qmm_t(dims.width, rows, bn, bm)
+                shapes::qmm_t(dims.width, rows, bn, bm)
             }
         }
-        Rule::Rms => dispatch::rms(dims.width, rows),
+        Rule::Rms => shapes::rms(dims.width, rows),
         Rule::Rope => rope_rows(dims.rotary_dims, dims.q_heads, rows),
-        Rule::Elementwise => dispatch::elementwise_mb(dims.width, rows),
+        Rule::Elementwise => shapes::elementwise_mb(dims.width, rows),
         Rule::ElementwiseRows => embed_rows(dims.width, rows),
+        Rule::SplitPacked => embed_rows(dims.in_width, rows),
         Rule::PerHead => per_head_rows(dims.head_dim, dims.kv_heads, rows),
         Rule::SdpaVector => sdpa_rows(dims.q_heads, rows),
-        Rule::PerHeadElementwise => dispatch::attn_gate(dims.q_heads, dims.head_dim),
-        Rule::GatedRms => dispatch::gated_rms(dims.kv_heads, dims.head_dim),
-        Rule::RouterLane => dispatch::router_topk(dims.n_experts),
-        Rule::RouteRows => dispatch::route_rows(dims.width, rows),
-        Rule::RoutedQmv => dispatch::routed_qmv(dims.width, dims.experts_per_token, rows),
+        Rule::PerHeadElementwise => shapes::attn_gate(dims.q_heads, dims.head_dim),
+        Rule::GatedRms => shapes::gated_rms(dims.kv_heads, dims.head_dim),
+        Rule::RouterLane => shapes::router_topk(dims.n_experts),
+        Rule::RouteRows => shapes::route_rows(dims.width, rows),
+        Rule::RoutedQmv => shapes::routed_qmv(dims.width, dims.experts_per_token, rows),
     })
 }
 
 /// The widest 16/32/64 column tile that divides `out_vec`, or zero.
 ///
 /// Wider is strictly fewer dequantizations of each weight tile —
-/// [`dispatch::qmm_bn`]'s finding, without its `min_batch` gate, which is a
+/// `dispatch_mb::qmm_bn`'s finding, without its `min_batch` gate, which is a
 /// per-family tuning number the lowering does not state.
 fn widest_column_tile(out_vec: u32) -> u32 {
     [16, 32, 64]
@@ -208,6 +219,7 @@ mod tests {
         Dims {
             rows: 7,
             width: 4096,
+            in_width: 4096,
             q_heads: 16,
             kv_heads: 4,
             head_dim: 128,
@@ -229,23 +241,23 @@ mod tests {
     fn every_rule_reproduces_the_function_the_driver_already_uses() {
         let d = Dims { rows: 1, ..dims() };
         for (rule, expected) in [
-            (Rule::Qmv, dispatch::qmv(d.width)),
-            (Rule::Rms, dispatch::rms(d.width, 1)),
-            (Rule::Rope, dispatch::rope(d.rotary_dims, d.q_heads)),
-            (Rule::Elementwise, dispatch::residual(d.width)),
-            (Rule::ElementwiseRows, dispatch::embed(d.width)),
-            (Rule::PerHead, dispatch::kv_append(d.head_dim, d.kv_heads)),
-            (Rule::SdpaVector, dispatch::sdpa(d.q_heads)),
+            (Rule::Qmv, shapes::qmv(d.width)),
+            (Rule::Rms, shapes::rms(d.width, 1)),
+            (Rule::Rope, shapes::rope(d.rotary_dims, d.q_heads)),
+            (Rule::Elementwise, shapes::residual(d.width)),
+            (Rule::ElementwiseRows, shapes::embed(d.width)),
+            (Rule::PerHead, shapes::kv_append(d.head_dim, d.kv_heads)),
+            (Rule::SdpaVector, shapes::sdpa(d.q_heads)),
             (
                 Rule::PerHeadElementwise,
-                dispatch::attn_gate(d.q_heads, d.head_dim),
+                shapes::attn_gate(d.q_heads, d.head_dim),
             ),
-            (Rule::GatedRms, dispatch::gated_rms(d.kv_heads, d.head_dim)),
-            (Rule::RouterLane, dispatch::router_topk(d.n_experts)),
-            (Rule::RouteRows, dispatch::route_rows(d.width, 1)),
+            (Rule::GatedRms, shapes::gated_rms(d.kv_heads, d.head_dim)),
+            (Rule::RouterLane, shapes::router_topk(d.n_experts)),
+            (Rule::RouteRows, shapes::route_rows(d.width, 1)),
             (
                 Rule::RoutedQmv,
-                dispatch::routed_qmv(d.width, d.experts_per_token, 1),
+                shapes::routed_qmv(d.width, d.experts_per_token, 1),
             ),
         ] {
             assert_eq!(
@@ -265,9 +277,9 @@ mod tests {
         let n = d.rows;
         assert!(n > 1, "the batched lane needs more than one row");
         for (rule, expected) in [
-            (Rule::Qmv, dispatch::qmv_mb(d.width, n)),
-            (Rule::Elementwise, dispatch::elementwise_mb(d.width, n)),
-            (Rule::Rms, dispatch::rms_mb(d.width, 1, n)),
+            (Rule::Qmv, shapes::qmv_mb(d.width, n)),
+            (Rule::Elementwise, shapes::elementwise_mb(d.width, n)),
+            (Rule::Rms, shapes::rms_mb(d.width, 1, n)),
             // The shapes whose batched form puts the row on its own axis.
             // `mb_geometry`'s arms are the reference for each.
             (Rule::ElementwiseRows, Launch {
@@ -307,7 +319,7 @@ mod tests {
         };
         assert_eq!(
             eval(Rule::Qmm, d).expect("stated"),
-            dispatch::qmm_t(4096, 32, 64, dispatch::qmm_bm(32)),
+            shapes::qmm_t(4096, 32, 64, shapes::qmm_bm(32)),
             "a divisible shape tiles"
         );
         // A row count no rung divides computes part of the output as a GEMM;
@@ -316,7 +328,7 @@ mod tests {
         let ragged = Dims { rows: 3, ..d };
         assert_eq!(
             eval(Rule::Qmm, ragged).expect("stated"),
-            dispatch::qmv_mb(4096, 3),
+            shapes::qmv_mb(4096, 3),
             "an indivisible shape falls back rather than dropping outputs"
         );
     }
@@ -337,15 +349,15 @@ mod tests {
         // launches like an existing one should cost zero arms.
         let d = Dims { rows: 1, ..dims() };
         let ew = eval(Rule::Elementwise, d).expect("stated");
-        assert_eq!(ew, dispatch::residual(d.width));
-        assert_eq!(ew, dispatch::embed(d.width));
-        assert_eq!(ew, dispatch::silu_mul(d.width));
+        assert_eq!(ew, shapes::residual(d.width));
+        assert_eq!(ew, shapes::embed(d.width));
+        assert_eq!(ew, shapes::silu_mul(d.width));
 
         // The same for the per-head pair: the q/k/v split and the KV append
         // launch identically, over whichever head count they address.
         assert_eq!(
             eval(Rule::PerHead, d).expect("stated"),
-            dispatch::q_split(d.head_dim, d.kv_heads),
+            shapes::q_split(d.head_dim, d.kv_heads),
             "one rule, read with the head count the operand names"
         );
     }

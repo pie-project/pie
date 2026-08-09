@@ -178,6 +178,18 @@ pub struct Launch {
     /// names — the order the trace states them, so nothing here is a
     /// convention a reader has to learn twice.
     pub args: Range<u32>,
+    /// The scalar arguments the statement states, as a run of
+    /// [`Lowered::params`].
+    ///
+    /// A kernel takes numbers no operand shape gives — a QKV split's two
+    /// widths, a strided kernel's row pitch. `OpKind::Launch::params` is the
+    /// channel the trace carries them on, and its own doc says why it exists:
+    /// *"a scalar that has nowhere to ride is a scalar the DRIVER re-derives
+    /// from its config. That is the thing this arc removes."* Dropping them
+    /// here would have put the derivation straight back.
+    ///
+    /// Empty for every statement that states none, which is most of them.
+    pub params: Range<u32>,
     /// Which peel region this rectangle sits in, when it sits in one.
     ///
     /// The executing arms read exactly four things about where they
@@ -188,6 +200,77 @@ pub struct Launch {
     /// COUNT, which is why the driver's band index, and its three-band
     /// ceiling, has nothing left to index.
     pub peel: Option<PeelRegion>,
+    /// Which CONDITIONAL region this rectangle sits in, as an index into
+    /// [`Lowered::conds`], or [`Launch::NO_COND`] for the root.
+    ///
+    /// Always `NO_COND` under [`GuardMode::Resolve`], which is the mode
+    /// that answers every guard at lowering time. Under
+    /// [`GuardMode::Union`] the guards are NOT answered — every arm
+    /// lowers, and this says which arm's body a rectangle belongs to, so
+    /// a driver can turn the tree back into conditional graph nodes.
+    pub cond: u32,
+}
+
+impl Launch {
+    /// [`Launch::cond`] for a rectangle that sits under no conditional.
+    pub const NO_COND: u32 = u32::MAX;
+}
+
+/// One arm of a guard chain, as a node in the tree
+/// [`GuardMode::Union`] preserves.
+///
+/// A guard chain of N arms plus an else is N NESTED conditionals — the
+/// second arm runs when the first predicate did not hold and the second
+/// did — so the tree is binary and every node carries exactly one
+/// predicate. That is also the shape a CUDA conditional node has, which
+/// is not a coincidence: the C++ emitter nests chains into else bodies
+/// for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CondRegion {
+    /// The enclosing region, or [`Launch::NO_COND`] at the root.
+    pub parent: u32,
+    /// The predicate's wire slot — `GuardPred::wire().0`, which is also
+    /// the driver's device predicate-word index.
+    pub slot: u32,
+    /// The predicate's parameter — `TokensLE(k)`'s `k`; zero for the
+    /// predicates that take none.
+    pub param: u32,
+    /// True for the body taken when the predicate HOLDS; false for the
+    /// else side, under which the rest of the chain nests.
+    pub on_true: bool,
+    /// The OTHER arm of this conditional.
+    ///
+    /// Stated rather than derived, and the difference is not cosmetic. A
+    /// family states the same guard once per layer, so `(parent, slot,
+    /// param)` identifies twenty-eight conditionals in a
+    /// twenty-eight-layer model, not one — a driver pairing arms by those
+    /// three fields matches the wrong node and captures an arm into some
+    /// other layer's else body. The pairing is a fact the lowering knows
+    /// when it emits the pair, so it says it.
+    pub sibling: u32,
+}
+
+/// Whether the lowering ANSWERS a guard or keeps it.
+///
+/// This is the axis the supergraph turns on, and it is worth being
+/// precise about what each mode produces:
+///
+/// * [`GuardMode::Resolve`] reads the fire's rows, decides each
+///   predicate, and emits only the arm that wins. The flat list is then
+///   already specialised to one fire's variant bits — which is what
+///   makes the eager executor simple, and what makes a union impossible.
+/// * [`GuardMode::Union`] decides nothing. Every arm lowers, tagged with
+///   its place in the tree, and the arena is sized for all of them. One
+///   lowering then covers every structurally-distinct program in the
+///   bucket, and the predicates move to device memory where a conditional
+///   node reads them per launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GuardMode {
+    /// Answer every guard at lowering time. The historical behaviour.
+    #[default]
+    Resolve,
+    /// Keep every arm and tag it — the unionized supergraph's input.
+    Union,
 }
 
 /// A rectangle's place inside a row partition.
@@ -317,6 +400,15 @@ pub struct Lowered {
     /// `launches` the WHOLE of what a fire executes, and only then can
     /// the driver stop walking.
     pub residue: Vec<Unlowered>,
+    /// Every launch's scalar arguments, concatenated; [`Launch::params`]
+    /// indexes it. Flat for the same reason [`Lowered::args`] is: the whole
+    /// frame stays two arrays and a table.
+    pub params: Vec<u32>,
+    /// The guard tree, when the lowering kept it ([`GuardMode::Union`]).
+    ///
+    /// Empty under [`GuardMode::Resolve`], where every guard was
+    /// answered and no rectangle sits under a condition.
+    pub conds: Vec<CondRegion>,
 }
 
 impl Launch {
@@ -345,7 +437,25 @@ impl Lowered {
 }
 
 /// Lower `plan` over `rows`, in the order the engine seriated them.
+///
+/// Guards are ANSWERED — see [`GuardMode`] for the other mode and why it
+/// exists.
 pub fn lower(plan: &ForwardPlan, rows: &[Row], fire: Fire) -> Result<Lowered, Uncovered> {
+    lower_with(plan, rows, fire, GuardMode::Resolve)
+}
+
+/// Lower `plan` over `rows`, choosing whether guards are answered.
+///
+/// [`GuardMode::Union`] is the unionized supergraph's input: one lowering
+/// that covers every structurally-distinct program in a bucket, with the
+/// guard tree preserved in [`Lowered::conds`] so a driver can rebuild it
+/// as conditional graph nodes.
+pub fn lower_with(
+    plan: &ForwardPlan,
+    rows: &[Row],
+    fire: Fire,
+    guards: GuardMode,
+) -> Result<Lowered, Uncovered> {
     let backend = Backend::of_family(&plan.family);
     let n = rows.len() as u32;
     let mut out = Lowerer {
@@ -360,8 +470,12 @@ pub fn lower(plan: &ForwardPlan, rows: &[Row], fire: Fire) -> Result<Lowered, Un
         fire,
         structural: Vec::new(),
         args: Vec::new(),
+        params: Vec::new(),
         buffers: Buffers::assign(plan, rows),
         peel_region: None,
+        guards,
+        cond: Launch::NO_COND,
+        conds: Vec::new(),
     };
     let arena_bytes = out.buffers.bytes;
     let value_offset = out.buffers.offset.clone();
@@ -379,8 +493,10 @@ pub fn lower(plan: &ForwardPlan, rows: &[Row], fire: Fire) -> Result<Lowered, Un
         epilogue_gather,
         epilogue_norm,
         args: out.args,
+        params: out.params,
         structural: out.structural,
         residue: out.residue,
+        conds: out.conds,
     })
 }
 
@@ -401,12 +517,20 @@ struct Lowerer<'a> {
     structural: Vec<Site>,
     /// The operand slots emitted so far.
     args: Vec<Arg>,
+    params: Vec<u32>,
     /// The arena, so an operand can be resolved to an offset as it is
     /// emitted rather than in a second pass that would have to re-walk
     /// the regions to know which launches exist.
     buffers: Buffers,
     /// The peel region the launches being emitted sit in.
     peel_region: Option<PeelRegion>,
+    /// Whether guards are answered or kept.
+    guards: GuardMode,
+    /// The conditional region the launches being emitted sit in, and the
+    /// tree they index into. Both stay empty under
+    /// [`GuardMode::Resolve`].
+    cond: u32,
+    conds: Vec<CondRegion>,
 }
 
 impl Lowerer<'_> {
@@ -425,6 +549,30 @@ impl Lowerer<'_> {
                     // emits nothing, which is the "vanishes" behaviour
                     // an argument-driven site already has.
                     let mut at = i + 1;
+                    if self.guards == GuardMode::Union {
+                        // UNION: answer nothing. Every arm lowers over
+                        // the whole window, tagged with its place in the
+                        // tree, and the chain nests — arm k runs when
+                        // predicates 0..k did not hold and k did, which
+                        // is a run of else bodies and therefore a run of
+                        // nested conditional nodes.
+                        let outer = self.cond;
+                        let mut parent = outer;
+                        for arm in arms {
+                            let (slot, param) = arm.pred.wire();
+                            let body = at..at + arm.ops as usize;
+                            let (if_arm, else_arm) = self.push_cond_pair(parent, slot, param);
+                            self.cond = if_arm;
+                            self.region(body, window.clone())?;
+                            parent = else_arm;
+                            at += arm.ops as usize;
+                        }
+                        self.cond = parent;
+                        self.region(at..at + *else_ops as usize, window.clone())?;
+                        self.cond = outer;
+                        i = at + *else_ops as usize;
+                        continue;
+                    }
                     let mut remaining = window.clone();
                     for arm in arms {
                         let taken = self.select(&remaining, arm.pred);
@@ -589,10 +737,15 @@ impl Lowerer<'_> {
         for &v in op.inputs.iter().chain(op.outputs.iter()) {
             self.args.push(self.slot(v));
         }
-        if let OpKind::Launch { weights, .. } = &op.kind {
+        let first_param = self.params.len() as u32;
+        if let OpKind::Launch {
+            weights, params, ..
+        } = &op.kind
+        {
             for name in weights {
                 self.args.push(Arg::Weight(name.clone()));
             }
+            self.params.extend_from_slice(params);
         }
         self.launches.push(Launch {
             kernel: id,
@@ -600,9 +753,24 @@ impl Lowerer<'_> {
             layers: layer..layer + 1,
             op: at as u32,
             args: first..self.args.len() as u32,
+            params: first_param..self.params.len() as u32,
             peel: self.peel_region,
+            cond: self.cond,
         });
         Ok(())
+    }
+
+    /// Add a conditional's TWO arms to the guard tree, paired, and return
+    /// `(if_arm, else_arm)`.
+    ///
+    /// Always in pairs: an arm without its sibling is a node the driver
+    /// cannot open a two-bodied conditional for.
+    fn push_cond_pair(&mut self, parent: u32, slot: u32, param: u32) -> (u32, u32) {
+        let t = self.conds.len() as u32;
+        let f = t + 1;
+        self.conds.push(CondRegion { parent, slot, param, on_true: true, sibling: f });
+        self.conds.push(CondRegion { parent, slot, param, on_true: false, sibling: t });
+        (t, f)
     }
 
     /// Where a value's bytes are, and how wide a row of it is.

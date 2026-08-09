@@ -42,8 +42,10 @@ crates/model-compiler/src/kernels.rs
 
 ## Three legs, and only one of them is done
 
-Going all in needs three things. They are independent and only the first is
-finished.
+Going all in needs three things. **All three are now done as code**, and what
+is left is the proof: no run against a real checkpoint has been held to
+`tests/device_smoke.rs` token for token, and until one has, this is a path that
+executes rather than a model that answers.
 
 ### 1. The lowering — **done**
 
@@ -52,7 +54,7 @@ Vec<String>` (symbols, not function pointers), `arena_bytes`, `value_offset`.
 Nothing in it is CUDA-shaped, and `Backend::Metal` resolves to `KERNELS_METAL`
 today.
 
-### 2. The Metal DSL text — **started, for one family**
+### 2. The Metal DSL text — **one family, and it now states an axis**
 
 `model-compiler` compiles a DSL, and **a text has to be written for Metal**:
 `dsl::trace_metal(family, ..)` records `<family>.metal.<class>`, and the
@@ -77,7 +79,24 @@ What exists: `crates/model/src/families/llama_like/forward/mod.rs`'s
   CUDA text states are absent, "because none of the machinery behind them
   exists on this backend yet";
 * qk-norm and bias are stated as ordinary norms and are **untested** against
-  what `declared_dag.hpp` expects.
+  what `declared_dag.hpp` expects — though they are now *asked of the tensors*
+  rather than assumed (`model::text::facts_from`);
+* ~~the text is monomorphic~~ — **closed 2026-08-10.** `m.depth_window()`
+  makes every layer-tagged statement implicitly `rows(depth > layer)`. On eight
+  prefill rows with half truncated at layer 4, row-work falls **2936 → 1688
+  (−42%) at the same 367 launches**: the shared prefix executes once, which is
+  the supergraph claim. Stating an axis also buys the **seriation contract** —
+  the text now refuses `Discontiguous { axis: "depth" }` on a row order whose
+  depth runs are not contiguous, so the frame bridge must hand rows over
+  seriated;
+* **four defects of one shape, all found by making it run.** The text assumed
+  bindings the checkpoint does not have, and not one would have failed loudly:
+  affine projections named one tensor where the kernel reads three; symbols
+  named STEMS where shaders export instantiated points; the gated MLP passed
+  one packed value where `silu_mul` takes gate and up as two buffers, so the
+  OUTPUT bound where `up` belongs; and the seam took a test fixture's facts for
+  every checkpoint. The cure is the same each time — **ask the tensors**. A
+  config states an architecture; a tensor states a binding.
 
 What does not exist: a Metal text for any other family. `crates/model/src/
 families/` holds only `llama_like`, while the Metal driver carries handwritten
@@ -92,12 +111,59 @@ the contract lives.
 kernel table". Both were true when written and neither is now — one caller, 98
 rows. Same staleness this crate's ledgers keep showing.)
 
-### 3. The Metal executor — **not started**
+### 3. The Metal executor — **done**
 
-The consumer. `driver-cuda-new/src/model/executor.rs` is the template — its own
-doc calls it *"the family-independent replacement the flat list was designed
-for: three resolution rules, stated once"*. `driver-metal-new` does not depend
-on `model-compiler` at all today.
+`src/model/` is it, and the shape is the argument:
+
+| | |
+|---|---|
+| `executor.rs` | binding — three resolution rules, stated once |
+| `geometry.rs` + `grid.rs` | a rectangle's thread grid, by the rule its row names |
+| `dispatch.rs` | the walk: symbol → row → file → rule → grid → operands |
+| `frame.rs` | a sealed frame's step → `&[Row]` |
+| `kv.rs` | the paged pool, sized by the fire |
+| `load.rs` / `resolve.rs` / `text.rs` | the checkpoint, the name map, which text |
+| `encode.rs` / `run.rs` | the device half: compile by name, bind, dispatch |
+
+**There is no arm per kernel and no branch per family.** `dispatch::plan_one`
+is: look the symbol up, read its file, evaluate its rule, bind its operands.
+`tests/device_text_fire.rs` runs all 367 launches of `llama_like`'s text on the
+GPU, in both fire classes, through that walk.
+
+Two things it proved on the way, both worth keeping:
+
+* **the M>1 lane was never a second vocabulary.** The plan recorded "which of
+  the two rule sets a row means" as a question to answer first. Measured, every
+  M=1 function is its M>1 function at ONE ROW, and where the lanes genuinely
+  differ they are *different kernels with different names*. The lane is
+  `dims.rows`;
+* **the frame bridge had a predecessor, and it was not the C++.** tart rung
+  ③'s region table maps bit-for-bit onto `Row` — the scheduler already computes
+  the seriation, so the driver reads it rather than deriving it.
+
+And the seam: `engine/src/driver/backend/metal.rs` is a **plain Rust library
+call**, not an ABI crossing, because the driver on the other side is Rust. That
+is task 9 arriving from the other end — nothing here adds a C boundary for it
+to remove.
+
+**Thirteen of its fourteen verbs are served.** `encode` refuses because Metal
+media encode is unsupported on this backend and on CUDA both. `resize_pool`
+and `copy_state` refuse by name: a resize means reallocating a pool that is a
+fixed allocation today, and `copy_state` wants recurrent-state slots no
+`llama_like` deployment has. Neither blocks serving a dense model.
+
+Two of those verbs were left refusing on reasons that did not survive looking,
+and both are worth recording because the rule that found them is the crate's
+own — *before starting anything a ledger calls missing, look for it*:
+
+* the **registry three** were said to need the ring's device addresses.
+  `ChannelState` holds `RefCell<Vec<u8>>` and four `AtomicU64`s: the channel
+  plane is host memory here exactly as it is on the dummy driver, and the
+  binding is those two addresses. They gate everything — without them no
+  instance is bound, so no `FrameSubmission` is built;
+* **`copy_kv`** was said to need an encoder. The pool is `StorageModeShared`,
+  so a move is a `memmove` — and `Region::copy`'s memmove semantics are the
+  point, because a compaction slides rows and the spans overlap.
 
 ### Metal is not behind on kernel resolution — it is ahead
 

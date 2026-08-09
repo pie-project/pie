@@ -357,6 +357,8 @@ fn ab(spec: &Spec) {
         altup_active: 0,
         altup_std_mult_by_layer: Vec::new(),
         lora: None,
+        peel_window: std::ptr::null(),
+        rows_total: 0,
     };
 
     let mut logits_value: Option<ValueId> = None;

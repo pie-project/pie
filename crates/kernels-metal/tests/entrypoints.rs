@@ -81,10 +81,15 @@ fn no_two_rows_claim_the_same_entrypoint() {
 /// so `affine_qmm_t_aligned` was a BODY and never a dispatchable name. The set
 /// comparison above passed either way — it compares the table to whatever the
 /// census says — and this is the assertion that made the correction visible.
+///
+/// Back to 99/480 deliberately: `split_qkv_bf16` is a NEW kernel, written
+/// because the Metal text names a QKV split and CUDA's answer to that —
+/// a kernel the driver launches that no text has to name — is the category
+/// this backend refuses to grow.
 #[test]
-fn the_table_is_ninety_eight_kernels_over_four_hundred_and_seventy_nine_entrypoints() {
-    assert_eq!(kernels_metal::KERNELS.len(), 98);
-    assert_eq!(kernels_metal::entrypoints().len(), 479);
+fn the_table_is_ninety_nine_kernels_over_four_hundred_and_eighty_entrypoints() {
+    assert_eq!(kernels_metal::KERNELS.len(), 99);
+    assert_eq!(kernels_metal::entrypoints().len(), 480);
 }
 
 /// Every entrypoint resolves through the public lookup `model-compiler` uses,

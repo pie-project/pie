@@ -269,8 +269,47 @@ fn llama_like_metal_text(
     // decode step) and M>1 (the multi-batch lane). `FireClass` is the
     // same instantiation index it is on CUDA.
     let multi_batch = class != FireClass::Decode;
-    dsl::trace_metal("llama_like", &facts.shape(), class, |m| {
+    // The namespace, with the deployment's WEIGHT REPRESENTATION on it, for
+    // the reason `llama_like_cuda` states at length: `facts.shape()` answers
+    // `Bf16` because the semantic facts carry no backend, and every handle
+    // `m.layer(l)` hands out is built from this one answer — which is why no
+    // projection below spells a repr and none can spell a different one.
+    let shape = dsl::ModelShape {
+        proj_repr: metal.proj_repr,
+        ..facts.shape()
+    };
+    dsl::trace_metal("llama_like", &shape, class, |m| {
+        // The depth axis, and it is stated unconditionally here where the
+        // CUDA text gates it on deployment facts. The gate exists there
+        // because a padded deployment stages q/k at PHYSICAL width while a
+        // row window addresses at LOGICAL width, so half the axis is
+        // unservable. Metal has neither padding fact nor an XQA path — its
+        // attention takes `head_dim` as an operand since the `_d_256` fix —
+        // so both halves are free, and the argument the CUDA comment makes
+        // for the narrowing half ("stopping after layer `k` addresses
+        // nothing at all, because the retired ops simply do not run")
+        // applies to the whole of it.
+        //
+        // This is the ONE statement that makes the text polymorphic on
+        // depth: every layer-tagged op below becomes implicitly
+        // `rows(depth > layer)`, so a fire whose rows truncate at different
+        // layers lowers to rectangles that narrow rather than to one
+        // rectangle per op. `driver-metal-new/tests/polymorphism.rs`
+        // measures it.
+        m.depth_window();
+
         let f = facts.clone();
+        // The affine entrypoints are instantiated over (dtype x group x bits),
+        // so every statement below names its POINT and not the stem. A stem
+        // does not resolve, and the runtime compiler says so by listing what
+        // the shader exports — which is the failure worth having, because a
+        // WRONG point compiles and reads the wrong bytes (the `_d_256` defect,
+        // one axis over).
+        let point = dsl::metal::affine_point(metal.proj_repr, metal.affine_bits);
+        // The GEMM carries its tile too — see `LlamaLikeMetalFacts::qmm_tile`
+        // for why a tile is a load-time fact and not a fire-time one.
+        let gemm_point =
+            dsl::metal::affine_gemm_point(metal.proj_repr, metal.affine_bits, metal.qmm_tile);
         let q_w = f.q_width();
         let kv_w = f.kv_width();
         let post_norm = f.norm_placement == NormPlacement::Post;
@@ -279,9 +318,9 @@ fn llama_like_metal_text(
         // the M=1 lane, MLX's steel GEMM above the batch gate.
         let gemm = |x: &Val, w: &MatW| {
             if multi_batch && metal.qmm_multi_batch {
-                dsl::metal::qmm(x, w)
+                dsl::metal::qmm(x, w, &gemm_point)
             } else {
-                dsl::metal::qmv(x, w)
+                dsl::metal::qmv(x, w, &point)
             }
         };
         // A `beta_one` matmul: the epilogue fold when the deployment has
@@ -289,17 +328,37 @@ fn llama_like_metal_text(
         let gemm_add = |x: &Val, w: &MatW, residual: &Val| {
             if metal.fuse_residual_gemv {
                 if multi_batch && metal.qmm_multi_batch {
-                    dsl::metal::qmm_residual(x, w, residual)
+                    dsl::metal::qmm_residual(x, w, residual, &gemm_point)
                 } else {
-                    dsl::metal::qmv_residual(x, w, residual)
+                    dsl::metal::qmv_residual(x, w, residual, &point)
                 }
             } else {
                 dsl::metal::residual_add(&gemm(x, w), residual)
             }
         };
         let paged = multi_batch && metal.paged_multi_batch;
+        // The gated MLP. `silu_mul` takes gate and up as TWO buffers, so a
+        // deployment whose loader did not join them states two projections —
+        // which on this backend is every deployment, because
+        // `compile_load_plan` authors with `Projections::InPlace` and the join
+        // declines under it. The packed arm stays for one that does.
+        assert!(
+            !metal.gate_up_fused,
+            "llama_like's Metal text has no packed gate\u{2016}up arm: `silu_mul` \
+             takes two buffers and no Metal kernel splits a packed bank into \
+             them. No deployment needs one -- `compile_load_plan` authors with \
+             `Projections::InPlace` and the join declines under it -- so the \
+             arm is refused at trace time rather than written untested."
+        );
+        let gated = |x: &Val, w: &dsl::Layer| {
+            dsl::metal::silu_mul(
+                &gemm(x, &w.gate_proj),
+                &gemm(x, &w.up_proj),
+                f.intermediate,
+            )
+        };
 
-        let mut y = dsl::metal::embed_gather(m.trace(), "embed", f.hidden, multi_batch);
+        let mut y = dsl::metal::embed_gather(m.trace(), "embed", f.hidden, multi_batch, metal.proj_repr, &point);
 
         for l in 0..f.layers {
             let w = m.layer(l);
@@ -311,7 +370,7 @@ fn llama_like_metal_text(
             };
 
             let (q, k, v) = if f.fused_qkv {
-                split_qkv(&gemm(&x, &w.qkv), q_w, kv_w)
+                dsl::metal::split_qkv(&gemm(&x, &w.qkv), q_w, kv_w)
             } else {
                 (
                     gemm(&x, &w.q_proj),
@@ -337,20 +396,20 @@ fn llama_like_metal_text(
             if post_norm {
                 let o = dsl::metal::rms_norm(&gemm(&a, &w.o_proj), &w.attn_norm);
                 y = dsl::metal::residual_add(&o, &y);
-                let h = dsl::metal::silu_mul(&gemm(&y, &w.gate_up), f.intermediate);
+                let h = gated(&y, &w);
                 let d = dsl::metal::rms_norm(&gemm(&h, &w.down), &w.mlp_norm);
                 y = dsl::metal::residual_add(&d, &y);
             } else {
                 y = gemm_add(&a, &w.o_proj, &y);
                 let x = dsl::metal::rms_norm(&y, &w.mlp_norm);
-                let h = dsl::metal::silu_mul(&gemm(&x, &w.gate_up), f.intermediate);
+                let h = gated(&x, &w);
                 y = gemm_add(&h, &w.down, &y);
             }
         }
 
         let normed = dsl::metal::rms_norm(&y, &m.final_norm());
         let head = if f.tied_embeddings { "embed" } else { "lm_head" };
-        dsl::metal::lm_head(&normed, head, f.vocab);
+        dsl::metal::lm_head(&normed, head, f.vocab, metal.proj_repr, &point);
     })
 }
 
@@ -1384,9 +1443,21 @@ mod metal_tests {
                 .iter()
                 .filter(|op| matches!(op.kind, OpKind::Launch { .. }))
                 .count();
-            // Every op of this text is a stated kernel except the
-            // SplitQkv the fused binding traces.
-            assert_eq!(launches + 28, plan.ops.len(), "one split per layer");
+            // EVERY op of this text is now a stated kernel. It used to be
+            // "every op except the 28 `SplitQkv`s the fused binding traces":
+            // the generic `split_qkv` records an `OpKind::SplitQkv`, whose two
+            // widths a driver could only reach by matching on `OpKind` — which
+            // is the driver knowing what a QKV split is. The Metal text states
+            // the launch outright now and rides the widths on
+            // `OpKind::Launch::params`, the channel built for scalars no
+            // operand shape gives. So the count is exact, and that exactness
+            // is the property: nothing in this text is a kind the driver has
+            // to recognise.
+            assert_eq!(
+                launches,
+                plan.ops.len(),
+                "every op of the metal text is a stated kernel"
+            );
         }
     }
 
@@ -1410,10 +1481,17 @@ mod metal_tests {
             },
             FireClass::Decode,
         );
+        // By PREFIX: an affine symbol is its INSTANTIATION POINT
+        // (`affine_qmv_fast_bfloat16_gs_64_b_4`), because a bare stem is not
+        // an entry point any shader exports. The stems are unambiguous
+        // prefixes of each other's points except for the residual pair, which
+        // is why the assertions below name the residual form explicitly.
         let count = |p: &ForwardPlan, sym: &str| {
             p.ops
                 .iter()
-                .filter(|op| matches!(&op.kind, OpKind::Launch { kernel, .. } if kernel == sym))
+                .filter(
+                    |op| matches!(&op.kind, OpKind::Launch { kernel, .. } if kernel.starts_with(sym)),
+                )
                 .count()
         };
         assert_eq!(count(&fold, "residual_add_bfloat16"), 0);
@@ -1429,7 +1507,13 @@ mod metal_tests {
             &LlamaLikeMetalFacts::synthetic(),
             FireClass::Prefill,
         );
-        assert_eq!(count(&mb, "affine_qmv_fast"), 1, "the readout only");
+        // `affine_qmv_fast` prefixes `affine_qmv_fast_residual`'s point too,
+        // so the readout is the difference of the two counts.
+        assert_eq!(
+            count(&mb, "affine_qmv_fast") - count(&mb, "affine_qmv_fast_residual"),
+            1,
+            "the readout only"
+        );
         assert!(count(&mb, "affine_qmm_t_residual") > 0);
         // The attention width is the DEPLOYMENT's, not a literal. It was
         // `_d_256` unconditionally, and `qwen3_0_6b`'s heads are 128 wide — a

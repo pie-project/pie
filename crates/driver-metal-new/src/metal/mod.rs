@@ -108,7 +108,7 @@ pub use program::{
     FusedExecutable, GroupedExecutable, ProgramExecutable, ProgramStage, Pso, RegionExecutable,
     StageExecutable,
 };
-pub use ring::Ring;
+pub use ring::{Ring, allocate};
 pub use runtime::{
     MAX_FUSED_CHANNELS, MAX_REGIONS_PER_PROGRAM, MAX_REGIONS_PER_STAGE, ORDINAL_BASE, Runtime,
 };

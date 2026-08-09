@@ -566,6 +566,13 @@ fn fuse_llama_like(
             n("mlp.gate_proj.weight"),
             n("mlp.up_proj.weight"),
         ])?;
+        // Some checkpoints ship the fused projections ALREADY (phi3's
+        // `qkv_proj` and `gate_up_proj`), in the same concatenation order
+        // the fuse above builds. Those want an alias, not a copy -- and
+        // `alias` is a no-op when the name is absent, so this costs the
+        // deployments that split nothing.
+        alias(model, format!("layer.{i}.qkv"), n("self_attn.qkv_proj.weight"));
+        alias(model, format!("layer.{i}.gate_up"), n("mlp.gate_up_proj.weight"));
         // The norm placement decides the mapping, and `input_layernorm`'s
         // presence IS the placement: pre-norm has it (attn_norm=input,
         // mlp_norm=post_attention); post-norm (olmo2) lacks it
@@ -1174,37 +1181,156 @@ fn qwen35_facts_from_hf(model: &LoadedModel) -> Result<FamilyFacts, i32> {
 /// its `linear_*` geometry + layer schedule, else the llama-like
 /// mapping. Only the qwen3-family pre-norm shape is claimed on the
 /// llama-like side; anything else refuses rather than mis-executes.
+/// What a row dispatches to: this family's facts, off the checkpoint.
+type FactsFrom = fn(&LoadedModel) -> Result<FamilyFacts, i32>;
+
+/// One row per `model_type` this shell can OPEN.
+///
+/// A table rather than the chain of weight-name sniffs this replaces, for
+/// exactly the reason `model::contract::HF_ROWS` is a table: the supported
+/// set becomes a VALUE something can iterate. The gap between what the
+/// loader can author and what this shell can open is then a test with a
+/// closed list (`tests/facts_registry.rs`) rather than a surprise at boot
+/// — which is what §3.3's "eight families dispatch but cannot load" was.
+///
+/// Dispatch is on the model type because that is what the descriptor
+/// SAYS. Sniffing a weight name infers the family from a consequence of
+/// it, which is how `gemma3` used to be answered by the llama-like
+/// derivation: it has `model.embed_tokens.weight` and a pre-norm, so the
+/// sniff accepted it and transcribed the wrong facts. A model type with
+/// no row now refuses by name, which is this plan's standing rule —
+/// refuse what cannot be derived rather than guess it.
+const FACTS_ROWS: &[(&str, FactsFrom)] = &[
+    // ── llama lineage: dense/GQA decoders the llama_like text serves.
+    ("qwen3", llama_like_facts_from_hf),
+    ("qwen2", llama_like_facts_from_hf),
+    ("llama", llama_like_facts_from_hf),
+    ("llama3", llama_like_facts_from_hf),
+    ("mistral", llama_like_facts_from_hf),
+    ("mistral3", llama_like_facts_from_hf),
+    ("ministral3", llama_like_facts_from_hf),
+    ("olmo2", llama_like_facts_from_hf),
+    ("olmo3", llama_like_facts_from_hf),
+    ("phi3", llama_like_facts_from_hf),
+    // Qwen3-VL binds the plain Qwen3 TEXT tower; the vision tower is a
+    // service behind `pie_cuda_encode`, not part of this decode plan.
+    ("qwen3_vl", llama_like_facts_from_hf),
+    ("qwen3_vl_text", llama_like_facts_from_hf),
+    // ── Gemma-4: nested decoder, PLE, two layer kinds.
+    ("gemma4", gemma4_facts_from_hf),
+    ("gemma4_text", gemma4_facts_from_hf),
+    // ── Qwen3.5 hybrids: GDN linear attention beside full attention.
+    ("qwen3_5", qwen35_facts_from_hf),
+    ("qwen3_5_text", qwen35_facts_from_hf),
+    ("qwen3_5_moe", qwen35_facts_from_hf),
+    ("qwen3_5_moe_text", qwen35_facts_from_hf),
+];
+
+/// Every `model_type` this shell can open, in table order.
+///
+/// Public so that `tests/facts_registry.rs` can hold it against the
+/// loader's own registry. The two lists answering "which model type is
+/// supported" from opposite sides of the load is exactly the pairing
+/// `model::contract`'s header describes, and the same failure it names
+/// applies here: a family whose forward is declared but whose facts were
+/// never written used to surface as a wrong answer rather than a refusal.
+#[must_use]
+pub fn openable_model_types() -> Vec<&'static str> {
+    FACTS_ROWS.iter().map(|(k, _)| *k).collect()
+}
+
+/// The facts for a loaded checkpoint, by the model type it declares.
 fn facts_from_hf(model: &LoadedModel) -> Result<FamilyFacts, i32> {
+    let model_type = model.hf.model_type.as_str();
+    match FACTS_ROWS.iter().find(|(k, _)| *k == model_type) {
+        Some((_, derive)) => derive(model),
+        None => {
+            eprintln!(
+                "[driver-cuda-new] launch: no facts derivation for \
+                 model_type='{model_type}'; the family declares a forward \
+                 but nobody has written its facts"
+            );
+            Err(PIE_STATUS_UNSUPPORTED)
+        }
+    }
+}
+
+/// The llama lineage's facts, off the checkpoint's own config.
+fn llama_like_facts_from_hf(model: &LoadedModel) -> Result<FamilyFacts, i32> {
     use model::families::llama_like::forward::facts::{
         LlamaLikeCudaFacts, LlamaLikeFacts, NormPlacement, QkNorm,
     };
     use model_compiler::trace::{NormVariant, RopeKind};
     let hf = &model.hf;
-    if model
-        .weights
-        .contains_key("model.language_model.embed_tokens_per_layer.weight")
-    {
-        return gemma4_facts_from_hf(model);
-    }
-    if hf.linear_num_key_heads > 0
-        && model
-            .weights
-            .contains_key("model.language_model.embed_tokens.weight")
-    {
-        return qwen35_facts_from_hf(model);
-    }
     if !model.weights.contains_key("model.embed_tokens.weight") {
         eprintln!("[driver-cuda-new] launch: only HF llama-like checkpoints execute today");
         return Err(PIE_STATUS_UNSUPPORTED);
     }
+    // THE GQA RATIO, refused here rather than discovered at launch.
+    //
+    // FlashInfer's decode instantiates group sizes {1, 2, 3, 4, 8} and
+    // reports anything else by THROWING. A throw crossing the C ABI is
+    // undefined behaviour; the generated shim now prints the message
+    // before it dies, but printing is all it can do — the launcher
+    // signatures have nowhere to put a failure. A load DOES: it returns a
+    // status code.
+    //
+    // So a deployment whose q/kv ratio this build cannot serve is turned
+    // away while turning it away is still cheap. Qwen2.5-1.5B is the live
+    // example — twelve query heads over two kv heads is a group size of
+    // six, and six is not in the list.
+    let kv_heads = hf.num_key_value_heads.max(1);
+    let group_size = hf.num_attention_heads / kv_heads;
+    if hf.num_attention_heads % kv_heads != 0
+        || !matches!(group_size, 1 | 2 | 3 | 4 | 8)
+    {
+        eprintln!(
+            "[driver-cuda-new] load: this build's decode does not instantiate \
+             GQA group size {group_size} ({} q heads over {kv_heads} kv heads); \
+             the supported set is 1, 2, 3, 4, 8",
+            hf.num_attention_heads
+        );
+        return Err(PIE_STATUS_UNSUPPORTED);
+    }
+
+    // NORM PLACEMENT, off the checkpoint. `input_layernorm`'s presence IS
+    // the placement, which is the same fact `fuse_llama_like` already
+    // binds on: pre-norm ships it, post-norm (olmo2) ships
+    // `post_attention` + `post_feedforward` instead. The binder was
+    // already correct for both; only this derivation refused.
     let pre_norm = model
         .aliases
         .get("layer.0.attn_norm")
         .is_some_and(|t| t.ends_with("input_layernorm.weight"));
-    if !pre_norm {
-        eprintln!("[driver-cuda-new] launch: post-norm families await their facts mapping");
-        return Err(PIE_STATUS_UNSUPPORTED);
-    }
+
+    // QK NORM, three ways, and the checkpoint distinguishes them by
+    // SHAPE rather than by any config key. A deployment that norms q and
+    // k ships `q_norm`/`k_norm`; whether it norms PER HEAD (qwen3, one
+    // gamma of `head_dim`) or over the whole projection (olmo2, one gamma
+    // of `q_heads * head_dim`) is the tensor's own extent. Reading the
+    // extent is deriving from the checkpoint; assuming one is guessing,
+    // and the two lower to different kernels.
+    let elems_of = |trace: &str| -> Option<usize> {
+        let ckpt = model.aliases.get(trace)?;
+        // bf16 gammas throughout this family.
+        Some(model.weights.get(ckpt)?.len() / 2)
+    };
+    let qk_norm = match elems_of("layer.0.q_norm") {
+        None => QkNorm::Off,
+        Some(n) if n == usize::try_from(hf.head_dim).unwrap_or(0) => QkNorm::PerHead,
+        Some(_) => QkNorm::Global,
+    };
+
+    // FUSED QKV is a fact about the LOAD, not about the checkpoint:
+    // `fuse_llama_like` concatenates q/k/v when all three are present and
+    // leaves them alone when they are not. So the honest source is
+    // whether the fused name exists, which is what the trace will state.
+    // Either spelling counts: `fuse` writes a concatenated buffer under
+    // the trace name, while a checkpoint that already ships the fused
+    // projection gets an alias to it instead.
+    let fused_qkv = model.weights.contains_key("layer.0.qkv")
+        || model.aliases.contains_key("layer.0.qkv");
+
     let to_u32 = |v: i32| u32::try_from(v).unwrap_or(0);
     let facts = LlamaLikeFacts {
         hidden: to_u32(hf.hidden_size),
@@ -1216,10 +1342,9 @@ fn facts_from_hf(model: &LoadedModel) -> Result<FamilyFacts, i32> {
         vocab: to_u32(hf.vocab_size),
         rope: RopeKind::Standard,
         norm_variant: NormVariant::Plain,
-        norm_placement: NormPlacement::Pre,
-        qk_norm: if hf.use_qk_norm { QkNorm::PerHead } else { QkNorm::Off },
-        // The load built the fused names, so the trace states them.
-        fused_qkv: true,
+        norm_placement: if pre_norm { NormPlacement::Pre } else { NormPlacement::Post },
+        qk_norm,
+        fused_qkv,
         tied_embeddings: hf.tie_word_embeddings,
         qkv_bias: hf.attention_bias,
     };
@@ -1836,6 +1961,16 @@ fn step_impl(
         }
         _ => (Vec::new(), Vec::new(), 0.0, 0, std::collections::BTreeMap::new()),
     };
+    // The peel window word, uploaded before the walk so a tail region's
+    // `_devwin` launch reads a split rather than whatever was there. The
+    // engine does not yet mark rows, so the window is the whole fire —
+    // which is what an unpeeled fire means and what the lowering's own
+    // prefix/tail split degenerates to.
+    let mut peel_win =
+        crate::cuda::PeelWindowWord::new(&alloc).map_err(|_| PIE_STATUS_EXHAUSTED)?;
+    peel_win.set(0, u32::try_from(rows).unwrap_or(0));
+    peel_win.upload(stream.as_ref()).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+
     let ctx = DispatchCtx {
         stream: raw_stream,
         cublas: cublas.handle().expect("created").cast(),
@@ -1867,6 +2002,13 @@ fn step_impl(
         altup_active: 0,
         altup_std_mult_by_layer: Vec::new(),
         lora: None,
+        // The fire's peel window, published so a `_devwin` statement in a
+        // tail region can early-out per lane. The prefix is the rows that
+        // do NOT carry the axis's mark, so the tail begins where the
+        // marked suffix does; with no marked rows there is no split and
+        // the word says the whole fire.
+        peel_window: peel_win.device_ptr(),
+        rows_total: i32::try_from(rows).unwrap_or(0),
     };
 
     let mut resolver = LiveResolver { model, named: &named_bufs };

@@ -118,6 +118,21 @@ impl Direction {
         }
     }
 
+    /// The direction a `PIE_CHANNEL_EXTERN_*` byte names.
+    ///
+    /// The inverse of [`Direction::to_wire`], for a caller that receives a
+    /// registration over the ABI rather than reading a program's declaration.
+    /// Anything that is not import or export is private, which is the same
+    /// reading [`Direction::of`] gives an unrecognised `extern_dir`.
+    #[must_use]
+    pub fn from_wire(dir: u8) -> Self {
+        match dir {
+            PIE_CHANNEL_EXTERN_IMPORT => Self::Import,
+            PIE_CHANNEL_EXTERN_EXPORT => Self::Export,
+            _ => Self::Private,
+        }
+    }
+
     /// The endpoint's `PIE_CHANNEL_EXTERN_*` byte.
     #[must_use]
     pub const fn to_wire(self) -> u8 {
@@ -150,6 +165,20 @@ impl HostRole {
             Self::Writer
         } else {
             Self::Reader
+        }
+    }
+
+    /// The role a `PIE_CHANNEL_HOST_ROLE_*` byte names.
+    ///
+    /// The inverse of [`HostRole::to_wire`]. An unrecognised byte reads as
+    /// `None`, which is the conservative answer: a channel nobody on the host
+    /// may touch is refused a host operation rather than granted one.
+    #[must_use]
+    pub fn from_wire(role: u8) -> Self {
+        match role {
+            PIE_CHANNEL_HOST_ROLE_WRITER => Self::Writer,
+            PIE_CHANNEL_HOST_ROLE_READER => Self::Reader,
+            _ => Self::None,
         }
     }
 
@@ -294,6 +323,11 @@ pub struct Endpoint {
     pub mirror_bytes: usize,
     /// Total bytes of the control words.
     pub word_bytes: usize,
+    /// Address of the cell storage, for the ABI's endpoint binding.
+    pub mirror_base: u64,
+    /// Address of the four control words, in the ABI's order: head, tail,
+    /// poison, closed.
+    pub word_base: u64,
 }
 
 /// A bound instance: one run of a program over a named set of channels.
@@ -427,6 +461,8 @@ impl Registry {
             capacity,
             mirror_bytes: state.cells_len(),
             word_bytes: state.words_len(),
+            mirror_base: state.mirror_base(),
+            word_base: state.word_base(),
         };
         self.channels.insert(
             id,

@@ -1,17 +1,23 @@
-// The bridge's HAND-WRITTEN entries — object lifecycle the generated shim
-// cannot express (retirement plan phase C).
+// The FlashInfer plan caches' lifecycle, as `extern "C"`.
 //
-// `emit_c_shim` forwards launcher calls, and a row states a signature. The
-// FlashInfer plan caches are neither: `make_decode_plan()` returns a
-// `unique_ptr` with a custom deleter, which is not an `extern "C"` shape,
-// and the prepare takes the cache by MUTABLE reference. So these few
-// entries are written by hand, own the release()/deleter dance, and speak
-// raw pointers across the boundary. They are compiled by the same `cc`
-// step as the generated shim, against the same headers — a drifted
-// signature is still a compile error, which is the property that matters.
+// `emit_c_shim` forwards launcher calls, and a row states a signature. These
+// are neither: `make_decode_plan()` returns a `unique_ptr` with a custom
+// deleter, which is not an `extern "C"` shape, and the prepare takes the
+// cache by MUTABLE reference. So they are written by hand and own the
+// release()/deleter dance.
 //
-// Naming: `pie_x_*` (extras), never `pie_k_*` — the generated namespace
-// stays the table's alone.
+// They live HERE, beside the plan types, rather than in the driver. The
+// driver used to compile them itself — 99 lines of hand-written C++ owned by
+// a crate that is supposed to be an executor, which `cuda.md` §3.4.5 named as
+// debt and §5.E5 gave two exits: move to Rust, or move into `kernels-cuda`
+// where the plan types already live. Rust was never available — the whole
+// reason these exist is a `unique_ptr` with a custom deleter — so this is the
+// other exit. `driver-cuda-new` now compiles no hand-written C++ at all; the
+// only thing `cc` builds for it is the GENERATED shim.
+//
+// Naming: `pie_x_*` (extras), never `pie_k_*` — the generated namespace stays
+// the table's alone, and that distinction is the reason these did not simply
+// become rows.
 
 #include <cstddef>
 #include <cstdint>

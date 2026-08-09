@@ -489,6 +489,7 @@ inline constexpr std::string_view kEntrypoints[] = {
     "shared_expert_combine_strided",
     "silu_mul_bfloat16",
     "silu_mul_strided_bfloat16",
+    "split_qkv_bf16",
     "vnorm_single_row_bfloat16",
 };
 

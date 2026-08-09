@@ -840,6 +840,38 @@ fn every_lowered_kernel_of_the_remaining_families_has_a_bridge_row() {
 /// than the match answers — an arm may still refuse on arity, and does —
 /// but the failure it catches is the one that keeps happening: a symbol
 /// nothing matches at all.
+/// The anchor decode over a fire whose rows are NOT all alike: the last
+/// two carry a custom mask.
+///
+/// `llama_like` states a `PeelWindow::UnmaskedPrefix` peel for masked
+/// attention — the causal dispatch serves the plain prefix, the custom
+/// dispatch the masked suffix — so this is the only lowering in the
+/// corpus that produces a WINDOWED rectangle (`rows.start != 0`), which
+/// is also the case §4's fourth decline-rule exists for.
+///
+/// The marked rows must be a contiguous suffix; `lower.rs::split_at`
+/// refuses anything else.
+fn masked_lowered(rows: usize) -> Lowered {
+    let plan = plan_of(FireClass::Decode);
+    let mut r: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
+    for row in r.iter_mut().skip(rows.saturating_sub(2)) {
+        row.custom_mask = true;
+    }
+    lower(&plan, &r, Fire { captures_across_splits: false }).expect("a masked fire lowers")
+}
+
+/// The same, on the hook axis: the suffix rows carry attached programs,
+/// which is the other `PeelWindow` and the other way a fire's rows stop
+/// being interchangeable.
+fn hooked_lowered(rows: usize) -> Lowered {
+    let plan = plan_of(FireClass::Decode);
+    let mut r: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
+    for row in r.iter_mut().skip(rows.saturating_sub(2)) {
+        row.hooked = true;
+    }
+    lower(&plan, &r, Fire { captures_across_splits: false }).expect("a hooked fire lowers")
+}
+
 #[test]
 fn every_lowered_symbol_has_an_arm() {
     let src = std::fs::read_to_string(
@@ -912,6 +944,19 @@ fn every_lowered_symbol_has_an_arm() {
         kimi_k2_lowered(4),
         kimi_k3_lowered(4),
         dsv4_lowered(4),
+        // ROW SHAPES, not just families. Every lowering above uses plain
+        // rows, and a `GuardPred` that no row satisfies removes its whole
+        // arm before the kernel list is built — so a symbol only a masked
+        // or hooked fire states was outside "every" entirely, and
+        // therefore outside UNARMED too. The set was closed over the
+        // families the corpus names and open over the fires they can be
+        // asked to run, which is not what "closed" was supposed to mean.
+        //
+        // `attn::dispatch_attention_flashinfer_prefill_custom` is how
+        // that surfaced: a mixed-mask decode lowers 28 launches of it, in
+        // the peel's tail region, and nothing anywhere serves it.
+        masked_lowered(4),
+        hooked_lowered(4),
     ] {
         every.extend(l.kernels.iter().cloned());
     }
@@ -954,6 +999,32 @@ fn every_lowered_symbol_has_an_arm() {
         "norm::hc_post_bf16",
         "norm::hc_pre_postprocess_bf16",
         "norm::hc_rmsnorm_to_f32",
+        // ── The PEEL PATH: symbols only a fire whose rows differ can
+        //    state, and the reason this list grew on 2026-08-10 without
+        //    anything regressing. Every other lowering in the corpus uses
+        //    plain rows, so a `GuardPred` no row satisfies removed its arm
+        //    before the kernel list existed — these were never in "every",
+        //    and so never in this closed set either.
+        //
+        //    A mixed-mask decode lowers 28 launches of the custom
+        //    dispatch, in the peel's TAIL region, which is also the only
+        //    place a WINDOWED rectangle (`rows.start != 0`) occurs — the
+        //    case §4's fourth decline-rule exists for. The `_devwin` split
+        //    is the tail's other half: the region asking for a different
+        //    kernel, not the driver choosing one.
+        //
+        //    Neither is served. A masked or hooked fire refuses with
+        //    NoArm today, which is the honest failure and not a silent
+        //    one — but it does mean `HasCustomMask` and `HasStageHooks`
+        //    are declared axes that no fire can currently take.
+        //    `attn::split_qkv_bf16_devwin` LEFT this list on 2026-08-10:
+        //    it has an arm now, and a peel window word
+        //    (`cuda::PeelWindowWord`) for it to read. The custom dispatch
+        //    is still unserved, and a hooked fire still cannot run — not
+        //    for want of this arm but because the tail's ATTENTION takes a
+        //    windowed rectangle and every arm binds base pointers plus a
+        //    count. See `bridge_smoke`'s ignored peel gate.
+        "attn::dispatch_attention_flashinfer_prefill_custom",
         // ── kimi_k3: KDA, the per-key-channel delta rule ──────────────
         //
         // `ssm::bf16_to_fp32` left this list without an arm being
@@ -970,11 +1041,7 @@ fn every_lowered_symbol_has_an_arm() {
     // it would scatter the three groups into one alphabetical run.
     let unarmed: BTreeSet<&str> = every.difference(&armed).map(String::as_str).collect();
     let expected: BTreeSet<&str> = UNARMED.iter().copied().collect();
-    assert_eq!(
-        unarmed.len(),
-        UNARMED.len(),
-        "a line in UNARMED is duplicated"
-    );
+    assert_eq!(unarmed.len(), UNARMED.len(), "a line in UNARMED is duplicated");
     assert_eq!(
         unarmed, expected,
         "the unarmed set moved. A symbol that LEFT means an arm landed — \

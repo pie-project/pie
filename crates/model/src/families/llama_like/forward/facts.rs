@@ -447,6 +447,70 @@ pub struct LlamaLikeMetalFacts {
     /// (`affine_qmm_t`) instead of the GEMV — the driver's
     /// `kQmmMinBatch` gate, as a load-time fact of the deployment.
     pub qmm_multi_batch: bool,
+    /// How this deployment's projections are STORED.
+    ///
+    /// Same role `LlamaLikeCudaFacts::proj_repr` plays and for the same
+    /// reason: `LlamaLikeFacts::shape()` answers `Bf16` because the semantic
+    /// facts carry no backend, and a trace with no backend cannot name the
+    /// kernel a scaled weight needs. The backend facts do carry one, so this
+    /// is where the representation reaches the namespace.
+    ///
+    /// It is load-bearing beyond the kernel name: an affine kernel reads
+    /// THREE tensors, and `MatW::scale_names` is what makes the statement say
+    /// so. A text that left this dense named `affine_qmv_fast` while stating
+    /// one weight, and the driver would have had to derive the other two from
+    /// a naming convention it was never told.
+    ///
+    /// Serde-defaulted, so a fixture written before this field reads as it did.
+    #[serde(default)]
+    pub proj_repr: model_compiler::dsl::WeightRepr,
+    /// Bits per packed weight element — 4 or 8.
+    ///
+    /// The affine entrypoints are instantiated over `(group size × bit
+    /// width)`, so the SYMBOL a statement names carries both. `proj_repr`
+    /// already carries the group; this is the other half, and it is a separate
+    /// field because `WeightRepr::Scaled` has nowhere to put it (a bit width
+    /// is a property of the weight's dtype, which the trace does not spell).
+    ///
+    /// This is the `_d_256` lesson generalised: a symbol whose axis point is
+    /// wrong does not fail, it reads the wrong bytes. A symbol that is a bare
+    /// STEM does not resolve at all, which is the better failure and the one
+    /// the runtime compiler reports by listing what the shader does export.
+    #[serde(default)]
+    pub affine_bits: u32,
+    /// The GEMM's `(row tile, column tile)`, as the entrypoint spells them.
+    ///
+    /// `affine_qmm_t` is instantiated over `(group × bits × bm × bn)`, so the
+    /// batched projection's symbol carries a TILE — and a tile is chosen from
+    /// the ROW COUNT, which is a fire-time fact a trace cannot know.
+    ///
+    /// So it is a load-time fact instead, and that is the honest reading of
+    /// what the driver was doing: `qmm_bm` picks the widest rung at or under
+    /// `n`, and a deployment that always fires the same window always picks
+    /// the same one. A deployment that wants the tile chosen per fire needs
+    /// the row count on a guard axis, which is a change to `Row` and not to
+    /// this text.
+    ///
+    /// Serde-defaulted to `(0, 0)`, which spells no tile — right for the
+    /// GEMV-only deployments, wrong loudly for a GEMM one, because a symbol
+    /// with no tile does not resolve.
+    #[serde(default)]
+    pub qmm_tile: (u32, u32),
+    /// The deployment bound ONE packed `gate‖up` bank.
+    ///
+    /// A binding fact, exactly as `LlamaLikeFacts::fused_qkv` is, and the
+    /// Metal answer to it is normally **false**: `compile_load_plan` authors
+    /// with `Projections::InPlace`, and `dense_fused_projection_joins` returns
+    /// before doing anything under that policy. So the MLX path publishes
+    /// `mlp.gate_proj` and `mlp.up_proj` separately and the text must state
+    /// two projections.
+    ///
+    /// It matters more than a name: `mlp/gated.metal::silu_mul` takes **gate
+    /// and up as two buffers**, so a text that states one packed value binds
+    /// the OUTPUT where `up` belongs and leaves the output unbound. That is a
+    /// fire that runs.
+    #[serde(default)]
+    pub gate_up_fused: bool,
 }
 
 impl LlamaLikeMetalFacts {
@@ -457,6 +521,25 @@ impl LlamaLikeMetalFacts {
             fuse_residual_gemv: true,
             paged_multi_batch: true,
             qmm_multi_batch: true,
+            // The symbols this text names are the affine ones
+            // (`affine_qmv_fast`, `embed_gather_4bit`), so the deployment
+            // they describe is a quantized checkpoint. MLX stores the pair
+            // beside the packed weight as `.scales` and `.biases`, which is
+            // a zero-point layout.
+            proj_repr: model_compiler::dsl::WeightRepr::Scaled {
+                layout: model_compiler::dsl::ScaleLayout::PerGroup,
+                group: 64,
+                axis: 0,
+                zero_point: true,
+            },
+            affine_bits: 4,
+            // The narrowest rung `qmm_bm` can pick, so it is the one a short
+            // window fires; `bn = 32` is the only column tile the residual
+            // variant is instantiated at.
+            qmm_tile: (16, 32),
+            // `Projections::InPlace` is what `compile_load_plan` authors with,
+            // and the join declines under it.
+            gate_up_fused: false,
         }
     }
 }

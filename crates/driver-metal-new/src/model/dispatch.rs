@@ -76,8 +76,39 @@ pub struct Dispatch<'a> {
     pub grid: [u32; 3],
     /// Threads per threadgroup per axis.
     pub threadgroup: [u32; 3],
-    /// Operands in the trace's stated order: inputs, outputs, weights.
+    /// Operands **in the order the kernel reads them**, when its row states
+    /// them; in the trace's stated order when it does not.
+    ///
+    /// The two are not the same order, and assuming they were is what made
+    /// every launch of every text misbind. The trace states inputs, outputs
+    /// then weights — the compiler's convention — while `affine_qmv_fast`
+    /// declares `w, scales, biases, x, y`. A row that states its operands
+    /// says which slot takes what, and [`reorder`] applies it.
+    ///
+    /// A row that states none is bound positionally, which is what every row
+    /// got before and is wrong for most of them. That is why
+    /// `tests/text_conformance.rs` counts them.
     pub args: Vec<BoundArg>,
+    /// Where each scalar binds: `(buffer slot, which scalar)`.
+    ///
+    /// Two spellings exist in the shader tree and the row is what tells them
+    /// apart. `moe/route.metal` takes `constant RouterParams&` — one buffer
+    /// holding every field — while `quant/qmv.metal` takes
+    /// `const constant int& in_vec_size` and `out_vec_size` as two.
+    ///
+    /// One rule serves both: scalar `i` binds at `base + i * 4`, because a
+    /// params struct is a run of `u32` with no padding and its address is the
+    /// address of its first field. A row stating one `Param(0)` therefore
+    /// describes the packed form and the separate form at once.
+    pub param_slots: Vec<(usize, u8)>,
+    /// The scalar arguments the statement states, in its stated order.
+    ///
+    /// A kernel takes numbers no operand shape gives — a QKV split's two
+    /// widths, a strided kernel's row pitch. The **text** states them; this
+    /// forwards them without knowing what they mean, which is the difference
+    /// between a driver that passes a constant and one that re-derives it
+    /// from a config it had to understand.
+    pub params: &'a [u32],
     /// The layers this rectangle covers.
     pub layers: Range<u16>,
     /// Which traced op produced it — where a refusal points.
@@ -128,6 +159,26 @@ pub enum Undispatchable {
         /// Which refusal the rule made.
         why: Ungeometric,
     },
+    /// The rectangle sits under a conditional region, so whether it runs is a
+    /// question this walk cannot answer.
+    ///
+    /// `GuardMode::Union` keeps every arm and tags it, for a backend that can
+    /// turn the tree back into conditional graph nodes. **Metal has no such
+    /// API**: `Stepper` re-encodes every step, so the merged rectangle list IS
+    /// the encode loop and `GuardMode::Resolve` is the mode that fits — the
+    /// guards are answered before a rectangle exists.
+    ///
+    /// Reaching here means a fire was lowered in `Union` mode and handed to
+    /// this walk, which would encode **every arm of every guard
+    /// unconditionally**. That is not a slower answer, it is a different one.
+    Conditional {
+        /// The symbol whose rectangle is conditional.
+        symbol: String,
+        /// The traced op that named it.
+        op: u32,
+        /// Which region of [`Lowered::conds`] it sits under.
+        cond: u32,
+    },
 }
 
 /// Elements per row of the operand that sizes this launch.
@@ -142,14 +193,28 @@ pub enum Undispatchable {
 /// Zero when the launch states no widthed operand at all, which leaves the
 /// rule to refuse rather than this to guess.
 fn sizing_width(lowered: &Lowered, launch: &Launch) -> u32 {
+    widths(lowered, launch).next_back().unwrap_or(0)
+}
+
+/// Elements per row of the launch's FIRST widthed operand — its first input.
+///
+/// What sizes a statement that reads one packed buffer and writes several: no
+/// one output spells the grid, because each is a fraction of the work.
+fn input_width(lowered: &Lowered, launch: &Launch) -> u32 {
+    widths(lowered, launch).next().unwrap_or(0)
+}
+
+/// The row widths this launch's operands state, in the trace's order.
+fn widths<'a>(
+    lowered: &'a Lowered,
+    launch: &Launch,
+) -> impl DoubleEndedIterator<Item = u32> + 'a {
     lowered.args[launch.args.start as usize..launch.args.end as usize]
         .iter()
-        .rev()
-        .find_map(|arg| match arg {
+        .filter_map(|arg| match arg {
             Arg::Arena { width, .. } | Arg::Named { width, .. } => Some(*width),
             Arg::Weight(_) => None,
         })
-        .unwrap_or(0)
 }
 
 /// The dims one launch evaluates its rule at.
@@ -158,6 +223,7 @@ pub fn dims_of(lowered: &Lowered, launch: &Launch, geometry: Geometry) -> Dims {
     Dims {
         rows: launch.rows.end - launch.rows.start,
         width: sizing_width(lowered, launch),
+        in_width: input_width(lowered, launch),
         q_heads: geometry.q_heads,
         kv_heads: geometry.kv_heads,
         head_dim: geometry.head_dim,
@@ -185,6 +251,15 @@ pub fn plan_one<'a, S: Resolver>(
     resolver: &mut S,
 ) -> Result<Dispatch<'a>, Undispatchable> {
     let symbol = &lowered.kernels[launch.kernel as usize];
+    // A conditional rectangle's guard was NOT answered by the lowering, and
+    // this walk has no way to answer it: encoding it would run every arm.
+    if launch.cond != Launch::NO_COND {
+        return Err(Undispatchable::Conditional {
+            symbol: symbol.clone(),
+            op: launch.op,
+            cond: launch.cond,
+        });
+    }
     let sig = kernels::sig_in(table, symbol).ok_or_else(|| Undispatchable::NoRow {
         symbol: symbol.clone(),
         op: launch.op,
@@ -205,12 +280,30 @@ pub fn plan_one<'a, S: Resolver>(
         op: launch.op,
         why,
     })?;
+    let args = reorder(sig, &bound.args, lowered, launch);
+    // Where the row puts its scalars. A row that states no operands has them
+    // appended as one packed struct after the operands, which is the only
+    // convention available when nothing said otherwise.
+    let param_slots: Vec<(usize, u8)> = if sig.operands.is_empty() {
+        vec![(args.len(), 0)]
+    } else {
+        sig.operands
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, o)| match o.source {
+                kernels::Source::Param(i) => Some((slot, i)),
+                _ => None,
+            })
+            .collect()
+    };
     Ok(Dispatch {
         symbol: bound.kernel,
+        params: &lowered.params[launch.params.start as usize..launch.params.end as usize],
         file,
         grid: grid.grid,
         threadgroup: grid.tg,
-        args: bound.args,
+        args,
+        param_slots,
         layers: bound.layers,
         op: launch.op,
     })
@@ -238,6 +331,92 @@ pub fn plan<'a, S: Resolver>(
         .launches
         .iter()
         .map(|launch| plan_one(lowered, launch, table, frame, geometry, resolver))
+        .collect()
+}
+
+/// The launch's operands in the order the KERNEL reads them.
+///
+/// A row states its buffers as [`Operand`]s, each carrying a [`Source`] that
+/// says where the value comes from — the statement's `i`-th input, its `i`-th
+/// result, the `i`-th weight it names, its `i`-th scalar. This walks the row
+/// and picks.
+///
+/// # What "the statement's i-th input" means here
+///
+/// The trace concatenates inputs, then outputs, then weights, and the binder
+/// keeps that order. A weight is an [`Arg::Weight`]; everything before the
+/// last widthed operand is an input and the widthed ones after are the
+/// results. That is the same reading `sizing_width` makes, and the two must
+/// agree or a rule sizes on an operand the row calls an input.
+///
+/// A row that states no operands is returned unchanged — bound positionally,
+/// which is what every row got before any of them stated anything.
+///
+/// A [`Source`] the row leaves `Unbound`, or one naming an operand the
+/// statement does not have, contributes a **zero slot**: an operand that
+/// addresses nothing, which is the same honest answer `resolve_arg` gives a
+/// `scale.` marker. It is not silently skipped, because a skipped slot shifts
+/// every operand after it.
+fn reorder(
+    sig: &'static KernelSig,
+    bound: &[BoundArg],
+    lowered: &Lowered,
+    launch: &Launch,
+) -> Vec<BoundArg> {
+    if sig.operands.is_empty() {
+        return bound.to_vec();
+    }
+    let args = &lowered.args[launch.args.start as usize..launch.args.end as usize];
+    let widthed: Vec<usize> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| !matches!(a, Arg::Weight(_)))
+        .map(|(i, _)| i)
+        .collect();
+    let weights: Vec<usize> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| matches!(a, Arg::Weight(_)))
+        .map(|(i, _)| i)
+        .collect();
+    // How many of the widthed operands are RESULTS: the row says, because the
+    // row is what knows how many values its kernel produces. A QKV split
+    // writes three and a norm writes one, and the trace states them all after
+    // its inputs, so the split is at `len - results`.
+    let results = sig
+        .operands
+        .iter()
+        .filter_map(|o| match o.source {
+            kernels::Source::Out(i) => Some(usize::from(i) + 1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(1)
+        .min(widthed.len());
+    let (ins, outs) = widthed.split_at(widthed.len() - results);
+
+    let nothing = BoundArg {
+        slice: crate::model::executor::Slice {
+            address: 0,
+            bytes: 0,
+        },
+        width: 0,
+    };
+    sig.operands
+        .iter()
+        .map(|operand| {
+            let at = match operand.source {
+                kernels::Source::In(i) => ins.get(i as usize).copied(),
+                kernels::Source::Out(i) => outs.get(i as usize).copied(),
+                kernels::Source::Weight(i) => weights.get(i as usize).copied(),
+                // A scalar does not come out of the operand list at all — it
+                // rides `Dispatch::params`, bound as one struct after the
+                // buffers — so its slot here addresses nothing and the
+                // encoder's own binding is what the kernel reads.
+                _ => None,
+            };
+            at.and_then(|i| bound.get(i).copied()).unwrap_or(nothing)
+        })
         .collect()
 }
 
@@ -299,6 +478,8 @@ mod tests {
                 rows: 0..rows,
                 layers: 0..1,
                 op: 7,
+                cond: Launch::NO_COND,
+                params: 0..0,
                 args: 0..args.len() as u32,
                 peel: None,
             }],
@@ -310,8 +491,10 @@ mod tests {
             epilogue_gather: usize::MAX,
             epilogue_norm: usize::MAX,
             args,
+            params: Vec::new(),
             structural: Vec::new(),
             residue: Vec::new(),
+            conds: Vec::new(),
         }
     }
 
@@ -406,6 +589,25 @@ mod tests {
     }
 
     #[test]
+    fn a_conditional_rectangle_refuses_because_metal_cannot_answer_a_guard() {
+        // `GuardMode::Union` keeps every arm for a backend that can build
+        // conditional graph nodes. Metal has no such API and re-encodes every
+        // step, so a union-lowered fire reaching this walk would encode every
+        // arm of every guard unconditionally — a different answer, not a
+        // slower one.
+        let mut low = one("sized", 1, vec![Arg::Arena { at: 0, width: 8 }]);
+        low.launches[0].cond = 3;
+        assert_eq!(
+            plan(&low, TABLE, frame(), Geometry::default(), &mut Anything),
+            Err(Undispatchable::Conditional {
+                symbol: "sized".into(),
+                op: 7,
+                cond: 3
+            })
+        );
+    }
+
+    #[test]
     fn one_symbol_named_many_times_is_compiled_once() {
         let d = Dispatch {
             symbol: "sized",
@@ -413,6 +615,8 @@ mod tests {
             grid: [1, 1, 1],
             threadgroup: [1, 1, 1],
             args: Vec::new(),
+            param_slots: vec![(0, 0)],
+            params: &[],
             layers: 0..1,
             op: 0,
         };

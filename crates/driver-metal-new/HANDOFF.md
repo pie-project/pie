@@ -2,6 +2,28 @@
 
 Date: 2026-08-09. Written for whoever picks this up next, human or agent.
 
+> **Two things below are out of date, and both matter on the first read.**
+>
+> 1. **The C++ driver is retired** (2026-08-10). `crates/driver-metal` is out
+>    of the workspace and out of `engine`'s graph, kept as reference only. The
+>    "grows beside the C++ crate, `main` still serves" arrangement described
+>    below was true and is not: Metal serving went down with the C++ and came
+>    back through `DriverBackend::Metal`, which is this crate.
+> 2. **The model-compiler path is the direction**, and `DIRECTION.md` is its
+>    decision record — read that first. In short: the executor is `src/model/`
+>    and is done; it walks a lowered fire with no arm per kernel and no branch
+>    per family, and `tests/device_text_fire.rs` runs all 367 launches of
+>    `llama_like`'s Metal text on the GPU. What is NOT done is the proof —
+>    nothing has been held to `tests/device_smoke.rs` token for token, and
+>    until it has, **no family's handwritten driver code may be deleted**.
+>
+> `PARITY-BATCH.md` and `CUTOVER.md` were written against the older plan and
+> describe work that is no longer worth doing. The box at the top of
+> `PARITY-BATCH.md` applies to every ledger here, including this line: a
+> `missing` row is only true on the day it is written, and nine of eleven such
+> rows turned out to be already done under a name the row could not have
+> predicted.
+
 This file is the canonical copy and lives in the repository on purpose. The
 port's state has already survived one lost session and one machine reboot
 because `PARITY.md` and `PARITY-M1.md` were committed and the session record was

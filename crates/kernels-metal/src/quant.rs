@@ -25,7 +25,21 @@ pub static KERNELS: &[KernelSig] = &[
     // 1 in quantized_qmm_t.metal
     kernel!(qmm_splitk_reduce_f32 "qmm_splitk_reduce_f32", axes = &[BF16]),
     // 54 in quantized_qmm_t.metal
-    kernel!(qmm_t "affine_qmm_t", file = Some("quant/qmm_t.metal"), launch = kernels::LaunchRule::Qmm, axes = &[BF16, GROUP, BITS, TILE_M, TILE_N]),
+    // The batched projection, and its operand order is the GEMV's: weights,
+    // then the activation, then the result, then the two extents. The template
+    // is `affine_qmm_t_aligned`, so a reader diffing this against the shader
+    // looks for that name.
+    kernel!(qmm_t "affine_qmm_t", file = Some("quant/qmm_t.metal"), launch = kernels::LaunchRule::Qmm,
+        operands = kernels::operands![
+            w: Buf <- kernels::Source::Weight(0),
+            scales: Buf <- kernels::Source::Weight(1),
+            biases: Buf <- kernels::Source::Weight(2),
+            x: Buf <- kernels::Source::In(0),
+            y: BufMut <- kernels::Source::Out(0),
+            k: I32 <- kernels::Source::Param(0),
+            n: I32 <- kernels::Source::Param(1),
+        ],
+        axes = &[BF16, GROUP, BITS, TILE_M, TILE_N]),
     // `affine_qmm_t_aligned` has no row: it is the TEMPLATE the two below are
     // stamped from, and the census counted it as an entrypoint until the
     // template guard learned that a parameter list wraps.
@@ -43,7 +57,18 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(qmm_t_fp16_precast "affine_qmm_t_fp16_precast",
         axes = &[BF16, GROUP_64, BITS_4, TILE_M, TILE_N]),
     // 54 in quantized_qmm_t.metal
-    kernel!(qmm_t_residual "affine_qmm_t_residual", file = Some("quant/qmm_t.metal"), launch = kernels::LaunchRule::Qmm, axes = &[BF16, GROUP, BITS, TILE_M, TILE_N]),
+    kernel!(qmm_t_residual "affine_qmm_t_residual", file = Some("quant/qmm_t.metal"), launch = kernels::LaunchRule::Qmm,
+        operands = kernels::operands![
+            w: Buf <- kernels::Source::Weight(0),
+            scales: Buf <- kernels::Source::Weight(1),
+            biases: Buf <- kernels::Source::Weight(2),
+            x: Buf <- kernels::Source::In(0),
+            y: BufMut <- kernels::Source::Out(0),
+            k: I32 <- kernels::Source::Param(0),
+            n: I32 <- kernels::Source::Param(1),
+            residual: Buf <- kernels::Source::In(1),
+        ],
+        axes = &[BF16, GROUP, BITS, TILE_M, TILE_N]),
     // 9 in quantized_qmm_t.metal
     kernel!(qmm_t_residual_fp16_precast "affine_qmm_t_residual_fp16_precast",
         axes = &[BF16, GROUP_64, BITS_4, TILE_M, TILE_N]),
@@ -70,9 +95,36 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(qmm_t_strided_residual "affine_qmm_t_strided_residual",
         axes = &[BF16, GROUP, BITS, TILE_M, TILE_N_32]),
     // 6 in quantized_qmv.metal
-    kernel!(qmv_fast "affine_qmv_fast", file = Some("quant/qmv.metal"), launch = kernels::LaunchRule::Qmv, axes = &[BF16, GROUP, BITS]),
+    // The loudest misbinding, and the reason the rows grew operands at all:
+    // this declares its WEIGHTS FIRST and the trace states them last, so
+    // positional binding put the activation where the packed weight belongs.
+    // Every projection of every layer.
+    kernel!(qmv_fast "affine_qmv_fast", file = Some("quant/qmv.metal"), launch = kernels::LaunchRule::Qmv,
+        operands = kernels::operands![
+            w: Buf <- kernels::Source::Weight(0),
+            scales: Buf <- kernels::Source::Weight(1),
+            biases: Buf <- kernels::Source::Weight(2),
+            x: Buf <- kernels::Source::In(0),
+            y: BufMut <- kernels::Source::Out(0),
+            in_vec_size: I32 <- kernels::Source::Param(0),
+            out_vec_size: I32 <- kernels::Source::Param(1),
+        ],
+        axes = &[BF16, GROUP, BITS]),
     // 6 in quantized_qmv.metal
-    kernel!(qmv_fast_residual "affine_qmv_fast_residual", file = Some("quant/qmv.metal"), launch = kernels::LaunchRule::Qmv, axes = &[BF16, GROUP, BITS]),
+    // The same, plus the block residual its epilogue folds — which the trace
+    // states as a second INPUT and the kernel takes at the very end.
+    kernel!(qmv_fast_residual "affine_qmv_fast_residual", file = Some("quant/qmv.metal"), launch = kernels::LaunchRule::Qmv,
+        operands = kernels::operands![
+            w: Buf <- kernels::Source::Weight(0),
+            scales: Buf <- kernels::Source::Weight(1),
+            biases: Buf <- kernels::Source::Weight(2),
+            x: Buf <- kernels::Source::In(0),
+            y: BufMut <- kernels::Source::Out(0),
+            in_vec_size: I32 <- kernels::Source::Param(0),
+            out_vec_size: I32 <- kernels::Source::Param(1),
+            residual: Buf <- kernels::Source::In(1),
+        ],
+        axes = &[BF16, GROUP, BITS]),
     // 2 in quantized_qmv.metal
     kernel!(qmv_tail "affine_qmv_tail", axes = &[BF16, GROUP_64, BITS]),
     // 2 in quantized_qmv.metal

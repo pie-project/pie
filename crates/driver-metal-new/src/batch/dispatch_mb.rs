@@ -33,6 +33,7 @@ use super::consts::qmv_kn;
 use super::dispatch::{DagOptions, Dispatch, Launch, build_decode_dag};
 use super::geometry::DecodeGeometry;
 use super::psos_mb::QMM_BMS;
+pub use crate::model::grid::{elementwise_mb, qmm_bm, qmm_t, qmv_mb, rms_mb};
 use super::sizing::{RoutedProjection, moe_sorted_rows};
 
 /// The routed decode GEMM's arm; see the module docs for why it is shut.
@@ -76,17 +77,6 @@ pub fn qmv_out_size(kind: Kernel, g: &DecodeGeometry) -> u32 {
     }
 }
 
-/// The widest row rung at or under `n` rows.
-#[must_use]
-pub fn qmm_bm(n: u32) -> u32 {
-    let mut best = QMM_BMS[0];
-    for &bm in &QMM_BMS {
-        if n >= bm {
-            best = bm;
-        }
-    }
-    best
-}
 
 /// Which [`QMM_BMS`] rung a chosen row block is — the dispatch records the
 /// block it launched, not the batch it came from, so the PSO lookup comes
@@ -155,42 +145,9 @@ pub fn qmm_mb_rows(n: u32, max_tokens: u32, min_batch: u32) -> u32 {
     }
 }
 
-/// `rms_single_row` over `n_rows × n` stacked rows.
-#[must_use]
-pub fn rms_mb(row_size: u32, n_rows: u32, n: u32) -> Launch {
-    let t = row_size.div_ceil(4).min(1024);
-    Launch {
-        grid: [t * n_rows * n, 1, 1],
-        tg: [t, 1, 1],
-    }
-}
 
-/// Flat elementwise over `width × n`.
-#[must_use]
-pub fn elementwise_mb(width: u32, n: u32) -> Launch {
-    Launch {
-        grid: [width * n, 1, 1],
-        tg: [256, 1, 1],
-    }
-}
 
-/// The matvec with rows on the first grid axis.
-#[must_use]
-pub fn qmv_mb(out_vec: u32, n: u32) -> Launch {
-    Launch {
-        grid: [32 * n, out_vec.div_ceil(4), 1],
-        tg: [32, 2, 1],
-    }
-}
 
-/// The GEMM grid for `n` rows at a `(bm, bn)` tile.
-#[must_use]
-pub fn qmm_t(out_vec: u32, n: u32, bn: u32, bm: u32) -> Launch {
-    Launch {
-        grid: [32 * (out_vec / bn), 2 * (n / bm), 2],
-        tg: [32, 2, 2],
-    }
-}
 
 /// Whether this checkpoint's GEMM reaches the FP16 matrix path.
 #[must_use]

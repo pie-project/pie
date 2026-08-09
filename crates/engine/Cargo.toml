@@ -23,6 +23,11 @@ tensor-compiler = { path = "../tensor-compiler" }
 # The native execution shells, for their archives alone -- see the feature
 # comments above and the `extern crate ... as _` in lib.rs.
 driver-cuda = { path = "../driver-cuda", optional = true }
+# The Rust Metal shell. Unlike `driver-cuda` this is not linked for an
+# archive: the seam calls it as a plain Rust library, which is what a driver
+# written in the same language should cost. Its device half is
+# `#[cfg(target_vendor = "apple")]`, so the seam below is too.
+driver-metal-new = { path = "../driver-metal-new", optional = true }
 client = { path = "../client" }
 tokio = { version = "1.53", features = ["full"] }
 tokio-util = "0.7"
@@ -114,6 +119,9 @@ default = []
 #
 # The crate that declares an `extern "C"` is the crate that owes the symbol.
 driver-cuda = ["dep:driver-cuda"]
+# The Rust Metal shell's seam. No archive and no `extern "C"`: this one is a
+# library call, so the feature owes nothing but the dependency.
+driver-metal-new = ["dep:driver-metal-new"]
 # Host-side performance probes. Each scenario is a separate flag so you
 # only pay for the probes you ask for — different domains have different
 # sample rates and different audiences. The `probe_<domain>!` macros in

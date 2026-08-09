@@ -95,7 +95,34 @@ pub fn emit_c_shim(
          // fact the table exists to carry.\n\n\
          #include <cstddef>\n\
          #include <cstdint>\n\
-         #include <cuda_runtime.h>\n\n",
+         #include <cstdio>\n\
+         #include <cstdlib>\n\
+         #include <exception>\n\
+         #include <cuda_runtime.h>\n\n\
+         // Every body is wrapped, and the reason is worth stating because the\n\
+         // wrapper looks like belt-and-braces and is not. A launcher reports a\n\
+         // capability it lacks by THROWING -- FlashInfer's dispatch macros end\n\
+         // in `throw std::invalid_argument(...)` for an unsupported head dim or\n\
+         // GQA group size. An exception crossing the C ABI boundary is\n\
+         // undefined behaviour, and what it does in practice is unwind through\n\
+         // Rust frames until the runtime aborts -- SIGABRT, no message, and a\n\
+         // backtrace pointing at whatever destructor ran last. Twice that cost\n\
+         // a debugger session to learn one sentence the launcher had already\n\
+         // written down.\n\
+         //\n\
+         // So the process still dies, because these signatures have nowhere to\n\
+         // put a failure -- but it dies SAYING WHY.\n\
+         #define PIE_K_GUARD(expr)                                             \\\n\
+             try { expr; } catch (const ::std::exception& e) {                 \\\n\
+                 ::std::fprintf(stderr, \"[pie_k] %s: %s\\n\", __func__, e.what()); \\\n\
+                 ::std::fflush(stderr);                                        \\\n\
+                 ::std::abort();                                               \\\n\
+             } catch (...) {                                                   \\\n\
+                 ::std::fprintf(stderr, \"[pie_k] %s: unknown C++ exception\\n\", \\\n\
+                                __func__);                                     \\\n\
+                 ::std::fflush(stderr);                                        \\\n\
+                 ::std::abort();                                               \\\n\
+             }\n\n",
     );
     for inc in includes {
         out.push_str(&format!("#include \"{inc}\"\n"));
@@ -136,10 +163,15 @@ pub fn emit_c_shim(
         // type, so a row that said `void` about a `bool` launcher is a
         // conversion C++ refuses rather than a value quietly dropped.
         let ret = if k.returns.is_empty() { "void" } else { k.returns };
+        // The guard cannot wrap a `return` (the value would escape the
+        // try block), so an answering launcher assigns first.
         let forward = if k.returns.is_empty() {
-            format!("    fwd({args});")
+            format!("    PIE_K_GUARD(fwd({args}))")
         } else {
-            format!("    return fwd({args});")
+            format!(
+                "    {ret} pie_k_answer{};\n    PIE_K_GUARD(pie_k_answer = fwd({args}))\n    return pie_k_answer;",
+                ""
+            )
         };
         out.push_str(&format!(
             "extern \"C\" {ret} {entry}(\n{params}) {{\n    \

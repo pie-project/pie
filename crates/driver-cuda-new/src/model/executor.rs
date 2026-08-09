@@ -719,6 +719,16 @@ pub struct DispatchCtx {
     /// derivation from the config (the C++ computes it per layer at fire
     /// time); empty means the deployment states no sparse layer.
     pub altup_std_mult_by_layer: Vec<f32>,
+    /// The fire's PEEL WINDOW, device-resident: `[start, count]`, or null
+    /// when this fire has no row split. The `_devwin` statements in a
+    /// peel's tail read it — their grid spans every lane and out-of-window
+    /// rows early-out, which is what lets one capture replay across
+    /// different splits. See [`crate::cuda::PeelWindowWord`].
+    pub peel_window: *const u32,
+    /// The fire's FULL row count, which a `_devwin` launch spans
+    /// regardless of how many rows its own region serves. `Launch::rows`
+    /// gives the region; this gives the lane space it sits in.
+    pub rows_total: i32,
     /// The fire's STAGED LoRA state and its xAᵀ scratch (`ws.gate` in
     /// the C++) — what a stated `pie_lora_qkv_correction` launch
     /// applies. Null/None on adapter-free fires. A raw pointer because
@@ -1316,6 +1326,43 @@ pub fn dispatch<R: Resolver>(
         }
         // args: [packed, q_raw, k_raw, v] — one input, then the op's THREE
         // outputs stated as args (SplitQkv's outputs are values).
+        // args: [packed, q, k, v] — the same four the host-window form
+        // takes, and the SAME base pointers. The difference is where the
+        // row window comes from: a peel's tail addresses rows at absolute
+        // offsets in a full-N buffer, so the split rides in device memory
+        // and the grid spans every lane, out-of-window rows early-outing
+        // on `win[0]`/`win[1]`. That is what makes the launch replayable
+        // across splits, which is the whole reason the region asks for
+        // this kernel instead of choosing it.
+        //
+        // Note the operands are NOT windowed by the caller here, and that
+        // is the kernel's stated contract ("Buffers are BASE pointers")
+        // rather than an oversight — the binder's base-resolving
+        // behaviour, which §4's fourth decline-rule works around for the
+        // host-window form, is exactly right for this one.
+        "attn::split_qkv_bf16_devwin" => {
+            need(4)?;
+            let (packed, q, k, v) =
+                (bound.args[0], bound.args[1], bound.args[2], bound.args[3]);
+            if ctx.peel_window.is_null() {
+                return Err(DispatchRefusal::NoArm(
+                    "attn::split_qkv_bf16_devwin: the fire published no peel window".into(),
+                ));
+            }
+            unsafe {
+                ffi::pie_k_attn_split_qkv_bf16_devwin(
+                    packed.ptr,
+                    q.ptr,
+                    k.ptr,
+                    v.ptr,
+                    ctx.peel_window,
+                    ctx.rows_total,
+                    i32::try_from(q.width).expect("q width"),
+                    i32::try_from(k.width).expect("kv width"),
+                    ctx.stream,
+                );
+            }
+        }
         "attn::split_qkv_bf16" => {
             need(4)?;
             let (packed, q, k, v) =
@@ -1505,6 +1552,64 @@ pub fn dispatch<R: Resolver>(
                     i32::try_from(out_arg.width).expect("dim"),
                     ctx.stream,
                 );
+            }
+        }
+        // args: [packed, padded] / [padded, packed]. What
+        // `head_dim_padded` COSTS, for a deployment whose logical head
+        // width is not one this build instantiated — phi3's 96 rounding
+        // up to 128.
+        //
+        // A hand arm rather than a stated row, and it is the third of
+        // §4's classes: the head COUNT is derived arithmetic. The op sits
+        // on either the q side or the kv side, so a fixed
+        // `Ctx("num_q_heads")` would be right half the time; and the
+        // padded width is the other operand's extent, which no `Source`
+        // names. Both fall out of the two widths and the logical head dim
+        // the ctx carries, which is what this computes.
+        "attn::pad_head_dim_bf16" | "attn::strip_head_dim_bf16" => {
+            need(2)?;
+            let (src, dst) = (bound.args[0], bound.args[1]);
+            let pad = bound.kernel == "attn::pad_head_dim_bf16";
+            // The PACKED side is whichever end is `head_dim` wide.
+            let packed = if pad { src } else { dst };
+            let padded = if pad { dst } else { src };
+            let hd = ctx.head_dim;
+            if hd <= 0 {
+                return Err(DispatchRefusal::NoArm(format!(
+                    "{}: the ctx states no head_dim",
+                    bound.kernel
+                )));
+            }
+            let heads = i32::try_from(packed.width).unwrap_or(0) / hd;
+            if heads <= 0 {
+                return Err(DispatchRefusal::NoArm(format!(
+                    "{}: a packed row of {} is not a multiple of head_dim {hd}",
+                    bound.kernel, packed.width
+                )));
+            }
+            let hd_padded = i32::try_from(padded.width).unwrap_or(0) / heads;
+            unsafe {
+                if pad {
+                    ffi::pie_k_attn_pad_head_dim_bf16(
+                        src.ptr.cast_const(),
+                        dst.ptr,
+                        rows,
+                        heads,
+                        hd,
+                        hd_padded,
+                        ctx.stream,
+                    );
+                } else {
+                    ffi::pie_k_attn_strip_head_dim_bf16(
+                        src.ptr.cast_const(),
+                        dst.ptr,
+                        rows,
+                        heads,
+                        hd,
+                        hd_padded,
+                        ctx.stream,
+                    );
+                }
             }
         }
         // ── The qwen3_5 hybrid's arms ────────────────────────────────
@@ -3321,6 +3426,169 @@ pub fn run<R: Resolver>(
         })?;
     }
     Ok(lowered.launches.len())
+}
+
+/// One open conditional on the capture stack: the node, and which of its
+/// two arms is currently being captured into.
+#[cfg(feature = "bridge")]
+struct OpenCond {
+    cond: crate::cuda::Cond,
+    /// The tree node ([`Lowered::conds`] index) whose body is open.
+    node: u32,
+}
+
+/// The path from the root to `cond`, as tree-node indices.
+#[cfg(feature = "bridge")]
+fn cond_path(conds: &[model_compiler::lower::CondRegion], cond: u32) -> Vec<u32> {
+    let mut path = Vec::new();
+    let mut at = cond;
+    while at != Launch::NO_COND {
+        path.push(at);
+        let Some(node) = conds.get(at as usize) else { break };
+        at = node.parent;
+    }
+    path.reverse();
+    path
+}
+
+/// Are these two tree nodes the two arms of ONE conditional?
+///
+/// Read off the lowering's stated pairing rather than derived from
+/// `(parent, slot, param)`: a family states the same guard once per
+/// layer, so those three fields identify one conditional PER LAYER, and
+/// deriving would pair an arm with some other layer's else body.
+#[cfg(feature = "bridge")]
+fn siblings(conds: &[model_compiler::lower::CondRegion], a: u32, b: u32) -> bool {
+    conds.get(a as usize).is_some_and(|x| x.sibling == b)
+}
+
+/// Execute one fire INTO A CAPTURE, rebuilding the union lowering's guard
+/// tree as conditional graph nodes.
+///
+/// This is the supergraph's body. `lowered` must come from
+/// `lower_with(.., GuardMode::Union)`: every arm is present, tagged with
+/// its place in the tree, and nothing about the fire's variant bits has
+/// been decided. What decides them is the device predicate word the
+/// builder was constructed with — read from inside the graph, per launch,
+/// with no host round-trip and no recapture.
+///
+/// The walk is a stack diff. Launches arrive in tree-walk order, so the
+/// region path only ever extends, switches arms, or retreats; each of
+/// those is one builder call.
+///
+/// `ctx.stream` is OVERWRITTEN per region — the arms issue onto whatever
+/// stream the builder is currently capturing, which is the root at depth
+/// zero and a pooled body stream inside an arm. That is the whole of what
+/// "issuable into a capture" means for a dispatch arm: it is the same
+/// call, onto a different stream.
+///
+/// # Errors
+///
+/// The first refusing launch, or a CUDA refusal from the builder
+/// (reported against the launch that provoked it).
+#[cfg(feature = "bridge")]
+pub fn run_captured<R: Resolver>(
+    lowered: &Lowered,
+    dplan: &DispatchPlan,
+    frame: Frame,
+    resolver: &mut R,
+    ctx: &DispatchCtx,
+    attn: Option<&AttnCtx>,
+    gdn: Option<&GdnCtx>,
+    builder: &mut crate::cuda::SupergraphBuilder<'_>,
+) -> Result<usize, RunRefusal> {
+    let mut ctx = ctx.clone();
+    let mut stack: Vec<OpenCond> = Vec::new();
+
+    // A CUDA refusal is reported against the launch that provoked it, so
+    // that a capture failure reads like every other drift diagnosis
+    // rather than like an unrelated device error.
+    let cuda = |i: usize, kernel: &str, e: crate::error::Error| RunRefusal {
+        launch: i,
+        kernel: kernel.to_string(),
+        why: RunRefusalKind::Dispatch(DispatchRefusal::NoArm(format!("capture: {e}"))),
+    };
+
+    for (i, launch) in lowered.launches.iter().enumerate() {
+        let kernel = lowered.kernels[launch.kernel as usize].clone();
+        let target = cond_path(&lowered.conds, launch.cond);
+
+        // How much of the open path the target still agrees with.
+        let mut keep = 0;
+        while keep < stack.len() && keep < target.len() && stack[keep].node == target[keep] {
+            keep += 1;
+        }
+        // The frame just past the agreement may be the OTHER ARM of the
+        // same conditional, which is a body switch rather than a close.
+        let switch_at = (keep < stack.len()
+            && keep < target.len()
+            && siblings(&lowered.conds, stack[keep].node, target[keep]))
+        .then_some(keep);
+        let close_to = switch_at.map_or(keep, |s| s + 1);
+
+        while stack.len() > close_to {
+            builder.end_body().map_err(|e| cuda(i, &kernel, e))?;
+            let f = stack.pop().expect("stack is non-empty");
+            builder.close_cond(&f.cond).map_err(|e| cuda(i, &kernel, e))?;
+        }
+
+        if let Some(s) = switch_at {
+            builder.end_body().map_err(|e| cuda(i, &kernel, e))?;
+            let want = target[s];
+            let body = arm_body(&stack[s].cond, &lowered.conds, want);
+            builder.begin_body(body).map_err(|e| cuda(i, &kernel, e))?;
+            stack[s].node = want;
+            keep = s + 1;
+        }
+
+        for &node in &target[keep..] {
+            let region = lowered.conds[node as usize];
+            // Always with_else: the sibling arm may arrive later, and a
+            // conditional opened without an else body has nowhere to put
+            // it.
+            let cond = builder
+                .open_cond(region.slot, true)
+                .map_err(|e| cuda(i, &kernel, e))?;
+            let body = arm_body(&cond, &lowered.conds, node);
+            builder.begin_body(body).map_err(|e| cuda(i, &kernel, e))?;
+            stack.push(OpenCond { cond, node });
+        }
+
+        ctx.stream = builder.stream().as_raw().cast::<c_void>();
+
+        let bound = bind(lowered, launch, frame, resolver).map_err(|e| RunRefusal {
+            launch: i,
+            kernel: kernel.clone(),
+            why: RunRefusalKind::Bind(e),
+        })?;
+        dispatch(&bound, dplan.spec(i), frame, resolver, &ctx, attn, gdn).map_err(|e| {
+            RunRefusal { launch: i, kernel: kernel.clone(), why: RunRefusalKind::Dispatch(e) }
+        })?;
+    }
+
+    // Unwind whatever the last launch left open.
+    let last = lowered.launches.len().saturating_sub(1);
+    while let Some(f) = stack.pop() {
+        builder.end_body().map_err(|e| cuda(last, "<unwind>", e))?;
+        builder.close_cond(&f.cond).map_err(|e| cuda(last, "<unwind>", e))?;
+    }
+
+    Ok(lowered.launches.len())
+}
+
+/// Which of a conditional's two bodies serves tree node `node`.
+#[cfg(feature = "bridge")]
+fn arm_body(
+    cond: &crate::cuda::Cond,
+    conds: &[model_compiler::lower::CondRegion],
+    node: u32,
+) -> cudarc::runtime::sys::cudaGraph_t {
+    let on_true = conds.get(node as usize).is_none_or(|r| r.on_true);
+    if on_true {
+        cond.if_body()
+    } else {
+        cond.else_body().unwrap_or_else(|| cond.if_body())
+    }
 }
 
 /// Resolve one [`Arg`] — the three rules, shared by [`bind`] and by the

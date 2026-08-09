@@ -54,10 +54,18 @@ pub mod cublas;
 mod device;
 mod graph;
 mod stream;
+mod supergraph;
 mod vmm;
 
 pub use alloc::{Allocator, CaptureScope, DeviceBuffer};
 pub use device::{COMPILED_MAJOR, Device};
 pub use graph::{ConditionalIf, Graph, GraphExec};
 pub use stream::{Event, OwnedStream, StreamRef};
+#[cfg(feature = "bridge")]
+pub use supergraph::{Cond, SupergraphBuilder};
+pub use supergraph::{
+    PRED_SLOTS, PeelWindowWord, PredicateWord, SLOT_HAS_CUSTOM_MASK, SLOT_HAS_LORA, SLOT_HAS_STAGE_HOOKS,
+    SLOT_HAS_WRITE_DESC, SLOT_PEEL_ALL_FAST, SLOT_PEEL_ALL_HOOKED, SLOT_TOKENS_GT,
+    SLOT_TOKENS_LE, SLOT_WANTS_ATTN_SCORE,
+};
 pub use vmm::{Arena, PhysicalPool, PoolBudget, LOGICAL_PAGE_BYTES, pages_for_bytes};

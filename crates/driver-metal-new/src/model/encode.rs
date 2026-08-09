@@ -24,10 +24,76 @@ use objc2_metal::MTLComputePipelineState;
 
 use crate::error::{Error, Result};
 use crate::metal::Context;
-use crate::metal::{ArgumentTable, Compiler, StepEncoder};
+use crate::metal::{ArgumentTable, Compiler, Handle, StepEncoder, allocate};
+use crate::region::Region as _;
 use crate::shader::Request;
 
 use super::dispatch::{Dispatch, pipelines_needed};
+
+/// The scalars a fire's statements state, in one device buffer.
+///
+/// MTL4 argument tables bind **addresses**, not bytes, so a kernel taking a
+/// `const constant uint&` needs a buffer to point at. One buffer per fire
+/// rather than one per launch: the values are known before any encoding
+/// starts, so they are written once and each dispatch binds a slice of the
+/// same region. A buffer per dispatch would allocate 367 times for a fire
+/// whose scalars total a few dozen bytes.
+pub struct Params {
+    region: Handle,
+    /// Byte offset of each dispatch's run, parallel to the dispatch list.
+    offsets: Vec<u64>,
+}
+
+impl std::fmt::Debug for Params {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Params")
+            .field("runs", &self.offsets.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Params {
+    /// Stage every dispatch's scalars into one buffer, in dispatch order.
+    ///
+    /// # Errors
+    ///
+    /// The allocation, or a write past it.
+    pub fn stage(context: &Context, dispatches: &[Dispatch<'_>]) -> Result<Self> {
+        let total: usize = dispatches.iter().map(|d| d.params.len()).sum();
+        // A fire whose statements state no scalars still gets a region: a
+        // zero-length allocation has no address to bind, and an unbound slot
+        // is a kernel reading whatever the last step left there.
+        let bytes = (total * size_of::<u32>()).max(size_of::<u32>()) as u64;
+        let region = allocate(context, bytes, "launch params")?;
+        let mut offsets = Vec::with_capacity(dispatches.len());
+        let mut at = 0u64;
+        for d in dispatches {
+            offsets.push(at);
+            if d.params.is_empty() {
+                continue;
+            }
+            let raw: &[u8] = unsafe {
+                core::slice::from_raw_parts(
+                    d.params.as_ptr().cast::<u8>(),
+                    core::mem::size_of_val(d.params),
+                )
+            };
+            // SAFETY: `region` was allocated to hold every run; this one
+            // starts at `at`, which advances by exactly the bytes written.
+            unsafe { region.write(at, raw)? };
+            at += core::mem::size_of_val(d.params) as u64;
+        }
+        Ok(Self { region, offsets })
+    }
+
+    /// The GPU address of dispatch `index`'s scalars.
+    #[must_use]
+    pub fn address_of(&self, index: usize) -> Option<u64> {
+        self.offsets
+            .get(index)
+            .map(|at| self.region.gpu_address() + at)
+    }
+}
 
 /// The pipelines a fire's symbols compile to, keyed by entry point.
 ///
@@ -129,6 +195,8 @@ pub fn encode_one(
     encoder: &mut StepEncoder<'_>,
     table: &ArgumentTable,
     pipelines: &Pipelines,
+    params: &Params,
+    index: usize,
     dispatch: &Dispatch<'_>,
 ) -> Result<()> {
     let pipeline = pipelines
@@ -141,8 +209,38 @@ pub fn encode_one(
             ),
         })?;
     encoder.set_pipeline(pipeline);
-    for (index, arg) in dispatch.args.iter().enumerate() {
-        table.bind_address(index, arg.slice.address)?;
+    for (slot, arg) in dispatch.args.iter().enumerate() {
+        table.bind_address(slot, arg.slice.address)?;
+    }
+    // The scalars, at the slots the ROW placed them. Scalar `i` binds at
+    // `base + i * 4`, which serves both spellings in the tree: a packed
+    // `constant RouterParams&` is the address of its first field, and a
+    // separate `const constant int&` is the address of that scalar. A row
+    // stating one `Param(0)` describes both at once.
+    //
+    // One slot and not one each, because that is what the shader tree already
+    // does: `moe/route.metal` takes `constant RouterParams&`, `norm/rms.metal`
+    // takes its own struct, and every such struct is a run of `unsigned int`
+    // with no padding. A statement's `params` in stated order IS that struct,
+    // so the address of the run is the address of the struct.
+    //
+    // The alternative — a slot per scalar — was what this did first, and it
+    // serves exactly one kernel: the QKV split, whose shader was written here
+    // and could be written either way. Every kernel that already existed
+    // wanted the packed form, so the packed form is the convention and the
+    // split's shader was changed to match it.
+    if !dispatch.params.is_empty() {
+        let base = params.address_of(index).ok_or_else(|| Error::Create {
+            what: "dispatch",
+            message: format!(
+                "`{}` states {} scalar(s) but was not staged",
+                dispatch.symbol,
+                dispatch.params.len()
+            ),
+        })?;
+        for &(slot, which) in &dispatch.param_slots {
+            table.bind_address(slot, base + u64::from(which) * size_of::<u32>() as u64)?;
+        }
     }
     encoder.set_argument_table(table);
     encoder.dispatch(
@@ -172,10 +270,11 @@ pub fn encode(
     encoder: &mut StepEncoder<'_>,
     table: &ArgumentTable,
     pipelines: &Pipelines,
+    params: &Params,
     dispatches: &[Dispatch<'_>],
 ) -> Result<()> {
-    for dispatch in dispatches {
-        encode_one(encoder, table, pipelines, dispatch)?;
+    for (index, dispatch) in dispatches.iter().enumerate() {
+        encode_one(encoder, table, pipelines, params, index, dispatch)?;
     }
     Ok(())
 }

@@ -16,7 +16,13 @@ pub static KERNELS: &[KernelSig] = &[
     // 1 in gptoss.metal
     kernel!(gptoss_swiglu "gptoss_swiglu", axes = &[BF16]),
     // 1 in silu_mul.metal
-    kernel!(silu_mul "silu_mul", file = Some("norm/residual_add.metal"), launch = kernels::LaunchRule::Elementwise, axes = &[BF16]),
+    kernel!(silu_mul "silu_mul", file = Some("mlp/gated.metal"), launch = kernels::LaunchRule::Elementwise,
+        operands = kernels::operands![
+            gate: Buf <- kernels::Source::In(0),
+            up: Buf <- kernels::Source::In(1),
+            out: BufMut <- kernels::Source::Out(0),
+        ],
+        axes = &[BF16]),
     // 1 in silu_mul.metal
     kernel!(silu_mul_strided "silu_mul_strided", axes = &[BF16]),
 ];

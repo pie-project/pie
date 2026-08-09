@@ -1663,8 +1663,15 @@ pub mod metal {
 
     /// `embed_gather.metal::embed_gather_4bit` (M=1) /
     /// `embed_gather_mb_4bit` (M>1).
-    pub fn embed_gather(t: &Trace, weight: &str, hidden: u32, multi_batch: bool) -> Val {
-        let kernel = if multi_batch {
+    pub fn embed_gather(
+        t: &Trace,
+        weight: &str,
+        hidden: u32,
+        multi_batch: bool,
+        repr: WeightRepr,
+        point: &str,
+    ) -> Val {
+        let stem = if multi_batch {
             "embed_gather_mb_4bit"
         } else {
             "embed_gather_4bit"
@@ -1672,8 +1679,8 @@ pub mod metal {
         record(
             t,
             None,
-            kernel,
-            vec![weight.to_string()],
+            &format!("{stem}{point}"),
+            quant_table(weight, repr),
             None,
             vec![],
             Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
@@ -1698,14 +1705,77 @@ pub mod metal {
         .expect("a norm produces its value")
     }
 
+    /// The tensors a quantized projection reads: the packed weight, then
+    /// its scales and zero point.
+    ///
+    /// An affine kernel takes THREE buffers and the statements here used to
+    /// name one, which left the driver to derive the other two from a naming
+    /// convention it had to know. `dsl::matmul` already states the triplet
+    /// for the same reason its own doc gives — *"the driver never sees a
+    /// descriptor and never routes: it binds the names the statement gives it
+    /// and calls the symbol the statement names"* — and the Metal statements
+    /// now say the same thing.
+    /// The instantiation point an affine entrypoint is compiled at.
+    ///
+    /// `quantized_qmv.metal` stamps one template over
+    /// `(activation dtype × group size × bit width)`, so the symbol a
+    /// statement names is `affine_qmv_fast_bfloat16_gs_64_b_4` and not the
+    /// stem. A stem does not resolve — which is the GOOD failure: the runtime
+    /// compiler reports it by listing what the shader does export, where a
+    /// WRONG point would compile and read the wrong bytes (the `_d_256`
+    /// defect, one axis over).
+    ///
+    /// Both numbers come from the deployment's facts. Nothing here derives
+    /// them: g64/b8 and g128/b4 pack to identical shapes, so no tensor can be
+    /// asked.
+    /// The GEMM's instantiation point: [`affine_point`] plus its tile.
+    ///
+    /// `affine_qmm_t` is stamped over `(group × bits × bm × bn)`, so its
+    /// symbol carries two more numbers than the GEMV's.
+    #[must_use]
+    pub fn affine_gemm_point(repr: WeightRepr, bits: u32, tile: (u32, u32)) -> String {
+        let (bm, bn) = tile;
+        format!("{}_bm_{bm}_bn_{bn}", affine_point(repr, bits))
+    }
+
+    #[must_use]
+    pub fn affine_point(repr: WeightRepr, bits: u32) -> String {
+        let group = match repr {
+            WeightRepr::Scaled { group, .. } => group,
+            _ => 0,
+        };
+        format!("_bfloat16_gs_{group}_b_{bits}")
+    }
+
+    fn quant_weights(w: &MatW) -> Vec<String> {
+        let mut out = vec![w.name.clone()];
+        out.extend(w.scale_names());
+        out
+    }
+
+    /// The same triplet for a table the text names by STRING rather than
+    /// through a [`MatW`] handle — the embedding and the readout.
+    ///
+    /// They take a `repr` for the same reason a projection does: the symbols
+    /// are `embed_gather_4bit` and `affine_qmv_fast`, both affine, both
+    /// reading three tensors.
+    fn quant_table(name: &str, repr: WeightRepr) -> Vec<String> {
+        quant_weights(&MatW {
+            name: name.to_string(),
+            width: 0,
+            layer: None,
+            repr,
+        })
+    }
+
     /// `quantized_qmv.metal::affine_qmv_fast` — the projection GEMV,
     /// M=1. The driver fans every projection kind onto it.
-    pub fn qmv(x: &Val, w: &MatW) -> Val {
+    pub fn qmv(x: &Val, w: &MatW, point: &str) -> Val {
         record(
             &x.t,
             w.layer,
-            "affine_qmv_fast",
-            vec![w.name.clone()],
+            &format!("affine_qmv_fast{point}"),
+            quant_weights(w),
             None,
             vec![x.id],
             Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
@@ -1716,12 +1786,12 @@ pub mod metal {
     /// `quantized_qmv.metal::affine_qmv_fast_residual` — the same GEMV
     /// with the block residual folded into its epilogue, which is what a
     /// `beta_one` matmul is on this backend.
-    pub fn qmv_residual(x: &Val, w: &MatW, residual: &Val) -> Val {
+    pub fn qmv_residual(x: &Val, w: &MatW, residual: &Val, point: &str) -> Val {
         record(
             &x.t,
             w.layer,
-            "affine_qmv_fast_residual",
-            vec![w.name.clone()],
+            &format!("affine_qmv_fast_residual{point}"),
+            quant_weights(w),
             None,
             vec![x.id, residual.id],
             Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
@@ -1731,12 +1801,12 @@ pub mod metal {
 
     /// `quantized_qmm_t.metal::affine_qmm_t` — MLX's steel quantized
     /// GEMM, the M>1 projection.
-    pub fn qmm(x: &Val, w: &MatW) -> Val {
+    pub fn qmm(x: &Val, w: &MatW, point: &str) -> Val {
         record(
             &x.t,
             w.layer,
-            "affine_qmm_t",
-            vec![w.name.clone()],
+            &format!("affine_qmm_t{point}"),
+            quant_weights(w),
             None,
             vec![x.id],
             Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
@@ -1745,12 +1815,12 @@ pub mod metal {
     }
 
     /// `quantized_qmm_t.metal::affine_qmm_t_residual`.
-    pub fn qmm_residual(x: &Val, w: &MatW, residual: &Val) -> Val {
+    pub fn qmm_residual(x: &Val, w: &MatW, residual: &Val, point: &str) -> Val {
         record(
             &x.t,
             w.layer,
-            "affine_qmm_t_residual",
-            vec![w.name.clone()],
+            &format!("affine_qmm_t_residual{point}"),
+            quant_weights(w),
             None,
             vec![x.id, residual.id],
             Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
@@ -1795,6 +1865,46 @@ pub mod metal {
             layer: q.layer,
         };
         (mk(ids[0]), mk(ids[1]))
+    }
+
+    /// `attn/split_qkv.metal::split_qkv_bf16`: deinterleave the packed QKV
+    /// projection `[rows, q_width + 2*kv_width]` into three buffers.
+    ///
+    /// # Why this exists beside `dsl::split_qkv`
+    ///
+    /// The generic `split_qkv` records an `OpKind::SplitQkv`, which carries
+    /// the two widths *in the op kind*. A driver could read them — by
+    /// matching on `OpKind`, which is exactly what "nothing in the driver may
+    /// choose a kernel" forbids: the widths would reach the kernel because the
+    /// driver knew what a QKV split is.
+    ///
+    /// So the Metal text states the launch outright, and the widths ride the
+    /// channel built for them — [`OpKind::Launch::params`], whose own doc says
+    /// *"a scalar that has nowhere to ride is a scalar the DRIVER re-derives
+    /// from its config. That is the thing this arc removes."* The driver then
+    /// forwards `params` to every kernel that states them, knowing nothing
+    /// about what they mean.
+    ///
+    /// [`OpKind::Launch::params`]: crate::trace::OpKind::Launch
+    pub fn split_qkv(packed: &Val, q_width: u32, kv_width: u32) -> (Val, Val, Val) {
+        let rows = packed.t.inner.borrow().value_shape(packed.id).0[0];
+        let out = |w: u32| (Shape(vec![rows, Dim::Const(w)]), DType::BF16);
+        let ids = packed.t.with(packed.layer, |b| {
+            b.launch_with_params(
+                "split_qkv_bf16",
+                vec![],
+                None,
+                vec![q_width, kv_width],
+                vec![packed.id],
+                vec![out(q_width), out(kv_width), out(kv_width)],
+            )
+        });
+        let mk = |id| Val {
+            t: packed.t.clone(),
+            id,
+            layer: packed.layer,
+        };
+        (mk(ids[0]), mk(ids[1]), mk(ids[2]))
     }
 
     /// `kv_append.metal::kv_append_bfloat16` (contiguous) /
@@ -1851,14 +1961,14 @@ pub mod metal {
 
     /// `silu_mul.metal::silu_mul_bfloat16` — the SwiGLU activation over
     /// the packed gate/up bank.
-    pub fn silu_mul(x: &Val, intermediate: u32) -> Val {
+    pub fn silu_mul(gate: &Val, up: &Val, intermediate: u32) -> Val {
         record(
-            &x.t,
-            x.layer,
+            &gate.t,
+            gate.layer,
             "silu_mul_bfloat16",
             vec![],
             None,
-            vec![x.id],
+            vec![gate.id, up.id],
             Some((
                 Shape(vec![Dim::Tokens, Dim::Const(intermediate)]),
                 DType::BF16,
@@ -1869,12 +1979,12 @@ pub mod metal {
 
     /// `quantized_qmv.metal::affine_qmv_fast` against the lm head — the
     /// readout, `[Requests, vocab]` f32 like every family's.
-    pub fn lm_head(x: &Val, weight: &str, vocab: u32) -> Val {
+    pub fn lm_head(x: &Val, weight: &str, vocab: u32, repr: WeightRepr, point: &str) -> Val {
         record(
             &x.t,
             None,
-            "affine_qmv_fast",
-            vec![weight.to_string()],
+            &format!("affine_qmv_fast{point}"),
+            quant_table(weight, repr),
             None,
             vec![x.id],
             Some((Shape(vec![Dim::Requests, Dim::Const(vocab)]), DType::F32)),

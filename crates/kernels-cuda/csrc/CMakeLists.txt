@@ -579,6 +579,11 @@ add_library(pie_kernels_cuda STATIC
   src/attn/attention_xqa_gqa4.cu
   src/attn/attention_xqa_gqa8.cu
   src/gemm/gemm.cpp
+  # The plan caches' extern "C" lifecycle (`pie_x_*`). Beside the plan
+  # types rather than in the driver, which is `cuda.md` §5.E5's second exit
+  # — the first (move it to Rust) is closed by the `unique_ptr` with a
+  # custom deleter that is the whole reason these entries exist.
+  src/attn/plan_lifecycle.cpp
   # kernels/ -- fused kernels
   src/norm/add_bias.cu
   src/sample/argmax.cu

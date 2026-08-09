@@ -11,6 +11,18 @@ use kernels::{Axis, Cap, KernelSig, kernel};
 use crate::axes::*;
 
 pub static KERNELS: &[KernelSig] = &[
+    // 1 in split_qkv.metal
+    // Three results, which is what makes the row's `Out` indices load-bearing:
+    // the reorder reads how many values a kernel produces off the row, and a
+    // statement writing three states them all after its inputs.
+    kernel!(split_qkv_bf16 "split_qkv_bf16", file = Some("attn/split_qkv.metal"), launch = kernels::LaunchRule::SplitPacked,
+        operands = kernels::operands![
+            packed: Buf <- kernels::Source::In(0),
+            q: BufMut <- kernels::Source::Out(0),
+            k: BufMut <- kernels::Source::Out(1),
+            v: BufMut <- kernels::Source::Out(2),
+            params: Buf <- kernels::Source::Param(0),
+        ]),
     // 1 in attn_gate.metal
     kernel!(gate "gate", axes = &[BF16]),
     // 1 in kv_append.metal
@@ -62,7 +74,7 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(sdpa_paged_tiled_strided "sdpa_paged_tiled_strided",
         axes = &[BF16, Axis { what: "head dim", points: &["_d_256"] }]),
     // 3 in sdpa_vector.metal
-    kernel!(sdpa_vector_decode "sdpa_vector_decode", file = Some("attn/sdpa_sliding.metal"), launch = kernels::LaunchRule::SdpaVector,
+    kernel!(sdpa_vector_decode "sdpa_vector_decode", file = Some("attn/sdpa_vector.metal"), launch = kernels::LaunchRule::SdpaVector,
         lacks = &[Cap::Scores, Cap::PageMaskSink],
         axes = &[BF16, Axis { what: "head dim", points: &["_d_64", "_d_128", "_d_256"] }]),
     // 1 in sdpa_sliding.metal

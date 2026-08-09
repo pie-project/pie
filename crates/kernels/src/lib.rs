@@ -109,6 +109,11 @@ pub enum LaunchRule {
     RouteRows,
     /// Routed GEMV: [`LaunchRule::Qmv`] per row, per expert slot.
     RoutedQmv,
+    /// Pointwise over the launch's INPUT width with the row on its own axis —
+    /// a statement that reads one packed buffer and writes several, where the
+    /// output widths are each a fraction of the work. The QKV split is the
+    /// case: three outputs, and the grid has to cover their sum.
+    SplitPacked,
     /// Affine GEMM: the batched projection, tiled over rows and columns.
     /// Distinct from [`LaunchRule::Qmv`] because it is a different kernel with
     /// a different name, not the same one launched wider — which is what makes

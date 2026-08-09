@@ -130,12 +130,6 @@ mod bridge {
             );
         }
 
-        // The hand-written extras ride in the same object library: the
-        // few entries the generated shim cannot express (plan-cache
-        // lifecycle — see csrc/launch_extras.cpp).
-        let extras = Path::new(env!("CARGO_MANIFEST_DIR")).join("csrc/launch_extras.cpp");
-        println!("cargo:rerun-if-changed=csrc/launch_extras.cpp");
-
         // The shim's own directive (`-lpie_launch_shim`) is emitted by `cc`
         // here, ahead of everything below.
         cc::Build::new()
@@ -144,8 +138,26 @@ mod bridge {
             .include(csrc_src())
             .include(&cuda_include)
             .file(&shim_path)
-            .file(&extras)
             .compile("pie_launch_shim");
+
+        // The supergraph's set-cond kernel, which is the ONE thing in this
+        // crate that has to be device code: `cudaGraphSetConditional` is a
+        // `__device__` function, so arming a conditional handle from inside a
+        // graph — the whole point, since it is what removes the host
+        // round-trip — cannot be spelled in Rust or in `.cpp`.
+        //
+        // Its own archive rather than a `.file` on the one above, because
+        // that build is `cpp(true)` and this needs nvcc. It goes in
+        // `driver-cuda-new` rather than `kernels-cuda` because its argument
+        // is a conditional handle — a shell object — not a tensor; see
+        // `src/cuda/graph.rs`'s header for the same argument.
+        let supergraph = Path::new(env!("CARGO_MANIFEST_DIR")).join("csrc/supergraph.cu");
+        println!("cargo:rerun-if-changed=csrc/supergraph.cu");
+        cc::Build::new()
+            .cuda(true)
+            .include(&cuda_include)
+            .file(&supergraph)
+            .compile("pie_supergraph");
 
         // The kernels archive the shim forwards into. Search paths come from
         // `kernels-cuda`'s own build script (the `native` feature this

@@ -25,7 +25,23 @@ pub static KERNELS: &[KernelSig] = &[
     // 1 in rms_norm.metal
     kernel!(rms_residual_scaled "rms_residual_scaled", axes = &[BF16]),
     // 1 in rms_norm.metal
-    kernel!(rms_single_row "rms_single_row", file = Some("norm/vector.metal"), launch = kernels::LaunchRule::Rms, axes = &[BF16]),
+    // The first Metal row to state its OPERANDS, and the reason is the
+    // finding that made them necessary: the trace states inputs, outputs then
+    // weights, and this kernel declares `x, w, out, params`. Binding
+    // positionally puts the output where the norm weight belongs. Nothing
+    // reported it, because Metal does not validate a binding.
+    //
+    // `source` is what makes the row a thing a call can be GENERATED from:
+    // `<- Source::In(0)` says this buffer takes the statement's first operand,
+    // wherever the statement chose to put it.
+    kernel!(rms_single_row "rms_single_row", file = Some("norm/rms.metal"), launch = kernels::LaunchRule::Rms,
+        operands = kernels::operands![
+            x: Buf <- kernels::Source::In(0),
+            w: Buf <- kernels::Source::Weight(0),
+            out: BufMut <- kernels::Source::Out(0),
+            params: Buf <- kernels::Source::Param(0),
+        ],
+        axes = &[BF16]),
     // 1 in rms_norm.metal
     kernel!(rms_strided_head_row "rms_strided_head_row", axes = &[BF16]),
     // 1 in rms_norm.metal

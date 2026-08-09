@@ -98,6 +98,28 @@ impl ChannelState {
         }
     }
 
+    /// The address of the ring's cell storage.
+    ///
+    /// For the ABI's `PieChannelEndpointBinding`, which hands a host a base and
+    /// a length so it can read the ring without calling back. Stable for the
+    /// life of the state: [`ChannelState::host`] allocates once and nothing
+    /// resizes the vector, which is what makes an address worth handing out at
+    /// all.
+    #[must_use]
+    pub fn mirror_base(&self) -> u64 {
+        self.cells.borrow().as_ptr() as u64
+    }
+
+    /// The address of the four control words.
+    ///
+    /// Their ORDER is the ABI's: head, tail, poison, closed at indices 0..3.
+    /// `load_word`/`store_word` below use the same indices, so the two cannot
+    /// drift without this comment being wrong.
+    #[must_use]
+    pub fn word_base(&self) -> u64 {
+        self.words.as_ptr() as u64
+    }
+
     fn load_word(&self, index: usize) -> u64 {
         self.words[index].load(Ordering::Acquire)
     }

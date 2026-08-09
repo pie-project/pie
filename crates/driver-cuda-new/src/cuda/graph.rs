@@ -65,7 +65,7 @@ use crate::error::{Error, Result, check_rt, ignore_in_drop};
 /// build targets, and [`crate::cuda::Device::bind`] refuses to start when the
 /// runtime it finds disagrees.
 #[cfg(feature = "cuda-12")]
-unsafe fn add_node(
+pub(super) unsafe fn add_node(
     node: *mut cudaGraphNode_t,
     graph: cudaGraph_t,
     deps: *const cudaGraphNode_t,
@@ -88,7 +88,7 @@ unsafe fn add_node(
 }
 
 #[cfg(feature = "cuda-13")]
-unsafe fn add_node(
+pub(super) unsafe fn add_node(
     node: *mut cudaGraphNode_t,
     graph: cudaGraph_t,
     deps: *const cudaGraphNode_t,

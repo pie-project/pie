@@ -85,9 +85,6 @@ fn frame(lowered: &Lowered) -> Frame {
     }
 }
 
-/// The one symbol with no `kernel!` row. `model_bind.rs` owns the argument;
-/// here it is only the launch this walk is allowed to refuse.
-const KNOWN_GAP: &str = "attn::split_qkv_bf16";
 
 /// Plan every launch, returning the dispatches and the refusals separately.
 fn planned(low: &Lowered) -> (Vec<Dispatch<'_>>, Vec<Undispatchable>) {
@@ -117,13 +114,14 @@ fn every_launch_whose_symbol_has_a_row_becomes_a_grid() {
         let low = lowered(class, rows);
         let (dispatches, refused) = planned(&low);
 
-        // Nothing may refuse for any reason other than the recorded gap.
-        for why in &refused {
-            match why {
-                Undispatchable::NoRow { symbol, .. } if symbol == KNOWN_GAP => {}
-                other => panic!("{class:?}: a launch refused for a NEW reason: {other:?}"),
-            }
-        }
+        // NOTHING may refuse. The `split_qkv` gap closed when the text
+        // started stating its two widths as launch params, so every symbol
+        // this text names now reaches a grid.
+        assert!(
+            refused.is_empty(),
+            "{class:?}: {} launch(es) refused: {refused:?}",
+            refused.len()
+        );
         assert!(
             !dispatches.is_empty(),
             "{class:?}: nothing dispatched at all"
@@ -155,9 +153,11 @@ fn every_launch_whose_symbol_has_a_row_becomes_a_grid() {
 }
 
 #[test]
-fn the_only_symbol_the_walk_refuses_is_the_one_with_no_row() {
-    // Stated as its own test so that closing the gap fails HERE, loudly,
-    // rather than quietly widening what the walk tolerates.
+fn there_is_no_symbol_this_backend_cannot_dispatch() {
+    // This used to record one: `attn::split_qkv_bf16`, the symbol with no row.
+    // It was never a missing shader — it was a kernel needing `q_width` as a
+    // dispatch constant with no channel to receive one. The text states it now
+    // and the driver forwards it, so the set is empty.
     let mut refusals: BTreeSet<String> = BTreeSet::new();
     for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 8)] {
         for why in planned(&lowered(class, rows)).1 {
@@ -165,15 +165,54 @@ fn the_only_symbol_the_walk_refuses_is_the_one_with_no_row() {
                 Undispatchable::NoRow { symbol, .. }
                 | Undispatchable::NoFile { symbol, .. }
                 | Undispatchable::Ungeometric { symbol, .. }
-                | Undispatchable::Unbound { symbol, .. } => symbol,
+                | Undispatchable::Unbound { symbol, .. }
+                | Undispatchable::Conditional { symbol, .. } => symbol,
             });
         }
     }
-    assert_eq!(
-        refusals,
-        [KNOWN_GAP.to_string()].into_iter().collect::<BTreeSet<_>>(),
-        "the set of symbols this backend cannot dispatch has changed"
+    assert!(
+        refusals.is_empty(),
+        "this backend cannot dispatch: {refusals:?}"
     );
+}
+
+#[test]
+fn a_statement_that_states_scalars_carries_them_to_its_dispatch() {
+    // The QKV split is the case that forced the channel: three outputs, each
+    // a fraction of the work, and a kernel that cannot find the boundary
+    // between them from any operand shape. The widths are the TEXT's, and the
+    // driver forwards them without knowing what they mean.
+    let low = lowered(FireClass::Decode, 1);
+    let split = planned(&low)
+        .0
+        .into_iter()
+        .find(|d| d.symbol == "split_qkv_bf16")
+        .expect("the text states a QKV split");
+    assert_eq!(split.params.len(), 2, "q_width and kv_width");
+    let packed: u32 = split.params[0] + 2 * split.params[1];
+    assert_eq!(
+        split.grid[0], packed,
+        "the grid covers the packed input, not one of the three outputs"
+    );
+    // Five slots, not four: the row states its operands now, and one of them
+    // is the params buffer the shader takes at index 4. A row that places its
+    // own scalars is the difference between binding positionally and binding
+    // where the kernel reads.
+    assert_eq!(split.args.len(), 5, "packed in, q/k/v out, and the params");
+    assert_eq!(
+        split.param_slots,
+        vec![(4, 0)],
+        "the row placed the scalars at buffer 4"
+    );
+
+    // And every other statement states none, so the channel is not a general
+    // escape hatch that grew.
+    let others = planned(&low)
+        .0
+        .into_iter()
+        .filter(|d| d.symbol != "split_qkv_bf16" && !d.params.is_empty())
+        .count();
+    assert_eq!(others, 0, "{others} other statements have grown scalars");
 }
 
 #[test]
@@ -244,14 +283,11 @@ fn the_batched_lane_is_the_row_count_and_not_a_second_vocabulary() {
     );
     // And every one of them dispatches, which is what says the row carries the
     // lane rather than the driver picking it.
-    for (_, refused) in [planned(&lowered(FireClass::Prefill, 8))] {
-        for why in refused {
-            assert!(
-                matches!(&why, Undispatchable::NoRow { symbol, .. } if symbol == KNOWN_GAP),
-                "a batched symbol did not dispatch: {why:?}"
-            );
-        }
-    }
+    let refused = planned(&lowered(FireClass::Prefill, 8)).1;
+    assert!(
+        refused.is_empty(),
+        "a batched symbol did not dispatch: {refused:?}"
+    );
 }
 
 /// The whole host path, joined: a sealed frame's step becomes rows, the rows
@@ -298,7 +334,6 @@ mod from_a_frame {
                     assert!(d.grid.iter().all(|&n| n > 0));
                     grids += 1;
                 }
-                Err(Undispatchable::NoRow { symbol, .. }) if symbol == KNOWN_GAP => {}
                 Err(other) => panic!("a frame-driven launch refused: {other:?}"),
             }
         }
@@ -308,29 +343,129 @@ mod from_a_frame {
     #[test]
     fn a_region_table_changes_the_rows_and_therefore_the_fire() {
         // The seriation's output IS the row feature points, so a step whose
-        // regions differ must lower differently from one whose regions do not.
-        // Today the Metal text splits on nothing, so the rectangle COUNT is
-        // unchanged — and that is the monomorphism `tests/polymorphism.rs`
-        // measures, showing up here from the frame end.
+        // regions differ lowers differently from one whose regions do not.
+        // This is where the two tasks meet: the region table supplies the
+        // rows, and the text's depth axis is what makes them matter.
         let plain = Step {
             token_ids: &[1, 2, 3, 4],
             qo_indptr: &[0, 4],
             ..Step::default()
         };
+        // Full-depth rows first, truncated last — the order a depth split
+        // requires, and the order the scheduler's seriation produces.
         let seriated = Step {
             region_row_indptr: &[0, 2, 4],
-            region_sig: &[sig::TRUNCATED, 0],
-            region_k: &[4, u32::MAX],
+            region_sig: &[0, sig::TRUNCATED],
+            region_k: &[u32::MAX, 4],
             ..plain.clone()
         };
         let plan = plan_for(FireClass::Prefill);
         let a = lower_step(&plan, &plain).expect("lowers");
-        let b = lower_step(&plan, &seriated).expect("lowers");
-        assert_eq!(
-            a.launches.len(),
-            b.launches.len(),
-            "the text gained a guard — rewrite this and tests/polymorphism.rs \
-             to assert WHICH axes split"
+        let b = lower_step(&plan, &seriated).expect("a seriated step lowers");
+
+        let work = |low: &model_compiler::lower::Lowered| -> u64 {
+            low.launches
+                .iter()
+                .map(|l| u64::from(l.rows.end - l.rows.start))
+                .sum()
+        };
+        assert!(
+            work(&b) < work(&a),
+            "the truncated region did no less work than the full one \
+             ({} against {}), so the depth axis is not reaching the frame",
+            work(&b),
+            work(&a)
         );
+    }
+
+    #[test]
+    fn a_region_table_the_scheduler_did_not_seriate_is_refused() {
+        // The truncated region FIRST. A rectangle is a row range, so at layer
+        // 4 the alive set would be a suffix and there is no honest way to
+        // state that — the lowering says so rather than covering the wrong
+        // rows. This is the contract the frame bridge inherits the moment the
+        // text states an axis, and it is why the region table's ORDER matters.
+        let unseriated = Step {
+            token_ids: &[1, 2, 3, 4],
+            qo_indptr: &[0, 4],
+            region_row_indptr: &[0, 2, 4],
+            region_sig: &[sig::TRUNCATED, 0],
+            region_k: &[4, u32::MAX],
+            ..Step::default()
+        };
+        assert!(
+            lower_step(&plan_for(FireClass::Prefill), &unseriated).is_err(),
+            "an unseriated region table lowered anyway"
+        );
+    }
+}
+
+/// The resolver's map, against the whole of what the text asks for.
+///
+/// `model_bind.rs` proves the names reach *a* resolver. This proves the real
+/// one knows all of them — which is the difference between a map that exists
+/// and a map that is complete.
+mod the_map {
+    use std::collections::HashMap;
+
+    use driver_metal_new::model::resolve::{Names, Store};
+
+    use super::*;
+
+    #[test]
+    fn every_name_the_text_states_has_a_checkpoint_spelling() {
+        let names = Names::mlx();
+        let (tensors, named) = (HashMap::new(), HashMap::new());
+        let store = Store::new(names, &tensors, &named);
+
+        let mut unknown: BTreeSet<String> = BTreeSet::new();
+        for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 8)] {
+            let low = lowered(class, rows);
+            for arg in &low.args {
+                if let model_compiler::lower::Arg::Weight(name) = arg {
+                    // A `scale.` marker is a constant riding the weight slot,
+                    // not a tensor; the binder never looks it up.
+                    if name.starts_with("scale.") {
+                        continue;
+                    }
+                    if store.checkpoint_name(name).is_none() {
+                        unknown.insert(name.clone());
+                    }
+                }
+            }
+        }
+        assert!(
+            unknown.is_empty(),
+            "the text states {} name(s) the map cannot spell: {unknown:?}\n\
+             Add the role to `Names::mlx`, or the name is drift.",
+            unknown.len()
+        );
+    }
+
+    #[test]
+    fn an_affine_projection_asks_for_all_three_of_its_tensors() {
+        // The property the `proj_repr` fact buys. A text that left its
+        // projections dense would name ONE tensor where `affine_qmv_fast`
+        // reads three, and the driver would have had to derive the other two
+        // from a naming convention nobody told it.
+        let low = lowered(FireClass::Decode, 1);
+        let qkv = low
+            .launches
+            .iter()
+            // By PREFIX: the symbol is the instantiated point
+            // (`affine_qmv_fast_bfloat16_gs_64_b_4`), because a bare stem does
+            // not resolve to any entry point the shader exports.
+            .find(|l| low.kernels[l.kernel as usize].starts_with("affine_qmv_fast_bfloat16"))
+            .expect("the text states a quantized projection");
+        let weights: Vec<&str> = low.args[qkv.args.start as usize..qkv.args.end as usize]
+            .iter()
+            .filter_map(|a| match a {
+                model_compiler::lower::Arg::Weight(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(weights.len(), 3, "packed weight, scales, zero point");
+        assert!(weights[1].ends_with(".scales"));
+        assert!(weights[2].ends_with(".zeros"));
     }
 }

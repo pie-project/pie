@@ -53,7 +53,18 @@ kernels = { path = "../kernels" }
 # flat list of launches naming kernel symbols. Host-portable — reading a
 # lowered trace builds no shader.
 model-compiler = { path = "../model-compiler" }
-model = { path = "../model", default-features = false, features = ["contract"] }
+# The Metal signature table. A real dependency and not a dev one: the executor
+# resolves every symbol the lowering states through `sig_in` AT RUN TIME -- the
+# row is where a kernel's file and launch rule live, so a driver that dispatches
+# by name cannot do it without the table. `default-features = false` keeps it to
+# the table itself, which is host-portable: no shader is built by reading one.
+kernels-metal = { path = "../kernels-metal", default-features = false }
+# `contract` for the load plan's author; `forward` for the TEXTS. The driver
+# needs the texts because selecting one is the driver's job -- it runs the
+# model it loaded -- and `driver-cuda-new` takes the same two for the same
+# reason. Selecting is not CHOOSING A KERNEL: the text names every symbol, and
+# what the driver does is look up which text the checkpoint it loaded is.
+model = { path = "../model", default-features = false, features = ["contract", "forward"] }
 model-loader = { path = "../model-loader" }
 
 # Apple-only. Everything that names a Metal type lives under `src/metal/` and
@@ -155,9 +166,6 @@ features = [
 [dev-dependencies]
 tempfile = "3"
 
-# The PSO plan's names are held against the shipped signature table, so a
-# name no shader instantiates fails in CI on any host. Table only, no Metal.
-kernels-metal = { path = "../kernels-metal", default-features = false }
 
 
 # Tests only. The driver deliberately does not depend on the compiler at build

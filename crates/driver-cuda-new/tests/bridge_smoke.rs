@@ -331,6 +331,8 @@ fn the_executor_prefix_runs_the_anchor_decode_on_device() {
         altup_active: 0,
         altup_std_mult_by_layer: Vec::new(),
         lora: None,
+        peel_window: std::ptr::null(),
+        rows_total: 0,
     };
     let dplan = DispatchPlan::new(&plan, &l);
 
@@ -449,6 +451,151 @@ fn the_decode_planner_plans_a_real_geometry() {
 /// swapped operand anywhere in the walk breaks one of the two.
 #[test]
 fn the_full_zero_weight_decode_walks_every_launch() {
+    zero_weight_decode(Leg::Eager);
+}
+
+/// The same decode over a fire whose last two rows carry attached
+/// programs — the only leg that exercises a PEEL.
+///
+/// `lower` splits a hooked fire on the hook axis, and the tail region
+/// addresses rows at absolute offsets in a full-N buffer, so its
+/// statements take `_devwin` kernels that read the split from device
+/// memory instead of taking a row count. Until this leg existed nothing
+/// in the tree ran one: every other lowering uses plain rows, so the peel
+/// path had no fire, `attn::split_qkv_bf16_devwin` had no arm, and the
+/// symbol was not even in `UNARMED` because it was never lowered.
+///
+/// No programs are actually attached, so both regions compute what the
+/// unpeeled fire computes. That is what makes it a gate rather than a
+/// smoke test: the residual and logit invariants must come out
+/// bit-identical, and a devwin launch reading the wrong window would move
+/// them.
+///
+/// # Why this is `ignore`d, and what un-ignoring it needs
+///
+/// It does not pass, and what it fails on is worth having written down.
+/// The devwin arm and the peel window word are enough for the SPLIT; the
+/// attention is not. A peel's tail region hands its attention launch a
+/// windowed rectangle (`rows.start == 2`), and every arm binds BASE
+/// pointers plus a row COUNT — so the tail's attention runs over rows
+/// 0..2 instead of 2..4, disagrees with the KV plan, and faults inside
+/// FlashInfer.
+///
+/// That is §4's fourth decline-rule, met head-on rather than declined
+/// around: the generated branches guard on `rows.start == 0` precisely
+/// because a base-bound launch writes the prefix's rows, and the hand
+/// arms have the same bug without the guard. Nothing noticed until now
+/// because nothing had ever run a peel.
+///
+/// So un-ignoring this needs the windowed rectangle solved, which
+/// `cuda.md` §4 records as needing a stride the operand vocabulary does
+/// not carry — `Arg::Arena { at, width }` gives elements per row and no
+/// dtype. Either `Arg` learns the operand's dtype (which the lowering
+/// knows and does not say) or the lowering emits already-windowed
+/// offsets. It is one of the four decline-rules and the only one whose
+/// removal has a fire waiting for it.
+#[test]
+#[ignore = "the peel's tail hands attention a windowed rectangle; see the doc comment"]
+fn a_hooked_fire_peels_and_still_lands_the_same_numbers() {
+    zero_weight_decode(Leg::Hooked);
+}
+
+/// The SAME walk, captured and replayed.
+///
+/// This is the gate `run_captured` was written for and the one thing its
+/// unit tests cannot reach: a real deployment's real decode, issued into
+/// a capture rather than onto a stream, instantiated, and launched. The
+/// arena is WIPED between the capture and the replay, so the two
+/// invariants below -- the residual is the embed rows bit-exactly, the
+/// logits are the tied lm_head's exact algebra -- can only be satisfied
+/// by work the replay did.
+///
+/// It captures the RESOLVED lowering. Capturing the union needs one more
+/// thing, which `the_union_capture_needs_every_arm_issuable` pins.
+#[test]
+fn a_resolved_walk_captures_and_replays() {
+    zero_weight_decode(Leg::Captured);
+}
+
+/// The constraint the union imposes on the arms, pinned as a closed set.
+///
+/// A union capture records EVERY arm, including the ones this fire's
+/// predicates are false for -- that is the whole point, since the
+/// conditional is what decides at replay. So an arm must be ISSUABLE
+/// even when its predicate does not hold.
+///
+/// Some are not. `pie_lora_qkv_correction` refuses when the fire staged
+/// no adapters, which under `Resolve` is unreachable (the guard removed
+/// the arm) and under `Union` is exactly the case that has to record. The
+/// arm is safe to record with a null state precisely BECAUSE the
+/// conditional guarding it reads the same fact the refusal does -- but
+/// nothing has taught it that yet.
+///
+/// This is the C++ arc's S4 "LoRA capture-safety" item, arrived at from
+/// the other direction. The list is closed and this test is how it stays
+/// closed: an arm that learns to record leaves it, and an arm that starts
+/// refusing joins it before it can surprise a capture.
+#[test]
+fn the_union_capture_needs_every_arm_issuable() {
+    use driver_cuda_new::model::executor::{RunRefusalKind, DispatchRefusal};
+
+    /// Arms that cannot yet be issued with their predicate false.
+    const NOT_YET_ISSUABLE: &[&str] = &["pie_lora_qkv_correction"];
+
+    let refusal = union_walk_refusal();
+    let Some((kernel, why)) = refusal else {
+        panic!(
+            "every arm is issuable now -- delete NOT_YET_ISSUABLE and \
+             capture the union in `a_resolved_walk_captures_and_replays`"
+        );
+    };
+    assert!(
+        NOT_YET_ISSUABLE.contains(&kernel.as_str()),
+        "a NEW arm refuses under the union: {kernel} ({why:?}). Either make \
+         it issuable with a false predicate, or add it to NOT_YET_ISSUABLE \
+         so the gap is closed rather than discovered by a capture."
+    );
+    assert!(
+        matches!(why, RunRefusalKind::Dispatch(DispatchRefusal::NoArm(_))),
+        "expected a NoArm refusal, got {why:?}"
+    );
+}
+
+/// Lower the anchor decode with every guard KEPT and walk it eagerly,
+/// returning the first arm that refuses to be issued.
+///
+/// Eager rather than captured on purpose: the question is whether the ARM
+/// can be issued at all with its predicate false, and a capture would
+/// answer it by aborting the process (a C++ `throw` crossing `extern "C"`)
+/// rather than by returning a refusal one can read.
+fn union_walk_refusal() -> Option<(String, driver_cuda_new::model::executor::RunRefusalKind)> {
+    zero_weight_decode(Leg::UnionProbe)
+}
+
+/// Which leg of the zero-weight decode to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leg {
+    /// Resolve the guards, issue onto the stream, assert the invariants.
+    Eager,
+    /// Resolve the guards, warm up, WIPE, capture, replay, assert the
+    /// same invariants against what the replay alone produced.
+    Captured,
+    /// Keep the guards and walk eagerly, reporting the first arm that
+    /// cannot be issued with its predicate false. Asserts nothing.
+    UnionProbe,
+    /// A fire whose LAST TWO ROWS carry attached programs, which makes
+    /// `lower` split it on the hook axis. The tail region then addresses
+    /// rows at absolute offsets and takes `_devwin` statements, so this is
+    /// the only leg that exercises a peel at all.
+    ///
+    /// No programs are actually attached, so the two regions compute the
+    /// same thing the unpeeled fire does — which is exactly why it is a
+    /// good gate: the invariants below must come out unchanged, and a
+    /// devwin launch that read the wrong window would change them.
+    Hooked,
+}
+
+fn zero_weight_decode(leg: Leg) -> Option<(String, driver_cuda_new::model::executor::RunRefusalKind)> {
     use std::collections::BTreeMap;
 
     use driver_cuda_new::cuda::cublas::{CublasHandle, LiveCublas};
@@ -456,18 +603,18 @@ fn the_full_zero_weight_decode_walks_every_launch() {
     use driver_cuda_new::launch::{KvCacheLayerView, KvCacheScheme};
     use driver_cuda_new::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
     use driver_cuda_new::model::executor::{
-        AttnCtx, DecodePlan, DispatchCtx, DispatchPlan, Frame, Resolver, run,
+        AttnCtx, DecodePlan, DispatchCtx, DispatchPlan, Frame, Resolver, run, run_captured,
     };
     use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
     use model::families::llama_like::forward::llama_like_cuda;
-    use model_compiler::lower::{Arg, Fire, Row, lower};
+    use model_compiler::lower::{Arg, Fire, GuardMode, Row, lower_with};
     use model_compiler::trace::{FireClass, ValueId};
 
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("full zero-weight decode") else { return };
+    let Some(_dev) = device_or_skip("full zero-weight decode") else { return None };
     let stream = OwnedStream::new(0).expect("stream");
     let raw_stream = stream.as_ref().as_raw().cast::<std::ffi::c_void>();
-    let alloc = Allocator::new();
+    let mut alloc = Allocator::new();
 
     const HIDDEN: usize = 1024;
     const LAYERS: usize = 28;
@@ -488,11 +635,21 @@ fn the_full_zero_weight_decode_walks_every_launch() {
         &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
         FireClass::Decode,
     );
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; ROWS];
-    let l = lower(&plan, &rows, Fire { captures_across_splits: false }).expect("lowers");
+    let mut rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; ROWS];
+    if leg == Leg::Hooked {
+        // A contiguous SUFFIX; `lower.rs::split_at` refuses anything else.
+        for r in rows.iter_mut().skip(ROWS - 2) {
+            r.hooked = true;
+        }
+    }
+    // The captured leg KEEPS every guard: that is what makes one capture
+    // able to serve fires that differ in their variant bits.
+    let mode = if leg == Leg::UnionProbe { GuardMode::Union } else { GuardMode::Resolve };
+    let l = lower_with(&plan, &rows, Fire { captures_across_splits: false }, mode)
+        .expect("lowers");
     let dplan = DispatchPlan::new(&plan, &l);
 
-    let arena = alloc.alloc(l.arena_bytes).expect("arena");
+    let mut arena = alloc.alloc(l.arena_bytes).expect("arena");
     let frame = Frame { arena: arena.as_ptr(), arena_bytes: l.arena_bytes };
 
     // ── Weights: embed pattern, norm ones, everything else zero. ──
@@ -671,6 +828,18 @@ fn the_full_zero_weight_decode_walks_every_launch() {
 
     let mut cublas_ops = LiveCublas;
     let mut cublas = CublasHandle::create(&mut cublas_ops, raw_stream).expect("cublas");
+    let mut peel_win =
+        driver_cuda_new::cuda::PeelWindowWord::new(&alloc).expect("peel window word");
+    // The window is the TAIL's, not the fire's. `_devwin` statements only
+    // occur in a peel's tail region, and the word is what tells them which
+    // absolute rows are theirs — publishing the whole fire makes the tail
+    // write the prefix's rows too, which is an out-of-bounds store into
+    // buffers the lowering sized for the region.
+    let split = rows.iter().position(|r| r.hooked).unwrap_or(0) as u32;
+    peel_win.set(split, ROWS as u32 - split);
+    peel_win.upload(stream.as_ref()).expect("publish the peel window");
+    stream.as_ref().synchronize().expect("the window lands");
+
     let ctx = DispatchCtx {
         stream: raw_stream,
         cublas: cublas.handle().expect("created").cast(),
@@ -702,6 +871,12 @@ fn the_full_zero_weight_decode_walks_every_launch() {
         altup_active: 0,
         altup_std_mult_by_layer: Vec::new(),
         lora: None,
+        // The peel's tail begins where the marked suffix does. The word is
+        // what a `_devwin` launch early-outs on, and publishing the WHOLE
+        // fire here is right for both legs: the unpeeled one has no split,
+        // and the hooked one's regions between them cover every row.
+        peel_window: peel_win.device_ptr(),
+        rows_total: ROWS as i32,
     };
 
     // ── The walk: every launch, no refusals allowed. ──
@@ -725,8 +900,60 @@ fn the_full_zero_weight_decode_walks_every_launch() {
             logits_value = Some(*value);
         }
     }
-    let ran = run(&l, &dplan, frame, &mut resolver, &ctx, Some(&attn), None)
-        .unwrap_or_else(|e| panic!("the walk refused: {e:?}"));
+    if leg == Leg::UnionProbe {
+        let refusal = run(&l, &dplan, frame, &mut resolver, &ctx, Some(&attn), None)
+            .err()
+            .map(|e| (e.kernel, e.why));
+        stream.as_ref().synchronize().ok();
+        ws.release(&mut sops);
+        cublas.release(&mut cublas_ops);
+        return refusal;
+    }
+
+    let ran = if leg == Leg::Captured {
+        use driver_cuda_new::cuda::{PredicateWord, SupergraphBuilder};
+        use driver_cuda_new::model::supergraph::fire_predicates;
+
+        // The word is filled and uploaded BEFORE the capture opens: the
+        // host decides the fire's bits, the graph reads them.
+        let mut preds = PredicateWord::new(&alloc).expect("predicate word");
+        fire_predicates(&rows, &l.conds, &mut preds).expect("the fire's bits");
+        preds.upload(stream.as_ref()).expect("upload");
+        stream.as_ref().synchronize().expect("the word lands before the capture");
+
+        // WARM UP FIRST, and this is not a test convenience -- it is a
+        // property of the layer. cuBLAS and several launchers allocate a
+        // workspace on first use, and an allocation inside a capture is
+        // refused; the C++ wrapper turns that refusal into a `throw`,
+        // which crosses `extern "C"` and aborts the process without a
+        // Rust panic to read. So a real driver captures a WARM fire, and
+        // so does this. (The C++ arc calls the same thing dual-prepare.)
+        run(&l, &dplan, frame, &mut resolver, &ctx, Some(&attn), None)
+            .unwrap_or_else(|e| panic!("the warm-up walk refused: {e:?}"));
+        stream.as_ref().synchronize().expect("the warm-up retires");
+
+        // Wipe what the warm-up computed, so that what the invariants
+        // read below can only have come from the REPLAY.
+        arena.memset(0, stream.as_ref()).expect("wipe the arena");
+        stream.as_ref().synchronize().expect("the wipe lands");
+
+        let (ran, graph) = {
+            let scope = alloc.begin_capture(stream.as_ref()).expect("begin capture");
+            let mut b = SupergraphBuilder::new(scope.stream(), &preds);
+            let ran = run_captured(
+                &l, &dplan, frame, &mut resolver, &ctx, Some(&attn), None, &mut b,
+            )
+            .unwrap_or_else(|e| panic!("the captured walk refused: {e:?}"));
+            drop(b);
+            (ran, scope.end().expect("end capture"))
+        };
+        let exec = graph.instantiate().expect("instantiate");
+        exec.launch(stream.as_ref()).expect("replay");
+        ran
+    } else {
+        run(&l, &dplan, frame, &mut resolver, &ctx, Some(&attn), None)
+            .unwrap_or_else(|e| panic!("the walk refused: {e:?}"))
+    };
     assert_eq!(ran, l.launches.len(), "every launch ran");
     stream.as_ref().synchronize().expect("the whole decode retires");
 
@@ -772,6 +999,7 @@ fn the_full_zero_weight_decode_walks_every_launch() {
 
     ws.release(&mut sops);
     cublas.release(&mut cublas_ops);
+    None
 }
 
 /// The FULL prefill: the decode walk's twin over `qwen3_0_6b`'s real
@@ -1028,6 +1256,8 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
         altup_active: 0,
         altup_std_mult_by_layer: Vec::new(),
         lora: None,
+        peel_window: std::ptr::null(),
+        rows_total: 0,
     };
 
     let mut embed_out = None;
@@ -1490,6 +1720,8 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
         altup_active: 0,
         altup_std_mult_by_layer: Vec::new(),
         lora: None,
+        peel_window: std::ptr::null(),
+        rows_total: 0,
     };
 
     // ── The walk. ──
@@ -1941,6 +2173,8 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
         altup_active: 0,
         altup_std_mult_by_layer: Vec::new(),
         lora: None,
+        peel_window: std::ptr::null(),
+        rows_total: 0,
     };
 
     let mut resolver = Live {
@@ -2330,6 +2564,8 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
         altup_active: 0,
         altup_std_mult_by_layer: Vec::new(),
         lora: None,
+        peel_window: std::ptr::null(),
+        rows_total: 0,
     };
 
     let mut resolver = Live {
@@ -3338,6 +3574,8 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
         // something; the sparse layers are the first two.
         altup_std_mult_by_layer: vec![1.6449, 1.6449, 0.0, 0.0],
         lora: None,
+        peel_window: std::ptr::null(),
+        rows_total: 0,
     };
 
     // Launch by launch, syncing after each: a wrong dimension read from
@@ -3649,6 +3887,8 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
         altup_active: 0,
         altup_std_mult_by_layer: Vec::new(),
         lora: None,
+        peel_window: std::ptr::null(),
+        rows_total: 0,
     };
 
     let mut resolver = Live {
