@@ -2778,14 +2778,14 @@ pub fn validate_create_out_params(caps: *mut PieDriverCaps) -> PieAbiValidationR
 // THE THIRTEEN `pie_cuda_*` DECLARATIONS ARE GONE.
 //
 // They were an `unsafe extern "C"` block, and the linker resolved them
-// against `driver-cuda-new` -- in this same workspace, in Rust. The
+// against `driver-cuda` -- in this same workspace, in Rust. The
 // declaration existed because the driver on the far side used to be C++, and
 // it outlived the C++ by the length of the cutover.
 //
 // A Rust crate calling a Rust crate through a C linkage buys nothing and
 // costs the type system: no checking across the call, no lifetimes, and a
 // `*mut PieDriver` where a `&mut Shell` would do. The engine calls
-// `driver_cuda_new::abi_shell::*` directly now.
+// `driver_cuda::serve::*` directly now.
 
 unsafe extern "C" {
     pub fn pie_metal_create(

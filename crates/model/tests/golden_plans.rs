@@ -835,6 +835,17 @@ fn nemotron_h_cuda_prefill() {
 }
 
 #[test]
+fn deepseek_v4_cuda_prefill() {
+    check_plan(
+        "deepseek_v4.cuda.prefill",
+        &model::deepseek_v4::forward::dsv4_cuda(
+            &model::deepseek_v4::forward::facts::Dsv4Facts::dsv4_synthetic(),
+            FireClass::Prefill,
+        ),
+    );
+}
+
+#[test]
 fn gemma3n_cuda_decode() {
     check_plan(
         "gemma3n.cuda.decode",
@@ -875,6 +886,48 @@ fn kimi_k2_cuda_decode() {
             &model::kimi_k2::forward::facts::KimiFacts::kimi_k2(),
             &model::kimi_k2::forward::facts::KimiCudaFacts::kimi_k2_synthetic(),
             FireClass::Decode,
+        ),
+    );
+}
+
+// The PREFILL goldens for the three MLA texts that gained the class.
+//
+// They are not a second text: MLA's attention is one planned dispatch over a
+// `qo_indptr`, so the body is the same statements and the class reaches only
+// the trace's name. That is exactly why they are worth pinning — a golden
+// that differs from its decode sibling in more than the family name would
+// mean the class had leaked into the body, which is the thing these texts
+// claim it does not do.
+#[test]
+fn kimi_k2_cuda_prefill() {
+    check_plan(
+        "kimi_k2.cuda.prefill",
+        &model::kimi_k2::forward::kimi_cuda(
+            &model::kimi_k2::forward::facts::KimiFacts::kimi_k2(),
+            &model::kimi_k2::forward::facts::KimiCudaFacts::kimi_k2_synthetic(),
+            FireClass::Prefill,
+        ),
+    );
+}
+
+#[test]
+fn kimi_k3_cuda_prefill() {
+    check_plan(
+        "kimi_k3.cuda.prefill",
+        &model::kimi_k3::forward::kimi_k3_cuda(
+            &model::kimi_k3::forward::facts::KimiK3Facts::kimi_k3_synthetic(),
+            FireClass::Prefill,
+        ),
+    );
+}
+
+#[test]
+fn glm5_cuda_prefill() {
+    check_plan(
+        "glm5.cuda.prefill",
+        &model::glm5::forward::glm5_cuda(
+            &model::glm5::forward::facts::Glm5Facts::glm5_106b_a12b(),
+            FireClass::Prefill,
         ),
     );
 }

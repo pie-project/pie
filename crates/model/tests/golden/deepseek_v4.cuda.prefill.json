@@ -1,0 +1,5650 @@
+{
+  "family": "deepseek_v4.cuda.prefill",
+  "values": [
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens"
+      ],
+      "dtype": "I32"
+    },
+    {
+      "shape": [
+        "Tokens"
+      ],
+      "dtype": "I32"
+    },
+    {
+      "shape": [
+        "Tokens"
+      ],
+      "dtype": "I32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 768
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 768
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 5632
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 5632
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 5632
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 768
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 768
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "I32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 768
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 768
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "I32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 768
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 768
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "I32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 768
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 768
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "I32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 768
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 768
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "I32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Requests",
+        {
+          "Const": 129280
+        }
+      ],
+      "dtype": "F32"
+    }
+  ],
+  "ops": [
+    {
+      "kind": {
+        "Embed": {
+          "weight": "embed"
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        0
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_expand_bf16"
+        }
+      },
+      "inputs": [
+        0
+      ],
+      "outputs": [
+        1
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dsv4_boundary_meta_paged"
+        }
+      },
+      "inputs": [
+        0
+      ],
+      "outputs": [
+        2,
+        3,
+        4
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_rmsnorm_to_f32",
+          "weights": [
+            "layer.0.attn_norm"
+          ]
+        }
+      },
+      "inputs": [
+        1
+      ],
+      "outputs": [
+        5
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_pre_postprocess_bf16"
+        }
+      },
+      "inputs": [
+        5,
+        1
+      ],
+      "outputs": [
+        6,
+        7,
+        8
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.wq_a",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        6
+      ],
+      "outputs": [
+        9
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.0.q_norm"
+          ]
+        }
+      },
+      "inputs": [
+        9
+      ],
+      "outputs": [
+        10
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.wq_b",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        10
+      ],
+      "outputs": [
+        11
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::per_head_rmsnorm_bf16",
+          "weights": [
+            ""
+          ]
+        }
+      },
+      "inputs": [
+        11
+      ],
+      "outputs": [
+        12
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.wkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        6
+      ],
+      "outputs": [
+        13
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.0.kv_norm"
+          ]
+        }
+      },
+      "inputs": [
+        13
+      ],
+      "outputs": [
+        14
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "rope::rope_partial_last_bf16"
+        }
+      },
+      "inputs": [
+        12
+      ],
+      "outputs": [
+        15
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "rope::rope_partial_last_bf16"
+        }
+      },
+      "inputs": [
+        14
+      ],
+      "outputs": [
+        16
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 0
+        }
+      },
+      "inputs": [
+        15
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 0
+          }
+        }
+      },
+      "inputs": [
+        16,
+        16
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::attention_flashinfer_prefill",
+          "state": {
+            "store": "KvCache",
+            "layer": 0
+          }
+        }
+      },
+      "inputs": [
+        15
+      ],
+      "outputs": [
+        17,
+        18
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::lse_log2_to_ln"
+        }
+      },
+      "inputs": [
+        18
+      ],
+      "outputs": [
+        19
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dsv4_compress_gather_paged_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 0
+          }
+        }
+      },
+      "inputs": [
+        2
+      ],
+      "outputs": [
+        20
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "rope::rope_partial_last_bf16"
+        }
+      },
+      "inputs": [
+        20
+      ],
+      "outputs": [
+        21
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dsv4_store_comp_entries_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 0
+          }
+        }
+      },
+      "inputs": [
+        21,
+        2
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::attention_compressed_paged_bf16"
+        }
+      },
+      "inputs": [
+        15
+      ],
+      "outputs": [
+        22,
+        23
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::combine_attn_outputs_bf16",
+          "params": [
+            16,
+            128
+          ]
+        }
+      },
+      "inputs": [
+        17,
+        19,
+        22,
+        23
+      ],
+      "outputs": [
+        24,
+        25
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::attn_sink_correction_bf16",
+          "weights": [
+            "layer.0.attn_sink"
+          ]
+        }
+      },
+      "inputs": [
+        24,
+        25
+      ],
+      "outputs": [
+        26
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 0
+        }
+      },
+      "inputs": [
+        26
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.wo_a",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        26
+      ],
+      "outputs": [
+        27
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.wo_b",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        27
+      ],
+      "outputs": [
+        28
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_post_bf16"
+        }
+      },
+      "inputs": [
+        28,
+        1,
+        7,
+        8
+      ],
+      "outputs": [
+        29
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_rmsnorm_to_f32",
+          "weights": [
+            "layer.0.mlp_norm"
+          ]
+        }
+      },
+      "inputs": [
+        29
+      ],
+      "outputs": [
+        30
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_pre_postprocess_bf16"
+        }
+      },
+      "inputs": [
+        30,
+        29
+      ],
+      "outputs": [
+        31,
+        32,
+        33
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.dense_gate_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        31
+      ],
+      "outputs": [
+        34
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.dense_up_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        31
+      ],
+      "outputs": [
+        35
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::swiglu_clamp_bf16"
+        }
+      },
+      "inputs": [
+        34
+      ],
+      "outputs": [
+        36
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.dense_down_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        36
+      ],
+      "outputs": [
+        37
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_post_bf16"
+        }
+      },
+      "inputs": [
+        37,
+        29,
+        32,
+        33
+      ],
+      "outputs": [
+        38
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_rmsnorm_to_f32",
+          "weights": [
+            "layer.1.attn_norm"
+          ]
+        }
+      },
+      "inputs": [
+        38
+      ],
+      "outputs": [
+        39
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_pre_postprocess_bf16"
+        }
+      },
+      "inputs": [
+        39,
+        38
+      ],
+      "outputs": [
+        40,
+        41,
+        42
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.wq_a",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        40
+      ],
+      "outputs": [
+        43
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.1.q_norm"
+          ]
+        }
+      },
+      "inputs": [
+        43
+      ],
+      "outputs": [
+        44
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.wq_b",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        44
+      ],
+      "outputs": [
+        45
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::per_head_rmsnorm_bf16",
+          "weights": [
+            ""
+          ]
+        }
+      },
+      "inputs": [
+        45
+      ],
+      "outputs": [
+        46
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.wkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        40
+      ],
+      "outputs": [
+        47
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.1.kv_norm"
+          ]
+        }
+      },
+      "inputs": [
+        47
+      ],
+      "outputs": [
+        48
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "rope::rope_partial_last_bf16"
+        }
+      },
+      "inputs": [
+        46
+      ],
+      "outputs": [
+        49
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "rope::rope_partial_last_bf16"
+        }
+      },
+      "inputs": [
+        48
+      ],
+      "outputs": [
+        50
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 1
+        }
+      },
+      "inputs": [
+        49
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 1
+          }
+        }
+      },
+      "inputs": [
+        50,
+        50
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::attention_flashinfer_prefill",
+          "state": {
+            "store": "KvCache",
+            "layer": 1
+          }
+        }
+      },
+      "inputs": [
+        49
+      ],
+      "outputs": [
+        51,
+        52
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::lse_log2_to_ln"
+        }
+      },
+      "inputs": [
+        52
+      ],
+      "outputs": [
+        53
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dsv4_compress_gather_paged_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 1
+          }
+        }
+      },
+      "inputs": [
+        2
+      ],
+      "outputs": [
+        54
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "rope::rope_partial_last_bf16"
+        }
+      },
+      "inputs": [
+        54
+      ],
+      "outputs": [
+        55
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dsv4_store_comp_entries_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 1
+          }
+        }
+      },
+      "inputs": [
+        55,
+        2
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::attention_compressed_paged_bf16"
+        }
+      },
+      "inputs": [
+        49
+      ],
+      "outputs": [
+        56,
+        57
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::combine_attn_outputs_bf16",
+          "params": [
+            16,
+            128
+          ]
+        }
+      },
+      "inputs": [
+        51,
+        53,
+        56,
+        57
+      ],
+      "outputs": [
+        58,
+        59
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::attn_sink_correction_bf16",
+          "weights": [
+            "layer.1.attn_sink"
+          ]
+        }
+      },
+      "inputs": [
+        58,
+        59
+      ],
+      "outputs": [
+        60
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 1
+        }
+      },
+      "inputs": [
+        60
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.wo_a",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        60
+      ],
+      "outputs": [
+        61
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.wo_b",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        61
+      ],
+      "outputs": [
+        62
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_post_bf16"
+        }
+      },
+      "inputs": [
+        62,
+        38,
+        41,
+        42
+      ],
+      "outputs": [
+        63
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_rmsnorm_to_f32",
+          "weights": [
+            "layer.1.mlp_norm"
+          ]
+        }
+      },
+      "inputs": [
+        63
+      ],
+      "outputs": [
+        64
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_pre_postprocess_bf16"
+        }
+      },
+      "inputs": [
+        64,
+        63
+      ],
+      "outputs": [
+        65,
+        66,
+        67
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.router",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        65
+      ],
+      "outputs": [
+        68
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::topk_sqrtsoftplus_bf16",
+          "weights": [
+            "layer.1.router_bias"
+          ]
+        }
+      },
+      "inputs": [
+        68
+      ],
+      "outputs": [
+        69,
+        70
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::moe_gate_up_decode_gemv_bf16",
+          "weights": [
+            "layer.1.expert.{e}.gate_up"
+          ]
+        }
+      },
+      "inputs": [
+        69,
+        65
+      ],
+      "outputs": [
+        71
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::chunked_swiglu_clamp_bf16"
+        }
+      },
+      "inputs": [
+        71
+      ],
+      "outputs": [
+        72
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::moe_down_decode_gemv_bf16",
+          "weights": [
+            "layer.1.expert.{e}.down"
+          ]
+        }
+      },
+      "inputs": [
+        69,
+        72
+      ],
+      "outputs": [
+        73
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::token_batched_weighted_sum_bf16"
+        }
+      },
+      "inputs": [
+        73,
+        70
+      ],
+      "outputs": [
+        74
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_post_bf16"
+        }
+      },
+      "inputs": [
+        74,
+        63,
+        66,
+        67
+      ],
+      "outputs": [
+        75
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_rmsnorm_to_f32",
+          "weights": [
+            "layer.2.attn_norm"
+          ]
+        }
+      },
+      "inputs": [
+        75
+      ],
+      "outputs": [
+        76
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_pre_postprocess_bf16"
+        }
+      },
+      "inputs": [
+        76,
+        75
+      ],
+      "outputs": [
+        77,
+        78,
+        79
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.wq_a",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        77
+      ],
+      "outputs": [
+        80
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.2.q_norm"
+          ]
+        }
+      },
+      "inputs": [
+        80
+      ],
+      "outputs": [
+        81
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.wq_b",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        81
+      ],
+      "outputs": [
+        82
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::per_head_rmsnorm_bf16",
+          "weights": [
+            ""
+          ]
+        }
+      },
+      "inputs": [
+        82
+      ],
+      "outputs": [
+        83
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.wkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        77
+      ],
+      "outputs": [
+        84
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.2.kv_norm"
+          ]
+        }
+      },
+      "inputs": [
+        84
+      ],
+      "outputs": [
+        85
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "rope::rope_partial_last_bf16"
+        }
+      },
+      "inputs": [
+        83
+      ],
+      "outputs": [
+        86
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "rope::rope_partial_last_bf16"
+        }
+      },
+      "inputs": [
+        85
+      ],
+      "outputs": [
+        87
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 2
+        }
+      },
+      "inputs": [
+        86
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 2
+          }
+        }
+      },
+      "inputs": [
+        87,
+        87
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::attention_flashinfer_prefill",
+          "state": {
+            "store": "KvCache",
+            "layer": 2
+          }
+        }
+      },
+      "inputs": [
+        86
+      ],
+      "outputs": [
+        88,
+        89
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::lse_log2_to_ln"
+        }
+      },
+      "inputs": [
+        89
+      ],
+      "outputs": [
+        90
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dsv4_compress_gather_paged_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 2
+          }
+        }
+      },
+      "inputs": [
+        2
+      ],
+      "outputs": [
+        91
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "rope::rope_partial_last_bf16"
+        }
+      },
+      "inputs": [
+        91
+      ],
+      "outputs": [
+        92
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dsv4_store_comp_entries_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 2
+          }
+        }
+      },
+      "inputs": [
+        92,
+        2
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::attention_compressed_paged_bf16"
+        }
+      },
+      "inputs": [
+        86
+      ],
+      "outputs": [
+        93,
+        94
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::combine_attn_outputs_bf16",
+          "params": [
+            16,
+            128
+          ]
+        }
+      },
+      "inputs": [
+        88,
+        90,
+        93,
+        94
+      ],
+      "outputs": [
+        95,
+        96
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::attn_sink_correction_bf16",
+          "weights": [
+            "layer.2.attn_sink"
+          ]
+        }
+      },
+      "inputs": [
+        95,
+        96
+      ],
+      "outputs": [
+        97
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 2
+        }
+      },
+      "inputs": [
+        97
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.wo_a",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        97
+      ],
+      "outputs": [
+        98
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.wo_b",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        98
+      ],
+      "outputs": [
+        99
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_post_bf16"
+        }
+      },
+      "inputs": [
+        99,
+        75,
+        78,
+        79
+      ],
+      "outputs": [
+        100
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_rmsnorm_to_f32",
+          "weights": [
+            "layer.2.mlp_norm"
+          ]
+        }
+      },
+      "inputs": [
+        100
+      ],
+      "outputs": [
+        101
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_pre_postprocess_bf16"
+        }
+      },
+      "inputs": [
+        101,
+        100
+      ],
+      "outputs": [
+        102,
+        103,
+        104
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.router",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        102
+      ],
+      "outputs": [
+        105
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::topk_sqrtsoftplus_bf16",
+          "weights": [
+            "layer.2.router_bias"
+          ]
+        }
+      },
+      "inputs": [
+        105
+      ],
+      "outputs": [
+        106,
+        107
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::moe_gate_up_decode_gemv_bf16",
+          "weights": [
+            "layer.2.expert.{e}.gate_up"
+          ]
+        }
+      },
+      "inputs": [
+        106,
+        102
+      ],
+      "outputs": [
+        108
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::chunked_swiglu_clamp_bf16"
+        }
+      },
+      "inputs": [
+        108
+      ],
+      "outputs": [
+        109
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::moe_down_decode_gemv_bf16",
+          "weights": [
+            "layer.2.expert.{e}.down"
+          ]
+        }
+      },
+      "inputs": [
+        106,
+        109
+      ],
+      "outputs": [
+        110
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::token_batched_weighted_sum_bf16"
+        }
+      },
+      "inputs": [
+        110,
+        107
+      ],
+      "outputs": [
+        111
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_post_bf16"
+        }
+      },
+      "inputs": [
+        111,
+        100,
+        103,
+        104
+      ],
+      "outputs": [
+        112
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_rmsnorm_to_f32",
+          "weights": [
+            "layer.3.attn_norm"
+          ]
+        }
+      },
+      "inputs": [
+        112
+      ],
+      "outputs": [
+        113
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_pre_postprocess_bf16"
+        }
+      },
+      "inputs": [
+        113,
+        112
+      ],
+      "outputs": [
+        114,
+        115,
+        116
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.wq_a",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        114
+      ],
+      "outputs": [
+        117
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.3.q_norm"
+          ]
+        }
+      },
+      "inputs": [
+        117
+      ],
+      "outputs": [
+        118
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.wq_b",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        118
+      ],
+      "outputs": [
+        119
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::per_head_rmsnorm_bf16",
+          "weights": [
+            ""
+          ]
+        }
+      },
+      "inputs": [
+        119
+      ],
+      "outputs": [
+        120
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.wkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        114
+      ],
+      "outputs": [
+        121
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.3.kv_norm"
+          ]
+        }
+      },
+      "inputs": [
+        121
+      ],
+      "outputs": [
+        122
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "rope::rope_partial_last_bf16"
+        }
+      },
+      "inputs": [
+        120
+      ],
+      "outputs": [
+        123
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "rope::rope_partial_last_bf16"
+        }
+      },
+      "inputs": [
+        122
+      ],
+      "outputs": [
+        124
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 3
+        }
+      },
+      "inputs": [
+        123
+      ],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 3
+          }
+        }
+      },
+      "inputs": [
+        124,
+        124
+      ],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::attention_flashinfer_prefill",
+          "state": {
+            "store": "KvCache",
+            "layer": 3
+          }
+        }
+      },
+      "inputs": [
+        123
+      ],
+      "outputs": [
+        125,
+        126
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::lse_log2_to_ln"
+        }
+      },
+      "inputs": [
+        126
+      ],
+      "outputs": [
+        127
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dsv4_compress_gather_paged_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 3
+          }
+        }
+      },
+      "inputs": [
+        2
+      ],
+      "outputs": [
+        128
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "rope::rope_partial_last_bf16"
+        }
+      },
+      "inputs": [
+        128
+      ],
+      "outputs": [
+        129
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dsv4_store_comp_entries_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 3
+          }
+        }
+      },
+      "inputs": [
+        129,
+        2
+      ],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::attention_compressed_paged_bf16"
+        }
+      },
+      "inputs": [
+        123
+      ],
+      "outputs": [
+        130,
+        131
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::combine_attn_outputs_bf16",
+          "params": [
+            16,
+            128
+          ]
+        }
+      },
+      "inputs": [
+        125,
+        127,
+        130,
+        131
+      ],
+      "outputs": [
+        132,
+        133
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::attn_sink_correction_bf16",
+          "weights": [
+            "layer.3.attn_sink"
+          ]
+        }
+      },
+      "inputs": [
+        132,
+        133
+      ],
+      "outputs": [
+        134
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 3
+        }
+      },
+      "inputs": [
+        134
+      ],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.wo_a",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        134
+      ],
+      "outputs": [
+        135
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.wo_b",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        135
+      ],
+      "outputs": [
+        136
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_post_bf16"
+        }
+      },
+      "inputs": [
+        136,
+        112,
+        115,
+        116
+      ],
+      "outputs": [
+        137
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_rmsnorm_to_f32",
+          "weights": [
+            "layer.3.mlp_norm"
+          ]
+        }
+      },
+      "inputs": [
+        137
+      ],
+      "outputs": [
+        138
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_pre_postprocess_bf16"
+        }
+      },
+      "inputs": [
+        138,
+        137
+      ],
+      "outputs": [
+        139,
+        140,
+        141
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.router",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        139
+      ],
+      "outputs": [
+        142
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::topk_sqrtsoftplus_bf16",
+          "weights": [
+            "layer.3.router_bias"
+          ]
+        }
+      },
+      "inputs": [
+        142
+      ],
+      "outputs": [
+        143,
+        144
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::moe_gate_up_decode_gemv_bf16",
+          "weights": [
+            "layer.3.expert.{e}.gate_up"
+          ]
+        }
+      },
+      "inputs": [
+        143,
+        139
+      ],
+      "outputs": [
+        145
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::chunked_swiglu_clamp_bf16"
+        }
+      },
+      "inputs": [
+        145
+      ],
+      "outputs": [
+        146
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::moe_down_decode_gemv_bf16",
+          "weights": [
+            "layer.3.expert.{e}.down"
+          ]
+        }
+      },
+      "inputs": [
+        143,
+        146
+      ],
+      "outputs": [
+        147
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::token_batched_weighted_sum_bf16"
+        }
+      },
+      "inputs": [
+        147,
+        144
+      ],
+      "outputs": [
+        148
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_post_bf16"
+        }
+      },
+      "inputs": [
+        148,
+        137,
+        140,
+        141
+      ],
+      "outputs": [
+        149
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_rmsnorm_to_f32",
+          "weights": [
+            "layer.4.attn_norm"
+          ]
+        }
+      },
+      "inputs": [
+        149
+      ],
+      "outputs": [
+        150
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_pre_postprocess_bf16"
+        }
+      },
+      "inputs": [
+        150,
+        149
+      ],
+      "outputs": [
+        151,
+        152,
+        153
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.wq_a",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        151
+      ],
+      "outputs": [
+        154
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.4.q_norm"
+          ]
+        }
+      },
+      "inputs": [
+        154
+      ],
+      "outputs": [
+        155
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.wq_b",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        155
+      ],
+      "outputs": [
+        156
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::per_head_rmsnorm_bf16",
+          "weights": [
+            ""
+          ]
+        }
+      },
+      "inputs": [
+        156
+      ],
+      "outputs": [
+        157
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.wkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        151
+      ],
+      "outputs": [
+        158
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.4.kv_norm"
+          ]
+        }
+      },
+      "inputs": [
+        158
+      ],
+      "outputs": [
+        159
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "rope::rope_partial_last_bf16"
+        }
+      },
+      "inputs": [
+        157
+      ],
+      "outputs": [
+        160
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "rope::rope_partial_last_bf16"
+        }
+      },
+      "inputs": [
+        159
+      ],
+      "outputs": [
+        161
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 4
+        }
+      },
+      "inputs": [
+        160
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 4
+          }
+        }
+      },
+      "inputs": [
+        161,
+        161
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::attention_flashinfer_prefill",
+          "state": {
+            "store": "KvCache",
+            "layer": 4
+          }
+        }
+      },
+      "inputs": [
+        160
+      ],
+      "outputs": [
+        162,
+        163
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::lse_log2_to_ln"
+        }
+      },
+      "inputs": [
+        163
+      ],
+      "outputs": [
+        164
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dsv4_compress_gather_paged_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 4
+          }
+        }
+      },
+      "inputs": [
+        2
+      ],
+      "outputs": [
+        165
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "rope::rope_partial_last_bf16"
+        }
+      },
+      "inputs": [
+        165
+      ],
+      "outputs": [
+        166
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dsv4_store_comp_entries_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 4
+          }
+        }
+      },
+      "inputs": [
+        166,
+        2
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::attention_compressed_paged_bf16"
+        }
+      },
+      "inputs": [
+        160
+      ],
+      "outputs": [
+        167,
+        168
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::combine_attn_outputs_bf16",
+          "params": [
+            16,
+            128
+          ]
+        }
+      },
+      "inputs": [
+        162,
+        164,
+        167,
+        168
+      ],
+      "outputs": [
+        169,
+        170
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::attn_sink_correction_bf16",
+          "weights": [
+            "layer.4.attn_sink"
+          ]
+        }
+      },
+      "inputs": [
+        169,
+        170
+      ],
+      "outputs": [
+        171
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 4
+        }
+      },
+      "inputs": [
+        171
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.wo_a",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        171
+      ],
+      "outputs": [
+        172
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.wo_b",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        172
+      ],
+      "outputs": [
+        173
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_post_bf16"
+        }
+      },
+      "inputs": [
+        173,
+        149,
+        152,
+        153
+      ],
+      "outputs": [
+        174
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_rmsnorm_to_f32",
+          "weights": [
+            "layer.4.mlp_norm"
+          ]
+        }
+      },
+      "inputs": [
+        174
+      ],
+      "outputs": [
+        175
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_pre_postprocess_bf16"
+        }
+      },
+      "inputs": [
+        175,
+        174
+      ],
+      "outputs": [
+        176,
+        177,
+        178
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.router",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        176
+      ],
+      "outputs": [
+        179
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::topk_sqrtsoftplus_bf16",
+          "weights": [
+            "layer.4.router_bias"
+          ]
+        }
+      },
+      "inputs": [
+        179
+      ],
+      "outputs": [
+        180,
+        181
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::moe_gate_up_decode_gemv_bf16",
+          "weights": [
+            "layer.4.expert.{e}.gate_up"
+          ]
+        }
+      },
+      "inputs": [
+        180,
+        176
+      ],
+      "outputs": [
+        182
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::chunked_swiglu_clamp_bf16"
+        }
+      },
+      "inputs": [
+        182
+      ],
+      "outputs": [
+        183
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::moe_down_decode_gemv_bf16",
+          "weights": [
+            "layer.4.expert.{e}.down"
+          ]
+        }
+      },
+      "inputs": [
+        180,
+        183
+      ],
+      "outputs": [
+        184
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::token_batched_weighted_sum_bf16"
+        }
+      },
+      "inputs": [
+        184,
+        181
+      ],
+      "outputs": [
+        185
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_post_bf16"
+        }
+      },
+      "inputs": [
+        185,
+        174,
+        177,
+        178
+      ],
+      "outputs": [
+        186
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_rmsnorm_to_f32",
+          "weights": [
+            "layer.5.attn_norm"
+          ]
+        }
+      },
+      "inputs": [
+        186
+      ],
+      "outputs": [
+        187
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_pre_postprocess_bf16"
+        }
+      },
+      "inputs": [
+        187,
+        186
+      ],
+      "outputs": [
+        188,
+        189,
+        190
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.wq_a",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        188
+      ],
+      "outputs": [
+        191
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.5.q_norm"
+          ]
+        }
+      },
+      "inputs": [
+        191
+      ],
+      "outputs": [
+        192
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.wq_b",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        192
+      ],
+      "outputs": [
+        193
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::per_head_rmsnorm_bf16",
+          "weights": [
+            ""
+          ]
+        }
+      },
+      "inputs": [
+        193
+      ],
+      "outputs": [
+        194
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.wkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        188
+      ],
+      "outputs": [
+        195
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.5.kv_norm"
+          ]
+        }
+      },
+      "inputs": [
+        195
+      ],
+      "outputs": [
+        196
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "rope::rope_partial_last_bf16"
+        }
+      },
+      "inputs": [
+        194
+      ],
+      "outputs": [
+        197
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "rope::rope_partial_last_bf16"
+        }
+      },
+      "inputs": [
+        196
+      ],
+      "outputs": [
+        198
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 5
+        }
+      },
+      "inputs": [
+        197
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 5
+          }
+        }
+      },
+      "inputs": [
+        198,
+        198
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::attention_flashinfer_prefill",
+          "state": {
+            "store": "KvCache",
+            "layer": 5
+          }
+        }
+      },
+      "inputs": [
+        197
+      ],
+      "outputs": [
+        199,
+        200
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::lse_log2_to_ln"
+        }
+      },
+      "inputs": [
+        200
+      ],
+      "outputs": [
+        201
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dsv4_compress_gather_paged_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 5
+          }
+        }
+      },
+      "inputs": [
+        2
+      ],
+      "outputs": [
+        202
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "rope::rope_partial_last_bf16"
+        }
+      },
+      "inputs": [
+        202
+      ],
+      "outputs": [
+        203
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dsv4_store_comp_entries_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 5
+          }
+        }
+      },
+      "inputs": [
+        203,
+        2
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::attention_compressed_paged_bf16"
+        }
+      },
+      "inputs": [
+        197
+      ],
+      "outputs": [
+        204,
+        205
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::combine_attn_outputs_bf16",
+          "params": [
+            16,
+            128
+          ]
+        }
+      },
+      "inputs": [
+        199,
+        201,
+        204,
+        205
+      ],
+      "outputs": [
+        206,
+        207
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::attn_sink_correction_bf16",
+          "weights": [
+            "layer.5.attn_sink"
+          ]
+        }
+      },
+      "inputs": [
+        206,
+        207
+      ],
+      "outputs": [
+        208
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 5
+        }
+      },
+      "inputs": [
+        208
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.wo_a",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        208
+      ],
+      "outputs": [
+        209
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.wo_b",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        209
+      ],
+      "outputs": [
+        210
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_post_bf16"
+        }
+      },
+      "inputs": [
+        210,
+        186,
+        189,
+        190
+      ],
+      "outputs": [
+        211
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_rmsnorm_to_f32",
+          "weights": [
+            "layer.5.mlp_norm"
+          ]
+        }
+      },
+      "inputs": [
+        211
+      ],
+      "outputs": [
+        212
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_pre_postprocess_bf16"
+        }
+      },
+      "inputs": [
+        212,
+        211
+      ],
+      "outputs": [
+        213,
+        214,
+        215
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.router",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        213
+      ],
+      "outputs": [
+        216
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::topk_sqrtsoftplus_bf16",
+          "weights": [
+            "layer.5.router_bias"
+          ]
+        }
+      },
+      "inputs": [
+        216
+      ],
+      "outputs": [
+        217,
+        218
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::moe_gate_up_decode_gemv_bf16",
+          "weights": [
+            "layer.5.expert.{e}.gate_up"
+          ]
+        }
+      },
+      "inputs": [
+        217,
+        213
+      ],
+      "outputs": [
+        219
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::chunked_swiglu_clamp_bf16"
+        }
+      },
+      "inputs": [
+        219
+      ],
+      "outputs": [
+        220
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::moe_down_decode_gemv_bf16",
+          "weights": [
+            "layer.5.expert.{e}.down"
+          ]
+        }
+      },
+      "inputs": [
+        217,
+        220
+      ],
+      "outputs": [
+        221
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::token_batched_weighted_sum_bf16"
+        }
+      },
+      "inputs": [
+        221,
+        218
+      ],
+      "outputs": [
+        222
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_post_bf16"
+        }
+      },
+      "inputs": [
+        222,
+        211,
+        214,
+        215
+      ],
+      "outputs": [
+        223
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::hc_head_postprocess_bf16"
+        }
+      },
+      "inputs": [
+        223,
+        223
+      ],
+      "outputs": [
+        224
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "final_norm"
+          ]
+        }
+      },
+      "inputs": [
+        224
+      ],
+      "outputs": [
+        225
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "LmHead": {
+          "weight": "lm_head"
+        }
+      },
+      "inputs": [
+        225
+      ],
+      "outputs": [
+        226
+      ],
+      "layer": null
+    }
+  ],
+  "seams": [
+    {
+      "seam": "in"
+    },
+    {
+      "seam": "attn.q",
+      "layer": 0,
+      "op": 13,
+      "values": [
+        15
+      ]
+    },
+    {
+      "seam": "attn.out",
+      "layer": 0,
+      "op": 23,
+      "values": [
+        26
+      ]
+    },
+    {
+      "seam": "attn.q",
+      "layer": 1,
+      "op": 44,
+      "values": [
+        49
+      ]
+    },
+    {
+      "seam": "attn.out",
+      "layer": 1,
+      "op": 54,
+      "values": [
+        60
+      ]
+    },
+    {
+      "seam": "attn.q",
+      "layer": 2,
+      "op": 77,
+      "values": [
+        86
+      ]
+    },
+    {
+      "seam": "attn.out",
+      "layer": 2,
+      "op": 87,
+      "values": [
+        97
+      ]
+    },
+    {
+      "seam": "attn.q",
+      "layer": 3,
+      "op": 110,
+      "values": [
+        123
+      ]
+    },
+    {
+      "seam": "attn.out",
+      "layer": 3,
+      "op": 120,
+      "values": [
+        134
+      ]
+    },
+    {
+      "seam": "attn.q",
+      "layer": 4,
+      "op": 143,
+      "values": [
+        160
+      ]
+    },
+    {
+      "seam": "attn.out",
+      "layer": 4,
+      "op": 153,
+      "values": [
+        171
+      ]
+    },
+    {
+      "seam": "attn.q",
+      "layer": 5,
+      "op": 176,
+      "values": [
+        197
+      ]
+    },
+    {
+      "seam": "attn.out",
+      "layer": 5,
+      "op": 186,
+      "values": [
+        208
+      ]
+    },
+    {
+      "seam": "out",
+      "values": [
+        226
+      ]
+    }
+  ]
+}

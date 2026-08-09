@@ -11,8 +11,8 @@
 //! it is bound to. Every one of those is the *text*'s fault, not the
 //! machine's, and a caller that reads `Program` knows to look at the program.
 //!
-//! The shells re-export their own error and convert: `driver-metal-new` and
-//! `driver-cuda-new` each carry a `Program` variant of their own, so a `?` on
+//! The shells re-export their own error and convert: `driver-metal` and
+//! `driver-cuda` each carry a `Program` variant of their own, so a `?` on
 //! one of this crate's results lands in the shell's type without a match.
 
 use std::fmt;

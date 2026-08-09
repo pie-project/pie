@@ -178,7 +178,10 @@ pub static DRIVER_KERNELS: &[KernelSig] = &[
     kernel!(sigmoid_gate_inplace "mlp::sigmoid_gate_inplace_bf16",
         in_place = &[(0, 0)],
         operands = operands![
-            x: BufMut, gate: Buf, num_elements: I32, stream: Stream,
+            x: BufMut <- Source::Out(0),
+            gate: Buf <- Source::In(1),
+            num_elements: I32 <- Source::OutElements(0),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // The gated norm with an FP32 `x`: the GDN recurrent step lands in
     // fp32, so this reads it there and the separate conversion launch
@@ -186,6 +189,14 @@ pub static DRIVER_KERNELS: &[KernelSig] = &[
     // header spells them `const void*`, and this table describes the
     // DECLARATION, not the contents. The shim initialises a function
     // pointer, so the spelling is what has to agree.
+    // UNSOURCED, and the two numbers say why. The GDN landing norm runs
+    // per (row, VALUE HEAD) over the trailing head width, so its rows are
+    // `rows * gdn.v_h` and its width is `gdn.v_d` -- a PRODUCT of the
+    // fire's rows and a context field, which no `Source::` spells. A row
+    // that said `Rows` and `OutWidth(0)` would launch the right kernel
+    // over the wrong rectangle, which is worse than having no row: the
+    // hybrid's prefill found it immediately, and only because the walk
+    // asserts every launch ran.
     kernel!(rmsnorm_gated_fp32_in "norm::rmsnorm_gated_fp32_in_bf16",
         operands = operands![
             x: Buf, gate: Buf, weight: Buf, y: BufMut,

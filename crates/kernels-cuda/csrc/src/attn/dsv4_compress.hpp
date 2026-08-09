@@ -118,6 +118,26 @@ void dsv4_boundary_meta_decode(
     cudaStream_t        stream,
     const std::uint8_t* row_valid = nullptr);
 
+/// The same metadata for a fire that brings MANY rows per request.
+///
+/// `dsv4_boundary_meta_decode` shortcuts the request index to the token index,
+/// which holds only when each request contributes one row. Here the request a
+/// token belongs to is the CSR row its index falls in, read from `qo_indptr`
+/// (`num_requests + 1` entries, non-decreasing). Everything else — whether a
+/// position closes a window, and the rope base of the window it closes — is a
+/// per-token fact and is computed identically.
+void dsv4_boundary_meta_paged(
+    const std::int32_t*  positions,
+    const std::uint32_t* qo_indptr,
+    std::int32_t*        out_pos,
+    std::int32_t*        out_req,
+    std::int32_t*        out_rope,
+    int                  n,
+    int                  num_requests,
+    int                  ratio,
+    cudaStream_t         stream,
+    const std::uint8_t*  row_valid = nullptr);
+
 void dsv4_store_comp_entries_bf16(
     const void* entries,                // [C, head_dim] BF16
     void* comp_kv_pages,                // [num_pages, page_size, head_dim] BF16

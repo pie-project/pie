@@ -1175,7 +1175,7 @@ fn the_buffer_table_crosses_and_agrees_with_the_operands() {
 /// **The gather still has nowhere to write.** It must compact `[sampled,
 /// hidden]` rows for the head to read, and its only output is the logits
 /// allocation, at the wrong width and stride. That is why
-/// `driver-cuda-new` over-claims `Row::samples`: reading the step's real
+/// `driver-cuda` over-claims `Row::samples`: reading the step's real
 /// readout list makes every prefill state this gather, and running it
 /// produces all-zero logits. Fixing it needs a temp value, which is a
 /// TRACE change — `OpKind::LmHead` has to name the gather's destination —
@@ -1213,10 +1213,22 @@ fn the_epilogue_binds_one_ops_two_operands_to_the_launches() {
             .collect()
     };
 
-    // One sampled row of four: the gather appears, and gets the same two
-    // operands as the head — an input at the hidden width and an output
-    // at the vocabulary's. There is no third buffer for it to compact
-    // into.
+    // One sampled row of four: the gather appears, and it writes into a
+    // TEMP the trace never named — `Buffers::epilogue_gather`, sized from
+    // this statement and carried on `Lowered` all along, which nothing
+    // ever bound.
+    //
+    // It used to get the head's own two operands, because
+    // `OpKind::LmHead` states `inputs=[hidden] outputs=[logits]` and the
+    // plain emit binds exactly those. So the compaction's destination was
+    // the LOGITS buffer at the wrong width, and the head then read what it
+    // had overwritten: all-zero logits on gemma-4 and the hybrid. The
+    // shell worked around it by forcing every row to sample, which costs a
+    // prefill its whole head over every token.
+    //
+    // This test pinned the defect for as long as it asserted only the
+    // SYMBOLS and the row ranges. It reads the ARGUMENTS now, which is the
+    // only reason the hand-off can be held.
     let mut gathered = vec![Row::default(); 4];
     gathered[3].samples = true;
     let got = args_of(&gathered);
@@ -1228,16 +1240,33 @@ fn the_epilogue_binds_one_ops_two_operands_to_the_launches() {
          already did is not one of its statements"
     );
     let widths: Vec<&Vec<String>> = got.iter().map(|(_, a)| a).collect();
+    assert_eq!(widths[0].len(), 2, "gather: the stream in, the temp out");
+    assert_eq!(widths[1].len(), 2, "head: the temp in, the logits out");
     assert_eq!(
-        widths[0], widths[1],
-        "the gather binds the SAME two operands as the head — one op, two \
-         values, both launches"
+        widths[0][0], widths[0][1],
+        "the gather reads the hidden stream and writes the temp — both at \
+         the HIDDEN width, which is what makes it a compaction rather than \
+         a projection"
     );
     assert_eq!(
-        widths[0].len(),
-        2,
-        "exactly two: there is no temp for the gather to write into, which \
-         is what makes the compaction unimplementable today"
+        widths[0][1], widths[1][0],
+        "THE HAND-OFF: the gather's destination is the head's source. \
+         Anything else and the head reads rows nobody compacted"
+    );
+    assert_ne!(
+        widths[1][0], widths[1][1],
+        "the head's output is the logits buffer, at the vocabulary width — \
+         so the temp is not it"
+    );
+
+    // Every row sampling: no compaction is needed, so none is stated, and
+    // the head reads the stream directly.
+    let all = vec![Row { samples: true, ..Default::default() }; 4];
+    let got = args_of(&all);
+    assert_eq!(
+        got.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        ["gemm::act_x_w"],
+        "a fire that reads every row has nothing to gather"
     );
 }
 
@@ -1246,7 +1275,7 @@ fn the_epilogue_binds_one_ops_two_operands_to_the_launches() {
 /// The whole point of reading the step's region table. `attn.qv` opens a
 /// `HasLora` guard whose then-arm is `cuda::lora_qkv_correction`, and
 /// `lower::select` resolves that guard with `rows.iter().any(|r|
-/// r.lora)`. `driver-cuda-new` built every row with `Row::default()` and
+/// r.lora)`. `driver-cuda` built every row with `Row::default()` and
 /// never read `region_sig`, so the answer was NO on every fire no matter
 /// what the engine sent — which is the whole of "LoRA is ported and
 /// never applied".

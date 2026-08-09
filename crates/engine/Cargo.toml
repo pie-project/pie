@@ -20,17 +20,16 @@ driver-api = { path = "../driver-api" }
 driver-dummy = { path = "../driver-dummy" }
 tensor-ir = { path = "../tensor-ir" }
 tensor-compiler = { path = "../tensor-compiler" }
-# THE CUTOVER. `driver-cuda-new` exports the same thirteen `pie_cuda_*`
-# symbols the seam calls, so which archive supplies them is a LINK
-# question and not a code one -- `backend/cuda.rs` is unchanged either
-# way. Enabling `driver-cuda-new` instead of `driver-cuda` is the whole
-# switch, which is what makes the C++ tree deletable.
-driver-cuda-new = { path = "../driver-cuda-new", optional = true }
+# THE CUTOVER, DONE. This was `driver-cuda-new` beside a C++ `driver-cuda`
+# that supplied the same thirteen `pie_cuda_*` symbols, so which archive
+# the seam linked was the whole switch and `backend/cuda.rs` was unchanged
+# either way. There is one now, and it has the name.
+driver-cuda = { path = "../driver-cuda", optional = true }
 # The Rust Metal shell. Unlike `driver-cuda` this is not linked for an
 # archive: the seam calls it as a plain Rust library, which is what a driver
 # written in the same language should cost. Its device half is
 # `#[cfg(target_vendor = "apple")]`, so the seam below is too.
-driver-metal-new = { path = "../driver-metal-new", optional = true }
+driver-metal = { path = "../driver-metal", optional = true }
 client = { path = "../client" }
 tokio = { version = "1.53", features = ["full"] }
 tokio-util = "0.7"
@@ -105,18 +104,18 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 
 [features]
 default = []
-# The Rust CUDA shell, supplying the same symbols. Mutually exclusive with
-# `driver-cuda` at LINK time -- two archives defining `pie_cuda_create`
-# is a duplicate-symbol error, which is the right failure: the seam must
-# not be ambiguous about which driver it is calling.
+# The CUDA shell. It used to share these symbols with a C++ archive of the
+# same name, and enabling both was a duplicate-symbol error -- the right
+# failure, since the seam must not be ambiguous about which driver it is
+# calling. Only one supplies them now.
 #
 # It needs a CUDA runtime ABI chosen, for the reason that crate's own
 # `compile_error!` gives: guessing wrong is a segfault inside the driver
 # rather than a build error.
-driver-cuda-new = ["dep:driver-cuda-new", "driver-cuda-new/cuda-13", "driver-cuda-new/abi"]
+driver-cuda = ["dep:driver-cuda", "driver-cuda/cuda-13", "driver-cuda/abi"]
 # The Rust Metal shell's seam. No archive and no `extern "C"`: this one is a
 # library call, so the feature owes nothing but the dependency.
-driver-metal-new = ["dep:driver-metal-new"]
+driver-metal = ["dep:driver-metal"]
 # Host-side performance probes. Each scenario is a separate flag so you
 # only pay for the probes you ask for — different domains have different
 # sample rates and different audiences. The `probe_<domain>!` macros in

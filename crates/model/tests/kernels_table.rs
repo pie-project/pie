@@ -134,7 +134,7 @@ fn the_metal_table_admits_its_rows_and_refuses_the_rest() {
 ///
 /// This list is the seam between the table's TWO jobs, which stopped being
 /// one job when the ABI pilot landed. The compiler's job is to plan against
-/// symbols a declaration can record; `driver-cuda-new`'s
+/// symbols a declaration can record; `driver-cuda`'s
 /// `every_launcher_the_header_declares_has_a_row` gives the table a second
 /// one — being the operand contract for every launcher a HEADER declares,
 /// whether a declaration reaches it or not. A row can now be real and
@@ -163,6 +163,12 @@ const UNSTATED_ROWS: &[&str] = &[
     // A statement the LOWERING makes is real without a text stating it,
     // which is precisely what this list is for.
     "layout::gather_bf16_rows",
+    // The LOADER's two quantizers, called from `loader/arena.rs` rather
+    // than recorded by any forward text: a weight transform runs once at
+    // load and never appears in a fire's op list. Real without a text
+    // stating it, which is what this list is for.
+    "quant::quantize_bf16_to_fp8_e4m3_per_channel",
+    "quant::quantize_bf16_to_mxfp4_e2m1_per_block",
     "rope::rope_partial_bf16_position_delta",
 ];
 

@@ -13,7 +13,7 @@ name = "driver"
 path = "src/lib.rs"
 
 # This crate can afford the workspace lints in full, and that is the point of
-# it being a crate. `driver-metal-new` and `driver-cuda-new` both opt OUT of
+# it being a crate. `driver-metal` and `driver-cuda` both opt OUT of
 # `[lints] workspace = true` because `unsafe_code = "forbid"` is violated by
 # construction — every objc2 message send, every `cudarc::*::sys` call. Nothing
 # here sends a message or calls a driver: the whole layer is arithmetic over

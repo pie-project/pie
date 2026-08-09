@@ -1,4 +1,4 @@
-//! The seam to `driver-metal-new`.
+//! The seam to `driver-metal`.
 //!
 //! # A library call, not an ABI crossing
 //!
@@ -36,11 +36,11 @@ use crate::driver::command::{
 use crate::driver::completion::{CompletionBroker, SubmissionCompletion};
 use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
 use crate::driver::submission::FrameSubmission;
-use driver_metal_new::Region;
+use driver_metal::Region;
 
 /// The Metal shell, behind the seam's fourteen verbs.
 pub struct MetalDriver {
-    context: std::sync::Arc<driver_metal_new::metal::Context>,
+    context: std::sync::Arc<driver_metal::metal::Context>,
     /// The command timeline, held ACROSS frames.
     ///
     /// This is what makes run-ahead run-ahead rather than within-frame
@@ -52,25 +52,32 @@ pub struct MetalDriver {
     /// `Stepper::shared` rather than `Stepper::new` because a borrowing
     /// stepper beside the `Context` it borrows is a self-reference; sharing
     /// the context is what lets one outlive a call.
-    stepper: driver_metal_new::metal::Stepper<'static>,
+    stepper: driver_metal::metal::Stepper<'static>,
     /// Reusable fire regions, held ACROSS frames for the same reason the
     /// stepper is. A fresh region per fire leaks it into the residency set
     /// permanently -- nothing removes -- and moves an address that is one of
     /// only three things differing between two fires of one shape.
-    scratch: driver_metal_new::metal::Scratch,
-    registry: driver_metal_new::pipeline::Registry,
+    scratch: driver_metal::metal::Scratch,
+    /// Which buffer each address belongs to. A recorded command binds a
+    /// BUFFER where this driver otherwise binds an address, so recording
+    /// needs the inverse of what a fire computes.
+    regions: driver_metal::metal::Regions,
+    /// Fires already recorded, by what they are valid for. Replaying one
+    /// costs 39.8 us where encoding the same fire costs 14.87 ms.
+    recordings: driver_metal::metal::Recordings,
+    registry: driver_metal::pipeline::Registry,
     device_facts: ::driver_api::DeviceFacts,
     /// The checkpoint, once one is loaded. Held because every address in its
     /// tensor map points into the region it owns.
-    model: Option<driver_metal_new::model::load::Loaded>,
+    model: Option<driver_metal::model::load::Loaded>,
     /// What the checkpoint said it is — which text `model::text` looks up.
     arch: String,
     /// The paged KV pool, allocated at load.
-    pool: Option<driver_metal_new::model::kv::Pool>,
+    pool: Option<driver_metal::model::kv::Pool>,
     /// `[model] descriptor` from the boot TOML.
     ///
     /// The one key this seam reads out of `config_bytes`, and the same one
-    /// `driver-cuda-new`'s shell reads. Model facts come from the
+    /// `driver-cuda`'s shell reads. Model facts come from the
     /// `pie.model/1` descriptor the worker hands over — **not** from a
     /// checkpoint's `config.json`, which `model::config` normalizes ONCE and
     /// which `crates/model/tests/one_normalizer.rs` refuses to let the runtime
@@ -100,8 +107,8 @@ pub struct MetalDriver {
     /// compiled to. Held across fires: a model's symbol set is bounded by its
     /// text, so a driver that recompiled per fire would spend more time in the
     /// compiler than on the GPU.
-    compiler: driver_metal_new::metal::Compiler,
-    pipelines: driver_metal_new::model::encode::Pipelines,
+    compiler: driver_metal::metal::Compiler,
+    pipelines: driver_metal::model::encode::Pipelines,
     broker: CompletionBroker,
 }
 
@@ -129,12 +136,12 @@ impl MetalDriver {
                     .map(std::path::PathBuf::from)
             });
         let context = std::sync::Arc::new(
-            driver_metal_new::metal::Context::new()
+            driver_metal::metal::Context::new()
                 .map_err(|e| anyhow!("metal context: {e:?}"))?,
         );
-        let stepper = driver_metal_new::metal::Stepper::shared(context.clone())
+        let stepper = driver_metal::metal::Stepper::shared(context.clone())
             .map_err(|e| anyhow!("metal stepper: {e:?}"))?;
-        let compiler = driver_metal_new::metal::Compiler::new(&context)
+        let compiler = driver_metal::metal::Compiler::new(&context)
             .map_err(|e| anyhow!("metal compiler: {e:?}"))?;
         // The facts a scheduler reads, stated from what this backend IS
         // rather than parsed out of a config — a config that disagreed with
@@ -162,8 +169,10 @@ impl MetalDriver {
             Self {
                 context: context.clone(),
                 stepper,
-                scratch: driver_metal_new::metal::Scratch::new(),
-                registry: driver_metal_new::pipeline::Registry::new(),
+                scratch: driver_metal::metal::Scratch::new(),
+                regions: driver_metal::metal::Regions::new(),
+                recordings: driver_metal::metal::Recordings::new(),
+                registry: driver_metal::pipeline::Registry::new(),
                 device_facts: device_facts.clone(),
                 model: None,
                 arch: String::new(),
@@ -173,7 +182,7 @@ impl MetalDriver {
                 deployment: None,
                 has_linear_attn: false,
                 compiler,
-                pipelines: driver_metal_new::model::encode::Pipelines::new(shader_tree()),
+                pipelines: driver_metal::model::encode::Pipelines::new(shader_tree()),
                 broker: CompletionBroker::new(),
             },
             device_facts,
@@ -194,13 +203,13 @@ impl MetalDriver {
 
     /// The device this driver runs on.
     #[must_use]
-    pub fn context(&self) -> &driver_metal_new::metal::Context {
+    pub fn context(&self) -> &driver_metal::metal::Context {
         &self.context
     }
 
     /// The program/instance/channel registry.
     #[must_use]
-    pub fn registry(&self) -> &driver_metal_new::pipeline::Registry {
+    pub fn registry(&self) -> &driver_metal::pipeline::Registry {
         &self.registry
     }
 
@@ -220,7 +229,7 @@ impl MetalDriver {
     ) -> Result<::driver_api::DriverCapabilities> {
         let [desc] = descs.as_slice() else {
             bail!(
-                "driver-metal-new holds ONE model; got {} descriptors",
+                "driver-metal holds ONE model; got {} descriptors",
                 descs.len()
             );
         };
@@ -231,7 +240,7 @@ impl MetalDriver {
         // time — two normalizers is how they come to disagree.
         let path = self.boot_descriptor.as_ref().ok_or_else(|| {
             anyhow!(
-                "driver-metal-new: no `[model] descriptor` in the boot config. \
+                "driver-metal: no `[model] descriptor` in the boot config. \
                  Model facts come from the descriptor the worker hands over, \
                  not from the checkpoint — see crates/model/tests/one_normalizer.rs."
             )
@@ -239,18 +248,18 @@ impl MetalDriver {
         let descriptor =
             std::fs::read_to_string(path).map_err(|e| anyhow!("{}: {e}", path.display()))?;
         let loaded =
-            driver_metal_new::model::load::load(&self.context, &desc.snapshot_dir, &descriptor)
+            driver_metal::model::load::load(&self.context, &desc.snapshot_dir, &descriptor)
                 .map_err(|e| anyhow!("metal load: {e:?}"))?;
-        let facts = driver_metal_new::facts::ModelFacts::from_descriptor(&descriptor)
+        let facts = driver_metal::facts::ModelFacts::from_descriptor(&descriptor)
             .ok_or_else(|| anyhow!("the descriptor does not parse as model facts"))?;
         self.arch = facts.arch_name.clone();
         self.has_linear_attn = facts.has_linear_attn;
-        if !driver_metal_new::model::text::serves(&self.arch) {
+        if !driver_metal::model::text::serves(&self.arch) {
             bail!(
-                "driver-metal-new has no Metal text for `{}`; it serves {:?}. \
+                "driver-metal has no Metal text for `{}`; it serves {:?}. \
                  The checkpoint loaded, but nothing states its forward pass.",
                 self.arch,
-                driver_metal_new::model::text::known()
+                driver_metal::model::text::known()
             );
         }
 
@@ -271,7 +280,7 @@ impl MetalDriver {
         // retirement list; when it goes, this reads the descriptor directly.
         // What is borrowed here is arithmetic over the config, not a model
         // definition.
-        let geometry = driver_metal_new::batch::geometry_from_facts(&facts).map_err(|why| {
+        let geometry = driver_metal::batch::geometry_from_facts(&facts).map_err(|why| {
             anyhow!("the descriptor does not describe a servable family: {why:?}")
         })?;
 
@@ -283,15 +292,15 @@ impl MetalDriver {
         // the load left in MXFP4. The second is what a MIXTURE needs -- a
         // checkpoint need not quantize uniformly, and reading an expert bank
         // with the dense format is NaNs rather than a near miss.
-        self.deployment = Some(driver_metal_new::model::text::facts_from_with(
+        self.deployment = Some(driver_metal::model::text::facts_from_with(
             &geometry,
             |name| loaded.tensors.contains_key(name),
             |name| loaded.mxfp4.contains(name),
         ));
-        self.inv_freq = driver_metal_new::model::rope::frequencies(
+        self.inv_freq = driver_metal::model::rope::frequencies(
             geometry.head_dim,
             geometry.rope_theta,
-            (geometry.rope_freq_factor > 0.0).then_some(driver_metal_new::model::rope::Rescale {
+            (geometry.rope_freq_factor > 0.0).then_some(driver_metal::model::rope::Rescale {
                 factor: geometry.rope_freq_factor,
                 low: geometry.rope_low_freq_factor,
                 high: geometry.rope_high_freq_factor,
@@ -301,8 +310,15 @@ impl MetalDriver {
         .iter()
         .map(|f| f.to_bits())
         .collect();
+        // Which buffer each weight address belongs to, so a fire can be
+        // RECORDED. A model reload moves every address, so the old recordings
+        // are invalid -- stated rather than left to the fingerprint, which
+        // would also catch it but says nothing about why.
+        self.recordings.clear();
+        self.regions = driver_metal::metal::Regions::new();
+        self.regions.add(&loaded.region);
         self.model = Some(loaded);
-        let shape = driver_metal_new::model::kv::Shape {
+        let shape = driver_metal::model::kv::Shape {
             layers: geometry.n_layers,
             kv_heads: geometry.n_kv_heads,
             head_dim: geometry.head_dim,
@@ -320,10 +336,16 @@ impl MetalDriver {
             global_kv_heads: geometry.global_kv_heads,
             full_attn_every: geometry.full_attn_every,
         };
-        self.pool = Some(
-            driver_metal_new::model::kv::Pool::allocate(&self.context, shape)
-                .map_err(|e| anyhow!("kv pool: {e:?}"))?,
-        );
+        let pool = driver_metal::model::kv::Pool::allocate(&self.context, shape)
+            .map_err(|e| anyhow!("kv pool: {e:?}"))?;
+        // Every layer's K and V, for the same reason as the weights.
+        for l in 0..shape.layers {
+            if let Some(layer) = pool.layer(l) {
+                self.regions.add(&layer.k);
+                self.regions.add(&layer.v);
+            }
+        }
+        self.pool = Some(pool);
 
         // What the checkpoint states, and what the pool states.
         //
@@ -389,7 +411,7 @@ impl MetalDriver {
 
     /// The tensors the loaded checkpoint published, or `None` before a load.
     #[must_use]
-    pub fn model(&self) -> Option<&driver_metal_new::model::load::Loaded> {
+    pub fn model(&self) -> Option<&driver_metal::model::load::Loaded> {
         self.model.as_ref()
     }
 
@@ -415,7 +437,7 @@ impl MetalDriver {
                 // alias would let a future field diverge silently.
                 desc.emitted_kernels
                     .iter()
-                    .map(|k| driver_metal_new::pipeline::EmittedKernel {
+                    .map(|k| driver_metal::pipeline::EmittedKernel {
                         kind: k.kind,
                         stage_index: k.stage_index,
                         region_index: k.region_index,
@@ -437,7 +459,7 @@ impl MetalDriver {
     /// driver: `ChannelState` holds the cells and four control words, and the
     /// binding is their addresses. Nothing about the channel plane is on the
     /// GPU — it is a different layer from the model forward and always has
-    /// been (`PARITY-INTERP.md`).
+    /// been (`.wiki/driver/progress-metal.md`).
     ///
     /// # Errors
     ///
@@ -446,14 +468,14 @@ impl MetalDriver {
         &mut self,
         desc: &ChannelRegistrationPlan,
     ) -> Result<RegisteredChannel> {
-        let spec = driver_metal_new::pipeline::ChannelSpec {
+        let spec = driver_metal::pipeline::ChannelSpec {
             id: desc.channel_id,
             dtype: desc.dtype,
             shape: desc.shape.clone(),
             capacity: desc.capacity,
-            role: driver_metal_new::pipeline::HostRole::from_wire(desc.host_role),
+            role: driver_metal::pipeline::HostRole::from_wire(desc.host_role),
             seeded: desc.seeded,
-            direction: driver_metal_new::pipeline::Direction::from_wire(desc.extern_dir),
+            direction: driver_metal::pipeline::Direction::from_wire(desc.extern_dir),
             extern_name: desc.extern_name.clone(),
         };
         let endpoint = self
@@ -493,7 +515,7 @@ impl MetalDriver {
     /// A program id the registry does not hold, a channel an instance may not
     /// attach to, or a geometry class it does not serve.
     pub fn bind_instance(&mut self, desc: &InstanceBindingPlan) -> Result<BoundInstance> {
-        let geometry = driver_metal_new::pipeline::Geometry::from_wire(desc.geometry_class as u32)
+        let geometry = driver_metal::pipeline::Geometry::from_wire(desc.geometry_class as u32)
             .map_err(|e| anyhow!("metal bind_instance: {e:?}"))?;
         let seeds: Vec<(u64, Vec<u8>)> = desc
             .seed_values
@@ -539,7 +561,7 @@ impl MetalDriver {
     /// engine re-posts, or `Impossible` when no eviction could ever make room.
     pub fn launch(&mut self, frame: &FrameSubmission) -> Result<FrameLaunchOutcome> {
         let (Some(model), Some(pool)) = (self.model.as_ref(), self.pool.as_ref()) else {
-            bail!("driver-metal-new: launch before load_model");
+            bail!("driver-metal: launch before load_model");
         };
 
         // ── Admission, against the frame-union demand. ──
@@ -560,7 +582,7 @@ impl MetalDriver {
         // would read it without complaint, so this is a refusal and not a
         // clamp.
         for lane in 0..frame.instance_ids.len() {
-            driver_metal_new::model::kv::translate(
+            driver_metal::model::kv::translate(
                 pool,
                 &frame.kv_translation,
                 &frame.kv_translation_indptr,
@@ -572,7 +594,7 @@ impl MetalDriver {
         let (facts, metal) = self
             .deployment
             .clone()
-            .ok_or_else(|| anyhow!("driver-metal-new: launch before load_model"))?;
+            .ok_or_else(|| anyhow!("driver-metal: launch before load_model"))?;
         let named = std::collections::HashMap::new();
 
         // ONE timeline for the whole frame, so a step is QUEUED while the
@@ -596,7 +618,7 @@ impl MetalDriver {
         let mut in_flight: Vec<(&crate::driver::submission::StepSubmission, _)> = Vec::new();
 
         for step in &frame.steps {
-            let s = driver_metal_new::model::frame::Step {
+            let s = driver_metal::model::frame::Step {
                 token_ids: &step.plan.token_ids,
                 qo_indptr: &step.plan.qo_indptr,
                 region_row_indptr: &step.region_row_indptr,
@@ -604,13 +626,13 @@ impl MetalDriver {
                 region_k: &step.region_k,
                 sampling_indices: &step.plan.sampling_indices,
             };
-            let class = driver_metal_new::model::frame::fire_class(&s);
-            let plan = driver_metal_new::model::text::plan_for(&self.arch, class, &facts, &metal)
+            let class = driver_metal::model::frame::fire_class(&s);
+            let plan = driver_metal::model::text::plan_for(&self.arch, class, &facts, &metal)
                 .map_err(|why| anyhow!("no text: {why:?}"))?;
-            let lowered = driver_metal_new::model::frame::lower_step(&plan, &s)
+            let lowered = driver_metal::model::frame::lower_step(&plan, &s)
                 .map_err(|why| anyhow!("step did not lower: {why:?}"))?;
 
-            let geometry = driver_metal_new::model::dispatch::Geometry {
+            let geometry = driver_metal::model::dispatch::Geometry {
                 q_heads: facts.q_heads,
                 kv_heads: facts.kv_heads,
                 head_dim: facts.head_dim,
@@ -673,9 +695,9 @@ impl MetalDriver {
                 (pages, offs)
             };
             let req = step.plan.req_of_token();
-            let staged = driver_metal_new::model::tables::stage(
+            let staged = driver_metal::model::tables::stage(
                 &self.context,
-                driver_metal_new::model::tables::Frame {
+                driver_metal::model::tables::Frame {
                     token_ids: &step.plan.token_ids,
                     position_ids: &step.plan.position_ids,
                     req_of_token: &req,
@@ -688,15 +710,23 @@ impl MetalDriver {
                 },
             )
             .map_err(|e| anyhow!("fire tables: {e:?}"))?;
+            // The fire's tables, and the stand-in for an operand that
+            // addresses NOTHING -- `dispatch::bind` answers an unfilled slot
+            // with address zero, which `encode` binds happily and a recorded
+            // command cannot. The tables region serves as that stand-in: it
+            // is real, resident, and no statement writes through a slot it
+            // did not fill.
+            self.regions.add(&staged.region);
+            self.regions.set_null(&staged.region);
             let tables = |which| staged.at(which);
 
-            let names = driver_metal_new::model::resolve::Names::mlx();
+            let names = driver_metal::model::resolve::Names::mlx();
             // The KV pages a statement's state reference resolves through. A
             // closure, because the map is portable and the pool is not.
             let pages = |layer: u16, values: bool| {
                 pool.layer(u32::from(layer)).map(|l| {
                     let h = if values { &l.v } else { &l.k };
-                    driver_metal_new::model::executor::Slice {
+                    driver_metal::model::executor::Slice {
                         address: h.gpu_address(),
                         // THIS layer's, not the pool's: gemma-4's
                         // full-attention layers hold a different page size
@@ -708,7 +738,7 @@ impl MetalDriver {
                 })
             };
             let mut store =
-                driver_metal_new::model::resolve::Store::new(names, &model.tensors, &named)
+                driver_metal::model::resolve::Store::new(names, &model.tensors, &named)
                     .with_kv(&pages)
                     .with_fire(&tables)
                     // The shape the pool was allocated at, which is where the
@@ -716,14 +746,16 @@ impl MetalDriver {
                     // answers zero, and a zero seq stride is every step of the
                     // scan reading the same token.
                     .with_pool(pool.shape());
-            let mut machine = driver_metal_new::model::run::Machine {
+            let mut machine = driver_metal::model::run::Machine {
                 context: &self.context,
                 compiler: &self.compiler,
                 pipelines: &mut self.pipelines,
                 stepper: &mut self.stepper,
                 scratch: &self.scratch,
+                regions: &mut self.regions,
+                recordings: &mut self.recordings,
             };
-            let fire = driver_metal_new::model::run::submit(
+            let fire = driver_metal::model::run::submit(
                 &mut machine,
                 &lowered,
                 geometry,
@@ -774,7 +806,7 @@ impl MetalDriver {
     /// Always. Media encode is unsupported on this backend, as it is on CUDA;
     /// both seams refuse rather than pretending.
     pub fn encode(&mut self, _plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
-        bail!("driver-metal-new: media encode is unsupported on this backend")
+        bail!("driver-metal: media encode is unsupported on this backend")
     }
 
     /// Move KV pages and rows within the pool.
@@ -797,8 +829,8 @@ impl MetalDriver {
         let pool = self
             .pool
             .as_ref()
-            .ok_or_else(|| anyhow!("driver-metal-new: copy_kv before load_model"))?;
-        let caps = driver_metal_new::store::Capabilities {
+            .ok_or_else(|| anyhow!("driver-metal: copy_kv before load_model"))?;
+        let caps = driver_metal::store::Capabilities {
             has_linear_attn: self.has_linear_attn,
             kv_total_pages: pool.pages(),
             rs_slots: 0,
@@ -817,7 +849,7 @@ impl MetalDriver {
         let (Some(grid), Some(page_bytes)) = (pool.shape().grid(), pool.shape().page_bytes())
         else {
             bail!(
-                "driver-metal-new: copy_kv needs one page stride for the pool \
+                "driver-metal: copy_kv needs one page stride for the pool \
                  and this model has two -- its full-attention layers are \
                  {} kv heads x {} against {} x {} on the sliding ones. \
                  Prefix sharing is unavailable on this checkpoint",
@@ -827,7 +859,7 @@ impl MetalDriver {
                 pool.shape().head_dim,
             );
         };
-        let work = driver_metal_new::store::plan_kv_copy(desc, caps, grid)
+        let work = driver_metal::store::plan_kv_copy(desc, caps, grid)
             .map_err(|why| anyhow!("metal copy_kv: {why:?}"))?;
 
         // Whole-page moves first, as page pairs; then the row cells. Both run
@@ -835,14 +867,14 @@ impl MetalDriver {
         // makes true.
         let mut cells = Vec::new();
         for &(src, dst) in &work.pages {
-            cells.push(driver_metal_new::store::CellCopy {
+            cells.push(driver_metal::store::CellCopy {
                 src_off: u64::from(src) * page_bytes,
                 dst_off: u64::from(dst) * page_bytes,
                 bytes: page_bytes,
             });
         }
         if !cells.is_empty() {
-            pool.apply(&driver_metal_new::store::CellMovePlan {
+            pool.apply(&driver_metal::store::CellMovePlan {
                 copies: cells,
                 pages_touched: work.pages_touched,
             })
@@ -912,7 +944,7 @@ impl MetalDriver {
     /// A roster row that names no bound instance — which is a frame the
     /// scheduler built against a registry it did not have.
     fn run_programs(
-        registry: &mut driver_metal_new::pipeline::Registry,
+        registry: &mut driver_metal::pipeline::Registry,
         instance_ids: &[u64],
         step: &crate::driver::submission::StepSubmission,
         logits: Option<&(Vec<f32>, u32, u32)>,
@@ -937,7 +969,7 @@ impl MetalDriver {
             // caller could forget — the interpreter's view is its own rows,
             // so there is no row it could reach that is not its.
             let inputs = match logits {
-                None => driver_metal_new::pipeline::PassInputs::none(),
+                None => driver_metal::pipeline::PassInputs::none(),
                 Some((values, rows, vocab)) => {
                     let (start, end) = member_rows(&step.program_row_indptr, member, *rows);
                     let span = (end - start) as usize * *vocab as usize;
@@ -949,7 +981,7 @@ impl MetalDriver {
                             values.len()
                         ));
                     }
-                    driver_metal_new::pipeline::PassInputs {
+                    driver_metal::pipeline::PassInputs {
                         logits: Some(&values[from..from + span]),
                         rows: end - start,
                         vocab: *vocab,
@@ -958,9 +990,9 @@ impl MetalDriver {
                 }
             };
             match registry.fire(id, &inputs) {
-                Ok(driver_metal_new::pipeline::StepOutcome::Committed)
-                | Ok(driver_metal_new::pipeline::StepOutcome::Blocked(_)) => {}
-                Ok(driver_metal_new::pipeline::StepOutcome::Faulted(why)) => {
+                Ok(driver_metal::pipeline::StepOutcome::Committed)
+                | Ok(driver_metal::pipeline::StepOutcome::Blocked(_)) => {}
+                Ok(driver_metal::pipeline::StepOutcome::Faulted(why)) => {
                     tracing::warn!(instance = id, %why, "metal: program faulted");
                 }
                 Err(e) => return Err(anyhow!("metal program {id}: {e:?}")),
@@ -988,7 +1020,7 @@ impl MetalDriver {
 /// f32. Nothing is lost here, and nothing is gained either — the precision
 /// was lost in the kernel.
 fn read_logits(
-    arena: &driver_metal_new::metal::Handle,
+    arena: &driver_metal::metal::Handle,
     readout: Option<model_compiler::lower::Readout>,
 ) -> Option<(Vec<f32>, u32, u32)> {
     let r = readout?;
@@ -1022,7 +1054,7 @@ fn read_logits(
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
-        driver_metal_new::batch::widen(&halves)
+        driver_metal::batch::widen(&halves)
     };
     Some((values, r.rows, r.vocab))
 }
@@ -1034,7 +1066,7 @@ fn read_logits(
 /// resize would do and `store::kv_move` plans the offsets, both portable and
 /// both tested. What is missing is the encoder that runs the plan, and the
 /// reallocation a resize implies for a pool that is a fixed allocation today.
-const UNSERVED_MOVE: &str = "driver-metal-new: KV copy/resize is not wired to the seam yet. \
+const UNSERVED_MOVE: &str = "driver-metal: KV copy/resize is not wired to the seam yet. \
      The pool exists and `launch` fires against it; `store::control::plan_kv_copy` and \
      `store::kv_move::plan_cell_moves` already decide and plan the movement. What is \
      missing is the encoder that runs the plan.";

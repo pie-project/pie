@@ -107,14 +107,15 @@ impl K3LayerW {
 }
 
 /// kimi_k3's CUDA text for one fire class.
+///
+/// **Both shaped classes, one body.** Like `kimi_k2`, the attention is MLA's
+/// single planned dispatch — `attn::plan_attention_mla_bf16` takes a
+/// `qo_indptr`, so a decode is the case where each request contributes one
+/// query row rather than a different kernel — and the KDA half is a
+/// recurrence over whatever rows the fire brought. Nothing here reads the
+/// class except the trace's name.
 pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
-    let family = format!(
-        "kimi_k3.cuda.{}",
-        match class {
-            FireClass::Decode => "decode",
-            other => panic!("kimi_k3 states no {other:?} class yet"),
-        }
-    );
+    let family = format!("kimi_k3.cuda.{}", class.suffix());
     let a = facts.attn.clone();
     let kd = facts.kda.clone();
     dsl::trace_named(&family, |t| {

@@ -290,6 +290,17 @@ pub static KERNELS: &[KernelSig] = &[
             positions: I32s, out_pos: I32sMut, out_req: I32sMut, out_rope: I32sMut,
             n: I32, ratio: I32, stream: Stream, row_valid: U8s,
         ]),
+    // The prefill form. A SECOND row rather than a wider first one: the decode
+    // launcher is what a CUDA-graph-captured decode calls, and giving it two
+    // more operands would make every capture carry a `qo_indptr` it does not
+    // read. The kernels differ in one line -- the request index -- and the
+    // tables say so by naming both.
+    kernel!(dsv4_boundary_meta_paged "attn::dsv4_boundary_meta_paged",
+        operands = operands![
+            positions: I32s, qo_indptr: U32s,
+            out_pos: I32sMut, out_req: I32sMut, out_rope: I32sMut,
+            n: I32, num_requests: I32, ratio: I32, stream: Stream, row_valid: U8s,
+        ]),
     // Both address through `kv_page_indptr` and the boundary arrays.
     kernel!(dsv4_compress_gather_paged "attn::dsv4_compress_gather_paged_bf16", whole = true,
         operands = operands![
@@ -361,6 +372,11 @@ pub static KERNELS: &[KernelSig] = &[
             stream: Stream, window_left: I32, sm_scale: F32, logits_soft_cap: F32,
             lse_out: F32sMut,
         ]),
+    // UNSOURCED, and `B` is the whole reason: how many blocks the prefix
+    // holds is the BLOCKS operand's row width over the RESULT's -- an
+    // operand-over-operand ratio, where every `*WidthOver` variant
+    // divides by a CONTEXT field. A row that guessed a param would launch
+    // the right kernel over the wrong rectangle.
     kernel!(attn_res_blend "attn::attn_res_blend_bf16",
         operands = operands![
             prefix: Buf, blocks: Buf, norm_weight: Buf, proj_weight: Buf,

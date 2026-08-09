@@ -211,6 +211,23 @@ pub enum FireClass {
     // InvalidArgument.
 }
 
+impl FireClass {
+    /// The suffix a trace's family name carries for this class.
+    ///
+    /// Every family spelled this match itself — nine of them, identically,
+    /// beside a `panic!` arm for whatever they had not written yet — which
+    /// is how seven families came to refuse Prefill by omission rather than
+    /// by decision. One statement, so a family names its class instead of
+    /// re-deciding what the classes are called.
+    #[must_use]
+    pub const fn suffix(self) -> &'static str {
+        match self {
+            Self::Decode => "decode",
+            Self::Prefill => "prefill",
+        }
+    }
+}
+
 // (The short-lived `AttnKernel` enum — rung 1's `Attention.param1` tag —
 // is gone: a lowered trace states its attention kernel the way it states
 // every kernel, as an [`OpKind::Launch`] with the launcher's name. Raw

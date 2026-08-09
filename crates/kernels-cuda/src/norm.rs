@@ -236,13 +236,16 @@ pub static KERNELS: &[KernelSig] = &[
     // refuse.
     kernel!(altup_predict "norm::altup_predict_bf16",
         operands = operands![
-            streams: Buf,
-            coefs: F32s,
-            predictions: BufMut,
-            k: I32,
-            t: I32,
-            h: I32,
-            stream: Stream,
+            streams: Buf <- Source::In(0),
+            coefs: F32s <- Source::In(1),
+            predictions: BufMut <- Source::Out(0),
+            // `[K, tokens, hidden]`: a three-dimensional value has no
+            // single row width, so the stream count rides the ctx and
+            // the hidden extent is the result's width over it.
+            k: I32 <- Source::Ctx("altup_streams"),
+            t: I32 <- Source::Rows,
+            h: I32 <- Source::InWidthOver(0, "altup_streams"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     kernel!(altup_correct "norm::altup_correct_bf16",
         operands = operands![

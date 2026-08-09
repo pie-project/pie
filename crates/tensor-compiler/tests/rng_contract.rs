@@ -258,7 +258,7 @@ fn allowlists() -> Allowlists {
             // NS-3 spatial-split layout key. That module is gone (2026-08-10,
             // `cuda.md` §3.4.1): nothing in the driver called it, so the
             // layout key it transcribed had no caller either.
-            "crates/driver-cuda-new/src/model/lora.rs",
+            "crates/driver-cuda/src/model/lora.rs",
             // boost-style `hash_combine` for the GEMM autotune cache key; the
             // golden-ratio word again, and nothing to do with the PTIR stream.
             // These have moved twice — `driver-cuda/ops/` to `kernels-cuda/ops/`

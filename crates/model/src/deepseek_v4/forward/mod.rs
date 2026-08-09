@@ -82,14 +82,16 @@ impl Dsv4LayerW {
 }
 
 /// deepseek_v4's CUDA text for one fire class.
+///
+/// **Both shaped classes.** The compressed pass needs the block boundaries
+/// this fire's positions imply, and that is a per-TOKEN fact: whether a
+/// position closes a compression window is a fact about the position. What
+/// used to be decode-only was the request index beside it —
+/// `dsv4_boundary_meta_decode` may shortcut it to the token index because a
+/// decode brings one row per request, and a prefill has to read it out of
+/// `qo_indptr`. Two launchers, one statement here.
 pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
-    let family = format!(
-        "deepseek_v4.cuda.{}",
-        match class {
-            FireClass::Decode => "decode",
-            other => panic!("deepseek_v4 states no {other:?} class yet"),
-        }
-    );
+    let family = format!("deepseek_v4.cuda.{}", class.suffix());
     let a = facts.attn.clone();
     let k = facts.hc.mult;
     dsl::trace_named(&family, |t| {
@@ -101,7 +103,7 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
         // positions imply, and they are a FIRE fact — one statement,
         // outside the layer loop, exactly as the hand-written pass has it.
         let (boundary_pos, _meta, _counts) =
-            dsl::cuda::dsv4_boundary_meta_decode(&embedded);
+            dsl::cuda::dsv4_boundary_meta(&embedded, class);
 
         for l in 0..facts.layers {
             let w = Dsv4LayerW::new(l, facts);

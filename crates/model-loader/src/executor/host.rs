@@ -25,7 +25,7 @@ use half::{bf16, f16};
 use std::collections::HashSet;
 
 use crate::error::Error;
-use crate::executor::arena::ArenaBacking;
+use crate::executor::arena::{ArenaBacking, ArenaSpan, TileMapOp};
 use crate::executor::sink::{MemorySink, TensorSink};
 use crate::plan::index::{PlanIndex, instr_by_id};
 use crate::plan::{
@@ -220,14 +220,21 @@ fn run(
     progress: &mut dyn FnMut(Progress<'_>),
     stream: bool,
 ) -> Result<usize, Error> {
-    // The gate is what this executor *implements* — the convert mask — not
-    // `HOST_TILE_MAP_MASK`, which is what a host-lowered plan may *advertise*.
-    // A CUDA plan that carries an `Encode` is executable here too; what stays
-    // refused is anything carrying a transform with no host implementation,
-    // `Repack` being the standing example.
-    if plan.target.tile_map_mask & !CONVERT_TILE_MAP_MASK != 0 {
+    // The gate is what this executor *implements* — the convert mask — WIDENED
+    // by whatever the backing runs itself. A CUDA plan that carries an
+    // `Encode` is executable here too; what stays refused is a transform
+    // neither side has an implementation of, `Repack` being the standing
+    // example when the backing declines it.
+    //
+    // Read once, here, rather than per instruction: a backing whose answer
+    // changed mid-plan would leave half a load on each path, and the caps are
+    // a property of the backing rather than of a moment.
+    let arena_tile_map_caps = arena.tile_map_caps();
+    let caps = CONVERT_TILE_MAP_MASK | arena_tile_map_caps;
+    if plan.target.tile_map_mask & !caps != 0 {
         return Err(invalid(
-            "host executor received a plan advertising unsupported TileMap transforms",
+            "executor received a plan advertising TileMap transforms neither \
+             the host nor the arena backing implements",
         ));
     }
     let files = plan
@@ -280,6 +287,7 @@ fn run(
         max_tile_write_bytes: 0,
         progress,
         read_bytes: 0,
+        arena_tile_map_caps,
     };
     executor.execute()?;
     Ok(executor.max_tile_write_bytes)
@@ -357,6 +365,9 @@ struct HostExecutor<'a, 'p> {
     max_tile_write_bytes: usize,
     progress: &'p mut dyn FnMut(Progress<'_>),
     read_bytes: u64,
+    /// Which [`TileMapKind`]s the arena backing runs itself, read once at
+    /// entry. Zero is host mode and is every backing that says nothing.
+    arena_tile_map_caps: u32,
 }
 
 /// Decode one GGUF `Q4_0` block: one F16 scale, then sixteen packed bytes whose
@@ -621,6 +632,29 @@ impl HostExecutor<'_, '_> {
         let (kind, max_tile_bytes) = (*kind, tile.max_tile_bytes);
         let (source, dest) = (source.as_ref(), dest.as_ref());
         let transform = transform.clone();
+        // THE DEVICE PATH, tried before a byte is staged to the host.
+        //
+        // Only when the backing claimed this kind AND every operand is
+        // already a span of the arena — which is exactly the case that costs
+        // a round trip on the host path, because `buffer_bytes` on an arena
+        // buffer is a device read that synchronizes. An operand the executor
+        // would have had to read from a FILE is not eligible: those bytes are
+        // on the host either way, so transforming them here saves nothing and
+        // the host path is the honest one.
+        //
+        // A backing may still DECLINE the operands it is shown — a kind is a
+        // coarser claim than a kernel — and then everything below runs as it
+        // always did. What it may not do is fail quietly; see
+        // `ArenaBacking::run_tile_map`.
+        if self.arena_tile_map_caps & kind.capability_bit() != 0 {
+            if let Some(op) =
+                self.arena_tile_map_op(kind, source, dest, inputs, outputs, &transform)?
+            {
+                if self.arena.run_tile_map(&op)? {
+                    return Ok(());
+                }
+            }
+        }
         let input = if let Some(source) = source {
             self.read_extent(source)?
         } else {
@@ -724,11 +758,151 @@ impl HostExecutor<'_, '_> {
         Ok(())
     }
 
+    /// The operands of a `TileMap`, as arena spans — or `None` when this one
+    /// is not the device path's business.
+    ///
+    /// `None` is the ordinary answer and is never an error: a transform
+    /// reading a checkpoint extent has its bytes on the host already, and one
+    /// writing an owned buffer has no arena address to write to. Both run on
+    /// the host path exactly as before. Only a transform whose input AND
+    /// every output are resident in the arena is handed over, because that is
+    /// the case the host path pays a round trip for.
+    fn arena_tile_map_op<'t>(
+        &self,
+        kind: TileMapKind,
+        source: Option<&SourceExtent>,
+        dest: Option<&DestExtent>,
+        inputs: &[BufferId],
+        outputs: &[BufferId],
+        transform: &'t TransformSpec,
+    ) -> Result<Option<TileMapOp<'t>>, Error> {
+        // A checkpoint source means host bytes; nothing to delegate.
+        if source.is_some() {
+            return Ok(None);
+        }
+        let Some(&input) = inputs.first() else {
+            return Ok(None);
+        };
+        let Some(src) = self.arena_span(input)? else {
+            return Ok(None);
+        };
+        // `Encode` publishes a payload AND the scales it cannot be read
+        // without — the same `&[payload, scales]` the host path destructures.
+        // Both have to be in the arena or neither is delegable.
+        let dst_scales = if kind == TileMapKind::Encode {
+            match outputs.get(1) {
+                Some(&scales) => match self.arena_span(scales)? {
+                    Some(span) => Some(span),
+                    None => return Ok(None),
+                },
+                // Two outputs is what `Encode` means; one is a plan the host
+                // path rejects with a better message than this one could.
+                None => return Ok(None),
+            }
+        } else {
+            None
+        };
+        // The destination is either an extent naming a buffer, or the first
+        // output buffer whole. Both must land in the arena.
+        let (dst, dst_buffer) = match dest {
+            Some(dest) => {
+                if !dest.stride.has_dense_destination() {
+                    return Ok(None);
+                }
+                let Some(whole) = self.arena_span(dest.buffer)? else {
+                    return Ok(None);
+                };
+                let base = checked_usize(dest.offset)?
+                    .checked_add(checked_usize(dest.stride.base_offset)?)
+                    .ok_or_else(|| invalid("destination offset overflow"))?;
+                let len = extent_bytes(&dest.stride)?;
+                let end = base
+                    .checked_add(len)
+                    .ok_or_else(|| invalid("destination range overflow"))?;
+                if end > whole.len {
+                    return Err(invalid("TileMap destination leaves its buffer"));
+                }
+                let offset = whole
+                    .offset
+                    .checked_add(base)
+                    .ok_or_else(|| invalid("destination offset overflow"))?;
+                (ArenaSpan { offset, len }, dest.buffer)
+            }
+            None => {
+                let Some(&output) = outputs.first() else {
+                    return Ok(None);
+                };
+                let Some(span) = self.arena_span(output)? else {
+                    return Ok(None);
+                };
+                (span, output)
+            }
+        };
+        // A blocked `Scale` reads its factors from a second input; a uniform
+        // one carries them in `scale_factor_bits`. An unfindable factor
+        // operand is not an error here — it is a plan the host path knows how
+        // to run and this one does not.
+        let factors = if transform.scale_blocks.is_empty() {
+            None
+        } else {
+            match inputs.get(1) {
+                Some(&factor_buffer) => match self.arena_span(factor_buffer)? {
+                    Some(span) => Some(span),
+                    None => return Ok(None),
+                },
+                None => return Ok(None),
+            }
+        };
+        Ok(Some(TileMapOp {
+            kind,
+            src,
+            dst,
+            dst_scales,
+            factors,
+            shape: self.buffer_shape_2d(dst_buffer),
+            src_encoding: self.buffer_encoding(input),
+            dst_encoding: self.buffer_encoding(dst_buffer),
+            transform,
+        }))
+    }
+
+    /// Where `id` lives in the arena, or `None` if it is a host-owned buffer.
+    fn arena_span(&self, id: BufferId) -> Result<Option<ArenaSpan>, Error> {
+        let (root, offset, len) = self.resolve(id, 0, usize::MAX)?;
+        Ok(match root {
+            Root::Arena => Some(ArenaSpan { offset, len }),
+            Root::Owned(_) => None,
+        })
+    }
+
+    /// A buffer's tensor's declared shape, when it is 2-D.
+    ///
+    /// The same source `host::encode_bytes` reads — a tensor's declaration,
+    /// not an extent's dims — so a backing and the host path launch over one
+    /// number rather than two that can disagree.
+    fn buffer_shape_2d(&self, id: BufferId) -> Option<(u32, u32)> {
+        let shape = &self.index.buffer_tensor(self.plan, id)?.shape;
+        let &[rows, cols] = shape.as_slice() else {
+            return None;
+        };
+        Some((u32::try_from(rows).ok()?, u32::try_from(cols).ok()?))
+    }
+
+    /// What a buffer's tensor IS.
+    ///
+    /// A buffer with no tensor behind it is scratch, and scratch has no
+    /// declaration — raw bytes is the honest answer for it, and it is the
+    /// answer a backing will decline on if it needed a real one.
+    fn buffer_encoding(&self, id: BufferId) -> Encoding {
+        self.index
+            .buffer_tensor(self.plan, id)
+            .map_or(Encoding::Raw(DType::U8), |tensor| tensor.encoding.clone())
+    }
+
     /// `Scale` multiplies, and what it multiplies by is the only thing that
     /// varies: a constant every element shares, or one factor per group of
     /// elements read from a second operand.
-    ///
-    /// The uniform form keeps the type it was handed — `infer` gives it back
+    ///    /// The uniform form keeps the type it was handed — `infer` gives it back
     /// unchanged — so there is no output dtype to look up. The per-group form
     /// is the one that also *decodes*, because a quantized tensor's elements
     /// are only numbers once their factors are applied; its output dtype is
@@ -1625,8 +1799,7 @@ fn extent_offset(index: &[usize], dims: &[crate::plan::Dim], source: bool) -> Re
         })
 }
 
-fn extent_bytes(extent: &Extent) -> Result<usize, Error> {
-    let elements = extent.dims.iter().try_fold(1usize, |n, dim| {
+fn extent_bytes(extent: &Extent) -> Result<usize, Error> {    let elements = extent.dims.iter().try_fold(1usize, |n, dim| {
         n.checked_mul(checked_usize_i64(dim.count)?)
             .ok_or_else(|| invalid("extent byte count overflow"))
     })?;
@@ -3843,10 +4016,17 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_advertised_transforms() {
+        // The gate is the host's implementation WIDENED by whatever the arena
+        // backing runs itself. `execute_plan` supplies a host arena, which
+        // claims nothing — so the answer here is the host's own set, and a
+        // `Transcode` is outside it either way.
         let (dir, mut plan) = fixture();
         plan.target.tile_map_mask |= crate::plan::TILE_MAP_TRANSCODE;
         let error = execute_plan(&plan, &dir).unwrap_err().to_string();
-        assert!(error.contains("unsupported TileMap transforms"));
+        assert!(
+            error.contains("neither the host nor the arena backing implements"),
+            "{error}"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 }

@@ -135,7 +135,7 @@ jobs:
       - name: cargo build (workspace, all targets)
         run: |
           cargo build --workspace --all-targets \
-            --exclude pie-server-py --exclude driver-cuda-new
+            --exclude pie-server-py --exclude driver-cuda
 
       # Run the workspace test set (benches are compiled above, not executed).
       # worker's library tests are pure-Rust, so run them explicitly here to
@@ -144,7 +144,7 @@ jobs:
       - name: cargo test (workspace + worker lib)
         run: |
           cargo test --workspace \
-            --exclude pie-server-py --exclude worker --exclude driver-cuda-new
+            --exclude pie-server-py --exclude worker --exclude driver-cuda
           cargo test -p worker --lib
 
       # Neither of these needs CUDA -- the audit is Python over the published
@@ -183,7 +183,7 @@ jobs:
       - name: weight-name seam (a trace name a checkpoint can never answer)
         run: cargo test -p model --features forward,contract --test seam_names
 
-      # driver-cuda-new is excluded from the two sweeps above because it has no
+      # driver-cuda is excluded from the two sweeps above because it has no
       # default feature and refuses to build until one of `cuda-12` / `cuda-13`
       # is chosen. That is deliberate: the CUDA runtime API is not ABI-stable
       # across major versions (`cudaGraphAddNode` takes five arguments in
@@ -206,10 +206,10 @@ jobs:
       # from `tests/oracle/launch_abi/stub/`, so it still asks for no toolkit --
       # deliberately, since a proof whose answer depends on which CUDA is
       # installed is not one.
-      - name: cargo test (driver-cuda-new, both CUDA ABIs)
+      - name: cargo test (driver-cuda, both CUDA ABIs)
         run: |
-          cargo test -p driver-cuda-new --features cuda-12
-          cargo test -p driver-cuda-new --features cuda-13
+          cargo test -p driver-cuda --features cuda-12
+          cargo test -p driver-cuda --features cuda-13
 
       # The one test that cannot live beside the driver. It registers a REAL
       # PTIR program through `pie_cuda_register_program` and fires it, which
@@ -222,7 +222,7 @@ jobs:
       # every GPU-touching test here — but it compiles everywhere, which is
       # what this step is for on a runner with no card.
       - name: cargo test (the PTIR program path, through the ABI)
-        run: cargo test -p engine --features driver-cuda-new --test ptir_shell
+        run: cargo test -p engine --features driver-cuda --test ptir_shell
 
   metal-kernel-table:
     name: metal kernel table (shaders vs entrypoints.generated.txt)
@@ -375,13 +375,13 @@ jobs:
 
   # The Metal driver and the seam that joins it to the engine.
   #
-  # `driver-metal-new` is an OPTIONAL feature of `engine`, so a plain
+  # `driver-metal` is an OPTIONAL feature of `engine`, so a plain
   # `cargo test -p engine` builds its seam OUT. That file once went weeks
   # without a compiler reading it and accumulated seven type errors; this job
   # is what catches that on the first push. It was added once and lost in a
   # rebase, which is its own argument for a job rather than a habit.
   driver-metal:
-    name: driver-metal-new (macOS)
+    name: driver-metal (macOS)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
@@ -398,24 +398,24 @@ jobs:
             target
           key: ${{ runner.os }}-driver-metal-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: cargo test (driver-metal-new)
-        run: cargo test -p driver-metal-new
+      - name: cargo test (driver-metal)
+        run: cargo test -p driver-metal
 
       # Type-check AND test: the seam's tests run everything that needs no
       # checkpoint, and the checkpoint-gated ones state that they skipped.
-      - name: cargo test (engine, driver-metal-new seam)
-        run: cargo test -p engine --features driver-metal-new
+      - name: cargo test (engine, driver-metal seam)
+        run: cargo test -p engine --features driver-metal
 
       # The worker feature the release build selects on macOS. `driver-metal`
-      # is `worker`'s name for `engine/driver-metal-new`, and nothing else
+      # is `worker`'s name for `engine/driver-metal`, and nothing else
       # compiles that composition.
       - name: cargo build (worker, driver-metal)
         run: |
           cargo build -p worker \
             --no-default-features --features driver-metal,driver-dummy
 
-      - name: cargo clippy (driver-metal-new)
-        run: cargo clippy --no-deps -p driver-metal-new --all-targets -- -D warnings
+      - name: cargo clippy (driver-metal)
+        run: cargo clippy --no-deps -p driver-metal --all-targets -- -D warnings
 
   pie-worker-cuda:
     name: pie-worker (driver-cuda)

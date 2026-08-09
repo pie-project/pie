@@ -128,13 +128,7 @@ pub fn gpt_oss_cuda(
          kernels only after a host round-trip that decides what to page in"
     );
     let family = format!(
-        "gpt_oss.cuda.{}",
-        match class {
-            FireClass::Decode => "decode",
-            FireClass::Prefill => "prefill",
-            other => panic!("gpt_oss states no {other:?} class yet"),
-        }
-    );
+        "gpt_oss.cuda.{}", class.suffix());
     let hidden = facts.hidden;
     dsl::trace_named(&family, |t| {
         // The entry boundary, where device puts and channel reads attach.

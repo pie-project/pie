@@ -782,6 +782,20 @@ pub enum Source {
     /// its result, the prefill spellings do not — cannot say `Out` and
     /// cannot say `Ctx`.
     ResultOrRegion(u8),
+    /// The `i`-th FOREIGN value the join collected for this statement.
+    ///
+    /// nemotron's mamba block wires values ACROSS statements: the dt/dA
+    /// prep and the scan consume the SPLIT's raw `dt` and the PARAMS
+    /// prep's fp32 tables, none of which their own statements carry. The
+    /// C++ hand pass routed them through its workspace; the Rust join
+    /// collects them per layer into [`LaunchSpec::aux`], and this is how a
+    /// row reaches one.
+    ///
+    /// Its own source rather than a use of [`Source::In`] because these
+    /// are not the statement's operands -- the statement does not mention
+    /// them, and their INDEX is the join's convention rather than the
+    /// trace's.
+    Aux(u8),
     /// The `i`-th result's LEADING extent, resolved for this fire.
     ///
     /// `Rows` for a token-shaped value, a constant for a fixed one, and
@@ -861,6 +875,26 @@ pub enum Source {
     /// Like [`Source::CtxByLayer`], the name is the DRIVER's field and
     /// the generator's claim is only where to look.
     Gdn(&'static str),
+    /// The STATEMENT'S OWN LAYER's entry in a per-layer GDN slab vector —
+    /// the conv window or the recurrent state, as a device address.
+    ///
+    /// Its own source and not a use of [`Source::Gdn`] because the field
+    /// is a `Vec<u64>` and what a kernel wants is ONE of its entries,
+    /// chosen by the layer the statement is tagged with. Nine arms open
+    /// with `slab(&g.conv_state, state_layer()?, "conv")?` for exactly
+    /// that, and the three-way it guards is real: a fire may carry a GDN
+    /// context, and that context may still hold no slab at this layer,
+    /// and an op may state no layer at all. All three decline.
+    GdnSlab(&'static str),
+    /// The statement's weight name plus a SUFFIX, or null.
+    ///
+    /// A conv or a norm whose checkpoint may or may not ship a bias: the
+    /// tensor is `<weight>_bias`, and its absence is a property of the
+    /// CHECKPOINT rather than drift, so null is the answer and not a
+    /// refusal. That is the one thing distinguishing it from
+    /// [`Source::WeightNamed`], whose absence IS drift and which declines
+    /// the branch.
+    WeightSuffix(&'static str),
     /// The `i`-th result's row width DIVIDED by a context field.
     ///
     /// One variant and not two, because "how many head-dims fit in this

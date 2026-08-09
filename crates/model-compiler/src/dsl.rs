@@ -2436,7 +2436,7 @@ pub mod metal {
     /// unconditionally, which is wrong for every checkpoint whose heads are
     /// narrower — `qwen3_0_6b`'s are 128 — and wrong in the way that does not
     /// fault: a 256-wide kernel over 128-wide heads reads past the end of
-    /// every head and answers with whatever is there. `PARITY-BATCH.md`
+    /// every head and answers with whatever is there. `.wiki/driver/progress-metal.md`
     /// records the same defect in the C++ llama walk, where `_d128` was a
     /// literal that strode 64-wide heads past their end.
     ///
@@ -4652,17 +4652,38 @@ pub mod cuda {
     /// Returns `(pos, req, rope)`. A token whose position is not a boundary
     /// gets `pos = -1`, which the gather zero-fills and the store skips --
     /// so the shape is fixed and the graph replays.
-    pub fn dsv4_boundary_meta_decode(positions: &Val) -> (Val, Val, Val) {
+    /// `kernels::attn::dsv4_boundary_meta_{decode,paged}`: which tokens close
+    /// a compression window, CUDA-graph-safely.
+    ///
+    /// Returns `(pos, req, rope)`. A token whose position is not a boundary
+    /// gets `pos = -1`, which the gather zero-fills and the store skips —
+    /// so the shape is fixed and the graph replays.
+    ///
+    /// **Per TOKEN, on both classes.** The outputs used to be stated as
+    /// `Dim::Requests`, which is true only on a pure-decode fire — the doc on
+    /// [`Dim::Tokens`] says the two coincide there — and that spelling was the
+    /// decode assumption leaking out of the kernel and into the shape. Whether
+    /// a position closes a window is a fact about that position, so the extent
+    /// is the fire's token rows and always was.
+    ///
+    /// The class picks the launcher, and they differ in one line: decode may
+    /// shortcut the request index to the token index, and a prefill has to read
+    /// it out of `qo_indptr`.
+    pub fn dsv4_boundary_meta(positions: &Val, class: crate::trace::FireClass) -> (Val, Val, Val) {
+        let kernel = match class {
+            crate::trace::FireClass::Decode => "attn::dsv4_boundary_meta_decode",
+            crate::trace::FireClass::Prefill => "attn::dsv4_boundary_meta_paged",
+        };
         let outs = record_many(
             &positions.t,
             positions.layer,
-            "attn::dsv4_boundary_meta_decode",
+            kernel,
             vec![],
             vec![positions.id],
             vec![
-                (Shape(vec![Dim::Requests]), DType::I32),
-                (Shape(vec![Dim::Requests]), DType::I32),
-                (Shape(vec![Dim::Requests]), DType::I32),
+                (Shape(vec![Dim::Tokens]), DType::I32),
+                (Shape(vec![Dim::Tokens]), DType::I32),
+                (Shape(vec![Dim::Tokens]), DType::I32),
             ],
         );
         let mut it = outs.into_iter();
@@ -4687,7 +4708,7 @@ pub mod cuda {
             }),
             vec![boundary_pos.id],
             Some((
-                Shape(vec![Dim::Requests, Dim::Const(head_dim)]),
+                Shape(vec![Dim::Tokens, Dim::Const(head_dim)]),
                 DType::BF16,
             )),
         )

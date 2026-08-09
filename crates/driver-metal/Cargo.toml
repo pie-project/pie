@@ -1,0 +1,193 @@
+[package]
+name = "driver-metal"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "The Metal execution shell, in Rust: MTL4 device objects, heaps and residency, runtime shader compilation and command encoding. Grows beside driver-metal until it replaces it."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+publish = false
+
+# Deliberately no `links` key. The C++ shell publishes
+# `pie_driver_metal_lib` and the two crates are members of one workspace at
+# the same time -- two packages claiming one `links` value is a resolution
+# error, not a link error, so it would break `cargo metadata` for everyone
+# rather than just for whoever selected this crate.
+[lib]
+name = "driver_metal"
+path = "src/lib.rs"
+
+# NOT `[lints] workspace = true`. That table sets `unsafe_code = "forbid"`,
+# which every objc2 message send violates by construction. The rest of it
+# (`missing_docs`, the clippy ratchets) is worth having and is set in
+# `lib.rs`, where `unsafe_code` can be left out of the list.
+
+[features]
+default = []
+
+# Portable, so it goes in the plain dependency table rather than the Apple one:
+# `facts.rs` reads a descriptor document and needs no GPU to do it.
+[dependencies]
+serde_json = "1.0"
+
+# The pipeline interpreter is pure CPU logic and reuses the launch/IR source of
+# truth rather than re-porting the C++ `pie::driver::launch` mirror:
+# `driver` owns the adopted launch-package types (`LaunchPackage` and its
+# members) and the `PIE_*` ABI constants, and `tensor-ir` owns the op table,
+# dtypes, intrinsic ids and the canonical RNG contract. Both are host-portable,
+# so they belong here in the plain (non-Apple) table.
+driver-api = { path = "../driver-api" }
+tensor-ir = { path = "../tensor-ir" }
+
+# The PTIR channel plane, which used to be `src/pipeline/` here. It moved out
+# when the CUDA shell reached the same layer -- both shells pack the same lane
+# table and read the same launch package, and the C++ answered that by keeping
+# three hand-written copies of one golden model. `src/pipeline.rs` re-exports
+# it, so every call site in `src/metal/` still spells `crate::pipeline::`.
+driver = { path = "../driver" }
+
+# The kernel contract vocabulary: `LaunchRule` (which grid shape a row states)
+# and `sig_in` (how an instantiated point resolves to its row). Tables only --
+# no shader is built by reading one.
+kernels = { path = "../kernels" }
+
+# The load-plan path calls the loader in-process where the C++ went through
+# the C ABI: `model` owns the author registry (the `contract` feature alone --
+# no chat aspect, so no tokenizer or image decoders ride along), and
+# `model-loader` owns the plan compiler and the checkpoint readers. Both are
+# host-portable.
+# The lowering the executor runs: `model_compiler::lower` states a fire as a
+# flat list of launches naming kernel symbols. Host-portable — reading a
+# lowered trace builds no shader.
+model-compiler = { path = "../model-compiler" }
+# The Metal signature table. A real dependency and not a dev one: the executor
+# resolves every symbol the lowering states through `sig_in` AT RUN TIME -- the
+# row is where a kernel's file and launch rule live, so a driver that dispatches
+# by name cannot do it without the table. `default-features = false` keeps it to
+# the table itself, which is host-portable: no shader is built by reading one.
+kernels-metal = { path = "../kernels-metal", default-features = false }
+# `contract` for the load plan's author; `forward` for the TEXTS. The driver
+# needs the texts because selecting one is the driver's job -- it runs the
+# model it loaded -- and `driver-cuda` takes the same two for the same
+# reason. Selecting is not CHOOSING A KERNEL: the text names every symbol, and
+# what the driver does is look up which text the checkpoint it loaded is.
+model = { path = "../model", default-features = false, features = ["contract", "forward"] }
+model-loader = { path = "../model-loader" }
+
+# Apple-only. Everything that names a Metal type lives under `src/metal/` and
+# is gated on this cfg, so the crate still builds -- and its portable half
+# still tests -- on the Linux boxes the rest of the workspace is developed on.
+# That is the point of the split: `shader.rs` and `tuning.rs` are the parts
+# with logic worth testing, and neither needs a GPU to run.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2 = "0.6.2"
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSError",
+    "NSString",
+    "NSArray",
+    # `resolveCounterRange:` answers with an `NSData` of packed ticks.
+    "NSData",
+    "NSObject",
+    "NSRange",
+    "NSURL",
+] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CFBase",
+    "CFNumber",
+    "CFString",
+    "CFDictionary",
+] }
+# `objc2-io-kit` publishes exactly one feature (`AppleUSBDefinitions`) and the
+# registry API is not behind it. `libc` comes with it for `mach_port_t` and
+# `kern_return_t`, which its signatures are written in.
+objc2-io-kit = { version = "0.3.2", default-features = false, features = [
+    # `kIOMainPortDefault` is behind the `libc` feature -- the registry
+    # signatures are written in `libc::mach_port_t`, so the port constant
+    # only exists when that dependency does.
+    "libc",
+] }
+libc = "0.2"
+# The commit-feedback handler is an Objective-C block. `block2` is the only
+# way to hand Metal one, and `objc2-metal`'s own `block2` feature is what
+# exposes `addFeedbackHandler:` at all.
+block2 = "0.6"
+
+# Feature-gated per header, so the list IS the API surface this shell uses.
+# Adding a Metal type means adding its feature here; that is the intended
+# friction, and it is why the list is not `features = ["all"]`.
+[target.'cfg(target_vendor = "apple")'.dependencies.objc2-metal]
+version = "0.3.2"
+default-features = false
+features = [
+    "std",
+    # `addFeedbackHandler:` takes a block, and the method does not exist
+    # without this.
+    "block2",
+    # `MTL4CommitFeedback`'s two timestamps are `CFTimeInterval`, so they do
+    # not exist without this.
+    "objc2-core-foundation",
+    # core device + resources
+    "MTLDevice",
+    "MTLResource",
+    "MTLAllocation",
+    "MTLBuffer",
+    "MTLHeap",
+    "MTLResidencySet",
+    # Indirect command buffers: a fire RECORDED once and replayed, rather than
+    # re-encoded every step. `.wiki/driver/graph-metal.md` measures what that
+    # is worth here -- host encode is 47.5% of a prefill and 76.4% of a decode
+    # -- and corrects this tree's older claim that Metal has no such API.
+    "MTLIndirectCommandBuffer",
+    "MTLIndirectCommandEncoder",
+    "MTLEvent",
+    "MTLLibrary",
+    "MTLComputePipeline",
+    "MTLTypes",
+    "MTLPixelFormat",
+    "MTLCounters",
+    "MTLArgument",
+    "MTLCommandBuffer",
+    # `MTLStages` and the encoder barrier live here; the MTL4 encoder's barrier
+    # methods are gated on it even though nothing else in this driver is.
+    "MTLCommandEncoder",
+    # `MTLSparseTextureMappingMode` and, transitively, the MTL4 queue's
+    # sparse-remap operation struct. Named for a texture encoder this driver
+    # never uses; the enum is what elastic buffers need.
+    "MTLResourceStateCommandEncoder",
+    # the Metal 4 stack this driver is written against
+    "MTL4CommandQueue",
+    "MTL4CommandBuffer",
+    "MTL4CommandAllocator",
+    "MTL4CommandEncoder",
+    "MTL4ComputeCommandEncoder",
+    "MTL4ComputePipeline",
+    "MTL4ArgumentTable",
+    "MTL4Compiler",
+    "MTL4CompilerTask",
+    "MTL4LibraryDescriptor",
+    "MTL4FunctionDescriptor",
+    "MTL4LibraryFunctionDescriptor",
+    "MTL4PipelineState",
+    "MTL4Counters",
+    "MTL4CommitFeedback",
+    "MTL4Archive",
+    "MTL4PipelineDataSetSerializer",
+]
+
+[dev-dependencies]
+tempfile = "3"
+
+
+
+# Tests only. The driver deliberately does not depend on the compiler at build
+# time -- see the `identity::Versions` comment -- but `pipeline::status` mirrors
+# the compiler's fault-code table, and a hand-copied table that nothing checks
+# drifts. The dev-dependency makes the mirror a test rather than a promise.
+tensor-compiler = { path = "../tensor-compiler" }
+
+# Tests only. The binder is proved against a REAL lowering, and the texts live
+# behind `model`'s `forward` feature -- which the driver itself does not need,
+# so it is enabled here rather than in the dependency table above.
+model = { path = "../model", default-features = false, features = ["contract", "forward"] }

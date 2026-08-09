@@ -125,13 +125,7 @@ pub fn gemma4_cuda(
     class: FireClass,
 ) -> ForwardPlan {
     let family = format!(
-        "gemma4.cuda.{}",
-        match class {
-            FireClass::Decode => "decode",
-            FireClass::Prefill => "prefill",
-            other => panic!("gemma4 states no {other:?} class yet"),
-        }
-    );
+        "gemma4.cuda.{}", class.suffix());
     let hidden = facts.hidden;
     dsl::trace_named(&family, |t| {
         // The entry boundary. A `Put` attachment lands device embeds or

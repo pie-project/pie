@@ -5,7 +5,7 @@
 //! — and that the half that does not refuses **by name** rather than by
 //! absence, panic, or a plausible wrong answer.
 
-#![cfg(all(feature = "driver-metal-new", target_vendor = "apple"))]
+#![cfg(all(feature = "driver-metal", target_vendor = "apple"))]
 
 use engine::driver::DriverBackend;
 
@@ -44,7 +44,7 @@ fn the_verbs_that_need_the_kv_pool_refuse_by_name() {
         Ok(_) => panic!("a copy before a load has no pool to move within"),
     };
     assert!(
-        text.contains("driver-metal-new"),
+        text.contains("driver-metal"),
         "a refusal must name the backend that made it: {text}"
     );
     assert!(
@@ -262,7 +262,7 @@ fn package() -> ::driver_api::plan::LaunchPackage {
 /// nothing taken out: a checkpoint loads through `load_model`, a frame goes in
 /// through `launch`, and a command buffer retires.
 ///
-/// `driver-metal-new`'s own `device_real_weights` holds both fire classes to
+/// `driver-metal`'s own `device_real_weights` holds both fire classes to
 /// MLX token-for-token, but it stages the fire's tables itself. This is the
 /// path an ENGINE takes, and the distance between the two was two tables and
 /// two numbers until `model::tables` made it one place. A test that only ever

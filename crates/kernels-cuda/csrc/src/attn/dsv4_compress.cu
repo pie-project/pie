@@ -559,8 +559,52 @@ __global__ void dsv4_boundary_meta_decode_kernel(
     out_rope[t] = is_boundary ? (p / ratio) * ratio : 0;
 }
 
-__global__ void dsv4_compress_gather_paged_kernel(
-    const __nv_bfloat16* __restrict__ state_kv,
+// The same metadata for a fire that brings MANY rows per request.
+//
+// Everything here is per TOKEN and identical to the decode form: whether a
+// position closes a compression window is a fact about that position, and so
+// is the rope base of the window it closes. One line differs, and it is the
+// one the decode kernel could shortcut — `out_req[t] = t` holds only when
+// each request contributes exactly one row.
+//
+// The request a token belongs to is the CSR row its index falls in, which is
+// what `qo_indptr` states: request `r` owns `[qo_indptr[r], qo_indptr[r+1])`.
+// Binary search rather than a linear scan because a prefill fire can carry
+// hundreds of requests and every token pays this.
+__global__ void dsv4_boundary_meta_paged_kernel(
+    const std::int32_t* __restrict__ positions,
+    const std::uint32_t* __restrict__ qo_indptr,
+    std::int32_t* __restrict__ out_pos,
+    std::int32_t* __restrict__ out_req,
+    std::int32_t* __restrict__ out_rope,
+    int n,
+    int num_requests,
+    int ratio,
+    const std::uint8_t* __restrict__ row_valid) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n) return;
+    const int p = positions[t];
+    const bool valid = (row_valid == nullptr) || (row_valid[t] != 0);
+    const bool is_boundary = valid && (((p + 1) % ratio) == 0);
+    out_pos[t] = is_boundary ? p : -1;
+    // The last `r` with `qo_indptr[r] <= t`. `qo_indptr` is non-decreasing and
+    // has `num_requests + 1` entries, so this lands in `[0, num_requests)` for
+    // every `t < qo_indptr[num_requests]`.
+    int lo = 0;
+    int hi = num_requests;
+    while (lo + 1 < hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if (static_cast<int>(qo_indptr[mid]) <= t) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    out_req[t] = lo;
+    out_rope[t] = is_boundary ? (p / ratio) * ratio : 0;
+}
+
+__global__ void dsv4_compress_gather_paged_kernel(    const __nv_bfloat16* __restrict__ state_kv,
     const __nv_bfloat16* __restrict__ state_score,
     const float* __restrict__ ape,
     const std::int32_t* __restrict__ boundary_pos,
@@ -797,6 +841,26 @@ void dsv4_boundary_meta_decode(
     const int blocks = (n + threads - 1) / threads;
     dsv4_boundary_meta_decode_kernel<<<blocks, threads, 0, stream>>>(
         positions, out_pos, out_req, out_rope, n, ratio, row_valid);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void dsv4_boundary_meta_paged(
+    const std::int32_t* positions,
+    const std::uint32_t* qo_indptr,
+    std::int32_t* out_pos,
+    std::int32_t* out_req,
+    std::int32_t* out_rope,
+    int n,
+    int num_requests,
+    int ratio,
+    cudaStream_t stream,
+    const std::uint8_t* row_valid) {
+    if (n <= 0 || ratio <= 0) return;
+    const int threads = 128;
+    const int blocks = (n + threads - 1) / threads;
+    dsv4_boundary_meta_paged_kernel<<<blocks, threads, 0, stream>>>(
+        positions, qo_indptr, out_pos, out_req, out_rope, n, num_requests, ratio,
+        row_valid);
     CUDA_CHECK(cudaGetLastError());
 }
 

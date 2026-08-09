@@ -118,12 +118,16 @@ pub static KERNELS: &[KernelSig] = &[
             stream: Stream <- Source::Ctx("stream"),
         ]),
     kernel!(gaussian_topk "mlp::gaussian_topk_bf16",
+        in_place = &[(0, 0)],
         operands = operands![
-            x: BufMut,
-            n: I32,
-            dim: I32,
-            std_multiplier: F32,
-            stream: Stream,
+            x: BufMut <- Source::Out(0),
+            n: I32 <- Source::Rows,
+            dim: I32 <- Source::OutWidth(0),
+            // Per-layer, and the driver's own derivation: the config
+            // states `activation_sparsity` and the kernel wants
+            // `gaussian_inverse_cdf` of it.
+            std_multiplier: F32 <- Source::CtxByLayer("altup_std_mult"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // GeGLU-tanh is not a swiglu variant: `gelu_pytorch_tanh` on the
     // gate is a different function. The packed/pair split is the same

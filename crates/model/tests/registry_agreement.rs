@@ -12,8 +12,8 @@
 //! answer is now compared against these rows directly, in the crate that owns
 //! it and can depend on both:
 //!
-//! * `driver-cuda-new/tests/facts_registry.rs` — `FACTS_ROWS` vs `HF_ROWS`.
-//! * `driver-metal-new/tests/family_registry.rs` — `ModelFamily` vs `MLX_ROWS`.
+//! * `driver-cuda/tests/facts_registry.rs` — `FACTS_ROWS` vs `HF_ROWS`.
+//! * `driver-metal/tests/family_registry.rs` — `ModelFamily` vs `MLX_ROWS`.
 //!
 //! Both are strictly stronger than the greps they replace: a `match` arm is
 //! not a literal list, and a table that stopped being greppable used to fail

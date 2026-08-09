@@ -136,13 +136,7 @@ pub fn gemma3n_cuda(facts: &Gemma3nFacts, class: FireClass) -> ForwardPlan {
     // class-dependent sites in this text number exactly one, the
     // attention op, which `dsl::cuda::attention_for` now holds.
     let family = format!(
-        "gemma3n.cuda.{}",
-        match class {
-            FireClass::Decode => "decode",
-            FireClass::Prefill => "prefill",
-            other => panic!("gemma3n states no {other:?} class yet"),
-        }
-    );
+        "gemma3n.cuda.{}", class.suffix());
     let k = facts.altup.num_streams;
     let active = facts.altup.active;
     dsl::trace_named(&family, |t| {

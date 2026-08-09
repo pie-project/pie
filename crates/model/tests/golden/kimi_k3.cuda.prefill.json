@@ -1,0 +1,6426 @@
+{
+  "family": "kimi_k3.cuda.prefill",
+  "values": [
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Requests",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 5632
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 5632
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 5632
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Requests",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "I32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Requests",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "I32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 768
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 768
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 320
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 256
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 256
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 256
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "I32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Requests",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "I32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Requests",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "I32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Requests",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "I32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 768
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 768
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 320
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 256
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 256
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 256
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "I32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Requests",
+        {
+          "Const": 163840
+        }
+      ],
+      "dtype": "F32"
+    }
+  ],
+  "ops": [
+    {
+      "kind": {
+        "Embed": {
+          "weight": "embed"
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        0
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.0.attn_norm"
+          ]
+        }
+      },
+      "inputs": [
+        0
+      ],
+      "outputs": [
+        1
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.kda_q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        1
+      ],
+      "outputs": [
+        2
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.kda_k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        1
+      ],
+      "outputs": [
+        3
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.kda_v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        1
+      ],
+      "outputs": [
+        4
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::causal_conv1d_update_batched_bf16",
+          "weights": [
+            "layer.0.kda_q_conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 0
+          }
+        }
+      },
+      "inputs": [
+        2
+      ],
+      "outputs": [
+        5
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::causal_conv1d_update_batched_bf16",
+          "weights": [
+            "layer.0.kda_k_conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 0
+          }
+        }
+      },
+      "inputs": [
+        3
+      ],
+      "outputs": [
+        6
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::causal_conv1d_update_batched_bf16",
+          "weights": [
+            "layer.0.kda_v_conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 0
+          }
+        }
+      },
+      "inputs": [
+        4
+      ],
+      "outputs": [
+        7
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.kda_f_a_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        1
+      ],
+      "outputs": [
+        8
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.kda_f_b_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        8
+      ],
+      "outputs": [
+        9
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.kda_b_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        1
+      ],
+      "outputs": [
+        10
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::kda_gate_beta_bf16",
+          "weights": [
+            "layer.0.kda_a_log",
+            "layer.0.kda_dt_bias"
+          ],
+          "params": [
+            128
+          ]
+        }
+      },
+      "inputs": [
+        9,
+        10
+      ],
+      "outputs": [
+        11,
+        12
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::l2norm_scale_bf16_to_fp32"
+        }
+      },
+      "inputs": [
+        5
+      ],
+      "outputs": [
+        13
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::l2norm_scale_bf16_to_fp32"
+        }
+      },
+      "inputs": [
+        6
+      ],
+      "outputs": [
+        14
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::bf16_to_fp32"
+        }
+      },
+      "inputs": [
+        7
+      ],
+      "outputs": [
+        15
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::kda_recurrent_step_batched",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 0
+          }
+        }
+      },
+      "inputs": [
+        13,
+        14,
+        15,
+        11,
+        12
+      ],
+      "outputs": [
+        16
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.kda_g_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        1
+      ],
+      "outputs": [
+        17
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::kda_o_norm_gated_bf16",
+          "weights": [
+            "layer.0.kda_o_norm"
+          ],
+          "params": [
+            16,
+            128
+          ]
+        }
+      },
+      "inputs": [
+        16,
+        17
+      ],
+      "outputs": [
+        18
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 0
+        }
+      },
+      "inputs": [
+        18
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.kda_o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        18,
+        0
+      ],
+      "outputs": [
+        19
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.0.mlp_norm"
+          ]
+        }
+      },
+      "inputs": [
+        19
+      ],
+      "outputs": [
+        20
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.dense_gate_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        20
+      ],
+      "outputs": [
+        21
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.dense_up_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        20
+      ],
+      "outputs": [
+        22
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::situ_bf16"
+        }
+      },
+      "inputs": [
+        21
+      ],
+      "outputs": [
+        23
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.dense_down_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        23,
+        19
+      ],
+      "outputs": [
+        24
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.1.attn_norm"
+          ]
+        }
+      },
+      "inputs": [
+        24
+      ],
+      "outputs": [
+        25
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.kda_q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        25
+      ],
+      "outputs": [
+        26
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.kda_k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        25
+      ],
+      "outputs": [
+        27
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.kda_v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        25
+      ],
+      "outputs": [
+        28
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::causal_conv1d_update_batched_bf16",
+          "weights": [
+            "layer.1.kda_q_conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 1
+          }
+        }
+      },
+      "inputs": [
+        26
+      ],
+      "outputs": [
+        29
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::causal_conv1d_update_batched_bf16",
+          "weights": [
+            "layer.1.kda_k_conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 1
+          }
+        }
+      },
+      "inputs": [
+        27
+      ],
+      "outputs": [
+        30
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::causal_conv1d_update_batched_bf16",
+          "weights": [
+            "layer.1.kda_v_conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 1
+          }
+        }
+      },
+      "inputs": [
+        28
+      ],
+      "outputs": [
+        31
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.kda_f_a_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        25
+      ],
+      "outputs": [
+        32
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.kda_f_b_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        32
+      ],
+      "outputs": [
+        33
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.kda_b_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        25
+      ],
+      "outputs": [
+        34
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::kda_gate_beta_bf16",
+          "weights": [
+            "layer.1.kda_a_log",
+            "layer.1.kda_dt_bias"
+          ],
+          "params": [
+            128
+          ]
+        }
+      },
+      "inputs": [
+        33,
+        34
+      ],
+      "outputs": [
+        35,
+        36
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::l2norm_scale_bf16_to_fp32"
+        }
+      },
+      "inputs": [
+        29
+      ],
+      "outputs": [
+        37
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::l2norm_scale_bf16_to_fp32"
+        }
+      },
+      "inputs": [
+        30
+      ],
+      "outputs": [
+        38
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::bf16_to_fp32"
+        }
+      },
+      "inputs": [
+        31
+      ],
+      "outputs": [
+        39
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::kda_recurrent_step_batched",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 1
+          }
+        }
+      },
+      "inputs": [
+        37,
+        38,
+        39,
+        35,
+        36
+      ],
+      "outputs": [
+        40
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.kda_g_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        25
+      ],
+      "outputs": [
+        41
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::kda_o_norm_gated_bf16",
+          "weights": [
+            "layer.1.kda_o_norm"
+          ],
+          "params": [
+            16,
+            128
+          ]
+        }
+      },
+      "inputs": [
+        40,
+        41
+      ],
+      "outputs": [
+        42
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 1
+        }
+      },
+      "inputs": [
+        42
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.kda_o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        42,
+        24
+      ],
+      "outputs": [
+        43
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.1.mlp_norm"
+          ]
+        }
+      },
+      "inputs": [
+        43
+      ],
+      "outputs": [
+        44
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.router",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        44
+      ],
+      "outputs": [
+        45
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::topk_sigmoid_bf16"
+        }
+      },
+      "inputs": [
+        45
+      ],
+      "outputs": [
+        46,
+        47
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
+          "weights": [
+            "layer.1.expert.{e}.gate_up"
+          ]
+        }
+      },
+      "inputs": [
+        46,
+        44
+      ],
+      "outputs": [
+        48,
+        49
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::chunked_situ_bf16"
+        }
+      },
+      "inputs": [
+        48
+      ],
+      "outputs": [
+        50
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
+          "weights": [
+            "layer.1.expert.{e}.down"
+          ]
+        }
+      },
+      "inputs": [
+        46,
+        50
+      ],
+      "outputs": [
+        51
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::token_batched_weighted_sum_bf16"
+        }
+      },
+      "inputs": [
+        51,
+        47
+      ],
+      "outputs": [
+        52
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.shared_expert.gate",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        44
+      ],
+      "outputs": [
+        53
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.shared_expert.up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        44
+      ],
+      "outputs": [
+        54
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::situ_bf16"
+        }
+      },
+      "inputs": [
+        53
+      ],
+      "outputs": [
+        55
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.shared_expert.down",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        55
+      ],
+      "outputs": [
+        56
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        52,
+        56
+      ],
+      "outputs": [
+        57
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        43,
+        57
+      ],
+      "outputs": [
+        58
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.2.attn_norm"
+          ]
+        }
+      },
+      "inputs": [
+        58
+      ],
+      "outputs": [
+        59
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.kda_q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        59
+      ],
+      "outputs": [
+        60
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.kda_k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        59
+      ],
+      "outputs": [
+        61
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.kda_v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        59
+      ],
+      "outputs": [
+        62
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::causal_conv1d_update_batched_bf16",
+          "weights": [
+            "layer.2.kda_q_conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 2
+          }
+        }
+      },
+      "inputs": [
+        60
+      ],
+      "outputs": [
+        63
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::causal_conv1d_update_batched_bf16",
+          "weights": [
+            "layer.2.kda_k_conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 2
+          }
+        }
+      },
+      "inputs": [
+        61
+      ],
+      "outputs": [
+        64
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::causal_conv1d_update_batched_bf16",
+          "weights": [
+            "layer.2.kda_v_conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 2
+          }
+        }
+      },
+      "inputs": [
+        62
+      ],
+      "outputs": [
+        65
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.kda_f_a_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        59
+      ],
+      "outputs": [
+        66
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.kda_f_b_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        66
+      ],
+      "outputs": [
+        67
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.kda_b_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        59
+      ],
+      "outputs": [
+        68
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::kda_gate_beta_bf16",
+          "weights": [
+            "layer.2.kda_a_log",
+            "layer.2.kda_dt_bias"
+          ],
+          "params": [
+            128
+          ]
+        }
+      },
+      "inputs": [
+        67,
+        68
+      ],
+      "outputs": [
+        69,
+        70
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::l2norm_scale_bf16_to_fp32"
+        }
+      },
+      "inputs": [
+        63
+      ],
+      "outputs": [
+        71
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::l2norm_scale_bf16_to_fp32"
+        }
+      },
+      "inputs": [
+        64
+      ],
+      "outputs": [
+        72
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::bf16_to_fp32"
+        }
+      },
+      "inputs": [
+        65
+      ],
+      "outputs": [
+        73
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::kda_recurrent_step_batched",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 2
+          }
+        }
+      },
+      "inputs": [
+        71,
+        72,
+        73,
+        69,
+        70
+      ],
+      "outputs": [
+        74
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.kda_g_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        59
+      ],
+      "outputs": [
+        75
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::kda_o_norm_gated_bf16",
+          "weights": [
+            "layer.2.kda_o_norm"
+          ],
+          "params": [
+            16,
+            128
+          ]
+        }
+      },
+      "inputs": [
+        74,
+        75
+      ],
+      "outputs": [
+        76
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 2
+        }
+      },
+      "inputs": [
+        76
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.kda_o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        76,
+        58
+      ],
+      "outputs": [
+        77
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.2.mlp_norm"
+          ]
+        }
+      },
+      "inputs": [
+        77
+      ],
+      "outputs": [
+        78
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.router",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        78
+      ],
+      "outputs": [
+        79
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::topk_sigmoid_bf16"
+        }
+      },
+      "inputs": [
+        79
+      ],
+      "outputs": [
+        80,
+        81
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
+          "weights": [
+            "layer.2.expert.{e}.gate_up"
+          ]
+        }
+      },
+      "inputs": [
+        80,
+        78
+      ],
+      "outputs": [
+        82,
+        83
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::chunked_situ_bf16"
+        }
+      },
+      "inputs": [
+        82
+      ],
+      "outputs": [
+        84
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
+          "weights": [
+            "layer.2.expert.{e}.down"
+          ]
+        }
+      },
+      "inputs": [
+        80,
+        84
+      ],
+      "outputs": [
+        85
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::token_batched_weighted_sum_bf16"
+        }
+      },
+      "inputs": [
+        85,
+        81
+      ],
+      "outputs": [
+        86
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.shared_expert.gate",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        78
+      ],
+      "outputs": [
+        87
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.shared_expert.up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        78
+      ],
+      "outputs": [
+        88
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::situ_bf16"
+        }
+      },
+      "inputs": [
+        87
+      ],
+      "outputs": [
+        89
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.shared_expert.down",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        89
+      ],
+      "outputs": [
+        90
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        86,
+        90
+      ],
+      "outputs": [
+        91
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        77,
+        91
+      ],
+      "outputs": [
+        92
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.3.attn_norm"
+          ]
+        }
+      },
+      "inputs": [
+        92
+      ],
+      "outputs": [
+        93
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.q_a_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        93
+      ],
+      "outputs": [
+        94
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.3.q_a_norm"
+          ]
+        }
+      },
+      "inputs": [
+        94
+      ],
+      "outputs": [
+        95
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.kv_a_proj_with_mqa",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        93
+      ],
+      "outputs": [
+        96
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.q_b_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        95
+      ],
+      "outputs": [
+        97
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::kimi_split_kv_a_norm_bf16",
+          "weights": [
+            "layer.3.kv_a_norm"
+          ]
+        }
+      },
+      "inputs": [
+        96
+      ],
+      "outputs": [
+        98,
+        99
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::kimi_split_q_b_bf16",
+          "params": [
+            16,
+            128,
+            64
+          ]
+        }
+      },
+      "inputs": [
+        97
+      ],
+      "outputs": [
+        100,
+        101
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::write_mla_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 3
+          }
+        }
+      },
+      "inputs": [
+        98,
+        99
+      ],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "gemm::mla_absorb_q_to_latent_bf16",
+          "weights": [
+            "layer.3.kv_b_proj"
+          ],
+          "params": [
+            16,
+            128,
+            128,
+            256
+          ]
+        }
+      },
+      "inputs": [
+        100
+      ],
+      "outputs": [
+        102
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_mla_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 3
+          }
+        }
+      },
+      "inputs": [
+        102,
+        101
+      ],
+      "outputs": [
+        103
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "gemm::mla_absorb_latent_to_v_bf16",
+          "weights": [
+            "layer.3.kv_b_proj"
+          ],
+          "params": [
+            16,
+            128,
+            128,
+            256
+          ]
+        }
+      },
+      "inputs": [
+        103
+      ],
+      "outputs": [
+        104
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 3
+        }
+      },
+      "inputs": [
+        104
+      ],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        104,
+        92
+      ],
+      "outputs": [
+        105
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.3.mlp_norm"
+          ]
+        }
+      },
+      "inputs": [
+        105
+      ],
+      "outputs": [
+        106
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.router",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        106
+      ],
+      "outputs": [
+        107
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::topk_sigmoid_bf16"
+        }
+      },
+      "inputs": [
+        107
+      ],
+      "outputs": [
+        108,
+        109
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
+          "weights": [
+            "layer.3.expert.{e}.gate_up"
+          ]
+        }
+      },
+      "inputs": [
+        108,
+        106
+      ],
+      "outputs": [
+        110,
+        111
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::chunked_situ_bf16"
+        }
+      },
+      "inputs": [
+        110
+      ],
+      "outputs": [
+        112
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
+          "weights": [
+            "layer.3.expert.{e}.down"
+          ]
+        }
+      },
+      "inputs": [
+        108,
+        112
+      ],
+      "outputs": [
+        113
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::token_batched_weighted_sum_bf16"
+        }
+      },
+      "inputs": [
+        113,
+        109
+      ],
+      "outputs": [
+        114
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.shared_expert.gate",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        106
+      ],
+      "outputs": [
+        115
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.shared_expert.up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        106
+      ],
+      "outputs": [
+        116
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::situ_bf16"
+        }
+      },
+      "inputs": [
+        115
+      ],
+      "outputs": [
+        117
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.shared_expert.down",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        117
+      ],
+      "outputs": [
+        118
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        114,
+        118
+      ],
+      "outputs": [
+        119
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        105,
+        119
+      ],
+      "outputs": [
+        120
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::attn_res_blend_bf16",
+          "weights": [
+            "layer.4.attn_res_norm",
+            "layer.4.attn_res_proj"
+          ]
+        }
+      },
+      "inputs": [
+        120,
+        120
+      ],
+      "outputs": [
+        121
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.4.attn_norm"
+          ]
+        }
+      },
+      "inputs": [
+        121
+      ],
+      "outputs": [
+        122
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.kda_q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        122
+      ],
+      "outputs": [
+        123
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.kda_k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        122
+      ],
+      "outputs": [
+        124
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.kda_v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        122
+      ],
+      "outputs": [
+        125
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::causal_conv1d_update_batched_bf16",
+          "weights": [
+            "layer.4.kda_q_conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 4
+          }
+        }
+      },
+      "inputs": [
+        123
+      ],
+      "outputs": [
+        126
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::causal_conv1d_update_batched_bf16",
+          "weights": [
+            "layer.4.kda_k_conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 4
+          }
+        }
+      },
+      "inputs": [
+        124
+      ],
+      "outputs": [
+        127
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::causal_conv1d_update_batched_bf16",
+          "weights": [
+            "layer.4.kda_v_conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 4
+          }
+        }
+      },
+      "inputs": [
+        125
+      ],
+      "outputs": [
+        128
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.kda_f_a_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        122
+      ],
+      "outputs": [
+        129
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.kda_f_b_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        129
+      ],
+      "outputs": [
+        130
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.kda_b_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        122
+      ],
+      "outputs": [
+        131
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::kda_gate_beta_bf16",
+          "weights": [
+            "layer.4.kda_a_log",
+            "layer.4.kda_dt_bias"
+          ],
+          "params": [
+            128
+          ]
+        }
+      },
+      "inputs": [
+        130,
+        131
+      ],
+      "outputs": [
+        132,
+        133
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::l2norm_scale_bf16_to_fp32"
+        }
+      },
+      "inputs": [
+        126
+      ],
+      "outputs": [
+        134
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::l2norm_scale_bf16_to_fp32"
+        }
+      },
+      "inputs": [
+        127
+      ],
+      "outputs": [
+        135
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::bf16_to_fp32"
+        }
+      },
+      "inputs": [
+        128
+      ],
+      "outputs": [
+        136
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::kda_recurrent_step_batched",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 4
+          }
+        }
+      },
+      "inputs": [
+        134,
+        135,
+        136,
+        132,
+        133
+      ],
+      "outputs": [
+        137
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.kda_g_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        122
+      ],
+      "outputs": [
+        138
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::kda_o_norm_gated_bf16",
+          "weights": [
+            "layer.4.kda_o_norm"
+          ],
+          "params": [
+            16,
+            128
+          ]
+        }
+      },
+      "inputs": [
+        137,
+        138
+      ],
+      "outputs": [
+        139
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 4
+        }
+      },
+      "inputs": [
+        139
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.kda_o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        139,
+        121
+      ],
+      "outputs": [
+        140
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.4.mlp_norm"
+          ]
+        }
+      },
+      "inputs": [
+        140
+      ],
+      "outputs": [
+        141
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.router",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        141
+      ],
+      "outputs": [
+        142
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::topk_sigmoid_bf16"
+        }
+      },
+      "inputs": [
+        142
+      ],
+      "outputs": [
+        143,
+        144
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
+          "weights": [
+            "layer.4.expert.{e}.gate_up"
+          ]
+        }
+      },
+      "inputs": [
+        143,
+        141
+      ],
+      "outputs": [
+        145,
+        146
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::chunked_situ_bf16"
+        }
+      },
+      "inputs": [
+        145
+      ],
+      "outputs": [
+        147
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
+          "weights": [
+            "layer.4.expert.{e}.down"
+          ]
+        }
+      },
+      "inputs": [
+        143,
+        147
+      ],
+      "outputs": [
+        148
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::token_batched_weighted_sum_bf16"
+        }
+      },
+      "inputs": [
+        148,
+        144
+      ],
+      "outputs": [
+        149
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.shared_expert.gate",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        141
+      ],
+      "outputs": [
+        150
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.shared_expert.up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        141
+      ],
+      "outputs": [
+        151
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::situ_bf16"
+        }
+      },
+      "inputs": [
+        150
+      ],
+      "outputs": [
+        152
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.shared_expert.down",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        152
+      ],
+      "outputs": [
+        153
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        149,
+        153
+      ],
+      "outputs": [
+        154
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        140,
+        154
+      ],
+      "outputs": [
+        155
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.5.attn_norm"
+          ]
+        }
+      },
+      "inputs": [
+        155
+      ],
+      "outputs": [
+        156
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.kda_q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        156
+      ],
+      "outputs": [
+        157
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.kda_k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        156
+      ],
+      "outputs": [
+        158
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.kda_v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        156
+      ],
+      "outputs": [
+        159
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::causal_conv1d_update_batched_bf16",
+          "weights": [
+            "layer.5.kda_q_conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 5
+          }
+        }
+      },
+      "inputs": [
+        157
+      ],
+      "outputs": [
+        160
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::causal_conv1d_update_batched_bf16",
+          "weights": [
+            "layer.5.kda_k_conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 5
+          }
+        }
+      },
+      "inputs": [
+        158
+      ],
+      "outputs": [
+        161
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::causal_conv1d_update_batched_bf16",
+          "weights": [
+            "layer.5.kda_v_conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 5
+          }
+        }
+      },
+      "inputs": [
+        159
+      ],
+      "outputs": [
+        162
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.kda_f_a_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        156
+      ],
+      "outputs": [
+        163
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.kda_f_b_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        163
+      ],
+      "outputs": [
+        164
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.kda_b_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        156
+      ],
+      "outputs": [
+        165
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::kda_gate_beta_bf16",
+          "weights": [
+            "layer.5.kda_a_log",
+            "layer.5.kda_dt_bias"
+          ],
+          "params": [
+            128
+          ]
+        }
+      },
+      "inputs": [
+        164,
+        165
+      ],
+      "outputs": [
+        166,
+        167
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::l2norm_scale_bf16_to_fp32"
+        }
+      },
+      "inputs": [
+        160
+      ],
+      "outputs": [
+        168
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::l2norm_scale_bf16_to_fp32"
+        }
+      },
+      "inputs": [
+        161
+      ],
+      "outputs": [
+        169
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::bf16_to_fp32"
+        }
+      },
+      "inputs": [
+        162
+      ],
+      "outputs": [
+        170
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::kda_recurrent_step_batched",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 5
+          }
+        }
+      },
+      "inputs": [
+        168,
+        169,
+        170,
+        166,
+        167
+      ],
+      "outputs": [
+        171
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.kda_g_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        156
+      ],
+      "outputs": [
+        172
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::kda_o_norm_gated_bf16",
+          "weights": [
+            "layer.5.kda_o_norm"
+          ],
+          "params": [
+            16,
+            128
+          ]
+        }
+      },
+      "inputs": [
+        171,
+        172
+      ],
+      "outputs": [
+        173
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 5
+        }
+      },
+      "inputs": [
+        173
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.kda_o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        173,
+        155
+      ],
+      "outputs": [
+        174
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.5.mlp_norm"
+          ]
+        }
+      },
+      "inputs": [
+        174
+      ],
+      "outputs": [
+        175
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.router",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        175
+      ],
+      "outputs": [
+        176
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::topk_sigmoid_bf16"
+        }
+      },
+      "inputs": [
+        176
+      ],
+      "outputs": [
+        177,
+        178
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
+          "weights": [
+            "layer.5.expert.{e}.gate_up"
+          ]
+        }
+      },
+      "inputs": [
+        177,
+        175
+      ],
+      "outputs": [
+        179,
+        180
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::chunked_situ_bf16"
+        }
+      },
+      "inputs": [
+        179
+      ],
+      "outputs": [
+        181
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
+          "weights": [
+            "layer.5.expert.{e}.down"
+          ]
+        }
+      },
+      "inputs": [
+        177,
+        181
+      ],
+      "outputs": [
+        182
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::token_batched_weighted_sum_bf16"
+        }
+      },
+      "inputs": [
+        182,
+        178
+      ],
+      "outputs": [
+        183
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.shared_expert.gate",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        175
+      ],
+      "outputs": [
+        184
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.shared_expert.up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        175
+      ],
+      "outputs": [
+        185
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::situ_bf16"
+        }
+      },
+      "inputs": [
+        184
+      ],
+      "outputs": [
+        186
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.shared_expert.down",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        186
+      ],
+      "outputs": [
+        187
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        183,
+        187
+      ],
+      "outputs": [
+        188
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        174,
+        188
+      ],
+      "outputs": [
+        189
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.6.attn_norm"
+          ]
+        }
+      },
+      "inputs": [
+        189
+      ],
+      "outputs": [
+        190
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.kda_q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        190
+      ],
+      "outputs": [
+        191
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.kda_k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        190
+      ],
+      "outputs": [
+        192
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.kda_v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        190
+      ],
+      "outputs": [
+        193
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::causal_conv1d_update_batched_bf16",
+          "weights": [
+            "layer.6.kda_q_conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 6
+          }
+        }
+      },
+      "inputs": [
+        191
+      ],
+      "outputs": [
+        194
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::causal_conv1d_update_batched_bf16",
+          "weights": [
+            "layer.6.kda_k_conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 6
+          }
+        }
+      },
+      "inputs": [
+        192
+      ],
+      "outputs": [
+        195
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::causal_conv1d_update_batched_bf16",
+          "weights": [
+            "layer.6.kda_v_conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 6
+          }
+        }
+      },
+      "inputs": [
+        193
+      ],
+      "outputs": [
+        196
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.kda_f_a_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        190
+      ],
+      "outputs": [
+        197
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.kda_f_b_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        197
+      ],
+      "outputs": [
+        198
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.kda_b_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        190
+      ],
+      "outputs": [
+        199
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::kda_gate_beta_bf16",
+          "weights": [
+            "layer.6.kda_a_log",
+            "layer.6.kda_dt_bias"
+          ],
+          "params": [
+            128
+          ]
+        }
+      },
+      "inputs": [
+        198,
+        199
+      ],
+      "outputs": [
+        200,
+        201
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::l2norm_scale_bf16_to_fp32"
+        }
+      },
+      "inputs": [
+        194
+      ],
+      "outputs": [
+        202
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::l2norm_scale_bf16_to_fp32"
+        }
+      },
+      "inputs": [
+        195
+      ],
+      "outputs": [
+        203
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::bf16_to_fp32"
+        }
+      },
+      "inputs": [
+        196
+      ],
+      "outputs": [
+        204
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::kda_recurrent_step_batched",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 6
+          }
+        }
+      },
+      "inputs": [
+        202,
+        203,
+        204,
+        200,
+        201
+      ],
+      "outputs": [
+        205
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.kda_g_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        190
+      ],
+      "outputs": [
+        206
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "ssm::kda_o_norm_gated_bf16",
+          "weights": [
+            "layer.6.kda_o_norm"
+          ],
+          "params": [
+            16,
+            128
+          ]
+        }
+      },
+      "inputs": [
+        205,
+        206
+      ],
+      "outputs": [
+        207
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 6
+        }
+      },
+      "inputs": [
+        207
+      ],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.kda_o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        207,
+        189
+      ],
+      "outputs": [
+        208
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.6.mlp_norm"
+          ]
+        }
+      },
+      "inputs": [
+        208
+      ],
+      "outputs": [
+        209
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.router",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        209
+      ],
+      "outputs": [
+        210
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::topk_sigmoid_bf16"
+        }
+      },
+      "inputs": [
+        210
+      ],
+      "outputs": [
+        211,
+        212
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
+          "weights": [
+            "layer.6.expert.{e}.gate_up"
+          ]
+        }
+      },
+      "inputs": [
+        211,
+        209
+      ],
+      "outputs": [
+        213,
+        214
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::chunked_situ_bf16"
+        }
+      },
+      "inputs": [
+        213
+      ],
+      "outputs": [
+        215
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
+          "weights": [
+            "layer.6.expert.{e}.down"
+          ]
+        }
+      },
+      "inputs": [
+        211,
+        215
+      ],
+      "outputs": [
+        216
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::token_batched_weighted_sum_bf16"
+        }
+      },
+      "inputs": [
+        216,
+        212
+      ],
+      "outputs": [
+        217
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.shared_expert.gate",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        209
+      ],
+      "outputs": [
+        218
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.shared_expert.up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        209
+      ],
+      "outputs": [
+        219
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::situ_bf16"
+        }
+      },
+      "inputs": [
+        218
+      ],
+      "outputs": [
+        220
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.shared_expert.down",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        220
+      ],
+      "outputs": [
+        221
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        217,
+        221
+      ],
+      "outputs": [
+        222
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        208,
+        222
+      ],
+      "outputs": [
+        223
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.7.attn_norm"
+          ]
+        }
+      },
+      "inputs": [
+        223
+      ],
+      "outputs": [
+        224
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.7.q_a_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        224
+      ],
+      "outputs": [
+        225
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.7.q_a_norm"
+          ]
+        }
+      },
+      "inputs": [
+        225
+      ],
+      "outputs": [
+        226
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.7.kv_a_proj_with_mqa",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        224
+      ],
+      "outputs": [
+        227
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.7.q_b_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        226
+      ],
+      "outputs": [
+        228
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::kimi_split_kv_a_norm_bf16",
+          "weights": [
+            "layer.7.kv_a_norm"
+          ]
+        }
+      },
+      "inputs": [
+        227
+      ],
+      "outputs": [
+        229,
+        230
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::kimi_split_q_b_bf16",
+          "params": [
+            16,
+            128,
+            64
+          ]
+        }
+      },
+      "inputs": [
+        228
+      ],
+      "outputs": [
+        231,
+        232
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::write_mla_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 7
+          }
+        }
+      },
+      "inputs": [
+        229,
+        230
+      ],
+      "outputs": [],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "gemm::mla_absorb_q_to_latent_bf16",
+          "weights": [
+            "layer.7.kv_b_proj"
+          ],
+          "params": [
+            16,
+            128,
+            128,
+            256
+          ]
+        }
+      },
+      "inputs": [
+        231
+      ],
+      "outputs": [
+        233
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "attn::dispatch_attention_mla_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 7
+          }
+        }
+      },
+      "inputs": [
+        233,
+        232
+      ],
+      "outputs": [
+        234
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "gemm::mla_absorb_latent_to_v_bf16",
+          "weights": [
+            "layer.7.kv_b_proj"
+          ],
+          "params": [
+            16,
+            128,
+            128,
+            256
+          ]
+        }
+      },
+      "inputs": [
+        234
+      ],
+      "outputs": [
+        235
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 7
+        }
+      },
+      "inputs": [
+        235
+      ],
+      "outputs": [],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.7.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        235,
+        223
+      ],
+      "outputs": [
+        236
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.7.mlp_norm"
+          ]
+        }
+      },
+      "inputs": [
+        236
+      ],
+      "outputs": [
+        237
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.7.router",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        237
+      ],
+      "outputs": [
+        238
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::topk_sigmoid_bf16"
+        }
+      },
+      "inputs": [
+        238
+      ],
+      "outputs": [
+        239,
+        240
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "quant::mxfp4_moe_gate_up_decode_bf16",
+          "weights": [
+            "layer.7.expert.{e}.gate_up"
+          ]
+        }
+      },
+      "inputs": [
+        239,
+        237
+      ],
+      "outputs": [
+        241,
+        242
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::chunked_situ_bf16"
+        }
+      },
+      "inputs": [
+        241
+      ],
+      "outputs": [
+        243
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "quant::mxfp4_moe_down_decode_bf16",
+          "weights": [
+            "layer.7.expert.{e}.down"
+          ]
+        }
+      },
+      "inputs": [
+        239,
+        243
+      ],
+      "outputs": [
+        244
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "moe::token_batched_weighted_sum_bf16"
+        }
+      },
+      "inputs": [
+        244,
+        240
+      ],
+      "outputs": [
+        245
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.7.shared_expert.gate",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        237
+      ],
+      "outputs": [
+        246
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.7.shared_expert.up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        237
+      ],
+      "outputs": [
+        247
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::situ_bf16"
+        }
+      },
+      "inputs": [
+        246
+      ],
+      "outputs": [
+        248
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.7.shared_expert.down",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        248
+      ],
+      "outputs": [
+        249
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        245,
+        249
+      ],
+      "outputs": [
+        250
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        236,
+        250
+      ],
+      "outputs": [
+        251
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "final_norm"
+          ]
+        }
+      },
+      "inputs": [
+        251
+      ],
+      "outputs": [
+        252
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "LmHead": {
+          "weight": "lm_head"
+        }
+      },
+      "inputs": [
+        252
+      ],
+      "outputs": [
+        253
+      ],
+      "layer": null
+    }
+  ],
+  "seams": [
+    {
+      "seam": "in"
+    },
+    {
+      "seam": "attn.out",
+      "layer": 0,
+      "op": 18,
+      "values": [
+        18
+      ]
+    },
+    {
+      "seam": "attn.out",
+      "layer": 1,
+      "op": 42,
+      "values": [
+        42
+      ]
+    },
+    {
+      "seam": "attn.out",
+      "layer": 2,
+      "op": 74,
+      "values": [
+        76
+      ]
+    },
+    {
+      "seam": "attn.out",
+      "layer": 3,
+      "op": 100,
+      "values": [
+        104
+      ]
+    },
+    {
+      "seam": "attn.out",
+      "layer": 4,
+      "op": 133,
+      "values": [
+        139
+      ]
+    },
+    {
+      "seam": "attn.out",
+      "layer": 5,
+      "op": 165,
+      "values": [
+        173
+      ]
+    },
+    {
+      "seam": "attn.out",
+      "layer": 6,
+      "op": 197,
+      "values": [
+        207
+      ]
+    },
+    {
+      "seam": "attn.out",
+      "layer": 7,
+      "op": 223,
+      "values": [
+        235
+      ]
+    },
+    {
+      "seam": "out",
+      "values": [
+        253
+      ]
+    }
+  ]
+}

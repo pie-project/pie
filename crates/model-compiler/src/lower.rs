@@ -89,7 +89,7 @@ pub struct Row {
 /// The region-signature bits, as the wire states them.
 ///
 /// Restated here rather than imported from the C ABI, for the reason
-/// `driver-metal-new` gives for its own copy: `Row` must not depend on
+/// `driver-metal` gives for its own copy: `Row` must not depend on
 /// the descriptor surface, and the VALUES are the contract. Stated beside
 /// `Row` so the mapping below can be one function instead of one per
 /// driver — the two shells were reading the same six bits into the same
@@ -165,7 +165,7 @@ impl Row {
 ///
 /// It is the only thing that turns the wire's axis bitset into the
 /// lowering's guard predicates, and a shell that does not call it gets
-/// `Row::default()` — every guard false, silently. `driver-cuda-new` did
+/// `Row::default()` — every guard false, silently. `driver-cuda` did
 /// exactly that: `vec![Row { samples: true, ..default() }; rows]`, so
 /// `HasLora`, `HasCustomMask`, `HasStageHooks` and the depth truncation
 /// could never hold no matter what the engine sent, and LoRA looked like
@@ -998,6 +998,47 @@ impl Lowerer<'_> {
         op: &Op,
         window: &Range<u32>,
     ) -> Result<(), Uncovered> {
+        self.emit_bound(at, kernel, op, window, None, None)
+    }
+
+    /// [`Self::emit`], with the statement's OUTPUT replaced.
+    ///
+    /// The epilogue's row gather is the only caller: one `LmHead` lowers
+    /// to two launches that pass a value between them, and the trace has
+    /// no name for it. See [`Self::epilogue`].
+    fn emit_with_out(
+        &mut self,
+        at: usize,
+        kernel: &str,
+        op: &Op,
+        window: &Range<u32>,
+        out: Option<Arg>,
+    ) -> Result<(), Uncovered> {
+        self.emit_bound(at, kernel, op, window, None, out)
+    }
+
+    /// [`Self::emit`], with the statement's INPUT replaced — the other
+    /// half of the gather's hand-off.
+    fn emit_with_in(
+        &mut self,
+        at: usize,
+        kernel: &str,
+        op: &Op,
+        window: &Range<u32>,
+        input: Option<Arg>,
+    ) -> Result<(), Uncovered> {
+        self.emit_bound(at, kernel, op, window, input, None)
+    }
+
+    fn emit_bound(
+        &mut self,
+        at: usize,
+        kernel: &str,
+        op: &Op,
+        window: &Range<u32>,
+        in_override: Option<Arg>,
+        out_override: Option<Arg>,
+    ) -> Result<(), Uncovered> {
         if window.is_empty() && !self.peel_region.is_some_and(|r| r.rows_device) {
             return Ok(());
         }
@@ -1058,8 +1099,17 @@ impl Lowerer<'_> {
             } else {
                 &op.outputs
             };
-        for &v in op.inputs.iter().chain(outs.iter()) {
-            self.args.push(self.slot(v));
+        for (i, &v) in op.inputs.iter().enumerate() {
+            match (i, in_override.clone()) {
+                (0, Some(a)) => self.args.push(a),
+                _ => self.args.push(self.slot(v)),
+            }
+        }
+        for (i, &v) in outs.iter().enumerate() {
+            match (i, out_override.clone()) {
+                (0, Some(a)) => self.args.push(a),
+                _ => self.args.push(self.slot(v)),
+            }
         }
         let first_param = self.params.len() as u32;
         if let OpKind::Launch {
@@ -1173,7 +1223,42 @@ impl Lowerer<'_> {
         }
         let out = 0..sampled;
         if sampled < window.len() as u32 {
-            self.emit(at, "layout::gather_bf16_rows", op, &out)?;
+            // THE GATHER NOW HAS SOMEWHERE TO WRITE.
+            //
+            // It used to be emitted through the plain `emit`, which binds
+            // the OP's operands -- and `OpKind::LmHead` states
+            // `inputs=[hidden] outputs=[logits]`. So the gather, whose job
+            // is to compact `[sampled, hidden]` for the head to read, was
+            // handed the LOGITS buffer as its destination: the wrong
+            // width, and the head then read what it had overwritten. It
+            // produced all-zero logits on gemma-4 and the hybrid, which is
+            // why the shell forces `samples: true` on every row and pays a
+            // prefill's head over every token rather than one per request.
+            //
+            // The scratch has existed all along -- `Buffers::epilogue_gather`
+            // is sized from this very statement and carried on `Lowered`.
+            // Nothing ever bound it. So the gather is emitted with its
+            // output REPLACED by that block, and the head's input with it,
+            // which is the whole of what "the epilogue names its temp"
+            // means.
+            //
+            // A fire whose planner refused the block (`NAMED`) keeps the
+            // old binding rather than inventing an address: that is a
+            // fire the caller must not ask a gather of, and `samples` is
+            // the shell's to over-claim.
+            let temp = (self.buffers.epilogue_gather != Buffers::NAMED).then(|| Arg::Arena {
+                at: self.buffers.epilogue_gather,
+                width: self.row_width(op.inputs.first().copied().unwrap_or(0)),
+                bytes: op
+                    .inputs
+                    .first()
+                    .and_then(|&v| self.plan.values.get(v as usize))
+                    .map_or(2, |i| dtype_bytes(i.dtype)),
+            });
+            self.emit_with_out(at, "layout::gather_bf16_rows", op, &out, temp.clone())?;
+            // The head reads the compacted rows, not the raw stream.
+            self.emit_with_in(at, "gemm::act_x_w", op, &out, temp)?;
+            return Ok(());
         }
         // NO FINAL NORM HERE, and its absence is the correction rather
         // than an omission.

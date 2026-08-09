@@ -5,7 +5,7 @@
 //! crate's — the DSL invents the first, the contract author the second — so
 //! the map between them belongs here and not in a driver.
 //!
-//! It lived in `driver-cuda-new`'s shell, which meant a backend knew what a
+//! It lived in `driver-cuda`'s shell, which meant a backend knew what a
 //! gemma-4 per-layer projection is called. A second backend would have needed
 //! the same 200 lines, and a family added here would have had to be added
 //! there too.
@@ -142,12 +142,35 @@ fn llama_like(w: &mut Wiring<'_>) {
                 n("mlp.up_proj.weight"),
             ]);
         }
-        // The norm placement decides the mapping, and `input_layernorm`'s
-        // presence IS the placement: pre-norm has it (attn_norm=input,
-        // mlp_norm=post_attention); post-norm (olmo2) lacks it
-        // (attn_norm=post_attention, mlp_norm=post_feedforward) — the
-        // bind_olmo3 convention the A/B verified.
-        if w.has(&n("input_layernorm.weight")) {
+        // THREE placements, and the discriminant is not what it looks
+        // like. `input_layernorm`'s presence tells pre-norm from post-norm
+        // and nothing else — a SANDWICH family publishes it too, so a
+        // two-way branch on it sends gemma-2 and gemma3n down the pre-norm
+        // arm and binds their `mlp_norm` to `post_attention_layernorm`
+        // where the forward means `pre_feedforward_layernorm`.
+        //
+        // That is the failure `seam_names` cannot catch: a name that
+        // resolves to the WRONG TENSOR rather than to nothing. Every
+        // resolver answers, every shape matches, and the model is
+        // slightly worse.
+        //
+        // So the sandwich is tested FIRST, by the tensor only it ships.
+        // Its four norms are the four its forward names — before and after
+        // both blocks — and none of them is a guess: the checkpoint either
+        // publishes `pre_feedforward_layernorm` or it does not, and if it
+        // does, the placement is unambiguous.
+        //
+        //   sandwich   attn=input   post_attn=post_attention
+        //              mlp=pre_feedforward   post_mlp=post_feedforward
+        //   pre-norm   attn=input   mlp=post_attention
+        //   post-norm  attn=post_attention   mlp=post_feedforward  (olmo2,
+        //              the bind_olmo3 convention the A/B verified)
+        if w.has(&n("pre_feedforward_layernorm.weight")) {
+            w.alias(format!("layer.{i}.attn_norm"), n("input_layernorm.weight"));
+            w.alias(format!("layer.{i}.post_attn_norm"), n("post_attention_layernorm.weight"));
+            w.alias(format!("layer.{i}.mlp_norm"), n("pre_feedforward_layernorm.weight"));
+            w.alias(format!("layer.{i}.post_mlp_norm"), n("post_feedforward_layernorm.weight"));
+        } else if w.has(&n("input_layernorm.weight")) {
             w.alias(format!("layer.{i}.attn_norm"), n("input_layernorm.weight"));
             w.alias(format!("layer.{i}.mlp_norm"), n("post_attention_layernorm.weight"));
         } else {
@@ -326,3 +349,105 @@ fn qwen3_5(w: &mut Wiring<'_>) {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::HfConfig;
+
+    /// Which checkpoint tensor a trace name resolves to.
+    fn bound(published: &[&str], trace: &str) -> Option<String> {
+        let hf = HfConfig { num_hidden_layers: 1, ..HfConfig::default() };
+        let set: std::collections::BTreeSet<String> =
+            published.iter().map(|s| (*s).to_string()).collect();
+        let has = |n: &str| set.contains(n);
+        let w = wire(&hf, &has);
+        w.aliases.iter().find(|(t, _)| t == trace).map(|(_, c)| c.clone())
+    }
+
+    fn base() -> Vec<&'static str> {
+        vec![
+            "model.embed_tokens.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.0.mlp.up_proj.weight",
+            "model.layers.0.mlp.down_proj.weight",
+        ]
+    }
+
+    /// THE FAILURE `seam_names` CANNOT SEE: a name that resolves to the
+    /// WRONG TENSOR rather than to nothing.
+    ///
+    /// A sandwich family — gemma-2, gemma3n — norms before AND after both
+    /// blocks, four per layer, and publishes `input_layernorm` like any
+    /// pre-norm checkpoint does. A branch keyed on THAT sent it down the
+    /// pre-norm arm, where `mlp_norm` binds `post_attention_layernorm`
+    /// while the forward means `pre_feedforward_layernorm`. Every
+    /// resolver answers, every shape matches, and the model is slightly
+    /// worse — which is the one failure worth a test that reads the
+    /// TARGET and not just the coverage.
+    #[test]
+    fn a_sandwich_checkpoint_binds_its_four_norms_to_four_tensors() {
+        let mut p = base();
+        p.extend([
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.layers.0.pre_feedforward_layernorm.weight",
+            "model.layers.0.post_feedforward_layernorm.weight",
+        ]);
+        let at = |t: &str| bound(&p, t);
+        assert_eq!(at("layer.0.attn_norm").as_deref(), Some("model.layers.0.input_layernorm.weight"));
+        assert_eq!(
+            at("layer.0.post_attn_norm").as_deref(),
+            Some("model.layers.0.post_attention_layernorm.weight")
+        );
+        assert_eq!(
+            at("layer.0.mlp_norm").as_deref(),
+            Some("model.layers.0.pre_feedforward_layernorm.weight"),
+            "the MLP's PRE norm, not the attention's post — the defect this \
+             test exists for"
+        );
+        assert_eq!(
+            at("layer.0.post_mlp_norm").as_deref(),
+            Some("model.layers.0.post_feedforward_layernorm.weight")
+        );
+    }
+
+    /// And the two placements that already worked keep working — the
+    /// sandwich branch is tested FIRST, so it has to decline for both.
+    #[test]
+    fn pre_norm_and_post_norm_are_unchanged() {
+        let mut pre = base();
+        pre.extend([
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+        ]);
+        assert_eq!(
+            bound(&pre, "layer.0.attn_norm").as_deref(),
+            Some("model.layers.0.input_layernorm.weight")
+        );
+        assert_eq!(
+            bound(&pre, "layer.0.mlp_norm").as_deref(),
+            Some("model.layers.0.post_attention_layernorm.weight"),
+            "a pre-norm checkpoint has no pre_feedforward norm to mean instead"
+        );
+
+        // olmo2: no `input_layernorm` at all.
+        let mut post = base();
+        post.extend([
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.layers.0.post_feedforward_layernorm.weight",
+        ]);
+        assert_eq!(
+            bound(&post, "layer.0.attn_norm").as_deref(),
+            Some("model.layers.0.post_attention_layernorm.weight")
+        );
+        assert_eq!(
+            bound(&post, "layer.0.mlp_norm").as_deref(),
+            Some("model.layers.0.post_feedforward_layernorm.weight")
+        );
+    }
+}

@@ -191,14 +191,27 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(rope_yarn_original "rope::rope_yarn_original_bf16",
         in_place = &[(0, 0), (1, 1)],
         operands = operands![
-            q: BufMut, k: BufMut,
-            positions: I32s,
-            num_tokens: I32, num_q_heads: I32, num_kv_heads: I32, head_dim: I32,
-            theta: F32,
-            factor: F32, beta_fast: F32, beta_slow: F32, attention_factor: F32,
-            original_max_position: I32,
-            stream: Stream,
-            interleaved: Bool,
+            q: BufMut <- Source::Out(0),
+            k: BufMut <- Source::Out(1),
+            positions: I32s <- Source::Ctx("positions"),
+            num_tokens: I32 <- Source::Rows,
+            // Heads, not width: the kernel rotates per head, and how many
+            // fit in a row is the row width over the head dim.
+            num_q_heads: I32 <- Source::OutWidthOver(0, "head_dim"),
+            num_kv_heads: I32 <- Source::OutWidthOver(1, "head_dim"),
+            head_dim: I32 <- Source::Ctx("head_dim"),
+            theta: F32 <- Source::Ctx("rope_theta"),
+            // YaRN's four scalars, in the order the config states them.
+            // `Ctx` names a FIELD PATH, so an index is as nameable as a
+            // name -- which is what keeps four near-identical sources
+            // from having to exist.
+            factor: F32 <- Source::Ctx("yarn[0]"),
+            beta_fast: F32 <- Source::Ctx("yarn[1]"),
+            beta_slow: F32 <- Source::Ctx("yarn[2]"),
+            attention_factor: F32 <- Source::Ctx("yarn[3]"),
+            original_max_position: I32 <- Source::Ctx("yarn_original_max"),
+            stream: Stream <- Source::Ctx("stream"),
+            interleaved: Bool <- Source::Ctx("rope_interleaved"),
         ]),
     kernel!(rope_write_kv "rope::rope_write_kv_bf16", whole = true, sink = Some("kv.pages"),
         operands = operands![

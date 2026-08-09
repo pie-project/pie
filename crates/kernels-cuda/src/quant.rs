@@ -101,4 +101,35 @@ pub static KERNELS: &[KernelSig] = &[
             width: I32,
             stream: Stream,
         ]),
+    // ── The ENCODING half, which the table was missing while the .cu files
+    //    had it all along.
+    //
+    // `quant/quant_bf16_to_{fp8,mxfp4}.cu` implement runtime quantization and
+    // say what for -- `quant_bf16_to_fp8.hpp:6` names the caller outright:
+    // "Used by the Rust LoadPlan runtime quantization path: the loader emits
+    // an Encode TileMap that reads the source weight, computes absmax, and
+    // stores the quantized weight plus scale tensor directly as runtime
+    // outputs." No row said so, so nothing could call them, and the loader's
+    // Encode ran on the host against kernels sitting unused beside it.
+    //
+    // Both write TWO outputs -- the payload and the scales it cannot be read
+    // without -- which is why `TileMapOp` carries a second destination.
+    kernel!(quantize_bf16_to_mxfp4 "quant::quantize_bf16_to_mxfp4_e2m1_per_block",
+        operands = operands![
+            w_bf16: Buf,
+            w_packed: U8sMut,
+            w_scale_e8m0: U8sMut,
+            rows: I32,
+            cols: I32,
+            stream: Stream,
+        ]),
+    kernel!(quantize_bf16_to_fp8_per_channel "quant::quantize_bf16_to_fp8_e4m3_per_channel",
+        operands = operands![
+            w_bf16: Buf,
+            w_fp8: U8sMut,
+            scale_inv_dev: F32sMut,
+            rows: I32,
+            cols: I32,
+            stream: Stream,
+        ]),
 ];

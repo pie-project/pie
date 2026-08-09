@@ -13,8 +13,8 @@
 // exports the same thirteen `pie_cuda_*` symbols, so which crate supplies
 // them is a link question. `backend/cuda.rs` never learns which one it
 // reached.
-#[cfg(feature = "driver-cuda-new")]
-extern crate driver_cuda_new as _;
+#[cfg(feature = "driver-cuda")]
+extern crate driver_cuda as _;
 
 pub mod bootstrap;
 pub mod driver;

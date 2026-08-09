@@ -295,27 +295,27 @@ const NOT_YET_WIRED: &[(&str, &[&str])] = &[
     ("llama_like", &[]),
     ("qwen3_5", &[]),
     ("gemma_4", &[]),
-    // TWO STEMS, AND BOTH ARE SPELLINGS. `llama_like`'s gemma branch
-    // wires `post_attention_layernorm` to `attn_norm` and
-    // `post_feedforward_layernorm` to `mlp_norm`; gemma-2's forward asks
-    // for `post_attn_norm` and `post_mlp_norm`. Both tensors are staged
-    // and named — the two halves of the seam simply chose different
-    // words, which is the cheapest possible instance of what this test
-    // exists to catch. `gemma_4`'s builder DOES emit these two spellings,
-    // which is how the union-of-schemes draft hid them.
-    ("gemma_2", &["layer.*.post_attn_norm", "layer.*.post_mlp_norm"]),
+    // WIRED, and the two missing names were the smaller half of it. This
+    // read "both halves of the seam chose different words" -- true, and
+    // it hid the real defect, which was that the word `mlp_norm` DID
+    // resolve, to `post_attention_layernorm`, where gemma-2's forward
+    // means `pre_feedforward_layernorm`. A test that asks what a family
+    // can NAME cannot see a name that resolves to the wrong tensor; the
+    // sandwich placement's own test in `weight_names` reads the target.
+    ("gemma_2", &[]),
     // WAS the row that bit: the only family with both a `FACTS_ROWS`
     // entry in the CUDA shell and a Prefill arm, so a gpt-oss checkpoint
     // loaded, reported itself healthy, and died at its first fire on
     // `UnknownWeight("layer.0.router")`. Wired now. The families below
     // owe the same debt and are not yet reachable, so theirs is not due.
     ("gpt_oss", &[]),
+    // Its two sandwich norms went with gemma-2's -- same placement, same
+    // branch. What is left is the AltUp and Laurel machinery, which is
+    // gemma3n's alone.
     ("gemma3n", &[
         "layer.*.altup_correct_norm",
         "layer.*.altup_norm",
         "layer.*.laurel_post_norm",
-        "layer.*.post_attn_norm",
-        "layer.*.post_mlp_norm",
     ]),
     // MLA and the latent cache: three families, one shape. `kv_b_proj`
     // and `q_a_norm` are the latent projection's two halves and all
@@ -433,7 +433,7 @@ fn every_traced_weight_is_a_name_wire_can_emit() {
 
 /// The fact that could only ever be false.
 ///
-/// `abi_shell.rs` derives kimi's fused latent projection as
+/// `serve.rs` derives kimi's fused latent projection as
 /// `aliases.contains_key("layer.0.q_kv_a_fused")`. The contract publishes
 /// that join and the forward consumes it — but `wire()` has no kimi
 /// builder, so the alias is never created, the fact is permanently
@@ -450,7 +450,7 @@ fn kimis_fused_latent_projection_is_still_unreachable() {
     assert!(
         !can.contains("layer.*.q_kv_a_fused"),
         "a kimi builder landed: `wire()` can now emit `q_kv_a_fused`, so \
-         `abi_shell`'s `aliases.contains_key(\"layer.0.q_kv_a_fused\")` is \
+         `serve`'s `aliases.contains_key(\"layer.0.q_kv_a_fused\")` is \
          no longer permanently false. Check that the forward, the contract \
          and the driver agree before deleting this test."
     );

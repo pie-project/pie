@@ -20,20 +20,20 @@
 //!
 //! # Why this is a crate and not a module
 //!
-//! It was a module of `driver-metal-new` until the CUDA shell reached the same
+//! It was a module of `driver-metal` until the CUDA shell reached the same
 //! file. Every line of it is arithmetic over the launch ABI's records: not one
 //! names a Metal type, and the compiler agrees — the whole directory built and
 //! tested on Linux while the crate around it did not. A layer that two device
 //! shells need and neither one owns is a crate, and the alternative was the
 //! thing the C++ actually did: THREE hand-written copies of one golden model
 //! (`tensor-compiler`'s interpreter, the CUDA driver's `tier0_runner.hpp`, the
-//! Metal driver's `interp.hpp`), which is why `PARITY-INTERP.md` opens by
+//! Metal driver's `interp.hpp`), which is why `.wiki/driver/progress-metal.md` opens by
 //! counting them.
 //!
 //! The seam is directional rather than polymorphic, and that is why there is
 //! no `trait Backend` here. This crate never calls a device; a device shell
-//! calls this crate. `driver-cuda-new` packs the lane table this crate lays
-//! out and hands it to `cuLaunchKernel`; `driver-metal-new` packs the same
+//! calls this crate. `driver-cuda` packs the lane table this crate lays
+//! out and hands it to `cuLaunchKernel`; `driver-metal` packs the same
 //! bytes into an argument table. The bytes are the interface.
 //!
 //! # The problem this solves

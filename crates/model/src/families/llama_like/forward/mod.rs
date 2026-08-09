@@ -240,7 +240,7 @@ pub fn llama_like_cuda(
 ///   **correct for what runs**. The live `MbFeatures` on this family is
 ///   `{ gdn, sdpa_d256 }` — every one of those variants is `false` in every
 ///   live path and set true only in `psos_mb.rs`'s `all_features()` test
-///   fixture, and `PARITY-BATCH.md` records them as deferred with reasons
+///   fixture, and `.wiki/driver/progress-metal.md` records them as deferred with reasons
 ///   ("with split-K deferred every dispatch is unsplit, which by the C++'s
 ///   OWN measurement makes `qmm_bn_unsplit` the right width"). `bias` is
 ///   gpt-oss's, and `routed` is a mixture this family does not model at all.
@@ -252,7 +252,7 @@ pub fn llama_like_cuda(
 ///   the width as a literal, so this family — whose heads are 128 wide —
 ///   named a 256-wide attention kernel. That does not fault: it reads past
 ///   the end of every head and answers with whatever is there, which is the
-///   same defect `PARITY-BATCH.md` records in the C++ llama walk, where
+///   same defect `.wiki/driver/progress-metal.md` records in the C++ llama walk, where
 ///   `_d128` was a literal that strode 64-wide heads past their end. The
 ///   symbol now takes `head_dim`; a width no kernel instantiates simply does
 ///   not resolve, and the driver's row check reports it by name.
@@ -295,7 +295,7 @@ fn llama_like_metal_text(
         // depth: every layer-tagged op below becomes implicitly
         // `rows(depth > layer)`, so a fire whose rows truncate at different
         // layers lowers to rectangles that narrow rather than to one
-        // rectangle per op. `driver-metal-new/tests/polymorphism.rs`
+        // rectangle per op. `driver-metal/tests/polymorphism.rs`
         // measures it.
         m.depth_window();
 
@@ -2069,7 +2069,7 @@ mod metal_tests {
         // `_d_256` unconditionally, and `qwen3_0_6b`'s heads are 128 wide — a
         // 256-wide kernel over them reads past the end of every head and
         // answers with whatever is there, which is the same defect
-        // `PARITY-BATCH.md` records in the C++ llama walk. Spelling the
+        // `.wiki/driver/progress-metal.md` records in the C++ llama walk. Spelling the
         // expectation from `facts.head_dim` is what stops it coming back: a
         // literal here would fail the moment a checkpoint's heads differ.
         assert_eq!(facts.head_dim, 128, "the fixture this expectation reads");

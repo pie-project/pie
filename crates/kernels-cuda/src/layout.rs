@@ -88,7 +88,7 @@ pub static KERNELS: &[KernelSig] = &[
     // a slice.
     //
     // It had no row and no arm, and the reason it was never missed is
-    // worth keeping: `driver-cuda-new`'s shell built every fire row as
+    // worth keeping: `driver-cuda`'s shell built every fire row as
     // `samples: true`, so `sampled < window.len()` was false on every
     // fire and `lower::epilogue` never stated the gather. The moment the
     // shell read the step's real readout list, every prefill asked for

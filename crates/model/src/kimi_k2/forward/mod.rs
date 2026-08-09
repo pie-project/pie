@@ -82,14 +82,19 @@ impl KimiLayerW {
 }
 
 /// kimi's CUDA text for one fire class.
+///
+/// **Both shaped classes, and the body is the same text for each.** MLA's
+/// attention is one planned dispatch — `attn::plan_attention_mla_bf16` takes
+/// a `qo_indptr` and a `causal` flag, so a decode is the special case where
+/// every request contributes one query row, not a different kernel. Nothing
+/// else here reads the class. So the class reaches only the trace's NAME,
+/// which is what a lowering keys its cache by.
+///
+/// It used to `panic!` on anything but Decode. That was not a statement about
+/// this text — it was the absence of one, and it made every prefill a failed
+/// request.
 pub fn kimi_cuda(facts: &KimiFacts, cuda: &KimiCudaFacts, class: FireClass) -> ForwardPlan {
-    let family = format!(
-        "kimi.cuda.{}",
-        match class {
-            FireClass::Decode => "decode",
-            other => panic!("kimi states no {other:?} class yet"),
-        }
-    );
+    let family = format!("kimi.cuda.{}", class.suffix());
     let a = facts.attn.clone();
     dsl::trace_named(&family, |t| {
         let mut y = dsl::embedded_prologue(t, facts.hidden);

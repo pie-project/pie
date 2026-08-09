@@ -51,31 +51,34 @@ members = [
     # `driver` is the C++ substrate both shells interpret the ABI with; the two
     # native shells build their own `csrc/` and are OS-exclusive.
     # The PTIR channel plane, shared by both Rust shells. It was `src/pipeline/`
-    # inside `driver-metal-new` until the CUDA shell reached the same file, and
+    # inside `driver-metal` until the CUDA shell reached the same file, and
     # the move cost nothing because not one line of it named a Metal type --
     # the directory already built and tested on Linux while the crate around it
     # did not. A `default-member`, unlike every driver below it: it needs no
     # GPU, no toolkit and no OS, so there is no reason a workspace sweep should
     # not carry its tests.
     "crates/driver",
-    # The Rust rewrite of the CUDA shell, grown beside the C++ one on the same
-    # terms `driver-metal-new` is. Unlike either C++ shell it builds ANYWHERE:
+    # The CUDA shell. It was `driver-cuda-new` while the C++ `driver-cuda`
+    # still existed, on the same terms the Metal one was, and took the name
+    # when that one went. Unlike either C++ shell it builds ANYWHERE:
     # `cudarc` is pinned to a named CUDA version with `fallback-dynamic-loading`,
     # so there is no link line and no toolkit probe, and the host logic this
     # crate is mostly made of stays testable on a box with no GPU. It is
     # outside `default-members` all the same -- linking a CUDA shell into a
     # sweep should be a choice, and that is the rule the siblings follow.
-    "crates/driver-cuda-new",
-    # The Rust rewrite of the Metal shell, grown beside the C++ one rather
-    # than inside it. A member so it shares this lockfile and so a workspace
-    # sweep on a Mac sees it; outside `default-members` for the same reason
-    # `driver-metal` is -- selecting it on a Linux box should be a choice.
+    "crates/driver-cuda",
+    # The Metal shell. It was `driver-metal-new` while the C++ `driver-metal`
+    # still existed; that one was retired (2026-08-10) and this took the name.
+    # A member so it shares this lockfile and so a workspace sweep on a Mac
+    # sees it; outside `default-members` because selecting a Metal shell on a
+    # Linux box should be a choice, which is the rule its siblings follow.
     #
-    # Unlike `driver-metal` it does BUILD on a non-Apple host: everything that
-    # names a Metal type is behind `cfg(target_vendor = "apple")`, and what is
-    # left is the shader-include splicer and the tuning table, which are the
-    # two parts with logic worth testing and no reason to need a GPU.
-    "crates/driver-metal-new",
+    # Unlike the C++ shell it replaced, it does BUILD on a non-Apple host:
+    # everything that names a Metal type is behind
+    # `cfg(target_vendor = "apple")`, and what is left is the shader-include
+    # splicer and the tuning table, which are the two parts with logic worth
+    # testing and no reason to need a GPU.
+    "crates/driver-metal",
     "crates/driver-dummy",
 
     # -- model-*: what a model IS, and how it gets onto a device ------------

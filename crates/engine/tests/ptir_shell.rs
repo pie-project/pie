@@ -1,11 +1,11 @@
 //! A real PTIR program, registered through the ABI and fired by the shell.
 //!
-//! `driver-cuda-new`'s own tests cover every piece of this and cannot
+//! `driver-cuda`'s own tests cover every piece of this and cannot
 //! cover the whole: `ptir::Session` runs a program end to end on the GPU,
 //! including a value crossing both channel planes, but the ABI corpus in
 //! that crate registers `PieProgramDesc { program_hash, ..Default }` — a
 //! descriptor with no bytecode — so `plan.executable` is false,
-//! `ptir_programs` stays empty, and `abi_shell::run_program` returns
+//! `ptir_programs` stays empty, and `serve::run_program` returns
 //! early in every one of them. The adapter shipped untested and this is
 //! the test it owed.
 //!
@@ -23,7 +23,7 @@
 //! and not raw logits. That is the whole of what `ptir_programs` having
 //! no reader used to cost.
 
-#![cfg(feature = "driver-cuda-new")]
+#![cfg(feature = "driver-cuda")]
 
 use driver_api::local::{
     PIE_DRIVER_ABI_VERSION, PIE_STATUS_OK, PieBytes, PieChannelEndpointBinding, PieCompletion,
@@ -60,7 +60,7 @@ static FIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0
 /// Every test here creates a driver, binds device 0 and loads a model,
 /// and two of those at once aborts the process — the failure looks like a
 /// broken change rather than a contended device, which is the worst way
-/// for it to look. `driver-cuda-new`'s own suite has the same mutex for
+/// for it to look. `driver-cuda`'s own suite has the same mutex for
 /// the same reason.
 static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -107,7 +107,7 @@ fn driver_or_skip(
         config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
         ..Default::default()
     };
-    let driver = driver_cuda_new::abi_shell::pie_cuda_create(&desc, caps);
+    let driver = driver_cuda::serve::pie_cuda_create(&desc, caps);
     if driver.is_null() {
         eprintln!("[ptir-shell] no CUDA device; skipping");
         return None;
@@ -118,7 +118,7 @@ fn driver_or_skip(
 /// The one-stage epilogue this test registers: read the channel, take an
 /// argmax, publish the index.
 ///
-/// An argmax because the observable is an INDEX. `PARITY-INTERP.md`'s
+/// An argmax because the observable is an INDEX. `.wiki/driver/progress-metal.md`'s
 /// tolerance contract admits one ulp on a magnitude and no slack at all
 /// on an argmax, so a disagreement here cannot be rounding — and the
 /// seed carries a TIE, which is the case where "the first maximum" is a
@@ -270,14 +270,14 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
     };
     let mut load_caps = PieDriverCaps::default();
     let status =
-        driver_cuda_new::abi_shell::pie_cuda_load_model(driver, &load, &mut load_caps);
+        driver_cuda::serve::pie_cuda_load_model(driver, &load, &mut load_caps);
     assert_eq!(status, PIE_STATUS_OK, "the snapshot loads");
 
     // ── Register the program. ──
     let program = registration(argmax_program());
     let borrow = ProgramDescBorrow::new(&program);
     let mut program_id = 0u64;
-    let status = driver_cuda_new::abi_shell::pie_cuda_register_program(
+    let status = driver_cuda::serve::pie_cuda_register_program(
         driver,
         borrow.as_raw(),
         &mut program_id,
@@ -312,7 +312,7 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
         };
         let borrow = ChannelDescBorrow::new(&plan);
         let mut binding = PieChannelEndpointBinding::default();
-        let status = driver_cuda_new::abi_shell::pie_cuda_register_channel(
+        let status = driver_cuda::serve::pie_cuda_register_channel(
             driver,
             borrow.as_raw(),
             &mut binding,
@@ -333,7 +333,7 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
     };
     let mut instance = PieInstanceBinding::default();
     let status =
-        driver_cuda_new::abi_shell::pie_cuda_bind_instance(driver, &inst, &mut instance);
+        driver_cuda::serve::pie_cuda_bind_instance(driver, &inst, &mut instance);
     assert_eq!(status, PIE_STATUS_OK, "the instance binds");
 
     // ── The engine's side: publish the seed the program will take. ──
@@ -379,7 +379,7 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
     let completion =
         PieCompletion { wait_id: 0x5E5, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
     let status =
-        driver_cuda_new::abi_shell::pie_cuda_launch(driver, &frame, completion);
+        driver_cuda::serve::pie_cuda_launch(driver, &frame, completion);
     assert_eq!(status, PIE_STATUS_OK, "the frame launches");
 
     // Run-ahead means the call returns with the fire still queued.
@@ -399,7 +399,7 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
     let got = i32::from_le_bytes(published[..4].try_into().expect("four bytes"));
     assert_eq!(got, 1, "argmax over the tie takes the FIRST maximum");
 
-    driver_cuda_new::abi_shell::pie_cuda_destroy(driver);
+    driver_cuda::serve::pie_cuda_destroy(driver);
 }
 
 /// Two requests in one frame each get their OWN answer.
@@ -434,7 +434,7 @@ fn every_request_in_a_frame_samples_its_own_row() {
     };
     let mut load_caps = PieDriverCaps::default();
     assert_eq!(
-        driver_cuda_new::abi_shell::pie_cuda_load_model(driver, &load, &mut load_caps),
+        driver_cuda::serve::pie_cuda_load_model(driver, &load, &mut load_caps),
         PIE_STATUS_OK,
         "the snapshot loads"
     );
@@ -443,7 +443,7 @@ fn every_request_in_a_frame_samples_its_own_row() {
     let borrow = ProgramDescBorrow::new(&program);
     let mut program_id = 0u64;
     assert_eq!(
-        driver_cuda_new::abi_shell::pie_cuda_register_program(
+        driver_cuda::serve::pie_cuda_register_program(
             driver,
             borrow.as_raw(),
             &mut program_id
@@ -492,7 +492,7 @@ fn every_request_in_a_frame_samples_its_own_row() {
             let borrow = ChannelDescBorrow::new(&plan);
             let mut binding = PieChannelEndpointBinding::default();
             assert_eq!(
-                driver_cuda_new::abi_shell::pie_cuda_register_channel(
+                driver_cuda::serve::pie_cuda_register_channel(
                     driver,
                     borrow.as_raw(),
                     &mut binding
@@ -513,7 +513,7 @@ fn every_request_in_a_frame_samples_its_own_row() {
         };
         let mut instance = PieInstanceBinding::default();
         assert_eq!(
-            driver_cuda_new::abi_shell::pie_cuda_bind_instance(driver, &inst, &mut instance),
+            driver_cuda::serve::pie_cuda_bind_instance(driver, &inst, &mut instance),
             PIE_STATUS_OK,
             "instance {req} binds"
         );
@@ -567,7 +567,7 @@ fn every_request_in_a_frame_samples_its_own_row() {
     let completion =
         PieCompletion { wait_id: 0x5E6, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
     assert_eq!(
-        driver_cuda_new::abi_shell::pie_cuda_launch(driver, &frame, completion),
+        driver_cuda::serve::pie_cuda_launch(driver, &frame, completion),
         PIE_STATUS_OK,
         "the two-request frame launches"
     );
@@ -592,5 +592,5 @@ fn every_request_in_a_frame_samples_its_own_row() {
         assert_eq!(got, expected[req], "request {req} sampled its OWN seed");
     }
 
-    driver_cuda_new::abi_shell::pie_cuda_destroy(driver);
+    driver_cuda::serve::pie_cuda_destroy(driver);
 }

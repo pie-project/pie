@@ -89,13 +89,7 @@ pub fn gemma2_cuda(facts: &Gemma2Facts, class: FireClass) -> ForwardPlan {
     // The MTP passes stay unstated, because those genuinely are different
     // passes and not this one under another name.
     let family = format!(
-        "gemma_2.cuda.{}",
-        match class {
-            FireClass::Decode => "decode",
-            FireClass::Prefill => "prefill",
-            other => panic!("gemma_2 states no {other:?} class yet"),
-        }
-    );
+        "gemma_2.cuda.{}", class.suffix());
     let a = facts.attn.clone();
     dsl::trace_named(&family, |t| {
         let embedded = dsl::embedded_prologue(t, facts.hidden);

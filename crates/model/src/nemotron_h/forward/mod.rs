@@ -86,13 +86,7 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
     // class-dependent sites in this text number exactly one, the
     // attention op, which `dsl::cuda::attention_for` now holds.
     let family = format!(
-        "nemotron_h.cuda.{}",
-        match class {
-            FireClass::Decode => "decode",
-            FireClass::Prefill => "prefill",
-            other => panic!("nemotron_h states no {other:?} class yet"),
-        }
-    );
+        "nemotron_h.cuda.{}", class.suffix());
     let mb = facts.mamba.clone();
     let _at = facts.attn.clone();
     dsl::trace_named(&family, |t| {

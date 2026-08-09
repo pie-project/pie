@@ -92,14 +92,13 @@ impl Glm5LayerW {
 }
 
 /// glm5's CUDA text for one fire class.
+///
+/// **Both shaped classes, one body.** The MLA attention is one planned
+/// dispatch over a `qo_indptr` (see `kimi_k2`), and the DSA indexer scores
+/// whatever query rows the fire brought. Nothing here reads the class except
+/// the trace's name.
 pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
-    let family = format!(
-        "glm5.cuda.{}",
-        match class {
-            FireClass::Decode => "decode",
-            other => panic!("glm5 states no {other:?} class yet"),
-        }
-    );
+    let family = format!("glm5.cuda.{}", class.suffix());
     let a = facts.attn.clone();
     dsl::trace_named(&family, |t| {
         let mut y = dsl::embedded_prologue(t, facts.hidden);

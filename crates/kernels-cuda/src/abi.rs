@@ -511,11 +511,19 @@ fn rust_bind_expr(op: &kernels::Operand) -> Option<String> {
         // below, same as `In`/`Out`.
         Source::Positions => "ctx.positions".to_string(),
         // The enclosing guard's value, when a REGION launch declares no
-        // result of its own. Which value that is depends on where the
-        // statement SITS, and the Rust join does not carry the guard's
-        // value yet — so these rows decline, like `InDim` does, and stay
-        // with the arm that knows.
-        Source::ResultOrRegion(..) => return None,
+        // result of its own. `LaunchSpec::outs` is where the join put it
+        // -- which it has since `DispatchPlan` learned to map a region op
+        // back to its owning guard, and the note that used to sit here
+        // ("the Rust join does not carry the guard's value yet") outlived
+        // that by some months. Guarded on the join HAVING one, below.
+        Source::ResultOrRegion(i) => format!(
+            "join_out(spec, {i}, frame, resolver).map_or(core::ptr::null_mut(), |a| a.ptr)"
+        ),
+        // The join's FOREIGN values -- nemotron's cross-statement mamba
+        // wiring. Guarded on the join having collected one, below.
+        Source::Aux(i) => format!(
+            "join_aux(spec, {i}, frame, resolver).map_or(core::ptr::null_mut(), |a| a.ptr)"
+        ),
         // The KV pages are a Metal spelling. CUDA's launchers take a
         // `KvCacheLayerView` by value rather than two pointers, so a row that
         // states these is not one this emitter can generate — and saying so
@@ -550,6 +558,15 @@ fn rust_bind_expr(op: &kernels::Operand) -> Option<String> {
         // `gdn.is_some()` in its guard, so the only way here is through
         // that test.
         Source::Gdn(f) => format!("g_of(gdn).{f}"),
+        // The layer's slab base. Guarded above, so the lookup is total.
+        Source::GdnSlab(f) => format!(
+            "gdn_slab(gdn, spec.state, \"{f}\").unwrap_or(core::ptr::null_mut())"
+        ),
+        // Null when the checkpoint ships none, which is a fact about the
+        // checkpoint and not drift. See the variant's own doc.
+        Source::WeightSuffix(suffix) => format!(
+            "spec.weight.as_deref()\n            .and_then(|n| resolver.weight(&format!(\"{{n}}{suffix}\")))\n            .unwrap_or(core::ptr::null())"
+        ),
         // Both total by the same construction `g_of` is: the guard below
         // proves the context is there, and `kv_view` also proves the
         // layer is in range.
@@ -750,8 +767,17 @@ pub fn emit_rust_dispatch(tables: &[&'static [KernelSig]]) -> String {
         // A FIRE WITH NO RECURRENT LAYERS CARRIES NO GDN CONTEXT, so a
         // row reading one declines rather than reading a default. This
         // is what makes `g_of`'s unwrap total.
-        if k.operands.iter().any(|o| matches!(o.source, Source::Gdn(_))) {
+        if k.operands.iter().any(|o| matches!(o.source, Source::Gdn(_) | Source::GdnSlab(_))) {
             guard.push_str(" && gdn.is_some()");
+        }
+        // THREE WAYS A SLAB IS ABSENT, and this tests all of them: the
+        // fire may carry no GDN context (above), the op may state no
+        // layer, and the context may hold no slab at that layer. The hand
+        // arms spelled the last two as `state_layer()?` and `slab(..)?`.
+        for o in k.operands {
+            if let Source::GdnSlab(f) = o.source {
+                guard.push_str(&format!(" && gdn_slab(gdn, spec.state, \"{f}\").is_some()"));
+            }
         }
         // A FIRE WITH NO ATTENTION CARRIES NO ATTENTION CONTEXT, and a
         // statement may name a layer the fire holds no cache for. Both
@@ -769,6 +795,20 @@ pub fn emit_rust_dispatch(tables: &[&'static [KernelSig]]) -> String {
         for o in k.operands {
             if let Source::AttnNonZero(f) = o.source {
                 guard.push_str(&format!(" && is_set(a_of(attn).{f})"));
+            }
+        }
+        // The join may hold no such output — a statement outside any
+        // value-producing region, or one whose guard produces nothing.
+        // The hand arms spelled it `out_slot(i, resolver)?`.
+        for o in k.operands {
+            match o.source {
+                Source::ResultOrRegion(i) => {
+                    guard.push_str(&format!(" && join_out(spec, {i}, frame, resolver).is_some()"));
+                }
+                Source::Aux(i) => {
+                    guard.push_str(&format!(" && join_aux(spec, {i}, frame, resolver).is_some()"));
+                }
+                _ => {}
             }
         }
         if k.operands.iter().any(|o| o.source == Source::KvLayerView) {

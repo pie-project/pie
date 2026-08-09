@@ -1,0 +1,331 @@
+[package]
+name = "driver-cuda"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "The CUDA execution shell, in Rust: streams, capture-safe allocation, graphs (incl. conditional nodes) and the elastic VMM arena."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+publish = false
+
+# Deliberately no `links` key, for the reason `driver-metal` states: the
+# C++ shell publishes `pie_driver_cuda_lib`, and two packages in one workspace
+# claiming one `links` value is a RESOLUTION error, not a link error -- it
+# would break `cargo metadata` for everyone rather than just for whoever
+# selected this crate.
+
+[lib]
+name = "driver_cuda"
+path = "src/lib.rs"
+
+# NOT `[lints] workspace = true`. That table sets `unsafe_code = "forbid"`,
+# which every `cudarc::*::sys` call violates by construction. The rest of it
+# (`missing_docs`, the clippy ratchets) is worth having and is set in
+# `lib.rs`, where `unsafe_code` can be left out of the list.
+
+[features]
+# Exactly one of these must be on, and it must match the CUDA runtime that
+# will be *loaded*, not merely the one available at build time. See
+# `src/cuda/graph.rs`'s `add_node` for what goes wrong otherwise: the symbol
+# `cudaGraphAddNode` has five parameters in `libcudart.so.12` and six in
+# `libcudart.so.13`, so a mismatched build segfaults inside the driver rather
+# than returning an error. `Device::bind` checks at startup so the failure is
+# a message instead of a crash.
+#
+# There is deliberately NO `default`. A default would have to be a guess about
+# someone else's machine, and the cost of guessing wrong is a segfault in the
+# driver rather than a build error -- so the honest thing is to refuse to
+# build until a human says which runtime this binary will meet. `lib.rs`
+# turns the omission into a compile_error that says so.
+cuda-12 = ["_cuda", "cudarc/cuda-12080"]
+cuda-13 = ["_cuda", "cudarc/cuda-13000"]
+
+# Private: "some CUDA version was chosen". Modules are gated on this so that a
+# build with no version selected emits one actionable error instead of burying
+# it under every use of `cudarc`. It also gates the test targets, which keeps
+# `cargo test` with no features on the same single error.
+_cuda = ["dep:cudarc"]
+
+# NOT a driver. The half of this crate that is correct without a GPU:
+# geometry, the memory planner, the profile cache, the scratch layout, the
+# arena growth rule -- everything whose answer a card does not change.
+#
+# It exists because north-star rule 2 says to cut by "is this correct
+# without a GPU?" rather than by subsystem, and because the cost of NOT
+# cutting there was measured: `store::memory_planner`, `mla_geometry` and
+# `dsv4_geometry` sat parity-tested with zero callers behind `_cuda`, where
+# no test that could have noticed was able to run. Eighteen of `store`'s
+# twenty-two files name no CUDA symbol at all.
+#
+# The gate now ends at the modules that own device memory (`kv_cache`,
+# `kv_cache_live`, `dsv4_compress_cache`, `attention_workspace`,
+# `supergraph`, `DeviceTensor`, `LiveDeviceMemory`) rather than at the
+# subsystem boundary. `tests/portable_half.rs` is what keeps it there --
+# without a job that builds this way, the gate drifts back.
+portable = []
+
+# The launch bridge (retirement plan phase A): build.rs generates the
+# `extern "C"` shim and the Rust bindings from the kernel table, compiles the
+# shim against the real headers, and links the kernels archive so
+# `launch::ffi` can actually be called. Off by default, deliberately: the
+# bridge needs the CUDA toolkit at BUILD time (real `cuda_runtime.h`, nvcc
+# for the archive), and this crate's toolkit-free build — cudarc resolves
+# symbols by `dlopen`, nothing links — is load-bearing for CI.
+bridge = ["dep:kernels-cuda"]
+
+# Phase D's door: the thirteen `pie_cuda_*` exports the engine binds
+# (retirement plan — "the cutover boundary, measured"). Implies `bridge`
+# (the shell runs the executor). MUTUALLY EXCLUSIVE with linking the C++
+# shell into the same binary: same symbols, one provider.
+abi = ["bridge", "dep:driver-api", "dep:model-loader", "dep:toml", "model/forward", "model/contract"]
+
+[dependencies]
+# The CUDA version is pinned EXPLICITLY rather than through
+# `cuda-version-from-build-system`, and that is the whole reason this crate
+# compiles on a machine with no CUDA at all: the build-system feature probes
+# `nvcc` and fails without one, while a named version plus
+# `fallback-dynamic-loading` emits no link line and resolves every symbol
+# through `dlopen` on first call. `csrc/CMakeLists.txt` looks for
+# `/usr/local/cuda-12.8`, so 12080 is the toolkit this tree is written
+# against; conditional graph nodes need >= 12030 and would silently vanish
+# from `sys` below that.
+#
+# `default-features = false` drops cublas/cublaslt/curand/nvrtc for now. They
+# come back one at a time, as the subsystem that needs them lands -- the
+# feature list is meant to read as the API surface this shell actually uses.
+#
+# `optional = true` is not about the dependency being optional -- there is no
+# build of this crate without it. It exists so that selecting no CUDA feature
+# leaves cudarc out of the graph entirely, and the build then fails on
+# `lib.rs`'s `compile_error!`, which names the two features. Without it, the
+# first thing to fail is cudarc's own build script, which panics about a
+# missing CUDA version and says nothing about how to fix it.
+cudarc = { version = "0.19.8", optional = true, default-features = false, features = [
+    "std",
+    "driver",
+    "runtime",
+    # The first subsystem to come back (see the note above): the live
+    # `CublasOps` behind `cuda::cublas::CublasHandle` makes the five handle
+    # calls the C++ wrapper makes. Dynamically loaded like everything else.
+    "cublas",
+    # The second: PTIR's compile plane. The host emits ONE self-contained CUDA
+    # translation unit per fused region and this driver carries no emitter, so
+    # NVRTC is not an optimisation -- a program with a generated region cannot
+    # run without it. Dynamically loaded like the rest, which is what keeps the
+    # toolkit-free build: `libnvrtc.so` is resolved on first compile, and a box
+    # that never registers a PTIR program never opens it.
+    "nvrtc",
+    "fallback-dynamic-loading",
+] }
+
+# The shell is a library loaded into someone else's process, so a degraded
+# path (a peer that turns out not to be reachable, say) has to be reported
+# through the host's subscriber rather than printed. The C++ writes those to
+# `std::cerr`, which is the behaviour being replaced, not preserved.
+tracing = "0.1"
+
+# The planner profile cache is a JSON document shared with the C++, which
+# parses it with nlohmann. Only the READER is serde_json: the writer is
+# `store::json`, hand-written so that key order and float formatting match
+# nlohmann exactly.
+#
+# `preserve_order` is requested DELIBERATELY, even though this crate does not
+# need insertion order. Four other crates in this workspace already enable it
+# (`engine`, `grammar`, `model`, `tokenizer`) and Cargo unifies features, so
+# the real build gets an `IndexMap` whatever this line says. Asking for it here
+# means the isolated `cargo test -p driver-cuda` build sees the same map
+# type as the workspace build -- without it, `Map` falls back to a `BTreeMap`
+# that is already sorted, `store::json`'s explicit key sort becomes dead code
+# in the tests, and the parity proof stops covering the one thing that sort
+# exists to prevent.
+serde_json = { version = "1.0", features = ["preserve_order"] }
+
+# The `pie.model/1` schema. `HfConfig` is ONE type with two consumers now:
+# the Rust normalizer writes it at import, this driver reads it back from the
+# artifact -- which is the whole point of the descriptor (config.hpp's tail
+# comment records the C++ parser's deletion for the same reason). The
+# `config` feature is the crate's declared leaf: serde + serde_json and
+# nothing of the loader, tracer, or kernels table.
+model = { path = "../model", default-features = false, features = ["config"] }
+
+# `flock` and `open`. The cache's read -> merge -> rename has to be atomic
+# against another process calibrating a different GPU under the same $HOME,
+# and an advisory whole-file lock is what the C++ uses.
+libc = "0.2"
+
+# The executor's input: `lower()`'s flat launch list and the trace types
+# its operands name. Pure Rust — the toolkit-free build is unaffected.
+model-compiler = { path = "../model-compiler" }
+
+# The PTIR channel plane, shared with the Metal shell: launch-package
+# adoption, the compile-cache identity, the emitted-table index, the bounded
+# caches, the channel ring and the reference pass. NOT optional and NOT gated
+# on a CUDA feature -- none of it names a CUDA symbol, which is the whole
+# reason it is a crate: the C++ carried three hand-written copies of this one
+# golden model, one per backend, and nothing ever checked that they agreed.
+driver = { path = "../driver" }
+
+# The ABI's Rust source of truth: the `#[repr(C)]` descriptors and status
+# codes the thirteen exports speak. Optional — only the `abi` shell needs
+# it.
+driver-api = { path = "../driver-api", optional = true }
+
+# `load_model`'s checkpoint reader — one parse of the snapshot, all three
+# layouts (.zt artifact, HF safetensors, GGUF), and the embedded
+# `model/descriptor` meta an artifact carries.
+model-loader = { path = "../model-loader", optional = true }
+
+# The boot config `create` receives as `config_bytes` — the C++ shell
+# parses the same TOML with toml++; `[model] descriptor` is where an HF
+# snapshot's descriptor path arrives.
+toml = { version = "1.1", optional = true }
+
+# The bridge's other half: with `bridge` on, the same crate that provides the
+# table also builds `libpie_kernels_cuda.a` (its `native` feature, CMake +
+# nvcc) and publishes the link-search paths. The `-l` directives are OURS to
+# emit, in build.rs, because a static archive must follow the shim that
+# references it on the link line. Optional so that without `bridge` the
+# archive build is not even in the graph.
+kernels-cuda = { path = "../kernels-cuda", default-features = false, features = ["native"], optional = true }
+
+# The launch ABI pilot reads the kernel table and generates both halves of the
+# flat entry points from it (`kernels_cuda::abi`). A dev-dependency rather
+# than a dependency: nothing in the library calls a launcher yet, and the
+# generated Rust bindings are only compiled by `tests/rope_abi.rs`. This moves
+# to `[dependencies]` when the first launcher is actually called.
+#
+# `default-features = false` is the point of the split in that crate -- it
+# leaves `native` off, so reading the table costs no nvcc.
+[dev-dependencies]
+kernels = { path = "../kernels" }
+kernels-cuda = { path = "../kernels-cuda", default-features = false }
+# The executor's binder test lowers a REAL deployment's traced form —
+# `forward` builds the family texts; the regular dependency above stays
+# `config`-only so the library never carries the tracer.
+model = { path = "../model", default-features = false, features = ["config", "forward", "contract"] }
+# The PRODUCER, for `tests/gpu_ptir_emitted.rs` only: that test authors a
+# trace, runs the host's real bind → compile → lower → emit chain over it, and
+# compiles the result — so it proves the emitter's CUDA and this driver's NVRTC
+# options agree rather than proving a hand-written kernel compiles. A
+# dev-dependency and never a regular one: the driver must not depend on the
+# compiler to RUN, only to prove it agrees with it before it ships. That is the
+# same arrangement `driver-pipeline`'s oracle uses.
+tensor-compiler = { path = "../tensor-compiler" }
+tensor-ir = { path = "../tensor-ir" }
+driver-api = { path = "../driver-api" }
+
+# The bridge generator: build.rs reads the SAME tables the tests read and
+# writes both halves of the flat ABI to OUT_DIR. Table-only (`native` off) —
+# generating text costs no nvcc; compiling the shim is `cc`'s job below.
+[build-dependencies]
+kernels-cuda = { path = "../kernels-cuda", default-features = false }
+cc = "1"
+
+# `required-features` keeps `cargo test` with no CUDA feature reporting the
+# same one error the library does, instead of additionally failing to compile
+# test targets whose imports have all been cfg'd away.
+# The one test target with no CUDA feature: it asks whether the portable
+# half is still portable, which is a question only a build can answer.
+[[test]]
+name = "portable_half"
+required-features = ["portable"]
+
+[[test]]
+name = "gpu_smoke"
+required-features = ["_cuda"]
+
+[[test]]
+name = "gpu_vmm"
+required-features = ["_cuda"]
+
+[[test]]
+name = "gpu_ptir"
+required-features = ["_cuda"]
+
+[[test]]
+name = "gpu_ptir_emitted"
+required-features = ["_cuda"]
+
+[[test]]
+name = "gpu_ptir_fire"
+required-features = ["_cuda"]
+
+[[test]]
+name = "gpu_graph"
+required-features = ["_cuda"]
+
+[[test]]
+name = "kv_format_parity"
+required-features = ["_cuda"]
+
+[[test]]
+name = "kv_geometry_parity"
+required-features = ["_cuda"]
+
+[[test]]
+name = "planner_policy_parity"
+required-features = ["_cuda"]
+
+[[test]]
+name = "store_parity"
+required-features = ["_cuda"]
+
+[[test]]
+name = "memory_planner_parity"
+required-features = ["_cuda"]
+
+[[test]]
+name = "kv_cache_parity"
+required-features = ["_cuda"]
+
+[[test]]
+name = "recurrent_parity"
+required-features = ["_cuda"]
+
+[[test]]
+name = "caches_parity"
+required-features = ["_cuda"]
+
+[[test]]
+name = "launch_abi"
+required-features = ["_cuda"]
+
+[[test]]
+name = "bridge_smoke"
+required-features = ["_cuda", "bridge"]
+
+[[test]]
+name = "executor_bind"
+required-features = ["_cuda"]
+
+[[test]]
+name = "real_prefill"
+required-features = ["_cuda", "bridge"]
+
+[[test]]
+name = "real_hybrid"
+required-features = ["_cuda", "bridge"]
+
+[[test]]
+name = "real_gemma4"
+required-features = ["_cuda", "bridge"]
+
+[[test]]
+name = "serve"
+required-features = ["_cuda", "abi"]
+
+[[test]]
+name = "union_lower"
+required-features = ["_cuda"]
+
+[[test]]
+name = "gpu_supergraph"
+required-features = ["_cuda", "bridge"]
+
+[[test]]
+name = "facts_registry"
+required-features = ["_cuda", "abi"]
+
+[[test]]
+name = "shape_analysis"
+required-features = ["_cuda"]

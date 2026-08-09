@@ -27,8 +27,8 @@ default = []
 # Each flavor turns on a DEPENDENCY, not a branch in this crate's build
 # script. Both drivers are Rust now, so what this crate needs from them is
 # that they be in the graph.
-driver-cuda = ["engine/driver-cuda-new"]
-driver-metal = ["engine/driver-metal-new"]
+driver-cuda = ["engine/driver-cuda"]
+driver-metal = ["engine/driver-metal"]
 driver-dummy = []
 nixl = ["dep:transport", "transport/nixl"]
 

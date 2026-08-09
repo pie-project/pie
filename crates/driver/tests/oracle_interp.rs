@@ -51,7 +51,7 @@
 //! two are *expected* to agree. Every case here is an epilogue program, which
 //! is what the channel-plane interpreter exists to run.
 //!
-//! This is also not yet the device comparison `CUTOVER.md`'s gate item 4
+//! This is also not yet the device comparison `.wiki/driver/progress-metal.md`'s gate item 4
 //! finishes with. It is its first half, and the half that runs without a GPU:
 //! proving the driver's interpreter *is* the golden model means a later device
 //! test can diff against the cheap local copy and still be making the strong
