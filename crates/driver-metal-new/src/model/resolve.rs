@@ -30,49 +30,75 @@
 use std::collections::HashMap;
 
 use super::executor::{Resolver, Slice};
+
+/// The scales sidecar, which no checkpoint spells two ways.
+static SCALES: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| ".scales".to_string());
 use model_compiler::trace::ValueId;
 
 /// How a checkpoint spells what a text names.
 ///
 /// Data rather than code: a family that spells its tensors differently is a
-/// different `Names`, not a different resolver.
+/// different spelling in this map, not a different resolver.
+///
+/// # Why a role has SEVERAL spellings
+///
+/// One role, one name was the earlier shape, and it forced a second map
+/// (`Names::mlx_gemma4`) the moment a second convention appeared — and then
+/// the driver had to CHOOSE which map, which is the driver choosing, which is
+/// the one thing this crate may not do.
+///
+/// So a role names every spelling it has ever been seen under, and the
+/// CHECKPOINT decides: [`Store::checkpoint_name`] takes the first candidate
+/// the loaded tensor map actually publishes. Adding a convention is adding a
+/// string, and no caller learns anything.
+///
+/// Three real disagreements this covers, all measured against checkpoints on
+/// disk rather than guessed:
+///
+///   - `embed`/`lm_head`: `shared_embedding` when the deployment TIES them,
+///     `embed_tokens` and `lm_head` when it does not (gpt-oss).
+///   - the expert bank: `mlp.switch_mlp.*` (qwen3-moe),
+///     `experts.switch_glu.*` (gemma4), `mlp.experts.*` (gpt-oss).
+///   - the router: `mlp.gate` (qwen3-moe), `mlp.router` (gpt-oss).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Names {
     /// What a layer-scoped name gets in front of its index —
     /// `model.layers.` for a HuggingFace export.
     pub layer_prefix: String,
-    /// The text's role name → the checkpoint's path within a layer.
-    /// `qkv` → `self_attn.qkv_proj`.
-    pub roles: HashMap<String, String>,
+    /// The text's role name → the checkpoint's paths within a layer, in the
+    /// order they are tried. `qkv` → `self_attn.qkv_proj`.
+    pub roles: HashMap<String, Vec<String>>,
     /// Names with no layer at all — `embed`, `lm_head`, `final_norm`.
-    pub globals: HashMap<String, String>,
+    pub globals: HashMap<String, Vec<String>>,
     /// What the checkpoint calls a packed weight's own tensor.
-    pub weight_suffix: String,
+    ///
+    /// `.weight` for a tensor that hangs under a module, and **the empty
+    /// string** for one that IS the value: gpt-oss ships `self_attn.sinks`,
+    /// not `self_attn.sinks.weight`, because a sink is a vector and not a
+    /// linear layer.
+    pub weight_suffix: Vec<String>,
     /// What it calls the zero point the text spells `.zeros`.
-    pub zero_point_suffix: String,
+    ///
+    /// `.biases` for MLX's affine quantisation and `.bias` for the MXFP4
+    /// expert banks, which spell the same role one character apart.
+    pub zero_point_suffix: Vec<String>,
 }
 
 impl Names {
-    /// The same convention with gemma4's expert bank.
+    /// gemma4's expert bank, which is now [`Names::mlx`] and nothing else.
     ///
-    /// gemma4 ships `layers.N.experts.switch_glu.{gate,up,down}_proj` where
-    /// qwen3-moe ships `layers.N.mlp.switch_mlp.*`. Measured against
-    /// `mlx-community/gemma-4-26b-a4b-it-4bit` and
-    /// `mlx-community/Qwen3.6-35B-A3B-4bit`.
+    /// Kept as a name so callers need not all change at once. It USED to be a
+    /// second map, because gemma4 ships `layers.N.experts.switch_glu.*` where
+    /// qwen3-moe ships `layers.N.mlp.switch_mlp.*` -- and that made the driver
+    /// pick a map per checkpoint, which is the driver choosing.
     ///
-    /// A SECOND map rather than a branch inside the first: which name a role
-    /// has is the checkpoint's convention, and two conventions is two maps.
+    /// Both spellings are candidates of the one map now, so there is nothing
+    /// left to pick.
+    #[deprecated(note = "`Names::mlx` carries gemma4's spellings as candidates")]
     #[must_use]
     pub fn mlx_gemma4() -> Self {
-        let mut names = Self::mlx();
-        for (role, spelled) in [
-            ("expert_gate", "experts.switch_glu.gate_proj"),
-            ("expert_up", "experts.switch_glu.up_proj"),
-            ("expert_down", "experts.switch_glu.down_proj"),
-        ] {
-            names.roles.insert(role.to_string(), spelled.to_string());
-        }
-        names
+        Self::mlx()
     }
 
     /// The convention `model::llama_3::contract` publishes, which is what
@@ -125,10 +151,22 @@ impl Names {
             // The expert banks carry no expert index: `switch_mlp` stores all
             // of them in one `[experts, out, in]` tensor and the routed kernel
             // indexes it by the slot it read.
-            ("router", "mlp.gate"),
-            ("expert_gate", "mlp.switch_mlp.gate_proj"),
-            ("expert_up", "mlp.switch_mlp.up_proj"),
-            ("expert_down", "mlp.switch_mlp.down_proj"),
+            // Three conventions for one bank, and the checkpoint picks:
+            // qwen3-moe's `switch_mlp`, gemma4's `switch_glu`, gpt-oss's
+            // plain `experts`.
+            ("router", "mlp.gate|mlp.router"),
+            (
+                "expert_gate",
+                "mlp.switch_mlp.gate_proj|experts.switch_glu.gate_proj|mlp.experts.gate_proj",
+            ),
+            (
+                "expert_up",
+                "mlp.switch_mlp.up_proj|experts.switch_glu.up_proj|mlp.experts.up_proj",
+            ),
+            (
+                "expert_down",
+                "mlp.switch_mlp.down_proj|experts.switch_glu.down_proj|mlp.experts.down_proj",
+            ),
             ("shared_gate", "mlp.shared_expert.gate_proj"),
             ("shared_up", "mlp.shared_expert.up_proj"),
             ("shared_down", "mlp.shared_expert.down_proj"),
@@ -152,32 +190,42 @@ impl Names {
             ("mlp_norm", "post_attention_layernorm"),
         ]
         .into_iter()
-        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .map(|(a, b): (&str, &str)| {
+            (a.to_string(), b.split('|').map(str::to_string).collect())
+        })
         .collect();
         let globals = [
             // Tied: one table serves both ends, which is why the readout and
             // the embedding answer to the same name.
-            ("embed", "shared_embedding"),
+            // Tied deployments publish ONE table under `shared_embedding`;
+            // untied ones (gpt-oss) publish `embed_tokens` and `lm_head`
+            // separately. Which is which is the checkpoint's to say.
+            ("embed", "shared_embedding|embed_tokens"),
             // gemma's SECOND embedding table and its projection: layer-less,
             // gathered once per step, so they are globals rather than a
             // layer's.
             ("ple_embed", "per_layer_embedding"),
             ("ple_proj", "per_layer_input_projection"),
             ("ple_proj_norm", "per_layer_input_norm"),
-            ("lm_head", "shared_embedding"),
+            ("lm_head", "shared_embedding|lm_head"),
             ("final_norm", "final_norm"),
         ]
         .into_iter()
-        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .map(|(a, b): (&str, &str)| {
+            (a.to_string(), b.split('|').map(str::to_string).collect())
+        })
         .collect();
         Self {
             layer_prefix: "layers.".to_string(),
             roles,
             globals,
-            weight_suffix: ".weight".to_string(),
-            // The text says `.zeros`, the checkpoint says `.biases`. Both are
-            // right on their own side; the map is where they meet.
-            zero_point_suffix: ".biases".to_string(),
+            // `.weight` first, then the bare name: a role whose tensor IS
+            // the value (`self_attn.sinks`) hangs under no module.
+            weight_suffix: vec![".weight".to_string(), String::new()],
+            // The text says `.zeros`, the checkpoint says `.biases` -- or
+            // `.bias`, for the MXFP4 expert banks. Both are right on their own
+            // side; the map is where they meet.
+            zero_point_suffix: vec![".biases".to_string(), ".bias".to_string()],
         }
     }
 }
@@ -298,19 +346,58 @@ impl<'a> Store<'a> {
     /// gap in this map.
     #[must_use]
     pub fn checkpoint_name(&self, traced: &str) -> Option<String> {
-        let t = decompose(traced)?;
-        let base = match t.layer {
-            Some(l) => {
-                let role = self.names.roles.get(t.role)?;
-                format!("{}{l}.{role}", self.names.layer_prefix)
-            }
-            None => self.names.globals.get(t.role)?.clone(),
+        let mut candidates = self.checkpoint_names(traced).into_iter().peekable();
+        let first = candidates.peek()?.clone();
+        // The one the checkpoint actually has. A store with no tensors -- the
+        // name-map tests, and the load-time gate that asks a plan rather than
+        // a staged map -- has nothing to choose with, so it gets the first
+        // candidate and a caller that wants them all asks for them all.
+        Some(
+            candidates
+                .find(|c| self.tensors.contains_key(c))
+                .unwrap_or(first),
+        )
+    }
+
+    /// Every spelling `traced` could have, in the order they are tried.
+    ///
+    /// The cross product of the role's candidate paths and the sidecar's
+    /// candidate suffixes. Published because the LOAD-TIME gate needs it: it
+    /// holds the text's names against a load plan rather than a staged tensor
+    /// map, so it has no `tensors` to choose with and must ask whether ANY
+    /// spelling is one the plan publishes.
+    ///
+    /// Empty for a name that is not in the text's shape at all -- which is
+    /// drift, not a gap in this map.
+    #[must_use]
+    pub fn checkpoint_names(&self, traced: &str) -> Vec<String> {
+        let Some(t) = decompose(traced) else {
+            return Vec::new();
         };
-        Some(match t.sidecar {
-            "" => format!("{base}{}", self.names.weight_suffix),
-            ".scales" => format!("{base}.scales"),
-            _ => format!("{base}{}", self.names.zero_point_suffix),
-        })
+        let bases: Vec<String> = match t.layer {
+            Some(l) => {
+                let Some(roles) = self.names.roles.get(t.role) else {
+                    return Vec::new();
+                };
+                roles
+                    .iter()
+                    .map(|role| format!("{}{l}.{role}", self.names.layer_prefix))
+                    .collect()
+            }
+            None => match self.names.globals.get(t.role) {
+                Some(g) => g.clone(),
+                None => return Vec::new(),
+            },
+        };
+        let suffixes: &[String] = match t.sidecar {
+            "" => &self.names.weight_suffix,
+            ".scales" => std::slice::from_ref(&*SCALES),
+            _ => &self.names.zero_point_suffix,
+        };
+        bases
+            .iter()
+            .flat_map(|b| suffixes.iter().map(move |s| format!("{b}{s}")))
+            .collect()
     }
 
     /// Every traced name this store was asked for and could not answer.
@@ -323,8 +410,9 @@ impl<'a> Store<'a> {
 impl Resolver for Store<'_> {
     fn weight(&mut self, name: &str) -> Option<Slice> {
         let found = self
-            .checkpoint_name(name)
-            .and_then(|spelled| self.tensors.get(&spelled).copied());
+            .checkpoint_names(name)
+            .into_iter()
+            .find_map(|spelled| self.tensors.get(&spelled).copied());
         if found.is_none() {
             self.missed.push(name.to_string());
         }

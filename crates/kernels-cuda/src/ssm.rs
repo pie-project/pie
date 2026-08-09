@@ -199,19 +199,23 @@ pub static KERNELS: &[KernelSig] = &[
     // with the decay per KEY CHANNEL rather than per head -- which is why
     // these exist beside the GDN kernels instead of reusing them with a
     // broadcast.
+    // Two operands, two weights, two results — and the head geometry is
+    // the results' own: `gate_out` is `[Tokens, h * d]` and `beta_out` is
+    // `[Tokens, h]`, so `h` is the second result's width and `d` the
+    // first's divided by it. The row says both directly off the shapes.
     kernel!(kda_gate_beta "ssm::kda_gate_beta_bf16",
         operands = operands![
-            raw_g: Buf,
-            raw_beta: Buf,
-            a_log: F32s,
-            dt_bias: F32s,
-            gate_out: F32sMut,
-            beta_out: F32sMut,
-            t: I32,
-            h: I32,
-            d: I32,
-            lower_bound: F32,
-            stream: Stream,
+            raw_g: Buf <- Source::In(0),
+            raw_beta: Buf <- Source::In(1),
+            a_log: F32s <- Source::Weight(0),
+            dt_bias: F32s <- Source::Weight(1),
+            gate_out: F32sMut <- Source::Out(0),
+            beta_out: F32sMut <- Source::Out(1),
+            t: I32 <- Source::Rows,
+            h: I32 <- Source::OutWidth(1),
+            d: I32 <- Source::Param(0),
+            lower_bound: F32 <- Source::Lit(Lit::F32(0.0)),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // `slot_ids` is indexed `0..R` against the fire's request order, so a row
     // window would advance the wrong slots.
@@ -252,17 +256,20 @@ pub static KERNELS: &[KernelSig] = &[
             d: I32,
             stream: Stream,
         ]),
+    // The gated output norm: the recurrence's fp32 output, the gate, one
+    // weight, one bf16 result. `h` and `d` ride the param channel — the
+    // result is `[Tokens, h * d]` and only their product is a shape.
     kernel!(kda_o_norm_gated "ssm::kda_o_norm_gated_bf16",
         operands = operands![
-            o: F32s,
-            g: Buf,
-            weight: F32s,
-            out: BufMut,
-            t: I32,
-            h: I32,
-            d: I32,
-            eps: F32,
-            stream: Stream,
+            o: F32s <- Source::In(0),
+            g: Buf <- Source::In(1),
+            weight: F32s <- Source::Weight(0),
+            out: BufMut <- Source::Out(0),
+            t: I32 <- Source::Rows,
+            h: I32 <- Source::Param(0),
+            d: I32 <- Source::Param(1),
+            eps: F32 <- Source::Ctx("eps"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     kernel!(gdn_conv_update "ssm::causal_conv1d_update_batched_bf16",
         operands = operands![
@@ -511,15 +518,18 @@ pub static KERNELS: &[KernelSig] = &[
         ]),
     // KDA's arithmetic is fp32 throughout, so operands living in bf16 in the
     // workspace cross explicitly. Launches, so the trace records them.
+    // Every argument is the statement's: one operand, one result, the
+    // fire's rows and the result's row width. The two scalars are the
+    // KDA convention — an unscaled L2 norm at the context's epsilon.
     kernel!(l2norm_scale_to_f32 "ssm::l2norm_scale_bf16_to_fp32",
         operands = operands![
-            x: Buf,
-            y: F32sMut,
-            n: I32,
-            hidden: I32,
-            scale: F32,
-            eps: F32,
-            stream: Stream,
+            x: Buf <- Source::In(0),
+            y: F32sMut <- Source::Out(0),
+            n: I32 <- Source::Rows,
+            hidden: I32 <- Source::OutWidth(0),
+            scale: F32 <- Source::Lit(Lit::F32(1.0)),
+            eps: F32 <- Source::Ctx("eps"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // The two casts, and the first rows whose every argument the
     // statement already carries: one operand, one result, and an element

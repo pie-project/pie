@@ -102,8 +102,7 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
     );
     let a = facts.attn.clone();
     dsl::trace_named(&family, |t| {
-        dsl::seam(t, &dsl::seam::IN, &[], None);
-        let mut y = dsl::embed_with(t, "embed", facts.hidden);
+        let mut y = dsl::embedded_prologue(t, facts.hidden);
 
         for l in 0..facts.layers {
             let w = Glm5LayerW::new(l, facts);
@@ -112,10 +111,15 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
             // The query's own latent, normed, then expanded. `hidden`
             // appears nowhere between here and `o_proj` — that is what
             // makes this MLA rather than a wide attention.
-            let q_a = matmul(&x, &w.q_a_proj);
-            let q_a_n = dsl::cuda::rmsnorm(&q_a, &w.q_a_norm);
-            let q_b = matmul(&q_a_n, &w.q_b_proj);
-            let kv_a = matmul(&x, &w.kv_a_proj);
+            let (q_b, kv_a, q_a_n) = dsl::mla_latents(
+                &x,
+                None,
+                &w.q_a_proj,
+                &w.q_a_norm,
+                &w.q_b_proj,
+                &w.kv_a_proj,
+                a.q_lora_rank,
+            );
 
             // ── DSA lightning indexer ────────────────────────────────
             // A second, smaller attention whose only product is a top-k
@@ -136,7 +140,7 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
                 facts.dsa.index_n_heads,
                 facts.dsa.index_head_dim,
             );
-            dsl::cuda::dsa_index_topk_mask(&idx_q, &idx_k, &idx_w);
+            dsl::cuda::dsa_index_topk_mask(&idx_q, &idx_k, &idx_w, facts.dsa.index_n_heads, facts.dsa.index_head_dim, facts.dsa.index_topk);
 
             // ── MLA ──────────────────────────────────────────────────
             let (_kv_c, _k_pe, q_nope, q_pe) = dsl::cuda::mla_prepare(
@@ -147,32 +151,34 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
                 a.qk_nope_head_dim,
                 a.qk_rope_head_dim,
             );
-            let kv_b = format!("layer.{l}.kv_b_proj");
-            let q_latent =
-                dsl::cuda::mla_absorb_q_to_latent(&q_nope, &kv_b, a.heads, a.kv_lora_rank);
-            let attn_latent =
-                dsl::cuda::attention_mla(&q_latent, &q_pe, l, a.heads, a.kv_lora_rank);
-            let attn_v = dsl::cuda::mla_absorb_latent_to_v(
-                &attn_latent,
-                &kv_b,
-                a.heads,
-                a.v_head_dim,
+            let attn_v = dsl::mla_absorbed_attention(
+                &q_nope,
+                &q_pe,
+                &format!("layer.{l}.kv_b_proj"),
+                l,
+                dsl::MlaWidths {
+                    heads: a.heads,
+                    kv_lora_rank: a.kv_lora_rank,
+                    qk_nope_head_dim: a.qk_nope_head_dim,
+                    v_head_dim: a.v_head_dim,
+                },
             );
             // The OnAttn site: after the core, before `o_proj` — the
             // hand-written invoke's position.
-            dsl::seam(attn_v.trace(), &dsl::seam::ATTN_OUT, &[&attn_v], Some(l));
             // `+=` of a fresh matmul IS the beta=1 fold the T==1 arm makes.
-            y += matmul(&attn_v, &w.o_proj);
+            y += dsl::attention_landing(&attn_v, &w.o_proj, l);
 
             // ── MLP / MoE ────────────────────────────────────────────
             let m = dsl::cuda::rmsnorm(&y, &w.mlp_norm);
             if !facts.is_moe_layer(l) {
-                // The pair form: glm5 binds gate and up separately and
-                // fires `kernels::mlp::swiglu_bf16` over the two buffers.
-                let gate = matmul(&m, &w.dense_gate);
-                let _up = matmul(&m, &w.dense_up);
-                let act = dsl::cuda::swiglu(&gate, facts.dense_intermediate, false);
-                y += matmul(&act, &w.dense_down);
+                y += dsl::dense_gated_mlp(
+                    &m,
+                    &w.dense_gate,
+                    &w.dense_up,
+                    &w.dense_down,
+                    facts.dense_intermediate,
+                    dsl::GatedAct::SwiGlu,
+                );
                 continue;
             }
 
@@ -222,16 +228,6 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
             y = dsl::cuda::residual_add(&y, &moe_out, facts.hidden);
         }
 
-        let normed = dsl::cuda::rmsnorm(
-            &y,
-            &NormW {
-                name: "final_norm".to_string(),
-                variant: NormVariant::Plain,
-                per_head: None,
-                layer: None,
-            },
-        );
-        let logits = dsl::lm_head_at(t, &normed, "lm_head", facts.vocab);
-        dsl::seam(t, &dsl::seam::OUT, &[&logits], None);
+        dsl::logits_epilogue(t, &y, NormVariant::Plain, false, facts.vocab, false);
     })
 }

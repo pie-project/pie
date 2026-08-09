@@ -773,6 +773,228 @@ pub fn rope(q: &Val, k: &Val, kind: RopeKind) -> (Val, Val) {
     (mk(qo), mk(ko))
 }
 
+/// THE PROLOGUE: the entry seam, then the token embedding.
+///
+/// Two lines, written identically by every family that has no per-layer
+/// embedding table to build first. It is shared for the reason the
+/// epilogue's exit seam is inside its block: the ORDER is the contract.
+/// The seam is where attached programs bind their inputs, so a family
+/// that embedded before seaming would hand them a value they were
+/// supposed to be able to influence.
+///
+/// Nothing enforces that order but this function, and nothing needs to
+/// once every caller is this function.
+pub fn embedded_prologue(t: &Trace, hidden: u32) -> Val {
+    seam(t, &seam::IN, &[], None);
+    embed_with(t, "embed", hidden)
+}
+
+/// THE EPILOGUE, and the three facts that vary in it.
+///
+/// Five families wrote this: final norm, readout, an optional logit
+/// softcap, and the exit seam. What differed was the norm's VARIANT
+/// (gemma's `(1 + w)` fold or plain), whether the readout is tied, and
+/// whether the deployment caps its logits — three facts, and everything
+/// else identical down to the `"final_norm"` weight name.
+///
+/// The softcap is a LAUNCH, not a parameter: a cap large enough to do
+/// nothing is still a kernel run per fire to compute the identity, so a
+/// deployment without one states no statement rather than a wide one.
+///
+/// The exit seam is inside, because it is the boundary sampling attaches
+/// to and a family that forgot it would trace a plan nothing can read
+/// from. Four of the five had it as the last line; making it the block's
+/// last line means a fifth cannot omit it.
+pub fn logits_epilogue(
+    t: &Trace,
+    y: &Val,
+    norm_variant: crate::trace::NormVariant,
+    tied_embeddings: bool,
+    vocab: u32,
+    logit_softcap: bool,
+) {
+    let normed = cuda::rmsnorm(
+        y,
+        &NormW {
+            name: "final_norm".to_string(),
+            variant: norm_variant,
+            per_head: None,
+            layer: None,
+        },
+    );
+    let logits = lm_head_tied(t, &normed, tied_embeddings, vocab);
+    let logits = if logit_softcap { cuda::logit_softcap(&logits, vocab) } else { logits };
+    seam(t, &seam::OUT, &[&logits], None);
+}
+
+/// THE ATTENTION LANDING: observe the core's output, then project it.
+///
+/// Nine sites across eight families, and the ORDER is the contract. The
+/// `attn.out` seam is the OnAttn site — where attached programs read the
+/// attention's result and where a score consumer binds — so it must see
+/// the value BEFORE `o_proj` consumes it. A family that projected first
+/// would seam a value nothing else can reach.
+///
+/// That is not locally visible: both orders trace, both lower, and the
+/// difference only shows when something actually attaches. Which is why
+/// it is worth being a function rather than a convention repeated nine
+/// times.
+///
+/// Returns the projection. Whether the caller writes `y += …` or folds
+/// the residual into the GEMM's beta is the family's business — gpt-oss
+/// does the second — so this has no opinion about the landing.
+pub fn attention_landing(a: &Val, o_proj: &MatW, layer: u32) -> Val {
+    seam(a.trace(), &seam::ATTN_OUT, &[a], Some(layer));
+    matmul(a, o_proj)
+}
+
+/// MLA's TWO LATENTS: the query's, normed and expanded, and the KV's.
+///
+/// Three families wrote the unfused form identically — glm5, kimi-k2's
+/// `else` arm and kimi-k3 — four statements that never varied. `hidden`
+/// appears nowhere in what they produce, which is what makes this MLA
+/// rather than a wide attention.
+///
+/// `fused` is the BINDING fact, and it is a different kernel rather than
+/// a buffer detail: a deployment whose load joined the two latents into
+/// one bank norms the query half IN PLACE with a pitch, and
+/// `rmsnorm_strided` reads a row stride the plain norm has no parameter
+/// for. So the fork is an `Option` on the fused bank — present means the
+/// join happened — rather than a bool beside a weight that may or may not
+/// exist.
+///
+/// Returns `(q_b, kv_a, q_a_n)`. The first two are what every MLA prepare
+/// takes next, fused or split; the third is the NORMED query latent,
+/// which glm5's DSA indexer scores its pages from — a second consumer of
+/// an intermediate, and the reason this returns it rather than keeping
+/// it private.
+pub fn mla_latents(
+    x: &Val,
+    fused: Option<&MatW>,
+    q_a_proj: &MatW,
+    q_a_norm: &NormW,
+    q_b_proj: &MatW,
+    kv_a_proj: &MatW,
+    q_lora_rank: u32,
+) -> (Val, Val, Val) {
+    let (q_a_n, kv_a) = match fused {
+        Some(bank) => {
+            let qkv_a = matmul(x, bank);
+            // The statement carries the NARROW extent it produces; the
+            // pitch is the buffer question the kernel owns.
+            let q_a_n = cuda::rmsnorm_strided(&qkv_a, &q_a_norm.name, q_lora_rank);
+            (q_a_n, qkv_a)
+        }
+        None => {
+            let q_a = matmul(x, q_a_proj);
+            (cuda::rmsnorm(&q_a, q_a_norm), matmul(x, kv_a_proj))
+        }
+    };
+    (matmul(&q_a_n, q_b_proj), kv_a, q_a_n)
+}
+
+/// The five widths an MLA layer is described by.
+///
+/// Three families carry a field-identical struct for these — glm5's
+/// `Glm5MlaFacts`, kimi-k2's `KimiMlaFacts`, kimi-k3's `KimiK3MlaFacts`
+/// — and pass them one at a time to statements that always want the same
+/// four. Grouping them is what lets the block below take one argument
+/// instead of four, and what makes a fifth family's copy obviously a
+/// copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MlaWidths {
+    pub heads: u32,
+    pub kv_lora_rank: u32,
+    pub qk_nope_head_dim: u32,
+    pub v_head_dim: u32,
+}
+
+/// MLA's ABSORBED attention: the three statements every latent-cache
+/// family runs, in the order all three wrote them.
+///
+/// `q_nope` is absorbed into the latent space, attention runs THERE
+/// against the compressed cache, and the result is absorbed back out to
+/// the value space. Both absorptions name the whole `kv_b_proj` bank and
+/// slice it themselves, which is why the bank is one weight name rather
+/// than two.
+///
+/// What is NOT here is the PREPARE, and that is the point of where the
+/// line falls. glm5 and kimi-k2 take the fused `mla_prepare`, which does
+/// the rope as part of what it fuses; kimi-k3 takes the split pair,
+/// because its MLA carries no rope. That is a real fact about a family,
+/// so it stays at the call site — while the three statements after it,
+/// which no family varies, stop being written three times.
+#[must_use]
+pub fn mla_absorbed_attention(
+    q_nope: &Val,
+    q_pe: &Val,
+    kv_b_proj: &str,
+    layer: u32,
+    w: MlaWidths,
+) -> Val {
+    let q_latent =
+        cuda::mla_absorb_q_to_latent(q_nope, kv_b_proj, w.heads, w.kv_lora_rank, w.v_head_dim, w.qk_nope_head_dim);
+    let attn_latent = cuda::attention_mla(&q_latent, q_pe, layer, w.heads, w.kv_lora_rank);
+    cuda::mla_absorb_latent_to_v(
+        &attn_latent,
+        kv_b_proj,
+        w.heads,
+        w.v_head_dim,
+        w.qk_nope_head_dim,
+        w.kv_lora_rank,
+    )
+}
+
+/// The DENSE GATED MLP, and which activation is a FACT.
+///
+/// Four families wrote this block identically — glm5, kimi-k2, kimi-k3
+/// and deepseek-v4 — and the only thing that differed was one statement:
+/// `swiglu`, `swiglu`, `situ`, `swiglu_clamp`. Four copies of a sequence
+/// with a single varying line is exactly what `cuda.md` §5.C2 means by
+/// "turn the variant forks into data": the fork is not an architecture,
+/// it is a value.
+///
+/// The `_up` binding is load-bearing and easy to lose. The gate and up
+/// projections are SEPARATE weights, and the activation kernel reads them
+/// as one contiguous pair — so the up matmul must be traced (it writes the
+/// second half) even though nothing names its value. Every one of the four
+/// copies had it as `let _up = …`, and a fifth would have to remember.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatedAct {
+    /// `kernels::mlp::swiglu_bf16` — the plain gated linear unit.
+    SwiGlu,
+    /// deepseek-v4's clamped variant. A DIFFERENT KERNEL, not a
+    /// parameter: the clamp changes the arithmetic.
+    SwiGluClamp,
+    /// kimi-k3's SiTU.
+    Situ,
+}
+
+/// Trace one dense gated MLP: norm-input in, contribution out.
+///
+/// The caller adds the result to its residual, because whether that is
+/// `y += …` or a stated `residual_add` is the family's business and this
+/// block does not have an opinion about it.
+#[must_use]
+pub fn dense_gated_mlp(
+    m: &Val,
+    gate_w: &MatW,
+    up_w: &MatW,
+    down_w: &MatW,
+    intermediate: u32,
+    act: GatedAct,
+) -> Val {
+    let gate = matmul(m, gate_w);
+    // Traced for its WRITE, not its value — see the note above.
+    let _up = matmul(m, up_w);
+    let activated = match act {
+        GatedAct::SwiGlu => cuda::swiglu(&gate, intermediate, false),
+        GatedAct::SwiGluClamp => cuda::swiglu_clamp(&gate, intermediate, false),
+        GatedAct::Situ => cuda::situ(&gate, intermediate, false),
+    };
+    matmul(&activated, down_w)
+}
+
 pub fn swiglu(x: &Val, inter: u32) -> Val {
     let id = x.t.with(x.layer, |b| b.swiglu(x.id, inter));
     Val {
@@ -3076,10 +3298,19 @@ pub mod cuda {
     /// A cuBLAS op, not a raw launch -- and that is why the vocabulary audit
     /// missed it twice: a launcher is anything that issues DEVICE work, and
     /// there are two ways to do that here.
-    pub fn mla_absorb_q_to_latent(q_nope: &Val, w: &str, heads: u32, kv_lora_rank: u32) -> Val {
-        record(
+    /// `v_head_dim` rides the PARAM channel: the bank is sliced by it and
+    /// this direction's result does not carry it.
+    pub fn mla_absorb_q_to_latent(
+        q_nope: &Val,
+        w: &str,
+        heads: u32,
+        kv_lora_rank: u32,
+        v_head_dim: u32,
+        qk_nope_dim: u32,
+    ) -> Val {
+        record_with_params(
             &q_nope.t, q_nope.layer, "gemm::mla_absorb_q_to_latent_bf16",
-            vec![w.to_string()], None, vec![q_nope.id],
+            vec![w.to_string()], None, vec![heads, qk_nope_dim, v_head_dim, kv_lora_rank], vec![q_nope.id],
             Some((
                 Shape(vec![Dim::Tokens, Dim::Const(heads), Dim::Const(kv_lora_rank)]),
                 DType::BF16,
@@ -3090,10 +3321,17 @@ pub mod cuda {
 
     /// `kernels::gemm::mla_absorb_latent_to_v_bf16`: project the latent attention
     /// output back to the value space.
-    pub fn mla_absorb_latent_to_v(latent: &Val, w: &str, heads: u32, v_head_dim: u32) -> Val {
-        record(
+    pub fn mla_absorb_latent_to_v(
+        latent: &Val,
+        w: &str,
+        heads: u32,
+        v_head_dim: u32,
+        qk_nope_dim: u32,
+        kv_lora_rank: u32,
+    ) -> Val {
+        record_with_params(
             &latent.t, latent.layer, "gemm::mla_absorb_latent_to_v_bf16",
-            vec![w.to_string()], None, vec![latent.id],
+            vec![w.to_string()], None, vec![heads, qk_nope_dim, v_head_dim, kv_lora_rank], vec![latent.id],
             Some((
                 Shape(vec![Dim::Tokens, Dim::Const(heads), Dim::Const(v_head_dim)]),
                 DType::BF16,
@@ -4469,11 +4707,12 @@ pub mod cuda {
         heads: u32,
         head_dim: u32,
     ) -> (Val, Val) {
-        let outs = record_many(
+        let outs = record_many_with_params(
             &o1.t,
             o1.layer,
             "attn::combine_attn_outputs_bf16",
             vec![],
+            vec![heads, head_dim],
             vec![o1.id, lse1.id, o2.id, lse2.id],
             vec![
                 (
@@ -5007,11 +5246,14 @@ pub mod cuda {
         heads: u32,
         head_dim: u32,
     ) -> (Val, Val) {
-        let outs = record_many(
+        let outs = record_many_with_params(
             &raw_g.t,
             raw_g.layer,
             "ssm::kda_gate_beta_bf16",
             vec![a_log.to_string(), dt_bias.to_string()],
+            // `head_dim`: the gate result is `[Tokens, heads * head_dim]`
+            // and only the product is a shape, so the row reads `d` here.
+            vec![head_dim],
             vec![raw_g.id, raw_beta.id],
             vec![
                 (
@@ -5105,13 +5347,23 @@ pub mod cuda {
     }
 
     /// `kernels::ssm::kda_o_norm_gated_bf16`: the output norm and gate.
-    pub fn kda_o_norm_gated(x: &Val, gate: &Val, weight: &str, width: u32) -> Val {
-        record(
+    /// `heads` and `head_dim` ride the PARAM channel: the result is
+    /// `[Tokens, heads * head_dim]` and only their product is a shape.
+    pub fn kda_o_norm_gated(
+        x: &Val,
+        gate: &Val,
+        weight: &str,
+        width: u32,
+        heads: u32,
+        head_dim: u32,
+    ) -> Val {
+        record_with_params(
             &x.t,
             x.layer,
             "ssm::kda_o_norm_gated_bf16",
             vec![weight.to_string()],
             None,
+            vec![heads, head_dim],
             vec![x.id, gate.id],
             Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16))
         )
@@ -5325,11 +5577,12 @@ pub mod cuda {
         qk_nope_dim: u32,
         qk_rope_dim: u32,
     ) -> (Val, Val) {
-        let outs = record_many(
+        let outs = record_many_with_params(
             &q_b.t,
             q_b.layer,
             "attn::kimi_split_q_b_bf16",
             vec![],
+            vec![heads, qk_nope_dim, qk_rope_dim],
             vec![q_b.id],
             vec![
                 (
@@ -5418,13 +5671,24 @@ pub mod cuda {
     /// `logit[i,j] = Σ_h relu(idx_q[i,h,·] · idx_k[j,·]) · idx_w[i,h]`, then
     /// the mask is 1 for the top-`k` of `j <= i`. The output is `[T, T]`, and
     /// it is what MLA's `index_mask` consumes.
-    pub fn dsa_index_topk_mask(idx_q: &Val, idx_k: &Val, idx_w: &Val) -> Val {
-        record(
+    /// `top_k` rides the PARAM channel: it is a load-time number and no
+    /// operand shape carries it — the same reading `moe_align` and the
+    /// aligned gather already use.
+    pub fn dsa_index_topk_mask(
+        idx_q: &Val,
+        idx_k: &Val,
+        idx_w: &Val,
+        n_heads: u32,
+        head_dim: u32,
+        top_k: u32,
+    ) -> Val {
+        record_with_params(
             &idx_q.t,
             idx_q.layer,
             "attn::dsa_index_topk_mask",
             vec![],
             None,
+            vec![n_heads, head_dim, top_k],
             vec![idx_q.id, idx_k.id, idx_w.id],
             Some((Shape(vec![Dim::Tokens, Dim::Tokens]), DType::I32)),
         )

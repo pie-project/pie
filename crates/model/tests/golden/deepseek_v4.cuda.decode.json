@@ -2616,7 +2616,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::combine_attn_outputs_bf16"
+          "kernel": "attn::combine_attn_outputs_bf16",
+          "params": [
+            16,
+            128
+          ]
         }
       },
       "inputs": [
@@ -3107,7 +3111,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::combine_attn_outputs_bf16"
+          "kernel": "attn::combine_attn_outputs_bf16",
+          "params": [
+            16,
+            128
+          ]
         }
       },
       "inputs": [
@@ -3637,7 +3645,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::combine_attn_outputs_bf16"
+          "kernel": "attn::combine_attn_outputs_bf16",
+          "params": [
+            16,
+            128
+          ]
         }
       },
       "inputs": [
@@ -4167,7 +4179,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::combine_attn_outputs_bf16"
+          "kernel": "attn::combine_attn_outputs_bf16",
+          "params": [
+            16,
+            128
+          ]
         }
       },
       "inputs": [
@@ -4697,7 +4713,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::combine_attn_outputs_bf16"
+          "kernel": "attn::combine_attn_outputs_bf16",
+          "params": [
+            16,
+            128
+          ]
         }
       },
       "inputs": [
@@ -5227,7 +5247,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::combine_attn_outputs_bf16"
+          "kernel": "attn::combine_attn_outputs_bf16",
+          "params": [
+            16,
+            128
+          ]
         }
       },
       "inputs": [

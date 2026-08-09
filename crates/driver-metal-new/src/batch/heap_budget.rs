@@ -10,15 +10,8 @@
 //! and bisecting the real function cannot, because when the DAG
 //! changes the function it bisects changes with it.
 
-use crate::tuning::Tuning;
 
-use super::dispatch_gemma4::gemma4_pool_elems;
-use super::dispatch_gptoss::{gptoss_pool_elems, gptoss_qmm_pool_rows};
-use super::dispatch_llama::{llama_pool_elems, llama_qmm_pool_rows};
-use super::gemma4::Gemma4Geometry;
 use super::geometry::DecodeGeometry;
-use super::gptoss::GptOssGeometry;
-use super::llama::LlamaGeometry;
 
 /// The fewest rows a paged fire is allowed to budget down to.
 pub const PAGED_MIN_FORWARD_TOKENS: u32 = 64;
@@ -30,86 +23,22 @@ pub const PAGED_MAX_FORWARD_TOKENS: u32 = 4096;
 /// allocation with no diagnosis of which one ran out.
 const BASE_SLACK: u64 = 256 << 20;
 
+/// The activation pool's row count for a fire of up to `max_rows`.
+///
+/// Rounded up to the WIDEST row tile, because a pool sized for the rows a
+/// fire has is a pool the widest GEMM rung reads past. Not one family's --
+/// it moved here when the llama layer went, having never been llama's.
+fn qmm_pool_rows(max_rows: u32) -> u32 {
+    let wide = super::psos_mb::QMM_BMS[super::psos_mb::QMM_BMS.len() - 1];
+    max_rows.max(1).div_ceil(wide) * wide
+}
+
 fn clamp_sampled(rows: u32, requests: u32) -> u32 {
     requests.max(1).min(rows.max(1))
 }
 
-/// The llama family's extra-heap bytes for a fire of up to `max_tokens`
-/// rows sampling up to `max_requests`.
-#[must_use]
-pub fn llama_extra_heap_bytes(
-    g: &LlamaGeometry,
-    tuning: &Tuning,
-    max_ctx: u32,
-    max_tokens: u32,
-    max_requests: u32,
-) -> u64 {
-    let mut bytes = BASE_SLACK;
-    // The KV region: per layer, both sides, plus one page's slack per
-    // layer per side — the engine pages, so max_ctx rounds up.
-    let per_layer = u64::from(g.n_kv_heads) * (u64::from(max_ctx) + 32) * u64::from(g.head_dim) * 2;
-    bytes += u64::from(g.n_layers) * 2 * per_layer;
-    let rows = llama_qmm_pool_rows(max_tokens);
-    let sampled = llama_qmm_pool_rows(clamp_sampled(max_tokens, max_requests));
-    for e in llama_pool_elems(g, tuning, rows, sampled) {
-        bytes += e * 2;
-    }
-    bytes += u64::from(sampled) * u64::from(g.vocab) * 2; // the logits slot
-    bytes
-}
 
-/// The gpt-oss family's extra-heap bytes.
-#[must_use]
-pub fn gptoss_extra_heap_bytes(
-    g: &GptOssGeometry,
-    tuning: &Tuning,
-    max_ctx: u32,
-    max_tokens: u32,
-    max_requests: u32,
-) -> u64 {
-    let mut bytes = BASE_SLACK;
-    let per_layer = u64::from(g.n_kv_heads) * (u64::from(max_ctx) + 32) * u64::from(g.head_dim) * 2;
-    bytes += u64::from(g.n_layers) * 2 * per_layer;
-    let rows = gptoss_qmm_pool_rows(max_tokens);
-    let sampled = gptoss_qmm_pool_rows(clamp_sampled(max_tokens, max_requests));
-    for e in gptoss_pool_elems(g, tuning, rows, sampled) {
-        bytes += e * 2;
-    }
-    bytes += u64::from(sampled) * u64::from(g.vocab) * 2;
-    bytes
-}
 
-/// The gemma4 family's extra-heap bytes. The KV term is per OWNING
-/// layer at its own width — the same shape `stage_gemma4_kv` allocates.
-#[must_use]
-pub fn gemma4_extra_heap_bytes(
-    g: &Gemma4Geometry,
-    tuning: &Tuning,
-    max_ctx: u32,
-    max_tokens: u32,
-    max_requests: u32,
-) -> u64 {
-    let mut bytes = BASE_SLACK;
-    for layer in 0..g.n_layers {
-        if g.is_kv_shared(layer) {
-            continue;
-        }
-        bytes += 2
-            * u64::from(g.n_kv_heads_of(layer))
-            * (u64::from(max_ctx) + 32)
-            * u64::from(g.head_dim_of(layer))
-            * 2;
-    }
-    // The dense projections tile through the shared rules, so the pool
-    // padding is the shared one.
-    let rows = llama_qmm_pool_rows(max_tokens);
-    let sampled = llama_qmm_pool_rows(clamp_sampled(max_tokens, max_requests));
-    for e in gemma4_pool_elems(g, tuning, rows, sampled) {
-        bytes += e * 2;
-    }
-    bytes += u64::from(sampled) * u64::from(g.vocab) * 2;
-    bytes
-}
 
 /// The most rows one fire can afford under `budget_bytes`, by bisecting
 /// the budget function itself.
@@ -379,22 +308,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_real_budgets_are_monotone_and_family_shaped() {
-        let tuning = Tuning::default();
-        let g = LlamaGeometry::default();
-        let at = |rows| llama_extra_heap_bytes(&g, &tuning, 4096, rows, rows);
-        assert!(at(64) < at(512) && at(512) < at(4096));
-        // gemma4's KV term counts OWNING layers at their own widths: the
-        // E2B has 15 owners, and doubling the shared tail must not move
-        // the KV term.
-        let g4 = Gemma4Geometry::default();
-        let base = gemma4_extra_heap_bytes(&g4, &tuning, 4096, 64, 1);
-        let mut more_shared = g4.clone();
-        more_shared.num_kv_shared_layers += 5;
-        let fewer_owners = gemma4_extra_heap_bytes(&more_shared, &tuning, 4096, 64, 1);
-        assert!(fewer_owners < base, "fewer owners is less KV");
-    }
+    // `the_real_budgets_are_monotone_and_family_shaped` went with the two
+    // per-family budget functions it drove. What it checked -- that a budget
+    // grows with rows, and that gemma4's KV term counts OWNING layers so a
+    // longer shared tail costs nothing -- is a claim about functions that no
+    // longer exist. The generic executor sizes its arena from the LOWERING
+    // (`Lowered::arena_bytes`), which is measured per fire rather than
+    // predicted per family.
 
     #[test]
     fn the_stream_predicate_is_one_pattern_and_the_bias_splits_on_paging() {

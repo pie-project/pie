@@ -7,14 +7,14 @@ use std::sync::{OnceLock, RwLock};
 
 use anyhow::{Result, anyhow};
 
-#[cfg(feature = "driver-cuda")]
+#[cfg(feature = "driver-cuda-new")]
 mod cuda;
 mod dummy;
 #[cfg(all(feature = "driver-metal-new", target_vendor = "apple"))]
 mod metal;
 mod remote;
 
-#[cfg(feature = "driver-cuda")]
+#[cfg(feature = "driver-cuda-new")]
 pub use cuda::CudaDriver;
 pub use dummy::DummyDriver;
 #[cfg(all(feature = "driver-metal-new", target_vendor = "apple"))]
@@ -64,7 +64,7 @@ pub enum FrameLaunchOutcome {
 
 pub enum DriverBackend {
     Dummy(DummyDriver),
-    #[cfg(feature = "driver-cuda")]
+    #[cfg(feature = "driver-cuda-new")]
     Cuda(CudaDriver),
     #[cfg(all(feature = "driver-metal-new", target_vendor = "apple"))]
     Metal(MetalDriver),
@@ -75,7 +75,7 @@ impl DriverBackend {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Dummy(_) => "dummy",
-            #[cfg(feature = "driver-cuda")]
+            #[cfg(feature = "driver-cuda-new")]
             Self::Cuda(_) => "cuda",
             #[cfg(all(feature = "driver-metal-new", target_vendor = "apple"))]
             Self::Metal(_) => "metal",
@@ -91,7 +91,7 @@ impl DriverBackend {
         Ok((Self::Dummy(driver), facts))
     }
 
-    #[cfg(feature = "driver-cuda")]
+    #[cfg(feature = "driver-cuda-new")]
     pub fn cuda_create(config_bytes: &[u8]) -> Result<(Self, driver_abi::DeviceFacts)> {
         let (driver, facts) = CudaDriver::create(config_bytes)?;
         Ok((Self::Cuda(driver), facts))
@@ -109,7 +109,7 @@ impl DriverBackend {
         Ok((Self::Metal(driver), facts))
     }
 
-    #[cfg(feature = "driver-cuda")]
+    #[cfg(feature = "driver-cuda-new")]
     pub fn cuda_group_create(
         config_blobs: Vec<Vec<u8>>,
     ) -> Result<(Self, Vec<driver_abi::DeviceFacts>)> {
@@ -132,7 +132,7 @@ impl DriverBackend {
                 };
                 driver.load_model(desc)
             }
-            #[cfg(feature = "driver-cuda")]
+            #[cfg(feature = "driver-cuda-new")]
             Self::Cuda(driver) => driver.load_model(descs),
             #[cfg(all(feature = "driver-metal-new", target_vendor = "apple"))]
             Self::Metal(driver) => driver.load_model(descs),
@@ -145,7 +145,7 @@ impl DriverBackend {
     /// says which native backend it is, so this needs no capability round-trip.
     fn codegen_backend(&self) -> Option<&'static str> {
         match self {
-            #[cfg(feature = "driver-cuda")]
+            #[cfg(feature = "driver-cuda-new")]
             Self::Cuda(_) => Some("cuda"),
             // The dummy driver interprets PTIR, and a remote driver's own
             // backend does its generation on the far side.
@@ -212,7 +212,7 @@ impl DriverBackend {
         };
         match self {
             Self::Dummy(driver) => driver.register_program(desc),
-            #[cfg(feature = "driver-cuda")]
+            #[cfg(feature = "driver-cuda-new")]
             Self::Cuda(driver) => driver.register_program(desc),
             #[cfg(all(feature = "driver-metal-new", target_vendor = "apple"))]
             Self::Metal(driver) => driver.register_program(desc),
@@ -226,7 +226,7 @@ impl DriverBackend {
     ) -> Result<RegisteredChannel> {
         match self {
             Self::Dummy(driver) => driver.register_channel(desc),
-            #[cfg(feature = "driver-cuda")]
+            #[cfg(feature = "driver-cuda-new")]
             Self::Cuda(driver) => driver.register_channel(desc),
             #[cfg(all(feature = "driver-metal-new", target_vendor = "apple"))]
             Self::Metal(driver) => driver.register_channel(desc),
@@ -237,7 +237,7 @@ impl DriverBackend {
     pub fn bind_instance(&mut self, desc: &InstanceBindingPlan) -> Result<BoundInstance> {
         match self {
             Self::Dummy(driver) => driver.bind_instance(desc),
-            #[cfg(feature = "driver-cuda")]
+            #[cfg(feature = "driver-cuda-new")]
             Self::Cuda(driver) => driver.bind_instance(desc),
             #[cfg(all(feature = "driver-metal-new", target_vendor = "apple"))]
             Self::Metal(driver) => driver.bind_instance(desc),
@@ -252,7 +252,7 @@ impl DriverBackend {
     pub fn launch(&mut self, desc: &FrameSubmission) -> Result<FrameLaunchOutcome> {
         match self {
             Self::Dummy(driver) => driver.launch(desc),
-            #[cfg(feature = "driver-cuda")]
+            #[cfg(feature = "driver-cuda-new")]
             Self::Cuda(driver) => driver.launch(desc),
             #[cfg(all(feature = "driver-metal-new", target_vendor = "apple"))]
             Self::Metal(driver) => driver.launch(desc),
@@ -263,7 +263,7 @@ impl DriverBackend {
     pub fn encode(&mut self, plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
         match self {
             Self::Dummy(driver) => driver.encode(plan),
-            #[cfg(feature = "driver-cuda")]
+            #[cfg(feature = "driver-cuda-new")]
             Self::Cuda(driver) => driver.encode(plan),
             #[cfg(all(feature = "driver-metal-new", target_vendor = "apple"))]
             Self::Metal(driver) => driver.encode(plan),
@@ -274,7 +274,7 @@ impl DriverBackend {
     pub fn copy_kv(&mut self, desc: &KvCopyPlan) -> Result<SubmissionCompletion> {
         match self {
             Self::Dummy(driver) => driver.copy_kv(desc),
-            #[cfg(feature = "driver-cuda")]
+            #[cfg(feature = "driver-cuda-new")]
             Self::Cuda(driver) => driver.copy_kv(desc),
             #[cfg(all(feature = "driver-metal-new", target_vendor = "apple"))]
             Self::Metal(driver) => driver.copy_kv(desc),
@@ -285,7 +285,7 @@ impl DriverBackend {
     pub fn copy_state(&mut self, desc: &StateCopyPlan) -> Result<SubmissionCompletion> {
         match self {
             Self::Dummy(driver) => driver.copy_state(desc),
-            #[cfg(feature = "driver-cuda")]
+            #[cfg(feature = "driver-cuda-new")]
             Self::Cuda(driver) => driver.copy_state(desc),
             #[cfg(all(feature = "driver-metal-new", target_vendor = "apple"))]
             Self::Metal(driver) => driver.copy_state(desc),
@@ -296,7 +296,7 @@ impl DriverBackend {
     pub fn resize_pool(&mut self, desc: &PoolResizePlan) -> Result<SubmissionCompletion> {
         match self {
             Self::Dummy(driver) => driver.resize_pool(desc),
-            #[cfg(feature = "driver-cuda")]
+            #[cfg(feature = "driver-cuda-new")]
             Self::Cuda(driver) => driver.resize_pool(desc),
             #[cfg(all(feature = "driver-metal-new", target_vendor = "apple"))]
             Self::Metal(driver) => driver.resize_pool(desc),
@@ -307,7 +307,7 @@ impl DriverBackend {
     pub fn close_instance(&mut self, id: u64) -> Result<()> {
         match self {
             Self::Dummy(driver) => driver.close_instance(id),
-            #[cfg(feature = "driver-cuda")]
+            #[cfg(feature = "driver-cuda-new")]
             Self::Cuda(driver) => driver.close_instance(id),
             #[cfg(all(feature = "driver-metal-new", target_vendor = "apple"))]
             Self::Metal(driver) => driver.close_instance(id),
@@ -318,7 +318,7 @@ impl DriverBackend {
     pub fn close_channel(&mut self, id: u64) -> Result<()> {
         match self {
             Self::Dummy(driver) => driver.close_channel(id),
-            #[cfg(feature = "driver-cuda")]
+            #[cfg(feature = "driver-cuda-new")]
             Self::Cuda(driver) => driver.close_channel(id),
             #[cfg(all(feature = "driver-metal-new", target_vendor = "apple"))]
             Self::Metal(driver) => driver.close_channel(id),
@@ -329,7 +329,7 @@ impl DriverBackend {
     pub fn export_kv_handle(&self) -> Option<driver_abi::KvHandle> {
         match self {
             Self::Dummy(driver) => driver.export_kv_handle(),
-            #[cfg(feature = "driver-cuda")]
+            #[cfg(feature = "driver-cuda-new")]
             Self::Cuda(driver) => driver.export_kv_handle(),
             #[cfg(all(feature = "driver-metal-new", target_vendor = "apple"))]
             Self::Metal(driver) => driver.export_kv_handle(),

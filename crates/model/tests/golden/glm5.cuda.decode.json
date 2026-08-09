@@ -41,7 +41,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -50,7 +50,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -273,7 +273,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -282,7 +282,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -505,7 +505,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -514,7 +514,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -737,7 +737,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -746,7 +746,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -1056,7 +1056,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -1065,7 +1065,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -1375,7 +1375,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -1384,7 +1384,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -1694,7 +1694,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -1703,7 +1703,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -2013,7 +2013,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -2022,7 +2022,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -2332,7 +2332,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -2341,7 +2341,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -2651,7 +2651,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -2660,7 +2660,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -2970,7 +2970,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -2979,7 +2979,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -3289,7 +3289,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -3298,7 +3298,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -3608,7 +3608,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -3617,7 +3617,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -3927,7 +3927,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -3936,7 +3936,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -4246,7 +4246,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -4255,7 +4255,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -4565,7 +4565,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -4574,7 +4574,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -4884,7 +4884,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -4893,7 +4893,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -5203,7 +5203,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -5212,7 +5212,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -5522,7 +5522,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -5531,7 +5531,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -5841,7 +5841,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -5850,7 +5850,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -6160,7 +6160,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -6169,7 +6169,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -6479,7 +6479,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -6488,7 +6488,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -6798,7 +6798,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -6807,7 +6807,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -7117,7 +7117,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -7126,7 +7126,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -7436,7 +7436,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -7445,7 +7445,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -7755,7 +7755,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -7764,7 +7764,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -8074,7 +8074,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -8083,7 +8083,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -8393,7 +8393,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -8402,7 +8402,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -8712,7 +8712,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -8721,7 +8721,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -9031,7 +9031,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -9040,7 +9040,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -9350,7 +9350,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -9359,7 +9359,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -9669,7 +9669,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -9678,7 +9678,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -9988,7 +9988,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -9997,7 +9997,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -10307,7 +10307,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -10316,7 +10316,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -10626,7 +10626,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -10635,7 +10635,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -10945,7 +10945,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -10954,7 +10954,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -11264,7 +11264,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -11273,7 +11273,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -11583,7 +11583,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -11592,7 +11592,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -11902,7 +11902,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -11911,7 +11911,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -12221,7 +12221,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -12230,7 +12230,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -12540,7 +12540,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -12549,7 +12549,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -12859,7 +12859,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -12868,7 +12868,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -13178,7 +13178,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -13187,7 +13187,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -13497,7 +13497,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -13506,7 +13506,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -13816,7 +13816,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -13825,7 +13825,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -14135,7 +14135,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 18432
+          "Const": 576
         }
       ],
       "dtype": "BF16"
@@ -14144,7 +14144,7 @@
       "shape": [
         "Tokens",
         {
-          "Const": 576
+          "Const": 18432
         }
       ],
       "dtype": "BF16"
@@ -14507,12 +14507,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.0.q_b_proj",
+          "weight": "layer.0.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        3
+        1
       ],
       "outputs": [
         4
@@ -14522,12 +14522,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.0.kv_a_proj_with_mqa",
+          "weight": "layer.0.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        1
+        3
       ],
       "outputs": [
         5
@@ -14616,7 +14616,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -14636,8 +14641,8 @@
         }
       },
       "inputs": [
-        5,
-        4
+        4,
+        5
       ],
       "outputs": [
         12,
@@ -14653,6 +14658,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.0.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -14689,6 +14700,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.0.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -14858,12 +14875,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.1.q_b_proj",
+          "weight": "layer.1.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        27
+        25
       ],
       "outputs": [
         28
@@ -14873,12 +14890,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.1.kv_a_proj_with_mqa",
+          "weight": "layer.1.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        25
+        27
       ],
       "outputs": [
         29
@@ -14967,7 +14984,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -14987,8 +15009,8 @@
         }
       },
       "inputs": [
-        29,
-        28
+        28,
+        29
       ],
       "outputs": [
         36,
@@ -15004,6 +15026,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.1.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -15040,6 +15068,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.1.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -15209,12 +15243,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.2.q_b_proj",
+          "weight": "layer.2.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        51
+        49
       ],
       "outputs": [
         52
@@ -15224,12 +15258,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.2.kv_a_proj_with_mqa",
+          "weight": "layer.2.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        49
+        51
       ],
       "outputs": [
         53
@@ -15318,7 +15352,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -15338,8 +15377,8 @@
         }
       },
       "inputs": [
-        53,
-        52
+        52,
+        53
       ],
       "outputs": [
         60,
@@ -15355,6 +15394,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.2.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -15391,6 +15436,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.2.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -15560,12 +15611,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.3.q_b_proj",
+          "weight": "layer.3.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        75
+        73
       ],
       "outputs": [
         76
@@ -15575,12 +15626,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.3.kv_a_proj_with_mqa",
+          "weight": "layer.3.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        73
+        75
       ],
       "outputs": [
         77
@@ -15669,7 +15720,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -15689,8 +15745,8 @@
         }
       },
       "inputs": [
-        77,
-        76
+        76,
+        77
       ],
       "outputs": [
         84,
@@ -15706,6 +15762,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.3.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -15742,6 +15804,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.3.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -16035,12 +16103,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.4.q_b_proj",
+          "weight": "layer.4.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        108
+        106
       ],
       "outputs": [
         109
@@ -16050,12 +16118,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.4.kv_a_proj_with_mqa",
+          "weight": "layer.4.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        106
+        108
       ],
       "outputs": [
         110
@@ -16144,7 +16212,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -16164,8 +16237,8 @@
         }
       },
       "inputs": [
-        110,
-        109
+        109,
+        110
       ],
       "outputs": [
         117,
@@ -16181,6 +16254,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.4.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -16217,6 +16296,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.4.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -16510,12 +16595,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.5.q_b_proj",
+          "weight": "layer.5.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        141
+        139
       ],
       "outputs": [
         142
@@ -16525,12 +16610,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.5.kv_a_proj_with_mqa",
+          "weight": "layer.5.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        139
+        141
       ],
       "outputs": [
         143
@@ -16619,7 +16704,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -16639,8 +16729,8 @@
         }
       },
       "inputs": [
-        143,
-        142
+        142,
+        143
       ],
       "outputs": [
         150,
@@ -16656,6 +16746,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.5.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -16692,6 +16788,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.5.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -16985,12 +17087,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.6.q_b_proj",
+          "weight": "layer.6.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        174
+        172
       ],
       "outputs": [
         175
@@ -17000,12 +17102,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.6.kv_a_proj_with_mqa",
+          "weight": "layer.6.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        172
+        174
       ],
       "outputs": [
         176
@@ -17094,7 +17196,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -17114,8 +17221,8 @@
         }
       },
       "inputs": [
-        176,
-        175
+        175,
+        176
       ],
       "outputs": [
         183,
@@ -17131,6 +17238,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.6.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -17167,6 +17280,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.6.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -17460,12 +17579,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.7.q_b_proj",
+          "weight": "layer.7.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        207
+        205
       ],
       "outputs": [
         208
@@ -17475,12 +17594,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.7.kv_a_proj_with_mqa",
+          "weight": "layer.7.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        205
+        207
       ],
       "outputs": [
         209
@@ -17569,7 +17688,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -17589,8 +17713,8 @@
         }
       },
       "inputs": [
-        209,
-        208
+        208,
+        209
       ],
       "outputs": [
         216,
@@ -17606,6 +17730,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.7.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -17642,6 +17772,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.7.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -17935,12 +18071,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.8.q_b_proj",
+          "weight": "layer.8.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        240
+        238
       ],
       "outputs": [
         241
@@ -17950,12 +18086,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.8.kv_a_proj_with_mqa",
+          "weight": "layer.8.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        238
+        240
       ],
       "outputs": [
         242
@@ -18044,7 +18180,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -18064,8 +18205,8 @@
         }
       },
       "inputs": [
-        242,
-        241
+        241,
+        242
       ],
       "outputs": [
         249,
@@ -18081,6 +18222,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.8.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -18117,6 +18264,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.8.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -18410,12 +18563,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.9.q_b_proj",
+          "weight": "layer.9.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        273
+        271
       ],
       "outputs": [
         274
@@ -18425,12 +18578,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.9.kv_a_proj_with_mqa",
+          "weight": "layer.9.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        271
+        273
       ],
       "outputs": [
         275
@@ -18519,7 +18672,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -18539,8 +18697,8 @@
         }
       },
       "inputs": [
-        275,
-        274
+        274,
+        275
       ],
       "outputs": [
         282,
@@ -18556,6 +18714,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.9.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -18592,6 +18756,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.9.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -18885,12 +19055,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.10.q_b_proj",
+          "weight": "layer.10.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        306
+        304
       ],
       "outputs": [
         307
@@ -18900,12 +19070,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.10.kv_a_proj_with_mqa",
+          "weight": "layer.10.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        304
+        306
       ],
       "outputs": [
         308
@@ -18994,7 +19164,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -19014,8 +19189,8 @@
         }
       },
       "inputs": [
-        308,
-        307
+        307,
+        308
       ],
       "outputs": [
         315,
@@ -19031,6 +19206,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.10.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -19067,6 +19248,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.10.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -19360,12 +19547,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.11.q_b_proj",
+          "weight": "layer.11.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        339
+        337
       ],
       "outputs": [
         340
@@ -19375,12 +19562,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.11.kv_a_proj_with_mqa",
+          "weight": "layer.11.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        337
+        339
       ],
       "outputs": [
         341
@@ -19469,7 +19656,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -19489,8 +19681,8 @@
         }
       },
       "inputs": [
-        341,
-        340
+        340,
+        341
       ],
       "outputs": [
         348,
@@ -19506,6 +19698,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.11.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -19542,6 +19740,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.11.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -19835,12 +20039,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.12.q_b_proj",
+          "weight": "layer.12.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        372
+        370
       ],
       "outputs": [
         373
@@ -19850,12 +20054,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.12.kv_a_proj_with_mqa",
+          "weight": "layer.12.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        370
+        372
       ],
       "outputs": [
         374
@@ -19944,7 +20148,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -19964,8 +20173,8 @@
         }
       },
       "inputs": [
-        374,
-        373
+        373,
+        374
       ],
       "outputs": [
         381,
@@ -19981,6 +20190,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.12.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -20017,6 +20232,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.12.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -20310,12 +20531,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.13.q_b_proj",
+          "weight": "layer.13.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        405
+        403
       ],
       "outputs": [
         406
@@ -20325,12 +20546,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.13.kv_a_proj_with_mqa",
+          "weight": "layer.13.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        403
+        405
       ],
       "outputs": [
         407
@@ -20419,7 +20640,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -20439,8 +20665,8 @@
         }
       },
       "inputs": [
-        407,
-        406
+        406,
+        407
       ],
       "outputs": [
         414,
@@ -20456,6 +20682,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.13.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -20492,6 +20724,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.13.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -20785,12 +21023,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.14.q_b_proj",
+          "weight": "layer.14.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        438
+        436
       ],
       "outputs": [
         439
@@ -20800,12 +21038,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.14.kv_a_proj_with_mqa",
+          "weight": "layer.14.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        436
+        438
       ],
       "outputs": [
         440
@@ -20894,7 +21132,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -20914,8 +21157,8 @@
         }
       },
       "inputs": [
-        440,
-        439
+        439,
+        440
       ],
       "outputs": [
         447,
@@ -20931,6 +21174,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.14.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -20967,6 +21216,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.14.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -21260,12 +21515,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.15.q_b_proj",
+          "weight": "layer.15.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        471
+        469
       ],
       "outputs": [
         472
@@ -21275,12 +21530,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.15.kv_a_proj_with_mqa",
+          "weight": "layer.15.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        469
+        471
       ],
       "outputs": [
         473
@@ -21369,7 +21624,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -21389,8 +21649,8 @@
         }
       },
       "inputs": [
-        473,
-        472
+        472,
+        473
       ],
       "outputs": [
         480,
@@ -21406,6 +21666,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.15.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -21442,6 +21708,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.15.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -21735,12 +22007,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.16.q_b_proj",
+          "weight": "layer.16.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        504
+        502
       ],
       "outputs": [
         505
@@ -21750,12 +22022,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.16.kv_a_proj_with_mqa",
+          "weight": "layer.16.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        502
+        504
       ],
       "outputs": [
         506
@@ -21844,7 +22116,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -21864,8 +22141,8 @@
         }
       },
       "inputs": [
-        506,
-        505
+        505,
+        506
       ],
       "outputs": [
         513,
@@ -21881,6 +22158,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.16.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -21917,6 +22200,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.16.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -22210,12 +22499,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.17.q_b_proj",
+          "weight": "layer.17.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        537
+        535
       ],
       "outputs": [
         538
@@ -22225,12 +22514,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.17.kv_a_proj_with_mqa",
+          "weight": "layer.17.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        535
+        537
       ],
       "outputs": [
         539
@@ -22319,7 +22608,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -22339,8 +22633,8 @@
         }
       },
       "inputs": [
-        539,
-        538
+        538,
+        539
       ],
       "outputs": [
         546,
@@ -22356,6 +22650,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.17.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -22392,6 +22692,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.17.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -22685,12 +22991,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.18.q_b_proj",
+          "weight": "layer.18.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        570
+        568
       ],
       "outputs": [
         571
@@ -22700,12 +23006,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.18.kv_a_proj_with_mqa",
+          "weight": "layer.18.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        568
+        570
       ],
       "outputs": [
         572
@@ -22794,7 +23100,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -22814,8 +23125,8 @@
         }
       },
       "inputs": [
-        572,
-        571
+        571,
+        572
       ],
       "outputs": [
         579,
@@ -22831,6 +23142,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.18.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -22867,6 +23184,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.18.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -23160,12 +23483,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.19.q_b_proj",
+          "weight": "layer.19.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        603
+        601
       ],
       "outputs": [
         604
@@ -23175,12 +23498,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.19.kv_a_proj_with_mqa",
+          "weight": "layer.19.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        601
+        603
       ],
       "outputs": [
         605
@@ -23269,7 +23592,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -23289,8 +23617,8 @@
         }
       },
       "inputs": [
-        605,
-        604
+        604,
+        605
       ],
       "outputs": [
         612,
@@ -23306,6 +23634,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.19.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -23342,6 +23676,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.19.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -23635,12 +23975,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.20.q_b_proj",
+          "weight": "layer.20.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        636
+        634
       ],
       "outputs": [
         637
@@ -23650,12 +23990,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.20.kv_a_proj_with_mqa",
+          "weight": "layer.20.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        634
+        636
       ],
       "outputs": [
         638
@@ -23744,7 +24084,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -23764,8 +24109,8 @@
         }
       },
       "inputs": [
-        638,
-        637
+        637,
+        638
       ],
       "outputs": [
         645,
@@ -23781,6 +24126,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.20.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -23817,6 +24168,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.20.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -24110,12 +24467,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.21.q_b_proj",
+          "weight": "layer.21.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        669
+        667
       ],
       "outputs": [
         670
@@ -24125,12 +24482,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.21.kv_a_proj_with_mqa",
+          "weight": "layer.21.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        667
+        669
       ],
       "outputs": [
         671
@@ -24219,7 +24576,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -24239,8 +24601,8 @@
         }
       },
       "inputs": [
-        671,
-        670
+        670,
+        671
       ],
       "outputs": [
         678,
@@ -24256,6 +24618,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.21.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -24292,6 +24660,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.21.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -24585,12 +24959,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.22.q_b_proj",
+          "weight": "layer.22.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        702
+        700
       ],
       "outputs": [
         703
@@ -24600,12 +24974,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.22.kv_a_proj_with_mqa",
+          "weight": "layer.22.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        700
+        702
       ],
       "outputs": [
         704
@@ -24694,7 +25068,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -24714,8 +25093,8 @@
         }
       },
       "inputs": [
-        704,
-        703
+        703,
+        704
       ],
       "outputs": [
         711,
@@ -24731,6 +25110,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.22.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -24767,6 +25152,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.22.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -25060,12 +25451,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.23.q_b_proj",
+          "weight": "layer.23.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        735
+        733
       ],
       "outputs": [
         736
@@ -25075,12 +25466,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.23.kv_a_proj_with_mqa",
+          "weight": "layer.23.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        733
+        735
       ],
       "outputs": [
         737
@@ -25169,7 +25560,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -25189,8 +25585,8 @@
         }
       },
       "inputs": [
-        737,
-        736
+        736,
+        737
       ],
       "outputs": [
         744,
@@ -25206,6 +25602,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.23.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -25242,6 +25644,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.23.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -25535,12 +25943,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.24.q_b_proj",
+          "weight": "layer.24.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        768
+        766
       ],
       "outputs": [
         769
@@ -25550,12 +25958,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.24.kv_a_proj_with_mqa",
+          "weight": "layer.24.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        766
+        768
       ],
       "outputs": [
         770
@@ -25644,7 +26052,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -25664,8 +26077,8 @@
         }
       },
       "inputs": [
-        770,
-        769
+        769,
+        770
       ],
       "outputs": [
         777,
@@ -25681,6 +26094,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.24.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -25717,6 +26136,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.24.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -26010,12 +26435,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.25.q_b_proj",
+          "weight": "layer.25.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        801
+        799
       ],
       "outputs": [
         802
@@ -26025,12 +26450,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.25.kv_a_proj_with_mqa",
+          "weight": "layer.25.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        799
+        801
       ],
       "outputs": [
         803
@@ -26119,7 +26544,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -26139,8 +26569,8 @@
         }
       },
       "inputs": [
-        803,
-        802
+        802,
+        803
       ],
       "outputs": [
         810,
@@ -26156,6 +26586,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.25.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -26192,6 +26628,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.25.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -26485,12 +26927,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.26.q_b_proj",
+          "weight": "layer.26.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        834
+        832
       ],
       "outputs": [
         835
@@ -26500,12 +26942,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.26.kv_a_proj_with_mqa",
+          "weight": "layer.26.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        832
+        834
       ],
       "outputs": [
         836
@@ -26594,7 +27036,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -26614,8 +27061,8 @@
         }
       },
       "inputs": [
-        836,
-        835
+        835,
+        836
       ],
       "outputs": [
         843,
@@ -26631,6 +27078,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.26.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -26667,6 +27120,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.26.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -26960,12 +27419,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.27.q_b_proj",
+          "weight": "layer.27.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        867
+        865
       ],
       "outputs": [
         868
@@ -26975,12 +27434,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.27.kv_a_proj_with_mqa",
+          "weight": "layer.27.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        865
+        867
       ],
       "outputs": [
         869
@@ -27069,7 +27528,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -27089,8 +27553,8 @@
         }
       },
       "inputs": [
-        869,
-        868
+        868,
+        869
       ],
       "outputs": [
         876,
@@ -27106,6 +27570,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.27.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -27142,6 +27612,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.27.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -27435,12 +27911,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.28.q_b_proj",
+          "weight": "layer.28.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        900
+        898
       ],
       "outputs": [
         901
@@ -27450,12 +27926,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.28.kv_a_proj_with_mqa",
+          "weight": "layer.28.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        898
+        900
       ],
       "outputs": [
         902
@@ -27544,7 +28020,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -27564,8 +28045,8 @@
         }
       },
       "inputs": [
-        902,
-        901
+        901,
+        902
       ],
       "outputs": [
         909,
@@ -27581,6 +28062,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.28.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -27617,6 +28104,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.28.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -27910,12 +28403,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.29.q_b_proj",
+          "weight": "layer.29.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        933
+        931
       ],
       "outputs": [
         934
@@ -27925,12 +28418,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.29.kv_a_proj_with_mqa",
+          "weight": "layer.29.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        931
+        933
       ],
       "outputs": [
         935
@@ -28019,7 +28512,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -28039,8 +28537,8 @@
         }
       },
       "inputs": [
-        935,
-        934
+        934,
+        935
       ],
       "outputs": [
         942,
@@ -28056,6 +28554,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.29.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -28092,6 +28596,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.29.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -28385,12 +28895,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.30.q_b_proj",
+          "weight": "layer.30.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        966
+        964
       ],
       "outputs": [
         967
@@ -28400,12 +28910,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.30.kv_a_proj_with_mqa",
+          "weight": "layer.30.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        964
+        966
       ],
       "outputs": [
         968
@@ -28494,7 +29004,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -28514,8 +29029,8 @@
         }
       },
       "inputs": [
-        968,
-        967
+        967,
+        968
       ],
       "outputs": [
         975,
@@ -28531,6 +29046,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.30.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -28567,6 +29088,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.30.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -28860,12 +29387,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.31.q_b_proj",
+          "weight": "layer.31.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        999
+        997
       ],
       "outputs": [
         1000
@@ -28875,12 +29402,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.31.kv_a_proj_with_mqa",
+          "weight": "layer.31.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        997
+        999
       ],
       "outputs": [
         1001
@@ -28969,7 +29496,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -28989,8 +29521,8 @@
         }
       },
       "inputs": [
-        1001,
-        1000
+        1000,
+        1001
       ],
       "outputs": [
         1008,
@@ -29006,6 +29538,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.31.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -29042,6 +29580,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.31.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -29335,12 +29879,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.32.q_b_proj",
+          "weight": "layer.32.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        1032
+        1030
       ],
       "outputs": [
         1033
@@ -29350,12 +29894,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.32.kv_a_proj_with_mqa",
+          "weight": "layer.32.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        1030
+        1032
       ],
       "outputs": [
         1034
@@ -29444,7 +29988,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -29464,8 +30013,8 @@
         }
       },
       "inputs": [
-        1034,
-        1033
+        1033,
+        1034
       ],
       "outputs": [
         1041,
@@ -29481,6 +30030,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.32.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -29517,6 +30072,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.32.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -29810,12 +30371,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.33.q_b_proj",
+          "weight": "layer.33.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        1065
+        1063
       ],
       "outputs": [
         1066
@@ -29825,12 +30386,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.33.kv_a_proj_with_mqa",
+          "weight": "layer.33.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        1063
+        1065
       ],
       "outputs": [
         1067
@@ -29919,7 +30480,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -29939,8 +30505,8 @@
         }
       },
       "inputs": [
-        1067,
-        1066
+        1066,
+        1067
       ],
       "outputs": [
         1074,
@@ -29956,6 +30522,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.33.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -29992,6 +30564,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.33.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -30285,12 +30863,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.34.q_b_proj",
+          "weight": "layer.34.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        1098
+        1096
       ],
       "outputs": [
         1099
@@ -30300,12 +30878,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.34.kv_a_proj_with_mqa",
+          "weight": "layer.34.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        1096
+        1098
       ],
       "outputs": [
         1100
@@ -30394,7 +30972,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -30414,8 +30997,8 @@
         }
       },
       "inputs": [
-        1100,
-        1099
+        1099,
+        1100
       ],
       "outputs": [
         1107,
@@ -30431,6 +31014,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.34.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -30467,6 +31056,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.34.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -30760,12 +31355,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.35.q_b_proj",
+          "weight": "layer.35.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        1131
+        1129
       ],
       "outputs": [
         1132
@@ -30775,12 +31370,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.35.kv_a_proj_with_mqa",
+          "weight": "layer.35.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        1129
+        1131
       ],
       "outputs": [
         1133
@@ -30869,7 +31464,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -30889,8 +31489,8 @@
         }
       },
       "inputs": [
-        1133,
-        1132
+        1132,
+        1133
       ],
       "outputs": [
         1140,
@@ -30906,6 +31506,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.35.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -30942,6 +31548,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.35.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -31235,12 +31847,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.36.q_b_proj",
+          "weight": "layer.36.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        1164
+        1162
       ],
       "outputs": [
         1165
@@ -31250,12 +31862,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.36.kv_a_proj_with_mqa",
+          "weight": "layer.36.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        1162
+        1164
       ],
       "outputs": [
         1166
@@ -31344,7 +31956,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -31364,8 +31981,8 @@
         }
       },
       "inputs": [
-        1166,
-        1165
+        1165,
+        1166
       ],
       "outputs": [
         1173,
@@ -31381,6 +31998,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.36.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -31417,6 +32040,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.36.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -31710,12 +32339,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.37.q_b_proj",
+          "weight": "layer.37.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        1197
+        1195
       ],
       "outputs": [
         1198
@@ -31725,12 +32354,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.37.kv_a_proj_with_mqa",
+          "weight": "layer.37.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        1195
+        1197
       ],
       "outputs": [
         1199
@@ -31819,7 +32448,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -31839,8 +32473,8 @@
         }
       },
       "inputs": [
-        1199,
-        1198
+        1198,
+        1199
       ],
       "outputs": [
         1206,
@@ -31856,6 +32490,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.37.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -31892,6 +32532,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.37.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -32185,12 +32831,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.38.q_b_proj",
+          "weight": "layer.38.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        1230
+        1228
       ],
       "outputs": [
         1231
@@ -32200,12 +32846,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.38.kv_a_proj_with_mqa",
+          "weight": "layer.38.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        1228
+        1230
       ],
       "outputs": [
         1232
@@ -32294,7 +32940,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -32314,8 +32965,8 @@
         }
       },
       "inputs": [
-        1232,
-        1231
+        1231,
+        1232
       ],
       "outputs": [
         1239,
@@ -32331,6 +32982,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.38.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -32367,6 +33024,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.38.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -32660,12 +33323,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.39.q_b_proj",
+          "weight": "layer.39.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        1263
+        1261
       ],
       "outputs": [
         1264
@@ -32675,12 +33338,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.39.kv_a_proj_with_mqa",
+          "weight": "layer.39.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        1261
+        1263
       ],
       "outputs": [
         1265
@@ -32769,7 +33432,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -32789,8 +33457,8 @@
         }
       },
       "inputs": [
-        1265,
-        1264
+        1264,
+        1265
       ],
       "outputs": [
         1272,
@@ -32806,6 +33474,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.39.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -32842,6 +33516,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.39.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -33135,12 +33815,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.40.q_b_proj",
+          "weight": "layer.40.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        1296
+        1294
       ],
       "outputs": [
         1297
@@ -33150,12 +33830,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.40.kv_a_proj_with_mqa",
+          "weight": "layer.40.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        1294
+        1296
       ],
       "outputs": [
         1298
@@ -33244,7 +33924,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -33264,8 +33949,8 @@
         }
       },
       "inputs": [
-        1298,
-        1297
+        1297,
+        1298
       ],
       "outputs": [
         1305,
@@ -33281,6 +33966,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.40.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -33317,6 +34008,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.40.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -33610,12 +34307,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.41.q_b_proj",
+          "weight": "layer.41.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        1329
+        1327
       ],
       "outputs": [
         1330
@@ -33625,12 +34322,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.41.kv_a_proj_with_mqa",
+          "weight": "layer.41.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        1327
+        1329
       ],
       "outputs": [
         1331
@@ -33719,7 +34416,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -33739,8 +34441,8 @@
         }
       },
       "inputs": [
-        1331,
-        1330
+        1330,
+        1331
       ],
       "outputs": [
         1338,
@@ -33756,6 +34458,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.41.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -33792,6 +34500,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.41.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -34085,12 +34799,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.42.q_b_proj",
+          "weight": "layer.42.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        1362
+        1360
       ],
       "outputs": [
         1363
@@ -34100,12 +34814,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.42.kv_a_proj_with_mqa",
+          "weight": "layer.42.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        1360
+        1362
       ],
       "outputs": [
         1364
@@ -34194,7 +34908,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -34214,8 +34933,8 @@
         }
       },
       "inputs": [
-        1364,
-        1363
+        1363,
+        1364
       ],
       "outputs": [
         1371,
@@ -34231,6 +34950,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.42.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -34267,6 +34992,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.42.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -34560,12 +35291,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.43.q_b_proj",
+          "weight": "layer.43.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        1395
+        1393
       ],
       "outputs": [
         1396
@@ -34575,12 +35306,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.43.kv_a_proj_with_mqa",
+          "weight": "layer.43.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        1393
+        1395
       ],
       "outputs": [
         1397
@@ -34669,7 +35400,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -34689,8 +35425,8 @@
         }
       },
       "inputs": [
-        1397,
-        1396
+        1396,
+        1397
       ],
       "outputs": [
         1404,
@@ -34706,6 +35442,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.43.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -34742,6 +35484,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.43.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -35035,12 +35783,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.44.q_b_proj",
+          "weight": "layer.44.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        1428
+        1426
       ],
       "outputs": [
         1429
@@ -35050,12 +35798,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.44.kv_a_proj_with_mqa",
+          "weight": "layer.44.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        1426
+        1428
       ],
       "outputs": [
         1430
@@ -35144,7 +35892,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -35164,8 +35917,8 @@
         }
       },
       "inputs": [
-        1430,
-        1429
+        1429,
+        1430
       ],
       "outputs": [
         1437,
@@ -35181,6 +35934,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.44.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -35217,6 +35976,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.44.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -35510,12 +36275,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.45.q_b_proj",
+          "weight": "layer.45.kv_a_proj_with_mqa",
           "beta_one": false
         }
       },
       "inputs": [
-        1461
+        1459
       ],
       "outputs": [
         1462
@@ -35525,12 +36290,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.45.kv_a_proj_with_mqa",
+          "weight": "layer.45.q_b_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        1459
+        1461
       ],
       "outputs": [
         1463
@@ -35619,7 +36384,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_topk_mask"
+          "kernel": "attn::dsa_index_topk_mask",
+          "params": [
+            64,
+            128,
+            2048
+          ]
         }
       },
       "inputs": [
@@ -35639,8 +36409,8 @@
         }
       },
       "inputs": [
-        1463,
-        1462
+        1462,
+        1463
       ],
       "outputs": [
         1470,
@@ -35656,6 +36426,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.45.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -35692,6 +36468,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.45.kv_b_proj"
+          ],
+          "params": [
+            96,
+            128,
+            128,
+            512
           ]
         }
       },

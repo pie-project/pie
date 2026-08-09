@@ -294,8 +294,7 @@ pub fn gemma4_cuda(
             // servable is the dispatch's business -- `attention_naive_paged`
             // above declares `lacks Scores`, and the table is where that is
             // written down.
-            dsl::seam(a.trace(), &dsl::seam::ATTN_OUT, &[&a], Some(l));
-            let attn_out = matmul(&a, &w.o_proj);
+            let attn_out = dsl::attention_landing(&a, &w.o_proj, l);
 
             // Post-attention norm, land on the stream, scale, and norm
             // for the MLP — four statements, one launch.

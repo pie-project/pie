@@ -50,8 +50,10 @@ const DECLARED_BUT_UNREAD: &[(&str, &[&str])] = &[
         "deepseek_v4",
         &["hash_routed", "o_groups", "sliding_window", "swiglu_limit_milli"],
     ),
-    // MLA's aligned MoE block and the indexer's top-k.
-    ("glm5", &["aligned_block", "index_topk"]),
+    // MLA's aligned MoE block. `index_topk` LEFT this list when the
+    // indexer's statement started carrying it on the param channel —
+    // which is the shape every line here is meant to leave by.
+    ("glm5", &["aligned_block"]),
     // The MXFP4 decode leg's route ceiling.
     ("gpt_oss", &["mxfp4_decode_max_routes"]),
     // No rope statement in the MLA text yet; see the header above.

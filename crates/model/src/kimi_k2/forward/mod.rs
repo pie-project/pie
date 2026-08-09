@@ -92,8 +92,7 @@ pub fn kimi_cuda(facts: &KimiFacts, cuda: &KimiCudaFacts, class: FireClass) -> F
     );
     let a = facts.attn.clone();
     dsl::trace_named(&family, |t| {
-        dsl::seam(t, &dsl::seam::IN, &[], None);
-        let mut y = dsl::embed_with(t, "embed", facts.hidden);
+        let mut y = dsl::embedded_prologue(t, facts.hidden);
 
         for l in 0..facts.layers {
             let w = KimiLayerW::new(l, facts);
@@ -103,19 +102,15 @@ pub fn kimi_cuda(facts: &KimiFacts, cuda: &KimiCudaFacts, class: FireClass) -> F
             // query half in place with a pitch, which is a different
             // kernel and not a buffer detail — `kernels::norm::rmsnorm_strided_bf16`
             // reads a row stride the plain one has no parameter for.
-            let (q_a_n, kv_a) = if cuda.q_kv_a_fused {
-                let qkv_a = matmul(&x, &w.q_kv_a);
-                // The pitch is the fused width; the statement carries the
-                // NARROW extent it produces, and the stride is the buffer
-                // question  owns.
-                let q_a_n =
-                    dsl::cuda::rmsnorm_strided(&qkv_a, &w.q_a_norm.name, a.q_lora_rank);
-                (q_a_n, qkv_a)
-            } else {
-                let q_a = matmul(&x, &w.q_a_proj);
-                (dsl::cuda::rmsnorm(&q_a, &w.q_a_norm), matmul(&x, &w.kv_a_proj))
-            };
-            let q_b = matmul(&q_a_n, &w.q_b_proj);
+            let (q_b, kv_a, _q_a_n) = dsl::mla_latents(
+                &x,
+                cuda.q_kv_a_fused.then_some(&w.q_kv_a),
+                &w.q_a_proj,
+                &w.q_a_norm,
+                &w.q_b_proj,
+                &w.kv_a_proj,
+                a.q_lora_rank,
+            );
 
             let (_kv_c, _k_pe, q_nope, q_pe) = dsl::cuda::mla_prepare(
                 &kv_a,
@@ -125,22 +120,30 @@ pub fn kimi_cuda(facts: &KimiFacts, cuda: &KimiCudaFacts, class: FireClass) -> F
                 a.qk_nope_head_dim,
                 a.qk_rope_head_dim,
             );
-            let kv_b = format!("layer.{l}.kv_b_proj");
-            let q_latent =
-                dsl::cuda::mla_absorb_q_to_latent(&q_nope, &kv_b, a.heads, a.kv_lora_rank);
-            let attn_latent =
-                dsl::cuda::attention_mla(&q_latent, &q_pe, l, a.heads, a.kv_lora_rank);
-            let attn_v =
-                dsl::cuda::mla_absorb_latent_to_v(&attn_latent, &kv_b, a.heads, a.v_head_dim);
-            dsl::seam(attn_v.trace(), &dsl::seam::ATTN_OUT, &[&attn_v], Some(l));
-            y += matmul(&attn_v, &w.o_proj);
+            let attn_v = dsl::mla_absorbed_attention(
+                &q_nope,
+                &q_pe,
+                &format!("layer.{l}.kv_b_proj"),
+                l,
+                dsl::MlaWidths {
+                    heads: a.heads,
+                    kv_lora_rank: a.kv_lora_rank,
+                    qk_nope_head_dim: a.qk_nope_head_dim,
+                    v_head_dim: a.v_head_dim,
+                },
+            );
+            y += dsl::attention_landing(&attn_v, &w.o_proj, l);
 
             let m = dsl::cuda::rmsnorm(&y, &w.mlp_norm);
             if !facts.is_moe_layer(l) {
-                let gate = matmul(&m, &w.dense_gate);
-                let _up = matmul(&m, &w.dense_up);
-                let act = dsl::cuda::swiglu(&gate, facts.dense_intermediate, false);
-                y += matmul(&act, &w.dense_down);
+                y += dsl::dense_gated_mlp(
+                    &m,
+                    &w.dense_gate,
+                    &w.dense_up,
+                    &w.dense_down,
+                    facts.dense_intermediate,
+                    dsl::GatedAct::SwiGlu,
+                );
                 continue;
             }
 
@@ -181,16 +184,6 @@ pub fn kimi_cuda(facts: &KimiFacts, cuda: &KimiCudaFacts, class: FireClass) -> F
             y = dsl::cuda::residual_add(&y, &moe_out, facts.hidden);
         }
 
-        let normed = dsl::cuda::rmsnorm(
-            &y,
-            &NormW {
-                name: "final_norm".to_string(),
-                variant: NormVariant::Plain,
-                per_head: None,
-                layer: None,
-            },
-        );
-        let logits = dsl::lm_head_at(t, &normed, "lm_head", facts.vocab);
-        dsl::seam(t, &dsl::seam::OUT, &[&logits], None);
+        dsl::logits_epilogue(t, &y, NormVariant::Plain, false, facts.vocab, false);
     })
 }

@@ -39,6 +39,13 @@ serde_json = "1.0"
 driver-abi = { path = "../driver-abi" }
 tensor-ir = { path = "../tensor-ir" }
 
+# The PTIR channel plane, which used to be `src/pipeline/` here. It moved out
+# when the CUDA shell reached the same layer -- both shells pack the same lane
+# table and read the same launch package, and the C++ answered that by keeping
+# three hand-written copies of one golden model. `src/pipeline.rs` re-exports
+# it, so every call site in `src/metal/` still spells `crate::pipeline::`.
+driver-pipeline = { path = "../driver-pipeline" }
+
 # The kernel contract vocabulary: `LaunchRule` (which grid shape a row states)
 # and `sig_in` (how an instantiated point resolves to its row). Tables only --
 # no shader is built by reading one.

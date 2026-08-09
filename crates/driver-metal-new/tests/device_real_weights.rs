@@ -300,7 +300,11 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let pages = |layer: u16, values: bool| {
         pool.layer(u32::from(layer)).map(|l| Slice {
-            address: if values { l.v.gpu_address() } else { l.k.gpu_address() },
+            address: if values {
+                l.v.gpu_address()
+            } else {
+                l.k.gpu_address()
+            },
             bytes: shape.layer_bytes(),
         })
     };
@@ -380,9 +384,7 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
             r.chunks_exact(2)
                 .take(6)
                 .map(|c| {
-                    let x = f32::from_bits(
-                        u32::from(u16::from_le_bytes([c[0], c[1]])) << 16,
-                    );
+                    let x = f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16);
                     format!("{x:.6}")
                 })
                 .collect::<Vec<_>>()
@@ -737,7 +739,8 @@ fn bisect(class: FireClass) {
         driver_metal_new::batch::geometry_from_facts(&model_facts).expect("a decodable geometry");
     let (facts, _metal) =
         driver_metal_new::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
-    let (_, metal) = driver_metal_new::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
+    let (_, metal) =
+        driver_metal_new::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
 
     // A decode posts four independent lanes; a prefill posts one sequence.
     let decode = class == FireClass::Decode;
@@ -772,7 +775,11 @@ fn bisect(class: FireClass) {
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let pages = |layer: u16, values: bool| {
         pool.layer(u32::from(layer)).map(|l| Slice {
-            address: if values { l.v.gpu_address() } else { l.k.gpu_address() },
+            address: if values {
+                l.v.gpu_address()
+            } else {
+                l.k.gpu_address()
+            },
             bytes: shape.layer_bytes(),
         })
     };
@@ -957,8 +964,7 @@ fn bisect(class: FireClass) {
             r.chunks_exact(2)
                 .take(6)
                 .map(|c| {
-                    let x =
-                        f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16);
+                    let x = f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16);
                     format!("{x:.6}")
                 })
                 .collect::<Vec<_>>()
@@ -1070,7 +1076,11 @@ fn one_token_at_position_zero_agrees_with_mlx() {
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let pages = |layer: u16, values: bool| {
         pool.layer(u32::from(layer)).map(|l| Slice {
-            address: if values { l.v.gpu_address() } else { l.k.gpu_address() },
+            address: if values {
+                l.v.gpu_address()
+            } else {
+                l.k.gpu_address()
+            },
             bytes: shape.layer_bytes(),
         })
     };
@@ -1123,17 +1133,15 @@ fn one_token_at_position_zero_agrees_with_mlx() {
 
     // The readout: the widest region the text states, because a vocabulary is
     // wider than anything else in a decode.
-    let (at, width, element) = lowered
-        .args
-        .iter()
-        .filter_map(|a| match a {
-            model_compiler::lower::Arg::Arena { at, width, bytes } => {
-                Some((*at, *width as usize, *bytes as usize))
-            }
-            _ => None,
-        })
-        .max_by_key(|(_, width, bytes)| width * bytes)
-        .expect("the text states a readout");
+    // The text's OWN statement of where its answer is, not a guess at it.
+    // This used to take the widest arena region, which was right by
+    // luck: the gemma text holds TWO vocabulary-wide buffers, because
+    // the logit softcap is out of place, and the tie-break picked the
+    // capped one.
+    let (at, width, element) = {
+        let r = lowered.readout.expect("the text states an exit seam");
+        (r.at, r.vocab as usize, r.bytes as usize)
+    };
     let vocab = width;
     let logits: Vec<f32> = read[at..at + vocab * element]
         .chunks_exact(element)
@@ -1270,7 +1278,11 @@ fn a_two_token_prefill_agrees_with_mlx() {
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let pages = |layer: u16, values: bool| {
         pool.layer(u32::from(layer)).map(|l| Slice {
-            address: if values { l.v.gpu_address() } else { l.k.gpu_address() },
+            address: if values {
+                l.v.gpu_address()
+            } else {
+                l.k.gpu_address()
+            },
             bytes: shape.layer_bytes(),
         })
     };
@@ -1325,17 +1337,15 @@ fn a_two_token_prefill_agrees_with_mlx() {
         read.copy_from_slice(raw);
     }
 
-    let (at, width, element) = lowered
-        .args
-        .iter()
-        .filter_map(|a| match a {
-            model_compiler::lower::Arg::Arena { at, width, bytes } => {
-                Some((*at, *width as usize, *bytes as usize))
-            }
-            _ => None,
-        })
-        .max_by_key(|(_, width, bytes)| width * bytes)
-        .expect("the text states a readout");
+    // The text's OWN statement of where its answer is, not a guess at it.
+    // This used to take the widest arena region, which was right by
+    // luck: the gemma text holds TWO vocabulary-wide buffers, because
+    // the logit softcap is out of place, and the tie-break picked the
+    // capped one.
+    let (at, width, element) = {
+        let r = lowered.readout.expect("the text states an exit seam");
+        (r.at, r.vocab as usize, r.bytes as usize)
+    };
     let logits: Vec<f32> = read[at..at + width * element]
         .chunks_exact(element)
         .map(|c| {
@@ -1415,4 +1425,196 @@ fn stage_prefill(
         },
     )
     .expect("the tables stage")
+}
+
+/// **A generation, token for token, against MLX.**
+///
+/// The standard `device_smoke.rs` holds the retiring path to — decode a
+/// sequence and compare every token — through the generic executor instead.
+/// It is the last thing between `batch/dispatch_llama.rs` and the bin.
+///
+/// One prefill of `[BOS, "Hello"]` then three decodes, each reading the KV the
+/// last one wrote. That carryover is what a single-fire gate cannot reach: an
+/// append that lands one row off, a page index that does not advance, a stride
+/// that is right for the first token and wrong for the second — none of them
+/// show until a second fire reads what a first one wrote.
+///
+/// MLX's greedy continuation from the same prompt is `0, 358, 2846, 12304`,
+/// computed by recomputing the WHOLE prefix at every step so that nothing is
+/// carried on the reference side. A KV bug here cannot hide in a shared
+/// assumption.
+#[test]
+fn a_generation_agrees_with_mlx_token_for_token() {
+    let Some(snapshot) = snapshot() else {
+        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        return;
+    };
+    let Ok(context) = Context::new() else {
+        eprintln!("SKIP: no Metal 4 device");
+        return;
+    };
+    let compiler = Compiler::new(&context).expect("a compiler");
+    let mut pipelines = Pipelines::new(kernels_dir());
+
+    let descriptor = descriptor_for(&snapshot);
+    let loaded = load(&context, &snapshot, &descriptor).expect("the checkpoint loads");
+    let model_facts = driver_metal_new::facts::ModelFacts::from_descriptor(&descriptor)
+        .expect("the descriptor states the model's facts");
+    let dg =
+        driver_metal_new::batch::geometry_from_facts(&model_facts).expect("a decodable geometry");
+    let (facts, metal) =
+        driver_metal_new::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
+
+    // ONE pool for the whole generation. That is the point: every fire after
+    // the first reads what its predecessors wrote.
+    let shape = Shape {
+        layers: facts.layers,
+        kv_heads: facts.kv_heads,
+        head_dim: facts.head_dim,
+        page_size: 16,
+        pages: 16,
+        element_bytes: 2,
+    };
+    let pool = Pool::allocate(&context, shape).expect("a pool");
+    let pages = |layer: u16, values: bool| {
+        pool.layer(u32::from(layer)).map(|l| Slice {
+            address: if values {
+                l.v.gpu_address()
+            } else {
+                l.k.gpu_address()
+            },
+            bytes: shape.layer_bytes(),
+        })
+    };
+    let freqs = driver_metal_new::model::rope::frequencies(
+        facts.head_dim,
+        metal.rope_theta,
+        (dg.rope_freq_factor > 0.0).then_some(driver_metal_new::model::rope::Rescale {
+            factor: dg.rope_freq_factor,
+            low: dg.rope_low_freq_factor,
+            high: dg.rope_high_freq_factor,
+            original_max: dg.rope_original_max_position as f32,
+        }),
+    );
+    let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
+
+    const MLX: [u32; 4] = [0, 358, 2846, 12304];
+    let mut seq: Vec<u32> = vec![128_000, 9906];
+    let mut got: Vec<u32> = Vec::new();
+
+    for turn in 0..MLX.len() {
+        // The first fire is the PREFILL of the prompt; every one after is a
+        // decode of the last token at its own position.
+        let (tokens, first): (Vec<u32>, u32) = if turn == 0 {
+            (seq.clone(), 0)
+        } else {
+            (vec![*seq.last().expect("a sequence")], seq.len() as u32 - 1)
+        };
+        let n = tokens.len() as u32;
+        let positions: Vec<u32> = (first..first + n).collect();
+        let class = if n > 1 {
+            FireClass::Prefill
+        } else {
+            FireClass::Decode
+        };
+
+        let step = Step {
+            token_ids: &tokens,
+            qo_indptr: &[0, n],
+            sampling_indices: &[n - 1],
+            ..Step::default()
+        };
+        let plan = llama_like_metal(&facts, &metal, class);
+        let lowered = lower_step(&plan, &step).expect("the step lowers");
+
+        // One request, one page list. The write destinations advance with the
+        // POSITION, which is what makes each fire land after the last.
+        let zeros: Vec<u32> = vec![0; n as usize];
+        let w_off: Vec<u32> = positions.iter().map(|p| p % shape.page_size).collect();
+        let staged = driver_metal_new::model::tables::stage(
+            &context,
+            driver_metal_new::model::tables::Frame {
+                token_ids: &tokens,
+                position_ids: &positions,
+                req_of_token: &zeros,
+                kv_page_indices: &[0],
+                kv_page_indptr: &[0, 1],
+                kv_write_page: &zeros,
+                kv_write_offset: &w_off,
+                rope_frequencies: &inv_freq,
+                sampling_indices: &[n - 1],
+            },
+        )
+        .expect("the tables stage");
+
+        let named = HashMap::new();
+        let mut live = Live {
+            store: Store::new(Names::mlx(), &loaded.tensors, &named),
+            tables: &staged,
+            shape,
+            pages: &pages,
+        };
+        let (_, arena) = driver_metal_new::model::run::run_keeping_arena(
+            &context,
+            &compiler,
+            &mut pipelines,
+            &lowered,
+            Geometry {
+                q_heads: facts.q_heads,
+                kv_heads: facts.kv_heads,
+                head_dim: facts.head_dim,
+                rotary_dims: facts.head_dim,
+                n_experts: facts.n_experts,
+                experts_per_token: facts.experts_per_token,
+            },
+            &mut live,
+        )
+        .expect("the fire runs");
+
+        let mut read = vec![0u8; arena.len() as usize];
+        // SAFETY: the command buffer retired before the call returned.
+        unsafe {
+            let raw = core::slice::from_raw_parts(
+                arena.contents().as_ptr().cast_const().cast::<u8>(),
+                arena.len() as usize,
+            );
+            read.copy_from_slice(raw);
+        }
+
+        let (at, width, element) = {
+            // The text's OWN statement of where its answer is, not a guess at it.
+            // This used to take the widest arena region, which was right by luck:
+            // the gemma text holds TWO vocabulary-wide buffers, because the logit
+            // softcap is out of place, and the tie-break picked the capped one.
+            let r = lowered.readout.expect("the text states an exit seam");
+            (r.at, r.vocab as usize, r.bytes as usize)
+        };
+        let logits: Vec<f32> = read[at..at + width * element]
+            .chunks_exact(element)
+            .map(|c| {
+                if element == 4 {
+                    f32::from_le_bytes([c[0], c[1], c[2], c[3]])
+                } else {
+                    f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16)
+                }
+            })
+            .collect();
+        let next = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i as u32)
+            .expect("a readout has an argmax");
+
+        eprintln!("turn {turn}: {next} (MLX {})", MLX[turn]);
+        got.push(next);
+        seq.push(next);
+    }
+
+    assert_eq!(
+        got, MLX,
+        "the generation diverged from MLX. A first token that agrees and a \
+         second that does not is the KV carryover, which no single-fire gate \
+         reaches."
+    );
 }

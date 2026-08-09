@@ -139,6 +139,153 @@ pub fn after_dense_prefix(dense_layers: u32, l: u32) -> bool {
     l >= dense_layers
 }
 
+/// The MLA attention block's dims — the LATENT-CACHE geometry, said once.
+///
+/// glm5, kimi-k2 and kimi-k3 each carried a struct with these fields, and
+/// the first two were field-identical; k3's added `output_gate` alone.
+/// Three structs for one geometry is three places a family can disagree
+/// about what MLA is.
+///
+/// `qk_nope_head_dim + qk_rope_head_dim` is the query width per head; the
+/// CACHE stores the latent plus the rope half, so
+/// `kv_lora_rank + qk_rope_head_dim` is its own number and not derivable
+/// from the query's. That distinction is the whole reason MLA is not a
+/// head count — the driver's pool geometry reads the second, and every
+/// `PlannedFamily::head_dim_of` in the MLA lineage answers with it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MlaFacts {
+    pub hidden: u32,
+    pub heads: u32,
+    pub q_lora_rank: u32,
+    pub kv_lora_rank: u32,
+    pub qk_nope_head_dim: u32,
+    pub qk_rope_head_dim: u32,
+    pub v_head_dim: u32,
+    /// kimi-k3 gates the MLA output; the others do not. Serde-defaulted
+    /// so the two families that never had the field read back unchanged.
+    #[serde(default)]
+    pub output_gate: bool,
+}
+
+impl MlaFacts {
+    /// The per-head query width the `q_b` projection produces.
+    #[must_use]
+    pub const fn qk_head_dim(&self) -> u32 {
+        self.qk_nope_head_dim + self.qk_rope_head_dim
+    }
+
+    /// The width `q_b_proj` writes: every head's nope+rope halves.
+    #[must_use]
+    pub const fn q_b_width(&self) -> u32 {
+        self.heads * self.qk_head_dim()
+    }
+
+    /// The width `kv_a_proj_with_mqa` writes: the latent plus ONE shared
+    /// rope half. Also one page row of the compressed cache, which is
+    /// what a driver allocates per token and what every MLA family's
+    /// `PlannedFamily::head_dim_of` answers with.
+    ///
+    /// A method rather than a stored fact, because a stored sum is a
+    /// second thing to keep in step with its addends.
+    #[must_use]
+    pub const fn kv_a_width(&self) -> u32 {
+        self.kv_lora_rank + self.qk_rope_head_dim
+    }
+
+    /// Every head's value half.
+    #[must_use]
+    pub const fn v_width(&self) -> u32 {
+        self.heads * self.v_head_dim
+    }
+
+    /// The FUSED `q_kv_a` projection's width, for a deployment whose load
+    /// joined the query's and the KV's latents into one bank.
+    #[must_use]
+    pub const fn q_kv_a_width(&self) -> u32 {
+        self.q_lora_rank + self.kv_a_width()
+    }
+}
+
+/// A ROUTED FFN's shape — the mixture, said once.
+///
+/// kimi-k2, kimi-k3 and nemotron-h carried this struct field-identically,
+/// and glm5, deepseek-v4 and qwen3.5 carry the same four numbers plus one
+/// of their own. These four ARE the mixture: how many experts, how many a
+/// row goes to, how wide one is, and whether a shared expert rides beside
+/// them.
+///
+/// The families that add a field are adding a real one — glm5's
+/// `aligned_block` is its dispatch's tile, deepseek-v4's `hash_routed`
+/// picks a different router — so they keep their own struct and this is
+/// the part that stopped being written six times.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MoeFacts {
+    /// Experts in this deployment's mixture.
+    pub num_experts: u32,
+    /// How many of them a row goes to — the router's k.
+    pub top_k: u32,
+    /// One expert's inner width.
+    pub moe_intermediate: u32,
+    /// The shared expert's inner width; 0 for a mixture without one,
+    /// which is the plain `qwen3_moe` shape.
+    pub shared_intermediate: u32,
+}
+
+impl MoeFacts {
+    /// Whether a shared expert rides beside the routed ones. A predicate
+    /// rather than a second field, for the reason every derived width in
+    /// this module is a method: a stored answer is a second thing to keep
+    /// in step.
+    #[must_use]
+    pub const fn has_shared_expert(&self) -> bool {
+        self.shared_intermediate > 0
+    }
+
+    /// The fire's ROUTE count at `tokens` rows — tokens times k, the
+    /// number the aligned dispatch's every extent is derived from.
+    #[must_use]
+    pub const fn routes(&self, tokens: u32) -> u32 {
+        tokens * self.top_k
+    }
+}
+
+/// A GQA attention block's three widths.
+///
+/// gemma-3n and nemotron-h carried this field-identically. It is the
+/// smallest fact a family can have and still be describing attention:
+/// query heads, key/value heads, and the width of one head. Everything
+/// else an attention statement wants is derived from these — which is
+/// what the two methods below are for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GqaFacts {
+    pub heads: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+}
+
+impl GqaFacts {
+    /// Every query head's width — what `q_proj` writes.
+    #[must_use]
+    pub const fn q_width(&self) -> u32 {
+        self.heads * self.head_dim
+    }
+
+    /// Every KV head's width — what `k_proj` and `v_proj` each write.
+    #[must_use]
+    pub const fn kv_width(&self) -> u32 {
+        self.kv_heads * self.head_dim
+    }
+
+    /// Query heads per KV head. FlashInfer instantiates a fixed set of
+    /// these and reports anything else by throwing, which is why the
+    /// driver refuses an unservable ratio at LOAD — see
+    /// `refuse_unservable_gqa`.
+    #[must_use]
+    pub const fn group_size(&self) -> u32 {
+        if self.kv_heads == 0 { 0 } else { self.heads / self.kv_heads }
+    }
+}
+
 #[cfg(test)]
 mod schedule {
     use super::full_attn_at;

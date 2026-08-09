@@ -40,8 +40,11 @@ fn sources(rel: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.clone()];
     while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir)
-            .unwrap_or_else(|err| panic!("read {}: {err}", dir.display()));
+        // A DELETED TREE IS NO SOURCES, not a panic. `crates/driver-cuda`
+        // is gone, and "the CUDA driver does not parse config.json" is
+        // then true in the strongest available way. The Metal claim below
+        // still walks a real tree, which is why this walker stays.
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
             if path.is_dir() {
@@ -98,24 +101,15 @@ fn callers(path: &Path, needle: &str) -> Vec<String> {
         .collect()
 }
 
-/// The CUDA driver does not parse `config.json`.
-///
-/// `parse_hf_config` and its 855-line implementation were deleted outright, so
-/// this guards against the declaration coming back as much as against a call.
-#[test]
-fn the_cuda_driver_has_no_config_json_parser() {
-    let found: Vec<String> = sources("crates/driver-cuda/csrc/src")
-        .iter()
-        .flat_map(|path| callers(path, "parse_hf_config"))
-        .collect();
-    assert!(
-        found.is_empty(),
-        "`parse_hf_config` is back in the CUDA driver. `config.json` is \
-         normalized once, in `model::config`, and the driver reads the \
-         `pie.model/1` descriptor (`crates/driver-cuda/csrc/src/model/descriptor.hpp`):\n{}",
-        found.join("\n")
-    );
-}
+// THE CUDA CLAIM IS STRUCTURAL NOW. `the_cuda_driver_has_no_config_json_parser`
+// walked `crates/driver-cuda/csrc/src` asking whether the C++ shell had
+// grown its own `config.json` parser. That tree is deleted, so the answer
+// is yes in the strongest available way and the test could only pass
+// vacuously — which its own guard refused to let it do.
+//
+// The Metal claim below still walks a real tree, and the guard stays for
+// it: a check that silently stops checking is worse than no check.
+
 
 /// The Metal driver does not parse `config.json` either.
 ///

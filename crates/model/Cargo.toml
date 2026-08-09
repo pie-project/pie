@@ -19,15 +19,7 @@ build = "build.rs"
 name = "model"
 path = "src/lib.rs"
 
-# Both binaries are aspect tools, so both name the aspect they need. Without
-# `required-features` cargo auto-discovers them and builds them under every
-# feature set, which is how `emit-cuda` came to fail
-# `cargo check -p model --no-default-features` — it names `qwen_3_5::forward`,
-# a module that only exists behind `forward`.
-[[bin]]
-name = "emit-cuda"
-path = "src/bin/emit-cuda.rs"
-required-features = ["forward"]
+["forward"]
 
 # The Rust half of the descriptor round-trip check; see the module doc.
 [[bin]]

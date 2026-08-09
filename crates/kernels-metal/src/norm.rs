@@ -28,7 +28,19 @@ pub static KERNELS: &[KernelSig] = &[
         ],
         axes = &[BF16]),
     // 1 in residual_add.metal
-    kernel!(residual_add "residual_add", axes = &[BF16]),
+    // Three buffers and no scalars: `out = x + residual`, elementwise, and
+    // `out` may alias `x`. Filled because a MIXTURE demands it -- a routed
+    // FFN's rows are already down-projected and combined, so all the block
+    // owes is the add, where a dense FFN fuses the add into its down
+    // projection (`gemm_add`) and never states this symbol.
+    kernel!(residual_add "residual_add", file = Some("norm/residual_add.metal"),
+        launch = kernels::LaunchRule::Elementwise,
+        operands = kernels::operands![
+            x: Buf <- kernels::Source::In(0),
+            residual: Buf <- kernels::Source::In(1),
+            out: BufMut <- kernels::Source::Out(0),
+        ],
+        axes = &[BF16]),
     // 1 in residual_add.metal
     kernel!(residual_add_strided "residual_add_strided", axes = &[BF16]),
     // 1 in rms_norm.metal

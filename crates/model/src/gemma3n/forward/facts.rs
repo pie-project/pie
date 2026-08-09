@@ -22,22 +22,12 @@ pub struct Gemma3nAltUpFacts {
     pub active: u32,
 }
 
-/// The attention block. gemma-4's geometry, so the same questions.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Gemma3nAttnFacts {
-    pub heads: u32,
-    pub kv_heads: u32,
-    pub head_dim: u32,
-}
+/// This family's attention IS a plain GQA block — see
+/// [`model_compiler::facts::GqaFacts`], which both families carried
+/// field-identically.
+pub type Gemma3nAttnFacts = model_compiler::facts::GqaFacts;
 
-impl Gemma3nAttnFacts {
-    pub fn q_width(&self) -> u32 {
-        self.heads * self.head_dim
-    }
-    pub fn kv_width(&self) -> u32 {
-        self.kv_heads * self.head_dim
-    }
-}
+
 
 /// The whole family.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

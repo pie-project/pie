@@ -96,6 +96,46 @@ struct Shell {
     /// first launch. This is also what the 711-fire soak enforced: the
     /// per-fire version leaked its 48 MB workspace every fire.
     scratch: Option<FireScratch>,
+    /// THE FIRE STREAM AND ITS ALLOCATOR, held per driver.
+    ///
+    /// Both were built per fire — `OwnedStream::new(0)` and
+    /// `Allocator::new()` at the top of every `step_impl` — which is two
+    /// costs and one impossibility.
+    ///
+    /// The costs: a stream create/destroy per fire, and an allocator that
+    /// POOLS discarding its pool every fire, so every buffer a fire wants
+    /// is a fresh `cudaMalloc`.
+    ///
+    /// The impossibility is run-ahead. A second fire cannot be enqueued
+    /// behind the first if there is no stream that outlives the first,
+    /// and `pie_cuda_launch` cannot return before its work retires if the
+    /// stream it queued onto dies with the call. Everything about
+    /// n+1-while-n-runs starts here.
+    ///
+    /// `None` until the first launch, because a driver that never fires
+    /// should not hold a stream.
+    fire_stream: Option<crate::cuda::OwnedStream>,
+    /// The allocator every fire's transient device memory comes from.
+    /// Held for the pool, and dropped with the shell.
+    fire_alloc: Option<crate::cuda::Allocator>,
+    /// The PTIR plane: what a registered program adopted to, and what its
+    /// generated regions compiled to.
+    ///
+    /// Two fields rather than one because they have different lifetimes.
+    /// [`crate::ptir::Runtime`] is the CACHE — it outlives any one program
+    /// and is what makes the second registration of a shared stage free —
+    /// while `ptir_programs` is this shell's OWNERSHIP of the compiled
+    /// modules, so closing the last user of a program can drop its
+    /// `CUmodule`s at a point the shell chose.
+    ptir: crate::ptir::Runtime,
+    /// The compiled form of each registered program, by program id.
+    ptir_programs: crate::ptir::Programs,
+    /// The adopted plans, by program id. Separate from the compiled
+    /// modules because a program can be adopted and REJECTED — an
+    /// unexecutable plan is still a plan, and the reason it was rejected
+    /// is what the launch that needs it has to report — while a
+    /// compilation only exists for a program that got that far.
+    ptir_plans: std::collections::BTreeMap<u64, driver_pipeline::ExecPlan>,
 }
 
 /// Driver-lifetime fire scratch.
@@ -456,6 +496,11 @@ pub extern "C" fn pie_cuda_create(
         channels: std::collections::BTreeMap::new(),
         swap: None,
         scratch: None,
+        fire_stream: None,
+        fire_alloc: None,
+        ptir: crate::ptir::Runtime::default(),
+        ptir_programs: crate::ptir::Programs::new(),
+        ptir_plans: std::collections::BTreeMap::new(),
     });
     let raw = Box::into_raw(boxed);
     if let Some(out) = unsafe { caps.as_mut() } {
@@ -571,10 +616,45 @@ fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result<(), i32> {
     let mut weights = std::collections::BTreeMap::new();
     let mut host = Vec::new();
     for t in meta.weights() {
+        // WHAT A LOAD CAN HAND THE KERNELS, and nothing else.
+        //
+        // Two answers, and the difference is whether the driver has to
+        // change the bytes.
+        //
+        // RAW bf16/f32 is what most of a checkpoint is. (f32 is the GDN
+        // parameter side of the `gdn_fp32_parameters` contract — `A_log`,
+        // the gate norm — consumed as f32 by its kernels.)
+        //
+        // A BYTE PAYLOAD is also loadable, and finding out why took
+        // reading the file. gpt-oss's MXFP4 expert banks are not a
+        // `Quant` encoding at all — safetensors stores them as `U8`
+        // tensors (`…experts.down_proj_blocks`, `U8 [32, 2880, 90, 16]`,
+        // beside a `_scales` companion), and the MXFP4 MEANING lives in
+        // the checkpoint's `quantization_config`, which the contract
+        // reads. The tensor's dtype says only "bytes".
+        //
+        // That is the right division and it makes the load's job small:
+        // get the bytes on the device unchanged. What they MEAN is the
+        // binder's business, and `quant::mxfp4_moe_gate_up_decode_bf16`
+        // indexes the stored layout directly.
+        //
+        // What still refuses is an encoding whose kernels want a
+        // DIFFERENT layout than the file has — a Marlin repack, an FP8
+        // re-encode, a GGUF block unpack. That is `transcode_engine`'s
+        // work in the retired C++ tree and it is not ported, so a
+        // checkpoint needing it is turned away at load rather than
+        // mis-bound at launch.
         match &t.encoding {
-            Encoding::Raw(d) if matches!(format!("{d:?}").as_str(), "BF16" | "F32") => {}
+            Encoding::Raw(d)
+                if matches!(format!("{d:?}").as_str(), "BF16" | "F32" | "U8") => {}
+            Encoding::Quant(spec) if reads_its_stored_form(spec.scheme) => {}
             other => {
-                eprintln!("[driver-cuda-new] load_model: {}: unsupported encoding {other:?}", t.name);
+                eprintln!(
+                    "[driver-cuda-new] load_model: {}: unsupported encoding {other:?}. \
+                     Raw bf16/f32 and packed schemes the kernels read as stored \
+                     load; anything needing a transcode does not.",
+                    t.name
+                );
                 return Err(PIE_STATUS_UNSUPPORTED);
             }
         }
@@ -881,10 +961,36 @@ fn alias_qwen3_5(
     Ok(())
 }
 
-/// Register a program: the id lifecycle, with the C3 hash as the dedup
-/// key — re-registering answers the existing id. The launch PACKAGE is
-/// not yet copied; it is deep-copied when the `launch` arm lands and has
-/// a reader for it.
+/// Register a program: adopt its launch package, compile its generated
+/// regions, and answer an id.
+///
+/// The C3 hash is the dedup key — re-registering answers the existing id
+/// without recompiling — which is what makes a program that is bound a
+/// thousand times compiled once.
+///
+/// # What a failure here means, and why it is not always one
+///
+/// Four outcomes, and only two of them are errors:
+///
+/// * The descriptor carries NO launch package — an empty stage list. That
+///   is a forward-only deployment: the model runs and the logits come
+///   back through the instance's reader channel, with no user program
+///   around the fire. An id is issued and nothing is adopted. `OK`.
+/// * The package adopts and every generated region compiles. `OK`.
+/// * The package adopts and the plan is UNEXECUTABLE — a per-layer tap
+///   stage, an op this driver does not implement. That is not a driver
+///   failure and not a registration failure either: the plan is recorded
+///   with its reason, and the refusal surfaces at the launch that needs
+///   it, where the caller can see which fire it lost.
+/// * A region NVRTC rejects, or an emitted table with a hole in it.
+///   `UNSUPPORTED`, and remembered: this driver carries no emitter, so a
+///   generated region with no host source has no slower path to fall
+///   back to.
+///
+/// A compile needs a device — the architecture comes from the GPU that
+/// will run the code, never a guess — so a shell with no model loaded has
+/// not bound one yet and defers the compile to the first launch rather
+/// than compiling for an architecture it made up.
 #[unsafe(no_mangle)]
 pub extern "C" fn pie_cuda_register_program(
     driver: *mut PieDriver,
@@ -900,28 +1006,148 @@ pub extern "C" fn pie_cuda_register_program(
     if desc.abi_version != PIE_DRIVER_ABI_VERSION {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
-    let existing = state
+    if let Some(id) = state
         .programs
         .iter()
         .find(|(_, p)| p.program_hash == desc.program_hash)
-        .map(|(&id, _)| id);
-    let id = existing.unwrap_or_else(|| {
-        let id = state.next_id;
-        state.next_id += 1;
-        state.programs.insert(
-            id,
-            ProgramEntry {
-                program_hash: desc.program_hash,
-                emitter_version: desc.emitter_version,
-            },
-        );
-        id
-    });
+        .map(|(&id, _)| id)
+    {
+        if let Some(out) = unsafe { program_id.as_mut() } {
+            *out = id;
+        }
+        return PIE_STATUS_OK;
+    }
+
+    // SAFETY: the engine's contract for `register_program` is that every
+    // array reachable from the descriptor is live for the duration of the
+    // call. Adoption COPIES, so nothing here outlives that window --
+    // which is the reason it is done now rather than by holding the
+    // descriptor: `PieProgramDesc` is the caller's transient memory.
+    let package = unsafe { driver_abi::adopt_package(&desc.launch) };
+    let kernels = unsafe { driver_abi::adopt_emitted_kernels(desc.emitted_kernels) };
+
+    let id = state.next_id;
+    state.next_id += 1;
+
+    // A package with NO STAGES is not a malformed program; it is the
+    // absence of one. The engine registers such a descriptor for a
+    // forward-only deployment — the model runs, the logits come back
+    // through the instance's reader channel, and no user program sits
+    // around the fire. `adopt_launch_package` refuses an empty stage list
+    // because an ExecPlan with nothing to execute is not a plan, and it is
+    // right to; the judgement that this is not an ERROR belongs here,
+    // where the difference between "the host sent a broken program" and
+    // "the host sent no program" is visible.
+    if !package.stages.is_empty() {
+        if let Err(code) = adopt_and_compile(state, id, desc, package, &kernels) {
+            return code;
+        }
+    }
+
+    state.programs.insert(
+        id,
+        ProgramEntry {
+            program_hash: desc.program_hash,
+            emitter_version: desc.emitter_version,
+        },
+    );
     if let Some(out) = unsafe { program_id.as_mut() } {
         *out = id;
     }
     PIE_STATUS_OK
 }
+
+/// Adopt one non-empty launch package and compile what it generates.
+///
+/// Split out so the id lifecycle above reads as the lifecycle: the empty
+/// case, the dedup case and the id assignment are all one paragraph, and
+/// the thing that can fail is one call.
+fn adopt_and_compile(
+    state: &mut Shell,
+    id: u64,
+    desc: &PieProgramDesc,
+    package: driver_pipeline::driver_abi::plan::LaunchPackage,
+    kernels: &[driver_pipeline::EmittedKernel],
+) -> Result<(), i32> {
+    let plan = match driver_pipeline::adopt_launch_package(package) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("[driver-cuda-new] register_program: {error}");
+            return Err(PIE_STATUS_UNSUPPORTED);
+        }
+    };
+
+    // The compile, when there is a device to compile FOR. `load_model`
+    // binds it; a registration that arrives first is not an error, and
+    // guessing an architecture would produce a cubin for the wrong GPU
+    // rather than a diagnostic.
+    if plan.executable && state.model.is_some() {
+        let target = ptir_target()?;
+        let versions = driver_pipeline::Versions::mirrored(desc.emitter_version);
+        match state
+            .ptir
+            .compile(desc.program_hash, &plan, kernels, versions, target)
+        {
+            Ok(compiled) => state.ptir_programs.insert(id, compiled),
+            Err(failure) => {
+                eprintln!(
+                    "[driver-cuda-new] register_program: cannot compile program \
+                     {:#018x}: {}",
+                    desc.program_hash,
+                    failure.reason()
+                );
+                return Err(PIE_STATUS_UNSUPPORTED);
+            }
+        }
+    } else if !plan.executable {
+        // Recorded rather than refused: an unexecutable plan is a fact
+        // about the program that the launch needing it must be able to
+        // report, and losing the reason here would leave that launch with
+        // nothing to say.
+        eprintln!(
+            "[driver-cuda-new] register_program: program {:#018x} adopted but is \
+             not executable by this driver: {}",
+            desc.program_hash,
+            plan.reject_reason.as_deref().unwrap_or("no reason given")
+        );
+    }
+
+    state.ptir_plans.insert(id, plan);
+    Ok(())
+}
+
+/// What the compile cache needs to know about the GPU it is compiling for.
+///
+/// Read per registration rather than cached on the shell because the two
+/// numbers that matter are cheap and the one that is not — the NVRTC
+/// version — is a `dlopen`'d call the loader has already resolved by the
+/// second registration. Caching it would trade nothing for a field that
+/// can go stale against a runtime swap.
+fn ptir_target() -> Result<crate::ptir::Target, i32> {
+    let device = crate::cuda::Device::bind(0).map_err(|error| {
+        eprintln!("[driver-cuda-new] register_program: no device to compile for: {error}");
+        PIE_STATUS_DRIVER_ERROR
+    })?;
+    let (major, minor) = device.compute_capability().map_err(|error| {
+        eprintln!("[driver-cuda-new] register_program: {error}");
+        PIE_STATUS_DRIVER_ERROR
+    })?;
+    let nvrtc = crate::ptir::nvrtc::version().map_err(|error| {
+        eprintln!("[driver-cuda-new] register_program: {error}");
+        PIE_STATUS_DRIVER_ERROR
+    })?;
+    Ok(crate::ptir::Target {
+        major,
+        minor,
+        // The ordinal, widened. A stable per-GPU id is what the identity
+        // wants and what stops one machine's cache answering for another
+        // family; with one device bound per process the ordinal IS that
+        // id, and it is the number the C++ used.
+        device: u64::try_from(device.ordinal()).unwrap_or(0),
+        nvrtc,
+    })
+}
+
 
 /// Register a channel endpoint: the C++ registry's binding contract —
 /// a pinned host MIRROR of `(capacity + 1)` wire cells and four pinned
@@ -1212,6 +1438,146 @@ trait PlannedFamily {
     /// The family's recurrent geometry, when it has one.
     fn gdn_shape(&self) -> Option<GdnShape> {
         None
+    }
+}
+
+impl PlannedFamily for model::gemma_2::forward::facts::Gemma2Facts {
+    fn trace(&self, class: model_compiler::trace::FireClass) -> model_compiler::trace::ForwardPlan {
+        model::gemma_2::forward::gemma2_cuda(self, class)
+    }
+    fn layers(&self) -> u32 {
+        self.layers
+    }
+    fn head_dim_of(&self, _l: u32, _uniform: u32) -> u32 {
+        self.attn.head_dim
+    }
+    fn window_by_layer(&self, _sliding_window: i32) -> Vec<i32> {
+        self.window_left.clone()
+    }
+    fn tables(&self, _model: &LoadedModel) -> FamilyTables {
+        FamilyTables {
+            softcap: if self.final_logit_softcap { 30.0 } else { 0.0 },
+            ..FamilyTables::default()
+        }
+    }
+}
+
+impl PlannedFamily
+    for (
+        model::gpt_oss::forward::facts::GptOssFacts,
+        model::gpt_oss::forward::facts::GptOssCudaFacts,
+    )
+{
+    fn trace(&self, class: model_compiler::trace::FireClass) -> model_compiler::trace::ForwardPlan {
+        model::gpt_oss::forward::gpt_oss_cuda(&self.0, &self.1, class)
+    }
+    fn layers(&self) -> u32 {
+        self.0.layers
+    }
+    fn head_dim_of(&self, _l: u32, _uniform: u32) -> u32 {
+        self.0.head_dim
+    }
+    fn window_by_layer(&self, _sliding_window: i32) -> Vec<i32> {
+        self.1.window_left.clone()
+    }
+}
+
+impl PlannedFamily for model::glm5::forward::facts::Glm5Facts {
+    fn trace(&self, class: model_compiler::trace::FireClass) -> model_compiler::trace::ForwardPlan {
+        model::glm5::forward::glm5_cuda(self, class)
+    }
+    fn layers(&self) -> u32 {
+        self.layers
+    }
+    fn head_dim_of(&self, _l: u32, _uniform: u32) -> u32 {
+        // MLA's pages hold the LATENT, not a head-split key, and
+        // `kv_a_width` is that row — the shared `MlaFacts` says it once
+        // for every family in this lineage.
+        self.attn.kv_a_width()
+    }
+}
+
+impl PlannedFamily
+    for (
+        model::kimi_k2::forward::facts::KimiFacts,
+        model::kimi_k2::forward::facts::KimiCudaFacts,
+    )
+{
+    fn trace(&self, class: model_compiler::trace::FireClass) -> model_compiler::trace::ForwardPlan {
+        model::kimi_k2::forward::kimi_cuda(&self.0, &self.1, class)
+    }
+    fn layers(&self) -> u32 {
+        self.0.layers
+    }
+    fn head_dim_of(&self, _l: u32, _uniform: u32) -> u32 {
+        self.0.attn.kv_a_width()
+    }
+}
+
+impl PlannedFamily for model::kimi_k3::forward::facts::KimiK3Facts {
+    fn trace(&self, class: model_compiler::trace::FireClass) -> model_compiler::trace::ForwardPlan {
+        model::kimi_k3::forward::kimi_k3_cuda(self, class)
+    }
+    fn layers(&self) -> u32 {
+        self.layers
+    }
+    fn head_dim_of(&self, _l: u32, _uniform: u32) -> u32 {
+        self.attn.kv_a_width()
+    }
+    fn recurrent(&self) -> bool {
+        // KDA carries per-request recurrent state, so a fire of this
+        // family stays eager for the rule the hybrid states.
+        true
+    }
+}
+
+impl PlannedFamily for model::deepseek_v4::forward::facts::Dsv4Facts {
+    fn trace(&self, class: model_compiler::trace::FireClass) -> model_compiler::trace::ForwardPlan {
+        model::deepseek_v4::forward::dsv4_cuda(self, class)
+    }
+    fn layers(&self) -> u32 {
+        self.layers
+    }
+    fn head_dim_of(&self, _l: u32, _uniform: u32) -> u32 {
+        self.attn.head_dim
+    }
+    fn window_by_layer(&self, _sliding_window: i32) -> Vec<i32> {
+        let w = i32::try_from(self.attn.sliding_window).unwrap_or(0);
+        (0..self.layers).map(|_| if w > 0 { w } else { -1 }).collect()
+    }
+}
+
+impl PlannedFamily for model::nemotron_h::forward::facts::NemotronHFacts {
+    fn trace(&self, class: model_compiler::trace::FireClass) -> model_compiler::trace::ForwardPlan {
+        model::nemotron_h::forward::nemotron_h_cuda(self, class)
+    }
+    fn layers(&self) -> u32 {
+        u32::try_from(self.layer_types.len()).unwrap_or(0)
+    }
+    fn head_dim_of(&self, _l: u32, _uniform: u32) -> u32 {
+        self.attn.head_dim
+    }
+    fn window_by_layer(&self, _sliding_window: i32) -> Vec<i32> {
+        self.window_left.clone()
+    }
+    fn recurrent(&self) -> bool {
+        // The mamba layers' selective-scan state is per request.
+        true
+    }
+}
+
+impl PlannedFamily for model::gemma3n::forward::facts::Gemma3nFacts {
+    fn trace(&self, class: model_compiler::trace::FireClass) -> model_compiler::trace::ForwardPlan {
+        model::gemma3n::forward::gemma3n_cuda(self, class)
+    }
+    fn layers(&self) -> u32 {
+        u32::try_from(self.per_layer_intermediate.len()).unwrap_or(0)
+    }
+    fn head_dim_of(&self, _l: u32, _uniform: u32) -> u32 {
+        self.attn.head_dim
+    }
+    fn window_by_layer(&self, _sliding_window: i32) -> Vec<i32> {
+        self.window_left.clone()
     }
 }
 
@@ -1578,13 +1944,34 @@ const SCORE_PIN: model_compiler::trace::ValueId = model_compiler::trace::ValueId
 
 /// Is the unionized supergraph armed for this process?
 ///
-/// `PIE_CUDA_SUPERGRAPH=1`. Off by default and deliberately so: every A/B
-/// in this tree pins the EAGER leg, and a capture is an optimisation that
-/// has to prove itself against that rather than replace it silently. The
-/// same shape as `decode_fused_post` and the lora grouping gate.
+/// **ON by default now**, and `PIE_CUDA_SUPERGRAPH=0` turns it off.
+///
+/// It was off, deliberately, with this reason: every A/B in the tree pins
+/// the EAGER leg, and a capture is an optimisation that has to prove
+/// itself against that rather than replace it silently. It has now proved
+/// it, on the three claims that were the actual doubt:
+///
+/// - the whole ABI suite records and replays (19/19 with the gate on),
+///   which is every family this shell opens and every fire shape it
+///   serves;
+/// - one exec runs two structurally distinct KV-write programs and
+///   returns byte-identical logits, selected by a byte of device memory
+///   (`bridge_smoke::the_union_captures_and_replays_the_same_decode`);
+/// - and one exec serves a SECOND fire's tokens
+///   (`a_cached_exec_serves_the_next_fire`), which is the property that
+///   makes a cached exec worth caching and the only one that can tell a
+///   baked address from baked contents.
+///
+/// What cannot be replayed still refuses rather than being captured
+/// wrong: recurrent-state families stay eager at the LOWERING decision,
+/// and an arm whose prepared state the fire declines to build is refused.
+/// So default-on changes which leg runs, not which answers are possible.
+///
+/// The env var inverts rather than disappears, because a default is a
+/// judgement and a judgement should stay reversible without a rebuild.
 fn supergraph_enabled() -> bool {
-    std::env::var_os("PIE_CUDA_SUPERGRAPH")
-        .is_some_and(|v| v == "1" || v == "true" || v == "on")
+    !std::env::var_os("PIE_CUDA_SUPERGRAPH")
+        .is_some_and(|v| v == "0" || v == "false" || v == "off")
 }
 
 /// What a row dispatches to: this family's facts, off the checkpoint.
@@ -1622,6 +2009,15 @@ const FACTS_ROWS: &[(&str, FactsFrom)] = &[
     // service behind `pie_cuda_encode`, not part of this decode plan.
     ("qwen3_vl", llama_like_facts_from_hf),
     ("qwen3_vl_text", llama_like_facts_from_hf),
+    // gemma-3 is a llama-lineage decoder with per-head qk-norm and an
+    // alternating window; the derivation reads both off the checkpoint.
+    ("gemma3", llama_like_facts_from_hf),
+    ("gemma3_text", llama_like_facts_from_hf),
+    // A ROUTED FFN is a fact, not a family: `n_experts > 0` selects the
+    // mixture and the attention is unchanged, which is why these two
+    // reach the same derivation as every dense deployment above.
+    ("mixtral", llama_like_facts_from_hf),
+    ("qwen3_moe", llama_like_facts_from_hf),
     // ── Gemma-4: nested decoder, PLE, two layer kinds.
     ("gemma4", gemma4_facts_from_hf),
     ("gemma4_text", gemma4_facts_from_hf),
@@ -1630,6 +2026,21 @@ const FACTS_ROWS: &[(&str, FactsFrom)] = &[
     ("qwen3_5_text", qwen35_facts_from_hf),
     ("qwen3_5_moe", qwen35_facts_from_hf),
     ("qwen3_5_moe_text", qwen35_facts_from_hf),
+    // ── gemma-2: alternating local/global attention, softcapped twice.
+    ("gemma2", gemma2_facts_from_hf),
+    // ── gpt-oss: MXFP4 mixture, attention sinks, alternating window.
+    ("gpt_oss", gpt_oss_facts_from_hf),
+    // ── The MLA lineage: latent q/kv, a dense prefix, then the mixture.
+    ("glm_moe_dsa", glm5_facts_from_hf),
+    ("deepseek_v2", kimi_k2_facts_from_hf),
+    ("deepseek_v3", kimi_k2_facts_from_hf),
+    ("kimi_k2", kimi_k2_facts_from_hf),
+    ("kimi_k3", kimi_k3_facts_from_hf),
+    ("deepseek_v4", dsv4_facts_from_hf),
+    // ── Hybrids and the per-layer-embedding gemma.
+    ("nemotron_h", nemotron_h_facts_from_hf),
+    ("gemma3n", gemma3n_facts_from_hf),
+    ("gemma3n_text", gemma3n_facts_from_hf),
 ];
 
 /// Every `model_type` this shell can open, in table order.
@@ -1728,6 +2139,361 @@ pub fn fire_class_of(
     // until then the shape answers, and `StateOnly` is reachable only
     // through the lowering tests.
     Ok(if rows == requests { FireClass::Decode } else { FireClass::Prefill })
+}
+
+/// gemma-2's facts off the checkpoint's config.
+///
+/// The window list is the family's own shape: gemma-2 ALTERNATES local
+/// and global attention, odd layers seeing the whole context. `layer_types`
+/// states it when the config ships one; the parity is the fallback the
+/// C++ parse used.
+fn gemma2_facts_from_hf(model: &LoadedModel) -> Result<Box<dyn PlannedFamily>, i32> {
+    use model::gemma_2::forward::facts::{Gemma2AttnFacts, Gemma2Facts};
+    let hf = &model.hf;
+    let to_u32 = |v: i32| u32::try_from(v).unwrap_or(0);
+    let layers = to_u32(hf.num_hidden_layers);
+    let window_left: Vec<i32> = (0..layers)
+        .map(|l| {
+            let global = hf
+                .layer_types
+                .get(l as usize)
+                .map_or(l % 2 == 1, |t| t == "full_attention");
+            if global { -1 } else { hf.sliding_window.max(0) }
+        })
+        .collect();
+    Ok(Box::new(Gemma2Facts {
+        layers,
+        vocab: to_u32(hf.vocab_size),
+        hidden: to_u32(hf.hidden_size),
+        intermediate: to_u32(hf.intermediate_size),
+        tied_embeddings: hf.tie_word_embeddings,
+        final_logit_softcap: hf.gemma_final_logit_softcap > 0.0,
+        window_left,
+        attn: Gemma2AttnFacts {
+            heads: to_u32(hf.num_attention_heads),
+            kv_heads: to_u32(hf.num_key_value_heads),
+            head_dim: to_u32(hf.head_dim),
+            qk_norm: false,
+            query_pre_attn_scale: true,
+            attn_logit_softcap: true,
+        },
+    }))
+}
+
+/// gpt-oss's facts. The sliding schedule is `layer_types`' when the
+/// config ships one — gpt-oss alternates from layer 0 — and the fused
+/// MXFP4 decode leg is the engine default this text states.
+fn gpt_oss_facts_from_hf(model: &LoadedModel) -> Result<Box<dyn PlannedFamily>, i32> {
+    use model::gpt_oss::forward::facts::{GptOssCudaFacts, GptOssFacts};
+    let hf = &model.hf;
+    let to_u32 = |v: i32| u32::try_from(v).unwrap_or(0);
+    let layers = to_u32(hf.num_hidden_layers);
+    let experts = to_u32(hf.num_experts);
+    let facts = GptOssFacts {
+        hidden: to_u32(hf.hidden_size),
+        layers,
+        q_heads: to_u32(hf.num_attention_heads),
+        kv_heads: to_u32(hf.num_key_value_heads),
+        head_dim: to_u32(hf.head_dim),
+        intermediate: to_u32(hf.intermediate_size),
+        experts,
+        top_k: to_u32(hf.num_experts_per_tok),
+        vocab: to_u32(hf.vocab_size),
+        tied_embeddings: hf.tie_word_embeddings,
+        swiglu_limit: 7.0,
+        attention_bias: true,
+        rope_yarn_original: true,
+        attn_sinks: true,
+    };
+    let cuda = GptOssCudaFacts {
+        mxfp4_decode_gemv: true,
+        mxfp4_decode_max_routes: 32 * experts.max(1),
+        streamed_experts: false,
+        window_left: (0..layers)
+            .map(|l| {
+                let sliding = hf
+                    .layer_types
+                    .get(l as usize)
+                    .map_or(l % 2 == 0, |t| t == "sliding_attention");
+                if sliding { hf.sliding_window.max(0) } else { -1 }
+            })
+            .collect(),
+    };
+    Ok(Box::new((facts, cuda)))
+}
+
+/// The MLA lineage's shared reading: a dense PREFIX then the mixture,
+/// latent q/kv projections, and the rope half carried beside the nope
+/// half. `first_k_dense_replace` is the prefix length in every config
+/// that ships one.
+fn glm5_facts_from_hf(model: &LoadedModel) -> Result<Box<dyn PlannedFamily>, i32> {
+    use model::glm5::forward::facts::{Glm5DsaFacts, Glm5Facts, Glm5MlaFacts, Glm5MoeFacts};
+    let hf = &model.hf;
+    let u = |v: i32| u32::try_from(v).unwrap_or(0);
+    Ok(Box::new(Glm5Facts {
+        layers: u(hf.num_hidden_layers),
+        vocab: u(hf.vocab_size),
+        hidden: u(hf.hidden_size),
+        dense_intermediate: u(hf.intermediate_size),
+        dense_layers: u(hf.first_k_dense_replace),
+        attn: Glm5MlaFacts {
+            hidden: u(hf.hidden_size),
+            heads: u(hf.num_attention_heads),
+            q_lora_rank: u(hf.q_lora_rank),
+            kv_lora_rank: u(hf.kv_lora_rank),
+            qk_nope_head_dim: u(hf.qk_nope_head_dim),
+            qk_rope_head_dim: u(hf.qk_rope_head_dim),
+            v_head_dim: u(hf.v_head_dim),
+            // Only kimi-k3 gates the MLA output.
+            output_gate: false,
+        },
+        dsa: Glm5DsaFacts {
+            index_n_heads: u(hf.dsv4_index_n_heads),
+            index_head_dim: u(hf.dsv4_index_head_dim),
+            index_topk: u(hf.dsv4_index_topk),
+        },
+        moe: Glm5MoeFacts {
+            hidden: u(hf.hidden_size),
+            num_experts: u(hf.num_experts),
+            top_k: u(hf.num_experts_per_tok),
+            moe_intermediate: u(hf.moe_intermediate_size),
+            shared_intermediate: u(hf.n_shared_experts) * u(hf.moe_intermediate_size),
+            aligned_block: 16,
+        },
+    }))
+}
+
+/// kimi-k2: the same MLA reading as glm5, without the DSA indexer.
+fn kimi_k2_facts_from_hf(model: &LoadedModel) -> Result<Box<dyn PlannedFamily>, i32> {
+    use model::kimi_k2::forward::facts::{KimiCudaFacts, KimiFacts, KimiMlaFacts, KimiMoeFacts};
+    let hf = &model.hf;
+    let u = |v: i32| u32::try_from(v).unwrap_or(0);
+    let facts = KimiFacts {
+        layers: u(hf.num_hidden_layers),
+        vocab: u(hf.vocab_size),
+        hidden: u(hf.hidden_size),
+        dense_intermediate: u(hf.intermediate_size),
+        dense_layers: u(hf.first_k_dense_replace),
+        attn: KimiMlaFacts {
+            hidden: u(hf.hidden_size),
+            heads: u(hf.num_attention_heads),
+            q_lora_rank: u(hf.q_lora_rank),
+            kv_lora_rank: u(hf.kv_lora_rank),
+            qk_nope_head_dim: u(hf.qk_nope_head_dim),
+            qk_rope_head_dim: u(hf.qk_rope_head_dim),
+            v_head_dim: u(hf.v_head_dim),
+            // Only kimi-k3 gates the MLA output.
+            output_gate: false,
+        },
+        moe: KimiMoeFacts {
+            num_experts: u(hf.num_experts),
+            top_k: u(hf.num_experts_per_tok),
+            moe_intermediate: u(hf.moe_intermediate_size),
+            shared_intermediate: u(hf.n_shared_experts) * u(hf.moe_intermediate_size),
+        },
+    };
+    // The BINDING facts: one fused q/kv latent GEMM when the load joined
+    // them, and YaRN when the config asked for it.
+    let cuda = KimiCudaFacts {
+        q_kv_a_fused: model.aliases.contains_key("layer.0.q_kv_a_fused"),
+        rope_yarn_original: matches!(
+            hf.rope_scaling_kind,
+            crate::model::config::RopeScaling::OriginalYarn
+        ),
+    };
+    Ok(Box::new((facts, cuda)))
+}
+
+/// kimi-k3: MLA beside KDA linear attention, on the periodic schedule
+/// `full_attn_at` states.
+fn kimi_k3_facts_from_hf(model: &LoadedModel) -> Result<Box<dyn PlannedFamily>, i32> {
+    use model::kimi_k3::forward::facts::{
+        KimiK3Facts, KimiK3KdaFacts, KimiK3MlaFacts, KimiK3MoeFacts,
+    };
+    let hf = &model.hf;
+    let u = |v: i32| u32::try_from(v).unwrap_or(0);
+    let interval = u32::try_from(
+        hf.layer_types.iter().position(|t| t == "full_attention").map_or(0, |i| i + 1),
+    )
+    .unwrap_or(0);
+    Ok(Box::new(KimiK3Facts {
+        layers: u(hf.num_hidden_layers),
+        vocab: u(hf.vocab_size),
+        hidden: u(hf.hidden_size),
+        dense_intermediate: u(hf.intermediate_size),
+        dense_layers: u(hf.first_k_dense_replace),
+        full_attn_interval: interval,
+        attn_res_block: 0,
+        attn: KimiK3MlaFacts {
+            hidden: u(hf.hidden_size),
+            heads: u(hf.num_attention_heads),
+            q_lora_rank: u(hf.q_lora_rank),
+            kv_lora_rank: u(hf.kv_lora_rank),
+            qk_nope_head_dim: u(hf.qk_nope_head_dim),
+            qk_rope_head_dim: u(hf.qk_rope_head_dim),
+            v_head_dim: u(hf.v_head_dim),
+            output_gate: true,
+        },
+        kda: KimiK3KdaFacts {
+            value_heads: u(hf.linear_num_value_heads),
+            value_head_dim: u(hf.linear_value_head_dim),
+            conv_kernel: u(hf.linear_conv_kernel_dim),
+            gate_lower_bound_milli: 0,
+        },
+        moe: KimiK3MoeFacts {
+            num_experts: u(hf.num_experts),
+            top_k: u(hf.num_experts_per_tok),
+            moe_intermediate: u(hf.moe_intermediate_size),
+            shared_intermediate: u(hf.n_shared_experts) * u(hf.moe_intermediate_size),
+        },
+    }))
+}
+
+/// deepseek-v4: the DSA indexer, hyper-connections, and a routed MLP
+/// whose activation clamps.
+fn dsv4_facts_from_hf(model: &LoadedModel) -> Result<Box<dyn PlannedFamily>, i32> {
+    use model::deepseek_v4::forward::facts::{
+        Dsv4AttnFacts, Dsv4Facts, Dsv4HcFacts, Dsv4MoeFacts,
+    };
+    let hf = &model.hf;
+    let u = |v: i32| u32::try_from(v).unwrap_or(0);
+    Ok(Box::new(Dsv4Facts {
+        layers: u(hf.num_hidden_layers),
+        vocab: u(hf.vocab_size),
+        hidden: u(hf.hidden_size),
+        dense_intermediate: u(hf.intermediate_size),
+        dense_layers: u(hf.first_k_dense_replace),
+        attn: Dsv4AttnFacts {
+            hidden: u(hf.hidden_size),
+            heads: u(hf.num_attention_heads),
+            head_dim: u(hf.head_dim),
+            q_lora_rank: u(hf.q_lora_rank),
+            qk_rope_head_dim: u(hf.qk_rope_head_dim),
+            sliding_window: u(hf.sliding_window.max(0)),
+            o_lora_rank: 0,
+            o_groups: 1,
+        },
+        hc: Dsv4HcFacts { mult: 1 },
+        moe: Dsv4MoeFacts {
+            num_experts: u(hf.num_experts),
+            top_k: u(hf.num_experts_per_tok),
+            moe_intermediate: u(hf.moe_intermediate_size),
+            swiglu_limit_milli: 0,
+            hash_routed: false,
+        },
+    }))
+}
+
+/// nemotron-h: three layer kinds, and the schedule is the LIST rather
+/// than an interval — the family has an MLP-only layer no period spells.
+fn nemotron_h_facts_from_hf(model: &LoadedModel) -> Result<Box<dyn PlannedFamily>, i32> {
+    use model::nemotron_h::forward::facts::{
+        NemotronAttnFacts, NemotronHFacts, NemotronLayerKind, NemotronMambaFacts,
+        NemotronMoeFacts,
+    };
+    let hf = &model.hf;
+    let u = |v: i32| u32::try_from(v).unwrap_or(0);
+    let layer_types: Vec<NemotronLayerKind> = hf
+        .layer_types
+        .iter()
+        .map(|t| match t.as_str() {
+            "attention" | "full_attention" => NemotronLayerKind::Attention,
+            "mlp" => NemotronLayerKind::Mlp,
+            _ => NemotronLayerKind::Mamba,
+        })
+        .collect();
+    if layer_types.is_empty() {
+        eprintln!("[driver-cuda-new] launch: nemotron-h states no layer_types");
+        return Err(PIE_STATUS_UNSUPPORTED);
+    }
+    let window_left = vec![-1; layer_types.len()];
+    Ok(Box::new(NemotronHFacts {
+        vocab: u(hf.vocab_size),
+        hidden: u(hf.hidden_size),
+        layer_types,
+        mamba: NemotronMambaFacts {
+            num_heads: u(hf.mamba_num_heads),
+            head_dim: u(hf.mamba_head_dim),
+            state_size: u(hf.mamba_state_size),
+            n_groups: u(hf.mamba_n_groups),
+            conv_kernel: u(hf.mamba_conv_kernel),
+        },
+        attn: NemotronAttnFacts {
+            heads: u(hf.num_attention_heads),
+            kv_heads: u(hf.num_key_value_heads),
+            head_dim: u(hf.head_dim),
+        },
+        moe: NemotronMoeFacts {
+            num_experts: u(hf.num_experts),
+            top_k: u(hf.num_experts_per_tok),
+            moe_intermediate: u(hf.moe_intermediate_size),
+            shared_intermediate: u(hf.shared_expert_intermediate_size),
+        },
+        window_left,
+    }))
+}
+
+/// gemma-3n: altUp streams, laurel, per-layer embeddings and a per-layer
+/// MLP width the config states as a list.
+fn gemma3n_facts_from_hf(model: &LoadedModel) -> Result<Box<dyn PlannedFamily>, i32> {
+    use model::gemma3n::forward::facts::{Gemma3nAltUpFacts, Gemma3nAttnFacts, Gemma3nFacts};
+    let hf = &model.hf;
+    let u = |v: i32| u32::try_from(v).unwrap_or(0);
+    let layers = u(hf.num_hidden_layers) as usize;
+    Ok(Box::new(Gemma3nFacts {
+        vocab: u(hf.vocab_size),
+        hidden: u(hf.hidden_size),
+        per_layer_intermediate: vec![u(hf.intermediate_size); layers],
+        laurel_rank: u(hf.laurel_rank),
+        ple_width: u(hf.gemma_hidden_size_per_layer_input),
+        sparsity_layers: u32::try_from(
+            hf.gemma3n_activation_sparsity.iter().filter(|&&s| s > 0.0).count(),
+        )
+        .unwrap_or(0),
+        altup: Gemma3nAltUpFacts {
+            num_streams: u(hf.altup_num_inputs),
+            active: u(hf.altup_active_idx),
+        },
+        attn: Gemma3nAttnFacts {
+            heads: u(hf.num_attention_heads),
+            kv_heads: u(hf.num_key_value_heads),
+            head_dim: u(hf.head_dim),
+        },
+        window_left: (0..layers)
+            .map(|l| {
+                if hf.layer_types.get(l).is_some_and(|t| t == "full_attention") {
+                    -1
+                } else {
+                    hf.sliding_window.max(0)
+                }
+            })
+            .collect(),
+    }))
+}
+
+/// Whether a quantized scheme's STORED bytes are what its kernels read.
+///
+/// The dividing line for what a load can accept without a transcode
+/// engine. A scheme here is uploaded verbatim; anything else needs its
+/// layout changed on the way in, which is `transcode_engine.hpp`'s job in
+/// the retired C++ tree and is not ported.
+///
+/// Note this is the arm for a checkpoint that DECLARES its scheme in the
+/// tensor encoding. gpt-oss does not — its MXFP4 banks arrive as plain
+/// `U8` and the scheme is in `quantization_config` — so the live MXFP4
+/// path is the `Raw(U8)` arm above. This one is for the encodings the
+/// loader does tag, and it is a MATCH rather than a default-allow for the
+/// same reason: a scheme nobody has checked should refuse, because
+/// guessing hands a kernel a layout it was not compiled for, which is not
+/// a crash but wrong numbers.
+///
+/// Deliberately a MATCH rather than a default-allow: a scheme nobody has
+/// checked should refuse, because the failure mode of guessing is a
+/// kernel reading a layout it was not compiled for — which is not a
+/// crash, it is wrong numbers.
+const fn reads_its_stored_form(scheme: model_loader::types::QuantScheme) -> bool {
+    use model_loader::types::QuantScheme as Q;
+    matches!(scheme, Q::Mxfp4E2M1E8M0 | Q::MlxAffineU4)
 }
 
 /// THE GQA RATIO, refused at LOAD rather than discovered at launch.
@@ -2172,10 +2938,27 @@ fn step_impl(
     }
     let dplan = DispatchPlan::new(&plan, &lowered);
 
-    // ── Device state: KV pools (persistent), fire arrays (per launch). ──
-    let stream = crate::cuda::OwnedStream::new(0).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+    // ── Device state, and all of it PERSISTENT now. ──
+    //
+    // The stream and the allocator used to be built here, per fire. The
+    // stream because nothing needed it to outlive the call, and the
+    // allocator because it was convenient — but an allocator that POOLS
+    // and is rebuilt every fire has no pool, so every buffer a fire
+    // wanted was a fresh `cudaMalloc`.
+    //
+    // Both are the shell's now. That is a saving on its own and it is the
+    // precondition for run-ahead: a second fire cannot queue behind the
+    // first onto a stream that dies with the first call.
+    if state.fire_stream.is_none() {
+        state.fire_stream =
+            Some(crate::cuda::OwnedStream::new(0).map_err(|_| PIE_STATUS_DRIVER_ERROR)?);
+    }
+    if state.fire_alloc.is_none() {
+        state.fire_alloc = Some(crate::cuda::Allocator::new());
+    }
+    let stream = state.fire_stream.as_ref().expect("just ensured");
     let raw_stream = stream.as_ref().as_raw().cast::<std::ffi::c_void>();
-    let alloc = crate::cuda::Allocator::new();
+    let alloc = state.fire_alloc.as_ref().expect("just ensured");
 
     let need_pages = frame.required_kv_pages.max(
         kv_indices.iter().copied().max().map_or(1, |m| m + 1),

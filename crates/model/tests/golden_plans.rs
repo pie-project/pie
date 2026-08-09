@@ -48,6 +48,34 @@ fn check(name: &str, facts: &LlamaLikeFacts) {
     check_plan(name, &llama_like(facts));
 }
 
+/// Every op kind and kernel name in a serialized plan, counted.
+///
+/// Deliberately reads the JSON rather than the `ForwardPlan`: the stored
+/// side IS json, and parsing both the same way is what makes the
+/// comparison mean "these two files describe the same launches".
+fn plan_multiset(json: &str) -> std::collections::BTreeMap<String, usize> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return out };
+    let Some(ops) = v.get("ops").and_then(|o| o.as_array()) else { return out };
+    for op in ops {
+        let Some(kind) = op.get("kind") else { continue };
+        let name = match kind {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Object(m) => m
+                .iter()
+                .next()
+                .map(|(k, v)| match v.get("kernel").and_then(|k| k.as_str()) {
+                    Some(sym) => format!("{k}:{sym}"),
+                    None => k.clone(),
+                })
+                .unwrap_or_default(),
+            _ => continue,
+        };
+        *out.entry(name).or_default() += 1;
+    }
+    out
+}
+
 fn check_plan(name: &str, plan: &ForwardPlan) {
     let fresh = serde_json::to_string_pretty(plan).expect("serialize plan");
     let path = golden_path(name);
@@ -63,6 +91,31 @@ fn check_plan(name: &str, plan: &ForwardPlan) {
             path.display()
         )
     });
+    // WHICH KIND OF CHANGE, said before the diff is printed.
+    //
+    // "The goldens moved" and "the plan changed" are different claims,
+    // and a 700-line reordering looks like the second when it is the
+    // first. A refactor that shares a block between families forces one
+    // statement ORDER on all of them, and where they disagreed the diff
+    // is enormous and the launch list is identical.
+    //
+    // So the message says which it is. Reading it wrong in either
+    // direction is expensive: blessing a real change because the diff was
+    // long, or re-deriving a reordering by hand because it looked real.
+    if stored != fresh {
+        let a = plan_multiset(&stored);
+        let b = plan_multiset(&fresh);
+        if a == b {
+            eprintln!(
+                "note: `{name}` has the SAME launches in a different ORDER \
+                 — same kernels, same counts, {} ops either way. A shared \
+                 block forcing one order does this.",
+                a.values().sum::<usize>()
+            );
+        } else {
+            eprintln!("note: `{name}`'s LAUNCH SET changed, not just its order");
+        }
+    }
     assert_eq!(
         stored, fresh,
         "traced form for `{name}` changed.\n\

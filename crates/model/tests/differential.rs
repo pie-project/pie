@@ -7,7 +7,7 @@
 //! with.
 //!
 //! So the check is a comparison against recorded output of the real thing.
-//! `crates/driver-cuda/csrc/tests/hf_config_dump/` builds `parse_hf_config` behind a JSON
+//! `crates/driver-cuda-new/tests/hf_config_dump/` holds the C++ oracle's transcript (a JSON
 //! dumper with a host compiler (no CUDA), runs it over 55 configs — 28 real,
 //! 27 synthetic for the branches a model cache does not happen to contain —
 //! and checks in the results. This test re-normalizes the same inputs here and
@@ -30,7 +30,11 @@ fn here() -> PathBuf {
 }
 
 fn oracle_dir() -> PathBuf {
-    here().join("../../crates/driver-cuda/csrc/tests/hf_config_dump")
+    // The corpus MOVED to `driver-cuda-new` when the C++ tree was
+    // deleted. It is the oracle rather than the producer: 58 real
+    // `config.json` files and a transcript of what the C++ parse made of
+    // each, and a recorded answer outlives the code that recorded it.
+    here().join("../../crates/driver-cuda-new/tests/hf_config_dump")
 }
 
 /// Every (name, config path, golden path) in the corpus.

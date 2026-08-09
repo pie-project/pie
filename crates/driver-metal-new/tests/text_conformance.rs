@@ -44,103 +44,105 @@ struct Text {
 /// **Add a row here when a family gets a text.** That is the whole cost of
 /// joining this harness, and the point of writing it over `ForwardPlan`.
 fn texts() -> Vec<Text> {
-    vec![Text {
-        name: "llama_like",
-        plan: |class| {
-            use model::families::llama_like::forward::facts::{
-                LlamaLikeFacts, LlamaLikeMetalFacts,
-            };
-            model::families::llama_like::forward::llama_like_metal(
-                &LlamaLikeFacts::qwen3_0_6b(),
-                &LlamaLikeMetalFacts::synthetic(),
-                class,
-            )
+    vec![
+        Text {
+            name: "llama_like",
+            plan: |class| {
+                use model::families::llama_like::forward::facts::{
+                    LlamaLikeFacts, LlamaLikeMetalFacts,
+                };
+                model::families::llama_like::forward::llama_like_metal(
+                    &LlamaLikeFacts::qwen3_0_6b(),
+                    &LlamaLikeMetalFacts::synthetic(),
+                    class,
+                )
+            },
+            geometry: Geometry {
+                q_heads: 16,
+                kv_heads: 8,
+                head_dim: 128,
+                rotary_dims: 128,
+                n_experts: 0,
+                experts_per_token: 0,
+            },
         },
-        geometry: Geometry {
-            q_heads: 16,
-            kv_heads: 8,
-            head_dim: 128,
-            rotary_dims: 128,
-            n_experts: 0,
-            experts_per_token: 0,
+        // The SAME text at a different fact, which is what a second entry here is
+        // for. qwen3-moe is a llama-like attention with a routed FFN, so it joins
+        // by naming a fixture rather than by being a family -- and every check
+        // below then applies to the mixture's six statements without knowing they
+        // are a mixture.
+        Text {
+            name: "llama_like (qwen3-moe)",
+            plan: |class| {
+                use model::families::llama_like::forward::facts::{
+                    LlamaLikeFacts, LlamaLikeMetalFacts,
+                };
+                model::families::llama_like::forward::llama_like_metal(
+                    &LlamaLikeFacts::qwen3_30b_a3b(),
+                    &LlamaLikeMetalFacts::synthetic(),
+                    class,
+                )
+            },
+            geometry: Geometry {
+                q_heads: 32,
+                kv_heads: 4,
+                head_dim: 128,
+                rotary_dims: 128,
+                n_experts: 128,
+                experts_per_token: 8,
+            },
         },
-    },
-    // The SAME text at a different fact, which is what a second entry here is
-    // for. qwen3-moe is a llama-like attention with a routed FFN, so it joins
-    // by naming a fixture rather than by being a family -- and every check
-    // below then applies to the mixture's six statements without knowing they
-    // are a mixture.
-    Text {
-        name: "llama_like (qwen3-moe)",
-        plan: |class| {
-            use model::families::llama_like::forward::facts::{
-                LlamaLikeFacts, LlamaLikeMetalFacts,
-            };
-            model::families::llama_like::forward::llama_like_metal(
-                &LlamaLikeFacts::qwen3_30b_a3b(),
-                &LlamaLikeMetalFacts::synthetic(),
-                class,
-            )
+        // gpt-oss, and it joins the same way: attention SINKS, its own SwiGLU and
+        // an alternating window are three facts, not a family. What is new is one
+        // weight per layer and one symbol.
+        Text {
+            name: "llama_like (gpt-oss)",
+            plan: |class| {
+                use model::families::llama_like::forward::facts::{
+                    LlamaLikeFacts, LlamaLikeMetalFacts,
+                };
+                model::families::llama_like::forward::llama_like_metal(
+                    &LlamaLikeFacts::gpt_oss_20b(),
+                    &LlamaLikeMetalFacts::gpt_oss_20b(),
+                    class,
+                )
+            },
+            geometry: Geometry {
+                q_heads: 64,
+                kv_heads: 8,
+                head_dim: 64,
+                rotary_dims: 64,
+                n_experts: 32,
+                experts_per_token: 4,
+            },
         },
-        geometry: Geometry {
-            q_heads: 32,
-            kv_heads: 4,
-            head_dim: 128,
-            rotary_dims: 128,
-            n_experts: 128,
-            experts_per_token: 8,
+        // The three gemma facts that ARE facts. NOT gemma4 — its per-layer
+        // embeddings are a side network of nine kernels no fact makes appear —
+        // but the geglu, the readout softcap and the alternating window all reach
+        // the device through this executor, so a gemma4 text has only the PLE and
+        // the branch structure left to state.
+        Text {
+            name: "llama_like (gemma facts)",
+            plan: |class| {
+                use model::families::llama_like::forward::facts::{
+                    LlamaLikeFacts, LlamaLikeMetalFacts,
+                };
+                model::families::llama_like::forward::llama_like_metal(
+                    &LlamaLikeFacts::qwen3_0_6b(),
+                    &LlamaLikeMetalFacts::gemma_like(),
+                    class,
+                )
+            },
+            geometry: Geometry {
+                q_heads: 16,
+                kv_heads: 8,
+                head_dim: 128,
+                rotary_dims: 128,
+                n_experts: 0,
+                experts_per_token: 0,
+            },
         },
-    },
-    // gpt-oss, and it joins the same way: attention SINKS, its own SwiGLU and
-    // an alternating window are three facts, not a family. What is new is one
-    // weight per layer and one symbol.
-    Text {
-        name: "llama_like (gpt-oss)",
-        plan: |class| {
-            use model::families::llama_like::forward::facts::{
-                LlamaLikeFacts, LlamaLikeMetalFacts,
-            };
-            model::families::llama_like::forward::llama_like_metal(
-                &LlamaLikeFacts::gpt_oss_20b(),
-                &LlamaLikeMetalFacts::gpt_oss_20b(),
-                class,
-            )
-        },
-        geometry: Geometry {
-            q_heads: 64,
-            kv_heads: 8,
-            head_dim: 64,
-            rotary_dims: 64,
-            n_experts: 32,
-            experts_per_token: 4,
-        },
-    },
-    // The three gemma facts that ARE facts. NOT gemma4 — its per-layer
-    // embeddings are a side network of nine kernels no fact makes appear —
-    // but the geglu, the readout softcap and the alternating window all reach
-    // the device through this executor, so a gemma4 text has only the PLE and
-    // the branch structure left to state.
-    Text {
-        name: "llama_like (gemma facts)",
-        plan: |class| {
-            use model::families::llama_like::forward::facts::{
-                LlamaLikeFacts, LlamaLikeMetalFacts,
-            };
-            model::families::llama_like::forward::llama_like_metal(
-                &LlamaLikeFacts::qwen3_0_6b(),
-                &LlamaLikeMetalFacts::gemma_like(),
-                class,
-            )
-        },
-        geometry: Geometry {
-            q_heads: 16,
-            kv_heads: 8,
-            head_dim: 128,
-            rotary_dims: 128,
-            n_experts: 0,
-            experts_per_token: 0,
-        },
-    }]
+    ]
 }
 
 /// Answers every name, so a check is about the walk and not about a store.
@@ -198,10 +200,16 @@ fn every_symbol_every_text_states_has_a_row_that_states_its_file_and_rule() {
                 match kernels::sig_in(kernels_metal::KERNELS, symbol) {
                     None => faults.push(format!("{}/{class:?}: `{symbol}` has no row", text.name)),
                     Some(sig) if sig.file.is_none() => {
-                        faults.push(format!("{}/{class:?}: `{symbol}` states no file", text.name));
+                        faults.push(format!(
+                            "{}/{class:?}: `{symbol}` states no file",
+                            text.name
+                        ));
                     }
                     Some(sig) if sig.launch == kernels::LaunchRule::Unstated => {
-                        faults.push(format!("{}/{class:?}: `{symbol}` states no rule", text.name));
+                        faults.push(format!(
+                            "{}/{class:?}: `{symbol}` states no rule",
+                            text.name
+                        ));
                     }
                     Some(_) => {}
                 }
@@ -713,4 +721,75 @@ fn every_scalar_a_row_names_is_a_scalar_the_statement_states() {
         short.len(),
         short.join("\n")
     );
+}
+
+/// Every text states where its answer is.
+///
+/// A fire that runs and computes a distribution nobody can find is a fire that
+/// did nothing, and until the `out` seam was stated that was literally the
+/// engine seam's behaviour: it encoded every launch, waited, and dropped the
+/// arena. The two places that DID read logits guessed, in two dialects — the
+/// reference gate took the widest arena region and the sampler had no path at
+/// all.
+///
+/// So this pins the derived answer against the guess. They must agree: if the
+/// widest region is not the exit seam's value, then either the text states the
+/// wrong exit or the arena holds something wider than a vocabulary, and both
+/// are worth failing over.
+#[test]
+fn every_text_says_where_its_answer_lands_and_it_is_the_widest_thing_there() {
+    for text in texts() {
+        for (class, low) in fires(&text) {
+            let r = low.readout.unwrap_or_else(|| {
+                panic!(
+                    "{}: {class:?} states no exit seam, so a driver running it \
+                     has no way to find the distribution it computed",
+                    text.name
+                )
+            });
+            // The guess the reference gate makes, computed the same way.
+            let widest = low
+                .args
+                .iter()
+                .filter_map(|a| match a {
+                    model_compiler::lower::Arg::Arena { at, width, bytes } => {
+                        Some((*at, *width as usize * *bytes as usize))
+                    }
+                    _ => None,
+                })
+                .max_by_key(|(_, span)| *span)
+                .expect("a fire binds at least one arena region");
+            assert_eq!(
+                r.at, widest.0,
+                "{}: {class:?} states its exit at {} but the widest arena \
+                 region is at {} ({} bytes). A vocabulary is the widest thing \
+                 a fire holds, so a disagreement means one of the two is not \
+                 the read-out.",
+                text.name, r.at, widest.0, widest.1
+            );
+            assert_eq!(
+                r.rows, low.n_requests,
+                "{}: {class:?} reads out {} rows over {} requests. A fire \
+                 samples one distribution per REQUEST, so anything else is \
+                 the row axis coming from the wrong place -- tokens, most \
+                 likely, which is the bug that made a two-token prefill \
+                 answer the first token's question.",
+                text.name, r.rows, low.n_requests
+            );
+            assert_eq!(
+                r.bytes, 2,
+                "{}: {class:?} declares a {}-byte read-out. The metal readout \
+                 is bf16 because `affine_qmv_fast` writes bf16; a text that \
+                 says four gets a vocabulary read as half zeros.",
+                text.name, r.bytes
+            );
+            assert!(
+                r.vocab > 1000,
+                "{}: {class:?} reads out {} elements, which is not a \
+                 vocabulary",
+                text.name,
+                r.vocab
+            );
+        }
+    }
 }

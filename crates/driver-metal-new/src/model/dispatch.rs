@@ -230,10 +230,7 @@ fn input_width(lowered: &Lowered, launch: &Launch) -> u32 {
 }
 
 /// The row widths this launch's operands state, in the trace's order.
-fn widths<'a>(
-    lowered: &'a Lowered,
-    launch: &Launch,
-) -> impl DoubleEndedIterator<Item = u32> + 'a {
+fn widths<'a>(lowered: &'a Lowered, launch: &Launch) -> impl DoubleEndedIterator<Item = u32> + 'a {
     lowered.args[launch.args.start as usize..launch.args.end as usize]
         .iter()
         .filter_map(|arg| match arg {
@@ -530,7 +527,15 @@ fn param_layout<S: Resolver>(
             let value = resolver.pool(want).unwrap_or(0);
             params.push(value);
             let i = u8::try_from(params.len() - 1).unwrap_or(u8::MAX);
-            (Some(i), if operand.ty == kernels::Ty::Usize { 8 } else { 4 }, false)
+            (
+                Some(i),
+                if operand.ty == kernels::Ty::Usize {
+                    8
+                } else {
+                    4
+                },
+                false,
+            )
         } else {
             match operand.source {
                 kernels::Source::Param(i) | kernels::Source::ParamF32(i) => match operand.ty {
@@ -574,14 +579,13 @@ fn fire<S: Resolver>(resolver: &mut S, table: FireTable) -> BoundArg {
 /// Nothing rather than a skip: a skipped slot shifts every operand after it,
 /// which turns one missing pointer into a whole misbound launch.
 fn pick(bound: &[BoundArg], at: Option<&usize>) -> BoundArg {
-    at.and_then(|&i| bound.get(i).copied())
-        .unwrap_or(BoundArg {
-            slice: crate::model::executor::Slice {
-                address: 0,
-                bytes: 0,
-            },
-            width: 0,
-        })
+    at.and_then(|&i| bound.get(i).copied()).unwrap_or(BoundArg {
+        slice: crate::model::executor::Slice {
+            address: 0,
+            bytes: 0,
+        },
+        width: 0,
+    })
 }
 
 /// The distinct `(file, entry point)` pairs a dispatch list needs compiled.
@@ -639,6 +643,9 @@ mod tests {
         Lowered {
             // One request: these fixtures state one row.
             n_requests: 1,
+            // A dispatch fixture is one launch, not a whole fire, so it has no
+            // exit to state.
+            readout: None,
 
             launches: vec![Launch {
                 kernel: 0,
@@ -679,17 +686,37 @@ mod tests {
         // Args are stated inputs, outputs, then weights, and a weight has no
         // row width. So the last widthed operand is the output, and that is
         // what every rule means by "width".
-        let low = one("sized", 3, vec![
-            Arg::Arena { at: 0, width: 11, bytes: 2 },
-            Arg::Arena { at: 64, width: 22, bytes: 2 },
-            Arg::Weight("w".into()),
-        ]);
+        let low = one(
+            "sized",
+            3,
+            vec![
+                Arg::Arena {
+                    at: 0,
+                    width: 11,
+                    bytes: 2,
+                },
+                Arg::Arena {
+                    at: 64,
+                    width: 22,
+                    bytes: 2,
+                },
+                Arg::Weight("w".into()),
+            ],
+        );
         assert_eq!(sizing_width(&low, &low.launches[0]), 22);
     }
 
     #[test]
     fn a_launch_evaluates_its_rows_and_the_fires_geometry_together() {
-        let low = one("sized", 5, vec![Arg::Arena { at: 0, width: 64, bytes: 2 }]);
+        let low = one(
+            "sized",
+            5,
+            vec![Arg::Arena {
+                at: 0,
+                width: 64,
+                bytes: 2,
+            }],
+        );
         let geometry = Geometry {
             q_heads: 16,
             kv_heads: 4,
@@ -704,11 +731,15 @@ mod tests {
 
     #[test]
     fn a_symbol_with_no_row_names_itself_and_the_op_it_came_from() {
-        let low = one("attn::split_qkv_bf16", 1, vec![Arg::Arena {
-            at: 0,
-            width: 8,
-            bytes: 16,
-        }]);
+        let low = one(
+            "attn::split_qkv_bf16",
+            1,
+            vec![Arg::Arena {
+                at: 0,
+                width: 8,
+                bytes: 16,
+            }],
+        );
         assert_eq!(
             plan(&low, TABLE, frame(), Geometry::default(), &mut Anything),
             Err(Undispatchable::NoRow {
@@ -722,7 +753,15 @@ mod tests {
     fn a_row_that_states_no_file_cannot_be_reached_on_this_backend() {
         // Metal compiles at run time from `(path, entry name)`. A row without
         // a file is not a kernel this driver can find.
-        let low = one("no_file", 1, vec![Arg::Arena { at: 0, width: 8, bytes: 2 }]);
+        let low = one(
+            "no_file",
+            1,
+            vec![Arg::Arena {
+                at: 0,
+                width: 8,
+                bytes: 2,
+            }],
+        );
         assert!(matches!(
             plan(&low, TABLE, frame(), Geometry::default(), &mut Anything),
             Err(Undispatchable::NoFile { .. })
@@ -731,7 +770,15 @@ mod tests {
 
     #[test]
     fn a_row_that_states_no_rule_refuses_rather_than_launching_something_plausible() {
-        let low = one("no_rule", 1, vec![Arg::Arena { at: 0, width: 8, bytes: 2 }]);
+        let low = one(
+            "no_rule",
+            1,
+            vec![Arg::Arena {
+                at: 0,
+                width: 8,
+                bytes: 2,
+            }],
+        );
         assert_eq!(
             plan(&low, TABLE, frame(), Geometry::default(), &mut Anything),
             Err(Undispatchable::Ungeometric {
@@ -746,7 +793,15 @@ mod tests {
     fn a_fire_that_cannot_be_dispatched_whole_returns_nothing_partial() {
         // A prefix of dispatches would leave the arena half-written, which is
         // indistinguishable from a model that answers nonsense.
-        let mut low = one("sized", 1, vec![Arg::Arena { at: 0, width: 8, bytes: 2 }]);
+        let mut low = one(
+            "sized",
+            1,
+            vec![Arg::Arena {
+                at: 0,
+                width: 8,
+                bytes: 2,
+            }],
+        );
         low.kernels.push("no_rule".into());
         let second = Launch {
             kernel: 1,
@@ -763,7 +818,15 @@ mod tests {
         // step, so a union-lowered fire reaching this walk would encode every
         // arm of every guard unconditionally — a different answer, not a
         // slower one.
-        let mut low = one("sized", 1, vec![Arg::Arena { at: 0, width: 8, bytes: 2 }]);
+        let mut low = one(
+            "sized",
+            1,
+            vec![Arg::Arena {
+                at: 0,
+                width: 8,
+                bytes: 2,
+            }],
+        );
         low.launches[0].cond = 3;
         assert_eq!(
             plan(&low, TABLE, frame(), Geometry::default(), &mut Anything),
@@ -794,13 +857,17 @@ mod tests {
             layers: 0..1,
             op: 0,
         };
-        let list = vec![d.clone(), d.clone(), Dispatch {
-            symbol: "other",
-            ..d
-        }];
-        assert_eq!(pipelines_needed(&list), vec![
-            ("f.metal", "sized"),
-            ("f.metal", "other")
-        ]);
+        let list = vec![
+            d.clone(),
+            d.clone(),
+            Dispatch {
+                symbol: "other",
+                ..d
+            },
+        ];
+        assert_eq!(
+            pipelines_needed(&list),
+            vec![("f.metal", "sized"), ("f.metal", "other")]
+        );
     }
 }

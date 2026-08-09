@@ -40,8 +40,8 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use cudarc::runtime::sys::{
-    cudaFree, cudaMalloc, cudaMemcpyAsync, cudaMemcpyKind, cudaMemsetAsync,
-    cudaStreamBeginCapture, cudaStreamCaptureMode, cudaStreamEndCapture, cudaGraph_t,
+    cudaFree, cudaGraph_t, cudaMalloc, cudaMemcpyAsync, cudaMemcpyKind, cudaMemsetAsync,
+    cudaStreamBeginCapture, cudaStreamCaptureMode, cudaStreamEndCapture,
 };
 
 use crate::cuda::graph::Graph;
@@ -174,11 +174,19 @@ impl Allocator {
     /// null-pointer buffer, matching the C++ `DeviceBuffer(0)`.
     pub fn alloc(&self, bytes: usize) -> Result<DeviceBuffer> {
         if bytes == 0 {
-            return Ok(DeviceBuffer { ptr: DevPtr(0), bytes: 0, owner: Arc::clone(&self.inner) });
+            return Ok(DeviceBuffer {
+                ptr: DevPtr(0),
+                bytes: 0,
+                owner: Arc::clone(&self.inner),
+            });
         }
         let mut raw: *mut c_void = std::ptr::null_mut();
         check_rt(unsafe { cudaMalloc(&mut raw, bytes) }, "cudaMalloc")?;
-        Ok(DeviceBuffer { ptr: DevPtr(raw as usize), bytes, owner: Arc::clone(&self.inner) })
+        Ok(DeviceBuffer {
+            ptr: DevPtr(raw as usize),
+            bytes,
+            owner: Arc::clone(&self.inner),
+        })
     }
 
     /// Begin capturing `stream` into a graph.
@@ -197,7 +205,10 @@ impl Allocator {
         }
         if let Err(e) = check_rt(
             unsafe {
-                cudaStreamBeginCapture(stream.as_raw(), cudaStreamCaptureMode::cudaStreamCaptureModeGlobal)
+                cudaStreamBeginCapture(
+                    stream.as_raw(),
+                    cudaStreamCaptureMode::cudaStreamCaptureModeGlobal,
+                )
             },
             "cudaStreamBeginCapture",
         ) {
@@ -211,7 +222,11 @@ impl Allocator {
             self.inner.drain(freed);
             return Err(e);
         }
-        Ok(CaptureScope { alloc: self, stream, open: true })
+        Ok(CaptureScope {
+            alloc: self,
+            stream,
+            open: true,
+        })
     }
 
     /// How many frees are currently parked waiting for a capture to close.
@@ -219,12 +234,21 @@ impl Allocator {
     /// Exposed for tests and for a metric: a number that is persistently
     /// non-zero outside a capture would mean the drain is not running.
     pub fn deferred_free_count(&self) -> usize {
-        self.inner.state.lock().unwrap_or_else(|e| e.into_inner()).pending.len()
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending
+            .len()
     }
 
     /// Is a capture open on this allocator?
     pub fn is_capturing(&self) -> bool {
-        self.inner.state.lock().unwrap_or_else(|e| e.into_inner()).capturing
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .capturing
     }
 }
 
@@ -262,7 +286,10 @@ impl<'a> CaptureScope<'a> {
     /// The body of both `end` and `drop`.
     fn finish(&mut self) -> Result<Graph> {
         if !self.open {
-            return Err(Error::invalid("cudaStreamEndCapture", "capture already ended"));
+            return Err(Error::invalid(
+                "cudaStreamEndCapture",
+                "capture already ended",
+            ));
         }
         self.open = false;
 
@@ -276,7 +303,12 @@ impl<'a> CaptureScope<'a> {
         // capture is exactly the case where parked pointers would otherwise be
         // stranded, and by this point the capture is closed either way.
         let freed = {
-            let mut st = self.alloc.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut st = self
+                .alloc
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             st.end()
         };
         self.alloc.inner.drain(freed);
@@ -365,7 +397,11 @@ impl DeviceBuffer {
         if dst.len() > self.bytes {
             return Err(Error::invalid(
                 "cudaMemcpyAsync",
-                format!("destination is {} bytes, buffer is {}", dst.len(), self.bytes),
+                format!(
+                    "destination is {} bytes, buffer is {}",
+                    dst.len(),
+                    self.bytes
+                ),
             ));
         }
         if dst.is_empty() {
@@ -392,10 +428,90 @@ impl DeviceBuffer {
         }
         check_rt(
             unsafe {
-                cudaMemsetAsync(self.ptr.as_raw(), i32::from(value), self.bytes, stream.as_raw())
+                cudaMemsetAsync(
+                    self.ptr.as_raw(),
+                    i32::from(value),
+                    self.bytes,
+                    stream.as_raw(),
+                )
             },
             "cudaMemsetAsync",
         )
+    }
+
+    /// Copy host bytes into a SPAN of this buffer, ordered on `stream`.
+    ///
+    /// The offset form exists because the PTIR plane's buffers are arrays of
+    /// records rather than single values: one channel's cell inside an
+    /// instance's ring, one lane's record inside a lane table. Without it a
+    /// caller would either allocate per record — thousands of allocations per
+    /// fire — or rebuild the whole buffer to change one entry.
+    ///
+    /// # Errors
+    ///
+    /// If the span leaves the allocation. Checked as `offset + len` in
+    /// `u64`-widened arithmetic rather than as `offset < bytes`, because the
+    /// second passes for a span that starts inside and ends outside, and CUDA
+    /// would write past the allocation without complaining.
+    pub fn write_at(&mut self, offset: usize, src: &[u8], stream: StreamRef<'_>) -> Result<()> {
+        self.check_span("cudaMemcpyAsync (write_at)", offset, src.len())?;
+        if src.is_empty() {
+            return Ok(());
+        }
+        check_rt(
+            unsafe {
+                cudaMemcpyAsync(
+                    self.ptr.as_raw().byte_add(offset),
+                    src.as_ptr().cast(),
+                    src.len(),
+                    cudaMemcpyKind::cudaMemcpyHostToDevice,
+                    stream.as_raw(),
+                )
+            },
+            "cudaMemcpyAsync",
+        )
+    }
+
+    /// Copy a SPAN of this buffer out to the host, ordered on `stream`.
+    ///
+    /// Asynchronous, like [`Self::copy_to_host`]: synchronize before reading
+    /// `dst`.
+    ///
+    /// # Errors
+    ///
+    /// If the span leaves the allocation.
+    pub fn read_at(&self, offset: usize, dst: &mut [u8], stream: StreamRef<'_>) -> Result<()> {
+        self.check_span("cudaMemcpyAsync (read_at)", offset, dst.len())?;
+        if dst.is_empty() {
+            return Ok(());
+        }
+        check_rt(
+            unsafe {
+                cudaMemcpyAsync(
+                    dst.as_mut_ptr().cast(),
+                    self.ptr.as_raw().byte_add(offset),
+                    dst.len(),
+                    cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                    stream.as_raw(),
+                )
+            },
+            "cudaMemcpyAsync",
+        )
+    }
+
+    /// `offset .. offset + len` must lie inside the allocation.
+    fn check_span(&self, call: &'static str, offset: usize, len: usize) -> Result<()> {
+        let end = (offset as u64).checked_add(len as u64);
+        if end.is_none_or(|end| end > self.bytes as u64) {
+            return Err(Error::invalid(
+                call,
+                format!(
+                    "span of {len} bytes at offset {offset} leaves a buffer of {}",
+                    self.bytes
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -426,7 +542,11 @@ mod tests {
     fn inside_a_capture_a_free_is_parked_not_performed() {
         let mut st = DeferState::default();
         st.begin().unwrap();
-        assert_eq!(st.release(DevPtr(0x1000)), None, "must not free during capture");
+        assert_eq!(
+            st.release(DevPtr(0x1000)),
+            None,
+            "must not free during capture"
+        );
         assert_eq!(st.pending, vec![DevPtr(0x1000)]);
     }
 
@@ -471,8 +591,8 @@ mod tests {
         // Driven through `AllocatorInner`'s decision path with the actual
         // `cudaFree` replaced by counting, which is what the pure state
         // machine makes possible.
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let state = Arc::new(Mutex::new(DeferState::default()));
         let freed_outside = Arc::new(AtomicUsize::new(0));
@@ -521,6 +641,9 @@ mod tests {
         let _ = st.release(DevPtr(0xdead));
         let freed = st.end();
         assert_eq!(freed, vec![DevPtr(0xdead)]);
-        assert!(!st.capturing, "capture must be closed even on the error path");
+        assert!(
+            !st.capturing,
+            "capture must be closed even on the error path"
+        );
     }
 }

@@ -294,17 +294,13 @@ pub fn gpt_oss_cuda(
             y = dsl::cuda::residual_add(&y, &combined, hidden);
         }
 
-        let normed = dsl::cuda::rmsnorm(
+        dsl::logits_epilogue(
+            t,
             &y,
-            &NormW {
-                name: "final_norm".into(),
-                variant: NormVariant::Plain,
-                per_head: None,
-                layer: None,
-            },
+            NormVariant::Plain,
+            facts.tied_embeddings,
+            facts.vocab,
+            false,
         );
-        let logits = dsl::lm_head_tied(t, &normed, facts.tied_embeddings, facts.vocab);
-        // The exit boundary: sampling and host-visible emits attach here.
-        dsl::seam(t, &dsl::seam::OUT, &[&logits], None);
     })
 }

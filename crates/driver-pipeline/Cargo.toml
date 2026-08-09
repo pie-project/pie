@@ -1,0 +1,43 @@
+[package]
+name = "driver-pipeline"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "The PTIR channel plane, in Rust: launch-package adoption, the channel ring, the reference pass, and every bind-time derivation a device shell needs. Backend-agnostic — the CUDA and Metal shells both read it."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+publish = false
+
+[lib]
+name = "driver_pipeline"
+path = "src/lib.rs"
+
+# This crate can afford the workspace lints in full, and that is the point of
+# it being a crate. `driver-metal-new` and `driver-cuda-new` both opt OUT of
+# `[lints] workspace = true` because `unsafe_code = "forbid"` is violated by
+# construction — every objc2 message send, every `cudarc::*::sys` call. Nothing
+# here sends a message or calls a driver: the whole layer is arithmetic over
+# `#[repr(C)]` records and `Vec`s. So the forbid is free, and it is worth
+# having, because it is the mechanical proof of the claim this crate makes:
+# that the PTIR plane needs no device.
+[lints]
+workspace = true
+
+[dependencies]
+# The launch ABI's owned types (`LaunchPackage` and its members) and the
+# `PIE_*` constants. The C++ interpreter carried its own mirror of these
+# structs; adopting the Rust types directly is what keeps one source of truth.
+driver-abi = { path = "../driver-abi" }
+
+# The op table, dtypes, intrinsic ids, the port registry and the canonical RNG
+# contract. `eval_op`'s numerics are a contract, not an implementation, and
+# this is where the contract is written down.
+tensor-ir = { path = "../tensor-ir" }
+
+# The producer, for tests only: `tests/oracle_interp.rs` runs ONE bound trace
+# through both `tensor_compiler::eval::interp` (the golden model) and
+# `pipeline::step` (this crate), and `lane.rs` drift-checks the emitted
+# preamble against the lane-table ABI it packs. A regular dependency would
+# invert the layering — the compiler produces what this crate consumes.
+[dev-dependencies]
+tensor-compiler = { path = "../tensor-compiler" }

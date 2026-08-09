@@ -428,6 +428,38 @@ pub struct Lowered {
     /// Empty under [`GuardMode::Resolve`], where every guard was
     /// answered and no rectangle sits under a condition.
     pub conds: Vec<CondRegion>,
+    /// Where this fire's read-out lands, when the text states an exit seam.
+    ///
+    /// Derived, not guessed: the `out` seam names the logits value, the plan
+    /// gives its shape and dtype, and buffer assignment gives its offset. A
+    /// driver that wants the distribution reads exactly this and needs to know
+    /// nothing about whose model it is.
+    ///
+    /// `None` for a text that states no exit — which is a fire that computes
+    /// something other than a distribution, not an error.
+    pub readout: Option<Readout>,
+}
+
+/// Where a fire's logits are, in the frame's own arena.
+///
+/// The four numbers a read-out needs and no more: a byte offset, the two
+/// extents, and the width of one element. Not a slice, because the arena is
+/// device memory and the lowering never held it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Readout {
+    /// Byte offset into the frame arena.
+    pub at: usize,
+    /// Distributions produced — one per request, so this is
+    /// [`Lowered::n_requests`] whenever the exit value is `Requests`-shaped.
+    pub rows: u32,
+    /// The vocabulary: elements per row, and the row stride.
+    pub vocab: u32,
+    /// Bytes per element. **Four is not a given** — the metal read-out is
+    /// bf16, because `affine_qmv_fast` writes bf16 and the text's declared
+    /// dtype does not change what the kernel does. A reader that assumed f32
+    /// got a vocabulary exactly half zeros, which looks like a dead half of a
+    /// tensor and is really two elements read as one.
+    pub bytes: u32,
 }
 
 impl Launch {
@@ -503,6 +535,41 @@ pub fn lower_with(
     let n_requests = out.buffers.n_requests;
     let epilogue_norm = out.buffers.epilogue_norm;
     let value_owner = alias_owners(plan);
+    // The exit, resolved before the walk so it needs nothing the walk builds.
+    // The seam names the value; the plan gives its shape and dtype; buffer
+    // assignment already placed it.
+    let readout = plan
+        .seams
+        .iter()
+        .find(|s| s.seam == crate::dsl::seam::OUT.name)
+        .and_then(|s| s.values.first().copied())
+        .and_then(|id| {
+            let info = plan.values.get(id as usize)?;
+            let at = *value_offset.get(id as usize)?;
+            if at == Buffers::NAMED {
+                return None;
+            }
+            // `[rows, vocab]`, and the last dim is the row stride. A vocabulary
+            // is a constant of the deployment; the row count is the FIRE's, so
+            // a `Requests` axis reads the count the fire computed rather than a
+            // number the text could not have known.
+            let vocab = match info.shape.0.last()? {
+                Dim::Const(v) => *v,
+                _ => return None,
+            };
+            let rows = match info.shape.0.first()? {
+                Dim::Requests => n_requests,
+                Dim::Tokens => n,
+                Dim::Const(v) => *v,
+                _ => return None,
+            };
+            Some(Readout {
+                at,
+                rows,
+                vocab,
+                bytes: dtype_bytes(info.dtype),
+            })
+        });
     out.region(0..plan.ops.len(), 0..n)?;
     Ok(Lowered {
         rectangles: out.launches.len(),
@@ -519,6 +586,7 @@ pub fn lower_with(
         structural: out.structural,
         residue: out.residue,
         conds: out.conds,
+        readout,
     })
 }
 
@@ -1397,9 +1465,37 @@ impl Buffers {
         // wrong answer: the sampler reads the logit softcap's RESULT,
         // which the arena was placing while the driver read `ws.logits`.
         let mut pinned: Vec<ValueId> = Vec::new();
+        // Who supplies the read-out's memory, which is the one thing the two
+        // backends genuinely disagree about here.
+        //
+        // A pin means "the BACKEND binds this; the arena does not" -- the CUDA
+        // driver hands in a logits buffer and the trace writes through it. The
+        // Metal executor has no such buffer: it allocates ONE arena per fire
+        // and the read-out lives in it, which is how the reference gate reads
+        // logits back at all. Pinning it there would move the distribution to
+        // a buffer nobody binds, so the fire would compute it into nothing.
+        //
+        // So the exit seam PINS on CUDA and PLACES on Metal. It must not be
+        // recycled on either -- see `last_use` below, which holds it to the
+        // end of the trace.
+        let arena_exit: Vec<ValueId> =
+            if matches!(Backend::of_family(&plan.family), Some(Backend::Metal)) {
+                plan.seams
+                    .iter()
+                    .filter(|s| s.seam == crate::dsl::seam::OUT.name)
+                    .flat_map(|s| s.values.iter().copied())
+                    .collect()
+            } else {
+                Vec::new()
+            };
         for stmt in &plan.seams {
             if !stmt.values.is_empty() {
-                pinned.extend(stmt.values.iter().copied());
+                pinned.extend(
+                    stmt.values
+                        .iter()
+                        .copied()
+                        .filter(|v| !arena_exit.contains(v)),
+                );
                 continue;
             }
             let Some(at) = stmt.op else { continue };
@@ -1463,6 +1559,14 @@ impl Buffers {
         }
         for v in 0..plan.values.len() {
             last_use[v] = last_use[owner[v] as usize];
+        }
+        // The exit outlives the trace. It is the fire's ANSWER -- read after
+        // every launch has run -- so a block handed on to a later value would
+        // be the read-out overwritten by whatever came next, and the reader
+        // would find a plausible tensor that is not logits.
+        for &v in &arena_exit {
+            last_use[owner[v as usize] as usize] = usize::MAX;
+            last_use[v as usize] = usize::MAX;
         }
 
         let mut offset = vec![Self::NAMED; plan.values.len()];

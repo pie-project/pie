@@ -522,11 +522,17 @@ fn every_attn_launcher_is_a_row_or_a_stated_exception() {
     assert!(stale.is_empty(), "exception for a launcher no header declares: {stale:?}");
 
     // The `KernelsInternal` claim, checked against the driver's sources.
-    let driver = Path::new(env!("CARGO_MANIFEST_DIR")).join("../driver-cuda/csrc/src");
+    // THE DRIVER IS THIS CRATE NOW. This used to read
+    // `../driver-cuda/csrc/src`; when that tree was deleted the scan
+    // found zero bytes and refused to pass, which is what the vacuity
+    // guard below is for. The claim did not change with the language: a
+    // launcher the DRIVER never calls is the question, and the driver is
+    // whichever shell reaches the kernels.
+    let driver = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut driver_text = String::new();
     collect_sources(&driver, &mut driver_text);
     assert!(
-        driver_text.len() > 1_000_000,
+        driver_text.len() > 500_000,
         "only {} bytes of driver source found, so the check is vacuous",
         driver_text.len()
     );
@@ -573,7 +579,9 @@ fn collect_sources(dir: &Path, out: &mut String) {
             collect_sources(&p, out);
         } else if matches!(
             p.extension().and_then(|e| e.to_str()),
-            Some("cpp" | "hpp" | "cu" | "inc")
+            // `rs` since the driver became Rust; the C++ extensions
+            // stay because this walker also reads `csrc/` trees.
+            Some("cpp" | "hpp" | "cu" | "inc" | "rs")
         ) && let Ok(t) = std::fs::read_to_string(&p)
         {
             out.push_str(&t);
@@ -1327,11 +1335,17 @@ fn every_norm_launcher_is_a_row_or_a_stated_exception() {
         );
     }
     // — and the driver never calls one.
-    let driver = Path::new(env!("CARGO_MANIFEST_DIR")).join("../driver-cuda/csrc/src");
+    // THE DRIVER IS THIS CRATE NOW. This used to read
+    // `../driver-cuda/csrc/src`; when that tree was deleted the scan
+    // found zero bytes and refused to pass, which is what the vacuity
+    // guard below is for. The claim did not change with the language: a
+    // launcher the DRIVER never calls is the question, and the driver is
+    // whichever shell reaches the kernels.
+    let driver = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut driver_text = String::new();
     collect_sources(&driver, &mut driver_text);
     assert!(
-        driver_text.len() > 1_000_000,
+        driver_text.len() > 500_000,
         "only {} bytes of driver source found, so the check is vacuous",
         driver_text.len()
     );

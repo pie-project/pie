@@ -107,9 +107,13 @@ pub fn execute_plan_with_progress(
     progress: &mut dyn FnMut(Progress<'_>),
 ) -> Result<HostStorage, Error> {
     let mut sink = MemorySink::default();
-    let (arena, max_tile_write_bytes) = run(
+    let arena_len = usize::try_from(plan.memory.persistent_bytes)
+        .map_err(|_| invalid("persistent arena does not fit host address space"))?;
+    let mut arena = vec![0u8; arena_len];
+    let max_tile_write_bytes = run(
         plan,
         snapshot_dir,
+        &mut arena,
         &mut sink,
         progress,
         /*stream=*/ false,
@@ -140,17 +144,60 @@ pub fn execute_plan_into(
     sink: &mut dyn TensorSink,
     progress: &mut dyn FnMut(Progress<'_>),
 ) -> Result<(), Error> {
-    run(plan, snapshot_dir, sink, progress, /*stream=*/ true)?;
+    run(plan, snapshot_dir, &mut [], sink, progress, /*stream=*/ true)?;
     Ok(())
+}
+
+/// Execute a plan whose persistent arena the CALLER owns.
+///
+/// The shape a resident DEVICE load wants, and the reason it is different
+/// from both of the above.
+///
+/// [`execute_plan`] allocates the arena as a `Vec<u8>`, fills it, and hands
+/// it back — so a driver staging weights holds the whole model TWICE, once in
+/// that vector and once in the buffer it copies the vector into. On a machine
+/// where the model is a meaningful fraction of RAM that is the difference
+/// between loading and being killed.
+///
+/// [`execute_plan_into`] avoids the arena entirely, which is right for
+/// `convert` and wrong here: a resident plan carries
+/// [`BulkExtentWrite`](StorageInstr::BulkExtentWrite), which addresses the
+/// arena by offset, and streaming refuses it.
+///
+/// This is the third shape: there IS an arena, and it is `arena` — whatever
+/// the caller allocated, including a memory-mapped or unified-memory device
+/// buffer. The executor writes the laid-out weights straight into their final
+/// home and copies nothing. Tensors the plan publishes OUTSIDE the arena
+/// still go to `sink`, because they have no offset to be written at.
+///
+/// `arena` must be at least `plan.memory.persistent_bytes`; a shorter one is
+/// refused rather than truncated. Its contents are overwritten.
+///
+/// Returns the largest single tile write the plan performed, which is what a
+/// caller sizing staging wants to know.
+///
+/// # Errors
+///
+/// As [`execute_plan`], plus an arena shorter than the plan's persistent
+/// bytes.
+pub fn execute_plan_into_arena(
+    plan: &LoadPlan,
+    snapshot_dir: &Path,
+    arena: &mut [u8],
+    sink: &mut dyn TensorSink,
+    progress: &mut dyn FnMut(Progress<'_>),
+) -> Result<usize, Error> {
+    run(plan, snapshot_dir, arena, sink, progress, /*stream=*/ false)
 }
 
 fn run(
     plan: &LoadPlan,
     snapshot_dir: &Path,
+    arena: &mut [u8],
     sink: &mut dyn TensorSink,
     progress: &mut dyn FnMut(Progress<'_>),
     stream: bool,
-) -> Result<(Vec<u8>, usize), Error> {
+) -> Result<usize, Error> {
     // The gate is what this executor *implements* — the convert mask — not
     // `HOST_TILE_MAP_MASK`, which is what a host-lowered plan may *advertise*.
     // A CUDA plan that carries an `Encode` is executable here too; what stays
@@ -182,6 +229,18 @@ fn run(
         usize::try_from(plan.memory.persistent_bytes)
             .map_err(|_| invalid("persistent arena does not fit host address space"))?
     };
+    if arena.len() < arena_len {
+        return Err(invalid(format!(
+            "arena is {} bytes and the plan needs {arena_len}",
+            arena.len()
+        )));
+    }
+    let arena = &mut arena[..arena_len];
+    // The poison the executor relies on to tell "written" from "never
+    // touched". A caller-supplied arena arrives holding whatever it held --
+    // for a fresh device allocation that is zeros, which is a legal tensor
+    // and therefore the worst possible disguise for a buffer nothing wrote.
+    arena.fill(POISON);
     let last_use = if stream {
         last_uses(plan)?
     } else {
@@ -191,7 +250,7 @@ fn run(
         plan,
         index: PlanIndex::new(plan),
         files,
-        arena: vec![POISON; arena_len],
+        arena,
         buffers: HashMap::new(),
         sink,
         finalized: HashSet::new(),
@@ -202,7 +261,7 @@ fn run(
         read_bytes: 0,
     };
     executor.execute()?;
-    Ok((executor.arena, executor.max_tile_write_bytes))
+    Ok(executor.max_tile_write_bytes)
 }
 
 /// The schedule position of each buffer's last reference, views chased.
@@ -264,7 +323,7 @@ struct HostExecutor<'a, 'p> {
     /// ids interleave two allocators and need the map.
     index: PlanIndex,
     files: HashMap<u32, PathBuf>,
-    arena: Vec<u8>,
+    arena: &'p mut [u8],
     buffers: HashMap<BufferId, BufferLoc>,
     sink: &'p mut dyn TensorSink,
     /// Names already published, because finalizing one twice is a plan bug

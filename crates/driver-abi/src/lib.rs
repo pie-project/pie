@@ -3,6 +3,10 @@
 //! This crate exposes the local ABI plus process-independent driver schemas:
 //!
 //! - [`local`]: plain `#[repr(C)]` direct-FFI descriptors and symbol declarations.
+//! - [`adopt`]: the `local` → [`plan`] direction, copying a borrowed C launch
+//!   package into the owned one. A driver's registration entry point is handed
+//!   a [`local::PieProgramDesc`] and every Rust consumer of a program reads
+//!   [`plan`]'s types, so without this the two halves of the crate do not meet.
 //! - [`capabilities`]: reduced cold-path JSON facts used at create time.
 //! - [`transfer`]: Rust-only KV transfer vocabulary shared with cross-node transport.
 //! - [`plan`]: owned verb plans shared by local and remote backends.
@@ -11,6 +15,7 @@
 //! The committed `include/pie_driver_abi.h` header is generated from [`local`]
 //! via `driver-abi-cbindgen`.
 
+pub mod adopt;
 pub mod capabilities;
 pub mod geometry;
 pub mod image;
@@ -19,6 +24,7 @@ pub mod plan;
 pub mod remote;
 pub mod transfer;
 
+pub use adopt::{adopt_emitted_kernels, adopt_package, adopt_region_analysis};
 pub use capabilities::{
     DeviceFacts, DriverCapabilities, ExpertSiteSummary, KV_COPY_DEVICE_TO_DEVICE,
     KV_COPY_DEVICE_TO_HOST, KV_COPY_HOST_TO_DEVICE, KV_COPY_HOST_TO_HOST, ModelLoadDesc,
@@ -35,8 +41,8 @@ pub use geometry::{
 pub use local::*;
 pub use plan::{
     CHANNEL_TICKET_NONE, ChannelRegistrationPlan, EmittedKernel, EncodedMask, KvCopyPlan,
-    LaunchPlan, MediaEncodePlan, PoolResizePlan, ProgramRegistration, RS_FLAG_BUFFER_WRITE, RS_FLAG_FOLD, RS_FLAG_FOLD_LEN_DEVICE, RS_FLAG_RESET,
-    StateCopyPlan,
+    LaunchPlan, MediaEncodePlan, PoolResizePlan, ProgramRegistration, RS_FLAG_BUFFER_WRITE,
+    RS_FLAG_FOLD, RS_FLAG_FOLD_LEN_DEVICE, RS_FLAG_RESET, StateCopyPlan,
 };
 pub use remote::*;
 pub use transfer::{KvDtype, KvExport, KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};

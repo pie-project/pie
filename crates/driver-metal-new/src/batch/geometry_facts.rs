@@ -67,6 +67,44 @@ pub fn geometry_from_facts(f: &ModelFacts) -> Result<DecodeGeometry, GeometryRef
     // gemma4's block, projected the same way. Its own marker is
     // `g4_num_hidden_layers`, and it is read BEFORE the llama-like one because
     // a gemma4 config fills both.
+    // gpt-oss's block, projected first because a gpt-oss config fills ONLY
+    // `go_*` -- `from_descriptor` takes the `model_type == "gpt_oss"` branch
+    // and never touches the llama-like or gemma4 readers. Without this
+    // projection a real gpt-oss checkpoint was refused as "carrying no decoder
+    // shape" while carrying it, which meant the GENERIC path could not reach
+    // gpt-oss weights at all: only the retiring per-family layer could, and it
+    // read `go_*` directly.
+    let f = &if f.q35_num_hidden_layers > 0 || f.go_num_hidden_layers == 0 {
+        f.clone()
+    } else {
+        ModelFacts {
+            q35_num_hidden_layers: f.go_num_hidden_layers,
+            q35_hidden_size: f.go_hidden_size,
+            q35_vocab_size: f.go_vocab_size,
+            q35_num_attention_heads: f.go_num_attention_heads,
+            q35_num_key_value_heads: f.go_num_key_value_heads,
+            q35_head_dim: f.go_head_dim,
+            // gpt-oss is a mixture in EVERY layer and has no dense FFN beside
+            // it, so the dense width and the expert width are the same number
+            // -- `intermediate_size`. Stating it in both places is what lets
+            // the shared reader below size a mixture without asking which
+            // family it is.
+            q35_intermediate_size: f.go_intermediate_size,
+            q35_moe_intermediate_size: f.go_intermediate_size,
+            q35_num_experts: f.go_num_local_experts,
+            q35_num_experts_per_tok: f.go_num_experts_per_tok,
+            q35_rms_norm_eps: f.go_rms_norm_eps,
+            // gpt-oss unties its read-out; the config says so and the
+            // checkpoint publishes a separate `lm_head`.
+            q35_tied_embeddings: false,
+            // Every layer attends and every layer routes: no GDN interleave,
+            // no MLP-only tail, no sparse step.
+            q35_full_attn_interval: 1,
+            q35_mlp_only_layer_count: 0,
+            q35_decoder_sparse_step: 1,
+            ..f.clone()
+        }
+    };
     let f = &if f.q35_num_hidden_layers > 0 || f.g4_num_hidden_layers == 0 {
         f.clone()
     } else {

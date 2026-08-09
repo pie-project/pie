@@ -1,16 +1,21 @@
-//! Three tables, one question, and a test that makes them answer it together.
+//! Two tables, one question, and a test that makes them answer it together.
 //!
 //! "Which `model_type` does pie support?" is asked in three places, on two
 //! sides of the C ABI:
 //!
 //! * [`model::contract::HF_ROWS`] / [`MLX_ROWS`] — which author writes the
 //!   storage contract (Rust, this crate);
-//! * `crates/driver-cuda/csrc/src/model/registry.cpp` — which decode DAG binds and runs
-//!   (C++, the CUDA driver's arch table);
-//! * `crates/driver-metal/csrc/src/model/facts.hpp` — the same question for Metal, whose
-//!   `model_family_of` picks both the geometry and the executor.
+//! * `crates/driver-metal/csrc/src/model/facts.hpp` — the same question for
+//!   Metal, whose `model_family_of` picks both the geometry and the executor.
 //!
-//! They are three because they answer *different* things — an author is a
+//! It used to be three, on two sides of the C ABI. The CUDA arch table was
+//! `crates/driver-cuda/csrc/src/model/registry.cpp`, and it is deleted with
+//! that shell; `driver-cuda-new`'s `FACTS_ROWS` answers for CUDA now, and
+//! `driver-cuda-new/tests/facts_registry.rs` holds it against `HF_ROWS`
+//! from both sides — a stronger check than a source grep, because both
+//! tables are Rust.
+//!
+//! They are two because they answer *different* things — an author is a
 //! storage schema, an arch row is a compute graph, and the two partition the
 //! model space differently (`phi3` loads as llama and runs as its own row).
 //! What they may not do is disagree about the **set**. A `model_type` with an
@@ -84,43 +89,6 @@ fn region<'a>(source: &'a str, what: &str, start: &str, end: &str) -> &'a str {
     &tail[..to]
 }
 
-/// The CUDA arch table's `model_type` column.
-///
-/// Two row shapes, and the reader has to know both because a row carries a
-/// *second* string — the binder key — that is not a model type:
-///
-/// ```text
-/// push("phi3", Family::LlamaLike, "phi3", …);
-/// for (const char* mt : {"olmo2", "olmo3"}) push(mt, Family::LlamaLike, "olmo3", …);
-/// ```
-///
-/// So take `push`'s first argument when it is a literal, and every element of
-/// the loop list when it is not.
-fn cuda_arch_table() -> BTreeSet<String> {
-    let source = read("crates/driver-cuda/csrc/src/model/registry.cpp");
-    let table = region(
-        &source,
-        "cuda registry.cpp",
-        "auto push = [&t]",
-        "const ArchEntry* find_arch_entry",
-    );
-
-    let mut out = BTreeSet::new();
-    for row in table.split("push(").skip(1) {
-        let first_arg = row.split(',').next().unwrap_or("").trim();
-        // `push(mt, …)` inside a loop: the types are in the list above it.
-        if first_arg.starts_with('"') {
-            out.extend(quoted(first_arg));
-        }
-    }
-    for loop_head in table.split("for (const char* mt : {").skip(1) {
-        let list = loop_head.split('}').next().unwrap_or("");
-        out.extend(quoted(list));
-    }
-    out
-}
-
-/// Metal's `model_family_of`, which answers the same question for that driver.
 fn metal_family_table() -> BTreeSet<String> {
     let source = read("crates/driver-metal/csrc/src/model/facts.hpp");
     let table = region(
@@ -158,15 +126,20 @@ fn assert_same(what: &str, rust: &BTreeSet<String>, native: &BTreeSet<String>, n
     );
 }
 
-#[test]
-fn cuda_arch_table_and_the_hf_authors_name_the_same_models() {
-    assert_same(
-        "CUDA",
-        &rows_of(HF_ROWS),
-        &cuda_arch_table(),
-        "crates/driver-cuda/csrc/src/model/registry.cpp",
-    );
-}
+// THE CUDA ARM IS GONE WITH ITS TABLE. `crates/driver-cuda`'s
+// `registry.cpp` was one of the three places "which model_type does pie
+// support?" was answered, and it is deleted along with the C++ shell.
+//
+// The question did not go with it — it moved into Rust, where it is a
+// stronger check than a source grep could be. `driver-cuda-new`'s
+// `FACTS_ROWS` is the arch table now, and
+// `crates/driver-cuda-new/tests/facts_registry.rs` holds it against
+// `HF_ROWS` from both sides: nothing openable without an author, and the
+// complement stated as `NOT_YET_OPENABLE`.
+//
+// The Metal arm below still greps a real table, and stays until that
+// shell retires the same way.
+
 
 #[test]
 fn metal_family_table_and_the_mlx_authors_name_the_same_models() {

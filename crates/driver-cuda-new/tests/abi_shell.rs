@@ -2505,3 +2505,98 @@ fn gemma4_audio_encode_matches_hf_cosine() {
 
     unsafe { driver_abi::local::pie_cuda_destroy(d) };
 }
+
+/// **gpt-oss-20b: the first QUANTIZED checkpoint this shell opens.**
+///
+/// The load used to refuse every `Encoding::Quant` wholesale, which made
+/// "no MoE checkpoint fits this machine" only half true — gpt-oss is
+/// 39 GB on a 46 GB card, and what actually turned it away was the
+/// encoding, not the size.
+///
+/// Its `quantization_config` says `quant_method: mxfp4` with
+/// `modules_to_not_convert` covering attention, the router, the embedding
+/// and lm_head — so the expert banks are MXFP4 and everything else is
+/// bf16, in one checkpoint. That mix is the point: a load that accepted
+/// only raw could not open it, and a load that accepted everything would
+/// hand some kernel a layout it was not compiled for.
+///
+/// `reads_its_stored_form` is the line. MXFP4's payload is what
+/// `quant::mxfp4_moe_gate_up_decode_bf16` indexes, so the bytes go up
+/// verbatim; a scheme wanting a Marlin repack or an FP8 re-encode still
+/// refuses, because that is `transcode_engine`'s work and it is not
+/// ported.
+///
+/// Asserts the LOAD, not a fire. Whether the mixture's aligned path can
+/// run is `UNARMED`'s question and `build_moe_ptrs_aligned_bf16` is still
+/// on it — but a checkpoint that cannot be loaded cannot answer any
+/// question at all, and this one now loads.
+#[test]
+fn a_quantized_checkpoint_loads_through_the_abi() {
+    use driver_abi::local::{PieBytes, PieModelLoadDesc, PieRuntimeCallbacks};
+
+    let _gpu = gpu_guard();
+    let home = std::env::var("HOME").expect("HOME");
+    let snaps = std::path::PathBuf::from(&home)
+        .join(".cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots");
+    let Some(snap) = std::fs::read_dir(&snaps).ok().and_then(|mut d| {
+        d.find_map(|e| {
+            let p = e.ok()?.path();
+            (p.join("model.safetensors").is_file()
+                || p.join("model.safetensors.index.json").is_file())
+            .then_some(p)
+        })
+    }) else {
+        eprintln!("skipped: no cached gpt-oss-20b");
+        return;
+    };
+    let Some(config) = std::fs::read_dir(&snap)
+        .ok()
+        .and_then(|mut d| d.find_map(|e| {
+            let p = e.ok()?.path();
+            (p.file_name()? == "config.json").then_some(p)
+        }))
+    else {
+        eprintln!("skipped: gpt-oss snapshot has no config.json");
+        return;
+    };
+
+    // The descriptor, built here rather than committed: it is a pure
+    // function of the checkpoint's own config, and generating it is what
+    // `pie model import` does.
+    let raw = std::fs::read_to_string(&config).expect("config.json");
+    let root: serde_json::Value = serde_json::from_str(&raw).expect("config parses");
+    let descriptor =
+        model::config::descriptor(&root, &config.to_string_lossy()).expect("descriptor");
+    let dpath = std::env::temp_dir().join("pie_gpt_oss_descriptor.json");
+    std::fs::write(&dpath, serde_json::to_string_pretty(&descriptor).expect("json"))
+        .expect("write descriptor");
+
+    unsafe extern "C" fn notify(_ctx: *mut std::ffi::c_void, _wait_id: u64, _epoch: u64) {}
+    let boot = format!("[model]\ndescriptor = \"{}\"\n", dpath.display());
+    let desc = PieDriverCreateDesc {
+        abi_version: PIE_DRIVER_ABI_VERSION,
+        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        runtime: PieRuntimeCallbacks {
+            abi_version: PIE_DRIVER_ABI_VERSION,
+            reserved0: 0,
+            ctx: std::ptr::null_mut(),
+            notify: Some(notify),
+        },
+        ..Default::default()
+    };
+    let d = unsafe { driver_abi::local::pie_cuda_create(&desc, std::ptr::null_mut()) };
+    assert!(!d.is_null(), "create");
+    let snap_str = snap.to_string_lossy().into_owned();
+    let load = PieModelLoadDesc {
+        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        ..Default::default()
+    };
+    let loaded = unsafe { driver_abi::local::pie_cuda_load_model(d, &load, std::ptr::null_mut()) };
+    unsafe { driver_abi::local::pie_cuda_destroy(d) };
+    assert_eq!(
+        loaded, PIE_STATUS_OK,
+        "gpt-oss-20b's MXFP4 expert banks must load beside its bf16 \
+         attention; a refusal here means `reads_its_stored_form` turned \
+         away a scheme whose bytes the kernels do read"
+    );
+}

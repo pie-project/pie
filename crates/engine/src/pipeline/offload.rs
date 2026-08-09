@@ -675,7 +675,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 static HOME_KV_HANDLE: LazyLock<RwLock<Option<driver_abi::KvHandle>>> =
     LazyLock::new(|| RwLock::new(None));
 
-#[cfg(feature = "driver-cuda")]
+#[cfg(feature = "driver-cuda-new")]
 unsafe extern "C" {
     fn cudaMemcpy(
         dst: *mut std::ffi::c_void,
@@ -687,10 +687,10 @@ unsafe extern "C" {
     fn cudaSetDevice(device: i32) -> i32;
 }
 
-#[cfg(feature = "driver-cuda")]
+#[cfg(feature = "driver-cuda-new")]
 struct CudaDeviceGuard(i32);
 
-#[cfg(feature = "driver-cuda")]
+#[cfg(feature = "driver-cuda-new")]
 impl CudaDeviceGuard {
     fn select(device: u32) -> Result<Self> {
         let mut previous = 0;
@@ -704,7 +704,7 @@ impl CudaDeviceGuard {
     }
 }
 
-#[cfg(feature = "driver-cuda")]
+#[cfg(feature = "driver-cuda-new")]
 impl Drop for CudaDeviceGuard {
     fn drop(&mut self) {
         unsafe {
@@ -720,7 +720,7 @@ fn copy_host_to_region(domain: MemoryDomain, dst: u64, src: &[u8]) -> Result<()>
             Ok(())
         },
         MemoryDomain::CudaDevice(_device) => {
-            #[cfg(feature = "driver-cuda")]
+            #[cfg(feature = "driver-cuda-new")]
             {
                 let _guard = CudaDeviceGuard::select(_device)?;
                 let status = unsafe {
@@ -734,7 +734,7 @@ fn copy_host_to_region(domain: MemoryDomain, dst: u64, src: &[u8]) -> Result<()>
                 ensure!(status == 0, "cudaMemcpy H2D failed with status {status}");
                 Ok(())
             }
-            #[cfg(not(feature = "driver-cuda"))]
+            #[cfg(not(feature = "driver-cuda-new"))]
             {
                 Err(anyhow!("CUDA KV import requires feature \"driver-cuda\""))
             }

@@ -36,6 +36,7 @@ use crate::driver::command::{
 use crate::driver::completion::{CompletionBroker, SubmissionCompletion};
 use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
 use crate::driver::submission::FrameSubmission;
+use driver_metal_new::Region;
 
 /// The Metal shell, behind the seam's fourteen verbs.
 pub struct MetalDriver {
@@ -110,8 +111,8 @@ impl MetalDriver {
                     .as_str()
                     .map(std::path::PathBuf::from)
             });
-        let context = driver_metal_new::metal::Context::new()
-            .map_err(|e| anyhow!("metal context: {e:?}"))?;
+        let context =
+            driver_metal_new::metal::Context::new().map_err(|e| anyhow!("metal context: {e:?}"))?;
         let compiler = driver_metal_new::metal::Compiler::new(&context)
             .map_err(|e| anyhow!("metal compiler: {e:?}"))?;
         // The facts a scheduler reads, stated from what this backend IS
@@ -212,14 +213,11 @@ impl MetalDriver {
                  not from the checkpoint — see crates/model/tests/one_normalizer.rs."
             )
         })?;
-        let descriptor = std::fs::read_to_string(path)
-            .map_err(|e| anyhow!("{}: {e}", path.display()))?;
-        let loaded = driver_metal_new::model::load::load(
-            &self.context,
-            &desc.snapshot_dir,
-            &descriptor,
-        )
-        .map_err(|e| anyhow!("metal load: {e:?}"))?;
+        let descriptor =
+            std::fs::read_to_string(path).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+        let loaded =
+            driver_metal_new::model::load::load(&self.context, &desc.snapshot_dir, &descriptor)
+                .map_err(|e| anyhow!("metal load: {e:?}"))?;
         let facts = driver_metal_new::facts::ModelFacts::from_descriptor(&descriptor)
             .ok_or_else(|| anyhow!("the descriptor does not parse as model facts"))?;
         self.arch = facts.arch_name.clone();
@@ -250,27 +248,27 @@ impl MetalDriver {
         // retirement list; when it goes, this reads the descriptor directly.
         // What is borrowed here is arithmetic over the config, not a model
         // definition.
-        let geometry = driver_metal_new::batch::geometry_from_facts(&facts)
-            .map_err(|why| anyhow!("the descriptor does not describe a servable family: {why:?}"))?;
+        let geometry = driver_metal_new::batch::geometry_from_facts(&facts).map_err(|why| {
+            anyhow!("the descriptor does not describe a servable family: {why:?}")
+        })?;
 
         // The deployment's facts, from the geometry the descriptor states and
         // the tensors the checkpoint actually shipped. The three binding facts
         // — qk-norm, fused QKV, attention bias — ask the TENSORS, because a
         // config states an architecture and a tensor states a binding.
-        self.deployment = Some(driver_metal_new::model::text::facts_from(&geometry, |name| {
-            loaded.tensors.contains_key(name)
-        }));
+        self.deployment = Some(driver_metal_new::model::text::facts_from(
+            &geometry,
+            |name| loaded.tensors.contains_key(name),
+        ));
         self.inv_freq = driver_metal_new::model::rope::frequencies(
             geometry.head_dim,
             geometry.rope_theta,
-            (geometry.rope_freq_factor > 0.0).then_some(
-                driver_metal_new::model::rope::Rescale {
-                    factor: geometry.rope_freq_factor,
-                    low: geometry.rope_low_freq_factor,
-                    high: geometry.rope_high_freq_factor,
-                    original_max: geometry.rope_original_max_position as f32,
-                },
-            ),
+            (geometry.rope_freq_factor > 0.0).then_some(driver_metal_new::model::rope::Rescale {
+                factor: geometry.rope_freq_factor,
+                low: geometry.rope_low_freq_factor,
+                high: geometry.rope_high_freq_factor,
+                original_max: geometry.rope_original_max_position as f32,
+            }),
         )
         .iter()
         .map(|f| f.to_bits())
@@ -288,7 +286,6 @@ impl MetalDriver {
             driver_metal_new::model::kv::Pool::allocate(&self.context, shape)
                 .map_err(|e| anyhow!("kv pool: {e:?}"))?,
         );
-
 
         // What the checkpoint states, and what the pool states.
         //
@@ -395,7 +392,10 @@ impl MetalDriver {
     /// # Errors
     ///
     /// A shape or dtype the registry will not serve, or a duplicate id.
-    pub fn register_channel(&mut self, desc: &ChannelRegistrationPlan) -> Result<RegisteredChannel> {
+    pub fn register_channel(
+        &mut self,
+        desc: &ChannelRegistrationPlan,
+    ) -> Result<RegisteredChannel> {
         let spec = driver_metal_new::pipeline::ChannelSpec {
             id: desc.channel_id,
             dtype: desc.dtype,
@@ -619,7 +619,7 @@ impl MetalDriver {
                     // answers zero, and a zero seq stride is every step of the
                     // scan reading the same token.
                     .with_pool(pool.shape());
-            driver_metal_new::model::run::run(
+            let arena = driver_metal_new::model::run::run_keeping_arena(
                 &self.context,
                 &self.compiler,
                 &mut self.pipelines,
@@ -637,7 +637,28 @@ impl MetalDriver {
                 } else {
                     anyhow!("metal fire: {e:?}; unresolved names: {missed:?}")
                 }
-            })?;
+            })?
+            .1;
+
+            // ── The read-out, and the channel plane over it. ──
+            //
+            // What the fire COMPUTED, handed to the programs bound to this
+            // frame. Until this landed the seam ran every launch and dropped
+            // the arena, so a green frame and a frame that computed the wrong
+            // thing were the same observation — `pipeline::step` had no
+            // production caller at all, and the interpreter was exercised
+            // only by tests that built their own inputs.
+            let logits = read_logits(&arena, &lowered);
+            let inputs = logits.as_ref().map_or_else(
+                driver_metal_new::pipeline::PassInputs::none,
+                |(v, rows, vocab)| driver_metal_new::pipeline::PassInputs {
+                    logits: Some(v),
+                    rows: *rows,
+                    vocab: *vocab,
+                    mtp_draft_row: None,
+                },
+            );
+            Self::run_programs(&mut self.registry, &frame.instance_ids, step, &inputs)?;
         }
 
         let (_raw, completion) = self.broker.launch_completion(1);
@@ -701,7 +722,8 @@ impl MetalDriver {
             .map_err(|e| anyhow!("metal copy_kv: {e:?}"))?;
         }
         if let Some(plan) = work.cells.as_ref() {
-            pool.apply(plan).map_err(|e| anyhow!("metal copy_kv: {e:?}"))?;
+            pool.apply(plan)
+                .map_err(|e| anyhow!("metal copy_kv: {e:?}"))?;
         }
 
         // Settled already: the move ran on the host, so nothing is in flight
@@ -743,6 +765,102 @@ impl MetalDriver {
         let _ = self.registry.close_channel(id);
         Ok(())
     }
+
+    /// Run the channel-plane pass for every program batched into one step.
+    ///
+    /// One instance per roster row, in sub-batch order, all over the SAME
+    /// read-out: the fire produced one distribution per request and the
+    /// members of a batch are those requests.
+    ///
+    /// A blocked pass is not an error. Readiness is the program's own gate and
+    /// missing it means the fire did not happen for that member — the
+    /// interpreter changed nothing, and the engine re-posts. A FAULT is also
+    /// not an error here, for a different reason: it poisons the one instance
+    /// that faulted, and failing the whole frame would take down every other
+    /// request batched with it for a fault that is one program's.
+    ///
+    /// # Errors
+    ///
+    /// A roster row that names no bound instance — which is a frame the
+    /// scheduler built against a registry it did not have.
+    fn run_programs(
+        registry: &mut driver_metal_new::pipeline::Registry,
+        instance_ids: &[u64],
+        step: &crate::driver::submission::StepSubmission,
+        inputs: &driver_metal_new::pipeline::PassInputs,
+    ) -> Result<()> {
+        for &row in &step.roster_rows {
+            let id = *instance_ids
+                .get(row as usize)
+                .ok_or_else(|| anyhow!("roster row {row} is outside the frame's instances"))?;
+            match registry.fire(id, inputs) {
+                Ok(driver_metal_new::pipeline::StepOutcome::Committed)
+                | Ok(driver_metal_new::pipeline::StepOutcome::Blocked(_)) => {}
+                Ok(driver_metal_new::pipeline::StepOutcome::Faulted(why)) => {
+                    tracing::warn!(instance = id, %why, "metal: program faulted");
+                }
+                Err(e) => return Err(anyhow!("metal program {id}: {e:?}")),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// This fire's logits, widened to `f32`, with the two extents beside them.
+///
+/// `None` when the text states no exit seam — a fire that computes something
+/// other than a distribution, which is not an error.
+///
+/// # Why a copy, and why widening
+///
+/// The interpreter's `PassInputs` wants `&[f32]`, and the metal read-out is
+/// **bf16**: `affine_qmv_fast` writes bf16 whatever the text declares, which
+/// is a defect the reference gate found by reading a vocabulary that was
+/// exactly half zeros. So the bytes have to be reinterpreted anyway, and a
+/// widening reinterpretation is a copy. The alternative — teaching the
+/// interpreter a dtype — buys nothing while there is one read-out format.
+///
+/// bf16 → f32 is exact: the low sixteen bits are zero and every bf16 is an
+/// f32. Nothing is lost here, and nothing is gained either — the precision
+/// was lost in the kernel.
+fn read_logits(
+    arena: &driver_metal_new::metal::Handle,
+    lowered: &model_compiler::lower::Lowered,
+) -> Option<(Vec<f32>, u32, u32)> {
+    let r = lowered.readout?;
+    let span = r.rows as usize * r.vocab as usize * r.bytes as usize;
+    if r.at + span > arena.len() as usize {
+        return None;
+    }
+    // SAFETY: the arena is `StorageModeShared`, so its contents are host
+    // addressable, and every launch encoded against it has completed —
+    // `run_keeping_arena` waits before returning.
+    let raw = unsafe {
+        std::slice::from_raw_parts(
+            arena
+                .contents()
+                .as_ptr()
+                .cast_const()
+                .cast::<u8>()
+                .add(r.at),
+            span,
+        )
+    };
+    let values: Vec<f32> = if r.bytes == 4 {
+        raw.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    } else {
+        // `batch::widen`, not a fourth hand-rolled shift-and-cast. The
+        // conversion is one line either way; having ONE of it is how a change
+        // to the rounding reaches every reader.
+        let halves: Vec<u16> = raw
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        driver_metal_new::batch::widen(&halves)
+    };
+    Some((values, r.rows, r.vocab))
 }
 
 /// The hole, named once so every verb that shares it reads the same.

@@ -121,6 +121,10 @@ pub fn stage(context: &Context, frame: Frame<'_>) -> Result<Staged> {
 }
 
 #[cfg(test)]
+// A device test that finds no device SAYS so and passes. Silence would make
+// "the machine has no Metal 4" and "the table staged correctly" the same
+// observation, which is the failure mode a skip is meant to avoid.
+#[allow(clippy::print_stderr)]
 mod tests {
     use super::*;
 

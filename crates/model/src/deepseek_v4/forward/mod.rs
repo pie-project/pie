@@ -93,8 +93,7 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
     let a = facts.attn.clone();
     let k = facts.hc.mult;
     dsl::trace_named(&family, |t| {
-        dsl::seam(t, &dsl::seam::IN, &[], None);
-        let embedded = dsl::embed_with(t, "embed", facts.hidden);
+        let embedded = dsl::embedded_prologue(t, facts.hidden);
         // The rank-K residual opens here and stays open to `hc_head`.
         let mut streams = dsl::cuda::hc_expand(&embedded, k, facts.hidden);
 
@@ -174,10 +173,14 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
                 dsl::cuda::hc_pre(&normed_f32, &streams, k, facts.hidden);
 
             let out = if !facts.is_moe_layer(l) {
-                let gate = matmul(&m, &w.dense_gate);
-                let _up = matmul(&m, &w.dense_up);
-                let act = dsl::cuda::swiglu_clamp(&gate, facts.dense_intermediate, false);
-                matmul(&act, &w.dense_down)
+                dsl::dense_gated_mlp(
+                    &m,
+                    &w.dense_gate,
+                    &w.dense_up,
+                    &w.dense_down,
+                    facts.dense_intermediate,
+                    dsl::GatedAct::SwiGluClamp,
+                )
             } else {
                 let logits = matmul(&m, &w.router);
                 let (experts, weights) = dsl::cuda::topk_sqrtsoftplus(
@@ -215,16 +218,6 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
 
         // The streams fold into one.
         let y = dsl::cuda::hc_head(&streams, &streams, facts.hidden);
-        let normed = dsl::cuda::rmsnorm(
-            &y,
-            &NormW {
-                name: "final_norm".to_string(),
-                variant: NormVariant::Plain,
-                per_head: None,
-                layer: None,
-            },
-        );
-        let logits = dsl::lm_head_at(t, &normed, "lm_head", facts.vocab);
-        dsl::seam(t, &dsl::seam::OUT, &[&logits], None);
+        dsl::logits_epilogue(t, &y, NormVariant::Plain, false, facts.vocab, false);
     })
 }

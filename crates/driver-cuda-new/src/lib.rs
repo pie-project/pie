@@ -77,7 +77,12 @@
 
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![deny(missing_docs)]
-#![deny(clippy::todo, clippy::unimplemented, clippy::dbg_macro, clippy::mem_forget)]
+#![deny(
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::dbg_macro,
+    clippy::mem_forget
+)]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 #[cfg(not(any(feature = "cuda-12", feature = "cuda-13")))]
@@ -133,6 +138,13 @@ pub mod launch;
 pub mod abi_shell;
 
 pub mod model;
+/// PTIR on CUDA: NVRTC, cubins, and the compile cache.
+///
+/// The channel plane itself is [`driver_pipeline`] and is shared with the
+/// Metal shell; this is the part that names a CUDA symbol. Gated on `_cuda`
+/// because every file in it calls `cudarc`.
+#[cfg(feature = "_cuda")]
+pub mod ptir;
 #[cfg(feature = "_cuda")]
 pub mod store;
 

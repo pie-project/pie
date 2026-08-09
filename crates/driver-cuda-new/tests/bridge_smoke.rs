@@ -517,6 +517,18 @@ fn a_resolved_walk_captures_and_replays() {
     zero_weight_decode(Leg::Captured);
 }
 
+/// **The concurrent-lane property: one exec, a SECOND fire.**
+///
+/// Clause 2's remaining item. Every other captured leg replays the fire
+/// it captured, which cannot tell a baked address from baked contents.
+/// This one captures at `[1, 2, 3, 5]` and replays at `[7, 11, 13, 17]`,
+/// and the residual invariant is exact per row — so a capture that baked
+/// contents fails here and nowhere else.
+#[test]
+fn a_cached_exec_serves_the_next_fire() {
+    zero_weight_decode(Leg::Reused);
+}
+
 /// **A5, at one lane: the UNION captured and replayed on real geometry.**
 ///
 /// Everything else proves a piece. `gpu_supergraph` proves the mechanism
@@ -588,6 +600,11 @@ fn the_union_captures_and_replays_the_same_decode() {
 /// and refuses at runtime, which is what the lora one did — that is
 /// covered by actually capturing a union, which is A5.
 
+/// The SECOND fire's tokens — a different set from the captured fire's
+/// `[1, 2, 3, 5]`, and all four inside the patterned range so the
+/// residual invariant stays exact for every row.
+const SECOND_FIRE: [i32; 4] = [7, 11, 13, 17];
+
 /// Which leg of the zero-weight decode to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Leg {
@@ -602,6 +619,18 @@ enum Leg {
     /// mechanism in isolation (`gpu_supergraph`) and not the launch list
     /// in isolation (`union_lower`).
     CapturedUnion,
+    /// CAPTURE ONCE, SERVE A SECOND FIRE. The exec is instantiated from
+    /// one fire's tokens and then replayed against a DIFFERENT fire's,
+    /// which is the property a cached exec has to have and the one no
+    /// other leg asks for: every leg above replays the fire it captured.
+    ///
+    /// A capture bakes ADDRESSES, and the whole `FireArrays` design is
+    /// the claim that only addresses are baked — the contents are
+    /// refreshed per fire. If a capture baked contents instead, this leg
+    /// returns the FIRST fire's answer for the second fire's tokens:
+    /// fluent, plausible, and wrong, which is this tree's most-named
+    /// failure mode.
+    Reused,
     /// A fire whose LAST TWO ROWS carry attached programs, which makes
     /// `lower` split it on the hook axis. The tail then addresses rows at
     /// absolute offsets, takes `_devwin` statements, and needs its own
@@ -786,7 +815,7 @@ fn zero_weight_decode(leg: Leg) {
     let w_page = up(&u32s(&[0, 1, 2, 3]));
     let w_off = up(&u32s(&[0, 0, 0, 0]));
     let row_valid = up(&[1u8, 1, 1, 1]);
-    let ids = up(&tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>());
+    let mut ids = up(&tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>());
     let positions = up(&[0i32, 0, 0, 0].iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>());
     let lse = alloc.alloc(ROWS * Q_HEADS as usize * 4).expect("lse");
 
@@ -995,7 +1024,7 @@ fn zero_weight_decode(leg: Leg) {
             logits_value = Some(*value);
         }
     }
-    let ran = if leg == Leg::Captured || leg == Leg::CapturedUnion {
+    let ran = if matches!(leg, Leg::Captured | Leg::CapturedUnion | Leg::Reused) {
         use driver_cuda_new::cuda::{PredicateWord, SupergraphBuilder};
         use driver_cuda_new::model::supergraph::fire_predicates;
 
@@ -1108,6 +1137,32 @@ fn zero_weight_decode(leg: Leg) {
              distinct programs — the union folded something it should not \
              have, or the conditional is not selecting"
         );
+
+        // ── A SECOND FIRE, on the exec the first one captured ──────────
+        //
+        // Every leg above replays the fire it CAPTURED, which cannot tell
+        // a baked address from baked contents — the answer is right
+        // either way. A cache is only worth having if the exec serves the
+        // NEXT fire too, so this writes different tokens into the same
+        // descriptor buffer and launches the same exec again.
+        //
+        // The residual invariant below is the discriminator and it is
+        // exact: row `r` must be the embed pattern for `SECOND_FIRE[r]`.
+        // Had the capture baked contents, this replay returns the first
+        // fire's rows.
+        if leg == Leg::Reused {
+            let bytes: Vec<u8> =
+                SECOND_FIRE.iter().flat_map(|t| t.to_le_bytes()).collect();
+            ids.copy_from_host(&bytes, stream.as_ref()).expect("the next fire's tokens");
+            arena.memset(0, stream.as_ref()).expect("wipe before the second fire");
+            preds
+                .set(driver_cuda_new::cuda::SLOT_HAS_WRITE_DESC, false)
+                .expect("slot");
+            preds.upload(stream.as_ref()).expect("upload");
+            stream.as_ref().synchronize().expect("the tokens land");
+            exec.launch(stream.as_ref()).expect("the second fire replays");
+            stream.as_ref().synchronize().expect("the second fire retires");
+        }
         ran
     } else {
         run(&l, &dplan, frame, &mut resolver, &ctx, regions, None)
@@ -1121,7 +1176,9 @@ fn zero_weight_decode(leg: Leg) {
     arena.copy_to_host(&mut arena_back, stream.as_ref()).expect("d2h");
     stream.as_ref().synchronize().expect("sync");
     let e = embed_out.expect("embed ran");
-    for (r, t) in tokens.iter().enumerate() {
+    // Whichever fire ran LAST is the one the arena holds.
+    let fired: &[i32] = if leg == Leg::Reused { &SECOND_FIRE } else { &tokens };
+    for (r, t) in fired.iter().enumerate() {
         for c in [0usize, 1, 700, 1023] {
             let want = bf16(if c % 2 == 0 { amp(*t) } else { -amp(*t) });
             let off = e + (r * HIDDEN + c) * 2;

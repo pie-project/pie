@@ -12,41 +12,13 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The MLA attention block's dims. `qk_nope_head_dim + qk_rope_head_dim`
-/// is the query width per head; the CACHE stores the latent plus the rope
-/// half, which is why `kv_lora_rank + qk_rope_head_dim` is its own number
-/// and not derivable from the query's.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Glm5MlaFacts {
-    pub hidden: u32,
-    pub heads: u32,
-    /// `q_lora_rank`: the query's own latent. glm5 always has one.
-    pub q_lora_rank: u32,
-    pub kv_lora_rank: u32,
-    pub qk_nope_head_dim: u32,
-    pub qk_rope_head_dim: u32,
-    pub v_head_dim: u32,
-}
+/// This family's MLA geometry IS the shared one — see
+/// [`model_compiler::facts::MlaFacts`]. Three families carried
+/// field-identical copies of it; the alias keeps every existing spelling
+/// working while there is only one definition to disagree with.
+pub type Glm5MlaFacts = model_compiler::facts::MlaFacts;
 
-impl Glm5MlaFacts {
-    /// The per-head query width the `q_b` projection produces.
-    pub fn qk_head_dim(&self) -> u32 {
-        self.qk_nope_head_dim + self.qk_rope_head_dim
-    }
-    /// The width `q_b_proj` writes: every head's nope+rope halves.
-    pub fn q_b_width(&self) -> u32 {
-        self.heads * self.qk_head_dim()
-    }
-    /// The width `kv_a_proj_with_mqa` writes: the latent plus ONE shared
-    /// rope half (MQA — the rope key is not per-head).
-    pub fn kv_a_width(&self) -> u32 {
-        self.kv_lora_rank + self.qk_rope_head_dim
-    }
-    /// The width the attention core's output carries before `o_proj`.
-    pub fn v_width(&self) -> u32 {
-        self.heads * self.v_head_dim
-    }
-}
+
 
 /// The DSA lightning indexer. A separate small attention whose only
 /// output is a top-k page mask for the real one.
@@ -116,6 +88,8 @@ impl Glm5Facts {
                 qk_nope_head_dim: 128,
                 qk_rope_head_dim: 64,
                 v_head_dim: 128,
+                // This family does not gate the MLA output; kimi-k3 does.
+                output_gate: false,
             },
             dsa: Glm5DsaFacts {
                 index_n_heads: 64,

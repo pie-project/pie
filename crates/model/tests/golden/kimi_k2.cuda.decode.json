@@ -16858,6 +16858,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.0.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -16894,6 +16900,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.0.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -17099,6 +17111,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.1.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -17135,6 +17153,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.1.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -17497,6 +17521,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.2.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -17533,6 +17563,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.2.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -17895,6 +17931,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.3.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -17931,6 +17973,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.3.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -18293,6 +18341,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.4.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -18329,6 +18383,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.4.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -18691,6 +18751,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.5.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -18727,6 +18793,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.5.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -19089,6 +19161,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.6.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -19125,6 +19203,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.6.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -19487,6 +19571,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.7.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -19523,6 +19613,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.7.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -19885,6 +19981,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.8.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -19921,6 +20023,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.8.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -20283,6 +20391,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.9.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -20319,6 +20433,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.9.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -20681,6 +20801,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.10.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -20717,6 +20843,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.10.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -21079,6 +21211,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.11.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -21115,6 +21253,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.11.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -21477,6 +21621,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.12.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -21513,6 +21663,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.12.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -21875,6 +22031,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.13.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -21911,6 +22073,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.13.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -22273,6 +22441,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.14.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -22309,6 +22483,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.14.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -22671,6 +22851,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.15.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -22707,6 +22893,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.15.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -23069,6 +23261,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.16.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -23105,6 +23303,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.16.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -23467,6 +23671,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.17.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -23503,6 +23713,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.17.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -23865,6 +24081,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.18.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -23901,6 +24123,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.18.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -24263,6 +24491,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.19.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -24299,6 +24533,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.19.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -24661,6 +24901,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.20.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -24697,6 +24943,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.20.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -25059,6 +25311,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.21.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -25095,6 +25353,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.21.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -25457,6 +25721,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.22.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -25493,6 +25763,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.22.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -25855,6 +26131,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.23.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -25891,6 +26173,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.23.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -26253,6 +26541,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.24.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -26289,6 +26583,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.24.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -26651,6 +26951,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.25.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -26687,6 +26993,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.25.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -27049,6 +27361,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.26.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -27085,6 +27403,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.26.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -27447,6 +27771,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.27.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -27483,6 +27813,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.27.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -27845,6 +28181,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.28.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -27881,6 +28223,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.28.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -28243,6 +28591,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.29.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -28279,6 +28633,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.29.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -28641,6 +29001,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.30.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -28677,6 +29043,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.30.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -29039,6 +29411,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.31.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -29075,6 +29453,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.31.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -29437,6 +29821,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.32.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -29473,6 +29863,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.32.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -29835,6 +30231,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.33.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -29871,6 +30273,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.33.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -30233,6 +30641,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.34.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -30269,6 +30683,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.34.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -30631,6 +31051,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.35.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -30667,6 +31093,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.35.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -31029,6 +31461,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.36.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -31065,6 +31503,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.36.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -31427,6 +31871,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.37.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -31463,6 +31913,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.37.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -31825,6 +32281,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.38.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -31861,6 +32323,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.38.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -32223,6 +32691,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.39.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -32259,6 +32733,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.39.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -32621,6 +33101,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.40.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -32657,6 +33143,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.40.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -33019,6 +33511,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.41.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -33055,6 +33553,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.41.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -33417,6 +33921,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.42.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -33453,6 +33963,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.42.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -33815,6 +34331,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.43.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -33851,6 +34373,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.43.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -34213,6 +34741,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.44.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -34249,6 +34783,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.44.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -34611,6 +35151,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.45.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -34647,6 +35193,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.45.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -35009,6 +35561,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.46.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -35045,6 +35603,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.46.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -35407,6 +35971,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.47.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -35443,6 +36013,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.47.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -35805,6 +36381,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.48.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -35841,6 +36423,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.48.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -36203,6 +36791,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.49.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -36239,6 +36833,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.49.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -36601,6 +37201,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.50.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -36637,6 +37243,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.50.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -36999,6 +37611,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.51.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -37035,6 +37653,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.51.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -37397,6 +38021,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.52.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -37433,6 +38063,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.52.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -37795,6 +38431,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.53.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -37831,6 +38473,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.53.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -38193,6 +38841,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.54.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -38229,6 +38883,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.54.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -38591,6 +39251,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.55.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -38627,6 +39293,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.55.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -38989,6 +39661,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.56.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -39025,6 +39703,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.56.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -39387,6 +40071,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.57.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -39423,6 +40113,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.57.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -39785,6 +40481,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.58.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -39821,6 +40523,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.58.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -40183,6 +40891,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.59.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -40219,6 +40933,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.59.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -40581,6 +41301,12 @@
           "kernel": "gemm::mla_absorb_q_to_latent_bf16",
           "weights": [
             "layer.60.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },
@@ -40617,6 +41343,12 @@
           "kernel": "gemm::mla_absorb_latent_to_v_bf16",
           "weights": [
             "layer.60.kv_b_proj"
+          ],
+          "params": [
+            64,
+            128,
+            128,
+            512
           ]
         }
       },

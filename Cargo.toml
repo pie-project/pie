@@ -52,7 +52,14 @@ members = [
     # `driver` is the C++ substrate both shells interpret the ABI with; the two
     # native shells build their own `csrc/` and are OS-exclusive.
     "crates/driver",
-    "crates/driver-cuda",
+    # The PTIR channel plane, shared by both Rust shells. It was `src/pipeline/`
+    # inside `driver-metal-new` until the CUDA shell reached the same file, and
+    # the move cost nothing because not one line of it named a Metal type --
+    # the directory already built and tested on Linux while the crate around it
+    # did not. A `default-member`, unlike every driver below it: it needs no
+    # GPU, no toolkit and no OS, so there is no reason a workspace sweep should
+    # not carry its tests.
+    "crates/driver-pipeline",
     # The Rust rewrite of the CUDA shell, grown beside the C++ one on the same
     # terms `driver-metal-new` is. Unlike either C++ shell it builds ANYWHERE:
     # `cudarc` is pinned to a named CUDA version with `fallback-dynamic-loading`,
@@ -150,6 +157,7 @@ default-members = [
     "crates/driver-abi-cbindgen",
     "crates/driver",
     "crates/driver-dummy",
+    "crates/driver-pipeline",
     "crates/model",
     "crates/model-compiler",
     "crates/model-cbindgen",

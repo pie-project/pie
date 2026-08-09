@@ -33,27 +33,8 @@ use driver_cuda_new::abi_shell::openable_model_types;
 /// be written, because that is how a reader decides whether a line is
 /// theirs.
 const NOT_YET_OPENABLE: &[&str] = &[
-    // ── MLA + latent cache: 11 unarmed symbols as well (executor_bind).
-    "deepseek_v2",
-    "deepseek_v3",
-    "glm_moe_dsa",
-    "kimi_k2",
-    // ── kimi_k3's KDA: 5 unarmed symbols.
-    "kimi_k3",
-    // ── deepseek_v4's DSA indexer + hyper-connections: 10 unarmed.
-    "deepseek_v4",
-    // ── Armed and dispatchable; ONLY the facts derivation is missing.
-    //    These are the cheapest ones to take off this list.
-    "gemma2",
-    "gemma3",
-    "gemma3_text",
-    "gemma3n",
-    "gemma3n_text",
-    "gpt_oss",
-    "mixtral",
-    "nemotron_h",
-    "qwen3_moe",
-    // ── Not a decode backbone at all: CSM is a codec stack.
+    // Not a decode backbone at all: CSM is a codec stack, so it has no
+    // fire class this shell serves and no facts to derive.
     "csm",
 ];
 

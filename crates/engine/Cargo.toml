@@ -20,9 +20,12 @@ driver-abi = { path = "../driver-abi" }
 driver-dummy = { path = "../driver-dummy" }
 tensor-ir = { path = "../tensor-ir" }
 tensor-compiler = { path = "../tensor-compiler" }
-# The native execution shells, for their archives alone -- see the feature
-# comments above and the `extern crate ... as _` in lib.rs.
-driver-cuda = { path = "../driver-cuda", optional = true }
+# THE CUTOVER. `driver-cuda-new` exports the same thirteen `pie_cuda_*`
+# symbols the seam calls, so which archive supplies them is a LINK
+# question and not a code one -- `backend/cuda.rs` is unchanged either
+# way. Enabling `driver-cuda-new` instead of `driver-cuda` is the whole
+# switch, which is what makes the C++ tree deletable.
+driver-cuda-new = { path = "../driver-cuda-new", optional = true }
 # The Rust Metal shell. Unlike `driver-cuda` this is not linked for an
 # archive: the seam calls it as a plain Rust library, which is what a driver
 # written in the same language should cost. Its device half is
@@ -102,23 +105,15 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 
 [features]
 default = []
-# Programmable-sampling output→tensor fast-path (#27 cut #1). Gates the host
-# eager-D2H populate: the `extern "C"` `pie_pinned_alloc`/`pie_pinned_free`
-# decls + the `sampling_output_*` carrier fill + the pinned `output()` read.
-# OFF (host-only builds / `cargo test -p pie`) ⇒ the fast-path is compiled out
-# entirely (the `pie_driver_cuda_lib` symbols are never referenced, so no
-# undefined-symbol link error), leaving the legacy host output path.
+# The Rust CUDA shell, supplying the same symbols. Mutually exclusive with
+# `driver-cuda` at LINK time -- two archives defining `pie_cuda_create`
+# is a duplicate-symbol error, which is the right failure: the seam must
+# not be ambiguous about which driver it is calling.
 #
-# ON ⇒ the fast-path is active, and this crate must be the one that supplies
-# the archive. It used to say "propagated from `worker`'s `driver-cuda`,
-# which links `pie_driver_cuda_lib`", and that held for the final binary and
-# ONLY for it: `worker` depends on this crate, not the other way round, so
-# THIS crate's own test binaries had the externs and no archive. Any build that
-# turned the feature on workspace-wide -- and `sdk/server/python` turns it on
-# unconditionally -- could not link `cargo test -p pie-engine`.
-#
-# The crate that declares an `extern "C"` is the crate that owes the symbol.
-driver-cuda = ["dep:driver-cuda"]
+# It needs a CUDA runtime ABI chosen, for the reason that crate's own
+# `compile_error!` gives: guessing wrong is a segfault inside the driver
+# rather than a build error.
+driver-cuda-new = ["dep:driver-cuda-new", "driver-cuda-new/cuda-13", "driver-cuda-new/abi"]
 # The Rust Metal shell's seam. No archive and no `extern "C"`: this one is a
 # library call, so the feature owes nothing but the dependency.
 driver-metal-new = ["dep:driver-metal-new"]

@@ -90,8 +90,7 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
     let mb = facts.mamba.clone();
     let _at = facts.attn.clone();
     dsl::trace_named(&family, |t| {
-        dsl::seam(t, &dsl::seam::IN, &[], None);
-        let mut y = dsl::embed_with(t, "embed", facts.hidden);
+        let mut y = dsl::embedded_prologue(t, facts.hidden);
 
         for l in 0..facts.layers() {
             // THIS LAYER's sliding window, `-1` for none — a
@@ -221,16 +220,6 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
             y = dsl::cuda::residual_add(&y, &moe_out, facts.hidden);
         }
 
-        let normed = dsl::cuda::rmsnorm(
-            &y,
-            &NormW {
-                name: "final_norm".to_string(),
-                variant: NormVariant::Plain,
-                per_head: None,
-                layer: None,
-            },
-        );
-        let logits = dsl::lm_head_at(t, &normed, "lm_head", facts.vocab);
-        dsl::seam(t, &dsl::seam::OUT, &[&logits], None);
+        dsl::logits_epilogue(t, &y, NormVariant::Plain, false, facts.vocab, false);
     })
 }

@@ -195,29 +195,98 @@ fn what_this_checkpoint_published() {
 /// which naming convention to read it with.
 #[test]
 fn every_name_the_text_states_is_a_tensor_the_load_plan_publishes() {
-    let Some(dir) = std::env::var_os("PIE_METAL_NAMES_SNAPSHOT") else {
-        eprintln!("SKIP: set PIE_METAL_NAMES_SNAPSHOT to an MLX snapshot");
+    let dirs = snapshots_to_check();
+    if dirs.is_empty() {
+        eprintln!(
+            "SKIP: no snapshots. Set PIE_METAL_NAMES_SNAPSHOT (one path, or \
+             several separated by `:`), or populate the HuggingFace cache."
+        );
         return;
+    }
+    for dir in dirs {
+        eprintln!("--- {}", dir.display());
+        check_one_snapshot(&dir);
+    }
+}
+
+/// Which snapshots this run holds the text to.
+///
+/// `PIE_METAL_NAMES_SNAPSHOT` when set -- one path, or several separated by
+/// `:`. Otherwise every MLX snapshot in the HuggingFace cache, because a
+/// machine that HAS six checkpoints should be told about all six and not the
+/// one somebody remembered to name. Discovery is what turned this from a gate
+/// somebody ran once into the gate that found gpt-oss's 246 misses.
+fn snapshots_to_check() -> Vec<PathBuf> {
+    if let Some(v) = std::env::var_os("PIE_METAL_NAMES_SNAPSHOT") {
+        return std::env::split_paths(&v).collect();
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
     };
-    let dir = PathBuf::from(dir);
+    let hub = PathBuf::from(home).join(".cache/huggingface/hub");
+    let Ok(entries) = std::fs::read_dir(&hub) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for repo in entries.flatten() {
+        // MLX snapshots only: a GGUF export is a different container and this
+        // gate reads safetensors.
+        if !repo.file_name().to_string_lossy().contains("mlx-community") {
+            continue;
+        }
+        let Ok(snaps) = std::fs::read_dir(repo.path().join("snapshots")) else {
+            continue;
+        };
+        for snap in snaps.flatten() {
+            if snap.path().join("config.json").is_file() {
+                found.push(snap.path());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Hold the text's names to one snapshot's load plan.
+///
+/// An architecture no Metal text serves is SKIPPED rather than failed: the
+/// llama-like text does not model `qwen3_5`'s linear-attention interleave, and
+/// reporting its every tensor as missing says nothing except that.
+fn check_one_snapshot(dir: &std::path::Path) {
+    let dir = dir.to_path_buf();
     let descriptor = descriptor_for(&dir);
     let target = driver_metal_new::loader::metal_storage_target();
     let (plan, _) = driver_metal_new::loader::compile_load_plan(&dir, &target, &descriptor)
         .expect("the plan compiles");
     let published: BTreeSet<&str> = plan.tensors.iter().map(|t| t.name.as_str()).collect();
 
-    let gemma4 = std::env::var("PIE_METAL_NAMES_ARCH").is_ok_and(|a| a == "gemma4");
-    let names = if gemma4 {
-        Names::mlx_gemma4()
-    } else {
-        Names::mlx()
-    };
+    // ONE map. gemma4 used to need its own, and the arch variable said which
+    // -- a driver picking a name map per checkpoint. Both conventions are
+    // candidates of `Names::mlx` now, so the checkpoint picks and this does
+    // not.
+    let names = Names::mlx();
     // The DEPLOYMENT's facts, derived from the same descriptor, so a name the
     // text states is one this checkpoint's shape actually asks for.
     let model_facts = driver_metal_new::facts::ModelFacts::from_descriptor(&descriptor)
         .expect("the descriptor states the model's facts");
-    let geometry =
-        driver_metal_new::batch::geometry_from_facts(&model_facts).expect("a decodable geometry");
+    let Ok(geometry) = driver_metal_new::batch::geometry_from_facts(&model_facts) else {
+        eprintln!("    SKIP: no decodable shape (an architecture no text serves)");
+        return;
+    };
+    // Whether a text serves this checkpoint at all, asked of the DRIVER
+    // rather than of a list kept here. `qwen3_5` interleaves linear
+    // attention, which the metal text does not model -- and every one of its
+    // tensors would then report as missing for that one reason, which is a
+    // page of output saying nothing.
+    let arch = std::fs::read_to_string(dir.join("config.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|c| c.get("model_type")?.as_str().map(str::to_string))
+        .unwrap_or_default();
+    if !driver_metal_new::model::text::serves(&arch) {
+        eprintln!("    SKIP: no metal text serves `{arch}`");
+        return;
+    }
     let (facts, metal) =
         driver_metal_new::model::text::facts_from(&geometry, |t| published.contains(t));
 
@@ -226,21 +295,28 @@ fn every_name_the_text_states_is_a_tensor_the_load_plan_publishes() {
     let store = Store::new(names, &tensors, &named);
     let mut missing: BTreeSet<String> = BTreeSet::new();
     for traced in names_the_text_states(&facts, &metal) {
-        let Some(spelled) = store.checkpoint_name(&traced) else {
+        // EVERY spelling, not the first: this store has no staged tensors to
+        // choose with, and a role that has several candidates resolves at run
+        // time against the ones the checkpoint published. Asking only the
+        // first would fail a checkpoint that spells it the second way, which
+        // is every checkpoint but one.
+        let candidates = store.checkpoint_names(&traced);
+        if candidates.is_empty() {
             missing.insert(format!("{traced} -> (no spelling)"));
             continue;
-        };
-        if !published.contains(spelled.as_str()) {
-            missing.insert(format!("{traced} -> {spelled}"));
+        }
+        if !candidates.iter().any(|c| published.contains(c.as_str())) {
+            missing.insert(format!("{traced} -> {}", candidates.join(" | ")));
         }
     }
 
     assert!(
         missing.is_empty(),
-        "{} name(s) the text states are not tensors this load plan publishes:\n  \
+        "{}: {} name(s) the text states are not tensors this load plan publishes:\n  \
          {}\n\nEither the map spells one wrong or the deployment's facts claim \
          something it does not ship — and the two are told apart by looking. \
          The plan publishes:\n  {}",
+        dir.display(),
         missing.len(),
         missing.iter().cloned().collect::<Vec<_>>().join("\n  "),
         published

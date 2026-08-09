@@ -178,17 +178,37 @@ pub static KERNELS: &[KernelSig] = &[
     // a launcher is "anything that issues DEVICE work" and not "anything
     // taking a cudaStream_t". `scripts/kernel-vocabulary-audit.py` learned
     // that the hard way.
+    // MLA's two absorptions. Both take the WHOLE `kv_b_proj` bank and
+    // slice it themselves, so the bank is a weight and the four widths
+    // are the shapes around it: `heads` and `kv_lora_rank` are the
+    // result's trailing extents, `qk_nope_dim` is the operand's, and
+    // `v_head_dim` rides the param channel because this statement's
+    // result does not carry it.
     kernel!(mla_absorb_q_to_latent "gemm::mla_absorb_q_to_latent_bf16",
         operands = operands![
-            handle: CublasHandle, q_nope: Buf, kv_b_proj: Buf, q_latent: BufMut,
-            tokens: I32, heads: I32, qk_nope_dim: I32, v_head_dim: I32,
-            kv_lora_rank: I32,
+            handle: CublasHandle <- Source::Ctx("cublas"),
+            q_nope: Buf <- Source::In(0),
+            kv_b_proj: Buf <- Source::Weight(0),
+            q_latent: BufMut <- Source::Out(0),
+            tokens: I32 <- Source::Rows,
+            heads: I32 <- Source::Param(0),
+            qk_nope_dim: I32 <- Source::Param(1),
+            v_head_dim: I32 <- Source::Param(2),
+            kv_lora_rank: I32 <- Source::Param(3),
         ]),
+    // The mirror: the latent goes in, `v_head_dim` comes out, and
+    // `qk_nope_dim` is the param this direction lacks a shape for.
     kernel!(mla_absorb_latent_to_v "gemm::mla_absorb_latent_to_v_bf16",
         operands = operands![
-            handle: CublasHandle, attn_latent: Buf, kv_b_proj: Buf, attn_v: BufMut,
-            tokens: I32, heads: I32, qk_nope_dim: I32, v_head_dim: I32,
-            kv_lora_rank: I32,
+            handle: CublasHandle <- Source::Ctx("cublas"),
+            attn_latent: Buf <- Source::In(0),
+            kv_b_proj: Buf <- Source::Weight(0),
+            attn_v: BufMut <- Source::Out(0),
+            tokens: I32 <- Source::Rows,
+            heads: I32 <- Source::Param(0),
+            qk_nope_dim: I32 <- Source::Param(1),
+            v_head_dim: I32 <- Source::Param(2),
+            kv_lora_rank: I32 <- Source::Param(3),
         ]),
     // MTP drafts several tokens per step and repairs on rejection, which
     // needs an attention that sees a HISTORY buffer beside the pages (the
@@ -272,18 +292,33 @@ pub static KERNELS: &[KernelSig] = &[
             num_q_heads: I32, head_dim: I32, ratio: I32, page_size: I32,
             sm_scale: F32, stream: Stream,
         ]),
+    // Two attention halves and their LSEs, merged. Four operands, two
+    // results, and the head geometry off the first result --
+    // `[Tokens, heads, head_dim]`.
     kernel!(combine_attn_outputs "attn::combine_attn_outputs_bf16",
         operands = operands![
-            o1: Buf, lse1: F32s, o2: Buf, lse2: F32s, o_out: BufMut,
-            lse_out: F32sMut, N: I32, num_heads: I32, head_dim: I32,
-            stream: Stream,
+            o1: Buf <- Source::In(0),
+            lse1: F32s <- Source::In(1),
+            o2: Buf <- Source::In(2),
+            lse2: F32s <- Source::In(3),
+            o_out: BufMut <- Source::Out(0),
+            lse_out: F32sMut <- Source::Out(1),
+            N: I32 <- Source::Rows,
+            num_heads: I32 <- Source::Param(0),
+            head_dim: I32 <- Source::Param(1),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // FlashInfer publishes its LSE in log2 and the combine works in ln. A
     // unit conversion, stated so a reader never has to guess which base an
     // LSE is in.
+    // The rebase is in place on the value it names: `Out(0)` is the
+    // statement's result and `In(0)` is the same buffer, so the element
+    // count is the result's own extent.
     kernel!(lse_log2_to_ln "attn::lse_log2_to_ln",
         operands = operands![
-            lse: F32sMut, n: I32, stream: Stream,
+            lse: F32sMut <- Source::Out(0),
+            n: I32 <- Source::OutElements(0),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     kernel!(write_kv_to_pages_bf16 "attn::write_kv_to_pages_bf16",
         operands = operands![
@@ -311,16 +346,35 @@ pub static KERNELS: &[KernelSig] = &[
     // The unfused counterpart of `mla_prepare`. `tokens` is their only
     // extent, so unlike the fused prepare they are NOT `whole` -- which is
     // the reason a deployment might bind them instead.
+    // One latent operand split in two: the normed `kv_c` and the
+    // rope-carrying `k_pe`. Both widths are the results' own, and the
+    // source stride is the operand's row width -- which is what makes
+    // the fused q/kv binding readable without being told.
     kernel!(kimi_split_kv_a_norm "attn::kimi_split_kv_a_norm_bf16",
         operands = operands![
-            kv_a: Buf, norm_weight: Buf, kv_c: BufMut, k_pe: BufMut, tokens: I32,
-            kv_lora_rank: I32, qk_rope_dim: I32, eps: F32, stream: Stream,
-            src_row_stride: I32,
+            kv_a: Buf <- Source::In(0),
+            norm_weight: Buf <- Source::Weight(0),
+            kv_c: BufMut <- Source::Out(0),
+            k_pe: BufMut <- Source::Out(1),
+            tokens: I32 <- Source::Rows,
+            kv_lora_rank: I32 <- Source::OutWidth(0),
+            qk_rope_dim: I32 <- Source::OutWidth(1),
+            eps: F32 <- Source::Ctx("eps"),
+            stream: Stream <- Source::Ctx("stream"),
+            src_row_stride: I32 <- Source::InWidth(0),
         ]),
+    // The query's half of the same split. `[Tokens, heads, dim]` on both
+    // results, so every extent is a result's own.
     kernel!(kimi_split_q_b "attn::kimi_split_q_b_bf16",
         operands = operands![
-            q_b: Buf, q_nope: BufMut, q_pe: BufMut, tokens: I32, heads: I32,
-            qk_nope_dim: I32, qk_rope_dim: I32, stream: Stream,
+            q_b: Buf <- Source::In(0),
+            q_nope: BufMut <- Source::Out(0),
+            q_pe: BufMut <- Source::Out(1),
+            tokens: I32 <- Source::Rows,
+            heads: I32 <- Source::Param(0),
+            qk_nope_dim: I32 <- Source::Param(1),
+            qk_rope_dim: I32 <- Source::Param(2),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // glm5 attends SPARSELY: a small side network scores every (query, key)
     // pair and only the top-k keys per query are attended.
@@ -338,10 +392,21 @@ pub static KERNELS: &[KernelSig] = &[
     // `whole`, and here the reason is the ALGEBRA rather than the addressing:
     // query `i` scores keys `0..=i`, so a row window starting anywhere but
     // zero cannot see the keys it must rank against.
+    // The indexer's three operands and its mask. `n_heads` and
+    // `head_dim` are `idx_q`'s own trailing extents -- it is
+    // `[Tokens, n_heads, head_dim]` -- and the top-k rides the param
+    // channel, because it is a load-time number no shape carries.
     kernel!(dsa_index_topk_mask "attn::dsa_index_topk_mask", whole = true,
         operands = operands![
-            idx_q: Buf, idx_k: Buf, idx_w: Buf, mask: U8sMut, tokens: I32,
-            n_heads: I32, head_dim: I32, topk: I32, stream: Stream,
+            idx_q: Buf <- Source::In(0),
+            idx_k: Buf <- Source::In(1),
+            idx_w: Buf <- Source::In(2),
+            mask: U8sMut <- Source::Out(0),
+            tokens: I32 <- Source::Rows,
+            n_heads: I32 <- Source::Param(0),
+            head_dim: I32 <- Source::Param(1),
+            topk: I32 <- Source::Param(2),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // deepseek_v4, glm5 and kimi_k3 attend through a compressed KV: a
     // `kv_lora_rank`-wide latent row plus a small rope-carrying companion,

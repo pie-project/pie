@@ -90,6 +90,13 @@ cudarc = { version = "0.19.8", optional = true, default-features = false, featur
     # `CublasOps` behind `cuda::cublas::CublasHandle` makes the five handle
     # calls the C++ wrapper makes. Dynamically loaded like everything else.
     "cublas",
+    # The second: PTIR's compile plane. The host emits ONE self-contained CUDA
+    # translation unit per fused region and this driver carries no emitter, so
+    # NVRTC is not an optimisation -- a program with a generated region cannot
+    # run without it. Dynamically loaded like the rest, which is what keeps the
+    # toolkit-free build: `libnvrtc.so` is resolved on first compile, and a box
+    # that never registers a PTIR program never opens it.
+    "nvrtc",
     "fallback-dynamic-loading",
 ] }
 
@@ -132,6 +139,14 @@ libc = "0.2"
 # its operands name. Pure Rust — the toolkit-free build is unaffected.
 model-compiler = { path = "../model-compiler" }
 
+# The PTIR channel plane, shared with the Metal shell: launch-package
+# adoption, the compile-cache identity, the emitted-table index, the bounded
+# caches, the channel ring and the reference pass. NOT optional and NOT gated
+# on a CUDA feature -- none of it names a CUDA symbol, which is the whole
+# reason it is a crate: the C++ carried three hand-written copies of this one
+# golden model, one per backend, and nothing ever checked that they agreed.
+driver-pipeline = { path = "../driver-pipeline" }
+
 # The ABI's Rust source of truth: the `#[repr(C)]` descriptors and status
 # codes the thirteen exports speak. Optional — only the `abi` shell needs
 # it.
@@ -170,6 +185,16 @@ kernels-cuda = { path = "../kernels-cuda", default-features = false }
 # `forward` builds the family texts; the regular dependency above stays
 # `config`-only so the library never carries the tracer.
 model = { path = "../model", default-features = false, features = ["config", "forward", "contract"] }
+# The PRODUCER, for `tests/gpu_ptir_emitted.rs` only: that test authors a
+# trace, runs the host's real bind → compile → lower → emit chain over it, and
+# compiles the result — so it proves the emitter's CUDA and this driver's NVRTC
+# options agree rather than proving a hand-written kernel compiles. A
+# dev-dependency and never a regular one: the driver must not depend on the
+# compiler to RUN, only to prove it agrees with it before it ships. That is the
+# same arrangement `driver-pipeline`'s oracle uses.
+tensor-compiler = { path = "../tensor-compiler" }
+tensor-ir = { path = "../tensor-ir" }
+driver-abi = { path = "../driver-abi" }
 
 # The bridge generator: build.rs reads the SAME tables the tests read and
 # writes both halves of the flat ABI to OUT_DIR. Table-only (`native` off) —
@@ -187,6 +212,18 @@ required-features = ["_cuda"]
 
 [[test]]
 name = "gpu_vmm"
+required-features = ["_cuda"]
+
+[[test]]
+name = "gpu_ptir"
+required-features = ["_cuda"]
+
+[[test]]
+name = "gpu_ptir_emitted"
+required-features = ["_cuda"]
+
+[[test]]
+name = "gpu_ptir_fire"
 required-features = ["_cuda"]
 
 [[test]]

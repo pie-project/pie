@@ -1085,151 +1085,56 @@ fn every_lowered_symbol_has_an_arm() {
     // a GPU. Sorted, so the diff when one leaves is one line.
     #[rustfmt::skip]
     const UNARMED: &[&str] = &[
-        // ── MLA: the latent-cache attention (glm5, kimi_k2) ──────────
+        // ── What a ROW alone cannot reach ────────────────────────────
+        // The list shrank from 27 to 17 by annotating rows rather than
+        // writing arms, and the ten that left share one shape: every
+        // number they wanted was either an operand's own row width, the
+        // fire's rows, or a load-time value the STATEMENT could carry on
+        // the param channel.
+        //
+        // The constraint that decides which is which: a DIM is the plan's
+        // and not the binder's. An arg carries its row width and nothing
+        // about the shape behind it, so `OutDim`/`InDim` cannot bind and
+        // a row wanting a trailing extent has to be TOLD — which is what
+        // `record_with_params` is for. Every one of the ten took that
+        // route.
+        //
+        // These seventeen want something a row has no vocabulary for:
+        //
+        //   the KV/MLA CACHE VIEW — `MlaCacheLayerView` is the driver's
+        //   pool geometry, reached the way `KvKeys`/`KvValues` reach the
+        //   paged one, and there is no MLA equivalent yet;
+        //
+        //   RECURRENT SLABS — `state_base`, `slot_ids` and the slot
+        //   stride live in `GdnCtx`, which is why every GDN row is
+        //   hand-armed too;
+        //
+        //   POINTER ARRAYS — `build_moe_ptrs_aligned_bf16` fills six of
+        //   them, and an array of device addresses has no dtype in this
+        //   vocabulary;
+        //
+        //   HYPER-CONNECTION MIXES — the four `norm::hc_*` rows take
+        //   `scale` and `base` arrays the statement does not name, so the
+        //   declaration has to grow before the row can.
+        //
+        // A line leaves when its arm lands or its vocabulary arrives.
         "attn::attention_compressed_paged_bf16",
-        "attn::combine_attn_outputs_bf16",
+        "attn::dispatch_attention_flashinfer_prefill_custom",
         "attn::dispatch_attention_mla_bf16",
-        "attn::kimi_split_kv_a_norm_bf16",
-        "attn::kimi_split_q_b_bf16",
-        "attn::lse_log2_to_ln",
-        "attn::mla_prepare_bf16",
-        "attn::write_mla_to_pages",
-        "gemm::mla_absorb_latent_to_v_bf16",
-        "gemm::mla_absorb_q_to_latent_bf16",
-        "rope::rope_partial_last_bf16",
-        // ── deepseek_v4: the DSA indexer and hyper-connections ────────
         "attn::dsa_index_knorm_rope_bf16",
         "attn::dsa_index_q_rope_bf16",
-        "attn::dsa_index_topk_mask",
         "attn::dsv4_boundary_meta_decode",
         "attn::dsv4_compress_gather_paged_bf16",
         "attn::dsv4_store_comp_entries_bf16",
+        "attn::mla_prepare_bf16",
+        "attn::write_mla_to_pages",
+        "moe::build_moe_ptrs_aligned_bf16",
         "norm::hc_head_postprocess_bf16",
         "norm::hc_post_bf16",
         "norm::hc_pre_postprocess_bf16",
         "norm::hc_rmsnorm_to_f32",
-        // ── The PEEL PATH: symbols only a fire whose rows differ can
-        //    state, and the reason this list grew on 2026-08-10 without
-        //    anything regressing. Every other lowering in the corpus uses
-        //    plain rows, so a `GuardPred` no row satisfies removed its arm
-        //    before the kernel list existed — these were never in "every",
-        //    and so never in this closed set either.
-        //
-        //    A mixed-mask decode lowers 28 launches of the custom
-        //    dispatch, in the peel's TAIL region, which is also the only
-        //    place a WINDOWED rectangle (`rows.start != 0`) occurs — the
-        //    case §4's fourth decline-rule exists for. The `_devwin` split
-        //    is the tail's other half: the region asking for a different
-        //    kernel, not the driver choosing one.
-        //
-        //    Neither is served. A masked or hooked fire refuses with
-        //    NoArm today, which is the honest failure and not a silent
-        //    one — but it does mean `HasCustomMask` and `HasStageHooks`
-        //    are declared axes that no fire can currently take.
-        //    `attn::split_qkv_bf16_devwin` LEFT this list on 2026-08-10:
-        //    it has an arm now, and a peel window word
-        //    (`cuda::PeelWindowWord`) for it to read. The custom dispatch
-        //    is still unserved, and a hooked fire still cannot run — not
-        //    for want of this arm but because the tail's ATTENTION takes a
-        //    windowed rectangle and every arm binds base pointers plus a
-        //    count. See `bridge_smoke`'s ignored peel gate.
-        "attn::dispatch_attention_flashinfer_prefill_custom",
-        // ── The ATTENTION-SCORE axis (`WantsAttnScore`). `_capture` here
-        //    means capturing SCORES, not capturing a graph — the row takes
-        //    `score_out` and `score_indptr_d` on top of the ordinary
-        //    decode dispatch's operands, and `AttnCtx` carries neither.
-        //
-        //    It joined when the corpus gained a fire carrying every row
-        //    mark, alongside `attn::write_kv_explicit_bf16` (which LEFT
-        //    the same day: `AttnCtx` already had its three descriptor
-        //    arrays, so that arm was twenty lines nobody had written
-        //    because no fire in the corpus set the mark).
-        //
-        //    Both LEFT on 2026-08-10. `write_kv_explicit` needed twenty
-        //    lines because `AttnCtx` already had its descriptor arrays;
-        //    the score dispatch needed two new ctx fields and the same
-        //    plan/window selection its plain sibling makes.
-        //
-        //    Armed is not served, though, and the difference matters here:
-        //    scores are a FOLDED predicate (slot 3), so the exec that
-        //    records this arm must also serve a fire that WANTS scores.
-        //    That needs the buffers real and arena-stable at capture time
-        //    — `attn_score::DecodeScoreCapturePlan`, ported and unwired.
-        //    See `bridge_smoke`'s ignored union gate.
-        // ── kimi_k3: KDA, the per-key-channel delta rule ──────────────
-        //
-        // `ssm::bf16_to_fp32` left this list without an arm being
-        // written: its row stated its sources, so a branch generates.
-        // That is the shape every line here is meant to leave by.
-        "ssm::kda_gate_beta_bf16",
-        "ssm::kda_o_norm_gated_bf16",
+        "rope::rope_partial_last_bf16",
         "ssm::kda_recurrent_step_batched",
-        "ssm::l2norm_scale_bf16_to_fp32",
-        // ── The MIXTURE's aligned path: 6 symbols, one subsystem ─────
-        // These joined the moment the hybrid's derivation started
-        // reading `num_experts` off the config, which is exactly what a
-        // closed set is for — they lowered with nothing to execute them
-        // and this line is where that is recorded, not a GPU.
-        //
-        // All six are ROWED and all six BIND (`the_mixture` holds them
-        // to both claims), and they split two ways for two different
-        // reasons — which is worth knowing before anyone starts, because
-        // only one half is the plan's cheap "annotate rows first".
-        //
-        // THREE WERE IN-PLACE, and an in-place row never generates: the
-        // generated branch binds `Out(0)` and calls, so it has nowhere to
-        // stage the copy the aliasing needs (`emit_rust_dispatch` skips
-        // them deliberately — the qwen3_5 A/B caught what happens when it
-        // does not). Their sources are already stated, so staging was the
-        // whole difference, and TWO OF THE THREE HAVE LEFT THIS LIST:
-        // the routed combine and the shared expert's gated landing are
-        // armed. `moe_grouped_gemm_bf16` remains, because it is the one
-        // whose staging is not a `stage_d2d` — it accumulates across a
-        // grouped launch.
-        //
-        // TWO MORE HAVE LEFT since: the gather and the reorder now
-        // GENERATE, with no arm written for either. What they needed was
-        // not an annotation but a change to the STATEMENT — `top_k` on
-        // the param channel, the way `moe_align` already carries its
-        // three load-time numbers — because `num_routes` is the fire's
-        // tokens times k and no operand of either statement carries the
-        // router's width. `Source::RoutesOfParam` reads that product.
-        //
-        // `moe_grouped_gemm_bf16` has an arm now too, and writing it
-        // found the thing that reorders the rest of this work.
-        //
-        // The launcher opens `if (max_blocks <= 0 || !supported(M, N, K))
-        // return;` — it DECLINES by doing nothing. A3B's gate_up is
-        // exactly such a shape (`K = hidden = 2048`, and the kernel
-        // bounds `K <= 512` because past that cuBLAS wins), so an arm
-        // that merely called it would write nothing and the mixture would
-        // answer fluently out of an untouched buffer. The arm refuses
-        // with `ShapeDeclined` instead.
-        //
-        // Which means the two symbols were never independent. The C++
-        // path answers the same predicate with a batched cuBLAS over the
-        // pointer arrays `build_moe_ptrs_aligned_bf16` fills, so THAT is
-        // the keystone of the aligned path rather than its leftover, and
-        // it is what remains: twenty operands including six pointer
-        // ARRAYS it fills, against `Dim::MoeAlignedRoutes` — the one
-        // extent in the tree that is neither the fire's rows nor a
-        // load-time number.
-        //
-        // IT IS UNWRITTEN ON PURPOSE. No MoE checkpoint fits this
-        // machine — the L40S holds 46 GB, Qwen3.5-35B-A3B is 67 GB,
-        // Qwen3.6-27B is 52 GB, gpt-oss-20b is 39 GB and needs its own
-        // family besides — so no fire can reach the arm and no A/B could
-        // catch a mistake in it. `cuda.md` §5.D1 refuses exactly this
-        // trade for the MLA/DSA/KDA arms, and §4's record backs it: all
-        // four decline-rules this port has found came from a GPU failure,
-        // never from a compile error. Writing it here would be code whose
-        // only gate is that it compiles.
-        //
-        // Note this is the path the LIVE L40S facts take for BOTH
-        // classes: `moe_cutlass_max_rows = 0` sends decode down the
-        // aligned body too, so arming these opens the mixture outright
-        // rather than opening prefill only.
-        "moe::build_moe_ptrs_aligned_bf16",
     ];
 
     // Compared as SETS: the list above is grouped by subsystem because

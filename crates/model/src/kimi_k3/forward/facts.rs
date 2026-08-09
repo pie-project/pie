@@ -7,35 +7,13 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The MLA half. Same vocabulary [`crate::kimi`] and [`crate::glm5`] use.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KimiK3MlaFacts {
-    pub hidden: u32,
-    pub heads: u32,
-    pub q_lora_rank: u32,
-    pub kv_lora_rank: u32,
-    pub qk_nope_head_dim: u32,
-    pub qk_rope_head_dim: u32,
-    pub v_head_dim: u32,
-    /// `cfg.mla_output_gate`: a sigmoid gate multiplied onto the
-    /// attention output before `o_proj`, from its own projection.
-    pub output_gate: bool,
-}
+/// This family's MLA geometry IS the shared one — see
+/// [`model_compiler::facts::MlaFacts`]. Three families carried
+/// field-identical copies of it; the alias keeps every existing spelling
+/// working while there is only one definition to disagree with.
+pub type KimiK3MlaFacts = model_compiler::facts::MlaFacts;
 
-impl KimiK3MlaFacts {
-    pub fn qk_head_dim(&self) -> u32 {
-        self.qk_nope_head_dim + self.qk_rope_head_dim
-    }
-    pub fn q_b_width(&self) -> u32 {
-        self.heads * self.qk_head_dim()
-    }
-    pub fn kv_a_width(&self) -> u32 {
-        self.kv_lora_rank + self.qk_rope_head_dim
-    }
-    pub fn v_width(&self) -> u32 {
-        self.heads * self.v_head_dim
-    }
-}
+
 
 /// The KDA half — Kimi Delta Attention: a per-KEY-CHANNEL decay, which is
 /// what separates it from qwen3_5's GDN (a per-head scalar).
@@ -54,14 +32,12 @@ impl KimiK3KdaFacts {
     }
 }
 
-/// The MoE block. MXFP4 experts, so the decode leg is the MXFP4 GEMV.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KimiK3MoeFacts {
-    pub num_experts: u32,
-    pub top_k: u32,
-    pub moe_intermediate: u32,
-    pub shared_intermediate: u32,
-}
+/// This family's mixture IS the shared one — see
+/// [`model_compiler::facts::MoeFacts`]. Three families carried
+/// field-identical copies; the alias keeps every spelling working while
+/// there is one definition.
+pub type KimiK3MoeFacts = model_compiler::facts::MoeFacts;
+
 
 /// The whole family.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

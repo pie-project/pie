@@ -86,8 +86,7 @@ pub fn gemma2_cuda(facts: &Gemma2Facts, class: FireClass) -> ForwardPlan {
     );
     let a = facts.attn.clone();
     dsl::trace_named(&family, |t| {
-        dsl::seam(t, &dsl::seam::IN, &[], None);
-        let embedded = dsl::embed_with(t, "embed", facts.hidden);
+        let embedded = dsl::embedded_prologue(t, facts.hidden);
         // `sqrt(hidden)` on the embedding — a launch, not a fold.
         let mut y = dsl::cuda::scalar_mul(
             &embedded,
@@ -139,8 +138,7 @@ pub fn gemma2_cuda(facts: &Gemma2Facts, class: FireClass) -> ForwardPlan {
             // statement of its own.
             let o = dsl::cuda::attention_flashinfer_decode(&q, &kv, window_left)
                 .expect("a plain attention statement produces its value");
-            dsl::seam(o.trace(), &dsl::seam::ATTN_OUT, &[&o], Some(l));
-            let o = matmul(&o, &w.o_proj);
+            let o = dsl::attention_landing(&o, &w.o_proj, l);
             // The POST norm, then an explicit add — gemma's pair.
             let o = dsl::cuda::rmsnorm(&o, &w.post_attn_norm);
             y = dsl::cuda::residual_add(&y, &o, facts.hidden);
@@ -154,21 +152,13 @@ pub fn gemma2_cuda(facts: &Gemma2Facts, class: FireClass) -> ForwardPlan {
             y = dsl::cuda::residual_add(&y, &mlp, facts.hidden);
         }
 
-        let normed = dsl::cuda::rmsnorm(
+        dsl::logits_epilogue(
+            t,
             &y,
-            &NormW {
-                name: "final_norm".to_string(),
-                variant: NormVariant::Gemma,
-                per_head: None,
-                layer: None,
-            },
+            NormVariant::Gemma,
+            facts.tied_embeddings,
+            facts.vocab,
+            facts.final_logit_softcap,
         );
-        let logits = dsl::lm_head_tied(t, &normed, facts.tied_embeddings, facts.vocab);
-        let logits = if facts.final_logit_softcap {
-            dsl::cuda::logit_softcap(&logits, facts.vocab)
-        } else {
-            logits
-        };
-        dsl::seam(t, &dsl::seam::OUT, &[&logits], None);
     })
 }

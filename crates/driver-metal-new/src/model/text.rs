@@ -49,7 +49,24 @@ pub enum Unfamiliar {
 /// this is a list rather than a name. Every entry is a deployment the family's
 /// facts can describe.
 const LLAMA_LIKE: &[&str] = &[
-    "llama", "llama3", "llama4", "mistral", "phi3", "olmo2", "qwen2", "qwen3",
+    "llama",
+    "llama3",
+    "llama4",
+    "mistral",
+    "phi3",
+    "olmo2",
+    "qwen2",
+    "qwen3",
+    // The mixtures and the branch, which are FACTS of this text and not
+    // families beside it -- and which were missing here for exactly as long as
+    // nothing asked. A text that models an architecture but whose driver
+    // refuses its name serves it in principle and not at all in practice: the
+    // seam calls `plan_for` before anything else, so `gpt_oss` and `gemma4`
+    // could not reach the device through the generic path, only through the
+    // per-family layers this crate is retiring.
+    "qwen3_moe",
+    "gpt_oss",
+    "gemma4",
 ];
 
 /// Every architecture some text serves.
@@ -101,19 +118,27 @@ mod tests {
         assert!(serves("qwen3"));
         assert!(serves("llama3"));
         assert!(serves("mistral"));
+        // The three that are FACTS of the same text rather than families
+        // beside it: a mixture, a mixture with sinks and a clamped
+        // activation, and a side network with a branch. One text, nine
+        // architectures, no per-family arm anywhere below this line.
+        assert!(serves("qwen3_moe"));
+        assert!(serves("gpt_oss"));
+        assert!(serves("gemma4"));
     }
 
     #[test]
     fn an_architecture_with_no_text_says_so_and_says_what_is_known() {
-        // Three of four families are here today. A driver that guessed would
-        // run another model's program against these weights, which is fluent
-        // nonsense rather than a failure.
-        assert!(!serves("gemma4"));
+        // `qwen3_5` is the GDN family: it interleaves linear attention with
+        // full attention, which no Metal text models. A driver that guessed
+        // would run another model's program against these weights, which is
+        // fluent nonsense rather than a failure.
+        assert!(!serves("qwen3_5"));
         let facts = model::families::llama_like::forward::facts::LlamaLikeFacts::qwen3_0_6b();
         let metal = model::families::llama_like::forward::facts::LlamaLikeMetalFacts::synthetic();
-        match plan_for("gemma4", FireClass::Decode, &facts, &metal) {
+        match plan_for("qwen3_5", FireClass::Decode, &facts, &metal) {
             Err(Unfamiliar::NoText { arch, known }) => {
-                assert_eq!(arch, "gemma4");
+                assert_eq!(arch, "qwen3_5");
                 assert!(known.contains(&"qwen3"), "and what IS served: {known:?}");
             }
             Ok(_) => panic!("gemma4 has no metal text yet"),
@@ -193,7 +218,14 @@ pub fn facts_from(
         // Asked of the TENSORS, like the other binding facts: a router weight
         // in the checkpoint is a mixture and its absence is a dense FFN. The
         // counts come from the geometry, which the fire already states.
-        n_experts: if has_tensor("layers.0.mlp.gate.weight") {
+        // Every router spelling, because a mixture that answers to one the
+        // probe does not know is read as a DENSE model: the text then states
+        // `mlp.gate_proj` against a checkpoint that publishes only expert
+        // banks, and every FFN name misses. gpt-oss spells it `mlp.router`.
+        n_experts: if ["layers.0.mlp.gate.weight", "layers.0.mlp.router.weight"]
+            .into_iter()
+            .any(&has_tensor)
+        {
             geometry.n_experts
         } else {
             0

@@ -131,6 +131,21 @@ pub enum Error {
     },
 }
 
+/// The channel plane's one failure, adopted rather than translated.
+///
+/// [`driver_pipeline`] carries a `Program` variant of its own — it is the only
+/// thing that layer can fail at — and this shell's is the same fact. The
+/// conversion exists so a `?` on a `pipeline::` result lands here without a
+/// match at every call site, which is what makes the extraction of
+/// `src/pipeline/` into its own crate invisible to the code that calls it.
+impl From<driver_pipeline::Error> for Error {
+    fn from(error: driver_pipeline::Error) -> Self {
+        match error {
+            driver_pipeline::Error::Program { message } => Self::Program { message },
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

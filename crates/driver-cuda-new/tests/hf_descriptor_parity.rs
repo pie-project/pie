@@ -32,9 +32,15 @@ const GOLDEN_ROWS: usize = 9608;
 
 const SEP: char = '\u{1f}';
 
+/// The corpus MOVED here when `crates/driver-cuda` was deleted.
+///
+/// It is the oracle this port was checked against — 58 real `config.json`
+/// files and a transcript of what the C++ parse made of each — and it
+/// outlives the C++ tree on purpose. The C++ dumper that produced the
+/// transcript is beside it, unbuilt: what is being kept is the ANSWER,
+/// and a recorded answer does not need its producer to still compile.
 fn corpus_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../driver-cuda/csrc/tests/hf_config_dump/corpus")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/hf_config_dump/corpus")
 }
 
 /// The corpus, in the oracle's (byte-lexicographic glob) order.

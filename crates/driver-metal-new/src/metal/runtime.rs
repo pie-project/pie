@@ -70,9 +70,9 @@ use super::program::{
     StageExecutable,
 };
 use crate::pipeline::{
-    Bounded, CacheStats, Emitted, ExecPlan, Failure, Lookup, MAX_CHANNELS, MAX_NEGATIVE_ENTRIES,
-    MAX_PROGRAM_ENTRIES, MAX_STAGE_ENTRIES, Slot, Stages, Versions, cache_identity,
-    channel_effects, combined_signature, op_metadata, port_consumes,
+    Backend, Bounded, CacheStats, Emitted, ExecPlan, Failure, Lookup, MAX_CHANNELS,
+    MAX_NEGATIVE_ENTRIES, MAX_PROGRAM_ENTRIES, MAX_STAGE_ENTRIES, Slot, Stages, Versions,
+    cache_identity, channel_effects, combined_signature, op_metadata, port_consumes,
 };
 use crate::shader;
 use crate::{Error, Result};
@@ -472,8 +472,12 @@ impl Runtime {
         let mut in_flight: HashMap<u64, (usize, u64)> = HashMap::new();
 
         for (index, stage_plan) in plans.iter().enumerate() {
-            let identity_string =
-                cache_identity(context.cache_id(), stage_plan.signature_hash, versions);
+            let identity_string = cache_identity(
+                Backend::Metal,
+                context.cache_id(),
+                stage_plan.signature_hash,
+                versions,
+            );
             let key = fnv1a64(identity_string.as_bytes());
             if let Some(&(piece, identity)) = in_flight.get(&key) {
                 if identity == stage_plan.identity {
@@ -803,8 +807,12 @@ impl Runtime {
 
         // One batch, one archive, keyed by everything that makes the text
         // what it is: device, the program's combined signature, versions.
-        let program_identity =
-            cache_identity(context.cache_id(), combined_signature(plans), versions);
+        let program_identity = cache_identity(
+            Backend::Metal,
+            context.cache_id(),
+            combined_signature(plans),
+            versions,
+        );
         let compiler =
             Compiler::with_archives(context, self.archives.clone()).map_err(|error| {
                 Failure::Retryable {
