@@ -191,3 +191,32 @@ fn import_streams_a_fully_decoded_model_without_a_spool() {
     let verified = verify_checkpoint(&artifact).expect("digests verify");
     assert_eq!(verified as usize, parsed.tensors.len());
 }
+
+#[test]
+fn import_refuses_a_tensor_larger_than_the_reorder_ceiling() {
+    let staging = tempfile::tempdir().expect("staging");
+    write_snapshot(staging.path(), "F32");
+    let store = tempfile::tempdir().expect("store");
+    let artifact = store.path().join("must-not-exist.zt");
+
+    let result = pie_bin::ops::model::import::run(pie_bin::ops::model::import::ImportArgs {
+        source: staging.path().to_string_lossy().into_owned(),
+        out: Some(artifact.clone()),
+        dry_run: false,
+        force: false,
+        max_shard_size: None,
+        reorder_buffer: 1024,
+        integrity_report: None,
+        delete_source: false,
+    });
+    let error = match result {
+        Ok(_) => panic!("an undersized reorder ceiling must fail"),
+        Err(error) => error,
+    };
+
+    assert!(
+        format!("{error:#}").contains("above the 1024-byte reorder ceiling"),
+        "unexpected error: {error:#}"
+    );
+    assert!(!artifact.exists(), "a rejected import published an artifact");
+}
