@@ -61,6 +61,98 @@ pub trait Resolver {
     /// The region a backend-named value lives in — the values a seam exposes,
     /// the ones `Buffers::NAMED` marks.
     fn named(&mut self, value: ValueId) -> Option<Slice>;
+
+    /// A layer's KV pages: its keys when `values` is clear, its values when
+    /// set.
+    ///
+    /// The third question, and it is a different KIND from the other two. A
+    /// weight and a named value are both things the TRACE mentions. The KV
+    /// cache is not: a statement names it as STATE
+    /// (`StateRef { store: KvCache, layer }`) because the cache outlives the
+    /// fire and no traced value stands for it. So a kernel that reads or
+    /// writes it has a pointer that cannot come from the statement's args, and
+    /// every backend has answered that with a hand-written arm.
+    ///
+    /// [`Source::KvKeys`] and [`Source::KvValues`] let a row ask instead, and
+    /// this is where the asking lands.
+    ///
+    /// Defaulted to `None` so a resolver with no pool — the binder's tests,
+    /// the name-map checks — needs no answer for a question it never faces. A
+    /// statement that asks and gets `None` binds a region addressing nothing,
+    /// which is the same honest answer a missing scale gets.
+    ///
+    /// [`Source::KvKeys`]: kernels::Source::KvKeys
+    /// [`Source::KvValues`]: kernels::Source::KvValues
+    fn kv(&mut self, _layer: u16, _values: bool) -> Option<Slice> {
+        None
+    }
+
+    /// One of the FIRE's own tables.
+    ///
+    /// The token ids a gather reads, the positions a rope reads, the page CSR
+    /// an attention walks. A text cannot state these — they are this fire's
+    /// data, not this model's structure — so the ROW names which table a slot
+    /// wants and this answers.
+    ///
+    /// That division is the point rather than a convenience. A kernel wanting
+    /// the positions and a driver that KNEW to bind them is the hand-written
+    /// arm this crate exists to remove; a row that names the table is the same
+    /// fact, stated once, where a reader looks.
+    ///
+    /// Defaulted to `None` for the same reason [`Resolver::kv`] is: a
+    /// resolver with no fire has no answer to a question it never faces.
+    fn fire(&mut self, _table: FireTable) -> Option<Slice> {
+        None
+    }
+
+    /// One of the pool's geometry numbers, as a value.
+    ///
+    /// A stride is `max_ctx * head_dim` for the pool the DRIVER allocated, so
+    /// no text can state it. Answered here beside the pages themselves, and
+    /// returned as a number rather than an address because it rides the
+    /// scalar channel: the row names it `Param`-like and the encoder stages it
+    /// with the statement's own.
+    ///
+    /// `None` for a resolver with no pool, and a slot it does not fill is a
+    /// slot the kernel reads as zero — which for a stride means every head
+    /// reads the first.
+    fn pool(&mut self, _which: FireTable) -> Option<u32> {
+        None
+    }
+}
+
+/// Which of the fire's tables a slot wants.
+///
+/// Mirrors the `kernels::Source` variants that name one, so the driver never
+/// matches on the table's meaning — it forwards a name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FireTable {
+    /// The tokens this fire runs.
+    TokenIds,
+    /// Each token's absolute position.
+    Positions,
+    /// Which request owns each token.
+    RequestOfToken,
+    /// The KV page translation.
+    KvPageIndices,
+    /// Its per-request CSR.
+    KvPageIndptr,
+    /// The custom attention mask.
+    AttentionMask,
+    /// The per-lane byte saying whether the mask applies.
+    AttentionMaskEnabled,
+    /// Elements between one KV head's pages and the next.
+    KvHeadStride,
+    /// Elements between one token and the next within a head.
+    KvSeqStride,
+    /// Token rows per page.
+    KvPageSize,
+    /// Per token: the physical page its KV row is written into.
+    KvWritePage,
+    /// Per token: the row within that page.
+    KvWriteOffset,
+    /// The rotary inverse frequencies, `[rotary_dims/2]` f32.
+    RopeFrequencies,
 }
 
 /// Where an operand is: a device address and the bytes it may address.
@@ -138,7 +230,7 @@ pub fn resolve_arg<S: Resolver>(
     resolver: &mut S,
 ) -> Result<BoundArg, BindRefusal> {
     Ok(match arg {
-        Arg::Arena { at, width } => {
+        Arg::Arena { at, width, .. } => {
             let at64 = *at as u64;
             let bytes = frame.arena.bytes;
             // The row is `width` elements from `at`; the arena must hold the
@@ -252,7 +344,7 @@ mod tests {
     fn an_arena_operand_addresses_its_offset_and_reports_what_is_left() {
         let frame = arena(4096);
         let mut store = Store::default();
-        let bound = resolve_arg(&Arg::Arena { at: 256, width: 64 }, frame, &mut store)
+        let bound = resolve_arg(&Arg::Arena { at: 256, width: 64, bytes: 2 }, frame, &mut store)
             .expect("inside the arena");
         assert_eq!(bound.slice.address, 0x1_0000 + 256);
         assert_eq!(bound.slice.bytes, 4096 - 256, "what it may still address");
@@ -267,7 +359,7 @@ mod tests {
         let frame = arena(1024);
         let mut store = Store::default();
         assert_eq!(
-            resolve_arg(&Arg::Arena { at: 4096, width: 8 }, frame, &mut store),
+            resolve_arg(&Arg::Arena { at: 4096, width: 8, bytes: 2 }, frame, &mut store),
             Err(BindRefusal::ArenaOutOfBounds {
                 at: 4096,
                 width: 8,

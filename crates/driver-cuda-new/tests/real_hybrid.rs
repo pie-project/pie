@@ -50,7 +50,7 @@ use driver_cuda_new::dtype::DType;
 use driver_cuda_new::launch::{KvCacheLayerView, KvCacheScheme};
 use driver_cuda_new::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
 use driver_cuda_new::model::executor::{
-    AttnCtx, DispatchCtx, DispatchPlan, Frame, GdnCtx, PrefillPlan, Resolver, run,
+    AttnCtx, AttnRegions, DispatchCtx, DispatchPlan, Frame, GdnCtx, PrefillPlan, Resolver, run,
 };
 use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
 use model::qwen_3_5::forward::qwen3_5_hybrid_cuda;
@@ -428,6 +428,8 @@ fn the_hybrid_matches_transformers_on_real_weights() {
         prefill_plan: pplan.as_ptr(),
         workspace: ws.view(),
         layers,
+        score_out: core::ptr::null_mut(),
+        score_indptr_d: core::ptr::null(),
         q_out: named_bufs[&q_pin_value].as_ptr(),
         o_out,
         kv_page_indices_d: csr_indices.as_ptr().cast(),
@@ -498,7 +500,7 @@ fn the_hybrid_matches_transformers_on_real_weights() {
     }
 
     let mut resolver = Live { weights: &weights, named: &named_bufs };
-    let ran = run(&l, &dplan, frame, &mut resolver, &ctx, Some(&attn), Some(&gdn))
+    let ran = run(&l, &dplan, frame, &mut resolver, &ctx, AttnRegions::whole(Some(&attn)), Some(&gdn))
         .unwrap_or_else(|e| panic!("the hybrid A/B walk refused: {e:?}"));
     assert_eq!(ran, l.launches.len());
     stream.as_ref().synchronize().expect("the fire retires");

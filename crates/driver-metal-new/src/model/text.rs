@@ -190,6 +190,22 @@ pub fn facts_from(
         fused_qkv: has_tensor("layers.0.self_attn.qkv_proj.weight"),
         tied_embeddings: geometry.tied_embeddings,
         qkv_bias: has_tensor("layers.0.self_attn.q_proj.bias"),
+        // Asked of the TENSORS, like the other binding facts: a router weight
+        // in the checkpoint is a mixture and its absence is a dense FFN. The
+        // counts come from the geometry, which the fire already states.
+        n_experts: if has_tensor("layers.0.mlp.gate.weight") {
+            geometry.n_experts
+        } else {
+            0
+        },
+        experts_per_token: geometry.experts_per_token,
+        moe_intermediate: geometry.moe_intermediate,
+        // A shared expert is its own tensor, and qwen3-moe has none.
+        shared_intermediate: if has_tensor("layers.0.mlp.shared_expert.up_proj.weight") {
+            geometry.moe_intermediate
+        } else {
+            0
+        },
     };
     let metal = LlamaLikeMetalFacts {
         fuse_residual_gemv: true,
@@ -214,6 +230,22 @@ pub fn facts_from(
         // `Projections::InPlace` and the join declines under it -- but asking
         // is what makes that a finding rather than an assumption.
         gate_up_fused: has_tensor("layers.0.mlp.gate_up_proj.fused.weight"),
+        // The checkpoint's own `rms_norm_eps`. A norm handed zero divides by
+        // the root of the mean square alone, which for a near-zero row is an
+        // infinity the next kernel spreads everywhere.
+        rms_eps: geometry.eps,
+        // The checkpoint's own rotary base.
+        rope_theta: geometry.rope_theta,
+        // Whether the ladder is RESCALED, in which case no base expresses it
+        // and the driver hands over a table instead.
+        rope_freq_table: geometry.rope_freq_factor > 0.0,
+        // Empty is every layer attending the whole context, which is what a
+        // llama-like deployment does. `DecodeGeometry` carries no window at
+        // all, so this is the honest answer and not a default: the families
+        // that alternate (gemma4, gpt-oss) will need the geometry to state one
+        // before their texts can, and stating it here from nothing would make
+        // that a silent wrong answer instead of a missing one.
+        window_left: Vec::new(),
     };
     (facts, metal)
 }

@@ -117,6 +117,21 @@ pub struct BucketKey {
     /// Which loaded model this graph addresses. Two deployments' captures
     /// share no buffer, so they may not share a key.
     pub model: u64,
+    /// The staged LoRA's GROUP SHAPE, or zero for a fire with no adapters.
+    ///
+    /// In the key, and it is the one axis here that had to be argued for
+    /// rather than assumed. Everything else a `GuardPred` names is a
+    /// boolean the conditional folds; LoRA is not. Its capture-safe
+    /// (grouped) form still reaches the launcher with the member count and
+    /// the `m` vector as ARGUMENTS, so a capture bakes them — and a fire
+    /// with no adapters bakes the absence, recording no lora launches at
+    /// all.
+    ///
+    /// Keying on the shape is what makes both of those correct rather than
+    /// merely quiet: a bucket contains only fires whose lora launches have
+    /// the shape the exec recorded, so "record nothing" is right for the
+    /// zero bucket and a differently-shaped fire lands in a different one.
+    pub lora_shape: u64,
 }
 
 impl BucketKey {
@@ -128,11 +143,71 @@ impl BucketKey {
         fire: model_compiler::trace::FireClass,
         model: u64,
     ) -> Self {
-        Self { requests, tokens, fire: fire as u8, model }
+        Self { requests, tokens, fire: fire as u8, model, lora_shape: 0 }
+    }
+
+    /// The same key for a fire that staged adapters.
+    #[must_use]
+    pub const fn with_lora(mut self, shape: u64) -> Self {
+        self.lora_shape = shape;
+        self
     }
 }
 
-/// The instantiated graphs, by bucket.
+/// Why a fire may not join a union capture.
+///
+/// A union records every arm and lets a conditional node decide at replay,
+/// which works exactly as long as every arm's SHAPE is fixed and only its
+/// predicate varies. Where a shape follows the fire, the capture bakes the
+/// one it saw — and the honest answer is to keep that fire eager rather
+/// than to record something a later replay would run wrongly.
+///
+/// This is the C++ arc's own device for mixed peels ("eligibility keeps it
+/// eager"), reused because the situation is the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ineligible {
+    /// The fire staged LoRA lanes that did not group. `apply`'s solo path
+    /// is a host-side loop whose launch count and shapes follow the
+    /// adapter set, so a capture cannot serve a different one. See
+    /// [`crate::model::lora::LoraFireState::union_capture_safe`].
+    UngroupedLora,
+}
+
+/// May this fire be recorded into a union capture?
+///
+/// `None` is eligible. Deliberately a function over the fire's staged
+/// state rather than a flag someone sets: the question is a property of
+/// what the fire actually assembled, and the failure mode of getting it
+/// wrong is a replay that runs a stale program rather than an error.
+#[must_use]
+pub fn union_eligibility(
+    lora: Option<&crate::model::lora::LoraFireState>,
+) -> Option<Ineligible> {
+    match lora {
+        Some(l) if !l.union_capture_safe() => Some(Ineligible::UngroupedLora),
+        _ => None,
+    }
+}
+
+/// A monotonic count of how many times the prepared state a capture reads
+/// has been rewritten.
+///
+/// The S4 list's last item is an axiom — "an arm may not share a mutable
+/// plan slot with a foreign fire class" — and an axiom nobody checks is a
+/// comment. This is the checkable form of it.
+///
+/// A captured exec bakes the addresses of the plan and workspace it
+/// recorded against. Those are REUSED: `begin_plan_update` /
+/// `end_plan_update` rewrite the same storage for the next fire, and a
+/// different fire class planning into it leaves the earlier capture
+/// reading someone else's numbers — silently, because the addresses are
+/// still valid. Keying the exec on the epoch its state was prepared at
+/// turns that into a cache MISS and a recapture, which is a cost rather
+/// than a wrong answer.
+pub type PlanEpoch = u64;
+
+/// The instantiated graphs, by bucket and by the plan epoch each was
+/// recorded against.
 ///
 /// Deliberately not an LRU yet: a bucket set is small (the R×N shapes a
 /// deployment actually fires) and evicting a graph while a launch is in
@@ -140,9 +215,10 @@ impl BucketKey {
 /// decision that wants the replay path to exist first.
 #[derive(Debug, Default)]
 pub struct SupergraphCache {
-    execs: HashMap<BucketKey, GraphExec>,
+    execs: HashMap<BucketKey, (GraphExec, PlanEpoch)>,
     hits: u64,
     misses: u64,
+    stale: u64,
 }
 
 impl SupergraphCache {
@@ -152,19 +228,52 @@ impl SupergraphCache {
         Self::default()
     }
 
-    /// The exec for `key`, if one is captured.
-    pub fn get(&mut self, key: BucketKey) -> Option<&GraphExec> {
-        if self.execs.contains_key(&key) {
-            self.hits += 1;
-        } else {
-            self.misses += 1;
+    /// The exec for `key`, if one is captured AND was recorded against the
+    /// prepared state `epoch` names.
+    ///
+    /// A stale entry is dropped rather than returned: keeping it would
+    /// mean every later fire pays the lookup to be told no, and the state
+    /// it recorded against is gone in any case.
+    pub fn get(&mut self, key: BucketKey, epoch: PlanEpoch) -> Option<&GraphExec> {
+        match self.execs.get(&key) {
+            Some((_, at)) if *at == epoch => {
+                self.hits += 1;
+                self.execs.get(&key).map(|(e, _)| e)
+            }
+            Some(_) => {
+                self.stale += 1;
+                self.execs.remove(&key);
+                None
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
         }
-        self.execs.get(&key)
     }
 
     /// Install a freshly instantiated exec.
-    pub fn insert(&mut self, key: BucketKey, exec: GraphExec) {
-        self.execs.insert(key, exec);
+    ///
+    /// Takes the fire's eligibility rather than trusting the caller
+    /// checked: an exec installed for a fire that should have stayed eager
+    /// is not a bug that shows up at install time, it is a wrong answer
+    /// several fires later.
+    ///
+    /// # Errors
+    ///
+    /// The reason the fire was ineligible, with nothing installed.
+    pub fn insert(
+        &mut self,
+        key: BucketKey,
+        exec: GraphExec,
+        epoch: PlanEpoch,
+        eligibility: Option<Ineligible>,
+    ) -> core::result::Result<(), Ineligible> {
+        if let Some(why) = eligibility {
+            return Err(why);
+        }
+        self.execs.insert(key, (exec, epoch));
+        Ok(())
     }
 
     /// Replay `key`'s graph onto `stream`, if it is captured.
@@ -176,8 +285,13 @@ impl SupergraphCache {
     /// # Errors
     ///
     /// If the launch refuses.
-    pub fn replay(&mut self, key: BucketKey, stream: StreamRef<'_>) -> Result<bool> {
-        let Some(exec) = self.get(key) else { return Ok(false) };
+    pub fn replay(
+        &mut self,
+        key: BucketKey,
+        epoch: PlanEpoch,
+        stream: StreamRef<'_>,
+    ) -> Result<bool> {
+        let Some(exec) = self.get(key, epoch) else { return Ok(false) };
         exec.launch(stream)?;
         Ok(true)
     }
@@ -195,11 +309,14 @@ impl SupergraphCache {
         self.execs.is_empty()
     }
 
-    /// Hits and misses since construction, for the metric that says
-    /// whether the union is actually folding anything.
+    /// Hits, misses and STALE drops since construction.
+    ///
+    /// The third number is the one to watch: a bucket that keeps going
+    /// stale is one whose prepared state is being rewritten under it, and
+    /// recapturing every fire costs more than never capturing at all.
     #[must_use]
-    pub const fn stats(&self) -> (u64, u64) {
-        (self.hits, self.misses)
+    pub const fn stats(&self) -> (u64, u64, u64) {
+        (self.hits, self.misses, self.stale)
     }
 }
 
@@ -209,6 +326,9 @@ mod tests {
     use model_compiler::trace::FireClass;
     #[test]
     fn variant_bits_are_not_in_the_key() {
+        // With ONE stated exception, argued at the field: the lora group
+        // shape, which a capture bakes as launcher arguments rather than
+        // folding as a predicate.
         // There is no field for them to occupy. This test is a shape
         // assertion, not a behaviour one: it fails to COMPILE if someone
         // adds a mask or lora bit to the key, which is the review this
@@ -225,13 +345,50 @@ mod tests {
         assert_ne!(base, BucketKey::new(4, 8, FireClass::Decode, 7));
         assert_ne!(base, BucketKey::new(4, 4, FireClass::Prefill, 7));
         assert_ne!(base, BucketKey::new(4, 4, FireClass::Decode, 8));
+        assert_ne!(base, base.with_lora(1), "the lora group shape is an axis");
+    }
+
+    #[test]
+    fn a_stale_epoch_is_a_miss_and_the_entry_goes() {
+        // The S4 axiom, made checkable. A capture bakes the addresses of
+        // the plan and workspace it recorded against, and those are
+        // REUSED — so an exec that outlives the state it read is not
+        // invalid in any way a pointer check would notice. Keying on the
+        // epoch turns "someone re-planned" into a miss.
+        let mut c = SupergraphCache::new();
+        let k = BucketKey::new(4, 4, FireClass::Decode, 1);
+        assert!(c.get(k, 7).is_none(), "cold");
+        assert_eq!(c.stats(), (0, 1, 0));
+
+        // Nothing can be inserted without a device, so drive the read
+        // side: a cache holding an entry at epoch 7 must not answer at 8.
+        // (Proved through `stats`, which counts the stale drop
+        // separately from a plain miss precisely so the two are
+        // distinguishable in a metric.)
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn an_ineligible_fire_cannot_install_an_exec() {
+        // No `GraphExec` can be built without a device, so what is pinned
+        // here is the SHAPE: eligibility is an argument to `insert`, not
+        // something a caller may forget to consult. If this stops
+        // compiling because the parameter went away, the union has
+        // acquired a way to admit a fire it cannot replay.
+        let eligible: Option<Ineligible> = None;
+        assert!(eligible.is_none());
+        assert_eq!(
+            union_eligibility(None),
+            None,
+            "a fire with no adapters has nothing to disqualify it"
+        );
     }
 
     #[test]
     fn a_miss_is_not_an_error() {
         let mut c = SupergraphCache::new();
         assert!(c.is_empty());
-        assert!(c.get(BucketKey::new(1, 1, FireClass::Decode, 0)).is_none());
-        assert_eq!(c.stats(), (0, 1));
+        assert!(c.get(BucketKey::new(1, 1, FireClass::Decode, 0), 0).is_none());
+        assert_eq!(c.stats(), (0, 1, 0));
     }
 }

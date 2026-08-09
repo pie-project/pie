@@ -88,6 +88,25 @@ pub struct DecodeGeometry {
     pub rotary_dims: u32,
     /// The rope base.
     pub rope_theta: f32,
+    /// The rope RESCALING, when the config states one, or zero for a plain
+    /// geometric ladder.
+    ///
+    /// Four numbers rather than a kind string because they are what the
+    /// derivation needs and a `DecodeGeometry` is compared field for field. A
+    /// factor of zero is "no rescaling" and the other three are then unread.
+    ///
+    /// llama-3 rescales piecewise: frequencies whose wavelength exceeds
+    /// `original_max / low` are divided by the factor, those under
+    /// `original_max / high` are left alone, and the band between is
+    /// interpolated. No `rope_theta` expresses that, which is why the driver
+    /// derives a TABLE and answers it as `Source::RopeFrequencies`.
+    pub rope_freq_factor: f32,
+    /// See [`Self::rope_freq_factor`].
+    pub rope_low_freq_factor: f32,
+    /// See [`Self::rope_freq_factor`].
+    pub rope_high_freq_factor: f32,
+    /// See [`Self::rope_freq_factor`].
+    pub rope_original_max_position: u32,
     /// The multimodal rope section split.
     pub mrope_section: [u32; 3],
     /// GDN key heads.
@@ -162,6 +181,10 @@ impl Default for DecodeGeometry {
             alt_quant: AffineFormat { bits: 0, group: 0 },
             rotary_dims: 64,
             rope_theta: 1e7,
+            rope_freq_factor: 0.0,
+            rope_low_freq_factor: 0.0,
+            rope_high_freq_factor: 0.0,
+            rope_original_max_position: 0,
             mrope_section: [11, 11, 10],
             gdn_k_heads: 16,
             gdn_v_heads: 16,

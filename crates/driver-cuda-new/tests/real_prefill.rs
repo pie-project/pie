@@ -23,7 +23,7 @@ use driver_cuda_new::dtype::DType;
 use driver_cuda_new::launch::{KvCacheLayerView, KvCacheScheme};
 use driver_cuda_new::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
 use driver_cuda_new::model::executor::{
-    AttnCtx, DispatchCtx, DispatchPlan, Frame, MapResolver, PrefillPlan, run,
+    AttnCtx, AttnRegions, DispatchCtx, DispatchPlan, Frame, MapResolver, PrefillPlan, run,
 };
 use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
 use model::families::llama_like::forward::llama_like_cuda;
@@ -302,6 +302,8 @@ fn ab(spec: &Spec) {
         workspace: ws.view(),
         layers,
         q_out: core::ptr::null_mut(),
+        score_out: core::ptr::null_mut(),
+        score_indptr_d: core::ptr::null(),
         o_out: unsafe { arena.as_ptr().cast::<u8>().add(o_off) }.cast(),
         kv_page_indices_d: csr_indices.as_ptr().cast(),
         kv_page_indptr_d: csr_indptr.as_ptr().cast(),
@@ -370,7 +372,7 @@ fn ab(spec: &Spec) {
         }
     }
 
-    let ran = run(&l, &dplan, frame, &mut resolver, &ctx, Some(&attn), None)
+    let ran = run(&l, &dplan, frame, &mut resolver, &ctx, AttnRegions::whole(Some(&attn)), None)
         .unwrap_or_else(|e| panic!("the walk refused: {e:?}"));
     assert_eq!(ran, l.launches.len());
     stream.as_ref().synchronize().expect("the fire retires");

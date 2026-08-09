@@ -687,7 +687,7 @@ pub fn lower(
             .iter()
             .map(|a| {
                 let (kind, value, width) = match a {
-                    Arg::Arena { at, width } => {
+                    Arg::Arena { at, width, .. } => {
                         (PieForwardArgKind::Arena, *at as u32, *width)
                     }
                     Arg::Named { value, width } => {

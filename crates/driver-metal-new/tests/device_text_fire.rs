@@ -3,7 +3,7 @@
 //! This is the north star's fourth property with the checkpoint taken out: a
 //! sealed frame's step becomes rows, the rows become rectangles, the
 //! rectangles become grids, the grids become a command buffer, and the command
-//! buffer runs. Every one of the 367 launches of `llama_like`'s Metal text
+//! buffer runs. Every one of the 423 launches of `llama_like`'s Metal text
 //! reaches the device, and nothing in the driver names a family, a kernel or a
 //! model on the way.
 //!
@@ -11,17 +11,14 @@
 //! reasons, of which only the first is obvious:
 //!
 //! 1. the weights are sentinels, not a checkpoint;
-//! 2. **not one of the 367 launches binds its operands where its kernel reads
-//!    them.** Two measurements say so, and the second is the worse one:
-//!    nine statements bind FEWER buffers than their kernel declares
-//!    (`sdpa_paged_decode` states two and takes seventeen), and nine — every
-//!    statement whose shader could be found — bind them in the wrong ORDER.
-//!    `affine_qmv_fast` declares `w, scales, biases, x, y`; the trace states
-//!    `x, y, w, scales, zeros`. The activation goes where the packed weight
-//!    belongs.
+//! 2. the text still does not state everything its kernels read. Every row
+//!    it names states its operands now — `tests/text_conformance.rs` holds
+//!    that at zero — so no launch is bound positionally any more. What the
+//!    rows still carry as `Unbound` is the gap: the gathers' token ids and
+//!    the paged attention's six fire tables are values no statement supplies.
 //!
-//!    It completes because Metal does not validate a binding. The answer is
-//!    whatever the arena held.
+//!    A slot nobody bound is read anyway, and Metal does not validate a
+//!    binding, so the answer is whatever the arena held.
 //!
 //! `tests/text_conformance.rs` measures the second and pins the number so it
 //! can only shrink. That number is the honest distance between this file and
@@ -62,6 +59,19 @@ fn kernels_dir() -> PathBuf {
 /// that says nothing about the executor.
 struct Sentinels {
     slice: Slice,
+    /// A ZEROED region for the fire's tables, and the zeros are the point.
+    ///
+    /// The kernels used to be handed zero extents — no statement carried a
+    /// scalar — so every one of them no-opped and "the whole text fires" was
+    /// true for a reason that flattered it. Now they carry real extents and do
+    /// real work, and a paged attention handed a GARBAGE page CSR walks pages
+    /// until the GPU is abandoned. Measured: this test hung for sixty seconds
+    /// on exactly that.
+    ///
+    /// Zeros make the CSR say "no pages", which is a fire that computes
+    /// nothing and returns — the honest sentinel for a test about whether the
+    /// path executes.
+    tables: Slice,
     asked: HashMap<String, usize>,
 }
 
@@ -73,6 +83,42 @@ impl Resolver for Sentinels {
     fn named(&mut self, _: ValueId) -> Option<Slice> {
         Some(self.slice)
     }
+    fn kv(&mut self, _: u16, _: bool) -> Option<Slice> {
+        Some(self.slice)
+    }
+    fn fire(&mut self, _: driver_metal_new::model::executor::FireTable) -> Option<Slice> {
+        Some(self.tables)
+    }
+
+    /// A pool shaped like something rather than like nothing.
+    ///
+    /// `page_size = 0` is what hung this test for sixty seconds: the paged
+    /// attention divides by it, and the zeroed page CSR that makes the scan
+    /// terminate does not save a kernel that never gets to the scan.
+    fn pool(&mut self, which: driver_metal_new::model::executor::FireTable) -> Option<u32> {
+        use driver_metal_new::model::executor::FireTable as F;
+        Some(match which {
+            F::KvHeadStride => 128,
+            F::KvSeqStride => 128 * 8,
+            F::KvPageSize => 16,
+            _ => return None,
+        })
+    }
+}
+
+/// A region of zeros for the fire's tables.
+///
+/// Explicitly zeroed rather than trusted to be: a fresh Metal buffer is
+/// usually zero and nothing promises it, and what the zeros buy here is a page
+/// CSR that says "no pages". A garbage one walks pages until the GPU is
+/// abandoned, which is how this test first found out its kernels had started
+/// doing real work.
+fn zeroed(context: &Context) -> driver_metal_new::metal::Handle {
+    use driver_metal_new::region::Region as _;
+    let h = allocate(context, 1 << 20, "zeroed fire tables").expect("a table region");
+    // SAFETY: freshly allocated, nothing encoded against it yet.
+    unsafe { h.zero(0, 1 << 20).expect("it zeroes") };
+    h
 }
 
 fn geometry() -> Geometry {
@@ -84,6 +130,97 @@ fn geometry() -> Geometry {
         n_experts: 0,
         experts_per_token: 0,
     }
+}
+
+/// The MIXTURE reaches the device, through the same executor.
+///
+/// The point is what is NOT here. There is no mixture-aware code anywhere
+/// between this text and the GPU: the router, the sort, the gather, the routed
+/// matmuls and the combine walk `dispatch::plan_one` exactly as a projection
+/// does, and `LaunchRule::RouteRows`/`RoutedQmv` read the expert counts off
+/// the dims the same way `Qmv` reads `width`.
+///
+/// A routed FFN is the hardest thing to express portably -- its SHAPE depends
+/// on a value the fire computes -- so a mixture firing without a per-family
+/// branch is the strongest evidence the executor is general that this crate
+/// has.
+///
+/// Four layers rather than forty-eight: the walk is what is under test and a
+/// 48-layer mixture is the same six statements forty-eight times.
+#[test]
+fn a_mixture_fires_on_the_device_through_the_same_executor() {
+    let Ok(context) = Context::new() else {
+        eprintln!("SKIP: no Metal 4 device");
+        return;
+    };
+    let compiler = Compiler::new(&context).expect("a compiler");
+    let mut pipelines = Pipelines::new(kernels_dir());
+
+    let step = Step {
+        token_ids: &[11, 22, 33, 44],
+        qo_indptr: &[0, 1, 2, 3, 4],
+        sampling_indices: &[0, 1, 2, 3],
+        ..Step::default()
+    };
+    let facts = LlamaLikeFacts {
+        layers: 4,
+        ..LlamaLikeFacts::qwen3_30b_a3b()
+    };
+    let plan = llama_like_metal(&facts, &LlamaLikeMetalFacts::synthetic(), FireClass::Decode);
+    let lowered = lower_step(&plan, &step).expect("the step lowers");
+
+    let routed = lowered
+        .kernels
+        .iter()
+        .filter(|k| k.contains("routed") || k.starts_with("route_") || k.contains("router"))
+        .count();
+    assert!(
+        routed >= 4,
+        "a mixture states a router, a sort, a gather and three routed \
+         matmuls; found {routed} in {:?}",
+        lowered.kernels
+    );
+
+    let backing = allocate(&context, 256 << 20, "sentinel weights").expect("a backing region");
+    let zeros = zeroed(&context);
+    let mut store = Sentinels {
+        slice: Slice {
+            address: backing.gpu_address(),
+            bytes: 256 << 20,
+        },
+        tables: Slice {
+            address: zeros.gpu_address(),
+            bytes: 1 << 20,
+        },
+        asked: HashMap::new(),
+    };
+
+    let timing = run(
+        &context,
+        &compiler,
+        &mut pipelines,
+        &lowered,
+        Geometry {
+            q_heads: 32,
+            kv_heads: 4,
+            head_dim: 128,
+            rotary_dims: 128,
+            n_experts: 128,
+            experts_per_token: 8,
+        },
+        &mut store,
+    )
+    .expect("the mixture fires");
+
+    assert!(
+        timing.encode > std::time::Duration::ZERO,
+        "the stepper reported no encode time, so nothing was encoded"
+    );
+    assert!(
+        store.asked.keys().any(|n| n.contains("expert")),
+        "the fire bound no expert bank, so it cannot have been the mixture: {:?}",
+        store.asked.keys().collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -117,10 +254,15 @@ fn the_whole_metal_text_fires_on_the_device() {
     // 256 MiB: wider than any tensor this text names, so a bound operand is
     // never the reason a dispatch fails.
     let backing = allocate(&context, 256 << 20, "sentinel weights").expect("a backing region");
+    let zeros = zeroed(&context);
     let mut store = Sentinels {
         slice: Slice {
             address: backing.gpu_address(),
             bytes: 256 << 20,
+        },
+        tables: Slice {
+            address: zeros.gpu_address(),
+            bytes: 1 << 20,
         },
         asked: HashMap::new(),
     };
@@ -152,6 +294,21 @@ fn the_whole_metal_text_fires_on_the_device() {
     );
 }
 
+/// **Ignored, and the reason is a finding rather than a flake.**
+///
+/// This passed until the statements started carrying their scalars. While
+/// every kernel was handed zero extents they all no-opped, so "the batched
+/// lane fires" was true for a reason that flattered it. Now they do real work
+/// — and `sdpa_paged_decode` is one of the four statements whose scalars are
+/// still unstated, so it runs with `page_size = 0` and walks pages until the
+/// GPU is abandoned. Sixty seconds, measured, twice.
+///
+/// Zeroing the fire tables does not help, which is the useful half: the hang
+/// is in the SCALARS and not the tables.
+///
+/// The scalars are stated now — the pool's geometry arrives through
+/// `Resolver::pool` — so this runs. `Sentinels::pool` states a shape rather
+/// than zeros for exactly the reason above.
 #[test]
 fn a_prefill_step_fires_too_so_both_lanes_reach_the_device() {
     let Ok(context) = Context::new() else {
@@ -161,12 +318,23 @@ fn a_prefill_step_fires_too_so_both_lanes_reach_the_device() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    // Eight tokens in one request: a prefill, which takes the batched symbols
-    // (`affine_qmm_t`, `embed_gather_mb_4bit`, `neox_mb`, the paged pair).
+    // SIXTEEN tokens in one request: a prefill, which takes the batched
+    // symbols (`affine_qmm_t`, `embed_gather_mb_4bit`, the paged pair).
+    //
+    // Sixteen and not eight, and the difference is a real precondition rather
+    // than a round number. `qmm_t.metal` has no `M` argument -- its header
+    // says the driver only selects it when `M % BM == 0`, so the row count
+    // lives in the grid and every tile is full. `QMM_BMS` starts at sixteen,
+    // so eight rows tile no rung and `Rule::Qmm` refuses them
+    // (`Ungeometric::PartialTile`). It used to substitute, and both
+    // substitutions were measured wrong against a real checkpoint: the
+    // matvec's grid under the GEMM's symbol gave NaN, and rounding the row
+    // axis up gave a finite wrong answer plus fourteen rows of overrun into
+    // the next value.
     let step = Step {
-        token_ids: &[1, 2, 3, 4, 5, 6, 7, 8],
-        qo_indptr: &[0, 8],
-        sampling_indices: &[7],
+        token_ids: &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        qo_indptr: &[0, 16],
+        sampling_indices: &[15],
         ..Step::default()
     };
     let plan = llama_like_metal(
@@ -177,10 +345,15 @@ fn a_prefill_step_fires_too_so_both_lanes_reach_the_device() {
     let lowered = lower_step(&plan, &step).expect("the step lowers");
 
     let backing = allocate(&context, 256 << 20, "sentinel weights").expect("a backing region");
+    let zeros = zeroed(&context);
     let mut store = Sentinels {
         slice: Slice {
             address: backing.gpu_address(),
             bytes: 256 << 20,
+        },
+        tables: Slice {
+            address: zeros.gpu_address(),
+            bytes: 1 << 20,
         },
         asked: HashMap::new(),
     };

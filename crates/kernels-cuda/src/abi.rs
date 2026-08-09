@@ -492,6 +492,26 @@ fn rust_bind_expr(op: &kernels::Operand) -> Option<String> {
         // value yet — so these rows decline, like `InDim` does, and stay
         // with the arm that knows.
         Source::ResultOrRegion(..) => return None,
+        // The KV pages are a Metal spelling. CUDA's launchers take a
+        // `KvCacheLayerView` by value rather than two pointers, so a row that
+        // states these is not one this emitter can generate — and saying so
+        // is better than emitting a call that binds the wrong thing.
+        Source::KvKeys | Source::KvValues => return None,
+        // The fire's own tables, likewise a Metal spelling: CUDA's launchers
+        // take them through a plan cache or a `KvCacheLayerView` rather than
+        // as loose pointers.
+        Source::TokenIds
+        | Source::RequestOfToken
+        | Source::KvPageIndices
+        | Source::KvPageIndptr
+        | Source::AttentionMask
+        | Source::AttentionMaskEnabled
+        | Source::KvHeadStride
+        | Source::KvSeqStride
+        | Source::KvPageSize
+        | Source::KvWritePage
+        | Source::KvWriteOffset
+        | Source::RopeFrequencies => return None,
         Source::Ctx(f) | Source::CtxNonZero(f) => format!("ctx.{f}"),
         // A NULL is returned fully typed and skips the cast step below:
         // that step turns a slot into the row's pointee, and a null has
@@ -604,26 +624,31 @@ pub fn emit_rust_dispatch(tables: &[&'static [KernelSig]]) -> String {
                 _ => {}
             }
         }
-        // THE RECTANGLE, made part of the match.
+        // THE RECTANGLE, and the guard that is no longer here.
         //
-        // `In`/`Out`/`Positions` bind a value's BASE, and that is the
-        // whole of the value only when the rectangle is the whole fire.
-        // A hook peel splits a layer body in two and the second starts at
+        // `In`/`Out`/`Positions` used to bind a value's BASE, which is the
+        // whole of the value only when the rectangle is the whole fire. A
+        // peel splits a layer body in two and the second region starts at
         // `win_start`, so a launch over it must address rows `[win_start,
-        // win_start + rows)`; at the base it writes the PREFIX region's
-        // rows with the tail region's positions, both regions write the
-        // same range, and the later one wins.
+        // win_start + rows)`; at the base it wrote the PREFIX region's
+        // rows, both regions wrote the same range, and the later one won.
         //
-        // The C++ twin answered this by putting the window in its context
-        // (`ArmCtx::row`). This side declines instead: a windowed
-        // rectangle falls through to the hand-written arm, which already
-        // windows by hand. That is the weaker answer and it is the honest
-        // one until the Rust binder carries the window — a generated
-        // branch must decline rather than guess, and guessing here is
-        // silent wrong rows rather than a refusal.
-        let mut guard = String::from(" if b.rows.start == 0");
+        // So every generated branch carried ` if b.rows.start == 0` and a
+        // windowed rectangle fell through to a hand arm. That was the
+        // honest answer and it was also the wrong shape: the hand arms had
+        // the SAME bug and no guard, so the fallthrough was not a safety
+        // net, it was a hiding place. Nothing noticed until a fire finally
+        // peeled.
+        //
+        // The binder carries the window now (`resolve_arg_windowed`), and
+        // it applies to the op join's placements as well as to the stated
+        // args — one place, so a launch cannot read at the window and
+        // write at the base. The C++ twin answered the same question by
+        // putting the row in its context (`ArmCtx::row`); this answers it
+        // one layer lower, where both consumers already meet.
+        let mut guard = String::new();
         guard.push_str(&format!(
-            " && n_in >= {need_in} && n_out >= {need_out} \
+            " if n_in >= {need_in} && n_out >= {need_out} \
              && b.args.len() >= n_in + n_out + {need_w}"
         ));
         if need_ps > 0 {

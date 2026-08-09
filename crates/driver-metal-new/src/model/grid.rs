@@ -266,7 +266,11 @@ pub fn qmv_mb(out_vec: u32, n: u32) -> Launch {
 #[must_use]
 pub fn qmm_t(out_vec: u32, n: u32, bn: u32, bm: u32) -> Launch {
     Launch {
-        grid: [32 * (out_vec / bn), 2 * (n / bm), 2],
+        // Exact division on BOTH axes, and the caller guarantees it:
+        // `Rule::Qmm` refuses a row count the tile does not divide
+        // (`Ungeometric::PartialTile`) because the shader has no `M` argument
+        // and reads the row count from the grid.
+        grid: [32 * (out_vec / bn), 2 * (n / bm.max(1)), 2],
         tg: [32, 2, 2],
     }
 }

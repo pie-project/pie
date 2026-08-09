@@ -64,6 +64,32 @@ fn texts() -> Vec<Text> {
             n_experts: 0,
             experts_per_token: 0,
         },
+    },
+    // The SAME text at a different fact, which is what a second entry here is
+    // for. qwen3-moe is a llama-like attention with a routed FFN, so it joins
+    // by naming a fixture rather than by being a family -- and every check
+    // below then applies to the mixture's six statements without knowing they
+    // are a mixture.
+    Text {
+        name: "llama_like (qwen3-moe)",
+        plan: |class| {
+            use model::families::llama_like::forward::facts::{
+                LlamaLikeFacts, LlamaLikeMetalFacts,
+            };
+            model::families::llama_like::forward::llama_like_metal(
+                &LlamaLikeFacts::qwen3_30b_a3b(),
+                &LlamaLikeMetalFacts::synthetic(),
+                class,
+            )
+        },
+        geometry: Geometry {
+            q_heads: 32,
+            kv_heads: 4,
+            head_dim: 128,
+            rotary_dims: 128,
+            n_experts: 128,
+            experts_per_token: 8,
+        },
     }]
 }
 
@@ -87,7 +113,7 @@ impl Resolver for Anything {
 
 /// Both fire classes, at a row count that exercises each lane.
 fn fires(text: &Text) -> Vec<(FireClass, Lowered)> {
-    [(FireClass::Decode, 1usize), (FireClass::Prefill, 8)]
+    [(FireClass::Decode, 1usize), (FireClass::Prefill, 16)]
         .into_iter()
         .map(|(class, rows)| {
             let plan = (text.plan)(class);
@@ -244,14 +270,19 @@ fn the_harness_covers_every_family_that_has_a_text() {
     // be silence — which is the one failure mode a conformance suite cannot
     // afford.
     //
-    // Counted rather than named: the list of Metal texts is short and its
-    // growth is the whole remaining plan (`.wiki/new-driver/metal.md` task 5).
+    // Counted rather than named: the list is short and its growth is the whole
+    // remaining plan (`.wiki/new-driver/metal.md` task 5).
+    //
+    // TWO entries over ONE text, and the gap is the interesting part: the
+    // mixture joined by naming a fixture rather than by being a family, so a
+    // routed FFN reaches the device with no second text and no per-family
+    // branch anywhere in the executor.
     assert_eq!(
         texts().len(),
-        1,
-        "a Metal text landed or left. Add or remove its row in `texts()` — \
-         everything above is per-text and a family not listed is a family not \
-         checked."
+        2,
+        "a Metal text or fixture landed or left. Add or remove its row in \
+         `texts()` — everything above is per-text and a shape not listed is a \
+         shape not checked."
     );
 }
 
@@ -281,7 +312,14 @@ fn declared_buffers(root: &std::path::Path, file: &str, stem: &str) -> Option<us
             seen.insert(n);
         }
     }
-    (!seen.is_empty()).then_some(seen.len())
+    // The HIGHEST index plus one, not the count. A row is positional — its
+    // n-th operand is buffer n — so a kernel with gaps in its indices needs a
+    // row that covers them, and `kv_append_paged` has gaps: it declares
+    // 0,1,2,3,5,10,12..15 and leaves the rest to a ring ABI it does not read.
+    // `Source::Unbound` is what a row says in a gap, and the operands doc
+    // already asks for exactly that: *"a row lists every operand the callee
+    // has, defaulted or not"*.
+    seen.iter().next_back().map(|&n| n + 1)
 }
 
 /// A shader entry's parameter list, by its template stem.
@@ -400,10 +438,17 @@ fn a_row_that_states_its_operands_agrees_with_its_shader() {
                     ));
                 }
                 if let Some(writes) = first_writable(&root, file, sig.symbol) {
+                    // A writable buffer is one the row declares `BufMut`, and
+                    // the `Ty` is the precise signal where the `Source` is
+                    // not: the KV writes have NO result — their whole effect
+                    // is on the cache, so `KvKeys` is writable there — while
+                    // attention READS the same store, so `KvKeys` is
+                    // read-only there. Two passes over this got it wrong in
+                    // both directions before asking the type.
                     let row_writes = sig
                         .operands
                         .iter()
-                        .position(|o| matches!(o.source, kernels::Source::Out(_)));
+                        .position(|o| matches!(o.ty, kernels::Ty::BufMut));
                     if row_writes != Some(writes) {
                         disagrees.push(format!(
                             "  {symbol}: shader writes buffer {writes}, row puts its \
@@ -431,34 +476,181 @@ fn a_row_that_states_its_operands_agrees_with_its_shader() {
         unstated.len(),
         unstated.join("\n")
     );
-    // EIGHT, measured 2026-08-10, down from fourteen. Seven rows state their
-    // operands now — `rms_single_row`, `silu_mul`, `split_qkv_bf16` and the
-    // four projections, which were the loud case: `affine_qmv_fast`
-    // declares its weights FIRST and the trace states them last, so every
-    // projection of every layer bound its activation where the packed weight
-    // belongs.
+    // ZERO, from fourteen. **Every symbol `llama_like` names states its
+    // operands**, so no launch is bound positionally any more and the
+    // trace-order/kernel-order mismatch is closed.
     //
-    // **Every remaining entry is a launch whose operands are at the wrong
-    // buffers**, and this may only shrink. What each still needs, so the next
-    // reader has a map rather than a count:
+    // It may not grow: a new symbol arrives with no row operands, and this is
+    // what says so before it reaches a GPU that will not.
     //
-    // | symbol | what is missing |
-    // |---|---|
-    // | `embed_gather_4bit`, `..._mb_4bit` | the token IDS. A fire value the text does not state; `Arg::Named` is the channel |
-    // | `neox_decode`, `neox_mb` | the POSITIONS. `Source::Positions` already exists for exactly this |
-    // | `kv_append`, `kv_append_paged` | the layer's K and V pages, plus `pos` and three strides. **`Source` has no variant for a state store** — the op carries `StateRef { KvCache, layer }` and the pool holds the pages, so this needs one |
-    // | `sdpa_vector_decode`, `sdpa_paged_decode` | the same K/V pages, six strides, a scale and a window. Blocked on the same variant |
+    // What ZERO does NOT mean, and the distinction is the whole remaining
+    // gap: a row states where a value goes, and the TEXT still has to state
+    // the value. Three holes are visible in the rows themselves, written
+    // there as `Unbound` because a positional row cannot omit a slot:
     //
-    // So the backlog is TWO pieces of work and not eight: teach the text to
-    // state its fire values (ids, positions — `Source::Positions` is already
-    // there), and give `Source` a way to name the KV store. The second is the
-    // only new vocabulary, and it is what the attention pair and the KV writes
-    // both wait on.
+    // * the gathers want the token IDS — a fire value `Source` has no name
+    //   for, and `Arg::Named` is the channel the text would state it on;
+    // * the paged attention wants six of the fire's TABLES — which request
+    //   owns each token, the page CSR, the mask and its stride;
+    // * `dsl::metal::rope` states ONE launch carrying q and k, and the kernel
+    //   rotates ONE buffer in place. The statement should be two, and until it
+    //   is, the second tensor is not rotated at all.
+    //
+    // The first two are the text stating what it carries. The third is a
+    // defect the rows made visible: nothing before this could see that a
+    // statement's shape disagreed with its kernel's.
     assert!(
-        unstated.len() <= 8,
-        "the backlog GREW to {}. A row with no operands is bound positionally, \
-         and the trace's order is not the kernel's.\n{}",
+        unstated.is_empty(),
+        "{} row(s) state no operands and are bound POSITIONALLY, and the \
+         trace's order is not the kernel's:\n{}",
         unstated.len(),
         unstated.join("\n")
+    );
+}
+
+/// **How many slots the statements actually fill.**
+///
+/// The rows say where every buffer goes; that is `a_row_that_states_its_
+/// operands_agrees_with_its_shader`, and it is at zero. This asks the other
+/// half: does the STATEMENT supply a value for each slot the row names?
+///
+/// A row's `Unbound` operand is a slot nobody fills, and a slot nobody fills
+/// is read anyway — on this backend, whatever the last dispatch left there. So
+/// this counts them, and the count is the last measurable distance between the
+/// executor and a fire worth checking against a checkpoint.
+#[test]
+fn every_slot_a_row_names_is_a_slot_a_statement_fills() {
+    let mut holes: Vec<String> = Vec::new();
+    for text in texts() {
+        for (_, low) in fires(&text) {
+            let mut seen = BTreeSet::new();
+            for symbol in &low.kernels {
+                if !seen.insert(symbol.clone()) {
+                    continue;
+                }
+                let Some(sig) = kernels::sig_in(kernels_metal::KERNELS, symbol) else {
+                    continue;
+                };
+                for (slot, o) in sig.operands.iter().enumerate() {
+                    if matches!(o.source, kernels::Source::Unbound) {
+                        holes.push(format!("  {symbol}: buffer {slot} (`{}`)", o.name));
+                    }
+                }
+            }
+        }
+    }
+    holes.sort();
+    holes.dedup();
+
+    eprintln!(
+        "{} slot(s) no statement fills:\n{}",
+        holes.len(),
+        holes.join("\n")
+    );
+    // TEN, measured 2026-08-11, and every one is named:
+    //
+    //   kv_append_paged: SEVEN buffers of a shared ring ABI the kernel
+    //     declares and does not read (4, 6-9, 11, 15). A row is positional so
+    //     they are listed; nothing fills them because nothing should.
+    //   sdpa_paged_decode: `sinks`, which gpt-oss reads and `llama_like` has
+    //     none of. The slot waits for a text that has them.
+    //   affine_qmv_routed: `bias`, which `affine_qmv_routed_bias` is the
+    //     symbol for. Same shape as `sinks` — a slot the OTHER instantiation
+    //     of this kernel fills.
+    //   router_topk: `per_expert_scale`, likewise `router_topk_scaled`'s.
+    //
+    // So every remaining hole is DELIBERATE — a declared-but-unread ABI and a
+    // feature this family lacks — rather than a value the text forgot. That is
+    // a different thing from the fourteen this started at, and the number
+    // should be read as "slots waiting on another family", not as debt.
+    assert!(
+        holes.len() <= 10,
+        "{} slots no statement fills, which is more than the ten that are \
+         deliberate. A slot nobody fills is read anyway.\n{}",
+        holes.len(),
+        holes.join("\n")
+    );
+}
+
+/// **Do the statements carry the scalars their rows name?**
+///
+/// A row says `in_vec_size: I32 <- Param(0)`; the statement has to state a
+/// scalar for slot 0 or the kernel reads a buffer nobody wrote. This is the
+/// operand question one level down, and the same answer applies: a slot nobody
+/// fills is read anyway.
+///
+/// It is separate from the operand check because it fails differently. A
+/// missing OPERAND is a wrong pointer; a missing SCALAR is a wrong extent, and
+/// a kernel told its output is zero wide computes nothing and reports success.
+#[test]
+fn every_scalar_a_row_names_is_a_scalar_the_statement_states() {
+    let mut short: Vec<String> = Vec::new();
+    for text in texts() {
+        for (_, low) in fires(&text) {
+            let mut seen = BTreeSet::new();
+            for launch in &low.launches {
+                let symbol = &low.kernels[launch.kernel as usize];
+                if !seen.insert(symbol.clone()) {
+                    continue;
+                }
+                let Some(sig) = kernels::sig_in(kernels_metal::KERNELS, symbol) else {
+                    continue;
+                };
+                let wants = sig
+                    .operands
+                    .iter()
+                    .filter_map(|o| match o.source {
+                        kernels::Source::Param(i) | kernels::Source::ParamF32(i) => {
+                            Some(usize::from(i) + 1)
+                        }
+                        _ => None,
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let states = (launch.params.end - launch.params.start) as usize;
+                if states < wants {
+                    short.push(format!(
+                        "  {symbol}: row names {wants} scalar(s), statement states {states}"
+                    ));
+                }
+            }
+        }
+    }
+    short.sort();
+    short.dedup();
+
+    eprintln!(
+        "{} statement(s) state fewer scalars than their row names:\n{}",
+        short.len(),
+        short.join("\n")
+    );
+    // ZERO, down from THIRTEEN — which was every statement but the QKV split,
+    // the only one that had ever stated a scalar. Every projection was told
+    // its extents were zero and computed nothing; every rope was told its head
+    // width was zero; the attention was told its strides were zero and read
+    // one key forever.
+    //
+    // The rows made it askable. Before they named their `Param` slots nothing
+    // stated how many scalars a kernel wants, so nothing could notice that
+    // none were supplied.
+    //
+    // The last four all wanted the SAME thing and it was not the text's to
+    // give: the KV pool's strides and its page size — the shape the DRIVER
+    // allocated (`model::kv::Shape`), which no model text can know. They are
+    // `Source::KvHeadStride`/`KvSeqStride`/`KvPageSize` now, answered by the
+    // resolver beside the pages themselves and APPENDED to the statement's own
+    // scalars by `dispatch::param_layout`.
+    //
+    // Writing them down found the layout was the other way around from the
+    // names: the pool is `[page, token, head, dim]`, so one head is `head_dim`
+    // away and one TOKEN is a whole interleaved row away. Swapping the two is
+    // a fire that reads real memory and attends to the wrong tokens.
+    assert_eq!(
+        short.len(),
+        0,
+        "the gap REOPENED at {}. A kernel told its output is zero wide computes \
+         nothing and reports success.\n{}",
+        short.len(),
+        short.join("\n")
     );
 }

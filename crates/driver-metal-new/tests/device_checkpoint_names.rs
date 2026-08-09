@@ -11,7 +11,23 @@
 //! and is gated on one.
 //!
 //! Gated on `PIE_METAL_SMOKE_CHECKPOINT`, the same variable `device_smoke.rs`
-//! takes.
+//! takes. **It has been run.** Against
+//! `mlx-community/Llama-3.2-1B-Instruct-4bit` (372 tensors) every name both
+//! fire classes state binds, which is the first claim about this text that a
+//! real checkpoint rather than another source file settles.
+//!
+//! Two defects were between here and that result, and neither was in the name
+//! map:
+//!
+//!   * The gate stated `qwen3_0_6b()` facts against a llama snapshot and
+//!     reported 308 missing names -- every one a `qkv` or a `q_norm`, which is
+//!     to say the FIXTURE's bindings. It derives facts from the checkpoint
+//!     now, through the chain the seam uses.
+//!   * `geometry_from_facts` read only the `q35_*` block, so a llama config
+//!     -- which `from_descriptor` reads into `ll_*` -- was refused as
+//!     "carrying no decoder shape" while carrying it in the other block. And
+//!     it demanded a linear-attention block of a stack that has no linear
+//!     layers.
 
 #![cfg(target_vendor = "apple")]
 
@@ -46,14 +62,20 @@ fn descriptor_for(snapshot: &std::path::Path) -> String {
 }
 
 /// Every weight name the Metal text states, over both fire classes.
-fn names_the_text_states() -> BTreeSet<String> {
+///
+/// The facts come from the CHECKPOINT, through the same chain the seam uses:
+/// descriptor -> `ModelFacts` -> `DecodeGeometry` -> `text::facts_from`. An
+/// earlier draft named `qwen3_0_6b()` here and reported 308 missing names
+/// against a llama-3.2 snapshot -- every one of them a `qkv` or a `q_norm`,
+/// which is to say the fixture's bindings and not the checkpoint's. A gate
+/// that states its own facts is not testing the checkpoint.
+fn names_the_text_states(
+    facts: &LlamaLikeFacts,
+    metal: &LlamaLikeMetalFacts,
+) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    for (class, rows) in [(FireClass::Decode, 1usize), (FireClass::Prefill, 8)] {
-        let plan = llama_like_metal(
-            &LlamaLikeFacts::qwen3_0_6b(),
-            &LlamaLikeMetalFacts::synthetic(),
-            class,
-        );
+    for (class, rows) in [(FireClass::Decode, 1usize), (FireClass::Prefill, 16)] {
+        let plan = llama_like_metal(facts, metal, class);
         let low = lower(
             &plan,
             &vec![
@@ -98,10 +120,18 @@ fn the_checkpoint_answers_the_names_the_text_states() {
         "the plan published no tensors at all"
     );
 
+    // The checkpoint's own facts, derived the way the seam derives them.
+    let model_facts = driver_metal_new::facts::ModelFacts::from_descriptor(&descriptor)
+        .expect("the descriptor states the model's facts");
+    let geometry =
+        driver_metal_new::batch::geometry_from_facts(&model_facts).expect("a decodable geometry");
+    let (facts, metal) =
+        driver_metal_new::model::text::facts_from(&geometry, |t| loaded.tensors.contains_key(t));
+
     let named = HashMap::new();
     let mut store = Store::new(Names::mlx(), &loaded.tensors, &named);
     let mut missing: BTreeSet<String> = BTreeSet::new();
-    for name in names_the_text_states() {
+    for name in names_the_text_states(&facts, &metal) {
         use driver_metal_new::model::executor::Resolver as _;
         if store.weight(&name).is_none() {
             missing.insert(name);

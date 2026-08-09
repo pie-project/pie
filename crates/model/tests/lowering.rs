@@ -1014,7 +1014,7 @@ fn every_launch_carries_operands_that_match_the_arena() {
         );
         for a in &out.args[l.args.start as usize..l.args.end as usize] {
             match a {
-                Arg::Arena { at, width } => {
+                Arg::Arena { at, width, .. } => {
                     arena_args += 1;
                     assert!(
                         *at < out.arena_bytes,

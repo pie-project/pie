@@ -1016,7 +1016,7 @@ fn what_the_epilogue_hands_each_of_its_rectangles() {
             let args: Vec<String> = out.args[l.args.start as usize..l.args.end as usize]
                 .iter()
                 .map(|a| match a {
-                    Arg::Arena { at, width } => format!("arena@{at}/w{width}"),
+                    Arg::Arena { at, width, .. } => format!("arena@{at}/w{width}"),
                     Arg::Named { value, width } => format!("named(v{value})/w{width}"),
                     Arg::Weight(w) => format!("weight({w})"),
                 })

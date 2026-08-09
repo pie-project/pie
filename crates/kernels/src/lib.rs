@@ -537,6 +537,68 @@ pub enum Source {
     Weight(u8),
     /// The `i`-th scalar the statement carries (`Launch`'s params).
     Param(u8),
+    /// The KEY pages of the layer this statement runs in.
+    ///
+    /// A statement writing or reading the KV cache names it as STATE
+    /// (`StateRef { store: KvCache, layer }`) and not as an operand, because
+    /// the cache outlives the fire and the trace has no value for it. So the
+    /// pointer cannot come from the statement's args, and every backend has
+    /// had to know which of its own buffers to bind — one hand-written arm at
+    /// a time, which is the thing this table exists to end.
+    ///
+    /// The layer is the statement's own; a rolled trace states a span and an
+    /// unrolled one states a layer, and both reach the same lookup.
+    KvKeys,
+    /// The VALUE pages of the layer this statement runs in. See
+    /// [`Source::KvKeys`].
+    KvValues,
+    /// The token ids this fire gathers embeddings for.
+    TokenIds,
+    /// Which request owns each token — the paged attention's causal bound.
+    RequestOfToken,
+    /// The fire's KV page translation, and the CSR that partitions it by
+    /// request.
+    KvPageIndices,
+    /// See [`Source::KvPageIndices`].
+    KvPageIndptr,
+    /// The custom attention mask, and the per-lane byte saying whether it
+    /// applies.
+    AttentionMask,
+    /// See [`Source::AttentionMask`].
+    AttentionMaskEnabled,
+    /// Rows between one KV head's pages and the next, in ELEMENTS.
+    ///
+    /// The pool's own geometry, and the reason it is a `Source` rather than a
+    /// scalar the text states: a stride is `max_ctx * head_dim` for the pool
+    /// the DRIVER allocated. A model text cannot know it and should not guess
+    /// — a text that guessed would be right for one deployment and silently
+    /// wrong for the next, which is the failure this table exists to prevent.
+    KvHeadStride,
+    /// Rows between one token and the next within a head. See
+    /// [`Source::KvHeadStride`].
+    KvSeqStride,
+    /// Token rows per page.
+    KvPageSize,
+    /// Per token: the physical page its KV row is written into.
+    ///
+    /// The paged append's destination, normalized from the ring position the
+    /// frame states: `position / page_size`. Driver arithmetic over a driver
+    /// allocation, which is why it is a table the resolver answers rather than
+    /// anything a text could name.
+    KvWritePage,
+    /// Per token: the row within [`Source::KvWritePage`]'s page.
+    KvWriteOffset,
+    /// The rotary INVERSE FREQUENCIES, `[rotary_dims/2]` f32.
+    ///
+    /// A table rather than a base, because a base cannot express what a
+    /// deployment does to it. llama-3 rescales its frequencies piecewise
+    /// (`rope_type: llama3`), YaRN rescales them differently, and a text that
+    /// stated `theta` would be right only for the deployments that leave the
+    /// ladder alone.
+    ///
+    /// Derived at LOAD from the checkpoint's config, so it is the driver's to
+    /// answer -- the same argument the KV pool's strides make for themselves.
+    RopeFrequencies,
     /// The same slot read as a FLOAT.
     ///
     /// The param channel is untyped `u32` — "what each slot means is the

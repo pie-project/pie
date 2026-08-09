@@ -26,9 +26,50 @@ pub static KERNELS: &[KernelSig] = &[
     // 1 in attn_gate.metal
     kernel!(gate "gate", axes = &[BF16]),
     // 1 in kv_append.metal
-    kernel!(kv_append "kv_append", file = Some("attn/kv_write.metal"), launch = kernels::LaunchRule::PerHead, axes = &[BF16]),
+    // The first row to name STATE. The cache is not an operand — no traced
+    // value stands for it, because it outlives the fire — so the pointers come
+    // from the driver's pool through `Resolver::kv` and the row is what asks.
+    kernel!(kv_append "kv_append", file = Some("attn/kv_write.metal"), launch = kernels::LaunchRule::PerHead,
+        operands = kernels::operands![
+            k_new: Buf <- kernels::Source::In(0),
+            v_new: Buf <- kernels::Source::In(1),
+            k_cache: BufMut <- kernels::Source::KvKeys,
+            v_cache: BufMut <- kernels::Source::KvValues,
+            pos: I32s <- kernels::Source::Positions,
+            head_dim: I32 <- kernels::Source::Param(0),
+            // The POOL's, not the statement's: `max_ctx * head_dim` for the
+            // pool the driver allocated.
+            k_head_stride: Usize <- kernels::Source::KvHeadStride,
+            k_seq_stride: Usize <- kernels::Source::KvSeqStride,
+        ],
+        axes = &[BF16]),
     // 1 in kv_append_paged.metal
-    kernel!(kv_append_paged "kv_append_paged", file = Some("attn/kv_write.metal"), launch = kernels::LaunchRule::PerHead, axes = &[BF16]),
+    // Sparse indices, and the gaps are stated. Buffers 4, 6-9 and 11 belong to
+    // a shared ring ABI this kernel does not read; a row is positional, so it
+    // lists them as `Unbound` rather than closing the gap and shifting
+    // everything after.
+    kernel!(kv_append_paged "kv_append_paged", file = Some("attn/kv_write.metal"), launch = kernels::LaunchRule::PerHead,
+        operands = kernels::operands![
+            k_new: Buf <- kernels::Source::In(0),
+            v_new: Buf <- kernels::Source::In(1),
+            k_pages: BufMut <- kernels::Source::KvKeys,
+            v_pages: BufMut <- kernels::Source::KvValues,
+            ring_4: Buf,
+            head_dim: I32 <- kernels::Source::Param(0),
+            ring_6: Buf,
+            ring_7: Buf,
+            ring_8: Buf,
+            ring_9: Buf,
+            page_size: I32 <- kernels::Source::KvPageSize,
+            ring_11: Buf,
+            n_kv_heads: I32 <- kernels::Source::Param(1),
+            // The normalized physical destination: `fire_csr` already
+            // computes both from the ring positions.
+            w_page: U32s <- kernels::Source::KvWritePage,
+            w_off: U32s <- kernels::Source::KvWriteOffset,
+            ring_15: Buf,
+        ],
+        axes = &[BF16]),
     // 1 in logit_softcap.metal
     kernel!(logit_softcap "logit_softcap", axes = &[BF16]),
     // 1 in attn_gate.metal
@@ -46,8 +87,33 @@ pub static KERNELS: &[KernelSig] = &[
     // substitution path, so an `attn.q` tap with a PageMaskSink is unservable
     // here, and no capture variant exists so neither can publish scores. The
     // declaration says so instead of a C++ throw discovering it.
+    // Seventeen buffers, and the row is the only place they are written down.
+    // Six are the FIRE's tables — the positions, which request owns each
+    // token, the page CSR, the mask and its enable — and the ROW names which,
+    // because a text cannot state this fire's data. `sinks` stays a gap:
+    // gpt-oss reads it and `llama_like` has none, so the row keeps the slot
+    // and no statement fills it until a text that has sinks does.
     kernel!(sdpa_paged_decode "sdpa_paged_decode", file = Some("attn/sdpa_paged.metal"),
     launch = kernels::LaunchRule::SdpaVector,
+    operands = kernels::operands![
+        queries: Buf <- kernels::Source::In(0),
+        k_pages: Buf <- kernels::Source::KvKeys,
+        v_pages: Buf <- kernels::Source::KvValues,
+        out: BufMut <- kernels::Source::Out(0),
+        gqa_factor: I32 <- kernels::Source::Param(0),
+        position_ids: I32s <- kernels::Source::Positions,
+        req_of_token: I32s <- kernels::Source::RequestOfToken,
+        kv_page_indices: U32s <- kernels::Source::KvPageIndices,
+        kv_page_indptr: U32s <- kernels::Source::KvPageIndptr,
+        page_size: I32 <- kernels::Source::KvPageSize,
+        n_kv_heads: I32 <- kernels::Source::Param(1),
+        scale: F32 <- kernels::Source::ParamF32(2),
+        attention_mask: U8s <- kernels::Source::AttentionMask,
+        attention_mask_stride: U32 <- kernels::Source::Param(3),
+        attention_mask_enabled: U8s <- kernels::Source::AttentionMaskEnabled,
+        window: I32 <- kernels::Source::Param(4),
+        sinks: Buf,
+    ],
     lacks = &[Cap::Scores, Cap::PageMaskSink],
     axes = &[Axis {
         what: "head dim and page shape",
@@ -74,7 +140,25 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(sdpa_paged_tiled_strided "sdpa_paged_tiled_strided",
         axes = &[BF16, Axis { what: "head dim", points: &["_d_256"] }]),
     // 3 in sdpa_vector.metal
+    // Dense 0..10, and the row is where the WIDTHS live: the four strides are
+    // `const constant size_t&` — eight bytes — while the params channel is
+    // `u32`. A driver handing a four-byte slot to an eight-byte read gives the
+    // kernel the next scalar as this one's high half, so the row's `Usize`
+    // says widen and the stage does.
     kernel!(sdpa_vector_decode "sdpa_vector_decode", file = Some("attn/sdpa_vector.metal"), launch = kernels::LaunchRule::SdpaVector,
+        operands = kernels::operands![
+            queries: Buf <- kernels::Source::In(0),
+            keys: Buf <- kernels::Source::KvKeys,
+            values: Buf <- kernels::Source::KvValues,
+            out: BufMut <- kernels::Source::Out(0),
+            gqa_factor: I32 <- kernels::Source::Param(0),
+            n: I32 <- kernels::Source::Param(1),
+            k_head_stride: Usize <- kernels::Source::KvHeadStride,
+            k_seq_stride: Usize <- kernels::Source::KvSeqStride,
+            v_head_stride: Usize <- kernels::Source::KvHeadStride,
+            v_seq_stride: Usize <- kernels::Source::KvSeqStride,
+            scale: F32 <- kernels::Source::ParamF32(2),
+        ],
         lacks = &[Cap::Scores, Cap::PageMaskSink],
         axes = &[BF16, Axis { what: "head dim", points: &["_d_64", "_d_128", "_d_256"] }]),
     // 1 in sdpa_sliding.metal

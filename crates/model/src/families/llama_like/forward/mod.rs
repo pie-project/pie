@@ -336,7 +336,23 @@ fn llama_like_metal_text(
                 dsl::metal::residual_add(&gemm(x, w), residual)
             }
         };
-        let paged = multi_batch && metal.paged_multi_batch;
+        // ALWAYS paged, and the class is not the question -- the POOL's
+        // layout is. `model::kv::Pool` allocates `[page, token, head, dim]`
+        // for every fire this driver runs, so a decode that names the
+        // contiguous `kv_append`/`sdpa_vector_decode` walks a paged pool with
+        // a contiguous kernel's arithmetic: it reads real memory at every step
+        // and attends to the wrong tokens.
+        //
+        // The two also disagree about what the scalars MEAN. The paged row
+        // reads `Param(1)` as `n_kv_heads` and the contiguous row reads it as
+        // `n`, the key count, so one statement cannot supply both correctly.
+        // Naming one variant everywhere is what makes the statement's scalars
+        // answerable at all.
+        //
+        // Same shape as the gather it sits beside: `multi_batch` is a fact
+        // about the FIRE and this is a fact about the DRIVER's allocation.
+        let _ = metal.paged_multi_batch;
+        let paged = true;
         // The gated MLP. `silu_mul` takes gate and up as TWO buffers, so a
         // deployment whose loader did not join them states two projections —
         // which on this backend is every deployment, because
@@ -350,11 +366,79 @@ fn llama_like_metal_text(
              `Projections::InPlace` and the join declines under it -- so the \
              arm is refused at trace time rather than written untested."
         );
+        // The FFN, dense or routed, and the branch is a FACT rather than a
+        // family. A llama-like architecture with a mixture is still llama-like
+        // -- the attention above is untouched and only the block between the
+        // two norms differs -- which is the tart argument stated as code: one
+        // supergraph, more polymorphism, no second text.
+        //
+        // The mixture is six statements because a routed FFN's SHAPE depends
+        // on a value the fire computes. The router picks experts; the sort
+        // groups rows by the expert they picked; the gather materialises those
+        // groups contiguously; the matmuls run over the groups; the combine
+        // puts the rows back weighted by the router's confidence. The executor
+        // walks all six exactly as it walks a projection -- symbol, row, file,
+        // rule, grid, operands -- and `RouteRows`/`RoutedQmv` read the expert
+        // counts off the dims the same way `Qmv` reads `width`.
         let gated = |x: &Val, w: &dsl::Layer| {
-            dsl::metal::silu_mul(
-                &gemm(x, &w.gate_proj),
-                &gemm(x, &w.up_proj),
-                f.intermediate,
+            if f.n_experts == 0 {
+                return dsl::metal::silu_mul(
+                    &gemm(x, &w.gate_proj),
+                    &gemm(x, &w.up_proj),
+                    f.intermediate,
+                );
+            }
+            let k = f.experts_per_token.max(1);
+            // Rows after the sort pads each expert's group up to a tile. The
+            // gather writes this many and the matmuls read them, so the number
+            // is stated once and threaded rather than recomputed.
+            let padded = (f.n_experts * k).max(1);
+            let (ids, weights) =
+                dsl::metal::router_topk(&gemm(x, &w.router), f.n_experts, k, false);
+            let (perm, _row_expert, _tile_expert, inv) = dsl::metal::route_sort(
+                &ids,
+                f.n_experts,
+                k,
+                metal.qmm_tile.0,
+                padded,
+                f.hidden,
+            );
+            let rows = dsl::metal::route_gather(
+                x,
+                &perm,
+                f.n_experts,
+                k,
+                metal.qmm_tile.0,
+                padded,
+                f.hidden,
+            );
+            let h = dsl::metal::silu_mul(
+                &dsl::metal::routed_qmv(&rows, &ids, &w.expert_gate, k, false),
+                &dsl::metal::routed_qmv(&rows, &ids, &w.expert_up, k, false),
+                f.moe_intermediate,
+            );
+            let routed = dsl::metal::combine_sorted(
+                &dsl::metal::routed_qmv(&h, &ids, &w.expert_down, k, false),
+                &weights,
+                &inv,
+                k,
+                f.hidden,
+            );
+            if f.shared_intermediate == 0 {
+                return routed;
+            }
+            // The dense expert a mixture may also have, blended in by a
+            // per-row sigmoid gate.
+            let shared = dsl::metal::silu_mul(
+                &gemm(x, &w.shared_gate),
+                &gemm(x, &w.shared_up),
+                f.shared_intermediate,
+            );
+            dsl::metal::shared_expert_combine(
+                &routed,
+                &gemm(&shared, &w.shared_down),
+                &gemm(x, &w.shared_gate_proj),
+                f.hidden,
             )
         };
 
@@ -366,7 +450,7 @@ fn llama_like_metal_text(
             let x = if post_norm {
                 y.clone()
             } else {
-                dsl::metal::rms_norm(&y, &w.attn_norm)
+                dsl::metal::rms_norm(&y, &w.attn_norm, f.hidden, metal.rms_eps)
             };
 
             let (q, k, v) = if f.fused_qkv {
@@ -382,32 +466,57 @@ fn llama_like_metal_text(
                 (q, k)
             } else {
                 (
-                    dsl::metal::rms_norm(&q, &w.q_norm),
-                    dsl::metal::rms_norm(&k, &w.k_norm),
+                    dsl::metal::rms_norm(&q, &w.q_norm, f.head_dim, metal.rms_eps),
+                    dsl::metal::rms_norm(&k, &w.k_norm, f.head_dim, metal.rms_eps),
                 )
             };
             // One dispatch for q and k together, as `declared_dag.hpp`'s
             // `Kind::Rope` states it.
-            let (q, k) = dsl::metal::rope(&q, &k, multi_batch);
-            dsl::metal::kv_append(&k, &v, &w.kv, paged);
-            let a = dsl::metal::sdpa(&q, &w.kv, q_w, f.head_dim, paged)
+            // A deployment that RESCALES its ladder takes the table form:
+            // llama-3's piecewise rescaling and YaRN's are not bases, so no
+            // theta expresses them. The driver derives the table at load and
+            // answers it; the text only says which form.
+            let (q, k) = dsl::metal::rope(
+                &q,
+                &k,
+                multi_batch,
+                metal.rope_theta,
+                1.0,
+                f.head_dim,
+                metal.rope_freq_table,
+            );
+            dsl::metal::kv_append(&k, &v, &w.kv, paged, f.head_dim, f.kv_heads);
+            // The window this layer attends over, `-1` for all of it. A
+            // load-time fact, and one the executor sites used to reach into
+            // `fwd_cfg.per_layer_window_left` for.
+            let window = metal.window_left_at(l);
+            let a = dsl::metal::sdpa(
+                &q,
+                &w.kv,
+                q_w,
+                f.head_dim,
+                paged,
+                f.q_heads / f.kv_heads.max(1),
+                f.kv_heads,
+                window,
+            )
                 .expect("a plain attention statement produces its value");
 
             if post_norm {
-                let o = dsl::metal::rms_norm(&gemm(&a, &w.o_proj), &w.attn_norm);
+                let o = dsl::metal::rms_norm(&gemm(&a, &w.o_proj), &w.attn_norm, f.hidden, metal.rms_eps);
                 y = dsl::metal::residual_add(&o, &y);
                 let h = gated(&y, &w);
-                let d = dsl::metal::rms_norm(&gemm(&h, &w.down), &w.mlp_norm);
+                let d = dsl::metal::rms_norm(&gemm(&h, &w.down), &w.mlp_norm, f.hidden, metal.rms_eps);
                 y = dsl::metal::residual_add(&d, &y);
             } else {
                 y = gemm_add(&a, &w.o_proj, &y);
-                let x = dsl::metal::rms_norm(&y, &w.mlp_norm);
+                let x = dsl::metal::rms_norm(&y, &w.mlp_norm, f.hidden, metal.rms_eps);
                 let h = gated(&x, &w);
                 y = gemm_add(&h, &w.down, &y);
             }
         }
 
-        let normed = dsl::metal::rms_norm(&y, &m.final_norm());
+        let normed = dsl::metal::rms_norm(&y, &m.final_norm(), f.hidden, metal.rms_eps);
         let head = if f.tied_embeddings { "embed" } else { "lm_head" };
         dsl::metal::lm_head(&normed, head, f.vocab, metal.proj_repr, &point);
     })
@@ -1525,8 +1634,24 @@ mod metal_tests {
         assert_eq!(facts.head_dim, 128, "the fixture this expectation reads");
         let paged = format!("sdpa_paged_decode_bfloat16_d_{}", facts.head_dim);
         let vector = format!("sdpa_vector_decode_bfloat16_d_{}", facts.head_dim);
+        // BOTH lanes take the paged symbol, because the POOL is paged. This
+        // expected the contiguous one at M=1 and the lane was never the
+        // question: `model::kv::Pool` allocates `[page, token, head, dim]` for
+        // every fire, so a decode naming `sdpa_vector_decode` walks a paged
+        // pool with a contiguous kernel's arithmetic -- real memory, wrong
+        // tokens, no bounds check anywhere.
+        //
+        // The two also disagree about their scalars: the paged row reads
+        // `Param(1)` as `n_kv_heads` and the contiguous row reads it as `n`,
+        // the key count. One statement cannot supply both, which is a second
+        // reason the choice cannot be per-lane.
         assert!(count(&mb, &paged) > 0, "the M>1 lane must take {paged}");
-        assert!(count(&fold, &vector) > 0, "the M=1 lane must take {vector}");
+        assert!(count(&fold, &paged) > 0, "the M=1 lane must take {paged} too");
+        assert_eq!(
+            count(&fold, &vector),
+            0,
+            "no contiguous attention over a paged pool"
+        );
         assert_eq!(
             count(&mb, "sdpa_paged_decode_bfloat16_d_256"),
             0,

@@ -23,6 +23,24 @@ pub struct LlamaLikeFacts {
     pub q_heads: u32,
     pub kv_heads: u32,
     pub head_dim: u32,
+    /// Experts in this deployment's mixture, and 0 for a dense one.
+    ///
+    /// A llama-like architecture with a ROUTED FFN is still llama-like: the
+    /// attention is unchanged and only the block between the two norms
+    /// differs. Stating it as a fact rather than a family is the whole tart
+    /// argument -- one supergraph, more polymorphism -- and it is what lets
+    /// qwen3-moe reach the device without a second text.
+    #[serde(default)]
+    pub n_experts: u32,
+    /// How many of them a row goes to.
+    #[serde(default)]
+    pub experts_per_token: u32,
+    /// One expert's inner width.
+    #[serde(default)]
+    pub moe_intermediate: u32,
+    /// The dense expert's inner width, 0 for a mixture without one.
+    #[serde(default)]
+    pub shared_intermediate: u32,
     pub intermediate: u32,
     pub vocab: u32,
     pub rope: RopeKind,
@@ -62,6 +80,9 @@ impl LlamaLikeFacts {
         model_compiler::dsl::ModelShape {
             hidden: self.hidden,
             intermediate: self.intermediate,
+            n_experts: self.n_experts,
+            moe_intermediate: self.moe_intermediate,
+            shared_intermediate: self.shared_intermediate,
             vocab: self.vocab,
             head_dim: self.head_dim,
             q_width: self.q_width(),
@@ -100,6 +121,13 @@ impl LlamaLikeFacts {
     /// tensors, added after the split — the hand-written order).
     pub fn qwen2_5_1_5b() -> Self {
         Self {
+            // DENSE: no mixture. Stated rather than defaulted because a
+            // fixture is a measurement of a real checkpoint, and "this one has
+            // no experts" is part of the measurement.
+            n_experts: 0,
+            experts_per_token: 0,
+            moe_intermediate: 0,
+            shared_intermediate: 0,
             hidden: 1536,
             layers: 28,
             q_heads: 12,
@@ -120,6 +148,13 @@ impl LlamaLikeFacts {
     /// Qwen3-0.6B, the workspace's parity model.
     pub fn qwen3_0_6b() -> Self {
         Self {
+            // DENSE: no mixture. Stated rather than defaulted because a
+            // fixture is a measurement of a real checkpoint, and "this one has
+            // no experts" is part of the measurement.
+            n_experts: 0,
+            experts_per_token: 0,
+            moe_intermediate: 0,
+            shared_intermediate: 0,
             hidden: 1024,
             layers: 28,
             q_heads: 16,
@@ -153,8 +188,52 @@ impl LlamaLikeFacts {
     /// projections and the trace writes three matmuls (verified against
     /// the live binding: the declared-forward trace reports the 387-op
     /// unfused form, 12 ops x 32 layers + 3).
+    /// Qwen3-30B-A3B: llama-like attention, ROUTED FFN.
+    ///
+    /// The fixture that makes the mixture reachable. Every attention number
+    /// here is a qwen3 number and every one of them is shared with
+    /// [`Self::qwen3_0_6b`]'s shape -- which is the point: the only thing this
+    /// deployment does differently is the block between the two norms.
+    ///
+    /// A SYNTHETIC fixture in the same sense as the rest: the numbers are the
+    /// published config's, not a measurement of a running checkpoint.
+    pub fn qwen3_30b_a3b() -> Self {
+        Self {
+            hidden: 2048,
+            layers: 48,
+            q_heads: 32,
+            kv_heads: 4,
+            head_dim: 128,
+            // The DENSE inner width, which a mixture has no use for. Stated as
+            // zero rather than left at the dense value so a text that reached
+            // for the wrong one computes nothing visible instead of something
+            // plausible.
+            intermediate: 0,
+            n_experts: 128,
+            experts_per_token: 8,
+            moe_intermediate: 768,
+            // No shared expert: qwen3-moe dropped the one qwen2-moe had.
+            shared_intermediate: 0,
+            vocab: 151_936,
+            rope: RopeKind::Standard,
+            norm_variant: NormVariant::Plain,
+            norm_placement: NormPlacement::Pre,
+            qk_norm: QkNorm::PerHead,
+            fused_qkv: false,
+            tied_embeddings: false,
+            qkv_bias: false,
+        }
+    }
+
     pub fn phi3_mini() -> Self {
         Self {
+            // DENSE: no mixture. Stated rather than defaulted because a
+            // fixture is a measurement of a real checkpoint, and "this one has
+            // no experts" is part of the measurement.
+            n_experts: 0,
+            experts_per_token: 0,
+            moe_intermediate: 0,
+            shared_intermediate: 0,
             hidden: 3072,
             layers: 32,
             q_heads: 32,
@@ -192,6 +271,13 @@ impl LlamaLikeFacts {
     /// trace reports the 355-op fused form, 11 ops x 32 layers + 3).
     pub fn mistral_7b_v03() -> Self {
         Self {
+            // DENSE: no mixture. Stated rather than defaulted because a
+            // fixture is a measurement of a real checkpoint, and "this one has
+            // no experts" is part of the measurement.
+            n_experts: 0,
+            experts_per_token: 0,
+            moe_intermediate: 0,
+            shared_intermediate: 0,
             hidden: 4096,
             layers: 32,
             q_heads: 32,
@@ -240,6 +326,13 @@ impl LlamaLikeFacts {
     /// single traced `gate_up` matmul, not a fact.)
     pub fn olmo2_1b() -> Self {
         Self {
+            // DENSE: no mixture. Stated rather than defaulted because a
+            // fixture is a measurement of a real checkpoint, and "this one has
+            // no experts" is part of the measurement.
+            n_experts: 0,
+            experts_per_token: 0,
+            moe_intermediate: 0,
+            shared_intermediate: 0,
             hidden: 2048,
             layers: 16,
             q_heads: 16,
@@ -432,7 +525,7 @@ pub struct LlamaLikeCudaFacts {
 /// rather than measured. `.wiki/tart/macos.md` records the ladder; the
 /// precedent for refusing to call an unmeasured fact set measured is
 /// [`Qwen35CudaFacts::qwen3_5_0_8b_synthetic`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlamaLikeMetalFacts {
     /// The projection GEMV folds the block residual in its epilogue
     /// (`affine_qmv_fast_residual`, `Dispatch::fuse_residual`,
@@ -511,9 +604,56 @@ pub struct LlamaLikeMetalFacts {
     /// fire that runs.
     #[serde(default)]
     pub gate_up_fused: bool,
+    /// `rms_norm_eps`, the epsilon every norm of this deployment carries.
+    ///
+    /// A load-time fact and not a constant: it comes from the checkpoint's
+    /// config, and the shader takes it as a field of `RmsParams` rather than
+    /// baking one in. A norm handed zero divides by the root of the mean
+    /// square alone, which for a near-zero row is an infinity the next kernel
+    /// spreads everywhere.
+    #[serde(default)]
+    pub rms_eps: f32,
+    /// `rope_theta`, the rotary base.
+    ///
+    /// Stated rather than defaulted for the reason `ModelFacts::rope_theta`
+    /// gives about its own: a reader that only knows the flat key finds
+    /// nothing on a config that nests it, silently keeps its default, and the
+    /// rotated channels come out wrong in a way that compounds layer over
+    /// layer until the activations saturate.
+    #[serde(default)]
+    pub rope_theta: f32,
+    /// Whether this deployment's rotary frequencies come from a TABLE.
+    ///
+    /// True for a config that rescales its ladder -- llama-3's `rope_scaling`
+    /// with `rope_type: llama3`, YaRN, and anything else that is not a plain
+    /// geometric series in a base. A `rope_theta` cannot express those, so a
+    /// text that stated one would rotate by the wrong frequencies from the
+    /// second channel on, at every position but zero.
+    ///
+    /// The table itself is the DRIVER's: derived at load from the config and
+    /// answered as `Source::RopeFrequencies`. This fact only says which form
+    /// the statement takes.
+    #[serde(default)]
+    pub rope_freq_table: bool,
+    /// The SLIDING WINDOW each layer attends over, `-1` for none.
+    ///
+    /// The same load-time fact [`LlamaLikeCudaFacts::window_left`] carries,
+    /// and stated here rather than shared because the two halves are
+    /// independently deserialized: a Metal deployment that alternates windows
+    /// (OLMo-3, Mistral) has to say so on its own side.
+    ///
+    /// Empty means every layer is `-1`. Read through
+    /// [`Self::window_left_at`].
+    #[serde(default)]
+    pub window_left: Vec<i32>,
 }
 
 impl LlamaLikeMetalFacts {
+    /// This layer's window, `-1` for all of it. See [`Self::window_left`].
+    pub fn window_left_at(&self, l: u32) -> i32 {
+        model_compiler::facts::window_left_at(&self.window_left, l)
+    }
+
     /// A SYNTHETIC fixture, not a measurement — see the struct comment.
     /// These are the driver's own defaults as its source reads them.
     pub fn synthetic() -> Self {
@@ -540,6 +680,16 @@ impl LlamaLikeMetalFacts {
             // `Projections::InPlace` is what `compile_load_plan` authors with,
             // and the join declines under it.
             gate_up_fused: false,
+            // qwen3's `rms_norm_eps`.
+            rms_eps: 1e-6,
+            // qwen3's `rope_theta`. The shader raises TWO to a base, so the
+            // statement hands it `log2(theta)`; handing theta rotates by a
+            // frequency ladder that is wrong from the second channel on.
+            rope_theta: 1_000_000.0,
+            // qwen3's ladder is a plain geometric series in `rope_theta`.
+            rope_freq_table: false,
+            // qwen3 attends over the whole context at every layer.
+            window_left: Vec::new(),
         }
     }
 }

@@ -607,6 +607,34 @@ impl LoraFireState {
         true
     }
 
+    /// Whether this staged state may be recorded into a union capture.
+    ///
+    /// Only the GROUPED path may. `apply`'s solo path is a host-side loop
+    /// over lanes whose launch count and shapes follow the fire's adapter
+    /// set — its rank, its token spans, which sites each lane touches — so
+    /// a capture bakes the lanes it happened to see and a later fire with
+    /// a different set needs a different launch sequence. That is not a
+    /// pointer to hand in; the arm is a PROGRAM whose shape is a variant
+    /// axis with unbounded cardinality, and no conditional node folds one.
+    ///
+    /// The grouped path is slot arithmetic over `ptr_slab` and a fixed
+    /// launch per group — which is what `apply` says where it does it,
+    /// "the slab was fully staged at fire setup … what a captured body
+    /// requires". It was written for this.
+    ///
+    /// So a fire joins a union only if EVERY lane grouped. This is an
+    /// eligibility rule of the same shape the C++ arc used for mixed
+    /// peels: what cannot be replayed stays eager.
+    ///
+    /// Note the group SHAPE is still baked by a capture (the member count
+    /// and the `m` vector reach the launcher as arguments), so a bucket
+    /// key that admits LoRA has to carry it. `true` here means "may be
+    /// captured", not "may share any exec".
+    #[must_use]
+    pub fn union_capture_safe(&self) -> bool {
+        self.grouped_enabled && self.lanes.iter().all(|l| l.grouped)
+    }
+
     /// The one-line grouping summary `PIE_LORA_FIRE_TRACE` prints. Ports
     /// `grouping_desc`.
     #[must_use]

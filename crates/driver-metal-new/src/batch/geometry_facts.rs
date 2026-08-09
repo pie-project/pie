@@ -53,6 +53,44 @@ fn positive(v: i32) -> Option<u32> {
 #[allow(clippy::too_many_lines)] // one refusal ladder; splitting hides the order
 pub fn geometry_from_facts(f: &ModelFacts) -> Result<DecodeGeometry, GeometryRefused> {
     let refuse = |why: &str| Err(GeometryRefused(why.to_string()));
+    // Whichever block the config filled. `from_descriptor` reads a llama-like
+    // config into `ll_*` and a qwen3.5 one into `q35_*` -- the marker fields
+    // its own doc describes -- and this read only the second, so a llama
+    // snapshot was refused as "carrying no decoder shape" while carrying it in
+    // the other block.
+    //
+    // Projecting rather than branching: every field below is the same question
+    // asked of a different prefix, and a `match` per field is the per-family
+    // ladder this crate is retiring. The GDN and interval fields have no `ll_`
+    // twin because a llama-like config has no linear attention -- zero there is
+    // the honest answer and not a default.
+    let f = &if f.q35_num_hidden_layers > 0 {
+        f.clone()
+    } else {
+        ModelFacts {
+            q35_num_hidden_layers: f.ll_num_hidden_layers,
+            q35_hidden_size: f.ll_hidden_size,
+            q35_vocab_size: f.ll_vocab_size,
+            q35_num_attention_heads: f.ll_num_attention_heads,
+            q35_num_key_value_heads: f.ll_num_key_value_heads,
+            q35_head_dim: f.ll_head_dim,
+            q35_intermediate_size: f.ll_intermediate_size,
+            q35_num_experts: f.ll_num_experts,
+            q35_num_experts_per_tok: f.ll_num_experts_per_tok,
+            q35_moe_intermediate_size: f.ll_moe_intermediate_size,
+            q35_rms_norm_eps: f.ll_rms_norm_eps,
+            q35_tied_embeddings: f.ll_tied_embeddings,
+            q35_norm_topk_prob: f.ll_norm_topk_prob,
+            // Every layer attends: a llama-like stack has no GDN interleave,
+            // so the interval is one and there are no MLP-only layers.
+            q35_full_attn_interval: 1,
+            q35_mlp_only_layer_count: 0,
+            // Every layer that has a mixture has it: a llama-like config
+            // states no sparse step, and 1 is "no layer is skipped".
+            q35_decoder_sparse_step: 1,
+            ..f.clone()
+        }
+    };
     if f.q35_num_hidden_layers <= 0 {
         return refuse("config carried no decoder shape");
     }
@@ -89,19 +127,32 @@ pub fn geometry_from_facts(f: &ModelFacts) -> Result<DecodeGeometry, GeometryRef
     };
 
     // ── the linear-attention block ──
-    let (Some(gdn_k_heads), Some(gdn_v_heads), Some(gdn_k_dim), Some(gdn_v_dim)) = (
-        positive(f.q35_linear_key_heads),
-        positive(f.q35_linear_value_heads),
-        positive(f.q35_linear_key_head_dim),
-        positive(f.q35_linear_value_head_dim),
-    ) else {
-        return refuse(
-            "the linear-attention block needs linear_num_key_heads, \
-             linear_num_value_heads, linear_key_head_dim and linear_value_head_dim",
-        );
-    };
-    let Some(gdn_conv_k) = positive(f.q35_linear_conv_kernel) else {
-        return refuse("the linear-attention block needs linear_conv_kernel_dim");
+    //
+    // A stack whose full-attention interval is ONE has no linear layers, so
+    // there is no block to state and demanding one refuses every llama-like
+    // config for lacking a thing it correctly does not have. The refusals
+    // below still apply to a stack that DOES interleave -- which is the
+    // distinction that matters: absent because there is none, versus absent
+    // because the config is short.
+    let interleaves = f.q35_full_attn_interval != 1;
+    let (gdn_k_heads, gdn_v_heads, gdn_k_dim, gdn_v_dim, gdn_conv_k) = if interleaves {
+        let (Some(k_heads), Some(v_heads), Some(k_dim), Some(v_dim)) = (
+            positive(f.q35_linear_key_heads),
+            positive(f.q35_linear_value_heads),
+            positive(f.q35_linear_key_head_dim),
+            positive(f.q35_linear_value_head_dim),
+        ) else {
+            return refuse(
+                "the linear-attention block needs linear_num_key_heads, \
+                 linear_num_value_heads, linear_key_head_dim and linear_value_head_dim",
+            );
+        };
+        let Some(conv_k) = positive(f.q35_linear_conv_kernel) else {
+            return refuse("the linear-attention block needs linear_conv_kernel_dim");
+        };
+        (k_heads, v_heads, k_dim, v_dim, conv_k)
+    } else {
+        (1, 1, 32, 32, 1)
     };
     if gdn_v_heads % gdn_k_heads != 0 {
         return Err(GeometryRefused(format!(
@@ -141,6 +192,21 @@ pub fn geometry_from_facts(f: &ModelFacts) -> Result<DecodeGeometry, GeometryRef
         hidden,
         vocab,
         eps: f.q35_rms_norm_eps,
+        // The rope RESCALING, when the config states one. `llama3` is the
+        // only kind whose four numbers this reads; a config that states
+        // another kind gets a factor of zero, which the derivation treats as
+        // "no rescaling" rather than guessing at a shape it does not know.
+        rope_freq_factor: if f.ll_rope_scaling_kind == "llama3" {
+            f.ll_rope_scale
+        } else {
+            0.0
+        },
+        rope_low_freq_factor: f.ll_rope_low_freq_factor,
+        rope_high_freq_factor: f.ll_rope_high_freq_factor,
+        rope_original_max_position: f
+            .ll_rope_original_max_position
+            .try_into()
+            .unwrap_or(0),
         n_q_heads,
         n_kv_heads,
         head_dim,

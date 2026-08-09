@@ -110,7 +110,12 @@ fn planned(low: &Lowered) -> (Vec<Dispatch<'_>>, Vec<Undispatchable>) {
 
 #[test]
 fn every_launch_whose_symbol_has_a_row_becomes_a_grid() {
-    for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 8)] {
+// SIXTEEN rows for a prefill, not eight, and it is a precondition rather than
+// a round number: `qmm_t.metal` has no `M` argument -- its header says the
+// driver only selects it when `M % BM == 0`, so the row count lives in the
+// grid -- and `QMM_BMS` starts at sixteen. `Rule::Qmm` refuses anything else
+// with `Ungeometric::PartialTile`.
+    for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 16)] {
         let low = lowered(class, rows);
         let (dispatches, refused) = planned(&low);
 
@@ -159,7 +164,7 @@ fn there_is_no_symbol_this_backend_cannot_dispatch() {
     // dispatch constant with no channel to receive one. The text states it now
     // and the driver forwards it, so the set is empty.
     let mut refusals: BTreeSet<String> = BTreeSet::new();
-    for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 8)] {
+    for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 16)] {
         for why in planned(&lowered(class, rows)).1 {
             refusals.insert(match why {
                 Undispatchable::NoRow { symbol, .. }
@@ -199,20 +204,36 @@ fn a_statement_that_states_scalars_carries_them_to_its_dispatch() {
     // own scalars is the difference between binding positionally and binding
     // where the kernel reads.
     assert_eq!(split.args.len(), 5, "packed in, q/k/v out, and the params");
+    assert_eq!(split.param_slots.len(), 1, "one packed struct");
     assert_eq!(
-        split.param_slots,
-        vec![(4, 0)],
+        split.param_slots[0].slot, 4,
         "the row placed the scalars at buffer 4"
     );
+    assert_eq!(split.param_slots[0].at, 0);
 
-    // And every other statement states none, so the channel is not a general
-    // escape hatch that grew.
-    let others = planned(&low)
+    // It used to be the ONLY statement carrying scalars, and this asserted
+    // that — "the channel is not a general escape hatch that grew". It grew,
+    // deliberately: the rows named their `Param` slots and every statement but
+    // four states them now, because a projection told its extents are zero
+    // computes nothing. So the assertion inverts.
+    let without: Vec<&str> = planned(&low)
         .0
         .into_iter()
-        .filter(|d| d.symbol != "split_qkv_bf16" && !d.params.is_empty())
-        .count();
-    assert_eq!(others, 0, "{others} other statements have grown scalars");
+        .filter(|d| d.params.is_empty())
+        .map(|d| d.symbol)
+        .collect();
+    let unexpected: BTreeSet<&str> = without
+        .into_iter()
+        // `silu_mul` takes none and its row names none — a kernel with no
+        // scalars is not a statement missing them.
+        .filter(|s| !s.starts_with("kv_append") && !s.starts_with("sdpa_") && *s != "silu_mul_bfloat16")
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "a statement other than the KV writes and the attentions carries no \
+         scalars: {unexpected:?}. Those four want the POOL's strides, which \
+         the text cannot state."
+    );
 }
 
 #[test]
@@ -253,7 +274,7 @@ fn a_rectangles_dims_come_from_the_rectangle_and_the_fire_and_nowhere_else() {
     // serves the attention norm at 1024 and the qk-norm at 2048 in the same
     // fire, because a width is the OPERAND's and not the kernel's — which is
     // the property that makes one rule serve every use of a kernel.
-    for (class, rows) in [(FireClass::Decode, 1u32), (FireClass::Prefill, 8)] {
+    for (class, rows) in [(FireClass::Decode, 1u32), (FireClass::Prefill, 16)] {
         let low = lowered(class, rows as usize);
         for launch in &low.launches {
             let symbol = low.kernels[launch.kernel as usize].as_str();
@@ -275,7 +296,7 @@ fn the_batched_lane_is_the_row_count_and_not_a_second_vocabulary() {
     // where the lanes differ they are DIFFERENT SYMBOLS, each stating its own
     // row, and the rest is `dims.rows`.
     let decode: BTreeSet<String> = lowered(FireClass::Decode, 1).kernels.into_iter().collect();
-    let prefill: BTreeSet<String> = lowered(FireClass::Prefill, 8).kernels.into_iter().collect();
+    let prefill: BTreeSet<String> = lowered(FireClass::Prefill, 16).kernels.into_iter().collect();
     let only_batched: Vec<&String> = prefill.difference(&decode).collect();
     assert!(
         !only_batched.is_empty(),
@@ -283,7 +304,7 @@ fn the_batched_lane_is_the_row_count_and_not_a_second_vocabulary() {
     );
     // And every one of them dispatches, which is what says the row carries the
     // lane rather than the driver picking it.
-    let refused = planned(&lowered(FireClass::Prefill, 8)).1;
+    let refused = planned(&lowered(FireClass::Prefill, 16)).1;
     assert!(
         refused.is_empty(),
         "a batched symbol did not dispatch: {refused:?}"
@@ -419,7 +440,7 @@ mod the_map {
         let store = Store::new(names, &tensors, &named);
 
         let mut unknown: BTreeSet<String> = BTreeSet::new();
-        for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 8)] {
+        for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 16)] {
             let low = lowered(class, rows);
             for arg in &low.args {
                 if let model_compiler::lower::Arg::Weight(name) = arg {
@@ -467,5 +488,140 @@ mod the_map {
         assert_eq!(weights.len(), 3, "packed weight, scales, zero point");
         assert!(weights[1].ends_with(".scales"));
         assert!(weights[2].ends_with(".zeros"));
+    }
+}
+
+/// A statement's STATE, which is not one of its operands.
+///
+/// The KV cache outlives the fire, so no traced value stands for it and a
+/// statement names it as `StateRef { KvCache, layer }`. Every backend has
+/// answered that with a hand-written arm; `Source::KvKeys`/`KvValues` let the
+/// ROW ask, and `Resolver::kv` is where the asking lands.
+mod state {
+    use std::collections::HashMap;
+
+    use driver_metal_new::model::executor::{Resolver, Slice};
+    use driver_metal_new::model::resolve::{Names, Store};
+
+    use super::*;
+
+    /// Distinct addresses per (layer, side), so a wrong one names itself.
+    fn pages(layer: u16, values: bool) -> Option<Slice> {
+        Some(Slice {
+            address: 0x7000_0000u64.wrapping_add(u64::from(layer) << 16)
+                + if values { 0x8000 } else { 0 },
+            bytes: 1 << 20,
+        })
+    }
+
+    #[test]
+    fn a_kv_write_binds_the_pages_of_its_own_layer() {
+        let low = lowered(FireClass::Decode, 1);
+        let (tensors, named) = (HashMap::new(), HashMap::new());
+        let kv = |l: u16, v: bool| pages(l, v);
+        let mut store = Store::new(Names::mlx(), &tensors, &named).with_kv(&kv);
+
+        // Answer the weights too, so a refusal is about state and nothing else.
+        assert!(store.weight("layer.0.attn_norm").is_none());
+
+        let mut checked = 0;
+        for launch in &low.launches {
+            if !low.kernels[launch.kernel as usize].starts_with("kv_append") {
+                continue;
+            }
+            let d = plan_one(
+                &low,
+                launch,
+                kernels_metal::KERNELS,
+                frame(&low),
+                geometry(),
+                &mut store,
+            )
+            .expect("a kv write plans");
+            let layer = launch.layers.start;
+            // Buffers 2 and 3 are the cache, which the ROW says and this
+            // reads back: keys then values, of this statement's own layer.
+            assert_eq!(
+                d.args[2].slice.address,
+                pages(layer, false).unwrap().address,
+                "layer {layer}: keys"
+            );
+            assert_eq!(
+                d.args[3].slice.address,
+                pages(layer, true).unwrap().address,
+                "layer {layer}: values"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 24, "only {checked} kv writes; a 24-layer text has one a layer");
+    }
+
+    #[test]
+    fn a_rope_binds_the_fires_positions_because_its_row_names_them() {
+        // A text cannot state the positions — they are this fire's data, not
+        // this model's structure — so the ROW names which table and the
+        // resolver answers. A kernel wanting them and a driver that KNEW to
+        // bind them is the hand-written arm this crate removes.
+        use driver_metal_new::model::executor::FireTable;
+
+        let low = lowered(FireClass::Decode, 1);
+        let (tensors, named) = (HashMap::new(), HashMap::new());
+        let tables = |t: FireTable| {
+            (t == FireTable::Positions).then_some(Slice {
+                address: 0x5150_0000,
+                bytes: 64,
+            })
+        };
+        let mut store = Store::new(Names::mlx(), &tensors, &named).with_fire(&tables);
+        let launch = low
+            .launches
+            .iter()
+            .find(|l| low.kernels[l.kernel as usize].starts_with("neox"))
+            .expect("the text rotates");
+        let d = plan_one(
+            &low,
+            launch,
+            kernels_metal::KERNELS,
+            frame(&low),
+            geometry(),
+            &mut store,
+        )
+        .expect("a rotation plans");
+        // Buffer 1 is `position`, which the row says and this reads back.
+        assert_eq!(d.args[1].slice.address, 0x5150_0000);
+        assert_eq!(d.args.len(), 5, "x, position, and three scalars");
+    }
+
+    #[test]
+    fn a_resolver_with_no_pool_binds_a_region_that_addresses_nothing() {
+        // The default. A binder's own tests have no pool and must not need
+        // one, and a statement that asks and gets nothing binds a region
+        // addressing nothing — the same honest answer a missing scale gets,
+        // and not a skipped slot, which would shift every operand after it.
+        let low = lowered(FireClass::Decode, 1);
+        let (tensors, named) = (HashMap::new(), HashMap::new());
+        let mut store = Store::new(Names::mlx(), &tensors, &named);
+        let launch = low
+            .launches
+            .iter()
+            .find(|l| low.kernels[l.kernel as usize].starts_with("kv_append"))
+            .expect("the text writes KV");
+        let d = plan_one(
+            &low,
+            launch,
+            kernels_metal::KERNELS,
+            frame(&low),
+            geometry(),
+            &mut store,
+        )
+        .expect("it still plans");
+        assert_eq!(d.args[2].slice.address, 0);
+        assert_eq!(d.args[2].slice.bytes, 0);
+        // SIXTEEN, which is `kv_append_paged`'s width. The text names the
+        // paged variant for every fire now -- the POOL is paged, so a decode
+        // that named the contiguous one would walk it with contiguous
+        // arithmetic -- and the paged row is positional over a shared ring ABI
+        // it does not read, which is where most of the sixteen go.
+        assert_eq!(d.args.len(), 16, "and every other slot is still in place");
     }
 }

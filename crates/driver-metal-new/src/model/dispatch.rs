@@ -35,7 +35,7 @@ use core::ops::Range;
 use kernels::KernelSig;
 use model_compiler::lower::{Arg, Launch, Lowered};
 
-use super::executor::{BindRefusal, BoundArg, Frame, Resolver, bind};
+use super::executor::{BindRefusal, BoundArg, FireTable, Frame, Resolver, bind};
 use super::geometry::{Dims, Ungeometric, eval};
 
 /// The fire-invariant half of [`Dims`]: what every launch of one fire shares.
@@ -89,18 +89,20 @@ pub struct Dispatch<'a> {
     /// got before and is wrong for most of them. That is why
     /// `tests/text_conformance.rs` counts them.
     pub args: Vec<BoundArg>,
-    /// Where each scalar binds: `(buffer slot, which scalar)`.
+    /// Where each scalar binds, and how wide it is there.
     ///
-    /// Two spellings exist in the shader tree and the row is what tells them
-    /// apart. `moe/route.metal` takes `constant RouterParams&` — one buffer
-    /// holding every field — while `quant/qmv.metal` takes
-    /// `const constant int& in_vec_size` and `out_vec_size` as two.
+    /// Three facts, because three are needed and the row states all of them.
     ///
-    /// One rule serves both: scalar `i` binds at `base + i * 4`, because a
-    /// params struct is a run of `u32` with no padding and its address is the
-    /// address of its first field. A row stating one `Param(0)` therefore
-    /// describes the packed form and the separate form at once.
-    pub param_slots: Vec<(usize, u8)>,
+    /// * **Which buffer.** Two spellings exist in the tree: `moe/route.metal`
+    ///   takes `constant RouterParams&`, one buffer holding every field, and
+    ///   `quant/qmv.metal` takes its two extents as separate buffers.
+    /// * **Which scalar**, as a byte offset into this dispatch's staged run.
+    /// * **How wide.** `attn/sdpa_vector.metal` declares its strides
+    ///   `const constant size_t&` — **eight bytes** — while the trace's params
+    ///   are `u32`. A driver that handed a four-byte slot to an eight-byte
+    ///   read would give the kernel four bytes of the next scalar as the high
+    ///   half of this one. The row's `Ty` says which, so the stage widens.
+    pub param_slots: Vec<ParamSlot>,
     /// The scalar arguments the statement states, in its stated order.
     ///
     /// A kernel takes numbers no operand shape gives — a QKV split's two
@@ -108,11 +110,34 @@ pub struct Dispatch<'a> {
     /// forwards them without knowing what they mean, which is the difference
     /// between a driver that passes a constant and one that re-derives it
     /// from a config it had to understand.
-    pub params: &'a [u32],
+    pub params: Vec<u32>,
     /// The layers this rectangle covers.
     pub layers: Range<u16>,
     /// Which traced op produced it — where a refusal points.
     pub op: u32,
+}
+
+/// One scalar's placement: which buffer, where in the staged run, how wide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParamSlot {
+    /// The argument-table index this binds at.
+    pub slot: usize,
+    /// Byte offset into this dispatch's staged scalars.
+    pub at: u32,
+    /// Bytes the kernel reads there — four or eight for a scalar.
+    pub bytes: u32,
+    /// This slot is a POINTER to a struct holding every remaining scalar,
+    /// rather than one scalar.
+    ///
+    /// Both spellings are in the tree and the row's `Ty` tells them apart: a
+    /// `Buf` param is `constant RouterParams&` — one buffer, every field —
+    /// while an `I32` param is `const constant int&`, one buffer per number.
+    /// A packed slot's run is as long as the statement's scalars; a scalar
+    /// slot's is its own width.
+    pub packed: bool,
+    /// Which of the statement's scalars this is, or `None` for a slot the row
+    /// names past what the statement states.
+    pub value: Option<u8>,
 }
 
 /// Why a launch could not become a dispatch.
@@ -280,25 +305,11 @@ pub fn plan_one<'a, S: Resolver>(
         op: launch.op,
         why,
     })?;
-    let args = reorder(sig, &bound.args, lowered, launch);
-    // Where the row puts its scalars. A row that states no operands has them
-    // appended as one packed struct after the operands, which is the only
-    // convention available when nothing said otherwise.
-    let param_slots: Vec<(usize, u8)> = if sig.operands.is_empty() {
-        vec![(args.len(), 0)]
-    } else {
-        sig.operands
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, o)| match o.source {
-                kernels::Source::Param(i) => Some((slot, i)),
-                _ => None,
-            })
-            .collect()
-    };
+    let args = reorder(sig, &bound.args, lowered, launch, resolver);
+    let (param_slots, params) = param_layout(sig, args.len(), lowered, launch, resolver);
     Ok(Dispatch {
         symbol: bound.kernel,
-        params: &lowered.params[launch.params.start as usize..launch.params.end as usize],
+        params,
         file,
         grid: grid.grid,
         threadgroup: grid.tg,
@@ -357,11 +368,12 @@ pub fn plan<'a, S: Resolver>(
 /// addresses nothing, which is the same honest answer `resolve_arg` gives a
 /// `scale.` marker. It is not silently skipped, because a skipped slot shifts
 /// every operand after it.
-fn reorder(
+fn reorder<S: Resolver>(
     sig: &'static KernelSig,
     bound: &[BoundArg],
     lowered: &Lowered,
     launch: &Launch,
+    resolver: &mut S,
 ) -> Vec<BoundArg> {
     if sig.operands.is_empty() {
         return bound.to_vec();
@@ -391,7 +403,20 @@ fn reorder(
             _ => None,
         })
         .max()
-        .unwrap_or(1)
+        // ZERO when the row names no `Out` at all, and that is not a
+        // degenerate case: `kv_append` writes the POOL and produces no traced
+        // value, so it has inputs and no outputs.
+        //
+        // This defaulted to ONE, which took `v_new` -- the last input -- for
+        // an output, so `In(1)` had nothing left to resolve to and the append
+        // bound a region addressing nothing where the values were. Measured
+        // against a real checkpoint: the K pages filled and the V pages were
+        // entirely zero, every layer, and the attention that read them
+        // answered zero without failing.
+        //
+        // A row with no operands at all returns above, so nothing needs the
+        // old default.
+        .unwrap_or(0)
         .min(widthed.len());
     let (ins, outs) = widthed.split_at(widthed.len() - results);
 
@@ -402,22 +427,150 @@ fn reorder(
         },
         width: 0,
     };
+    // The layer this statement runs in, for the state lookups. A rolled trace
+    // states a span and an unrolled one states a layer; the span's first is
+    // the answer either way, because a rolled statement runs once per layer
+    // and reaches this once per layer with it.
+    let layer = launch.layers.start;
     sig.operands
         .iter()
-        .map(|operand| {
-            let at = match operand.source {
-                kernels::Source::In(i) => ins.get(i as usize).copied(),
-                kernels::Source::Out(i) => outs.get(i as usize).copied(),
-                kernels::Source::Weight(i) => weights.get(i as usize).copied(),
-                // A scalar does not come out of the operand list at all — it
-                // rides `Dispatch::params`, bound as one struct after the
-                // buffers — so its slot here addresses nothing and the
-                // encoder's own binding is what the kernel reads.
-                _ => None,
-            };
-            at.and_then(|i| bound.get(i).copied()).unwrap_or(nothing)
+        .map(|operand| match operand.source {
+            kernels::Source::In(i) => pick(bound, ins.get(i as usize)),
+            kernels::Source::Out(i) => pick(bound, outs.get(i as usize)),
+            kernels::Source::Weight(i) => pick(bound, weights.get(i as usize)),
+            // The KV cache is STATE, not an operand: no traced value stands
+            // for it, so the pointer comes from the driver's own pool through
+            // the resolver rather than from the statement's args.
+            kernels::Source::KvKeys => resolver
+                .kv(layer, false)
+                .map_or(nothing, |slice| BoundArg { slice, width: 0 }),
+            kernels::Source::KvValues => resolver
+                .kv(layer, true)
+                .map_or(nothing, |slice| BoundArg { slice, width: 0 }),
+            // The fire's own tables. The row names which; this forwards the
+            // name and never reads what it means.
+            kernels::Source::TokenIds => fire(resolver, FireTable::TokenIds),
+            kernels::Source::Positions => fire(resolver, FireTable::Positions),
+            kernels::Source::RequestOfToken => fire(resolver, FireTable::RequestOfToken),
+            kernels::Source::KvPageIndices => fire(resolver, FireTable::KvPageIndices),
+            kernels::Source::KvPageIndptr => fire(resolver, FireTable::KvPageIndptr),
+            kernels::Source::KvWritePage => fire(resolver, FireTable::KvWritePage),
+            kernels::Source::KvWriteOffset => fire(resolver, FireTable::KvWriteOffset),
+            kernels::Source::RopeFrequencies => fire(resolver, FireTable::RopeFrequencies),
+            kernels::Source::AttentionMask => fire(resolver, FireTable::AttentionMask),
+            kernels::Source::AttentionMaskEnabled => {
+                fire(resolver, FireTable::AttentionMaskEnabled)
+            }
+            // A scalar does not come out of the operand list at all — it rides
+            // `Dispatch::params`, bound at the slot the row placed it — so its
+            // slot here addresses nothing and the encoder's binding is what
+            // the kernel reads.
+            _ => nothing,
         })
         .collect()
+}
+
+/// Where each of a statement's scalars binds, and how wide.
+///
+/// A row that states no operands has them appended as one packed struct after
+/// the operands — the only convention available when nothing said otherwise,
+/// and right for the `RouterParams` shape.
+///
+/// A row that states them places each itself, and its `Ty` gives the width.
+/// The staged run is laid out in the row's order with each scalar naturally
+/// aligned, so an eight-byte stride starts on an eight-byte boundary rather
+/// than wherever the previous four-byte extent happened to end.
+fn param_layout<S: Resolver>(
+    sig: &'static KernelSig,
+    operands: usize,
+    lowered: &Lowered,
+    launch: &Launch,
+    resolver: &mut S,
+) -> (Vec<ParamSlot>, Vec<u32>) {
+    let mut params: Vec<u32> =
+        lowered.params[launch.params.start as usize..launch.params.end as usize].to_vec();
+    if sig.operands.is_empty() {
+        return (
+            vec![ParamSlot {
+                slot: operands,
+                at: 0,
+                bytes: 4,
+                packed: true,
+                value: Some(0),
+            }],
+            params,
+        );
+    }
+    let mut at = 0u32;
+    let mut out = Vec::new();
+    for (slot, operand) in sig.operands.iter().enumerate() {
+        // A pool number is not one of the statement's scalars: the driver
+        // resolves it and APPENDS it, so the slot points at a value the
+        // statement never carried. That is the whole reason it is a `Source`
+        // — a stride is the pool's shape, and a text that guessed one would be
+        // right for a deployment and silently wrong for the next.
+        let pooled = match operand.source {
+            kernels::Source::KvHeadStride => Some(FireTable::KvHeadStride),
+            kernels::Source::KvSeqStride => Some(FireTable::KvSeqStride),
+            kernels::Source::KvPageSize => Some(FireTable::KvPageSize),
+            _ => None,
+        };
+        let (which, bytes, packed) = if let Some(want) = pooled {
+            let value = resolver.pool(want).unwrap_or(0);
+            params.push(value);
+            let i = u8::try_from(params.len() - 1).unwrap_or(u8::MAX);
+            (Some(i), if operand.ty == kernels::Ty::Usize { 8 } else { 4 }, false)
+        } else {
+            match operand.source {
+                kernels::Source::Param(i) | kernels::Source::ParamF32(i) => match operand.ty {
+                    kernels::Ty::Usize => (Some(i), 8, false),
+                    // A pointer where a scalar could be is the packed struct.
+                    kernels::Ty::Buf | kernels::Ty::BufMut => (Some(i), 4, true),
+                    _ => (Some(i), 4, false),
+                },
+                _ => continue,
+            }
+        };
+        at = at.next_multiple_of(bytes);
+        out.push(ParamSlot {
+            slot,
+            at,
+            bytes,
+            packed,
+            value: which,
+        });
+        at += bytes;
+    }
+    (out, params)
+}
+
+/// One of the fire's tables, or a region addressing nothing.
+fn fire<S: Resolver>(resolver: &mut S, table: FireTable) -> BoundArg {
+    resolver.fire(table).map_or(
+        BoundArg {
+            slice: crate::model::executor::Slice {
+                address: 0,
+                bytes: 0,
+            },
+            width: 0,
+        },
+        |slice| BoundArg { slice, width: 0 },
+    )
+}
+
+/// The bound operand at `at`, or one that addresses nothing.
+///
+/// Nothing rather than a skip: a skipped slot shifts every operand after it,
+/// which turns one missing pointer into a whole misbound launch.
+fn pick(bound: &[BoundArg], at: Option<&usize>) -> BoundArg {
+    at.and_then(|&i| bound.get(i).copied())
+        .unwrap_or(BoundArg {
+            slice: crate::model::executor::Slice {
+                address: 0,
+                bytes: 0,
+            },
+            width: 0,
+        })
 }
 
 /// The distinct `(file, entry point)` pairs a dispatch list needs compiled.
@@ -513,8 +666,8 @@ mod tests {
         // row width. So the last widthed operand is the output, and that is
         // what every rule means by "width".
         let low = one("sized", 3, vec![
-            Arg::Arena { at: 0, width: 11 },
-            Arg::Arena { at: 64, width: 22 },
+            Arg::Arena { at: 0, width: 11, bytes: 2 },
+            Arg::Arena { at: 64, width: 22, bytes: 2 },
             Arg::Weight("w".into()),
         ]);
         assert_eq!(sizing_width(&low, &low.launches[0]), 22);
@@ -522,7 +675,7 @@ mod tests {
 
     #[test]
     fn a_launch_evaluates_its_rows_and_the_fires_geometry_together() {
-        let low = one("sized", 5, vec![Arg::Arena { at: 0, width: 64 }]);
+        let low = one("sized", 5, vec![Arg::Arena { at: 0, width: 64, bytes: 2 }]);
         let geometry = Geometry {
             q_heads: 16,
             kv_heads: 4,
@@ -540,6 +693,7 @@ mod tests {
         let low = one("attn::split_qkv_bf16", 1, vec![Arg::Arena {
             at: 0,
             width: 8,
+            bytes: 16,
         }]);
         assert_eq!(
             plan(&low, TABLE, frame(), Geometry::default(), &mut Anything),
@@ -554,7 +708,7 @@ mod tests {
     fn a_row_that_states_no_file_cannot_be_reached_on_this_backend() {
         // Metal compiles at run time from `(path, entry name)`. A row without
         // a file is not a kernel this driver can find.
-        let low = one("no_file", 1, vec![Arg::Arena { at: 0, width: 8 }]);
+        let low = one("no_file", 1, vec![Arg::Arena { at: 0, width: 8, bytes: 2 }]);
         assert!(matches!(
             plan(&low, TABLE, frame(), Geometry::default(), &mut Anything),
             Err(Undispatchable::NoFile { .. })
@@ -563,7 +717,7 @@ mod tests {
 
     #[test]
     fn a_row_that_states_no_rule_refuses_rather_than_launching_something_plausible() {
-        let low = one("no_rule", 1, vec![Arg::Arena { at: 0, width: 8 }]);
+        let low = one("no_rule", 1, vec![Arg::Arena { at: 0, width: 8, bytes: 2 }]);
         assert_eq!(
             plan(&low, TABLE, frame(), Geometry::default(), &mut Anything),
             Err(Undispatchable::Ungeometric {
@@ -578,7 +732,7 @@ mod tests {
     fn a_fire_that_cannot_be_dispatched_whole_returns_nothing_partial() {
         // A prefix of dispatches would leave the arena half-written, which is
         // indistinguishable from a model that answers nonsense.
-        let mut low = one("sized", 1, vec![Arg::Arena { at: 0, width: 8 }]);
+        let mut low = one("sized", 1, vec![Arg::Arena { at: 0, width: 8, bytes: 2 }]);
         low.kernels.push("no_rule".into());
         let second = Launch {
             kernel: 1,
@@ -595,7 +749,7 @@ mod tests {
         // step, so a union-lowered fire reaching this walk would encode every
         // arm of every guard unconditionally — a different answer, not a
         // slower one.
-        let mut low = one("sized", 1, vec![Arg::Arena { at: 0, width: 8 }]);
+        let mut low = one("sized", 1, vec![Arg::Arena { at: 0, width: 8, bytes: 2 }]);
         low.launches[0].cond = 3;
         assert_eq!(
             plan(&low, TABLE, frame(), Geometry::default(), &mut Anything),
@@ -615,8 +769,14 @@ mod tests {
             grid: [1, 1, 1],
             threadgroup: [1, 1, 1],
             args: Vec::new(),
-            param_slots: vec![(0, 0)],
-            params: &[],
+            param_slots: vec![ParamSlot {
+                slot: 0,
+                at: 0,
+                bytes: 4,
+                packed: true,
+                value: Some(0),
+            }],
+            params: Vec::new(),
             layers: 0..1,
             op: 0,
         };

@@ -12,7 +12,7 @@ Date: 2026-08-09. Written for whoever picks this up next, human or agent.
 > 2. **The model-compiler path is the direction**, and `DIRECTION.md` is its
 >    decision record — read that first. In short: the executor is `src/model/`
 >    and is done; it walks a lowered fire with no arm per kernel and no branch
->    per family, and `tests/device_text_fire.rs` runs all 367 launches of
+>    per family, and `tests/device_text_fire.rs` runs all 423 launches of
 >    `llama_like`'s Metal text on the GPU. What is NOT done is the proof —
 >    nothing has been held to `tests/device_smoke.rs` token for token, and
 >    until it has, **no family's handwritten driver code may be deleted**.

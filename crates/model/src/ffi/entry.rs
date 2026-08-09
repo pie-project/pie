@@ -109,6 +109,19 @@ fn read_facts(facts: &PieForwardLlamaLikeFacts) -> Result<LlamaLikeFacts, PieFor
         fused_qkv: facts.fused_qkv != 0,
         tied_embeddings: facts.tied_embeddings != 0,
         qkv_bias: facts.qkv_bias != 0,
+        // DENSE, because the C ABI has not been widened for the mixture and
+        // this is the C entry. Widening `PieForwardLlamaLikeFacts` is
+        // append-only-safe but regenerates a committed header, and no C caller
+        // wants a mixture yet -- the Metal path that does reaches
+        // `llama_like_metal` as a Rust call and states its own facts.
+        //
+        // Zero here is therefore the honest answer rather than a default: a C
+        // caller cannot express a mixture, so every trace it asks for is
+        // dense.
+        n_experts: 0,
+        experts_per_token: 0,
+        moe_intermediate: 0,
+        shared_intermediate: 0,
     })
 }
 

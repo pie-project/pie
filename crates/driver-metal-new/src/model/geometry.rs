@@ -91,6 +91,32 @@ pub struct Dims {
 pub enum Ungeometric {
     /// The row states no rule, so nothing can be dispatched from it.
     Unstated,
+    /// A tiled GEMM over a row count its tile does not divide.
+    ///
+    /// `qmm_t.metal`'s own header states the precondition: *"The driver only
+    /// selects this kernel when M % BM == 0 ... so every tile is full and the
+    /// `load_unsafe` path is the only one reachable; the row count lives in
+    /// the grid."* There is no M argument, so a partial tile is not a shorter
+    /// tile -- it is a full tile reading and writing rows that are not there.
+    ///
+    /// This refuses instead of substituting, and both substitutions have been
+    /// tried against a real checkpoint. Handing the GEMM's symbol the MATVEC's
+    /// grid made a two-token prefill entirely NaN. Rounding the row axis up
+    /// made it finite and WRONG -- q_proj came out 1.258 where the matvec and
+    /// MLX both say 1.320 -- which is the worse of the two, because the arena
+    /// is laid out back to back and fourteen rows of overrun land on the next
+    /// value.
+    ///
+    /// The answer is a text that states the pair with a predicate on rows, the
+    /// way the DSL states every other polymorphism. A DRIVER that picks
+    /// between two kernels is the thing this crate exists to remove, so it
+    /// refuses and says why.
+    PartialTile {
+        /// Rows the fire has.
+        rows: u32,
+        /// Rows the tile needs a multiple of.
+        tile: u32,
+    },
 }
 
 /// The launch a rule produces for `dims`.
@@ -133,13 +159,14 @@ pub fn eval(rule: Rule, dims: Dims) -> Result<Launch, Ungeometric> {
         Rule::Qmm => {
             let bm = shapes::qmm_bm(rows);
             let bn = widest_column_tile(dims.width);
-            // A tile that does not divide the work is a GEMM computing part of
-            // the output. Falling back to the matvec grid computes all of it,
-            // slower — which is the failure worth having.
-            if bn == 0 || !rows.is_multiple_of(bm) {
+            // See `Ungeometric::PartialTile`. Both substitutions were tried
+            // against a real checkpoint and both were wrong; this refuses.
+            if bn == 0 {
                 shapes::qmv_mb(dims.width, rows)
-            } else {
+            } else if rows.is_multiple_of(bm) {
                 shapes::qmm_t(dims.width, rows, bn, bm)
+            } else {
+                return Err(Ungeometric::PartialTile { rows, tile: bm });
             }
         }
         Rule::Rms => shapes::rms(dims.width, rows),
@@ -311,7 +338,7 @@ mod tests {
     /// is what makes the batched lane a row's statement rather than a mode the
     /// driver picks.
     #[test]
-    fn the_gemm_tiles_over_rows_and_falls_back_when_a_tile_would_not_divide() {
+    fn the_gemm_tiles_over_rows_and_refuses_a_partial_one() {
         let d = Dims {
             rows: 32,
             width: 4096,
@@ -322,14 +349,20 @@ mod tests {
             shapes::qmm_t(4096, 32, 64, shapes::qmm_bm(32)),
             "a divisible shape tiles"
         );
-        // A row count no rung divides computes part of the output as a GEMM;
-        // the matvec grid computes all of it, slower, which is the failure
-        // worth having.
+        // A row count no rung divides is still the GEMM's: the last tile is
+        // PARTIAL and the kernel bounds-checks within it.
+        //
+        // This expected `shapes::qmv_mb` — the matvec grid — on the theory
+        // that it "computes all of it, slower". It does not: `affine_qmm_t`
+        // reads its tile FROM the grid, so a matvec grid points it at a tiling
+        // that is not there, and a two-token prefill against a real checkpoint
+        // came back entirely NaN. `QMM_BMS` starts at sixteen, so EVERY
+        // prefill shorter than sixteen rows took that path.
         let ragged = Dims { rows: 3, ..d };
         assert_eq!(
-            eval(Rule::Qmm, ragged).expect("stated"),
-            shapes::qmv_mb(4096, 3),
-            "an indivisible shape falls back rather than dropping outputs"
+            eval(Rule::Qmm, ragged),
+            Err(Ungeometric::PartialTile { rows: 3, tile: 16 }),
+            "an indivisible shape refuses rather than substituting"
         );
     }
 

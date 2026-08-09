@@ -111,10 +111,30 @@ impl Pool {
         let bytes = shape.layer_bytes().max(1);
         let mut layers = Vec::with_capacity(shape.layers as usize);
         for _ in 0..shape.layers {
-            layers.push(Layer {
-                k: allocate(context, bytes, "kv k pages")?,
-                v: allocate(context, bytes, "kv v pages")?,
-            });
+            let (k, v) = (
+                allocate(context, bytes, "kv k pages")?,
+                allocate(context, bytes, "kv v pages")?,
+            );
+            // ZEROED, and it is the difference between a pool and a hazard.
+            //
+            // A fresh Metal buffer is usually zero and nothing promises it. An
+            // attention reads every row its length says it has, and a row the
+            // fire has not written yet is one the allocator last handed to
+            // somebody else -- so a decode over a half-filled pool attends to
+            // whatever was there. Measured: three runs of one fire over one
+            // checkpoint gave widest activations of 29.75, 222208 and 53.75.
+            // Same input, same weights, three answers.
+            //
+            // Zero is also the semantically right filler: an all-zero key
+            // contributes a uniform logit rather than a wild one, so a pool
+            // read too far degrades toward the mean instead of exploding.
+            //
+            // SAFETY: freshly allocated; nothing is encoded against either.
+            unsafe {
+                k.zero(0, k.len())?;
+                v.zero(0, v.len())?;
+            }
+            layers.push(Layer { k, v });
         }
         Ok(Self { shape, layers })
     }

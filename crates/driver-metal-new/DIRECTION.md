@@ -84,7 +84,7 @@ What exists: `crates/model/src/families/llama_like/forward/mod.rs`'s
 * ~~the text is monomorphic~~ — **closed 2026-08-10.** `m.depth_window()`
   makes every layer-tagged statement implicitly `rows(depth > layer)`. On eight
   prefill rows with half truncated at layer 4, row-work falls **2936 → 1688
-  (−42%) at the same 367 launches**: the shared prefix executes once, which is
+  (−42%) at an unchanged launch count**: the shared prefix executes once, which is
   the supergraph claim. Stating an axis also buys the **seriation contract** —
   the text now refuses `Discontiguous { axis: "depth" }` on a row order whose
   depth runs are not contiguous, so the frame bridge must hand rows over
@@ -127,7 +127,7 @@ rows. Same staleness this crate's ledgers keep showing.)
 
 **There is no arm per kernel and no branch per family.** `dispatch::plan_one`
 is: look the symbol up, read its file, evaluate its rule, bind its operands.
-`tests/device_text_fire.rs` runs all 367 launches of `llama_like`'s text on the
+`tests/device_text_fire.rs` runs all 423 launches of `llama_like`'s text on the
 GPU, in both fire classes, through that walk.
 
 Two things it proved on the way, both worth keeping:

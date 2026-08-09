@@ -92,7 +92,7 @@ fn frame(lowered: &Lowered) -> Frame {
 
 #[test]
 fn every_launch_of_the_metal_text_binds_in_both_fire_classes() {
-    for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 8)] {
+    for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 16)] {
         let low = lowered(class, rows);
         assert!(
             !low.launches.is_empty(),
@@ -120,7 +120,7 @@ fn no_arena_operand_addresses_past_the_arena_the_lowering_sized() {
     // The lowering assigns offsets and reports `arena_bytes`; nothing else
     // checks that the two agree. A frame sized exactly to its own report is
     // the strictest version of that question.
-    for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 8)] {
+    for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 16)] {
         let low = lowered(class, rows);
         let frame = frame(&low);
         let mut store = Sentinels::default();
@@ -149,7 +149,7 @@ fn every_symbol_the_lowering_names_has_a_row_in_the_metal_table() {
     // `silu_mul_bfloat16`). Comparing against `KernelSig::name` instead would
     // be comparing a dsl-side name to a recorded symbol.
     let mut missing: BTreeSet<String> = BTreeSet::new();
-    for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 8)] {
+    for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 16)] {
         for symbol in &lowered(class, rows).kernels {
             if kernels::sig_in(kernels_metal::KERNELS, symbol).is_none() {
                 missing.insert(symbol.clone());
@@ -183,7 +183,7 @@ fn every_symbol_the_lowering_names_states_the_file_that_defines_it() {
     // Demand-driven: a row gets its `file` when a text names it, and this is
     // what asks.
     let mut unstated: BTreeSet<String> = BTreeSet::new();
-    for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 8)] {
+    for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 16)] {
         for symbol in &lowered(class, rows).kernels {
             match kernels::sig_in(kernels_metal::KERNELS, symbol) {
                 Some(sig) if sig.file.is_some() => {}

@@ -209,7 +209,14 @@ impl DispatchPlan {
         };
         let out_arg = |v: ValueId| -> Arg {
             match lowered.value_offset.get(v as usize) {
-                Some(&at) if at != Buffers::NAMED => Arg::Arena { at, width: width_of(v) },
+                Some(&at) if at != Buffers::NAMED => Arg::Arena {
+                    at,
+                    width: width_of(v),
+                    bytes: plan
+                        .values
+                        .get(v as usize)
+                        .map_or(2, |i| model_compiler::lower::dtype_bytes(i.dtype)),
+                },
                 _ => Arg::Named { value: v, width: width_of(v) },
             }
         };
@@ -802,6 +809,20 @@ pub struct AttnCtx {
     /// outputs of their own), so it is fire context until the join learns
     /// to walk back to the guard op.
     pub q_out: *mut c_void,
+    /// The folded attention SCORES a `WantsAttnScore` fire captures, and
+    /// the device CSR saying where each request's rows begin.
+    ///
+    /// Both must be ARENA-STABLE, which is not a detail: scores are a
+    /// FOLDED predicate (`SLOT_WANTS_ATTN_SCORE`), so one captured exec
+    /// serves a fire that wants them and a fire that does not, and an
+    /// address recorded now has to still mean something when the
+    /// predicate goes true. `attn_score::DecodeScoreCapturePlan` exists
+    /// to answer exactly that — "arena-stable folded-row base",
+    /// "arena-stable device CSR base" — and these are where its answer
+    /// reaches the arm.
+    pub score_out: *mut f32,
+    /// See [`Self::score_out`].
+    pub score_indptr_d: *const i32,
     /// The attention output slot the o_proj reads — guard-owned like
     /// `q_out`, and one arena slot reused by every layer (liveness).
     pub o_out: *mut c_void,
@@ -1056,12 +1077,15 @@ pub fn dispatch<R: Resolver>(
     let rows = i32::try_from(bound.rows.end - bound.rows.start).expect("row count fits i32");
     // The op join's output placements: what a guard-region launch binds
     // for the value the GUARD owns (the recurrence three-way's core out).
+    // The join's placements window with the args, or a launch reads its
+    // input at the window and writes its output at the base.
+    let win = if bound.kernel.ends_with("_devwin") { 0 } else { bound.rows.start };
     let out_slot = |i: usize, resolver: &mut R| -> Result<BoundArg, DispatchRefusal> {
         let arg = spec
             .outs
             .get(i)
             .ok_or_else(|| DispatchRefusal::Out(format!("{}: no output {i}", bound.kernel)))?;
-        resolve_arg(arg, frame, resolver)
+        resolve_arg_windowed(arg, frame, resolver, win)
             .map_err(|e| DispatchRefusal::Out(format!("{}: {e:?}", bound.kernel)))
     };
     // The spec's FOREIGN values (`LaunchSpec::aux`) — nemotron's mamba
@@ -1071,7 +1095,7 @@ pub fn dispatch<R: Resolver>(
             .aux
             .get(i)
             .ok_or_else(|| DispatchRefusal::Out(format!("{}: no aux {i}", bound.kernel)))?;
-        resolve_arg(arg, frame, resolver)
+        resolve_arg_windowed(arg, frame, resolver, win)
             .map_err(|e| DispatchRefusal::Out(format!("{}: {e:?}", bound.kernel)))
     };
     let need = |n: usize| -> Result<(), DispatchRefusal> {
@@ -1269,6 +1293,65 @@ pub fn dispatch<R: Resolver>(
         }
         // args: [q (the pin)]; o is the op's arena output; the plan, the
         // workspace and the layer view are the fire's.
+        // args: as the plain decode dispatch, plus the SCORE outputs.
+        // `_capture` is capturing scores, not capturing a graph —
+        // `WantsAttnScore` is the guard that selects this spelling.
+        //
+        // The score buffers ride the ctx rather than the statement because
+        // they must be arena-STABLE: the predicate is folded, so one exec
+        // serves a fire that wants scores and one that does not, and an
+        // address recorded now has to still be right when it goes true.
+        "attn::dispatch_attention_flashinfer_decode_capture" => {
+            let a = attn
+                .ok_or_else(|| DispatchRefusal::NoAttnCtx(bound.kernel.to_string()))?;
+            let layer = a
+                .layers
+                .get(bound.layers.start as usize)
+                .ok_or_else(|| DispatchRefusal::NoAttnCtx(bound.kernel.to_string()))?;
+            if a.score_out.is_null() || a.score_indptr_d.is_null() {
+                return Err(DispatchRefusal::NoAttnCtx(format!(
+                    "{}: the fire published no score buffers",
+                    bound.kernel
+                )));
+            }
+            let (q, o, lse) = match bound.args.len() {
+                1 => (bound.args[0], a.o_out, a.lse_out_d),
+                2 => (bound.args[0], bound.args[1].ptr, a.lse_out_d),
+                3 => (bound.args[0], bound.args[1].ptr, bound.args[2].ptr.cast()),
+                got => {
+                    return Err(DispatchRefusal::ArgCount {
+                        kernel: bound.kernel.to_string(),
+                        expected: 1,
+                        got,
+                    });
+                }
+            };
+            let window = window_of(spec, a, u32::from(bound.layers.start));
+            let plan = if window == -1 && !a.decode_plan_full.is_null() {
+                a.decode_plan_full
+            } else {
+                a.decode_plan
+            };
+            unsafe {
+                ffi::pie_k_attn_dispatch_attention_flashinfer_decode_capture(
+                    plan.cast_const(),
+                    q.ptr,
+                    *layer,
+                    o,
+                    a.kv_page_indices_d,
+                    a.kv_page_indptr_d,
+                    a.kv_last_page_lens_d,
+                    a.workspace,
+                    ctx.stream,
+                    a.score_out,
+                    a.score_indptr_d,
+                    window,
+                    a.logits_soft_cap,
+                    a.sm_scale,
+                    lse,
+                );
+            }
+        }
         "attn::dispatch_attention_flashinfer_decode" => {
             let a = attn
                 .ok_or_else(|| DispatchRefusal::NoAttnCtx(bound.kernel.to_string()))?;
@@ -1416,6 +1499,41 @@ pub fn dispatch<R: Resolver>(
         }
         // args: [k_curr, v_curr]; the layer view, the CSRs and the fire
         // scalars are the fire's.
+        // args: [k_curr, v_curr]. The write-descriptor spelling: the fire
+        // steers a graph replay, so the destination page and offset of
+        // every row are DESCRIPTORS the host published rather than
+        // something the kernel derives from the CSRs. `HasWriteDesc` is
+        // the guard that picks it, and `AttnCtx` already carried the three
+        // descriptor arrays — the arm was simply never written, because
+        // nothing in the corpus set the mark.
+        "attn::write_kv_explicit_bf16" => {
+            need(2)?;
+            let a = attn
+                .ok_or_else(|| DispatchRefusal::NoAttnCtx(bound.kernel.to_string()))?;
+            let layer = a
+                .layers
+                .get(bound.layers.start as usize)
+                .ok_or_else(|| DispatchRefusal::NoAttnCtx(bound.kernel.to_string()))?;
+            if a.w_page_d.is_null() || a.w_off_d.is_null() {
+                return Err(DispatchRefusal::NoAttnCtx(format!(
+                    "{}: the fire published no write descriptors",
+                    bound.kernel
+                )));
+            }
+            let (k_curr, v_curr) = (bound.args[0], bound.args[1]);
+            unsafe {
+                ffi::pie_k_attn_write_kv_explicit_bf16(
+                    *layer,
+                    k_curr.ptr,
+                    v_curr.ptr,
+                    a.w_page_d,
+                    a.w_off_d,
+                    rows,
+                    ctx.stream,
+                    a.row_valid_d,
+                );
+            }
+        }
         "attn::write_kv_to_pages" => {
             need(2)?;
             let a = attn
@@ -1463,6 +1581,71 @@ pub fn dispatch<R: Resolver>(
         }
         // args: [q]; o is guard-owned ([`AttnCtx::o_out`]); the pages are
         // the layer's bf16 MIRRORS — the native alias, the decode lesson.
+        // The prefill sibling of the score-capturing decode dispatch, and
+        // the same story: `WantsAttnScore` selects it, the score buffers
+        // ride the ctx because they must be arena-stable under a folded
+        // predicate, and it takes one more output than the decode form —
+        // `folded_out` beside `score_out`, since a prefill's raw scores
+        // and their per-request fold are different extents.
+        //
+        // The fold shares `score_out`'s slot here: an empty CSR makes both
+        // zero-length, which is what a fire that wants no scores means,
+        // and a fire that does want them needs `DecodeScoreCapturePlan`'s
+        // layout for both anyway.
+        "attn::dispatch_attention_flashinfer_prefill_capture_bf16" => {
+            let a = attn
+                .ok_or_else(|| DispatchRefusal::NoAttnCtx(bound.kernel.to_string()))?;
+            let layer = a
+                .layers
+                .get(bound.layers.start as usize)
+                .ok_or_else(|| DispatchRefusal::NoAttnCtx(bound.kernel.to_string()))?;
+            if a.score_out.is_null() || a.score_indptr_d.is_null() {
+                return Err(DispatchRefusal::NoAttnCtx(format!(
+                    "{}: the fire published no score buffers",
+                    bound.kernel
+                )));
+            }
+            let (q, o) = match bound.args.len() {
+                1 => (bound.args[0], a.o_out),
+                2 => (bound.args[0], bound.args[1].ptr),
+                got => {
+                    return Err(DispatchRefusal::ArgCount {
+                        kernel: bound.kernel.to_string(),
+                        expected: 1,
+                        got,
+                    });
+                }
+            };
+            unsafe {
+                ffi::pie_k_attn_dispatch_attention_flashinfer_prefill_capture_bf16(
+                    a.prefill_plan.cast_const(),
+                    q.ptr,
+                    layer.k_bf16_pages,
+                    layer.v_bf16_pages,
+                    o,
+                    a.qo_indptr_d,
+                    a.kv_page_indices_d,
+                    a.kv_page_indptr_d,
+                    a.kv_last_page_lens_d,
+                    a.workspace,
+                    ctx.stream,
+                    a.score_out,
+                    a.score_out,
+                    a.score_indptr_d,
+                    // The OBSERVATION window, not the attention one. The
+                    // launcher refuses `<= 0`, and `window_left` is -1 on
+                    // a family that attends the whole context — passing it
+                    // here reads as "no window" to one layer and "invalid"
+                    // to the other. It is a driver policy, which is what
+                    // `attn_score` is for.
+                    i32::try_from(crate::model::attn_score::default_attn_score_window())
+                        .unwrap_or(i32::MAX),
+                    a.logits_soft_cap,
+                    a.sm_scale,
+                    a.lse_out_d,
+                );
+            }
+        }
         "attn::dispatch_attention_flashinfer_prefill_bf16" => {
             let a = attn
                 .ok_or_else(|| DispatchRefusal::NoAttnCtx(bound.kernel.to_string()))?;
@@ -2605,10 +2788,25 @@ pub fn dispatch<R: Resolver>(
         // C++'s first live A/B caught.
         "pie_lora_qkv_correction" => {
             need(2)?;
+            // NO ADAPTERS STAGED IS AN ANSWER, not a refusal, and this
+            // line is the one that lets a union capture record the arm at
+            // all.
+            //
+            // Under `GuardMode::Resolve` the case is unreachable — the
+            // `HasLora` guard removes the arm when no row carries an
+            // adapter. Under `Union` every arm lowers and the conditional
+            // decides at replay, so the arm has to be ISSUABLE with its
+            // predicate false. Doing nothing is what the correction means
+            // for a fire with nothing to correct.
+            //
+            // What makes that safe rather than merely quiet is the bucket
+            // key: `BucketKey::lora_shape` is zero for a fire with no
+            // adapters, so an exec recorded here serves only fires that
+            // also have none. A fire that stages adapters has a different
+            // shape and lands in a different bucket, where the arm records
+            // its grouped launches. See `model::supergraph`.
             let Some((state, scratch)) = ctx.lora else {
-                return Err(DispatchRefusal::NoArm(
-                    "pie_lora_qkv_correction: stated but the fire staged no lora".into(),
-                ));
+                return Ok(());
             };
             let x = aux_slot(0, resolver)?;
             let (q, v) = (bound.args[0], bound.args[1]);
@@ -3397,6 +3595,54 @@ pub enum RunRefusalKind {
     Dispatch(DispatchRefusal),
 }
 
+/// The prepared attention state a fire publishes, BY REGION.
+///
+/// A peel splits a fire's rows, and the tail region serves a different
+/// row count against different requests — so it needs a different
+/// prepared plan, and different KV page CSRs, and different output pins.
+/// `Launch::peel`'s own doc says the first of those: a prepared plan "is
+/// found by the rectangle's ROW COUNT".
+///
+/// The point of the type is that an arm no longer RESOLVES its state; it
+/// is handed the state for the region it is executing. That is the
+/// discipline `cuda.md` §3.1 asks for from the capture side — the C++'s
+/// `f28ec1fed`, "the plan follows `kv_layer`; the family resolves and
+/// hands the answer over" — and a peel region needs it for the same
+/// reason a replayed capture does: neither may assume the fire's.
+#[cfg(feature = "bridge")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AttnRegions<'a> {
+    /// The fire's own state, for rectangles that span it.
+    pub fire: Option<&'a AttnCtx>,
+    /// A peel TAIL's state. `None` on a fire with no split, where it is
+    /// never selected because no rectangle is windowed.
+    pub tail: Option<&'a AttnCtx>,
+}
+
+#[cfg(feature = "bridge")]
+impl<'a> AttnRegions<'a> {
+    /// A fire with no split: one prepared state, every rectangle.
+    #[must_use]
+    pub const fn whole(fire: Option<&'a AttnCtx>) -> Self {
+        Self { fire, tail: None }
+    }
+
+    /// A peeled fire: the prefix uses the fire's state, the tail its own.
+    #[must_use]
+    pub const fn split(fire: &'a AttnCtx, tail: &'a AttnCtx) -> Self {
+        Self { fire: Some(fire), tail: Some(tail) }
+    }
+
+    /// The state a rectangle executes against.
+    ///
+    /// Keyed on whether the rectangle is WINDOWED, which is what makes it
+    /// a tail: a peel's prefix starts at row zero and its tail does not.
+    #[must_use]
+    pub fn of(&self, rows: &std::ops::Range<u32>) -> Option<&'a AttnCtx> {
+        if rows.start == 0 { self.fire } else { self.tail.or(self.fire) }
+    }
+}
+
 /// Execute one fire: bind and dispatch every launch of the lowering, in
 /// order. The walk the full-decode smoke proved, as the executor's entry.
 ///
@@ -3411,7 +3657,7 @@ pub fn run<R: Resolver>(
     frame: Frame,
     resolver: &mut R,
     ctx: &DispatchCtx,
-    attn: Option<&AttnCtx>,
+    attn: AttnRegions<'_>,
     gdn: Option<&GdnCtx>,
 ) -> Result<usize, RunRefusal> {
     for (i, launch) in lowered.launches.iter().enumerate() {
@@ -3421,7 +3667,8 @@ pub fn run<R: Resolver>(
             kernel: kernel(),
             why: RunRefusalKind::Bind(e),
         })?;
-        dispatch(&bound, dplan.spec(i), frame, resolver, ctx, attn, gdn).map_err(|e| {
+        dispatch(&bound, dplan.spec(i), frame, resolver, ctx, attn.of(&launch.rows), gdn)
+            .map_err(|e| {
             RunRefusal { launch: i, kernel: kernel(), why: RunRefusalKind::Dispatch(e) }
         })?;
     }
@@ -3493,7 +3740,7 @@ pub fn run_captured<R: Resolver>(
     frame: Frame,
     resolver: &mut R,
     ctx: &DispatchCtx,
-    attn: Option<&AttnCtx>,
+    attn: AttnRegions<'_>,
     gdn: Option<&GdnCtx>,
     builder: &mut crate::cuda::SupergraphBuilder<'_>,
 ) -> Result<usize, RunRefusal> {
@@ -3561,7 +3808,8 @@ pub fn run_captured<R: Resolver>(
             kernel: kernel.clone(),
             why: RunRefusalKind::Bind(e),
         })?;
-        dispatch(&bound, dplan.spec(i), frame, resolver, &ctx, attn, gdn).map_err(|e| {
+        dispatch(&bound, dplan.spec(i), frame, resolver, &ctx, attn.of(&launch.rows), gdn)
+            .map_err(|e| {
             RunRefusal { launch: i, kernel: kernel.clone(), why: RunRefusalKind::Dispatch(e) }
         })?;
     }
@@ -3602,16 +3850,37 @@ pub fn resolve_arg<R: Resolver>(
     frame: Frame,
     resolver: &mut R,
 ) -> Result<BoundArg, BindRefusal> {
+    resolve_arg_windowed(arg, frame, resolver, 0)
+}
+
+/// [`resolve_arg`], addressing from row `row` of the operand rather than
+/// from its base.
+///
+/// `row` is in the LAUNCH's row space, and the stride is the operand's own
+/// — `width` elements of `bytes` each, which is why the lowering states
+/// the element width at all.
+///
+/// # Errors
+///
+/// See [`BindRefusal`].
+pub fn resolve_arg_windowed<R: Resolver>(
+    arg: &Arg,
+    frame: Frame,
+    resolver: &mut R,
+    row: u32,
+) -> Result<BoundArg, BindRefusal> {
     Ok(match arg {
-        Arg::Arena { at, width } => {
-            if *at >= frame.arena_bytes {
+        Arg::Arena { at, width, bytes } => {
+            let skip = row as usize * *width as usize * *bytes as usize;
+            let at = *at + skip;
+            if at >= frame.arena_bytes {
                 return Err(BindRefusal::ArenaOutOfBounds {
-                    at: *at,
+                    at,
                     arena_bytes: frame.arena_bytes,
                 });
             }
             BoundArg {
-                ptr: unsafe { frame.arena.cast::<u8>().add(*at) }.cast(),
+                ptr: unsafe { frame.arena.cast::<u8>().add(at) }.cast(),
                 width: *width,
             }
         }
@@ -3652,14 +3921,31 @@ pub fn bind<'a, R: Resolver>(
     frame: Frame,
     resolver: &mut R,
 ) -> Result<BoundLaunch<'a>, BindRefusal> {
+    let kernel = &lowered.kernels[launch.kernel as usize];
+    // THE WINDOW, applied once and here.
+    //
+    // A peel's tail region serves rows `[win_start, …)` of a full-N
+    // buffer, and every arm binds a pointer plus a row COUNT — so a
+    // base-bound launch runs over the prefix's rows instead. That was
+    // §4's fourth decline-rule (the generated branches guarded on
+    // `rows.start == 0` and fell through) and it was also a live bug in
+    // every hand arm, which had the same reading and no guard. Nothing
+    // noticed until a fire finally peeled.
+    //
+    // Applied in the binder rather than in the arms because the arms are
+    // not the only consumer: the op join's `outs` and `aux` resolve
+    // through the same `resolve_arg`, and windowing one without the other
+    // is how a launch reads its input at the window and writes its output
+    // at the base.
+    //
+    // The `_devwin` forms are the stated exception. Their contract is
+    // BASE pointers — the grid spans every lane and out-of-window rows
+    // early-out on a device word — which is what makes them replayable
+    // across splits, so windowing them would offset twice.
+    let row = if kernel.ends_with("_devwin") { 0 } else { launch.rows.start };
     let mut args = Vec::with_capacity(launch.args.len());
     for arg in &lowered.args[launch.args.start as usize..launch.args.end as usize] {
-        args.push(resolve_arg(arg, frame, resolver)?);
+        args.push(resolve_arg_windowed(arg, frame, resolver, row)?);
     }
-    Ok(BoundLaunch {
-        kernel: &lowered.kernels[launch.kernel as usize],
-        rows: launch.rows.clone(),
-        layers: launch.layers.clone(),
-        args,
-    })
+    Ok(BoundLaunch { kernel, rows: launch.rows.clone(), layers: launch.layers.clone(), args })
 }

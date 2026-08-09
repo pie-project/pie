@@ -55,7 +55,7 @@ pub fn table_width(dispatches: &[Dispatch<'_>]) -> usize {
             let params = if d.params.is_empty() {
                 0
             } else {
-                d.param_slots.iter().map(|(s, _)| s + 1).max().unwrap_or(0)
+                d.param_slots.iter().map(|p| p.slot + 1).max().unwrap_or(0)
             };
             d.args.len().max(params)
         })
@@ -130,6 +130,31 @@ pub fn run<R: Resolver>(
     geometry: Geometry,
     resolver: &mut R,
 ) -> Result<Timing> {
+    run_keeping_arena(context, compiler, pipelines, lowered, geometry, resolver).map(|(t, _)| t)
+}
+
+/// [`run`], returning the ARENA beside the timing.
+///
+/// The arena is where every activation this fire produced landed, and reading
+/// it is the difference between "the fire executed" and "the fire computed
+/// something". `run` drops it, which is right for a caller that wants the next
+/// fire and wrong for one that wants to look — and looking is how the three
+/// failure modes that survive a green execution get caught: an arena of zeros
+/// is a fire whose projections no-opped, an arena of NaNs is a norm handed a
+/// zero epsilon, and an arena of identical rows is a per-token axis that never
+/// reached the kernels.
+///
+/// # Errors
+///
+/// As [`run`].
+pub fn run_keeping_arena<R: Resolver>(
+    context: &Context,
+    compiler: &Compiler,
+    pipelines: &mut Pipelines,
+    lowered: &Lowered,
+    geometry: Geometry,
+    resolver: &mut R,
+) -> Result<(Timing, Handle)> {
     // The arena has to exist before the operands can be bound, and the
     // dispatches have to exist before the arena's width is known to be
     // enough — so the arena is allocated from the lowering's own number and
@@ -139,6 +164,15 @@ pub fn run<R: Resolver>(
         (lowered.arena_bytes as u64).max(1),
         "activation arena",
     )?;
+    // ZEROED, and it is not a formality. A fresh Metal buffer is usually zero
+    // and nothing promises it, so a slot no kernel writes holds whatever the
+    // allocator handed over -- which made two runs of the same fire over the
+    // same weights produce different numbers, measured. Zeroing turns "a
+    // region nobody wrote" from garbage that looks like saturation into a
+    // zero, which is diagnosable.
+    //
+    // SAFETY: freshly allocated; nothing is encoded against it yet.
+    unsafe { arena.zero(0, arena.len())? };
     let frame = Frame {
         arena: Slice {
             address: arena.gpu_address(),
@@ -152,7 +186,9 @@ pub fn run<R: Resolver>(
     pipelines.ensure(context, compiler, &dispatches)?;
 
     let mut stepper = Stepper::new(context)?;
-    stepper.run(|encoder| encode(encoder, &table, pipelines, &params, &dispatches))
+    let timing =
+        stepper.run(|encoder| encode(encoder, &table, pipelines, &params, &dispatches))?;
+    Ok((timing, arena))
 }
 
 /// A refusal, as this crate's error.

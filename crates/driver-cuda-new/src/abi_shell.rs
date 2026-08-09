@@ -63,6 +63,12 @@ struct Shell {
     notify_ctx: *mut std::ffi::c_void,
     /// The hybrid's GDN state slabs, allocated on first hybrid launch.
     gdn: Option<GdnState>,
+    /// The per-fire device arrays, pooled so a capture can outlive the
+    /// fire that recorded it. See [`FireArrays`].
+    fire_arrays: FireArrays,
+    /// The unionized supergraph's instantiated graphs, one per (R, N)
+    /// bucket. Empty unless `PIE_CUDA_SUPERGRAPH` armed it.
+    supergraph: crate::model::supergraph::SupergraphCache,
     /// The driver-owned KV pools, allocated on first launch and grown on
     /// demand — decode continuity across launches lives here.
     kv: Option<KvState>,
@@ -166,6 +172,100 @@ impl ChannelState {
 /// The shell's KV: one (k, v) pool per layer, plus the capacity in
 /// pages. A `None` row is a layer that owns no pages — gemma-4's
 /// KV-shared trailing layers, whose views ride their source's pool.
+/// The per-fire device arrays, POOLED across fires.
+///
+/// They used to be allocated and dropped every launch — `step_impl`'s own
+/// comment said "KV pools (persistent), fire arrays (per launch)" — and
+/// that is the one thing standing between the supergraph and the live
+/// path. A captured exec bakes the addresses it recorded, so an arena
+/// freed at the end of its fire can never be replayed into.
+///
+/// So they are kept and reused, and grown when a fire needs more than the
+/// last one did. Growth MOVES a base address, which invalidates every
+/// capture that recorded it — hence [`Self::epoch`], which is the
+/// `PlanEpoch` `model::supergraph::SupergraphCache` keys its execs on. A
+/// bump means stale, and stale means recapture rather than a wrong
+/// answer.
+#[derive(Default)]
+struct FireArrays {
+    arena: Option<crate::cuda::DeviceBuffer>,
+    named: std::collections::BTreeMap<model_compiler::trace::ValueId, crate::cuda::DeviceBuffer>,
+    /// The small per-fire u32 descriptor arrays, by slot.
+    slots: Vec<Option<crate::cuda::DeviceBuffer>>,
+    epoch: u64,
+}
+
+impl FireArrays {
+    /// The activation arena, at least `bytes` wide.
+    fn arena(
+        &mut self,
+        alloc: &crate::cuda::Allocator,
+        bytes: usize,
+    ) -> Result<*mut std::ffi::c_void, i32> {
+        if self.arena.as_ref().is_none_or(|b| b.len() < bytes) {
+            self.arena = Some(alloc.alloc(bytes).map_err(|_| PIE_STATUS_EXHAUSTED)?);
+            self.epoch += 1;
+        }
+        Ok(self.arena.as_ref().expect("just ensured").as_ptr())
+    }
+
+    /// One per-fire u32 descriptor array, by SLOT.
+    ///
+    /// The same discipline the arena gets, for the small arrays: the
+    /// buffer is kept and its CONTENTS refreshed, so a capture that
+    /// recorded the address keeps addressing something real. Slots are
+    /// positional because these are a fixed list — see the constants
+    /// beside the call site.
+    ///
+    /// Returns the device pointer rather than the buffer, so a caller
+    /// holds no borrow and the next slot can be uploaded on the next line.
+    fn upload_u32(
+        &mut self,
+        alloc: &crate::cuda::Allocator,
+        slot: usize,
+        vals: &[u32],
+        stream: crate::cuda::StreamRef<'_>,
+    ) -> Result<*const u32, i32> {
+        if self.slots.len() <= slot {
+            self.slots.resize_with(slot + 1, || None);
+        }
+        let bytes: Vec<u8> = vals.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let need = bytes.len().max(4);
+        if self.slots[slot].as_ref().is_none_or(|b| b.len() < need) {
+            self.slots[slot] = Some(alloc.alloc(need).map_err(|_| PIE_STATUS_EXHAUSTED)?);
+            self.epoch += 1;
+        }
+        let b = self.slots[slot].as_mut().expect("just ensured");
+        b.copy_from_host(&bytes, stream).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+        Ok(b.as_ptr().cast_const().cast::<u32>())
+    }
+
+    /// One named seam buffer, at least `bytes` wide, zeroed.
+    ///
+    /// Zeroed on every fire rather than only on allocation: the pin is
+    /// per-fire state whatever its storage is, and a reused buffer still
+    /// holds the last fire's values.
+    fn named(
+        &mut self,
+        alloc: &crate::cuda::Allocator,
+        v: model_compiler::trace::ValueId,
+        bytes: usize,
+        stream: crate::cuda::StreamRef<'_>,
+    ) -> Result<(), i32> {
+        let grow = self.named.get(&v).is_none_or(|b| b.len() < bytes);
+        if grow {
+            self.named
+                .insert(v, alloc.alloc(bytes).map_err(|_| PIE_STATUS_EXHAUSTED)?);
+            self.epoch += 1;
+        }
+        self.named
+            .get_mut(&v)
+            .expect("just ensured")
+            .memset(0, stream)
+            .map_err(|_| PIE_STATUS_DRIVER_ERROR)
+    }
+}
+
 struct KvState {
     pools: Vec<Option<(crate::cuda::DeviceBuffer, crate::cuda::DeviceBuffer)>>,
     num_pages: u32,
@@ -338,6 +438,8 @@ pub extern "C" fn pie_cuda_create(
         next_id: 1,
         notify: desc.runtime.notify,
         notify_ctx: desc.runtime.ctx,
+        fire_arrays: FireArrays::default(),
+        supergraph: crate::model::supergraph::SupergraphCache::new(),
         kv: None,
         gdn: None,
         channels: std::collections::BTreeMap::new(),
@@ -1181,6 +1283,26 @@ fn qwen35_facts_from_hf(model: &LoadedModel) -> Result<FamilyFacts, i32> {
 /// its `linear_*` geometry + layer schedule, else the llama-like
 /// mapping. Only the qwen3-family pre-norm shape is claimed on the
 /// llama-like side; anything else refuses rather than mis-executes.
+/// The `FireArrays::named` key the SCORE pin is pooled under.
+///
+/// A reserved id rather than a traced one: no statement names this value,
+/// the driver publishes it, and the pool is keyed by `ValueId` because
+/// every other thing in it is a traced seam. `u32::MAX` cannot collide
+/// with a trace value — a plan with four billion values would have failed
+/// long before.
+const SCORE_PIN: model_compiler::trace::ValueId = model_compiler::trace::ValueId::MAX;
+
+/// Is the unionized supergraph armed for this process?
+///
+/// `PIE_CUDA_SUPERGRAPH=1`. Off by default and deliberately so: every A/B
+/// in this tree pins the EAGER leg, and a capture is an optimisation that
+/// has to prove itself against that rather than replace it silently. The
+/// same shape as `decode_fused_post` and the lora grouping gate.
+fn supergraph_enabled() -> bool {
+    std::env::var_os("PIE_CUDA_SUPERGRAPH")
+        .is_some_and(|v| v == "1" || v == "true" || v == "on")
+}
+
 /// What a row dispatches to: this family's facts, off the checkpoint.
 type FactsFrom = fn(&LoadedModel) -> Result<FamilyFacts, i32>;
 
@@ -1338,6 +1460,14 @@ fn llama_like_facts_from_hf(model: &LoadedModel) -> Result<FamilyFacts, i32> {
         q_heads: to_u32(hf.num_attention_heads),
         kv_heads: to_u32(hf.num_key_value_heads),
         head_dim: to_u32(hf.head_dim),
+        // A ROUTED FFN is a fact, not a family (the `LlamaLikeFacts` doc's
+        // own argument), so these come off the checkpoint like every other
+        // width. Zero throughout is a dense deployment, which is what the
+        // fields mean rather than a stand-in for "unknown".
+        n_experts: to_u32(hf.num_experts),
+        experts_per_token: to_u32(hf.num_experts_per_tok),
+        moe_intermediate: to_u32(hf.moe_intermediate_size),
+        shared_intermediate: to_u32(hf.shared_expert_intermediate_size),
         intermediate: to_u32(hf.intermediate_size),
         vocab: to_u32(hf.vocab_size),
         rope: RopeKind::Standard,
@@ -1371,6 +1501,144 @@ fn llama_like_facts_from_hf(model: &LoadedModel) -> Result<FamilyFacts, i32> {
     Ok(FamilyFacts::LlamaLike(facts, cuda))
 }
 
+/// Replay this fire's bucket if it is captured, and capture it if not.
+///
+/// The whole supergraph arc, at its one live call site. What it does, in
+/// the order the pieces were built:
+///
+/// 1. **Eligibility.** A fire whose staged LoRA did not group cannot be
+///    recorded at all — `apply`'s solo path is a host loop whose launch
+///    count follows the adapter set. Ineligible means eager, which is the
+///    C++ arc's own device for what cannot be replayed.
+/// 2. **The bucket.** `(R, N, fire class, model)` plus the lora group
+///    shape. Every `GuardPred` axis is deliberately absent: those are what
+///    the conditionals fold.
+/// 3. **The epoch.** `FireArrays` bumps it whenever a pool grew, because
+///    growth moves a base address out from under a recorded launch. A
+///    stale exec is dropped and recaptured rather than replayed.
+/// 4. **Dual-prepare.** A capture must be taken warm — a launcher that
+///    allocates on first use cannot do so inside a capture — and a warm-up
+///    must walk a VALID program, so warm once per variant with its own
+///    resolved lowering. A union records arms no single valid program
+///    takes, which is why one warm fire is not enough.
+/// 5. **The predicates**, uploaded before every launch: this is the fire's
+///    own shape, and the only thing that differs between two replays of
+///    one exec.
+#[allow(clippy::too_many_arguments)]
+fn capture_or_replay<R: crate::model::executor::Resolver>(
+    cache: &mut crate::model::supergraph::SupergraphCache,
+    epoch: u64,
+    model_id: u64,
+    plan: &model_compiler::trace::ForwardPlan,
+    rows_desc: &[model_compiler::lower::Row],
+    lowered: &model_compiler::lower::Lowered,
+    dplan: &crate::model::executor::DispatchPlan,
+    frame: crate::model::executor::Frame,
+    resolver: &mut R,
+    ctx: &crate::model::executor::DispatchCtx,
+    regions: crate::model::executor::AttnRegions<'_>,
+    gdn: Option<&crate::model::executor::GdnCtx>,
+    alloc: &crate::cuda::Allocator,
+    stream: crate::cuda::StreamRef<'_>,
+    requests: usize,
+    rows: usize,
+    class: model_compiler::trace::FireClass,
+) -> Result<usize, crate::model::executor::RunRefusal> {
+    use crate::model::executor::{DispatchPlan, run};
+    use crate::model::supergraph::{BucketKey, fire_predicates, union_eligibility};
+
+    let eligibility = union_eligibility(None);
+    let key = BucketKey::new(
+        u32::try_from(requests).unwrap_or(0),
+        u32::try_from(rows).unwrap_or(0),
+        class,
+        model_id,
+    );
+
+    // The fire's own bits, and the only thing that differs between two
+    // replays of one exec.
+    let mut preds = match crate::cuda::PredicateWord::new(alloc) {
+        Ok(p) => p,
+        Err(_) => return run(lowered, dplan, frame, resolver, ctx, regions, gdn),
+    };
+    if fire_predicates(rows_desc, &lowered.conds, &mut preds).is_err()
+        || preds.upload(stream).is_err()
+        || stream.synchronize().is_err()
+    {
+        return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
+    }
+
+    if cache.replay(key, epoch, stream).unwrap_or(false) {
+        return Ok(lowered.launches.len());
+    }
+
+    // DUAL-PREPARE: one warm fire per variant, each a resolved program.
+    // Only variants this fire can PREPARE. A `wants_scores` warm-up would
+    // lower the score-capturing dispatch, which refuses without a score
+    // sink — and warming is not the place to discover that. It is also
+    // why scores are not a union axis: the north star's list is "hook
+    // attachment, mask kind, correction arm, depth, LoRA rank", and every
+    // one of those is a branch rather than a different prepared state.
+    for marks in [
+        model_compiler::lower::Row { samples: true, ..Default::default() },
+        model_compiler::lower::Row { samples: true, write_desc: true, ..Default::default() },
+    ] {
+        let warm_rows = vec![marks; rows];
+        let Ok(warm) = model_compiler::lower::lower_with(
+            plan,
+            &warm_rows,
+            model_compiler::lower::Fire { captures_across_splits: false },
+            model_compiler::lower::GuardMode::Resolve,
+        ) else {
+            return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
+        };
+        let warm_dplan = DispatchPlan::new(plan, &warm);
+        run(&warm, &warm_dplan, frame, resolver, ctx, regions, gdn)?;
+        let _ = stream.synchronize();
+    }
+
+    let captured = {
+        let mut a = crate::cuda::Allocator::new();
+        let Ok(scope) = a.begin_capture(stream) else {
+            return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
+        };
+        let mut b = crate::cuda::SupergraphBuilder::new(scope.stream(), &preds);
+        let ran = crate::model::executor::run_captured(
+            lowered, dplan, frame, resolver, ctx, regions, gdn, &mut b,
+        );
+        drop(b);
+        // A REFUSED CAPTURE IS NOT A REFUSED FIRE.
+        //
+        // Some arms cannot be recorded at all, and the reason is always
+        // the same shape: their prepared state is something the fire
+        // declined to build. The score-capturing prefill dispatch wants a
+        // plan raised for the full-attention variant, buffers laid out for
+        // an observation window, and a positive window — none of which a
+        // fire that wants no scores has any reason to prepare.
+        //
+        // So the capture is abandoned and the fire runs eagerly. That is
+        // the same answer ungrouped LoRA gets from `union_eligibility`,
+        // and the same one the C++ arc gives mixed peels: what cannot be
+        // replayed stays eager. The alternative — failing the fire — would
+        // make an optimisation into a correctness requirement.
+        match (ran, scope.end()) {
+            (Ok(n), Ok(g)) => Some((n, g)),
+            (Err(_) | Ok(_), _) => None,
+        }
+    };
+    let Some((ran, graph)) = captured else {
+        return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
+    };
+    let Ok(exec) = graph.instantiate() else {
+        return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
+    };
+    if exec.launch(stream).is_err() {
+        return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
+    }
+    let _ = cache.insert(key, exec, epoch, eligibility);
+    Ok(ran)
+}
+
 /// The fire itself. Everything here is the proven smoke assembly, run
 /// against the shell's own state.
 #[allow(clippy::too_many_lines)]
@@ -1398,10 +1666,10 @@ fn step_impl(
 ) -> Result<(), i32> {
     use crate::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
     use crate::model::executor::{
-        AttnCtx, DecodePlan, DispatchCtx, DispatchPlan, Frame, GdnCtx, PrefillPlan, Resolver,
+        AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, GdnCtx, PrefillPlan, Resolver,
         run,
     };
-    use model_compiler::lower::{Arg, Fire, Row, lower};
+    use model_compiler::lower::{Arg, Fire, GuardMode, Row, lower_with};
     use model_compiler::trace::{FireClass, ValueId};
 
     let sub_batches = slice_of(step.sub_batch_indptr.ptr, step.sub_batch_indptr.len);
@@ -1445,11 +1713,69 @@ fn step_impl(
         }
     };
     let fire_rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
-    let lowered = lower(&plan, &fire_rows, Fire { captures_across_splits: false })
-        .map_err(|e| {
+    // THE SUPERGRAPH GATE, off unless asked. `Union` keeps every guard so
+    // the arms can be recorded into conditional bodies and decided at
+    // replay; `Resolve` answers them here and produces one program. Off by
+    // default because the eager leg is what every A/B in the tree pins,
+    // and a capture is an optimisation that must prove itself against it.
+    let mut union = supergraph_enabled();
+    let lower_as = |g: GuardMode| {
+        lower_with(&plan, &fire_rows, Fire { captures_across_splits: false }, g).map_err(|e| {
             eprintln!("[driver-cuda-new] launch: uncovered: {e:?}");
             PIE_STATUS_UNSUPPORTED
-        })?;
+        })
+    };
+    let mut lowered = lower_as(if union { GuardMode::Union } else { GuardMode::Resolve })?;
+
+    // A union this fire cannot record is not a union worth building, and
+    // the decision has to be made HERE — before the arena, the pins and
+    // the attention context are sized against it — because falling back
+    // later would run one lowering's program against another's offsets.
+    //
+    // The test is narrow on purpose: a SCORE-capturing dispatch needs a
+    // plan raised for the full-attention variant, a folded-row layout and
+    // an observation window, none of which a fire that wants no scores
+    // prepares. Its launcher answers by throwing, which the shim can only
+    // turn into a message and an abort. So a union that names one is
+    // abandoned for this fire and the guards are answered instead.
+    if union {
+        let d = DispatchPlan::new(&plan, &lowered);
+        // Two things make a union unservable for THIS fire, and both are
+        // about prepared state rather than about the graph.
+        //
+        // A `_capture` dispatch wants a plan raised for the full-attention
+        // variant, a folded-row layout and an observation window, none of
+        // which a fire that wants no scores builds; its launcher answers
+        // by throwing, which the shim can only turn into an abort.
+        //
+        // And the attention output slot has to be findable from the op
+        // JOIN. The neighbour trick — "the launch after the dispatch is
+        // the o_proj" — is what `Resolve` allows and `Union` does not,
+        // because every arm is present and the neighbour belongs to some
+        // other body. A deployment that states its attention as [q, o]
+        // records no output in the join and has only the neighbour.
+        let servable = !lowered.kernels.iter().any(|k| k.contains("_capture"))
+            && {
+                let name = if lowered
+                    .kernels
+                    .iter()
+                    .any(|k| k == "attn::dispatch_attention_flashinfer_decode")
+                {
+                    "attn::dispatch_attention_flashinfer_decode"
+                } else {
+                    "attn::dispatch_attention_flashinfer_prefill_bf16"
+                };
+                lowered
+                    .launches
+                    .iter()
+                    .position(|x| lowered.kernels[x.kernel as usize] == name)
+                    .is_some_and(|fi| matches!(d.spec(fi).outs.first(), Some(Arg::Arena { .. })))
+            };
+        if !servable {
+            union = false;
+            lowered = lower_as(GuardMode::Resolve)?;
+        }
+    }
     let dplan = DispatchPlan::new(&plan, &lowered);
 
     // ── Device state: KV pools (persistent), fire arrays (per launch). ──
@@ -1548,18 +1874,27 @@ fn step_impl(
         })
         .collect();
 
-    let up_u32 = |vals: &[u32]| -> Result<crate::cuda::DeviceBuffer, i32> {
-        let bytes: Vec<u8> = vals.iter().flat_map(|x| x.to_le_bytes()).collect();
-        let mut b = alloc.alloc(bytes.len().max(4)).map_err(|_| PIE_STATUS_EXHAUSTED)?;
-        b.copy_from_host(&bytes, stream.as_ref()).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-        Ok(b)
-    };
-    let d_ids = up_u32(token_ids)?;
-    let d_pos = up_u32(position_ids)?;
-    let d_kv_indices = up_u32(kv_indices)?;
-    let d_kv_indptr = up_u32(kv_indptr)?;
-    let d_kv_lens = up_u32(kv_lens)?;
-    let d_qo = up_u32(qo_indptr)?;
+    // The fire's descriptor arrays, POOLED like the arena and for the same
+    // reason: a capture bakes an address, so the buffer has to be the same
+    // one next fire with only its contents refreshed. Slots are positional
+    // and this is the whole list of them.
+    const S_IDS: usize = 0;
+    const S_POS: usize = 1;
+    const S_KV_INDICES: usize = 2;
+    const S_KV_INDPTR: usize = 3;
+    const S_KV_LENS: usize = 4;
+    const S_QO: usize = 5;
+    const S_W_PAGE: usize = 6;
+    const S_W_OFF: usize = 7;
+    let d_ids = state.fire_arrays.upload_u32(&alloc, S_IDS, token_ids, stream.as_ref())?;
+    let d_pos = state.fire_arrays.upload_u32(&alloc, S_POS, position_ids, stream.as_ref())?;
+    let d_kv_indices =
+        state.fire_arrays.upload_u32(&alloc, S_KV_INDICES, kv_indices, stream.as_ref())?;
+    let d_kv_indptr =
+        state.fire_arrays.upload_u32(&alloc, S_KV_INDPTR, kv_indptr, stream.as_ref())?;
+    let d_kv_lens =
+        state.fire_arrays.upload_u32(&alloc, S_KV_LENS, kv_lens, stream.as_ref())?;
+    let d_qo = state.fire_arrays.upload_u32(&alloc, S_QO, qo_indptr, stream.as_ref())?;
 
     // Write targets: each request appends its NEW tokens at the CSR tail.
     // Decode appends one token at `len - 1`; prefill appends its whole
@@ -1576,8 +1911,8 @@ fn step_impl(
             w_off.push(pos % page_size as u32);
         }
     }
-    let d_w_page = up_u32(&w_page)?;
-    let d_w_off = up_u32(&w_off)?;
+    let d_w_page = state.fire_arrays.upload_u32(&alloc, S_W_PAGE, &w_page, stream.as_ref())?;
+    let d_w_off = state.fire_arrays.upload_u32(&alloc, S_W_OFF, &w_off, stream.as_ref())?;
     let mut d_valid = alloc.alloc(rows).map_err(|_| PIE_STATUS_EXHAUSTED)?;
     d_valid
         .copy_from_host(&vec![1u8; rows], stream.as_ref())
@@ -1678,8 +2013,9 @@ fn step_impl(
     };
     ws.end_plan_update(&mut sops, raw_stream);
 
-    let arena = alloc.alloc(lowered.arena_bytes.max(64)).map_err(|_| PIE_STATUS_EXHAUSTED)?;
-    let exec_frame = Frame { arena: arena.as_ptr(), arena_bytes: lowered.arena_bytes.max(64) };
+    let arena_bytes = lowered.arena_bytes.max(64);
+    let arena_ptr = state.fire_arrays.arena(&alloc, arena_bytes)?;
+    let exec_frame = Frame { arena: arena_ptr, arena_bytes };
 
     let mut named_widths: std::collections::BTreeMap<ValueId, u32> =
         std::collections::BTreeMap::new();
@@ -1695,16 +2031,31 @@ fn step_impl(
             }
         }
     }
-    let mut named_bufs: std::collections::BTreeMap<ValueId, crate::cuda::DeviceBuffer> =
-        std::collections::BTreeMap::new();
     for (&v, &w) in &named_widths {
         // fp32-wide: the GDN seam pins are f32; llama-like's are bf16 and
         // simply leave half the pin unread.
-        let mut b =
-            alloc.alloc(rows * w as usize * 4).map_err(|_| PIE_STATUS_EXHAUSTED)?;
-        b.memset(0, stream.as_ref()).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-        named_bufs.insert(v, b);
+        state.fire_arrays.named(&alloc, v, rows * w as usize * 4, stream.as_ref())?;
     }
+    // NO SCORE SINK, deliberately, and this is what makes the capture
+    // path safe rather than merely optional.
+    //
+    // A fire that wants no scores prepares no score path: no plan raised
+    // for the full-attention variant, no folded-row layout, no
+    // observation window. The score-capturing dispatch needs all three,
+    // and its launcher REFUSES by throwing — which the generated shim
+    // prints and then aborts on, because an exception crossing the C ABI
+    // has nowhere else to go.
+    //
+    // So the arm has to refuse before the launcher is reached, and a null
+    // sink is how it knows to. `run_captured` then returns a refusal, the
+    // capture is abandoned, and the fire runs eagerly — the same answer
+    // ungrouped LoRA gets. Publishing a plausible-looking empty sink
+    // instead would put the decision inside a launcher that can only
+    // answer by killing the process.
+    let d_score_indptr: *const u32 = core::ptr::null();
+    let d_scores: *mut std::ffi::c_void = core::ptr::null_mut();
+
+    let named_bufs = &state.fire_arrays.named;
 
     // ── The hybrid's GDN context: driver-owned slabs, instance slots. ──
     let mut gdn_ctx: Option<GdnCtx> = None;
@@ -1820,6 +2171,7 @@ fn step_impl(
         .alloc(rows * model.hf.num_attention_heads as usize * 4)
         .map_err(|_| PIE_STATUS_EXHAUSTED)?;
 
+
     // The guard-owned attention values, discovered from the lowering as
     // the smokes discovered them. gemma-4 has NONE: both its attention
     // forms state [q, o] as SSA args, so the pins stay null.
@@ -1831,11 +2183,16 @@ fn step_impl(
         } else {
             "attn::dispatch_attention_flashinfer_prefill_bf16"
         };
-        let fi = lowered
+        let Some(fi) = lowered
             .launches
             .iter()
             .position(|x| lowered.kernels[x.kernel as usize] == dispatch_name)
-            .ok_or(PIE_STATUS_UNSUPPORTED)?;
+        else {
+            eprintln!(
+                "[driver-cuda-new] launch: the lowering states no {dispatch_name}"
+            );
+            return Err(PIE_STATUS_UNSUPPORTED);
+        };
         let q_pin = lowered.launches[fi]
             .args
             .clone()
@@ -1843,9 +2200,42 @@ fn step_impl(
                 Arg::Named { value, .. } => Some(*value),
                 _ => None,
             });
-        let o_off = match &lowered.args[lowered.launches[fi + 1].args.start as usize] {
-            Arg::Arena { at, .. } => *at,
-            _ => return Err(PIE_STATUS_UNSUPPORTED),
+        // The dispatch's OUTPUT, read off its own op join.
+        //
+        // This used to be `launches[fi + 1]`'s first operand — "the launch
+        // after the dispatch is the o_proj, and its input is the slot the
+        // dispatch wrote". True under `Resolve`, where the guard has
+        // already deleted every arm the fire did not take, and false under
+        // `Union`, where every arm is present and the next launch belongs
+        // to some other guard's body.
+        //
+        // A value found by counting launches is a fact derived from where
+        // a statement SITS. The join says it: the attention statement
+        // carries one arg (q) and its output placement, which is exactly
+        // the slot wanted. Same read the executor's arms make.
+        // Prefer the join, fall back to the neighbour.
+        //
+        // The join is the STATED read: the attention statement carries its
+        // output placement, which is the slot the o_proj goes on to read.
+        // Where a deployment spells the attention with [q, o] as SSA args
+        // the join records no output of its own, and there the old
+        // positional read is still the only answer available.
+        //
+        // Positional is what breaks under `Union` — every guard arm is
+        // present, so the launch after the dispatch belongs to some other
+        // body — which is why the join is tried first rather than second.
+        let o_off = match dplan.spec(fi).outs.first() {
+            Some(Arg::Arena { at, .. }) => *at,
+            _ => match lowered.launches.get(fi + 1).map(|n| &lowered.args[n.args.start as usize]) {
+                Some(Arg::Arena { at, .. }) => *at,
+                _ => {
+                    eprintln!(
+                        "[driver-cuda-new] launch: {dispatch_name} states no arena \
+                         output, and the launch after it is not one either"
+                    );
+                    return Err(PIE_STATUS_UNSUPPORTED);
+                }
+            },
         };
         (q_pin, Some(o_off))
     };
@@ -1888,22 +2278,24 @@ fn step_impl(
         q_out: q_pin
             .and_then(|v| named_bufs.get(&v).map(|b| b.as_ptr()))
             .unwrap_or(core::ptr::null_mut()),
+        score_out: d_scores.cast(),
+        score_indptr_d: d_score_indptr.cast(),
         o_out: o_off
             .map_or(core::ptr::null_mut(), |off| unsafe {
-                arena.as_ptr().cast::<u8>().add(off)
+                arena_ptr.cast::<u8>().add(off)
             }
             .cast()),
-        kv_page_indices_d: d_kv_indices.as_ptr().cast(),
-        kv_page_indptr_d: d_kv_indptr.as_ptr().cast(),
-        kv_last_page_lens_d: d_kv_lens.as_ptr().cast(),
-        qo_indptr_d: d_qo.as_ptr().cast(),
+        kv_page_indices_d: d_kv_indices.cast(),
+        kv_page_indptr_d: d_kv_indptr.cast(),
+        kv_last_page_lens_d: d_kv_lens.cast(),
+        qo_indptr_d: d_qo.cast(),
         qo_indptr_h: if is_gemma4 { qo_indptr.as_ptr() } else { core::ptr::null() },
         kv_page_indptr_h: if is_gemma4 { kv_indptr.as_ptr() } else { core::ptr::null() },
         num_requests: requests as i32,
         num_pages_in_batch: kv_indices.len() as i32,
         first_token: 0,
-        w_page_d: d_w_page.as_ptr().cast(),
-        w_off_d: d_w_off.as_ptr().cast(),
+        w_page_d: d_w_page.cast(),
+        w_off_d: d_w_off.cast(),
         row_valid_d: d_valid.as_ptr().cast(),
         lse_out_d: lse.as_ptr().cast(),
         window_left: -1,
@@ -1984,8 +2376,8 @@ fn step_impl(
         vocab: model.hf.vocab_size,
         gate_second: false,
         rope_interleaved: false,
-        token_ids: d_ids.as_ptr(),
-        positions: d_pos.as_ptr(),
+        token_ids: d_ids.cast_mut().cast(),
+        positions: d_pos.cast_mut().cast(),
         final_logit_softcap: softcap,
         ple_dim,
         scales,
@@ -2012,8 +2404,18 @@ fn step_impl(
     };
 
     let mut resolver = LiveResolver { model, named: &named_bufs };
-    let result =
-        run(&lowered, &dplan, exec_frame, &mut resolver, &ctx, Some(&attn), gdn_ctx.as_ref());
+    let regions = AttnRegions::whole(Some(&attn));
+    let result = if union {
+        capture_or_replay(
+            &mut state.supergraph,
+            state.fire_arrays.epoch,
+            u64::from(model.hf.num_hidden_layers.unsigned_abs()),
+            &plan, &fire_rows, &lowered, &dplan, exec_frame, &mut resolver, &ctx,
+            regions, gdn_ctx.as_ref(), &alloc, stream.as_ref(), requests, rows, class,
+        )
+    } else {
+        run(&lowered, &dplan, exec_frame, &mut resolver, &ctx, regions, gdn_ctx.as_ref())
+    };
     let sync = stream.as_ref().synchronize();
     cublas.release(&mut cublas_ops);
     match (result, sync) {

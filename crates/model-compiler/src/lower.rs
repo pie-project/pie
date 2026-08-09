@@ -140,7 +140,19 @@ pub enum Arg {
     /// which is exactly what the flat list exists to avoid. The rows come
     /// from [`Launch::rows`]; together they are the rectangle the kernel
     /// addresses.
-    Arena { at: usize, width: u32 },
+    Arena {
+        at: usize,
+        width: u32,
+        /// Bytes per ELEMENT of this operand.
+        ///
+        /// Stated because a driver that windows a rectangle needs the row
+        /// STRIDE, and `width` alone is elements. Every hand windowing in
+        /// the CUDA executor used to multiply by two — true of activations
+        /// and an assumption rather than a fact the trace carried, which
+        /// is the shape of defect §4 of the retirement plan keeps finding.
+        /// The lowering knows the dtype; now it says it.
+        bytes: u32,
+    },
     /// A value the BACKEND binds by name — the values a seam exposes
     /// (the observed query, the logits). `Buffers::NAMED` says which.
     Named { value: ValueId, width: u32 },
@@ -537,7 +549,7 @@ impl Lowerer<'_> {
     /// Lower the ops in `span` over `window`, the rows currently live.
     fn region(&mut self, span: Range<usize>, window: Range<u32>) -> Result<(), Uncovered> {
         let mut i = span.start;
-        while i < span.end {
+        'ops: while i < span.end {
             let op = &self.plan.ops[i];
             match &op.kind {
                 OpKind::Guard { arms, else_ops } => {
@@ -550,6 +562,25 @@ impl Lowerer<'_> {
                     // an argument-driven site already has.
                     let mut at = i + 1;
                     if self.guards == GuardMode::Union {
+                        // NOT EVERY PREDICATE FOLDS, and the north star's
+                        // own list says which: "hook attachment, mask
+                        // kind, correction arm, depth, LoRA rank". Scores
+                        // are not on it, and the reason shows up the
+                        // moment you try — a score-capturing dispatch
+                        // needs a plan prepared for it, buffers laid out
+                        // for it, and an observation window, none of which
+                        // a fire that wants no scores builds. An arm whose
+                        // PREPARED STATE the fire declines to build cannot
+                        // be recorded, only refused.
+                        //
+                        // So a non-foldable predicate is answered here,
+                        // exactly as `Resolve` answers it, and the axis
+                        // belongs in the bucket KEY instead — the same
+                        // conclusion `BucketKey::lora_shape` reached from
+                        // the other end.
+                        fn folds(p: GuardPred) -> bool {
+                            !matches!(p, GuardPred::WantsAttnScore)
+                        }
                         // UNION: answer nothing. Every arm lowers over
                         // the whole window, tagged with its place in the
                         // tree, and the chain nests — arm k runs when
@@ -559,13 +590,27 @@ impl Lowerer<'_> {
                         let outer = self.cond;
                         let mut parent = outer;
                         for arm in arms {
-                            let (slot, param) = arm.pred.wire();
                             let body = at..at + arm.ops as usize;
+                            at += arm.ops as usize;
+                            if !folds(arm.pred) {
+                                // Answered, not folded. An arm that does
+                                // not hold vanishes; one that does takes
+                                // the whole window and ends the chain,
+                                // because a resolved arm is the choice.
+                                if !self.select(&window, arm.pred).is_empty() {
+                                    self.cond = parent;
+                                    self.region(body, window.clone())?;
+                                    self.cond = outer;
+                                    i = at + *else_ops as usize;
+                                    continue 'ops;
+                                }
+                                continue;
+                            }
+                            let (slot, param) = arm.pred.wire();
                             let (if_arm, else_arm) = self.push_cond_pair(parent, slot, param);
                             self.cond = if_arm;
                             self.region(body, window.clone())?;
                             parent = else_arm;
-                            at += arm.ops as usize;
                         }
                         self.cond = parent;
                         self.region(at..at + *else_ops as usize, window.clone())?;
@@ -773,12 +818,18 @@ impl Lowerer<'_> {
         (t, f)
     }
 
-    /// Where a value's bytes are, and how wide a row of it is.
+    /// Where a value's bytes are, how wide a row of it is, and how many
+    /// bytes one element takes.
     fn slot(&self, v: ValueId) -> Arg {
         let width = self.row_width(v);
+        let bytes = self
+            .plan
+            .values
+            .get(v as usize)
+            .map_or(2, |info| dtype_bytes(info.dtype));
         match self.buffers.offset.get(v as usize) {
             Some(&Buffers::NAMED) | None => Arg::Named { value: v, width },
-            Some(&at) => Arg::Arena { at, width },
+            Some(&at) => Arg::Arena { at, width, bytes },
         }
     }
 
@@ -1650,9 +1701,15 @@ pub fn value_bytes(plan: &ForwardPlan, v: ValueId, n_tokens: usize, n_requests: 
             } => Dim::moe_aligned_rows(n_tokens as u32, *top_k, *experts, *block) as usize,
         };
     }
-    elements
-        * match info.dtype {
-            DType::BF16 | DType::F16 => 2,
-            DType::F32 | DType::I32 => 4,
-        }
+    elements * dtype_bytes(info.dtype) as usize
+}
+
+/// Bytes per element. One place, because two answers to this question is
+/// how a row stride and a buffer size disagree.
+#[must_use]
+pub const fn dtype_bytes(d: DType) -> u32 {
+    match d {
+        DType::BF16 | DType::F16 => 2,
+        DType::F32 | DType::I32 => 4,
+    }
 }

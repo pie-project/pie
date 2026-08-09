@@ -95,6 +95,22 @@ impl Names {
             ("gate_proj", "mlp.gate_proj"),
             ("up_proj", "mlp.up_proj"),
             ("down", "mlp.down_proj"),
+            // The mixture. `mlp.gate` is MLX's name for the ROUTER -- an
+            // unfortunate collision with `mlp.gate_proj`, which is an
+            // expert's gate half, and worth spelling out here because the two
+            // are one character apart and mean entirely different tensors.
+            //
+            // The expert banks carry no expert index: `switch_mlp` stores all
+            // of them in one `[experts, out, in]` tensor and the routed kernel
+            // indexes it by the slot it read.
+            ("router", "mlp.gate"),
+            ("expert_gate", "mlp.switch_mlp.gate_proj"),
+            ("expert_up", "mlp.switch_mlp.up_proj"),
+            ("expert_down", "mlp.switch_mlp.down_proj"),
+            ("shared_gate", "mlp.shared_expert.gate_proj"),
+            ("shared_up", "mlp.shared_expert.up_proj"),
+            ("shared_down", "mlp.shared_expert.down_proj"),
+            ("shared_gate_proj", "mlp.shared_expert_gate"),
             // The norms.
             ("q_norm", "self_attn.q_norm"),
             ("k_norm", "self_attn.k_norm"),
@@ -167,6 +183,16 @@ pub struct Store<'a> {
     tensors: &'a HashMap<String, Slice>,
     /// The values a seam binds, by id.
     named: &'a HashMap<ValueId, Slice>,
+    /// The layer KV pages a statement's state reference resolves through.
+    ///
+    /// `None` for a store with no pool — the host checks, the name-map tests —
+    /// which is why [`Resolver::kv`] defaults to `None` rather than being
+    /// required.
+    kv: Option<&'a dyn Fn(u16, bool) -> Option<Slice>>,
+    /// The fire's own tables, when this store has a fire behind it.
+    fire: Option<&'a dyn Fn(super::executor::FireTable) -> Option<Slice>>,
+    /// The pool's geometry, when this store has a pool behind it.
+    pool: Option<super::kv::Shape>,
     /// Every traced name this store could not answer, in ask order.
     ///
     /// Collected rather than logged: a fire that cannot bind is diagnosed by
@@ -187,8 +213,43 @@ impl<'a> Store<'a> {
             names,
             tensors,
             named,
+            kv: None,
+            fire: None,
+            pool: None,
             missed: Vec::new(),
         }
+    }
+
+    /// The same store, answering a statement's KV state through `pages`.
+    ///
+    /// A closure rather than a borrowed pool, so this module stays portable:
+    /// the pool is Apple-only and the map is not, and a resolver that named
+    /// the pool's type would drag one into the other.
+    #[must_use]
+    pub fn with_kv(mut self, pages: &'a dyn Fn(u16, bool) -> Option<Slice>) -> Self {
+        self.kv = Some(pages);
+        self
+    }
+
+    /// The same store, answering the FIRE's tables through `tables`.
+    #[must_use]
+    pub fn with_fire(
+        mut self,
+        tables: &'a dyn Fn(super::executor::FireTable) -> Option<Slice>,
+    ) -> Self {
+        self.fire = Some(tables);
+        self
+    }
+
+    /// The same store, answering the POOL's geometry from `shape`.
+    ///
+    /// Separate from [`Self::with_kv`], which hands out the pages themselves,
+    /// because the two answer different questions: where a layer's keys are,
+    /// and how far apart the rows in them sit.
+    #[must_use]
+    pub fn with_pool(mut self, shape: super::kv::Shape) -> Self {
+        self.pool = Some(shape);
+        self
     }
 
     /// The checkpoint tensor a traced name means, spelled the checkpoint's way.
@@ -232,6 +293,35 @@ impl Resolver for Store<'_> {
 
     fn named(&mut self, value: ValueId) -> Option<Slice> {
         self.named.get(&value).copied()
+    }
+
+    fn kv(&mut self, layer: u16, values: bool) -> Option<Slice> {
+        self.kv.and_then(|pages| pages(layer, values))
+    }
+
+    fn fire(&mut self, table: super::executor::FireTable) -> Option<Slice> {
+        self.fire.and_then(|tables| tables(table))
+    }
+
+    fn pool(&mut self, which: super::executor::FireTable) -> Option<u32> {
+        use super::executor::FireTable;
+        let shape = self.pool?;
+        // The pool is `[page, token, head, dim]` -- `row_bytes` is "every
+        // head's channels, contiguously", so a token row INTERLEAVES the heads
+        // rather than a head owning a contiguous span of tokens. The strides
+        // therefore come out the other way around from the head-major layout
+        // the names suggest: one head is `head_dim` away, one token is a whole
+        // row away.
+        //
+        // Worth stating rather than deriving at the call site. Swapping these
+        // two is a fire that reads real memory at every step and attends to
+        // the wrong tokens, which no bounds check catches.
+        Some(match which {
+            FireTable::KvHeadStride => shape.head_dim,
+            FireTable::KvSeqStride => shape.kv_heads * shape.head_dim,
+            FireTable::KvPageSize => shape.page_size,
+            _ => return None,
+        })
     }
 }
 

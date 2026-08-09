@@ -473,29 +473,29 @@ fn the_full_zero_weight_decode_walks_every_launch() {
 ///
 /// # Why this is `ignore`d, and what un-ignoring it needs
 ///
-/// It does not pass, and what it fails on is worth having written down.
-/// The devwin arm and the peel window word are enough for the SPLIT; the
-/// attention is not. A peel's tail region hands its attention launch a
-/// windowed rectangle (`rows.start == 2`), and every arm binds BASE
-/// pointers plus a row COUNT — so the tail's attention runs over rows
-/// 0..2 instead of 2..4, disagrees with the KV plan, and faults inside
-/// FlashInfer.
+/// It does not pass yet, and the reason moved once already, which is the
+/// useful part. Two layers came off:
 ///
-/// That is §4's fourth decline-rule, met head-on rather than declined
-/// around: the generated branches guard on `rows.start == 0` precisely
-/// because a base-bound launch writes the prefix's rows, and the hand
-/// arms have the same bug without the guard. Nothing noticed until now
-/// because nothing had ever run a peel.
+/// * the SPLIT — `attn::split_qkv_bf16_devwin` had no arm and no device
+///   word to read. `cuda::PeelWindowWord` and its arm fixed that.
+/// * the WINDOWED RECTANGLE — the tail's launches bound BASE pointers
+///   plus a row count, so they ran over the prefix's rows. `Arg::Arena`
+///   states its element width now and `resolve_arg_windowed` applies the
+///   window once, for the stated args and the op join's placements
+///   together. §4's fourth decline-rule is gone with it.
 ///
-/// So un-ignoring this needs the windowed rectangle solved, which
-/// `cuda.md` §4 records as needing a stride the operand vocabulary does
-/// not carry — `Arg::Arena { at, width }` gives elements per row and no
-/// dtype. Either `Arg` learns the operand's dtype (which the lowering
-/// knows and does not say) or the lowering emits already-windowed
-/// offsets. It is one of the four decline-rules and the only one whose
-/// removal has a fire waiting for it.
+/// What is left is the PLAN. `Launch::peel`'s own doc says a prepared
+/// plan "is found by the rectangle's ROW COUNT" — and this fire builds
+/// ONE `DecodePlan`, for all four rows, while the tail's attention serves
+/// two. FlashInfer reads a plan that does not describe the launch it was
+/// given and faults.
+///
+/// So un-ignoring needs a plan per row count, which is A4's plan-stability
+/// item arriving from the peel side rather than the capture side. The two
+/// want the same thing: an arm must be HANDED its plan rather than
+/// resolve one, because neither a peel region nor a captured replay can
+/// assume the fire's.
 #[test]
-#[ignore = "the peel's tail hands attention a windowed rectangle; see the doc comment"]
 fn a_hooked_fire_peels_and_still_lands_the_same_numbers() {
     zero_weight_decode(Leg::Hooked);
 }
@@ -517,60 +517,76 @@ fn a_resolved_walk_captures_and_replays() {
     zero_weight_decode(Leg::Captured);
 }
 
-/// The constraint the union imposes on the arms, pinned as a closed set.
+/// **A5, at one lane: the UNION captured and replayed on real geometry.**
 ///
-/// A union capture records EVERY arm, including the ones this fire's
-/// predicates are false for -- that is the whole point, since the
-/// conditional is what decides at replay. So an arm must be ISSUABLE
-/// even when its predicate does not hold.
+/// Everything else proves a piece. `gpu_supergraph` proves the mechanism
+/// against memsets; `union_lower` proves the launch list, GPU-free;
+/// `a_resolved_walk_captures_and_replays` proves a capture of an
+/// already-decided program. This one keeps every guard, records every arm
+/// into conditional bodies, arms the predicates from a device word, and
+/// then asks the only question that matters: does the same decode come
+/// out?
 ///
-/// Some are not. `pie_lora_qkv_correction` refuses when the fire staged
-/// no adapters, which under `Resolve` is unreachable (the guard removed
-/// the arm) and under `Union` is exactly the case that has to record. The
-/// arm is safe to record with a null state precisely BECAUSE the
-/// conditional guarding it reads the same fact the refusal does -- but
-/// nothing has taught it that yet.
+/// The arena is wiped between the capture and the replay, so the residual
+/// and logit invariants can only be met by work the replay did — through
+/// the conditionals, off the predicate word.
 ///
-/// This is the C++ arc's S4 "LoRA capture-safety" item, arrived at from
-/// the other direction. The list is closed and this test is how it stays
-/// closed: an arm that learns to record leaves it, and an arm that starts
-/// refusing joins it before it can surprise a capture.
+/// What it is NOT yet is A5 in full: the plan asks for byte-identity
+/// across CONCURRENT structurally-distinct lanes, which needs more than
+/// one fire in flight. This is the single-lane form, and it is the one
+/// that had to work first.
+///
+/// # Why this is `ignore`d: the warm-up paradox
+///
+/// Everything structural is in place. The score dispatch is armed, the
+/// tree is right — its launch sits under `cond.slot == 3`,
+/// `SLOT_WANTS_ATTN_SCORE`, exactly where it should — and the buffers can
+/// be valid and EMPTY, because a body the conditional never enters writes
+/// nothing.
+///
+/// What blocks it is the interaction of two facts each of which is
+/// correct alone:
+///
+/// * a capture must be taken on a WARM fire, because a launcher that
+///   allocates its workspace on first use cannot do so inside a capture
+///   (established this morning, the hard way — a C++ throw crossing the C
+///   ABI and aborting with no message);
+/// * a warm-up must walk a VALID program, because walking a union eagerly
+///   runs both sides of every guard over the same rows.
+///
+/// Together they say: a union capture must warm every arm it will record,
+/// and a warm-up that walks one valid program cannot warm the arms that
+/// program does not take. The score dispatch's first use therefore lands
+/// inside the capture, and it faults there.
+///
+/// The way out is presumably what the C++ arc calls DUAL-PREPARE — warm
+/// each variant once before recording the union — and that is the next
+/// thing to port. It is not a missing arm and not a missing buffer; both
+/// of those were the answers to the previous two attempts, and both are
+/// now done.
 #[test]
-fn the_union_capture_needs_every_arm_issuable() {
-    use driver_cuda_new::model::executor::{RunRefusalKind, DispatchRefusal};
-
-    /// Arms that cannot yet be issued with their predicate false.
-    const NOT_YET_ISSUABLE: &[&str] = &["pie_lora_qkv_correction"];
-
-    let refusal = union_walk_refusal();
-    let Some((kernel, why)) = refusal else {
-        panic!(
-            "every arm is issuable now -- delete NOT_YET_ISSUABLE and \
-             capture the union in `a_resolved_walk_captures_and_replays`"
-        );
-    };
-    assert!(
-        NOT_YET_ISSUABLE.contains(&kernel.as_str()),
-        "a NEW arm refuses under the union: {kernel} ({why:?}). Either make \
-         it issuable with a false predicate, or add it to NOT_YET_ISSUABLE \
-         so the gap is closed rather than discovered by a capture."
-    );
-    assert!(
-        matches!(why, RunRefusalKind::Dispatch(DispatchRefusal::NoArm(_))),
-        "expected a NoArm refusal, got {why:?}"
-    );
+fn the_union_captures_and_replays_the_same_decode() {
+    zero_weight_decode(Leg::CapturedUnion);
 }
 
-/// Lower the anchor decode with every guard KEPT and walk it eagerly,
-/// returning the first arm that refuses to be issued.
+/// Every arm the union states is now armed, and that claim moved.
 ///
-/// Eager rather than captured on purpose: the question is whether the ARM
-/// can be issued at all with its predicate false, and a capture would
-/// answer it by aborting the process (a C++ `throw` crossing `extern "C"`)
-/// rather than by returning a refusal one can read.
-fn union_walk_refusal() -> Option<(String, driver_cuda_new::model::executor::RunRefusalKind)> {
-    zero_weight_decode(Leg::UnionProbe)
-}
+/// This file used to carry a runtime probe: lower with every guard KEPT,
+/// walk eagerly, and report the first arm that refused. It found the two
+/// gaps it was built for — `pie_lora_qkv_correction`, which refused when a
+/// fire staged no adapters, and `attn::write_kv_explicit_bf16`, which had
+/// no arm at all — and then it could not survive its own success. With
+/// everything armed, walking a union EAGERLY runs both sides of every
+/// guard over the same rows, which is not a meaningful program: the
+/// explicit KV write and the CSR-derived one both fire, and the fire
+/// faults rather than refusing.
+///
+/// So the check is static now and lives where the other closed set does:
+/// `executor_bind`'s corpus gained a `union_lowered` entry, so an arm that
+/// only a guard's losing side states is inside `UNARMED` rather than
+/// invisible to it. What a static check cannot see is an arm that EXISTS
+/// and refuses at runtime, which is what the lora one did — that is
+/// covered by actually capturing a union, which is A5.
 
 /// Which leg of the zero-weight decode to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -580,22 +596,21 @@ enum Leg {
     /// Resolve the guards, warm up, WIPE, capture, replay, assert the
     /// same invariants against what the replay alone produced.
     Captured,
-    /// Keep the guards and walk eagerly, reporting the first arm that
-    /// cannot be issued with its predicate false. Asserts nothing.
-    UnionProbe,
+    /// KEEP the guards and capture. The union records every arm and lets
+    /// a conditional decide at replay, so this is the leg that asks
+    /// whether the whole design produces the right numbers — not the
+    /// mechanism in isolation (`gpu_supergraph`) and not the launch list
+    /// in isolation (`union_lower`).
+    CapturedUnion,
     /// A fire whose LAST TWO ROWS carry attached programs, which makes
-    /// `lower` split it on the hook axis. The tail region then addresses
-    /// rows at absolute offsets and takes `_devwin` statements, so this is
-    /// the only leg that exercises a peel at all.
-    ///
-    /// No programs are actually attached, so the two regions compute the
-    /// same thing the unpeeled fire does — which is exactly why it is a
-    /// good gate: the invariants below must come out unchanged, and a
-    /// devwin launch that read the wrong window would change them.
+    /// `lower` split it on the hook axis. The tail then addresses rows at
+    /// absolute offsets, takes `_devwin` statements, and needs its own
+    /// prepared attention state — so this is the only leg that exercises
+    /// a peel.
     Hooked,
 }
 
-fn zero_weight_decode(leg: Leg) -> Option<(String, driver_cuda_new::model::executor::RunRefusalKind)> {
+fn zero_weight_decode(leg: Leg) {
     use std::collections::BTreeMap;
 
     use driver_cuda_new::cuda::cublas::{CublasHandle, LiveCublas};
@@ -603,7 +618,7 @@ fn zero_weight_decode(leg: Leg) -> Option<(String, driver_cuda_new::model::execu
     use driver_cuda_new::launch::{KvCacheLayerView, KvCacheScheme};
     use driver_cuda_new::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
     use driver_cuda_new::model::executor::{
-        AttnCtx, DecodePlan, DispatchCtx, DispatchPlan, Frame, Resolver, run, run_captured,
+        AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, Resolver, run, run_captured,
     };
     use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
     use model::families::llama_like::forward::llama_like_cuda;
@@ -611,7 +626,7 @@ fn zero_weight_decode(leg: Leg) -> Option<(String, driver_cuda_new::model::execu
     use model_compiler::trace::{FireClass, ValueId};
 
     let _gpu = gpu_guard();
-    let Some(_dev) = device_or_skip("full zero-weight decode") else { return None };
+    let Some(_dev) = device_or_skip("full zero-weight decode") else { return };
     let stream = OwnedStream::new(0).expect("stream");
     let raw_stream = stream.as_ref().as_raw().cast::<std::ffi::c_void>();
     let mut alloc = Allocator::new();
@@ -644,7 +659,7 @@ fn zero_weight_decode(leg: Leg) -> Option<(String, driver_cuda_new::model::execu
     }
     // The captured leg KEEPS every guard: that is what makes one capture
     // able to serve fires that differ in their variant bits.
-    let mode = if leg == Leg::UnionProbe { GuardMode::Union } else { GuardMode::Resolve };
+    let mode = if leg == Leg::CapturedUnion { GuardMode::Union } else { GuardMode::Resolve };
     let l = lower_with(&plan, &rows, Fire { captures_across_splits: false }, mode)
         .expect("lowers");
     let dplan = DispatchPlan::new(&plan, &l);
@@ -799,6 +814,55 @@ fn zero_weight_decode(leg: Leg) -> Option<(String, driver_cuda_new::model::execu
         other => panic!("o_proj reads the attention slot, got {other:?}"),
     };
 
+    // The TAIL region's prepared attention state, for the peeled leg.
+    //
+    // A peel's tail serves rows [split, N) — a different row count, a
+    // different set of requests, and therefore a different plan, different
+    // KV page CSRs, and output pins that start at the tail's first row.
+    // `AttnRegions` is what hands it to the arm; building it here is what
+    // makes the peel gate a real test of the handing-over rather than of
+    // the vocabulary alone.
+    //
+    // The CSR indptr is REBASED: FlashInfer reads a prefix sum that starts
+    // at zero, so a sub-batch cannot borrow the fire's.
+    let split = rows.iter().position(|r| r.hooked).unwrap_or(0);
+    let tail_rows = ROWS - split;
+    let tail_indptr = up(&u32s(&(0..=tail_rows as u32).collect::<Vec<_>>()));
+    let tail_lens = up(&u32s(&vec![1u32; tail_rows]));
+    let tail_indices = up(&u32s(&(split as u32..ROWS as u32).collect::<Vec<_>>()));
+    let mut tail_plan = DecodePlan::new();
+    ws.begin_plan_update(&mut sops).expect("begin tail plan");
+    tail_plan.plan_decode(
+        &(0..=tail_rows as u32).collect::<Vec<_>>(),
+        Q_HEADS,
+        KV_HEADS,
+        HEAD_DIM,
+        PAGE,
+        ws.view(),
+        raw_stream,
+        false,
+        -1,
+    );
+    ws.end_plan_update(&mut sops, raw_stream);
+
+
+    // SCORE buffers: valid, stable, and EMPTY.
+    //
+    // The union records the score-capturing decode dispatch whether or not
+    // this fire wants scores, so the addresses must be real — a null
+    // faults the instant `WantsAttnScore` goes true. They may be empty,
+    // and that is the trick: the CSR says every request folds zero rows,
+    // so a body that did run would write nothing, and the conditional
+    // means it does not run at all.
+    //
+    // A later fire in this bucket that DOES want scores needs a bigger
+    // slot, and growing it moves the base — which is precisely what
+    // `PlanEpoch` exists to notice. Growth bumps the epoch, the captured
+    // exec goes stale, and the bucket recaptures. A cost, not a wrong
+    // answer.
+    let score_indptr = up(&u32s(&vec![0u32; ROWS + 1]));
+    let scores = alloc.alloc(4).expect("scores");
+
     let attn = AttnCtx {
         decode_plan: dplan_cache.as_ptr(),
         decode_plan_full: core::ptr::null_mut(),
@@ -806,6 +870,8 @@ fn zero_weight_decode(leg: Leg) -> Option<(String, driver_cuda_new::model::execu
         workspace: ws.view(),
         layers,
         q_out: named_bufs[&q_pin_value].as_ptr(),
+        score_out: scores.as_ptr().cast(),
+        score_indptr_d: score_indptr.as_ptr().cast(),
         o_out: unsafe { arena.as_ptr().cast::<u8>().add(o_off) }.cast(),
         kv_page_indices_d: csr_indices.as_ptr().cast(),
         kv_page_indptr_d: csr_indptr.as_ptr().cast(),
@@ -825,6 +891,35 @@ fn zero_weight_decode(leg: Leg) -> Option<(String, driver_cuda_new::model::execu
         logits_soft_cap: 0.0,
         sm_scale: 1.0 / (HEAD_DIM as f32).sqrt(),
     };
+
+    // The tail's state: the fire's, with the region's plan, its rebased
+    // CSRs, and pins that start at the tail's first row. Everything else
+    // (workspace, layers, geometry) is fire-wide and shared.
+    let attn_tail = AttnCtx {
+        decode_plan: tail_plan.as_ptr(),
+        kv_page_indices_d: tail_indices.as_ptr().cast(),
+        kv_page_indptr_d: tail_indptr.as_ptr().cast(),
+        kv_last_page_lens_d: tail_lens.as_ptr().cast(),
+        num_requests: tail_rows as i32,
+        first_token: split as i32,
+        score_out: core::ptr::null_mut(),
+        score_indptr_d: core::ptr::null(),
+        o_out: unsafe {
+            arena.as_ptr().cast::<u8>().add(o_off + split * HIDDEN * 2)
+        }
+        .cast(),
+        lse_out_d: unsafe {
+            lse.as_ptr().cast::<u8>().add(split * Q_HEADS as usize * 4)
+        }
+        .cast(),
+        ..attn.clone()
+    };
+    let regions = if leg == Leg::Hooked {
+        AttnRegions::split(&attn, &attn_tail)
+    } else {
+        AttnRegions::whole(Some(&attn))
+    };
+
 
     let mut cublas_ops = LiveCublas;
     let mut cublas = CublasHandle::create(&mut cublas_ops, raw_stream).expect("cublas");
@@ -900,36 +995,55 @@ fn zero_weight_decode(leg: Leg) -> Option<(String, driver_cuda_new::model::execu
             logits_value = Some(*value);
         }
     }
-    if leg == Leg::UnionProbe {
-        let refusal = run(&l, &dplan, frame, &mut resolver, &ctx, Some(&attn), None)
-            .err()
-            .map(|e| (e.kernel, e.why));
-        stream.as_ref().synchronize().ok();
-        ws.release(&mut sops);
-        cublas.release(&mut cublas_ops);
-        return refusal;
-    }
-
-    let ran = if leg == Leg::Captured {
+    let ran = if leg == Leg::Captured || leg == Leg::CapturedUnion {
         use driver_cuda_new::cuda::{PredicateWord, SupergraphBuilder};
         use driver_cuda_new::model::supergraph::fire_predicates;
 
         // The word is filled and uploaded BEFORE the capture opens: the
         // host decides the fire's bits, the graph reads them.
         let mut preds = PredicateWord::new(&alloc).expect("predicate word");
+        // Under `Union` the conditionals are real and this word is what
+        // decides them; under `Resolve` the tree is empty and it decides
+        // nothing. The same call serves both, which is the point of
+        // `fire_predicates` reading the tree rather than a fire's flags.
         fire_predicates(&rows, &l.conds, &mut preds).expect("the fire's bits");
         preds.upload(stream.as_ref()).expect("upload");
         stream.as_ref().synchronize().expect("the word lands before the capture");
 
-        // WARM UP FIRST, and this is not a test convenience -- it is a
-        // property of the layer. cuBLAS and several launchers allocate a
-        // workspace on first use, and an allocation inside a capture is
-        // refused; the C++ wrapper turns that refusal into a `throw`,
-        // which crosses `extern "C"` and aborts the process without a
-        // Rust panic to read. So a real driver captures a WARM fire, and
-        // so does this. (The C++ arc calls the same thing dual-prepare.)
-        run(&l, &dplan, frame, &mut resolver, &ctx, Some(&attn), None)
-            .unwrap_or_else(|e| panic!("the warm-up walk refused: {e:?}"));
+        // DUAL-PREPARE: warm each VARIANT, not just this fire.
+        //
+        // A capture must be taken warm, because a launcher that allocates
+        // its workspace on first use cannot do so inside a capture -- the
+        // refusal becomes a C++ `throw` crossing the C ABI, which aborts
+        // the process. A warm-up must walk a VALID program, because
+        // walking a union eagerly runs both sides of every guard over the
+        // same rows. And a union records arms that no single valid program
+        // takes.
+        //
+        // So warm once per variant, each with its own RESOLVED lowering --
+        // every one a real program -- and let the union of their arms
+        // cover the union lowering's. The numbers they produce are
+        // discarded: the arena is wiped below, and what survives is the
+        // allocation each launcher did on its first call. This is what the
+        // C++ arc calls dual-prepare.
+        for marks in [
+            Row { samples: true, ..Row::default() },
+            Row { samples: true, wants_scores: true, ..Row::default() },
+            Row { samples: true, write_desc: true, ..Row::default() },
+        ] {
+            let warm_rows: Vec<Row> = vec![marks; ROWS];
+            let warm = lower_with(
+                &plan,
+                &warm_rows,
+                Fire { captures_across_splits: false },
+                GuardMode::Resolve,
+            )
+            .expect("the warm-up lowers");
+            let warm_dplan = DispatchPlan::new(&plan, &warm);
+            run(&warm, &warm_dplan, frame, &mut resolver, &ctx, regions, None)
+                .unwrap_or_else(|e| panic!("the warm-up walk refused: {e:?}"));
+            stream.as_ref().synchronize().expect("the warm-up retires");
+        }
         stream.as_ref().synchronize().expect("the warm-up retires");
 
         // Wipe what the warm-up computed, so that what the invariants
@@ -941,17 +1055,62 @@ fn zero_weight_decode(leg: Leg) -> Option<(String, driver_cuda_new::model::execu
             let scope = alloc.begin_capture(stream.as_ref()).expect("begin capture");
             let mut b = SupergraphBuilder::new(scope.stream(), &preds);
             let ran = run_captured(
-                &l, &dplan, frame, &mut resolver, &ctx, Some(&attn), None, &mut b,
+                &l, &dplan, frame, &mut resolver, &ctx, AttnRegions::whole(Some(&attn)), None, &mut b,
             )
             .unwrap_or_else(|e| panic!("the captured walk refused: {e:?}"));
             drop(b);
             (ran, scope.end().expect("end capture"))
         };
         let exec = graph.instantiate().expect("instantiate");
-        exec.launch(stream.as_ref()).expect("replay");
+
+        // ── A5 AT WIDTH: one exec, two structurally distinct programs ──
+        //
+        // This is the claim the whole workstream exists to make. The same
+        // instantiated graph is launched twice; the ONLY thing that
+        // changes between them is one byte of the device predicate word,
+        // and that byte selects a different KV-write program — the
+        // explicit descriptor form on one launch and the CSR-derived form
+        // on the other. Different launches, different kernels, one exec.
+        //
+        // They must agree. Both write the same cells to the same pages, so
+        // the logits that come back are the test: if the conditional were
+        // not selecting, or were selecting the wrong body, or the union
+        // had folded two programs that are not equivalent, these two byte
+        // arrays would differ.
+        //
+        // The non-zero check is what keeps the equality from being
+        // vacuous — two empty buffers also match.
+        let lv = logits_value.expect("the last launch writes a named pin");
+        let mut lanes: Vec<Vec<u8>> = Vec::new();
+        for has_write_desc in [false, true] {
+            arena.memset(0, stream.as_ref()).expect("wipe between lanes");
+            preds
+                .set(driver_cuda_new::cuda::SLOT_HAS_WRITE_DESC, has_write_desc)
+                .expect("slot");
+            preds.upload(stream.as_ref()).expect("upload");
+            stream.as_ref().synchronize().expect("the word lands");
+            exec.launch(stream.as_ref()).expect("replay");
+            stream.as_ref().synchronize().expect("the replay retires");
+            let mut back = vec![0u8; named_bufs[&lv].len()];
+            named_bufs[&lv]
+                .copy_to_host(&mut back, stream.as_ref())
+                .expect("d2h logits");
+            stream.as_ref().synchronize().expect("sync");
+            lanes.push(back);
+        }
+        assert!(
+            lanes[0].iter().any(|&b| b != 0),
+            "the lanes agree only because both are empty"
+        );
+        assert_eq!(
+            lanes[0], lanes[1],
+            "ONE exec produced different logits for two structurally \
+             distinct programs — the union folded something it should not \
+             have, or the conditional is not selecting"
+        );
         ran
     } else {
-        run(&l, &dplan, frame, &mut resolver, &ctx, Some(&attn), None)
+        run(&l, &dplan, frame, &mut resolver, &ctx, regions, None)
             .unwrap_or_else(|e| panic!("the walk refused: {e:?}"))
     };
     assert_eq!(ran, l.launches.len(), "every launch ran");
@@ -999,7 +1158,6 @@ fn zero_weight_decode(leg: Leg) -> Option<(String, driver_cuda_new::model::execu
 
     ws.release(&mut sops);
     cublas.release(&mut cublas_ops);
-    None
 }
 
 /// The FULL prefill: the decode walk's twin over `qwen3_0_6b`'s real
@@ -1018,7 +1176,7 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
     use driver_cuda_new::launch::{KvCacheLayerView, KvCacheScheme};
     use driver_cuda_new::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
     use driver_cuda_new::model::executor::{
-        AttnCtx, DispatchCtx, DispatchPlan, Frame, PrefillPlan, Resolver, run,
+        AttnCtx, AttnRegions, DispatchCtx, DispatchPlan, Frame, PrefillPlan, Resolver, run,
     };
     use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
     use model::families::llama_like::forward::llama_like_cuda;
@@ -1203,6 +1361,8 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
         workspace: ws.view(),
         layers,
         q_out: core::ptr::null_mut(),
+        score_out: core::ptr::null_mut(),
+        score_indptr_d: core::ptr::null(),
         o_out: unsafe { arena.as_ptr().cast::<u8>().add(o_off) }.cast(),
         kv_page_indices_d: csr_indices.as_ptr().cast(),
         kv_page_indptr_d: csr_indptr.as_ptr().cast(),
@@ -1281,7 +1441,7 @@ fn the_full_zero_weight_prefill_walks_every_launch() {
         zeros: zeros_dev.as_ptr(),
         named: &named_bufs,
     };
-    let ran = run(&l, &dplan, frame, &mut resolver, &ctx, Some(&attn), None)
+    let ran = run(&l, &dplan, frame, &mut resolver, &ctx, AttnRegions::whole(Some(&attn)), None)
         .unwrap_or_else(|e| panic!("the walk refused: {e:?}"));
     assert_eq!(ran, l.launches.len(), "every launch ran");
     stream.as_ref().synchronize().expect("the whole prefill retires");
@@ -1346,7 +1506,7 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
     use driver_cuda_new::launch::{KvCacheLayerView, KvCacheScheme};
     use driver_cuda_new::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
     use driver_cuda_new::model::executor::{
-        AttnCtx, DecodePlan, DispatchCtx, DispatchPlan, Frame, GdnCtx, Resolver, run,
+        AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, GdnCtx, Resolver, run,
     };
     use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
     use model::qwen_3_5::forward::qwen3_5_hybrid_cuda;
@@ -1664,6 +1824,8 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
         prefill_plan: core::ptr::null_mut(),
         workspace: ws.view(),
         layers,
+        score_out: core::ptr::null_mut(),
+        score_indptr_d: core::ptr::null(),
         q_out: named_bufs[&q_pin_value].as_ptr(),
         o_out,
         kv_page_indices_d: csr_indices.as_ptr().cast(),
@@ -1764,7 +1926,7 @@ fn the_hybrid_zero_weight_decode_walks_every_launch() {
         }
         l.launches.len()
     } else {
-        run(&l, &dplan, frame, &mut resolver, &ctx, Some(&attn), Some(&gdn))
+        run(&l, &dplan, frame, &mut resolver, &ctx, AttnRegions::whole(Some(&attn)), Some(&gdn))
             .unwrap_or_else(|e| panic!("the hybrid walk refused: {e:?}"))
     };
     assert_eq!(ran, l.launches.len(), "every launch ran");
@@ -1825,7 +1987,7 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
     use driver_cuda_new::launch::{KvCacheLayerView, KvCacheScheme};
     use driver_cuda_new::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
     use driver_cuda_new::model::executor::{
-        AttnCtx, DispatchCtx, DispatchPlan, Frame, GdnCtx, PrefillPlan, Resolver, run,
+        AttnCtx, AttnRegions, DispatchCtx, DispatchPlan, Frame, GdnCtx, PrefillPlan, Resolver, run,
     };
     use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
     use model::qwen_3_5::forward::qwen3_5_hybrid_cuda;
@@ -2119,6 +2281,8 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
         prefill_plan: pplan.as_ptr(),
         workspace: ws.view(),
         layers,
+        score_out: core::ptr::null_mut(),
+        score_indptr_d: core::ptr::null(),
         q_out: named_bufs[&q_pin_value].as_ptr(),
         o_out,
         kv_page_indices_d: csr_indices.as_ptr().cast(),
@@ -2200,7 +2364,7 @@ fn the_hybrid_zero_weight_prefill_walks_every_launch() {
             logits_value = Some(*value);
         }
     }
-    let ran = run(&l, &dplan, frame, &mut resolver, &ctx, Some(&attn), Some(&gdn))
+    let ran = run(&l, &dplan, frame, &mut resolver, &ctx, AttnRegions::whole(Some(&attn)), Some(&gdn))
         .unwrap_or_else(|e| panic!("the hybrid prefill walk refused: {e:?}"));
     assert_eq!(ran, l.launches.len(), "every launch ran");
     stream.as_ref().synchronize().expect("the whole hybrid prefill retires");
@@ -2266,7 +2430,7 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
     use driver_cuda_new::launch::{KvCacheLayerView, KvCacheScheme};
     use driver_cuda_new::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
     use driver_cuda_new::model::executor::{
-        AttnCtx, DecodePlan, DispatchCtx, DispatchPlan, Frame, GdnCtx, Resolver, run,
+        AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, GdnCtx, Resolver, run,
     };
     use model::nemotron_h::forward::facts::NemotronHFacts;
     use model::nemotron_h::forward::nemotron_h_cuda;
@@ -2510,6 +2674,8 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
         prefill_plan: core::ptr::null_mut(),
         workspace: ws.view(),
         layers,
+        score_out: core::ptr::null_mut(),
+        score_indptr_d: core::ptr::null(),
         q_out,
         o_out,
         kv_page_indices_d: csr_indices.as_ptr().cast(),
@@ -2604,7 +2770,7 @@ fn the_nemotron_zero_weight_decode_walks_every_launch() {
         }
         l.launches.len()
     } else {
-        run(&l, &dplan, frame, &mut resolver, &ctx, Some(&attn), Some(&gdn))
+        run(&l, &dplan, frame, &mut resolver, &ctx, AttnRegions::whole(Some(&attn)), Some(&gdn))
             .unwrap_or_else(|e| panic!("the nemotron walk refused: {e:?}"))
     };
     assert_eq!(ran, l.launches.len(), "every launch ran");
@@ -3313,7 +3479,7 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
     use driver_cuda_new::launch::{KvCacheLayerView, KvCacheScheme};
     use driver_cuda_new::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
     use driver_cuda_new::model::executor::{
-        AttnCtx, DecodePlan, DispatchCtx, DispatchPlan, Frame, Resolver, bind, dispatch,
+        AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, Resolver, bind, dispatch,
     };
     use model::gemma3n::forward::facts::{Gemma3nAltUpFacts, Gemma3nAttnFacts, Gemma3nFacts};
     use model::gemma3n::forward::gemma3n_cuda;
@@ -3495,6 +3661,8 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
         workspace: ws.view(),
         layers,
         q_out: core::ptr::null_mut(),
+        score_out: core::ptr::null_mut(),
+        score_indptr_d: core::ptr::null(),
         o_out: core::ptr::null_mut(),
         kv_page_indices_d: csr_indices.as_ptr().cast(),
         kv_page_indptr_d: csr_indptr.as_ptr().cast(),
@@ -3637,7 +3805,7 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
     use driver_cuda_new::launch::{KvCacheLayerView, KvCacheScheme};
     use driver_cuda_new::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
     use driver_cuda_new::model::executor::{
-        AttnCtx, DecodePlan, DispatchCtx, DispatchPlan, Frame, Resolver, bind, dispatch,
+        AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, Resolver, bind, dispatch,
     };
     use model::gpt_oss::forward::facts::{GptOssCudaFacts, GptOssFacts};
     use model::gpt_oss::forward::gpt_oss_cuda;
@@ -3833,6 +4001,8 @@ fn the_gpt_oss_zero_weight_decode_walks_every_launch() {
         workspace: ws.view(),
         layers,
         q_out: core::ptr::null_mut(),
+        score_out: core::ptr::null_mut(),
+        score_indptr_d: core::ptr::null(),
         o_out: core::ptr::null_mut(),
         kv_page_indices_d: csr_indices.as_ptr().cast(),
         kv_page_indptr_d: csr_indptr.as_ptr().cast(),

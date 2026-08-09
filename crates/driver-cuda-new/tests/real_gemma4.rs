@@ -54,7 +54,7 @@ use driver_cuda_new::cuda::{Allocator, DeviceBuffer, OwnedStream};
 use driver_cuda_new::dtype::DType;
 use driver_cuda_new::launch::{KvCacheLayerView, KvCacheScheme};
 use driver_cuda_new::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
-use driver_cuda_new::model::executor::{AttnCtx, DispatchCtx, DispatchPlan, Frame, Resolver, run};
+use driver_cuda_new::model::executor::{AttnCtx, AttnRegions, DispatchCtx, DispatchPlan, Frame, Resolver, run};
 use model::gemma_4::forward::facts::{Gemma4CudaFacts, Gemma4Facts};
 use model::gemma_4::forward::gemma4_cuda;
 use model_compiler::lower::{Arg, Fire, Row, lower};
@@ -392,6 +392,8 @@ fn gemma4_matches_transformers_on_real_weights() {
         // No guard-owned pins in this walk: both attention arms take
         // [q, o] as stated values.
         q_out: core::ptr::null_mut(),
+        score_out: core::ptr::null_mut(),
+        score_indptr_d: core::ptr::null(),
         o_out: core::ptr::null_mut(),
         kv_page_indices_d: csr_indices.as_ptr().cast(),
         kv_page_indptr_d: csr_indptr.as_ptr().cast(),
@@ -541,7 +543,7 @@ fn gemma4_matches_transformers_on_real_weights() {
             });
             if let Some(a) = out {
                 let (host, width): (Vec<u8>, usize) = match a {
-                    Arg::Arena { at, width } => {
+                    Arg::Arena { at, width, .. } => {
                         let w = width as usize;
                         let rows = (launch.rows.end - launch.rows.start) as usize;
                         let mut whole = vec![0u8; l.arena_bytes];
@@ -582,7 +584,7 @@ fn gemma4_matches_transformers_on_real_weights() {
         }
         l.launches.len()
     } else {
-        run(&l, &dplan, frame, &mut resolver, &ctx, Some(&attn), None)
+        run(&l, &dplan, frame, &mut resolver, &ctx, AttnRegions::whole(Some(&attn)), None)
             .unwrap_or_else(|e| panic!("the gemma-4 A/B walk refused: {e:?}"))
     };
     assert_eq!(ran, l.launches.len());

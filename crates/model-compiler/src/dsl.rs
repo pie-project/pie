@@ -273,6 +273,26 @@ pub struct Layer {
     pub gate_proj: MatW,
     pub up_proj: MatW,
     pub down: MatW,
+    /// The router: hidden -> one logit per expert.
+    ///
+    /// A MIXTURE's handles, and they live on the same `Layer` as the dense
+    /// ones for the reason `ModelShape` gives about itself: a namespace is
+    /// shared and a text states the shape its facts describe. A dense
+    /// deployment simply never names these, exactly as a deployment whose
+    /// loader did not join gate and up never names `gate_up`.
+    pub router: MatW,
+    /// The expert banks. `MatW::name` carries no expert index -- the routed
+    /// kernel indexes the bank by the slot it read, which is what makes it
+    /// ONE weight rather than `n_experts` of them.
+    pub expert_gate: MatW,
+    pub expert_up: MatW,
+    pub expert_down: MatW,
+    /// The dense expert a mixture may also have, and the scalar gate that
+    /// blends it in (`shared_expert_combine`).
+    pub shared_gate: MatW,
+    pub shared_up: MatW,
+    pub shared_down: MatW,
+    pub shared_gate_proj: MatW,
     pub attn_norm: NormW,
     pub mlp_norm: NormW,
     pub q_norm: NormW,
@@ -300,6 +320,17 @@ pub struct ModelShape {
     pub hidden: u32,
     /// Width of the MLP's inner dimension. `gate_up` is twice this.
     pub intermediate: u32,
+    /// Experts in a mixture's bank, and 0 for a dense deployment.
+    ///
+    /// The three mixture numbers live on the shared shape rather than one
+    /// family's facts for the reason the rest of this struct does: a routed
+    /// FFN is true of many architectures (qwen3-moe, gemma-4, gpt-oss) and
+    /// nothing about how any of them ROUTES appears here.
+    pub n_experts: u32,
+    /// One expert's inner width.
+    pub moe_intermediate: u32,
+    /// The dense expert's inner width, and 0 for a mixture without one.
+    pub shared_intermediate: u32,
     /// Readout width.
     pub vocab: u32,
     /// One attention head's width — the per-head qk-norm's row length.
@@ -423,6 +454,15 @@ impl M {
             gate_proj: mat("gate_proj", f.intermediate),
             up_proj: mat("up_proj", f.intermediate),
             down: mat("down", f.hidden),
+            router: mat("router", f.n_experts),
+            expert_gate: mat("expert_gate", f.moe_intermediate),
+            expert_up: mat("expert_up", f.moe_intermediate),
+            expert_down: mat("expert_down", f.hidden),
+            shared_gate: mat("shared_gate", f.shared_intermediate),
+            shared_up: mat("shared_up", f.shared_intermediate),
+            shared_down: mat("shared_down", f.hidden),
+            // One number per row: how much of the shared expert to keep.
+            shared_gate_proj: mat("shared_gate_proj", 1),
             attn_norm: row_norm("attn_norm"),
             mlp_norm: row_norm("mlp_norm"),
             q_norm: qk_norm("q_norm"),
@@ -1640,8 +1680,39 @@ pub mod metal {
         inputs: Vec<crate::trace::ValueId>,
         out: Option<(Shape, DType)>,
     ) -> Option<Val> {
+        with_params(t, layer, kernel, weights, state, Vec::new(), inputs, out)
+    }
+
+    /// [`record`], plus the scalars the symbol's row names.
+    ///
+    /// A kernel takes numbers no operand shape gives — a projection's two
+    /// extents, a norm's epsilon, an attention's strides. The row says which
+    /// slot wants which; this is where the statement supplies them, and the
+    /// order is the row's `Param(i)` order.
+    ///
+    /// A float rides as its bits (`f32::to_bits`) and the row reads it back
+    /// with `ParamF32`: the channel is untyped `u32` and what each slot means
+    /// is the symbol's contract, which is the row.
+    #[allow(clippy::too_many_arguments)]
+    fn with_params(
+        t: &Trace,
+        layer: Option<u32>,
+        kernel: &str,
+        weights: Vec<String>,
+        state: Option<StateRef>,
+        params: Vec<u32>,
+        inputs: Vec<crate::trace::ValueId>,
+        out: Option<(Shape, DType)>,
+    ) -> Option<Val> {
         let ids = t.with(layer, |b| {
-            b.launch(kernel, weights, state, inputs, out.into_iter().collect())
+            b.launch_with_params(
+                kernel,
+                weights,
+                state,
+                params,
+                inputs,
+                out.into_iter().collect(),
+            )
         });
         ids.first().map(|&id| Val {
             t: t.clone(),
@@ -1671,17 +1742,28 @@ pub mod metal {
         repr: WeightRepr,
         point: &str,
     ) -> Val {
-        let stem = if multi_batch {
-            "embed_gather_mb_4bit"
-        } else {
-            "embed_gather_4bit"
-        };
-        record(
+        // ALWAYS the M>1 symbol, and `multi_batch` is deliberately unread.
+        //
+        // `embed_gather_4bit` reads `id[0]` and writes `out[hidden]` — one row,
+        // by construction, whatever grid it is handed. The class is not the
+        // question: a DECODE of four requests is four rows, so a text that
+        // picks by class names the single-row gather for a four-row fire and
+        // three lanes get nothing. Measured against a real checkpoint: one of
+        // four readout lanes held anything, and bisecting the fire put the
+        // stop at statement ZERO.
+        //
+        // The mb variant's own comment says it "reduces to embed_gather_4bit
+        // at N=1", so naming it unconditionally is not a widening — it is the
+        // same kernel with the row read from the grid instead of assumed.
+        let _ = multi_batch;
+        let stem = "embed_gather_mb_4bit";
+        with_params(
             t,
             None,
             &format!("{stem}{point}"),
             quant_table(weight, repr),
             None,
+            vec![hidden],
             vec![],
             Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
         )
@@ -1691,14 +1773,39 @@ pub mod metal {
     /// `rms_norm.metal::rms_single_row_bfloat16` — ONE entrypoint for
     /// every norm this family states (attn_norm, mlp_norm, q_norm,
     /// k_norm, final_norm; the driver fans five `Kernel` kinds onto it).
-    pub fn rms_norm(x: &Val, w: &NormW) -> Val {
+    pub fn rms_norm(x: &Val, w: &NormW, row: u32, eps: f32) -> Val {
         let out = same_shape(x);
-        record(
+        with_params(
             &x.t,
             w.layer,
             "rms_single_row_bfloat16",
             vec![w.name.clone()],
             None,
+            // `RmsParams`, field for field: eps, axis_size, w_stride,
+            // plus_one, gain.
+            //
+            // `w_stride` is ONE, and the distance between this and the `row`
+            // it used to say is the whole of a wrong answer. It is the stride
+            // between consecutive CHANNELS of the gain vector -- `ws[w_stride
+            // * i]` in the shader -- and a contiguous row's channels are one
+            // apart. `rms.metal`'s own header says `w_stride=1`.
+            //
+            // Passing the axis made every norm read `w[2048 * i]`: it strode
+            // out of the gain vector on the second channel and multiplied by
+            // whatever followed it in the checkpoint. Measured against MLX at
+            // position zero, channel 1 came out -0.016 where the reference
+            // says +0.052 -- the wrong SIGN, from the wrong tensor, on the
+            // second statement of the fire.
+            //
+            // `plus_one` is the `(1 + w)` reading gemma takes and this family
+            // does not; the gain is unity.
+            vec![
+                eps.to_bits(),
+                row,
+                1,
+                u32::from(w.variant == crate::trace::NormVariant::Gemma),
+                1.0f32.to_bits(),
+            ],
             vec![x.id],
             Some(out),
         )
@@ -1747,6 +1854,19 @@ pub mod metal {
         format!("_bfloat16_gs_{group}_b_{bits}")
     }
 
+    /// A value's row width, from the shape the trace already carries.
+    ///
+    /// A projection's INPUT extent, which no fact states and no operand
+    /// carries — the statement's own operand does, and this reads it. Zero for
+    /// a shape whose trailing dim is not a constant, which is a shape no
+    /// projection here has.
+    fn in_width(x: &Val) -> u32 {
+        match x.t.inner.borrow().value_shape(x.id).0.last() {
+            Some(Dim::Const(n)) => *n,
+            _ => 0,
+        }
+    }
+
     fn quant_weights(w: &MatW) -> Vec<String> {
         let mut out = vec![w.name.clone()];
         out.extend(w.scale_names());
@@ -1771,12 +1891,16 @@ pub mod metal {
     /// `quantized_qmv.metal::affine_qmv_fast` — the projection GEMV,
     /// M=1. The driver fans every projection kind onto it.
     pub fn qmv(x: &Val, w: &MatW, point: &str) -> Val {
-        record(
+        with_params(
             &x.t,
             w.layer,
             &format!("affine_qmv_fast{point}"),
             quant_weights(w),
             None,
+            // The GEMV's two extents: the row it reads and the row it writes.
+            // A projection told its output is zero wide computes nothing and
+            // reports success, which is why these are stated and not derived.
+            vec![in_width(x), w.width],
             vec![x.id],
             Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
         )
@@ -1787,12 +1911,13 @@ pub mod metal {
     /// with the block residual folded into its epilogue, which is what a
     /// `beta_one` matmul is on this backend.
     pub fn qmv_residual(x: &Val, w: &MatW, residual: &Val, point: &str) -> Val {
-        record(
+        with_params(
             &x.t,
             w.layer,
             &format!("affine_qmv_fast_residual{point}"),
             quant_weights(w),
             None,
+            vec![in_width(x), w.width],
             vec![x.id, residual.id],
             Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
         )
@@ -1802,12 +1927,16 @@ pub mod metal {
     /// `quantized_qmm_t.metal::affine_qmm_t` — MLX's steel quantized
     /// GEMM, the M>1 projection.
     pub fn qmm(x: &Val, w: &MatW, point: &str) -> Val {
-        record(
+        with_params(
             &x.t,
             w.layer,
             &format!("affine_qmm_t{point}"),
             quant_weights(w),
             None,
+            // The GEMV's two extents: the row it reads and the row it writes.
+            // A projection told its output is zero wide computes nothing and
+            // reports success, which is why these are stated and not derived.
+            vec![in_width(x), w.width],
             vec![x.id],
             Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
         )
@@ -1816,12 +1945,13 @@ pub mod metal {
 
     /// `quantized_qmm_t.metal::affine_qmm_t_residual`.
     pub fn qmm_residual(x: &Val, w: &MatW, residual: &Val, point: &str) -> Val {
-        record(
+        with_params(
             &x.t,
             w.layer,
             &format!("affine_qmm_t_residual{point}"),
             quant_weights(w),
             None,
+            vec![in_width(x), w.width],
             vec![x.id, residual.id],
             Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
         )
@@ -1848,23 +1978,83 @@ pub mod metal {
     /// `rope/rope.metal::neox_decode_bfloat16` (M=1) /
     /// `neox_mb_bfloat16` (M>1). One dispatch for q and k together,
     /// as the plan states it (`declared_dag.hpp`'s `Kind::Rope`).
-    pub fn rope(q: &Val, k: &Val, multi_batch: bool) -> (Val, Val) {
+    pub fn rope(
+        q: &Val,
+        k: &Val,
+        multi_batch: bool,
+        theta: f32,
+        scale: f32,
+        head_dim: u32,
+        table: bool,
+    ) -> (Val, Val) {
+        (
+            rope_one(q, multi_batch, theta, scale, head_dim, table),
+            rope_one(k, multi_batch, theta, scale, head_dim, table),
+        )
+    }
+
+    /// One tensor's rotation — which is what the kernel does.
+    ///
+    /// `rope_neox_decode` takes ONE `device T* x` and rotates it in place.
+    /// This helper used to state a single launch carrying q and k, two inputs
+    /// and two results, on the strength of a comment saying the DAG spells it
+    /// as one `Kind::Rope`. The DAG spells one KIND and dispatches it twice;
+    /// the trace stated one LAUNCH, so the second tensor was never rotated.
+    ///
+    /// Nothing could see it until the rows carried their operands: a statement
+    /// whose shape disagrees with its kernel's is invisible to every check
+    /// that only asks whether the symbol exists.
+    ///
+    /// In place, so the result is the operand: the row states `x` as its
+    /// `Out(0)` and the same buffer is read and written.
+    fn rope_one(
+        x: &Val,
+        multi_batch: bool,
+        theta: f32,
+        scale: f32,
+        head_dim: u32,
+        table: bool,
+    ) -> Val {
+        // A deployment that RESCALES its frequency ladder cannot state a base:
+        // llama-3 rescales piecewise and YaRN rescales differently, and both
+        // are tables. The driver derives one at load and answers it as
+        // `Source::RopeFrequencies`, so the statement's job is only to say
+        // WHICH form this deployment takes.
+        if table {
+            return with_params(
+                &x.t,
+                x.layer,
+                "neox_freqs_decode_bfloat16",
+                vec![],
+                None,
+                // Scale, head width, and YaRN's `mscale` -- one for llama-3,
+                // whose rescaling lives entirely in the frequencies.
+                vec![scale.to_bits(), head_dim, 1.0f32.to_bits()],
+                vec![x.id],
+                Some(same_shape(x)),
+            )
+            .expect("a rotation produces its value");
+        }
         let kernel = if multi_batch {
             "neox_mb_bfloat16"
         } else {
             "neox_decode_bfloat16"
         };
-        let q_sh = same_shape(q);
-        let k_sh = same_shape(k);
-        let ids = q.t.with(q.layer, |b| {
-            b.launch(kernel, vec![], None, vec![q.id, k.id], vec![q_sh, k_sh])
-        });
-        let mk = |id| Val {
-            t: q.t.clone(),
-            id,
-            layer: q.layer,
-        };
-        (mk(ids[0]), mk(ids[1]))
+        with_params(
+            &x.t,
+            x.layer,
+            kernel,
+            vec![],
+            None,
+            // The rotation's scale, its log2 base and the head width. The base
+            // is `log2(theta)` because the shader raises two to it —
+            // `rope_neox_geometric_body` — and handing it theta rotates by a
+            // frequency ladder that is wrong from the second channel on.
+            vec![scale.to_bits(), theta.log2().to_bits(), head_dim],
+            vec![x.id],
+            Some(same_shape(x)),
+        )
+        .expect("a rotation produces its value")
     }
 
     /// `attn/split_qkv.metal::split_qkv_bf16`: deinterleave the packed QKV
@@ -1909,18 +2099,23 @@ pub mod metal {
 
     /// `kv_append.metal::kv_append_bfloat16` (contiguous) /
     /// `kv_append_paged.metal::kv_append_paged_bfloat16` (page table).
-    pub fn kv_append(k: &Val, v: &Val, kv: &Kv, paged: bool) {
+    pub fn kv_append(k: &Val, v: &Val, kv: &Kv, paged: bool, head_dim: u32, kv_heads: u32) {
         let kernel = if paged {
             "kv_append_paged_bfloat16"
         } else {
             "kv_append_bfloat16"
         };
-        record(
+        with_params(
             &kv.t,
             Some(kv.l),
             kernel,
             vec![],
             kv_state(kv),
+            // The model's two: how wide a head is and how many there are. The
+            // pool's strides come from the ROW (`KvHeadStride`, `KvSeqStride`)
+            // because they are the shape the driver allocated, not the shape
+            // the model has.
+            vec![head_dim, kv_heads],
             vec![k.id, v.id],
             None,
         );
@@ -1941,19 +2136,45 @@ pub mod metal {
     /// also `_d_512`. A width neither carries has no kernel, and the symbol
     /// this returns will simply not resolve — which the driver's
     /// `every_symbol_the_lowering_names_has_a_row` check reports by name.
-    pub fn sdpa(q: &Val, kv: &Kv, q_width: u32, head_dim: u32, paged: bool) -> Option<Val> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn sdpa(
+        q: &Val,
+        kv: &Kv,
+        q_width: u32,
+        head_dim: u32,
+        paged: bool,
+        gqa_factor: u32,
+        kv_heads: u32,
+        window: i32,
+    ) -> Option<Val> {
         let kernel = if paged {
             format!("sdpa_paged_decode_bfloat16_d_{head_dim}")
         } else {
             format!("sdpa_vector_decode_bfloat16_d_{head_dim}")
         };
         let kernel = kernel.as_str();
-        record(
+        // The model's scalars, in the order both rows name them. The strides
+        // and the page size are the POOL's and come from the row; the mask
+        // stride is zero because this text states no custom mask.
+        //
+        // The scale is `1/sqrt(head_dim)` — the softmax temperature, and the
+        // one number here a reader is most likely to assume the kernel knows.
+        // It does not: it takes it, and a zero makes every logit zero and
+        // every attention uniform.
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        with_params(
             &q.t,
             Some(kv.l),
             kernel,
             vec![],
             kv_state(kv),
+            vec![
+                gqa_factor,
+                kv_heads,
+                scale.to_bits(),
+                0,
+                window as u32,
+            ],
             vec![q.id],
             Some((Shape(vec![Dim::Tokens, Dim::Const(q_width)]), DType::BF16)),
         )
@@ -1980,16 +2201,207 @@ pub mod metal {
     /// `quantized_qmv.metal::affine_qmv_fast` against the lm head — the
     /// readout, `[Requests, vocab]` f32 like every family's.
     pub fn lm_head(x: &Val, weight: &str, vocab: u32, repr: WeightRepr, point: &str) -> Val {
-        record(
+        with_params(
             &x.t,
             None,
             &format!("affine_qmv_fast{point}"),
             quant_table(weight, repr),
             None,
+            vec![in_width(x), vocab],
             vec![x.id],
-            Some((Shape(vec![Dim::Requests, Dim::Const(vocab)]), DType::F32)),
+            // BF16, because that is what the kernel WRITES. `affine_qmv_fast`
+            // is instantiated at bfloat and its output is `device T*`; the
+            // readout is not special-cased to widen.
+            //
+            // Stating F32 here sized the arena slot for four bytes an element
+            // and the kernel filled two, so the logits region came back
+            // EXACTLY half zero -- 64128 of 128256 -- with every surviving
+            // value a fraction of its real magnitude. A dtype the trace states
+            // and the kernel disagrees with is not a rounding difference; it
+            // is a stride, and every value after the first is at the wrong
+            // address.
+            Some((Shape(vec![Dim::Requests, Dim::Const(vocab)]), DType::BF16)),
         )
         .expect("the readout produces the logits")
+    }
+
+    // ── The mixture. ──
+    //
+    // Six statements, and the reason they are six rather than one is the
+    // reason a mixture is interesting at all: a routed FFN's SHAPE depends on
+    // a value the fire computes. The router picks experts, the sort groups
+    // rows by the expert they picked, the gather materializes those groups
+    // contiguously, the matmuls run over the groups, and the combine puts the
+    // rows back where they started weighted by the router's confidence.
+    //
+    // Nothing here is a per-family branch. The executor walks these exactly as
+    // it walks a projection: symbol, row, file, rule, grid, operands. What is
+    // different is only that `LaunchRule::RouteRows` and `RoutedQmv` read
+    // `n_experts` and `experts_per_token` off the dims -- which is the same
+    // way `Qmv` reads `width`.
+
+    /// `moe/route.metal::router_topk` — which experts a row goes to, and how
+    /// much of each.
+    ///
+    /// Two outputs: the expert slots and their weights. Both are read by name
+    /// downstream, which is why this returns the pair rather than folding them.
+    pub fn router_topk(
+        logits: &Val,
+        n_experts: u32,
+        experts_per_token: u32,
+        scaled: bool,
+    ) -> (Val, Val) {
+        let sym = if scaled { "router_topk_scaled_bfloat16" } else { "router_topk_bfloat16" };
+        let slots = Dim::Const(experts_per_token);
+        let ids = logits.t.with(logits.layer, |b| {
+            b.launch_with_params(
+                sym,
+                vec![],
+                None,
+                // `RouterParams`, packed: the shader takes a struct pointer.
+                vec![n_experts, experts_per_token],
+                vec![logits.id],
+                vec![
+                    (Shape(vec![Dim::Tokens, slots]), DType::I32),
+                    (Shape(vec![Dim::Tokens, slots]), DType::BF16),
+                ],
+            )
+        });
+        let mk = |id| Val { t: logits.t.clone(), id, layer: logits.layer };
+        (mk(ids[0]), mk(ids[1]))
+    }
+
+    /// `moe/route.metal::route_sort` — group the rows by expert.
+    ///
+    /// FOUR outputs, and a text that named fewer would leave the combine
+    /// reading whatever was in the buffer: the permutation, the per-row
+    /// expert, the per-tile expert, and the inverse the combine reads back.
+    pub fn route_sort(
+        expert_ids: &Val,
+        n_experts: u32,
+        experts_per_token: u32,
+        tile_rows: u32,
+        padded: u32,
+        width: u32,
+    ) -> (Val, Val, Val, Val) {
+        let pad = Dim::Const(padded);
+        let ids = expert_ids.t.with(expert_ids.layer, |b| {
+            b.launch_with_params(
+                "route_sort",
+                vec![],
+                None,
+                // `MoeRouteParams`, packed and SHARED with the gather so the
+                // sort's padding and the gather's bounds cannot disagree.
+                vec![padded, n_experts, experts_per_token, tile_rows, padded, width, width],
+                vec![expert_ids.id],
+                vec![
+                    (Shape(vec![pad]), DType::I32),
+                    (Shape(vec![pad]), DType::I32),
+                    (Shape(vec![Dim::Const(padded.div_ceil(tile_rows.max(1)))]), DType::I32),
+                    (Shape(vec![pad]), DType::I32),
+                ],
+            )
+        });
+        let mk = |id| Val { t: expert_ids.t.clone(), id, layer: expert_ids.layer };
+        (mk(ids[0]), mk(ids[1]), mk(ids[2]), mk(ids[3]))
+    }
+
+    /// `moe/route.metal::route_gather` — the rows, in expert order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_gather(
+        x: &Val,
+        perm: &Val,
+        n_experts: u32,
+        experts_per_token: u32,
+        tile_rows: u32,
+        padded: u32,
+        width: u32,
+    ) -> Val {
+        with_params(
+            &x.t,
+            x.layer,
+            "route_gather",
+            vec![],
+            None,
+            vec![padded, n_experts, experts_per_token, tile_rows, padded, width, width],
+            vec![x.id, perm.id],
+            Some((Shape(vec![Dim::Const(padded), Dim::Const(width)]), DType::BF16)),
+        )
+        .expect("the gather produces its rows")
+    }
+
+    /// `quant/qmv.metal::affine_qmv_routed` — the expert-selecting GEMV.
+    ///
+    /// `sel = row * slots_per_row + slot`, which is why the launch's row and
+    /// slot axes are not interchangeable and why `slots_per_row` is stated.
+    pub fn routed_qmv(
+        x: &Val,
+        expert_ids: &Val,
+        w: &MatW,
+        experts_per_token: u32,
+        biased: bool,
+    ) -> Val {
+        let sym = if biased {
+            "affine_qmv_routed_bias_bfloat16_gs_64_b_4"
+        } else {
+            "affine_qmv_routed_bfloat16_gs_64_b_4"
+        };
+        let in_w = in_width(x);
+        with_params(
+            &x.t,
+            w.layer,
+            sym,
+            quant_weights(w),
+            None,
+            vec![in_w, w.width, 0, in_w, experts_per_token],
+            vec![x.id, expert_ids.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
+        )
+        .expect("a routed projection produces its value")
+    }
+
+    /// `moe/route.metal::combine_sorted` — the rows back where they started,
+    /// weighted by the router.
+    pub fn combine_sorted(
+        y: &Val,
+        expert_weights: &Val,
+        inv: &Val,
+        experts_per_token: u32,
+        width: u32,
+    ) -> Val {
+        with_params(
+            &y.t,
+            y.layer,
+            "combine_sorted",
+            vec![],
+            None,
+            // `ExpertCombineParams`, packed.
+            vec![width, experts_per_token],
+            vec![y.id, expert_weights.id, inv.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
+        )
+        .expect("the combine produces its rows")
+    }
+
+    /// `moe/route.metal::shared_expert_combine` — `routed + sigmoid(gate) *
+    /// shared`, the landing for a mixture that also has a dense expert.
+    pub fn shared_expert_combine(
+        routed: &Val,
+        shared: &Val,
+        gate: &Val,
+        width: u32,
+    ) -> Val {
+        with_params(
+            &routed.t,
+            routed.layer,
+            "shared_expert_combine",
+            vec![],
+            None,
+            vec![width],
+            vec![routed.id, shared.id, gate.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
+        )
+        .expect("the shared landing produces its rows")
     }
 }
 
