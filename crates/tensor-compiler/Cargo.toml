@@ -25,7 +25,7 @@ path = "src/lib.rs"
 tensor-ir = { path = "../tensor-ir" }
 # The shared host<->driver contract: the launch package is built out of the
 # same declarations the drivers read it with, rather than a second copy.
-driver-abi = { path = "../driver-abi" }
+driver = { path = "../driver" }
 
 # Shared ratchet from the root manifest. The toolchain's three crates are gated
 # with `-D warnings` in CI; see `[workspace.lints]` in the workspace `Cargo.toml`.

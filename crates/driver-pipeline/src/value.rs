@@ -4,7 +4,7 @@
 //! module owns the two shapes those tensors take: [`Value`], the in-memory cell
 //! an op reads and writes, and the wire encoding a channel ring stores.
 //!
-//! # Why a dedicated cell type rather than [`driver_abi::plan::LaunchValue`]
+//! # Why a dedicated cell type rather than [`driver::plan::LaunchValue`]
 //!
 //! `LaunchValue` is a *declaration* — a value id, a dtype byte, a shape. It says
 //! nothing about the numbers a value holds at run time. [`Value`] is the
@@ -33,7 +33,7 @@
 //! the only places that bridge the two, and a test pins the asymmetry because
 //! getting it wrong is invisible until a bool channel is read back.
 
-use driver_abi::local::PIE_CHANNEL_DTYPE_ACT;
+use driver::local::PIE_CHANNEL_DTYPE_ACT;
 use tensor_ir::DType;
 
 /// The concrete cell dtype a wire dtype byte names.

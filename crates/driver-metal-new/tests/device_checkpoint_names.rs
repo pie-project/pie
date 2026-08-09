@@ -254,6 +254,21 @@ fn snapshots_to_check() -> Vec<PathBuf> {
 /// reporting its every tensor as missing says nothing except that.
 fn check_one_snapshot(dir: &std::path::Path) {
     let dir = dir.to_path_buf();
+    // Whether a text serves this checkpoint at all, asked of the DRIVER
+    // rather than of a list kept here. `qwen3_5` interleaves linear
+    // attention, which the metal text does not model -- and every one of its
+    // tensors would then report as missing for that one reason, which is a
+    // page of output saying nothing.
+    let arch = std::fs::read_to_string(dir.join("config.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|c| c.get("model_type")?.as_str().map(str::to_string))
+        .unwrap_or_default();
+    if !driver_metal_new::model::text::serves(&arch) {
+        eprintln!("    SKIP: no metal text serves `{arch}`");
+        return;
+    }
+
     let descriptor = descriptor_for(&dir);
     let target = driver_metal_new::loader::metal_storage_target();
     let (plan, _) = driver_metal_new::loader::compile_load_plan(&dir, &target, &descriptor)
@@ -273,20 +288,6 @@ fn check_one_snapshot(dir: &std::path::Path) {
         eprintln!("    SKIP: no decodable shape (an architecture no text serves)");
         return;
     };
-    // Whether a text serves this checkpoint at all, asked of the DRIVER
-    // rather than of a list kept here. `qwen3_5` interleaves linear
-    // attention, which the metal text does not model -- and every one of its
-    // tensors would then report as missing for that one reason, which is a
-    // page of output saying nothing.
-    let arch = std::fs::read_to_string(dir.join("config.json"))
-        .ok()
-        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-        .and_then(|c| c.get("model_type")?.as_str().map(str::to_string))
-        .unwrap_or_default();
-    if !driver_metal_new::model::text::serves(&arch) {
-        eprintln!("    SKIP: no metal text serves `{arch}`");
-        return;
-    }
     let (facts, metal) =
         driver_metal_new::model::text::facts_from(&geometry, |t| published.contains(t));
 

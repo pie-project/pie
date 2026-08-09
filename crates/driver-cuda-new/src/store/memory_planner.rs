@@ -365,6 +365,14 @@ pub struct Planned {
     /// invisible. That invisibility is what makes the C++'s scoring untestable
     /// in place.
     pub introspection: Introspection,
+    /// The profile-cache key this plan was looked up under.
+    ///
+    /// Handed back rather than rebuilt, because the cache's own module doc
+    /// says why: reader and writer share `ProfileKey` deliberately, and "if
+    /// the two sides built it independently a single disagreement would make
+    /// every lookup miss silently -- the cache would look empty rather than
+    /// broken". A calibration boot writes what this read.
+    pub key: ProfileKey,
     /// Diagnostics the C++ writes to `std::cerr`, in order.
     ///
     /// Returned rather than printed: this crate denies `print_stderr`, and a
@@ -1203,21 +1211,26 @@ fn select(
     let mut best: Option<usize> = None;
     let mut selector = Selector::Rule;
     let use_profile_cache = auto_profile && FORCED_PREFILL == 0 && !cfg.calibrating;
+    // BUILT UNCONDITIONALLY, though only read when the cache is consulted: a
+    // calibration boot does not read the cache and does WRITE it, and the two
+    // sides have to agree about the key or the file the sweep fills is a file
+    // no later boot can find. So there is one construction and `Planned`
+    // hands it back.
+    let key = ProfileKey {
+        gpu_name: prop.name.clone(),
+        compute_major: prop.major,
+        compute_minor: prop.minor,
+        sm_count: prop.sm_count,
+        kv_cache_dtype: cfg.kv_cache_dtype.clone(),
+        tp_size: cfg.tp_size,
+        model_type: hf.model_type.clone(),
+        hidden_size: hf.hidden_size,
+        num_hidden_layers: hf.num_hidden_layers,
+        num_attention_heads: hf.num_attention_heads,
+        num_key_value_heads: hf.num_key_value_heads,
+        head_dim: hf.head_dim_kernel,
+    };
     if use_profile_cache {
-        let key = ProfileKey {
-            gpu_name: prop.name.clone(),
-            compute_major: prop.major,
-            compute_minor: prop.minor,
-            sm_count: prop.sm_count,
-            kv_cache_dtype: cfg.kv_cache_dtype.clone(),
-            tp_size: cfg.tp_size,
-            model_type: hf.model_type.clone(),
-            hidden_size: hf.hidden_size,
-            num_hidden_layers: hf.num_hidden_layers,
-            num_attention_heads: hf.num_attention_heads,
-            num_key_value_heads: hf.num_key_value_heads,
-            head_dim: hf.head_dim_kernel,
-        };
         let read = profiles.lookup(&key);
         if let Some(why) = read.complaint {
             notes.push(format!(
@@ -1389,6 +1402,7 @@ fn select(
         decode_target: winner.decode_target,
         prefill_target: winner.prefill_target,
         candidate_count: candidates.len(),
+        key,
         notes: std::mem::take(notes),
     })
 }

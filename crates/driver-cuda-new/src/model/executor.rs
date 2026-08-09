@@ -226,7 +226,34 @@ impl DispatchPlan {
         // Map each region op back to its owning guard, once.
         let mut guard_of: Vec<Option<usize>> = vec![None; plan.ops.len()];
         for (g, op) in plan.ops.iter().enumerate() {
-            if let OpKind::Guard { arms, else_ops } = &op.kind {
+            // WHY THIS DOES NOT SKIP OUTPUT-LESS GUARDS, which is the one
+            // line that would let a DECODE be captured.
+            //
+            // Guards nest and this loop runs in op order, so an inner guard
+            // overwrites the outer one that actually owns the value — and the
+            // decode arm's innermost guard produces nothing, leaving `outs`
+            // empty for its attention dispatch. `Union` reads that slot to
+            // find where attention lands (`Resolve` may count launches
+            // instead; `Union` may not, since every arm is present), so every
+            // decode declines the graph and walks its ~400 launches by hand:
+            // ~9 ms for one token on a 0.6B model.
+            //
+            // Adding `&& !op.outputs.is_empty()` here does make every decode
+            // capture and replay, and issue drops to ~7.9 ms. It also
+            // exposes two things decode capture has never been held to,
+            // because no decode has ever been captured:
+            //
+            //   1. `pie_cuda_resize_pool` moved the KV pages without
+            //      invalidating captures. FIXED — it bumps the epoch now,
+            //      which is a real bug either way.
+            //   2. Phi-3 FAULTS INSIDE THE CAPTURE of its first decode
+            //      (`[sg] miss …launches=580`, then SIGSEGV). Not diagnosed.
+            //
+            // So the line stays out until (2) is understood. See
+            // `.wiki/new-driver/next.md`.
+            if let OpKind::Guard { arms, else_ops } = &op.kind
+                && !op.outputs.is_empty()
+            {
                 let span = arms.iter().map(|a| a.ops as usize).sum::<usize>()
                     + *else_ops as usize;
                 for slot in guard_of.iter_mut().skip(g + 1).take(span) {

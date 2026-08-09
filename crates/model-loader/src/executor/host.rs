@@ -14,6 +14,7 @@
 //! this executes the result. The compiler is on the other side of that line —
 //! `tests/standalone.rs` pins it.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -24,6 +25,7 @@ use half::{bf16, f16};
 use std::collections::HashSet;
 
 use crate::error::Error;
+use crate::executor::arena::ArenaBacking;
 use crate::executor::sink::{MemorySink, TensorSink};
 use crate::plan::index::{PlanIndex, instr_by_id};
 use crate::plan::{
@@ -113,7 +115,7 @@ pub fn execute_plan_with_progress(
     let max_tile_write_bytes = run(
         plan,
         snapshot_dir,
-        &mut arena,
+        &mut &mut arena[..],
         &mut sink,
         progress,
         /*stream=*/ false,
@@ -144,7 +146,7 @@ pub fn execute_plan_into(
     sink: &mut dyn TensorSink,
     progress: &mut dyn FnMut(Progress<'_>),
 ) -> Result<(), Error> {
-    run(plan, snapshot_dir, &mut [], sink, progress, /*stream=*/ true)?;
+    run(plan, snapshot_dir, &mut &mut [][..], sink, progress, /*stream=*/ true)?;
     Ok(())
 }
 
@@ -187,13 +189,33 @@ pub fn execute_plan_into_arena(
     sink: &mut dyn TensorSink,
     progress: &mut dyn FnMut(Progress<'_>),
 ) -> Result<usize, Error> {
+    execute_plan_into_backing(plan, snapshot_dir, &mut &mut *arena, sink, progress)
+}
+
+/// [`execute_plan_into_arena`] where the arena is not host memory.
+///
+/// The same execution, with the arena supplied as an [`ArenaBacking`] rather
+/// than as a slice — which is what a DISCRETE device needs, since its arena is
+/// reachable only through a copy. See [`crate::executor::arena`] for why that
+/// is a trait here rather than an executor inside each driver.
+///
+/// # Errors
+///
+/// As [`execute_plan_into_arena`].
+pub fn execute_plan_into_backing(
+    plan: &LoadPlan,
+    snapshot_dir: &Path,
+    arena: &mut dyn ArenaBacking,
+    sink: &mut dyn TensorSink,
+    progress: &mut dyn FnMut(Progress<'_>),
+) -> Result<usize, Error> {
     run(plan, snapshot_dir, arena, sink, progress, /*stream=*/ false)
 }
 
 fn run(
     plan: &LoadPlan,
     snapshot_dir: &Path,
-    arena: &mut [u8],
+    arena: &mut dyn ArenaBacking,
     sink: &mut dyn TensorSink,
     progress: &mut dyn FnMut(Progress<'_>),
     stream: bool,
@@ -229,18 +251,17 @@ fn run(
         usize::try_from(plan.memory.persistent_bytes)
             .map_err(|_| invalid("persistent arena does not fit host address space"))?
     };
-    if arena.len() < arena_len {
+    if ArenaBacking::len(arena) < arena_len {
         return Err(invalid(format!(
             "arena is {} bytes and the plan needs {arena_len}",
-            arena.len()
+            ArenaBacking::len(arena)
         )));
     }
-    let arena = &mut arena[..arena_len];
     // The poison the executor relies on to tell "written" from "never
     // touched". A caller-supplied arena arrives holding whatever it held --
     // for a fresh device allocation that is zeros, which is a legal tensor
     // and therefore the worst possible disguise for a buffer nothing wrote.
-    arena.fill(POISON);
+    arena.fill(0, arena_len, POISON)?;
     let last_use = if stream {
         last_uses(plan)?
     } else {
@@ -323,7 +344,7 @@ struct HostExecutor<'a, 'p> {
     /// ids interleave two allocators and need the map.
     index: PlanIndex,
     files: HashMap<u32, PathBuf>,
-    arena: &'p mut [u8],
+    arena: &'p mut dyn ArenaBacking,
     buffers: HashMap<BufferId, BufferLoc>,
     sink: &'p mut dyn TensorSink,
     /// Names already published, because finalizing one twice is a plan bug
@@ -446,7 +467,7 @@ impl HostExecutor<'_, '_> {
             let end = offset
                 .checked_add(len)
                 .ok_or_else(|| invalid("persistent buffer range overflow"))?;
-            if end > self.arena.len() {
+            if end > ArenaBacking::len(self.arena) {
                 return Err(invalid(format!("persistent buffer {} exceeds arena", id.0)));
             }
             BufferLoc::Arena { offset, len }
@@ -464,7 +485,7 @@ impl HostExecutor<'_, '_> {
     fn fill(&mut self, id: BufferId) -> Result<(), Error> {
         let (root, offset, len) = self.resolve(id, 0, usize::MAX)?;
         match root {
-            Root::Arena => self.arena[offset..offset + len].fill(0),
+            Root::Arena => self.arena.fill(offset, len, 0)?,
             Root::Owned(owner) => match self.buffers.get_mut(&owner) {
                 Some(BufferLoc::Owned(bytes)) => bytes[offset..offset + len].fill(0),
                 _ => return Err(invalid(format!("buffer {} is not writable", id.0))),
@@ -579,12 +600,8 @@ impl HostExecutor<'_, '_> {
         let end = offset
             .checked_add(bytes.len())
             .ok_or_else(|| invalid("arena write range overflow"))?;
-        let dest = self
-            .arena
-            .get_mut(offset..end)
-            .ok_or_else(|| invalid("arena write is out of bounds"))?;
-        dest.copy_from_slice(bytes);
-        Ok(())
+        debug_assert!(end <= ArenaBacking::len(self.arena));
+        self.arena.write(offset, bytes)
     }
 
     fn tile_map(&mut self, instr: &StorageInstr) -> Result<(), Error> {
@@ -890,7 +907,7 @@ impl HostExecutor<'_, '_> {
         let factors = *inputs
             .last()
             .ok_or_else(|| invalid("per-block Scale has no factor operand"))?;
-        let factors = decode_values(self.buffer_bytes(factors)?, self.buffer_dtype(factors)?)?;
+        let factors = decode_values(&self.buffer_bytes(factors)?, self.buffer_dtype(factors)?)?;
         let shape = self
             .index
             .buffer_tensor(self.plan, output)
@@ -1385,16 +1402,14 @@ impl HostExecutor<'_, '_> {
         }
     }
 
-    fn buffer_bytes(&self, id: BufferId) -> Result<&[u8], Error> {
+    fn buffer_bytes(&self, id: BufferId) -> Result<Cow<'_, [u8]>, Error> {
         let (root, offset, len) = self.resolve(id, 0, usize::MAX)?;
         match root {
-            Root::Arena => self
-                .arena
-                .get(offset..offset + len)
-                .ok_or_else(|| invalid("arena buffer range is out of bounds")),
+            Root::Arena => self.arena.read(offset, len),
             Root::Owned(root) => match self.buffers.get(&root) {
                 Some(BufferLoc::Owned(bytes)) => bytes
                     .get(offset..offset + len)
+                    .map(Cow::Borrowed)
                     .ok_or_else(|| invalid("owned buffer range is out of bounds")),
                 _ => Err(invalid("resolved owned buffer is missing")),
             },
@@ -1407,11 +1422,10 @@ impl HostExecutor<'_, '_> {
             .checked_add(bytes.len())
             .ok_or_else(|| invalid("buffer write range overflow"))?;
         match root {
-            Root::Arena => self
-                .arena
-                .get_mut(base..end)
-                .ok_or_else(|| invalid("arena buffer write is out of bounds"))?
-                .copy_from_slice(bytes),
+            Root::Arena => {
+                debug_assert!(end <= ArenaBacking::len(self.arena));
+                self.arena.write(base, bytes)?;
+            }
             Root::Owned(root) => match self.buffers.get_mut(&root) {
                 Some(BufferLoc::Owned(dest)) => dest
                     .get_mut(base..end)

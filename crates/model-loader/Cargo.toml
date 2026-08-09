@@ -52,4 +52,3 @@ ztensor = { workspace = true }
 # the *marshalled* view of a plan, and the marshalling lives in the ABI crate
 # above this one. The lib itself must never depend on it — that is the whole
 # point of the split.
-model-loader-capi = { path = "../model-loader-capi", default-features = false }

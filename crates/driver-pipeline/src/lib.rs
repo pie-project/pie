@@ -33,7 +33,7 @@
 //! # Why it reuses the launch ABI rather than re-porting it
 //!
 //! The C++ interpreter carried its own `launch::` structs that mirror Rust's
-//! [`driver_abi::plan::LaunchPackage`]. Re-porting that mirror would fork the
+//! [`driver::plan::LaunchPackage`]. Re-porting that mirror would fork the
 //! source of truth. Instead this module adopts the Rust owned types directly
 //! ([`plan::adopt_launch_package`]) and reuses [`tensor_ir`]'s op tags, dtype,
 //! intrinsic ids, port registry, and RNG contract. Only genuine *runtime state*
@@ -84,19 +84,19 @@ pub use error::{Error, Result};
 /// The launch ABI, re-exported.
 ///
 /// Not a convenience. This crate's public API is *written in* these types —
-/// [`ExecPlan::package`] is a [`driver_abi::plan::LaunchPackage`], every stage
-/// plan is a [`driver_abi::plan::LaunchStagePlan`], and the emitted-kernel
-/// kinds are `driver_abi::local`'s constants — so a consumer cannot call
+/// [`ExecPlan::package`] is a [`driver::plan::LaunchPackage`], every stage
+/// plan is a [`driver::plan::LaunchStagePlan`], and the emitted-kernel
+/// kinds are `driver::local`'s constants — so a consumer cannot call
 /// `adopt_launch_package` or read what it returns without naming them. Making
 /// them reachable from here is what stops two shells from each declaring their
-/// own `driver-abi` dependency and, one day, resolving it to two versions:
+/// own `driver` dependency and, one day, resolving it to two versions:
 /// the types would then be nominally distinct and the mismatch would surface
 /// as an inscrutable trait error rather than as a version conflict.
-pub use driver_abi;
+pub use driver;
 
 /// The IR vocabulary, re-exported.
 ///
-/// Re-exported for the same reason as [`driver_abi`], one step weaker: this
+/// Re-exported for the same reason as [`driver`], one step weaker: this
 /// crate's *signatures* mostly do not name `tensor_ir` types, but its
 /// *contracts* are written in them — [`Value`] is a `DType`'s lanes, an
 /// [`OpParams`] carries an `IntrinsicId`, and the RNG a shell must reproduce

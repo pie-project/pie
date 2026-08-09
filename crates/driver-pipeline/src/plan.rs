@@ -1,6 +1,6 @@
 //! The executable plan: a launch package plus the derived facts the pass reads.
 //!
-//! A [`driver_abi::plan::LaunchPackage`] is what the host ships — the value
+//! A [`driver::plan::LaunchPackage`] is what the host ships — the value
 //! table, channels, ports and stage DAGs. It is complete but not yet *indexed*
 //! for execution: it does not say which values a given stage must evaluate,
 //! which const ports fold to which cells, or whether the program is even
@@ -20,10 +20,10 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use driver_abi::local::{
+use driver::local::{
     PIE_READINESS_NEEDS_FULL, PIE_VALUE_CHANNEL_READ, PIE_VALUE_CHANNEL_TAKE, PIE_VALUE_INTRINSIC,
 };
-use driver_abi::plan::LaunchPackage;
+use driver::plan::LaunchPackage;
 use tensor_ir::op::{IntrinsicId, intrinsic_tags, tags};
 use tensor_ir::registry::{Port, Stage};
 
@@ -196,10 +196,10 @@ pub fn bounded_mtp_row_base(plan: &ExecPlan, vocab: u32) -> Option<u32> {
 /// wrong — a wrong-length const is a rejected-upstream case, and zeros keep the
 /// fold total.
 #[must_use]
-pub fn const_port_value(port: &driver_abi::plan::LaunchPort) -> Value {
+pub fn const_port_value(port: &driver::plan::LaunchPort) -> Value {
     let count = shape_numel(&port.const_shape).max(1) as usize;
     let dtype = concrete_dtype(port.const_dtype);
-    if port.const_dtype == driver_abi::local::PIE_CHANNEL_DTYPE_BOOL {
+    if port.const_dtype == driver::local::PIE_CHANNEL_DTYPE_BOOL {
         let mut values: Vec<u8> = port
             .const_data
             .iter()
@@ -409,8 +409,8 @@ pub fn adopt_launch_package(package: LaunchPackage) -> Result<ExecPlan> {
 
 #[cfg(test)]
 mod tests {
-    use driver_abi::local::{PIE_VALUE_INTRINSIC, PIE_VALUE_OP_RESULT};
-    use driver_abi::plan::{LaunchOp, LaunchPackage, LaunchStage, LaunchStagePlan, LaunchValue};
+    use driver::local::{PIE_VALUE_INTRINSIC, PIE_VALUE_OP_RESULT};
+    use driver::plan::{LaunchOp, LaunchPackage, LaunchStage, LaunchStagePlan, LaunchValue};
 
     use super::*;
 

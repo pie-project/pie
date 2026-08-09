@@ -35,7 +35,7 @@
 //! `key.empty()` first. `Option<GroupKey>` is the same discipline with the test
 //! moved into the type.
 
-use driver_abi::plan::LaunchOp;
+use driver::plan::LaunchOp;
 
 use super::extent::Extents;
 use super::readiness::Effect;

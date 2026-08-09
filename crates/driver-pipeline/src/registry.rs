@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::rc::Rc;
 
-use driver_abi::local::{
+use driver::local::{
     PIE_CHANNEL_DTYPE_ACT, PIE_CHANNEL_DTYPE_BOOL, PIE_CHANNEL_DTYPE_F32, PIE_CHANNEL_DTYPE_I32,
     PIE_CHANNEL_DTYPE_U32, PIE_CHANNEL_EXTERN_EXPORT, PIE_CHANNEL_EXTERN_IMPORT,
     PIE_CHANNEL_EXTERN_NONE, PIE_CHANNEL_HOST_READER, PIE_CHANNEL_HOST_ROLE_NONE,
@@ -44,7 +44,7 @@ use driver_abi::local::{
     PIE_CHANNEL_SEEDED, PIE_GEOMETRY_CLASS_DECODE_ENVELOPE, PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY,
     PIE_GEOMETRY_CLASS_HOST,
 };
-use driver_abi::plan::{LaunchChannel, LaunchPackage};
+use driver::plan::{LaunchChannel, LaunchPackage};
 
 use super::channel::{ChannelState, InterpInstance, make_host_channel_state, make_instance};
 use super::plan::{ExecPlan, adopt_launch_package};
@@ -211,7 +211,7 @@ pub const fn channel_dtype(dtype: u8) -> u8 {
 
 /// One host-emitted kernel, or the reason the host chose not to emit it.
 ///
-/// [`driver_abi::plan::EmittedKernel`], re-exported rather than restated. The
+/// [`driver::plan::EmittedKernel`], re-exported rather than restated. The
 /// port declared its own field-identical copy of this struct — six fields, the
 /// same six names — and the two were never reconciled because nothing in the
 /// Metal shell called both halves: `Registry::register_program` took the copy
@@ -226,7 +226,7 @@ pub const fn channel_dtype(dtype: u8) -> u8 {
 /// for it. The empty-source-with-an-error case is deliberate and is not a
 /// failure to register: it is the host saying "I could not emit this one", and
 /// the runtime takes its fallback path.
-pub use driver_abi::plan::EmittedKernel;
+pub use driver::plan::EmittedKernel;
 
 /// A registered program: its plan, its channel declarations, its kernels.
 #[derive(Debug)]
@@ -853,7 +853,7 @@ fn check_slot(slot: usize, endpoint: &Channel, declared: &LaunchChannel) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use driver_abi::plan::{LaunchStage, LaunchStagePlan};
+    use driver::plan::{LaunchStage, LaunchStagePlan};
     use tensor_ir::registry::Stage;
 
     use super::*;

@@ -44,7 +44,7 @@ use model_compiler::lower::Row;
 use model_compiler::trace::FireClass;
 
 /// The region-signature bits, restated so this module does not depend on the
-/// C ABI surface that [Task 9] retires. `driver-abi`'s `local.rs` is where
+/// C ABI surface that [Task 9] retires. `driver`'s `local.rs` is where
 /// they are defined; the values are the contract.
 ///
 /// [Task 9]: https://example.invalid/

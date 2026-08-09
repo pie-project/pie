@@ -6,11 +6,11 @@
 //! driver-exported handle to one and dispatches.
 //!
 //! The KV handle the data plane consumes lives on the schema floor
-//! ([`driver_abi::KvHandle`]) — transport never owns or interprets the
+//! ([`driver::KvHandle`]) — transport never owns or interprets the
 //! bytes, it only moves pages between workers.
 
 use crate::error::Result;
-use driver_abi::KvHandle;
+use driver::KvHandle;
 
 /// Worker identity on the data plane — re-exported from the interface leaf.
 ///

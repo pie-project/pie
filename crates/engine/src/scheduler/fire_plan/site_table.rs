@@ -87,7 +87,7 @@
 //! the C++ mirror of [`derive_sites`] (`context.cpp`'s
 //! `derive_expert_site_summary`; this module's tests pin the derivation)
 //! and emits a `model_site_summary` capability row
-//! (`driver_abi::ModelSiteSummary` — empty when `PIE_DECLARED_FORWARD`
+//! (`::driver::ModelSiteSummary` — empty when `PIE_DECLARED_FORWARD`
 //! is off, the validation refused, or the plan is dense). The summary rides
 //! `DriverCapabilities` → worker `translate` → `bootstrap::DriverConfig` →
 //! `DriverSpec`, where the driver's scheduler picks it up at spawn, maps it
@@ -110,7 +110,7 @@ use super::{Site, expert_weights_site};
 /// The summary states ONLY what [`derive_sites`] emits from a traced form
 /// today — distinct `(experts, top_k)` parameterizations — so this map is
 /// total; a summary entry the vocabulary cannot express does not exist.
-pub(crate) fn summary_sites(summary: &driver_abi::ModelSiteSummary) -> Vec<Site> {
+pub(crate) fn summary_sites(summary: &::driver::ModelSiteSummary) -> Vec<Site> {
     summary
         .expert_sites
         .iter()
@@ -244,15 +244,15 @@ use model::qwen_3_5::forward::facts::{Qwen35HybridFacts, Qwen35MlpKind, Qwen35Mo
     /// empty to empty (absent summary = today's behavior).
     #[test]
     fn summary_sites_maps_the_reported_entries() {
-        assert!(summary_sites(&driver_abi::ModelSiteSummary::default()).is_empty());
+        assert!(summary_sites(&::driver::ModelSiteSummary::default()).is_empty());
 
-        let summary = driver_abi::ModelSiteSummary {
+        let summary = ::driver::ModelSiteSummary {
             expert_sites: vec![
-                driver_abi::ExpertSiteSummary {
+                ::driver::ExpertSiteSummary {
                     experts: 256,
                     top_k: 8,
                 },
-                driver_abi::ExpertSiteSummary {
+                ::driver::ExpertSiteSummary {
                     experts: 64,
                     top_k: 4,
                 },
@@ -278,8 +278,8 @@ use model::qwen_3_5::forward::facts::{Qwen35HybridFacts, Qwen35MlpKind, Qwen35Mo
     fn summary_of_a_moe_trace_round_trips_through_the_vocabulary() {
         let plan = model::qwen_3_5::forward::qwen3_5_moe_mlp_block(&Qwen35MoeMlpFacts::qwen3_5_35b_a3b());
         let derived = derive_sites(&plan);
-        let summary = driver_abi::ModelSiteSummary {
-            expert_sites: vec![driver_abi::ExpertSiteSummary {
+        let summary = ::driver::ModelSiteSummary {
+            expert_sites: vec![::driver::ExpertSiteSummary {
                 experts: 256,
                 top_k: 8,
             }],

@@ -14,10 +14,10 @@ thiserror = "2.0"
 # control-plane vocab (`cluster`/`transfer`).
 serde = { version = "1.0", features = ["derive"] }
 
-# KV layout + handle vocabulary live in `driver-abi` (the dependency floor):
-# `pie_driver_abi::{KvLayout, KvDtype, KvLayoutKind, KvHandle, KvRegion,
-# MemoryDomain}` — pure-Rust types (pie-driver-abi is Python-free, no features).
-driver-abi = { path = "../driver-abi", default-features = false }
+# KV layout + handle vocabulary live in `driver` (the dependency floor):
+# `driver::{KvLayout, KvDtype, KvLayoutKind, KvHandle, KvRegion,
+# MemoryDomain}` — pure-Rust types (the driver crate is Python-free, no features).
+driver = { path = "../driver", default-features = false }
 # `WorkerId` now lives on the interface leaf (`ids`); transport names a
 # transfer's src/dst by it. Plain serde, no internal deps.
 ids = { path = "../ids" }

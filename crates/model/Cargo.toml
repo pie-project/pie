@@ -79,5 +79,4 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # loader's whole job; the marshalled-view verifier they finish with lives in
 # the ABI crate, the same pipeline a driver boot runs.
 model-loader = { path = "../model-loader", default-features = false }
-model-loader-capi = { path = "../model-loader-capi", default-features = false }
 serde_json = { version = "1.0", features = ["preserve_order"] }

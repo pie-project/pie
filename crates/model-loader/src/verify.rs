@@ -505,3 +505,175 @@ fn encoding_matches(planned: &Encoding, demanded: &Encoding) -> bool {
 
 // The verifier's tests live in `capi/tests/verify_marshalled.rs`: every one
 // checks the verdict through the marshalled view, which is the ABI crate's.
+
+/// The verification view of a compiled plan, read straight off it.
+///
+/// # Why this did not exist before
+///
+/// Verification used to run only on the MARSHALLED plan — the POD form a C++
+/// driver held — and `model-loader-capi::view::verify_marshalled` was the only
+/// way in. Its own doc explained the choice: "Verification runs *here*, on the
+/// marshalled bytes, and nowhere else. There is no path that verifies the Rust
+/// plan directly, and that is the point: a bug in the marshalling is in scope
+/// for every caller."
+///
+/// That was right while a marshalling existed. Both drivers are Rust now and
+/// read [`LoadPlan`] itself, so the POD form and the bug class it guarded
+/// against are gone together — and routing verification through a C round-trip
+/// that no longer happens would be checking a translation nobody performs.
+///
+/// What is verified is unchanged: the same [`verify`] over the same views.
+#[must_use]
+pub fn view_of(plan: &crate::plan::LoadPlan) -> PlanView<'_> {
+    use crate::plan::StorageInstr;
+
+    let files = plan
+        .files
+        .iter()
+        .map(|f| FileView {
+            id: f.id.0,
+            path: &f.path,
+            size_bytes: f.size_bytes,
+        })
+        .collect();
+    let sources = plan
+        .sources
+        .iter()
+        .map(|s| SourceView {
+            name: &s.name,
+            file_id: s.file_id.0,
+            offset_bytes: s.file_offset,
+            span_bytes: s.span_bytes,
+        })
+        .collect();
+    let tensors = plan
+        .tensors
+        .iter()
+        .map(|t| TensorView::new(&t.name, &t.shape, &t.encoding, t.visibility))
+        .collect();
+
+    let mut finalized = Vec::new();
+    let mut reads = Vec::new();
+    for instr in &plan.instrs {
+        // Named rather than left to a wildcard, for the reason the marshalled
+        // reader gave: `verify` decides a file is unread by finding no
+        // `ReadView` for it, so an instruction that grows a source and is not
+        // added here would make the plan look like it never touched the
+        // checkpoint.
+        match instr {
+            StorageInstr::Finalize { name, .. } => finalized.push(name.as_str()),
+            StorageInstr::ExtentWrite { id, source, .. }
+            | StorageInstr::BulkExtentWrite { id, source, .. } => reads.push(ReadView {
+                instr: id.0,
+                file_id: source.file_id.0,
+                file_offset: source.file_offset,
+                span_bytes: source.span_bytes,
+            }),
+            StorageInstr::TileMap { id, source, .. } => {
+                if let Some(source) = source {
+                    reads.push(ReadView {
+                        instr: id.0,
+                        file_id: source.file_id.0,
+                        file_offset: source.file_offset,
+                        span_bytes: source.span_bytes,
+                    });
+                }
+            }
+            StorageInstr::Allocate { .. }
+            | StorageInstr::CreateView { .. }
+            | StorageInstr::Fill { .. } => {}
+        }
+    }
+
+    PlanView {
+        compiler_version: plan.compiler_version,
+        files,
+        sources,
+        tensors,
+        instr_count: plan.instrs.len(),
+        schedule: plan.schedule.iter().map(|i| i.0).collect(),
+        finalized,
+        reads,
+    }
+}
+
+/// Verify a plan AND every instance of every group it carries.
+///
+/// The instances are the point. A group's plan is compiled at index 0, so
+/// verifying it alone checks one instance out of `arity` and leaves the other
+/// bindings — which are what the driver will actually read — unchecked.
+/// Rewriting the template's reads with each instance's binding and running the
+/// same file-bounds check over the result is the cheapest way to say "every
+/// instance stays inside its file", and it reuses the check rather than
+/// restating it.
+///
+/// Ported from `model-loader-capi`'s `verify_marshalled`, which is where this
+/// lived while a plan had to cross a C boundary to be verified.
+///
+/// # Errors
+///
+/// Every violation found, in plan-then-group order.
+pub fn verify_plan(
+    plan: &crate::plan::LoadPlan,
+    contract: Option<&ContractView<'_>>,
+) -> Result<Certificate, Vec<Violation>> {
+    let certificate = verify(&view_of(plan), contract)?;
+    let mut found = Vec::new();
+    for group in &plan.groups {
+        verify_group(group, &mut found);
+    }
+    if found.is_empty() {
+        Ok(certificate)
+    } else {
+        Err(found)
+    }
+}
+
+fn verify_group(group: &crate::plan::GroupPlan, found: &mut Vec<Violation>) {
+    let name = &group.name;
+    let mut template = view_of(&group.plan);
+    if let Err(mut violations) = verify(&template, None) {
+        for violation in &mut violations {
+            violation.message = format!("group '{name}': {}", violation.message);
+        }
+        found.append(&mut violations);
+        return;
+    }
+    let per = template.reads.len();
+    if group.bindings.len() != group.arity as usize
+        || group.bindings.iter().any(|b| b.len() != per)
+    {
+        found.push(Violation::plan(format!(
+            "group '{name}': {} binding sets for {} instances of a plan with {per} reads",
+            group.bindings.len(),
+            group.arity
+        )));
+        return;
+    }
+
+    // Mutated in place, one instance at a time: every read's file and offset is
+    // overwritten on each pass, so there is nothing to restore between them.
+    for (index, bindings) in group.bindings.iter().enumerate() {
+        for (read, binding) in template.reads.iter_mut().zip(bindings) {
+            if read.instr != binding.instr.0 {
+                found.push(Violation::plan(format!(
+                    "group '{name}' index {index}: binding names instruction {} where \
+                     the plan reads at instruction {}",
+                    binding.instr.0, read.instr
+                )));
+                return;
+            }
+            read.file_id = binding.file_id.0;
+            read.file_offset = binding.file_offset;
+        }
+        if let Err(violations) = verify(&template, None) {
+            for violation in violations {
+                found.push(Violation::plan(format!(
+                    "group '{name}' index {index}: {}",
+                    violation.message
+                )));
+            }
+            return;
+        }
+    }
+}

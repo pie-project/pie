@@ -191,6 +191,81 @@ pub fn run_keeping_arena<R: Resolver>(
     Ok((timing, arena))
 }
 
+/// A fire that has been COMMITTED and may still be running.
+///
+/// Everything the GPU still refers to, held together so a caller cannot drop
+/// half of it. The command buffer addresses the arena, reads its operands out
+/// of the argument table and its scalars out of the staged params; freeing
+/// any of the three while the buffer executes is a use-after-free that a
+/// green run will not show, because the bytes are usually still there.
+///
+/// So this owns them and hands back only `arena`, and only after
+/// [`Stepper::has_passed`] says the fire retired.
+pub struct InFlight {
+    /// The timeline value this fire signals.
+    pub value: u64,
+    /// Where its activations landed. Read it after the fire retires.
+    pub arena: Handle,
+    /// Held for the GPU, not for the caller.
+    _table: ArgumentTable,
+    _params: Params,
+}
+
+/// Plan, encode and COMMIT one fire, without waiting for it.
+///
+/// [`run`] and [`run_keeping_arena`] end in a wait, so a caller cannot queue
+/// the next fire until this one has finished -- the call that would queue it
+/// has not returned. That makes a dispatch depth a number the engine honours
+/// and the driver serialises, which is what `.wiki/new-driver/next.md`
+/// priority 1 is about.
+///
+/// `stepper` is the caller's and must be the SAME one across fires: the
+/// timeline and the allocator ring live on it, and a fresh `Stepper` per fire
+/// -- which is what `run_keeping_arena` does -- has neither a value to
+/// compare against nor an allocator to alternate. [`Stepper::submit`] bounds
+/// the depth by waiting for the step two back.
+///
+/// # Errors
+///
+/// As [`run`], plus a wedged stepper.
+pub fn submit<R: Resolver>(
+    context: &Context,
+    compiler: &Compiler,
+    pipelines: &mut Pipelines,
+    stepper: &mut Stepper,
+    lowered: &Lowered,
+    geometry: Geometry,
+    resolver: &mut R,
+) -> Result<InFlight> {
+    let arena = allocate(
+        context,
+        (lowered.arena_bytes as u64).max(1),
+        "activation arena",
+    )?;
+    // SAFETY: freshly allocated; nothing is encoded against it yet. Zeroed
+    // for the reason `run_keeping_arena` states -- a slot no kernel writes
+    // otherwise holds whatever the allocator handed over.
+    unsafe { arena.zero(0, arena.len())? };
+    let frame = Frame {
+        arena: Slice {
+            address: arena.gpu_address(),
+            bytes: arena.len(),
+        },
+    };
+    let dispatches = plan(lowered, table(), frame, geometry, resolver).map_err(refusal)?;
+    let params = Params::stage(context, &dispatches)?;
+    let table = ArgumentTable::new(context, table_width(&dispatches))?;
+    pipelines.ensure(context, compiler, &dispatches)?;
+    let value =
+        stepper.submit(|encoder| encode(encoder, &table, pipelines, &params, &dispatches))?;
+    Ok(InFlight {
+        value,
+        arena,
+        _table: table,
+        _params: params,
+    })
+}
+
 /// A refusal, as this crate's error.
 ///
 /// Rendered rather than wrapped: every variant is drift, and what a reader

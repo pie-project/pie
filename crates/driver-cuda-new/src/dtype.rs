@@ -11,7 +11,7 @@
 //!   `u32`, `bool`. It describes what a kernel *computes in*, and it has no
 //!   notion of a packed nibble or an exponent-only scale byte because nothing
 //!   computes in those.
-//! * `driver_abi::KvDtype` is the cross-node *wire* vocabulary, and is
+//! * `driver::KvDtype` is the cross-node *wire* vocabulary, and is
 //!   deliberately narrow -- five variants, no `FP8_E5M2`, no `UINT8`, both of
 //!   which a KV cache format here can select. Widening it to fit would put
 //!   local storage decisions into a type whose job is to be stable across a

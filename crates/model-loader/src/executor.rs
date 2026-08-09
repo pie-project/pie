@@ -13,5 +13,6 @@
 //! receives each tensor once, in schedule order, and the streaming entry
 //! point frees buffers the moment the schedule is done with them.
 
+pub mod arena;
 pub mod host;
 pub mod sink;

@@ -406,9 +406,9 @@ pub fn classify_decode_envelope_why(
 /// class demands of a driver.
 pub fn envelope_required_ports(envelope: &DecodeEnvelope) -> u32 {
     let mut required =
-        driver_abi::PIE_DEVICE_PORT_EMBED_TOKENS | driver_abi::PIE_DEVICE_PORT_KV_LEN;
+        ::driver::PIE_DEVICE_PORT_EMBED_TOKENS | ::driver::PIE_DEVICE_PORT_KV_LEN;
     if envelope.device_positions {
-        required |= driver_abi::PIE_DEVICE_PORT_POSITIONS;
+        required |= ::driver::PIE_DEVICE_PORT_POSITIONS;
     }
     // No `PIE_DEVICE_PORT_ATTN_MASK` clause: the classifier declines a
     // channel-bound mask outright, so no envelope reaches here carrying one.

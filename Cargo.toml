@@ -45,13 +45,11 @@ members = [
     "crates/client-api",
     "crates/controller-api",
     "crates/worker-api",
-    "crates/driver-abi",
-    "crates/driver-abi-cbindgen",
+    "crates/driver",
 
     # -- driver-*: execution shells ----------------------------------------
     # `driver` is the C++ substrate both shells interpret the ABI with; the two
     # native shells build their own `csrc/` and are OS-exclusive.
-    "crates/driver",
     # The PTIR channel plane, shared by both Rust shells. It was `src/pipeline/`
     # inside `driver-metal-new` until the CUDA shell reached the same file, and
     # the move cost nothing because not one line of it named a Metal type --
@@ -90,15 +88,12 @@ members = [
     # Forward-pass declarations: a tracing eDSL whose static control flow runs
     # at model-load time; the traced form is what a driver executes.
     "crates/model-compiler",
-    "crates/model-cbindgen",
     # Weight loader: checkpoints -> verified device-memory layouts. Consumed by
     # drivers at cold start, not by the serving runtime. `model-loader` is the
     # compiler alone; `-capi` is its C ABI — the repr(C) marshalling, the extern
     # entry points, the committed pie_loader.h and the `pie-loader` CLI — which
     # is what the drivers actually link.
     "crates/model-loader",
-    "crates/model-loader-capi",
-    "crates/model-loader-capi-cbindgen",
 
     # -- kernels-*: the device kernels, and the words their tables use ------
     # `kernels` is bare for the reason `driver` is: it is the shared floor
@@ -153,17 +148,12 @@ default-members = [
     "crates/client-api",
     "crates/controller-api",
     "crates/worker-api",
-    "crates/driver-abi",
-    "crates/driver-abi-cbindgen",
     "crates/driver",
     "crates/driver-dummy",
     "crates/driver-pipeline",
     "crates/model",
     "crates/model-compiler",
-    "crates/model-cbindgen",
     "crates/model-loader",
-    "crates/model-loader-capi",
-    "crates/model-loader-capi-cbindgen",
     "crates/kernels",
     "crates/kernels-cuda",
     "crates/kernels-metal",

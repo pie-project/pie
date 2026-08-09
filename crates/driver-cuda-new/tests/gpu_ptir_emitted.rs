@@ -90,8 +90,8 @@ fn greedy_epilogue() -> TraceContainer {
 ///
 /// Three field-identical `EmittedKernel` structs exist in this workspace —
 /// `tensor_compiler::codegen::program`'s (what the emitter returns),
-/// `driver_abi::plan`'s (what a driver adopts to), and
-/// `driver_abi::local::PieEmittedKernel` (what crosses the C ABI) — and the
+/// `driver::plan`'s (what a driver adopts to), and
+/// `driver::local::PieEmittedKernel` (what crosses the C ABI) — and the
 /// engine copies field by field between the first two at
 /// `crates/engine/src/driver/abi.rs:129-141`. This reproduces that hop, which
 /// is what makes this test measure the emitter-to-driver agreement rather than
@@ -102,10 +102,10 @@ fn greedy_epilogue() -> TraceContainer {
 /// place the three copies are ever seen together.
 fn as_abi(
     kernels: &[tensor_compiler::codegen::program::EmittedKernel],
-) -> Vec<driver_abi::plan::EmittedKernel> {
+) -> Vec<driver::plan::EmittedKernel> {
     kernels
         .iter()
-        .map(|kernel| driver_abi::plan::EmittedKernel {
+        .map(|kernel| driver::plan::EmittedKernel {
             kind: kernel.kind,
             stage_index: kernel.stage_index,
             region_index: kernel.region_index,
@@ -164,7 +164,7 @@ fn the_hosts_own_emitted_cuda_compiles_in_this_driver() {
     for kernel in &kernels {
         assert_eq!(
             kernel.kind,
-            driver_abi::local::PIE_KERNEL_FUSED,
+            driver::local::PIE_KERNEL_FUSED,
             "CUDA emits only fused regions; kind {} is a shape this driver \
              does not look up",
             kernel.kind

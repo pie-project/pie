@@ -85,14 +85,14 @@ impl DriverBackend {
 
     pub fn dummy(
         options: driver_dummy::DummyDriverOptions,
-    ) -> Result<(Self, driver_abi::DeviceFacts)> {
+    ) -> Result<(Self, ::driver::DeviceFacts)> {
         let driver = DummyDriver::new(options);
         let facts = driver.device_facts().clone();
         Ok((Self::Dummy(driver), facts))
     }
 
     #[cfg(feature = "driver-cuda-new")]
-    pub fn cuda_create(config_bytes: &[u8]) -> Result<(Self, driver_abi::DeviceFacts)> {
+    pub fn cuda_create(config_bytes: &[u8]) -> Result<(Self, ::driver::DeviceFacts)> {
         let (driver, facts) = CudaDriver::create(config_bytes)?;
         Ok((Self::Cuda(driver), facts))
     }
@@ -104,7 +104,7 @@ impl DriverBackend {
     ///
     /// No Metal 4 device.
     #[cfg(all(feature = "driver-metal-new", target_vendor = "apple"))]
-    pub fn metal_create(config_bytes: &[u8]) -> Result<(Self, driver_abi::DeviceFacts)> {
+    pub fn metal_create(config_bytes: &[u8]) -> Result<(Self, ::driver::DeviceFacts)> {
         let (driver, facts) = MetalDriver::create(config_bytes)?;
         Ok((Self::Metal(driver), facts))
     }
@@ -112,7 +112,7 @@ impl DriverBackend {
     #[cfg(feature = "driver-cuda-new")]
     pub fn cuda_group_create(
         config_blobs: Vec<Vec<u8>>,
-    ) -> Result<(Self, Vec<driver_abi::DeviceFacts>)> {
+    ) -> Result<(Self, Vec<::driver::DeviceFacts>)> {
         let (driver, facts) = CudaDriver::create_group(config_blobs)?;
         Ok((Self::Cuda(driver), facts))
     }
@@ -120,8 +120,8 @@ impl DriverBackend {
 
     pub fn load_model(
         &mut self,
-        descs: Vec<driver_abi::ModelLoadDesc>,
-    ) -> Result<driver_abi::DriverCapabilities> {
+        descs: Vec<::driver::ModelLoadDesc>,
+    ) -> Result<::driver::DriverCapabilities> {
         match self {
             Self::Dummy(driver) => {
                 let [desc] = descs.as_slice() else {
@@ -192,7 +192,7 @@ impl DriverBackend {
                 next.emitted_kernels = emitted
                     .kernels
                     .iter()
-                    .map(|kernel| driver_abi::EmittedKernel {
+                    .map(|kernel| ::driver::EmittedKernel {
                         kind: kernel.kind,
                         stage_index: kernel.stage_index,
                         region_index: kernel.region_index,
@@ -326,7 +326,7 @@ impl DriverBackend {
         }
     }
 
-    pub fn export_kv_handle(&self) -> Option<driver_abi::KvHandle> {
+    pub fn export_kv_handle(&self) -> Option<::driver::KvHandle> {
         match self {
             Self::Dummy(driver) => driver.export_kv_handle(),
             #[cfg(feature = "driver-cuda-new")]

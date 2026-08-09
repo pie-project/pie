@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, ensure};
-use driver_abi::{
+use ::driver::{
     ExecutorRequest, ExecutorResponse, ExecutorRpcClient, RemoteBindInstance, RemoteChannelValue,
     RemoteError, RemoteErrorKind, RemoteLaunch, RemoteRegisterChannel, ScratchGrant,
     TerminalCellState,
@@ -28,7 +28,7 @@ pub struct RemoteDriver {
     broker: CompletionBroker,
     connected: Arc<AtomicBool>,
     disconnected: Arc<tokio::sync::Notify>,
-    capabilities: driver_abi::DriverCapabilities,
+    capabilities: ::driver::DriverCapabilities,
     grant: ScratchGrant,
     programs: HashMap<u64, u64>,
     channels: HashMap<u64, u64>,
@@ -60,7 +60,7 @@ impl RemoteDriver {
     pub fn new(
         client: ExecutorRpcClient,
         runtime: tokio::runtime::Handle,
-        capabilities: driver_abi::DriverCapabilities,
+        capabilities: ::driver::DriverCapabilities,
         grant: ScratchGrant,
     ) -> Self {
         Self {
@@ -78,7 +78,7 @@ impl RemoteDriver {
         }
     }
 
-    pub fn capabilities(&self) -> &driver_abi::DriverCapabilities {
+    pub fn capabilities(&self) -> &::driver::DriverCapabilities {
         &self.capabilities
     }
 
@@ -200,7 +200,7 @@ impl RemoteDriver {
         );
         for (&address, state) in pointers.iter().zip(states) {
             ensure!(address != 0, "local terminal cell pointer is null");
-            let cell = address as *mut driver_abi::PieTerminalCell;
+            let cell = address as *mut ::driver::PieTerminalCell;
             unsafe {
                 (*cell).reserved0 = state.reserved0;
                 std::sync::atomic::AtomicU32::from_ptr(std::ptr::addr_of_mut!((*cell).outcome))
@@ -267,8 +267,8 @@ impl RemoteDriver {
 
     pub fn load_model(
         &mut self,
-        _descs: Vec<driver_abi::ModelLoadDesc>,
-    ) -> Result<driver_abi::DriverCapabilities> {
+        _descs: Vec<::driver::ModelLoadDesc>,
+    ) -> Result<::driver::DriverCapabilities> {
         self.ensure_connected()?;
         Ok(self.capabilities.clone())
     }
@@ -324,7 +324,7 @@ impl RemoteDriver {
         );
         self.channels
             .insert(desc.channel_id, binding.executor_channel_id);
-        let mut native = driver_abi::PieChannelEndpointBinding::default();
+        let mut native = ::driver::PieChannelEndpointBinding::default();
         native.channel_id = desc.channel_id;
         Ok(RegisteredChannel {
             driver_id: desc.driver_id,
@@ -395,7 +395,7 @@ impl RemoteDriver {
         Ok(BoundInstance::new(
             desc.driver_id,
             desc.program_id,
-            driver_abi::PieInstanceBinding {
+            ::driver::PieInstanceBinding {
                 instance_id: local_instance_id,
                 geometry_class: binding.geometry_class as u32,
                 reserved0: 0,

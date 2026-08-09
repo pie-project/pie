@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use driver_abi::local::{PIE_CHANNEL_HOST_READER, PIE_CHANNEL_HOST_VISIBLE};
+use driver::local::{PIE_CHANNEL_HOST_READER, PIE_CHANNEL_HOST_VISIBLE};
 
 use super::plan::ExecPlan;
 use super::shape_numel;

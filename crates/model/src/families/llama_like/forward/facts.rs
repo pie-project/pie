@@ -626,6 +626,27 @@ pub struct LlamaLikeMetalFacts {
     /// the runtime compiler reports by listing what the shader does export.
     #[serde(default)]
     pub affine_bits: u32,
+    /// How this deployment stores its EXPERT BANKS, when that is not how it
+    /// stores its dense projections.
+    ///
+    /// The DSL's own note beside `proj_repr` says "a checkpoint quantizes
+    /// uniformly", and that is very nearly true. `mlx-community/
+    /// gpt-oss-20b-MXFP4-Q4` is the exception: its `quantization` block names
+    /// 98 tensors as `affine`/64/4 and leaves the expert banks OUT, so they
+    /// take the top-level default -- `mxfp4`, group **32**. One checkpoint,
+    /// two formats.
+    ///
+    /// Reading the banks with the dense format is not a near miss. Every scale
+    /// comes from the wrong offset, and bf16 garbage is NaN more often than
+    /// not: the fire bound everything, ran, and produced 909,207 NaNs
+    /// beginning at the first routed projection of layer 0.
+    ///
+    /// `None` is "the same as `proj_repr`", which is every other checkpoint.
+    #[serde(default)]
+    pub moe_repr: Option<model_compiler::dsl::WeightRepr>,
+    /// [`Self::affine_bits`] for the expert banks; see [`Self::moe_repr`].
+    #[serde(default)]
+    pub moe_bits: u32,
     /// The GEMM's `(row tile, column tile)`, as the entrypoint spells them.
     ///
     /// `affine_qmm_t` is instantiated over `(group × bits × bm × bn)`, so the
@@ -845,6 +866,9 @@ impl LlamaLikeMetalFacts {
                 zero_point: true,
             },
             affine_bits: 4,
+            // Uniform: the synthetic fixture's banks are the dense format.
+            moe_repr: None,
+            moe_bits: 0,
             // The narrowest rung `qmm_bm` can pick, so it is the one a short
             // window fires; `bn = 32` is the only column tile the residual
             // variant is instantiated at.

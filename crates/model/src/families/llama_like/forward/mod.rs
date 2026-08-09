@@ -492,13 +492,25 @@ fn llama_like_metal_text(
                 padded,
                 f.hidden,
             );
+            // The bank's OWN format, which need not be the dense one --
+            // gpt-oss stores 98 tensors affine/64 and its expert banks
+            // mxfp4/32. See `LlamaLikeMetalFacts::moe_repr`.
+            let bank = |m: &dsl::MatW| match metal.moe_repr {
+                Some(repr) => dsl::MatW { repr, ..m.clone() },
+                None => m.clone(),
+            };
+            let bits = if metal.moe_repr.is_some() {
+                metal.moe_bits
+            } else {
+                metal.affine_bits
+            };
             let h = activate(
-                &dsl::metal::routed_qmv(&rows, &ids, &w.expert_gate, k, false),
-                &dsl::metal::routed_qmv(&rows, &ids, &w.expert_up, k, false),
+                &dsl::metal::routed_qmv(&rows, &ids, &bank(&w.expert_gate), k, false, bits),
+                &dsl::metal::routed_qmv(&rows, &ids, &bank(&w.expert_up), k, false, bits),
                 f.moe_intermediate,
             );
             let routed = dsl::metal::combine_sorted(
-                &dsl::metal::routed_qmv(&h, &ids, &w.expert_down, k, false),
+                &dsl::metal::routed_qmv(&h, &ids, &bank(&w.expert_down), k, false, bits),
                 &weights,
                 &inv,
                 k,

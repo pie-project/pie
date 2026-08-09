@@ -16,17 +16,10 @@ mod color;
 mod consts;
 mod dispatch;
 mod dispatch_mb;
-mod fire_csr;
 mod geometry;
 mod geometry_facts;
-mod heap_budget;
 mod logits;
-mod member;
-mod paging;
-mod psos;
 mod psos_mb;
-mod schedule;
-mod sequence;
 mod sizing;
 mod timing;
 
@@ -54,33 +47,12 @@ pub use dispatch_mb::{
     rms_mb, uses_alt_quant,
 };
 pub use geometry::{AffineFormat, DecodeGeometry};
-pub use fire_csr::{FireCsr, FireRefused};
 pub use geometry_facts::{
     GeometryRefused, ROUTER_MAX_EXPERTS, ROUTER_MAX_TOP_K, geometry_from_facts,
 };
-pub use heap_budget::{
-    MAX_RS_SLOTS, PAGED_MAX_FORWARD_TOKENS, PAGED_MIN_FORWARD_TOKENS, RS_SLOT_BUDGET_FLOOR,
-
-    max_forward_tokens_for_budget, rs_slot_budget_bytes, rs_slot_bytes, rs_slots_for_budget,
-    stream_predicate,
-};
 pub use logits::{LengthMismatch, bf16_to_f32, widen, widen_into};
-pub use member::{BuildError, ForwardDesc, ResolvedGeometry, build_member_desc};
-pub use paging::{
-    Cut, IdsLayout, PagingPlan, PagingRefused, RenumberRefused, SlabShape, plan_paging,
-    renumber_routing,
-};
-pub use psos::{DecodePsoPlan, EntryNames, Features as PsoFeatures, PsoRequest, plan_decode_psos};
 pub use psos_mb::{
     MOE_TILE_WIDTHS, MbFeatures, MbRequest, MbSlot, QMM_BMS, QMM_SPLIT_BN, plan_multibatch_psos,
-};
-pub use schedule::{
-    BatchSchedule, DEFAULT_PAGE_SIZE, Malformed, Rejected, RequestSpan, build_schedule,
-    find_request, validate_capacity, validate_paged,
-};
-pub use sequence::{
-    Backing, Continuation, SequenceRefused, SequenceState, close as close_sequence,
-    validate_continuation,
 };
 pub use sizing::{
     RoutedProjection, RowAxis, Target, ValueExtent, conv_state_target_bytes, kv_pool_row_bytes,

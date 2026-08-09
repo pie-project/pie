@@ -45,7 +45,7 @@
 //! `std::string* err` beside it, because a status that carries no reason and a
 //! reason that arrives by side channel are the two halves of one value.
 
-use driver_abi::plan::{LaunchPackage, LaunchPort};
+use driver::plan::{LaunchPackage, LaunchPort};
 use tensor_ir::registry::Port;
 
 use super::channel::InterpInstance;
@@ -406,7 +406,7 @@ fn resolve_inner(
 mod tests {
     use std::rc::Rc;
 
-    use driver_abi::plan::{LaunchChannel, LaunchStage, LaunchStagePlan};
+    use driver::plan::{LaunchChannel, LaunchStage, LaunchStagePlan};
     use tensor_ir::registry::Stage;
 
     use super::super::channel::ChannelState;

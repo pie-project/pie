@@ -137,6 +137,10 @@ pub mod launch;
 #[cfg(feature = "abi")]
 pub mod abi_shell;
 
+/// The checkpoint's bytes onto the device, through `model-loader`'s plan.
+#[cfg(all(feature = "abi", feature = "_cuda"))]
+pub mod loader;
+
 pub mod model;
 /// PTIR on CUDA: NVRTC, cubins, and the compile cache.
 ///

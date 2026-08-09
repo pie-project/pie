@@ -32,11 +32,11 @@ serde_json = "1.0"
 
 # The pipeline interpreter is pure CPU logic and reuses the launch/IR source of
 # truth rather than re-porting the C++ `pie::driver::launch` mirror:
-# `driver-abi` owns the adopted launch-package types (`LaunchPackage` and its
+# `driver` owns the adopted launch-package types (`LaunchPackage` and its
 # members) and the `PIE_*` ABI constants, and `tensor-ir` owns the op table,
 # dtypes, intrinsic ids and the canonical RNG contract. Both are host-portable,
 # so they belong here in the plain (non-Apple) table.
-driver-abi = { path = "../driver-abi" }
+driver = { path = "../driver" }
 tensor-ir = { path = "../tensor-ir" }
 
 # The PTIR channel plane, which used to be `src/pipeline/` here. It moved out

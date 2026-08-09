@@ -69,6 +69,42 @@
 //! Gated on `PIE_METAL_SMOKE_CHECKPOINT`, the same variable the other
 //! checkpoint tests take. Run against
 //! `mlx-community/Llama-3.2-1B-Instruct-4bit`.
+//!
+//! # gpt-oss-20b: it loads now, and it NaNs
+//!
+//! Measured 2026-08-10 against `mlx-community/gpt-oss-20b-MXFP4-Q4`, which
+//! became runnable here the day `stage_plan_weights` stopped holding the
+//! model twice (12.1 GB peak; the old path wanted about twice that and this
+//! machine has 32 GB).
+//!
+//! `a_real_checkpoints_weights_produce_finite_varied_activations` **fails**
+//! on it: 909,207 NaNs. That is the first numeric result gpt-oss has ever
+//! produced here -- every prior gate was structural (names resolve, the fire
+//! encodes, the launches are legal grids), and all of those still pass.
+//!
+//! What the bisection says, which is where anyone picking this up should
+//! start: **layer 0 is entirely finite and plausible.** Twelve statements,
+//! every one writing both rows, magnitudes from 2.5 to 36, the KV pool
+//! holding real keys and values --
+//!
+//! ```text
+//! [ 8] sdpa_paged_decode_sink_bfloat16_d_64   max|v| 10.25
+//! [ 9] affine_qmv_fast_residual_...           max|v| 31.25
+//! [10] rms_single_row_bfloat16                max|v|  2.51
+//! [11] affine_qmv_fast_...  (the router)      max|v|  3.90
+//! ```
+//!
+//! So the attention half is right, the sink kernel runs, and the router is
+//! handed a sane activation. The NaN is downstream of statement 11 -- in the
+//! six-statement routed FFN (`route_sort`, `route_gather`, two
+//! `routed_qmv`, the clamped `swiglu`, `combine_sorted`) or in what a later
+//! layer does with its output.
+//!
+//! Two candidates worth checking first, in order: the SwiGLU's `limit` and
+//! `alpha` (gpt-oss clamps the gate above, clamps the linear branch both ways
+//! and adds one to it -- a wrong bound there is an overflow, not a rounding
+//! error), and the expert bank's row count after the sort pads each group up
+//! to a tile.
 
 #![cfg(target_vendor = "apple")]
 
@@ -980,6 +1016,239 @@ fn bisect(class: FireClass) {
              and not row 1."
         ),
         None => eprintln!("\nEvery statement in the first layer wrote both rows."),
+    }
+}
+
+/// Which statement first writes a NaN, over the WHOLE fire.
+///
+/// # Why this is a search and not a walk
+///
+/// [`bisect`] re-runs a prefix per statement, which is fine for the twelve
+/// that make one layer and quadratic for the four hundred that make a fire.
+/// This binary-searches instead: the shortest prefix whose arena holds a NaN
+/// is the statement that made it, and that is ~9 runs for a 24-layer model
+/// rather than ~480.
+///
+/// The claim it can make is narrow and worth being exact about. A NaN in the
+/// arena after `n` statements and none after `n-1` means statement `n` WROTE
+/// one -- it does not say the arithmetic in statement `n` is wrong, because a
+/// kernel handed a bad operand produces a bad answer honestly. What it does
+/// is turn "somewhere in a 20B model" into one symbol and one layer, and
+/// everything after that is reading.
+///
+/// Prints and passes. A checkpoint with no NaN says so and this is a no-op;
+/// making it an assertion would fail every green run for the one model that
+/// is not.
+#[test]
+fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
+    let Some(snapshot) = snapshot() else {
+        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        return;
+    };
+    let Ok(context) = Context::new() else {
+        eprintln!("SKIP: no Metal 4 device");
+        return;
+    };
+    let compiler = Compiler::new(&context).expect("a compiler");
+    let mut pipelines = Pipelines::new(kernels_dir());
+
+    let descriptor = descriptor_for(&snapshot);
+    let loaded = load(&context, &snapshot, &descriptor).expect("the checkpoint loads");
+    let model_facts = driver_metal_new::facts::ModelFacts::from_descriptor(&descriptor)
+        .expect("the descriptor states the model's facts");
+    let dg =
+        driver_metal_new::batch::geometry_from_facts(&model_facts).expect("a decodable geometry");
+    let (facts, metal) =
+        driver_metal_new::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
+
+    let step = Step {
+        token_ids: &[128_000],
+        qo_indptr: &[0, 1],
+        sampling_indices: &[0],
+        ..Step::default()
+    };
+    let plan = llama_like_metal(&facts, &metal, FireClass::Decode);
+    let lowered = lower_step(&plan, &step).expect("the step lowers");
+    let geometry = Geometry {
+        q_heads: facts.q_heads,
+        kv_heads: facts.kv_heads,
+        head_dim: facts.head_dim,
+        rotary_dims: facts.head_dim,
+        n_experts: facts.n_experts,
+        experts_per_token: facts.experts_per_token,
+    };
+
+    let shape = Shape {
+        layers: facts.layers,
+        kv_heads: facts.kv_heads,
+        head_dim: facts.head_dim,
+        page_size: 16,
+        pages: 64,
+        element_bytes: 2,
+    };
+    let pool = Pool::allocate(&context, shape).expect("a pool");
+    let freqs = driver_metal_new::model::rope::frequencies(
+        facts.head_dim,
+        metal.rope_theta,
+        (dg.rope_freq_factor > 0.0).then_some(driver_metal_new::model::rope::Rescale {
+            factor: dg.rope_freq_factor,
+            low: dg.rope_low_freq_factor,
+            high: dg.rope_high_freq_factor,
+            original_max: dg.rope_original_max_position as f32,
+        }),
+    );
+    let staged = stage_tables(&context, &step, shape.page_size, &freqs);
+    let named = HashMap::new();
+
+    // Which arena spans hold FLOATS, off the text's own declared dtypes.
+    // `Arg::Arena` carries a byte WIDTH, which cannot tell an i32 from an f32,
+    // and the plan can.
+    let int_offsets: std::collections::HashSet<usize> = plan
+        .values
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| matches!(v.dtype, model_compiler::trace::DType::I32))
+        .filter_map(|(id, _)| lowered.value_offset.get(id).copied())
+        .collect();
+    let mut float_spans: Vec<(usize, usize, usize)> = lowered
+        .args
+        .iter()
+        .filter_map(|a| match a {
+            model_compiler::lower::Arg::Arena { at, width, bytes } => {
+                Some((*at, *width as usize * *bytes as usize, *bytes as usize))
+            }
+            _ => None,
+        })
+        .filter(|(at, _, _)| !int_offsets.contains(at))
+        .collect();
+    float_spans.sort_unstable();
+    float_spans.dedup();
+    eprintln!(
+        "{} float span(s), {} integer value(s) excluded",
+        float_spans.len(),
+        int_offsets.len()
+    );
+
+    // Run the first `n` statements and say whether the arena holds a NaN.
+    let mut nan_after = |n: usize| -> bool {
+        let arena = allocate(
+            &context,
+            (lowered.arena_bytes as u64).max(1),
+            "nan search arena",
+        )
+        .expect("an arena");
+        // SAFETY: freshly allocated. Zeroed so an unwritten slot reads as a
+        // zero and not as whatever the allocator had -- a stale NaN would
+        // otherwise be attributed to whichever statement ran last.
+        unsafe { arena.zero(0, arena.len()).expect("it zeroes") };
+        let pages = |layer: u16, values: bool| {
+            pool.layer(u32::from(layer)).map(|l| Slice {
+                address: if values {
+                    l.v.gpu_address()
+                } else {
+                    l.k.gpu_address()
+                },
+                bytes: shape.layer_bytes(),
+            })
+        };
+        let mut live = Live {
+            store: Store::new(Names::mlx(), &loaded.tensors, &named),
+            tables: &staged,
+            shape,
+            pages: &pages,
+        };
+        let dispatches = driver_metal_new::model::dispatch::plan(
+            &lowered,
+            driver_metal_new::model::run::table(),
+            driver_metal_new::model::executor::Frame {
+                arena: Slice {
+                    address: arena.gpu_address(),
+                    bytes: arena.len(),
+                },
+            },
+            geometry,
+            &mut live,
+        )
+        .expect("the fire plans");
+        let prefix = &dispatches[..n.min(dispatches.len())];
+        let prepared = driver_metal_new::model::run::prepare(&context, &lowered, prefix)
+            .expect("the prefix prepares");
+        pipelines
+            .ensure(&context, &compiler, prefix)
+            .expect("the pipelines compile");
+        let mut stepper = driver_metal_new::metal::Stepper::new(&context).expect("a stepper");
+        stepper
+            .run(|encoder| {
+                driver_metal_new::model::encode::encode(
+                    encoder,
+                    &prepared.table,
+                    &pipelines,
+                    &prepared.params,
+                    prefix,
+                )
+            })
+            .expect("the prefix runs");
+        // SAFETY: the command buffer retired.
+        let raw = unsafe {
+            core::slice::from_raw_parts(
+                arena.contents().as_ptr().cast_const().cast::<u8>(),
+                arena.len() as usize,
+            )
+        };
+        // FLOAT regions only. A routed FFN's arena is half INDEX buffers --
+        // `route_sort` writes a permutation, a per-row expert, a per-tile
+        // expert and an inverse, all integers -- and an index read as a float
+        // is a NaN whenever its top bits happen to be an all-ones exponent.
+        // `-1`, the sentinel a padded tile carries, is 0xFFFFFFFF, which is
+        // exactly that. So a detector that reads the whole arena as floats
+        // reports the sort as the first NaN of every mixture, every time, and
+        // says nothing.
+        float_spans.iter().any(|&(at, len, element)| {
+            raw[at..(at + len).min(raw.len())]
+                .chunks_exact(element)
+                .any(|c| {
+                    let v = if element == 4 {
+                        f32::from_le_bytes([c[0], c[1], c[2], c[3]])
+                    } else {
+                        f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16)
+                    };
+                    v.is_nan()
+                })
+        })
+    };
+
+    let total = lowered.launches.len();
+    if !nan_after(total) {
+        eprintln!("the whole fire ({total} statements) is NaN-free");
+        return;
+    }
+    // The smallest prefix that has one.
+    let (mut lo, mut hi) = (0usize, total);
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if nan_after(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let launch = &lowered.launches[hi - 1];
+    let symbol = &lowered.kernels[launch.kernel as usize];
+    eprintln!(
+        "\nthe first NaN appears at statement {} of {total}: `{symbol}`, layer {:?}, rows {:?}",
+        hi - 1,
+        launch.layers,
+        launch.rows
+    );
+    // Its neighbours, because a symbol alone does not say what it was handed.
+    for i in hi.saturating_sub(4)..(hi + 2).min(total) {
+        let l = &lowered.launches[i];
+        eprintln!(
+            "  [{i:3}]{} {} layer {:?}",
+            if i == hi - 1 { " <-" } else { "   " },
+            lowered.kernels[l.kernel as usize],
+            l.layers
+        );
     }
 }
 

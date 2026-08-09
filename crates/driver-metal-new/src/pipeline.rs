@@ -9,7 +9,7 @@
 //! half that can be tested without a GPU."*
 //!
 //! `PARITY-INTERP.md` named the destination before the move happened:
-//! *"`driver-cuda-new` shares `driver-abi` and `tensor-ir` with this crate, so
+//! *"`driver-cuda-new` shares `driver` and `tensor-ir` with this crate, so
 //! `src/pipeline/` is the natural single home for both device copies when that
 //! port reaches this file."* It has, so this file is the re-export and
 //! [`driver_pipeline`] is the home.

@@ -20,7 +20,7 @@
 
 use std::rc::Rc;
 
-use driver_abi::plan::{LaunchRegion, LaunchStagePlan};
+use driver::plan::{LaunchRegion, LaunchStagePlan};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLComputePipelineState;

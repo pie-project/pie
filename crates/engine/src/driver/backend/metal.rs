@@ -40,9 +40,21 @@ use driver_metal_new::Region;
 
 /// The Metal shell, behind the seam's fourteen verbs.
 pub struct MetalDriver {
-    context: driver_metal_new::metal::Context,
+    context: std::sync::Arc<driver_metal_new::metal::Context>,
+    /// The command timeline, held ACROSS frames.
+    ///
+    /// This is what makes run-ahead run-ahead rather than within-frame
+    /// pipelining. The timeline and the two-allocator ring live on the
+    /// stepper, so a fresh one per frame has no previous value to compare
+    /// against and no allocator to alternate: frame n+1 could not be queued
+    /// while frame n ran, however the steps inside each were arranged.
+    ///
+    /// `Stepper::shared` rather than `Stepper::new` because a borrowing
+    /// stepper beside the `Context` it borrows is a self-reference; sharing
+    /// the context is what lets one outlive a call.
+    stepper: driver_metal_new::metal::Stepper<'static>,
     registry: driver_metal_new::pipeline::Registry,
-    device_facts: driver_abi::DeviceFacts,
+    device_facts: ::driver::DeviceFacts,
     /// The checkpoint, once one is loaded. Held because every address in its
     /// tensor map points into the region it owns.
     model: Option<driver_metal_new::model::load::Loaded>,
@@ -101,7 +113,7 @@ impl MetalDriver {
     ///
     /// No Metal 4 device, or a device whose queue could not be created. Both
     /// are boot conditions, not runtime ones.
-    pub fn create(config_bytes: &[u8]) -> Result<(Self, driver_abi::DeviceFacts)> {
+    pub fn create(config_bytes: &[u8]) -> Result<(Self, ::driver::DeviceFacts)> {
         let boot_descriptor = std::str::from_utf8(config_bytes)
             .ok()
             .and_then(|text| text.parse::<toml::Table>().ok())
@@ -111,8 +123,12 @@ impl MetalDriver {
                     .as_str()
                     .map(std::path::PathBuf::from)
             });
-        let context =
-            driver_metal_new::metal::Context::new().map_err(|e| anyhow!("metal context: {e:?}"))?;
+        let context = std::sync::Arc::new(
+            driver_metal_new::metal::Context::new()
+                .map_err(|e| anyhow!("metal context: {e:?}"))?,
+        );
+        let stepper = driver_metal_new::metal::Stepper::shared(context.clone())
+            .map_err(|e| anyhow!("metal stepper: {e:?}"))?;
         let compiler = driver_metal_new::metal::Compiler::new(&context)
             .map_err(|e| anyhow!("metal compiler: {e:?}"))?;
         // The facts a scheduler reads, stated from what this backend IS
@@ -122,8 +138,8 @@ impl MetalDriver {
         // `unified_memory` is the one that changes scheduling: on Apple
         // silicon the KV pool and the host share physical memory, so a
         // "device is full" question is a different question here.
-        let device_facts = driver_abi::DeviceFacts {
-            abi_version: driver_abi::PIE_DRIVER_ABI_VERSION,
+        let device_facts = ::driver::DeviceFacts {
+            abi_version: ::driver::PIE_DRIVER_ABI_VERSION,
             backend: "metal".to_string(),
             unified_memory: true,
             // Metal has no native fp8 path and no MXFP4 MoE kernel; the table
@@ -139,7 +155,8 @@ impl MetalDriver {
         };
         Ok((
             Self {
-                context,
+                context: context.clone(),
+                stepper,
                 registry: driver_metal_new::pipeline::Registry::new(),
                 device_facts: device_facts.clone(),
                 model: None,
@@ -159,13 +176,13 @@ impl MetalDriver {
 
     /// The device's stated facts.
     #[must_use]
-    pub fn device_facts(&self) -> &driver_abi::DeviceFacts {
+    pub fn device_facts(&self) -> &::driver::DeviceFacts {
         &self.device_facts
     }
 
     /// Metal exports no KV handle: there is no cross-process sharing path.
     #[must_use]
-    pub fn export_kv_handle(&self) -> Option<driver_abi::KvHandle> {
+    pub fn export_kv_handle(&self) -> Option<::driver::KvHandle> {
         None
     }
 
@@ -193,8 +210,8 @@ impl MetalDriver {
     /// not compile or stage.
     pub fn load_model(
         &mut self,
-        descs: Vec<driver_abi::ModelLoadDesc>,
-    ) -> Result<driver_abi::DriverCapabilities> {
+        descs: Vec<::driver::ModelLoadDesc>,
+    ) -> Result<::driver::DriverCapabilities> {
         let [desc] = descs.as_slice() else {
             bail!(
                 "driver-metal-new holds ONE model; got {} descriptors",
@@ -256,9 +273,14 @@ impl MetalDriver {
         // the tensors the checkpoint actually shipped. The three binding facts
         // — qk-norm, fused QKV, attention bias — ask the TENSORS, because a
         // config states an architecture and a tensor states a binding.
-        self.deployment = Some(driver_metal_new::model::text::facts_from(
+        // Two probes: which tensors the checkpoint shipped, and which of them
+        // the load left in MXFP4. The second is what a MIXTURE needs -- a
+        // checkpoint need not quantize uniformly, and reading an expert bank
+        // with the dense format is NaNs rather than a near miss.
+        self.deployment = Some(driver_metal_new::model::text::facts_from_with(
             &geometry,
             |name| loaded.tensors.contains_key(name),
+            |name| loaded.mxfp4.contains(name),
         ));
         self.inv_freq = driver_metal_new::model::rope::frequencies(
             geometry.head_dim,
@@ -293,8 +315,8 @@ impl MetalDriver {
         // against what was actually allocated. It read zero while no pool
         // existed, which was the truth then and the reason nothing was
         // admitted.
-        Ok(driver_abi::DriverCapabilities {
-            abi_version: driver_abi::PIE_DRIVER_ABI_VERSION,
+        Ok(::driver::DriverCapabilities {
+            abi_version: ::driver::PIE_DRIVER_ABI_VERSION,
             total_pages: pages,
             kv_page_size: self.device_facts.page_size,
             swap_pool_size: 0,
@@ -316,7 +338,7 @@ impl MetalDriver {
             has_attn_score: false,
             has_attn_page_mask: false,
             has_lora: false,
-            model_site_summary: driver_abi::ModelSiteSummary::default(),
+            model_site_summary: ::driver::ModelSiteSummary::default(),
             device_geometry_port_mask: 0,
             // The ceilings a scheduler batches under. Stated rather than
             // unbounded: a fire wider than this has no arena sized for it.
@@ -412,7 +434,7 @@ impl MetalDriver {
             .map_err(|e| anyhow!("metal register_channel: {e:?}"))?;
         Ok(RegisteredChannel {
             driver_id: desc.driver_id,
-            binding: driver_abi::PieChannelEndpointBinding {
+            binding: ::driver::PieChannelEndpointBinding {
                 channel_id: endpoint.channel_id,
                 mirror_base: endpoint.mirror_base,
                 word_base: endpoint.word_base,
@@ -461,7 +483,7 @@ impl MetalDriver {
                 &seeds,
             )
             .map_err(|e| anyhow!("metal bind_instance: {e:?}"))?;
-        let binding = driver_abi::PieInstanceBinding {
+        let binding = ::driver::PieInstanceBinding {
             instance_id,
             geometry_class: desc.geometry_class as u32,
             reserved0: 0,
@@ -524,6 +546,26 @@ impl MetalDriver {
             .clone()
             .ok_or_else(|| anyhow!("driver-metal-new: launch before load_model"))?;
         let named = std::collections::HashMap::new();
+
+        // ONE timeline for the whole frame, so a step is QUEUED while the
+        // previous one runs rather than after it finishes.
+        //
+        // Every step used to build its own `Stepper` and end in a wait, which
+        // made the frame N submissions and N full GPU stalls. `Stepper` is
+        // bounded internally -- it waits for the step two back, because there
+        // are two command allocators -- so this is one fire in flight while
+        // one runs, which is the shape run-ahead wants
+        // (`.wiki/new-driver/next.md`, priority 1).
+        //
+        // Command buffers committed to one queue execute in submission order,
+        // which is what makes this SAFE for steps that depend on each other:
+        // step n+1 reads the KV step n appended.
+        //
+        // Still per-FRAME rather than per-driver, and the reason is a
+        // lifetime: `Stepper<'ctx>` borrows the `Context` this struct owns, so
+        // holding one across `launch` calls is a self-reference. Making it own
+        // an `Arc<Context>` is what across-frame run-ahead needs next.
+        let mut in_flight: Vec<(&crate::driver::submission::StepSubmission, _)> = Vec::new();
 
         for step in &frame.steps {
             let s = driver_metal_new::model::frame::Step {
@@ -619,10 +661,11 @@ impl MetalDriver {
                     // answers zero, and a zero seq stride is every step of the
                     // scan reading the same token.
                     .with_pool(pool.shape());
-            let arena = driver_metal_new::model::run::run_keeping_arena(
+            let fire = driver_metal_new::model::run::submit(
                 &self.context,
                 &self.compiler,
                 &mut self.pipelines,
+                &mut self.stepper,
                 &lowered,
                 geometry,
                 &mut store,
@@ -637,18 +680,29 @@ impl MetalDriver {
                 } else {
                     anyhow!("metal fire: {e:?}; unresolved names: {missed:?}")
                 }
-            })?
-            .1;
+            })?;
+            // Committed, not waited for. `lowered` is dropped at the end of
+            // this iteration, so the read-out's shape is carried forward with
+            // the fire rather than looked up again.
+            in_flight.push((step, (fire, lowered.readout)));
+        }
 
-            // ── The read-out, and the channel plane over it. ──
-            //
+        // ── The read-outs, and the channel plane over them. ──
+        //
+        // After the whole frame is committed, in submission order. Reading an
+        // arena before its fire retires is reading whatever the last fire left
+        // there, which is a plausible tensor and the wrong one.
+        for (step, (fire, readout)) in &in_flight {
+            self.stepper
+                .wait_for(fire.value)
+                .map_err(|e| anyhow!("metal fire {}: {e:?}", fire.value))?;
             // What the fire COMPUTED, handed to the programs bound to this
             // frame. Until this landed the seam ran every launch and dropped
             // the arena, so a green frame and a frame that computed the wrong
             // thing were the same observation — `pipeline::step` had no
             // production caller at all, and the interpreter was exercised
             // only by tests that built their own inputs.
-            let logits = read_logits(&arena, &lowered);
+            let logits = read_logits(&fire.arena, *readout);
             let inputs = logits.as_ref().map_or_else(
                 driver_metal_new::pipeline::PassInputs::none,
                 |(v, rows, vocab)| driver_metal_new::pipeline::PassInputs {
@@ -825,9 +879,9 @@ impl MetalDriver {
 /// was lost in the kernel.
 fn read_logits(
     arena: &driver_metal_new::metal::Handle,
-    lowered: &model_compiler::lower::Lowered,
+    readout: Option<model_compiler::lower::Readout>,
 ) -> Option<(Vec<f32>, u32, u32)> {
-    let r = lowered.readout?;
+    let r = readout?;
     let span = r.rows as usize * r.vocab as usize * r.bytes as usize;
     if r.at + span > arena.len() as usize {
         return None;

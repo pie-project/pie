@@ -39,11 +39,11 @@
 //! is a `u32`. Narrowing it to `u16` to fit the old field would be a silent
 //! collision at 65536, so the field is a `u32` and its suffix width is eight.
 //!
-//! [`ProgramRegistration::emitter_version`]: driver_abi::plan::ProgramRegistration::emitter_version
+//! [`ProgramRegistration::emitter_version`]: driver::plan::ProgramRegistration::emitter_version
 
 use std::fmt::Write as _;
 
-use driver_abi::plan::LaunchStagePlan;
+use driver::plan::LaunchStagePlan;
 use tensor_ir::fnv1a64;
 
 /// Which device shell is compiling.
@@ -103,7 +103,7 @@ pub struct Versions {
     /// `tensor_compiler::plan::LANE_TABLE_ABI_VERSION` — the layout the lane
     /// table is written in, which the emitted kernels index directly.
     pub lane_table: u32,
-    /// [`ProgramRegistration::emitter_version`](driver_abi::plan::ProgramRegistration::emitter_version)
+    /// [`ProgramRegistration::emitter_version`](driver::plan::ProgramRegistration::emitter_version)
     /// — the host emitter that produced the kernels being compiled. Taken from
     /// the registration, never hardcoded; see the module docs.
     pub emitter: u32,
@@ -140,7 +140,7 @@ impl Versions {
     /// owns — and it had already drifted to 36 by the time anyone looked. A
     /// copy of another process's version cannot do the job of noticing when
     /// that process changes, so `emitter` is a parameter and comes from
-    /// [`PieProgramDesc::emitter_version`](driver_abi::local::PieProgramDesc).
+    /// [`PieProgramDesc::emitter_version`](driver::local::PieProgramDesc).
     #[must_use]
     pub const fn mirrored(emitter: u32) -> Self {
         Self {

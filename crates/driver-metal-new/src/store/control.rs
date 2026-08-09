@@ -43,12 +43,12 @@
 //! distinction it already has to make: [`Refusal::status`] separates "this
 //! build cannot ever do that" from "that request was malformed".
 
-use driver_abi::local::{
+use driver::local::{
     PIE_ELASTIC_POOL_KV, PIE_ELASTIC_POOL_STATE, PIE_ELASTIC_POOL_WORKSPACE,
     PIE_MEMORY_DOMAIN_METAL_SHARED, PIE_STATUS_INVALID_ARGUMENT, PIE_STATUS_UNSUPPORTED,
     PieMemoryDomain,
 };
-use driver_abi::plan::{KvCopyPlan, PoolResizePlan, StateCopyPlan};
+use driver::plan::{KvCopyPlan, PoolResizePlan, StateCopyPlan};
 
 use super::kv_move::{CellMovePlan, KvMoveCell, PoolGrid, plan_cell_moves};
 
@@ -358,7 +358,7 @@ pub fn plan_pool_resize(plan: &PoolResizePlan, caps: Capabilities) -> Result<Res
 
 #[cfg(test)]
 mod tests {
-    use driver_abi::local::{
+    use driver::local::{
         PIE_MEMORY_DOMAIN_HOST_PINNED, PIE_MEMORY_DOMAIN_METAL_PRIVATE, PieKvMoveCell,
         PieStateCopyRange,
     };

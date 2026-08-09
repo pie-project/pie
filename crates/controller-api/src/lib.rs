@@ -24,9 +24,9 @@ use serde::{Deserialize, Serialize};
 // consumers can still reach them as `controller_api::{WorkerId, …}`.
 pub use ids::{GatewayId, NodeId, WorkerId};
 
-// `DriverCapabilities` is owned by `driver-abi` (`capabilities.rs`);
+// `DriverCapabilities` is owned by `driver` (`capabilities.rs`);
 // `WorkerInfo.capability` carries it.
-use driver_abi::capabilities::DriverCapabilities;
+use driver::capabilities::DriverCapabilities;
 
 // ──────────────────────────── role / health ───────────────────────────
 

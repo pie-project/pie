@@ -38,7 +38,7 @@
 //! Anything only one backend's driver reads lives under that backend, not here
 //! — see [`cuda::region_analysis`].
 //!
-//! Those last two are built out of [`driver_abi`], which is why this crate
+//! Those last two are built out of [`driver`], which is why this crate
 //! is the one that reaches outside `compiler/`. That crate is the contract, not
 //! a driver: the compiler writes a `LaunchPackage` and the driver reads one out
 //! of the same declarations, so there is no second copy to keep in step.

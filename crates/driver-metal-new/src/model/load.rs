@@ -36,6 +36,22 @@ pub struct Loaded {
     pub region: Handle,
     /// Checkpoint tensor name → its address and extent.
     pub tensors: HashMap<String, Slice>,
+    /// Weights the plan leaves in MXFP4, by name.
+    ///
+    /// The load's job is to get the bytes onto the device unchanged; what
+    /// they MEAN is the binder's business (`.wiki/new-driver/next.md`,
+    /// priority 2). This is how the load tells the binder, and it is a set of
+    /// names rather than a flag because a checkpoint need not be uniform:
+    /// `mlx-community/gpt-oss-20b-MXFP4-Q4` names 98 tensors as affine/64/4
+    /// in its `quantization` block and leaves the expert banks out, so they
+    /// take the top-level default -- mxfp4, group 32.
+    ///
+    /// Reading a bank with the dense format is not a near miss. Every scale
+    /// comes from the wrong offset and bf16 garbage is NaN more often than
+    /// not: measured, the fire bound every name, ran all 484 statements, and
+    /// produced NaNs from the first routed projection of layer 0 onward while
+    /// every structural gate passed.
+    pub mxfp4: std::collections::HashSet<String>,
 }
 
 impl std::fmt::Debug for Loaded {
@@ -85,5 +101,21 @@ pub fn load(context: &Context, snapshot_dir: &Path, descriptor_json: &str) -> Re
             })
         })
         .collect();
-    Ok(Loaded { region, tensors })
+    let mxfp4 = plan
+        .tensors
+        .iter()
+        .filter(|t| {
+            matches!(
+                &t.encoding,
+                model_loader::types::Encoding::Quant(spec)
+                    if spec.scheme == model_loader::types::QuantScheme::Mxfp4E2M1E8M0
+            )
+        })
+        .map(|t| t.name.clone())
+        .collect();
+    Ok(Loaded {
+        region,
+        tensors,
+        mxfp4,
+    })
 }

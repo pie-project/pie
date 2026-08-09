@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::driver::ChannelEndpoint;
-use driver_abi::PieChannelEndpointBinding;
+use ::driver::PieChannelEndpointBinding;
 use tensor_ir::container::{self, ChanDType, ChannelDecl, ExternDir, HostRole};
 use tensor_ir::types::DType;
 

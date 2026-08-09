@@ -417,7 +417,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // hardwired to (0, 0) until the per-driver core lands) can physically
     // move KV bytes to/from host swap — arms the suspend rung.
     let kv_swap_required =
-        driver_abi::KV_COPY_DEVICE_TO_HOST | driver_abi::KV_COPY_HOST_TO_DEVICE;
+        ::driver::KV_COPY_DEVICE_TO_HOST | ::driver::KV_COPY_HOST_TO_DEVICE;
     let kv_swap_capable = driver_configs
         .first()
         .is_some_and(|d| d.kv_copy_domain_mask & kv_swap_required == kv_swap_required);
@@ -619,7 +619,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                             |kv| kv.committed_high_water_pages().max(1),
                         );
                         let capacity = capacities[ordinal] as u32;
-                        let unmap_ranges = vec![driver_abi::PiePoolRange {
+                        let unmap_ranges = vec![::driver::PiePoolRange {
                             page_index: u64::from(target),
                             page_count: u64::from(capacity - target),
                         }];
@@ -631,7 +631,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                         }
                         if let Ok(completion) = crate::scheduler::resize_pool(
                             driver_id,
-                            driver_abi::PIE_ELASTIC_POOL_KV,
+                            ::driver::PIE_ELASTIC_POOL_KV,
                             u64::from(target),
                             Vec::new(),
                             unmap_ranges,
@@ -653,7 +653,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                                     if applied[ordinal][1] != Some(state_pages)
                                         && let Ok(state) = crate::scheduler::resize_pool(
                                             driver_id,
-                                            driver_abi::PIE_ELASTIC_POOL_STATE,
+                                            ::driver::PIE_ELASTIC_POOL_STATE,
                                             state_pages,
                                             Vec::new(),
                                             Vec::new(),
@@ -670,7 +670,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                                 if applied[ordinal][2] != Some(0)
                                     && let Ok(workspace) = crate::scheduler::resize_pool(
                                         driver_id,
-                                        driver_abi::PIE_ELASTIC_POOL_WORKSPACE,
+                                        ::driver::PIE_ELASTIC_POOL_WORKSPACE,
                                         0,
                                         Vec::new(),
                                         Vec::new(),

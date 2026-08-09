@@ -40,8 +40,8 @@
 //! nothing and is the difference between a large allocation and a heap
 //! corruption, so both functions here answer in [`u64`].
 
-use driver_abi::local::PIE_EXTENT_STATIC;
-use driver_abi::plan::LaunchPlanValue;
+use driver::local::PIE_EXTENT_STATIC;
+use driver::plan::LaunchPlanValue;
 use tensor_ir::DType;
 use tensor_ir::types::MAX_RANK;
 

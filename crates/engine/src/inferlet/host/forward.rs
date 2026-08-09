@@ -740,10 +740,10 @@ impl ProcessCtx {
                         tensor_ir::container::PortSource::Channel(_)
                     )
             });
-            let devgeo_capable = device_port_mask & driver_abi::PIE_DEVICE_GEOMETRY_PORTS
-                == driver_abi::PIE_DEVICE_GEOMETRY_PORTS
+            let devgeo_capable = device_port_mask & ::driver::PIE_DEVICE_GEOMETRY_PORTS
+                == ::driver::PIE_DEVICE_GEOMETRY_PORTS
                 && (!needs_mask_port
-                    || device_port_mask & driver_abi::PIE_DEVICE_PORT_ATTN_MASK != 0);
+                    || device_port_mask & ::driver::PIE_DEVICE_PORT_ATTN_MASK != 0);
             let devgeo = match crate::pipeline::fire::lease::detect_device_geometry(
                 &prog.bound.container,
             ) {
@@ -877,11 +877,11 @@ impl ProcessCtx {
                 None => None,
             };
             let geometry_class = if devgeo.is_some() {
-                driver_abi::GeometryClass::DeviceGeometry
+                ::driver::GeometryClass::DeviceGeometry
             } else if decode_envelope.is_some() {
-                driver_abi::GeometryClass::DecodeEnvelope
+                ::driver::GeometryClass::DecodeEnvelope
             } else {
-                driver_abi::GeometryClass::Host
+                ::driver::GeometryClass::Host
             };
             let rs_reps = rs_working_sets.iter().map(Resource::rep).collect();
 
@@ -920,13 +920,13 @@ impl ProcessCtx {
                     extern_dir: extern_binding
                         .map(|(_, dir)| match dir {
                             tensor_ir::container::ExternDir::Import => {
-                                driver_abi::PIE_CHANNEL_EXTERN_IMPORT
+                                ::driver::PIE_CHANNEL_EXTERN_IMPORT
                             }
                             tensor_ir::container::ExternDir::Export => {
-                                driver_abi::PIE_CHANNEL_EXTERN_EXPORT
+                                ::driver::PIE_CHANNEL_EXTERN_EXPORT
                             }
                         })
-                        .unwrap_or(driver_abi::PIE_CHANNEL_EXTERN_NONE),
+                        .unwrap_or(::driver::PIE_CHANNEL_EXTERN_NONE),
                     capacity: decls[dense].capacity,
                     reader_wait_id: 0,
                     writer_wait_id: 0,

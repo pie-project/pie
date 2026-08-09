@@ -35,7 +35,7 @@ use model_loader::types::{
     BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec, TensorId,
 };
 use model_loader::verify::ContractView;
-use model_loader_capi::view::verify_marshalled;
+use model_loader::verify::verify_plan;
 
 // ── the checkpoints ─────────────────────────────────────────────────
 
@@ -450,7 +450,7 @@ fn check(name: &str, metadata: &CheckpointMetadata, target: StorageTarget) {
     let plan = compile_load_plan(metadata, &contract, target)
         .unwrap_or_else(|err| panic!("{name}: compiling failed: {err}"));
 
-    if let Err(violations) = verify_marshalled(&plan, Some(&ContractView::of(&contract))) {
+    if let Err(violations) = verify_plan(&plan, Some(&ContractView::of(&contract))) {
         let listed: Vec<String> = violations.iter().map(ToString::to_string).collect();
         panic!(
             "{name}: the plan does not honour its contract:\n  {}",

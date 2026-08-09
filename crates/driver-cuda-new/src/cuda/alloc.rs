@@ -439,6 +439,35 @@ impl DeviceBuffer {
         )
     }
 
+    /// Fill a SPAN of this buffer with a byte value, ordered on `stream`.
+    ///
+    /// # Errors
+    ///
+    /// If the span leaves the allocation.
+    pub fn memset_at(
+        &mut self,
+        offset: usize,
+        len: usize,
+        value: u8,
+        stream: StreamRef<'_>,
+    ) -> Result<()> {
+        self.check_span("cudaMemsetAsync (memset_at)", offset, len)?;
+        if len == 0 {
+            return Ok(());
+        }
+        check_rt(
+            unsafe {
+                cudaMemsetAsync(
+                    self.ptr.as_raw().byte_add(offset),
+                    i32::from(value),
+                    len,
+                    stream.as_raw(),
+                )
+            },
+            "cudaMemsetAsync",
+        )
+    }
+
     /// Copy host bytes into a SPAN of this buffer, ordered on `stream`.
     ///
     /// The offset form exists because the PTIR plane's buffers are arrays of

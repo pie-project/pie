@@ -46,7 +46,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use driver_pipeline::driver_abi::plan::LaunchStagePlan;
+use driver_pipeline::driver::plan::LaunchStagePlan;
 use driver_pipeline::{
     Backend, Bounded, CacheStats, Emitted, ExecPlan, Failure, Lookup, MAX_NEGATIVE_ENTRIES,
     MAX_PROGRAM_ENTRIES, MAX_STAGE_ENTRIES, Slot, Stages, Versions, cache_identity,
@@ -62,10 +62,10 @@ use super::nvrtc::{self, FailureKind};
 /// Taken from the ABI rather than written as a literal: the numbering is the
 /// host's, and a driver that hardcodes it looks up an empty slot forever after
 /// a renumbering instead of failing at the seam.
-const KERNEL_FUSED: u32 = driver_pipeline::driver_abi::local::PIE_KERNEL_FUSED;
+const KERNEL_FUSED: u32 = driver_pipeline::driver::local::PIE_KERNEL_FUSED;
 
 /// `PIE_REGION_LIBRARY` — a region the driver implements rather than compiles.
-const REGION_LIBRARY: u8 = driver_pipeline::driver_abi::local::PIE_REGION_LIBRARY;
+const REGION_LIBRARY: u8 = driver_pipeline::driver::local::PIE_REGION_LIBRARY;
 
 /// One compiled region: the module that holds it and how wide to launch it.
 #[derive(Debug)]
@@ -493,7 +493,7 @@ mod tests {
     fn cuda_compiles_the_fused_kind_the_abi_names() {
         assert_eq!(
             KERNEL_FUSED,
-            driver_pipeline::driver_abi::local::PIE_KERNEL_FUSED
+            driver_pipeline::driver::local::PIE_KERNEL_FUSED
         );
     }
 }

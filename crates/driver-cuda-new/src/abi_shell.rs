@@ -2,7 +2,7 @@
 //! plan phase D).
 //!
 //! The engine consumes a driver through `pie_driver_abi.h`, whose Rust
-//! source of truth is `driver_abi::local`. This module DEFINES the symbols
+//! source of truth is `driver::local`. This module DEFINES the symbols
 //! that crate declares; a test resolving the declaration against these
 //! definitions makes the linker prove the contract, the same way the
 //! launch bridge's shim makes the C++ compiler prove the rows.
@@ -26,12 +26,12 @@
 
 // Every export takes raw pointers by C-ABI necessity and null-checks them
 // before the deref — the same defensive shape the C++ shell has. The
-// caller-side contract is `driver_abi::local`'s `unsafe extern` block;
+// caller-side contract is `driver::local`'s `unsafe extern` block;
 // marking the DEFINITIONS `unsafe fn` would change their ABI type for a
 // fact the boundary already states.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use driver_abi::local::{
+use driver::local::{
     PIE_DRIVER_ABI_VERSION, PIE_STATUS_DRIVER_ERROR, PIE_STATUS_EXHAUSTED,
     PIE_STATUS_INVALID_ARGUMENT, PIE_STATUS_OK,
     PIE_STATUS_UNSUPPORTED, PieChannelDesc, PieChannelEndpointBinding, PieCompletion,
@@ -48,6 +48,70 @@ struct Shell {
     /// `[model] descriptor` from the boot TOML, for HF snapshots whose
     /// descriptor does not ride inside the checkpoint.
     boot_descriptor: Option<std::path::PathBuf>,
+    /// Does this driver hand its completions to a stream callback and
+    /// return with the fire still queued? See `runahead_env`.
+    runahead: bool,
+    /// The traced-and-lowered program for a fire SHAPE, kept.
+    ///
+    /// Tracing the forward, lowering it and joining the ops back onto the
+    /// launches is ~3.3 ms per fire on a 0.6B decode — 1.25 ms of trace,
+    /// 1.85 ms of lowering, 0.17 ms of dispatch plan — and it is a pure
+    /// function of the key below. It was being redone on every launch, which
+    /// on a decode is most of the time the call takes.
+    ///
+    /// Keyed by what the answer can depend on: which model, which fire class,
+    /// how many rows, and whether a union was ASKED for. The union may still
+    /// be declined after the servability test, so the answer records what was
+    /// actually built rather than what was requested.
+    lowerings: std::collections::BTreeMap<LoweringKey, LoweredFire>,
+    /// The cuBLAS handle, created once.
+    ///
+    /// It used to be created and DESTROYED inside every fire, and
+    /// `cublasDestroy` costs **3.2 ms** — measured, and it was three quarters
+    /// of what a warm decode spent being issued. Creating one per fire also
+    /// meant a fresh workspace allocation each time, which is the part that
+    /// actually takes the time.
+    ///
+    /// The stream is rebound per fire instead, which is what `cublasSetStream`
+    /// is for.
+    cublas: Option<crate::cuda::cublas::CublasHandle<cudarc::cublas::sys::cublasHandle_t>>,
+    /// The fire's predicate word, allocated once.
+    ///
+    /// PERSISTENT for two reasons, and the second is correctness. It used to
+    /// be built and dropped inside every `capture_or_replay`, which is a
+    /// `cudaMalloc` and a `cudaFree` per fire — and `cudaFree` SYNCHRONIZES
+    /// THE DEVICE, so the run-ahead the rest of this file is built around was
+    /// being undone by the graph path. It is also the address a captured
+    /// graph BAKES: a word that is freed and reallocated between two replays
+    /// is one whose address the exec has no reason to still be right about.
+    preds: Option<crate::cuda::PredicateWord>,
+    /// The fire's peel-window word, allocated once. Same reasoning as
+    /// [`Shell::preds`]: it was a `cudaMalloc` and a `cudaFree` per fire, and
+    /// `cudaFree` synchronizes the device.
+    peel_win: Option<crate::cuda::PeelWindowWord>,
+    /// The pinned host buffer the logits D2H lands in, grown to fit and
+    /// reused. The shell's rather than the fire's because a stream
+    /// callback may not free it — see `FireDebt::staging`.
+    logits_staging: Option<crate::cuda::PinnedBuf>,
+    /// Is this boot MEASURING rather than serving? `[driver]
+    /// calibrate_planner`.
+    ///
+    /// READ BY NOTHING YET, and the reason is recorded in
+    /// `.wiki/new-driver/next.md`: the sweep works — it measures a ladder and
+    /// stores a winner — but only below the shape this driver ADVERTISES,
+    /// because a fire it cannot bind aborts inside a CUDA seam
+    /// (`attention_workspace`'s `assert!` on the runtime status) instead of
+    /// returning one. A probe that cannot fail safely cannot probe, so the
+    /// flag is parsed and nothing acts on it until the fire path refuses.
+    #[allow(dead_code)]
+    calibrating: bool,
+    /// This driver's place in its tensor-parallel group, from
+    /// `[driver] tp_rank` / `tp_size`. One rank, rank zero, unless told
+    /// otherwise — and the two numbers travel together into both the load
+    /// plan and the KV geometry, so a rank cannot be one width for its
+    /// weights and another for its cache.
+    tp_rank: u32,
+    tp_size: u32,
     /// The loaded model, once `load_model` succeeds.
     model: Option<LoadedModel>,
     /// Registered programs by id — the C3 hash is the dedup key, so
@@ -59,7 +123,7 @@ struct Shell {
     /// simpler, and nothing in the ABI wants them dense).
     next_id: u64,
     /// The runtime's notify callback + its context, from `create`.
-    notify: driver_abi::local::PieRuntimeNotifyFn,
+    notify: driver::local::PieRuntimeNotifyFn,
     notify_ctx: *mut std::ffi::c_void,
     /// The hybrid's GDN state slabs, allocated on first hybrid launch.
     gdn: Option<GdnState>,
@@ -115,6 +179,9 @@ struct Shell {
     /// `None` until the first launch, because a driver that never fires
     /// should not hold a stream.
     fire_stream: Option<crate::cuda::OwnedStream>,
+    /// The fire that is still running, if any — see [`InFlight`]. One
+    /// slot, so the driver runs exactly one fire ahead.
+    in_flight: std::collections::VecDeque<InFlight>,
     /// The allocator every fire's transient device memory comes from.
     /// Held for the pool, and dropped with the shell.
     fire_alloc: Option<crate::cuda::Allocator>,
@@ -175,6 +242,7 @@ impl SwapPool {
 
 /// One channel's host endpoint: the pinned mirror and the four control
 /// words, exactly the C++ registry's binding contract.
+#[derive(Clone, Copy)]
 struct ChannelState {
     mirror: *mut std::ffi::c_void,
     words: *mut std::ffi::c_void,
@@ -183,6 +251,163 @@ struct ChannelState {
     /// `capacity + 1` — the ring modulus.
     ring: u32,
     host_role: u8,
+}
+
+/// A fire's transient device memory, kept alive until the fire retires.
+///
+/// **`cudaFree` synchronizes the device.** So a fire that returns with
+/// work still queued and then drops its scratch drains its own stream
+/// inside the call — which is exactly what the first run-ahead attempt
+/// did, and `a_launch_returns_before_its_fire_retires` caught it: the
+/// completion fired on the calling thread because freeing the LSE buffer
+/// waited for the fire that was still using it.
+///
+/// Freeing on the CALLBACK thread is not the fix either: CUDA forbids
+/// calling into the runtime from a host callback, and `cudaFree` is the
+/// runtime.
+///
+/// So the buffers outlive the call and the NEXT launch reclaims them,
+/// after waiting on the event that says the fire they belong to is done.
+/// That wait is where the run-ahead depth lives: with one holder the
+/// driver runs one fire ahead, which is the whole of the property and the
+/// smallest thing that has it.
+struct InFlight {
+    done: crate::cuda::Event,
+    /// Ordinary scratch. Named for what it is rather than listed, because
+    /// the point is that nothing here is read again — it is held only so
+    /// that dropping it does not synchronize at the wrong moment.
+    scratch: Vec<crate::cuda::DeviceBuffer>,
+}
+
+/// How many fires the driver may have queued ahead of the GPU.
+///
+/// Backpressure by SCRATCH, not by time: each in-flight fire holds the
+/// buffers it is still writing, so the bound is on how much the driver is
+/// carrying rather than on how far ahead it has run.
+///
+/// Two, which is the C++'s `kSchedulerMaxInFlight` minus the frame the
+/// engine itself is holding. One is what this had, and one is not run-ahead:
+/// the call that would queue fire n+1 waited for fire n.
+const RUNAHEAD_DEPTH: usize = 2;
+
+/// What a lowering can depend on: see [`Shell::lowerings`].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct LoweringKey {
+    model_id: u64,
+    class: model_compiler::trace::FireClass,
+    rows: u32,
+    union_asked: bool,
+}
+
+/// A traced, lowered and joined program, and whether it kept its union.
+struct LoweredFire {
+    plan: model_compiler::trace::ForwardPlan,
+    lowered: model_compiler::lower::Lowered,
+    dplan: crate::model::executor::DispatchPlan,
+    union: bool,
+}
+
+/// EVERYTHING A FIRE STILL OWES WHEN ITS WORK IS ENQUEUED.
+///
+/// The driver used to pay these debts on the calling thread, after a
+/// `stream.synchronize()`: widen the logits, publish them, mark the
+/// terminal cells, notify. That is why `pie_cuda_launch` was synchronous
+/// and why the engine's `frame_dispatch_depth` was serialized by the
+/// driver — the call that would enqueue fire n+1 had not returned.
+///
+/// So the debts move into a stream-ordered HOST CALLBACK. It runs when
+/// everything queued before it has retired, on a CUDA-owned thread, and
+/// everything it needs is here because a callback cannot borrow.
+///
+/// The staging buffer is the reason this is a struct rather than a
+/// closure: the D2H used to land in a `Vec` on the stack, which is a
+/// use-after-free the moment the call returns before the copy does.
+///
+/// **The debt BORROWS that buffer; it does not own it.** A callback may
+/// not make CUDA runtime calls, and freeing pinned memory is one — an
+/// owned `PinnedBuf` here means `cudaFreeHost` on a CUDA-owned thread,
+/// which is undefined and shows up as heap corruption several fires
+/// later. It is the same rule that put the device scratch in `InFlight`.
+/// The buffer is the shell's, reused every fire.
+struct FireDebt {
+    /// The bf16 logits, D2H'd into the SHELL's pinned staging by a
+    /// stream-ordered copy, as (pointer, length).
+    ///
+    /// PINNED, and that is the whole reason the shell keeps one:
+    /// `cudaMemcpyAsync` into pageable host memory blocks until the copy
+    /// completes, so a `Vec` here drains the stream inside
+    /// `pie_cuda_launch` and undoes the run-ahead.
+    staging: Option<(*const u8, usize)>,
+    /// Where the widened cell goes, and how wide the readout is.
+    channel: Option<ChannelState>,
+    vocab: usize,
+    /// Which row carries the answer — the fire's last.
+    last_row: usize,
+    /// The terminal cells this frame publishes, and the completion the
+    /// runtime is waiting on.
+    cells: Vec<*mut driver::local::PieTerminalCell>,
+    completion: PieCompletion,
+    notify: driver::local::PieRuntimeNotifyFn,
+    notify_ctx: *mut std::ffi::c_void,
+}
+
+// The debt crosses to a CUDA callback thread. Every field is either owned
+// bytes or a raw pointer into memory the runtime keeps alive for the
+// driver's lifetime — the channel's mirror and words are the engine's
+// mapping, the terminal cells are the frame's.
+unsafe impl Send for FireDebt {}
+
+/// The stream-ordered callback: pay the debt, then drop it.
+///
+/// # Safety
+///
+/// `data` is a `Box<FireDebt>` leaked by the enqueuing side. CUDA forbids
+/// calling back into the runtime from here, and nothing below does: this
+/// is host memory, a volatile write and a function pointer.
+unsafe extern "C" fn retire_fire(data: *mut std::ffi::c_void) {
+    if data.is_null() {
+        return;
+    }
+    let debt = unsafe { Box::from_raw(data.cast::<FireDebt>()) };
+
+    // The logits, widened bf16 -> f32 and published. The widening is the
+    // wire's, not the model's: the ring's cell is f32 and the device
+    // wrote bf16, so the shift is the conversion.
+    if let (Some(ch), Some(&(ptr, len))) = (debt.channel.as_ref(), debt.staging.as_ref())
+        && debt.vocab > 0
+    {
+        // SAFETY: the shell's staging buffer, alive for the driver's
+        // lifetime, and the D2H that filled it is ordered before this
+        // callback on the same stream.
+        let staged = unsafe { std::slice::from_raw_parts(ptr, len) };
+        let mut cell = vec![0u8; debt.vocab * 4];
+        for t in 0..debt.vocab {
+            let off = (debt.last_row * debt.vocab + t) * 2;
+            if off + 1 < staged.len() {
+                let bits = u16::from_le_bytes([staged[off], staged[off + 1]]);
+                cell[t * 4..t * 4 + 4].copy_from_slice(&(u32::from(bits) << 16).to_le_bytes());
+            }
+        }
+        if !ch.publish(&cell) {
+            eprintln!("[driver-cuda-new] launch: logits ring full; frame dropped its output");
+        }
+    }
+
+    // Then the terminal cells, then the notify — in that order, with a
+    // release between, because the runtime reads the cells the moment the
+    // notify lands.
+    for &cell in &debt.cells {
+        if !cell.is_null() {
+            unsafe {
+                std::ptr::addr_of_mut!((*cell).outcome)
+                    .write_volatile(driver::local::PIE_TERMINAL_OUTCOME_SUCCESS);
+            }
+        }
+    }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    if let Some(notify) = debt.notify {
+        unsafe { notify(debt.notify_ctx, debt.completion.wait_id, debt.completion.target_epoch) };
+    }
 }
 
 impl ChannelState {
@@ -243,6 +468,19 @@ struct FireArrays {
     named: std::collections::BTreeMap<model_compiler::trace::ValueId, crate::cuda::DeviceBuffer>,
     /// The small per-fire u32 descriptor arrays, by slot.
     slots: Vec<Option<crate::cuda::DeviceBuffer>>,
+    /// PINNED host staging for those uploads, ONE PER SLOT.
+    ///
+    /// A `cudaMemcpyAsync` out of PAGEABLE host memory is SYNCHRONOUS — it
+    /// blocks until the copy lands — and there are eight of these per fire.
+    /// A `Vec` here therefore drained the stream eight times inside
+    /// `pie_cuda_launch`, which is the same trap the logits D2H fell into.
+    ///
+    /// Per slot and not one shared buffer, because pinning is what makes the
+    /// copy genuinely ASYNCHRONOUS: a single buffer would be overwritten by
+    /// the next slot's upload while the previous copy was still queued. Two
+    /// fires cannot collide on one slot either — the next launch waits on the
+    /// previous fire's event before it reclaims anything (`InFlight`).
+    staging: Vec<Option<crate::cuda::PinnedBuf>>,
     epoch: u64,
 }
 
@@ -280,14 +518,26 @@ impl FireArrays {
         if self.slots.len() <= slot {
             self.slots.resize_with(slot + 1, || None);
         }
-        let bytes: Vec<u8> = vals.iter().flat_map(|x| x.to_le_bytes()).collect();
-        let need = bytes.len().max(4);
+        if self.staging.len() <= slot {
+            self.staging.resize_with(slot + 1, || None);
+        }
+        let live = vals.len() * 4;
+        let need = live.max(4);
+        if self.staging[slot].as_ref().is_none_or(|p| p.len() < need) {
+            self.staging[slot] =
+                Some(crate::cuda::PinnedBuf::new(need).map_err(|_| PIE_STATUS_EXHAUSTED)?);
+        }
+        let pin = self.staging[slot].as_mut().expect("just sized");
+        for (dst, v) in pin.as_mut_slice()[..live].chunks_exact_mut(4).zip(vals) {
+            dst.copy_from_slice(&v.to_le_bytes());
+        }
         if self.slots[slot].as_ref().is_none_or(|b| b.len() < need) {
             self.slots[slot] = Some(alloc.alloc(need).map_err(|_| PIE_STATUS_EXHAUSTED)?);
             self.epoch += 1;
         }
+        let src = &self.staging[slot].as_ref().expect("just sized").as_slice()[..live];
         let b = self.slots[slot].as_mut().expect("just ensured");
-        b.copy_from_host(&bytes, stream).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+        b.copy_from_host(src, stream).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
         Ok(b.as_ptr().cast_const().cast::<u32>())
     }
 
@@ -414,7 +664,15 @@ struct LoadedModel {
     hf: crate::model::config::HfConfig,
     /// The caps JSON `load_model` answered with; owned like `Shell::caps`.
     load_caps: Vec<u8>,
-    weights: std::collections::BTreeMap<String, crate::cuda::DeviceBuffer>,
+    /// Every tensor the plan named, as a span of the arena. A SPAN and not
+    /// an allocation: a resident plan lays the whole model out contiguously,
+    /// so a weight is an offset into one buffer rather than one of a thousand
+    /// `cudaMalloc`s.
+    weights: std::collections::BTreeMap<String, crate::loader::stage::WeightSpan>,
+    /// The arena, and anything the plan published outside it. Held so the
+    /// spans above stay valid; never indexed.
+    #[allow(dead_code)]
+    owned: Vec<crate::cuda::DeviceBuffer>,
     /// Trace-name RENAMES onto checkpoint names (`layer.3.attn_norm` →
     /// `model.layers.3.input_layernorm.weight`); concats get buffers of
     /// their own in `weights`, renames get a row here — no second copy of
@@ -425,6 +683,11 @@ struct LoadedModel {
     /// norm's whole-stream multiplier, carried into `DispatchCtx::scales`
     /// per fire. Empty on every other family.
     gemma_layer_scalars: Vec<f32>,
+    /// The group this rank's weights were sharded for, carried from the
+    /// shell so a family's facts and its load plan cannot disagree about
+    /// how wide a rank is. A forward derivation reads it to decide whether
+    /// its landing needs a collective.
+    tp_size: u32,
 }
 
 impl LoadedModel {
@@ -435,10 +698,10 @@ impl LoadedModel {
     #[allow(dead_code)]
     fn weight(&self, name: &str) -> Option<*const std::ffi::c_void> {
         if let Some(b) = self.weights.get(name) {
-            return Some(b.as_ptr().cast_const());
+            return Some(b.ptr.cast_const());
         }
         let target = self.aliases.get(name)?;
-        self.weights.get(target).map(|b| b.as_ptr().cast_const())
+        self.weights.get(target).map(|b| b.ptr.cast_const())
     }
 }
 
@@ -455,8 +718,7 @@ fn shell(driver: *mut PieDriver) -> Option<&'static mut Shell> {
 
 /// Create the driver. Refuses a null descriptor or a mismatched ABI
 /// version by returning null, as the C++ shell does.
-#[unsafe(no_mangle)]
-pub extern "C" fn pie_cuda_create(
+pub fn pie_cuda_create(
     desc: *const PieDriverCreateDesc,
     caps: *mut PieDriverCaps,
 ) -> *mut PieDriver {
@@ -466,23 +728,51 @@ pub extern "C" fn pie_cuda_create(
     if desc.abi_version != PIE_DRIVER_ABI_VERSION {
         return std::ptr::null_mut();
     }
-    // The boot TOML rides in `config_bytes`; `[model] descriptor` is the
-    // one key this shell reads today.
-    let boot_descriptor = (!desc.config_bytes.ptr.is_null())
+    // The boot TOML rides in `config_bytes`. Two keys are read today:
+    // `[model] descriptor` and `[driver] runahead`.
+    let boot = (!desc.config_bytes.ptr.is_null())
         .then(|| unsafe {
             std::slice::from_raw_parts(desc.config_bytes.ptr, desc.config_bytes.len)
         })
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
         .and_then(|text| text.parse::<toml::Table>().ok())
-        .and_then(|v| {
-            v.get("model")?
-                .get("descriptor")?
-                .as_str()
-                .map(std::path::PathBuf::from)
-        });
+        .unwrap_or_default();
+    let boot_descriptor = boot
+        .get("model")
+        .and_then(|m| m.get("descriptor")?.as_str())
+        .map(std::path::PathBuf::from);
+    // PER-DRIVER, not per-process, so a caller that wants asynchronous
+    // completions can ask for them without deciding for every other
+    // driver alive in the same process. The env var is the default the
+    // boot key overrides.
+    let runahead = boot
+        .get("driver")
+        .and_then(|d| d.get("runahead")?.as_bool())
+        .unwrap_or_else(runahead_env);
+    let driver_u32 = |key: &str, default: u32| {
+        boot.get("driver")
+            .and_then(|d| d.get(key)?.as_integer())
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(default)
+    };
+    let calibrating = boot
+        .get("driver")
+        .and_then(|d| d.get("calibrate_planner")?.as_bool())
+        .unwrap_or(false);
+    let tp_size = driver_u32("tp_size", 1).max(1);
+    let tp_rank = driver_u32("tp_rank", 0).min(tp_size - 1);
     let boxed = Box::new(Shell {
         caps: CAPS_JSON.as_bytes().to_vec(),
         boot_descriptor,
+        runahead,
+        cublas: None,
+        lowerings: std::collections::BTreeMap::new(),
+        calibrating,
+        preds: None,
+        peel_win: None,
+        logits_staging: None,
+        tp_rank,
+        tp_size,
         model: None,
         programs: std::collections::BTreeMap::new(),
         instances: std::collections::BTreeMap::new(),
@@ -497,6 +787,7 @@ pub extern "C" fn pie_cuda_create(
         swap: None,
         scratch: None,
         fire_stream: None,
+        in_flight: std::collections::VecDeque::new(),
         fire_alloc: None,
         ptir: crate::ptir::Runtime::default(),
         ptir_programs: crate::ptir::Programs::new(),
@@ -511,8 +802,7 @@ pub extern "C" fn pie_cuda_create(
 }
 
 /// Tear the driver down. Null is a no-op, as everywhere in the ABI.
-#[unsafe(no_mangle)]
-pub extern "C" fn pie_cuda_destroy(driver: *mut PieDriver) {
+pub fn pie_cuda_destroy(driver: *mut PieDriver) {
     if !driver.is_null() {
         let mut shell = unsafe { Box::from_raw(driver.cast::<Shell>()) };
         for ch in shell.channels.values() {
@@ -520,6 +810,11 @@ pub extern "C" fn pie_cuda_destroy(driver: *mut PieDriver) {
         }
         if let Some(swap) = &shell.swap {
             swap.free();
+        }
+        // The handle is the DRIVER's now, so its destructor is the driver's
+        // too — `CublasHandle` asserts it was released rather than dropped.
+        if let Some(mut h) = shell.cublas.take() {
+            h.release(&mut crate::cuda::cublas::LiveCublas);
         }
         if let Some(mut scratch) = shell.scratch.take() {
             let mut sops = crate::model::attention_workspace::LiveStagingOps;
@@ -539,8 +834,7 @@ pub extern "C" fn pie_cuda_destroy(driver: *mut PieDriver) {
 ///
 /// Still awaited here: quantized encodings (refused, not mis-loaded),
 /// the memory plan, and KV materialization — those land with `launch`.
-#[unsafe(no_mangle)]
-pub extern "C" fn pie_cuda_load_model(
+pub fn pie_cuda_load_model(
     driver: *mut PieDriver,
     load: *const PieModelLoadDesc,
     caps: *mut PieDriverCaps,
@@ -576,7 +870,6 @@ pub extern "C" fn pie_cuda_load_model(
 /// The load itself; `i32` errors are the ABI's status codes.
 fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result<(), i32> {
     use model_loader::checkpoint::read::{parse_checkpoint_metadata, read_meta};
-    use model_loader::types::Encoding;
 
     let meta = parse_checkpoint_metadata(snapshot).map_err(|e| {
         eprintln!("[driver-cuda-new] load_model: checkpoint parse: {e:?}");
@@ -607,358 +900,298 @@ fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result<(), i32> {
             PIE_STATUS_INVALID_ARGUMENT
         })?;
 
-    // Every raw bf16/fp32 weight, uploaded through one stream — fp32 is
-    // the GDN parameter side of the `gdn_fp32_parameters` contract
-    // (`A_log`, the gate norm), consumed as fp32 by its kernels.
-    // Quantized encodings refuse rather than mis-load.
-    let stream = crate::cuda::OwnedStream::new(0).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+    // THE LOAD IS `model-loader`'s PLAN, EXECUTED ONTO THE DEVICE.
+    //
+    // What this replaced: a loop that read each checkpoint tensor into a
+    // host `Vec`, uploaded it, and then read three of them BACK off the
+    // device to concatenate a `qkv` and uploaded that — three round trips
+    // for bytes a plan lays out once, and a thousand `cudaMalloc`s where
+    // a resident plan wants one arena.
+    //
+    // The plan also decides what the driver used to decide by hand: which
+    // encodings are loadable (a transform outside `CUDA_TILE_MAP_MASK` is
+    // refused when the plan COMPILES, with the tensor named, rather than
+    // mis-bound at launch), and which projections are fused.
+    let target = crate::loader::plan::cuda_storage_target(state.tp_rank, state.tp_size);
+    let (plan, _moe) =
+        crate::loader::plan::compile_load_plan(snapshot, &meta, &target, &descriptor_json)
+            .map_err(|e| {
+                eprintln!("[driver-cuda-new] load_model: {e}");
+                PIE_STATUS_UNSUPPORTED
+            })?;
     let alloc = crate::cuda::Allocator::new();
-    let mut weights = std::collections::BTreeMap::new();
-    let mut host = Vec::new();
-    for t in meta.weights() {
-        // WHAT A LOAD CAN HAND THE KERNELS, and nothing else.
-        //
-        // Two answers, and the difference is whether the driver has to
-        // change the bytes.
-        //
-        // RAW bf16/f32 is what most of a checkpoint is. (f32 is the GDN
-        // parameter side of the `gdn_fp32_parameters` contract — `A_log`,
-        // the gate norm — consumed as f32 by its kernels.)
-        //
-        // A BYTE PAYLOAD is also loadable, and finding out why took
-        // reading the file. gpt-oss's MXFP4 expert banks are not a
-        // `Quant` encoding at all — safetensors stores them as `U8`
-        // tensors (`…experts.down_proj_blocks`, `U8 [32, 2880, 90, 16]`,
-        // beside a `_scales` companion), and the MXFP4 MEANING lives in
-        // the checkpoint's `quantization_config`, which the contract
-        // reads. The tensor's dtype says only "bytes".
-        //
-        // That is the right division and it makes the load's job small:
-        // get the bytes on the device unchanged. What they MEAN is the
-        // binder's business, and `quant::mxfp4_moe_gate_up_decode_bf16`
-        // indexes the stored layout directly.
-        //
-        // What still refuses is an encoding whose kernels want a
-        // DIFFERENT layout than the file has — a Marlin repack, an FP8
-        // re-encode, a GGUF block unpack. That is `transcode_engine`'s
-        // work in the retired C++ tree and it is not ported, so a
-        // checkpoint needing it is turned away at load rather than
-        // mis-bound at launch.
-        match &t.encoding {
-            Encoding::Raw(d)
-                if matches!(format!("{d:?}").as_str(), "BF16" | "F32" | "U8") => {}
-            Encoding::Quant(spec) if reads_its_stored_form(spec.scheme) => {}
-            other => {
-                eprintln!(
-                    "[driver-cuda-new] load_model: {}: unsupported encoding {other:?}. \
-                     Raw bf16/f32 and packed schemes the kernels read as stored \
-                     load; anything needing a transcode does not.",
-                    t.name
-                );
-                return Err(PIE_STATUS_UNSUPPORTED);
-            }
-        }
-        let file = meta
-            .files
-            .iter()
-            .find(|f| f.id == t.file_id)
-            .ok_or(PIE_STATUS_DRIVER_ERROR)?;
-        use std::io::{Read, Seek, SeekFrom};
-        let mut f = std::fs::File::open(snapshot.join(&file.path))
-            .or_else(|_| std::fs::File::open(&file.path))
-            .map_err(|_| PIE_STATUS_INVALID_ARGUMENT)?;
-        f.seek(SeekFrom::Start(t.file_offset)).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-        host.resize(usize::try_from(t.span_bytes).map_err(|_| PIE_STATUS_DRIVER_ERROR)?, 0);
-        f.read_exact(&mut host).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-        let mut buf = alloc.alloc(host.len()).map_err(|_| PIE_STATUS_EXHAUSTED)?;
-        buf.copy_from_host(&host, stream.as_ref()).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-        weights.insert(t.name.clone(), buf);
-    }
-    stream.as_ref().synchronize().map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+    let staged = crate::loader::stage::stage_plan_weights(&plan, snapshot, &alloc).map_err(
+        |e| {
+            eprintln!("[driver-cuda-new] load_model: staging: {e:?}");
+            PIE_STATUS_EXHAUSTED
+        },
+    )?;
 
     let mut model = LoadedModel {
         hf,
         load_caps: Vec::new(),
-        weights,
+        weights: staged.spans,
+        owned: staged.owned,
         aliases: std::collections::BTreeMap::new(),
         gemma_layer_scalars: Vec::new(),
+        tp_size: state.tp_size,
     };
-    fuse_llama_like(&mut model, &alloc, &stream)?;
-    alias_gemma4(&mut model, &alloc, &stream)?;
-    alias_qwen3_5(&mut model, &alloc, &stream)?;
-    model.load_caps = format!(
-        r#"{{"model_type":"{}","hidden":{},"layers":{},"vocab":{},"weights":{}}}"#,
-        model.hf.model_type,
-        model.hf.hidden_size,
-        model.hf.num_hidden_layers,
-        model.hf.vocab_size,
-        model.weights.len(),
-    )
-    .into_bytes();
+    wire_trace_names(&mut model);
     state.model = Some(model);
+    // AFTER the model is stored, because a calibration boot fires through the
+    // ordinary path and that path reads `state.model`.
+    let caps = capabilities_json(state, snapshot)?;
+    state.model.as_mut().expect("just stored").load_caps = caps;
     Ok(())
 }
 
-/// Build the llama-like fused trace names beside the checkpoint names —
-/// the A/B harness's binder, generalized over `HfConfig` and promoted
-/// into the shell. Families beyond llama-like keep their raw names; a
-/// later launch asking for an unfused trace name gets the resolver's
-/// drift refusal, which is the honest state until their binders land.
-fn fuse_llama_like(
-    model: &mut LoadedModel,
-    alloc: &crate::cuda::Allocator,
-    stream: &crate::cuda::OwnedStream,
-) -> Result<(), i32> {
-    let has = |m: &LoadedModel, n: &str| m.weights.contains_key(n);
-    if !has(model, "model.embed_tokens.weight") {
-        return Ok(()); // not an HF llama-like naming scheme; leave raw
-    }
-    let alias = |model: &mut LoadedModel, trace: String, ckpt: String| {
-        if model.weights.contains_key(&ckpt) {
-            model.aliases.insert(trace, ckpt);
-        }
-    };
-    let fuse = |model: &mut LoadedModel,
-                trace: String,
-                parts: &[String]|
-     -> Result<(), i32> {
-        if parts.iter().any(|p| !model.weights.contains_key(p)) {
-            return Ok(()); // this deployment lacks the part; skip
-        }
-        let mut host = Vec::new();
-        for p in parts {
-            let src = &model.weights[p];
-            let mut back = vec![0u8; src.len()];
-            src.copy_to_host(&mut back, stream.as_ref()).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-            stream.as_ref().synchronize().map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-            host.extend_from_slice(&back);
-        }
-        let mut buf = alloc.alloc(host.len()).map_err(|_| PIE_STATUS_EXHAUSTED)?;
-        buf.copy_from_host(&host, stream.as_ref()).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-        stream.as_ref().synchronize().map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-        model.weights.insert(trace, buf);
-        Ok(())
-    };
-    alias(model, "embed".into(), "model.embed_tokens.weight".into());
-    alias(model, "final_norm".into(), "model.norm.weight".into());
-    if model.weights.contains_key("lm_head.weight") {
-        alias(model, "lm_head".into(), "lm_head.weight".into());
-    } else {
-        // Tied embeddings: the trace's lm_head name IS "embed".
-        alias(model, "lm_head".into(), "model.embed_tokens.weight".into());
-    }
-    let layers = usize::try_from(model.hf.num_hidden_layers).unwrap_or(0);
-    for i in 0..layers {
-        let n = |s: &str| format!("model.layers.{i}.{s}");
-        fuse(model, format!("layer.{i}.qkv"), &[
-            n("self_attn.q_proj.weight"),
-            n("self_attn.k_proj.weight"),
-            n("self_attn.v_proj.weight"),
-        ])?;
-        fuse(model, format!("layer.{i}.gate_up"), &[
-            n("mlp.gate_proj.weight"),
-            n("mlp.up_proj.weight"),
-        ])?;
-        // Some checkpoints ship the fused projections ALREADY (phi3's
-        // `qkv_proj` and `gate_up_proj`), in the same concatenation order
-        // the fuse above builds. Those want an alias, not a copy -- and
-        // `alias` is a no-op when the name is absent, so this costs the
-        // deployments that split nothing.
-        alias(model, format!("layer.{i}.qkv"), n("self_attn.qkv_proj.weight"));
-        alias(model, format!("layer.{i}.gate_up"), n("mlp.gate_up_proj.weight"));
-        // The norm placement decides the mapping, and `input_layernorm`'s
-        // presence IS the placement: pre-norm has it (attn_norm=input,
-        // mlp_norm=post_attention); post-norm (olmo2) lacks it
-        // (attn_norm=post_attention, mlp_norm=post_feedforward) — the
-        // bind_olmo3 convention the A/B verified.
-        if model.weights.contains_key(&n("input_layernorm.weight")) {
-            alias(model, format!("layer.{i}.attn_norm"), n("input_layernorm.weight"));
-            alias(model, format!("layer.{i}.mlp_norm"), n("post_attention_layernorm.weight"));
-        } else {
-            alias(model, format!("layer.{i}.attn_norm"), n("post_attention_layernorm.weight"));
-            alias(model, format!("layer.{i}.mlp_norm"), n("post_feedforward_layernorm.weight"));
-        }
-        for (trace, ckpt) in [
-            ("q_norm", "self_attn.q_norm.weight"),
-            ("k_norm", "self_attn.k_norm.weight"),
-            ("o_proj", "self_attn.o_proj.weight"),
-            ("down", "mlp.down_proj.weight"),
-            ("q_proj", "self_attn.q_proj.weight"),
-            ("k_proj", "self_attn.k_proj.weight"),
-            ("v_proj", "self_attn.v_proj.weight"),
-            ("q_bias", "self_attn.q_proj.bias"),
-            ("k_bias", "self_attn.k_proj.bias"),
-            ("v_bias", "self_attn.v_proj.bias"),
-        ] {
-            alias(model, format!("layer.{i}.{trace}"), n(ckpt));
-        }
-    }
-    Ok(())
-}
+/// Answer the trace names a launch will ask for, from `model`'s tables.
+///
+/// The driver's whole part in naming, and it is deliberately small: which
+/// trace name means which published tensor is FAMILY knowledge and lives in
+/// `model::weight_names`, beside the DSL that invents the trace names and the
+/// contract author that invents the published ones. What is left here is the
+/// two things only a driver can answer.
+///
+/// **Whether a join is a rename or nothing.** A checkpoint that ships its
+/// projections pre-joined (Phi-3) has its contract SPLIT them, so
+/// `Projections::Fused` has nothing to fuse and the halves are merely
+/// adjacent. They are adjacent IN THE ARENA — the plan wrote them once, in
+/// file order — so the fused operand exists and only wants a name. Only the
+/// driver holds the addresses that decide it, and it checks rather than
+/// assumes: a GEMM handed a discontiguous operand reads what lies between.
+///
+/// **Reading a load-time scalar to the host.** gemma-4's per-layer
+/// `layer_scalar` is one bf16 on the device; `model` says which tensors they
+/// are and in what order, and the copy is CUDA's.
+fn wire_trace_names(model: &mut LoadedModel) {
+    let published: Vec<String> = model.weights.keys().cloned().collect();
+    let set: std::collections::BTreeSet<&str> =
+        published.iter().map(String::as_str).collect();
+    let has = |n: &str| set.contains(n);
+    let wiring = model::weight_names::wire(&model.hf, &has);
 
-/// Build the qwen3_5 hybrid's trace names — the `real_hybrid` A/B's
-/// binder vocabulary, promoted into the shell. The checkpoint naming is
-/// the VL config's (`model.language_model.*`); the vision tower and the
-/// MTP block stay untouched under their raw names.
-/// Build the gemma-4 trace names beside the checkpoint names —
-/// `gemma4.cpp`'s binder plus the engine's `dense_fused_projection_joins`
-/// (q‖k‖v on the layers that project their own KV, gate‖up everywhere),
-/// as the real-weight A/B proved them. Also reads the per-layer
-/// `layer_scalar` [1] tensors to host — the load-time
-/// `read_bf16_scalar_once`, stashed for the fire's `scales` map.
-#[allow(clippy::too_many_lines)]
-fn alias_gemma4(
-    model: &mut LoadedModel,
-    alloc: &crate::cuda::Allocator,
-    stream: &crate::cuda::OwnedStream,
-) -> Result<(), i32> {
-    let p = "model.language_model";
-    if !model.weights.contains_key(&format!("{p}.embed_tokens_per_layer.weight")) {
-        return Ok(()); // the PLE table IS the family's signature
+    for (trace, name) in wiring.aliases {
+        model.aliases.insert(trace, name);
     }
-    let alias = |model: &mut LoadedModel, trace: String, ckpt: String| {
-        if model.weights.contains_key(&ckpt) {
-            model.aliases.insert(trace, ckpt);
+    for (trace, parts) in wiring.joins {
+        let mut spans = Vec::with_capacity(parts.len());
+        for p in &parts {
+            let Some(span) = model.weights.get(p).copied() else {
+                spans.clear();
+                break;
+            };
+            spans.push(span);
         }
-    };
-    let fuse = |model: &mut LoadedModel, trace: String, parts: &[String]| -> Result<(), i32> {
-        if parts.iter().any(|q| !model.weights.contains_key(q)) {
-            return Ok(());
+        if spans.len() != parts.len() {
+            continue;
         }
-        let mut host = Vec::new();
-        for q in parts {
-            let src = &model.weights[q];
-            let mut back = vec![0u8; src.len()];
-            src.copy_to_host(&mut back, stream.as_ref())
-                .map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-            stream.as_ref().synchronize().map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-            host.extend_from_slice(&back);
-        }
-        let mut buf = alloc.alloc(host.len()).map_err(|_| PIE_STATUS_EXHAUSTED)?;
-        buf.copy_from_host(&host, stream.as_ref()).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-        stream.as_ref().synchronize().map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-        model.weights.insert(trace, buf);
-        Ok(())
-    };
-    alias(model, "embed".into(), format!("{p}.embed_tokens.weight"));
-    alias(model, "embed_per_layer".into(), format!("{p}.embed_tokens_per_layer.weight"));
-    alias(model, "ple_model_proj".into(), format!("{p}.per_layer_model_projection.weight"));
-    alias(model, "ple_model_norm".into(), format!("{p}.per_layer_projection_norm.weight"));
-    alias(model, "final_norm".into(), format!("{p}.norm.weight"));
-    let layers = usize::try_from(model.hf.num_hidden_layers).unwrap_or(0);
-    let first_shared =
-        layers.saturating_sub(usize::try_from(model.hf.num_kv_shared_layers).unwrap_or(0));
-    let mut scalars = Vec::with_capacity(layers);
-    for i in 0..layers {
-        let n = |sfx: &str| format!("{p}.layers.{i}.{sfx}");
-        alias(model, format!("layer.{i}.attn_norm"), n("input_layernorm.weight"));
-        alias(model, format!("layer.{i}.post_attn_norm"), n("post_attention_layernorm.weight"));
-        alias(model, format!("layer.{i}.pre_ffw_norm"), n("pre_feedforward_layernorm.weight"));
-        alias(model, format!("layer.{i}.post_ffw_norm"), n("post_feedforward_layernorm.weight"));
-        alias(model, format!("layer.{i}.q_norm"), n("self_attn.q_norm.weight"));
-        alias(model, format!("layer.{i}.o_proj"), n("self_attn.o_proj.weight"));
-        alias(model, format!("layer.{i}.down"), n("mlp.down_proj.weight"));
-        alias(model, format!("layer.{i}.ple_gate"), n("per_layer_input_gate.weight"));
-        alias(model, format!("layer.{i}.ple_proj"), n("per_layer_projection.weight"));
-        alias(model, format!("layer.{i}.ple_norm"), n("post_per_layer_input_norm.weight"));
-        if i >= first_shared {
-            // A KV-shared layer states only the Q leg.
-            alias(model, format!("layer.{i}.q_proj"), n("self_attn.q_proj.weight"));
-        } else {
-            alias(model, format!("layer.{i}.k_norm"), n("self_attn.k_norm.weight"));
-            fuse(model, format!("layer.{i}.qkv"), &[
-                n("self_attn.q_proj.weight"),
-                n("self_attn.k_proj.weight"),
-                n("self_attn.v_proj.weight"),
-            ])?;
-        }
-        fuse(model, format!("layer.{i}.gate_up"), &[
-            n("mlp.gate_proj.weight"),
-            n("mlp.up_proj.weight"),
-        ])?;
-        // The layer scalar, host-read: one bf16.
-        let s = model.weights.get(&n("layer_scalar")).map_or(1.0f32, |b| {
-            let mut back = [0u8; 2];
-            if b.len() == 2
-                && b.copy_to_host(&mut back, stream.as_ref()).is_ok()
-                && stream.as_ref().synchronize().is_ok()
-            {
-                f32::from_bits(u32::from(u16::from_le_bytes(back)) << 16)
-            } else {
-                1.0
-            }
+        let abut = spans.windows(2).all(|p| {
+            std::ptr::eq(
+                p[0].ptr.wrapping_byte_add(p[0].bytes).cast_const(),
+                p[1].ptr.cast_const(),
+            )
         });
-        scalars.push(s);
+        if abut {
+            model.weights.insert(trace, crate::loader::stage::WeightSpan {
+                ptr: spans[0].ptr,
+                bytes: spans.iter().map(|s| s.bytes).sum(),
+            });
+        }
     }
-    model.gemma_layer_scalars = scalars;
-    Ok(())
+    model.gemma_layer_scalars = wiring
+        .scalars
+        .iter()
+        .map(|n| {
+            model.weights.get(n).map_or(1.0f32, |b| {
+                match crate::loader::stage::read_span(*b) {
+                    Ok(back) if back.len() == 2 => {
+                        f32::from_bits(u32::from(u16::from_le_bytes([back[0], back[1]])) << 16)
+                    }
+                    _ => 1.0,
+                }
+            })
+        })
+        .collect();
 }
 
-fn alias_qwen3_5(
-    model: &mut LoadedModel,
-    alloc: &crate::cuda::Allocator,
-    stream: &crate::cuda::OwnedStream,
-) -> Result<(), i32> {
-    let p = "model.language_model";
-    if !model.weights.contains_key(&format!("{p}.embed_tokens.weight")) {
-        return Ok(()); // not the qwen3_5 naming scheme; leave raw
-    }
-    if model.weights.contains_key(&format!("{p}.embed_tokens_per_layer.weight")) {
-        return Ok(()); // gemma-4 shares the prefix; its aliases are its own
-    }
-    let alias = |model: &mut LoadedModel, trace: String, ckpt: String| {
-        if model.weights.contains_key(&ckpt) {
-            model.aliases.insert(trace, ckpt);
-        }
+/// What `load_model` answers: a `driver::DriverCapabilities` document.
+///
+/// **This used to be a five-field summary of the checkpoint** —
+/// `{"model_type":…,"hidden":…,"layers":…,"vocab":…,"weights":…}` — which is
+/// not a capability payload and which `DriverCapabilities` rejects outright,
+/// field by field, at `unknown field \`model_type\``. So no engine could load
+/// a model through this driver; the ABI tests call `pie_cuda_load_model`
+/// directly and pass `null` for the caps, so nothing here noticed.
+///
+/// # The KV pool is SIZED HERE, and that is the substance
+///
+/// `total_pages` is what a scheduler admits against, so answering it is
+/// answering how much context this device holds. The budget comes from
+/// `store::memory_planner::budget_for` — the ported planner's own reserve
+/// arithmetic, which until now had no live caller — measured AFTER the
+/// weights are resident, so `cudaMemGetInfo`'s free figure already has them
+/// subtracted.
+///
+/// What the budget then has to cover is the KV pool and the fire's
+/// activations. The activation share is a fraction rather than a computed
+/// arena, because the arena is a property of the LOWERING and no fire has
+/// been lowered yet; a fifth is the C++'s own rule of thumb and it is stated
+/// here rather than hidden in a constant.
+fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Vec<u8>, i32> {
+    use crate::store::memory_planner::{
+        DeviceMemory, DeviceProps, Family, ModelCosts, ModelShape, NoProfiles, PlannerConfig,
+        ProfileSource, plan,
     };
-    alias(model, "embed".into(), format!("{p}.embed_tokens.weight"));
-    alias(model, "final_norm".into(), format!("{p}.norm.weight"));
-    let layers = usize::try_from(model.hf.num_hidden_layers).unwrap_or(0);
-    for i in 0..layers {
-        let n = |sfx: &str| format!("{p}.layers.{i}.{sfx}");
-        alias(model, format!("layer.{i}.attn_norm"), n("input_layernorm.weight"));
-        alias(model, format!("layer.{i}.mlp_norm"), n("post_attention_layernorm.weight"));
-        alias(model, format!("layer.{i}.down"), n("mlp.down_proj.weight"));
-        let full = model
-            .hf
-            .layer_types
-            .get(i)
-            .is_some_and(|t| t == "full_attention");
-        if full {
-            for f in ["q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm"] {
-                alias(model, format!("layer.{i}.{f}"), n(&format!("self_attn.{f}.weight")));
-            }
-        } else {
-            for f in ["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b"] {
-                alias(model, format!("layer.{i}.{f}"), n(&format!("linear_attn.{f}.weight")));
-            }
-            alias(model, format!("layer.{i}.conv"), n("linear_attn.conv1d.weight"));
-            alias(model, format!("layer.{i}.conv_bias"), n("linear_attn.conv1d.bias"));
-            alias(model, format!("layer.{i}.a_log"), n("linear_attn.A_log"));
-            alias(model, format!("layer.{i}.dt_bias"), n("linear_attn.dt_bias"));
-            alias(model, format!("layer.{i}.gate_norm"), n("linear_attn.norm.weight"));
-            alias(model, format!("layer.{i}.o_proj"), n("linear_attn.out_proj.weight"));
-        }
-        // The fused gate‖up bank, gate first — the dense MLP's binding.
-        let parts = [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")];
-        if parts.iter().all(|q| model.weights.contains_key(q)) {
-            let mut host = Vec::new();
-            for q in &parts {
-                let src = &model.weights[q];
-                let mut back = vec![0u8; src.len()];
-                src.copy_to_host(&mut back, stream.as_ref())
-                    .map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-                stream.as_ref().synchronize().map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-                host.extend_from_slice(&back);
-            }
-            let mut buf = alloc.alloc(host.len()).map_err(|_| PIE_STATUS_EXHAUSTED)?;
-            buf.copy_from_host(&host, stream.as_ref())
-                .map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-            stream.as_ref().synchronize().map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-            model.weights.insert(format!("layer.{i}.gate_up"), buf);
-        }
+    use crate::store::model_costs::{CheckpointCosts, DiskProfiles};
+
+    let model = state.model.as_ref().expect("the model is stored");
+    let hf = model.hf.clone();
+    let hf = &hf;
+    let model_tp = model.tp_size;
+    let device = crate::cuda::Device::bind(0).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+    let (free, total) = device.memory_info().map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+    let (major, minor) = device.compute_capability().unwrap_or((0, 0));
+    let cfg = PlannerConfig {
+        gpu_mem_utilization: 0.90,
+        memory_profile: "auto".to_owned(),
+        max_forward_tokens: 0,
+        max_forward_requests: 0,
+        // PINNED, and this is a coupling rather than a preference: the fire
+        // path builds 16-token pages by construction (`page_size: usize = 16`
+        // in `step_impl` and in `resize_pool`). Letting the lattice sweep page
+        // sizes would have it answer a geometry the driver does not build.
+        kv_page_size: 16,
+        kv_cache_dtype: "bf16".to_owned(),
+        tp_size: i32::try_from(model_tp).unwrap_or(1),
+        mtp_num_drafts: 0,
+        // FALSE EVEN WHEN CALIBRATING, and the divergence is deliberate.
+        //
+        // `calibrating` makes the planner build the CEILING of the feasible
+        // region — the largest rectangle whose `arena + persistent` fits the
+        // budget — on the reasoning that a bigger arena can run a smaller
+        // shape. That holds when the arena is the only limit. It is not here:
+        // the attention workspace is a FIXED 32 MB the shell allocates, and a
+        // fire wider than it supports fails inside CUDA rather than returning
+        // a status. On an L40S the ceiling is N=65536, whose logits buffer
+        // alone is twenty gigabytes and whose fire aborts.
+        //
+        // So the sweep explores at or below the shape the driver is built to
+        // fire, which is the scored pick. It measures which of the REACHABLE
+        // shapes is fastest — a smaller claim than the C++'s and a true one.
+        calibrating: false,
+        rs_slot_mult: 1,
+        nccl_unique_id_hex: String::new(),
+    };
+    let costs = CheckpointCosts::new(hf, model_tp);
+    let shape = ModelShape {
+        hidden_size: hf.hidden_size,
+        num_hidden_layers: hf.num_hidden_layers,
+        num_attention_heads: hf.num_attention_heads,
+        num_key_value_heads: hf.num_key_value_heads,
+        head_dim_kernel: hf.head_dim_kernel.max(hf.head_dim),
+        model_type: hf.model_type.clone(),
+    };
+    let props = DeviceProps {
+        name: String::new(),
+        major,
+        minor,
+        sm_count: device.sm_count().unwrap_or(0),
+    };
+    let mem = DeviceMemory {
+        free_bytes: free as u64,
+        total_bytes: total as u64,
+    };
+    // MEASURED AFTER THE WEIGHTS ARE RESIDENT, so `cudaMemGetInfo`'s free
+    // figure already has them subtracted and the budget is what is left.
+    // A MEASUREMENT BEATS THE SCORE, when there is one. `DiskProfiles` reads
+    // the cache a calibration boot writes; a machine that has never
+    // calibrated has no file, which is a miss and not an error, and the
+    // planner falls back to the analytic pick. `NoProfiles` is the honest
+    // stand-in when no cache directory can even be derived.
+    let disk = DiskProfiles::discover("").ok();
+    let profiles: &dyn ProfileSource = disk.as_ref().map_or(&NoProfiles, |d| d);
+    let planned = plan(&cfg, &shape, &props, mem, Family::Generic, &costs, profiles)
+        .map_err(|e| {
+            eprintln!("[driver-cuda-new] load_model: memory planner: {e:?}");
+            PIE_STATUS_EXHAUSTED
+        })?;
+    for note in &planned.notes {
+        eprintln!("[driver-cuda-new] {note}");
     }
-    Ok(())
+
+    // PAGES AGAINST WHAT THE ARENA LEAVES, and this is a deliberate
+    // divergence from the planner's own rule.
+    //
+    // The planner sizes pages against the FULL budget, and says why: "the
+    // arena is a transient graph workspace that is freed between fires, while
+    // the KV pool is the resident one". That was true of the C++. It is not
+    // true here — `FireArrays` keeps the arena, the named seam buffers and
+    // the descriptor arrays for the life of the driver, because a captured
+    // graph bakes the addresses it recorded and a freed arena can never be
+    // replayed into. Persistence is the precondition for the supergraph and
+    // for run-ahead, and it is not negotiable.
+    //
+    // So the two resident allocations share one budget, and charging only one
+    // of them would advertise a page count whose pool cannot be built: on
+    // qwen3-0.6B the full-budget figure is 22,016 pages against a budget the
+    // arena also has to come out of.
+    let per_page = planned.plan.kv_page_bytes.max(1);
+    let resident_arena = costs
+        .arena_bytes(
+            planned.plan.capacity.max_forward_tokens,
+            planned.plan.capacity.max_logit_rows,
+            0,
+        )
+        .saturating_add(planned.plan.attn_float_workspace_bytes)
+        .saturating_add(planned.plan.persistent_input_bytes)
+        .saturating_add(planned.plan.runtime_quant_scratch_bytes);
+    let total_pages = planned.budget.saturating_sub(resident_arena) / per_page;
+
+    let caps = driver::DriverCapabilities {
+        abi_version: driver::PIE_DRIVER_ABI_VERSION,
+        total_pages: u32::try_from(total_pages).unwrap_or(u32::MAX),
+        kv_page_size: u32::try_from(planned.plan.kv_page_size).unwrap_or(16),
+        // THE LATTICE'S ANSWER, not a stated ceiling. These are what a
+        // scheduler batches under, and the arena the planner chose is sized
+        // for exactly this rectangle — a fire wider than it has no workspace.
+        max_forward_tokens: u32::try_from(planned.plan.capacity.max_forward_tokens).unwrap_or(0),
+        max_forward_requests: u32::try_from(planned.plan.capacity.max_forward_requests)
+            .unwrap_or(0),
+        max_page_refs: u32::try_from(planned.plan.capacity.max_page_refs).unwrap_or(0),
+        arch_name: hf.model_type.clone(),
+        vocab_size: u32::try_from(hf.vocab_size).unwrap_or(0),
+        max_model_len: u32::try_from(hf.max_position_embeddings).unwrap_or(0),
+        activation_dtype: "bf16".to_owned(),
+        hidden_size: u32::try_from(hf.hidden_size).unwrap_or(0),
+        rs_cache_required: costs.has_linear_state(),
+        snapshot_dir: snapshot.display().to_string(),
+        // No swap pool, no elastic accounting, no MTP or value head, and no
+        // sink this shell honours yet. Every one of these is a claim a
+        // program BINDS against, so a false advertisement is a program that
+        // runs as a silent no-op rather than one that is refused.
+        swap_pool_size: 0,
+        kv_copy_domain_mask: 0,
+        rs_cache_slots: 0,
+        rs_cache_slot_bytes: costs.state_slot_bytes(),
+        elastic_page_bytes: 0,
+        elastic_budget_pages: 0,
+        has_mtp_logits: false,
+        has_mtp_drafts: false,
+        has_value_head: false,
+        has_kv_envelopes: false,
+        has_attn_score: false,
+        has_attn_page_mask: false,
+        has_lora: false,
+        model_site_summary: driver::ModelSiteSummary::default(),
+        device_geometry_port_mask: 0,
+        supports_media_encode: false,
+        kv_handle: None,
+        // This driver compiles its own PTIR through NVRTC; nothing upstream
+        // needs to generate a kernel for it.
+        codegen_backend: String::new(),
+    };
+    serde_json::to_vec(&caps).map_err(|_| PIE_STATUS_DRIVER_ERROR)
 }
 
 /// Register a program: adopt its launch package, compile its generated
@@ -991,8 +1224,7 @@ fn alias_qwen3_5(
 /// will run the code, never a guess — so a shell with no model loaded has
 /// not bound one yet and defers the compile to the first launch rather
 /// than compiling for an architecture it made up.
-#[unsafe(no_mangle)]
-pub extern "C" fn pie_cuda_register_program(
+pub fn pie_cuda_register_program(
     driver: *mut PieDriver,
     program: *const PieProgramDesc,
     program_id: *mut u64,
@@ -1023,8 +1255,8 @@ pub extern "C" fn pie_cuda_register_program(
     // call. Adoption COPIES, so nothing here outlives that window --
     // which is the reason it is done now rather than by holding the
     // descriptor: `PieProgramDesc` is the caller's transient memory.
-    let package = unsafe { driver_abi::adopt_package(&desc.launch) };
-    let kernels = unsafe { driver_abi::adopt_emitted_kernels(desc.emitted_kernels) };
+    let package = unsafe { driver::adopt_package(&desc.launch) };
+    let kernels = unsafe { driver::adopt_emitted_kernels(desc.emitted_kernels) };
 
     let id = state.next_id;
     state.next_id += 1;
@@ -1066,7 +1298,7 @@ fn adopt_and_compile(
     state: &mut Shell,
     id: u64,
     desc: &PieProgramDesc,
-    package: driver_pipeline::driver_abi::plan::LaunchPackage,
+    package: driver_pipeline::driver::plan::LaunchPackage,
     kernels: &[driver_pipeline::EmittedKernel],
 ) -> Result<(), i32> {
     let plan = match driver_pipeline::adopt_launch_package(package) {
@@ -1155,8 +1387,7 @@ fn ptir_target() -> Result<crate::ptir::Target, i32> {
 /// the wire-cell math reproduced exactly (bool bit-packs, everything
 /// else is four bytes per element; `capacity + 1 ≤ 64`). Device-side
 /// rings and fire delivery ride with the launch integration.
-#[unsafe(no_mangle)]
-pub extern "C" fn pie_cuda_register_channel(
+pub fn pie_cuda_register_channel(
     driver: *mut PieDriver,
     channel: *const PieChannelDesc,
     binding: *mut PieChannelEndpointBinding,
@@ -1172,7 +1403,7 @@ pub extern "C" fn pie_cuda_register_channel(
     };
     if desc.abi_version != PIE_DRIVER_ABI_VERSION
         || state.channels.contains_key(&desc.channel_id)
-        || desc.dtype > driver_abi::local::PIE_CHANNEL_DTYPE_ACT
+        || desc.dtype > driver::local::PIE_CHANNEL_DTYPE_ACT
     {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
@@ -1184,7 +1415,7 @@ pub extern "C" fn pie_cuda_register_channel(
         };
         numel = next;
     }
-    let wire_bytes: u64 = if desc.dtype == driver_abi::local::PIE_CHANNEL_DTYPE_BOOL {
+    let wire_bytes: u64 = if desc.dtype == driver::local::PIE_CHANNEL_DTYPE_BOOL {
         numel.div_ceil(8)
     } else {
         match numel.checked_mul(4) {
@@ -1248,8 +1479,7 @@ pub extern "C" fn pie_cuda_register_channel(
 /// Bind an instance to a registered program: the id lifecycle, honoring
 /// a nonzero `requested_instance_id` and echoing the geometry class.
 /// KV-slot and adapter state ride in with the `launch` arm.
-#[unsafe(no_mangle)]
-pub extern "C" fn pie_cuda_bind_instance(
+pub fn pie_cuda_bind_instance(
     driver: *mut PieDriver,
     instance: *const PieInstanceDesc,
     binding: *mut PieInstanceBinding,
@@ -1302,8 +1532,7 @@ pub extern "C" fn pie_cuda_bind_instance(
 /// frames, device-geometry sub-batches and channel-delivered outputs
 /// refuse with UNSUPPORTED until their machinery lands — logits stay in
 /// the shell until channels exist to carry them out.
-#[unsafe(no_mangle)]
-pub extern "C" fn pie_cuda_launch(
+pub fn pie_cuda_launch(
     driver: *mut PieDriver,
     frame: *const PieFrameDesc,
     completion: PieCompletion,
@@ -1314,26 +1543,20 @@ pub extern "C" fn pie_cuda_launch(
     let Some(frame) = (unsafe { frame.as_ref() }) else {
         return PIE_STATUS_INVALID_ARGUMENT;
     };
-    match launch_impl(state, frame) {
-        Ok(()) => {
-            // Publish every member's terminal cell, then notify.
-            if let Some(step) = slice_of(frame.steps.ptr, frame.steps.len).first() {
-                for &cell in slice_of(step.terminal_cells.ptr, step.terminal_cells.len) {
-                    if !cell.is_null() {
-                        unsafe {
-                            std::ptr::addr_of_mut!((*cell).outcome).write_volatile(
-                                driver_abi::local::PIE_TERMINAL_OUTCOME_SUCCESS,
-                            );
-                        }
-                    }
-                }
-            }
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            if let Some(notify) = state.notify {
-                unsafe { notify(state.notify_ctx, completion.wait_id, completion.target_epoch) };
-            }
-            PIE_STATUS_OK
-        }
+    // THE CALL RETURNS WITH THE WORK STILL ON THE STREAM.
+    //
+    // Publishing the terminal cells and notifying used to happen here,
+    // after `launch_impl` had synchronized — which made the driver
+    // serialize the engine's `frame_dispatch_depth`, because the call
+    // that would enqueue fire n+1 could not start until fire n had
+    // retired on the GPU.
+    //
+    // Both debts moved into a stream-ordered host callback
+    // (`retire_fire`), so an `Ok` here means ENQUEUED rather than DONE.
+    // An error still returns synchronously: a fire that could not be
+    // built owes nothing and the runtime must hear so on this thread.
+    match launch_impl(state, frame, completion) {
+        Ok(()) => PIE_STATUS_OK,
         Err(code) => code,
     }
 }
@@ -1942,6 +2165,89 @@ fn qwen35_facts_from_hf(model: &LoadedModel) -> Result<Box<dyn PlannedFamily>, i
 /// long before.
 const SCORE_PIN: model_compiler::trace::ValueId = model_compiler::trace::ValueId::MAX;
 
+/// Does a fire's completion ride a stream callback? **YES unless told not to**
+/// (`PIE_CUDA_RUNAHEAD=0`, or `[driver] runahead = false` per driver).
+///
+/// It was off, and the reason was honest: `pie_cuda_launch` used to finish the
+/// fire before it returned, and a caller reading the ring on the next line was
+/// asserting that. The gate protected a CONTRACT CHANGE.
+///
+/// It is on because the contract is now the ABI's: the notify says the fire
+/// retired, the engine waits for it, and this tree's tests do too. And because
+/// there is finally something to gain — a warm decode issues in 0.68 ms and
+/// retires 3.75 ms later, so the call returns with 3 ms of GPU work queued
+/// behind it. When the gate was written those two numbers were the same, and
+/// run-ahead bought nothing.
+fn runahead_env() -> bool {
+    !std::env::var_os("PIE_CUDA_RUNAHEAD").is_some_and(|v| v == "0" || v == "false" || v == "off")
+}
+
+/// The arena offset the attention dispatch at `fi` WRITES.
+///
+/// Two readings, and only the first is right under a union lowering.
+///
+/// 1. **The dispatch's own op join.** The attention statement carries its
+///    output placement, which is exactly the slot the o_proj goes on to read.
+/// 2. **The next launch's first operand** — "the launch after the dispatch is
+///    the o_proj". True under `Resolve`, where the guard has already deleted
+///    every arm the fire did not take. False under `Union`, where every arm is
+///    present and the next launch belongs to some other body, which is why a
+///    union that has to fall back here declines instead.
+///
+/// # And why every DECODE declines
+///
+/// `dsl::seam::attn_at` records an output only when the statement is NOT
+/// inside a value-producing region:
+///
+/// ```ignore
+/// let out = q.t.inner.borrow().inside_value_region();
+/// let shape = (!out).then(|| …);   // None inside a region
+/// ```
+///
+/// The decode arm states its attention inside one and the prefill arm does
+/// not. So reading 1 is empty for every decode, the union is declined, and a
+/// one-token fire walks all 396 launches — ~9 ms on a 0.6B model, which is
+/// most of what `.wiki/new-driver/next.md`'s table measures.
+///
+/// **Recovering it from the enclosing region here does not work, and the
+/// failure is quiet.** Two attempts, both green on 20 of 21 ABI tests and
+/// both wrong on `multi_step_resize_and_copy_preserve_the_kv`: the nearest
+/// preceding region is as often a closed guard from an earlier layer as the
+/// enclosing one; requiring coverage and matching the output's shape to q's
+/// still picks the wrong construct for some fires, because several covering
+/// regions can carry a q-shaped value. A wrong offset here is not a refusal —
+/// it binds the attention plan over another activation.
+///
+/// The fix belongs at the STATEMENT, not here: `attn_at` should record its
+/// landing in the join even inside a region, so the value has one stated
+/// producer instead of being reverse-engineered from op adjacency.
+fn attention_landing(
+    lowered: &model_compiler::lower::Lowered,
+    dplan: &crate::model::executor::DispatchPlan,
+    fi: usize,
+) -> Option<usize> {
+    use model_compiler::lower::Arg;
+    match dplan.spec(fi).outs.first() {
+        Some(Arg::Arena { at, .. }) => Some(*at),
+        _ => match lowered.launches.get(fi + 1).map(|n| &lowered.args[n.args.start as usize]) {
+            Some(Arg::Arena { at, .. }) => Some(*at),
+            _ => None,
+        },
+    }
+}
+
+/// `PIE_CUDA_TRACE_SUPERGRAPH=1`: say what each fire did with the graph.
+///
+/// The one instrument that answers the question the measurements raise —
+/// whether a fire REPLAYED or walked its launches, and if it walked, which
+/// clause of the servability test turned it away. Lazy, so an unset variable
+/// costs a `getenv` and no formatting.
+fn sg_trace(what: impl FnOnce() -> String) {
+    if std::env::var_os("PIE_CUDA_TRACE_SUPERGRAPH").is_some() {
+        eprintln!("[sg] {}", what());
+    }
+}
+
 /// Is the unionized supergraph armed for this process?
 ///
 /// **ON by default now**, and `PIE_CUDA_SUPERGRAPH=0` turns it off.
@@ -2080,11 +2386,11 @@ pub fn openable_model_types() -> Vec<&'static str> {
 /// a property of the pass, so it is answered here, once, rather than by
 /// every arm that would otherwise find half a fire.
 pub fn fire_class_of(
-    step: &driver_abi::local::PieStepDesc,
+    step: &driver::local::PieStepDesc,
     rows: usize,
     requests: usize,
 ) -> Result<model_compiler::trace::FireClass, i32> {
-    use driver_abi::local::{PIE_RS_FLAG_BUFFER_WRITE, PIE_RS_FLAG_FOLD};
+    use driver::local::{PIE_RS_FLAG_BUFFER_WRITE, PIE_RS_FLAG_FOLD};
     use model_compiler::trace::FireClass;
 
     let flags = slice_of(step.rs_slot_flags.ptr, step.rs_slot_flags.len);
@@ -2471,31 +2777,6 @@ fn gemma3n_facts_from_hf(model: &LoadedModel) -> Result<Box<dyn PlannedFamily>, 
     }))
 }
 
-/// Whether a quantized scheme's STORED bytes are what its kernels read.
-///
-/// The dividing line for what a load can accept without a transcode
-/// engine. A scheme here is uploaded verbatim; anything else needs its
-/// layout changed on the way in, which is `transcode_engine.hpp`'s job in
-/// the retired C++ tree and is not ported.
-///
-/// Note this is the arm for a checkpoint that DECLARES its scheme in the
-/// tensor encoding. gpt-oss does not — its MXFP4 banks arrive as plain
-/// `U8` and the scheme is in `quantization_config` — so the live MXFP4
-/// path is the `Raw(U8)` arm above. This one is for the encodings the
-/// loader does tag, and it is a MATCH rather than a default-allow for the
-/// same reason: a scheme nobody has checked should refuse, because
-/// guessing hands a kernel a layout it was not compiled for, which is not
-/// a crash but wrong numbers.
-///
-/// Deliberately a MATCH rather than a default-allow: a scheme nobody has
-/// checked should refuse, because the failure mode of guessing is a
-/// kernel reading a layout it was not compiled for — which is not a
-/// crash, it is wrong numbers.
-const fn reads_its_stored_form(scheme: model_loader::types::QuantScheme) -> bool {
-    use model_loader::types::QuantScheme as Q;
-    matches!(scheme, Q::Mxfp4E2M1E8M0 | Q::MlxAffineU4)
-}
-
 /// THE GQA RATIO, refused at LOAD rather than discovered at launch.
 ///
 /// FlashInfer's decode instantiates group sizes {1, 2, 3, 4, 8} and
@@ -2575,7 +2856,7 @@ fn llama_like_facts_from_hf(model: &LoadedModel) -> Result<Box<dyn PlannedFamily
     let elems_of = |trace: &str| -> Option<usize> {
         let ckpt = model.aliases.get(trace)?;
         // bf16 gammas throughout this family.
-        Some(model.weights.get(ckpt)?.len() / 2)
+        Some(model.weights.get(ckpt)?.bytes / 2)
     };
     let qk_norm = match elems_of("layer.0.q_norm") {
         None => QkNorm::Off,
@@ -2634,7 +2915,10 @@ fn llama_like_facts_from_hf(model: &LoadedModel) -> Result<Box<dyn PlannedFamily
         // `hf.sliding_window` where a family has them, and that path is
         // unchanged.
         proj_repr: model_compiler::dsl::WeightRepr::Bf16,
-        tp_size: 1,
+        // The group the load sharded for. A rank whose weights are a band
+        // of the real ones has to land its projections with a collective,
+        // and this is where the trace learns that.
+        tp_size: model.tp_size,
         window_left: Vec::new(),
         all_reduce_p2p_max_rows: 0,
     };
@@ -2678,7 +2962,8 @@ fn capture_or_replay<R: crate::model::executor::Resolver>(
     ctx: &crate::model::executor::DispatchCtx,
     regions: crate::model::executor::AttnRegions<'_>,
     gdn: Option<&crate::model::executor::GdnCtx>,
-    alloc: &crate::cuda::Allocator,
+    alloc: &mut crate::cuda::Allocator,
+    preds: &mut crate::cuda::PredicateWord,
     stream: crate::cuda::StreamRef<'_>,
     requests: usize,
     rows: usize,
@@ -2696,21 +2981,20 @@ fn capture_or_replay<R: crate::model::executor::Resolver>(
     );
 
     // The fire's own bits, and the only thing that differs between two
-    // replays of one exec.
-    let mut preds = match crate::cuda::PredicateWord::new(alloc) {
-        Ok(p) => p,
-        Err(_) => return run(lowered, dplan, frame, resolver, ctx, regions, gdn),
-    };
-    if fire_predicates(rows_desc, &lowered.conds, &mut preds).is_err()
+    // replays of one exec. NOT synchronized after: the upload and the replay
+    // are ordered on the same stream, so waiting here only made the call
+    // block on work it had just enqueued.
+    if fire_predicates(rows_desc, &lowered.conds, preds).is_err()
         || preds.upload(stream).is_err()
-        || stream.synchronize().is_err()
     {
         return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
     }
 
     if cache.replay(key, epoch, stream).unwrap_or(false) {
+        sg_trace(|| format!("replay {key:?}"));
         return Ok(lowered.launches.len());
     }
+    sg_trace(|| format!("miss {key:?} launches={}", lowered.launches.len()));
 
     // DUAL-PREPARE: one warm fire per variant, each a resolved program.
     // Only variants this fire can PREPARE. A `wants_scores` warm-up would
@@ -2738,11 +3022,19 @@ fn capture_or_replay<R: crate::model::executor::Resolver>(
     }
 
     let captured = {
-        let mut a = crate::cuda::Allocator::new();
-        let Ok(scope) = a.begin_capture(stream) else {
+        // THE CAPTURE OPENS ON THE FIRE'S OWN ALLOCATOR, and it used to open
+        // on a throwaway one made right here. That looked harmless — nothing
+        // allocates during a capture — but the flag it raises is what makes a
+        // `cudaFree` DEFER, and the deferral has to happen on the allocator
+        // that OWNS the buffer. A temporary dropped inside `run_captured`
+        // therefore freed immediately, in the middle of an open stream
+        // capture, and the graph that came out faulted when it was destroyed.
+        //
+        // Phi-3's decode found it, because no decode had ever been captured.
+        let Ok(scope) = alloc.begin_capture(stream) else {
             return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
         };
-        let mut b = crate::cuda::SupergraphBuilder::new(scope.stream(), &preds);
+        let mut b = crate::cuda::SupergraphBuilder::new(scope.stream(), preds);
         let ran = crate::model::executor::run_captured(
             lowered, dplan, frame, resolver, ctx, regions, gdn, &mut b,
         );
@@ -2761,9 +3053,29 @@ fn capture_or_replay<R: crate::model::executor::Resolver>(
         // and the same one the C++ arc gives mixed peels: what cannot be
         // replayed stays eager. The alternative — failing the fire — would
         // make an optimisation into a correctness requirement.
-        match (ran, scope.end()) {
+        let ended = scope.end();
+        sg_trace(|| format!("capture ran={ran:?} ended_ok={}", ended.is_ok()));
+        match (ran, ended) {
             (Ok(n), Ok(g)) => Some((n, g)),
-            (Err(_) | Ok(_), _) => None,
+            (Err(_), Ok(g)) => {
+                // AN ABANDONED CAPTURE IS NOT DESTROYED, it is forgotten.
+                //
+                // A run that refused part-way leaves a recording whose nodes
+                // the builder has already dropped, and `cudaGraphDestroy` on
+                // that faults inside the CUDA driver — no device error, a
+                // host segfault. Found through phi-3, where an unservable
+                // arm made every decode capture abandon.
+                //
+                // Leaking one graph template per abandoned capture is the
+                // cheaper wrong answer: captures are per (bucket, epoch) and
+                // a refusal is meant to be rare. The refusals that are NOT
+                // rare belong in the servability test above, which is where
+                // phi-3's went. `ManuallyDrop` rather than `mem::forget`
+                // because the leak is the POINT and should read as one.
+                let _leaked = std::mem::ManuallyDrop::new(g);
+                None
+            }
+            (_, Err(_)) => None,
         }
     };
     let Some((ran, graph)) = captured else {
@@ -2782,8 +3094,11 @@ fn capture_or_replay<R: crate::model::executor::Resolver>(
 /// The fire itself. Everything here is the proven smoke assembly, run
 /// against the shell's own state.
 #[allow(clippy::too_many_lines)]
-fn launch_impl(state: &mut Shell, frame: &PieFrameDesc) -> Result<(), i32> {
-
+fn launch_impl(
+    state: &mut Shell,
+    frame: &PieFrameDesc,
+    completion: PieCompletion,
+) -> Result<(), i32> {
     let steps = slice_of(frame.steps.ptr, frame.steps.len);
     if steps.is_empty() {
         return Err(PIE_STATUS_INVALID_ARGUMENT);
@@ -2791,10 +3106,92 @@ fn launch_impl(state: &mut Shell, frame: &PieFrameDesc) -> Result<(), i32> {
     // Steps run SEQUENTIALLY, each a fire of its own — the frame's
     // producer→consumer ordering. One shared KV, per-step everything else.
     for step in &steps[..steps.len() - 1] {
-        step_impl(state, frame, step)?;
+        step_impl(state, frame, step, None)?;
     }
+    // The LAST step carries the frame's debt: its terminal cells and the
+    // completion the runtime waits on. Only it enqueues an asynchronous
+    // retire, because a frame completes once.
     let step = steps.last().expect("nonempty");
-    step_impl(state, frame, step)
+    let cells = slice_of(step.terminal_cells.ptr, step.terminal_cells.len).to_vec();
+    step_impl(state, frame, step, Some((completion, cells)))
+}
+
+/// Trace a family's forward for one fire shape, lower it, and join the ops
+/// back onto the launches.
+///
+/// Split out of `step_impl` so its result can be CACHED — see
+/// [`Shell::lowerings`]. Nothing here reads the fire's data; it reads the
+/// shape, which is what makes the answer reusable.
+fn build_lowering(
+    family: &dyn PlannedFamily,
+    class: model_compiler::trace::FireClass,
+    rows: usize,
+    union_asked: bool,
+) -> Result<LoweredFire, i32> {
+    use crate::model::executor::DispatchPlan;
+    use model_compiler::lower::{Arg, Fire, GuardMode, Row, lower_with};
+
+    let plan = family.trace(class);
+    let fire_rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
+    let lower_as = |g: GuardMode| {
+        lower_with(&plan, &fire_rows, Fire { captures_across_splits: false }, g).map_err(|e| {
+            eprintln!("[driver-cuda-new] launch: uncovered: {e:?}");
+            PIE_STATUS_UNSUPPORTED
+        })
+    };
+    let mut union = union_asked;
+    if !union {
+        sg_trace(|| "union off at the gate".into());
+    }
+    let mut lowered = lower_as(if union { GuardMode::Union } else { GuardMode::Resolve })?;
+
+    // A union this fire cannot record is not a union worth building, and the
+    // decision has to be made HERE — before the arena, the pins and the
+    // attention context are sized against it — because falling back later
+    // would run one lowering's program against another's offsets.
+    //
+    // Two things make a union unservable, and both are about prepared state.
+    // A `_capture` dispatch wants a plan raised for the full-attention
+    // variant, a folded-row layout and an observation window; a `_custom`
+    // one wants a mask the fire did not build. Under `Union` every arm is
+    // present whether this fire takes it or not, so the capture runs the one
+    // that cannot run and the whole recording is abandoned.
+    //
+    // And the attention output slot has to be findable from the op JOIN. The
+    // neighbour trick — "the launch after the dispatch is the o_proj" — is
+    // what `Resolve` allows and `Union` does not, because every arm is
+    // present and the neighbour belongs to some other body.
+    if union {
+        let d = DispatchPlan::new(&plan, &lowered);
+        let servable = !lowered
+            .kernels
+            .iter()
+            .any(|k| k.contains("_capture") || k.contains("_custom"))
+            && {
+                let name = if lowered
+                    .kernels
+                    .iter()
+                    .any(|k| k == "attn::dispatch_attention_flashinfer_decode")
+                {
+                    "attn::dispatch_attention_flashinfer_decode"
+                } else {
+                    "attn::dispatch_attention_flashinfer_prefill_bf16"
+                };
+                lowered
+                    .launches
+                    .iter()
+                    .position(|x| lowered.kernels[x.kernel as usize] == name)
+                    .is_some_and(|fi| matches!(d.spec(fi).outs.first(), Some(Arg::Arena { .. })))
+            };
+        if !servable {
+            sg_trace(|| "union declined: unservable for this fire".into());
+            union = false;
+            lowered = lower_as(GuardMode::Resolve)?;
+        }
+    }
+    let dplan = DispatchPlan::new(&plan, &lowered);
+    sg_trace(|| format!("built: launches={} union={union}", lowered.launches.len()));
+    Ok(LoweredFire { plan, lowered, dplan, union })
 }
 
 /// One step's fire — the former single-step body.
@@ -2802,16 +3199,25 @@ fn launch_impl(state: &mut Shell, frame: &PieFrameDesc) -> Result<(), i32> {
 fn step_impl(
     state: &mut Shell,
     frame: &PieFrameDesc,
-    step: &driver_abi::local::PieStepDesc,
+    step: &driver::local::PieStepDesc,
+    // `owes` is the debt this step carries when it is the frame's LAST:
+    // `None` for the earlier steps, which owe nothing because a frame
+    // completes once. A step handed one enqueues an asynchronous
+    // completion and does NOT synchronize; a step handed `None`
+    // synchronizes, because the next step's work depends on it and the
+    // producer→consumer ordering inside a frame is what makes steps
+    // sequential in the first place.
+    owes: Option<(PieCompletion, Vec<*mut driver::local::PieTerminalCell>)>,
 ) -> Result<(), i32> {
     use crate::model::attention_workspace::{AttentionWorkspace, LiveStagingOps};
     use crate::model::executor::{
-        AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, GdnCtx, PrefillPlan, Resolver,
+        AttnCtx, AttnRegions, DecodePlan, DispatchCtx, Frame, GdnCtx, PrefillPlan, Resolver,
         run,
     };
-    use model_compiler::lower::{Arg, Fire, GuardMode, Row, lower_with};
+    use model_compiler::lower::{Arg, Row};
     use model_compiler::trace::{FireClass, ValueId};
 
+    let t_head = std::time::Instant::now();
     let sub_batches = slice_of(step.sub_batch_indptr.ptr, step.sub_batch_indptr.len);
     if sub_batches.len() > 2 {
         eprintln!("[driver-cuda-new] launch: one sub-batch per step today");
@@ -2853,90 +3259,32 @@ fn step_impl(
         return Err(PIE_STATUS_UNSUPPORTED);
     }
 
-    // ── The lowering. ──
-    let plan = family.trace(class);
-    let fire_rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
-    // THE SUPERGRAPH GATE, off unless asked. `Union` keeps every guard so
-    // the arms can be recorded into conditional bodies and decided at
-    // replay; `Resolve` answers them here and produces one program. Off by
-    // default because the eager leg is what every A/B in the tree pins,
-    // and a capture is an optimisation that must prove itself against it.
-    // A family carrying RECURRENT STATE is not replayable, and the rule is
-    // decided HERE rather than at the capture, because a fire built
-    // against a union lowering cannot fall back to an eager one — it would
-    // run the union's program, both sides of every guard, over the same
-    // rows.
+    sg_trace(|| format!("  head {:?}", t_head.elapsed()));
+    let t_low = std::time::Instant::now();
+    // ── The lowering, or the one this shape already has. ──
     //
-    // The hybrid's GDN slabs are per-fire mutable state reached through a
-    // slot indirection the host rewrites, so a captured body bakes one
-    // fire's slots and a replay would update another instance's
-    // recurrence. Found the hard way: the corruption surfaced as a fault
-    // inside `cudaGraphDestroy`, about as far from the cause as a symptom
-    // gets.
-    //
-    // Third instance of one rule — ungrouped LoRA, an arm whose prepared
-    // state the fire declines to build, and now recurrent state. What
-    // cannot be replayed stays eager.
-    let mut union =
-        supergraph_enabled() && !family.recurrent();
-    let lower_as = |g: GuardMode| {
-        lower_with(&plan, &fire_rows, Fire { captures_across_splits: false }, g).map_err(|e| {
-            eprintln!("[driver-cuda-new] launch: uncovered: {e:?}");
-            PIE_STATUS_UNSUPPORTED
-        })
+    // Everything between here and `DispatchPlan` is a pure function of the
+    // key, and it costs ~3.3 ms on a 0.6B decode. See `Shell::lowerings`.
+    let key = LoweringKey {
+        model_id: u64::from(model.hf.num_hidden_layers.unsigned_abs()),
+        class,
+        rows: u32::try_from(rows).unwrap_or(0),
+        union_asked: supergraph_enabled() && !family.recurrent(),
     };
-    let mut lowered = lower_as(if union { GuardMode::Union } else { GuardMode::Resolve })?;
-
-    // A union this fire cannot record is not a union worth building, and
-    // the decision has to be made HERE — before the arena, the pins and
-    // the attention context are sized against it — because falling back
-    // later would run one lowering's program against another's offsets.
-    //
-    // The test is narrow on purpose: a SCORE-capturing dispatch needs a
-    // plan raised for the full-attention variant, a folded-row layout and
-    // an observation window, none of which a fire that wants no scores
-    // prepares. Its launcher answers by throwing, which the shim can only
-    // turn into a message and an abort. So a union that names one is
-    // abandoned for this fire and the guards are answered instead.
-    if union {
-        let d = DispatchPlan::new(&plan, &lowered);
-        // Two things make a union unservable for THIS fire, and both are
-        // about prepared state rather than about the graph.
-        //
-        // A `_capture` dispatch wants a plan raised for the full-attention
-        // variant, a folded-row layout and an observation window, none of
-        // which a fire that wants no scores builds; its launcher answers
-        // by throwing, which the shim can only turn into an abort.
-        //
-        // And the attention output slot has to be findable from the op
-        // JOIN. The neighbour trick — "the launch after the dispatch is
-        // the o_proj" — is what `Resolve` allows and `Union` does not,
-        // because every arm is present and the neighbour belongs to some
-        // other body. A deployment that states its attention as [q, o]
-        // records no output in the join and has only the neighbour.
-        let servable = !lowered.kernels.iter().any(|k| k.contains("_capture"))
-            && {
-                let name = if lowered
-                    .kernels
-                    .iter()
-                    .any(|k| k == "attn::dispatch_attention_flashinfer_decode")
-                {
-                    "attn::dispatch_attention_flashinfer_decode"
-                } else {
-                    "attn::dispatch_attention_flashinfer_prefill_bf16"
-                };
-                lowered
-                    .launches
-                    .iter()
-                    .position(|x| lowered.kernels[x.kernel as usize] == name)
-                    .is_some_and(|fi| matches!(d.spec(fi).outs.first(), Some(Arg::Arena { .. })))
-            };
-        if !servable {
-            union = false;
-            lowered = lower_as(GuardMode::Resolve)?;
-        }
+    if !state.lowerings.contains_key(&key) {
+        let built = build_lowering(family.as_ref(), class, rows, key.union_asked)?;
+        state.lowerings.insert(key, built);
     }
-    let dplan = DispatchPlan::new(&plan, &lowered);
+    let LoweredFire { plan, lowered, dplan, union } =
+        state.lowerings.get(&key).expect("just built");
+    let union = *union;
+    let fire_rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
+    sg_trace(|| format!("  lowering {:?}", t_low.elapsed()));
+    let mut phase = std::time::Instant::now();
+    let mut lap = |what: &str| {
+        sg_trace(|| format!("  {what} {:?}", phase.elapsed()));
+        phase = std::time::Instant::now();
+    };
 
     // ── Device state, and all of it PERSISTENT now. ──
     //
@@ -2955,6 +3303,33 @@ fn step_impl(
     }
     if state.fire_alloc.is_none() {
         state.fire_alloc = Some(crate::cuda::Allocator::new());
+    }
+    // RECLAIM WHAT HAS FINISHED, AND ONLY WAIT WHEN THE QUEUE IS FULL.
+    //
+    // A fire's scratch cannot be freed while it runs and cannot be freed
+    // from the callback, so it is freed here. What matters is WHEN.
+    //
+    // This used to hold exactly one and `synchronize()` on it, which is a
+    // run-ahead that never runs ahead: the call that would queue fire n+1
+    // blocked until fire n had finished. It cost nothing to notice while
+    // issuing a fire took longer than running one — which is what the first
+    // measurements on this branch said — and it is the whole game now that
+    // issue is 0.81 ms against 2.9 ms of work.
+    //
+    // So: drop everything already retired, without asking the driver to
+    // wait, and wait only when the queue is at depth. `RUNAHEAD_DEPTH` is
+    // the backpressure — the driver runs at most that many fires ahead of
+    // the GPU, which bounds the scratch it is holding rather than the time.
+    while state
+        .in_flight
+        .front()
+        .is_some_and(|f| f.done.is_complete().unwrap_or(true))
+    {
+        state.in_flight.pop_front();
+    }
+    while state.in_flight.len() >= RUNAHEAD_DEPTH {
+        let oldest = state.in_flight.pop_front().expect("nonempty");
+        oldest.done.synchronize().map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
     }
     let stream = state.fire_stream.as_ref().expect("just ensured");
     let raw_stream = stream.as_ref().as_raw().cast::<std::ffi::c_void>();
@@ -3003,7 +3378,12 @@ fn step_impl(
         // NOTE: growth REPLACES the pools without migrating pages — decode
         // continuity holds while the page demand is stable, which is the
         // single-frame smoke's world. Page migration rides with resize_pool.
+        //
+        // AND IT MOVES BASE ADDRESSES, so every capture that recorded one is
+        // stale. Same rule as `FireArrays`' own growth, and the same bump:
+        // stale means recapture rather than a replay into freed pages.
         state.kv = Some(KvState { pools, num_pages: need_pages });
+        state.fire_arrays.epoch += 1;
     }
     let kv = state.kv.as_ref().expect("just ensured");
     let kv_source_of = |i: usize| -> usize {
@@ -3085,6 +3465,7 @@ fn step_impl(
         .copy_from_host(&vec![1u8; rows], stream.as_ref())
         .map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
 
+    lap("kv+arrays");
     // ── Workspace + plan caches: DRIVER-lifetime, first-launch built. ──
     let mut sops = LiveStagingOps;
     if state.scratch.is_none() {
@@ -3224,6 +3605,7 @@ fn step_impl(
 
     let named_bufs = &state.fire_arrays.named;
 
+    lap("attn-plan");
     // ── The hybrid's GDN context: driver-owned slabs, instance slots. ──
     let mut gdn_ctx: Option<GdnCtx> = None;
     let mut _slot_ids_buf: Option<crate::cuda::DeviceBuffer> = None;
@@ -3266,14 +3648,14 @@ fn step_impl(
             eprintln!("[driver-cuda-new] launch: hybrid fire without rs_slot_ids");
             return Err(PIE_STATUS_INVALID_ARGUMENT);
         }
-        if rs_flags.iter().any(|f| f & !driver_abi::local::PIE_RS_FLAG_RESET != 0) {
+        if rs_flags.iter().any(|f| f & !driver::local::PIE_RS_FLAG_RESET != 0) {
             eprintln!("[driver-cuda-new] launch: rs fold/buffer flags await spec-decode");
             return Err(PIE_STATUS_UNSUPPORTED);
         }
         let need_slots = rs_slot_ids.iter().copied().max().map_or(1, |m| m + 1);
         gdn_state.ensure_slots(need_slots, &alloc, &stream)?;
         for (r, &slot) in rs_slot_ids.iter().enumerate() {
-            if rs_flags.get(r).copied().unwrap_or(0) & driver_abi::local::PIE_RS_FLAG_RESET
+            if rs_flags.get(r).copied().unwrap_or(0) & driver::local::PIE_RS_FLAG_RESET
                 == 0
             {
                 continue;
@@ -3389,18 +3771,12 @@ fn step_impl(
         // Positional is what breaks under `Union` — every guard arm is
         // present, so the launch after the dispatch belongs to some other
         // body — which is why the join is tried first rather than second.
-        let o_off = match dplan.spec(fi).outs.first() {
-            Some(Arg::Arena { at, .. }) => *at,
-            _ => match lowered.launches.get(fi + 1).map(|n| &lowered.args[n.args.start as usize]) {
-                Some(Arg::Arena { at, .. }) => *at,
-                _ => {
-                    eprintln!(
-                        "[driver-cuda-new] launch: {dispatch_name} states no arena \
-                         output, and the launch after it is not one either"
-                    );
-                    return Err(PIE_STATUS_UNSUPPORTED);
-                }
-            },
+        let Some(o_off) = attention_landing(&lowered, &dplan, fi) else {
+            eprintln!(
+                "[driver-cuda-new] launch: {dispatch_name} states no arena \
+                 output, and the launch after it is not one either"
+            );
+            return Err(PIE_STATUS_UNSUPPORTED);
         };
         (q_pin, Some(o_off))
     };
@@ -3460,8 +3836,18 @@ fn step_impl(
         sm_scale,
     };
 
+    // ONE HANDLE FOR THE DRIVER, its stream rebound per fire. See
+    // `Shell::cublas`: creating and destroying one per fire cost 3.2 ms.
     let mut cublas_ops = crate::cuda::cublas::LiveCublas;
-    let mut cublas = crate::cuda::cublas::CublasHandle::create(&mut cublas_ops, raw_stream)
+    if state.cublas.is_none() {
+        state.cublas = Some(
+            crate::cuda::cublas::CublasHandle::create(&mut cublas_ops, raw_stream)
+                .map_err(|_| PIE_STATUS_DRIVER_ERROR)?,
+        );
+    }
+    let cublas = state.cublas.as_mut().expect("just ensured");
+    cublas
+        .set_stream(&mut cublas_ops, raw_stream)
         .map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
     // The family's per-layer tables and named constants — the C++
     // parse-time vectors (`per_layer_rope_theta`, `rotary_of`) and the
@@ -3475,10 +3861,15 @@ fn step_impl(
     // engine does not yet mark rows, so the window is the whole fire —
     // which is what an unpeeled fire means and what the lowering's own
     // prefix/tail split degenerates to.
-    let mut peel_win =
-        crate::cuda::PeelWindowWord::new(&alloc).map_err(|_| PIE_STATUS_EXHAUSTED)?;
+    if state.peel_win.is_none() {
+        state.peel_win = Some(
+            crate::cuda::PeelWindowWord::new(alloc).map_err(|_| PIE_STATUS_EXHAUSTED)?,
+        );
+    }
+    let peel_win = state.peel_win.as_mut().expect("just ensured");
     peel_win.set(0, u32::try_from(rows).unwrap_or(0));
     peel_win.upload(stream.as_ref()).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+    let peel_window_ptr = peel_win.device_ptr();
 
     let ctx = DispatchCtx {
         stream: raw_stream,
@@ -3516,25 +3907,52 @@ fn step_impl(
         // do NOT carry the axis's mark, so the tail begins where the
         // marked suffix does; with no marked rows there is no split and
         // the word says the whole fire.
-        peel_window: peel_win.device_ptr(),
+        peel_window: peel_window_ptr,
         rows_total: i32::try_from(rows).unwrap_or(0),
     };
 
+    lap("bind");
     let mut resolver = LiveResolver { model, named: &named_bufs };
     let regions = AttnRegions::whole(Some(&attn));
+    // The last use of `alloc` is above, so the shared borrow is dead and the
+    // capture can take the same allocator mutably — which is the point: a
+    // capture has to be opened on the allocator that owns what the fire
+    // frees, or the frees are not deferred.
+    if state.preds.is_none() {
+        state.preds = crate::cuda::PredicateWord::new(
+            state.fire_alloc.as_ref().expect("the fire allocator exists"),
+        )
+        .ok();
+    }
+    let (capture_alloc, capture_preds) = match (&mut state.fire_alloc, &mut state.preds) {
+        (Some(a), Some(p)) => (a, p),
+        _ => return Err(PIE_STATUS_EXHAUSTED),
+    };
+    lap("ctx");
     let result = if union {
         capture_or_replay(
             &mut state.supergraph,
             state.fire_arrays.epoch,
             u64::from(model.hf.num_hidden_layers.unsigned_abs()),
             &plan, &fire_rows, &lowered, &dplan, exec_frame, &mut resolver, &ctx,
-            regions, gdn_ctx.as_ref(), &alloc, stream.as_ref(), requests, rows, class,
+            regions, gdn_ctx.as_ref(), capture_alloc, capture_preds, stream.as_ref(),
+            requests, rows, class,
         )
     } else {
         run(&lowered, &dplan, exec_frame, &mut resolver, &ctx, regions, gdn_ctx.as_ref())
     };
-    let sync = stream.as_ref().synchronize();
-    cublas.release(&mut cublas_ops);
+    lap("run");
+    // A step that owes nothing SYNCHRONIZES, because the next step in the
+    // frame reads what this one wrote. A step that owes the frame's
+    // completion does not: its debt rides a stream-ordered callback and
+    // this call returns with the work still queued, which is the whole
+    // point.
+    let sync = if owes.is_some() && state.runahead {
+        Ok(())
+    } else {
+        stream.as_ref().synchronize()
+    };
+    lap("sync");
     match (result, sync) {
         (Ok(_), Ok(())) => {}
         (Err(e), _) => {
@@ -3546,6 +3964,23 @@ fn step_impl(
             return Err(PIE_STATUS_DRIVER_ERROR);
         }
     }
+
+    lap("post-match");
+    // THE FRAME'S DEBT, built before the delivery below because it is
+    // owed whether or not this fire has logits to deliver. Paying it
+    // inside the delivery block meant a fire with no readout channel
+    // never published its terminal cells and never notified — the
+    // runtime waited forever on a frame the driver had finished.
+    let mut debt = owes.map(|(completion, cells)| FireDebt {
+        staging: None,
+        channel: None,
+        vocab: usize::try_from(model.hf.vocab_size).unwrap_or(0),
+        last_row: rows.saturating_sub(1),
+        cells,
+        completion,
+        notify: state.notify,
+        notify_ctx: state.notify_ctx,
+    });
 
     // ── Delivery: the LAST row's logits, out through the instance's
     // reader channel. The convention until the launch package's channel
@@ -3567,28 +4002,101 @@ fn step_impl(
         let vocab = usize::try_from(model.hf.vocab_size).unwrap_or(0);
         let target = inst.channel_ids.iter().find_map(|cid| {
             state.channels.get(cid).filter(|ch| {
-                ch.host_role == driver_abi::local::PIE_CHANNEL_HOST_ROLE_READER
+                ch.host_role == driver::local::PIE_CHANNEL_HOST_ROLE_READER
                     && ch.cell_bytes == vocab * 4
             })
         });
+        // THE D2H IS ENQUEUED, NOT AWAITED. Its destination belongs to
+        // the debt rather than to this stack frame — a `Vec` here would
+        // be freed the moment this call returns, which with an
+        // asynchronous completion is before the copy lands.
         if let (Some(ch), Some(buf)) = (target, named_bufs.get(&lv)) {
-            let mut bf16 = vec![0u8; buf.len()];
-            buf.copy_to_host(&mut bf16, stream.as_ref())
-                .map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-            stream.as_ref().synchronize().map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
-            let last = rows - 1;
-            let mut cell = vec![0u8; vocab * 4];
-            for t in 0..vocab {
-                let off = (last * vocab + t) * 2;
-                let bits = u16::from_le_bytes([bf16[off], bf16[off + 1]]);
-                cell[t * 4..t * 4 + 4]
-                    .copy_from_slice(&(u32::from(bits) << 16).to_le_bytes());
-            }
-            if !ch.publish(&cell) {
-                eprintln!("[driver-cuda-new] launch: logits ring full; frame dropped its output");
+            match debt.as_mut() {
+                Some(d) => {
+                    // The shell's buffer, grown to fit and reused. Not the
+                    // debt's: see `FireDebt::staging`.
+                    if state.logits_staging.as_ref().is_none_or(|p| p.len() < buf.len()) {
+                        state.logits_staging = Some(
+                            crate::cuda::PinnedBuf::new(buf.len())
+                                .map_err(|_| PIE_STATUS_EXHAUSTED)?,
+                        );
+                    }
+                    let pin = state.logits_staging.as_mut().expect("just sized");
+                    let view = (pin.as_slice().as_ptr(), buf.len());
+                    buf.copy_to_host(&mut pin.as_mut_slice()[..buf.len()], stream.as_ref())
+                        .map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+                    d.staging = Some(view);
+                    d.channel = Some(*ch);
+                }
+                None => {
+                    // A step that owes nothing has already synchronized,
+                    // so the old shape is still correct for it.
+                    let mut bf16 = vec![0u8; buf.len()];
+                    buf.copy_to_host(&mut bf16, stream.as_ref())
+                        .map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+                    stream.as_ref().synchronize().map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+                    let last = rows - 1;
+                    let mut cell = vec![0u8; vocab * 4];
+                    for t in 0..vocab {
+                        let off = (last * vocab + t) * 2;
+                        let bits = u16::from_le_bytes([bf16[off], bf16[off + 1]]);
+                        cell[t * 4..t * 4 + 4]
+                            .copy_from_slice(&(u32::from(bits) << 16).to_le_bytes());
+                    }
+                    if !ch.publish(&cell) {
+                        eprintln!(
+                            "[driver-cuda-new] launch: logits ring full; frame dropped its output"
+                        );
+                    }
+                }
             }
         }
+
     }
+
+    // The debt goes last in stream order, so it runs after every
+    // launch and after the D2H above.
+    if let Some(d) = debt {
+        let raw = Box::into_raw(Box::new(d)).cast::<std::ffi::c_void>();
+        // ONE SET OF DEBTS, TWO WAYS TO PAY THEM. Gated off, this
+        // thread pays after the synchronize above — which is what the
+        // driver always did, and what every caller reading a result
+        // on the next line still expects. Gated on, a stream-ordered
+        // callback pays them and this call returns with the work
+        // still queued.
+        if !state.runahead {
+            // The D2H above was ENQUEUED, so paying here means waiting
+            // here. Without this the callback's staging is read before
+            // the copy into it has landed.
+            stream.as_ref().synchronize().map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+            unsafe { retire_fire(raw) };
+            return Ok(());
+        }
+        if let Err(e) = unsafe { stream.as_ref().host_fn(retire_fire, raw) } {
+            // The callback never ran, so nothing will reclaim the box
+            // or pay the debt — do both here rather than leak a frame
+            // the runtime is waiting on.
+            eprintln!("[driver-cuda-new] launch: cannot enqueue completion: {e:?}");
+            let _ = stream.as_ref().synchronize();
+            unsafe { retire_fire(raw) };
+            return Err(PIE_STATUS_DRIVER_ERROR);
+        }
+        // AND THE SCRATCH SURVIVES THE CALL. Dropping it here would
+        // `cudaFree` while the fire runs, which synchronizes the
+        // device and undoes everything above. The next launch
+        // reclaims it — see `InFlight`.
+        lap("debt");
+        let done = crate::cuda::Event::new().map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+        stream.as_ref().record(&done).map_err(|_| PIE_STATUS_DRIVER_ERROR)?;
+        state.in_flight.push_back(InFlight {
+            done,
+            scratch: [Some(lse), Some(d_valid), _slot_ids_buf]
+                .into_iter()
+                .flatten()
+                .collect(),
+        });
+    }
+    lap("tail");
     Ok(())
 }
 
@@ -3613,13 +4121,13 @@ fn encode_gemma4_audio_arm(
         return PIE_STATUS_UNSUPPORTED;
     };
     let need = |n: &str| -> Result<*const std::ffi::c_void, i32> {
-        model.weights.get(n).map(|b| b.as_ptr().cast_const()).ok_or_else(|| {
+        model.weights.get(n).map(|b| b.ptr.cast_const()).ok_or_else(|| {
             eprintln!("[driver-cuda-new] encode: missing audio weight {n}");
             PIE_STATUS_UNSUPPORTED
         })
     };
     let opt = |n: String| -> *const std::ffi::c_void {
-        model.weights.get(&n).map_or(core::ptr::null(), |b| b.as_ptr().cast_const())
+        model.weights.get(&n).map_or(core::ptr::null(), |b| b.ptr.cast_const())
     };
     let ap = "model.audio_tower";
     let g = |n: &str| need(&format!("{ap}.{n}"));
@@ -3680,7 +4188,7 @@ fn encode_gemma4_audio_arm(
     let text_hidden = model
         .weights
         .get("model.embed_audio.embedding_projection.weight")
-        .map_or(0, |b| b.len() / (usize::try_from(ac.output_proj_dims.max(1)).unwrap_or(1) * 2));
+        .map_or(0, |b| b.bytes / (usize::try_from(ac.output_proj_dims.max(1)).unwrap_or(1) * 2));
     let Ok(stream) = crate::cuda::OwnedStream::new(0) else {
         return PIE_STATUS_DRIVER_ERROR;
     };
@@ -3729,8 +4237,7 @@ fn encode_gemma4_audio_arm(
 /// The MULTIMODAL encode: image/audio media in, embedding rows out —
 /// the towers behind `vision::gemma4_*_encode`. One media kind per call
 /// today; mixed batches await the offset plumbing.
-#[unsafe(no_mangle)]
-pub extern "C" fn pie_cuda_encode(
+pub fn pie_cuda_encode(
     driver: *mut PieDriver,
     encode: *const PieEncodeDesc,
     completion: PieCompletion,
@@ -3781,13 +4288,13 @@ pub extern "C" fn pie_cuda_encode(
     // built per call from the loaded weights — name lookups, no stored
     // pointers. The binder mapping is `bind_gemma4_vision`'s.
     let need = |n: &str| -> Result<*const std::ffi::c_void, i32> {
-        model.weights.get(n).map(|b| b.as_ptr().cast_const()).ok_or_else(|| {
+        model.weights.get(n).map(|b| b.ptr.cast_const()).ok_or_else(|| {
             eprintln!("[driver-cuda-new] encode: missing vision weight {n}");
             PIE_STATUS_UNSUPPORTED
         })
     };
     let opt = |n: String| -> *const std::ffi::c_void {
-        model.weights.get(&n).map_or(core::ptr::null(), |b| b.as_ptr().cast_const())
+        model.weights.get(&n).map_or(core::ptr::null(), |b| b.ptr.cast_const())
     };
     let vp = "model.vision_tower";
     let patch_w = match need(&format!("{vp}.patch_embedder.input_proj.weight")) {
@@ -3847,11 +4354,11 @@ pub extern "C" fn pie_cuda_encode(
     let pos_table_size = model
         .weights
         .get(&format!("{vp}.patch_embedder.position_embedding_table"))
-        .map_or(0, |b| b.len() / (2 * hidden * 2));
+        .map_or(0, |b| b.bytes / (2 * hidden * 2));
     let text_hidden = model
         .weights
         .get("model.embed_vision.embedding_projection.weight")
-        .map_or(0, |b| b.len() / (hidden * 2));
+        .map_or(0, |b| b.bytes / (hidden * 2));
 
     let Ok(stream) = crate::cuda::OwnedStream::new(0) else {
         return PIE_STATUS_DRIVER_ERROR;
@@ -3928,13 +4435,12 @@ pub extern "C" fn pie_cuda_encode(
 /// moves through the bridged `copy_kv_cells_bf16`. Host-pinned domains
 /// refuse until the swap pool wires in — a swap, not a copy, and its
 /// store is ported but not yet mounted here.
-#[unsafe(no_mangle)]
-pub extern "C" fn pie_cuda_copy_kv(
+pub fn pie_cuda_copy_kv(
     driver: *mut PieDriver,
     copy: *const PieKvCopyDesc,
     completion: PieCompletion,
 ) -> i32 {
-    use driver_abi::local::PIE_MEMORY_DOMAIN_CUDA_DEVICE;
+    use driver::local::PIE_MEMORY_DOMAIN_CUDA_DEVICE;
 
     let Some(state) = shell(driver) else {
         return PIE_STATUS_INVALID_ARGUMENT;
@@ -4151,8 +4657,7 @@ pub extern "C" fn pie_cuda_copy_kv(
 /// (`context.cpp` ignores the token fields — those ride for the rs
 /// BUFFER pool, spec-decode machinery). Slot ids are the engine's; the
 /// slabs grow with migration to cover them.
-#[unsafe(no_mangle)]
-pub extern "C" fn pie_cuda_copy_state(
+pub fn pie_cuda_copy_state(
     driver: *mut PieDriver,
     copy: *const PieStateCopyDesc,
     _completion: PieCompletion,
@@ -4223,8 +4728,7 @@ pub extern "C" fn pie_cuda_copy_state(
 /// drop the tail; `map_ranges`/`unmap_ranges` (the elastic-VMM form) are
 /// accepted but the shell's pools are plain allocations, so the target
 /// page count is the whole contract here — stated, not hidden.
-#[unsafe(no_mangle)]
-pub extern "C" fn pie_cuda_resize_pool(
+pub fn pie_cuda_resize_pool(
     driver: *mut PieDriver,
     resize: *const PiePoolResizeDesc,
     completion: PieCompletion,
@@ -4325,6 +4829,12 @@ pub extern "C" fn pie_cuda_resize_pool(
         return PIE_STATUS_DRIVER_ERROR;
     }
     state.kv = Some(KvState { pools, num_pages: target });
+    // A RESIZE MOVES THE KV PAGES, and a captured graph baked their old
+    // addresses into every attention launch. Bumping the epoch is what tells
+    // `SupergraphCache` to recapture instead of replaying into memory the
+    // pool no longer owns — which showed up as a segfault the moment decode
+    // fires became capturable at all.
+    state.fire_arrays.epoch += 1;
     std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
     if let Some(notify) = state.notify {
         unsafe { notify(state.notify_ctx, completion.wait_id, completion.target_epoch) };
@@ -4334,8 +4844,7 @@ pub extern "C" fn pie_cuda_resize_pool(
 
 /// Close an instance — idempotently, the C++'s reading: closing what is
 /// not open is not an error.
-#[unsafe(no_mangle)]
-pub extern "C" fn pie_cuda_close_instance(driver: *mut PieDriver, instance_id: u64) -> i32 {
+pub fn pie_cuda_close_instance(driver: *mut PieDriver, instance_id: u64) -> i32 {
     let Some(state) = shell(driver) else {
         return PIE_STATUS_INVALID_ARGUMENT;
     };
@@ -4344,8 +4853,7 @@ pub extern "C" fn pie_cuda_close_instance(driver: *mut PieDriver, instance_id: u
 }
 
 /// Close a channel — idempotently, freeing its pinned endpoint.
-#[unsafe(no_mangle)]
-pub extern "C" fn pie_cuda_close_channel(driver: *mut PieDriver, channel_id: u64) -> i32 {
+pub fn pie_cuda_close_channel(driver: *mut PieDriver, channel_id: u64) -> i32 {
     let Some(state) = shell(driver) else {
         return PIE_STATUS_INVALID_ARGUMENT;
     };

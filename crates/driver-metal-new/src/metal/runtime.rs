@@ -53,11 +53,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use driver_abi::local::{
+use driver::local::{
     PIE_KERNEL_COMMIT, PIE_KERNEL_FUSED, PIE_KERNEL_GROUPED, PIE_KERNEL_READINESS,
     PIE_KERNEL_SINGLETON, PIE_REGION_LIBRARY,
 };
-use driver_abi::plan::{EmittedKernel, LaunchOp};
+use driver::plan::{EmittedKernel, LaunchOp};
 use tensor_ir::fnv1a64;
 use tensor_ir::op::tags;
 use tensor_ir::registry::Stage;

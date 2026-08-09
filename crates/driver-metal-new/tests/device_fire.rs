@@ -14,11 +14,11 @@
 
 use std::rc::Rc;
 
-use driver_abi::local::{
+use driver::local::{
     PIE_KERNEL_COMMIT, PIE_KERNEL_GROUPED, PIE_KERNEL_READINESS, PIE_KERNEL_SINGLETON,
     PIE_READINESS_NEEDS_FULL,
 };
-use driver_abi::plan::{
+use driver::plan::{
     EmittedKernel, LaunchChannel, LaunchOp, LaunchPackage, LaunchPlanValue, LaunchRegion,
     LaunchStage, LaunchStagePlan,
 };

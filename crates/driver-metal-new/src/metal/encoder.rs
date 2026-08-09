@@ -302,7 +302,15 @@ impl StepEncoder<'_> {
 /// pipelined version needs and a synchronous one that ignores it would have to
 /// grow the state back when it stops being synchronous.
 pub struct Stepper<'ctx> {
-    context: &'ctx Context,
+    /// The device objects this timeline commits to.
+    ///
+    /// Borrowed OR shared, and the second is what run-ahead needs: a driver
+    /// that owns a `Context` cannot also hold a `Stepper<'_>` borrowing it,
+    /// which is a self-reference — so a stepper held across fires has to keep
+    /// its context alive itself. [`Stepper::shared`] is that constructor;
+    /// [`Stepper::new`] still borrows, because every test and every one-shot
+    /// caller has a context on the stack and should not have to allocate.
+    context: ContextRef<'ctx>,
     event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     /// The event value the last committed step signals.
     committed: u64,
@@ -320,14 +328,69 @@ pub struct Stepper<'ctx> {
     mappings: Option<Mappings>,
 }
 
+/// This device's shared event, which is the timeline a stepper signals.
+fn new_shared_event(
+    context: &Context,
+) -> Result<Retained<ProtocolObject<dyn MTLSharedEvent>>> {
+    context.device().newSharedEvent().ok_or(Error::Create {
+        what: "MTLSharedEvent",
+        message: String::new(),
+    })
+}
+
+/// A context a [`Stepper`] either borrows or keeps alive.
+enum ContextRef<'ctx> {
+    Borrowed(&'ctx Context),
+    Shared(std::sync::Arc<Context>),
+}
+
+impl std::ops::Deref for ContextRef<'_> {
+    type Target = Context;
+    fn deref(&self) -> &Context {
+        match self {
+            ContextRef::Borrowed(c) => c,
+            ContextRef::Shared(c) => c,
+        }
+    }
+}
+
+impl std::fmt::Debug for ContextRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Context")
+    }
+}
+
+impl Stepper<'static> {
+    /// A stepper that KEEPS its context alive, so it can outlive the scope
+    /// that made it.
+    ///
+    /// What a driver holding one across fires needs. The timeline and the
+    /// allocator ring live on the stepper, so a fresh one per fire has no
+    /// previous value to compare against and no allocator to alternate — it
+    /// cannot pipeline even in principle.
+    ///
+    /// # Errors
+    ///
+    /// As [`Stepper::new`].
+    pub fn shared(context: std::sync::Arc<Context>) -> Result<Self> {
+        let event = new_shared_event(&context)?;
+        Ok(Self::with_context(ContextRef::Shared(context), event))
+    }
+}
+
 impl<'ctx> Stepper<'ctx> {
     /// Build a stepper for `context`.
     pub fn new(context: &'ctx Context) -> Result<Self> {
-        let event = context.device().newSharedEvent().ok_or(Error::Create {
-            what: "MTLSharedEvent",
-            message: String::new(),
-        })?;
-        Ok(Self {
+        let event = new_shared_event(context)?;
+        Ok(Self::with_context(ContextRef::Borrowed(context), event))
+    }
+
+    /// The fields every constructor fills the same way.
+    fn with_context(
+        context: ContextRef<'ctx>,
+        event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    ) -> Self {
+        Self {
             context,
             event,
             committed: 0,
@@ -335,7 +398,7 @@ impl<'ctx> Stepper<'ctx> {
             feedback: Feedbacks::new(),
             surfaced: 0,
             mappings: None,
-        })
+        }
     }
 
     /// How many steps have been committed.
@@ -381,6 +444,76 @@ impl<'ctx> Stepper<'ctx> {
         let value = self.commit(std::slice::from_ref(&buffer));
         self.await_value(value)?;
         Ok(self.timing(value, committed - encode_begin, committed.elapsed()))
+    }
+
+    /// Encode one step and COMMIT it, without waiting for the GPU.
+    ///
+    /// The half of [`run`](Self::run) that run-ahead needs. `run` ends in
+    /// `await_value`, so a caller cannot queue step n+1 until step n has
+    /// FINISHED -- the call that would queue it has not returned. That makes
+    /// the engine's `frame_dispatch_depth` a number the engine honours and
+    /// the driver serialises, which is the invariant pie is built on
+    /// (`.wiki/new-driver/next.md`, priority 1).
+    ///
+    /// Returns the timeline value this step signals. Hand it to
+    /// [`has_passed`](Self::has_passed) to ask whether the GPU is done with
+    /// it, or to [`wait_for`](Self::wait_for) to block.
+    ///
+    /// # The allocator is why this is bounded
+    ///
+    /// A step encodes against `context.allocator(committed)`, which alternates
+    /// over [`ALLOCATOR_COUNT`](super::context::ALLOCATOR_COUNT) = 2, and this
+    /// RESETS it first. Resetting an allocator whose command buffer is still
+    /// executing is a use-after-free, so a caller may have at most
+    /// `ALLOCATOR_COUNT - 1` steps outstanding. This checks rather than
+    /// trusting: the step two back must have passed, and if it has not this
+    /// waits for it.
+    ///
+    /// One in flight while one runs is exactly the shape run-ahead wants; a
+    /// deeper pipeline wants more allocators, and that is the constant to
+    /// change.
+    ///
+    /// # Errors
+    ///
+    /// A wedged context, a fault reported since the last step, or an encode
+    /// that failed. As [`run`](Self::run).
+    pub fn submit<F>(&mut self, encode: F) -> Result<u64>
+    where
+        F: FnOnce(&mut StepEncoder<'_>) -> Result<()>,
+    {
+        self.preflight()?;
+        // The allocator this step is about to reset was last used by the step
+        // `ALLOCATOR_COUNT` back. Nothing may reset it while its buffer runs.
+        let reused = self
+            .committed
+            .checked_sub(super::context::ALLOCATOR_COUNT as u64);
+        if let Some(value) = reused {
+            self.await_value(value)?;
+        }
+        let allocator = self.allocator();
+        allocator.reset();
+        let buffer = self.encode_one(allocator, encode)?;
+        Ok(self.commit(std::slice::from_ref(&buffer)))
+    }
+
+    /// Whether the GPU has passed `value`. Does not block.
+    ///
+    /// The completion path run-ahead needs: a fire retires when its event
+    /// value is reached, which is a read of the shared event's counter and
+    /// not a wait on it.
+    #[must_use]
+    pub fn has_passed(&self, value: u64) -> bool {
+        self.event.signaledValue() >= value
+    }
+
+    /// Block until the GPU passes `value`.
+    ///
+    /// # Errors
+    ///
+    /// The context wedged: the GPU did not reach `value` within the probe
+    /// budget, after which nothing more will run.
+    pub fn wait_for(&mut self, value: u64) -> Result<()> {
+        self.await_value(value)
     }
 
     /// Encode `count` command buffers and submit them in ONE commit.
@@ -710,7 +843,7 @@ impl<'ctx> Stepper<'ctx> {
     ) -> Result<T> {
         self.preflight()?;
         if self.mappings.is_none() {
-            self.mappings = Some(Mappings::new(self.context)?);
+            self.mappings = Some(Mappings::new(&self.context)?);
         }
         let queue = &self.mappings.as_ref().expect("just built").queue;
         let event = &*self.event;
@@ -736,14 +869,14 @@ impl<'ctx> Stepper<'ctx> {
                 heap_tile,
             )
         };
-        body(self.context, &mut schedule)
+        body(&self.context, &mut schedule)
     }
 
     /// The shrink half, which needs no heap and must be waited for.
     fn remap_shrink(&mut self, buffer: &mut Elastic, bytes: u64) -> Result<()> {
         self.preflight()?;
         if self.mappings.is_none() {
-            self.mappings = Some(Mappings::new(self.context)?);
+            self.mappings = Some(Mappings::new(&self.context)?);
         }
         let through = {
             let queue = &self.mappings.as_ref().expect("just built").queue;
@@ -798,7 +931,7 @@ impl<'ctx> Stepper<'ctx> {
     /// Safe because this stepper is synchronous: the work drawn from this
     /// allocator was waited for two submissions ago. The parity is what makes
     /// that sentence still true when the wait moves off the commit path.
-    fn allocator(&self) -> &'ctx ProtocolObject<dyn MTL4CommandAllocator> {
+    fn allocator(&self) -> &ProtocolObject<dyn MTL4CommandAllocator> {
         self.context.allocator(self.committed as usize)
     }
 

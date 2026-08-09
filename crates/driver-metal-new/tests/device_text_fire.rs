@@ -654,3 +654,108 @@ fn a_move_plan_slides_rows_without_smearing_them() {
         assert_eq!(got[4 * row], 4, "{name}: page 2 untouched");
     }
 }
+
+/// Two WHOLE-TEXT fires in flight: the second is queued while the first runs.
+///
+/// The executor-level statement of `.wiki/new-driver/next.md` priority 1, and
+/// the reason it is here rather than only in `device_steps`: a synthetic
+/// two-dispatch step proves the stepper can hold two timeline values, and
+/// this proves a real 300-launch decode can — that nothing in planning,
+/// staging or binding secretly serialises on the previous fire.
+///
+/// What it measures is the property, not a duration. `run::submit` returns
+/// having committed and not waited, so holding two `InFlight` values at once
+/// is something `run` cannot express at all: it ends in `await_value`, so the
+/// call that would produce the second cannot return until the first is done.
+///
+/// It also pins the ownership rule that makes this safe. A committed fire's
+/// command buffer addresses its arena, reads operands out of its argument
+/// table and scalars out of its staged params; `InFlight` holds all three, so
+/// dropping the handle a caller kept cannot free memory the GPU is reading.
+/// The arenas being DIFFERENT is asserted, because two fires sharing one is
+/// the first thing that would go wrong.
+#[test]
+fn two_whole_text_fires_are_in_flight_at_once() {
+    let Ok(context) = Context::new() else {
+        eprintln!("SKIP: no Metal 4 device");
+        return;
+    };
+    let compiler = Compiler::new(&context).expect("a compiler");
+    let mut pipelines = Pipelines::new(kernels_dir());
+
+    let step = Step {
+        token_ids: &[11, 22, 33, 44],
+        qo_indptr: &[0, 1, 2, 3, 4],
+        sampling_indices: &[0, 1, 2, 3],
+        ..Step::default()
+    };
+    let plan = llama_like_metal(
+        &LlamaLikeFacts::qwen3_0_6b(),
+        &LlamaLikeMetalFacts::synthetic(),
+        FireClass::Decode,
+    );
+    let lowered = lower_step(&plan, &step).expect("the step lowers");
+
+    let backing = allocate(&context, 256 << 20, "sentinel weights").expect("a backing region");
+    let zeros = zeroed(&context);
+    let mut store = Sentinels {
+        slice: Slice {
+            address: backing.gpu_address(),
+            bytes: 256 << 20,
+        },
+        tables: Slice {
+            address: zeros.gpu_address(),
+            bytes: 1 << 20,
+        },
+        asked: HashMap::new(),
+    };
+
+    // ONE stepper across both fires. A fresh one per fire — which is what
+    // `run_keeping_arena` builds — has no timeline to compare against and no
+    // allocator ring to alternate, so it could not pipeline even in
+    // principle.
+    let mut stepper = driver_metal_new::metal::Stepper::new(&context).expect("a stepper");
+
+    let first = driver_metal_new::model::run::submit(
+        &context,
+        &compiler,
+        &mut pipelines,
+        &mut stepper,
+        &lowered,
+        geometry(),
+        &mut store,
+    )
+    .expect("the first fire commits");
+
+    // Committed, not waited for. The second is planned, staged, bound and
+    // committed with the first still outstanding.
+    let second = driver_metal_new::model::run::submit(
+        &context,
+        &compiler,
+        &mut pipelines,
+        &mut stepper,
+        &lowered,
+        geometry(),
+        &mut store,
+    )
+    .expect("the second fire commits while the first is outstanding");
+
+    assert_eq!(
+        second.value,
+        first.value + 1,
+        "two fires must be two timeline points"
+    );
+    assert_ne!(
+        first.arena.gpu_address(),
+        second.arena.gpu_address(),
+        "two fires in flight shared one arena, so the second overwrote the \
+         first's activations while it was still computing them"
+    );
+
+    stepper.wait_for(second.value).expect("both fires retire");
+    assert!(
+        stepper.has_passed(first.value) && stepper.has_passed(second.value),
+        "the timeline reached {} but reports otherwise",
+        second.value
+    );
+}

@@ -19,8 +19,8 @@
 mod msl_corpus;
 
 use msl_corpus::{GOLDEN_NAMES, golden_container, golden_profile, synthetic_traces};
-use driver_abi::plan::LaunchStagePlan;
-use driver_abi::{
+use driver::plan::LaunchStagePlan;
+use driver::{
     PIE_STAGE_GROUPED_VALID, PIE_STAGE_REQUIRES_ATTN_SCORE, PIE_STAGE_REQUIRES_KERNEL_CALL,
     PIE_STAGE_REQUIRES_LAYER, PIE_STAGE_REQUIRES_LORA, PIE_STAGE_REQUIRES_MTP_ROWS,
     PIE_STAGE_REQUIRES_PAGE_MASK, PIE_STAGE_REQUIRES_QUERY,

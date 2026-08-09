@@ -160,10 +160,10 @@ impl MockEnv {
             .map(|_| DriverConfig {
                 total_pages: self.num_pages,
                 cpu_pages: self.num_pages * 4,
-                kv_copy_domain_mask: driver_abi::KV_COPY_DEVICE_TO_DEVICE
-                    | driver_abi::KV_COPY_DEVICE_TO_HOST
-                    | driver_abi::KV_COPY_HOST_TO_DEVICE
-                    | driver_abi::KV_COPY_HOST_TO_HOST,
+                kv_copy_domain_mask: ::driver::KV_COPY_DEVICE_TO_DEVICE
+                    | ::driver::KV_COPY_DEVICE_TO_HOST
+                    | ::driver::KV_COPY_HOST_TO_DEVICE
+                    | ::driver::KV_COPY_HOST_TO_HOST,
                 backend_kind: "dummy".to_string(),
                 rs_cache_required: false,
                 rs_cache_slots: self.rs_slots,
@@ -177,7 +177,7 @@ impl MockEnv {
                 has_attn_page_mask: false,
                 has_attn_score: false,
                 has_lora: false,
-                device_geometry_port_mask: driver_abi::PIE_DEVICE_GEOMETRY_PORTS,
+                device_geometry_port_mask: ::driver::PIE_DEVICE_GEOMETRY_PORTS,
                 limits: SchedulerLimits {
                     max_forward_requests: 32,
                     max_forward_tokens: 4096,

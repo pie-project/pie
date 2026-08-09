@@ -36,7 +36,7 @@
 //! the plan plus three runtime numbers -- so it is a pure function here, and it
 //! is tested without a device.
 
-use driver_abi::plan::LaunchOp;
+use driver::plan::LaunchOp;
 use tensor_ir::op::IntrinsicId;
 use tensor_ir::op::tags;
 

@@ -285,10 +285,10 @@ fn run_both(
     let bound = bind(container, profile()).expect("the container binds");
     let stages = compile_bound(&bound);
     let package = tensor_compiler::codegen::launch::build(&bound, &stages);
-    let emitted: Vec<driver_abi::plan::EmittedKernel> =
+    let emitted: Vec<driver::plan::EmittedKernel> =
         emit_program(Backend::Metal, &stages, &bound)
             .into_iter()
-            .map(|k| driver_abi::plan::EmittedKernel {
+            .map(|k| driver::plan::EmittedKernel {
                 kind: k.kind,
                 stage_index: k.stage_index,
                 region_index: k.region_index,

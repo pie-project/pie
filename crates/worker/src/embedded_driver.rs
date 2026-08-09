@@ -20,40 +20,17 @@ use crate::config::{
 };
 use crate::driver_ffi::Flavor;
 
-/// Anchors the loader ABI's C entry points into the final binary.
-///
-/// `model-loader-capi` is an rlib and the only callers of
-/// `pie_loader_compile_model` and friends are the C++ drivers, which link
-/// *after* Rust. A linker never pulls an rlib member in on behalf of a C++
-/// reference, so without a reference from reachable Rust the entry points are
-/// simply absent and the failure surfaces as an undefined symbol at final
-/// link (`loader/architecture.md` §3.4). The `#[used]` table inside
-/// `model_loader_capi::entry` keeps all six alive once the object is pulled in;
-/// this static is what pulls it in.
-///
-/// **This is load-bearing.** No Rust in this process calls the loader any more —
-/// §12 step 2 moved plan compilation behind the FFI, and the boot's request
-/// entry is `pie_loader_compile_model` (`plan/model-in-rust.md` §6) — so this
-/// reference is the only thing keeping the object file in the link.
-#[used]
-static PIE_LOADER_ENTRY_ANCHOR: unsafe extern "C" fn(
-    *const model_loader_capi::model::PieLoaderModelRequest,
-    *mut *mut model_loader_capi::PieLoaderPlan,
-    *mut u32,
-    *mut *mut model_loader_capi::PieLoaderDiagnostics,
-) -> model_loader_capi::PieLoaderStatus = model_loader_capi::model::pie_loader_compile_model;
-
-/// Same story for the forward toolchain (tart): the drivers trace a
-/// family's declaration over `pie_forward.h`, no Rust in this process
-/// calls it, and the crate-side `#[used] KEEP_ALIVE` only keeps symbols
-/// alive once the object file is in the link — this reference is what
-/// puts it there.
-#[used]
-static PIE_FORWARD_ENTRY_ANCHOR: unsafe extern "C" fn(
-    *const model::ffi::entry::PieForwardLlamaLikeFacts,
-    *mut model::ffi::PieForwardPlan,
-) -> model::ffi::entry::PieForwardStatus =
-    model::ffi::entry::pie_forward_trace_llama_like;
+// THE TWO LINK ANCHORS ARE GONE WITH THE C++ THEY SERVED.
+//
+// `PIE_LOADER_ENTRY_ANCHOR` and `PIE_FORWARD_ENTRY_ANCHOR` existed because a
+// linker never pulls an rlib member in on behalf of a C++ reference: the only
+// callers of `pie_loader_compile_model` and `pie_forward_trace_llama_like`
+// were the C++ drivers, which link after Rust, so without a reference from
+// reachable Rust the entry points were simply absent at final link.
+//
+// Both drivers are Rust now. `model-loader` and `model` are called directly,
+// through their own types, and there is nothing on the far side of an FFI
+// boundary to keep alive.
 
 #[cfg(feature = "driver-cuda")]
 #[repr(C)]
@@ -329,11 +306,11 @@ pub fn remove_launch_state() {
     }
 }
 
-// `DriverCapabilities` is owned by `driver-abi` (single source of truth
+// `DriverCapabilities` is owned by `driver` (single source of truth
 // for the driver ↔ runtime interface). Re-exported here so existing call
 // sites in pie-worker keep working through the
 // `embedded_driver::DriverCapabilities` path.
-pub use driver_abi::DriverCapabilities;
+pub use driver::DriverCapabilities;
 
 /// Parse a capability JSON blob into the typed driver-capability struct.
 /// Lives in pie-worker (not bridge) so bridge can stay free of a
@@ -474,11 +451,11 @@ fn model_load_desc(
     snapshot_dir: &Path,
     runtime_quant: &str,
     mxfp4_moe: &str,
-    component: driver_abi::ModelComponent,
-) -> Result<driver_abi::ModelLoadDesc> {
-    let mxfp4_moe = driver_abi::Mxfp4MoeRequest::parse(mxfp4_moe)
+    component: driver::ModelComponent,
+) -> Result<driver::ModelLoadDesc> {
+    let mxfp4_moe = driver::Mxfp4MoeRequest::parse(mxfp4_moe)
         .ok_or_else(|| anyhow!("unknown mxfp4_moe policy '{mxfp4_moe}'"))?;
-    Ok(driver_abi::ModelLoadDesc {
+    Ok(driver::ModelLoadDesc {
         snapshot_dir: snapshot_dir.to_path_buf(),
         runtime_quant: runtime_quant.to_string(),
         mxfp4_moe,
@@ -701,7 +678,7 @@ pub(crate) fn create_driver_backend_group(
     descriptor: &[u8],
     group_id: usize,
     tp_launches: &[TpLaunch],
-    component: driver_abi::ModelComponent,
+    component: driver::ModelComponent,
 ) -> Result<crate::translate::GroupDriver> {
     validate_snapshot_dir(snapshot_dir)?;
     if rank_options.is_empty() {
@@ -776,7 +753,7 @@ pub(crate) fn create_driver_backend(
     descriptor: &[u8],
     group_id: usize,
     tp: Option<&TpLaunch>,
-    component: driver_abi::ModelComponent,
+    component: driver::ModelComponent,
 ) -> Result<crate::translate::GroupDriver> {
     // Each is used only inside a `#[cfg(feature = "driver-…")]` arm below.
     let _ = (group_id, tp, descriptor);
@@ -861,10 +838,10 @@ mod tests {
             "activation_dtype": "bfloat16",
             "snapshot_dir": "/tmp/snap"
         }}"#,
-            driver_abi::PIE_DRIVER_ABI_VERSION
+            driver::PIE_DRIVER_ABI_VERSION
         );
         let caps = parse_caps_json(&json).unwrap();
-        assert_eq!(caps.abi_version, driver_abi::PIE_DRIVER_ABI_VERSION);
+        assert_eq!(caps.abi_version, driver::PIE_DRIVER_ABI_VERSION);
         assert_eq!(caps.total_pages, 1024);
         assert_eq!(caps.arch_name, "qwen3");
         assert_eq!(caps.snapshot_dir, "/tmp/snap");
@@ -909,7 +886,7 @@ mod tests {
             DESCRIPTOR,
             0,
             None,
-            driver_abi::ModelComponent::Full,
+            driver::ModelComponent::Full,
         )
         .unwrap();
         assert_eq!(group.caps.arch_name, "qwen3");
@@ -937,7 +914,7 @@ mod tests {
             &[],
             0,
             None,
-            driver_abi::ModelComponent::Encode,
+            driver::ModelComponent::Encode,
         )
         .unwrap();
         assert!(group.caps.supports_media_encode);
@@ -954,7 +931,7 @@ mod tests {
                     patch_positions.extend([x, y]);
                 }
             }
-            driver_abi::MediaEncodePlan {
+            driver::MediaEncodePlan {
                 image_grids: vec![1, 3, 3],
                 image_pixels: vec![0; pixel_bytes],
                 image_pixel_indptr: vec![0, pixel_bytes as u32],
@@ -969,7 +946,7 @@ mod tests {
         };
         let audio_frames = 16usize;
         let audio_rows = 4usize;
-        let make_audio = || driver_abi::MediaEncodePlan {
+        let make_audio = || driver::MediaEncodePlan {
             image_grids: Vec::new(),
             image_pixels: Vec::new(),
             image_pixel_indptr: Vec::new(),
@@ -1000,17 +977,17 @@ mod tests {
         assert!(audio.output_rows.iter().any(|byte| *byte != 0));
         let tower_audio_rows = audio.output_rows;
 
-        let model = driver_abi::ModelIdentity {
+        let model = driver::ModelIdentity {
             hash: [9; 32],
-            component: driver_abi::ModelComponent::Encode,
+            component: driver::ModelComponent::Encode,
         };
-        let layout = driver_abi::KvLayout {
+        let layout = driver::KvLayout {
             num_layers: 0,
             num_kv_heads: 0,
             head_dim: 0,
             page_size: 0,
-            dtype: driver_abi::KvDtype::Bf16,
-            kind: driver_abi::KvLayoutKind::KvSeparate,
+            dtype: driver::KvDtype::Bf16,
+            kind: driver::KvLayoutKind::KvSeparate,
             storage_format: String::new(),
             region_page_bytes: Vec::new(),
         };
@@ -1028,8 +1005,8 @@ mod tests {
         let hello = client
             .execute(
                 tarpc::context::current(),
-                driver_abi::ExecutorRequest::Hello(driver_abi::HelloRequest {
-                    wire_version: driver_abi::REMOTE_WIRE_VERSION,
+                driver::ExecutorRequest::Hello(driver::HelloRequest {
+                    wire_version: driver::REMOTE_WIRE_VERSION,
                     client_nonce: 1,
                     model,
                     kv_layout: layout,
@@ -1039,7 +1016,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let driver_abi::ExecutorResponse::Hello(hello) = hello else {
+        let driver::ExecutorResponse::Hello(hello) = hello else {
             panic!("executor Hello response");
         };
         assert_eq!(hello.grant.num_pages, 0);
@@ -1048,8 +1025,8 @@ mod tests {
         let response = client
             .execute(
                 tarpc::context::current(),
-                driver_abi::ExecutorRequest::Encode(driver_abi::RemoteEncode {
-                    plan: driver_abi::LaunchPlan {
+                driver::ExecutorRequest::Encode(driver::RemoteEncode {
+                    plan: driver::LaunchPlan {
                         token_ids: vec![0],
                         qo_indptr: vec![0, 1],
                         image_grids: image.image_grids,
@@ -1065,7 +1042,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let driver_abi::ExecutorResponse::Embeddings(image) = response else {
+        let driver::ExecutorResponse::Embeddings(image) = response else {
             panic!("executor image response");
         };
         assert_eq!(image.rows, tower_rows);
@@ -1074,8 +1051,8 @@ mod tests {
         let response = client
             .execute(
                 tarpc::context::current(),
-                driver_abi::ExecutorRequest::Encode(driver_abi::RemoteEncode {
-                    plan: driver_abi::LaunchPlan {
+                driver::ExecutorRequest::Encode(driver::RemoteEncode {
+                    plan: driver::LaunchPlan {
                         token_ids: vec![0; audio_rows],
                         qo_indptr: vec![0, audio_rows as u32],
                         audio_features: audio.audio_features,
@@ -1089,7 +1066,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let driver_abi::ExecutorResponse::Embeddings(audio) = response else {
+        let driver::ExecutorResponse::Embeddings(audio) = response else {
             panic!("executor audio response");
         };
         assert_eq!(audio.rows, tower_audio_rows);
@@ -1108,7 +1085,7 @@ mod tests {
             &[],
             1,
             None,
-            driver_abi::ModelComponent::Full,
+            driver::ModelComponent::Full,
         )
         .unwrap();
         assert!(full.caps.supports_media_encode);

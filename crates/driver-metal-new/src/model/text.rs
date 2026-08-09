@@ -193,6 +193,28 @@ pub fn facts_from(
     model::families::llama_like::forward::facts::LlamaLikeFacts,
     model::families::llama_like::forward::facts::LlamaLikeMetalFacts,
 ) {
+    facts_from_with(geometry, has_tensor, |_| false)
+}
+
+/// [`facts_from`], told which weights the load left in MXFP4.
+///
+/// The second probe is the one a mixture needs. A checkpoint need not
+/// quantize uniformly -- `mlx-community/gpt-oss-20b-MXFP4-Q4` names 98
+/// tensors as affine/64/4 and leaves the expert banks out, so they take the
+/// top-level default, mxfp4/32 -- and reading a bank with the dense format is
+/// 909,207 NaNs rather than a near miss.
+///
+/// `Loaded::mxfp4` is what answers it: the LOAD gets the bytes onto the
+/// device unchanged and says what they are, and this is the binder deciding
+/// what they mean.
+pub fn facts_from_with(
+    geometry: &crate::batch::DecodeGeometry,
+    has_tensor: impl Fn(&str) -> bool,
+    is_mxfp4: impl Fn(&str) -> bool,
+) -> (
+    model::families::llama_like::forward::facts::LlamaLikeFacts,
+    model::families::llama_like::forward::facts::LlamaLikeMetalFacts,
+) {
     use model::families::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
     use model_compiler::dsl::{ScaleLayout, WeightRepr};
 
@@ -254,6 +276,30 @@ pub fn facts_from(
             zero_point: true,
         },
         affine_bits: geometry.quant.bits,
+        // Uniform, for now, and the reason is worth stating because it is a
+        // load-time fact and not a text one.
+        //
+        // `metal_storage_target` sets `native_mxfp4_moe: false`, which tells
+        // the loader this driver has no MXFP4 routed kernel and its banks must
+        // be TRANSCODED to affine at load. When that transcode runs, one
+        // format serves the whole checkpoint and `None` is right.
+        //
+        // It does not run yet -- the load takes gpt-oss's bytes unchanged --
+        // so the banks reach the device as mxfp4/32 while the text reads them
+        // as affine/64, which is the 909,207 NaNs
+        // `the_first_statement_that_writes_a_nan_says_which_one_it_is` points
+        // at `affine_qmv_routed_bfloat16_gs_64_b_4`, layer 0.
+        //
+        // The mechanism to say otherwise now exists (`moe_repr`), so whichever
+        // way that lands -- the loader transcodes, or this driver grows the
+        // native kernel and states the bank's own format here -- the text can
+        // express it.
+        // The expert bank's OWN format, asked of the checkpoint. `None` is
+        // "the same as the dense projections", which is every checkpoint but
+        // gpt-oss.
+        moe_repr: is_mxfp4("layers.0.mlp.experts.gate_proj.weight")
+            .then_some(model_compiler::dsl::WeightRepr::Mxfp4Marlin),
+        moe_bits: 4,
         // The narrowest rung, which is what a short window fires; `bn = 32` is
         // the only column tile the residual GEMM is instantiated at.
         qmm_tile: (16, 32),

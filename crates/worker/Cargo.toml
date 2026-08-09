@@ -25,9 +25,10 @@ crate-type = ["rlib"]
 # Rust driver is no longer gated.
 default = []
 # Each flavor turns on a DEPENDENCY, not a branch in this crate's build
-# script. The driver crates build their own `csrc/` and emit their own link
-# lines; what this crate needs from them is that they be in the graph.
+# script. Both drivers are Rust now, so what this crate needs from them is
+# that they be in the graph.
 driver-cuda = ["engine/driver-cuda-new"]
+driver-metal = ["engine/driver-metal-new"]
 driver-dummy = []
 nixl = ["dep:transport", "transport/nixl"]
 
@@ -52,9 +53,10 @@ controller-api = { path = "../controller-api" }
 # INTO the gateway and serves WorkerControl over the split connection.
 worker-api = { path = "../worker-api" }
 
-# Direct dep so this crate's build script receives `DEP_PIE_DRIVER_ABI_INCLUDE`
-# (the C header dir) from pie-driver-abi's `links` build-script handoff.
-driver-abi = { path = "../driver-abi" }
+# The runtime <-> driver vocabulary. A direct dep because this crate names
+# those types, not (as it once did) so its build script could receive a C
+# header directory through a `links` handoff.
+driver = { path = "../driver" }
 transport = { path = "../transport", optional = true }
 # Shared id atoms (WorkerId / NodeId / ReqId / SessionId) and the client wire
 # vocabulary (ClientMessage / ServerMessage) the gateway data plane carries.
@@ -106,7 +108,6 @@ model-compiler = { path = "../model-compiler" }
 # The loader's C ABI. Depended on for two build-time reasons: the entry-point
 # anchor in `embedded_driver.rs`, and `DEP_PIE_LOADER_INCLUDE` — this crate's
 # `links = "pie_loader"` metadata — which `build.rs` hands to the C++ drivers.
-model-loader-capi = { path = "../model-loader-capi", default-features = false }
 # The artifact's compiled metadata is lifted here and handed to the runtime
 # whole: `model` owns the shape it arrives in, `tokenizer` names the
 # objects that make up a `pie.tokenizer/1`.

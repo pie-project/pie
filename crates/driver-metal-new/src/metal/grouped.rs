@@ -721,7 +721,7 @@ impl Runtime {
                 fixed,
                 grid,
                 threadgroup,
-                library: region.region.kind == driver_abi::local::PIE_REGION_LIBRARY,
+                library: region.region.kind == driver::local::PIE_REGION_LIBRARY,
                 parallel_selection: parallel,
             });
         }

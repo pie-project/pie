@@ -16,7 +16,7 @@ path = "src/lib.rs"
 # tart: the declared-forward toolchain — the fire planner's site table
 # maps driver-reported model sites onto its vocabulary.
 model-compiler = { path = "../model-compiler" }
-driver-abi = { path = "../driver-abi" }
+driver = { path = "../driver" }
 driver-dummy = { path = "../driver-dummy" }
 tensor-ir = { path = "../tensor-ir" }
 tensor-compiler = { path = "../tensor-compiler" }

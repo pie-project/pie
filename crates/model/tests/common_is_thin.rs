@@ -103,6 +103,13 @@ const NOT_SHARED: &[(&str, &str)] = &[
          the C surface of a per-family declaration looks like",
     ),
     (
+        "weight_names.rs",
+        "a MAP between two of this crate's own vocabularies: the trace names \
+         the DSL invents and the published names a contract author invents. \
+         Each family's walk recognises itself by a tensor only it ships, so \
+         naming families is what the module IS",
+    ),
+    (
         "emissions.rs",
         "a DEPLOYMENT LIST: which families' static forms are committed, from \
          which fact sets -- shared between the emit-cuda bin and the \

@@ -92,6 +92,9 @@ pub mod probe;
 // the whole point — see the module doc.
 #[cfg(feature = "config")]
 pub mod config;
+/// Trace names for the weights a checkpoint publishes.
+#[cfg(feature = "config")]
+pub mod weight_names;
 #[cfg(feature = "contract")]
 pub mod facts;
 

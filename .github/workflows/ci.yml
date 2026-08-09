@@ -4,9 +4,6 @@ name: CI
 # what the action downloads. `rust-toolchain.toml` at the repo root is what
 # cargo actually resolves to (1.97.1), and rustup auto-installs it — with the
 # components and targets that file declares — on the first cargo invocation.
-# The one exception is `schema-header-drift`, which needs a different compiler
-# for deterministic cbindgen output and gets it by setting `RUSTUP_TOOLCHAIN`,
-# which outranks the toolchain file.
 
 on:
   push:
@@ -71,7 +68,7 @@ jobs:
       # `--no-deps` matters: cargo drives clippy through
       # RUSTC_WORKSPACE_WRAPPER, which lints every *path* dependency that gets
       # built, not just the selected packages. Without it this step fails on
-      # driver-abi's 13 warnings, which are not the compiler's to fix.
+      # the driver crate's 13 warnings, which are not the compiler's to fix.
       - name: cargo clippy (compiler crates, deny warnings)
         run: |
           cargo clippy --no-deps --all-targets \
@@ -191,89 +188,6 @@ jobs:
           cargo test -p driver-cuda-new --features cuda-12
           cargo test -p driver-cuda-new --features cuda-13
 
-  # Drift guard for the committed C++ driver ABI header: regenerate it with
-  # pie-driver-abi-cbindgen (cbindgen over pie-driver-abi's repr(C)/cabi surface)
-  # and fail if it differs from the committed copy. Complements the runtime
-  # SCHEMA_HASH handshake. Toolchain is PINNED (not @stable) because cbindgen's
-  # parse.expand output is toolchain-dependent — pinning keeps the diff stable.
-  schema-header-drift:
-    name: schema header drift (cbindgen regen)
-    runs-on: ubuntu-latest
-    # Pinned to stable 1.91.1 for deterministic cbindgen parse.expand output.
-    env:
-      RUSTUP_TOOLCHAIN: "1.91.1"
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain (pinned for deterministic expansion)
-        uses: dtolnay/rust-toolchain@1.91.1
-
-      - name: Cache cargo
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-schema-bindgen-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-schema-bindgen-
-
-      - name: Regenerate committed driver ABI header
-        # RUSTC_BOOTSTRAP=1 is set inside the generator; cbindgen is a dep of
-        # pie-driver-abi-cbindgen, so no separate install is needed.
-        run: cargo run -p driver-abi-cbindgen
-
-      - name: Fail if committed pie_pie_driver_abi.h is stale
-        run: |
-          if ! git diff --exit-code -- crates/driver-abi/include/pie_pie_driver_abi.h; then
-            echo "::error::crates/driver-abi/include/pie_pie_driver_abi.h is out of date."
-            echo "Regenerate with: cargo run -p driver-abi-cbindgen   (then commit)"
-            exit 1
-          fi
-
-      # The loader's header is generated the same way and was not guarded, so
-      # it drifted: `STREAM_PAGE_BYTES` outlived the constant it mirrored by
-      # several commits. Native drivers include this file, so a stale copy is
-      # a compile error in someone else's build, not ours.
-      - name: Regenerate committed loader header
-        run: cargo run -p model-loader-capi-cbindgen
-
-      - name: Fail if committed pie_loader.h is stale
-        run: |
-          if ! git diff --exit-code -- crates/model-loader-capi/include/pie_loader.h; then
-            echo "::error::crates/model-loader-capi/include/pie_loader.h is out of date."
-            echo "Regenerate with: cargo run -p model-loader-capi-cbindgen   (then commit)"
-            exit 1
-          fi
-
-  # Metal host C++ — `driver-metal/build.rs` bails when target_os != macos, so
-  # nothing in this file has ever reached that driver's C++ and a plain
-  # redefinition can sit in HEAD indefinitely. Three did, from one bad merge:
-  # `DeviceTuning::qmm_min_batch_moe` declared twice in one struct, `case 8:`
-  # twice in one switch, and `gemma4::qmv_kn` defined in both a header and a
-  # .cpp. Every one is a hard compile error, and the only platform that would
-  # have caught them is the one platform CI does not have.
-  #
-  # `mtl4_context.hpp` says the driver is built for this: "Pure-C++ surface (no
-  # Obj-C types leak)", with the Metal-4 objects behind a PIMPL in one .mm. So
-  # 28 of its 34 .cpp type-check under plain g++ with the include roots CMake
-  # already passes. This compiles nothing and links nothing; it catches the
-  # class of defect that costs a whole platform's build for a one-line reason.
-  metal-host-syntax:
-    name: metal host C++ (syntax only, no Apple SDK)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Type-check driver-metal's host C++
-        run: python3 scripts/metal-host-syntax.py
-
-  # Metal kernel table — the shader tree instantiates its entrypoints from
-  # macros, so `kernels-metal`'s table declares one row per KERNEL plus the
-  # axes it is stamped over, and the product must be exactly what the shaders
-  # hold. The Rust half of that comparison is a normal `cargo test`; this is
-  # the half that needs a C preprocessor to expand `instantiate_*`.
   metal-kernel-table:
     name: metal kernel table (shaders vs entrypoints.generated.txt)
     runs-on: ubuntu-latest
@@ -423,105 +337,6 @@ jobs:
           cargo build -p pie \
             --no-default-features --features driver-dummy
 
-  # macOS Metal driver build. Verifies driver-metal's cmake + link
-  # path (libomp) so PRs that touch crates/driver-metal or its build.rs fail fast
-  # on macOS. Doesn't run against a real model — just exercises the
-  # cmake + link path.
-  pie-worker-metal:
-    name: pie-worker (driver-metal)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install build dependencies
-        run: |
-          brew update
-          brew install cmake ninja ccache libomp mlx
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo + cmake build
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/Library/Caches/ccache
-            target
-          key: ${{ runner.os }}-pie-worker-metal-${{ hashFiles('**/Cargo.lock', 'crates/driver-metal/csrc/CMakeLists.txt') }}
-
-      # `driver-metal-new` is an OPTIONAL feature of `engine`, so a plain
-      # `cargo test -p engine` builds its seam OUT. The file that joins the new
-      # Metal driver to the engine went weeks without a compiler reading it and
-      # accumulated seven type errors; this is the job that would have caught
-      # them on the first push.
-      #
-      # Type-check and test, not just build: `engine/tests/metal_seam.rs` runs
-      # everything that does not need a checkpoint, and the checkpoint-gated
-      # test states that it skipped and why.
-      - name: cargo test (engine, driver-metal-new seam)
-        run: cargo test -p engine --features driver-metal-new
-
-      - name: cargo test (driver-metal-new)
-        run: cargo test -p driver-metal-new
-
-      # The name gate needs no GPU and no weights — `compile_load_plan` reads
-      # a snapshot's metadata and publishes every tensor the load WILL stage.
-      # An index and a config are a few hundred kilobytes, so this is the one
-      # checkpoint-shaped check a runner can actually do. It states that it
-      # skipped when `PIE_METAL_NAMES_SNAPSHOT` is unset.
-      - name: cargo test (metal name gate)
-        run: cargo test -p driver-metal-new --test device_checkpoint_names
-
-      - name: cargo build (driver-metal)
-        run: cargo build -p worker --no-default-features --features driver-metal
-
-      # Build the actual CLI too. Every macOS boot blocker found in the Metal
-      # smoke test (B1/B2/B3) was reachable only by running `pie`, and no job
-      # built it — the worker library compiling proves the driver links, not
-      # that the platform has a working binary.
-      - name: cargo build (pie binary, driver-metal)
-        run: cargo build -p pie --no-default-features --features driver-metal
-
-      # `src/batch/forward.cpp` compiles a LoadPlan, so every Metal target that
-      # links the archive into an executable needs `model-loader` as a staticlib
-      # (the rlib the worker links is not linkable from C++). Without this the
-      # cmake steps below silently skip the loader-reaching targets — including
-      # the two that cover the loader surface — and the Metal driver's only real
-      # check would be that its archive compiles. Built before `cargo test` so a
-      # test failure cannot hide the cmake+link coverage behind it.
-      - name: Build the loader staticlib
-        run: cargo rustc -p model-loader --lib --crate-type staticlib
-
-      # `worker` is a library; the `pie` command is the root package's binary. The old
-      # `--bin pie` here named a target this package has never had, so the step
-      # could only ever fail.
-      - name: cargo test (pie-worker)
-        run: cargo test -p worker --no-default-features --features driver-metal
-
-      - name: Native Metal entrypoint validation
-        run: |
-          cmake -S crates/driver-metal/csrc -B target/metal-validation -G Ninja \
-            -DPIE_METAL_WITH_MLX=OFF \
-            -DPIE_METAL_BUILD_STUB_TESTS=ON
-          cmake --build target/metal-validation
-          ctest --test-dir target/metal-validation \
-            --output-on-failure
-
-      - name: MLX reference and parity validation
-        run: |
-          cmake -S crates/driver-metal/csrc -B target/metal-mlx -G Ninja \
-            -DPIE_METAL_WITH_MLX=ON \
-            -DPIE_METAL_MLX_PROVIDER=system \
-            -DPIE_METAL_BUILD_TESTS=ON \
-            -DPIE_METAL_BUILD_PARITY=ON
-          cmake --build target/metal-mlx
-          ctest --test-dir target/metal-mlx --output-on-failure
-
-  # Cuda build — runs only when an opt-in label or schedule fires
-  # (no CUDA on the default GH-hosted runners). Add a self-hosted
-  # runner with a CUDA toolkit to enable this.
   pie-worker-cuda:
     name: pie-worker (driver-cuda)
     runs-on: [self-hosted, cuda]

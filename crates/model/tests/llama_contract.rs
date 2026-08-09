@@ -222,7 +222,10 @@ fn check(name: &str, target: &StorageTarget) {
     let plan = compile_load_plan(&metadata, &contract, target.clone())
         .unwrap_or_else(|err| panic!("{name}: compiling failed: {err}"));
     if let Err(violations) =
-        model_loader_capi::view::verify_marshalled(&plan, Some(&ContractView::of(&contract)))
+        model_loader::verify::verify(
+            &model_loader::verify::view_of(&plan),
+            Some(&ContractView::of(&contract)),
+        )
     {
         let listed: Vec<String> = violations.iter().map(ToString::to_string).collect();
         panic!(

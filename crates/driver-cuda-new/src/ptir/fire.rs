@@ -37,7 +37,7 @@
 //! reads channels, computes, and puts — is what runs, and it is the shape
 //! every decode loop is.
 
-use driver_pipeline::driver_abi::plan::{LaunchOp, LaunchStagePlan};
+use driver_pipeline::driver::plan::{LaunchOp, LaunchStagePlan};
 use driver_pipeline::tensor_ir::op::tags;
 use driver_pipeline::{
     Diagnosis, Extents, LANE_HEADER_BYTES, LANE_RECORD_BYTES, LANE_SLOT_BYTES, LaneChannelSlot,

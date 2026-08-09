@@ -101,9 +101,9 @@ fn run_both(container: TraceContainer, seed: &[f32]) -> Option<Answers> {
     let stages = compile_bound(&bound);
     let package = tensor_compiler::codegen::launch::build(&bound, &stages);
     let emitted = emit_program(Backend::Cuda, &stages, &bound);
-    let kernels: Vec<driver_abi::plan::EmittedKernel> = emitted
+    let kernels: Vec<driver::plan::EmittedKernel> = emitted
         .iter()
-        .map(|k| driver_abi::plan::EmittedKernel {
+        .map(|k| driver::plan::EmittedKernel {
             kind: k.kind,
             stage_index: k.stage_index,
             region_index: k.region_index,

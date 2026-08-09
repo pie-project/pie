@@ -27,7 +27,7 @@ workspace = true
 # The launch ABI's owned types (`LaunchPackage` and its members) and the
 # `PIE_*` constants. The C++ interpreter carried its own mirror of these
 # structs; adopting the Rust types directly is what keeps one source of truth.
-driver-abi = { path = "../driver-abi" }
+driver = { path = "../driver" }
 
 # The op table, dtypes, intrinsic ids, the port registry and the canonical RNG
 # contract. `eval_op`'s numerics are a contract, not an implementation, and

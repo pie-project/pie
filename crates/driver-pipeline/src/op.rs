@@ -17,7 +17,7 @@
 //! never wins an argmax), and signed zero is fixed (`max(-0, +0) = +0`). Each of
 //! these has a test that fails if the rule is relaxed.
 
-use driver_abi::plan::{LaunchOp, LaunchPackage};
+use driver::plan::{LaunchOp, LaunchPackage};
 use tensor_ir::op::tags;
 use tensor_ir::{DType, RngKind, rng};
 

@@ -176,7 +176,7 @@ pub enum RopeKind {
 ///
 /// Semantic traces ([`crate::family::llama_like`]) have no class: they
 /// serve every fire shape, and kernel choice stays with their consumer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum FireClass {
     /// Pure decode: every request contributes one token row.
     Decode,

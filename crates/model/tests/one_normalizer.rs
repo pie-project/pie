@@ -5,24 +5,23 @@
 //! `worker/src/weights.rs` before any driver is created. What a driver reads
 //! is the answer, never the question.
 //!
-//! That property is worth a test because it is not one a type can hold: the
-//! second normalizer would be new C++, in another language, behind an FFI
-//! boundary this crate cannot see. It had already grown three times —
+//! That property was worth a source GREP for as long as the second normalizer
+//! could be new C++, in another language, behind an FFI boundary this crate
+//! cannot see. It had already grown three times —
 //! `crates/driver-cuda/csrc/src/model/config.cpp` (855 lines, 25 `model_type`
-//! conditionals), `crates/driver-metal/csrc/src/model_facts.cpp`'s `read_model_facts`,
-//! and `model::config` — and the three agreed only by coincidence and a
-//! differential test.
+//! conditionals), `crates/driver-metal/csrc/src/model_facts.cpp`'s
+//! `read_model_facts`, and `model::config` — and the three agreed only by
+//! coincidence and a differential test.
 //!
-//! So this is a source grep, in the idiom of `registry_agreement.rs` beside it
-//! and `loader/tests/standalone.rs`: the property is about what another
-//! language declares, and no amount of Rust-side assertion can reach it.
+//! **Both of those trees are deleted.** Both drivers are Rust and read the
+//! descriptor they are handed, so a fourth normalizer can no longer appear
+//! where this file could not see it. The two greps that watched them are
+//! retired below, each in the idiom its own guard demanded rather than left
+//! to pass vacuously.
 //!
-//! What it does **not** check: that the drivers read the descriptor
-//! *correctly*. That is `crates/driver-cuda/csrc/tests/hf_config_dump/check_descriptor.sh`,
-//! which ran the whole round trip — `config.json` → Rust normalize →
-//! `pie.model/1` → C++ read — against `parse_hf_config` on all 55 corpus
-//! configs and got the same answer. This test is what keeps the thing that
-//! check retired from coming back.
+//! What is left is the half a type still cannot hold: nothing stops a future
+//! reader in `model` or `engine` from opening `config.json` again, and
+//! `serde_json` is already in scope for the descriptor.
 
 use std::path::{Path, PathBuf};
 
@@ -34,72 +33,7 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Every `.cpp`/`.hpp`/`.mm`/`.cu` file under `rel`, recursively.
-fn sources(rel: &str) -> Vec<PathBuf> {
-    let root = repo_root().join(rel);
-    let mut out = Vec::new();
-    let mut stack = vec![root.clone()];
-    while let Some(dir) = stack.pop() {
-        // A DELETED TREE IS NO SOURCES, not a panic. `crates/driver-cuda`
-        // is gone, and "the CUDA driver does not parse config.json" is
-        // then true in the strongest available way. The Metal claim below
-        // still walks a real tree, which is why this walker stays.
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path
-                .extension()
-                .is_some_and(|ext| matches!(ext.to_str(), Some("cpp" | "hpp" | "mm" | "cu")))
-            {
-                out.push(path);
-            }
-        }
-    }
-    assert!(
-        !out.is_empty(),
-        "found no sources under {rel}; the guard below would pass vacuously"
-    );
-    out.sort();
-    out
-}
 
-/// Lines that call `needle`, ignoring comments and the function's own
-/// definition or declaration.
-///
-/// Deliberately blunt. A cleverer filter would be a second thing to keep in
-/// step with the C++; what this has to catch is a *call*, and a call is
-/// `name(` in code that is neither commented out nor the signature itself.
-///
-/// Comments are cut at `//` rather than only skipped when they start the
-/// line: prose that names the function it is about — a trailing
-/// `// read_model_facts() arch` — is documentation, not a caller, and the
-/// first version of this test failed on exactly that.
-fn callers(path: &Path, needle: &str) -> Vec<String> {
-    let text = std::fs::read_to_string(path)
-        .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
-    text.lines()
-        .enumerate()
-        .filter(|(_, line)| {
-            let code = line.split("//").next().unwrap_or("");
-            let trimmed = code.trim_start();
-            if trimmed.starts_with('*') {
-                return false;
-            }
-            if !trimmed.contains(&format!("{needle}(")) {
-                return false;
-            }
-            // The definition (`ModelFacts read_model_facts(const std::string&`)
-            // and the declaration end in `{` or `;` with the return type on the
-            // same line. A call site has the name preceded by `=`, `(`, or the
-            // start of a statement.
-            let before = trimmed.split(needle).next().unwrap_or("");
-            !before.ends_with("ModelFacts ") && !before.ends_with("HfConfig ")
-        })
-        .map(|(i, line)| format!("{}:{}: {}", path.display(), i + 1, line.trim()))
-        .collect()
-}
 
 // THE CUDA CLAIM IS STRUCTURAL NOW. `the_cuda_driver_has_no_config_json_parser`
 // walked `crates/driver-cuda/csrc/src` asking whether the C++ shell had
@@ -107,31 +41,23 @@ fn callers(path: &Path, needle: &str) -> Vec<String> {
 // is yes in the strongest available way and the test could only pass
 // vacuously — which its own guard refused to let it do.
 //
-// The Metal claim below still walks a real tree, and the guard stays for
-// it: a check that silently stops checking is worse than no check.
-
-
-/// The Metal driver does not parse `config.json` either.
-///
-/// `read_model_facts` still *exists* — two Metal test binaries build fixtures
-/// from a snapshot directory and link the driver lib to get it — but nothing
-/// the driver runs may call it. That is the line this holds.
-#[test]
-fn the_metal_driver_boot_has_no_config_json_parser() {
-    let found: Vec<String> = sources("crates/driver-metal/csrc/src")
-        .iter()
-        .flat_map(|path| callers(path, "read_model_facts"))
-        .filter(|line| !line.contains("read_model_facts_from_descriptor"))
-        .collect();
-    assert!(
-        found.is_empty(),
-        "the Metal driver calls `read_model_facts` again. It is test-only: \
-         the boot reads the `pie.model/1` descriptor it is handed, and a \
-         snapshot is normalized by `worker/src/weights.rs` before the driver \
-         exists:\n{}",
-        found.join("\n")
-    );
-}
+// AND NOW THE METAL CLAIM IS STRUCTURAL TOO.
+//
+// `the_metal_driver_boot_has_no_config_json_parser` walked
+// `crates/driver-metal/csrc/src` asking whether the Metal C++ shell called
+// `read_model_facts` on a boot path. That tree is deleted -- both drivers are
+// Rust -- so the answer is yes in the strongest available way, and the test
+// could only pass vacuously, which its own guard refused to let it do.
+//
+// `the_grep_finds_what_it_is_looking_for` went with it, and it named this
+// exact ending: "Either it moved into the test tree -- in which case delete
+// the Metal guard above, the duplication is gone for good -- or it was
+// renamed". It was neither: the tree went.
+//
+// What remains of this file is the RUST-side half below, which is the half a
+// type still cannot hold: nothing stops a future reader from opening
+// `config.json` again, and `serde_json` is already in scope for the
+// descriptor.
 
 /// The **runtime** does not read `config.json` either.
 ///
@@ -189,23 +115,3 @@ fn the_runtime_does_not_read_config_json() {
     );
 }
 
-/// The guard is not vacuous: the needle it greps for is one the file it was
-/// deleted from would still match.
-///
-/// Without this, a rename on the C++ side (or a typo here) would turn both
-/// tests above into assertions about a string nothing contains — passing
-/// forever while the duplication grows back under a new name.
-#[test]
-fn the_grep_finds_what_it_is_looking_for() {
-    let metal = sources("crates/driver-metal/csrc/src");
-    let declared = metal
-        .iter()
-        .any(|path| std::fs::read_to_string(path).unwrap().contains("read_model_facts"));
-    assert!(
-        declared,
-        "no file under crates/driver-metal/csrc/src mentions `read_model_facts`. Either it \
-         moved into the test tree — in which case delete the Metal guard above, \
-         the duplication is gone for good — or it was renamed, and the guard is \
-         now watching a name nobody uses."
-    );
-}

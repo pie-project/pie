@@ -60,7 +60,7 @@ mod vmm;
 pub use alloc::{Allocator, CaptureScope, DeviceBuffer};
 pub use device::{COMPILED_MAJOR, Device};
 pub use graph::{ConditionalIf, Graph, GraphExec};
-pub use stream::{Event, OwnedStream, StreamRef};
+pub use stream::{Event, OwnedStream, PinnedBuf, StreamRef};
 #[cfg(feature = "bridge")]
 pub use supergraph::{Cond, SupergraphBuilder};
 pub use supergraph::{

@@ -272,3 +272,82 @@ fn an_empty_batch_costs_nothing() {
         .expect("empty");
     assert_eq!(stepper.steps(), 0);
 }
+
+/// Two fires in flight: the second is QUEUED while the first still runs.
+///
+/// **This is the invariant pie is built on** (`.wiki/new-driver/next.md`,
+/// priority 1), and the reason it needed a new verb. `Stepper::run` ends in
+/// `await_value`, so the call that would queue step n+1 cannot return until
+/// step n has finished — the engine's `frame_dispatch_depth` is a number the
+/// engine honours and the driver then serialises.
+///
+/// What this measures is not "submit returned quickly", which a fast GPU
+/// would satisfy by accident. It submits a step, and then — BEFORE waiting
+/// for it — submits a second one and asks the timeline how far it has got.
+/// Two distinct values outstanding from one thread is the property; a `run`
+/// loop cannot produce it at all, because it never holds two.
+#[test]
+fn a_second_step_is_queued_while_the_first_is_still_outstanding() {
+    let Some(context) = context() else {
+        println!("no Metal device; skipped");
+        return;
+    };
+    let compiler = Compiler::new(&context).expect("compiler");
+    let pipeline = compiler
+        .compile(&context, SPREAD, "spread")
+        .expect("spread");
+    let pool = Pool::new(1 << 20);
+    let out = pool
+        .acquire(&context, (PER_CHUNK * 4) as u64)
+        .expect("out");
+    let tags = pool.acquire(&context, 4).expect("tags");
+    // SAFETY: nothing is in flight and the slice is exactly the region.
+    unsafe { tags.write(0, &7u32.to_le_bytes()) }.expect("tags");
+
+    let mut tables = Tables::new();
+    tables
+        .bind_address(&context, 0, 0, out.gpu_address())
+        .expect("out");
+    tables
+        .bind_address(&context, 0, 1, tags.gpu_address())
+        .expect("tag");
+
+    let mut stepper = Stepper::new(&context).expect("stepper");
+    let encode = |step: &mut driver_metal_new::metal::StepEncoder<'_>| {
+        step.set_pipeline(&pipeline);
+        step.set_argument_table_for(&tables, 0)?;
+        step.dispatch([PER_CHUNK, 1, 1], [64, 1, 1])
+    };
+
+    let first = stepper.submit(encode).expect("the first step submits");
+    // The second is encoded and committed WITHOUT the first having been
+    // waited for. `submit` only blocks on the step two back, and there is
+    // none.
+    let second = stepper.submit(encode).expect("the second step submits");
+
+    assert_eq!(
+        second,
+        first + 1,
+        "two submissions must be two timeline points, or they were one commit"
+    );
+    assert_eq!(
+        stepper.steps(),
+        second,
+        "the stepper's committed count must be the value it last handed out"
+    );
+
+    // Both retire, and the query that says so does not block.
+    stepper.wait_for(second).expect("the GPU reaches the second");
+    assert!(
+        stepper.has_passed(first) && stepper.has_passed(second),
+        "the event passed {second} but reports otherwise"
+    );
+    assert!(
+        !stepper.has_passed(second + 1),
+        "a value nothing signalled must not read as passed, or the completion \
+         path retires fires that never ran"
+    );
+
+    let got = read_u32s(&out, PER_CHUNK);
+    assert_eq!(got, vec![7u32; PER_CHUNK], "the queued steps did not run");
+}

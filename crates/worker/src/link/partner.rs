@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use controller_api::{NeighborPeer, Role};
-use driver_abi::{
+use driver::{
     ExecutorRequest, ExecutorResponse, HelloRequest, ModelIdentity, REMOTE_WIRE_VERSION,
 };
 use ids::WorkerId;
@@ -17,9 +17,9 @@ const PARTNER_RPC_DEADLINE: Duration = Duration::from_secs(10);
 pub(crate) struct PartnerBootstrap {
     pub full_identity: ModelIdentity,
     pub encode_identity: ModelIdentity,
-    pub kv_layout: driver_abi::KvLayout,
+    pub kv_layout: driver::KvLayout,
     #[cfg_attr(not(feature = "nixl"), allow(dead_code))]
-    pub home_kv_handle: driver_abi::KvHandle,
+    pub home_kv_handle: driver::KvHandle,
     pub transfer: crate::config::OffloadTransfer,
     pub model_idx: usize,
     pub page_size: u32,
@@ -36,7 +36,7 @@ struct ClientNixl {
 struct PartnerLink {
     peer: NeighborPeer,
     driver_id: Option<usize>,
-    client: driver_abi::ExecutorRpcClient,
+    client: driver::ExecutorRpcClient,
     disconnect: Option<::engine::driver::RemoteDisconnectHandle>,
     role: ::engine::offload::PartnerRole,
     partner: std::sync::Arc<::engine::offload::Partner>,
@@ -168,8 +168,8 @@ impl PartnerLinkManager {
             {
                 self.nixl
                     .as_ref()
-                    .map(|nixl| driver_abi::RemotePeerConn {
-                        kind: driver_abi::RemoteTransferKind::Nixl,
+                    .map(|nixl| driver::RemotePeerConn {
+                        kind: driver::RemoteTransferKind::Nixl,
                         handle: Some(self.config.home_kv_handle.clone()),
                         metadata: nixl.metadata.clone(),
                     })
@@ -215,7 +215,7 @@ impl PartnerLinkManager {
                 None::<usize>,
                 role,
                 self.config.max_outstanding,
-                driver_abi::RemoteTransferKind::Inline,
+                driver::RemoteTransferKind::Inline,
                 Some(client.clone()),
             );
             partner.set_blob_host(local_ip);
@@ -250,7 +250,7 @@ impl PartnerLinkManager {
         );
         if self.config.transfer == crate::config::OffloadTransfer::Nixl {
             ensure!(
-                hello.peer_conn.kind == driver_abi::RemoteTransferKind::Nixl,
+                hello.peer_conn.kind == driver::RemoteTransferKind::Nixl,
                 "executor did not accept required NIXL transfer"
             );
         }

@@ -93,7 +93,7 @@ mod native {
         // --- the handoff -------------------------------------------------------
         //
         // Read as DEP_PIE_KERNELS_CUDA_<KEY> by any crate with a direct dependency
-        // on this one. `include` is the conventional key (`driver`, `driver-abi`
+        // on this one. `include` is the conventional key (`driver`, `driver`
         // and `model-loader-capi` all publish one); the rest are this crate's,
         // and each names a tree that only exists because the CMake here fetched
         // or vendored it.

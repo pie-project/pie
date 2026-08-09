@@ -329,12 +329,16 @@ fn on_disk(mut meta: CheckpointMetadata, tag: &str) -> (CheckpointMetadata, std:
     (meta, dir)
 }
 
-/// The plan the driver sees carries its groups, and every instance of every
-/// group is verified -- not just the index the template was compiled at.
+/// A plan carries its groups, and every instance of every group is verified —
+/// not just the index the template was compiled at.
+///
+/// This used to assert the POD ROUND-TRIP as well: that the plan survived
+/// marshalling with the child plan reachable and the bindings laid out
+/// instance-major. There is no marshalling now, so what is left is the claim
+/// that outlives it — every instance is checked.
 #[test]
-fn a_marshalled_group_survives_the_abi_and_every_instance_is_checked() {
-    use model_loader_capi::arena;
-    use model_loader_capi::view::verify_marshalled;
+fn every_instance_of_a_group_is_checked() {
+    use model_loader::verify::verify_plan;
 
     let (meta, dir) = on_disk(named_checkpoint(), "abi");
     let plan = compile(
@@ -343,26 +347,15 @@ fn a_marshalled_group_survives_the_abi_and_every_instance_is_checked() {
         target(),
     )
     .unwrap();
-    verify_marshalled(&plan, None).expect("a well-formed group verifies");
-
-    // Round-trips as POD, with the child plan reachable and the bindings laid
-    // out instance-major.
-    let pod = arena::build(&plan, "0000000000000000");
-    assert!(!pod.is_null());
-    unsafe {
-        let groups = std::slice::from_raw_parts((*pod).groups.ptr, (*pod).groups.len);
-        assert_eq!(groups.len(), 1);
-        let view = &groups[0];
-        assert_eq!(view.arity, EXPERTS);
-        assert_eq!(view.bindings_per_instance, 1);
-        assert_eq!(view.bindings.len, EXPERTS as usize);
-        assert!(!view.plan.is_null());
-        assert!((*view.plan).instrs.len > 0, "the child plan is a real plan");
-        let bindings = std::slice::from_raw_parts(view.bindings.ptr, view.bindings.len);
-        for (index, binding) in bindings.iter().enumerate() {
-            assert_eq!(binding.tensor_id, index as u32);
-        }
-        arena::release(pod);
+    verify_plan(&plan, None).expect("a well-formed group verifies");
+    assert_eq!(plan.groups.len(), 1);
+    let g = &plan.groups[0];
+    assert_eq!(g.arity, EXPERTS);
+    assert_eq!(g.bindings.len(), EXPERTS as usize);
+    assert!(!g.plan.instrs.is_empty(), "the child plan is a real plan");
+    for (index, bindings) in g.bindings.iter().enumerate() {
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].tensor_id.0, index as u32);
     }
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -371,7 +364,7 @@ fn a_marshalled_group_survives_the_abi_and_every_instance_is_checked() {
 /// template -- index 0 -- is perfectly in bounds.
 #[test]
 fn an_instance_that_reads_past_its_file_is_rejected() {
-    use model_loader_capi::view::verify_marshalled;
+    use model_loader::verify::verify_plan;
 
     let (meta, dir) = on_disk(named_checkpoint(), "past-end");
     let mut plan = compile(
@@ -385,7 +378,7 @@ fn an_instance_that_reads_past_its_file_is_rejected() {
     let last = plan.groups[0].bindings.last_mut().unwrap();
     last[0].file_offset = 1 << 40;
 
-    let violations = verify_marshalled(&plan, None).unwrap_err();
+    let violations = verify_plan(&plan, None).unwrap_err();
     let text = violations
         .iter()
         .map(ToString::to_string)

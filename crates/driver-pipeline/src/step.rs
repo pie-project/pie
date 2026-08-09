@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use tensor_ir::op::{IntrinsicId, intrinsic_tags};
 use tensor_ir::registry::Stage;
 
-use driver_abi::local::{
+use driver::local::{
     PIE_READINESS_NEEDS_EMPTY, PIE_READINESS_NEEDS_FULL, PIE_VALUE_CHANNEL_READ,
     PIE_VALUE_CHANNEL_TAKE, PIE_VALUE_CONST, PIE_VALUE_INTRINSIC,
 };
@@ -245,7 +245,7 @@ fn exec_stage(
 }
 
 /// Decode a `const` value root from its literal bits, per its dtype byte.
-fn const_root_value(root: &driver_abi::plan::LaunchValue) -> Value {
+fn const_root_value(root: &driver::plan::LaunchValue) -> Value {
     match super::value::concrete_dtype(root.dtype) {
         tensor_ir::DType::I32 => Value::I32(vec![root.literal_bits as i32]),
         tensor_ir::DType::U32 => Value::U32(vec![root.literal_bits]),
@@ -396,10 +396,10 @@ fn commit(inst: &mut InterpInstance, overlay: &Overlay) -> StepOutcome {
 mod tests {
     use std::collections::BTreeMap;
 
-    use driver_abi::local::{
+    use driver::local::{
         PIE_CHANNEL_HOST_VISIBLE, PIE_READINESS_NEEDS_EMPTY, PIE_READINESS_NEEDS_FULL,
     };
-    use driver_abi::plan::{
+    use driver::plan::{
         LaunchChannel, LaunchOp, LaunchPackage, LaunchPut, LaunchStage, LaunchStagePlan,
         LaunchValue,
     };
@@ -457,7 +457,7 @@ mod tests {
             },
             LaunchValue {
                 id: 2,
-                source: driver_abi::local::PIE_VALUE_OP_RESULT,
+                source: driver::local::PIE_VALUE_OP_RESULT,
                 dtype: 0,
                 intrinsic: 0,
                 channel: 0,

@@ -2904,12 +2904,46 @@ pub mod metal {
         w: &MatW,
         experts_per_token: u32,
         biased: bool,
+        bits: u32,
     ) -> Val {
-        let sym = if biased {
-            "affine_qmv_routed_bias_bfloat16_gs_64_b_4"
-        } else {
-            "affine_qmv_routed_bfloat16_gs_64_b_4"
+        // The EXPERT BANK's own format, which is not the dense projections'.
+        //
+        // This used to be the literal `..._bfloat16_gs_64_b_4`, both arms, and
+        // that is a text choosing a quantisation instead of reading one. It
+        // held for as long as the only routed checkpoint anyone ran was affine
+        // at group 64.
+        //
+        // `mlx-community/gpt-oss-20b-MXFP4-Q4` is not: its `quantization`
+        // block lists 98 tensors as `affine/64/4` and leaves the expert banks
+        // OUT, so they take the top-level default -- `mxfp4`, group **32**.
+        // Dequantising that as affine-64 reads every scale from the wrong
+        // offset, and bf16 garbage is NaN more often than not. The fire ran,
+        // bound everything, and produced 909,207 NaNs starting at the first
+        // routed projection of layer 0.
+        //
+        // So the symbol comes from the repr the caller states, the same way
+        // `qmv`'s does. A format with no routed instantiation names a symbol
+        // no shader defines, which fails at pipeline construction with the
+        // name in hand -- the refusal `moe.rs` already promised and was not
+        // getting.
+        let sym = match w.repr {
+            // MXFP4's E2M1 mantissas with E8M0 block exponents. Not affine at
+            // some other point -- different arithmetic -- so it is a different
+            // symbol, and `quantized_qmv.metal` exports exactly one:
+            // `mxfp4_qmv_routed_bias`, at group 32 and 4 bits, which is the
+            // only shape MXFP4 has. There is no unbiased twin, which is why
+            // this arm ignores `biased`.
+            WeightRepr::Mxfp4Marlin => "mxfp4_qmv_routed_bias".to_string(),
+            repr => {
+                let point = affine_point(repr, bits);
+                if biased {
+                    format!("affine_qmv_routed_bias{point}")
+                } else {
+                    format!("affine_qmv_routed{point}")
+                }
+            }
         };
+        let sym = sym.as_str();
         let in_w = in_width(x);
         with_params(
             &x.t,

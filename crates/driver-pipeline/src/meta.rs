@@ -20,7 +20,7 @@
 //!
 //! [`readiness::check`]: crate::check
 
-use driver_abi::plan::{LaunchChannel, LaunchOp};
+use driver::plan::{LaunchChannel, LaunchOp};
 
 use crate::readiness::Effect;
 

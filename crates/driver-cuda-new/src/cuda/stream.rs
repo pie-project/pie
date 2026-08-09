@@ -23,7 +23,7 @@ use cudarc::runtime::sys::{
     cudaEvent_t, cudaEventCreateWithFlags, cudaEventDestroy, cudaEventDisableTiming,
     cudaEventElapsedTime, cudaEventQuery, cudaEventRecord, cudaEventSynchronize, cudaError,
     cudaStreamCreateWithPriority, cudaStreamDestroy, cudaStreamNonBlocking, cudaStreamQuery,
-    cudaStreamSynchronize, cudaStreamWaitEvent, cudaStream_t,
+    cudaLaunchHostFunc, cudaStreamSynchronize, cudaStreamWaitEvent, cudaStream_t,
 };
 
 use crate::error::{Result, check_rt, ignore_in_drop};
@@ -100,6 +100,33 @@ impl<'a> StreamRef<'a> {
         check_rt(
             unsafe { cudaStreamWaitEvent(self.raw, event.raw, 0) },
             "cudaStreamWaitEvent",
+        )
+    }
+
+    /// Enqueue a HOST callback in stream order — it runs when everything
+    /// queued before it has retired.
+    ///
+    /// This is what lets a fire complete without the next call coming to
+    /// collect it. An event plus a poll would need someone to poll, and
+    /// "someone" is either a thread or the next launch; the second hangs a
+    /// stream that goes quiet, and the first is a thread this driver does
+    /// not otherwise need.
+    ///
+    /// # Safety
+    ///
+    /// `f` runs on a CUDA-owned thread, and CUDA forbids calling back into
+    /// the runtime from it — no allocation on a device, no launch, no
+    /// synchronize. `data` must outlive the callback and be `Send`; the
+    /// caller owns keeping it alive, which in practice means leaking a
+    /// `Box` into the call and reclaiming it inside.
+    pub unsafe fn host_fn(
+        self,
+        f: unsafe extern "C" fn(*mut std::ffi::c_void),
+        data: *mut std::ffi::c_void,
+    ) -> Result<()> {
+        check_rt(
+            unsafe { cudaLaunchHostFunc(self.raw, Some(f), data) },
+            "cudaLaunchHostFunc",
         )
     }
 
@@ -287,5 +314,71 @@ mod tests {
         let b = std::mem::ManuallyDrop::new(Event { raw: std::ptr::null_mut(), timing: true });
         let err = a.elapsed_ms(&b).unwrap_err();
         assert_eq!(err.call(), "cudaEventElapsedTime");
+    }
+}
+
+/// PINNED HOST MEMORY, and the reason the run-ahead needs it.
+///
+/// `cudaMemcpyAsync` into PAGEABLE host memory is asynchronous in name
+/// only: the runtime must stage it, so the call blocks until the copy
+/// completes. A fire that D2H's its logits into a `Vec` therefore drains
+/// its own stream inside `pie_cuda_launch`, which is precisely the
+/// synchronization run-ahead exists to remove —
+/// `a_launch_returns_before_its_fire_retires` measured it doing so.
+///
+/// Pinned memory is what makes the copy actually asynchronous, and it is
+/// why the retired C++ tree sized a pinned staging pool from
+/// `runahead.hpp` rather than allocating per fire. This is the one-slot
+/// version of that pool: enough for the property, and the shape the pool
+/// grows from when the depth does.
+pub struct PinnedBuf {
+    ptr: *mut u8,
+    len: usize,
+}
+
+// The buffer is host memory the driver owns; nothing about the pointer is
+// thread-affine, and the debt it belongs to crosses to a callback thread.
+unsafe impl Send for PinnedBuf {}
+
+impl PinnedBuf {
+    /// Pin `len` bytes, or fail.
+    pub fn new(len: usize) -> Result<Self> {
+        use cudarc::runtime::sys::cudaMallocHost;
+        let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+        check_rt(unsafe { cudaMallocHost(&mut p, len.max(1)) }, "cudaMallocHost")?;
+        Ok(Self { ptr: p.cast::<u8>(), len })
+    }
+
+    /// How many bytes are pinned.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Was this a zero-length request?
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The bytes, as a slice.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    /// The bytes, mutably — what a D2H writes into.
+    #[must_use]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for PinnedBuf {
+    fn drop(&mut self) {
+        use cudarc::runtime::sys::cudaFreeHost;
+        if !self.ptr.is_null() {
+            let _ = unsafe { cudaFreeHost(self.ptr.cast()) };
+        }
     }
 }

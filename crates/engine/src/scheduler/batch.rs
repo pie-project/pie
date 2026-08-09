@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use driver_abi::PieTerminalCell;
+use ::driver::PieTerminalCell;
 
 use super::stats::SchedulerStats;
 use super::wire;
@@ -243,19 +243,19 @@ fn planned_region_table(
                 .qo_indptr
                 .windows(2)
                 .any(|w| w[1] - w[0] > 1),
-        ) * driver_abi::PIE_REGION_SIG_MULTI_TOKEN
-            | u32::from(req.hook_program) * driver_abi::PIE_REGION_SIG_HOOK
+        ) * ::driver::PIE_REGION_SIG_MULTI_TOKEN
+            | u32::from(req.hook_program) * ::driver::PIE_REGION_SIG_HOOK
             | u32::from(req.request.has_user_mask)
-                * driver_abi::PIE_REGION_SIG_MASK
+                * ::driver::PIE_REGION_SIG_MASK
             | u32::from(req.request.max_layers.is_some())
-                * driver_abi::PIE_REGION_SIG_TRUNCATED
-            | u32::from(req.lora_program) * driver_abi::PIE_REGION_SIG_LORA
+                * ::driver::PIE_REGION_SIG_TRUNCATED
+            | u32::from(req.lora_program) * ::driver::PIE_REGION_SIG_LORA
             | u32::from(req.hook_program && req.request.hook_page_mask)
-                * driver_abi::PIE_REGION_SIG_HOOK_PAGE_MASK;
+                * ::driver::PIE_REGION_SIG_HOOK_PAGE_MASK;
         let k = req
             .request
             .max_layers
-            .unwrap_or(driver_abi::PIE_MAX_LAYERS_FULL);
+            .unwrap_or(::driver::PIE_MAX_LAYERS_FULL);
         let end = row_indptr[member + 1];
         if sigs.last() == Some(&sig) && ks.last() == Some(&k) {
             *indptr.last_mut().expect("indptr starts nonempty") = end;
@@ -378,11 +378,11 @@ pub(crate) fn build_frame_submission(
         let mut sub_batch_class: Vec<u32> = Vec::new();
         if wire_count > 0 {
             sub_batch_indptr.push(wire_count as u32);
-            sub_batch_class.push(driver_abi::PIE_GEOMETRY_CLASS_HOST);
+            sub_batch_class.push(::driver::PIE_GEOMETRY_CLASS_HOST);
         }
         if envelope_count > 0 {
             sub_batch_indptr.push(group.len() as u32);
-            sub_batch_class.push(driver_abi::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE);
+            sub_batch_class.push(::driver::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE);
         }
         let build = build_batch_request(&group, page_size, stats);
         let mut roster_rows: Vec<u32> = Vec::with_capacity(build.instance_ids.len());

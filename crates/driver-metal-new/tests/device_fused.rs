@@ -10,11 +10,11 @@
 
 #![allow(clippy::print_stdout)]
 
-use driver_abi::local::{
+use driver::local::{
     PIE_KERNEL_COMMIT, PIE_KERNEL_FUSED, PIE_KERNEL_GROUPED, PIE_KERNEL_READINESS,
     PIE_KERNEL_SINGLETON,
 };
-use driver_abi::plan::{
+use driver::plan::{
     EmittedKernel, LaunchOp, LaunchPackage, LaunchPlanValue, LaunchRegion, LaunchStage,
     LaunchStagePlan,
 };

@@ -170,8 +170,8 @@ pub fn layout(descriptors: &[ValueDesc]) -> Result<Layout, TooLarge> {
 mod tests {
     use super::*;
     use crate::extent::{Extents, describe};
-    use driver_abi::local::PIE_EXTENT_STATIC;
-    use driver_abi::plan::LaunchPlanValue;
+    use driver::local::PIE_EXTENT_STATIC;
+    use driver::plan::LaunchPlanValue;
 
     fn desc(dtype: u8, len: u32) -> ValueDesc {
         describe(
