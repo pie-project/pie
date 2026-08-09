@@ -404,7 +404,7 @@ void enqueue_mtp_draft_logits(
                 // and permanently misalign the group.
                 TpFireCommit mtp_commit;
                 tp_publish_mtp(
-                    engine.tp_cpu_gate_key, 1,
+                    engine.tp_cpu_gate_key, engine.tp_comm->world_size(), 1,
                     static_cast<int>(draft), max_global_tokens);
                 mtp_commit.key = &engine.tp_cpu_gate_key;
                 tp_broadcast_mtp_step(
@@ -2221,6 +2221,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             : static_cast<int>(s.h_kvpp_forward[s.forward_R]);
         tp_publish_fire(
             engine.tp_cpu_gate_key,
+            engine.tp_comm->world_size(),
             pie_cuda_driver::TpFirePlanViews{
                 .qo_indptr = s.h_qo_forward,
                 .kv_page_indptr = s.rs_is_fold ? nullptr : s.h_kvpp_forward,

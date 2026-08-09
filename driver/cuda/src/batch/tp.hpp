@@ -84,6 +84,7 @@ void tp_report_rank_failure(const std::string& cpu_gate_key,
 // rank 0's entire all-reduce time). Waking the follower before rank 0's own
 // uploads and compose hands it that window as a head start.
 void tp_publish_fire(const std::string& cpu_gate_key,
+                     int tp_size,
                      const TpFirePlanViews& views,
                      int N, int R, bool is_pure_decode,
                      int kv_indices_count,
@@ -127,6 +128,7 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
 // Every gate epoch must own exactly one published slot or the follower's slot
 // index drifts away from rank 0's.
 void tp_publish_mtp(const std::string& cpu_gate_key,
+                    int tp_size,
                     int rows,
                     int draft_step,
                     int max_global_tokens);

@@ -8,6 +8,30 @@
 #include "batch/rs_metadata.hpp"
 
 int main() {
+    {
+        pie_cuda_driver::TpFollowerAcks acks;
+        acks.mark(2, 8);
+        if (acks.all_consumed(4, 8)) {
+            std::fputs(
+                "TP mailbox released a slot before every follower consumed it\n",
+                stderr);
+            return 1;
+        }
+        acks.mark(1, 8);
+        if (acks.all_consumed(4, 8)) {
+            std::fputs(
+                "TP mailbox released a slot while rank 3 was still unread\n",
+                stderr);
+            return 1;
+        }
+        acks.mark(3, 8);
+        if (!acks.all_consumed(4, 8)) {
+            std::fputs(
+                "TP mailbox did not release a slot after every follower consumed it\n",
+                stderr);
+            return 1;
+        }
+    }
     std::uint64_t consumed = 0;
     if (!pie_cuda_driver::tp_cpu_gate_consume_one(3, consumed) ||
         consumed != 1 ||

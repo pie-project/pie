@@ -298,7 +298,7 @@ struct TpFireMailbox {
     // header and planner views into locals before posting any collective, so
     // it always releases a slot without needing rank 0 to progress first —
     // that is what makes the reserve below deadlock-free).
-    std::atomic<std::uint64_t> consumed_fires{0};
+    TpFollowerAcks consumed_fires;
     // Set by rank 0 immediately before the gate notify; the follower diffs it
     // on wake to separate "how long the wake took" from "how long my own work
     // takes". Plain store/load: the gate's release/acquire pair orders it.
@@ -436,16 +436,17 @@ bool tp_cpu_gate_stopped(const std::string& key) {
     return tp_cpu_gate_for(key)->stopped();
 }
 
-void tp_mailbox_reserve_slot(TpFireMailbox& box, const std::string& key) {
+void tp_mailbox_reserve_slot(TpFireMailbox& box, const std::string& key,
+                             int tp_size) {
     if (box.fire_seq < kTpMailboxRing) return;  // ring not full yet
     const std::uint64_t oldest_live = box.fire_seq - kTpMailboxRing + 1;
-    if (box.consumed_fires.load(std::memory_order_acquire) >= oldest_live) {
+    if (box.consumed_fires.all_consumed(tp_size, oldest_live)) {
         return;
     }
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(30);
     for (int spin = 0;; ++spin) {
-        if (box.consumed_fires.load(std::memory_order_acquire) >= oldest_live) {
+        if (box.consumed_fires.all_consumed(tp_size, oldest_live)) {
             return;
         }
         // A stopped gate means the follower is gone (teardown, or a failed
@@ -462,7 +463,7 @@ void tp_mailbox_reserve_slot(TpFireMailbox& box, const std::string& key) {
                 "tp: mailbox ring stalled - the follower stopped consuming "
                 "fires (published " + std::to_string(box.fire_seq) +
                 ", consumed " +
-                std::to_string(box.consumed_fires.load()) + ")");
+                std::to_string(box.consumed_fires.oldest_consumed(tp_size)) + ")");
         }
     }
 }
@@ -470,6 +471,7 @@ void tp_mailbox_reserve_slot(TpFireMailbox& box, const std::string& key) {
 }  // namespace
 
 void tp_publish_fire(const std::string& cpu_gate_key,
+                     int tp_size,
                      const TpFirePlanViews& views,
                      int N, int R, bool is_pure_decode,
                      int kv_indices_count,
@@ -489,7 +491,7 @@ void tp_publish_fire(const std::string& cpu_gate_key,
     tp_check_ranks_alive();
     auto box = tp_mailbox_for(cpu_gate_key);
     TpStallWatchdog::instance().start();
-    tp_mailbox_reserve_slot(*box, cpu_gate_key);
+    tp_mailbox_reserve_slot(*box, cpu_gate_key, tp_size);
     TpFireSlot& fire = box->slots[box->fire_seq % kTpMailboxRing];
     fire.header = TpFireHeader{
         TP_FIRE_MAGIC, N, R, is_pure_decode ? 1 : 0,
@@ -729,13 +731,14 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
 // read the wrong slot — a stale header, or a zeroed one that trips the
 // "unexpected header magic" abort and kills the follower thread.
 void tp_publish_mtp(const std::string& cpu_gate_key,
+                    int tp_size,
                     int rows,
                     int draft_step,
                     int max_global_tokens) {
     if (cpu_gate_key.empty()) return;
     tp_check_ranks_alive();
     auto box = tp_mailbox_for(cpu_gate_key);
-    tp_mailbox_reserve_slot(*box, cpu_gate_key);
+    tp_mailbox_reserve_slot(*box, cpu_gate_key, tp_size);
     TpFireSlot& fire = box->slots[box->fire_seq % kTpMailboxRing];
     fire.header = TpFireHeader{};
     fire.header.magic = TP_MTP_MAGIC;
@@ -987,8 +990,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
             // collectives below, or rank 0 (which is what unblocks them) could
             // be waiting on this very slot.
             if (mailbox != nullptr) {
-                mailbox->consumed_fires.store(cpu_gate_seq,
-                                              std::memory_order_release);
+                mailbox->consumed_fires.mark(comm.rank(), cpu_gate_seq);
                 TpStallWatchdog::instance().consumed.store(
                     cpu_gate_seq, std::memory_order_release);
             }
@@ -1265,8 +1267,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
             // Everything this fire's slot carries now lives in locals, so rank
             // 0 may reuse it. Released before the payload collectives below for
             // the same reason as the MTP branch.
-            mailbox->consumed_fires.store(cpu_gate_seq,
-                                          std::memory_order_release);
+            mailbox->consumed_fires.mark(comm.rank(), cpu_gate_seq);
             auto& wd_ = TpStallWatchdog::instance();
             wd_.consumed.store(cpu_gate_seq, std::memory_order_release);
             wd_.follower_forwards.fetch_add(1, std::memory_order_release);
