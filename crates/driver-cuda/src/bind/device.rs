@@ -168,8 +168,12 @@ pub enum ArgError {
     },
     /// An operand of a type Tier A cannot marshal.
     ///
-    /// `Stream` is the interesting member: it is not unsupported so much as
-    /// misplaced, and a row that still carries one has not been ported.
+    /// The two HANDLE kinds are the interesting members: neither is
+    /// unsupported so much as misplaced, and a row carrying one has not been
+    /// ported. `Stream` is `cuLaunchKernel`'s sixth parameter;
+    /// `CublasHandle` belongs to the service that issues the launch, which is
+    /// `kernels_cuda_new::execution`'s `RUST_SERVED` rule. `Display` says so
+    /// per kind, and `CublasHandle`'s arm was missing until `849be7f2e`.
     Unsupported {
         /// The row's symbol.
         symbol: &'static str,
@@ -202,6 +206,20 @@ impl std::fmt::Display for ArgError {
                 f,
                 "{symbol}: operand `{operand}` is declared {expected:?} and was bound {got}"
             ),
+            // ONE ARM PER HANDLE, and the second was missing. Both kinds fall
+            // to `Args::bind`'s catch-all -- neither is in `is_pointer` and
+            // neither has a scalar arm -- so both produce this variant, and
+            // only `Ty::Stream` got a sentence. That is a gap and not a
+            // distinction: the diagnosis is identical in kind for the two,
+            // *"this row is unported"*, and the difference is only WHOSE the
+            // handle is. A mirror that disagrees in one arm says nothing
+            // about whether the disagreement is meant.
+            //
+            // BYTE-IDENTICAL with `kernels_cuda_new::runtime::args`'s copy,
+            // like `is_pointer` below. Change both or neither: one refuses a
+            // launch and the other refuses a bind, and a reader who meets the
+            // two messages should not have to work out which crate they are
+            // in to know what is wrong with the row.
             ArgError::Unsupported {
                 symbol,
                 operand,
@@ -210,10 +228,12 @@ impl std::fmt::Display for ArgError {
                 f,
                 "{symbol}: operand `{operand}` is {ty:?}, which a device entry point \
                  cannot take{}",
-                if *ty == Ty::Stream {
-                    " -- a stream is a launch argument, so this row is unported"
-                } else {
-                    ""
+                match *ty {
+                    Ty::Stream => " -- a stream is a launch argument, so this row is unported",
+                    Ty::CublasHandle =>
+                        " -- a cuBLAS handle is the service's rather than the statement's, \
+                         so this row is unported",
+                    _ => "",
                 }
             ),
         }
@@ -241,6 +261,8 @@ const fn is_pointer(ty: Ty) -> bool {
             | Ty::I8sMut
             | Ty::Bf16s
             | Ty::F16s
+            | Ty::Bf16sMut
+            | Ty::F16sMut
             | Ty::F32s
             | Ty::F32sMut
             | Ty::BufArray
@@ -254,6 +276,18 @@ const fn is_pointer(ty: Ty) -> bool {
             // this one refuses a launch and that one refuses a bind, and a
             // `Ty` accepted by one and refused by the other is a symbol that
             // binds in one crate and not the other.
+            //
+            // THEY HAD ALREADY DIVERGED, and nothing looked. `Ty::Bf16sMut`
+            // and `Ty::F16sMut` were added to the other list when the kinds
+            // were minted and never to this one, which was invisible for as
+            // long as no row stated them. `x::abi`'s `ptr_abi!(bf16, …)` now
+            // tags `*mut bf16` `Ty::Bf16sMut`, so 269 operand positions
+            // across 172 rows present them -- and every one would have taken
+            // the `ty =>` arm of `Args::bind` and been told it "cannot take"
+            // a kind that is an ordinary device pointer. Loud rather than
+            // silent, and wrong. `launch_abi.rs`'s
+            // `both_is_pointer_lists_admit_the_same_kinds` is the check that
+            // was missing.
             | Ty::StructuredMasks
     )
 }

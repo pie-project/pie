@@ -11,14 +11,9 @@
 #include <bit>
 #include <boost/math/ccmath/fabs.hpp>
 #include <cstdint>
-// PIE: guarded for NVRTC -- host-only `<limits>`, and unused -- this file names no
-// `std::numeric_limits`. The three includes above it stay: `<bit>`,
-// `boost/math/ccmath/fabs.hpp` and `<cstdint>` all feed device-callable constexpr code, and
-// are carried under their exact spellings beside this tree. Upstream is unmodified apart
-// from markers of this form; see NOTICE. Removing them restores the file.
-#ifndef __CUDACC_RTC__
-#include <limits>
-#endif
+// PIE: REMOVED -- host-only `<limits>`. 1 line of host C++, guarded out of every NVRTC compile
+// before it was removed, so removing it changes no compile. This marker is one a strip does NOT
+// undo; see MODIFICATIONS.
 
 /*
  * Convert a 32-bit floating-point number in IEEE single-precision format to a

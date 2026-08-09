@@ -16,17 +16,17 @@
 #ifndef FLASHINFER_PAGE_CUH_
 #define FLASHINFER_PAGE_CUH_
 
-// PIE: guarded for NVRTC -- host-only. `<driver_types.h>` is `cudaError_t` and
-// `cudaStream_t`, wanted only by the five append launchers below, all guarded; `<vector>`
-// is the `std::vector<int64_t>` one of them builds. Upstream is unmodified apart from
-// markers of this form; see NOTICE. Removing them restores the file.
-#ifndef __CUDACC_RTC__
-#include <driver_types.h>
+// PIE: REMOVED -- host-only `<driver_types.h>` and `<vector>`. 3 lines of host C++, guarded out
+// of every NVRTC compile before it was removed, so removing it changes no compile. This marker
+// is one a strip does NOT undo; see MODIFICATIONS.
 
-#include <vector>
-#endif
-
-#include "exception.h"
+// PIE: `exception.h` is deleted, and this include with it. That file was pure
+// host C++ -- `flashinfer::Error` derives from `std::exception` and every macro
+// in it builds its message in a `std::ostringstream` -- so its entire body was
+// already inside `#ifndef __CUDACC_RTC__` and NVRTC has always seen an empty
+// file through this line. `src/plan/error.rs` owns the refusals now. This is
+// the one marker in the tree that a strip does NOT undo: restoring upstream
+// means restoring the deleted file too. See MODIFICATIONS.
 #include "fastdiv.cuh"
 #include "layout.cuh"
 #include "utils.cuh"
@@ -96,29 +96,9 @@ struct paged_kv_t {
    * \param last_page_len The offset of the last page for each request in the batch
    * \param rope_pos_offset The start position of each request in the batch.
    */
-// PIE: guarded for NVRTC -- an explicitly `__host__` constructor, which NVRTC refuses
-// outright whether or not it is called. Under the JIT this struct is filled by the Rust
-// caller and arrives as a kernel argument, so device code never constructs one.
-#ifndef __CUDACC_RTC__
-  __host__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size, uint32_t head_dim,
-                                      uint32_t batch_size, QKVLayout layout, DType* k_data,
-                                      DType* v_data, IdType* indices, IdType* indptr,
-                                      IdType* last_page_len, IdType* rope_pos_offset = nullptr)
-      : num_heads(num_heads),
-        page_size(page_size),
-        head_dim(head_dim),
-        batch_size(batch_size),
-        indices(indices),
-        indptr(indptr),
-        last_page_len(last_page_len),
-        rope_pos_offset(rope_pos_offset) {
-    stride_page = num_heads * page_size * head_dim;
-    this->k_data = k_data;
-    this->v_data = v_data;
-    stride_n = layout == QKVLayout::kHND ? head_dim : num_heads * head_dim;
-    stride_h = layout == QKVLayout::kHND ? page_size * head_dim : head_dim;
-  }
-#endif
+// PIE: REMOVED -- a `__host__` `paged_kv_t` constructor. 18 lines of host C++, guarded out of
+// every NVRTC compile before it was removed, so removing it changes no compile. This marker is
+// one a strip does NOT undo; see MODIFICATIONS.
 
   /*!
    * \brief Construct a paged key-value cache with custom kv-cache strides
@@ -135,28 +115,9 @@ struct paged_kv_t {
    * \param last_page_len The offset of the last page for each request in the batch
    * \param rope_pos_offset The start position of each request in the batch.
    */
-// PIE: guarded for NVRTC -- the custom-strides `__host__` constructor, same refusal.
-#ifndef __CUDACC_RTC__
-  __host__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size, uint32_t head_dim,
-                                      uint32_t batch_size, QKVLayout layout, DType* k_data,
-                                      DType* v_data, const int64_t* kv_strides, IdType* indices,
-                                      IdType* indptr, IdType* last_page_len,
-                                      IdType* rope_pos_offset = nullptr)
-      : num_heads(num_heads),
-        page_size(page_size),
-        head_dim(head_dim),
-        batch_size(batch_size),
-        indices(indices),
-        indptr(indptr),
-        last_page_len(last_page_len),
-        rope_pos_offset(rope_pos_offset) {
-    stride_page = kv_strides[0];
-    this->k_data = k_data;
-    this->v_data = v_data;
-    stride_n = layout == QKVLayout::kHND ? kv_strides[2] : kv_strides[1];
-    stride_h = layout == QKVLayout::kHND ? kv_strides[1] : kv_strides[2];
-  }
-#endif
+// PIE: REMOVED -- the second `__host__` `paged_kv_t` constructor. 19 lines of host C++, guarded
+// out of every NVRTC compile before it was removed, so removing it changes no compile. This
+// marker is one a strip does NOT undo; see MODIFICATIONS.
 
   __host__ __device__ __forceinline__ uint32_t get_length(uint32_t batch_idx) const {
     if (indptr[batch_idx + 1] == indptr[batch_idx]) {
@@ -383,79 +344,9 @@ __global__ void AppendPagedKVCacheKernel(paged_kv_t<DType, IdType> paged_kv,
  * \param stream The CUDA stream to execute kernels.
  * \return status Indicates whether CUDA calls are successful
  */
-// PIE: guarded for NVRTC -- the two append launchers -- `cudaError_t`, `cudaStream_t`,
-// `cudaLaunchKernel`, and a `DISPATCH_HEAD_DIM` over host code. Under the JIT a launch is
-// `cuLaunchKernel` from Rust, so this is the half the crate replaces rather than compiles;
-// the `__global__` kernels above it stay.
-#ifndef __CUDACC_RTC__
-template <typename DType, typename IdType>
-cudaError_t AppendPagedKVCacheDecode(paged_kv_t<DType, IdType> paged_kv, DType* key, DType* value,
-                                     cudaStream_t stream = nullptr) {
-  uint32_t head_dim = paged_kv.head_dim;
-  uint32_t batch_size = paged_kv.batch_size;
-  uint32_t num_heads = paged_kv.num_heads;
-  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-    constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
-    uint32_t bdx = HEAD_DIM / vec_size;
-    uint32_t bdy = num_heads;
-    // NOTE(Zihao): could be slow for small batch size, will optimize later
-    dim3 nblks(batch_size);
-    dim3 nthrs(bdx, bdy);
-    auto kernel = AppendPagedKVCacheDecodeKernel<HEAD_DIM, vec_size, DType, IdType>;
-    void* args[] = {(void*)&paged_kv, (void*)&key, (void*)&value};
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
-  });
-  return cudaSuccess;
-}
-
-/*!
- * \brief Append new keys/values to the paged key-value cache
- * \tparam layout The layout of last 3 dimension in KV-Cache
- * \tparam DType The data type of the key-value cache
- * \tparam IdType The index data type of the kv-cache
- * \param paged_kv The paged key-value cache
- * \param key The key to be appended
- * \param value The value to be appended
- * \param append_indptr The indptr array of the appended ragged tensor
- * \param stream The CUDA stream to execute kernels.
- * \return status Indicates whether CUDA calls are successful
- */
-template <typename DType, typename IdType>
-cudaError_t AppendPagedKVCache(paged_kv_t<DType, IdType> paged_kv, DType* append_key,
-                               DType* append_value, IdType* batch_indices, IdType* positions,
-                               uint32_t nnz, size_t append_k_stride_n, size_t append_k_stride_h,
-                               size_t append_v_stride_n, size_t append_v_stride_h,
-                               cudaStream_t stream = nullptr) {
-  uint32_t head_dim = paged_kv.head_dim;
-  uint32_t num_heads = paged_kv.num_heads;
-  int dev_id = 0;
-  int num_sms = 0;
-  int num_blocks_per_sm = 0;
-  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
-  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
-
-  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-    constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
-    uint32_t bdx = HEAD_DIM / vec_size;
-    uint32_t bdy = num_heads;
-    uint32_t num_threads = bdx * bdy;
-    uint32_t smem_size = 0;
-    auto kernel = AppendPagedKVCacheKernel<HEAD_DIM, vec_size, DType, IdType>;
-    FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
-                                                                       num_threads, smem_size));
-    num_blocks_per_sm = min(num_blocks_per_sm, ceil_div(int(nnz), num_sms));
-    dim3 nblks(num_blocks_per_sm * num_sms);
-    dim3 nthrs(bdx, bdy);
-
-    void* args[] = {(void*)&paged_kv,          (void*)&append_key,        (void*)&append_value,
-                    (void*)&batch_indices,     (void*)&positions,         (void*)&nnz,
-                    (void*)&append_k_stride_n, (void*)&append_k_stride_h, (void*)&append_v_stride_n,
-                    (void*)&append_v_stride_h};
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
-  });
-  return cudaSuccess;
-}
-#endif
+// PIE: REMOVED -- `AppendPagedKVCacheDecode` and `AppendPagedKVCache`, host launchers. 67 lines
+// of host C++, guarded out of every NVRTC compile before it was removed, so removing it changes
+// no compile. This marker is one a strip does NOT undo; see MODIFICATIONS.
 
 template <uint32_t HEAD_DIM, typename DType, typename IdType>
 __global__ void NVFP4QuantizeAppendPagedKVCacheKernel(
@@ -573,99 +464,9 @@ __global__ void NVFP4QuantizeAppendPagedKVCacheWithSlotMappingKernel(
   }
 }
 
-// PIE: guarded for NVRTC -- the two NVFP4 quantise-and-append launchers, host for the same
-// reason.
-#ifndef __CUDACC_RTC__
-template <typename DType, typename IdType>
-cudaError_t NVFP4QuantizeAppendPagedKVCache(
-    paged_kv_t<uint8_t, IdType> paged_kv, DType* append_key, DType* append_value,
-    IdType* batch_indices, IdType* positions, uint32_t nnz, size_t append_k_stride_n,
-    size_t append_k_stride_h, size_t append_v_stride_n, size_t append_v_stride_h,
-    uint8_t* k_scale_cache, uint8_t* v_scale_cache, size_t k_sf_stride_page, size_t k_sf_stride_n,
-    size_t k_sf_stride_h, size_t v_sf_stride_page, size_t v_sf_stride_n, size_t v_sf_stride_h,
-    float k_scale, float v_scale, cudaStream_t stream = nullptr) {
-  const uint32_t head_dim = paged_kv.head_dim * 2;
-  const uint32_t num_heads = paged_kv.num_heads;
-  if (nnz == 0 || num_heads == 0) {
-    return cudaSuccess;
-  }
-  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-    constexpr uint32_t active_threads = (HEAD_DIM / 16) * 2;
-    constexpr uint32_t num_threads =
-        active_threads < 32 ? 32 : (active_threads > 128 ? 128 : active_threads);
-    dim3 nblks(nnz, num_heads);
-    dim3 nthrs(num_threads);
-    auto kernel = NVFP4QuantizeAppendPagedKVCacheKernel<HEAD_DIM, DType, IdType>;
-    void* args[] = {(void*)&paged_kv,          (void*)&append_key,
-                    (void*)&append_value,      (void*)&batch_indices,
-                    (void*)&positions,         (void*)&nnz,
-                    (void*)&append_k_stride_n, (void*)&append_k_stride_h,
-                    (void*)&append_v_stride_n, (void*)&append_v_stride_h,
-                    (void*)&k_scale_cache,     (void*)&v_scale_cache,
-                    (void*)&k_sf_stride_page,  (void*)&k_sf_stride_n,
-                    (void*)&k_sf_stride_h,     (void*)&v_sf_stride_page,
-                    (void*)&v_sf_stride_n,     (void*)&v_sf_stride_h,
-                    (void*)&k_scale,           (void*)&v_scale};
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
-  });
-  return cudaSuccess;
-}
-
-template <typename DType, typename IdType>
-cudaError_t NVFP4QuantizeAppendPagedKVCacheWithSlotMapping(
-    DType* append_key, DType* append_value, IdType* slot_mapping, uint32_t nnz, uint32_t num_heads,
-    uint32_t page_size, uint32_t max_num_pages, uint32_t packed_head_dim, size_t append_k_stride_n,
-    size_t append_k_stride_h, size_t append_v_stride_n, size_t append_v_stride_h,
-    uint8_t* paged_k_cache, uint8_t* paged_v_cache, uint8_t* k_scale_cache, uint8_t* v_scale_cache,
-    size_t k_stride_page, size_t k_stride_n, size_t k_stride_h, size_t v_stride_page,
-    size_t v_stride_n, size_t v_stride_h, size_t k_sf_stride_page, size_t k_sf_stride_n,
-    size_t k_sf_stride_h, size_t v_sf_stride_page, size_t v_sf_stride_n, size_t v_sf_stride_h,
-    float* k_scale, float* v_scale, cudaStream_t stream = nullptr) {
-  if (nnz == 0 || num_heads == 0) {
-    return cudaSuccess;
-  }
-  const uint32_t head_dim = packed_head_dim * 2;
-  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-    constexpr uint32_t active_threads = (HEAD_DIM / 16) * 2;
-    constexpr uint32_t num_threads =
-        active_threads < 32 ? 32 : (active_threads > 128 ? 128 : active_threads);
-    dim3 nblks(nnz, num_heads);
-    dim3 nthrs(num_threads);
-    auto kernel = NVFP4QuantizeAppendPagedKVCacheWithSlotMappingKernel<HEAD_DIM, DType, IdType>;
-    void* args[] = {(void*)&append_key,
-                    (void*)&append_value,
-                    (void*)&slot_mapping,
-                    (void*)&nnz,
-                    (void*)&num_heads,
-                    (void*)&page_size,
-                    (void*)&max_num_pages,
-                    (void*)&append_k_stride_n,
-                    (void*)&append_k_stride_h,
-                    (void*)&append_v_stride_n,
-                    (void*)&append_v_stride_h,
-                    (void*)&paged_k_cache,
-                    (void*)&paged_v_cache,
-                    (void*)&k_scale_cache,
-                    (void*)&v_scale_cache,
-                    (void*)&k_stride_page,
-                    (void*)&k_stride_n,
-                    (void*)&k_stride_h,
-                    (void*)&v_stride_page,
-                    (void*)&v_stride_n,
-                    (void*)&v_stride_h,
-                    (void*)&k_sf_stride_page,
-                    (void*)&k_sf_stride_n,
-                    (void*)&k_sf_stride_h,
-                    (void*)&v_sf_stride_page,
-                    (void*)&v_sf_stride_n,
-                    (void*)&v_sf_stride_h,
-                    (void*)&k_scale,
-                    (void*)&v_scale};
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
-  });
-  return cudaSuccess;
-}
-#endif
+// PIE: REMOVED -- `NVFP4QuantizeAppendPagedKVCache` and its `WithSlotMapping` twin, host
+// launchers. 89 lines of host C++, guarded out of every NVRTC compile before it was removed, so
+// removing it changes no compile. This marker is one a strip does NOT undo; see MODIFICATIONS.
 
 template <typename DType, typename IdType>
 struct paged_kv_mla_t {
@@ -722,29 +523,9 @@ struct paged_kv_mla_t {
    * \param last_page_len The offset of the last page for each request in the batch
    * \param rope_pos_offset The start position of each request in the batch.
    */
-// PIE: guarded for NVRTC -- an explicitly `__host__` constructor, same refusal.
-#ifndef __CUDACC_RTC__
-  __host__ __forceinline__ paged_kv_mla_t(uint32_t page_size, uint32_t head_dim_compressed_kv,
-                                          uint32_t head_dim_kpe, uint32_t batch_size,
-                                          DType* compressed_kv_data, DType* kpe_data,
-                                          IdType* indices, IdType* indptr, IdType* last_page_len,
-                                          IdType* rope_pos_offset = nullptr)
-      : page_size(page_size),
-        head_dim_ckv(head_dim_compressed_kv),
-        head_dim_kpe(head_dim_kpe),
-        batch_size(batch_size),
-        ckv_data(compressed_kv_data),
-        kpe_data(kpe_data),
-        indices(indices),
-        indptr(indptr),
-        last_page_len(last_page_len),
-        rope_pos_offset(rope_pos_offset) {
-    stride_page_ckv = page_size * head_dim_ckv;
-    stride_n_ckv = head_dim_ckv;
-    stride_page_kpe = page_size * head_dim_kpe;
-    stride_n_kpe = head_dim_kpe;
-  }
-#endif
+// PIE: REMOVED -- a `__host__` `paged_kv_mla_t` constructor. 20 lines of host C++, guarded out
+// of every NVRTC compile before it was removed, so removing it changes no compile. This marker
+// is one a strip does NOT undo; see MODIFICATIONS.
 
   /*!
    * \brief Construct a paged key-value cache with custom kv-cache strides
@@ -761,31 +542,9 @@ struct paged_kv_mla_t {
    * \param last_page_len The offset of the last page for each request in the batch
    * \param rope_pos_offset The start position of each request in the batch.
    */
-// PIE: guarded for NVRTC -- the custom-strides `__host__` constructor, same refusal.
-#ifndef __CUDACC_RTC__
-  __host__ __forceinline__ paged_kv_mla_t(uint32_t page_size, uint32_t head_dim_compressed_kv,
-                                          uint32_t head_dim_kpe, uint32_t batch_size,
-                                          DType* compressed_kv_data,
-                                          const int64_t* compressed_kv_strides, DType* kpe_data,
-                                          const int64_t* kpe_strides, IdType* indices,
-                                          IdType* indptr, IdType* last_page_len,
-                                          IdType* rope_pos_offset = nullptr)
-      : page_size(page_size),
-        head_dim_ckv(head_dim_compressed_kv),
-        head_dim_kpe(head_dim_kpe),
-        batch_size(batch_size),
-        ckv_data(compressed_kv_data),
-        kpe_data(kpe_data),
-        indices(indices),
-        indptr(indptr),
-        last_page_len(last_page_len),
-        rope_pos_offset(rope_pos_offset) {
-    stride_page_ckv = compressed_kv_strides[0];
-    stride_n_ckv = compressed_kv_strides[1];
-    stride_page_kpe = kpe_strides[0];
-    stride_n_kpe = kpe_strides[1];
-  }
-#endif
+// PIE: REMOVED -- the second `__host__` `paged_kv_mla_t` constructor. 22 lines of host C++,
+// guarded out of every NVRTC compile before it was removed, so removing it changes no compile.
+// This marker is one a strip does NOT undo; see MODIFICATIONS.
 
   __host__ __device__ __forceinline__ uint32_t get_length(uint32_t batch_idx) const {
     if (indptr[batch_idx + 1] == indptr[batch_idx]) {
@@ -864,50 +623,9 @@ __global__ void AppendPagedKVMlaCacheKernel(paged_kv_mla_t<DType, IdType> paged_
   }
 }
 
-// PIE: guarded for NVRTC -- the MLA append launcher, host for the same reason -- and it
-// also asks `cudaOccupancyMaxActiveBlocksPerMultiprocessor` for an occupancy the JIT reads
-// off the module it just built.
-#ifndef __CUDACC_RTC__
-template <typename DType, typename IdType>
-cudaError_t AppendPagedKVMlaCache(paged_kv_mla_t<DType, IdType> paged_kv, DType* append_ckv,
-                                  DType* append_kpe, IdType* batch_indices, IdType* positions,
-                                  uint32_t nnz, size_t append_ckv_stride_n,
-                                  size_t append_kpe_stride_n, cudaStream_t stream = nullptr) {
-  int dev_id = 0;
-  int num_sms = 0;
-  int num_blocks_per_sm = 0;
-  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
-  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
-
-  uint32_t head_dim_ckv = paged_kv.head_dim_ckv;
-  uint32_t head_dim_kpe = paged_kv.head_dim_kpe;
-  constexpr uint32_t HEAD_CKV_DIM = 512;
-  constexpr uint32_t HEAD_KPE_DIM = 64;
-  FLASHINFER_CHECK(head_dim_ckv == HEAD_CKV_DIM, "head_dim_ckv must be equal to 512");
-  FLASHINFER_CHECK(head_dim_kpe == HEAD_KPE_DIM, "head_dim_kpe must be equal to 64");
-  constexpr uint32_t vec_size = 2;
-
-  uint32_t bdx = HEAD_CKV_DIM / vec_size;
-  uint32_t num_threads = bdx;
-  uint32_t smem_size = 0;
-  auto kernel = AppendPagedKVMlaCacheKernel<HEAD_CKV_DIM, HEAD_KPE_DIM, vec_size, DType, IdType>;
-  FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
-                                                                     num_threads, smem_size));
-  num_blocks_per_sm = min(num_blocks_per_sm, ceil_div(int(nnz), num_sms));
-  dim3 nblks(num_blocks_per_sm * num_sms);
-  dim3 nthrs(bdx);
-  void* args[] = {(void*)&paged_kv,
-                  (void*)&append_ckv,
-                  (void*)&append_kpe,
-                  (void*)&batch_indices,
-                  (void*)&positions,
-                  (void*)&nnz,
-                  (void*)&append_ckv_stride_n,
-                  (void*)&append_kpe_stride_n};
-  FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
-  return cudaSuccess;
-}
-#endif
+// PIE: REMOVED -- `AppendPagedKVMlaCache`, a host launcher. 39 lines of host C++, guarded out
+// of every NVRTC compile before it was removed, so removing it changes no compile. This marker
+// is one a strip does NOT undo; see MODIFICATIONS.
 
 }  // namespace flashinfer
 

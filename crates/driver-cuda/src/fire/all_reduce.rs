@@ -16,7 +16,7 @@
 //! `flashinfer/comm/vllm_custom_all_reduce.cuh` and
 //! `flashinfer/comm/trtllm_allreduce_fusion.cuh`, which are CPM-*fetched*
 //! at configure time and are **not** vendored:
-//! `crates/kernels-cuda-new/csrc/vendor/flashinfer/` holds `attention/` and
+//! `crates/kernels-cuda-new/csrc/src/attn/flashinfer/` holds `attention/` and
 //! has no `comm/` directory at all, so NVRTC has nothing to compile. Both
 //! points therefore answer [`Decline::NoDeviceText`], and each answer carries
 //! the resolved [`Instantiation`] and the exact header that would supply it —
@@ -457,7 +457,7 @@ impl Instantiation {
     /// in. The `__global__` NVRTC would actually compile is one of the three
     /// [`Leaf`] bodies this specialisation dispatches to, and its own
     /// template parameter list is NOT transcribed here because this tree
-    /// cannot see it: `csrc/vendor/flashinfer/` has no `comm/`. Inventing it
+    /// cannot see it: `csrc/src/attn/flashinfer/` has no `comm/`. Inventing it
     /// would be inventing an ABI.
     #[must_use]
     pub fn name_expression(&self) -> String {
@@ -723,7 +723,7 @@ impl fmt::Display for Decline {
             } => write!(
                 f,
                 "{what} has no device text in this tree: `{header}` is CPM-fetched, not vendored, \
-                 and `crates/kernels-cuda-new/csrc/vendor/flashinfer/` has no `comm/`. The point \
+                 and `crates/kernels-cuda-new/csrc/src/attn/flashinfer/` has no `comm/`. The point \
                  is resolved -- NVRTC would need `{name_expression}`"
             ),
         }

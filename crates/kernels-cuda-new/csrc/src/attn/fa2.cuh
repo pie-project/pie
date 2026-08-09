@@ -99,7 +99,7 @@
 //
 // This unit therefore demands `Headers::LibraryAndUpstream` (`unit.rs`'s
 // `DEMANDS`, keyed `attn/fa2_*`), which is `ALL_HEADERS` — `SHIM + LIBRARY +
-// UPSTREAM`, the 1.2 MB internalised closure included. A unit that forgot to
+// UPSTREAM`, the 1.1 MB internalised closure included. A unit that forgot to
 // say so would get `DEVICE_HEADERS` and fail on line one of `decode.cuh`.
 //
 // **The reachability test does not cover this file's angle includes.**

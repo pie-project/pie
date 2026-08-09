@@ -281,19 +281,38 @@ macro_rules! ptr_abi {
 
 // The spellings are `kernels::Ty::cpp()`'s, so a row and a declaration
 // describing the same parameter produce the same typecheck line.
+//
+// THAT SENTENCE BECAME TRUE OF THE TWO SIXTEEN-BIT FORMATS HERE, and it had
+// been false of them since this file was written. `CPP` for `*mut bf16` has
+// always been `::pie_cuda_driver::kernels::device::bf16*`, and the tag beside
+// it said `Ty::BufMut`, whose `cpp()` is `void*` -- so a row and a declaration
+// describing one destination produced two different lines, and
+// `abi::self_describing` declined the `void*` one outright because every
+// object pointer converts to it and an assertion against it holds for every
+// possible kernel.
+//
+// Measured over `unit!`'s declarations at `d737aad29`, with each row's own
+// `where [T = …]` substituted first: 266 fn-world rows at 2207 operand
+// positions, of which **172 rows carry a written sixteen-bit destination at
+// 269 positions** -- 252 bf16 (`*mut bf16` 245, `Option<NonNull<bf16>>` 7) and
+// 17 f16 (`*mut f16` 11, `Option<NonNull<f16>>` 6). All 269 were `void*` and
+// none was asserted. `tests/device_typecheck_types.rs`'s
+// `the_written_sixteen_bit_positions_are_two_hundred_and_sixty_nine`
+// re-derives that number from `unit::rows()` at run time rather than trusting
+// this comment.
 ptr_abi!(
     bf16,
     "const ::pie_cuda_driver::kernels::device::bf16*",
     Bf16s,
     "::pie_cuda_driver::kernels::device::bf16*",
-    BufMut
+    Bf16sMut
 );
 ptr_abi!(
     f16,
     "const ::pie_cuda_driver::kernels::device::f16*",
     F16s,
     "::pie_cuda_driver::kernels::device::f16*",
-    BufMut
+    F16sMut
 );
 ptr_abi!(
     fp8_e4m3,
@@ -304,9 +323,19 @@ ptr_abi!(
 );
 ptr_abi!(i32, "const ::std::int32_t*", I32s, "::std::int32_t*", I32sMut);
 // `moe::hash_route_lookup`'s `tid2eid`, a `[vocab, K]` `const int64_t*` table.
+//
 // `kernels::Ty::I64s` exists and `I64sMut` does not, so the mut spelling
-// reuses `BufMut` exactly as `bf16` and `f16` do above — the asymmetry is the
-// row vocabulary's, not this file's.
+// reuses `BufMut`. This used to read "exactly as `bf16` and `f16` do above",
+// and that clause went with the tags: **`i64` is now the only pointee in this
+// file whose READ half has a kind of its own and whose WRITTEN half does
+// not.** That is a statement about `kernels::Ty`, not about this file --
+// closing it is one variant plus its `cpp()`/`rust()`/`is_buffer` arms in the
+// PORTABLE crate, which Metal, Vulkan, WGPU and CPU all read, so it is not an
+// edit this file can make.
+//
+// `fp8_e4m3` above is a DIFFERENT shape and not a fourth case of this one:
+// neither of its halves is named (`Buf`/`BufMut`), so it is a format with no
+// vocabulary rather than a half missing from one.
 ptr_abi!(i64, "const ::std::int64_t*", I64s, "::std::int64_t*", BufMut);
 // `moe::build_moe_ptrs_aligned`'s six operands, `const T**` and `T**` at
 // `moe_dispatch.cuh:1046-1051`. **The pointee is the POINTER**, which is why
@@ -333,6 +362,20 @@ ptr_abi!(
     BufArrayOutMut,
     "::pie_cuda_driver::kernels::device::bf16**",
     BufArrayOutMut
+);
+ptr_abi!(
+    *const u8,
+    "const ::std::uint8_t* const*",
+    BufArrayOut,
+    "const ::std::uint8_t**",
+    BufArrayOut
+);
+ptr_abi!(
+    *const i32,
+    "const ::std::int32_t* const*",
+    BufArrayOut,
+    "const ::std::int32_t**",
+    BufArrayOut
 );
 // The impl arrives with its first kernel, which is what an open set means
 // (see the note above `scalar_abi!`). `i8`'s is

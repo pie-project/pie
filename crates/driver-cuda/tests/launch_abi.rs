@@ -1900,7 +1900,7 @@ fn records_are_declared_in_the_headers_that_are_included() {
 ///     in a comment about host arithmetic;
 ///   * a struct that really does cross to NVRTC goes through `by_value!`,
 ///     and the tree has exactly one instance — `x/xqa.rs`'s `KvCacheList`,
-///     a vendored XQA type under `csrc/vendor/xqa/`, none of these.
+///     a vendored XQA type under `csrc/src/attn/xqa/`, none of these.
 ///
 /// So after `bridge` there is no second description of these layouts, and
 /// moving the headers into `driver-cuda/tests/` would keep this suite
@@ -2585,52 +2585,165 @@ fn collect_files_named(dir: &Path, name: &str, out: &mut String) {
     }
 }
 
-/// The two by-value `enum class` mirrors carry the C++'s own discriminants.
+/// `MoeActivation`'s three variants each still name a kernel that exists.
 ///
-/// Enums are not records — `record!` has no fields to walk — so the claim is
-/// made directly, in the layout proof's own style: every number below is read
-/// off the RUST side (`as i32`, `size_of`) and baked into a generated TU as
-/// `static_assert`s against the real headers. A reordered C++ enum fails here
-/// rather than routing gemma-4's experts through qwen's activation.
+/// # This was `the_enum_mirrors_carry_the_cpp_discriminants`, and it was RED
 ///
-/// # `Mxfp4RowSelect` left this TU, and did not leave the test
+/// It generated a TU that `#include`d `moe/flashinfer_moe.hpp` and
+/// `static_assert`ed `sizeof(MoeActivation)` and the three discriminants
+/// against that header. **The header was deleted in `efaad26b4` — "NVCC
+/// LEAVES THE BUILD: the fused CUTLASS leg retired, 66 files deleted".**
+/// Neither include path [`compile`] passes can supply it: the stub directory
+/// holds `cuda_runtime.h` and `cublas_v2.h` and nothing else, and [`csrc`]
+/// has no `moe/` directory at all. So `g++` failed on a missing file, every
+/// time, and the failure arrived as
 ///
-/// It was checked here against `quant/mxfp4_marlin.hpp`, which is DELETED
-/// with `quant/mxfp4_marlin.cu`. Its three values did not stop existing: they
-/// cross into device code as a plain `int` (`families::quant:481`), and
-/// `kernels-cuda-new/csrc/src/quant/mxfp4_marlin.cuh:70-72` names them
-/// `kRowSelectIdentity`, `kRowSelectEven` and `kRowSelectOdd` precisely so
-/// the mapping is one grep. So the claim moved rather than dying:
-/// [`the_mxfp4_row_select_mirror_matches_the_device_text`] reads those three
-/// lines out of the `.cuh` and compares them to the Rust enum. It is a weaker
-/// proof than a `static_assert` — text, not a compiler — and it is the
-/// strongest one available once the host header is gone, which is the trade
-/// every row that leaves the archive makes.
+/// ```text
+/// an enum mirror disagrees with the C++:
+/// ```
+///
+/// A discriminant-mismatch diagnosis for a deleted-header cause. This tree's
+/// recurring instrument failure is that breakage and pass produce the same
+/// observation; this is the polarity reversed and it is worse, because the
+/// message actively points the reader at the Rust enum — the one part of the
+/// arrangement that was still correct.
+///
+/// # The claim moved, and NOT the way `Mxfp4RowSelect`'s did
+///
+/// [`the_mxfp4_row_select_mirror_matches_the_device_text`] is the sibling
+/// migrated in the same pass, and its shape is `include_str!` the `.cuh` and
+/// match `constexpr int kRowSelectEven = 1;`. **That shape is not available
+/// here**, and the reason is the finding rather than an obstacle: there is no
+/// number left to match. `csrc/src/moe/` is nine headers and forty-two
+/// `__global__`s and not one of them takes an activation selector — no enum,
+/// no `constexpr int kAct*`, no `int act` parameter. `act` in those signatures
+/// is always `const T* __restrict__ act`, an activation TENSOR. `moe::silu` is
+/// a `__tile__` inline in `moe_fused_tile.cuh`, which declares no `__global__`
+/// at all.
+///
+/// The three activations did not die with the enum. They became three
+/// separate `__global__` templates in `mlp/swiglu.cuh`, each with its own
+/// row — so the selection that used to be a VALUE passed to one kernel is now
+/// the SYMBOL of which kernel fires:
+///
+/// | variant | `__global__` | row |
+/// |---|---|---|
+/// | `Relu2` | `swiglu.cuh:247` | `mlp::relu2_bf16` (`x/mlp.rs:229`) |
+/// | `Swiglu` | `swiglu.cuh:135` | `mlp::swiglu_bf16` (`x/mlp.rs:182`) |
+/// | `Geglu` | `swiglu.cuh:230` | `mlp::geglu_tanh_bf16` (`x/mlp.rs:220`) |
+///
+/// So what has to hold is no longer "Rust's `1` is C++'s `Swiglu`" — there is
+/// no C++ `MoeActivation` to be `1`, in either `csrc/` tree — but that **each
+/// variant still names a kernel this tree has**, at both ends: the device text
+/// declares it, and [`kernels_cuda_new::unit::unit_of`] says some unit will
+/// compile it. A variant whose kernel was renamed or retired is then a named
+/// failure here rather than a `MoeActivation::Geglu` nothing can dispatch.
+///
+/// # Telling a missing header from a wrong discriminant
+///
+/// The defect above was that one panic covered both causes. This separates
+/// them structurally, at four levels with four messages:
+///
+/// 1. **A moved or deleted header is a COMPILE error.** `include_str!`
+///    resolves at build time, so `swiglu.cuh` going away cannot reach a
+///    runtime message at all — which is the whole reason the sibling reads
+///    the `.cuh` instead of `#include`ing it.
+/// 2. **A file that exists but is not the one meant** fails the namespace
+///    assertion, which names the namespace and no variant.
+/// 3. **A renamed kernel** fails naming the variant, the symbol and the exact
+///    `__global__` spelling looked for.
+/// 4. **A row that left the JIT** fails `unit_of`, naming the row and saying
+///    which of the two ends moved.
+///
+/// # The half of `sizeof` that survived
+///
+/// The old TU asserted `sizeof(MoeActivation)` against the C++. There is no
+/// C++ side left, so what remains is the Rust-internal claim the mirror rests
+/// on: `#[repr(i32)]` is four bytes, and [`kernels::Ty::MoeActivation`]'s
+/// `rust()` spelling has to be a four-byte integer for a row ever carrying
+/// that kind to marshal into a `void**` cell against its parameter.
+///
+/// **It is `"u32"` today against an `#[repr(i32)]` mirror.** That is a real
+/// disagreement and it is invisible: `Ty::MoeActivation` has ZERO writers —
+/// its only row was `moe::flashinfer_cutlass_moe_bf16` and it went in
+/// `0dc8e9e9b`, one commit before the header — so nothing marshals one, and
+/// the signedness cannot bite until a row returns. The assertion below is
+/// deliberately "a four-byte integer, either sign": pinning `"u32"` would
+/// freeze the disagreement, and pinning `"i32"` would be red until somebody
+/// fixed it. It goes red on a WIDTH change, which is the half that corrupts a
+/// launch rather than a value.
 #[test]
-fn the_enum_mirrors_carry_the_cpp_discriminants() {
+fn the_moe_activation_mirror_names_kernels_that_exist() {
     use driver_cuda::bind::abi::MoeActivation;
-    let tu = format!(
-        "#include <cstdint>\n\
-         #include \"moe/flashinfer_moe.hpp\"\n\
-         using ::pie_cuda_driver::kernels::moe::MoeActivation;\n\
-         static_assert(sizeof(MoeActivation) == {});\n\
-         static_assert(static_cast<int>(MoeActivation::Relu2) == {});\n\
-         static_assert(static_cast<int>(MoeActivation::Swiglu) == {});\n\
-         static_assert(static_cast<int>(MoeActivation::Geglu) == {});\n",
-        core::mem::size_of::<MoeActivation>(),
-        MoeActivation::Relu2 as i32,
-        MoeActivation::Swiglu as i32,
-        MoeActivation::Geglu as i32,
+
+    let cuh = include_str!("../../kernels-cuda-new/csrc/src/mlp/swiglu.cuh");
+    assert!(
+        cuh.contains("namespace pie_cuda_driver::kernels::mlp::device {"),
+        "`mlp/swiglu.cuh` does not open `pie_cuda_driver::kernels::mlp::device`, so it is \
+         not the header the `MoeActivation` variants were mapped onto and every assertion \
+         below is about the wrong file. This is the WRONG-FILE failure and it is \
+         deliberately not one of the per-variant ones -- a variant naming a kernel that \
+         moved has a different fix from a header that moved."
     );
-    if let Err(err) = compile(&tu) {
-        panic!("an enum mirror disagrees with the C++:\n{err}");
+
+    for (variant, global, row) in [
+        (MoeActivation::Relu2, "relu2", "mlp::relu2_bf16"),
+        (MoeActivation::Swiglu, "swiglu", "mlp::swiglu_bf16"),
+        (MoeActivation::Geglu, "geglu_tanh", "mlp::geglu_tanh_bf16"),
+    ] {
+        // The trailing `(` is what separates `swiglu` from `swiglu_clamp`,
+        // which is the neighbouring `__global__` in this very file and the
+        // one a bare substring test would accept for `Swiglu`.
+        let decl = format!("__global__ void {global}(");
+        assert!(
+            cuh.contains(&decl),
+            "`MoeActivation::{variant:?}` selects `mlp::device::{global}`, and \
+             `mlp/swiglu.cuh` does not say `{decl}`. The activation the variant names has \
+             been renamed or retired in the DEVICE TEXT, so a caller reaching for it holds \
+             a discriminant and no kernel."
+        );
+        assert!(
+            kernels_cuda_new::unit::unit_of(row).is_some(),
+            "`MoeActivation::{variant:?}` selects the row `{row}` and no unit hosts it, so \
+             the symbol cannot be JIT-compiled. `mlp/swiglu.cuh` still declares \
+             `{global}` -- this is the ROW leaving the JIT, not the kernel leaving the \
+             header, and the fix is in `x/mlp.rs` rather than in `csrc/`."
+        );
     }
+
+    assert_eq!(
+        core::mem::size_of::<MoeActivation>(),
+        4,
+        "`abi::MoeActivation` is `#[repr(i32)]` and must stay four bytes: it crossed BY \
+         VALUE, and a `cuLaunchKernel` cell narrower than its parameter mis-marshals every \
+         argument after it."
+    );
+    let spelling = kernels::Ty::MoeActivation.rust();
+    assert!(
+        matches!(spelling, "i32" | "u32"),
+        "`Ty::MoeActivation.rust()` is `{spelling}`, which is not a four-byte integer. The \
+         mirror is `#[repr(i32)]`, so a row carrying this kind would put a cell of one \
+         width against a parameter of another. Either SIGN is accepted here on purpose -- \
+         see this test's doc: `u32` against an `i32` mirror is a real disagreement, it is \
+         unreachable while the kind has no writers, and pinning either spelling would make \
+         this test the thing that has to change when it is fixed."
+    );
 }
 
 /// `Mxfp4RowSelect`'s three discriminants still match the device text.
 ///
-/// The half of [`the_enum_mirrors_carry_the_cpp_discriminants`] that lost its
-/// header. `abi::Mxfp4RowSelect` is `#[repr(i32)]` and reaches the kernel as
+/// The half of the old `the_enum_mirrors_carry_the_cpp_discriminants` that
+/// lost its header FIRST — the other half lost its own in `efaad26b4` and is
+/// now [`the_moe_activation_mirror_names_kernels_that_exist`], so the pairing
+/// this sentence used to draw has collapsed: **neither mirror has a C++ enum
+/// to be compared against any more, and both read text.** They did not land in
+/// the same place, and the difference is worth the sentence. `Mxfp4RowSelect`
+/// kept its three NUMBERS — the kernels take the underlying `int` and
+/// `mxfp4_marlin.cuh` names the values — so its claim is still an equality.
+/// `MoeActivation` did not: its activations became three separate `__global__`
+/// templates, so its claim became existence, not equality.
+///
+/// `abi::Mxfp4RowSelect` is `#[repr(i32)]` and reaches the kernel as
 /// `ArgValue::I32`, so what has to hold is that Rust's `Even` and the
 /// `.cuh`'s `kRowSelectEven` are the same NUMBER — the enum's C++ type is no
 /// longer part of the story, because there is no longer a C++ caller to have
@@ -2654,6 +2767,202 @@ fn the_mxfp4_row_select_mirror_matches_the_device_text() {
              device text disagree about which half of an interleaved MXFP4 bank a row \
              reads. `select_row` takes the number, not the enum, so nothing else catches \
              this."
+        );
+    }
+}
+
+/// The two `ArgError` copies say the SAME thing about the same operand.
+///
+/// # A mirror is only a mirror while something looks
+///
+/// `driver_cuda::bind::device::ArgError` and
+/// `kernels_cuda_new::runtime::args::ArgError` are two independent `Display`
+/// impls over the same three variants, and each one's `is_pointer` carries a
+/// comment naming the other and saying the lists *"are byte-identical and
+/// must stay so"*. Nothing looked. The `Unsupported` clause had drifted
+/// already: it named `Ty::Stream` and not `Ty::CublasHandle`, in both copies,
+/// which is the failure mode where a mirror stays consistent by being equally
+/// wrong on both sides — so equality alone is not the whole check and the
+/// clauses are asserted by CONTENT below as well.
+///
+/// The two handles are not interchangeable and the messages must differ: a
+/// stream is `cuLaunchKernel`'s sixth parameter, a cuBLAS handle belongs to
+/// the service that issues the launch. `Ty::Dtype` is the control — a kind
+/// with no clause, where both copies must still agree and neither may invent
+/// one, so a passing run cannot be explained by every message being the same
+/// string.
+///
+/// Since `849be7f2e` neither handle reaches a JIT'd launch: `Unit::source`
+/// calls `Unit::typecheck`, so `abi::device_typecheck` refuses the whole row
+/// set before NVRTC sees it. These messages are the last resort for a path
+/// that did not go through a `Unit`, and a last resort that lies is worse
+/// than one that is missing.
+#[test]
+fn both_arg_error_copies_diagnose_a_handle_the_same_way() {
+    use driver_cuda::bind::device::ArgError as Theirs;
+    use kernels::Ty;
+    use kernels_cuda_new::runtime::args::ArgError as Ours;
+
+    let cases: &[(Ty, Option<&'static str>)] = &[
+        (Ty::Stream, Some("a stream is a launch argument")),
+        (Ty::CublasHandle, Some("a cuBLAS handle is the service's")),
+        // The control. If this one grew a clause the two `contains` checks
+        // above would still pass and the test would be asserting nothing
+        // about WHICH kinds are called out.
+        (Ty::Dtype, None),
+    ];
+
+    // Symbol and operand held fixed so that `ty` is the only variable, and
+    // the `assert_ne!` at the end is about the KIND rather than about two
+    // messages that were never going to match anyway.
+    const SYMBOL: &str = "gemm::act_x_wt_bf16";
+    const OPERAND: &str = "handle";
+
+    let mut rendered = Vec::new();
+    for &(ty, clue) in cases {
+        let theirs = Theirs::Unsupported { symbol: SYMBOL, operand: OPERAND, ty }.to_string();
+        let ours = Ours::Unsupported { symbol: SYMBOL, operand: OPERAND, ty }.to_string();
+        assert_eq!(
+            theirs, ours,
+            "the two `ArgError::Unsupported` copies disagree about `{ty:?}`. They are a \
+             mirror by hand -- see either `is_pointer`'s comment -- so one crate now \
+             tells a caller something the other does not. Change both or neither."
+        );
+        match clue {
+            Some(clue) => assert!(
+                ours.contains(clue) && ours.ends_with("so this row is unported"),
+                "`{ty:?}` lost its clause. A handle in a row is not an unsupported type, \
+                 it is a row that has not been ported -- `execution`'s `RUST_SERVED` doc \
+                 for the cuBLAS one, `cuLaunchKernel`'s signature for the stream -- and \
+                 the bare message sends the reader to the marshaller instead: {ours}"
+            ),
+            None => assert!(
+                !ours.contains(" -- "),
+                "`{ty:?}` grew a clause it should not have, which makes the two \
+                 assertions above pass without discriminating anything: {ours}"
+            ),
+        }
+        rendered.push(ours);
+    }
+
+    assert_ne!(
+        rendered[0], rendered[1],
+        "the two handle kinds render identically, so the message says a handle was found \
+         rather than which one -- and the two belong to different owners: the launch, and \
+         the service that issues it"
+    );
+}
+
+/// The two `is_pointer` lists admit the SAME kinds, as a set.
+///
+/// # The sibling of the test above, and the half it did not cover
+///
+/// `both_arg_error_copies_diagnose_a_handle_the_same_way` asserts the two
+/// crates SAY the same thing. This asserts they DO the same thing. Each
+/// `is_pointer` carries a comment naming the other and stating the lists
+/// *"are byte-identical and must stay so"*, with the consequence spelled out:
+/// a `Ty` accepted by one and refused by the other is a symbol that binds in
+/// one crate and not the other.
+///
+/// **They had diverged, and the sentence was the only thing guarding them.**
+/// `Ty::Bf16sMut` and `Ty::F16sMut` went into `kernels_cuda_new`'s list when
+/// the variants were minted and never into `driver_cuda`'s. Nothing noticed,
+/// because `x::abi`'s `ptr_abi!(bf16, …)` tagged every `*mut bf16` parameter
+/// `Ty::BufMut` and no row could present the kinds. The moment that tag moved
+/// — 269 operand positions across 172 rows — `driver_cuda::bind::device`
+/// would have taken `Args::bind`'s catch-all arm and answered
+/// *"which a device entry point cannot take"* about an ordinary device
+/// pointer.
+///
+/// # Why the text and not the behaviour
+///
+/// Both `is_pointer`s are private `const fn`s, so there is nothing to call.
+/// `Args::bind` is reachable but answers for one `Ty` at a time and only
+/// through a `KernelSig`, which would make the population of this test *the
+/// kinds some row happens to state* — the same "measured against itself"
+/// shape that let the divergence live. `include_str!` takes the whole list
+/// from each file, so a kind added to one and not the other is caught whether
+/// or not any row states it yet.
+///
+/// It also buys the property `#[cfg]` and dead code cannot: a moved or
+/// renamed file is a COMPILE error here, not a runtime message about
+/// something else. That is the distinction `the_enum_mirrors_carry_the_cpp_discriminants`
+/// was migrated for.
+#[test]
+fn both_is_pointer_lists_admit_the_same_kinds() {
+    /// The `matches!` arm list out of one `is_pointer`, as a sorted set of
+    /// variant names.
+    ///
+    /// Deliberately not a string compare of the two bodies. The lists are
+    /// hand-written in two crates and their ORDER is not the claim — a reader
+    /// who groups the buffer kinds differently in one file has changed
+    /// nothing about which kinds bind. What must agree is the set, and saying
+    /// so is what keeps this test from going red for a reason it does not
+    /// name.
+    fn kinds(src: &str, file: &str) -> Vec<String> {
+        let at = src
+            .find("const fn is_pointer(ty: Ty) -> bool {")
+            .unwrap_or_else(|| panic!("{file} has no `is_pointer`, so this test reads nothing"));
+        let body = &src[at..];
+        let end = body.find("\n}\n").unwrap_or_else(|| panic!("{file}'s `is_pointer` never ends"));
+        let mut out: Vec<String> = body[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.split('|'))
+            .filter_map(|t| t.trim().trim_end_matches(',').strip_prefix("Ty::"))
+            .map(|t| t.split_whitespace().next().unwrap_or(t).to_string())
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        // The extractor proves it can return non-zero before any comparison
+        // is believed. Two lists that both parsed to nothing are equal, and a
+        // rename of the function or a reformat of the `matches!` would
+        // produce exactly that.
+        assert!(
+            out.len() > 15,
+            "{file}'s `is_pointer` parsed to {} kinds ({out:?}). Two empty lists compare \
+             equal, so this test would pass by failing to read either one",
+            out.len()
+        );
+        out
+    }
+
+    let ours = kinds(
+        include_str!("../../kernels-cuda-new/src/runtime/args.rs"),
+        "kernels-cuda-new/src/runtime/args.rs",
+    );
+    let theirs = kinds(
+        include_str!("../src/bind/device.rs"),
+        "driver-cuda/src/bind/device.rs",
+    );
+
+    let only_ours: Vec<&str> = ours
+        .iter()
+        .filter(|k| !theirs.iter().any(|t| t == *k))
+        .map(String::as_str)
+        .collect();
+    let only_theirs: Vec<&str> = theirs
+        .iter()
+        .filter(|k| !ours.iter().any(|t| t == *k))
+        .map(String::as_str)
+        .collect();
+    assert!(
+        only_ours.is_empty() && only_theirs.is_empty(),
+        "the two `is_pointer` lists disagree. Only in `kernels-cuda-new`: {only_ours:?}; \
+         only in `driver-cuda`: {only_theirs:?}. A `Ty` in one list and not the other is \
+         a row that binds in one crate and is refused in the other, with a message \
+         saying a device entry point cannot take it -- change both or neither"
+    );
+
+    // AND THE TWO KINDS THIS TEST WAS WRITTEN FOR ARE IN BOTH, named rather
+    // than left to the set comparison. Two lists that had BOTH lost them
+    // would satisfy everything above, and that is the state the tree was in
+    // for `driver-cuda` alone.
+    for want in ["Bf16sMut", "F16sMut", "Bf16s", "F16s"] {
+        assert!(
+            ours.iter().any(|k| k.as_str() == want) && theirs.iter().any(|k| k.as_str() == want),
+            "`Ty::{want}` is not bound as a pointer by both crates. `x::abi` tags \
+             `*mut bf16` `Ty::Bf16sMut` and 269 operand positions state it"
         );
     }
 }

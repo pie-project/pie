@@ -94,7 +94,8 @@ pub fn fire(
 /// [`fire`]'s sibling for the third shim mechanism. `families::fa2`'s 460 rows
 /// state **no operands** — not because they take none, but because each
 /// `__global__` takes exactly one argument, a params struct by value
-/// (`decode.cuh:618-621`, `prefill.cuh:3966-3967`), and
+/// (`decode.cuh`'s `BatchDecodeWithPagedKVCacheKernel`, `prefill.cuh`'s
+/// `BatchPrefillWithPagedKVCacheKernel`), and
 /// [`kernels_cuda_new::Ty`] has no variant for a struct and must not grow one:
 /// a `Ty::Struct` would have to carry a layout, and the layout is
 /// [`kernels_cuda_new::fa2::params`]'s job, pinned by assertion, in one place.

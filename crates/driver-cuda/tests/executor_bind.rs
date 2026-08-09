@@ -1436,6 +1436,10 @@ fn every_lowered_symbol_has_an_arm() {
         // (`gemm::act_x_w`) and a backend names a symbol
         // (`gemm::act_x_wt_bf16`), and both reach a text. Taking
         // `nth(1)` alone reported the alias unarmed.
+        //
+        // The alias is `x::Contract`'s since step 9, not `KernelSig`'s, and
+        // the or-pattern survives that: `emit_dispatch` looks it up by
+        // symbol, and every symbol in `table::TABLES` has a contract.
         for sym in line.split('"').skip(1).step_by(2) {
             if sym.contains("::") {
                 armed.insert(sym.to_string());
@@ -1765,8 +1769,16 @@ mod the_mixture {
 /// The join used to recognise four literal symbols
 /// (`ssm::nemotron_mamba_split_bf16` and its neighbours) to route the split's
 /// raw `dt` and the params prep's fp32 tables to the scan. Both ends are
-/// stated now — `KernelSig::publishes_aux` for the publishers, the
+/// stated now — `x::Contract::publishes_aux` for the publishers, the
 /// `Source::Aux` operands for the consumers — so the join names nothing.
+///
+/// The two ends are read from two oracles over the same population:
+/// `x::contract` for the publisher half (that is where the claim lives once
+/// it is out of the portable vocabulary) and `sig_in` for the consumer half
+/// (`operands` stayed there). It must NOT be `x::entry` — that searches
+/// `FAMILIES` and a driver op is deliberately absent from it, so the width
+/// would come out short and this very assertion would be the one that broke,
+/// reporting a filling failure for a width mistake.
 ///
 /// This pins the OUTCOME rather than the mechanism: every launch whose row
 /// reads an aux slot must come out of the join with every slot filled. A row
@@ -1785,19 +1797,23 @@ fn every_aux_reading_launch_gets_a_full_set_of_slots() {
 
     // The widest slot any row in this lowering mentions, which is what the
     // join sizes its vector by.
-    let width = l
+    let published = l
+        .kernels
+        .iter()
+        .filter_map(|k| kernels_cuda_new::x::contract(k))
+        .flat_map(|c| c.publishes_aux.iter().map(|&(slot, _)| slot));
+    let consumed = l
         .kernels
         .iter()
         .filter_map(|k| kernels::sig_in(kernels_cuda_new::table::KERNELS, k))
         .flat_map(|s| {
-            s.publishes_aux
-                .iter()
-                .map(|&(slot, _)| slot)
-                .chain(s.operands.iter().filter_map(|o| match o.source {
-                    kernels::Source::Aux(i) => Some(i),
-                    _ => None,
-                }))
-        })
+            s.operands.iter().filter_map(|o| match o.source {
+                kernels::Source::Aux(i) => Some(i),
+                _ => None,
+            })
+        });
+    let width = published
+        .chain(consumed)
         .max()
         .map_or(0, |m| usize::from(m) + 1);
     assert_eq!(width, 6, "the mamba block's stated order is six slots");
@@ -1827,5 +1843,82 @@ fn every_aux_reading_launch_gets_a_full_set_of_slots() {
     assert!(
         seen > 0,
         "no launch in this lowering reads an aux slot — the claim is vacuous"
+    );
+}
+
+/// The publisher oracle for `aux_width` covers exactly the rows the row
+/// lookup does.
+///
+/// `bind::resolve` used to read `publishes_aux` off a `KernelSig` and now
+/// reads it off an `x::Contract`. `aux_width` is a `max`, so the swap is
+/// only safe if the two lookups answer over the SAME set of symbols: a
+/// population that shrank would size the aux vector shorter, and the
+/// out-of-range publish then fills nothing for a slot that used to exist —
+/// reported by the test above as a filling failure, which is not what went
+/// wrong.
+///
+/// **The test above cannot catch that, and this is the measurement that says
+/// so.** All three of the mamba block's publishers
+/// (`ssm::nemotron_mamba_split_bf16`, `ssm::nemotron_prepare_mamba_params`,
+/// `ssm::nemotron_prepare_mamba_dt_da`) carry a `bind!` as well as a
+/// `contract!`, so for THAT lowering `x::entry` and `x::contract` agree and
+/// a width of 6 comes out either way. The wrong oracle would have passed.
+/// The hazard is latent rather than absent: it arrives with the first
+/// unbound contract that publishes a slot, and `gemm` alone already declares
+/// twelve unbound contracts.
+///
+/// So the claim is pinned as a population statement over the whole table
+/// instead of as an outcome on one model. `table::KERNELS` is
+/// `ROW_TABLES ++ x::SIGS` with `ROW_TABLES` empty, and `x::SIGS` is the
+/// product of `x::CONTRACTS`, so the two must agree symbol for symbol.
+#[test]
+fn every_row_the_join_can_look_up_has_a_contract_behind_it() {
+    let rows = kernels_cuda_new::table::KERNELS;
+    assert!(
+        rows.len() > 50,
+        "the row table came back with {} entries, which means the table was \
+         not linked rather than that it is small",
+        rows.len(),
+    );
+
+    let orphans: Vec<&str> = rows
+        .iter()
+        .map(|s| s.symbol)
+        .filter(|s| kernels_cuda_new::x::contract(s).is_none())
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "{orphans:?} are rows the join can resolve with `sig_in` but not with \
+         `x::contract`. `aux_width` reads publications off the contract, so \
+         each of these is a launch that can no longer widen the aux vector.",
+    );
+
+    // And the other direction, which is the one that would let a contract
+    // state a publication no row-shaped consumer could ever see.
+    let unrowed: Vec<&str> = kernels_cuda_new::x::CONTRACTS
+        .iter()
+        .flat_map(|f| f.iter())
+        .map(|c| c.symbol)
+        .filter(|s| kernels::sig_in(rows, s).is_none())
+        .collect();
+    assert!(
+        unrowed.is_empty(),
+        "{unrowed:?} have a contract but no row in `table::KERNELS`",
+    );
+
+    // The oracle that must NOT be used, kept here so the difference is a
+    // number in a message rather than a claim in a comment.
+    let unbound: Vec<&str> = kernels_cuda_new::x::CONTRACTS
+        .iter()
+        .flat_map(|f| f.iter())
+        .map(|c| c.symbol)
+        .filter(|s| kernels_cuda_new::x::entry(s).is_none())
+        .collect();
+    assert!(
+        !unbound.is_empty(),
+        "every contract now has an entry, so `x::entry` and `x::contract` \
+         cover the same symbols and the reason `resolve` must use the latter \
+         has expired. Re-read `bind::resolve`'s aux comment before deleting \
+         anything.",
     );
 }

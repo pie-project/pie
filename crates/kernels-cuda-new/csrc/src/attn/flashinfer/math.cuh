@@ -19,19 +19,9 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-// PIE: guarded for NVRTC -- host-only `<cmath>`; every arithmetic function
-// below is a PTX instruction or a `__`-prefixed intrinsic, both of which NVRTC
-// supplies itself. `<cuda_runtime.h>` above is NOT guarded, and that is the
-// measurement: it is the only host header in this closure that a `__device__`
-// function still needs a name out of -- `ushort`, in the two `ex2.approx.f16`
-// and `tanh.approx.f16` wrappers, a `vector_types.h` typedef NVRTC's preamble
-// does not predefine even though it predefines `uint4` and `float4`. The
-// header set answers the directive with a `cuda_runtime.h` of its own.
-// Upstream is unmodified apart from markers of this form; see NOTICE.
-// Removing them restores the file.
-#ifndef __CUDACC_RTC__
-#include <cmath>
-#endif
+// PIE: REMOVED -- host-only `<cmath>`. 1 line of host C++, guarded out of every NVRTC compile
+// before it was removed, so removing it changes no compile. This marker is one a strip does NOT
+// undo; see MODIFICATIONS.
 #include <cstdint>
 
 namespace flashinfer {

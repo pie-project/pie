@@ -249,8 +249,13 @@ __host__ __device__ constexpr const T& min(const T& a, const T& b) {
 
 /// A value of `T` in an unevaluated context. Declared and never defined, as
 /// the standard requires -- calling it is the diagnostic.
+///
+/// `__host__ __device__` because NVRTC's JIT mode refuses an unannotated
+/// function outright: "host functions are not allowed in JIT mode". The
+/// annotation costs nothing here -- the function has no body to compile for
+/// either space -- and every other function in this header already carries it.
 template <class T>
-T&& declval() noexcept;
+__host__ __device__ T&& declval() noexcept;
 
 }  // namespace std
 

@@ -614,6 +614,10 @@ fn every_uniform_block_is_laid_out_the_way_wgsl_reads_it() {
 ///
 /// It is not hypothetical. `publishes_aux` was added to `KernelSig` while this
 /// crate was being written, and the scrape went on passing without it.
+/// (That field has since left `KernelSig` altogether — step 9 measured it
+/// CUDA-only and consolidated it onto `kernels_cuda_new::x::Contract`. The
+/// anecdote is history, and it is the reason this test exists; the check
+/// below is what caught the departure too, from the other direction.)
 ///
 /// So the list is held against the struct itself: `kernels/src/lib.rs` is read,
 /// its `pub struct KernelSig` fields are counted, and [`FIELDS`] together with
@@ -690,8 +694,10 @@ fn the_parity_check_reads_every_field_a_row_can_carry() {
 /// Held against the struct itself by
 /// [`the_parity_check_reads_every_field_a_row_can_carry`], because a named list
 /// rots: a field added upstream and not added here is a field the comparison
-/// silently stops making. `publishes_aux` arrived exactly that way.
-const FIELDS: [&str; 15] = [
+/// silently stops making. `publishes_aux` arrived exactly that way, and left
+/// the same list in step 9 — the `phantom` half of that test is what made the
+/// departure visible.
+const FIELDS: [&str; 12] = [
     "grid_param",
     "rows_param",
     "head_param",
@@ -702,11 +708,8 @@ const FIELDS: [&str; 15] = [
     "sink",
     "in_place",
     "whole",
-    "returns",
     "depth_prefix_plan",
     "axes",
-    "lowered_as",
-    "publishes_aux",
 ];
 
 /// The `KernelSig` fields the parity check deliberately does NOT compare.

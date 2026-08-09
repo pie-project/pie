@@ -26,7 +26,7 @@
 //!
 //! Three things, and the report names each so a refusal can be attributed:
 //!
-//! * **The internalised closure** — `csrc/src/attn/flashinfer/`, 28 files
+//! * **The internalised closure** — `csrc/src/attn/flashinfer/`, 24 files
 //!   copied byte-for-byte from FlashInfer v0.6.15 and modified only by
 //!   `#ifndef __CUDACC_RTC__` guards, each marked `// PIE:` (see `NOTICE` and
 //!   `csrc/src/attn/flashinfer/MODIFICATIONS`). It lived at `csrc/vendor/`
@@ -197,7 +197,7 @@ mod probe {
     /// unsets `CUDA_VERSION` and the fp4 vector types disappear with no
     /// diagnostic at all. A host header whose names reach device code is
     /// CARRIED, under the exact spelling the directive uses. That rule is the
-    /// difference between 35 guards and roughly seventy.
+    /// difference between 33 guards and roughly seventy.
     ///
     /// They used to sit at the root of the vendor tree, and this function used
     /// to find them by *not* being FlashInfer's — a definition by exclusion,
@@ -336,8 +336,8 @@ mod probe {
         );
         // Entries against FILES, because they stopped being the same number when
         // the generator learned that NVRTC matches an include literally. The
-        // group now spans both internalised trees: 43 files (28 FlashInfer, 15
-        // XQA) under 87 names, the extra 44 being the relative spellings each
+        // group now spans both internalised trees: 39 files (24 FlashInfer, 15
+        // XQA) under 79 names, the extra 40 being the relative spellings each
         // tree reaches its own siblings by. A probe that printed only one of
         // these two numbers would be hiding the mechanism that makes the tree
         // compile.

@@ -156,8 +156,8 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // `bind/mod.rs` left this table entirely. Its four were the mamba
         // join's kernel SYMBOLS — `ssm::nemotron_mamba_split_bf16` and its
         // neighbours — matched by name to route values across statements.
-        // The wiring is stated on the kernel rows now
-        // (`KernelSig::publishes_aux` for the publishers, the `Source::Aux`
+        // The wiring is stated on the declarations now
+        // (`x::Contract::publishes_aux` for the publishers, the `Source::Aux`
         // operands already there for the consumers), so the join is
         // arithmetic over the table and names nothing.
     ]

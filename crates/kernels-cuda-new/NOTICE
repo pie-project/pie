@@ -42,46 +42,134 @@ build hash; all seventeen were compared and are identical.
 
 ### What is carried
 
-Twenty-eight files: the transitive `#include` closure, inside the FlashInfer
-tree, of the fifteen headers `crates/kernels-cuda/csrc/src` names --
-`attention/{cascade,decode,mask,mla,prefill,scheduler,state,variants,
+Twenty-four files: the transitive `#include` closure, inside the FlashInfer
+tree, of the headers `csrc/src/attn/` names --
+`attention/{cascade,decode,mask,mla,prefill,state,variants,
 default_decode_params,default_prefill_params}.cuh` and
-`{fastdiv,layout,page,pos_enc,utils}.cuh`. 18,207 lines.
+`{fastdiv,layout,page,pos_enc,utils}.cuh`. 13,662 lines, 589,556 bytes.
+
+It was twenty-eight, and the four that left are the subject of "What was
+deleted" below. `attention/scheduler.cuh` used to be one of the seeds of this
+closure, because the ahead-of-time crate's `.cu` files included it; under the
+JIT nothing includes it and it is gone. The line count was 16,084 until the
+host C++ inside the twenty-four came out as well -- same section, second
+half.
 
 Not carried, and deliberately: `attention/hopper/*`, `comm/*`,
 `gemm/bmm_fp8.cuh`, `cutlass_utils.cuh` and `mamba/selective_state_update.cuh`.
-They are outside the closure of those fifteen seeds, they are a different
+They are outside the closure of those seeds, they are a different
 architecture's problem (sm_90 TMA, NVSHMEM, CUTLASS), and carrying text
 nobody compiles would be weight in every binary.
 
+### What was deleted
+
+Four files, and this is the one change in this tree that is not a guard.
+`attention/scheduler.cuh`, `exception.h`, `allocator.h` and
+`attention/heap.h` contained no device code at all -- no `__global__` body, no
+`__device__` function, 2,138 lines and 97,847 bytes of host C++ between them.
+Every one was already guarded in its ENTIRETY, so NVRTC had always seen four
+empty files; the guards were doing a deletion's work at the cost of shipping
+the text, and `csrc/` is device text only.
+
+Each had a Rust owner before it was deleted, which is why this is a deletion
+and not a port: `src/plan/{decode,prefill,mla,sm90}.rs` for the scheduler,
+`src/plan/error.rs`, `src/plan/alloc.rs` and `src/plan/heap.rs` for the other
+three, 3,853 lines of Rust that were written against these files and had been
+carrying the behaviour for some time.
+
+The measurement that made it safe: `scheduler.cuh` was `#include`d by nothing
+in this tree, and `allocator.h` and `heap.h` only by `scheduler.cuh`. Walking
+the four compilation roots reached 40 of the 43 internalised files and missed
+exactly those three. `exception.h` was the fourth and the only reachable one
+-- `page.cuh` and `utils.cuh` included it -- so deleting it deleted two
+`#include` lines as well. That is safe for a reason worth stating plainly:
+because `exception.h` was guarded in its entirety, `FLASHINFER_CHECK` and
+`FLASHINFER_ERROR` were ALREADY undefined in every NVRTC translation unit
+here, and the expansions that survive are all inside `#define` bodies NVRTC
+never expands or host launchers it never reaches. What NVRTC sees did not
+change by one token. (Removing the launchers, below, took the second kind
+with them: 13 expansions remain and every one is a `#define` continuation
+line.)
+
+### And then the host C++ inside the surviving files went too
+
+Four whole files was the easy half. The rule is *`csrc/` holds pure kernels*,
+and after those four deletions it held in effect and not in letter: 34 guarded
+regions carrying 1,503 lines of upstream host text were still on disk, hidden
+from NVRTC by `#ifndef __CUDACC_RTC__` and by XQA's own `#ifndef
+GENERATE_CUBIN`, plus **1,055 lines in 13 `cudaError_t` host launchers that
+were not guarded at all** -- `SinglePrefillWithKVCacheDispatched`,
+`BatchDecodeWithPagedKVCacheDispatched` and their siblings across
+`cascade.cuh`, `decode.cuh`, `mla.cuh` and `prefill.cuh`. Those thirteen
+survived only by being uninstantiated templates, which is a far weaker shield
+than a guard: a single explicit instantiation anywhere would have handed
+`cudaMalloc`, `std::vector` and `cudaStreamCreate` to a device compiler. They
+form a closed set -- the only callers of any of the thirteen are the others --
+so removing them removed no reachable code.
+
+A fifth whole file went with them: **`xqa/hostUtils.h`**, one `inline
+cudaLaunchConfig_t makeLaunchConfig(...)`, no device text, included only from
+the `mha.cuh` host block being deleted. It was found by the deletion rather
+than before it.
+
+Net across both trees: **15 files touched, 2,694 lines and 123,642 bytes
+removed**, each site keeping a `// PIE: REMOVED` marker naming what stood
+there -- 40 markers, and they are inside that net. `MODIFICATIONS` carries the
+per-file ledger and the reasoning.
+
+What was NOT removed: **12 two-sided regions, 36 host lines**, where the
+`#ifndef` has an `#else` arm holding our device replacement -- `<cstdint>`
+against XQA's `mha_stdheaders.cuh` shims, chiefly. The documented strip keeps
+the guarded body and discards the `#else`, so deleting the host arm of one of
+those would make a strip silently promote OUR text into a file that claims to
+be upstream's. They stay, and they are the reason this section says *removed*
+rather than *all removed*.
+
+Deleting text a marker names is the one edit a strip cannot undo, and there
+are now twelve files' worth of it rather than two `#include` lines.
+`MODIFICATIONS` states it as step 3 of its transform and says plainly that
+step 3 needs upstream's tarball.
+
 ### What was changed
 
-Nothing but guards. **35 `#ifndef __CUDACC_RTC__` guards across 14 of the 28
-files, 226 added lines**; the other 14 files are byte-identical to upstream.
+Guards, markers, and the `#include` lines named above. **39 `// PIE:` markers
+across 12 of the 24 files, 156 added lines**; the other 12 files are
+byte-identical to upstream. Only **two** `#ifndef __CUDACC_RTC__` directives
+remain in the whole FlashInfer tree, both in `attention/mla.cuh`, both
+two-sided; there were thirty-three markers over ten files when every guard was
+still a guard.
 Every copyright header is intact and untouched. Nothing was reformatted,
 renamed, reordered or "improved" -- include order in particular is upstream's,
-which is why several files carry four small guards where one large one would
+which is why several files carry four small markers where one large one would
 have needed a line moved.
 
-A guard exists because NVRTC compiles for the device only. It refuses a
+A guard existed because NVRTC compiles for the device only. It refuses a
 function marked `__host__` outright ("a function explicitly marked as a
 __host__ function is not allowed in JIT mode"), it has no C++ standard
 library, and it has no include path -- so `<iostream>`, `<sstream>`,
 `<vector>`, the `cudaLaunchKernel` wrappers and the `std::ostringstream` error
-paths have to be hidden from it. They are hidden, not deleted: the ahead-of-
-time build defines no `__CUDACC_RTC__` and therefore sees upstream exactly.
+paths had to be hidden from it. They are no longer hidden: they are gone, and
+a marker records each one. The ahead-of-time build that used to see upstream
+exactly by defining no `__CUDACC_RTC__` no longer exists -- there is no nvcc
+in this crate -- so nothing was left to serve by keeping the text.
 
-Each guard is preceded by a marker of a fixed form:
+Each change is preceded by a marker of one of two fixed forms:
 
     // PIE: guarded for NVRTC -- <what and why>. Upstream is unmodified apart
     // from markers of this form; see NOTICE. Removing them restores the file.
 
-One `grep -rn "// PIE:" csrc/src/attn/flashinfer/` finds all 35. The
-boilerplate sentence appears once per file, on its first marker.
+    // PIE: REMOVED -- <what stood here>. <N> lines of host C++, <why removing
+    // it changes no compile>. This marker is one a strip does NOT undo; see
+    // MODIFICATIONS.
+
+One `grep -rn "// PIE:" csrc/src/attn/flashinfer/` finds all 39, of which 40
+across both trees are `REMOVED`. The boilerplate sentence appears once per
+file, on its first marker.
 `csrc/src/attn/flashinfer/MODIFICATIONS` lists the count per file, and the
 property that list asserts -- *strip the markers, the `#ifndef` under each and
-its matching `#endif`, and every file is byte-for-byte upstream* -- was checked
-mechanically, per file, against the CPM tree before this NOTICE was written.
+its matching `#endif`, and put back what a REMOVED marker names, and every
+file is byte-for-byte upstream* -- was checked mechanically, per file, against
+the CPM tree before this NOTICE was written.
 `tests/upstream_manifest.rs` re-checks the half of that claim which needs no
 network: every file's guard count, added-line count, line count and byte count
 still match the table, and the strip is still well defined for every file. The
@@ -90,12 +178,14 @@ checkout and is a manual step on rebase.
 
 Two consequences are worth recording because they are not visible in a diff:
 
-  * `attention/scheduler.cuh` is guarded in its entirety, all 1,808 lines of
-    it. It is the host planner -- `std::vector` bin-packing, workspace
+  * `attention/scheduler.cuh` used to be guarded in its entirety, all 1,808
+    lines of it, and that whole-file guard is what identified it as a
+    deletion. It was the host planner -- `std::vector` bin-packing, workspace
     carving, `cudaOccupancyMaxActiveBlocksPerMultiprocessor` -- and the three
-    `__global__` declarations at its top are forward declarations that exist
-    only to give the occupancy query a function pointer. There is no device
-    code in it to keep. Under the JIT the plan is Rust's job.
+    `__global__` declarations at its top were forward declarations that
+    existed only to give the occupancy query a function pointer. There was no
+    device code in it to keep. Under the JIT the plan is Rust's job, and the
+    file is now gone rather than guarded; see "What was deleted" above.
   * `attention/default_prefill_params.cuh` loses its six `__host__`
     constructors, and `page.cuh` and `fastdiv.cuh` theirs, for the reason
     above: NVRTC rejects the *declaration*, not just the body. The structs and
@@ -138,11 +228,13 @@ rules. It is not a guest. It is compiled by the same JIT, guarded by the same
 markers, and tested by the same tests as everything beside it.
 
 **Not one byte of the twenty-nine changed in the move** -- all 28 source files
-and `LICENSE`, zero changed lines each; only `MODIFICATIONS`, which is PIE's
+as the tree then stood, and `LICENSE`, zero changed lines each; only
+`MODIFICATIONS`, which is PIE's
 own file, was edited, to record the new path. The subtree shape is what makes
 that true: upstream's files include each other relatively (`"../cp_async.cuh"`,
 `"mask.cuh"`) and a relative spelling survives a move that carries the whole
-tree.
+tree. Four of those 28 were deleted afterwards and for an unrelated reason;
+that is "What was deleted" above, not part of the move.
 
 Seventeen `#include` directives changed across the whole internalisation, and
 the split is worth stating because only one half of it touches upstream text:
@@ -178,11 +270,17 @@ was missing. It is below.
 
 ### What is carried
 
-Fifteen files, 7,249 lines, 274,966 bytes:
+Fourteen files, 6,977 lines, 265,143 bytes:
 
-    barriers.cuh   defines.h     mha.cuh      mha_components.cuh   mma.cuh
-    cuda_hint.cuh  hostUtils.h   mha.h        mha_stdheaders.cuh   platform.h
-    ldgsts.cuh     specDec.h     mhaUtils.cuh utils.cuh            utils.h
+    barriers.cuh   defines.h     mha.h        mha_stdheaders.cuh   platform.h
+    cuda_hint.cuh  ldgsts.cuh    mhaUtils.cuh mma.cuh              specDec.h
+    mha.cuh        mha_components.cuh         utils.cuh            utils.h
+
+It was fifteen. `hostUtils.h` was deleted -- see "What was changed" below --
+and the counts above are the tree as it now stands, re-derived rather than
+adjusted. The previous figure in this document, `274,966 bytes`, was 36 bytes
+under the truth for the fifteen-file tree it described; nothing had a second
+derivation to disagree with it.
 
 Not carried, and deliberately: `gmma.cuh`, `gmma_impl.cuh`, `mha_sm90.cu`,
 `mla_sm120.cu`, `mla_sm120.cuh`, `tensorMap.cpp`, `tensorMap.h`, `tma.h`,
@@ -193,8 +291,9 @@ whose job (tensor-map construction, kernel launch) is Rust's here, in
 
 ### What was changed
 
-**Three of the fifteen files differ from upstream at all; the other twelve are
-byte-identical.** Across those three: 56 lines added, 5 replaced, net +51.
+**Four of the fourteen files differ from upstream at all; the other ten are
+byte-identical.** Those four are `mha.cuh`, `mha_components.cuh`,
+`mhaUtils.cuh` and `utils.h`.
 
   * `mha.cu` is carried as **`mha.cuh`**. It is a rename and nothing else.
     This crate holds no translation units -- a `.cu` is an ahead-of-time TU
@@ -203,12 +302,24 @@ byte-identical.** Across those three: 56 lines added, 5 replaced, net +51.
     this repo is against upstream; `mha.cuh:N` means our copy. The file's own
     header note gives the offset both ways and it is arithmetic, not memory:
     3,093 - 3,051 = 42.
-  * One `#ifndef GENERATE_CUBIN` guard, around the host tail of `mha.cuh`
-    (`configureKernel`, `launchMHAFlashInfer` -- `cudaMemcpyFromSymbol`,
-    `cudaFuncSetAttribute`, `cudaLaunchKernelEx`). Upstream guards its *own*
-    host launcher `launchMHA` exactly this way at `mha.cu:2820`; this tail is
-    FlashInfer's downstream addition and they never guarded it. The guarded
-    body's replacement is `driver-cuda/src/fire/xqa.rs`.
+  * The host tail of `mha.cuh` is **deleted**, not guarded. It used to sit
+    under one `#ifndef GENERATE_CUBIN` of ours -- `configureKernel`,
+    `launchMHAFlashInfer`, and with them `cudaMemcpyFromSymbol`,
+    `cudaFuncSetAttribute` and `cudaLaunchKernelEx`. Upstream guards its *own*
+    host launcher `launchMHA` exactly this way at `mha.cu:2820`; that tail was
+    FlashInfer's downstream addition and they never guarded it. Both are gone
+    now, along with upstream's `throw std::runtime_error("not implemented")`
+    under `#if USE_INPUT_KV`. The replacement is `driver-cuda/src/fire/xqa.rs`
+    and always was.
+  * `utils.h` loses `checkCuda` and `checkCu`, two host error checkers that
+    `throw std::runtime_error`. `utils.h` is included by `utils.cuh` and by
+    `mha.h`, so it is genuinely inside the include closure -- but the four
+    call sites were all in the `mha.cuh` host tail above, so after that tail
+    went, nothing called either. They were dead text in a file NVRTC parses,
+    which is the same shape as the four FlashInfer headers.
+  * `xqa/hostUtils.h` is **deleted entirely**: one `inline
+    cudaLaunchConfig_t makeLaunchConfig(...)`, no device text at all, and its
+    only includer was the deleted `mha.cuh` tail.
   * Five `#include` spellings made tree-relative -- `"mma.cuh"` and
     `"utils.cuh"` become `"attn/xqa/mma.cuh"` and `"attn/xqa/utils.cuh"` in
     `mha.cuh`, `mhaUtils.cuh` and `mha_components.cuh`. This is the one change
@@ -218,16 +329,26 @@ byte-identical.** Across those three: 56 lines added, 5 replaced, net +51.
     would otherwise resolve to FlashInfer's. Those five are the only bare
     spellings either tree shares; the other nine XQA directives name files
     FlashInfer does not have and were left alone.
-  * 48 `// PIE:` marker lines across the same three files, in the same fixed
-    form used on the FlashInfer side. `grep -rn "// PIE:" csrc/src/attn/xqa/`
-    finds all 48.
+  * 39 `// PIE:` marker lines across those four files -- 28 in `mha.cuh`,
+    6 in `mha_components.cuh`, 3 in `mhaUtils.cuh`, 2 in `utils.h` -- in the
+    same fixed forms used on the FlashInfer side. `grep -rn "// PIE:"
+    csrc/src/attn/xqa/` finds all 39. It was 48 before the strip, and it went
+    DOWN rather than up: fourteen of the old markers were *inside* the host
+    tail and were deleted with it, and three new `REMOVED` markers replaced
+    them. Markers went up on the FlashInfer side, 33 to 39, and down here, for
+    the same operation. That is the reason to count them rather than reason
+    about them.
 
 Note the shape of the difference from the FlashInfer side of this document:
-there, the changes are 35 `#ifndef __CUDACC_RTC__` guards; here there are
-**none**. XQA was written to be compiled as a cubin -- it carries upstream's
-own `GENERATE_CUBIN` switch for exactly that -- so the JIT needed one guard
-where FlashInfer's host-facing headers needed thirty-three. Diffing XQA
-against a fresh checkout is correspondingly cheap.
+there, the changes began as 33 `#ifndef __CUDACC_RTC__` guards; here there
+were **none**. XQA was written to be compiled as a cubin -- it carries
+upstream's own `GENERATE_CUBIN` switch for exactly that, and
+`src/families/attn.rs` passes `-DGENERATE_CUBIN=1` -- so the JIT needed one
+guard of ours where FlashInfer's host-facing headers needed thirty-three.
+Both counts are now zero on the XQA side and two on the FlashInfer side, and
+what stood behind them is deleted rather than hidden. Diffing XQA against a
+fresh checkout is correspondingly cheap on ten of fourteen files and needs
+`MODIFICATIONS` for the other four.
 
 
 FP16 (Marat Dukhan / AMD), via FlashInfer

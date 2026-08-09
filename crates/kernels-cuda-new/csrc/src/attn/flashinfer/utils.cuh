@@ -16,40 +16,35 @@
 #ifndef FLASHINFER_UTILS_CUH_
 #define FLASHINFER_UTILS_CUH_
 #include <cuda_bf16.h>
-// PIE: guarded for NVRTC -- the host standard library and the CUDA device
-// runtime API, wanted only by `GetCudaComputeCapability`,
-// `GetCudaMultiProcessorCount` and `DebugPrintCUDAArray` below, all three
-// guarded with them. `<cstdint>` and `<type_traits>` are NOT guarded and are
-// carried instead: NVRTC has no fixed-width integer types and no `std::`
-// traits, and this file's `DEFINE_HAS_MEMBER` is `std::void_t` +
-// `std::declval` at namespace scope, expanded on `decode.cuh`'s first line of
-// code. The include ORDER is upstream's; guarding a run rather than moving one
-// line is what keeps the diff readable as guards and nothing else. Upstream is
-// unmodified apart from markers of this form; see NOTICE. Removing them
-// restores the file.
-#ifndef __CUDACC_RTC__
-#include <cuda_device_runtime_api.h>
-#endif
+// PIE: REMOVED -- host-only `<cuda_device_runtime_api.h>`. 1 line of host C++, guarded out of
+// every NVRTC compile before it was removed, so removing it changes no compile. This marker is
+// one a strip does NOT undo; see MODIFICATIONS.
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
-// PIE: guarded for NVRTC -- host-only.
-#ifndef __CUDACC_RTC__
-#include <atomic>
-#endif
+// PIE: REMOVED -- host-only `<atomic>`. 1 line of host C++, guarded out of every NVRTC compile
+// before it was removed, so removing it changes no compile. This marker is one a strip does NOT
+// undo; see MODIFICATIONS.
 #include <cstdint>
-// PIE: guarded for NVRTC -- host-only.
-#ifndef __CUDACC_RTC__
-#include <iostream>
-#endif
+// PIE: REMOVED -- host-only `<iostream>`. 1 line of host C++, guarded out of every NVRTC
+// compile before it was removed, so removing it changes no compile. This marker is one a strip
+// does NOT undo; see MODIFICATIONS.
 #include <type_traits>
-// PIE: guarded for NVRTC -- host-only.
-#ifndef __CUDACC_RTC__
-#include <vector>
-#endif
+// PIE: REMOVED -- host-only `<vector>`. 1 line of host C++, guarded out of every NVRTC compile
+// before it was removed, so removing it changes no compile. This marker is one a strip does NOT
+// undo; see MODIFICATIONS.
 
-#include "exception.h"
+// PIE: `exception.h` is deleted, and this include with it. That file was pure
+// host C++ -- `flashinfer::Error` derives from `std::exception` and every macro
+// in it builds its message in a `std::ostringstream` -- so its entire body was
+// already inside `#ifndef __CUDACC_RTC__` and NVRTC has always seen an empty
+// file through this line. The twelve `FLASHINFER_CHECK`/`FLASHINFER_ERROR`
+// expansions below are all inside `#define` bodies that NVRTC never expands,
+// which is why they compiled against an undefined macro before this deletion
+// and still do. `src/plan/error.rs` owns the refusals now. This is the one
+// marker in the tree that a strip does NOT undo: restoring upstream means
+// restoring the deleted file too. See MODIFICATIONS.
 
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
@@ -372,89 +367,10 @@ __forceinline__ __device__ __host__ constexpr T1 round_down(const T1 x, const T2
   return (x / y) * y;
 }
 
-// PIE: guarded for NVRTC -- four host functions that ask the CUDA runtime
-// about the device (`cudaGetDevice`, `cudaDeviceGetAttribute`,
-// `cudaGetDeviceProperties`, `cudaMemcpy`) or print through `std::cout`, plus
-// the two heuristics that call them. `FA2DetermineCtaTileQ` and `UpPowerOfTwo`
-// are guarded not because they are unportable but because the first calls
-// `GetCudaComputeCapability`: under the JIT a tile size is chosen by the Rust
-// caller before a compile, which is the same fact from the other side.
-#ifndef __CUDACC_RTC__
-inline std::pair<int, int> GetCudaComputeCapability() {
-  int device_id = 0;
-  cudaGetDevice(&device_id);
-  int major = 0, minor = 0;
-  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id);
-  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id);
-  return std::make_pair(major, minor);
-}
-
-// This function is thread-safe and cached the sm_count.
-// But it will only check the current CUDA device, thus assuming each process handles single GPU.
-inline int GetCudaMultiProcessorCount() {
-  static std::atomic<int> sm_count{0};
-  int cached = sm_count.load(std::memory_order_relaxed);
-  if (cached == 0) {
-    int device_id;
-    cudaGetDevice(&device_id);
-    cudaDeviceProp device_prop;
-    cudaGetDeviceProperties(&device_prop, device_id);
-    cached = device_prop.multiProcessorCount;
-    sm_count.store(cached, std::memory_order_relaxed);
-  }
-  return cached;
-}
-
-template <typename T>
-inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix = "") {
-  std::vector<T> host_array(size);
-  std::cout << prefix;
-  cudaMemcpy(host_array.data(), device_ptr, size * sizeof(T), cudaMemcpyDeviceToHost);
-  for (size_t i = 0; i < size; ++i) {
-    std::cout << host_array[i] << " ";
-  }
-  std::cout << std::endl;
-}
-
-inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim) {
-  if (head_dim >= 512) {
-    if (avg_packed_qo_len <= 32) {
-      return 16;  // decode / short-q (incl. speculative decode): lean CTA16
-    }
-    return 32;  // Long-q prefill use CTA_TILE_Q=32
-  }
-  if (avg_packed_qo_len > 64 && head_dim < 256) {
-    return 128;
-  } else {
-    auto compute_capacity = GetCudaComputeCapability();
-    if (compute_capacity.first >= 8) {
-      // Ampere or newer
-      if (avg_packed_qo_len > 16) {
-        // avg_packed_qo_len <= 64
-        return 64;
-      } else {
-        // avg_packed_qo_len <= 16
-        return 16;
-      }
-    } else {
-      // NOTE(Zihao): not enough shared memory on Turing for 1x4 warp layout
-      return 64;
-    }
-  }
-}
-
-inline int UpPowerOfTwo(int x) {
-  // Returns the smallest power of two greater than or equal to x
-  if (x <= 0) return 1;
-  --x;
-  x |= x >> 1;
-  x |= x >> 2;
-  x |= x >> 4;
-  x |= x >> 8;
-  x |= x >> 16;
-  return x + 1;
-}
-#endif  // __CUDACC_RTC__ -- PIE guard, opened at GetCudaComputeCapability
+// PIE: REMOVED -- five host functions, `GetCudaComputeCapability` through `UpPowerOfTwo`,
+// including `DebugPrintCUDAArray` -- the last `cudaMemcpy` under `csrc/`. 74 lines of host C++,
+// guarded out of every NVRTC compile before it was removed, so removing it changes no compile.
+// This marker is one a strip does NOT undo; see MODIFICATIONS.
 
 #define LOOP_SPLIT_MASK(iter, COND1, COND2, ...)       \
   {                                                    \

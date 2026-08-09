@@ -4023,12 +4023,7 @@ mod fires {
     struct AltUpOps {
         _inputs: Vec<Buffer>,
         out: Buffer,
-        /// Built and unread since the row crossed: the fire above goes
-        /// through the host `fn`'s typed parameters, not through a
-        /// `Cx`-shaped value list. Kept because `packed_operands` is the
-        /// one place the operand ORDER is written down, and the order is
-        /// what `PackedCells` and the `fn` call both depend on.
-        _values: Vec<ArgValue>,
+        values: Vec<ArgValue>,
         raw: Vec<u64>,
         scalars: Vec<i32>,
     }
@@ -4434,7 +4429,12 @@ mod fires {
         q_out: Buffer,
         k_pages: Buffer,
         v_pages: Buffer,
-        values: Vec<ArgValue>,
+        /// Built and unread since the row crossed: the fire above goes
+        /// through the host `fn`'s typed parameters, not through a
+        /// `Cx`-shaped value list. Kept because `packed_operands` is the
+        /// one place the operand ORDER is written down, and the order is
+        /// what `PackedCells` and the `fn` call both depend on.
+        _values: Vec<ArgValue>,
         raw: Vec<u64>,
     }
 

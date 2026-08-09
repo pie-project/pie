@@ -1,58 +1,10 @@
-//! The four `PlanInfo` structs, whose layout is a contract with a device kernel.
-//!
-//! # Why these are asserted and not merely written down
-//!
-//! A `PlanInfo` is passed to a kernel as part of `Params`, or read field by
-//! field by the host launcher to build one. Either way the **offsets are the
-//! interface**, and they are an interface with code that this crate does not
-//! compile: the kernels come from FlashInfer's headers, through nvcc today and
-//! NVRTC tomorrow. If `split_kv` ends up at offset 64 here and 65 there,
-//! nothing fails to build, nothing throws, and no test that exercises only the
-//! Rust side can tell — the kernel simply reads `enable_cuda_graph` where it
-//! wanted `split_kv`, takes the partition-KV path on a plan that has no partial
-//! buffers carved, and reads the float workspace at an offset of zero. That is
-//! `new-horizon.md` §11.2's exact warning: *"taking ownership of a struct
-//! layout we do not control, and the failure mode is a silently wrong plan
-//! rather than a compile error."*
-//!
-//! So every field of every struct carries a `const _: () = assert!(offset_of!(..)
-//! == ..)`, and every struct carries its size. The numbers were taken from
-//! `offsetof` on the real headers (`scheduler.cuh`, FlashInfer as vendored in
-//! `kernels-cuda`'s build tree), and `tests/plan.rs` re-derives them from that
-//! same C++ on every run — so a FlashInfer bump that moves a field turns into a
-//! failing test here rather than a fluent wrong answer in production.
-//!
-//! # Why `#[repr(C)]` and plain `bool`
-//!
-//! `bool` in Rust is one byte with values 0 and 1, which is what the Itanium
-//! ABI says C++ `bool` is on every platform this runs on. The trailing bools in
-//! `DecodePlanInfo` and `PrefillPlanInfo` therefore sit at offsets 64/65 and
-//! 104/105 and the struct tail-pads to a multiple of 8 — asserted below, since
-//! that padding is what a `memcpy` of the struct would carry.
-//!
-//! # `to_vector`
-//!
-//! Upstream's `ToVector`/`FromVector` flatten a `PlanInfo` into
-//! `std::vector<int64_t>` — how the plan crosses FlashInfer's own JIT boundary,
-//! with `bool` widening to 0/1. Ported because it is the other half of the ABI:
-//! a caller that hands a plan to FlashInfer-generated code passes the vector,
-//! not the struct, and the two orders are not the same list. `tests/plan.rs`
-//! compares this vector element for element against `ToVector()`.
-
 use core::mem::{align_of, offset_of, size_of};
 
 /// `flashinfer::DecodePlanInfo` — the batch-decode descriptor.
-///
-/// Offsets are into the int workspace, except [`Self::v_offset`] and
-/// [`Self::s_offset`] which are into the float workspace. Zero is a legitimate
-/// offset for an array that was carved first, so an unused field is *not*
-/// distinguishable by value — `split_kv` is what says whether the partial
-/// buffers exist.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DecodePlanInfo {
     /// Work items the grid is sized for: `new_batch_size`, or under CUDA graphs
-    /// a fixed `max_grid_size / gdy` (split) or `batch_size` (unsplit).
     pub padded_batch_size: i64,
     /// Partial outputs, in the float workspace. Carved only when splitting.
     pub v_offset: i64,
@@ -65,14 +17,12 @@ pub struct DecodePlanInfo {
     /// `o_indptr[request]` — where a request's work items start.
     pub o_indptr_offset: i64,
     /// `block_valid_mask[work]` — false for the padding a CUDA graph's fixed
-    /// grid runs over. Carved only when splitting.
     pub block_valid_mask_offset: i64,
     /// A single `IdType`: the KV chunk size **in tokens** (`pages * page_size`).
     pub kv_chunk_size_ptr_offset: i64,
     /// Whether the plan was built for graph capture, and so has a fixed grid.
     pub enable_cuda_graph: bool,
     /// Whether KV is partitioned across work items — the flag that says the
-    /// float carves and the valid mask exist.
     pub split_kv: bool,
 }
 
@@ -109,10 +59,6 @@ impl DecodePlanInfo {
 }
 
 /// `flashinfer::PrefillPlanInfo` — the batch-prefill (FA2) descriptor.
-///
-/// The widest of the four, because a prefill work item is a *(request, QO tile,
-/// KV tile)* triple rather than a *(request, KV tile)* pair, and because the
-/// merge that reassembles split outputs needs its own indptr.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PrefillPlanInfo {
@@ -121,10 +67,8 @@ pub struct PrefillPlanInfo {
     /// Total QO rows in the batch — the merge's outer dimension.
     pub total_num_rows: i64,
     /// A single `uint32_t` holding `qo_indptr[batch_size]`, carved only under
-    /// CUDA graphs, where the real row count is not known at capture time.
     pub total_num_rows_offset: i64,
     /// The QO tile width the whole plan was built around; see
-    /// [`super::arith::fa2_determine_cta_tile_q`].
     pub cta_tile_q: i64,
     /// `request_indices[work]`.
     pub request_indices_offset: i64,
@@ -193,19 +137,12 @@ impl PrefillPlanInfo {
 }
 
 /// `flashinfer::PrefillPlanSM90Info` — the FA3 (Hopper) prefill descriptor.
-///
-/// A different shape from [`PrefillPlanInfo`], and the difference is the whole
-/// point of the SM90 path: instead of a padded grid over tiles, it is a
-/// **persistent** grid of one CTA per SM, each walking a private work list
-/// delimited by `work_indptr`. There is no `padded_batch_size` because there is
-/// no padding — there is a work queue.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PrefillPlanSm90Info {
     /// `qo_tile_indices[work]`.
     pub qo_tile_indices_offset: i64,
     /// `qo_indptr[work]` — the request's QO base, copied per work item rather
-    /// than indexed, so the kernel needs no second lookup.
     pub qo_indptr_offset: i64,
     /// `kv_indptr[work]`.
     pub kv_indptr_offset: i64,
@@ -220,8 +157,6 @@ pub struct PrefillPlanSm90Info {
     /// `batch_indices[work]`.
     pub batch_indices_offset: i64,
     /// Whether one schedule is shared by all QO heads, which is what the
-    /// planner falls back to when the per-head work list would exceed 4096
-    /// entries.
     pub same_schedule_for_all_heads: bool,
 }
 
@@ -256,11 +191,6 @@ impl PrefillPlanSm90Info {
 }
 
 /// `flashinfer::MLAPlanInfo` — the MLA (DeepSeek-style) descriptor.
-///
-/// Also a persistent work queue, but with a merge whose CTAs are laid out
-/// separately: `merge_packed_offset_{start,end}` and their partial twins are
-/// `num_sm`-long arrays indexed by *merge* CTA, not by work item. Five of the
-/// eighteen fields exist only to describe that merge.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MlaPlanInfo {
@@ -273,7 +203,6 @@ pub struct MlaPlanInfo {
     /// `kv_indptr[work]`.
     pub kv_indptr_offset: i64,
     /// `partial_indptr[work]` — where this work item's partial output goes, or
-    /// `-1` when it writes straight through because its KV was not split.
     pub partial_indptr_offset: i64,
     /// Merge CTA's first packed output row.
     pub merge_packed_offset_start_offset: i64,
@@ -356,7 +285,6 @@ mod tests {
     use super::*;
 
     /// The vectors are the other half of the ABI, and their lengths are fixed
-    /// by upstream's `FromVector`, which refuses any other size.
     #[test]
     fn the_vectors_are_the_lengths_from_vector_demands() {
         assert_eq!(DecodePlanInfo::default().to_vector().len(), 10);

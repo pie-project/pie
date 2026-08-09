@@ -17,15 +17,9 @@
 #define FLASHINFER_LAYOUT_CUH_
 
 #include <cstdint>
-// PIE: guarded for NVRTC -- host-only standard library, reached only by
-// `QKVLayoutToString` and `get_qkv_strides`, both guarded below. `<cstdint>`
-// above is NOT guarded: NVRTC supplies no fixed-width integer types at all, so
-// the header set carries a `cstdint` of its own. Upstream is unmodified apart
-// from markers of this form; see NOTICE. Removing them restores the file.
-#ifndef __CUDACC_RTC__
-#include <string>
-#include <tuple>
-#endif
+// PIE: REMOVED -- host-only `<string>` and `<tuple>`. 2 lines of host C++, guarded out of every
+// NVRTC compile before it was removed, so removing it changes no compile. This marker is one a
+// strip does NOT undo; see MODIFICATIONS.
 
 namespace flashinfer {
 
@@ -45,19 +39,9 @@ __host__ __device__ __forceinline__ size_t get_elem_offset_impl(size_t elem_idx,
   return elem_idx * stride_n + head_idx * stride_h + feat_idx;
 }
 
-// PIE: guarded for NVRTC -- `__host__`-only, and `std::make_tuple` with it.
-// The strides it computes are what the Rust caller passes in the params
-// struct under the JIT.
-#ifndef __CUDACC_RTC__
-__host__ __forceinline__ auto get_qkv_strides(QKVLayout kv_layout, uint32_t kv_len,
-                                              uint32_t num_qo_heads, uint32_t num_kv_heads,
-                                              uint32_t head_dim) {
-  const uint32_t q_stride_n = num_qo_heads * head_dim, q_stride_h = head_dim,
-                 kv_stride_n = (kv_layout == QKVLayout::kNHD) ? num_kv_heads * head_dim : head_dim,
-                 kv_stride_h = (kv_layout == QKVLayout::kNHD) ? head_dim : kv_len * head_dim;
-  return std::make_tuple(q_stride_n, q_stride_h, kv_stride_n, kv_stride_h);
-}
-#endif
+// PIE: REMOVED -- `get_qkv_strides`, `__host__`-only, and `std::make_tuple` with it. 8 lines of
+// host C++, guarded out of every NVRTC compile before it was removed, so removing it changes no
+// compile. This marker is one a strip does NOT undo; see MODIFICATIONS.
 
 struct tensor_info_t {
   uint32_t qo_len;
@@ -125,20 +109,9 @@ struct tensor_info_t {
  * \brief Convert QKVLayout to string
  * \param layout The QKVLayout to convert
  */
-// PIE: guarded for NVRTC -- returns `std::string`, and is called only by host
-// error messages.
-#ifndef __CUDACC_RTC__
-inline std::string QKVLayoutToString(const QKVLayout& layout) {
-  switch (layout) {
-    case QKVLayout::kNHD:
-      return "NHD";
-    case QKVLayout::kHND:
-      return "HND";
-    default:
-      return "Unknown";
-  }
-}
-#endif
+// PIE: REMOVED -- `QKVLayoutToString`, which returns `std::string` and had no caller left. 10
+// lines of host C++, guarded out of every NVRTC compile before it was removed, so removing it
+// changes no compile. This marker is one a strip does NOT undo; see MODIFICATIONS.
 
 }  // namespace flashinfer
 #endif  // FLASHINFER_LAYOUT_CUH_

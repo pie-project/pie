@@ -29,14 +29,14 @@
 // PIE: from its path -- so the only thing that had to change with it is the
 // PIE: one includer, `csrc/src/attn/attention_xqa_mha.cuh`, which is ours.
 // PIE: Nothing inside `csrc/src/attn/xqa/` includes a `.cu` by name (checked
-// PIE: across all fifteen files), so no upstream byte spells the old name.
+// PIE: across all fourteen files), so no upstream byte spells the old name.
 // PIE:
 // PIE: LINE NUMBERS: a `mha.cu:N` citation is UPSTREAM's, a `mha.cuh:N` one
-// PIE: is this file's. THREE insertions separate them: this note, 23 lines
-// PIE: at 18; the include marker below, 3 lines at upstream 28; and the
-// PIE: `GENERATE_CUBIN` guard, 15 lines at upstream 2955, plus its `#endif`
-// PIE: at the tail -- 3093 - 3051 = 42. So upstream `:409` is `:435` here,
-// PIE: `:2757` is `:2783`, and `:2955` (`configureKernel`) is `:2996`.
+// PIE: is this file's. TWO insertions separate them and both sit above the
+// PIE: cited lines: this note, 23 lines at 18, and the include marker below,
+// PIE: 3 lines at upstream 28. So upstream `:409` is `:435` here and `:2757`
+// PIE: is `:2783`. Upstream `:2955` (`configureKernel`) has NO line here: the
+// PIE: host tail is removed. The marker at `:56` is 8 lines for 8 to say so.
 
 #include "cuda_hint.cuh"
 #include "defines.h"
@@ -53,14 +53,14 @@
 // PIE: include namespace. See `mha_components.cuh` for the whole note.
 #include "attn/xqa/mma.cuh"
 #include "attn/xqa/utils.cuh"
-#ifndef GENERATE_CUBIN
-#include <cuda_runtime.h>
-
-#include "hostUtils.h"
-#ifndef NDEBUG
-#include <cstdio>
-#endif
-#endif
+// PIE: REMOVED -- host-only `<cuda_runtime.h>`, `hostUtils.h` and `<cstdio>`. 6 lines of
+// host C++, guarded out of every NVRTC compile before it was removed, so removing it
+// changes no compile. `hostUtils.h` was deleted with it: this was its only includer, and
+// the file was one `inline cudaLaunchConfig_t makeLaunchConfig(...)` and nothing else.
+//
+// THIS MARKER IS EXACTLY AS LONG AS WHAT IT REPLACES -- 8 lines for 8 -- because it sits
+// ABOVE the cited lines `:1598`, `:2783`, `:2804` and `:2814`. A shorter marker moves them.
+// This marker is one a strip does NOT undo; see MODIFICATIONS.
 
 // There are 4 ways to pass ctaRowMax backward from gemm1 warps to gemm0 warps:
 //  1. Protect with xFwdBarriers+xBwdBarriers. This way, ctaRowMax is available to gemm0 warps
@@ -2843,251 +2843,11 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
 static constexpr auto kernel_mha = kernel_mha_impl;
 #endif
 
-#ifndef GENERATE_CUBIN
-void launchMHA(
-    cudaDeviceProp const& prop, uint32_t nbKHeads,
-#if SLIDING_WINDOW
-    uint32_t slidingWinSize,
-#endif
-    float qScale, float const* qScalePtr, OutputHead* output,
-#if LOW_PREC_OUTPUT
-    float rcpOutScale,
-#endif
-#if USE_INPUT_KV
-    InputHead const* qkv,
-#if ROPE_STYLE != 0
-    Vec<float, validElemsPerHead> const* ropeCosSin,
-#endif
-#else
-    InputHead const* q,
-#endif
-    float const* attentionSinks,  // [headGrpSize]
-    GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
-#if ENABLE_4BIT_KV_CACHE
-    GMemCacheHeadSf* kSfCacheVLLM, GMemCacheHeadSf* vSfCacheVLLM,
-#endif
-    KVCachePageIndex const*
-        kvCachePageList,  // device pointer. shape:
-                          // KVCachePageIndex[batchSize][beamWidth][2][maxNbPagesPerSeq].
-    uint32_t maxSeqLen, uint32_t const* seqLen,
-#if BEAM_WIDTH > 1
-    BeamSearchParams const& beamSearchParams,
-#endif
-    uint32_t batchSize, float kvCacheScale,
-    float const* kvScalePtr,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
-#if SPEC_DEC
-    SpecDecParams const& specDecParams,
-#endif
-    uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
-    uint64_t kv_stride_token, uint64_t kv_stride_head,
-#if ENABLE_4BIT_KV_CACHE
-    uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
-#endif
-    cudaStream_t stream) {
-#if SPEC_DEC
-  auto const qSeqLen = specDecParams.qSeqLen;
-  auto const qCuSeqLens = specDecParams.qCuSeqLens;
-  auto const mask = specDecParams.mask;
-#endif
-#if USE_INPUT_KV
-  throw std::runtime_error("not implemented");
-#else
-  static uint32_t const hostSmemSize = [&]() {
-    uint32_t size;
-    checkCuda(cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize)));
-    checkCuda(cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize, size));
-    return size;
-  }();
-  uint32_t const nbVHeads = nbKHeads;
-  uint32_t const nbQHeads = nbKHeads * headGrpSize;
+// PIE: REMOVED -- `launchMHA`, a host launcher. 132 lines of host C++, guarded out of every
+// NVRTC compile before it was removed, so removing it changes no compile. This marker is one a
+// strip does NOT undo; see MODIFICATIONS.
 
-  // const uint32_t nbSubSeqPerSeq = allowMultiBlockMode ? DBG_NB_CTAS_PER_SEQ : 1;
-  uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
-    if (!allowMultiBlockMode) {
-      return 1;
-    }
-    auto const env = std::getenv("XQA_NB_SUB_SEQ");
-    if (env != nullptr) {
-      int32_t const val = std::stoi(env);
-      if (val > 0) {
-        return val;
-      }
-    }
-    return std::min<uint32_t>(
-        std::max<uint32_t>(1U, prop.multiProcessorCount / (batchSize * nbKHeads)),
-        divUp(maxSeqLen, ctaTile.x));
-  }();
-  // gridDim.z == batchSize && gridDim.y == nbKHeads && gridDim.x == nbSubSeqPerSeq
-#if SPEC_DEC
-  const uint32_t nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, rowsPerBlock);
-  dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads * nbTokenBlocksPerGrp, batchSize};
-#else
-  dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads, batchSize};
-#endif
-  dim3 const dimCta{warp_size * ctaShapeInWarps.x, ctaShapeInWarps.y, ctaShapeInWarps.z};
-  auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, enable_pdl);
-  uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
-  KVCacheList<true> const cacheList{kCacheVLLM,      vCacheVLLM,
-#if ENABLE_4BIT_KV_CACHE
-                                    kSfCacheVLLM,    vSfCacheVLLM,
-#endif
-                                    kvCachePageList, seqLen,       maxNbPagesPerSeq};
-  // Convert stride from elements to Heads
-  uint32_t const stride_page_in_heads = static_cast<uint32_t>(kv_stride_page / validElemsPerHead);
-  uint32_t const stride_token_in_heads = static_cast<uint32_t>(kv_stride_token / validElemsPerHead);
-  uint32_t const stride_head_in_heads = static_cast<uint32_t>(kv_stride_head / validElemsPerHead);
-#if ENABLE_4BIT_KV_CACHE
-  uint32_t const sf_elems_per_head = validElemsPerHead / CacheElemConverter::QuantVectorSize;
-  uint32_t const sf_stride_page_in_heads =
-      static_cast<uint32_t>(sf_stride_page / sf_elems_per_head);
-  uint32_t const sf_stride_token_in_heads =
-      static_cast<uint32_t>(sf_stride_token / sf_elems_per_head);
-  uint32_t const sf_stride_head_in_heads =
-      static_cast<uint32_t>(sf_stride_head / sf_elems_per_head);
-#endif
-
-  cudaLaunchKernelEx(&launchCfg, kernel_mha,
-#if SPEC_DEC
-                     qSeqLen, nbKHeads, headGrpSize, qCuSeqLens,
-#else
-                     nbKHeads,
-#endif
-#if SLIDING_WINDOW
-                     slidingWinSize,
-#endif
-                     qScale, qScalePtr, output,
-#if LOW_PREC_OUTPUT
-                     rcpOutScale,
-#endif
-                     q,
-#if SPEC_DEC
-                     mask,
-#endif
-                     attentionSinks, cacheList,
-#if BEAM_WIDTH > 1
-                     beamSearchParams,
-#endif
-                     batchSize, kvCacheScale, kvScalePtr, stride_page_in_heads,
-                     stride_token_in_heads, stride_head_in_heads,
-#if ENABLE_4BIT_KV_CACHE
-                     sf_stride_page_in_heads, sf_stride_token_in_heads, sf_stride_head_in_heads,
-#endif
-                     semaphores, scratch);
-  checkCuda(cudaPeekAtLastError());
-#endif  // USE_INPUT_KV
-}
-#endif
-
-// PIE: NVRTC compiles this file as a device unit (GENERATE_CUBIN), and this
-// PIE: tail is host code -- `configureKernel` calls `cudaMemcpyFromSymbol`
-// PIE: and `cudaFuncSetAttribute`, and `launchMHAFlashInfer` calls
-// PIE: `cudaLaunchKernelEx`. Upstream guards the OTHER host launcher,
-// PIE: `launchMHA`, exactly this way at mha.cu:2820; this tail is
-// PIE: FlashInfer's own downstream addition and they never guarded it.
-// PIE: The guard is `GENERATE_CUBIN` rather than `__CUDACC_RTC__` so that
-// PIE: both halves of one decision are spelled with one name -- it is the
-// PIE: define upstream chose for "this is a cubin build", and the units in
-// PIE: `families::attn`'s XQA lattice set it.
-// PIE:
-// PIE: What the guarded body becomes is `driver-cuda/src/fire/xqa.rs`:
-// PIE: `plan_decode` for the launcher, `Launch::smem` plus
-// PIE: `runtime::module::raise_dynamic_smem_cap` for `configureKernel`.
-#ifndef GENERATE_CUBIN
-static uint32_t configureKernel() {
-  uint32_t size;
-  cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize));
-  cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize, size);
-  return size;
-}
-
-static uint32_t const hostSmemSize = configureKernel();
-
-void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32_t slidingWinSize,
-                         float qScale, float const* qScalePtr, OutputHead* output,
-#if LOW_PREC_OUTPUT
-                         float rcpOutScale,
-#endif
-                         InputHead const* q, float const* attentionSinks, GMemCacheHead* kCacheVLLM,
-                         GMemCacheHead* vCacheVLLM,
-#if ENABLE_4BIT_KV_CACHE
-                         GMemCacheHeadSf* kSfCacheVLLM, GMemCacheHeadSf* vSfCacheVLLM,
-#endif
-                         KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
-                         uint32_t const* seqLen, uint32_t batchSize, float kvCacheScale,
-                         float const* kvScalePtr,
-#if SPEC_DEC
-                         uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
-#endif
-                         uint32_t* semaphores, void* scratch, bool enable_pdl,
-                         uint64_t kv_stride_page, uint64_t kv_stride_token, uint64_t kv_stride_head,
-#if ENABLE_4BIT_KV_CACHE
-                         uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
-#endif
-                         cudaStream_t stream) {
-  uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
-    if (!allowMultiBlockMode) {
-      return 1;
-    }
-    return std::min<uint32_t>(std::max<uint32_t>(1U, multiProcessorCount / (batchSize * nbKHeads)),
-                              divUp(maxSeqLen, ctaTile.x));
-  }();
-#if SPEC_DEC
-  const uint32_t nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, rowsPerBlock);
-  dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads * nbTokenBlocksPerGrp, batchSize};
-#else
-  dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads, batchSize};
-#endif
-  dim3 const dimCta{warp_size * ctaShapeInWarps.x, ctaShapeInWarps.y, ctaShapeInWarps.z};
-  auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, enable_pdl);
-  uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
-  KVCacheList<true> const cacheList{kCacheVLLM,      vCacheVLLM,
-#if ENABLE_4BIT_KV_CACHE
-                                    kSfCacheVLLM,    vSfCacheVLLM,
-#endif
-                                    kvCachePageList, seqLen,       maxNbPagesPerSeq};
-  // Convert stride from elements to Heads
-  uint32_t const container_elems_per_head =
-      validElemsPerHead / CacheElemConverter::ElemsPerContainer;
-  uint32_t const stride_page_in_heads =
-      static_cast<uint32_t>(kv_stride_page / container_elems_per_head);
-  uint32_t const stride_token_in_heads =
-      static_cast<uint32_t>(kv_stride_token / container_elems_per_head);
-  uint32_t const stride_head_in_heads =
-      static_cast<uint32_t>(kv_stride_head / container_elems_per_head);
-#if ENABLE_4BIT_KV_CACHE
-  uint32_t const sf_elems_per_head = validElemsPerHead / CacheElemConverter::QuantVectorSize;
-  uint32_t const sf_stride_page_in_heads =
-      static_cast<uint32_t>(sf_stride_page / sf_elems_per_head);
-  uint32_t const sf_stride_token_in_heads =
-      static_cast<uint32_t>(sf_stride_token / sf_elems_per_head);
-  uint32_t const sf_stride_head_in_heads =
-      static_cast<uint32_t>(sf_stride_head / sf_elems_per_head);
-#endif
-
-  cudaLaunchKernelEx(&launchCfg, kernel_mha,
-#if SPEC_DEC
-                     qSeqLen, nbKHeads, headGrpSize, qCuSeqLens,
-#else
-                     nbKHeads,
-#endif
-#if SLIDING_WINDOW
-                     slidingWinSize,
-#endif
-                     qScale, qScalePtr, output,
-#if LOW_PREC_OUTPUT
-                     rcpOutScale,
-#endif
-                     q,
-#if SPEC_DEC
-                     mask,
-#endif
-                     attentionSinks, cacheList, batchSize, kvCacheScale, kvScalePtr,
-                     stride_page_in_heads, stride_token_in_heads, stride_head_in_heads,
-#if ENABLE_4BIT_KV_CACHE
-                     sf_stride_page_in_heads, sf_stride_token_in_heads, sf_stride_head_in_heads,
-#endif
-                     semaphores, scratch);
-  checkCuda(cudaPeekAtLastError());
-}
-#endif  // GENERATE_CUBIN -- PIE
+// PIE: REMOVED -- `configureKernel` and `launchMHAFlashInfer`, host launchers. 96 lines of host
+// C++, guarded out of every NVRTC compile before it was removed, so removing it changes no
+// compile. This marker is one a strip does NOT undo; see MODIFICATIONS.
 #endif

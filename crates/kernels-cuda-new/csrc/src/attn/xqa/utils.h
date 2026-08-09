@@ -17,15 +17,10 @@
 
 #pragma once
 
-#ifndef GENERATE_CUBIN
-#include <cuda.h>
-#include <cuda_runtime_api.h>
-
-#include <cassert>
-#include <cstdint>
-#include <cstdio>
-#include <stdexcept>
-#endif
+// PIE: REMOVED -- host-only `<cuda.h>`, `<cuda_runtime_api.h>`, `<cassert>`, `<cstdint>`,
+// `<cstdio>` and `<stdexcept>`. 7 lines of host C++, guarded out of every NVRTC compile before
+// it was removed, so removing it changes no compile. This marker is one a strip does NOT undo;
+// see MODIFICATIONS.
 #include "mha_stdheaders.cuh"
 
 template <typename T>
@@ -33,25 +28,10 @@ HOST_DEVICE_FUNC constexpr inline void unused(T&& x) {
   static_cast<void>(x);
 }
 
-#ifndef GENERATE_CUBIN
-inline void checkCuda(cudaError_t err) {
-  if (err != cudaSuccess) {
-    printf("%s\n", cudaGetErrorName(err));
-    throw std::runtime_error(cudaGetErrorName(err));
-  }
-}
-
-inline void checkCu(CUresult err) {
-  if (err != CUDA_SUCCESS) {
-    char const* str = nullptr;
-    if (cuGetErrorName(err, &str) != CUDA_SUCCESS) {
-      str = "A cuda driver API error happened, but we failed to query the error name\n";
-    }
-    printf("%s\n", str);
-    throw std::runtime_error(str);
-  }
-}
-#endif
+// PIE: REMOVED -- `checkCuda` and `checkCu`, host error checkers that `throw
+// std::runtime_error`. 17 lines of host C++, guarded out of every NVRTC compile before it was
+// removed, so removing it changes no compile. This marker is one a strip does NOT undo; see
+// MODIFICATIONS.
 
 HOST_DEVICE_FUNC constexpr inline uint32_t greatestPowerOf2Divisor(uint32_t x) {
   return x & ~(x - 1);

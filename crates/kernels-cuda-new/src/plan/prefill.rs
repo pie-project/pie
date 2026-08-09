@@ -1,33 +1,3 @@
-//! `PrefillPlan`: how a batch of variable-length prefills is spread over CTAs.
-//!
-//! # The decision it makes
-//!
-//! A prefill work item is a *(request, QO tile, KV tile)* triple. The QO tile
-//! width is chosen once for the whole batch by
-//! [`super::arith::fa2_determine_cta_tile_q`] from the **average** packed QO
-//! length — one number for a batch that may hold a 4000-token prefill beside
-//! thirty single-token decodes, which is why a mixed batch is planned worse
-//! than either half alone would be. The KV chunk size is then binary-searched:
-//! the smallest chunk whose total tile count still fits `max_grid_size /
-//! num_kv_heads`.
-//!
-//! Three inputs bypass the search, and all three come from our own callers:
-//! `disable_split_kv` (chunk = `INT64_MAX`, one chunk per request),
-//! `fixed_split_size > 0` (chunk = that), and `window_left >= 0`, which does
-//! not bypass the search but *shrinks what it searches over* — a sliding-window
-//! layer only ever reads `window_left + cta_tile_q` tokens back, so its
-//! effective KV length is capped there and the split is bounded no matter how
-//! long the sequence is.
-//!
-//! # Why `num_blocks_per_sm` is 2 and not a query
-//!
-//! Upstream hard-codes `int num_blocks_per_sm = 2;` in `PrefillPlanImpl` — no
-//! occupancy call, unlike the decode estimator. Ported as written. It is a
-//! guess about the prefill kernel's occupancy, and a wrong one changes only how
-//! aggressively KV is split, never correctness; a caller that knows better can
-//! spend the difference through `num_colocated_ctas`, which subtracts CTAs from
-//! the same budget (POD attention's use for it).
-
 use super::alloc::{AlignedAllocator, Staging};
 use super::arith::{ceil_div_i64, ceil_div_u32, fa2_determine_cta_tile_q};
 use super::info::PrefillPlanInfo;
@@ -49,11 +19,8 @@ pub struct Request<'a> {
     /// Key/value heads; must divide `num_qo_heads`.
     pub num_kv_heads: u32,
     /// QK head dimension. Upstream takes it and immediately `(void)`s it — kept
-    /// so the signature is the same shape, and so a future upstream that uses
-    /// it does not need a new parameter here.
     pub head_dim_qk: u32,
     /// VO head dimension, which chooses the tile width and sizes the partial
-    /// output carve.
     pub head_dim_vo: u32,
     /// Tokens per page.
     pub page_size: u32,
@@ -62,14 +29,12 @@ pub struct Request<'a> {
     /// `sizeof(DTypeO)`. Also `(void)`d upstream; also kept.
     pub sizeof_dtype_o: u32,
     /// Sliding-window span, or `-1` for full attention. The one input that
-    /// bounds a long sequence's split.
     pub window_left: i32,
     /// A caller-imposed KV chunk size in pages, or `-1`/`0` to search.
     pub fixed_split_size: i32,
     /// Refuse to split at all: one KV chunk per request.
     pub disable_split_kv: bool,
     /// CTAs already spoken for by a co-resident decode kernel (POD attention),
-    /// subtracted from the grid budget before the split is sized.
     pub num_colocated_ctas: i64,
 }
 
@@ -108,12 +73,10 @@ pub struct Split {
     /// Work items produced.
     pub new_batch_size: u32,
     /// Work-item slots the plan reserves — larger than `new_batch_size` only
-    /// under CUDA graphs.
     pub padded_batch_size: u64,
     /// The QO tile width chosen for the whole batch.
     pub cta_tile_q: u32,
     /// The KV chunk size **in tokens** (the splitter's page-denominated answer
-    /// multiplied by `page_size` on the last line).
     pub kv_chunk_size: i64,
     /// `request_indices[work]`.
     pub request_indices: Vec<i32>,
@@ -128,14 +91,6 @@ pub struct Split {
 }
 
 /// `PrefillBinarySearchKVChunkSize`.
-///
-/// Searches for the smallest KV chunk size whose resulting tile count fits
-/// `max_batch_size_if_split`, counting tiles as `ceil(packed_qo / tile_q) *
-/// ceil(kv / chunk)`. The returned flag is *not* "it split": it is
-/// `enable_cuda_graph || low < max_kv_len`, so a graph capture always claims a
-/// split even when the chunk it found covers the longest sequence whole —
-/// because a captured grid must have the partition-KV shape whether or not this
-/// particular batch needed it.
 #[must_use]
 pub fn binary_search_kv_chunk_size(
     enable_cuda_graph: bool,
@@ -173,12 +128,6 @@ pub fn binary_search_kv_chunk_size(
 }
 
 /// `PrefillSplitQOKVIndptr` — the schedule.
-///
-/// # Errors
-///
-/// [`Error::NegativeSpan`] if either indptr goes backwards,
-/// [`Error::EmptyBatch`] where upstream divides by `batch_size`,
-/// [`Error::BatchExceedsPadded`] for upstream's `FLASHINFER_CHECK`.
 pub fn split_qo_kv_indptr(
     req: &Request<'_>,
     max_batch_size_if_split: u32,
@@ -187,7 +136,6 @@ pub fn split_qo_kv_indptr(
     let batch_size = req.batch_size as usize;
     let gqa_group_size = req.num_qo_heads / req.num_kv_heads;
 
-    // step 1: packed QO lengths, and the two sign checks upstream makes.
     let mut packed_qo_len_arr = vec![0i64; batch_size];
     let mut kv_len_arr = vec![0i64; batch_size];
     for i in 0..batch_size {
@@ -212,14 +160,10 @@ pub fn split_qo_kv_indptr(
         }
     }
 
-    // step 2: the tile width, and an upper bound on the tile count.
     let min_kv_chunk_size = (128 / req.page_size).max(1);
     let cta_tile_q: u32;
     let total_num_tiles_q: u32;
     if req.enable_cuda_graph {
-        // Under capture the real lengths are unknown, so the dummy batch's
-        // longest possible sequence stands in for them. Evaluated in `uint32_t`
-        // and therefore wrapping for an empty batch, exactly as upstream.
         let max_seq_len = req.total_num_rows.wrapping_sub(req.batch_size).wrapping_add(1);
         let max_qo_len = u64::from(max_seq_len) * u64::from(gqa_group_size);
         cta_tile_q = fa2_determine_cta_tile_q(max_qo_len as i64, req.head_dim_vo, cc_major);
@@ -228,10 +172,6 @@ pub fn split_qo_kv_indptr(
             .wrapping_sub(1);
     } else {
         if batch_size == 0 {
-            // DEVIATION: upstream computes `sum / batch_size` here, which is an
-            // integer division by zero -- SIGFPE, not an exception. There is no
-            // byte sequence to be faithful to, so this refuses. See
-            // `error::Error::EmptyBatch`.
             return Err(Error::EmptyBatch);
         }
         let sum_packed_qo_len: i64 = packed_qo_len_arr.iter().fold(0i64, |a, b| a.wrapping_add(*b));
@@ -242,8 +182,6 @@ pub fn split_qo_kv_indptr(
         });
     }
 
-    // A sliding window bounds what a CTA reads, so it bounds the split. The
-    // ternary's arms are `uint32_t` and `int64_t`, which meet at `int64_t`.
     let effective_kv_len_arr: Vec<i64> = (0..batch_size)
         .map(|i| {
             let windowed = if req.window_left >= 0 {
@@ -277,7 +215,6 @@ pub fn split_qo_kv_indptr(
         kv_chunk_size = chunk;
     }
 
-    // step 3: walk the batch, emitting one work item per (QO tile, KV tile).
     let mut request_indices = Vec::new();
     let mut qo_tile_indices = Vec::new();
     let mut kv_tile_indices = Vec::new();
@@ -287,10 +224,6 @@ pub fn split_qo_kv_indptr(
     for request_idx in 0..batch_size {
         let packed_qo_len = packed_qo_len_arr[request_idx];
         let num_tiles_q = ceil_div_i64(packed_qo_len, i64::from(cta_tile_q));
-        // The `int()` cast is upstream's, and it truncates: a 2^31-token
-        // effective KV length would come out negative here. Kept, because a
-        // port that silently widened would disagree with the kernel that was
-        // compiled against the C++.
         let kv_len = i64::from((effective_kv_len_arr[request_idx] as i32).max(1));
         let num_chunks_kv =
             if req.disable_split_kv { 1 } else { ceil_div_i64(kv_len, kv_chunk_size) };
@@ -327,8 +260,6 @@ pub fn split_qo_kv_indptr(
         });
     }
 
-    // step 4: pages become tokens. `INT64_MAX * page_size` is signed overflow
-    // upstream (undefined, in practice a wrap); wrapping here says so.
     kv_chunk_size = kv_chunk_size.wrapping_mul(i64::from(req.page_size));
 
     Ok(Split {
@@ -346,11 +277,6 @@ pub fn split_qo_kv_indptr(
 }
 
 /// `PrefillPlan` — the plan, and the bytes to upload under it.
-///
-/// # Errors
-///
-/// Everything [`split_qo_kv_indptr`] refuses, plus
-/// [`Error::WorkspaceOverflow`].
 pub fn plan(
     req: &Request<'_>,
     device: &Device,
@@ -360,11 +286,6 @@ pub fn plan(
 }
 
 /// `PrefillPlanWorkspaceSize` — the same arithmetic with the writes turned off.
-///
-/// # Errors
-///
-/// Everything [`split_qo_kv_indptr`] refuses. Cannot overflow; see
-/// [`Workspace::unbounded`].
 pub fn workspace_size(req: &Request<'_>, device: &Device) -> Result<Sizes, Error> {
     let plan = plan_impl(req, device, Workspace::unbounded(), Staging::sizing())?;
     Ok(Sizes { float_bytes: plan.float_bytes, int_bytes: plan.int_bytes })
@@ -378,10 +299,6 @@ fn plan_impl(
 ) -> Result<Plan<PrefillPlanInfo>, Error> {
     req.check()?;
 
-    // step 0: the grid budget. Two CTAs per SM, less whatever a co-resident
-    // decode kernel already holds, floored at zero and then divided by the KV
-    // head count -- so a device with fewer SMs than KV heads gets zero, and the
-    // binary search below refuses to split anything.
     let num_blocks_per_sm: i64 = 2;
     let available_ctas = num_blocks_per_sm * i64::from(device.num_sm) - req.num_colocated_ctas;
     let max_grid_size = available_ctas.max(0) as i32;
@@ -415,7 +332,6 @@ fn plan_impl(
         info.total_num_rows_offset =
             int_alloc.alloc(4, 16, "batch_prefill_total_num_rows")? as i64;
         if staging.materialises() {
-            // The real row count, for a grid that was captured with a dummy one.
             staging.put_u32(
                 info.total_num_rows_offset as usize,
                 req.qo_indptr[req.batch_size as usize] as u32,
@@ -441,7 +357,6 @@ fn plan_impl(
             "batch_prefill_kv_tile_indices",
         )?;
         staging.put_i32s(info.o_indptr_offset as usize, &split.o_indptr, "batch_prefill_o_indptr")?;
-        // `int64_t` truncated into an `IdType`, upstream's assignment.
         staging.put_i32(
             info.kv_chunk_size_ptr_offset as usize,
             split.kv_chunk_size as i32,
@@ -525,9 +440,6 @@ mod tests {
     const L40S: Device = Device::new(142, 8);
 
     /// A long prefill already fills the grid with QO tiles, so KV is not split
-    /// at all -- 4096 rows x 4 GQA / 128 is 128 tiles against a 35-work budget,
-    /// and no chunk size brings that under. The QO dimension alone saturates a
-    /// prefill; the KV split exists for the batches where it does not.
     #[test]
     fn a_lone_prefill_saturates_the_grid_with_qo_tiles_alone() {
         let qo = [0i32, 4096];
@@ -551,7 +463,6 @@ mod tests {
     }
 
     /// `disable_split_kv` is the flag our own decode-shaped prefills use, and
-    /// it must leave exactly one work item per QO tile.
     #[test]
     fn disabling_the_split_leaves_one_chunk_per_tile() {
         let qo = [0i32, 1, 2, 3];
@@ -565,7 +476,6 @@ mod tests {
     }
 
     /// A sliding window caps the effective KV length, so a 100k-token sequence
-    /// splits like a short one.
     #[test]
     fn a_window_bounds_the_split_of_a_long_sequence() {
         let qo = [0i32, 8];
@@ -579,7 +489,6 @@ mod tests {
     }
 
     /// The empty batch is upstream's division by zero, and this port's one
-    /// deliberate refusal.
     #[test]
     fn the_empty_batch_is_refused_rather_than_dividing_by_zero() {
         let qo = [0i32];

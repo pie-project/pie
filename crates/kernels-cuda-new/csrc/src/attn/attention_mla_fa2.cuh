@@ -56,10 +56,13 @@
 // where it is launched (`x::attn::mla_fa2` repeats them beside the Rust).
 //
 //  1. **The grid is `num_sm` blocks and is resident by construction.** It is
-//     not an occupancy query. `scheduler.cuh:1607-1608` sets
-//     `num_blks_x = cluster_size` (1 or 2) and `num_blks_y = num_sm /
-//     cluster_size`, so the product is exactly `num_sm` and every block of a
+//     not an occupancy query. `src/plan/mla.rs:207-208` sets
+//     `cluster_size` (1 or 2) and `num_clusters = num_sm / cluster_size`,
+//     so the product is exactly `num_sm` and every block of a
 //     cooperative launch is co-resident because the PLAN was built that way.
+//     That is upstream `scheduler.cuh:1607-1608`, ported; this tree no longer
+//     carries the file, because it held no device code and Rust had already
+//     taken the whole of it.
 //     `driver-cuda/src/fire/flashinfer_decode.rs:1860-1885` claims otherwise
 //     and is wrong; the plan is `plan::mla`'s `Schedule`, already Rust.
 //  2. **`sizeof(KTraits::SharedStorage)` is exactly the arm's own threshold

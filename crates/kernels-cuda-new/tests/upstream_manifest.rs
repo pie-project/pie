@@ -5,18 +5,35 @@
 //! `csrc/src/attn/flashinfer/MODIFICATIONS` opens by asserting a property rather than
 //! describing one:
 //!
-//! > *"Generated from the tree, and kept honest by the property it asserts:
-//! > strip every `// PIE:` marker, the `#ifndef __CUDACC_RTC__` under it and
-//! > that directive's matching `#endif`, and each file below is byte-for-byte
-//! > FlashInfer v0.6.15. That was checked per file before this list was
-//! > written."*
+//! > *"Generated from the tree, and kept honest by the property it asserts.
+//! > Apply this transform to any file below and you get FlashInfer v0.6.15,
+//! > byte for byte -- steps 1 and 2 mechanically, step 3 from upstream and
+//! > not from here."*
 //!
-//! **"Was checked" is a past-tense fact about a person, not a property of the
-//! tree.** Nothing re-checks it. A guard widened by one line, a stray edit
-//! inside a `#ifndef __CUDACC_RTC__` block, or a row left stale after a file
-//! changed all leave a `MODIFICATIONS` that reads correct and is not — and
-//! the whole value of vendoring upstream *byte-identically* is that a reader
-//! can diff against upstream and a bump is a re-fetch rather than a merge.
+//! **"Apply this transform" is an instruction to a person, not a property of
+//! the tree.** Nothing re-checks it. A guard widened by one line, a stray
+//! edit inside a `#ifndef __CUDACC_RTC__` block, or a row left stale after a
+//! file changed all leave a `MODIFICATIONS` that reads correct and is not —
+//! and the whole value of vendoring upstream *byte-identically* is that a
+//! reader can diff against upstream and a bump is a re-fetch rather than a
+//! merge.
+//!
+//! # The claim got weaker, and this paragraph is the record of it
+//!
+//! The quote above used to end *"and each file below is byte-for-byte
+//! FlashInfer v0.6.15. That was checked per file before this list was
+//! written."* — one step, entirely mechanical, entirely local. The strip of
+//! host C++ split it in three and made the third step non-local: text that
+//! was **removed** leaves a `// PIE: REMOVED` marker naming it, and a marker
+//! is not the text. Twelve of the 24 files now need upstream's tarball to
+//! reconstruct; twelve still come back from steps 1 and 2 alone.
+//!
+//! What this test checks did not change, because it never checked that.
+//! [`measure`] reads our tree and compares it against our table, and a
+//! deletion is as visible to those four columns as an addition is. What
+//! changed is the sentence a reader is being asked to trust, so the sentence
+//! moved rather than the code — which is the opposite of the failure at
+//! `f622dcf8d`, where the prose moved and the columns did not.
 //!
 //! # What this test can check without a network, and what it cannot
 //!
@@ -299,12 +316,19 @@ fn strip(text: &str) -> (String, usize) {
 /// `#include`s that DID change are ours — `attn/fa2.cuh` and its three
 /// siblings, which reached in from outside and had to learn the new prefix.
 ///
-/// So the transform in this file is still the identity, all 28 files are
-/// still byte-for-byte upstream plus their guards, and all four numeric
-/// columns of the manifest are unchanged. The map stays because the
-/// prediction it was built for is deferred, not refuted: separating the
-/// device stdlib from the attention algorithms still rewrites upstream's
-/// lines, and that is still not something to derive after the fact.
+/// So the transform in this file is still the identity, and the move left
+/// all four numeric columns of the manifest unchanged. (Four files were
+/// deleted afterwards, for an unrelated reason — they held no device code;
+/// see `MODIFICATIONS`. That took four rows out of the table and two
+/// `#include` lines out of `page.cuh` and `utils.cuh`. A later pass deleted
+/// the rest of the host C++, which is why *"the 24 files that remain are
+/// still byte-for-byte upstream plus their guards"* no longer stands here:
+/// twelve of them are upstream-minus-a-named-removal now, and the removals
+/// are named in `MODIFICATIONS` rather than derivable from this map.) The
+/// map stays because the prediction it was built for is deferred, not
+/// refuted: separating the device stdlib from the attention algorithms still
+/// rewrites upstream's lines, and that is still not something to derive
+/// after the fact.
 ///
 /// A row is added by the same commit that moves the file. A row whose file no
 /// longer holds that directive is a dead row and
@@ -463,12 +487,28 @@ fn modifications_describes_the_vendored_tree() {
 
 /// The table's own totals row agrees with the rows above it.
 ///
-/// `28 files   35   226   18207   799944` is a summary, and a summary is the
+/// `24 files   39   156   13662   589556` is a summary, and a summary is the
 /// line a reader takes on trust. It is also the line that survives a per-file
 /// edit unchanged, so it is the one most likely to go stale — and it did:
 /// `f622dcf8d` grew `mla.cuh` by 20 lines and 1,069 bytes without touching
 /// either its row or this line, which is the drift this test was written for
 /// and which nothing had yet run it to catch.
+///
+/// It read `28 files 35 226 18207 799944` until the four pure-host files came
+/// out of the tree — `attention/scheduler.cuh`, `exception.h`, `allocator.h`
+/// and `attention/heap.h`, 2,138 lines with no device code between them and a
+/// Rust owner apiece under `src/plan/`. Four rows leaving a table is the one
+/// edit that moves all five numbers at once, which is a good reason for this
+/// assertion to exist and a poor reason to trust the row.
+///
+/// It then read `24 files 33 208 16084 703339` until the host C++ inside the
+/// surviving files went the same way. That edit moved four of the five
+/// numbers **in two directions at once** — `guards` UP from 33 to 39,
+/// because a removal leaves a marker behind, and `added`, `lines` and `bytes`
+/// all DOWN, because what the marker replaced was larger than the marker. A
+/// row adjusted by hand in that pass would have had to guess a sign per
+/// column. The columns below were re-derived by running [`measure`] over the
+/// tree, which is the only method that has ever been right about this table.
 #[test]
 fn the_totals_row_sums_the_table() {
     let text = std::fs::read_to_string(csrc().join("src/attn/flashinfer/MODIFICATIONS")).expect("manifest");
@@ -499,17 +539,34 @@ fn the_totals_row_sums_the_table() {
 /// A sentence in the same file as the table it describes, and nothing tied
 /// the two together: vendor one more file with a guard and the sentence is
 /// wrong in a document whose entire purpose is being right about this tree.
+///
+/// # This test was red, and the prose it reads was not the thing that broke
+///
+/// The window used to be three words — `N`, `files`, `are` — with a comment
+/// explaining that it deliberately does not match the totals row's `28
+/// files`, whose third word is a number rather than `are`. That defence was
+/// real and it was aimed one word short. `ee1d016c7` added a sentence to the
+/// preamble reading *"these 28 files are now at `csrc/src/attn/flashinfer/`"*
+/// — `28`, `files`, `are`, matching the window, and standing **before** the
+/// sentence this test exists to check. From that commit until this one the
+/// test parsed `28`, compared it against the 14 rows with no guard, and
+/// failed; the manifest's own numbers were never wrong.
+///
+/// The window is four words now and the fourth is `untouched.`, with the
+/// period, because that is how `split_whitespace` yields it. A sentence that
+/// says `files are` in passing can no longer answer for the one sentence
+/// that says how many files are untouched.
 #[test]
 fn the_untouched_count_in_the_prose_is_the_table_s() {
     let text = std::fs::read_to_string(csrc().join("src/attn/flashinfer/MODIFICATIONS")).expect("manifest");
     let words: Vec<&str> = text.split_whitespace().collect();
-    // `N files are untouched`, and not the totals row's `28 files`, which
-    // appears first and would answer with the wrong number.
+    // `N files are untouched.`, and not the totals row's `24 files` — nor
+    // any other sentence in the preamble that happens to say `files are`.
     let quoted: usize = words
-        .windows(3)
-        .find(|w| w[1] == "files" && w[2] == "are")
+        .windows(4)
+        .find(|w| w[1] == "files" && w[2] == "are" && w[3] == "untouched.")
         .and_then(|w| w[0].parse().ok())
-        .expect("MODIFICATIONS quotes `N files are untouched`");
+        .expect("MODIFICATIONS quotes `N files are untouched.`");
 
     let untouched = manifest().values().filter(|r| r.guards == 0).count();
     assert_eq!(
@@ -722,21 +779,46 @@ fn every_normalisation_row_is_used_and_no_pie_include_survives() {
 /// unless disagreement was possible, and *how possible* is a number.
 ///
 /// So this mutates the real vendored files — not synthetic snippets — and
-/// requires the check to reject every mutant. **154 discriminating inputs**,
+/// requires the check to reject every mutant. **121 discriminating inputs**,
 /// in two families:
 ///
-/// * **126 measurement mutants**, each of which must make [`measure`]
-///   disagree with the file's row: three per file over 28 files (append a
-///   line, drop the last line, pad a line without changing the line count)
-///   and three per guarded file over 14 (rename a marker, delete a marker
-///   line, insert a line inside a guard).
-/// * **28 recoverability mutants**, one per file: inject a
+/// * **97 measurement mutants**, each of which must make [`measure`]
+///   disagree with the file's row: three per file over 24 files (append a
+///   line, drop the last line, pad a line without changing the line count),
+///   two per marker-bearing file over 12 (rename a marker, delete a marker
+///   line), and one per guard-bearing file over 1 (insert a line inside a
+///   guard).
+/// * **24 recoverability mutants**, one per file: inject a
 ///   `#include <pie/…>` with no map row, which [`normalise`] must refuse.
 ///
-/// The 28 `pad_a_line` mutants are why the fourth column exists and are
+/// The 24 `pad_a_line` mutants are why the fourth column exists and are
 /// asserted as such: each is invisible to `guards`, `added` and `lines`
-/// together, and `bytes` alone catches it. Before the column, those 28 inputs
-/// were 28 ways for this file to be wrong and say nothing.
+/// together, and `bytes` alone catches it. Before the column, those 24 inputs
+/// were 24 ways for this file to be wrong and say nothing.
+///
+/// # The count moved, and the doc used to describe a battery that never ran
+///
+/// This said **126**, *"three per guarded file over 10"*, and *"the 28
+/// `pad_a_line` mutants"*. Every one of those was stale, and they had gone
+/// stale in two different ways.
+///
+/// `28` was the file count before the four host-only headers were deleted;
+/// `pad_a_line` is one per file, so it followed `files.len()` down to 24 and
+/// the prose did not. `10` and the *"three per"* were worse than stale: the
+/// formula in the assertion below is `2 * with_markers + with_guards`, two
+/// families with two different populations, and the doc had folded them into
+/// one product with one population. It read as a single `3 × 10 = 30` when
+/// the code computed `2 × 10 + 10`, which is also 30 — the arithmetic agreed
+/// by coincidence, and a coincidence is exactly what stops a reader looking.
+///
+/// The strip of host C++ separated them, because it deleted the guards but
+/// left markers where they had been: 12 files now carry a marker and exactly
+/// **one** — `attention/mla.cuh` — still carries an `#ifndef __CUDACC_RTC__`.
+/// `2 × 12 + 1` is 25, `3 × 12` is 36, and the folded form is now wrong by
+/// eleven. Grepping for the directive names three files; two of those hits
+/// are this tree's own prose *about* the directive, in `page.cuh:26` and
+/// `utils.cuh:41`, and [`is_rtc_guard`] requires the line to start with it.
+/// The count that matters is the one the battery computes, and it is 1.
 ///
 /// # What it still cannot catch
 ///
@@ -836,8 +918,8 @@ fn the_manifest_check_can_fail_on_every_drift_it_claims_to_catch() {
     );
     assert_eq!(
         measured + unrecoverable,
-        154,
-        "this control ran on {} inputs, and the number it is documented as running on is 154. \
+        121,
+        "this control ran on {} inputs, and the number it is documented as running on is 121. \
          If a FlashInfer bump changed the file count, update both this number and the doc \
          comment above — a control whose input count nobody states is a control nobody has \
          checked.",

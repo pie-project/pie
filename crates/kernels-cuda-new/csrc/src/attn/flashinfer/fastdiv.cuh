@@ -26,15 +26,9 @@ namespace flashinfer {
 struct uint_fastdiv {
   __host__ __device__ uint_fastdiv() : impl_(1), d_(0) {}
 
-  // PIE: guarded for NVRTC -- an explicitly `__host__` constructor, which NVRTC
-  // refuses outright ("a function explicitly marked as a __host__ function is
-  // not allowed in JIT mode") whether or not anything calls it. Under the JIT
-  // a divisor is computed by the Rust caller and arrives inside the params
-  // struct, so device code never constructs one. Upstream is unmodified apart
-  // from markers of this form; see NOTICE. Removing them restores the file.
-#ifndef __CUDACC_RTC__
-  __host__ uint_fastdiv(uint32_t d) : impl_(d ? d : 1), d_(d) {}
-#endif
+  // PIE: REMOVED -- the explicitly `__host__` `uint_fastdiv` constructor. 1 line of host C++,
+  // guarded out of every NVRTC compile before it was removed, so removing it changes no
+  // compile. This marker is one a strip does NOT undo; see MODIFICATIONS.
 
   __host__ __device__ __forceinline__ operator unsigned int() const { return d_; }
 

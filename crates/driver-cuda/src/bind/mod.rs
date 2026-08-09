@@ -423,54 +423,80 @@ impl DispatchPlan {
                 }
             }
         }
-        // CROSS-STATEMENT WIRING, read off the kernel rows.
+        // CROSS-STATEMENT WIRING, read off the declarations.
         //
         // Some blocks wire values ACROSS statements: nemotron's mamba scan
         // consumes the split's raw `dt` and the params prep's fp32 tables,
         // none of which its own statement carries (the C++ hand pass routed
         // them through its workspace). Both ends of that wiring are now
-        // STATED — `KernelSig::publishes_aux` says which output fills which
-        // slot, `Source::Aux(i)` says which slot an operand reads — so this
-        // collects publishers into per-layer slots and knows no kernel by
-        // name. What stood here matched four literal symbols, which made
+        // STATED — `x::Contract::publishes_aux` says which output fills
+        // which slot, `Source::Aux(i)` says which slot an operand reads — so
+        // this collects publishers into per-layer slots and knows no kernel
+        // by name. What stood here matched four literal symbols, which made
         // this crate the only place that knew how one architecture's block
         // is put together.
+        //
+        // TWO ORACLES, AND THEY RANGE OVER THE SAME LAUNCHES. The publisher
+        // half reads a `Contract`, because that is where `publishes_aux`
+        // lives once it is out of the portable vocabulary; the consumer half
+        // reads a row, because `operands` stayed there. `x::contract` and
+        // `table::sig` cover the same symbols — `table::KERNELS` is the
+        // concatenation of `x::SIGS` and `ROW_TABLES` is empty — so this is
+        // one population asked two questions, not two populations.
+        //
+        // **`x::entry` is not the third way to ask it.** `entry()` searches
+        // `FAMILIES`, which a driver op is deliberately absent from, so it
+        // answers `None` for all twelve of `gemm`'s and for `adapter`'s. The
+        // failure that produces is not a missing lookup: `aux_width` is a
+        // `max`, so a dropped population sizes the vector SHORTER, the
+        // `slots.get_mut` below silently publishes nothing for a slot that
+        // used to exist, and the loss surfaces as the `all slots filled`
+        // test's message — about filling, not about width.
         let sig_of = |launch: &Launch| -> Option<&'static kernels::KernelSig> {
             kernels::sig_in(
                 kernels_cuda_new::table::KERNELS,
                 &lowered.kernels[launch.kernel as usize],
             )
         };
-        // Widest slot any row publishes or reads, so the vector is sized by
-        // the table rather than by a constant this file would have to keep
-        // in step with it.
-        let aux_width = lowered
+        let contract_of = |launch: &Launch| -> Option<&'static kernels_cuda_new::x::Contract> {
+            kernels_cuda_new::x::contract(&lowered.kernels[launch.kernel as usize])
+        };
+        // Widest slot any declaration publishes or any row reads, so the
+        // vector is sized by the table rather than by a constant this file
+        // would have to keep in step with it.
+        let published = lowered
+            .launches
+            .iter()
+            .filter_map(contract_of)
+            .flat_map(|c| c.publishes_aux.iter().map(|&(slot, _)| slot));
+        let consumed = lowered
             .launches
             .iter()
             .filter_map(sig_of)
             .flat_map(|s| {
-                s.publishes_aux
-                    .iter()
-                    .map(|&(slot, _)| slot)
-                    .chain(s.operands.iter().filter_map(|o| match o.source {
-                        kernels::Source::Aux(i) => Some(i),
-                        _ => None,
-                    }))
-            })
+                s.operands.iter().filter_map(|o| match o.source {
+                    kernels::Source::Aux(i) => Some(i),
+                    _ => None,
+                })
+            });
+        let aux_width = published
+            .chain(consumed)
             .max()
             .map_or(0, |m| usize::from(m) + 1);
         let mut aux: std::collections::BTreeMap<u16, Vec<Option<Arg>>> =
             std::collections::BTreeMap::new();
         for launch in &lowered.launches {
-            let Some(sig) = sig_of(launch) else { continue };
-            if sig.publishes_aux.is_empty() {
+            let Some(contract) = contract_of(launch) else {
+                continue;
+            };
+            if contract.publishes_aux.is_empty() {
                 continue;
             }
             let op = &plan.ops[launch.op as usize];
             let slots = aux
                 .entry(launch.layers.start)
                 .or_insert_with(|| vec![None; aux_width]);
-            for &(slot, out_ix) in sig.publishes_aux {
+            for &(slot, out_ix) in contract.publishes_aux {
                 // Out of range is a trace that does not fit this kernel; the
                 // arity guard reports it, and publishing nothing keeps the
                 // `all slots filled` test below the one that decides.

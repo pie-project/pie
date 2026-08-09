@@ -32,7 +32,7 @@
 //!
 //! The device text is not deleted and did not move to history: it is
 //! `kernels-cuda-new/csrc/src/attn/attention_xqa_mha.cuh` over
-//! `csrc/vendor/xqa/`, enrolled as five NVRTC units by
+//! `csrc/src/attn/xqa/`, enrolled as five NVRTC units by
 //! `kernels_cuda_new::x::xqa::UNITS`.
 //!
 //! # The specification of this program, in four terms
@@ -991,7 +991,7 @@ pub struct XqaLaunch {
 /// the member, the carve, the geometry, the strides — and stops one step
 /// short of the fire.
 ///
-/// The device half is no longer what is missing. `csrc/vendor/xqa/` carries
+/// The device half is no longer what is missing. `csrc/src/attn/xqa/` carries
 /// the fifteen-file closure of upstream's `xqa/mha.cu` — as `xqa/mha.cuh`,
 /// because `kernels-cuda-new` holds no translation units — and all five
 /// non-Hopper members compile clean through it: rc = 0, one `.visible
@@ -1006,7 +1006,7 @@ pub struct XqaLaunch {
 /// construction (`new-horizon.md` §62.8).
 ///
 /// Every `xqa/mha.cu:N` cited in this file is a line in UPSTREAM's copy,
-/// which is the anchor that does not move; `csrc/vendor/xqa/mha.cuh`'s own
+/// which is the anchor that does not move; `csrc/src/attn/xqa/mha.cuh`'s own
 /// `// PIE:` header carries the offsets.
 ///
 /// What is missing is the row, and it is missing for one reason:

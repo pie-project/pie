@@ -31,8 +31,8 @@
 // # The surface is the measurement, and the measurement is small
 //
 // Two trees were counted. The FlashInfer attention closure -- the 28 files
-// and 18,009 lines reachable from `decode.cuh`, `prefill.cuh`, `mla.cuh`,
-// `scheduler.cuh` and the rest of the roots -- and the whole of
+// and 18,009 lines it held then, reachable from `decode.cuh`, `prefill.cuh`,
+// `mla.cuh`, `scheduler.cuh` and the rest of the roots -- and the whole of
 // `kernels-cuda/csrc/src`, the ahead-of-time crate's own device code:
 //
 // | name | closure | our csrc |

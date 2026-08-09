@@ -3,21 +3,345 @@ MODIFICATIONS -- every internalised file, and how many guards it carries
 
 Generated from the tree, and kept honest by the property it asserts.  Apply
 this transform to any file below and you get FlashInfer v0.6.15, byte for
-byte:
+byte -- steps 1 and 2 mechanically, step 3 from upstream and not from here:
 
     1. strip every `// PIE:` marker, its continuation comments, the
        `#ifndef __CUDACC_RTC__` under it and that directive's matching
        `#endif` -- keeping the guarded BODY, which is upstream's, and
        DISCARDING the `#else` branch, if any, which is ours;
     2. rewrite every `#include <pie/...>` back to the spelling upstream
-       wrote, using the map in `tests/upstream_manifest.rs`.
+       wrote, using the map in `tests/upstream_manifest.rs`;
+    3. put back everything a `// PIE: REMOVED` marker names, and the files
+       listed under HOST C++ below.  A strip cannot perform step 3 on its
+       own: removed text leaves nothing to strip, only a marker saying what
+       stood there.  Step 3 needs the upstream tarball; steps 1 and 2 do not.
+
+THE DIRECTION OF STEP 3 REVERSED, and this document said the opposite until
+it did.  It used to read "restore `#include "exception.h"` to `page.cuh` and
+to `utils.cuh`, and restore the four deleted files ... it applies to two
+files".  It now applies to FIFTEEN, because the guarded host C++ those two
+sentences were built around is gone rather than hidden.  What follows is the
+count, not a summary of it.
 
 THE TREE HAS MOVED AND STEP 2 IS STILL THE IDENTITY.  This paragraph used to
 read "no vendored file has moved out of `csrc/vendor/flashinfer/` yet".  That
 directory no longer exists: `csrc/` was narrowed to device text only, which
-left a provenance-named directory nowhere to be, and these 28 files are now
+left a provenance-named directory nowhere to be, and these 24 files now live
 at `csrc/src/attn/flashinfer/`.  Vendoring became INTERNALISING.  Not one
 byte below changed in that move.
+
+HOST C++ IS GONE, AND THAT IS WHY THIS TABLE LOST FOUR ROWS.  The move
+carried 28 files.  Four of them contained no device code at all -- not one
+`__global__` body, not one `__device__` function -- and they are deleted:
+
+    attention/scheduler.cuh    1     13    1840     87507
+    exception.h                1      9     115      4194
+    allocator.h                1      7     111      4038
+    attention/heap.h           1      6      72      2108
+
+That is 2,138 lines and 97,847 bytes of pure host C++ that NVRTC was being
+handed and could never have compiled.  Every one of them was guarded in its
+ENTIRETY, so NVRTC saw four empty files; the guards were doing the work a
+deletion does, at the cost of shipping the text.  Each has a Rust owner that
+predates this deletion:
+
+    attention/scheduler.cuh    src/plan/{decode,prefill,mla,sm90}.rs
+    exception.h                src/plan/error.rs
+    allocator.h                src/plan/alloc.rs
+    attention/heap.h           src/plan/heap.rs
+
+The measurement that made this safe, and it was the one worth running:
+`scheduler.cuh` is `#include`d by NOTHING in this tree, and `allocator.h`
+and `heap.h` are `#include`d only by `scheduler.cuh`.  Walking the four
+compilation roots -- `attn/fa2.cuh`, `attn/attention_mla_fa2.cuh`,
+`attn/attention_xqa_mha.cuh`, `cascade/merge_states.cuh` -- reached 40 of
+the 43 internalised files, and the three it missed were exactly those.  They
+were unreachable weight, not a dependency.
+
+`exception.h` is the fourth and the only one that was reachable, from
+`page.cuh` and from `utils.cuh`.  Deleting it therefore deleted two
+`#include` lines, which is step 3 above and was, at the time, the only edit
+in this tree that a strip could not undo.  It is safe for a reason that is
+easy to state and worth stating: because `exception.h` was guarded in its
+entirety, `FLASHINFER_CHECK` and `FLASHINFER_ERROR` were ALREADY undefined in
+every NVRTC translation unit here.  24 expansions survived it, inside
+`#define` bodies NVRTC never expands or inside host launchers NVRTC never
+reaches.  Removing the launchers took the second kind with them: 13
+expansions remain and every one is a `#define` continuation line.  The
+deletion changed what NVRTC sees by nothing at all, and still does.
+
+`scheduler.cuh`'s three `__global__` lines were forward declarations with no
+bodies, present only so `cudaOccupancyMaxActiveBlocksPerMultiprocessor` had a
+function pointer to ask about.  Under the JIT that query is Rust's, so there
+was never a kernel in that file to keep.
+
+AND THEN THE REST OF IT WENT.  Deleting four whole files left the rule
+holding in effect and not in letter: `csrc/` still held host C++, it was
+merely hidden.  34 guarded regions and 13 unguarded launchers later, it does
+not.  Measured against the commit before the removal, per file, lines then
+bytes:
+
+    flashinfer/pos_enc.cuh                             614    29148
+    flashinfer/attention/prefill.cuh                   579    32444
+    flashinfer/page.cuh                                288    13527
+    flashinfer/attention/decode.cuh                    270    12161
+    flashinfer/attention/default_prefill_params.cuh    266     9578
+    xqa/mha.cuh                                        240     9285
+    flashinfer/attention/cascade.cuh                   227    10940
+    flashinfer/utils.cuh                                93     2730
+    flashinfer/attention/mla.cuh                        37     1342
+    flashinfer/layout.cuh                               27      818
+    xqa/utils.h                                         20       79
+    xqa/hostUtils.h                                     12      495
+    flashinfer/math.cuh                                 10      550
+    flashinfer/fastdiv.cuh                               6      307
+    flashinfer/fp16.h                                    5      238
+                                                     -----  -------
+    15 files                                          2694   123642
+
+That is net: each site keeps a `// PIE: REMOVED` marker naming what stood
+there, 40 of them, and those markers are in the count.  What went was 34
+guarded regions -- `#ifndef __CUDACC_RTC__` in FlashInfer, upstream's own
+`#ifndef GENERATE_CUBIN` in XQA -- carrying 1,503 lines of upstream host
+text, and 13 `cudaError_t` launchers carrying 1,055 more.
+
+CITATIONS INTO THESE FILES MOVED, AND THE FIX IS NOT IN THIS DIRECTORY.
+Rust in `crates/kernels-cuda-new/src/` and `crates/driver-cuda/src/` cites
+these files by line -- `utils.cuh:116-133`, `decode.cuh:823`, `mla.cuh:1079`
+and 238 more.  Removing 2,694 lines moved 202 of those 241 citations.
+
+Whether they were citations into OUR copy or into upstream's is the whole
+question, because upstream's numbering never had our guards in it and was
+never going to match anyway.  It was settled by discriminator, not by
+assumption: of the 64 citations that name a C++ identifier alongside the line
+number, 52 find that identifier within +-3 lines of OUR text at the commit
+before the removal, 1 finds it in upstream's, and 11 find it in neither.  They
+are citations into this tree.  The convention `mha.cu` = upstream and
+`mha.cuh` = ours has no counterpart on the FlashInfer side, where both are
+spelled `.cuh`, and that is why this had to be measured.
+
+Eleven of the twelve `DISPATCH_*` macros and `FLASHINFER_CUDA_CALL` still
+stand, in `utils.cuh` and `mla.cuh`, holding all 13 remaining `std::` tokens
+in this tree -- every one a `\`-continued `#define` line, none of them ever
+expanded.  They are dead text by the same argument that removed everything
+above, and they were KEPT anyway: they are the single most-cited construct in
+the two crates, `src/` is not this task's to edit, and deleting them would
+move a further 18 citations while the owner is holding a tripwire in
+`src/x/abi.rs`.  Dead text that nothing compiles is a smaller debt than a
+hundred wrong line numbers, and this paragraph is the reason, not an excuse.
+`DEFINE_HAS_MEMBER` is the twelfth and it is not dead and not host: its
+`std::false_type`, `std::void_t` and `std::declval` are `<type_traits>`, it
+has eleven real expansions, and `csrc/shim` provides all three.
+
+The translation, per file: at and after each upstream-side line below, add
+the offset to get the line in the file as it now stands.
+
+    flashinfer/attention/cascade.cuh                788->-227
+    flashinfer/attention/decode.cuh                 33->-6  836->-193  1188->-270
+    flashinfer/attention/default_prefill_params.cuh 27->-3  132->-66  310->-175  462->-266
+    flashinfer/attention/mla.cuh                    30->-5  1158->-37
+    flashinfer/attention/prefill.cuh                2571->-194  4364->-579
+    flashinfer/fastdiv.cuh                          38->-6
+    flashinfer/fp16.h                               22->-5
+    flashinfer/layout.cuh                           29->-6  61->-16  142->-27
+    flashinfer/math.cuh                             35->-10
+    flashinfer/page.cuh                             28->-6  128->-26  166->-45  465->-115
+                                                    675->-205  754->-225  795->-247  917->-288
+    flashinfer/pos_enc.cuh                          26->-4  33->-7  100->-20  1650->-614
+    flashinfer/utils.cuh                            33->-11  41->-12  46->-13  51->-14  467->-93
+    xqa/mha.cuh                                     2948->-99  3093->-240
+    xqa/utils.h                                     29->-5  55->-20
+
+`xqa/mha.cuh` is the one file whose first offset is deliberate.  Four live
+citations sit at `:1598`, `:2783`, `:2804` and `:2814` in `src/x/xqa.rs` and
+`src/x/abi.rs`, so the removal at `:56` was padded to be exactly as long as
+what it replaced -- 8 lines for 8 -- and nothing above `:2948` moved.  That
+was possible there because one marker replaced one small block.  It is not
+possible for 2,694 lines, and pretending otherwise is how a file ends up with
+padding nobody can explain.
+
+Citations that name a DELETED entity rather than a moved one are a separate
+and smaller list, and they cannot be repaired by an offset:
+`families/cascade.rs:10` cites `prefill.cuh:4351` for
+`BatchPrefillWithPagedKVCacheDispatched` and `:11` cites `decode.cuh:823` for
+`BatchDecodeWithPagedKVCacheDispatched`.  Both launchers are gone.  The prose
+around them is still true -- it describes what the Rust replaced -- so those
+become upstream citations and should say so.
+
+THAT PARAGRAPH IS RIGHT ABOUT ITS TWO AND WRONG ABOUT "SMALLER", AND THE
+TABLE ABOVE IT NEEDS A DOMAIN.  Both were found by consuming this ledger to
+do the repair, at `a91cadcec`, and both errors point the same way: toward
+applying an offset where an offset is destructive.
+
+The table is a STEP FUNCTION, so it is total.  It returns a number for every
+input, including a line that no longer exists and a citation that was never
+written against the old numbering.  Re-deriving it independently -- `git diff
+-U0` from `d737aad29` to here, an exact per-line map -- agrees with it on all
+12,384 surviving lines, 0 disagreements.  That is the strongest check
+available and it CANNOT see either error, because it ranges only over the
+lines the table is valid for.  Two derivations of one quantity catch a
+mis-measured quantity; they say nothing about a quantity measured over the
+wrong set.  Read the table as: valid at and after each breakpoint, FOR LINES
+THAT SURVIVED.  It is silent, not correct, elsewhere.
+
+Errors, measured:
+
+1. The citation population is MIXED, and mixed within single files.  Of the
+   27 citations this table would renumber, 21 ALREADY cite the post-strip
+   numbering, 1 was wrong before the strip, and 5 are genuinely pre-strip.
+   Applying the table wholesale breaks 21 to fix 5.  `fa2/params.rs` cites
+   `page.cuh` 45-51 for the seven-field run `page_size..stride_h`, which is
+   where those fields are TODAY and not where they were; the same file's
+   `fastdiv.cuh:47`/`:48` are pre-strip.  Six `utils.cuh` citations land
+   inside their `DISPATCH_*` macro today and inside the wrong macro before.
+   The discriminator that settles a citation is its enclosing entity's
+   position in BOTH versions, and the answer is per citation, not per file.
+
+   The discriminator recorded above -- 52 of 64 identifiers resolving in our
+   pre-strip text -- is reproducible and is not what was wrong.  What was
+   wrong is that it was never run against the post-strip text.  A test given
+   one hypothesis cannot rank two, and this one errs toward "needs repair".
+
+2. The deleted-entity class has EIGHT members and 104 citations, not two.  The
+   two named above are real and are the two most-cited.  The rest:
+   `MergeStates` 22, `SingleDecodeWithKVCacheDispatched` 10,
+   `VariableLengthMergeStates` 7, `SinglePrefillWithKVCacheDispatched` 3,
+   `BatchMLAPagedAttention` 3, and the `__host__` constructors in
+   `fastdiv.cuh` and `page.cuh`.  66 of the 104 cite a line PAST THE END of
+   the file they name -- `cascade.cuh` is 564 lines and is cited at 637-736,
+   `prefill.cuh` is 3788 and is cited at 4176-4356.  That measurement needs
+   neither this table nor this document, which is why it is the one to trust
+   and the one to re-run.  For every one of the 104 the table yields a
+   plausible wrong answer: `decode.cuh:823` becomes `:817`, unrelated MLA
+   device code.  They need their entity's NAME, which every `// PIE: REMOVED`
+   marker below already carries.
+
+   CORRECTION, same pass, one commit later.  The first version of this
+   paragraph said 98 citations and 91 past-EOF.  Both were wrong, and wrongly
+   in the way this document exists to catch: 141/91 came from a scan at
+   `0b0a4f829` and 98 from a later partial re-run at `a91cadcec`, and I
+   published the numerator of one beside the denominator of the other.
+   `a91cadcec` deleted 36,616 comment lines from `kernels-cuda-new/src`, and
+   citations live in comments, so the population genuinely shrank between the
+   two runs -- neither number was fabricated, and that is exactly why the pair
+   read as consistent.  A count is only a count AT a commit.  Re-derived whole
+   at `55c3e144c`: 211 citations resolve to a header here, 104 un-repairable,
+   66 of those past-EOF and 38 deleted-but-in-range.
+
+   Add 4.  The extractor matched `file.cuh:NNN` and silently ignored a bare
+   `` `:NNN` `` continuation -- the form `` `cascade.cuh:649` and `:702` ``
+   uses.  425 such continuations exist in the two src trees; 4 share a line
+   with an already-broken citation.  So 108 dead numbers across 104 citations.
+   The gap was found by reading one line of `families/cascade.rs` while
+   repairing it, not by the extractor, which is the ordinary way a grammar gap
+   is found.
+
+3. SEVEN of the 104 are not this strip's doing, and finding them is the reason
+   to widen the population before believing any of the above.  All seven are in
+   `driver-cuda/src/fire/mla_naive.rs` and all cite
+   `attn/attention_mla_naive.cuh`, which is OUTSIDE flashinfer/ and xqa/ and
+   has not been touched since `d737aad29`.  They rot for an older reason:
+   `d69beb982` unmixed that header, moving four host functions
+   (`launch_mla_naive_paged_raw`, `launch_mla_mma_paged_raw`,
+   `mla_mma_supported`, `mma_detail::smem_bytes`) out of a 736-line file that
+   is now 635.  Every citation in that block resolves exactly at `d69beb982^`
+   -- `:45` is `constexpr int kMlaNaiveBlock = 256;`, `:682` is
+   `inline std::size_t smem_bytes() {`, `:717-723` is the `std::once_flag`
+   block -- and four MORE of them, in range and so never flagged as
+   suspicious, resolve to nothing today.  Two carry a further off-by-one:
+   `:725`/`:726` are cited for `dim3 grid` and the launch, which are `:724`
+   and `:725`.  Left unrepaired; that file's citations are a different
+   commit's debt, and naming it is worth more than half-fixing it.
+
+   That header's own "# What left, and where it went" is stale by one more
+   step: it says the four moved to `kernels-cuda/csrc/src/attn/attention_mla.cu`,
+   and the archive crate was deleted at `85c6c674b`.
+
+   And ZERO of the 104 are xqa.  The `xqa/mha.cuh` padding described above --
+   8 lines for 8, so nothing above `:2948` moved -- is the only intervention in
+   this strip that provably cost its citations nothing.  It is the control for
+   everything else on this page.
+
+4. The dead `DISPATCH_*` retention note above says 11 macros and 10
+   `std::ostringstream` lines.  Re-derived independently at `55c3e144c`:
+   13 definitions under `csrc/`, ALL with zero expansions, and 10
+   `ostringstream` code lines (12 hits, 2 of them prose).  The 10 sit in 10 of
+   the 13; the note counted the macros carrying the marker and reported that
+   as the dead set.  The zero is confirmed -- it is the population that was
+   short.  They stay: the condition for removing them was that some pass
+   repair the files citing them, and the six `utils.cuh` citations turned out
+   to need no repair, so nothing here touched those files.
+
+
+`xqa/hostUtils.h` is a fifth whole-file deletion in the shape of the first
+four: one `inline cudaLaunchConfig_t makeLaunchConfig(...)`, zero device text,
+and a single includer -- `mha.cuh`, inside the host block that went with it.
+It was found by the deletion, not before it; nothing had ever reached it.
+
+WHAT WAS NOT REMOVED, and why, because a rule applied to 34 of 46 candidates
+needs the other 12 named.  `xqa/mha_stdheaders.cuh` and two sites in
+`attention/mla.cuh` and `xqa/utils.cuh` hold twelve TWO-SIDED regions: an
+`#if` whose host arm is upstream's `std::` and whose `#else` arm is our
+device `mha::` replacement.  Deleting the host arm there would leave our
+device text standing where step 1 expects upstream's, so a strip would
+quietly promote OUR code into a file claiming to be upstream's.  The host arm
+is what makes the `#else` legible as a substitution.
+
+TWO MORE STAY AND THEY ARE NOT TWO-SIDED, which the sentence above claimed
+until the classification was re-run over all fourteen instead of over the ten
+that fit it.  `xqa/mha_stdheaders.cuh:20` and `:976` are one-sided
+`#ifndef GENERATE_CUBIN` blocks; `:20` carries four host `#include`s
+(`<algorithm>`, `<array>`, `<limits>`, `<utility>` -- the other three in it
+are shim-provided), `:976` carries none.  They stay for a different reason
+than the twelve, and it is a better one: that file is byte-identical to
+upstream, carries ZERO `// PIE:` markers, and the guard is UPSTREAM'S OWN
+switch, not ours.  `src/families/attn.rs` passes `-DGENERATE_CUBIN=1`, so
+NVRTC never reads them.  Removing them would turn the one XQA file that needs
+no entry in any ledger into a modified file needing markers and a row, to
+delete text no compiler reaches.  The owner's own earlier survey recorded
+`mha_stdheaders.cuh` as having 0 real host lines, and that was right about
+the thing that matters.
+
+Those fourteen are NOT all the host text left in `csrc/` -- an earlier draft
+of this paragraph said they were, and the `DISPATCH_*` macros below are the
+counterexample.  What is left is: fourteen guarded regions here, and ten
+`std::ostringstream` lines inside eleven `#define` bodies that nothing
+expands.  Both sets are named, counted, and argued for.
+
+THE DISCRIMINATOR CHANGED, and the old one is kept here because it was
+right about the facts and wrong about what to do with them.  It read: "a
+file is deleted when it has NO device text, and guarded when it has some
+... those stay guarded, because cutting a fragment out of a file this tree
+must keep byte-recoverable buys nothing NVRTC can see: it already sees
+nothing there."  Every clause of that is true.  It answers the wrong
+question.  The rule is not "can NVRTC see it" -- a guard already settles
+that -- it is "is `csrc/` device text and nothing else", and a guarded host
+launcher is still host C++ sitting in `csrc/`.  So the discriminator is now:
+
+    host C++ is REMOVED, wherever it is, whatever hides it.
+
+Three things fell out of running that over the whole set instead of over
+the three fragments named above, and all three were surprises:
+
+  * The three named fragments were the SMALL case.  `pos_enc.cuh` alone hid
+    591 lines -- fourteen `cudaError_t` launchers -- behind one guard.
+  * Not all of it was guarded.  Thirteen host launchers in `cascade.cuh`,
+    `decode.cuh`, `mla.cuh` and `prefill.cuh`, 1,055 lines, sat OUTSIDE any
+    guard and survived only by being uninstantiated templates.  That is a
+    much weaker shield than a guard: it holds while nothing names them and
+    while the frontend defers lookup of non-dependent names in a template
+    body.  A guard is a decision; non-instantiation is a coincidence.
+  * `QKVLayoutToString` and `PosEncodingModeToString` had ZERO callers, not
+    one apiece.  Both were briefed as having one.  The single hit each was
+    the sentence in this file describing them.
+
+Three files have no device text AND no host text -- `attention/mask.cuh` is
+an enum, `attention/mla_params.cuh` a parameter struct, `fp16.h` a set of
+`static inline` conversions -- so they are neither case and were never
+candidates.  What survives in `csrc/` now is device text, comments, and
+`#define` bodies that nothing expands: `FLASHINFER_CUDA_CALL` and every
+`DISPATCH_*` macro went from many expansions to zero when the launchers
+went, and are kept because a `#define` nothing expands compiles to nothing.
 
 ONE ROW WAS ALREADY WRONG WHEN THE MOVE FOUND IT, and the correction is
 below rather than hidden in it.  This paragraph first claimed "all four
@@ -64,7 +388,7 @@ stdlib from the attention algorithms still rewrites upstream's lines, and the
 whole risk of that cut is still that internalising quietly becomes a fork.  A
 version bump stays re-fetch plus re-apply.
 
-`grep -rn "// PIE:" csrc/src/attn/flashinfer/` finds all 35 markers.
+`grep -rn "// PIE:" csrc/src/attn/flashinfer/` finds all 39 markers.
 
 Columns: guards, added lines, file lines, file bytes.
 
@@ -78,40 +402,58 @@ drift, and unlike a checksum it is computed identically by `wc -c` and by
 -- a length-preserving edit outside every guard -- is what the network-side
 check covers; `.wiki/driver/new-horizon.md` §23.8 records it being run.
 
+AND THAT PARAGRAPH IS EXACTLY WHERE THE REGENERATION WENT WRONG.  The strip
+of host C++ recomputed all four columns with a throwaway script, and the
+script measured `bytes` as the length of the DECODED text rather than of the
+file.  Rust's `str::len` is a byte count; Python's `len(str)` is a character
+count; they agree on every ASCII file and this tree has two that are not.
+Upstream's own comments in `attention/prefill.cuh` carry twelve non-ASCII
+bytes -- em dashes and a `->` arrow, in `The SF smem layout is a plain flat
+byte array` and three lines like it -- so its row was written 12 low, and the
+totals row with it.  `xqa/mha_components.cuh` has two more and is not in this
+table.  The row said 190667; the file is 190679.
+
+It is recorded here rather than quietly fixed because the sentence above
+promised the two sides *cannot* disagree about the algorithm, and that is
+true only of `wc -c` and `str::len`.  A third implementation was introduced
+to regenerate the table and it was not checked against either.  The columns
+below were re-derived once more, reading bytes, and every row now equals its
+file -- but the way this was caught is worth more than the fix: the per-file
+removal ledger and a whole-tree before/after count were computed separately
+and disagreed by 14 bytes, 12 in one tree and 2 in the other.  Neither number
+was suspicious on its own.  Two derivations of one quantity are how the
+defect surfaced, and the reason `f622dcf8d` stood for months is that nobody
+had a second one.
+
 file                                       guards   added    lines      bytes
 -----------------------------------------------------------------------------
-allocator.h                                      1       7      111       4038
-attention/cascade.cuh                            0       0      791      34376
-attention/decode.cuh                             1       8     1191      53167
+attention/cascade.cuh                            1       6      564      23436
+attention/decode.cuh                             3      13      921      41006
 attention/default_decode_params.cuh              0       0      279       8705
-attention/default_prefill_params.cuh             4      26      474      15831
-attention/heap.h                                 1       6       72       2108
+attention/default_prefill_params.cuh             4      12      208       6253
 attention/mask.cuh                               0       0       30        922
-attention/mla.cuh                                3      27     1163      55245
+attention/mla.cuh                                4      27     1126      53903
 attention/mla_params.cuh                         0       0       84       2251
-attention/prefill.cuh                            0       0     4367     223123
-attention/scheduler.cuh                          1      13     1840      87507
+attention/prefill.cuh                            2      10     3788     190679
 attention/state.cuh                              0       0       83       2554
 attention/variant_helper.cuh                     0       0      104       5118
 attention/variants.cuh                           0       0       97       3223
 cp_async.cuh                                     0       0      265      10227
-exception.h                                      1       9      115       4194
-fastdiv.cuh                                      1       8       67       2385
-fp16.h                                           1       7      184       8049
+fastdiv.cuh                                      1       3       61       2078
+fp16.h                                           1       3      179       7811
 frag_layout_swizzle.cuh                          0       0       75       3481
-layout.cuh                                       3      16      144       5774
-math.cuh                                         1      12      284       8894
+layout.cuh                                       3       9      117       4956
+math.cuh                                         1       3      274       8344
 mma.cuh                                          0       0      705      26618
-page.cuh                                         8      35      914      41255
+page.cuh                                         9      31      632      28238
 permuted_smem.cuh                                0       0      191       6692
-pos_enc.cuh                                      4      21     1653      74804
+pos_enc.cuh                                      4      13     1039      45656
 profiler.cuh                                     0       0      149       6708
-utils.cuh                                        5      31      581      28134
+utils.cuh                                        6      26      497      26136
 vec_dtypes.cuh                                   0       0     2194      74561
 -----------------------------------------------------------------------------
-28 files                                        35     226    18207     799944
-
-14 files are untouched. `LICENSE` is upstream's, copied and not counted.
+24 files                                        39     156    13662     589556
+12 files are untouched. `LICENSE` is upstream's, copied and not counted.
 
 Not upstream, written by PIE, and NO LONGER IN THIS DIRECTORY:
 
@@ -138,9 +480,21 @@ be renamed without ceasing to do its job.  nvcc needed one line: a second
 `-iquote` at each of the four sites that pass the first.
 
 One row in this table changed, and not because of the move: see the
-correction near the top.  Every file in it moved, together, from
-`csrc/vendor/flashinfer/` to `csrc/src/attn/flashinfer/`, byte for byte, and
-the transform above still recovers upstream v0.6.15 from every file listed.
+correction near the top.  Four rows LEFT it, and that was not the move
+either: see HOST C++ above.  Every file still listed moved, together, from
+`csrc/vendor/flashinfer/` to `csrc/src/attn/flashinfer/`, byte for byte.
+
+WHAT THE TRANSFORM RECOVERS IS NOW SMALLER, and saying so is the point of
+keeping this document.  Twelve files still come back by steps 1 and 2 alone
+-- the ones with a `0` in the `guards` column, which is what a `0` there now
+means.  Twelve need step 3, and step 3 needs the upstream tarball, because
+what a `// PIE: REMOVED` marker records is what a file no longer contains.
+The property this document asserts is therefore weaker than it was, and it is
+still checkable: every line that REMAINS in the twenty-four files below is
+upstream's, and every line that does not is named, counted and attributed.
+The columns are re-derived from the tree by the same code the test runs, not
+adjusted by hand -- which is the failure this file exists to have caught once
+already, at `attention/mla.cuh`.
 The shim group was done first for a reason that turned out to generalise: it
 was the one role whose files are neither upstream's nor included by relative
 path from an upstream file, so it moved without editing a single upstream

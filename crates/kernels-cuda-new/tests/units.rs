@@ -669,3 +669,419 @@ fn compile(unit: &Unit, arch: &str, headers: &[source::Header]) -> Result<Outcom
 
     Ok(Outcome { unit: unit.name, rows: unit.rows.len(), millis, cubin: cubin.len() })
 }
+
+/// **A drifted row is REFUSED by the compiler the JIT actually uses.**
+///
+/// # The instrument this falsifies, and why it needed falsifying
+///
+/// `abi::device_typecheck` writes one `static_assert` per row, comparing the
+/// operand list the row states against the type of the `__global__` it names,
+/// and `Unit::source` appends that text to the root so `nvrtcCompileProgram`
+/// has to agree with it. Two sentences in the portable `kernels` crate — the
+/// ones under `Ty::Fp8Kind` and `Ty::KvScheme`, read by Metal, Vulkan, WGPU
+/// and CPU as well as here — have claimed for a long time that the rows are
+/// ASSERTED rather than assumed. Until this walk they were assumed: the
+/// emitter's only caller was a hand-run example, over one row list, producing
+/// a file for a compiler this tree no longer contains.
+///
+/// **A translation unit with no assertions in it compiles exactly like one
+/// that checks everything.** So a green `every_unit_compiles_and_every_row_resolves`
+/// is not evidence that anything is being checked, and this test is the
+/// evidence. It is a control and a mutant:
+///
+/// * the REAL row must compile — otherwise a red below would only mean the
+///   appendix is broken;
+/// * the SAME row with one operand's `Ty` swapped must NOT compile;
+/// * and the diagnosis must be OUR `static_assert`, naming the row. A "must
+///   not compile" test satisfied by its own setup failing is the decoy this
+///   requirement exists to rule out, so a generic NVRTC failure is not
+///   accepted as a pass.
+///
+/// # Why `attn::write_kv_fp8_per_tensor`
+///
+/// It is one of the two rows in the tree whose operands name `Ty::Fp8Kind`,
+/// which is the failure the whole instrument is ordered around — a
+/// `cuLaunchKernel` cell one byte wide against a four-byte parameter
+/// mis-marshals every argument after it, silently. It is also
+/// `DeviceKernel::PLAIN`, and `PLAIN` is the string `"(no template
+/// arguments)"`: before this change the emitter demanded an element type of
+/// every row, found a `(` in that sentinel, and refused the whole slice — so
+/// the `sizeof(__nv_fp8_interpretation_t)` assertion was generated into a
+/// string that was then discarded with the error. This row being checked
+/// here is the widening, measured.
+///
+/// # The drift
+///
+/// `d: I32` spelled `F32`. Both are four bytes and both cross as one 32-bit
+/// cell, so nothing between the row and the launch can tell them apart. The
+/// C++ can, and that is the entire argument for compiling this text.
+#[test]
+fn a_drifted_row_is_refused_by_the_compiler_the_jit_uses() {
+    use kernels::{KernelSig, kernel, operands};
+
+    let Some(arch) = cache::arch() else {
+        eprintln!("SKIP a_drifted_row_is_refused_by_the_compiler_the_jit_uses: no CUDA device");
+        return;
+    };
+
+    const SYMBOL: &str = "attn::write_kv_fp8_per_tensor";
+    let (_, unit) = unit::unit_of(SYMBOL).unwrap_or_else(|| {
+        panic!("`{SYMBOL}` is in no unit -- this test's subject has moved and it is now checking nothing")
+    });
+    let real = unit.row(SYMBOL).expect("the unit that hosts it holds it");
+
+    // THE CONTROL. One row, so the compile that follows is about this row and
+    // not about the other thirty in the unit.
+    let checked = unit.typecheck(&[real]).unwrap_or_else(|why| panic!("{}: {why}", unit.name));
+    assert_eq!(
+        checked.checked, 1,
+        "`{SYMBOL}` produced no assertion, so the mutant below cannot fail for the \
+         reason this test claims:\n{:?}",
+        checked.skipped
+    );
+    assert!(
+        checked.text.contains("sizeof(::__nv_fp8_interpretation_t) == 4"),
+        "the fp8 width assertion is not in the text this test compiles:\n{}",
+        checked.text
+    );
+    match nvrtc::compile_rows(unit, arch, &[real]) {
+        Ok(_) => {}
+        Err(nvrtc::CompileError::Toolchain { needs, have, .. }) => {
+            eprintln!("SKIP a_drifted_row_is_refused: needs NVRTC {needs}, this box loads {have}");
+            return;
+        }
+        Err(why) => panic!(
+            "the REAL `{SYMBOL}` does not compile with its own typecheck appended, so \
+             every red this test could report would be the instrument's rather than a \
+             row's:\n{why}\n\n{}",
+            checked.text
+        ),
+    }
+
+    // THE MUTANT. Everything the emitter reads is identical except `d`.
+    static DRIFTED: KernelSig = kernel!(write_kv_fp8_per_tensor "attn::write_kv_fp8_per_tensor",
+        file = Some("attn/kv_paged.cuh"),
+        operands = operands![
+            k_curr: Bf16s,
+            v_curr: Bf16s,
+            k_pages: U8sMut,
+            v_pages: U8sMut,
+            qo_indptr: U32s,
+            kv_page_indices: U32s,
+            kv_page_indptr: U32s,
+            kv_last_page_lens: U32s,
+            r: I32,
+            page_size: I32,
+            h_kv: I32,
+            d: F32,
+            fp8_kind: Fp8Kind,
+        ]);
+
+    // Pinned to the original, so a later edit to the row cannot leave this
+    // mutant quietly testing a different shape -- or nothing.
+    assert_eq!(
+        DRIFTED.operands.len(),
+        real.sig.operands.len(),
+        "the mutant and `{SYMBOL}` no longer have the same arity, which any emitter \
+         would catch: the point is a same-width substitution"
+    );
+    let differ: Vec<&str> = real
+        .sig
+        .operands
+        .iter()
+        .zip(DRIFTED.operands)
+        .filter(|(a, b)| a.ty != b.ty)
+        .map(|(a, _)| a.name)
+        .collect();
+    assert_eq!(differ, vec!["d"], "the mutant must differ in exactly `d`");
+
+    let mutant =
+        DeviceKernel { sig: &DRIFTED, template_path: real.template_path, elem: real.elem };
+    let Err(why) = nvrtc::compile_rows(unit, arch, &[&mutant]) else {
+        let text = unit.typecheck(&[&mutant]).expect("emitted");
+        panic!(
+            "THE DRIFTED `{SYMBOL}` COMPILED. The typecheck appended to every unit is \
+             not distinguishing an `int` parameter from a `float` one, which means it \
+             distinguishes nothing and every green it has ever shown is a \
+             decoration:\n\n{}",
+            text.text
+        );
+    };
+    let why = why.to_string();
+    assert!(
+        why.contains(SYMBOL) || why.contains("static assert") || why.contains("static_assert"),
+        "the mutant failed, but not on the assertion this test is about -- a compile \
+         that breaks for any other reason satisfies a `must not compile` test while \
+         proving nothing:\n{why}"
+    );
+}
+
+/// A `*mut bf16` destination, asserted as `bf16*` — and REFUSED as `f16*`.
+///
+/// # What is on trial
+///
+/// [`kernels::Ty::Bf16sMut`] and [`kernels::Ty::F16sMut`]. They were added
+/// because `kernels::Ty` had `Bf16s` and `F16s` and no written halves, so
+/// every bf16 OUTPUT in the tree said `Ty::BufMut`, whose `cpp()` is `void*`
+/// — and `abi::self_describing` declines `void*` outright, because every
+/// object pointer converts to it and an assertion against it holds for every
+/// possible kernel.
+///
+/// # The tag has moved, and this test's copies are gone with it
+///
+/// This test was written around the sentence *"nothing produces the new kinds
+/// yet — `x::abi`'s `ptr_abi!(bf16, …)` still tags `*mut bf16` `Ty::BufMut`
+/// while already declaring its `Abi::CPP` to be the exact string
+/// `Ty::Bf16sMut.cpp()` returns, so a variant added and left there is a
+/// decoration: it renders, and nothing ever compiles it."* It stated the rows
+/// **the way `ptr_abi!` WOULD state them** once the tag moved, because no
+/// real row could.
+///
+/// The tag moved. `unit::rows()`'s `norm::tanh_bf16` now states `x:
+/// Bf16sMut` itself, so the two `WRITES_*` copies became a SECOND POPULATION
+/// — a fixture outliving the gap it stood in for, free to drift from the
+/// thing it was standing in for with nothing to notice. They are deleted and
+/// the controls below compile the real rows.
+///
+/// **The two mutants stay synthetic and always must.** A mutant is by
+/// definition not a real row: if `unit::rows()` ever stated
+/// `norm::tanh_bf16`'s `x` as `Ty::F16sMut`, this test would be asserting
+/// that a correct row is refused.
+///
+/// # The count the old text carried, corrected
+///
+/// It said *"122 fn-world rows carry such a destination at 170 operand
+/// positions, and 12 more carry an f16 one at 13; those 183 are the dominant
+/// part of the fifth of operand positions the JIT's typecheck leaves
+/// unasserted."* The shape of that sentence was right — rows and positions
+/// are different quantities and it distinguished them — and every value in it
+/// was wrong, produced by an extractor that stopped at the first `]` of an
+/// operand list and so read one row per `fn`. Re-derived at `d737aad29` with
+/// each row's own `where [T = …]` substituted first:
+///
+/// **172 rows at 269 positions** — 252 bf16 (`*mut bf16` 245,
+/// `Option<NonNull<bf16>>` 7) and 17 f16 (`*mut f16` 11,
+/// `Option<NonNull<f16>>` 6), six rows carrying both. Tree-wide that took
+/// operand positions asserted from 1843/2207 (83%) to 2112/2207 (95%) and
+/// rows fully checked from 61 to 226.
+/// `tests/device_typecheck_types.rs`'s
+/// `the_written_sixteen_bit_positions_are_two_hundred_and_sixty_nine`
+/// re-derives 269 at run time; this is a note, not the check.
+///
+/// # Why this pair and not a synthetic kernel
+///
+/// `norm::tanh_bf16` and `norm::tanh_f16` are ONE `__global__` —
+/// `template <class T> __global__ void tanh_inplace(T* __restrict__ x, int n)`
+/// at `csrc/src/norm/altup_aux.cuh:189` — at two instantiations. So the
+/// mutant of each is the OTHER's correct type. That is the sharpest control
+/// available: `f16*` is not a nonsense spelling that a translation unit might
+/// reject for some incidental reason, it is a type this very template really
+/// has at the instantiation next door. A red here can only be the operand.
+///
+/// It also proves the two directions independently. A checker that spelled
+/// every sixteen-bit destination `bf16*` would pass the first half of this
+/// test and fail the second.
+///
+/// # And the whole unit, which is a different population
+///
+/// One row per compile is what makes a red attributable, and it is also a
+/// population of one. The last step compiles this unit's ENTIRE row set — the
+/// text the JIT itself hands `nvrtcCreateProgram` — and requires the number
+/// of `bf16*` destination assertions in it to equal the number of
+/// `Ty::Bf16sMut` operands the unit's rows state. A tag that rendered
+/// correctly for the hand-picked row and was dropped for the rest would pass
+/// everything above.
+#[test]
+fn a_written_bf16_is_asserted_as_bf16_by_the_jit() {
+    use kernels::{KernelSig, kernel, operands};
+
+    let Some(arch) = cache::arch() else {
+        eprintln!("SKIP a_written_bf16_is_asserted_as_bf16_by_the_jit: no CUDA device");
+        return;
+    };
+
+    const BF16: &str = "norm::tanh_bf16";
+    const F16: &str = "norm::tanh_f16";
+    const BF16_CPP: &str = "::pie_cuda_driver::kernels::device::bf16*";
+    const F16_CPP: &str = "::pie_cuda_driver::kernels::device::f16*";
+
+    // Each row claiming its SIBLING's destination format. Synthetic, and
+    // permanently so -- see the header.
+    static BF16_CLAIMS_F16: KernelSig = kernel!(tanh_inplace "norm::tanh_bf16",
+        file = Some("norm/altup_aux.cuh"),
+        operands = operands![
+            x: F16sMut,
+            n: I32,
+        ]);
+    static F16_CLAIMS_BF16: KernelSig = kernel!(tanh_inplace "norm::tanh_f16",
+        file = Some("norm/altup_aux.cuh"),
+        operands = operands![
+            x: Bf16sMut,
+            n: I32,
+        ]);
+
+    let (_, unit) = unit::unit_of(BF16).unwrap_or_else(|| {
+        panic!("`{BF16}` is in no unit -- this test's subject has moved and it is now checking nothing")
+    });
+    assert!(
+        unit.hosts(F16),
+        "`{BF16}` and `{F16}` are no longer in one unit, so the two halves below \
+         would be compiling different translation units and the symmetry this \
+         test rests on is gone"
+    );
+
+    // THE REAL ROWS CARRY THE WRITTEN KINDS. This loop used to pin the
+    // opposite -- it required the tree's own tag to still be `Ty::BufMut` and
+    // said "if it is already `{want:?}`, delete this test's copy and check the
+    // real row". This is that instruction, carried out: the copies are gone
+    // and the assertion is inverted, so a revert to `BufMut` fails here with
+    // a message rather than silently un-asserting 269 positions.
+    for (symbol, want) in [(BF16, kernels::Ty::Bf16sMut), (F16, kernels::Ty::F16sMut)] {
+        let real = unit.row(symbol).expect("the unit that hosts it holds it");
+        assert_eq!(
+            real.sig.operands.len(),
+            2,
+            "`{symbol}`'s arity moved; the mutants below are pinned to two operands"
+        );
+        assert_eq!(real.sig.operands[0].name, "x", "`{symbol}`'s first operand is not `x`");
+        assert_eq!(
+            real.sig.operands[0].ty, want,
+            "`{symbol}`'s `x` is stated {:?}. `x::abi`'s `ptr_abi!` tag is the only \
+             thing that sets it, and if it is back to `Ty::BufMut` then `void*` is \
+             being asserted -- a type every object pointer converts to, so nothing \
+             downstream would fail",
+            real.sig.operands[0].ty
+        );
+    }
+
+    // AND THE MUTANTS DIFFER FROM THEM IN EXACTLY `x`. With the copies gone
+    // this is the only thing tying the synthetic sigs to the tree; without it
+    // a mutant is free to drift and its refusal stops being about the operand
+    // it names.
+    for (sig, symbol, want) in [
+        (&BF16_CLAIMS_F16, BF16, kernels::Ty::F16sMut),
+        (&F16_CLAIMS_BF16, F16, kernels::Ty::Bf16sMut),
+    ] {
+        let real = unit.row(symbol).expect("held");
+        assert_eq!(real.sig.symbol, sig.symbol, "the mutant is a different row");
+        assert_eq!(real.sig.operands.len(), sig.operands.len(), "the mutant's arity drifted");
+        let differ: Vec<(&str, kernels::Ty, kernels::Ty)> = real
+            .sig
+            .operands
+            .iter()
+            .zip(sig.operands)
+            .inspect(|(a, b)| assert_eq!(a.name, b.name, "`{symbol}`: operands reordered"))
+            .filter(|(a, b)| a.ty != b.ty)
+            .map(|(a, b)| (a.name, a.ty, b.ty))
+            .collect();
+        assert_eq!(
+            differ.len(),
+            1,
+            "`{symbol}`'s mutant must differ from the real row in exactly one \
+             operand and differs in {differ:?}"
+        );
+        assert_eq!(differ[0].0, "x", "`{symbol}`'s mutant drifts the wrong operand");
+        assert_eq!(differ[0].2, want, "`{symbol}`'s mutant no longer claims the sibling's kind");
+    }
+
+    // THE CONTROLS. Each REAL row under its own format, one row per compile,
+    // so the result is about this row and not about the twenty others in the
+    // unit.
+    for (symbol, want) in [(BF16, BF16_CPP), (F16, F16_CPP)] {
+        let row = unit.row(symbol).expect("held");
+        let checked = unit.typecheck(&[row]).unwrap_or_else(|why| panic!("{}: {why}", unit.name));
+        assert_eq!(
+            checked.checked, 1,
+            "`{symbol}` is not fully checked under the written kind, so the mutant \
+             below cannot fail for the reason this test claims:\n{:?}",
+            checked.skipped
+        );
+        assert_eq!(
+            checked.asserted, checked.positions,
+            "an operand of `{symbol}` went unasserted:\n{:?}",
+            checked.skipped
+        );
+        assert!(
+            checked.text.contains(&format!("{want}>")),
+            "the destination is not asserted as `{want}`:\n{}",
+            checked.text
+        );
+        match nvrtc::compile_rows(unit, arch, &[row]) {
+            Ok(_) => {}
+            Err(nvrtc::CompileError::Toolchain { needs, have, .. }) => {
+                eprintln!("SKIP a_written_bf16_is_asserted: needs NVRTC {needs}, this box loads {have}");
+                return;
+            }
+            Err(why) => panic!(
+                "`{symbol}` does NOT compile with its destination asserted as \
+                 `{want}`. Either `Ty::{:?}`'s C++ spelling is wrong or the kernel \
+                 does not take what this test says it takes -- and until this is \
+                 green the mutant's red below proves nothing:\n{why}\n\n{}",
+                row.sig.operands[0].ty, checked.text
+            ),
+        }
+    }
+
+    // THE MUTANTS. Each row claiming the other's format.
+    for (sig, symbol, sibling) in
+        [(&BF16_CLAIMS_F16, BF16, F16), (&F16_CLAIMS_BF16, F16, BF16)]
+    {
+        let real = unit.row(symbol).expect("held");
+        let row = DeviceKernel { sig, template_path: real.template_path, elem: real.elem };
+        let Err(why) = nvrtc::compile_rows(unit, arch, &[&row]) else {
+            let text = unit.typecheck(&[&row]).expect("emitted");
+            panic!(
+                "`{symbol}` COMPILED with its destination asserted as `{sibling}`'s \
+                 format. The two sixteen-bit formats are the same WIDTH, so nothing \
+                 else in this tree would ever have said so -- and `Ty::Bf16sMut` and \
+                 `Ty::F16sMut` are two kinds instead of one `Ty::U16sMut` for exactly \
+                 this reason:\n\n{}",
+                text.text
+            );
+        };
+        let why = why.to_string();
+        assert!(
+            why.contains(symbol) || why.contains("static assert") || why.contains("static_assert"),
+            "`{symbol}` failed, but not on the assertion this test is about -- a \
+             compile that breaks for any other reason satisfies a `must not compile` \
+             test while proving nothing:\n{why}"
+        );
+    }
+
+    // THE WHOLE UNIT, which is the population the JIT actually compiles. Every
+    // row, one translation unit, and the count of destination assertions in it
+    // derived from the ROWS rather than read off the text it is checking.
+    let all: Vec<&DeviceKernel> = unit.rows.iter().collect();
+    let want_bf16 = unit
+        .rows
+        .iter()
+        .flat_map(|r| r.sig.operands)
+        .filter(|o| o.ty == kernels::Ty::Bf16sMut)
+        .count();
+    assert!(
+        want_bf16 > 1,
+        "`{}` states {want_bf16} written-bf16 destinations, so this step is the \
+         same population as the control above rather than a wider one",
+        unit.name
+    );
+    let whole = unit.typecheck(&all).unwrap_or_else(|why| panic!("{}: {why}", unit.name));
+    assert_eq!(
+        whole.text.matches(&format!("{BF16_CPP}>")).count(),
+        want_bf16,
+        "`{}` states {want_bf16} `Ty::Bf16sMut` operands and its typecheck asserts \
+         `{BF16_CPP}` at a different number of them -- a kind that renders for one \
+         hand-picked row and is dropped for the rest passes every check above",
+        unit.name
+    );
+    match nvrtc::compile_rows(unit, arch, &all) {
+        Ok(_) => {}
+        Err(nvrtc::CompileError::Toolchain { needs, have, .. }) => {
+            eprintln!("SKIP a_written_bf16_is_asserted (whole unit): needs {needs}, have {have}");
+        }
+        Err(why) => panic!(
+            "`{}` does not compile with all {want_bf16} of its bf16 destinations \
+             asserted, though the single-row control above did:\n{why}\n\n{}",
+            unit.name, whole.text
+        ),
+    }
+}

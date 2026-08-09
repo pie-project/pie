@@ -640,14 +640,11 @@ mod tests {
         in_place: &[],
         depth_prefix_plan: false,
         operands: &[],
-        returns: "",
         axes: &[],
         grid_param: None,
         head_param: None,
         heads_param: None,
         rows_param: None,
-        lowered_as: None,
-        publishes_aux: &[],
     }];
 
     impl Resolve for Store {

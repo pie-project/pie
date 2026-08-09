@@ -1,42 +1,3 @@
-//! `MLAPlan`: the DeepSeek-style scheduler, which balances *and* splits.
-//!
-//! # Why this one is different
-//!
-//! MLA attention has a 512-wide latent K/V and one shared head, so a single
-//! request's KV can be long enough that no assignment of whole requests to CTAs
-//! balances — the longest request alone sets the makespan. So this planner does
-//! both things the other two do only one of: it assigns QO tiles to clusters
-//! greedily like [`super::sm90`], **and** it chops a tile's KV range into
-//! chunks like [`super::prefill`], with a chunk limit derived from the batch
-//! rather than binary-searched.
-//!
-//! The limit is `f(ceil(total_kv / num_clusters))`, where `f` snaps to
-//! 32/64/128/192 and then to multiples of 256. Snapping matters: the chunk
-//! length is a loop bound in the kernel, and a ragged one costs a tail
-//! iteration on every cluster. The bound `merge_cta_counter <= num_sm` that
-//! makes the merge pass fit in one grid follows from `kv_len_limit *
-//! num_clusters >= total_kv_lens` — upstream writes the proof out in a comment
-//! and then checks it at runtime anyway, which is the right instinct and is
-//! kept here.
-//!
-//! # Clusters, not CTAs
-//!
-//! When the average packed QO length exceeds 64 rows the planner pairs CTAs
-//! into two-CTA clusters and doubles the QO tile to 128. `num_blks_x` is the
-//! cluster size and `num_blks_y` the cluster count, and the kernel is launched
-//! as that 2-D grid. A batch of single-token decodes gets `cluster_size = 1`
-//! and 64-row tiles; a batch with any real prefill in it gets 2 and 128 — one
-//! more place where a mixed batch is planned as neither of its halves.
-//!
-//! # Two bounds upstream writes past
-//!
-//! `merge_*` are sized `num_sm` and written at `merge_cta_counter` **before**
-//! the check that bounds it; the work arrays are sized `max_total_num_works =
-//! 16384` and written with `total_num_works` entries, unchecked. Both are
-//! refusals here ([`Error::MergeCtasExceedSm`], [`Error::TooManyWorks`]),
-//! because a heap overflow inside a planner is indistinguishable from a
-//! miscompiled kernel when it finally shows up.
-
 use super::alloc::{AlignedAllocator, Staging};
 use super::arith::{ceil_div_i32, ceil_div_i64, cost_function, packed_causal_kv_end};
 use super::heap::MinHeap;
@@ -44,10 +5,6 @@ use super::info::MlaPlanInfo;
 use super::{Device, Error, Plan, Workspace};
 
 /// The cap on work items MLA's index arrays are sized for.
-///
-/// `int max_total_num_works = 16384;  // NOTE(Zihao): adjust it later`. It is a
-/// constant, not a function of the batch — which is why the plan's int
-/// workspace is a fixed ~900 KiB whatever the batch looks like.
 pub const MAX_TOTAL_NUM_WORKS: i32 = 16384;
 
 /// The batch an MLA plan is built for.
@@ -102,7 +59,6 @@ pub struct Schedule {
     /// `kv_indptr[work]`.
     pub kv_indptr: Vec<i32>,
     /// `partial_indptr[work]` — the partial-output row this work item writes
-    /// at, or `-1` for a work item that writes the real output directly.
     pub partial_indptr: Vec<i32>,
     /// `q_len[work]`.
     pub q_len: Vec<i32>,
@@ -129,11 +85,6 @@ pub struct Schedule {
 }
 
 /// The KV chunk limit's step function.
-///
-/// `f(x)` in `MLAPlan`. Below 65 it snaps to one of four sizes; above, to a
-/// multiple of 256. Not `x` itself: the kernel's KV loop is written for a
-/// chunk length it can tile, and a 193-token chunk costs the same as a
-/// 256-token one.
 #[must_use]
 pub const fn kv_len_limit_step(x: i32) -> i32 {
     if x <= 8 {
@@ -150,24 +101,13 @@ pub const fn kv_len_limit_step(x: i32) -> i32 {
 }
 
 /// Build the MLA schedule without laying it out in a workspace.
-///
-/// # Errors
-///
-/// [`Error::EmptyBatch`] (upstream divides by `batch_size`),
-/// [`Error::NegativeSpan`], [`Error::MergeCtasExceedSm`],
-/// [`Error::TooManyWorks`], [`Error::IndptrTooShort`].
 #[allow(clippy::too_many_lines)]
 pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
     let batch_size = req.batch_size as usize;
     if batch_size == 0 {
-        // DEVIATION: `accum_packed_qo_len / batch_size` below. See
-        // `error::Error::EmptyBatch`.
         return Err(Error::EmptyBatch);
     }
     if device.num_sm == 0 {
-        // Upstream would build a zero-capacity heap and pop it. There is no
-        // device with no SMs, so this is a guard on a bad `Device`, not a port
-        // of anything.
         return Err(Error::MergeCtasExceedSm { counter: 0, num_sm: 0 });
     }
     for (array, len, needed) in [
@@ -180,9 +120,6 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
         }
     }
 
-    // step 0: the grid shape. `qo_len * num_heads` is `int * uint32_t`, so it
-    // is computed unsigned and truncated back -- as is the average, which is an
-    // `int` divided by a `uint32_t`.
     let mut accum_packed_qo_len: i32 = 0;
     let mut idx_qo_kv_len: Vec<(i32, i32, i32)> = Vec::with_capacity(batch_size);
     for i in 0..batch_size {
@@ -197,13 +134,10 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
         }
         let packed_qo_len = (qo_len as u32).wrapping_mul(req.num_heads) as i32;
         accum_packed_qo_len = accum_packed_qo_len.wrapping_add(packed_qo_len);
-        // Note what is *not* checked: `kv_len_arr[i] < 0`. FA3's planner refuses
-        // it and this one does not, and the difference is upstream's.
         idx_qo_kv_len.push((i as i32, qo_len, req.kv_len_arr[i]));
     }
     let avg_packed_qo_len = ((accum_packed_qo_len as u32) / req.batch_size) as i32;
 
-    // Two CTAs in a cluster once the average tile is more than 64 rows.
     let cluster_size: i32 = if avg_packed_qo_len > 64 { 2 } else { 1 };
     let num_clusters = device.num_sm / cluster_size as u32;
     if num_clusters == 0 {
@@ -215,7 +149,6 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
     const CTA_TILE_Q: i32 = 64;
     let cluster_tile_q = cluster_size * CTA_TILE_Q;
 
-    // The KV the batch will actually read, which sets the chunk limit.
     let mut total_kv_lens: i64 = 0;
     for &(_, qo_len, kv_len) in &idx_qo_kv_len {
         let packed_qo_len = (qo_len as u32).wrapping_mul(req.num_heads) as i32;
@@ -239,7 +172,6 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
     let kv_len_limit =
         kv_len_limit_step(ceil_div_i64(total_kv_lens, i64::from(num_clusters)).max(1) as i32);
 
-    // step 1: greedy assignment, with a split when a tile's KV exceeds the limit.
     let mut heap = MinHeap::new(num_clusters);
     let mut clusters = vec![ClusterWork::default(); num_clusters as usize];
     let num_sm = device.num_sm as usize;
@@ -273,15 +205,8 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
             let row_tile_size =
                 cluster_tile_q.min(packed_qo_len.wrapping_sub(qo_tile_idx * cluster_tile_q));
             if split_kv {
-                // Proof(Zihao): merge_cta_counter <= num_sm, given
-                //   kv_len_limit * num_clusters >= total_kv_lens, and
-                //   num_qo_chunks <= max(remaining_len * cluster_size / kv_len_limit, 1).
-                // Checked anyway, below -- upstream writes these arrays first
-                // and checks afterwards, which is a heap overflow on the path
-                // where the proof is wrong.
                 let num_qo_chunks =
                     (remaining_len.wrapping_mul(cluster_size) / kv_len_limit).max(1);
-                // row_chunk_size * num_qo_chunks >= row_tile_size
                 let row_chunk_size = ceil_div_i32(row_tile_size, num_qo_chunks);
                 let current_q_tile_end =
                     cluster_tile_q.min(packed_qo_len.wrapping_sub(qo_tile_idx * cluster_tile_q));
@@ -294,8 +219,6 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
                             num_sm: i64::from(device.num_sm),
                         });
                     }
-                    // `qo_indptr_h[i] * num_heads` is `int32_t * uint32_t`:
-                    // unsigned, then truncated back into the `IdType` array.
                     let base = (req.qo_indptr[i as usize] as u32)
                         .wrapping_mul(req.num_heads)
                         .wrapping_add((qo_tile_idx * cluster_tile_q) as u32);
@@ -316,8 +239,6 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
                     offset_start = offset_start.wrapping_add(row_chunk_size);
                 }
             }
-            // A zero-length tile still gets exactly one work item: the kernel
-            // must write its zeros and its LSE somewhere.
             let zero_kv_len = remaining_len == 0;
             while remaining_len > 0 || zero_kv_len {
                 let (cluster_idx, accum_cost) = heap.pop();
@@ -362,8 +283,6 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
     }
     let total_num_works = *work_indptr.last().expect("work_indptr has num_clusters + 1 entries");
     if total_num_works > MAX_TOTAL_NUM_WORKS {
-        // Not upstream's check -- upstream has none, and copies `total_num_works`
-        // entries into an array sized for the cap.
         return Err(Error::TooManyWorks {
             total: i64::from(total_num_works),
             max: i64::from(MAX_TOTAL_NUM_WORKS),
@@ -398,15 +317,6 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
 }
 
 /// `MLAPlan` — the plan, and the bytes to upload under it.
-///
-/// The float workspace holds the partial output and its log-sum-exp, and it is
-/// sized from the *grid*, not the batch: `2 * num_clusters * cluster_tile_q`
-/// rows. `sizeof_dtype_o` is a `constexpr size_t 2` upstream — MLA's output is
-/// always 16-bit — so it is not a parameter here either.
-///
-/// # Errors
-///
-/// Everything [`schedule`] refuses, plus [`Error::WorkspaceOverflow`].
 pub fn plan(
     req: &Request<'_>,
     device: &Device,
@@ -515,7 +425,6 @@ mod tests {
     }
 
     /// A batch of single-token decodes gets one-CTA clusters and 64-row tiles;
-    /// nothing is split, so every work item writes the output directly.
     #[test]
     fn a_decode_batch_gets_one_cta_clusters() {
         let qo: Vec<i32> = (0..=8).collect();
@@ -540,8 +449,6 @@ mod tests {
     }
 
     /// One very long sequence beside short ones is the case the KV split
-    /// exists for: the long one's tile becomes several work items with
-    /// disjoint, contiguous KV ranges, and it is the only one that does.
     #[test]
     fn a_long_sequence_is_chopped_into_contiguous_kv_ranges() {
         let qo = [0i32, 1, 2];
@@ -565,7 +472,6 @@ mod tests {
     }
 
     /// A zero-length KV still gets a work item, because the kernel must write
-    /// its zeros somewhere.
     #[test]
     fn a_zero_length_request_still_gets_one_work_item() {
         let qo = [0i32, 1];
@@ -598,7 +504,6 @@ mod tests {
     }
 
     /// The int workspace does not depend on the batch — it is `max_total_num_works`
-    /// wide whatever happens, which is worth knowing before sizing one.
     #[test]
     fn the_int_workspace_is_a_constant_size() {
         let small_qo = [0i32, 1];

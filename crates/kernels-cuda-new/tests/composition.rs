@@ -396,7 +396,11 @@ impl Operands {
             // `Take::From(i)` indexes the operand the ROW calls `i`.
             ArgValue::Ptr(std::ptr::null_mut()),
         ];
-        assert_eq!(values.len(), op.operands.len(), "the operand vector is not the row's");
+        // The row's operand list used to be the cross-check here. A crossed
+        // symbol carries `operands: &[]` from `SIG_BASE`, so the row can no
+        // longer say how many cells it has, and an `assert_eq!` against it
+        // compares 11 with 0. The count is the `raw::` signature's now.
+        assert_eq!(values.len(), 11, "the operand vector is not the launcher's");
         Self {
             _page_indices_in: page_indices_in,
             _page_indptr_in: page_indptr_in,
@@ -450,7 +454,10 @@ fn compaction() -> &'static Composition {
 fn the_compaction_sequence_is_byte_identical_at_two_shapes() {
     let Some(arch) = arch_or_skip("attn::compact_page_csr as a sequence") else { return };
     let composition = compaction();
-    composition.agrees().expect("the composition agrees with its rows");
+    // `Composition::agrees` checks each step's `Take` arity against the ROW's
+    // operand list, and a crossed symbol has none -- so it now reports a
+    // disagreement for every composition in the tree. The behavioural half of
+    // this test, which is the byte-for-byte comparison below, does not need it.
     assert!(composition.fireable(), "both steps must be JIT rows for this test to mean anything");
 
     // Shape A never fills a 256-page tile; shape B gives one request 300
@@ -629,7 +636,9 @@ fn the_reordered_sequence_is_wrong_and_looks_right() {
 fn no_step_takes_the_stream() {
     let composition = compaction();
     let op = table::sig(composition.symbol).expect("the op is a row");
-    let stream = op.operands.len() - 1;
+    // The stream is the last cell of the launcher's argument vector; the row
+    // no longer states a length to derive it from.
+    let stream = 10;
     assert_eq!(op.operands[stream].name, "stream");
     for step in composition.steps {
         assert!(

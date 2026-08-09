@@ -43,7 +43,7 @@
 //!
 //! # Three groups, because a compile should not carry what it cannot need
 //!
-//! `SHIM` and `LIBRARY` go to every unit. `UPSTREAM` is 1.2 MB of somebody
+//! `SHIM` and `LIBRARY` go to every unit. `UPSTREAM` is 1.1 MB of somebody
 //! else's attention library, and `nvrtcCreateProgram` copies every byte it is
 //! handed, so a `norm` kernel does not get it. Which units want `UPSTREAM` is
 //! stated by the units.
@@ -157,7 +157,7 @@ const NOT_SOURCE: &[&str] = &["LICENSE", "NOTICE", "MODIFICATIONS", "README", "R
 ///
 /// Prefixes and not directory names, and with the trailing slash spelled:
 /// `starts_with("attn/xqa")` would also claim a file called
-/// `attn/xqa_helpers.cuh`, which is the kind of near-miss that puts 1.2 MB
+/// `attn/xqa_helpers.cuh`, which is the kind of near-miss that puts 1.1 MB
 /// into the wrong group without changing a count anyone reads.
 const UPSTREAM_TREES: &[&str] = &["attn/flashinfer/", "attn/xqa/"];
 

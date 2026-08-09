@@ -19,14 +19,9 @@
 
 #include <cstdint>
 #include <cuda/std/limits>
-// PIE: guarded for NVRTC -- host-only `<sstream>`. `<cuda/std/limits>` above it is NOT
-// guarded: `cuda::std::numeric_limits<float>::infinity()` is the initial value of every
-// softmax accumulator in this file's device code, so that header is carried, not hidden.
-// Upstream is unmodified apart from markers of this form; see NOTICE. Removing them
-// restores the file.
-#ifndef __CUDACC_RTC__
-#include <sstream>
-#endif
+// PIE: REMOVED -- host-only `<sstream>`. 1 line of host C++, guarded out of every NVRTC
+// compile before it was removed, so removing it changes no compile. This marker is one a strip
+// does NOT undo; see MODIFICATIONS.
 
 #include "../profiler.cuh"
 #include "mla_params.cuh"
@@ -1119,42 +1114,10 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
     return cudaErrorNotSupported;                                                       \
   }
 
-template <MaskMode MASK_MODE, uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename Params>
-cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t num_blks_y,
-                                   cudaStream_t stream) {
-  using DTypeQ = typename Params::DTypeQ;
-  using DTypeKV = typename Params::DTypeKV;
-  using DTypeO = typename Params::DTypeO;
-  using IdType = typename Params::IdType;
-  if (MASK_MODE == MaskMode::kCustom) {
-    return cudaErrorNotSupported;
-  }
-  constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
-
-  dim3 nblks(num_blks_x, num_blks_y);
-  dim3 nthrs(32, 4, 2);
-
-  // get GPU shared memory size
-  int device;
-  int smem_limit_per_sm;
-  cudaGetDevice(&device);
-  cudaDeviceGetAttribute(&smem_limit_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
-
-  DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, QK_SHARD, {
-    using KTraits = KernelTraits<CAUSAL, NUM_STAGES, QK_SHARD, HEAD_DIM_CKV, HEAD_DIM_KPE,
-                                 /*CTA_TILE_Q_=*/64, CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType>;
-    size_t smem_size = sizeof(typename KTraits::SharedStorage);
-    auto kernel = BatchMLAPagedAttentionKernel<KTraits, Params>;
-    void* args[] = {(void*)&params};
-
-    FLASHINFER_CUDA_CALL(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(
-        cudaLaunchCooperativeKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-  });
-
-  return cudaSuccess;
-}
+// PIE: REMOVED -- `BatchMLAPagedAttention`, a host launcher. 36 lines of host C++ that built a
+// `void* args[]` for `cudaLaunchKernel`. Unguarded and unreached -- NVRTC parsed it as an
+// uninstantiated template, which is a weaker shield than a guard. Rust plans and fires these
+// kernels with `cuLaunchKernel`. This marker is one a strip does NOT undo; see MODIFICATIONS.
 
 }  // namespace mla
 

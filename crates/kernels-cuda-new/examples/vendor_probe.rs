@@ -30,8 +30,8 @@
 //! `new-horizon.md` §14 sets the bar a vendoring has to meet, and it is not
 //! *"it compiles"*:
 //!
-//! * **strippable back to upstream byte for byte** — 35 guards over 226 added
-//!   lines across 28 files today, every one marked `// PIE:`;
+//! * **strippable back to upstream byte for byte** — 33 guards over 208 added
+//!   lines across 24 files today, every one marked `// PIE:`;
 //! * every `#include` answered by the carried header set or by a shim, **never
 //!   by the toolkit**;
 //! * `NOTICE`, `MODIFICATIONS` and upstream's `LICENSE` carried beside it.
@@ -44,7 +44,7 @@
 //! 2. **the externals** — every `#include` that leaves the FlashInfer tree,
 //!    split into *carried by name* (a shim or a vendored stub answers it),
 //!    *guarded in the baseline* (the 23 host includes §13.6 sorted out, which
-//!    the existing 28 files already guard away), and **unanswered**;
+//!    the existing 24 files already guard away), and **unanswered**;
 //! 3. **NVRTC** — the real compile, with the real header set, at `sm_89`, with
 //!    `--device-as-default-execution-space` and the same three float flags
 //!    `runtime::nvrtc` uses, because a cubin built under different arithmetic
@@ -1585,7 +1585,7 @@ __host__ __device__ inline unsigned long long* barrier_native_handle(
             // answer -- including the ones this report calls
             // "guarded-in-baseline". That is not a shortcut, it is what the
             // baseline IS: `<utility>` is not answered by anything, it is
-            // `#ifndef __CUDACC_RTC__`-ed away in the 28 files that reach it,
+            // `#ifndef __CUDACC_RTC__`-ed away in the 24 files that reach it,
             // and a NEW file needs its OWN guard. An empty header is that
             // guard, applied from the outside, so the stub count IS the guard
             // count the vendoring would pay.

@@ -292,8 +292,7 @@ fn a_served_symbol_is_never_hosted() {
 /// the symbol executes.
 #[test]
 fn the_lookup_agrees_with_the_tables_it_reads() {
-    let (mut jit, mut served, mut composed, mut walked, mut pending) =
-        (0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut jit, mut served, mut composed, mut pending) = (0usize, 0usize, 0usize, 0usize);
     for row in table::KERNELS {
         match execution::execution(row.symbol) {
             Some(execution::Execution::Jit(kernel)) => {
@@ -323,63 +322,25 @@ fn the_lookup_agrees_with_the_tables_it_reads() {
                     row.symbol
                 );
             }
-            Some(execution::Execution::Walk(walk)) => {
-                walked += 1;
-                assert_eq!(walk.symbol, row.symbol, "the walk table answers the wrong row");
-                assert!(
-                    unit::unit_of(row.symbol).is_none(),
-                    "{} answers `Walk` and a unit hosts it -- a walk is a HOST program whose \
-                     shape comes from the input, and `fire` takes a `Dims` that has no meaning \
-                     for one",
-                    row.symbol
-                );
-                assert!(
-                    execution::service(row.symbol).is_none(),
-                    "{} answers `Walk` and a service serves it",
-                    row.symbol
-                );
-                assert!(
-                    execution::composition(row.symbol).is_none(),
-                    "{} answers `Walk` and a composition states it -- a fixed sequence and an \
-                     input-shaped one are different claims about the same program, and at most \
-                     one of them is true",
-                    row.symbol
-                );
-            }
             None => pending += 1,
         }
     }
     assert_eq!(served, execution::SERVED.len(), "a served row is not a table row");
     assert_eq!(composed, execution::COMPOSED.len(), "a composed row is not a table row");
-    // Not `WALKED.len()`: three of the walks are `driver_internal` rows,
-    // which `table::KERNELS` deliberately does not hold (`table/mod.rs`'s
-    // `the_driver_internal_rows_are_not_statable`). The denominator is the
-    // walks a model text CAN state, and this loop is over exactly those.
-    // (It was "three of the five" until the `norm/` and `rope/` launchers
-    // became `driver-cuda/src/fire/{rmsnorm,rope,dsv4_hc}.rs`, which added
-    // fifteen statable walks at once; the filter is why that needed no edit
-    // here.)
-    // `execution::tests::every_walk_agrees_and_is_stated_once` is what checks
-    // the other three against the table that does hold them.
-    let statable_walks =
-        execution::WALKED.iter().filter(|w| table::sig(w.symbol).is_some()).count();
-    assert_eq!(walked, statable_walks, "a walked row is not a table row");
-    // `walked > 0` LEFT THIS CONJUNCTION AND `walked` IS STILL PRINTED.
-    //
-    // `execution::WALKED` is empty: `attn::qkv_decode_qk_norm_rope_write_kv_\
-    // bf16` was its last entry and the last row in `table::ROW_TABLES`, and
-    // both went in the same index. The other three floors stay because their
-    // arms still have members; this one would assert that a list the
-    // migration exists to empty is not empty. It stays in the message so a
-    // future non-zero is visible rather than silent.
+    // `WALKED` AND ITS DENOMINATOR STOOD HERE. The list is gone with the
+    // `Walk` type, so there is no fourth arm to count and no `statable_walks`
+    // to compare it against. The comment that stood here explained why the
+    // denominator was a FILTER (`driver_internal` rows are not statable) —
+    // preserved in the record below `WALKED` in `execution.rs`, which is
+    // where a reader looking for it will land.
     assert_eq!(
-        jit + served + composed + walked + pending,
+        jit + served + composed + pending,
         table::KERNELS.len(),
         "the lookup is not total"
     );
     assert!(
         jit > 100 && composed > 0 && pending > 0,
-        "the arms are not all exercised: {jit} jit, {composed} composed, {walked} walked, \
+        "the arms are not all exercised: {jit} jit, {composed} composed, \
          {pending} pending"
     );
 }

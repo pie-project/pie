@@ -114,20 +114,25 @@ members = [
 
     # -- kernels-*: the device kernels, and the words their tables use ------
     # `kernels` is bare for the reason `driver` is: it is the shared floor
-    # under a prefixed pair, holding what both backends' tables are written
-    # in rather than anything either backend does. The two implementation
-    # crates default to table-only -- `native` is what costs nvcc.
+    # under the prefixed backends, holding what all of their tables are
+    # written in rather than anything any one of them does.
     "crates/kernels",
-    "crates/kernels-cuda",
+    # `crates/kernels-cuda` STOOD HERE, and the sentence above it used to end
+    # "-- the two implementation crates default to table-only, `native` is
+    # what costs nvcc." There is no longer a CUDA pair to be the floor under
+    # and no `native` on this side to cost anything: the archive crate is
+    # deleted and the JIT below is the CUDA half entire.
     # The JIT-native shape of the CUDA half: the table, the device sources
     # carried in the binary, and the runtime that NVRTC-compiles and fires
     # them. No CMake, no archive, no `links` key -- a kernel is text, so there
-    # is nothing to build ahead of time and nothing to link. It builds beside
-    # `kernels-cuda` while both paths must run, and HOLDS the rows both read:
-    # the seam that had it borrow them closed by moving the table here and
-    # inverting the edge, so `kernels-cuda` depends on this and re-exports
-    # what it used to own. A symbol still has exactly one contract; the crate
-    # that authors it is now the one a row is written for.
+    # is nothing to build ahead of time and nothing to link. It built beside
+    # `kernels-cuda` while both paths had to run, and HOLDS the rows both
+    # read: the seam that had it borrow them closed by moving the table here
+    # and inverting the edge, so `kernels-cuda` depended on this and
+    # re-exported what it used to own. That inversion is why the archive could
+    # be deleted at all -- the arrow pointed at this crate, so nothing here
+    # had to move when the other end went. A symbol still has exactly one
+    # contract; the crate that authors it is the one a row is written for.
     "crates/kernels-cuda-new",
     "crates/kernels-metal",
     # The Vulkan tree. Its table is `kernels-metal`'s coverage, row for row, so
@@ -201,7 +206,6 @@ default-members = [
     "crates/model-compiler",
     "crates/model-loader",
     "crates/kernels",
-    "crates/kernels-cuda",
     "crates/kernels-cuda-new",
     "crates/kernels-metal",
     "crates/kernels-vulkan",
