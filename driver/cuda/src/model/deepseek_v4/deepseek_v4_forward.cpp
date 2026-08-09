@@ -209,7 +209,6 @@ DsV4Workspace DsV4Workspace::allocate(
 
     // Routed experts: weights are sharded on intermediate dim → moe_I / T.
     const int local_moe_I_ws = moe_I / std::max(1, tp_size);
-    const int native_moe_I_ws = ((local_moe_I_ws + 127) / 128) * 128;
     ws.expert_in     = DeviceTensor::allocate(DType::BF16,{N, H});
     ws.expert_gate_w = DeviceTensor::allocate(DType::BF16,{local_moe_I_ws, H});
     ws.expert_up_w   = DeviceTensor::allocate(DType::BF16,{local_moe_I_ws, H});
@@ -244,10 +243,8 @@ DsV4Workspace DsV4Workspace::allocate(
         ws.aligned_route_ids  = DeviceTensor::allocate(DType::INT32, {aligned_rows});
         ws.aligned_expert_ids = DeviceTensor::allocate(DType::INT32, {max_blocks});
         ws.aligned_expert_in  = DeviceTensor::allocate(DType::BF16, {aligned_rows, H});
-        // Native Marlin writes the padded width; the BF16 paths use the same
-        // allocations at their tighter logical stride.
-        ws.aligned_gate_up    = DeviceTensor::allocate(DType::BF16, {aligned_rows, 2 * native_moe_I_ws});
-        ws.aligned_act        = DeviceTensor::allocate(DType::BF16, {aligned_rows, native_moe_I_ws});
+        ws.aligned_gate_up    = DeviceTensor::allocate(DType::BF16, {aligned_rows, 2 * local_moe_I_ws});
+        ws.aligned_act        = DeviceTensor::allocate(DType::BF16, {aligned_rows, local_moe_I_ws});
         ws.aligned_out        = DeviceTensor::allocate(DType::BF16, {aligned_rows, H});
         const std::int64_t pw =
             static_cast<std::int64_t>(max_blocks) * sizeof(void*) / sizeof(std::int64_t);
@@ -255,15 +252,6 @@ DsV4Workspace DsV4Workspace::allocate(
                                 &ws.a_dn_ptrs, &ws.b_dn_ptrs, &ws.c_dn_ptrs}) {
             *t = DeviceTensor::allocate(DType::INT64, {std::max<std::int64_t>(pw, 1)});
         }
-#ifdef PIE_CUDA_HAS_MARLIN_MOE
-        ws.marlin_num_tokens_past_padded =
-            DeviceTensor::allocate(DType::INT32, {1});
-        ws.marlin_workspace = DeviceTensor::allocate(
-            DType::UINT8,
-            {static_cast<std::int64_t>(
-                marlin_moe::marlin_moe_workspace_bytes(
-                    std::max(native_moe_I_ws, H), 16))});
-#endif
     }
 
     const int O = max_logit_rows > 0 ? max_logit_rows : N;
@@ -1201,17 +1189,28 @@ void dsv4_forward_paged(
                 throw std::runtime_error(
                     "deepseek_v4: native MXFP4 Marlin scratch geometry mismatch");
             }
+            const std::size_t marlin_workspace_bytes =
+                marlin_moe::marlin_moe_workspace_bytes(std::max(Ip, H), 16);
+            if (Ip != local_moe_I ||
+                ws.expert_gate_w.nbytes() < marlin_workspace_bytes) {
+                throw std::runtime_error(
+                    "deepseek_v4: native MXFP4 Marlin workspace mismatch");
+            }
+            // These BF16 fallback buffers are unreachable when the contract
+            // publishes native banks. Reuse them so native support adds no
+            // workspace bytes to the BF16 or streamed configurations.
+            void* marlin_workspace = ws.expert_gate_w.data();
+            auto* marlin_num_tokens_past_padded =
+                static_cast<std::int32_t*>(ws.route_idx.data());
             CUDA_CHECK(cudaMemsetAsync(
-                ws.marlin_workspace.data(), 0,
-                ws.marlin_workspace.nbytes(), stream));
+                marlin_workspace, 0, marlin_workspace_bytes, stream));
             kernels::launch_moe_align_decode(
                 static_cast<const std::int32_t*>(ws.topk_idx.data()),
                 static_cast<std::int32_t*>(ws.aligned_route_ids.data()),
                 static_cast<std::int32_t*>(ws.aligned_expert_ids.data()),
                 /*route_to_aligned_row=*/nullptr,
                 routes, E, marlin_block, max_blocks,
-                static_cast<std::int32_t*>(
-                    ws.marlin_num_tokens_past_padded.data()),
+                marlin_num_tokens_past_padded,
                 stream);
 
             auto* gate_out =
@@ -1225,13 +1224,12 @@ void dsv4_forward_paged(
                 marlin_moe::launch_mxfp4_moe_gemm_w4a16_bf16(
                     act, packed, scales, /*bias=*/nullptr, out,
                     /*reduce_scratch=*/nullptr,
-                    ws.marlin_workspace.data(),
+                    marlin_workspace,
                     static_cast<const std::int32_t*>(
                         ws.aligned_route_ids.data()),
                     static_cast<const std::int32_t*>(
                         ws.aligned_expert_ids.data()),
-                    static_cast<const std::int32_t*>(
-                        ws.marlin_num_tokens_past_padded.data()),
+                    marlin_num_tokens_past_padded,
                     /*topk_weights=*/nullptr,
                     marlin_block, E, top_k,
                     /*mul_topk_weights=*/false,

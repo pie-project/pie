@@ -955,8 +955,6 @@ if(PIE_CUDA_BUILD_MARLIN OR PIE_CUDA_BUILD_MARLIN_MOE)
     third_party/marlin/marlin_repack.cpp)
   target_include_directories(pie_driver_cuda_lib PRIVATE
     third_party/marlin)
-  target_compile_definitions(pie_driver_cuda_lib PRIVATE
-    PIE_CUDA_HAS_MARLIN_MXFP4_REPACK=1)
 endif()
 
 # The expert-indexed MoE variant of the same kernel. Separate directory and

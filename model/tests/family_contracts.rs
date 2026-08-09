@@ -1466,7 +1466,7 @@ fn deepseek_v4_native_cuda_keeps_imported_mxfp4_packed() {
     assert_eq!(resolved, Mxfp4MoePolicy::NativeGemm);
     assert_imported_block_scale_decodes(&contract);
     for half in ["gate", "up", "down"] {
-        let weight_name = format!("layers.0.ffn.experts.{half}.weight");
+        let weight_name = format!("layers.0.ffn.experts.marlin.{half}.weight");
         let weight = contract
             .tensors
             .iter()
@@ -1480,7 +1480,7 @@ fn deepseek_v4_native_cuda_keeps_imported_mxfp4_packed() {
         let scale = contract
             .tensors
             .iter()
-            .find(|tensor| tensor.name == format!("layers.0.ffn.experts.{half}.scale"))
+            .find(|tensor| tensor.name == format!("layers.0.ffn.experts.marlin.{half}.scale"))
             .unwrap_or_else(|| panic!("native {half} scale is published"));
         assert_eq!(scale.encoding, Encoding::Raw(DType::U8));
         assert_eq!(

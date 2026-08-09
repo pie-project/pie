@@ -13,7 +13,7 @@ use pie_loader::types::{
     DType, Encoding, QuantGranularity, RepackLayout, ScaleForm, TensorId, Visibility,
 };
 
-use pie_model_common::builder::{Builder, align_up, is_raw, mxfp4_encoding};
+use pie_model_common::builder::{Builder, is_raw, mxfp4_encoding};
 use pie_model_common::policy::{Mxfp4MoePolicy, Mxfp4MoeRequest};
 
 fn fail<T>(what: impl Into<String>) -> Result<T, Error> {
@@ -220,7 +220,12 @@ fn native_expert_stacks(b: &mut Builder<'_>) -> Result<(), Error> {
             continue;
         }
         let experts = gate.len() as i64;
-        let native_inter = align_up(local_inter, 128)?;
+        if local_inter % 128 != 0 {
+            return fail(format!(
+                "deepseek_v4 native expert stack: local intermediate {local_inter} must be a multiple of 128"
+            ));
+        }
+        let native_inter = local_inter;
 
         let mut publish = |half: &str,
                            weights: Vec<Expr>,
@@ -229,7 +234,7 @@ fn native_expert_stacks(b: &mut Builder<'_>) -> Result<(), Error> {
                            cols: i64,
                            encoding: Encoding|
          -> Result<(), Error> {
-            let weight_name = format!("{ffn}experts.{half}.weight");
+            let weight_name = format!("{ffn}experts.marlin.{half}.weight");
             b.push_repack(
                 weight_name.clone(),
                 Expr::concat(0, weights),
@@ -237,7 +242,7 @@ fn native_expert_stacks(b: &mut Builder<'_>) -> Result<(), Error> {
                 encoding,
                 vec![experts, rows, cols],
             );
-            let scale_name = format!("{ffn}experts.{half}.scale");
+            let scale_name = format!("{ffn}experts.marlin.{half}.scale");
             let scale = b.push_repack(
                 scale_name,
                 Expr::concat(0, scales),

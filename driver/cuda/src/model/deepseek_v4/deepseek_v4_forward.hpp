@@ -116,8 +116,6 @@ struct DsV4Workspace {
     DeviceTensor aligned_out;         // [aligned_rows, H]
     DeviceTensor a_gu_ptrs, b_gu_ptrs, c_gu_ptrs;
     DeviceTensor a_dn_ptrs, b_dn_ptrs, c_dn_ptrs;
-    DeviceTensor marlin_num_tokens_past_padded;  // [1] int32
-    DeviceTensor marlin_workspace;               // lock/reduction workspace
     int aligned_block_size = 0;
     int aligned_max_blocks = 0;
 
