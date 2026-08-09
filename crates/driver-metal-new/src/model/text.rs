@@ -239,13 +239,56 @@ pub fn facts_from(
         // Whether the ladder is RESCALED, in which case no base expresses it
         // and the driver hands over a table instead.
         rope_freq_table: geometry.rope_freq_factor > 0.0,
+        // gemma's side network, asked of the TENSORS: a checkpoint that ships
+        // a per-layer embedding table is a deployment that has one.
+        per_layer_emb_dim: 0,
+        per_layer_scalar: false,
+        dense_beside_moe: false,
+        // The CONFIG's, not a tensor's. Asking layer 0 was the first draft
+        // and it is a SLIDING layer, which ships its `v_proj` — only the full
+        // ones do not, and a fact derived from the wrong layer is false for
+        // exactly the deployment it describes.
+        v_from_k: geometry.attention_k_eq_v,
+        kv_shared_layers: 0,
+        // gemma's readout cap. Zero is "none" and the text names nothing.
+        logit_softcap: geometry.final_logit_softcap,
+        // Asked of the TENSORS: a sink is a weight, and a checkpoint that
+        // ships one is a deployment that has them.
+        attn_sinks: has_tensor("layers.0.self_attn.sinks"),
+        // WHICH activation. A swiglu limit of zero is "this deployment is not
+        // gpt-oss" and not a clamp at zero, which would zero the gate branch
+        // entirely. `Geglu` is gemma's and reaches here when a gemma text does.
+        activation: if geometry.swiglu_limit > 0.0 {
+            model::families::llama_like::forward::facts::Activation::SwiGlu {
+                limit: geometry.swiglu_limit,
+                alpha: geometry.swiglu_alpha,
+            }
+        } else {
+            model::families::llama_like::forward::facts::Activation::SiluMul
+        },
         // Empty is every layer attending the whole context, which is what a
         // llama-like deployment does. `DecodeGeometry` carries no window at
         // all, so this is the honest answer and not a default: the families
         // that alternate (gemma4, gpt-oss) will need the geometry to state one
         // before their texts can, and stating it here from nothing would make
         // that a silent wrong answer instead of a missing one.
-        window_left: Vec::new(),
+        // Which layers slide. A gemma4 stack alternates: every
+        // `full_attn_every`-th layer attends everything and the rest attend a
+        // window. Empty for a deployment that does not alternate, which is
+        // every llama-like one.
+        window_left: if geometry.full_attn_every > 1 && geometry.sliding_window > 0 {
+            (0..geometry.n_layers)
+                .map(|l| {
+                    if (l + 1).is_multiple_of(geometry.full_attn_every) {
+                        -1
+                    } else {
+                        i32::try_from(geometry.sliding_window).unwrap_or(-1)
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
     };
     (facts, metal)
 }

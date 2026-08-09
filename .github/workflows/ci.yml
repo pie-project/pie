@@ -451,6 +451,29 @@ jobs:
             target
           key: ${{ runner.os }}-pie-worker-metal-${{ hashFiles('**/Cargo.lock', 'crates/driver-metal/csrc/CMakeLists.txt') }}
 
+      # `driver-metal-new` is an OPTIONAL feature of `engine`, so a plain
+      # `cargo test -p engine` builds its seam OUT. The file that joins the new
+      # Metal driver to the engine went weeks without a compiler reading it and
+      # accumulated seven type errors; this is the job that would have caught
+      # them on the first push.
+      #
+      # Type-check and test, not just build: `engine/tests/metal_seam.rs` runs
+      # everything that does not need a checkpoint, and the checkpoint-gated
+      # test states that it skipped and why.
+      - name: cargo test (engine, driver-metal-new seam)
+        run: cargo test -p engine --features driver-metal-new
+
+      - name: cargo test (driver-metal-new)
+        run: cargo test -p driver-metal-new
+
+      # The name gate needs no GPU and no weights — `compile_load_plan` reads
+      # a snapshot's metadata and publishes every tensor the load WILL stage.
+      # An index and a config are a few hundred kilobytes, so this is the one
+      # checkpoint-shaped check a runner can actually do. It states that it
+      # skipped when `PIE_METAL_NAMES_SNAPSHOT` is unset.
+      - name: cargo test (metal name gate)
+        run: cargo test -p driver-metal-new --test device_checkpoint_names
+
       - name: cargo build (driver-metal)
         run: cargo build -p worker --no-default-features --features driver-metal
 

@@ -373,8 +373,7 @@ pub fn gemma4_cuda(
                 layer: None,
             },
         );
-        let lm_head = if facts.tied_embeddings { "embed" } else { "lm_head" };
-        let logits = dsl::lm_head_at(t, &normed, lm_head, facts.vocab);
+        let logits = dsl::lm_head_tied(t, &normed, facts.tied_embeddings, facts.vocab);
         let logits = if facts.logit_softcap > 0.0 {
             dsl::cuda::logit_softcap(&logits, facts.vocab)
         } else {

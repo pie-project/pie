@@ -83,11 +83,11 @@ pub struct KimiK3Facts {
 
 impl KimiK3Facts {
     pub fn is_moe_layer(&self, l: u32) -> bool {
-        l >= self.dense_layers
+        model_compiler::facts::after_dense_prefix(self.dense_layers, l)
     }
     /// MLA or KDA. The hybrid's schedule, said once.
     pub fn is_full_attn(&self, l: u32) -> bool {
-        self.full_attn_interval > 0 && (l + 1) % self.full_attn_interval == 0
+        model_compiler::facts::full_attn_at(self.full_attn_interval, l)
     }
 
     pub fn kimi_k3_synthetic() -> Self {

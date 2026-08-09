@@ -317,6 +317,31 @@ fn print_the_gemma4_vocabulary() {
 /// own name.
 const RENAMED_AT_THE_ABI: &[(&str, &str)] = &[("gemm::act_x_w", "gemm::act_x_wt_bf16")];
 
+/// The two PSEUDO-SYMBOLS of the frozen-verify pair, and the one thing
+/// they still need.
+///
+/// Both name an OPERATION rather than a `__global__` entry point — a
+/// `cudaMemcpyAsync` trio moving a linear layer's in-proj triple
+/// (`mixed_qkv`, `a`, `b`) between the workspace and that layer's verify
+/// stash. `dsl::cuda::verify_stash_load`'s own doc says so, and a driver
+/// arm is the right shape for them: three memcpys, no launcher.
+///
+/// What is missing is not the arm but the SLAB it copies to. The stash is
+/// a per-(layer, slot, token) pool, and the new driver's
+/// `RecurrentStateLayout` allocates three: conv state, recurrent state,
+/// and the one-row-per-slot MTP pending hidden. None of them is this. So
+/// the pair is listed rather than armed, because an arm writing into a
+/// pool nobody allocated is worse than a refusal — it is the same trade
+/// `NOT_YET_OPENABLE` and `UNARMED` make, and for the same reason: a gap
+/// stated in a commit beats a gap discovered by a fire.
+///
+/// Everything else about both service classes is live. `FrozenVerify` and
+/// `CommitAdvance` lower, and every launch of both BINDS
+/// (`every_launch_of_the_hybrid_deployment_binds` runs the full
+/// [`HYBRID_CORPUS`]) — these two symbols are what a fire would refuse.
+const AWAITING_THE_VERIFY_STASH_POOL: &[&str] =
+    &["qwen35_verify_stash_load", "qwen35_verify_stash_store"];
+
 fn bridged_symbols() -> BTreeSet<&'static str> {
     let rows: BTreeSet<&'static str> = kernels_cuda::KERNELS
         .iter()
@@ -325,6 +350,7 @@ fn bridged_symbols() -> BTreeSet<&'static str> {
         .map(|k| k.symbol)
         .collect();
     let mut reachable = rows.clone();
+    reachable.extend(AWAITING_THE_VERIFY_STASH_POOL);
     for (lowered, row) in RENAMED_AT_THE_ABI {
         // The exception buys nothing if its TARGET is imaginary: a
         // rename is only reachable when the row it renames to is.
@@ -372,7 +398,7 @@ fn every_launch_of_the_anchor_deployment_binds() {
 /// (StateOnly, CommitAdvance) join when spec-decode does.
 #[test]
 fn every_launch_of_the_hybrid_deployment_binds() {
-    for (class, rows) in [(FireClass::Decode, 4), (FireClass::Prefill, 7)] {
+    for &(class, rows) in HYBRID_CORPUS {
         let l = qwen35_lowered(class, rows);
         assert!(!l.launches.is_empty(), "{class:?} lowered to nothing");
         let frame = Frame { arena: 0x10000 as *mut c_void, arena_bytes: l.arena_bytes };
@@ -390,13 +416,35 @@ fn every_launch_of_the_hybrid_deployment_binds() {
     }
 }
 
+/// The hybrid's fire classes, all five of them.
+///
+/// The two SHAPES are what any family serves. The other three are the MTP
+/// service passes, and they are here because the hybrid is the only
+/// family that declares them: `CommitAdvance` replays the confirmed
+/// prefix through the linear layers alone, `FrozenVerify` is the prefill
+/// body plus a verify-stash store, and `StateOnly` is the whole backbone
+/// with the epilogue cut off.
+///
+/// They were declared in the text and unreachable from the driver, which
+/// is the failure this file exists to catch: a trace nobody lowers is a
+/// trace nobody can tell is broken. Listing them here means a service
+/// pass that stops binding, or that names a kernel with no bridge row,
+/// fails the same way a decode would.
+const HYBRID_CORPUS: &[(FireClass, usize)] = &[
+    (FireClass::Decode, 4),
+    (FireClass::Prefill, 7),
+    (FireClass::CommitAdvance, 7),
+    (FireClass::StateOnly, 7),
+    (FireClass::FrozenVerify, 7),
+];
+
 /// The hybrid's dispatchability claim — same as the anchor's, separate
 /// test so a missing row names the family that needs it.
 #[test]
 fn every_lowered_hybrid_kernel_has_a_bridge_row() {
     let bridged = bridged_symbols();
     let mut unreachable = BTreeSet::new();
-    for (class, rows) in [(FireClass::Decode, 4), (FireClass::Prefill, 7)] {
+    for &(class, rows) in HYBRID_CORPUS {
         for symbol in &qwen35_lowered(class, rows).kernels {
             if !bridged.contains(symbol.as_str()) {
                 unreachable.insert(symbol.clone());
@@ -1010,6 +1058,14 @@ fn every_lowered_symbol_has_an_arm() {
         hooked_lowered(4),
         every_mark_lowered(4),
         union_lowered(4),
+        // THE MIXTURE. `n_experts > 0` selects a different block between
+        // the same two norms — the routed FFN — and until the hybrid's
+        // derivation read it off the config, no lowering in this corpus
+        // contained one. So the routed symbols were outside "every" for
+        // the same reason the masked and hooked arms were: the set was
+        // closed over the FACTS the corpus states, not just its families.
+        the_mixture::moe_lowered(FireClass::Decode, 4),
+        the_mixture::moe_lowered(FireClass::Prefill, 7),
     ] {
         every.extend(l.kernels.iter().cloned());
     }
@@ -1109,6 +1165,71 @@ fn every_lowered_symbol_has_an_arm() {
         "ssm::kda_o_norm_gated_bf16",
         "ssm::kda_recurrent_step_batched",
         "ssm::l2norm_scale_bf16_to_fp32",
+        // ── The MIXTURE's aligned path: 6 symbols, one subsystem ─────
+        // These joined the moment the hybrid's derivation started
+        // reading `num_experts` off the config, which is exactly what a
+        // closed set is for — they lowered with nothing to execute them
+        // and this line is where that is recorded, not a GPU.
+        //
+        // All six are ROWED and all six BIND (`the_mixture` holds them
+        // to both claims), and they split two ways for two different
+        // reasons — which is worth knowing before anyone starts, because
+        // only one half is the plan's cheap "annotate rows first".
+        //
+        // THREE WERE IN-PLACE, and an in-place row never generates: the
+        // generated branch binds `Out(0)` and calls, so it has nowhere to
+        // stage the copy the aliasing needs (`emit_rust_dispatch` skips
+        // them deliberately — the qwen3_5 A/B caught what happens when it
+        // does not). Their sources are already stated, so staging was the
+        // whole difference, and TWO OF THE THREE HAVE LEFT THIS LIST:
+        // the routed combine and the shared expert's gated landing are
+        // armed. `moe_grouped_gemm_bf16` remains, because it is the one
+        // whose staging is not a `stage_d2d` — it accumulates across a
+        // grouped launch.
+        //
+        // TWO MORE HAVE LEFT since: the gather and the reorder now
+        // GENERATE, with no arm written for either. What they needed was
+        // not an annotation but a change to the STATEMENT — `top_k` on
+        // the param channel, the way `moe_align` already carries its
+        // three load-time numbers — because `num_routes` is the fire's
+        // tokens times k and no operand of either statement carries the
+        // router's width. `Source::RoutesOfParam` reads that product.
+        //
+        // `moe_grouped_gemm_bf16` has an arm now too, and writing it
+        // found the thing that reorders the rest of this work.
+        //
+        // The launcher opens `if (max_blocks <= 0 || !supported(M, N, K))
+        // return;` — it DECLINES by doing nothing. A3B's gate_up is
+        // exactly such a shape (`K = hidden = 2048`, and the kernel
+        // bounds `K <= 512` because past that cuBLAS wins), so an arm
+        // that merely called it would write nothing and the mixture would
+        // answer fluently out of an untouched buffer. The arm refuses
+        // with `ShapeDeclined` instead.
+        //
+        // Which means the two symbols were never independent. The C++
+        // path answers the same predicate with a batched cuBLAS over the
+        // pointer arrays `build_moe_ptrs_aligned_bf16` fills, so THAT is
+        // the keystone of the aligned path rather than its leftover, and
+        // it is what remains: twenty operands including six pointer
+        // ARRAYS it fills, against `Dim::MoeAlignedRoutes` — the one
+        // extent in the tree that is neither the fire's rows nor a
+        // load-time number.
+        //
+        // IT IS UNWRITTEN ON PURPOSE. No MoE checkpoint fits this
+        // machine — the L40S holds 46 GB, Qwen3.5-35B-A3B is 67 GB,
+        // Qwen3.6-27B is 52 GB, gpt-oss-20b is 39 GB and needs its own
+        // family besides — so no fire can reach the arm and no A/B could
+        // catch a mistake in it. `cuda.md` §5.D1 refuses exactly this
+        // trade for the MLA/DSA/KDA arms, and §4's record backs it: all
+        // four decline-rules this port has found came from a GPU failure,
+        // never from a compile error. Writing it here would be code whose
+        // only gate is that it compiles.
+        //
+        // Note this is the path the LIVE L40S facts take for BOTH
+        // classes: `moe_cutlass_max_rows = 0` sends decode down the
+        // aligned body too, so arming these opens the mixture outright
+        // rather than opening prefill only.
+        "moe::build_moe_ptrs_aligned_bf16",
     ];
 
     // Compared as SETS: the list above is grouped by subsystem because
@@ -1220,4 +1341,70 @@ fn every_pair_form_activation_recovers_its_up_projection() {
         }
     }
     assert!(seen_any, "no family stated a pair-form activation — the claim is vacuous");
+}
+
+/// THE MIXTURE, held to the same claim as every other lowering.
+///
+/// `qwen3_5_moe` and `qwen3_5_moe_text` have been in `FACTS_ROWS` since
+/// the registry landed, and the hybrid's text has branched on
+/// `Qwen35MlpKind` for as long — but the derivation built `Dense`
+/// unconditionally, so no fire ever reached the routed block and nothing
+/// held its symbols to the bridge. Qwen3.5-35B-A3B is the deployment: 256
+/// routed experts, top-k 8, `moe_intermediate` 512 beside a shared expert
+/// of the same width.
+///
+/// This asks the two questions the dense corpus asks. Every launch binds,
+/// and every kernel the mixture names has a row — which is how the
+/// aligned path's symbols get counted rather than assumed.
+mod the_mixture {
+    use super::*;
+
+    pub fn moe_lowered(class: FireClass, rows: usize) -> Lowered {
+        use model::qwen_3_5::forward::facts::{Qwen35MlpKind, Qwen35MoeMlpFacts};
+        let mut facts = Qwen35HybridFacts::qwen3_5_0_8b();
+        // The A3B mixture on the 0.8B geometry: the routed block's own
+        // numbers are the deployment's, `hidden` has to be the hybrid's
+        // (its sub-facts are cross-checked at trace start).
+        facts.mlp = Qwen35MlpKind::Moe(Qwen35MoeMlpFacts {
+            hidden: facts.hidden(),
+            ..Qwen35MoeMlpFacts::qwen3_5_35b_a3b()
+        });
+        let plan = qwen3_5_hybrid_cuda(&facts, &qwen35_live_cuda(), class);
+        let r: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
+        lower(&plan, &r, Fire { captures_across_splits: false })
+            .expect("the mixture lowers")
+    }
+
+    #[test]
+    fn every_launch_of_the_mixture_binds() {
+        for (class, rows) in [(FireClass::Decode, 4), (FireClass::Prefill, 7)] {
+            let l = moe_lowered(class, rows);
+            assert!(!l.launches.is_empty(), "{class:?} lowered to nothing");
+            let frame = Frame { arena: 0x10000 as *mut c_void, arena_bytes: l.arena_bytes };
+            let mut resolver = Sentinels::default();
+            for launch in &l.launches {
+                let bound = bind(&l, launch, frame, &mut resolver)
+                    .unwrap_or_else(|r| panic!("mixture {class:?}: launch refused: {r:?}"));
+                assert_eq!(
+                    bound.args.len(),
+                    (launch.args.end - launch.args.start) as usize,
+                    "every stated operand binds"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_lowered_kernel_of_the_mixture_has_a_bridge_row() {
+        let bridged = bridged_symbols();
+        let mut unreachable = BTreeSet::new();
+        for (class, rows) in [(FireClass::Decode, 4), (FireClass::Prefill, 7)] {
+            for symbol in &moe_lowered(class, rows).kernels {
+                if !bridged.contains(symbol.as_str()) {
+                    unreachable.insert(symbol.clone());
+                }
+            }
+        }
+        assert!(unreachable.is_empty(), "mixture kernels with no bridge row: {unreachable:?}");
+    }
 }

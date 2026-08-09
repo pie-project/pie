@@ -53,6 +53,28 @@ pub struct Names {
 }
 
 impl Names {
+    /// The same convention with gemma4's expert bank.
+    ///
+    /// gemma4 ships `layers.N.experts.switch_glu.{gate,up,down}_proj` where
+    /// qwen3-moe ships `layers.N.mlp.switch_mlp.*`. Measured against
+    /// `mlx-community/gemma-4-26b-a4b-it-4bit` and
+    /// `mlx-community/Qwen3.6-35B-A3B-4bit`.
+    ///
+    /// A SECOND map rather than a branch inside the first: which name a role
+    /// has is the checkpoint's convention, and two conventions is two maps.
+    #[must_use]
+    pub fn mlx_gemma4() -> Self {
+        let mut names = Self::mlx();
+        for (role, spelled) in [
+            ("expert_gate", "experts.switch_glu.gate_proj"),
+            ("expert_up", "experts.switch_glu.up_proj"),
+            ("expert_down", "experts.switch_glu.down_proj"),
+        ] {
+            names.roles.insert(role.to_string(), spelled.to_string());
+        }
+        names
+    }
+
     /// The convention `model::llama_3::contract` publishes, which is what
     /// `stage_plan_weights` keys its map by.
     ///
@@ -112,6 +134,18 @@ impl Names {
             ("shared_down", "mlp.shared_expert.down_proj"),
             ("shared_gate_proj", "mlp.shared_expert_gate"),
             // The norms.
+            // gemma's per-layer embedding network: a second table, its
+            // projection and norm, and the per-layer gate and output.
+            ("ple_gate", "per_layer_gate"),
+            ("ple_out", "per_layer_projection"),
+            // `layer_scalar`, measured against
+            // `mlx-community/gemma-4-26b-a4b-it-4bit`'s index and NOT the
+            // `per_layer_scalar` the role is called. A role name and a
+            // checkpoint name are two different things, which is what this map
+            // is for.
+            ("scalar", "layer_scalar"),
+            // The attention sink, one learned logit per head.
+            ("attn_sinks", "self_attn.sinks"),
             ("q_norm", "self_attn.q_norm"),
             ("k_norm", "self_attn.k_norm"),
             ("attn_norm", "input_layernorm"),
@@ -124,6 +158,12 @@ impl Names {
             // Tied: one table serves both ends, which is why the readout and
             // the embedding answer to the same name.
             ("embed", "shared_embedding"),
+            // gemma's SECOND embedding table and its projection: layer-less,
+            // gathered once per step, so they are globals rather than a
+            // layer's.
+            ("ple_embed", "per_layer_embedding"),
+            ("ple_proj", "per_layer_input_projection"),
+            ("ple_proj_norm", "per_layer_input_norm"),
             ("lm_head", "shared_embedding"),
             ("final_norm", "final_norm"),
         ]

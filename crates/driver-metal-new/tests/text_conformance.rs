@@ -90,6 +90,56 @@ fn texts() -> Vec<Text> {
             n_experts: 128,
             experts_per_token: 8,
         },
+    },
+    // gpt-oss, and it joins the same way: attention SINKS, its own SwiGLU and
+    // an alternating window are three facts, not a family. What is new is one
+    // weight per layer and one symbol.
+    Text {
+        name: "llama_like (gpt-oss)",
+        plan: |class| {
+            use model::families::llama_like::forward::facts::{
+                LlamaLikeFacts, LlamaLikeMetalFacts,
+            };
+            model::families::llama_like::forward::llama_like_metal(
+                &LlamaLikeFacts::gpt_oss_20b(),
+                &LlamaLikeMetalFacts::gpt_oss_20b(),
+                class,
+            )
+        },
+        geometry: Geometry {
+            q_heads: 64,
+            kv_heads: 8,
+            head_dim: 64,
+            rotary_dims: 64,
+            n_experts: 32,
+            experts_per_token: 4,
+        },
+    },
+    // The three gemma facts that ARE facts. NOT gemma4 — its per-layer
+    // embeddings are a side network of nine kernels no fact makes appear —
+    // but the geglu, the readout softcap and the alternating window all reach
+    // the device through this executor, so a gemma4 text has only the PLE and
+    // the branch structure left to state.
+    Text {
+        name: "llama_like (gemma facts)",
+        plan: |class| {
+            use model::families::llama_like::forward::facts::{
+                LlamaLikeFacts, LlamaLikeMetalFacts,
+            };
+            model::families::llama_like::forward::llama_like_metal(
+                &LlamaLikeFacts::qwen3_0_6b(),
+                &LlamaLikeMetalFacts::gemma_like(),
+                class,
+            )
+        },
+        geometry: Geometry {
+            q_heads: 16,
+            kv_heads: 8,
+            head_dim: 128,
+            rotary_dims: 128,
+            n_experts: 0,
+            experts_per_token: 0,
+        },
     }]
 }
 
@@ -279,7 +329,7 @@ fn the_harness_covers_every_family_that_has_a_text() {
     // branch anywhere in the executor.
     assert_eq!(
         texts().len(),
-        2,
+        4,
         "a Metal text or fixture landed or left. Add or remove its row in \
          `texts()` — everything above is per-text and a shape not listed is a \
          shape not checked."
@@ -429,12 +479,22 @@ fn a_row_that_states_its_operands_agrees_with_its_shader() {
                     unstated.push(format!("  {symbol}"));
                     continue;
                 }
+                // `Ty::InPacked` operands are FIELDS of a preceding packed
+                // struct, not buffers of their own, so they are named by the
+                // row and absent from the shader's parameter list. Counting
+                // them here would make a row that spells a struct's contents
+                // look like a row that miscounted its kernel.
+                let slots = sig
+                    .operands
+                    .iter()
+                    .filter(|o| o.ty != kernels::Ty::InPacked)
+                    .count();
                 if let Some(buffers) = declared_buffers(&root, file, sig.symbol)
-                    && buffers != sig.operands.len()
+                    && buffers != slots
                 {
                     disagrees.push(format!(
-                        "  {symbol}: row states {} operands, shader declares {buffers} buffers",
-                        sig.operands.len()
+                        "  {symbol}: row states {slots} buffer operands, shader \
+                         declares {buffers}"
                     ));
                 }
                 if let Some(writes) = first_writable(&root, file, sig.symbol) {

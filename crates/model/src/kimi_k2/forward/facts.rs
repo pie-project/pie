@@ -79,7 +79,7 @@ pub struct KimiFacts {
 
 impl KimiFacts {
     pub fn is_moe_layer(&self, l: u32) -> bool {
-        l >= self.dense_layers
+        model_compiler::facts::after_dense_prefix(self.dense_layers, l)
     }
 
     /// `moonshotai/Kimi-K2-Instruct`, read off its config the way the

@@ -163,7 +163,7 @@ pub fn gemma2_cuda(facts: &Gemma2Facts, class: FireClass) -> ForwardPlan {
                 layer: None,
             },
         );
-        let logits = dsl::lm_head_at(t, &normed, "lm_head", facts.vocab);
+        let logits = dsl::lm_head_tied(t, &normed, facts.tied_embeddings, facts.vocab);
         let logits = if facts.final_logit_softcap {
             dsl::cuda::logit_softcap(&logits, facts.vocab)
         } else {

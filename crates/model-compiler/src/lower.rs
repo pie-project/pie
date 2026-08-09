@@ -416,6 +416,13 @@ pub struct Lowered {
     /// indexes it. Flat for the same reason [`Lowered::args`] is: the whole
     /// frame stays two arrays and a table.
     pub params: Vec<u32>,
+    /// Rows the fire SAMPLES — one distribution per request, and the number
+    /// `Dim::Requests` already sizes every epilogue value by.
+    ///
+    /// Published because a driver needs it and cannot recompute it: it is
+    /// `rows` filtered two ways and maxed, not `rows.len()`, and a text cannot
+    /// state it at all. `Source::RequestCount` is how a row asks.
+    pub n_requests: u32,
     /// The guard tree, when the lowering kept it ([`GuardMode::Union`]).
     ///
     /// Empty under [`GuardMode::Resolve`], where every guard was
@@ -487,11 +494,13 @@ pub fn lower_with(
         peel_region: None,
         guards,
         cond: Launch::NO_COND,
+        region_outs: Vec::new(),
         conds: Vec::new(),
     };
     let arena_bytes = out.buffers.bytes;
     let value_offset = out.buffers.offset.clone();
     let epilogue_gather = out.buffers.epilogue_gather;
+    let n_requests = out.buffers.n_requests;
     let epilogue_norm = out.buffers.epilogue_norm;
     let value_owner = alias_owners(plan);
     out.region(0..plan.ops.len(), 0..n)?;
@@ -504,6 +513,7 @@ pub fn lower_with(
         value_owner,
         epilogue_gather,
         epilogue_norm,
+        n_requests,
         args: out.args,
         params: out.params,
         structural: out.structural,
@@ -542,6 +552,21 @@ struct Lowerer<'a> {
     /// tree they index into. Both stay empty under
     /// [`GuardMode::Resolve`].
     cond: u32,
+    /// The enclosing value-producing region's outputs, when there is one.
+    ///
+    /// A guard or peel that produces a value owns it, and its arms' launches
+    /// are LOWERINGS of that value rather than producers of their own --
+    /// `dsl::guarded_value`'s doc states it exactly: *"each region's launches
+    /// are their lowerings, binding the same output buffer and recording no
+    /// SSA outputs of their own."* The tape half of that has existed since
+    /// `seam::attn_at` (`TraceBuilder::inside_value_region`); this is the
+    /// lowering half.
+    ///
+    /// Without it an arm's launch reaches `dispatch::reorder` with no result
+    /// operand at all, and the row's `Out(0)` resolves to the launch's only
+    /// widthed operand -- its INPUT. Measured on a real checkpoint: every
+    /// projection in the arm wrote zeros over the value it had just read.
+    region_outs: Vec<ValueId>,
     conds: Vec<CondRegion>,
 }
 
@@ -553,6 +578,11 @@ impl Lowerer<'_> {
             let op = &self.plan.ops[i];
             match &op.kind {
                 OpKind::Guard { arms, else_ops } => {
+                    // A guard that produces a value owns it; its arms bind it.
+                    // Saved and restored so a nested guard does not leak its
+                    // outputs to an enclosing one's arms.
+                    let outer_outs = std::mem::take(&mut self.region_outs);
+                    self.region_outs = op.outputs.clone();
                     // A fire-level chain: the first arm whose predicate
                     // holds runs, over the SAME rows. In the flattened
                     // world these are row predicates, and an arm's rows
@@ -601,6 +631,7 @@ impl Lowerer<'_> {
                                     self.cond = parent;
                                     self.region(body, window.clone())?;
                                     self.cond = outer;
+                                    self.region_outs = outer_outs;
                                     i = at + *else_ops as usize;
                                     continue 'ops;
                                 }
@@ -615,6 +646,7 @@ impl Lowerer<'_> {
                         self.cond = parent;
                         self.region(at..at + *else_ops as usize, window.clone())?;
                         self.cond = outer;
+                        self.region_outs = outer_outs;
                         i = at + *else_ops as usize;
                         continue;
                     }
@@ -632,6 +664,7 @@ impl Lowerer<'_> {
                     if !remaining.is_empty() {
                         self.region(else_body, remaining)?;
                     }
+                    self.region_outs = outer_outs;
                     i = at + *else_ops as usize;
                 }
                 OpKind::Peel {
@@ -779,7 +812,30 @@ impl Lowerer<'_> {
         // weight names the statement carries. A driver reading this run
         // needs nothing else about the op, which is the whole point.
         let first = self.args.len() as u32;
-        for &v in op.inputs.iter().chain(op.outputs.iter()) {
+        // A statement inside a value-producing region states no result of its
+        // own and binds the REGION's -- see `Self::region_outs`.
+        //
+        // "States no result" is not the same as "has none to state", and
+        // the difference is STATE. A statement that names a `StateRef`
+        // writes the KV pages or the recurrent slabs, which outlive the
+        // fire and have no SSA value; producing nothing is what it IS,
+        // not evidence that a region owns its output.
+        //
+        // `attn::dequant_kv_cache_layer_to_bf16_active` is the one that
+        // found this. It stages a quantized cache before a prefill
+        // dispatch, names `kv_state` and declares no result -- and inside
+        // the attention's value-producing guard it was handed the guard's
+        // output as a fourth operand, so its row's arity check refused
+        // every fire that took the quantized path.
+        let outs: &[ValueId] =
+            if op.outputs.is_empty()
+                && op.kind.state_ref().is_none()
+                && !self.region_outs.is_empty() {
+                &self.region_outs
+            } else {
+                &op.outputs
+            };
+        for &v in op.inputs.iter().chain(outs.iter()) {
             self.args.push(self.slot(v));
         }
         let first_param = self.params.len() as u32;
@@ -1303,6 +1359,8 @@ pub struct Buffers {
     /// because the flat list handed all three rectangles the same
     /// operand run: `(activation, logits)`, which is true of the GEMM
     /// and of neither of the others.
+    /// Rows the fire samples — see [`Lowered::n_requests`].
+    pub n_requests: u32,
     pub epilogue_gather: usize,
     pub epilogue_norm: usize,
 }
@@ -1311,6 +1369,7 @@ impl Buffers {
     /// `offset[v]` for a value whose bytes are a named buffer's.
     pub const NAMED: usize = usize::MAX;
 
+    #[allow(clippy::too_many_lines)]
     pub fn assign(plan: &ForwardPlan, rows: &[Row]) -> Buffers {
         let n_tokens = rows.len();
         // `Dim::Requests` sizes the epilogue's values, so it must bound
@@ -1537,6 +1596,8 @@ impl Buffers {
         }
 
         Buffers {
+            n_requests: u32::try_from(n_requests).unwrap_or(u32::MAX),
+
             offset,
             bytes: used,
             pinned,

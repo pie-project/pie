@@ -459,6 +459,12 @@ fn rust_bind_expr(op: &kernels::Operand) -> Option<String> {
         Source::Weight(i) => format!("b.args[n_in + n_out + {i}].ptr"),
         Source::Param(i) => format!("i32::try_from(spec.params[{i}]).unwrap_or(0)"),
         Source::ParamF32(i) => format!("f32::from_bits(spec.params[{i}])"),
+        // Rows times a param — the MoE aligned path's route count, and
+        // the one product that is neither an operand's extent nor a
+        // load-time number.
+        Source::RoutesOfParam(i) => format!(
+            "rows.saturating_mul(i32::try_from(spec.params[{i}]).unwrap_or(0))"
+        ),
         Source::Rows => "rows".to_string(),
         Source::OutRows(i) => format!("rows_of(b, n_in + {i}, rows)"),
         Source::InRows(i) => format!("rows_of(b, {i}, rows)"),
@@ -511,7 +517,9 @@ fn rust_bind_expr(op: &kernels::Operand) -> Option<String> {
         | Source::KvPageSize
         | Source::KvWritePage
         | Source::KvWriteOffset
-        | Source::RopeFrequencies => return None,
+        | Source::RopeFrequencies
+        | Source::SamplingIndices
+        | Source::RequestCount => return None,
         Source::Ctx(f) | Source::CtxNonZero(f) => format!("ctx.{f}"),
         // A NULL is returned fully typed and skips the cast step below:
         // that step turns a slot into the row's pointee, and a null has
@@ -620,7 +628,9 @@ pub fn emit_rust_dispatch(tables: &[&'static [KernelSig]]) -> String {
                 | Source::OutWidth(i)
                 | Source::OutElements(i) => need_out = need_out.max(i + 1),
                 Source::Weight(i) => need_w = need_w.max(i + 1),
-                Source::Param(i) | Source::ParamF32(i) => need_ps = need_ps.max(i + 1),
+                Source::Param(i) | Source::ParamF32(i) | Source::RoutesOfParam(i) => {
+                    need_ps = need_ps.max(i + 1);
+                }
                 _ => {}
             }
         }

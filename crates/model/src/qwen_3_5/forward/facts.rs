@@ -500,8 +500,7 @@ impl Qwen35HybridFacts {
     /// Whether layer `l` runs full attention —
     /// `crates/driver-metal/csrc/src/model/qwen3_5/geometry.hpp::is_full_attn`.
     pub fn is_full_attn(&self, l: u32) -> bool {
-        self.full_attn_interval <= 1
-            || l % self.full_attn_interval == self.full_attn_interval - 1
+        model_compiler::facts::full_attn_at(self.full_attn_interval, l)
     }
 
     /// The model's hidden size (the sub-facts each carry it for standalone

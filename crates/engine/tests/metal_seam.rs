@@ -254,3 +254,107 @@ fn package() -> driver_abi::plan::LaunchPackage {
         ..driver_abi::plan::LaunchPackage::default()
     }
 }
+
+/// **The seam serves a token.**
+///
+/// Everything above this checks that the seam refuses what it cannot do.
+/// This checks the other half, and it is the north star's fourth property with
+/// nothing taken out: a checkpoint loads through `load_model`, a frame goes in
+/// through `launch`, and a command buffer retires.
+///
+/// `driver-metal-new`'s own `device_real_weights` holds both fire classes to
+/// MLX token-for-token, but it stages the fire's tables itself. This is the
+/// path an ENGINE takes, and the distance between the two was two tables and
+/// two numbers until `model::tables` made it one place. A test that only ever
+/// exercised one of them could not have said so.
+///
+/// Gated on `PIE_METAL_SMOKE_CHECKPOINT` **and** on a descriptor: model facts
+/// come from the one the worker hands over, never from a checkpoint this seam
+/// re-normalizes (`crates/model/tests/one_normalizer.rs`). The test writes one
+/// beside the snapshot rather than reaching for a boot TOML.
+#[test]
+fn a_frame_reaches_the_device_through_the_seam() {
+    let Some(snapshot) = std::env::var_os("PIE_METAL_SMOKE_CHECKPOINT") else {
+        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        return;
+    };
+    let snapshot = std::path::PathBuf::from(snapshot);
+
+    // The descriptor, normalized ONCE and handed over as a worker would.
+    let raw = std::fs::read_to_string(snapshot.join("config.json"))
+        .expect("the snapshot has a config.json");
+    let root: serde_json::Value = serde_json::from_str(&raw).expect("it parses");
+    let descriptor = model::config::descriptor(&root, snapshot.to_str().expect("utf8"))
+        .expect("it normalizes")
+        .to_string();
+    let dir = std::env::temp_dir().join("pie-metal-seam-descriptor");
+    std::fs::create_dir_all(&dir).expect("a scratch dir");
+    let path = dir.join("descriptor.json");
+    std::fs::write(&path, &descriptor).expect("it writes");
+
+    // TOML, which is what the boot config is — `[model] descriptor`.
+    let config = format!("[model]\ndescriptor = \"{}\"\n", path.display());
+    let Ok((mut backend, _)) = DriverBackend::metal_create(config.as_bytes()) else {
+        eprintln!("SKIP: no Metal 4 device");
+        return;
+    };
+
+    backend
+        .load_model(vec![driver_abi::ModelLoadDesc {
+            snapshot_dir: snapshot.clone(),
+            runtime_quant: String::new(),
+            mxfp4_moe: driver_abi::Mxfp4MoeRequest::Auto,
+            component: driver_abi::ModelComponent::Full,
+        }])
+        .expect("the checkpoint loads through the seam");
+
+    // ONE request, TWO tokens at positions 0 and 1: a prefill, and the shape
+    // `device_real_weights` holds to MLX.
+    let plan = driver_abi::plan::LaunchPlan {
+        token_ids: vec![128_000, 9906],
+        position_ids: vec![0, 1],
+        kv_page_indices: vec![0],
+        kv_page_indptr: vec![0, 1],
+        kv_last_page_lens: vec![2],
+        qo_indptr: vec![0, 2],
+        sampling_indices: vec![1],
+        ..driver_abi::plan::LaunchPlan::default()
+    };
+    let frame = engine::driver::submission::FrameSubmission {
+        instance_ids: vec![1],
+        kv_translation: vec![0],
+        kv_translation_indptr: vec![0, 1],
+        required_kv_pages: 1,
+        steps: vec![engine::driver::submission::StepSubmission {
+            plan,
+            roster_rows: vec![0],
+            sub_batch_indptr: vec![0, 1],
+            sub_batch_class: vec![0],
+            terminal_cells: Vec::new(),
+            program_row_indptr: vec![0, 1],
+            logical_fire_ids: vec![1],
+            channel_expected_head: Vec::new(),
+            channel_expected_tail: Vec::new(),
+            channel_ticket_indptr: vec![0],
+            // ONE region covering both rows. The regions must TILE the fire:
+            // a gap leaves rows with no feature point and an overlap gives one
+            // row two, and `frame::rows_of` refuses either by name.
+            region_row_indptr: vec![0, 2],
+            region_sig: vec![0],
+            region_k: vec![0],
+        }],
+    };
+
+    // LAUNCHED, not admitted-and-declined: a frame this small fits any pool,
+    // so `Exhausted` or `Impossible` here would be the seam refusing rather
+    // than the device being full.
+    match backend.launch(&frame).expect("the frame launches") {
+        engine::driver::backend::FrameLaunchOutcome::Launched(_) => {}
+        engine::driver::backend::FrameLaunchOutcome::Exhausted => {
+            panic!("one page did not fit a pool sized for hundreds")
+        }
+        engine::driver::backend::FrameLaunchOutcome::Impossible => {
+            panic!("two tokens in one request is not an impossible frame")
+        }
+    }
+}

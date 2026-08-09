@@ -153,6 +153,8 @@ pub enum FireTable {
     KvWriteOffset,
     /// The rotary inverse frequencies, `[rotary_dims/2]` f32.
     RopeFrequencies,
+    /// Which rows the fire samples, one per request.
+    SamplingIndices,
 }
 
 /// Where an operand is: a device address and the bytes it may address.

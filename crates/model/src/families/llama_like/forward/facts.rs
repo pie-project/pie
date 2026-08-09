@@ -225,6 +225,41 @@ impl LlamaLikeFacts {
         }
     }
 
+    /// gpt-oss-20b: llama-like attention with SINKS, a routed FFN, and its
+    /// own SwiGLU.
+    ///
+    /// The numbers are the published config's. What makes it interesting is
+    /// how little of it is new: the attention is a qwen3 attention with one
+    /// extra weight per layer, the mixture is the one qwen3-moe already
+    /// proved, and the activation is a symbol. `sliding_window: 128` alternates
+    /// with full attention every other layer, which `window_left` states.
+    pub fn gpt_oss_20b() -> Self {
+        Self {
+            hidden: 2880,
+            layers: 24,
+            q_heads: 64,
+            kv_heads: 8,
+            head_dim: 64,
+            // The DENSE inner width, which a mixture has no use for.
+            intermediate: 0,
+            n_experts: 32,
+            experts_per_token: 4,
+            moe_intermediate: 2880,
+            // No shared expert.
+            shared_intermediate: 0,
+            vocab: 201_088,
+            rope: RopeKind::Standard,
+            norm_variant: NormVariant::Plain,
+            norm_placement: NormPlacement::Pre,
+            // No QK norm; gpt-oss normalizes neither.
+            qk_norm: QkNorm::Off,
+            fused_qkv: false,
+            tied_embeddings: false,
+            // `attention_bias: true` — every projection carries one.
+            qkv_bias: true,
+        }
+    }
+
     pub fn phi3_mini() -> Self {
         Self {
             // DENSE: no mixture. Stated rather than defaulted because a
@@ -525,6 +560,26 @@ pub struct LlamaLikeCudaFacts {
 /// rather than measured. `.wiki/tart/macos.md` records the ladder; the
 /// precedent for refusing to call an unmeasured fact set measured is
 /// [`Qwen35CudaFacts::qwen3_5_0_8b_synthetic`].
+/// WHICH gated activation a deployment takes. See
+/// [`LlamaLikeMetalFacts::activation`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub enum Activation {
+    /// `silu_mul` — `silu(gate) * up`, every llama-like deployment's.
+    #[default]
+    SiluMul,
+    /// `gptoss_swiglu` — the gate clamped ABOVE only, the linear branch
+    /// clamped both ways and carrying a `+1`.
+    SwiGlu {
+        /// The clamp.
+        limit: f32,
+        /// The sigmoid's slope. NOT from a config: it is part of the
+        /// activation the way `silu`'s sigmoid is.
+        alpha: f32,
+    },
+    /// `geglu_tanh` — gemma's, and the gelu is the TANH approximation.
+    Geglu,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlamaLikeMetalFacts {
     /// The projection GEMV folds the block residual in its epilogue
@@ -622,6 +677,79 @@ pub struct LlamaLikeMetalFacts {
     /// layer until the activations saturate.
     #[serde(default)]
     pub rope_theta: f32,
+    /// Whether the FULL-attention layers take V from the K projection.
+    ///
+    /// PER LAYER, and measured: `mlx-community/gemma-4-26b-a4b-it-4bit` ships
+    /// no `v_proj` for layers 5, 11, 17, 23 and 29 — every sixth, which is
+    /// exactly the layers `window_left` marks as full attention. A text that
+    /// stated a `v_proj` for one of them would name a tensor that is not
+    /// there.
+    ///
+    /// It also reorders the two norms on those layers: V reads the projection
+    /// K's norm is about to overwrite, so V goes first.
+    ///
+    /// A bool and not a list because the layers it applies to are already
+    /// stated — `window_left_at(l) < 0` is the full-attention test — and two
+    /// lists that must agree is one more thing to keep agreeing.
+    #[serde(default)]
+    pub v_from_k: bool,
+    /// Whether the mixture sits BESIDE the dense MLP rather than replacing it.
+    ///
+    /// gemma4's. Both branches read the post-attention residual and their
+    /// results are added — five norms round one block. Every other deployment
+    /// this text serves runs one FFN or the other, which is why this is a fact
+    /// and not the shape of the walk.
+    #[serde(default)]
+    pub dense_beside_moe: bool,
+    /// Whether each layer scales the stream by a learned SCALAR.
+    ///
+    /// gemma's, for a deployment with no per-layer embeddings: one number per
+    /// layer, read from a buffer rather than stated, because which layer is
+    /// running is the fire's and not the text's.
+    #[serde(default)]
+    pub per_layer_scalar: bool,
+    /// gemma's PER-LAYER EMBEDDING width, or zero for a deployment with none.
+    ///
+    /// A SIDE NETWORK: a second embedding table gathered once per step,
+    /// projected, normed and joined into `[n_layers, ple_dim]` that each layer
+    /// reads its own slice of. Nothing llama-like has a counterpart, which is
+    /// why gemma4 needs a text where qwen3-moe and gpt-oss needed a fixture.
+    #[serde(default)]
+    pub per_layer_emb_dim: u32,
+    /// Layers at the END of the stack that SHARE their KV with an earlier one.
+    ///
+    /// A shared layer rotates its own Q and reads the pages its source wrote:
+    /// no k/v projection, no k/v norm, no append. Suppressing those dispatches
+    /// is not an optimisation — it is which tensors the checkpoint ships.
+    #[serde(default)]
+    pub kv_shared_layers: u32,
+    /// The readout's SOFTCAP — `cap * tanh(x / cap)` — or zero for none.
+    ///
+    /// gemma's. Zero is "no softcap" and the text names nothing, rather than
+    /// passing a cap so large it does nothing: that would be a kernel run per
+    /// fire to compute the identity.
+    #[serde(default)]
+    pub logit_softcap: f32,
+    /// Whether every layer carries an attention SINK.
+    ///
+    /// A per-head learned logit that joins the softmax without a value behind
+    /// it, so a sinked attention normalizes over one more term than it sums.
+    /// gpt-oss's; asked of the TENSORS, like the other binding facts.
+    #[serde(default)]
+    pub attn_sinks: bool,
+    /// WHICH gated activation this deployment takes.
+    ///
+    /// Three symbols, not one with flags, and the difference is not
+    /// cosmetic: gpt-oss clamps the gate ABOVE only, clamps the linear branch
+    /// both ways and adds one to it; gemma's gelu is the TANH approximation
+    /// rather than the erf one. Dropping any of that produces a model that
+    /// runs and is wrong, which is why a text names a symbol and a fact
+    /// chooses.
+    ///
+    /// Serde-defaulted (append-only discipline); the default is `silu_mul`,
+    /// every llama-like deployment's.
+    #[serde(default)]
+    pub activation: Activation,
     /// Whether this deployment's rotary frequencies come from a TABLE.
     ///
     /// True for a config that rescales its ladder -- llama-3's `rope_scaling`
@@ -649,6 +777,50 @@ pub struct LlamaLikeMetalFacts {
 }
 
 impl LlamaLikeMetalFacts {
+    /// gpt-oss-20b's Metal facts. A SYNTHETIC fixture like `synthetic`.
+    #[must_use]
+    pub fn gpt_oss_20b() -> Self {
+        Self {
+            // Every layer carries one learned logit per head.
+            attn_sinks: true,
+            // `swiglu_limit: 7.0`, and alpha is the activation's own constant.
+            activation: Activation::SwiGlu {
+                limit: 7.0,
+                alpha: 1.702,
+            },
+            // `rope_theta: 150000`, a plain geometric ladder.
+            rope_theta: 150_000.0,
+            rope_freq_table: false,
+            rms_eps: 1e-5,
+            // `sliding_window: 128`, ALTERNATING: every other layer attends
+            // the window and the rest attend everything. `window_left_at`
+            // reads the list per layer, which is what the accessor is for.
+            window_left: (0..24).map(|l| if l % 2 == 0 { 128 } else { -1 }).collect(),
+            ..Self::synthetic()
+        }
+    }
+
+    /// The three gemma facts that ARE facts, on an otherwise llama-like
+    /// deployment.
+    ///
+    /// The PLE and the KV sharing are here too, which makes this the fixture
+    /// a gemma4 text reads. What it is NOT is a measurement: the widths are
+    /// plausible rather than any published config's, and a real gemma4
+    /// deployment states its own.
+    #[must_use]
+    pub fn gemma_like() -> Self {
+        Self {
+            activation: Activation::Geglu,
+            logit_softcap: 30.0,
+            per_layer_emb_dim: 256,
+            kv_shared_layers: 4,
+            dense_beside_moe: true,
+            window_left: (0..24).map(|l| if l % 6 == 5 { -1 } else { 512 }).collect(),
+            rope_theta: 1_000_000.0,
+            ..Self::synthetic()
+        }
+    }
+
     /// This layer's window, `-1` for all of it. See [`Self::window_left`].
     pub fn window_left_at(&self, l: u32) -> i32 {
         model_compiler::facts::window_left_at(&self.window_left, l)
@@ -686,6 +858,20 @@ impl LlamaLikeMetalFacts {
             // statement hands it `log2(theta)`; handing theta rotates by a
             // frequency ladder that is wrong from the second channel on.
             rope_theta: 1_000_000.0,
+            // qwen3's mixture replaces its dense MLP rather than sitting
+            // beside it, and it has no per-layer embeddings or scalar and
+            // shares no KV.
+            // qwen3 projects its own V.
+            v_from_k: false,
+            dense_beside_moe: false,
+            per_layer_scalar: false,
+            per_layer_emb_dim: 0,
+            kv_shared_layers: 0,
+            // qwen3 caps no logits, has no attention sinks, and takes the
+            // plain gated activation.
+            logit_softcap: 0.0,
+            attn_sinks: false,
+            activation: Activation::SiluMul,
             // qwen3's ladder is a plain geometric series in `rope_theta`.
             rope_freq_table: false,
             // qwen3 attends over the whole context at every layer.

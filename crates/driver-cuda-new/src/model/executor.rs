@@ -908,6 +908,25 @@ pub enum DispatchRefusal {
     /// An output placement failed to resolve — the join and the resolver
     /// disagree.
     Out(String),
+    /// The launcher this arm calls would DECLINE this shape, and
+    /// declining is spelled as a silent early return rather than as an
+    /// error.
+    ///
+    /// `moe::moe_grouped_gemm_bf16` is the one that needs this: it opens
+    /// `if (max_blocks <= 0 || !supported(M, N, K)) return;`, so an arm
+    /// that simply called it would leave the destination holding whatever
+    /// was there and the fire would keep going. The C++ driver reads the
+    /// same predicate and takes a batched-cuBLAS fallback; until that
+    /// fallback exists here, saying so is the only honest answer.
+    ///
+    /// Smoothly wrong is the failure mode this tree keeps naming, and a
+    /// silent no-op inside a GEMM is its purest form.
+    ShapeDeclined {
+        /// The kernel whose launcher declines.
+        kernel: String,
+        /// Why, in the launcher's own terms.
+        why: String,
+    },
     /// The arm and the lowering disagree about the operand count — a
     /// drift between the trace's statement and this arm's reading of it.
     ArgCount {
@@ -1706,6 +1725,135 @@ pub fn dispatch<R: Resolver>(
                     ctx.theta_of(bound.layers.start as usize),
                     ctx.stream,
                     ctx.rope_interleaved,
+                );
+            }
+        }
+        // args: [act, expert_ids, stage, out] — the grouped expert GEMM,
+        // one launch for every (block, expert) route.
+        //
+        // `stage` is the DESTINATION the pointer build named and `out`
+        // aliases it (`in_place = &[(0, 2)]`), so the arm stages only if
+        // the assignment did not give them one buffer.
+        //
+        // THE PREDICATE IS THE POINT. The launcher opens with
+        // `if (max_blocks <= 0 || !supported(M, N, K)) return;` — it
+        // DECLINES by doing nothing. Qwen3.5-35B-A3B's gate_up is exactly
+        // such a shape (`K = hidden = 2048`, and the kernel bounds
+        // `K <= 512` because past that cuBLAS wins; the measurements are
+        // in `moe_grouped_gemm.cu`'s header). So an arm that just called
+        // it would write nothing for gate_up and the mixture would answer
+        // fluently from an untouched buffer.
+        //
+        // The C++ path reads the same predicate and falls back to a
+        // batched cuBLAS over the pointer arrays `build_moe_ptrs_aligned`
+        // fills. That symbol has no arm yet, so this one REFUSES instead
+        // of guessing — and the two are therefore coupled: the pointer
+        // build is the keystone of the aligned path, not its leftover.
+        "moe::moe_grouped_gemm_bf16" => {
+            need(4)?;
+            let (a_in, expert_ids, stage, out) =
+                (bound.args[0], bound.args[1], bound.args[2], bound.args[3]);
+            let w = weight(resolver)?;
+            #[allow(clippy::cast_possible_wrap)]
+            let block = spec.params.first().copied().unwrap_or(0) as i32;
+            #[allow(clippy::cast_possible_wrap)]
+            let max_blocks = spec.params.get(1).copied().unwrap_or(0) as i32;
+            let n = i32::try_from(out.width).expect("dim");
+            let k = i32::try_from(a_in.width).expect("dim");
+            // Mirrors `moe_grouped_gemm_bf16_supported`. Duplicated on
+            // purpose and marked as such: the alternative is a launcher
+            // that answers "did nothing" the same way it answers "done".
+            const FRAG: i32 = 16;
+            const SHORT_K: i32 = 512;
+            const N_TILE: i32 = 64;
+            if max_blocks <= 0
+                || block != FRAG
+                || k > SHORT_K
+                || n % N_TILE != 0
+                || k % FRAG != 0
+            {
+                return Err(DispatchRefusal::ShapeDeclined {
+                    kernel: "moe::moe_grouped_gemm_bf16".into(),
+                    why: format!(
+                        "the grouped kernel serves M == {FRAG}, K <= {SHORT_K}, \
+                         N % {N_TILE} == 0 and K % {FRAG} == 0; this launch is \
+                         M = {block}, N = {n}, K = {k} over {max_blocks} blocks. \
+                         The batched-cuBLAS fallback needs \
+                         moe::build_moe_ptrs_aligned_bf16, which has no arm yet"
+                    ),
+                });
+            }
+            if stage.ptr != out.ptr {
+                stage_d2d(ctx, &bound.rows, out, stage);
+            }
+            unsafe {
+                ffi::pie_k_moe_moe_grouped_gemm_bf16(
+                    a_in.ptr,
+                    w,
+                    out.ptr,
+                    expert_ids.ptr.cast::<i32>(),
+                    max_blocks,
+                    block,
+                    n,
+                    k,
+                    ctx.stream,
+                );
+            }
+        }
+        // ── The MIXTURE's landing pair, both in-place ───────────────
+        // Neither can generate: `emit_rust_dispatch` skips every
+        // `in_place` row because a generated branch binds `Out(0)` and
+        // calls, with nowhere to stage the copy the aliasing needs. The
+        // rows already state their sources; staging is the whole
+        // difference, and it is `stage_d2d` in both.
+
+        // args: [src, weights, residual, out] — the routed combine that
+        // ACCUMULATES. `out += sum_k(src[t, k] * w[t, k])`, so the
+        // residual is staged into `out` first and the kernel adds onto
+        // it. The plain `token_batched_weighted_sum_bf16` writes instead,
+        // which is why only this spelling is in-place.
+        "moe::token_batched_weighted_sum_add_bf16" => {
+            need(4)?;
+            let (src, weights, resid, out) =
+                (bound.args[0], bound.args[1], bound.args[2], bound.args[3]);
+            stage_d2d(ctx, &bound.rows, out, resid);
+            // `src` is `[Tokens, top_k, hidden]` and `out` is
+            // `[Tokens, hidden]`, so the route count is the ratio of
+            // their row widths. Derived from what the two args SAY
+            // rather than from a config the arm would have to be told.
+            let hidden = i32::try_from(out.width).expect("dim");
+            let top_k = i32::try_from(src.width / out.width.max(1)).unwrap_or(1).max(1);
+            unsafe {
+                ffi::pie_k_moe_token_batched_weighted_sum_add_bf16(
+                    out.ptr,
+                    src.ptr,
+                    weights.ptr.cast::<f32>(),
+                    rows,
+                    top_k,
+                    hidden,
+                    ctx.stream,
+                );
+            }
+        }
+        // args: [x, y, out] — the SHARED expert's landing, and the
+        // operand order is the trap the row's own comment names: `y` is
+        // the ADDEND, not the accumulator. `out = out + sigmoid(x·gate) *
+        // y`, so the routed block's output stages into `out` and the
+        // shared expert's contribution is gated onto it.
+        "mlp::sigmoid_dot_scalar_gate_add_bf16" => {
+            need(3)?;
+            let (x, y, out) = (bound.args[0], bound.args[1], bound.args[2]);
+            let w = weight(resolver)?;
+            stage_d2d(ctx, &bound.rows, out, y);
+            unsafe {
+                ffi::pie_k_mlp_sigmoid_dot_scalar_gate_add_bf16(
+                    x.ptr,
+                    w,
+                    out.ptr,
+                    y.ptr,
+                    rows,
+                    i32::try_from(out.width).expect("dim"),
+                    ctx.stream,
                 );
             }
         }

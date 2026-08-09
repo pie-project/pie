@@ -306,7 +306,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "moe::gather_moe_aligned_inputs_bf16"
+          "kernel": "moe::gather_moe_aligned_inputs_bf16",
+          "params": [
+            8
+          ]
         }
       },
       "inputs": [
@@ -345,6 +348,10 @@
           "kernel": "moe::moe_grouped_gemm_bf16",
           "weights": [
             "layer.0.expert.{e}.gate_up"
+          ],
+          "params": [
+            16,
+            1024
           ]
         }
       },
@@ -379,6 +386,10 @@
           "kernel": "moe::moe_grouped_gemm_bf16",
           "weights": [
             "layer.0.expert.{e}.down"
+          ],
+          "params": [
+            16,
+            1024
           ]
         }
       },
@@ -395,7 +406,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "moe::reorder_moe_aligned_output_bf16"
+          "kernel": "moe::reorder_moe_aligned_output_bf16",
+          "params": [
+            8
+          ]
         }
       },
       "inputs": [

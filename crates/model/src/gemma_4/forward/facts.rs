@@ -75,8 +75,7 @@ impl Gemma4Facts {
     /// [`Qwen35HybridFacts::is_full_attn`] states, because the two
     /// families schedule their layer kinds the same way.
     pub fn is_full_attn(&self, l: u32) -> bool {
-        self.full_attn_interval <= 1
-            || l % self.full_attn_interval == self.full_attn_interval - 1
+        model_compiler::facts::full_attn_at(self.full_attn_interval, l)
     }
 
     /// Whether layer `l` reuses another layer's KV pages, projecting and

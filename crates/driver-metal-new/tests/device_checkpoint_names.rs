@@ -177,3 +177,77 @@ fn what_this_checkpoint_published() {
         }
     }
 }
+
+/// **Every name a text states, against a checkpoint's PLAN — no device.**
+///
+/// The same claim as `the_checkpoint_answers_the_names_the_text_states` and a
+/// hundredth of the cost: `compile_load_plan` reads a snapshot's metadata and
+/// a descriptor and publishes every tensor the load WILL stage, without
+/// staging any of it. The 26B gemma4 on this machine is SIGKILLed by the
+/// staging test — fifteen gigabytes — and answers this one in milliseconds.
+///
+/// The published names are what matters, and they are NOT the checkpoint's own
+/// keys: the plan renames. Comparing `Names::mlx` against a
+/// `safetensors.index.json` was the first draft of this test and it reported
+/// fifty mismatches that were all the rename.
+///
+/// Gated on `PIE_METAL_NAMES_SNAPSHOT`, and on `PIE_METAL_NAMES_ARCH` saying
+/// which naming convention to read it with.
+#[test]
+fn every_name_the_text_states_is_a_tensor_the_load_plan_publishes() {
+    let Some(dir) = std::env::var_os("PIE_METAL_NAMES_SNAPSHOT") else {
+        eprintln!("SKIP: set PIE_METAL_NAMES_SNAPSHOT to an MLX snapshot");
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let descriptor = descriptor_for(&dir);
+    let target = driver_metal_new::loader::metal_storage_target();
+    let (plan, _) = driver_metal_new::loader::compile_load_plan(&dir, &target, &descriptor)
+        .expect("the plan compiles");
+    let published: BTreeSet<&str> = plan.tensors.iter().map(|t| t.name.as_str()).collect();
+
+    let gemma4 = std::env::var("PIE_METAL_NAMES_ARCH").is_ok_and(|a| a == "gemma4");
+    let names = if gemma4 {
+        Names::mlx_gemma4()
+    } else {
+        Names::mlx()
+    };
+    // The DEPLOYMENT's facts, derived from the same descriptor, so a name the
+    // text states is one this checkpoint's shape actually asks for.
+    let model_facts = driver_metal_new::facts::ModelFacts::from_descriptor(&descriptor)
+        .expect("the descriptor states the model's facts");
+    let geometry =
+        driver_metal_new::batch::geometry_from_facts(&model_facts).expect("a decodable geometry");
+    let (facts, metal) =
+        driver_metal_new::model::text::facts_from(&geometry, |t| published.contains(t));
+
+    let tensors = HashMap::new();
+    let named = HashMap::new();
+    let store = Store::new(names, &tensors, &named);
+    let mut missing: BTreeSet<String> = BTreeSet::new();
+    for traced in names_the_text_states(&facts, &metal) {
+        let Some(spelled) = store.checkpoint_name(&traced) else {
+            missing.insert(format!("{traced} -> (no spelling)"));
+            continue;
+        };
+        if !published.contains(spelled.as_str()) {
+            missing.insert(format!("{traced} -> {spelled}"));
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "{} name(s) the text states are not tensors this load plan publishes:\n  \
+         {}\n\nEither the map spells one wrong or the deployment's facts claim \
+         something it does not ship — and the two are told apart by looking. \
+         The plan publishes:\n  {}",
+        missing.len(),
+        missing.iter().cloned().collect::<Vec<_>>().join("\n  "),
+        published
+            .iter()
+            .take(30)
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+}

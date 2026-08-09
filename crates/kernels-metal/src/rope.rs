@@ -59,7 +59,19 @@ pub static KERNELS: &[KernelSig] = &[
         ],
         axes = &[BF16]),
     // 1 in rope.metal
-    kernel!(neox_prop_decode "neox_prop_decode", axes = &[BF16]),
+    // gemma's rotation: the same neox body over a PROPORTIONAL slice of each
+    // head rather than all of it. Same operands as `neox_decode`, and in
+    // place like every rotation in this file.
+    kernel!(neox_prop_decode "neox_prop_decode", file = Some("rope/neox.metal"),
+        launch = kernels::LaunchRule::Rope,
+        operands = kernels::operands![
+            x: BufMut <- kernels::Source::Out(0),
+            position: I32s <- kernels::Source::Positions,
+            scale: F32 <- kernels::Source::ParamF32(0),
+            base: F32 <- kernels::Source::ParamF32(1),
+            head_dim: I32 <- kernels::Source::Param(2),
+        ],
+        axes = &[BF16]),
     // 1 in rope.metal
     kernel!(neox_prop_mb "neox_prop_mb", axes = &[BF16]),
     // 1 in rope.metal

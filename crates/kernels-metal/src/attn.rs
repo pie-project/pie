@@ -71,7 +71,18 @@ pub static KERNELS: &[KernelSig] = &[
         ],
         axes = &[BF16]),
     // 1 in logit_softcap.metal
-    kernel!(logit_softcap "logit_softcap", axes = &[BF16]),
+    // gemma's logit softcap: `cap * tanh(x / cap)`, applied to the readout so
+    // no logit runs away. A statement and not a mode -- a deployment without
+    // one names nothing here rather than passing an infinite cap.
+    kernel!(logit_softcap "logit_softcap", file = Some("attn/logit_softcap.metal"),
+        launch = kernels::LaunchRule::Elementwise,
+        operands = kernels::operands![
+            logits: Buf <- kernels::Source::In(0),
+            out: BufMut <- kernels::Source::Out(0),
+            // `SoftcapParams`: cap then n, packed.
+            params: Buf <- kernels::Source::Param(0),
+        ],
+        axes = &[BF16]),
     // 1 in attn_gate.metal
     kernel!(q_gate_split "q_gate_split", axes = &[BF16]),
     // 7 in sdpa_paged.metal.
@@ -122,8 +133,33 @@ pub static KERNELS: &[KernelSig] = &[
                   "_bfloat16_d_128_p32", "_bfloat16_d_64_p32_sg8"],
     }]),
     // 1 in sdpa_paged.metal
-    kernel!(sdpa_paged_decode_sink "sdpa_paged_decode_sink",
-        axes = &[BF16, Axis { what: "head dim", points: &["_d_64"] }]),
+    // The SAME template at `sinks = true`, so the same row with one slot
+    // filled. A sink is a per-head learned logit that joins the softmax
+    // without a value behind it -- gpt-oss's, and the reason the slot has been
+    // open on `sdpa_paged_decode` since the rows were written.
+    kernel!(sdpa_paged_decode_sink "sdpa_paged_decode_sink", file = Some("attn/sdpa_paged.metal"),
+    launch = kernels::LaunchRule::SdpaVector,
+    operands = kernels::operands![
+        queries: Buf <- kernels::Source::In(0),
+        k_pages: Buf <- kernels::Source::KvKeys,
+        v_pages: Buf <- kernels::Source::KvValues,
+        out: BufMut <- kernels::Source::Out(0),
+        gqa_factor: I32 <- kernels::Source::Param(0),
+        position_ids: I32s <- kernels::Source::Positions,
+        req_of_token: I32s <- kernels::Source::RequestOfToken,
+        kv_page_indices: U32s <- kernels::Source::KvPageIndices,
+        kv_page_indptr: U32s <- kernels::Source::KvPageIndptr,
+        page_size: I32 <- kernels::Source::KvPageSize,
+        n_kv_heads: I32 <- kernels::Source::Param(1),
+        scale: F32 <- kernels::Source::ParamF32(2),
+        attention_mask: U8s <- kernels::Source::AttentionMask,
+        attention_mask_stride: U32 <- kernels::Source::Param(3),
+        attention_mask_enabled: U8s <- kernels::Source::AttentionMaskEnabled,
+        window: I32 <- kernels::Source::Param(4),
+        sinks: Buf <- kernels::Source::Weight(0),
+    ],
+    lacks = &[Cap::Scores, Cap::PageMaskSink],
+    axes = &[BF16, Axis { what: "head dim", points: &["_d_64"] }]),
     // 1 in sdpa_paged_mma.metal
     kernel!(sdpa_paged_mma "sdpa_paged_mma",
         axes = &[BF16, Axis { what: "head dim", points: &["_d_64"] }]),
@@ -165,6 +201,31 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(sdpa_vector_decode_sink "sdpa_vector_decode_sink",
         axes = &[BF16, Axis { what: "head dim", points: &["_d_64"] }]),
     // 2 in sdpa_sliding.metal
+    // `sdpa_vector_decode` over a SLIDING window, and the window is an
+    // operand rather than a flag -- the port's rule that a per-fire choice the
+    // C++ made at encode time becomes data on the dispatch.
+    //
+    // Two row pitches the contiguous form does not have: gemma reads its query
+    // out of a wider buffer than it writes.
     kernel!(sdpa_vector_decode_swa "sdpa_vector_decode_swa",
+        file = Some("attn/sdpa_sliding.metal"),
+        launch = kernels::LaunchRule::SdpaVector,
+        operands = kernels::operands![
+            queries: Buf <- kernels::Source::In(0),
+            keys: Buf <- kernels::Source::KvKeys,
+            values: Buf <- kernels::Source::KvValues,
+            out: BufMut <- kernels::Source::Out(0),
+            gqa_factor: I32 <- kernels::Source::Param(0),
+            n: I32 <- kernels::Source::Param(1),
+            k_head_stride: Usize <- kernels::Source::KvHeadStride,
+            k_seq_stride: Usize <- kernels::Source::KvSeqStride,
+            v_head_stride: Usize <- kernels::Source::KvHeadStride,
+            v_seq_stride: Usize <- kernels::Source::KvSeqStride,
+            scale: F32 <- kernels::Source::ParamF32(2),
+            window: I32 <- kernels::Source::Param(3),
+            q_row_stride: I32 <- kernels::Source::Param(4),
+            o_row_stride: I32 <- kernels::Source::Param(5),
+        ],
+        lacks = &[Cap::Scores, Cap::PageMaskSink],
         axes = &[BF16, Axis { what: "head dim", points: &["_d_256", "_d_512"] }]),
 ];

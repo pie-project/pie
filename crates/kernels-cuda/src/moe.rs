@@ -23,11 +23,15 @@ pub static KERNELS: &[KernelSig] = &[
             weight_base: Buf <- Source::Weight(0),
             c: BufMut <- Source::Out(0),
             expert_ids: I32s <- Source::In(1),
-            max_blocks: I32,
-            m: I32,
-            n: I32,
-            k: I32,
-            stream: Stream,
+            // The two block numbers come off the param channel because
+            // the operands carry only their PRODUCT — the aligned
+            // rectangle's leading extent. `n` and `k` need no help: they
+            // are the result's and the operand's own row widths.
+            max_blocks: I32 <- Source::Param(1),
+            m: I32 <- Source::Param(0),
+            n: I32 <- Source::OutWidth(0),
+            k: I32 <- Source::InWidth(0),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // `topk_idx` here is `[N, K]` in TOKEN order, not the route-major order
     // the aligned path sorts into, so a row window keeps each token's routing
@@ -230,18 +234,28 @@ pub static KERNELS: &[KernelSig] = &[
     // and the table deliberately has no arithmetic: an expression
     // language here is one more place a binding can be wrong, checked by
     // nothing. The next ask decides whether that is worth revisiting.
+    // Every number here comes off the statement, and the one that could
+    // not is why `top_k` now rides the param channel: `num_routes` is the
+    // fire's tokens times k, and neither `[Tokens, hidden]` nor the
+    // permutation `[max_blocks * block_size]` nor the aligned result
+    // carries the router's width.
+    //
+    // `shared_row_begin` is `-1` at EVERY call site in the C++ tree (the
+    // hybrid spells it `constexpr int shared_row_begin = -1`, and glm5,
+    // kimi and deepseek_v4 pass the literal). A row states that once
+    // instead of each arm restating it.
     kernel!(gather_moe_aligned_inputs "moe::gather_moe_aligned_inputs_bf16", whole = true,
         operands = operands![
-            norm_x: Buf,
-            sorted_route_ids: I32s,
-            aligned_in: BufMut,
-            num_routes: I32,
-            aligned_rows: I32,
-            top_k: I32,
-            hidden: I32,
-            shared_row_begin: I32,
-            num_tokens: I32,
-            stream: Stream,
+            norm_x: Buf <- Source::In(0),
+            sorted_route_ids: I32s <- Source::In(1),
+            aligned_in: BufMut <- Source::Out(0),
+            num_routes: I32 <- Source::RoutesOfParam(0),
+            aligned_rows: I32 <- Source::InRows(1),
+            top_k: I32 <- Source::Param(0),
+            hidden: I32 <- Source::OutWidth(0),
+            shared_row_begin: I32 <- Source::Lit(Lit::I32(-1)),
+            num_tokens: I32 <- Source::Rows,
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     kernel!(build_moe_ptrs_aligned "moe::build_moe_ptrs_aligned_bf16", whole = true,
         operands = operands![
@@ -267,18 +281,27 @@ pub static KERNELS: &[KernelSig] = &[
             shared_down_base: Buf,
             stream: Stream,
         ]),
+    // The gather's other half, read the same way. `shared_out` is the
+    // FOLD's destination and this deployment does not fold the shared
+    // expert here — the hand path's `constexpr bool fold_shared = false`,
+    // which is the same decision `shared_row_begin = -1` states.
     kernel!(reorder_moe_aligned_output "moe::reorder_moe_aligned_output_bf16", whole = true,
         operands = operands![
-            aligned_out: Buf,
-            sorted_route_ids: I32s,
-            route_out: BufMut,
-            num_routes: I32,
-            aligned_rows: I32,
-            hidden: I32,
-            shared_row_begin: I32,
-            num_tokens: I32,
-            shared_out: BufMut,
-            stream: Stream,
+            aligned_out: Buf <- Source::In(0),
+            sorted_route_ids: I32s <- Source::In(1),
+            route_out: BufMut <- Source::Out(0),
+            num_routes: I32 <- Source::RoutesOfParam(0),
+            aligned_rows: I32 <- Source::InRows(1),
+            // The RESULT is `[Tokens, top_k, hidden]`, so its row width
+            // is `top_k * hidden` and not this. The OPERAND is
+            // `[aligned, hidden]` — one row of the aligned rectangle IS
+            // the hidden width, which is why this reads off the input
+            // where the gather reads off its output.
+            hidden: I32 <- Source::InWidth(0),
+            shared_row_begin: I32 <- Source::Lit(Lit::I32(-1)),
+            num_tokens: I32 <- Source::Rows,
+            shared_out: BufMut <- Source::Lit(Lit::Null),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // `out[dst_idx[i]] += src[i]·w[i]`, and `dst_idx` is route-global: a
     // window over output ROWS is not a window over routes.

@@ -388,6 +388,15 @@ fn mistral_loads_and_fires_through_the_abi() {
 /// This test asserts the REFUSAL. It is a capability limit of the build,
 /// not a defect in the derivation, and pinning it means the day someone
 /// instantiates group size 6 this test tells them to come delete it.
+///
+/// "Of the build, not of the derivation" is now where the check LIVES,
+/// too. It used to sit inside the llama lineage's facts, which made it a
+/// property of that lineage — but every family whose attention reaches
+/// the same dispatch is subject to the same instantiation set. The live
+/// proof is Qwen3.6-27B: it declares `qwen3_5_text`, so it is already
+/// openable through the hybrid's derivation, and its 24 query heads over
+/// 4 kv heads is the same group size of six. `refuse_unservable_gqa` runs
+/// once, before the registry dispatches to any family.
 #[test]
 fn an_unserveable_gqa_ratio_is_refused_at_load() {
     use driver_abi::local::{PieBytes, PieModelLoadDesc, PieRuntimeCallbacks};

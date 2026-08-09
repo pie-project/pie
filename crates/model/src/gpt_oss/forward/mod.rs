@@ -303,8 +303,7 @@ pub fn gpt_oss_cuda(
                 layer: None,
             },
         );
-        let lm_head = if facts.tied_embeddings { "embed" } else { "lm_head" };
-        let logits = dsl::lm_head_at(t, &normed, lm_head, facts.vocab);
+        let logits = dsl::lm_head_tied(t, &normed, facts.tied_embeddings, facts.vocab);
         // The exit boundary: sampling and host-visible emits attach here.
         dsl::seam(t, &dsl::seam::OUT, &[&logits], None);
     })

@@ -179,7 +179,7 @@ fn moe_mlp_body_aligned_cuda(
         facts.top_k,
         facts.num_experts,
     );
-    let aligned_in = dsl::cuda::gather_moe_aligned_inputs(&m, &sorted, aligned, facts.hidden);
+    let aligned_in = dsl::cuda::gather_moe_aligned_inputs(&m, &sorted, aligned, facts.hidden, facts.top_k);
     // The pointer build DECLARES the aligned staging, because it bakes
     // those buffers' base addresses into the device pointer arrays the
     // batched-cuBLAS fallback dereferences. Everything below fills a
@@ -209,6 +209,8 @@ fn moe_mlp_body_aligned_cuda(
         aligned,
         2 * facts.moe_intermediate,
         &w.expert_gate_up.name,
+        MOE_ALIGNED_BLOCK,
+        MOE_MAX_BLOCKS,
     );
     let act =
         dsl::cuda::swiglu_aligned(&gate_up, &act_stage, aligned, facts.moe_intermediate);
@@ -219,6 +221,8 @@ fn moe_mlp_body_aligned_cuda(
         aligned,
         facts.hidden,
         &w.expert_down.name,
+        MOE_ALIGNED_BLOCK,
+        MOE_MAX_BLOCKS,
     );
 
     let route_out =
@@ -1305,13 +1309,12 @@ fn hybrid_epilogue(t: &Trace, facts: &Qwen35HybridFacts, y: &Val, stated: bool) 
         per_head: None,
         layer: None,
     };
-    let lm_head = if facts.tied_embeddings { "embed" } else { "lm_head" };
     let normed = if stated {
         dsl::cuda::rmsnorm(y, &final_norm)
     } else {
         rmsnorm(y, &final_norm)
     };
-    let logits = dsl::lm_head_at(t, &normed, lm_head, facts.vocab);
+    let logits = dsl::lm_head_tied(t, &normed, facts.tied_embeddings, facts.vocab);
     dsl::seam(t, &dsl::seam::OUT, &[&logits], None);
 }
 

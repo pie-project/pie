@@ -159,9 +159,7 @@ fn census(bytes: &[u8], element: usize) -> Census {
 /// The checkpoint's weights, the fire's tables, and the pool's geometry.
 struct Live<'a> {
     store: Store<'a>,
-    tables: Slice,
-    /// Where each table starts in `tables`, and how long it is, in u32s.
-    spans: Vec<(usize, usize)>,
+    tables: &'a driver_metal_new::model::tables::Staged,
     shape: Shape,
     pages: &'a dyn Fn(u16, bool) -> Option<Slice>,
 }
@@ -177,27 +175,7 @@ impl Resolver for Live<'_> {
         (self.pages)(layer, values)
     }
     fn fire(&mut self, which: FireTable) -> Option<Slice> {
-        // The REAL tables, staged the way the seam stages them. A zeroed
-        // region for all of them was the first draft, and it decodes token 0
-        // at position 0 on every lane -- a legitimate input, and a degenerate
-        // one that tells you nothing about whether the per-token axis works.
-        let i = match which {
-            FireTable::TokenIds => 0,
-            FireTable::Positions => 1,
-            FireTable::RequestOfToken => 2,
-            FireTable::KvPageIndices => 3,
-            FireTable::KvPageIndptr => 4,
-            FireTable::KvWritePage => 5,
-            FireTable::KvWriteOffset => 6,
-            FireTable::RopeFrequencies => 7,
-            // No custom mask on this path, and no pool number is an address.
-            _ => return None,
-        };
-        let (at, len) = self.spans[i];
-        (len > 0).then(|| Slice {
-            address: self.tables.address + (at * 4) as u64,
-            bytes: (len * 4) as u64,
-        })
+        self.tables.at(which)
     }
     fn pool(&mut self, which: FireTable) -> Option<u32> {
         Some(match which {
@@ -255,44 +233,28 @@ fn stage_tables(
     step: &Step<'_>,
     page_size: u32,
     freqs: &[f32],
-) -> (driver_metal_new::metal::Handle, Vec<(usize, usize)>) {
-    let tokens: Vec<u32> = step.token_ids.to_vec();
-    let positions: Vec<u32> = (0..tokens.len() as u32).collect();
-    let req_of_token: Vec<u32> = (0..tokens.len() as u32).collect();
-    // One page per request, and the CSR that says so.
-    let kv_page_indices: Vec<u32> = (0..tokens.len() as u32).collect();
-    let kv_page_indptr: Vec<u32> = (0..=tokens.len() as u32).collect();
-    let w_page: Vec<u32> = kv_page_indices.clone();
+) -> driver_metal_new::model::tables::Staged {
+    let n = step.token_ids.len() as u32;
+    let positions: Vec<u32> = (0..n).collect();
+    let each: Vec<u32> = (0..n).collect();
+    let indptr: Vec<u32> = (0..=n).collect();
     let w_off: Vec<u32> = positions.iter().map(|p| p % page_size.max(1)).collect();
-
-    // The rotary frequencies ride the same region: f32 bits in a u32 channel,
-    // which is what the channel is for. A rescaled ladder is not a base and
-    // the shader reads it as a buffer.
     let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
-
-    let mut blob: Vec<u32> = Vec::new();
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    for table in [
-        &tokens,
-        &positions,
-        &req_of_token,
-        &kv_page_indices,
-        &kv_page_indptr,
-        &w_page,
-        &w_off,
-        &inv_freq,
-    ] {
-        spans.push((blob.len(), table.len()));
-        blob.extend_from_slice(table);
-    }
-    let staged =
-        allocate(context, (blob.len() * 4) as u64, "fire tables").expect("a table region");
-    // SAFETY: freshly allocated, nothing encoded against it yet.
-    unsafe {
-        let raw = core::slice::from_raw_parts(blob.as_ptr().cast::<u8>(), blob.len() * 4);
-        staged.write(0, raw).expect("the tables stage");
-    }
-    (staged, spans)
+    driver_metal_new::model::tables::stage(
+        context,
+        driver_metal_new::model::tables::Frame {
+            token_ids: step.token_ids,
+            position_ids: &positions,
+            req_of_token: &each,
+            kv_page_indices: &each,
+            kv_page_indptr: &indptr,
+            kv_write_page: &each,
+            kv_write_offset: &w_off,
+            rope_frequencies: &inv_freq,
+            sampling_indices: step.sampling_indices,
+        },
+    )
+    .expect("the tables stage")
 }
 
 #[test]
@@ -353,16 +315,12 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
             original_max: dg.rope_original_max_position as f32,
         }),
     );
-    let (staged, spans) = stage_tables(&context, &step, shape.page_size, &freqs);
+    let staged = stage_tables(&context, &step, shape.page_size, &freqs);
 
     let named = HashMap::new();
     let mut live = Live {
         store: Store::new(Names::mlx(), &loaded.tensors, &named),
-        tables: Slice {
-            address: staged.gpu_address(),
-            bytes: staged.len(),
-        },
-        spans,
+        tables: &staged,
         shape,
         pages: &pages,
     };
@@ -415,10 +373,27 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
                 ),
             )
         };
+        // The first row of each, as numbers. A byte count says the pool was
+        // written; it cannot say WHICH tensor landed there, and "the attention
+        // answers with K" is exactly the question of which.
+        let head = |r: &[u8]| {
+            r.chunks_exact(2)
+                .take(6)
+                .map(|c| {
+                    let x = f32::from_bits(
+                        u32::from(u16::from_le_bytes([c[0], c[1]])) << 16,
+                    );
+                    format!("{x:.6}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         eprintln!(
-            "  kv layer {l}: {} of {n} K bytes non-zero, {} V",
+            "  kv layer {l}: {} of {n} K bytes non-zero, {} V\n    K[0..6] [{}]\n    V[0..6] [{}]",
             k.iter().filter(|&&b| b != 0).count(),
             v.iter().filter(|&&b| b != 0).count(),
+            head(k),
+            head(v),
         );
     }
 
@@ -774,13 +749,12 @@ fn bisect(class: FireClass) {
             ..Step::default()
         }
     } else {
+        // TWO rows, which the GEMM's tile does not divide -- the guard's
+        // GEMV arm is what serves them.
         Step {
-            token_ids: &[
-                128_000, 9906, 1917, 11, 420, 374, 264, 1296, 315, 279, 1646,
-                596, 4741, 1522, 902, 1288,
-            ],
-            qo_indptr: &[0, 16],
-            sampling_indices: &[15],
+            token_ids: &[128_000, 9906],
+            qo_indptr: &[0, 2],
+            sampling_indices: &[0],
             ..Step::default()
         }
     };
@@ -812,7 +786,7 @@ fn bisect(class: FireClass) {
             original_max: dg.rope_original_max_position as f32,
         }),
     );
-    let (staged, spans) = if decode {
+    let staged = if decode {
         stage_tables(&context, &step, shape.page_size, &freqs)
     } else {
         stage_prefill(&context, &step, shape.page_size, &freqs)
@@ -821,11 +795,7 @@ fn bisect(class: FireClass) {
     let named = HashMap::new();
     let mut live = Live {
         store: Store::new(Names::mlx(), &loaded.tensors, &named),
-        tables: Slice {
-            address: staged.gpu_address(),
-            bytes: staged.len(),
-        },
-        spans,
+        tables: &staged,
         shape,
         pages: &pages,
     };
@@ -966,6 +936,38 @@ fn bisect(class: FireClass) {
         }
     }
 
+    // The pool, after the whole prefix: which tensor actually landed where.
+    {
+        let layer = pool.layer(0).expect("a layer");
+        let n = shape.layer_bytes() as usize;
+        // SAFETY: the command buffers retired.
+        let (k, v) = unsafe {
+            (
+                core::slice::from_raw_parts(
+                    layer.k.contents().as_ptr().cast_const().cast::<u8>(),
+                    n,
+                ),
+                core::slice::from_raw_parts(
+                    layer.v.contents().as_ptr().cast_const().cast::<u8>(),
+                    n,
+                ),
+            )
+        };
+        let head = |r: &[u8]| {
+            r.chunks_exact(2)
+                .take(6)
+                .map(|c| {
+                    let x =
+                        f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16);
+                    format!("{x:.6}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        eprintln!("  pool K[0..6] [{}]", head(k));
+        eprintln!("  pool V[0..6] [{}]", head(v));
+    }
+
     match &first_bad {
         Some((i, symbol)) => eprintln!(
             "\nThe second lane stops at statement {i}, `{symbol}`: it wrote row 0 \
@@ -1082,16 +1084,12 @@ fn one_token_at_position_zero_agrees_with_mlx() {
             original_max: dg.rope_original_max_position as f32,
         }),
     );
-    let (staged, spans) = stage_tables(&context, &step, shape.page_size, &freqs);
+    let staged = stage_tables(&context, &step, shape.page_size, &freqs);
 
     let named = HashMap::new();
     let mut live = Live {
         store: Store::new(Names::mlx(), &loaded.tensors, &named),
-        tables: Slice {
-            address: staged.gpu_address(),
-            bytes: staged.len(),
-        },
-        spans,
+        tables: &staged,
         shape,
         pages: &pages,
     };
@@ -1207,35 +1205,23 @@ fn one_token_at_position_zero_agrees_with_mlx() {
 /// a sampler wants. MLX's answer for `[128000, 9906]` at position 1 is argmax
 /// **0** with the distribution spanning [-5.42, 18.56].
 ///
-/// # Ignored, and the reason is a precondition rather than a bug
+/// **It agrees.** Same argmax, same top five in order, span [-5.41, 18.63]
+/// against MLX's [-5.42, 18.56]. So the M>1 lane is held to a reference too,
+/// and between them the two gates cover both halves of the kernel table.
 ///
-/// Two rows do not tile. `qmm_t.metal` has no `M` argument -- its own header
-/// says *"the driver only selects this kernel when M % BM == 0 ... every tile
-/// is full and the `load_unsafe` path is the only one reachable; the row count
-/// lives in the grid"* -- and `QMM_BMS` starts at sixteen. So `Rule::Qmm`
-/// refuses this fire with `Ungeometric::PartialTile { rows: 2, tile: 16 }`,
-/// which is the honest answer and the reason this stays ignored.
+/// Three things had to land for it, and each was invisible to the other gate:
 ///
-/// Both substitutions were tried here first, against this checkpoint, and both
-/// were wrong:
-///
-///   * the MATVEC's grid under the GEMM's symbol — which is what the arm did
-///     before — made every logit **NaN**;
-///   * rounding the row axis up made them finite and WRONG: q_proj came out
-///     1.258 where the matvec and MLX both say 1.320. That is the worse of the
-///     two, because the arena is laid out back to back and fourteen rows of
-///     overrun land on the next value.
-///
-/// What it wants is a TEXT that states the pair with a predicate on rows, the
-/// way the DSL states every other polymorphism — a driver picking between two
-/// kernels is the thing this crate exists to remove. Until then a prefill is
-/// served at sixteen rows and up, which is what
-/// `device_text_fire::a_prefill_step_fires_too...` now posts.
-///
-/// Reviving this test therefore means changing the TEXT, not this file, and
-/// the constants below are ready for when it happens.
+///   * the projection GUARD, because `qmm_t.metal` needs `M % BM == 0` and two
+///     rows tile nothing — which took `region_out` on the arms and
+///     `Lowering::region_outs` under them;
+///   * the ROW GATHER, because a prefill's stream is one row per TOKEN and its
+///     readout one per REQUEST. Without it the readout read row 0 and answered
+///     the FIRST token's distribution — exactly right, for a question nobody
+///     asked;
+///   * `Source::RequestCount` as `Ty::InPacked`, because how many rows to
+///     gather is the fire's number and it is a FIELD of a packed struct rather
+///     than an operand.
 #[test]
-#[ignore = "two rows do not tile; Rule::Qmm refuses, and the text has no short-row arm yet"]
 fn a_two_token_prefill_agrees_with_mlx() {
     let Some(snapshot) = snapshot() else {
         eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
@@ -1258,10 +1244,16 @@ fn a_two_token_prefill_agrees_with_mlx() {
         driver_metal_new::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
 
     // ONE request, TWO tokens: a prefill.
+    //
+    // `sampling_indices: &[1]` — the LAST token's, which is what a prefill
+    // produces and what a sampler wants. Asking for index 0 returns position
+    // zero's distribution, and it returns it EXACTLY: 16309 at 6.40625,
+    // matching the decode gate and MLX. Worth knowing, because it means the
+    // readout gather is right and the difference below is the sequence.
     let step = Step {
         token_ids: &[128_000, 9906],
         qo_indptr: &[0, 2],
-        sampling_indices: &[0],
+        sampling_indices: &[1],
         ..Step::default()
     };
     let plan = llama_like_metal(&facts, &metal, FireClass::Prefill);
@@ -1296,16 +1288,12 @@ fn a_two_token_prefill_agrees_with_mlx() {
     // land in that request's first page at their own offsets. `stage_tables`
     // states one request per token, which is a decode's shape — so the tables
     // here are the prefill's own.
-    let (staged, spans) = stage_prefill(&context, &step, shape.page_size, &freqs);
+    let staged = stage_prefill(&context, &step, shape.page_size, &freqs);
 
     let named = HashMap::new();
     let mut live = Live {
         store: Store::new(Names::mlx(), &loaded.tensors, &named),
-        tables: Slice {
-            address: staged.gpu_address(),
-            bytes: staged.len(),
-        },
-        spans,
+        tables: &staged,
         shape,
         pages: &pages,
     };
@@ -1406,38 +1394,25 @@ fn stage_prefill(
     step: &Step<'_>,
     page_size: u32,
     freqs: &[f32],
-) -> (driver_metal_new::metal::Handle, Vec<(usize, usize)>) {
+) -> driver_metal_new::model::tables::Staged {
     let n = step.token_ids.len() as u32;
-    let tokens: Vec<u32> = step.token_ids.to_vec();
     let positions: Vec<u32> = (0..n).collect();
-    let req_of_token: Vec<u32> = vec![0; n as usize];
-    let kv_page_indices: Vec<u32> = vec![0];
-    let kv_page_indptr: Vec<u32> = vec![0, 1];
-    let w_page: Vec<u32> = vec![0; n as usize];
+    let zeros: Vec<u32> = vec![0; n as usize];
     let w_off: Vec<u32> = positions.iter().map(|p| p % page_size.max(1)).collect();
     let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
-
-    let mut blob: Vec<u32> = Vec::new();
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    for table in [
-        &tokens,
-        &positions,
-        &req_of_token,
-        &kv_page_indices,
-        &kv_page_indptr,
-        &w_page,
-        &w_off,
-        &inv_freq,
-    ] {
-        spans.push((blob.len(), table.len()));
-        blob.extend_from_slice(table);
-    }
-    let staged =
-        allocate(context, (blob.len() * 4) as u64, "fire tables").expect("a table region");
-    // SAFETY: freshly allocated, nothing encoded against it yet.
-    unsafe {
-        let raw = core::slice::from_raw_parts(blob.as_ptr().cast::<u8>(), blob.len() * 4);
-        staged.write(0, raw).expect("the tables stage");
-    }
-    (staged, spans)
+    driver_metal_new::model::tables::stage(
+        context,
+        driver_metal_new::model::tables::Frame {
+            token_ids: step.token_ids,
+            position_ids: &positions,
+            req_of_token: &zeros,
+            kv_page_indices: &[0],
+            kv_page_indptr: &[0, 1],
+            kv_write_page: &zeros,
+            kv_write_offset: &w_off,
+            rope_frequencies: &inv_freq,
+            sampling_indices: step.sampling_indices,
+        },
+    )
+    .expect("the tables stage")
 }

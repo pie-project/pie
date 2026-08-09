@@ -20260,7 +20260,7 @@
     {
       "kind": {
         "LmHead": {
-          "weight": "lm_head"
+          "weight": "embed"
         }
       },
       "inputs": [

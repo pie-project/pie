@@ -310,6 +310,15 @@ pub enum Ty {
     /// A host byte count, spelled `std::size_t`. Its width is the platform's,
     /// which is why it is not [`Ty::U32`] widened by hand.
     Usize,
+    /// A scalar that rides the PRECEDING packed struct rather than a buffer of
+    /// its own.
+    ///
+    /// `RowGatherParams` packs width and count into one buffer and there is no
+    /// second: the count is the struct's second FIELD. A row lists it so the
+    /// driver knows to supply the value, and this says "append it to the
+    /// scalars, bind nothing" — a packed slot's run already covers every
+    /// scalar after it, so the field lands where the struct expects it.
+    InPacked,
     /// A host scalar.
     F32,
     /// A host flag. Spelled `bool` in C++, so it is ONE byte and not `i32`;
@@ -383,6 +392,9 @@ impl Ty {
     /// text a reader finds in the header it is checked against.
     pub const fn cpp(self) -> &'static str {
         match self {
+            // No C spelling: it is a FIELD of the preceding struct, so the
+            // header already names it there.
+            Ty::InPacked => "::std::uint32_t",
             Ty::BufMut => "void*",
             Ty::Buf => "const void*",
             Ty::I32s => "const ::std::int32_t*",
@@ -435,6 +447,7 @@ impl Ty {
     /// and this crate does not have to name either API to say so.
     pub const fn rust(self) -> &'static str {
         match self {
+            Ty::InPacked => "u32",
             Ty::BufMut => "*mut ::core::ffi::c_void",
             Ty::Buf => "*const ::core::ffi::c_void",
             Ty::I32s => "*const i32",
@@ -588,6 +601,20 @@ pub enum Source {
     KvWritePage,
     /// Per token: the row within [`Source::KvWritePage`]'s page.
     KvWriteOffset,
+    /// HOW MANY rows the fire samples, one per request.
+    ///
+    /// A number and not an address, so it rides the scalar channel beside the
+    /// statement's own — the same shape as the KV pool's strides, and for the
+    /// same reason: the driver knows it and no text can state it. `Lowered`
+    /// publishes it because it is `rows` filtered two ways and maxed, not
+    /// `rows.len()`.
+    RequestCount,
+    /// Which ROWS the fire samples, one per request.
+    ///
+    /// A prefill's readout is one distribution per request and its stream is
+    /// one row per token, so something has to pick. `Step::sampling_indices`
+    /// is the frame's answer and the row is where it is named.
+    SamplingIndices,
     /// The rotary INVERSE FREQUENCIES, `[rotary_dims/2]` f32.
     ///
     /// A table rather than a base, because a base cannot express what a
@@ -691,6 +718,22 @@ pub enum Source {
     /// Dimension `d` of the `i`-th result, which is how a head count
     /// reaches a launcher: the shape says `[Tokens, heads, dim]`.
     OutDim(u8, u8),
+    /// The fire's ROUTE COUNT: rows times the `i`-th param.
+    ///
+    /// The MoE aligned path's `num_routes`, and the one product the
+    /// table could not otherwise reach. `InElements` covers the case
+    /// where a value already IS the routes (`topk_idx` is
+    /// `[Tokens, top_k]`, so its element count is the answer), but the
+    /// gather and the reorder take the PERMUTATION as their integer
+    /// operand — `[max_blocks * block_size]`, the padded aligned extent —
+    /// and neither their other operand nor their result carries the
+    /// router's width. So the statement states `top_k` on the param
+    /// channel and this reads rows times it.
+    ///
+    /// Deliberately narrow: it is a row's way of saying "per-token
+    /// fan-out", not a general arithmetic escape hatch. A row wanting a
+    /// different product should say what the product IS.
+    RoutesOfParam(u8),
     /// A named field of the executing context — the stream, the handle,
     /// `eps`, the head geometry.
     ///

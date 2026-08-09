@@ -635,6 +635,27 @@ pub fn lm_head_at(t: &Trace, x: &Val, weight: &str, vocab: u32) -> Val {
     }
 }
 
+/// The epilogue, with the TIED-EMBEDDING fact resolved here rather than
+/// by each caller.
+///
+/// The fork is one line — `if tied { "embed" } else { "lm_head" }` — and
+/// four families wrote it: llama_like, gemma-4, qwen3.5 and gpt-oss. A
+/// FIFTH did not, and that is why this exists rather than being left as
+/// four tidy duplicates.
+///
+/// gemma-2 carries `tied_embeddings: true` in its facts, correctly (the
+/// checkpoint ships no `lm_head.weight`), and its text named `"lm_head"`
+/// unconditionally. A fact declared and never read — so the trace asked
+/// the binder for a tensor the checkpoint does not contain, and the
+/// family sits in `NOT_YET_OPENABLE` where nothing could notice.
+///
+/// A one-line fork repeated per family is a fact each family can forget
+/// to read. Taking the BOOLEAN instead of the resolved name means the
+/// forgetting has nowhere to happen.
+pub fn lm_head_tied(t: &Trace, x: &Val, tied: bool, vocab: u32) -> Val {
+    lm_head_at(t, x, if tied { "embed" } else { "lm_head" }, vocab)
+}
+
 // ── The semantic vocabulary, as free functions ─────────────────────────
 
 /// `x[index]` — the window of a value along its LEADING dim.
@@ -1732,6 +1753,34 @@ pub mod metal {
         (v.t.inner.borrow().value_shape(v.id), DType::BF16)
     }
 
+    /// The result a statement records — `None` inside a value-producing
+    /// region, where the enclosing construct owns it.
+    ///
+    /// The same rule `seam::attn_at` follows and for the same reason: whether
+    /// a dispatch produces its own value is a property of the STATEMENT'S
+    /// POSITION, which the tape knows. A projection written plainly produces
+    /// its value; the same projection written as a guard's arm is a LOWERING
+    /// of the guard's.
+    ///
+    /// Getting this wrong is not a small error. A guard arm that records its
+    /// own value leaves the guard's unwritten, so every statement after reads
+    /// the slot one before it — measured, when the projection guard first went
+    /// in: the KV pool came back holding q in its K pages and k in its V.
+    fn region_out(t: &Trace, shape: (Shape, DType)) -> Option<(Shape, DType)> {
+        (!t.inner.borrow().inside_value_region()).then_some(shape)
+    }
+
+    /// The value a statement hands back.
+    ///
+    /// `Some` outside a region, where the statement produced it. Inside one,
+    /// `with_params` recorded no output and there is nothing to hand back —
+    /// the caller has the GUARD's value and ignores this one — so the input is
+    /// returned as a placeholder rather than panicking on a `None` that is
+    /// correct.
+    fn or_regions(v: Option<Val>, x: &Val) -> Val {
+        v.unwrap_or_else(|| x.clone())
+    }
+
     /// `embed_gather.metal::embed_gather_4bit` (M=1) /
     /// `embed_gather_mb_4bit` (M>1).
     pub fn embed_gather(
@@ -1891,7 +1940,7 @@ pub mod metal {
     /// `quantized_qmv.metal::affine_qmv_fast` — the projection GEMV,
     /// M=1. The driver fans every projection kind onto it.
     pub fn qmv(x: &Val, w: &MatW, point: &str) -> Val {
-        with_params(
+        let out = with_params(
             &x.t,
             w.layer,
             &format!("affine_qmv_fast{point}"),
@@ -1902,16 +1951,19 @@ pub mod metal {
             // reports success, which is why these are stated and not derived.
             vec![in_width(x), w.width],
             vec![x.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
-        )
-        .expect("a projection produces its value")
+            region_out(
+                &x.t,
+                (Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16),
+            ),
+        );
+        or_regions(out, x)
     }
 
     /// `quantized_qmv.metal::affine_qmv_fast_residual` — the same GEMV
     /// with the block residual folded into its epilogue, which is what a
     /// `beta_one` matmul is on this backend.
     pub fn qmv_residual(x: &Val, w: &MatW, residual: &Val, point: &str) -> Val {
-        with_params(
+        let out = with_params(
             &x.t,
             w.layer,
             &format!("affine_qmv_fast_residual{point}"),
@@ -1919,15 +1971,18 @@ pub mod metal {
             None,
             vec![in_width(x), w.width],
             vec![x.id, residual.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
-        )
-        .expect("a folded projection produces its value")
+            region_out(
+                &x.t,
+                (Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16),
+            ),
+        );
+        or_regions(out, x)
     }
 
     /// `quantized_qmm_t.metal::affine_qmm_t` — MLX's steel quantized
     /// GEMM, the M>1 projection.
     pub fn qmm(x: &Val, w: &MatW, point: &str) -> Val {
-        with_params(
+        let out = with_params(
             &x.t,
             w.layer,
             &format!("affine_qmm_t{point}"),
@@ -1938,14 +1993,17 @@ pub mod metal {
             // reports success, which is why these are stated and not derived.
             vec![in_width(x), w.width],
             vec![x.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
-        )
-        .expect("a projection produces its value")
+            region_out(
+                &x.t,
+                (Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16),
+            ),
+        );
+        or_regions(out, x)
     }
 
     /// `quantized_qmm_t.metal::affine_qmm_t_residual`.
     pub fn qmm_residual(x: &Val, w: &MatW, residual: &Val, point: &str) -> Val {
-        with_params(
+        let out = with_params(
             &x.t,
             w.layer,
             &format!("affine_qmm_t_residual{point}"),
@@ -1953,26 +2011,29 @@ pub mod metal {
             None,
             vec![in_width(x), w.width],
             vec![x.id, residual.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
-        )
-        .expect("a folded projection produces its value")
+            region_out(
+                &x.t,
+                (Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16),
+            ),
+        );
+        or_regions(out, x)
     }
 
     /// `residual_add.metal::residual_add_bfloat16` — the explicit
     /// landing, for the deployments and positions where no epilogue fold
     /// exists.
     pub fn residual_add(x: &Val, residual: &Val) -> Val {
-        let out = same_shape(x);
-        record(
+        let shape = same_shape(x);
+        let out = record(
             &x.t,
             x.layer,
             "residual_add_bfloat16",
             vec![],
             None,
             vec![x.id, residual.id],
-            Some(out),
-        )
-        .expect("the residual landing produces its value")
+            region_out(&x.t, shape),
+        );
+        or_regions(out, x)
     }
 
     /// `rope/rope.metal::neox_decode_bfloat16` (M=1) /
@@ -2015,46 +2076,57 @@ pub mod metal {
         head_dim: u32,
         table: bool,
     ) -> Val {
+        // IN PLACE, and the statement has to say so. Every `neox` entrypoint
+        // takes ONE buffer -- `device T* x`, read and written -- so a
+        // statement that declared a separate result had the row's `Out(0)`
+        // bind the RESULT's slot, which no kernel had written. The rotation
+        // then read whatever the arena held there and the value everything
+        // downstream wanted was never rotated at all.
+        //
+        // Position zero hid it completely: rope is the identity at position
+        // zero (cos 0 = 1, sin 0 = 0), so rotating the wrong buffer and
+        // rotating the right one agree exactly, and the first reference gate
+        // was set there for an unrelated reason.
+        //
+        // Stating no result makes `dispatch::reorder` bind `Out(0)` to the
+        // last widthed operand, which for a one-operand launch is the input --
+        // the buffer the kernel actually mutates. The value handed back is the
+        // input's, because after the launch that IS the rotated tensor.
+        //
         // A deployment that RESCALES its frequency ladder cannot state a base:
         // llama-3 rescales piecewise and YaRN rescales differently, and both
         // are tables. The driver derives one at load and answers it as
         // `Source::RopeFrequencies`, so the statement's job is only to say
         // WHICH form this deployment takes.
-        if table {
-            return with_params(
-                &x.t,
-                x.layer,
-                "neox_freqs_decode_bfloat16",
-                vec![],
-                None,
+        let (kernel, params) = if table {
+            (
+                "neox_freqs_decode_bfloat16".to_string(),
                 // Scale, head width, and YaRN's `mscale` -- one for llama-3,
                 // whose rescaling lives entirely in the frequencies.
                 vec![scale.to_bits(), head_dim, 1.0f32.to_bits()],
-                vec![x.id],
-                Some(same_shape(x)),
             )
-            .expect("a rotation produces its value");
-        }
-        let kernel = if multi_batch {
-            "neox_mb_bfloat16"
         } else {
-            "neox_decode_bfloat16"
+            let stem = if multi_batch { "neox_mb_bfloat16" } else { "neox_decode_bfloat16" };
+            (
+                stem.to_string(),
+                // The rotation's scale, its log2 base and the head width. The
+                // base is `log2(theta)` because the shader raises two to it --
+                // `rope_neox_geometric_body` -- and handing it theta rotates
+                // by a frequency ladder wrong from the second channel on.
+                vec![scale.to_bits(), theta.log2().to_bits(), head_dim],
+            )
         };
         with_params(
-            &x.t,
-            x.layer,
-            kernel,
+            x.trace(),
+            x.layer(),
+            &kernel,
             vec![],
             None,
-            // The rotation's scale, its log2 base and the head width. The base
-            // is `log2(theta)` because the shader raises two to it —
-            // `rope_neox_geometric_body` — and handing it theta rotates by a
-            // frequency ladder that is wrong from the second channel on.
-            vec![scale.to_bits(), theta.log2().to_bits(), head_dim],
+            params,
             vec![x.id],
-            Some(same_shape(x)),
-        )
-        .expect("a rotation produces its value")
+            None,
+        );
+        x.clone()
     }
 
     /// `attn/split_qkv.metal::split_qkv_bf16`: deinterleave the packed QKV
@@ -2146,11 +2218,17 @@ pub mod metal {
         gqa_factor: u32,
         kv_heads: u32,
         window: i32,
+        sinks: Option<&str>,
     ) -> Option<Val> {
-        let kernel = if paged {
-            format!("sdpa_paged_decode_bfloat16_d_{head_dim}")
-        } else {
-            format!("sdpa_vector_decode_bfloat16_d_{head_dim}")
+        // The SINK variant is the same template at `sinks = true`, so it is
+        // the same statement with one weight. A sink is a per-head learned
+        // logit that joins the softmax without a value behind it — gpt-oss's,
+        // and the reason `sdpa_paged_decode`'s row has carried an open slot
+        // since the rows were written.
+        let kernel = match (paged, sinks.is_some()) {
+            (true, true) => format!("sdpa_paged_decode_sink_bfloat16_d_{head_dim}"),
+            (true, false) => format!("sdpa_paged_decode_bfloat16_d_{head_dim}"),
+            (false, _) => format!("sdpa_vector_decode_bfloat16_d_{head_dim}"),
         };
         let kernel = kernel.as_str();
         // The model's scalars, in the order both rows name them. The strides
@@ -2166,7 +2244,9 @@ pub mod metal {
             &q.t,
             Some(kv.l),
             kernel,
-            vec![],
+            // The sink weight, when this deployment has one: a per-head
+            // learned logit, and the row's `Weight(0)`.
+            sinks.map(|w| vec![w.to_string()]).unwrap_or_default(),
             kv_state(kv),
             vec![
                 gqa_factor,
@@ -2196,6 +2276,268 @@ pub mod metal {
             )),
         )
         .expect("the activation produces its value")
+    }
+
+    // ── gemma's per-layer embeddings. ──
+    //
+    // A SIDE NETWORK, and the only thing in this module that is: a second
+    // embedding table gathered once per step, projected, normed and joined,
+    // producing `[n_layers, ple_dim]` that each layer then reads its own slice
+    // of. Nothing llama-like has a counterpart, which is what makes gemma4 a
+    // family where qwen3-moe and gpt-oss were facts.
+    //
+    // Four statements before the stack and four inside it, and every symbol is
+    // one this backend already had — `psos_gemma4.rs` maps six of the nine
+    // `G4Ple*` roles onto kernels other families name. What is new is the
+    // WALK.
+
+    /// `layout/embed_gather.metal::embed_gather_scaled_4bit` — the embedding,
+    /// with gemma's `sqrt(hidden)` scale folded into the gather.
+    ///
+    /// The scale is the STATEMENT's, not the kernel's: a kernel that knew it
+    /// would be a kernel that knew the model.
+    pub fn embed_gather_scaled(
+        t: &Trace,
+        weight: &str,
+        width: u32,
+        multi_batch: bool,
+        repr: WeightRepr,
+        point: &str,
+        scale: f32,
+    ) -> Val {
+        let stem = if multi_batch {
+            "embed_gather_scaled_mb_4bit"
+        } else {
+            "embed_gather_scaled_4bit"
+        };
+        with_params(
+            t,
+            None,
+            &format!("{stem}{point}"),
+            quant_table(weight, repr),
+            None,
+            vec![width, scale.to_bits()],
+            vec![],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
+        )
+        .expect("the gather produces its rows")
+    }
+
+    /// `layout/ple_combine.metal::ple_combine` — `(proj + token) * inv_sqrt2`.
+    ///
+    /// The scale is the JOIN's rather than a deployment's: two streams
+    /// averaged in the root-mean-square sense, which is what `1/sqrt(2)` is.
+    pub fn ple_combine(proj: &Val, token: &Val, width: u32) -> Val {
+        with_params(
+            &proj.t,
+            None,
+            "ple_combine_bfloat16",
+            vec![],
+            None,
+            // `PleCombineParams`: inv_sqrt2 then n.
+            vec![std::f32::consts::FRAC_1_SQRT_2.to_bits(), width],
+            vec![proj.id, token.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
+        )
+        .expect("the join produces its value")
+    }
+
+    /// `mlp/gated.metal::geglu_tanh_strided` — the activation over rows that
+    /// are not contiguous.
+    ///
+    /// gemma's PLE reads a narrow gate out of a wide buffer, so each operand
+    /// states its own pitch. The plain `geglu` is this with all three equal.
+    pub fn geglu_strided(gate: &Val, up: &Val, width: u32, gate_pitch: u32, up_pitch: u32) -> Val {
+        with_params(
+            &gate.t,
+            gate.layer,
+            "geglu_tanh_strided_bfloat16",
+            vec![],
+            None,
+            // `GegluStridedParams`: width, rows, then the three pitches. The
+            // row count is the fire's and rides the shape.
+            vec![width, 1, gate_pitch, up_pitch, width],
+            vec![gate.id, up.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
+        )
+        .expect("the activation produces its value")
+    }
+
+    /// `norm/vector.metal::vnorm_single_row` — a norm with NO gain.
+    ///
+    /// The row divided by its own RMS and nothing else. The absence of a
+    /// weight is the whole difference from [`rms_norm`], and it is why this is
+    /// its own symbol rather than a norm handed a vector of ones — which would
+    /// be a multiply per element to compute the identity.
+    pub fn vnorm(x: &Val, row: u32, eps: f32) -> Val {
+        with_params(
+            &x.t,
+            x.layer,
+            "vnorm_single_row_bfloat16",
+            vec![],
+            None,
+            // `VNormParams`: eps then axis_size.
+            vec![eps.to_bits(), row],
+            vec![x.id],
+            Some(same_shape(x)),
+        )
+        .expect("the norm produces its value")
+    }
+
+    /// `norm/layer_scalar.metal::layer_scalar_mul` — one number per layer.
+    ///
+    /// Read from a BUFFER rather than stated, because which layer is running
+    /// is the fire's and not the text's.
+    pub fn layer_scalar(x: &Val, scalar: &str, width: u32) -> Val {
+        with_params(
+            &x.t,
+            x.layer,
+            "layer_scalar_mul_bfloat16",
+            vec![scalar.to_string()],
+            None,
+            // `LayerScalarParams`: the hidden width.
+            vec![width],
+            vec![x.id],
+            Some(same_shape(x)),
+        )
+        .expect("the scale produces its value")
+    }
+
+    /// `norm/rms.metal::rms_residual` — a norm with the block residual folded
+    /// into its epilogue, and `rms_residual_scaled` with a per-layer gain
+    /// beside it.
+    pub fn rms_norm_residual(
+        x: &Val,
+        w: &NormW,
+        residual: &Val,
+        scale: Option<&Val>,
+        row: u32,
+        eps: f32,
+    ) -> Val {
+        let mut ins = vec![x.id, residual.id];
+        let kernel = match scale {
+            Some(s) => {
+                ins.push(s.id);
+                "rms_residual_scaled_bfloat16"
+            }
+            None => "rms_residual_bfloat16",
+        };
+        with_params(
+            &x.t,
+            w.layer,
+            kernel,
+            vec![w.name.clone()],
+            None,
+            // `RmsParams`, field for field — `w_stride` is ONE, the distance
+            // between consecutive CHANNELS of the gain vector. See `rms_norm`.
+            vec![
+                eps.to_bits(),
+                row,
+                1,
+                u32::from(w.variant == crate::trace::NormVariant::Gemma),
+                1.0f32.to_bits(),
+            ],
+            ins,
+            Some(same_shape(x)),
+        )
+        .expect("a norm produces its value")
+    }
+
+    /// `attn/logit_softcap.metal::logit_softcap` — `cap * tanh(x / cap)`.
+    ///
+    /// gemma's, applied to the readout so no logit runs away. A STATEMENT and
+    /// not a mode: a deployment without one names nothing here, rather than
+    /// passing a cap so large it does nothing — which would be a kernel run
+    /// per fire to compute the identity.
+    pub fn softcap(x: &Val, width: u32, cap: f32) -> Val {
+        with_params(
+            &x.t,
+            x.layer,
+            "logit_softcap_bfloat16",
+            vec![],
+            None,
+            // `SoftcapParams`, field for field: cap then n.
+            vec![cap.to_bits(), width],
+            vec![x.id],
+            Some((Shape(vec![Dim::Requests, Dim::Const(width)]), DType::BF16)),
+        )
+        .expect("the softcap produces its value")
+    }
+
+    /// `mlp/gated.metal::geglu_tanh` — gemma's activation.
+    ///
+    /// `gelu_tanh(gate) * up`, and the gelu is the TANH approximation rather
+    /// than the erf one. A third symbol beside `silu_mul` and
+    /// `gptoss_swiglu`, and which a deployment takes is a load-time fact.
+    pub fn geglu(gate: &Val, up: &Val, intermediate: u32) -> Val {
+        with_params(
+            &gate.t,
+            gate.layer,
+            "geglu_tanh_bfloat16",
+            vec![],
+            None,
+            // `GegluParams`: the element count.
+            vec![intermediate],
+            vec![gate.id, up.id],
+            Some((
+                Shape(vec![Dim::Tokens, Dim::Const(intermediate)]),
+                DType::BF16,
+            )),
+        )
+        .expect("the activation produces its value")
+    }
+
+    /// `mlp/gated.metal::gptoss_swiglu` — gpt-oss's activation.
+    ///
+    /// Not `silu_mul` with parameters. The gate is clamped ABOVE only, the
+    /// linear branch is clamped both ways and carries a `+1`, and dropping
+    /// either produces a model that runs and is wrong. So it is its own
+    /// symbol, and which one a deployment takes is a load-time fact.
+    pub fn swiglu(gate: &Val, up: &Val, intermediate: u32, limit: f32, alpha: f32) -> Val {
+        with_params(
+            &gate.t,
+            gate.layer,
+            "gptoss_swiglu_bfloat16",
+            vec![],
+            None,
+            // `GptOssSwiGluParams`, field for field: n, limit, alpha.
+            vec![intermediate, limit.to_bits(), alpha.to_bits()],
+            vec![gate.id, up.id],
+            Some((
+                Shape(vec![Dim::Tokens, Dim::Const(intermediate)]),
+                DType::BF16,
+            )),
+        )
+        .expect("the activation produces its value")
+    }
+
+    /// `layout/row_gather.metal::row_gather` — the sampled rows, in order.
+    ///
+    /// A prefill's stream is one row per TOKEN and its readout is one
+    /// distribution per REQUEST, so the rows a fire samples have to be picked
+    /// out before the lm head runs. Which rows is `Step::sampling_indices`, a
+    /// fire table, so the row names it and no statement supplies it.
+    ///
+    /// Absent, a prefill's readout reads row 0 and answers the FIRST token's
+    /// distribution — measured against MLX, and exactly right for a question
+    /// nobody asked.
+    pub fn sample_rows(x: &Val, width: u32) -> Val {
+        with_params(
+            &x.t,
+            None,
+            "row_gather_bfloat16",
+            vec![],
+            None,
+            // `RowGatherParams`, packed: width then count. WIDTH only here --
+            // how many rows to gather is the REQUEST count, a number of the
+            // fire's that no text can state, and the row names it
+            // (`Source::RequestCount`, `Ty::InPacked`) so the driver appends
+            // it as the struct's second field.
+            vec![width],
+            vec![x.id],
+            Some((Shape(vec![Dim::Requests, Dim::Const(width)]), DType::BF16)),
+        )
+        .expect("the gather produces its rows")
     }
 
     /// `quantized_qmv.metal::affine_qmv_fast` against the lm head — the
@@ -3128,6 +3470,13 @@ pub mod cuda {
     /// spells it with and the binding resolves to the whole bank. Without
     /// this the statement said "a grouped GEMM" and left which weights
     /// entirely to the executor -- readable, but not a declaration.
+    /// The two block numbers ride the PARAM channel, for the reason
+    /// [`gather_moe_aligned_inputs`]'s `top_k` does: the kernel takes
+    /// `max_blocks` and the per-block row count `m`, and the statement's
+    /// operands carry only their PRODUCT — the aligned rectangle's
+    /// leading extent. `n` and `k` are the result's and the operand's row
+    /// widths and need no help; these two do. Same numbers
+    /// [`moe_align`] already states, and it is the same permutation.
     pub fn moe_grouped_gemm(
         act: &Val,
         expert_ids: &Val,
@@ -3135,13 +3484,16 @@ pub mod cuda {
         aligned: Dim,
         width: u32,
         bank: &str,
+        block_size: u32,
+        max_blocks: u32,
     ) -> Val {
-        record(
+        record_with_params(
             &act.t,
             act.layer,
             "moe::moe_grouped_gemm_bf16",
             vec![bank.to_string()],
             None,
+            vec![block_size, max_blocks],
             // The second operand is the ALIGN's per-block expert id --
             // what the kernel indexes the bank by. It used to be the
             // sorted route order, which the kernel never reads: the
@@ -5160,18 +5512,28 @@ pub mod cuda {
 
     /// `kernels::moe::gather_moe_aligned_inputs_bf16`: the block-major
     /// operand, gathered in the sorted order.
+    /// `top_k` rides the PARAM channel because the kernel wants
+    /// `num_routes` — the fire's tokens times k — and nothing else in the
+    /// statement says k. `x` is `[Tokens, hidden]`, `sorted_route_ids` is
+    /// `[max_blocks * block_size]`, and the result is the aligned
+    /// rectangle; none of the three carries the router's width. Same
+    /// reason [`moe_align`] carries its three load-time numbers there,
+    /// and stating it is what lets the row generate instead of needing a
+    /// hand-written arm.
     pub fn gather_moe_aligned_inputs(
         x: &Val,
         sorted_route_ids: &Val,
         aligned: Dim,
         hidden: u32,
+        top_k: u32,
     ) -> Val {
-        record(
+        record_with_params(
             &x.t,
             x.layer,
             "moe::gather_moe_aligned_inputs_bf16",
             vec![],
             None,
+            vec![top_k],
             vec![x.id, sorted_route_ids.id],
             Some((Shape(vec![aligned, Dim::Const(hidden)]), DType::BF16)),
         )
@@ -5244,12 +5606,19 @@ pub mod cuda {
         top_k: u32,
         hidden: u32,
     ) -> Val {
-        record(
+        record_with_params(
             &aligned_out.t,
             aligned_out.layer,
             "moe::reorder_moe_aligned_output_bf16",
             vec![],
             None,
+            // `top_k` on the param channel, for the gather's reason: the
+            // kernel wants `num_routes` and no operand of this statement
+            // carries the router's width. The result's SECOND dim is
+            // `top_k` as well, so this one could be read off `OutDim(0,
+            // 1)` — it is stated the same way as the gather's so the two
+            // halves of one permutation read alike.
+            vec![top_k],
             vec![aligned_out.id, sorted_route_ids.id],
             Some((
                 Shape(vec![

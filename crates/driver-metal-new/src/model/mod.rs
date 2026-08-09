@@ -41,6 +41,7 @@ pub mod kv;
 #[cfg(target_vendor = "apple")]
 pub mod load;
 pub mod resolve;
+pub mod tables;
 pub mod rope;
 pub mod text;
 #[cfg(target_vendor = "apple")]

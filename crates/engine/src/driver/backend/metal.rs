@@ -67,6 +67,13 @@ pub struct MetalDriver {
     ///
     /// Held rather than re-derived per fire: they come from a file, and a
     /// second reading is a second chance to disagree with the first.
+    /// The rotary ladder, derived ONCE at load.
+    ///
+    /// A load-time derivation and not a per-fire one: a deployment that
+    /// rescales its frequencies (llama-3, YaRN) states the rescaling in its
+    /// config, and the config does not change between fires. Held as f32 bits
+    /// because that is the channel it rides.
+    inv_freq: Vec<u32>,
     deployment: Option<(
         model::families::llama_like::forward::facts::LlamaLikeFacts,
         model::families::llama_like::forward::facts::LlamaLikeMetalFacts,
@@ -138,6 +145,7 @@ impl MetalDriver {
                 arch: String::new(),
                 pool: None,
                 boot_descriptor,
+                inv_freq: Vec::new(),
                 deployment: None,
                 has_linear_attn: false,
                 compiler,
@@ -252,6 +260,21 @@ impl MetalDriver {
         self.deployment = Some(driver_metal_new::model::text::facts_from(&geometry, |name| {
             loaded.tensors.contains_key(name)
         }));
+        self.inv_freq = driver_metal_new::model::rope::frequencies(
+            geometry.head_dim,
+            geometry.rope_theta,
+            (geometry.rope_freq_factor > 0.0).then_some(
+                driver_metal_new::model::rope::Rescale {
+                    factor: geometry.rope_freq_factor,
+                    low: geometry.rope_low_freq_factor,
+                    high: geometry.rope_high_freq_factor,
+                    original_max: geometry.rope_original_max_position as f32,
+                },
+            ),
+        )
+        .iter()
+        .map(|f| f.to_bits())
+        .collect();
         self.model = Some(loaded);
         let shape = driver_metal_new::model::kv::Shape {
             layers: geometry.n_layers,
@@ -522,8 +545,12 @@ impl MetalDriver {
                 kv_heads: facts.kv_heads,
                 head_dim: facts.head_dim,
                 rotary_dims: facts.head_dim,
-                n_experts: 0,
-                experts_per_token: 0,
+                // The DEPLOYMENT's, not zero. `Rule::RouterLane`/`RouteRows`/
+                // `RoutedQmv` read these off the dims the same way `Qmv` reads
+                // `width`, so a mixture handed zeros launches a router over no
+                // experts -- which is a fire that runs and routes nothing.
+                n_experts: facts.n_experts,
+                experts_per_token: facts.experts_per_token,
             };
             // The fire's own tables, staged into one device region. The row
             // names which a slot wants and this answers — the driver never
@@ -553,57 +580,23 @@ impl MetalDriver {
                 }
                 (pages, offs)
             };
-            let mut blob: Vec<u32> = Vec::new();
-            let mut spans: Vec<(usize, usize)> = Vec::new();
-            for table in [
-                step.plan.token_ids.as_slice(),
-                step.plan.position_ids.as_slice(),
-                // Which request owns each token, expanded from the qo CSR:
-                // the scheduler states the boundaries and the kernel wants it
-                // per token.
-                &req_of_token(&step.plan.qo_indptr),
-                step.plan.kv_page_indices.as_slice(),
-                step.plan.kv_page_indptr.as_slice(),
-                &w_page,
-                &w_off,
-            ] {
-                spans.push((blob.len(), table.len()));
-                blob.extend_from_slice(table);
-            }
-            let staged = driver_metal_new::metal::allocate(
+            let req = req_of_token(&step.plan.qo_indptr);
+            let staged = driver_metal_new::model::tables::stage(
                 &self.context,
-                ((blob.len() * 4).max(4)) as u64,
-                "fire tables",
+                driver_metal_new::model::tables::Frame {
+                    token_ids: &step.plan.token_ids,
+                    position_ids: &step.plan.position_ids,
+                    req_of_token: &req,
+                    kv_page_indices: &step.plan.kv_page_indices,
+                    kv_page_indptr: &step.plan.kv_page_indptr,
+                    kv_write_page: &w_page,
+                    kv_write_offset: &w_off,
+                    rope_frequencies: &self.inv_freq,
+                    sampling_indices: &step.plan.sampling_indices,
+                },
             )
             .map_err(|e| anyhow!("fire tables: {e:?}"))?;
-            // SAFETY: freshly allocated and not yet encoded against.
-            unsafe {
-                use driver_metal_new::region::Region as _;
-                let raw = core::slice::from_raw_parts(blob.as_ptr().cast::<u8>(), blob.len() * 4);
-                staged.write(0, raw).map_err(|e| anyhow!("fire tables: {e:?}"))?;
-            }
-            let tables = |which: driver_metal_new::model::executor::FireTable| {
-                use driver_metal_new::model::executor::FireTable as F;
-                let i = match which {
-                    F::TokenIds => 0,
-                    F::Positions => 1,
-                    F::RequestOfToken => 2,
-                    F::KvPageIndices => 3,
-                    F::KvPageIndptr => 4,
-                    F::KvWritePage => 5,
-                    F::KvWriteOffset => 6,
-                    // No custom mask on this path yet; a slot nobody fills is
-                    // better than one filled with the wrong table.
-                    F::AttentionMask | F::AttentionMaskEnabled => return None,
-                    // Numbers, not addresses: answered by `pool`.
-                    F::KvHeadStride | F::KvSeqStride | F::KvPageSize => return None,
-                };
-                let (at, len) = spans[i];
-                (len > 0).then(|| driver_metal_new::model::executor::Slice {
-                    address: staged.gpu_address() + (at * 4) as u64,
-                    bytes: (len * 4) as u64,
-                })
-            };
+            let tables = |which| staged.at(which);
 
             let names = driver_metal_new::model::resolve::Names::mlx();
             // The KV pages a statement's state reference resolves through. A
@@ -625,7 +618,7 @@ impl MetalDriver {
                     // attention kernels' strides come from. A store without it
                     // answers zero, and a zero seq stride is every step of the
                     // scan reading the same token.
-                    .with_pool(model.kv.shape());
+                    .with_pool(pool.shape());
             driver_metal_new::model::run::run(
                 &self.context,
                 &self.compiler,

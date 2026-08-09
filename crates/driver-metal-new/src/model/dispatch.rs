@@ -457,6 +457,7 @@ fn reorder<S: Resolver>(
             kernels::Source::KvWritePage => fire(resolver, FireTable::KvWritePage),
             kernels::Source::KvWriteOffset => fire(resolver, FireTable::KvWriteOffset),
             kernels::Source::RopeFrequencies => fire(resolver, FireTable::RopeFrequencies),
+            kernels::Source::SamplingIndices => fire(resolver, FireTable::SamplingIndices),
             kernels::Source::AttentionMask => fire(resolver, FireTable::AttentionMask),
             kernels::Source::AttentionMaskEnabled => {
                 fire(resolver, FireTable::AttentionMaskEnabled)
@@ -509,6 +510,16 @@ fn param_layout<S: Resolver>(
         // statement never carried. That is the whole reason it is a `Source`
         // — a stride is the pool's shape, and a text that guessed one would be
         // right for a deployment and silently wrong for the next.
+        // A field of the PRECEDING packed struct: append the value and bind
+        // nothing. The packed slot's run covers every scalar after it, so the
+        // field lands where the struct expects it.
+        if operand.ty == kernels::Ty::InPacked {
+            params.push(match operand.source {
+                kernels::Source::RequestCount => lowered.n_requests,
+                _ => 0,
+            });
+            continue;
+        }
         let pooled = match operand.source {
             kernels::Source::KvHeadStride => Some(FireTable::KvHeadStride),
             kernels::Source::KvSeqStride => Some(FireTable::KvSeqStride),
@@ -626,6 +637,9 @@ mod tests {
     /// One launch of `symbol` over `rows`, with the args given.
     fn one(symbol: &str, rows: u32, args: Vec<Arg>) -> Lowered {
         Lowered {
+            // One request: these fixtures state one row.
+            n_requests: 1,
+
             launches: vec![Launch {
                 kernel: 0,
                 rows: 0..rows,
