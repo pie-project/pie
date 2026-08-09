@@ -30,7 +30,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
 
-use crate::gpu::device::handle::Handle;
+use crate::device::handle::Handle;
 use crate::layout::region::Region as _;
 
 /// One registered allocation.
@@ -137,7 +137,7 @@ impl std::fmt::Debug for Regions {
 #[cfg(test)]
 mod tests {
     use super::Regions;
-    use crate::gpu::{Allocation, Context};
+    use crate::{Allocation, Context};
 
     /// An address resolves to the allocation it is in, and to an offset.
     #[test]

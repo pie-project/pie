@@ -35,15 +35,15 @@ use std::rc::Rc;
 
 use tensor_ir::op::tags;
 
-use crate::gpu::device::context::Context;
-use crate::gpu::device::encoder::{StepEncoder, Visibility};
-use crate::gpu::device::external::{External, Externals};
-use crate::gpu::program::single::{DeviceInputs, PreparedFire};
-use crate::gpu::device::handle::Handle;
-use crate::gpu::device::allocator::{Pool, Transient};
-use crate::gpu::program::executable::Pso;
-use crate::gpu::program::cache::Runtime;
-use crate::gpu::device::argtable::Tables;
+use crate::device::context::Context;
+use crate::device::encoder::{StepEncoder, Visibility};
+use crate::device::external::{External, Externals};
+use crate::program::single::{DeviceInputs, PreparedFire};
+use crate::device::handle::Handle;
+use crate::device::allocator::{Pool, Transient};
+use crate::program::executable::Pso;
+use crate::program::cache::Runtime;
+use crate::device::argtable::Tables;
 use crate::channel::{
     OpParams, OpRuntime, STATUS_BYTES, StatusOutcome, ValueDesc, describe, layout, report_status,
 };

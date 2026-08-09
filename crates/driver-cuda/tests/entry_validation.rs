@@ -34,7 +34,7 @@ use std::collections::BTreeSet;
 ///
 /// EVERY module of it, concatenated. The shell was one file when this
 /// test was written, became six, and is now TWO DIRECTORIES —
-/// `gpu/serve/` holds the doors and `gpu/fire/` holds the pass they open
+/// `serve/` holds the doors and `fire/` holds the pass they open
 /// onto. Reading only the one that happens to hold a door today would
 /// let a new entry point written the old way land next door and pass.
 /// The guarantee is about the whole shell, so the source is.
@@ -45,8 +45,8 @@ use std::collections::BTreeSet;
 /// decoration.
 fn shell_source() -> String {
     let dirs = [
-        concat!(env!("CARGO_MANIFEST_DIR"), "/src/gpu/serve"),
-        concat!(env!("CARGO_MANIFEST_DIR"), "/src/gpu/fire"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/src/serve"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/src/fire"),
     ];
     let mut files: Vec<_> = dirs
         .iter()

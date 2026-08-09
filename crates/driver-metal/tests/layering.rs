@@ -44,12 +44,12 @@ use std::path::Path;
 /// encoder, a queue. Everything here is something built ON that.
 const ABOVE: &[&str] = &[
     "crate::lowering",
-    "crate::gpu::bind",
-    "crate::gpu::fire",
-    "crate::gpu::pools",
-    "crate::gpu::program",
-    "crate::gpu::serve",
-    "crate::gpu::weights",
+    "crate::bind",
+    "crate::fire",
+    "crate::pools",
+    "crate::program",
+    "crate::serve",
+    "crate::weights",
 ];
 
 /// The one upward import that is allowed, and why.
@@ -63,7 +63,7 @@ const ABOVE: &[&str] = &[
 /// The honest reading is that `keepalive` is a subsystem shelved under
 /// `device/`, not a device primitive. Moving it is a separate change; until
 /// then this is the exception, named, with the reason attached.
-const ALLOWED: &[(&str, &str)] = &[("keepalive.rs", "crate::gpu::program::compile::Compiler")];
+const ALLOWED: &[(&str, &str)] = &[("keepalive.rs", "crate::program::compile::Compiler")];
 
 #[test]
 fn gpu_device_does_not_import_the_layers_built_on_it() {

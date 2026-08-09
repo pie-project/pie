@@ -1,9 +1,9 @@
-//! The shell's hand-built KV views against `gpu::pools::kv_cache_live`'s.
+//! The shell's hand-built KV views against `pools::kv_cache_live`'s.
 //!
 //! `serve::kv_pools_for` builds a `KvCacheLayerView` per layer by
 //! hand: two `cudaMalloc`s per source layer, a `kv_source` lookup to
 //! point shared layers at their owner's pages, and fifteen fields filled
-//! literally. `gpu::pools::kv_cache_live::KvCache::layer_view` does the same
+//! literally. `pools::kv_cache_live::KvCache::layer_view` does the same
 //! thing from a planned layout, and has since the port — with envelopes,
 //! quantized formats and the scale planes the shell's version cannot
 //! express.
@@ -29,8 +29,8 @@ use std::ffi::c_void;
 
 use driver_cuda::dtype::DType;
 use driver_cuda::layout::KvCacheFormat;
-use driver_cuda::gpu::pools::kv_cache::{KvCacheLayout, PerLayer};
-use driver_cuda::gpu::pools::kv_cache_live::{ElasticPool, KvCache, KvCacheDeviceOps};
+use driver_cuda::pools::kv_cache::{KvCacheLayout, PerLayer};
+use driver_cuda::pools::kv_cache_live::{ElasticPool, KvCache, KvCacheDeviceOps};
 
 /// A cache whose pages are all resident.
 ///
@@ -98,15 +98,15 @@ fn shell_view(
     head_dim: i32,
     k: *mut c_void,
     v: *mut c_void,
-) -> driver_cuda::gpu::bind::abi::KvCacheLayerView {
-    driver_cuda::gpu::bind::abi::KvCacheLayerView {
+) -> driver_cuda::bind::abi::KvCacheLayerView {
+    driver_cuda::bind::abi::KvCacheLayerView {
         layer,
         source_layer: source,
         num_pages,
         page_size,
         num_kv_heads,
         head_dim,
-        scheme: driver_cuda::gpu::bind::abi::KvCacheScheme::Native,
+        scheme: driver_cuda::bind::abi::KvCacheScheme::Native,
         storage_dtype: DType::Bf16,
         block_size: 0,
         k_pages: k,

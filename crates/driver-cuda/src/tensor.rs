@@ -115,7 +115,7 @@ impl TensorSpec {
 #[derive(Debug)]
 pub struct DeviceTensor {
     spec: TensorSpec,
-    buffer: Option<crate::gpu::device::DeviceBuffer>,
+    buffer: Option<crate::device::DeviceBuffer>,
 }
 
 #[cfg(feature = "_cuda")]
@@ -126,7 +126,7 @@ impl DeviceTensor {
     /// null, matching the C++'s `if (t.nbytes_ > 0)` guard. The cache classes
     /// rely on that: they distinguish a real layer from an aliased one by
     /// asking whether its tensor is empty.
-    pub fn allocate(alloc: &crate::gpu::device::Allocator, spec: TensorSpec) -> Result<Self> {
+    pub fn allocate(alloc: &crate::device::Allocator, spec: TensorSpec) -> Result<Self> {
         let buffer = if spec.nbytes() == 0 {
             None
         } else {
@@ -148,7 +148,7 @@ impl DeviceTensor {
     pub fn as_ptr(&self) -> *mut core::ffi::c_void {
         self.buffer
             .as_ref()
-            .map_or(core::ptr::null_mut(), crate::gpu::device::DeviceBuffer::as_ptr)
+            .map_or(core::ptr::null_mut(), crate::device::DeviceBuffer::as_ptr)
     }
 
     /// Whether this tensor has no memory behind it.

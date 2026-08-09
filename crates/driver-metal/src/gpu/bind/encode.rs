@@ -22,11 +22,11 @@ use objc2::runtime::ProtocolObject;
 use objc2::rc::Retained;
 use objc2_metal::MTLComputePipelineState;
 
-use crate::gpu::device::recording::{Bind, Command};
+use crate::device::recording::{Bind, Command};
 
 use crate::error::{Error, Result};
-use crate::gpu::Context;
-use crate::gpu::{ArgumentTable, Compiler, StepEncoder};
+use crate::Context;
+use crate::{ArgumentTable, Compiler, StepEncoder};
 use crate::layout::region::Region as _;
 use crate::layout::shader::Request;
 
@@ -45,7 +45,7 @@ pub struct Params {
     /// leaks it into the residency set permanently and moves its address, and
     /// the address is one of only three things that vary between two fires of
     /// one shape.
-    region: crate::gpu::Lease,
+    region: crate::Lease,
     /// Byte offset of each dispatch's run, parallel to the dispatch list.
     offsets: Vec<u64>,
 }
@@ -65,7 +65,7 @@ impl Params {
     ///
     /// The allocation, or a write past it.
     pub fn stage(context: &Context, dispatches: &[Dispatch<'_>]) -> Result<Self> {
-        Self::stage_in(context, &crate::gpu::Scratch::new(), dispatches)
+        Self::stage_in(context, &crate::Scratch::new(), dispatches)
     }
 
     /// The same, out of a pool the caller keeps.
@@ -79,7 +79,7 @@ impl Params {
     /// As [`Self::stage`].
     pub fn stage_in(
         context: &Context,
-        scratch: &crate::gpu::Scratch,
+        scratch: &crate::Scratch,
         dispatches: &[Dispatch<'_>],
     ) -> Result<Self> {
         // Each dispatch's run is as wide as its layout says, because a row
@@ -158,7 +158,7 @@ impl Params {
     /// For `gpu::device::recording::record`, which has to turn a scalar's ADDRESS back into
     /// the buffer holding it — a recorded command binds a buffer.
     #[must_use]
-    pub fn region(&self) -> &crate::gpu::Handle {
+    pub fn region(&self) -> &crate::Handle {
         &self.region
     }
 
@@ -371,7 +371,7 @@ pub fn encode(
 ) -> Result<()> {
     for (index, dispatch) in dispatches.iter().enumerate() {
         encode_one(encoder, table, pipelines, params, index, dispatch)?;
-        encoder.barrier(crate::gpu::Visibility::Device);
+        encoder.barrier(crate::Visibility::Device);
     }
     Ok(())
 }

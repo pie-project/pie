@@ -27,11 +27,11 @@
 use std::ffi::c_void;
 use std::fmt::Write as _;
 
-use driver_cuda::gpu::fire::page_mask::{
+use driver_cuda::fire::page_mask::{
     FireGeometry, FirePageMask, MaskError, MaskOps, MaskSlotLayout, PageMaskCapturePlan,
     prepare_page_mask_capture,
 };
-use driver_cuda::gpu::fire::sideband_arena::{DeviceMemory, Region, SidebandArena};
+use driver_cuda::fire::sideband_arena::{DeviceMemory, Region, SidebandArena};
 
 /// FNV-1a 64 of the C++ oracle's transcript.
 const GOLDEN_FNV1A64: u64 = 0xa084_1dc3_318a_057b;

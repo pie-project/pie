@@ -97,6 +97,12 @@ const SHARED: &[&str] = &[
     // holding here is the same guard `driver-cuda/tests/no_family_names.rs`
     // holds from the other side.
     "deployment.rs",
+    // `boot.rs` is the load path both drivers walk. It belongs here for the
+    // same reason `deployment.rs` does: a driver calls it, so a family name
+    // reachable from it is a family name reachable from a driver. It asks
+    // `contract.rs` — which IS a family table — but asking a registry is
+    // not knowing its rows, and that distinction is what this list checks.
+    "boot.rs",
 ];
 /// Root files that name families ON PURPOSE, with the reason each does.
 const NOT_SHARED: &[(&str, &str)] = &[

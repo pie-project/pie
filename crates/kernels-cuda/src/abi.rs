@@ -479,8 +479,127 @@ fn elem_count(e: &str, ty: kernels::Ty) -> Option<String> {
 /// for its reason: a slot is opaque and the entry point's parameter is
 /// the row's declared width, so a substitution is a compile error rather
 /// than a stride bug.
+/// Every leaf a source reaches, for the guard builder.
+///
+/// THE GUARDS ARE A PRESENCE QUESTION and a nested source's leaves are
+/// as present-or-not as a top-level one's: `Mul(&Gdn(..), &Rows)` needs
+/// `gdn.is_some()` exactly as `Gdn(..)` does. Matching flatly would emit
+/// a branch calling `g_of`'s unwrap on a fire that carries no GDN
+/// context, which is the same shape of bug as an arity arm forgotten in
+/// a `match` — silent, and only on the families that reach it.
+///
+/// `Or` IS NOT DESCENDED. Its whole point is that one of its branches
+/// may be absent, so a guard demanding either would defeat it; the `Or`
+/// arm guards the composed expression instead.
+fn for_each_leaf(s: &Source, f: &mut impl FnMut(&Source)) {
+    match *s {
+        Source::Width(ref a) | Source::Isqrt(ref a) => for_each_leaf(a, f),
+        Source::Mul(ref a, ref b)
+        | Source::Sub(ref a, ref b)
+        | Source::Div(ref a, ref b)
+        | Source::Ne(ref a, ref b) => {
+            for_each_leaf(a, f);
+            for_each_leaf(b, f);
+        }
+        // THE PROBE COUNTS TOO. It is asked, not demanded, so no
+        // positive guard comes of it — but the `per_head_dim` refusal is
+        // a NEGATIVE one ("no row mentions it, so require its absence"),
+        // and a probe the walk skipped would leave that refusal standing
+        // over the very row written to lift it.
+        Source::IfPresent(ref p, ref a, ref b) => {
+            for_each_leaf(p, f);
+            for_each_leaf(a, f);
+            for_each_leaf(b, f);
+        }
+        Source::Or(..) => f(s),
+        _ => f(s),
+    }
+}
+
+/// Whether a kernel MENTIONS a leaf anywhere, `Or` branches included.
+///
+/// The counterpart to [`any_leaf`], and the difference is the direction
+/// of the guard. A POSITIVE guard demands ("this row reads the GDN
+/// context, so require one"), and demanding a branch of an `Or` would
+/// defeat the `Or`. A NEGATIVE guard refuses ("no row states `aux`, so
+/// require the statement carries none"), and there the `Or` branch is
+/// exactly what lifts the refusal -- `Or(&In(1), &Aux(0))` is a row
+/// saying it can take the join's value, and a walk that skipped the
+/// branch would leave the blanket refusal standing over it.
+fn mentions(k: &kernels::KernelSig, mut pred: impl FnMut(&Source) -> bool) -> bool {
+    fn walk(s: &Source, f: &mut impl FnMut(&Source) -> bool) -> bool {
+        if f(s) {
+            return true;
+        }
+        match *s {
+            Source::Width(ref a) | Source::Isqrt(ref a) => walk(a, f),
+            Source::Mul(ref a, ref b)
+            | Source::Div(ref a, ref b)
+            | Source::Ne(ref a, ref b)
+            | Source::Sub(ref a, ref b)
+            | Source::Or(ref a, ref b) => walk(a, f) || walk(b, f),
+            Source::IfPresent(ref p, ref a, ref b) => walk(p, f) || walk(a, f) || walk(b, f),
+            _ => false,
+        }
+    }
+    k.operands.iter().any(|o| walk(&o.source, &mut pred))
+}
+
+/// Whether any of a kernel's sources reaches a leaf the predicate likes.
+fn any_leaf(k: &kernels::KernelSig, mut pred: impl FnMut(&Source) -> bool) -> bool {
+    let mut hit = false;
+    for o in k.operands {
+        for_each_leaf(&o.source, &mut |s| hit |= pred(s));
+    }
+    hit
+}
+
+/// The presence test for the first SLOT a source reaches.
+///
+/// `Or`'s left is not always a bare slot -- `rope_partial`'s kv head
+/// count is "the second result's width over the head dim, or zero", and
+/// what decides is still whether that second result is there. So the
+/// question is asked of the tree rather than of one leaf.
+///
+/// THE STATEMENT'S ARITY, not the flat run's length. The run is
+/// `[in.., out.., weight..]` laid end to end, so `b.args.get(1)` on a
+/// one-input statement answers with its OUTPUT -- a row asking "the
+/// second input, or the join's" would bind the result as an operand and
+/// launch into it.
+fn slot_presence(s: &Source) -> Option<String> {
+    match *s {
+        Source::In(i) => Some(format!("n_in > {i}")),
+        Source::Out(i) => Some(format!("n_out > {i}")),
+        Source::Weight(i) => Some(format!("b.args.len() > n_in + n_out + {i}")),
+        Source::Param(i) | Source::ParamF32(i) => Some(format!("spec.params.len() > {i}")),
+        Source::Width(ref a) | Source::Isqrt(ref a) => slot_presence(a),
+        Source::Mul(ref a, ref b)
+        | Source::Sub(ref a, ref b)
+        | Source::Div(ref a, ref b)
+        | Source::Ne(ref a, ref b) => slot_presence(a).or_else(|| slot_presence(b)),
+        _ => None,
+    }
+}
+
 fn rust_bind_expr(op: &kernels::Operand) -> Option<String> {
-    let e = match op.source {
+    let e = rust_bind_expr_of(&op.source, op.ty)?;
+    // `Lit::Null` and the element counts produce their final form
+    // already — they are the two places a source's expression depends on
+    // the operand's declared type rather than only on the source.
+    if matches!(op.source, Source::Lit(Lit::Null) | Source::OutElements(_) | Source::InElements(_))
+    {
+        return Some(e);
+    }
+    cast_for(&e, op.ty)
+}
+
+/// One SOURCE's expression, without the operand's cast.
+///
+/// Split from [`rust_bind_expr`] so the grammar's arms can recurse: a
+/// `Div` asks its two children for their expressions and composes, and
+/// neither child has an operand type of its own.
+fn rust_bind_expr_of(source: &Source, ty: kernels::Ty) -> Option<String> {
+    let e = match *source {
         Source::Unbound => return None,
         Source::In(i) => format!("b.args[{i}].ptr"),
         Source::Out(i) => format!("b.args[n_in + {i}].ptr"),
@@ -488,6 +607,7 @@ fn rust_bind_expr(op: &kernels::Operand) -> Option<String> {
         // Resolved ONCE before the match, so the guard below can test it
         // and so a branch does not re-look-up a name per launch.
         Source::WeightNamed => "w_named".to_string(),
+        Source::WeightNamed2 => "w_named2".to_string(),
         Source::Param(i) => format!("i32::try_from(spec.params[{i}]).unwrap_or(0)"),
         Source::ParamF32(i) => format!("f32::from_bits(spec.params[{i}])"),
         // Rows times a param — the MoE aligned path's route count, and
@@ -501,16 +621,6 @@ fn rust_bind_expr(op: &kernels::Operand) -> Option<String> {
         Source::InRows(i) => format!("rows_of(b, {i}, rows)"),
         Source::OutWidth(i) => format!("width_of(b, n_in + {i})"),
         Source::InWidth(i) => format!("width_of(b, {i})"),
-        // The `max(1)` is inside `width_over`, on the driver's side, for
-        // the reason `is_set` is: the row states which value's width to
-        // read and what to divide it by, and what a zero divisor means is
-        // the fire's business. The guard below refuses the branch outright
-        // when the field is unset, so the `max(1)` is belt to that braces.
-        Source::OutWidthOver(i, f) => format!("width_over(b, n_in + {i}, ctx.{f})"),
-        Source::InWidthOver(i, f) => format!("width_over(b, {i}, ctx.{f})"),
-        Source::OutWidthOverIn(o, i) => {
-            format!("width_over(b, n_in + {o}, width_of(b, {i}))")
-        }
         // An ACCESSOR, not a field: the driver decides whether its
         // per-layer vector falls back, filters or refuses, and the
         // generator's claim is only that the statement's layer is the
@@ -522,10 +632,10 @@ fn rust_bind_expr(op: &kernels::Operand) -> Option<String> {
         // silently; this one has to ask the row, which is the better of
         // the two behaviours to have been forced into.
         Source::OutElements(i) => {
-            elem_count(&format!("elems_of(b, n_in + {i}, rows)"), op.ty)?
+            elem_count(&format!("elems_of(b, n_in + {i}, rows)"), ty)?
         }
         Source::InElements(i) => {
-            elem_count(&format!("elems_of(b, {i}, rows)"), op.ty)?
+            elem_count(&format!("elems_of(b, {i}, rows)"), ty)?
         }
         // A DIM is the plan's, not the binder's: an arg carries its row
         // width and nothing about the shape behind it. The join could
@@ -552,11 +662,21 @@ fn rust_bind_expr(op: &kernels::Operand) -> Option<String> {
         Source::Aux(i) => format!(
             "join_aux(spec, {i}, frame, resolver).map_or(core::ptr::null_mut(), |a| a.ptr)"
         ),
-        // The KV pages are a Metal spelling. CUDA's launchers take a
-        // `KvCacheLayerView` by value rather than two pointers, so a row that
-        // states these is not one this emitter can generate — and saying so
-        // is better than emitting a call that binds the wrong thing.
-        Source::KvKeys | Source::KvValues => return None,
+        // THE BF16 MIRRORS, which is the native alias. Most CUDA
+        // launchers take a `KvCacheLayerView` whole, and for a long time
+        // this emitter refused the pair on that ground — but the refusal
+        // was on the SOURCE when the fact it was really about is the
+        // OPERAND'S TYPE. `dispatch_attention_flashinfer_prefill_bf16`
+        // takes the two pointers loose, and a row saying so is exactly
+        // right; a row saying so where the parameter is a view is what
+        // the refusal is for, and that one is a type error the generated
+        // file gets caught on.
+        Source::KvKeys => format!(
+            "kv_view(attn, b.layers.start as usize).k_bf16_pages"
+        ),
+        Source::KvValues => format!(
+            "kv_view(attn, b.layers.start as usize).v_bf16_pages"
+        ),
         // The fire's own tables, likewise a Metal spelling: CUDA's launchers
         // take them through a plan cache or a `KvCacheLayerView` rather than
         // as loose pointers.
@@ -599,14 +719,28 @@ fn rust_bind_expr(op: &kernels::Operand) -> Option<String> {
         // proves the context is there, and `kv_view` also proves the
         // layer is in range.
         Source::Attn(f) | Source::AttnNonZero(f) => format!("a_of(attn).{f}"),
+        // THE DRIVER'S RULE STAYS THE DRIVER'S. `window_of` reads the
+        // statement's param, then the per-layer vector, then the fire's
+        // default; `attn_plan` picks the full-attention plan when the
+        // layer's window says FULL. Both are one call here because a row
+        // may not spell either.
+        Source::AttnWindow => {
+            "window_of(spec, a_of(attn), u32::from(b.layers.start))".to_string()
+        }
+        Source::AttnPlan(family) => {
+            format!("attn_plan(a_of(attn), spec, u32::from(b.layers.start), \"{family}\")")
+        }
         Source::KvLayerView => "kv_view(attn, b.layers.start as usize)".to_string(),
+        Source::KvLayerField(f) => {
+            format!("kv_view(attn, b.layers.start as usize).{f}")
+        }
         // A NULL is returned fully typed and skips the cast step below:
         // that step turns a slot into the row's pointee, and a null has
         // no slot to turn. `null_mut().cast::<i32>()` leaves the original
         // `T` for an inference with nothing to work from, so the row's
         // own declared type produces the pointer directly.
         Source::Lit(Lit::Null) => {
-            let rust = op.ty.rust();
+            let rust = ty.rust();
             return Some(match rust.strip_prefix("*mut ") {
                 Some(p) => format!("core::ptr::null_mut::<{p}>()"),
                 None => format!("core::ptr::null::<{}>()", rust.strip_prefix("*const ")?),
@@ -618,11 +752,92 @@ fn rust_bind_expr(op: &kernels::Operand) -> Option<String> {
         // is what a vocabulary looks like when it speaks one consumer's
         // language. The row holds `Lit::F32(1.702)` now and there is
         // nothing to parse.
+        // ── The grammar, recursively ──
+        //
+        // Each arm asks its children for THEIR expression and composes.
+        // Nothing here knows which leaves exist, which is the property
+        // that lets a new row compose without an emitter edit.
+        // WIDTH IS A PROJECTION ON A SLOT, so it is only meaningful over
+        // `In`/`Out`. Anything else is a row asking for the width of a
+        // number, and declining is better than inventing one.
+        Source::Width(s) => match *s {
+            Source::In(i) => format!("width_of(b, {i})"),
+            Source::Out(i) => format!("width_of(b, n_in + {i})"),
+            _ => return None,
+        },
+        Source::Mul(a, c) => {
+            format!("({}) * ({})", rust_bind_expr_of(a, ty)?, rust_bind_expr_of(c, ty)?)
+        }
+        Source::Sub(a, c) => format!(
+            "({}).saturating_sub({})",
+            rust_bind_expr_of(a, ty)?,
+            rust_bind_expr_of(c, ty)?
+        ),
+        Source::Div(a, c) => {
+            format!("({}) / ({}).max(1)", rust_bind_expr_of(a, ty)?, rust_bind_expr_of(c, ty)?)
+        }
+        Source::Isqrt(s) => format!("isqrt_exact_i32({})", rust_bind_expr_of(s, ty)?),
+        Source::Ne(a, c) => {
+            format!("({}) != ({})", rust_bind_expr_of(a, ty)?, rust_bind_expr_of(c, ty)?)
+        }
+        // PRESENCE is a per-leaf question, so the probe is asked as a
+        // pointer-or-option rather than evaluated: `Or` on two pointer
+        // leaves takes the first non-null, and on a slot takes it when
+        // the run is long enough.
+        Source::Or(a, c) => {
+            let present = slot_presence(a)?;
+            let left = rust_bind_expr_of(a, ty)?;
+            let fallback = rust_bind_expr_of(c, ty)?;
+            // `as *mut _` ON THE FALLBACK, and only for a pointer. Both
+            // arms of the `if` must agree; an arg's pointer is always
+            // `*mut c_void` while the fallback's mutability varies
+            // (`w_named` const, `o_out` mut, `lse_out_d` a `*mut f32`),
+            // so coercing the other side is the one rule that holds for
+            // every pair. A scalar `Or` needs none and would not compile
+            // with one.
+            // A NULL FALLBACK IS UNTYPED. `Lit::Null` normally spells
+            // its own pointee out of the operand's declared type, but
+            // here the other arm is an arg's `*mut c_void` and the two
+            // must agree — so the inference goes the other way and the
+            // operand's cast lands on top as it does for any source.
+            let fallback = if matches!(*c, Source::Lit(Lit::Null)) {
+                "core::ptr::null_mut()".to_string()
+            } else if ty.rust().starts_with('*') {
+                format!("{fallback} as *mut _")
+            } else {
+                fallback
+            };
+            format!("if {present} {{ {left} }} else {{ {fallback} }}")
+        }
+        Source::IfPresent(probe, then, other) => match *probe {
+            Source::PerHeadDim => format!(
+                "if spec.per_head_dim.is_some() {{ {} }} else {{ {} }}",
+                rust_bind_expr_of(then, ty)?,
+                rust_bind_expr_of(other, ty)?
+            ),
+            // Only `PerHeadDim` is a probe today. Another would need its
+            // own presence test, and guessing one would be worse than
+            // declining the row.
+            _ => return None,
+        },
+        Source::PerHeadDim => "spec.per_head_dim.map_or(0, |d| d as i32)".to_string(),
+        Source::NamedScale => "named_scale(ctx, spec).unwrap_or(0.0)".to_string(),
+        Source::LayerScale => "layer_scale(ctx, spec)".to_string(),
+        Source::Beta => "if spec.beta_one { 1.0f32 } else { 0.0f32 }".to_string(),
+        Source::RotaryWidth => {
+            "rotary_width(ctx, spec, b.layers.start as usize).unwrap_or(0)".to_string()
+        }
         Source::Lit(Lit::Bool(v)) => v.to_string(),
         Source::Lit(Lit::F32(v)) => format!("{v}f32"),
         Source::Lit(Lit::I32(v)) => format!("{v}i32"),
     };
-    Some(match op.ty {
+    Some(e)
+}
+
+/// The cast an operand's TYPE puts on its source expression.
+fn cast_for(e: &str, ty: kernels::Ty) -> Option<String> {
+    let e = e.to_string();
+    Some(match ty {
         kernels::Ty::Buf => format!("({e}).cast_const()"),
         kernels::Ty::BufMut => e,
         kernels::Ty::I32s => format!("({e}).cast_const().cast::<i32>()"),
@@ -650,6 +865,18 @@ fn rust_bind_expr(op: &kernels::Operand) -> Option<String> {
         kernels::Ty::BufArrayOutMut => format!("({e}).cast::<*mut ::core::ffi::c_void>()"),
         kernels::Ty::U8Array => format!("({e}).cast_const().cast::<*const u8>()"),
         kernels::Ty::I32Array => format!("({e}).cast_const().cast::<*const i32>()"),
+        // A ROW DECLARES `I32` AND GETS AN i32, whatever the width of
+        // the thing it named. Driver fields are `u32` where a count
+        // cannot be negative and `i32` where a sentinel needs the sign,
+        // and a row should not have to know which -- `score_window` is
+        // `u32`, `window_left` is `i32`, and both are `I32` operands.
+        //
+        // `i32::MAX` rather than `0` on overflow, because every `I32`
+        // operand here is a count or a window and a value too large for
+        // an i32 means "effectively unbounded" in both readings. Zero
+        // would mean the opposite. The hand arm this replaces chose the
+        // same, for the same reason.
+        kernels::Ty::I32 => format!("i32::try_from({e}).unwrap_or(i32::MAX)"),
         _ => e,
     })
 }
@@ -691,28 +918,50 @@ pub fn emit_rust_dispatch(tables: &[&'static [KernelSig]]) -> String {
         // checking is worse than a wrong answer, because the flat run
         // means an over-index reads the NEXT operand rather than faulting.
         let (mut need_in, mut need_out, mut need_w, mut need_ps) = (0u8, 0u8, 0u8, 0u8);
-        for o in k.operands {
-            match o.source {
-                Source::In(i)
-                | Source::InRows(i)
-                | Source::InElements(i)
-                | Source::InWidthOver(i, _)
-                | Source::InWidth(i) => need_in = need_in.max(i + 1),
-                Source::Out(i)
-                | Source::OutRows(i)
-                | Source::OutWidth(i)
-                | Source::OutWidthOver(i, _)
-                | Source::OutElements(i) => need_out = need_out.max(i + 1),
-                Source::OutWidthOverIn(o, i) => {
-                    need_out = need_out.max(o + 1);
-                    need_in = need_in.max(i + 1);
+        // WALKED, not matched. The arity a row asks for is the deepest
+        // index its sources reach, and reaching it by walking means a
+        // new combinator cannot forget to contribute — which is what a
+        // hand-maintained `match` over combination variants did, and how
+        // a branch comes to decline silently.
+        fn reach(s: &Source, i: &mut u8, o: &mut u8, w: &mut u8, p: &mut u8) {
+            match *s {
+                Source::In(x)
+                | Source::InRows(x)
+                | Source::InElements(x)
+                | Source::InWidth(x) => *i = (*i).max(x + 1),
+                Source::Out(x)
+                | Source::OutRows(x)
+                | Source::OutWidth(x)
+                | Source::OutElements(x) => *o = (*o).max(x + 1),
+                Source::Weight(x) => *w = (*w).max(x + 1),
+                Source::Param(x) | Source::ParamF32(x) | Source::RoutesOfParam(x) => {
+                    *p = (*p).max(x + 1)
                 }
-                Source::Weight(i) => need_w = need_w.max(i + 1),
-                Source::Param(i) | Source::ParamF32(i) | Source::RoutesOfParam(i) => {
-                    need_ps = need_ps.max(i + 1);
+                // A slot reached through `Or` is OPTIONAL by
+                // construction — that is what `Or` means — so the left
+                // branch must not raise the arity. Only the fallback's
+                // reach counts, and a fallback that is also a slot would
+                // be a row saying "either of two slots", which no row
+                // says.
+                Source::Or(_, ref b) => reach(b, i, o, w, p),
+                Source::Width(ref a) | Source::Isqrt(ref a) => reach(a, i, o, w, p),
+                Source::Mul(ref a, ref b)
+                | Source::Sub(ref a, ref b)
+                | Source::Div(ref a, ref b)
+                | Source::Ne(ref a, ref b) => {
+                    reach(a, i, o, w, p);
+                    reach(b, i, o, w, p);
+                }
+                Source::IfPresent(ref q, ref a, ref b) => {
+                    reach(q, i, o, w, p);
+                    reach(a, i, o, w, p);
+                    reach(b, i, o, w, p);
                 }
                 _ => {}
             }
+        }
+        for o in k.operands {
+            reach(&o.source, &mut need_in, &mut need_out, &mut need_w, &mut need_ps);
         }
         // AN IN-PLACE ROW IS STAGED, and the staging is the row's too.
         //
@@ -778,10 +1027,30 @@ pub fn emit_rust_dispatch(tables: &[&'static [KernelSig]]) -> String {
         // putting the row in its context (`ArmCtx::row`); this answers it
         // one layer lower, where both consumers already meet.
         let mut guard = String::new();
-        guard.push_str(&format!(
-            " if n_in >= {need_in} && n_out >= {need_out} \
-             && b.args.len() >= n_in + n_out + {need_w}"
-        ));
+        // A ZERO BOUND IS NOT A CLAUSE. `n_out >= 0` on an unsigned is
+        // always true and rustc says so, thirty-six times, in a file
+        // nobody edits — which is how a real warning in generated code
+        // would go unread.
+        let mut first = true;
+        // ADDITION on the right, not subtraction on the left:
+        // `b.args.len() - n_in - n_out` underflows a `usize` on a
+        // statement shorter than its arity, which is a panic where a
+        // declined branch is wanted.
+        for clause in [
+            (need_in > 0).then(|| format!("n_in >= {need_in}")),
+            (need_out > 0).then(|| format!("n_out >= {need_out}")),
+            (need_w > 0).then(|| format!("b.args.len() >= n_in + n_out + {need_w}")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            guard.push_str(if first { " if " } else { " && " });
+            first = false;
+            guard.push_str(&clause);
+        }
+        if first {
+            guard.push_str(" if true");
+        }
         if need_ps > 0 {
             guard.push_str(&format!(" && spec.params.len() >= {need_ps}"));
         }
@@ -789,13 +1058,51 @@ pub fn emit_rust_dispatch(tables: &[&'static [KernelSig]]) -> String {
         // answer is the hand arm's `UnknownWeight` rather than a null
         // bound into a kernel. So the branch declines and says nothing;
         // the fallthrough is what reports.
-        if k.operands.iter().any(|o| o.source == Source::WeightNamed) {
+        for o in k.operands {
+            // THE WHOLE `Or`, not either branch. Guarding a branch would
+            // defeat the point — the row says "either", and what it needs
+            // is that the composition lands on something. So: the left is
+            // PRESENT, or the right RESOLVES.
+            if let Source::Or(a, b) = o.source {
+                let Some(present) = slot_presence(a) else { continue };
+                let resolves = match *b {
+                    Source::NamedScale => "named_scale(ctx, spec).is_some()".to_string(),
+                    // A NULL FALLBACK RESOLVES. `Or(&Out(1), &Lit(Null))`
+                    // is a row saying "the second result, or nothing" --
+                    // the launcher reads the null as "there is no k" --
+                    // so demanding it be non-null refuses the very form
+                    // the row was written to serve.
+                    Source::Lit(Lit::Null) => "true".to_string(),
+                    // A POINTER FALLBACK MAY BE NULL — a fire that
+                    // published no output leaves `o_out` null, and a
+                    // launch into it is a segfault with no CUDA error.
+                    // A scalar fallback is always a value.
+                    _ if o.ty.rust().starts_with('*') => {
+                        match rust_bind_expr_of(b, o.ty) {
+                            Some(e) => format!("!({e}).is_null()"),
+                            None => continue,
+                        }
+                    }
+                    _ => "true".to_string(),
+                };
+                guard.push_str(&format!(" && ({present} || {resolves})"));
+            }
+        }
+        if any_leaf(k, |s| *s == Source::WeightNamed2) {
+            guard.push_str(" && !w_named2.is_null()");
+        }
+        if any_leaf(k, |s| *s == Source::WeightNamed) {
             guard.push_str(" && !w_named.is_null()");
         }
         // A FIRE WITH NO RECURRENT LAYERS CARRIES NO GDN CONTEXT, so a
         // row reading one declines rather than reading a default. This
         // is what makes `g_of`'s unwrap total.
-        if k.operands.iter().any(|o| matches!(o.source, Source::Gdn(_) | Source::GdnSlab(_))) {
+        if any_leaf(k, |s| {
+            matches!(
+                *s,
+                Source::Gdn(_) | Source::GdnSlab(_)
+            )
+        }) {
             guard.push_str(" && gdn.is_some()");
         }
         // THREE WAYS A SLAB IS ABSENT, and this tests all of them: the
@@ -810,12 +1117,27 @@ pub fn emit_rust_dispatch(tables: &[&'static [KernelSig]]) -> String {
         // A FIRE WITH NO ATTENTION CARRIES NO ATTENTION CONTEXT, and a
         // statement may name a layer the fire holds no cache for. Both
         // are tested here so `a_of` and `kv_view` are total.
-        if k
-            .operands
-            .iter()
-            .any(|o| matches!(o.source, Source::Attn(_) | Source::AttnNonZero(_)))
-        {
+        if any_leaf(k, |s| {
+            matches!(
+                *s,
+                Source::Attn(_)
+                    | Source::AttnNonZero(_)
+                    | Source::AttnWindow
+                    | Source::AttnPlan(_)
+            )
+        }) {
             guard.push_str(" && attn.is_some()");
+        }
+        // A NULL PLAN IS A FIRE THAT RAISED NONE -- a pure-prefill fire
+        // has no decode plan and vice versa, and the hand arms tested it
+        // by hand (`if a.prefill_plan.is_null() { return Err(..) }`).
+        // After `attn.is_some()` for the same short-circuit reason.
+        for o in k.operands {
+            if let Source::AttnPlan(family) = o.source {
+                guard.push_str(&format!(
+                    " && !attn_plan(a_of(attn), spec, u32::from(b.layers.start), \"{family}\").is_null()"
+                ));
+            }
         }
         // AFTER `attn.is_some()`, and that order is load-bearing: `&&`
         // short-circuits left to right, so `a_of` is only reached once
@@ -855,10 +1177,30 @@ pub fn emit_rust_dispatch(tables: &[&'static [KernelSig]]) -> String {
         // launch that carries one, which is the same answer the blanket
         // check gave, and a row that states one is asked whether the
         // value it names is actually there.
-        if !k.operands.iter().any(|o| matches!(o.source, Source::Aux(_))) {
+        if !mentions(k, |s| matches!(*s, Source::Aux(_))) {
             guard.push_str(" && spec.aux.is_empty()");
         }
-        if k.operands.iter().any(|o| o.source == Source::KvLayerView) {
+        // THE SAME MOVE `aux` MADE. A statement carrying `per_head_dim`
+        // has a reading a flat row cannot express, so the check was
+        // ahead of the match; `IfPresent(&PerHeadDim, ..)` is a row
+        // expressing it, and the refusal is per row now.
+        if !mentions(k, |s| *s == Source::PerHeadDim) {
+            guard.push_str(" && spec.per_head_dim.is_none()");
+        }
+        // A STATEMENT THAT STATES NO ROTARY WIDTH AND A FIRE THAT CARRIES
+        // NO TABLE is the hand arm's `NoArm`, one layer earlier.
+        if any_leaf(k, |s| *s == Source::RotaryWidth) {
+            guard.push_str(" && rotary_width(ctx, spec, b.layers.start as usize).is_some()");
+        }
+        if any_leaf(k, |s| {
+            matches!(
+                *s,
+                Source::KvLayerView
+                    | Source::KvKeys
+                    | Source::KvValues
+                    | Source::KvLayerField(_)
+            )
+        }) {
             guard.push_str(" && has_kv_layer(attn, b.layers.start as usize)");
         }
         // A field a family zeroes to say "not mine" — and a divisor,
@@ -872,10 +1214,7 @@ pub fn emit_rust_dispatch(tables: &[&'static [KernelSig]]) -> String {
         // makes a reader look for the difference.
         let mut guarded: Vec<&str> = Vec::new();
         for o in k.operands {
-            if let Source::CtxNonZero(f)
-            | Source::OutWidthOver(_, f)
-            | Source::InWidthOver(_, f) = o.source
-            {
+            if let Source::CtxNonZero(f) = o.source {
                 if guarded.contains(&f) {
                     continue;
                 }
@@ -889,12 +1228,22 @@ pub fn emit_rust_dispatch(tables: &[&'static [KernelSig]]) -> String {
             }
         }
 
+        // BOTH NAMES, not one instead of the other. `lowered_as` is an
+        // ALIAS: the symbol is this row's identity everywhere else (the
+        // shim, the audit, the ABI), and both spellings reach a lowering
+        // -- `gemm::act_x_wt_bf16` is what a text naming the CUDA symbol
+        // directly produces, `gemm::act_x_w` what the portable operation
+        // does. One branch answers to both.
+        let pattern = match k.lowered_as {
+            Some(also) => format!("\"{}\" | \"{also}\"", k.symbol),
+            None => format!("\"{}\"", k.symbol),
+        };
         out.push_str(&format!(
-            "\"{}\"{} => {{\n{}    unsafe {{ {}(\n        {},\n    ) }};\n    true\n}}\n",
-            k.symbol,
+            "{}{} => {{\n{}    unsafe {{ {}(\n        {},\n    ) }};\n    true\n}}\n",
+            pattern,
             guard,
             stage,
-            format!("crate::gpu::bind::abi::ffi::{}", entry_name(k.symbol)),
+            format!("crate::bind::abi::ffi::{}", entry_name(k.symbol)),
             binds.join(",\n        "),
         ));
     }
@@ -907,35 +1256,53 @@ pub fn emit_rust_dispatch(tables: &[&'static [KernelSig]]) -> String {
 }
 
 #[cfg(test)]
-mod aux_probe {
-    /// A row that states every source MUST emit, and the failure names
-    /// which operand did not.
+mod stated_rows {
+    /// EVERY fully-stated row emits a branch, and the failure names the
+    /// operand that declined.
     ///
     /// This exists because a row that silently fails to emit is
     /// indistinguishable from one whose branch never fires, and the
-    /// difference took two sessions to find. `stream` was left
-    /// `Unbound` — every other operand was sourced, the row read as
-    /// complete, and `Source::Unbound` skips the whole row by design.
-    /// Nothing said so, because the skip is silent on purpose: a
-    /// partially-stated row is not a row.
+    /// difference cost two sessions. `Source::Unbound` skips the WHOLE
+    /// row by design — a partially-stated row is not a row — so a row
+    /// sourced everywhere but `stream` reads as complete and vanishes.
     ///
-    /// The assertion reports the declining operand rather than just
-    /// failing, so the next one is a minute rather than a session.
+    /// Over every table rather than one row, because the next one to
+    /// vanish will be a different one.
     #[test]
     fn a_fully_stated_row_emits_a_branch() {
-        let text = super::emit_rust_dispatch(&[crate::ssm::KERNELS]);
-        assert!(
-            text.contains("nemotron_prepare_mamba_dt_da"),
-            "the row states every source; it must emit. Declining operands: {:?}",
-            crate::ssm::KERNELS
-                .iter()
-                .find(|k| k.symbol.ends_with("prepare_mamba_dt_da"))
-                .map(|k| k
+        let tables: &[&[crate::KernelSig]] = &[
+            crate::attn::KERNELS,
+            crate::gemm::KERNELS,
+            crate::layout::KERNELS,
+            crate::mlp::KERNELS,
+            crate::moe::KERNELS,
+            crate::norm::KERNELS,
+            crate::quant::KERNELS,
+            crate::rope::KERNELS,
+            crate::ssm::KERNELS,
+        ];
+        let mut missing = Vec::new();
+        for table in tables {
+            let text = super::emit_rust_dispatch(&[table]);
+            for k in table.iter().filter(|k| !k.operands.is_empty()) {
+                let declining: Vec<String> = k
                     .operands
                     .iter()
                     .filter(|o| super::rust_bind_expr(o).is_none())
                     .map(|o| format!("{:?}/{:?}", o.source, o.ty))
-                    .collect::<Vec<_>>())
+                    .collect();
+                // A row with a declining operand is EXPECTED not to
+                // emit — that is the skip working. What this catches is
+                // a row whose every operand binds and which still does
+                // not appear.
+                if declining.is_empty() && !text.contains(k.symbol) {
+                    missing.push(k.symbol.to_string());
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "every operand of these rows binds and none emitted a branch: {missing:?}"
         );
     }
 }

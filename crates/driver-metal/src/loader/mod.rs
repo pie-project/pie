@@ -10,7 +10,6 @@ mod plan;
 mod slab;
 
 pub use plan::{
-    LoadPlanError, METAL_MAX_TILE_BYTES, METAL_PREFERRED_ALIGNMENT, METAL_TILE_MAP_MASK, TestFacts,
-    compile_load_plan, descriptor_for_testing, metal_storage_target, plan_ties_embeddings,
+    LoadPlanError, TestFacts, compile_load_plan, descriptor_for_testing, metal_storage_target,
 };
 pub use slab::{ExpertSlab, SlabError, SlabTensor};

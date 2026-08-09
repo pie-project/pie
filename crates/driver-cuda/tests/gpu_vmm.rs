@@ -11,8 +11,8 @@
 //! Skipped when no device is present, or when the device has no VMM support.
 
 mod common;
-use driver_cuda::gpu::device::{Allocator, Arena, Device, OwnedStream, PhysicalPool, pages_for_bytes};
-use driver_cuda::gpu::device::LOGICAL_PAGE_BYTES;
+use driver_cuda::device::{Allocator, Arena, Device, OwnedStream, PhysicalPool, pages_for_bytes};
+use driver_cuda::device::LOGICAL_PAGE_BYTES;
 use common::{device_or_skip, gpu_guard};
 
 /// A pool sized well under the L40S's 45 GiB so the tests never compete with

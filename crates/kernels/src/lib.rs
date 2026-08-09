@@ -859,12 +859,33 @@ pub enum Source {
     /// `let a = attn.ok_or(NoAttnCtx)?;`, and the four that need ONLY
     /// this and [`Source::KvLayerView`] are the ones a row can reach.
     ///
-    /// The other nine are not blocked on vocabulary and this does not
-    /// pretend they are: the flashinfer dispatches serve three arities,
-    /// select between two planned caches on the layer's window, and read
-    /// a guard-owned output when the trace states none. That is per-call
-    /// form, which is what a hand arm is FOR.
+    /// The other nine WERE blocked on vocabulary after all, and the
+    /// three things they do have three names now: the arities are `Or`,
+    /// the guard-owned output is `Or`, and the plan selection is
+    /// [`Source::AttnPlan`]. What is left of "per-call form" is a
+    /// statement of what the call needs, which is a row.
     Attn(&'static str),
+    /// The layer's attention WINDOW: how far back a query may look.
+    ///
+    /// Not `CtxByLayer` because the fall-through is three deep — the
+    /// statement's own first param, then the per-layer vector, then the
+    /// fire's default — and a row has no business spelling that. `-1` is
+    /// unbounded.
+    AttnWindow,
+    /// The planned cache the driver would use for THIS statement's layer.
+    ///
+    /// A ROW STATES WHAT IT NEEDS, NEVER HOW THE DRIVER FINDS IT, and
+    /// this is the line between them. Two-kind families keep a second
+    /// plan for their full-attention layers and the C++ picks with
+    /// `cur_full ? decode_plan_full : decode_plan_sliding`; the rule is
+    /// the driver's, because the driver owns `window_left_by_layer` and
+    /// built both plans. The row says "the decode plan for my layer" and
+    /// gets the one that is right for it.
+    ///
+    /// The argument is the plan FAMILY — `"decode"`, `"prefill"` — not a
+    /// field name, so a row cannot name the sliding one specifically and
+    /// then be wrong on a full layer.
+    AttnPlan(&'static str),
     /// An attention-context field a fire leaves NULL to say "not
     /// published" — the write descriptors, which only a fire that
     /// computed them carries.
@@ -889,6 +910,13 @@ pub enum Source {
     /// span and an unrolled one states a layer, and both reach the same
     /// lookup.
     KvLayerView,
+    /// A FIELD of that view — `head_dim`, `page_size`.
+    ///
+    /// The planless prefills divide the query width by the head dim to
+    /// get a head count, and the head dim is a property of the CACHE
+    /// rather than of the fire: two layer kinds may disagree on it,
+    /// which is the whole reason gemma-4 keeps two decode plans.
+    KvLayerField(&'static str),
     /// A field of the fire's GDN context, which is the hybrids' recurrent
     /// geometry: head counts, conv width, group count, slab strides.
     ///
@@ -913,6 +941,13 @@ pub enum Source {
     /// context, and that context may still hold no slab at this layer,
     /// and an op may state no layer at all. All three decline.
     GdnSlab(&'static str),
+    /// The statement's SECOND named weight (`LaunchSpec::weight2`).
+    ///
+    /// The mirror of [`Source::WeightNamed`]. A statement that names two
+    /// tensors by name — the GDN prep's `a_log` and `dt_bias` — has
+    /// nowhere to put the second without this, which is the whole of why
+    /// that row stayed hand-written.
+    WeightNamed2,
     /// The statement's weight name plus a SUFFIX, or null.
     ///
     /// A conv or a norm whose checkpoint may or may not ship a bias: the
@@ -922,47 +957,6 @@ pub enum Source {
     /// [`Source::WeightNamed`], whose absence IS drift and which declines
     /// the branch.
     WeightSuffix(&'static str),
-    /// The `i`-th result's row width DIVIDED by a context field.
-    ///
-    /// One variant and not two, because "how many head-dims fit in this
-    /// row" and "how many PLE layers fit in this row" are the same
-    /// question asked of different fields, and a `OutHeads` beside a
-    /// `OutPleLayers` would be the repetition this table exists to end.
-    /// Nine hand arms compute `width / ctx.head_dim.max(1)` — rope's q
-    /// and k counts, the attention sink correction, the per-head norms,
-    /// the q/gate split — and one computes `width / ctx.ple_dim`.
-    ///
-    /// Not the same question as [`Source::OutDim`], and that is why it is
-    /// its own source rather than a use of one. `OutDim(i, 1)` asks the
-    /// PLAN what the second extent of a `[Tokens, heads, dim]` value is,
-    /// and the join does not carry it; this asks the BINDER how many of
-    /// something fit in a row it already holds the width of.
-    ///
-    /// A row stating this is guarded on the field being set, because
-    /// dividing a width by an unset field is not a smaller answer, it is
-    /// a meaningless one — the same reason [`Source::CtxNonZero`] guards.
-    /// Two of the arms this replaces refused explicitly on it and the
-    /// rest wrote `max(1)`, which is the same judgment less loudly.
-    OutWidthOver(u8, &'static str),
-    /// The same for the `i`-th operand. See [`Source::OutWidthOver`].
-    InWidthOver(u8, &'static str),
-    /// The `o`-th result's row width divided by the `i`-th OPERAND's.
-    ///
-    /// The divisor is a value the statement already carries, which is the
-    /// only difference from [`Source::OutWidthOver`] — and it is worth a
-    /// variant because three rows want it and none of them can name a
-    /// context field for it. The MoE decode GEMVs read their intermediate
-    /// as `expert_out.width / topk_idx.width`, because the result is
-    /// `[Tokens, top_k * i_moe]` and the routing table IS `[Tokens,
-    /// top_k]`; gemma-3n's hyper-connection expand reads its multiplier
-    /// as `output.width / input.width`.
-    ///
-    /// Unguarded, unlike its context twin: an operand with a zero row
-    /// width is not a fire that states nothing, it is a fire whose
-    /// binding is already wrong, and the arity guard has covered the case
-    /// where the operand is absent. `width_over`'s `max(1)` stands behind
-    /// it either way.
-    OutWidthOverIn(u8, u8),
     /// A context field the fire holds PER LAYER, read at the statement's
     /// own layer.
     ///
@@ -1038,6 +1032,108 @@ pub enum Source {
     /// any language that reads this table; it was a float in the one
     /// language that wrote it.
     Lit(Lit),
+
+    // ── The grammar ──────────────────────────────────────────────────
+    //
+    // Everything above is a LEAF: a fact about the statement, the fire
+    // or the driver. Everything below COMBINES leaves, and the four of
+    // them together replace thirteen variants that were the same three
+    // operations over different leaves — `InWidthOver`, `OutWidthOver`,
+    // `OutWidthOverIn`, `RowsTimesParam`, `GdnProduct`, `RowsTimesGdn`,
+    // `InWidthOverGdn`, `InWidthIsqrt`, `InWidthOverOut`,
+    // `OutWidthOverInWidth`, `InWidthOverInWidth`, `RowsPerHead`,
+    // `WidthPerHead`.
+    //
+    // THE POINT IS NOT THE COUNT. It is that a flat enum of
+    // combinations needs a new variant per row, so every kernel added
+    // was a chance to edit the emitter — and the emitter's arity
+    // computation is a hand-maintained `match` over those variants,
+    // where a forgotten arm is a branch that declines silently. That is
+    // exactly how `Source::Aux` came to emit code nothing could reach.
+    // A grammar closes the table: a new row composes, and the arity
+    // falls out of walking the tree.
+    //
+    // `&'static Source` rather than `Box`, because a kernel table is a
+    // `const` and a const can hold a reference to another const.
+
+    /// An operand's row width.
+    Width(&'static Source),
+    /// Product.
+    Mul(&'static Source, &'static Source),
+    /// Difference, floored at zero.
+    ///
+    /// FLOORED for `Div`'s reason: a bind expression runs after the
+    /// guard and has nowhere to refuse from, and a negative head count
+    /// is a shape the launcher rejects one layer lower anyway.
+    Sub(&'static Source, &'static Source),
+    /// Quotient, with the divisor floored at one.
+    ///
+    /// FLOORED, not checked, and the reason is the same one
+    /// `InWidthOver` gave: a family that states no groups means one, and
+    /// a division that refused would decline the family rather than
+    /// serve it.
+    Div(&'static Source, &'static Source),
+    /// Exact integer square root, or `0` when the value is not a perfect
+    /// square.
+    ///
+    /// Zero rather than a refusal, because bind expressions run after
+    /// the guard and have nowhere to refuse from. The launcher rejects a
+    /// zero, which is the same outcome one layer lower.
+    Isqrt(&'static Source),
+    /// Inequality, as a bool operand.
+    Ne(&'static Source, &'static Source),
+
+    /// The first source if it is PRESENT, the second otherwise.
+    ///
+    /// A source that DEGRADES rather than DEMANDS, which is how one row
+    /// serves an arity family without the emitter knowing arities
+    /// exist. `[x, y]` and `[x, y, w]` are two live spellings of
+    /// rmsnorm; `Or(&Weight(0), &WeightNamed)` serves both.
+    Or(&'static Source, &'static Source),
+    /// `IfPresent(probe, then, else)` — `then` when `probe` resolves,
+    /// `else` when it does not.
+    ///
+    /// The per-head reading is this: a statement carrying `PerHeadDim`
+    /// norms `rows * (width / head_dim)` rows of `head_dim`, and one
+    /// without it norms `rows` of `width`.
+    IfPresent(&'static Source, &'static Source, &'static Source),
+    /// The statement's per-head dim, when it states one.
+    PerHeadDim,
+    /// A scalar constant the statement names in its `scale.<name>` slot.
+    ///
+    /// A scale is a CONSTANT, not a tensor (the dsl's own words), so it
+    /// resolves out of a table the driver built from the config rather
+    /// than out of the weight store. Paired with `ParamF32` under an
+    /// `Or`: a statement carrying the number rides the params, and one
+    /// that does not names it.
+    NamedScale,
+    /// The ROTARY WIDTH for this statement — how many channels rotate.
+    ///
+    /// Three places it can come from, and the order prefers what a
+    /// STATEMENT said: the launch's own param, then the semantic
+    /// `Rope { partial }`, then the fire's per-layer table. The first two
+    /// are one fact under two spellings and both are live — qwen3_5's
+    /// prefill states the launch and its decode records the semantic op.
+    ///
+    /// A row may not spell that, for [`Source::AttnWindow`]'s reason: a
+    /// fall-through is the driver's rule, and a row states what it needs.
+    RotaryWidth,
+    /// The layer's own scalar, or `1.0` where the layer states none.
+    ///
+    /// [`Source::NamedScale`]'s sibling and NOT the same thing: that one
+    /// resolves a `scale.<name>` and refuses a miss, because the whole
+    /// launch is the multiply. This one is one term of a fused norm, and
+    /// a family whose landing carries no scalar means one — the C++
+    /// reads `layer_scalar_value` the same way. A refusal here would
+    /// decline every family but the one with a PLE.
+    LayerScale,
+    /// The accumulation coefficient the STATEMENT implies: `1.0` when it
+    /// accumulates into its destination, `0.0` when it overwrites.
+    ///
+    /// One symbol serves both because the launcher takes beta as an
+    /// argument — what differs is the statement, not the kernel, and
+    /// `spec.beta_one` is where the lowering already wrote it down.
+    Beta,
 }
 
 /// What a [`Source::Lit`] holds.
@@ -1142,6 +1238,20 @@ pub struct KernelSig {
     /// lists every operand the callee has, defaulted or not, because a
     /// caller that is not C++ cannot omit one — and because a default is a
     /// choice the table should be able to see.
+    /// The name a LOWERING gives this kernel, where it differs.
+    ///
+    /// A portable lowering names an operation and a backend names a
+    /// symbol, and they are not always the same word: the lowering says
+    /// `gemm::act_x_w` and CUDA's is `gemm::act_x_wt_bf16`, which is
+    /// what `gemm.hpp` defines as `act_x_w` with `WeightView::raw(W,
+    /// BF16)` — the one view the dense path ever built. Metal binds the
+    /// same lowering to its own.
+    ///
+    /// So the row keeps the SYMBOL as its identity (the shim, the
+    /// audit and the ABI are all built from it) and says here which
+    /// lowering it answers to. The alternative was renaming in the
+    /// lowering, which would have told Metal a CUDA word.
+    pub lowered_as: Option<&'static str>,
     pub operands: &'static [Operand],
     /// What the launcher RETURNS, spelled as C++ spells it.
     ///
@@ -1319,6 +1429,7 @@ macro_rules! kernel {
                 returns: "",
                 axes: &[],
                 grid_param: None,
+                lowered_as: None,
             }
         }
     };
@@ -1510,3 +1621,4 @@ mod tests {
         }
     }
 }
+

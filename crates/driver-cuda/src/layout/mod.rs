@@ -2,18 +2,20 @@
 //!
 //! Geometry, memory budgets, swap plans, the load plan and the profile
 //! cache. Every answer here is arithmetic over shapes and budgets, which
-//! is why this directory is OUTSIDE `gpu/` and builds with no CUDA
+//! is why this directory is OUTSIDE `` and builds with no CUDA
 //! feature selected at all (`tests/portable_half.rs`).
 //!
-//! The line between this and [`crate::gpu::pools`] is the one this
+//! The line between this and [`crate::pools`] is the one this
 //! crate's `Cargo.toml` already drew: **`kv_geometry` says what shape
 //! the pages are and `kv_cache` allocates them, and only the second one
 //! needs a card.** It used to run between 22 files inside one `store/`;
-//! raised to a directory, the `#[cfg]` collapses from per-file to one.
+//! raised to a boundary, the `#[cfg]` collapses from per-file to one
+//! block of module declarations in `lib.rs`.
 
 // THE CRATE'S THESIS, held by the compiler on the half where it is
-// reachable today (§8 row 11). `lib.rs` cannot carry this: `gpu/` has
-// 342 `unsafe` blocks and needs them, because that is where CUDA is.
+// reachable today (§8 row 11). `lib.rs` cannot carry this: the gated
+// modules hold 237 `unsafe` blocks and need them, because that is
+// where CUDA is.
 // `layout/` needed exactly one — a `libc::flock` on the profile
 // cache — and it did not need to be `unsafe` at all; `File::lock` is
 // the same advisory lock with the descriptor's lifetime in the type.

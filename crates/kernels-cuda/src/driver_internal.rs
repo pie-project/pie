@@ -150,11 +150,23 @@ pub static DRIVER_KERNELS: &[KernelSig] = &[
     // exactly the step's first five inputs, which is the shape of it.
     kernel!(gdn_post_conv_prep "ssm::qwen_gdn_post_conv_prep_bf16",
         operands = operands![
-            qkv_post: Buf, a: Buf, b: Buf, a_log: Buf, dt_bias: Buf,
-            q_norm_kh: F32sMut, k_norm_kh: F32sMut, v_fp32: F32sMut,
-            g_log_out: F32sMut, beta_out: F32sMut,
-            n: I32, k_h: I32, v_h: I32, k_d: I32, v_d: I32, conv_dim: I32,
-            stream: Stream,
+            qkv_post: Buf <- Source::In(0),
+            a: Buf <- Source::In(1),
+            b: Buf <- Source::In(2),
+            a_log: Buf <- Source::WeightNamed,
+            dt_bias: Buf <- Source::WeightNamed2,
+            q_norm_kh: F32sMut <- Source::Out(0),
+            k_norm_kh: F32sMut <- Source::Out(1),
+            v_fp32: F32sMut <- Source::Out(2),
+            g_log_out: F32sMut <- Source::Out(3),
+            beta_out: F32sMut <- Source::Out(4),
+            n: I32 <- Source::Rows,
+            k_h: I32 <- Source::Gdn("k_h"),
+            v_h: I32 <- Source::Gdn("v_h"),
+            k_d: I32 <- Source::Gdn("k_d"),
+            v_d: I32 <- Source::Gdn("v_d"),
+            conv_dim: I32 <- Source::Gdn("conv_dim"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // Full attention's q_proj packs the query and the per-token output
     // gate PER HEAD — `[N, heads, 2*head_dim]`, query first — so this is
@@ -169,7 +181,7 @@ pub static DRIVER_KERNELS: &[KernelSig] = &[
             // Off the QUERY half, not the packed operand: `packed` is
             // `[N, heads, 2*head_dim]` and only the query's half of it
             // lands here, so the head count comes from what is written.
-            num_heads: I32 <- Source::OutWidthOver(0, "head_dim"),
+            num_heads: I32 <- Source::Div(&Source::Width(&Source::Out(0)), &Source::CtxNonZero("head_dim")),
             head_dim: I32 <- Source::Ctx("head_dim"),
             stream: Stream <- Source::Ctx("stream"),
         ]),
@@ -199,8 +211,18 @@ pub static DRIVER_KERNELS: &[KernelSig] = &[
     // asserts every launch ran.
     kernel!(rmsnorm_gated_fp32_in "norm::rmsnorm_gated_fp32_in_bf16",
         operands = operands![
-            x: Buf, gate: Buf, weight: Buf, y: BufMut,
-            num_rows: I32, hidden: I32, eps: F32, stream: Stream,
+            x: Buf <- Source::In(0),
+            gate: Buf <- Source::In(1),
+            // BY NAME, not an arg slot: the hand arm resolved
+            // `spec.weight` through the resolver.
+            weight: Buf <- Source::WeightNamed,
+            y: BufMut <- Source::Out(0),
+            // ONE ROW PER (token, head), which is what the comment above
+            // means by a rectangle no `Source::` spelled. It does now.
+            num_rows: I32 <- Source::Mul(&Source::Rows, &Source::Gdn("v_h")),
+            hidden: I32 <- Source::Gdn("v_d"),
+            eps: F32 <- Source::Ctx("eps"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // The qwen3_vl vision TOWER, bridged at tower granularity — one row
     // that is a whole subgraph, the flashinfer-dispatch precedent (see

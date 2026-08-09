@@ -141,7 +141,7 @@ pub static KERNELS: &[KernelSig] = &[
             // row once that is divided out — which is exactly the
             // arithmetic the hand arm did, refusal on an unset `ple_dim`
             // included.
-            layers: I32 <- Source::InWidthOver(0, "ple_dim"),
+            layers: I32 <- Source::Div(&Source::Width(&Source::In(0)), &Source::CtxNonZero("ple_dim")),
             dim: I32 <- Source::Ctx("ple_dim"),
             stream: Stream <- Source::Ctx("stream"),
         ]),

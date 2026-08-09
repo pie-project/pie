@@ -105,6 +105,7 @@ const EMPTY: KernelSig = KernelSig {
     returns: "",
     axes: &[],
     grid_param: None,
+    lowered_as: None,
 };
 
 const fn copy_sig(k: &KernelSig) -> KernelSig {
@@ -123,6 +124,7 @@ const fn copy_sig(k: &KernelSig) -> KernelSig {
         returns: k.returns,
         axes: k.axes,
         grid_param: k.grid_param,
+        lowered_as: k.lowered_as,
     }
 }
 

@@ -5,7 +5,7 @@
 //! `cuda-progress.md` records the rule this suite is written under: *"Non-GPU
 //! green is weak evidence. Every dispatch defect found on 2026-08-10 compiled
 //! cleanly and passed the full non-GPU battery."* The unit tests beside
-//! [`driver_cuda::gpu::program::cache`] and [`driver_cuda::gpu::program::compile`] pin arithmetic — a cache key, a rounded
+//! [`driver_cuda::program::cache`] and [`driver_cuda::program::compile`] pin arithmetic — a cache key, a rounded
 //! launch width — and arithmetic is exactly the class of thing that can be
 //! right in isolation and wrong against a driver.
 //!
@@ -17,7 +17,7 @@
 //!
 //! Skipped without a device, like every other `gpu_*` binary here.
 
-use driver_cuda::gpu::program::{Disk, Module, disk_key, compile};
+use driver_cuda::program::{Disk, Module, disk_key, compile};
 
 mod common;
 use common::{device_or_skip, gpu_guard};
@@ -92,7 +92,7 @@ fn a_generated_region_compiles_loads_and_resolves_its_entry() {
 /// fire, recompiled each time, is the difference between a slow model and an
 /// unusable one.
 ///
-/// [`Deterministic`]: driver_cuda::gpu::program::FailureKind::Deterministic
+/// [`Deterministic`]: driver_cuda::program::FailureKind::Deterministic
 #[test]
 fn a_source_nvrtc_rejects_is_deterministic_and_carries_its_log() {
     let _gpu = gpu_guard();
@@ -109,7 +109,7 @@ fn a_source_nvrtc_rejects_is_deterministic_and_carries_its_log() {
 
     assert_eq!(
         error.kind,
-        driver_cuda::gpu::program::FailureKind::Deterministic,
+        driver_cuda::program::FailureKind::Deterministic,
         "a source NVRTC rejects will be rejected identically forever; not \
          remembering that is a recompile per fire"
     );
@@ -180,11 +180,11 @@ fn a_cubin_survives_the_disk_cache_and_still_loads() {
 
 /// The two control kernels are prebuilt on CUDA, absent from the kernels
 /// archive, and therefore compiled here. This is the test that says the
-/// forty lines of hand-written CUDA in `driver_cuda::gpu::program::run` are legal CUDA — which
+/// forty lines of hand-written CUDA in `driver_cuda::program::run` are legal CUDA — which
 /// nothing else can, because they never reach a compiler at build time.
 #[test]
 fn the_control_kernels_compile_and_both_entry_points_resolve() {
-    use driver_cuda::gpu::program::{Control, run};
+    use driver_cuda::program::{Control, run};
 
     let _gpu = gpu_guard();
     let Some(device) = device_or_skip("PTIR control kernels") else {
@@ -225,8 +225,8 @@ fn the_control_kernels_compile_and_both_entry_points_resolve() {
 /// about a value the device wrote.
 #[test]
 fn the_control_kernels_gate_and_advance_the_device_ring() {
-    use driver_cuda::gpu::device::{Allocator, OwnedStream};
-    use driver_cuda::gpu::program::{ChannelShape, Control, Rings, run, launch_control};
+    use driver_cuda::device::{Allocator, OwnedStream};
+    use driver_cuda::program::{ChannelShape, Control, Rings, run, launch_control};
     use driver::tensor_ir::DType;
 
     let _gpu = gpu_guard();

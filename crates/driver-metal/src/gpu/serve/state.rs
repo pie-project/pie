@@ -36,7 +36,7 @@ use crate::error::{Error, Result};
 /// there because a completion is the engine's object — the driver reports
 /// that work was submitted, and what a scheduler waits on is not its concern.
 pub struct Shell {
-    pub(crate) context: Arc<crate::gpu::Context>,
+    pub(crate) context: Arc<crate::Context>,
     /// The command timeline, held ACROSS frames.
     ///
     /// This is what makes run-ahead run-ahead rather than within-frame
@@ -48,24 +48,24 @@ pub struct Shell {
     /// `Stepper::shared` rather than `Stepper::new` because a borrowing
     /// stepper beside the `Context` it borrows is a self-reference; sharing
     /// the context is what lets one outlive a call.
-    pub(crate) stepper: crate::gpu::Stepper<'static>,
+    pub(crate) stepper: crate::Stepper<'static>,
     /// Reusable fire regions, held ACROSS frames for the same reason the
     /// stepper is. A fresh region per fire leaks it into the residency set
     /// permanently -- nothing removes -- and moves an address that is one of
     /// only three things differing between two fires of one shape.
-    pub(crate) scratch: crate::gpu::Scratch,
+    pub(crate) scratch: crate::Scratch,
     /// Which buffer each address belongs to. A recorded command binds a
     /// BUFFER where this driver otherwise binds an address, so recording
     /// needs the inverse of what a fire computes.
-    pub(crate) regions: crate::gpu::Regions,
+    pub(crate) regions: crate::Regions,
     /// Fires already recorded, by what they are valid for. Replaying one
     /// costs 39.8 us where encoding the same fire costs 14.87 ms.
-    pub(crate) recordings: crate::gpu::Recordings,
+    pub(crate) recordings: crate::Recordings,
     pub(crate) registry: crate::channel::Registry,
     pub(crate) device_facts: driver_api::DeviceFacts,
     /// The checkpoint, once one is loaded. Held because every address in its
     /// tensor map points into the region it owns.
-    pub(crate) model: Option<crate::gpu::weights::load::Loaded>,
+    pub(crate) model: Option<crate::weights::load::Loaded>,
     /// What the checkpoint said it is — which text `model::text` looks up.
     pub(crate) arch: String,
     /// The paged KV pool, allocated at load.
@@ -74,14 +74,14 @@ pub struct Shell {
     /// an elastic buffer charges its tiles back to the arena on the way out.
     /// The other order leaves the arena with nothing to charge and the
     /// accounting permanently short.
-    pub(crate) pool: Option<crate::gpu::pools::kv::Pool>,
+    pub(crate) pool: Option<crate::pools::kv::Pool>,
     /// What the KV pool's memory is charged against.
     ///
     /// Held on the driver rather than made per-load, because it is the thing
     /// that knows how much of the machine is already spoken for -- a fresh
     /// arena per load would let two pools each believe they had the whole
     /// budget.
-    pub(crate) arena: crate::gpu::Arena,
+    pub(crate) arena: crate::Arena,
     /// `[model] descriptor` from the boot TOML, parsed by the caller.
     ///
     /// The one key this seam reads out of the boot config, and the same one
@@ -119,8 +119,8 @@ pub struct Shell {
     /// compiled to. Held across fires: a model's symbol set is bounded by its
     /// text, so a driver that recompiled per fire would spend more time in the
     /// compiler than on the GPU.
-    pub(crate) compiler: crate::gpu::Compiler,
-    pub(crate) pipelines: crate::gpu::bind::encode::Pipelines,
+    pub(crate) compiler: crate::Compiler,
+    pub(crate) pipelines: crate::bind::encode::Pipelines,
 }
 
 // The context holds Objective-C objects, which are not `Send` by declaration.
@@ -159,16 +159,16 @@ impl Shell {
         // signature is `Arc<Context>`, and the whole point of the type is to
         // be held across frames by a caller that is itself `Send`.
         #[allow(clippy::arc_with_non_send_sync)]
-        let context = Arc::new(crate::gpu::Context::new()?);
-        let stepper = crate::gpu::Stepper::shared(context.clone())?;
-        let compiler = crate::gpu::Compiler::new(&context)?;
+        let context = Arc::new(crate::Context::new()?);
+        let stepper = crate::Stepper::shared(context.clone())?;
+        let compiler = crate::Compiler::new(&context)?;
         Ok(Self {
             arena: elastic_arena(&context),
             context,
             stepper,
-            scratch: crate::gpu::Scratch::new(),
-            regions: crate::gpu::Regions::new(),
-            recordings: crate::gpu::Recordings::new(),
+            scratch: crate::Scratch::new(),
+            regions: crate::Regions::new(),
+            recordings: crate::Recordings::new(),
             registry: crate::channel::Registry::new(),
             device_facts: device_facts(),
             model: None,
@@ -179,7 +179,7 @@ impl Shell {
             deployment: None,
             has_linear_attn: false,
             compiler,
-            pipelines: crate::gpu::bind::encode::Pipelines::new(shader_tree()),
+            pipelines: crate::bind::encode::Pipelines::new(shader_tree()),
         })
     }
 
@@ -197,7 +197,7 @@ impl Shell {
 
     /// The device this driver runs on.
     #[must_use]
-    pub fn context(&self) -> &crate::gpu::Context {
+    pub fn context(&self) -> &crate::Context {
         &self.context
     }
 
@@ -209,18 +209,18 @@ impl Shell {
 
     /// The loaded checkpoint, if `load_model` has run.
     #[must_use]
-    pub fn model(&self) -> Option<&crate::gpu::weights::load::Loaded> {
+    pub fn model(&self) -> Option<&crate::weights::load::Loaded> {
         self.model.as_ref()
     }
 
     /// The KV pool the checkpoint's geometry was allocated at.
     #[must_use]
-    pub fn pool(&self) -> Option<&crate::gpu::pools::kv::Pool> {
+    pub fn pool(&self) -> Option<&crate::pools::kv::Pool> {
         self.pool.as_ref()
     }
 
     /// The pool, or the refusal that names what would create one.
-    pub(crate) fn need_pool(&self, what: &'static str) -> Result<&crate::gpu::pools::kv::Pool> {
+    pub(crate) fn need_pool(&self, what: &'static str) -> Result<&crate::pools::kv::Pool> {
         self.pool.as_ref().ok_or_else(|| Error::Unserved {
             what,
             message: "called before load_model, which is what allocates the KV pool. \
@@ -269,7 +269,7 @@ fn device_facts() -> driver_api::DeviceFacts {
 /// nothing; `Context::check_working_set` reads it the same way. Advertising a
 /// budget there would be inventing one, so the answer is zero and the
 /// scheduler sees a backend that cannot resize.
-pub(crate) fn elastic_budget_bytes(context: &crate::gpu::Context) -> u64 {
+pub(crate) fn elastic_budget_bytes(context: &crate::Context) -> u64 {
     let working_set = context.working_set_bytes();
     if working_set == 0 {
         0
@@ -284,8 +284,8 @@ pub(crate) fn elastic_budget_bytes(context: &crate::gpu::Context) -> u64 {
 /// is already mapped stays -- see `Need`. A pool that could be taken back out
 /// from under a bound address by the pressure probe would be a pool no fire
 /// could rely on.
-fn elastic_arena(context: &crate::gpu::Context) -> crate::gpu::Arena {
-    crate::gpu::Arena::new(elastic_budget_bytes(context), 0)
+fn elastic_arena(context: &crate::Context) -> crate::Arena {
+    crate::Arena::new(elastic_budget_bytes(context), 0)
 }
 
 /// Where the Metal shader tree lives.

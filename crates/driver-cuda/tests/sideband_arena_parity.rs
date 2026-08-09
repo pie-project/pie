@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fmt::Write as _;
 
-use driver_cuda::gpu::fire::sideband_arena::{DeviceMemory, Refusal, Region, SidebandArena};
+use driver_cuda::fire::sideband_arena::{DeviceMemory, Refusal, Region, SidebandArena};
 
 /// FNV-1a 64 of the C++ oracle's transcript.
 const GOLDEN_FNV1A64: u64 = 0x120b66e719e34f18;

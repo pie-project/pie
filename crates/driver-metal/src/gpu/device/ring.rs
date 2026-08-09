@@ -48,9 +48,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use tensor_ir::DType;
 
-use crate::gpu::device::allocation::Allocation;
-use crate::gpu::device::context::Context;
-use crate::gpu::device::handle::Handle;
+use crate::device::allocation::Allocation;
+use crate::device::context::Context;
+use crate::device::handle::Handle;
 use crate::channel::{Words, wire_cell_bytes};
 use crate::layout::region::Region;
 use crate::Result;

@@ -2,7 +2,7 @@
 //!
 //! # The event says the step ended, not that it worked
 //!
-//! [`Stepper`](crate::gpu::device::encoder::Stepper) waits on a shared event, and the
+//! [`Stepper`](crate::device::encoder::Stepper) waits on a shared event, and the
 //! queue signals that event as a separate operation after the commit. A
 //! command buffer that FAULTED still reaches the signal: the wait returns,
 //! the step reports success, and the output buffer holds whatever it held.
@@ -17,7 +17,7 @@
 //!
 //! Metal invokes the handler on a queue of its own, after the fence the step
 //! waited on. So a step's own feedback is usually NOT available when
-//! [`Stepper::run`](crate::gpu::device::encoder::Stepper::run) returns; it arrives during
+//! [`Stepper::run`](crate::device::encoder::Stepper::run) returns; it arrives during
 //! the next one. Two consequences shape this module:
 //!
 //! * The state is an [`Arc`], not a field. Handlers can fire after everything

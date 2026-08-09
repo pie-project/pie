@@ -2,7 +2,7 @@
 //!
 //! # Why these do not come out of the heap
 //!
-//! [`Heap`](crate::gpu::device::heap::Heap) is a bump allocator: it hands out placements
+//! [`Heap`](crate::device::heap::Heap) is a bump allocator: it hands out placements
 //! in order and never takes one back. That is right for the weights and the
 //! KV cache, which live as long as the model does, and wrong for the buffers
 //! a step needs for the length of one forward pass -- a scratch reduction, a
@@ -48,7 +48,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLAllocation, MTLBuffer, MTLDevice, MTLResidencySet, MTLResourceOptions};
 
-use crate::gpu::device::context::Context;
+use crate::device::context::Context;
 use crate::error::{Error, Result};
 
 /// The smallest size class, and the alignment every buffer therefore has.
@@ -116,7 +116,7 @@ impl Transient {
     /// The CPU-visible bytes.
     ///
     /// A pointer rather than a slice, for the same reason as
-    /// [`Slot::contents`](crate::gpu::device::heap::Slot::contents): the GPU may be reading
+    /// [`Slot::contents`](crate::device::heap::Slot::contents): the GPU may be reading
     /// them.
     #[must_use]
     pub const fn contents(&self) -> NonNull<c_void> {

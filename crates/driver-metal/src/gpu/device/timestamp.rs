@@ -41,7 +41,7 @@ use objc2_metal::{
     MTL4TimestampHeapEntry, MTLDevice,
 };
 
-use crate::gpu::device::context::{Context, describe};
+use crate::device::context::{Context, describe};
 use crate::error::{Error, Result};
 
 /// How precisely a timestamp is asked to be taken.

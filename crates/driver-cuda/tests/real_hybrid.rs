@@ -45,11 +45,11 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use driver_cuda::gpu::device::{Allocator, DeviceBuffer, OwnedStream};
+use driver_cuda::device::{Allocator, DeviceBuffer, OwnedStream};
 use driver_cuda::dtype::DType;
-use driver_cuda::gpu::bind::abi::{KvCacheLayerView, KvCacheScheme};
-use driver_cuda::gpu::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
-use driver_cuda::gpu::bind::{
+use driver_cuda::bind::abi::{KvCacheLayerView, KvCacheScheme};
+use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
+use driver_cuda::bind::{
     AttnCtx, AttnRegions, DispatchCtx, DispatchPlan, Frame, GdnCtx, PrefillPlan, Resolver, run,
 };
 use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
@@ -459,9 +459,9 @@ fn the_hybrid_matches_transformers_on_real_weights() {
         sm_scale: 1.0 / (HEAD_DIM as f32).sqrt(),
     };
 
-    let mut cublas_ops = driver_cuda::gpu::device::cublas::LiveCublas;
+    let mut cublas_ops = driver_cuda::device::cublas::LiveCublas;
     let mut cublas =
-        driver_cuda::gpu::device::cublas::CublasHandle::create(&mut cublas_ops, raw_stream)
+        driver_cuda::device::cublas::CublasHandle::create(&mut cublas_ops, raw_stream)
             .expect("cublas");
     let ctx = DispatchCtx {
         // Every row sampled, so no compaction is stated and the gather

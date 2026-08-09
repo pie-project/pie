@@ -122,9 +122,29 @@ pub mod deployment;
 /// `driver-cuda` because §4's rule is that **the driver reads the
 /// answer, never the question** — and a table of `model_type` strings
 /// inside a driver is the question.
+///
+/// Gated on BOTH aspects it reads, because it reads both:
+/// `PlannedFamily::trace` returns a `model_compiler::trace::ForwardPlan`
+/// and the rows dispatch into `families::*::forward` (`forward`), while
+/// the derivations take a `crate::config::schema::HfConfig` (`config`).
+///
+/// It was declared ungated, which made `model` fail to build under any
+/// feature set missing either one — including `features = ["config"]`,
+/// exactly what `driver-cuda`'s LIBRARY dependency asked for. It went
+/// unnoticed because that crate's dev-dependency adds the rest, so every
+/// `cargo test` unified the features back on; `cargo tree -e
+/// features,no-dev` is what shows the truth.
+#[cfg(all(feature = "forward", feature = "config"))]
 pub mod deployment_cuda;
 
 /// The `pie.model/1` descriptor reader.
+///
+/// The config aspect's, not a third thing: it reads
+/// `crate::config::schema` and serde_json, and the `config` feature's own
+/// doc describes this module ("HuggingFace `config.json` normalization on
+/// the way in, `ModelFacts` projection on the way out"). Ungated, it made
+/// `model` fail to compile under `chat` alone and under `forward` alone.
+#[cfg(feature = "config")]
 pub mod descriptor;
 
 // ── The shared root: the chat aspect ─────────────────────────────────
@@ -156,6 +176,10 @@ pub mod emissions;
 // ── The registries ───────────────────────────────────────────────────
 #[cfg(feature = "contract")]
 pub mod contract;
+/// The load path itself: descriptor in, plan out, stated once for every
+/// driver. Sits with `contract` because it is that registry's caller.
+#[cfg(feature = "contract")]
+pub mod boot;
 #[cfg(feature = "chat")]
 pub mod multimodal;
 

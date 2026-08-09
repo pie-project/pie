@@ -47,7 +47,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLAllocation, MTLBuffer, MTLDevice, MTLResidencySet, MTLResourceOptions};
 
-use crate::gpu::device::context::Context;
+use crate::device::context::Context;
 use crate::error::{Error, Result};
 use crate::layout::region::Region;
 

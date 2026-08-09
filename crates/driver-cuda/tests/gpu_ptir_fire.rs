@@ -26,10 +26,10 @@
 //! → `ptir::Runtime::compile` (NVRTC) → `ptir::Prepared::build` → launch.
 //! That is every step the engine takes, with nothing stubbed.
 
-use driver_cuda::gpu::device::{Allocator, OwnedStream};
-use driver_cuda::gpu::program;
-use driver_cuda::gpu::program::run::Lane;
-use driver_cuda::gpu::program::{
+use driver_cuda::device::{Allocator, OwnedStream};
+use driver_cuda::program;
+use driver_cuda::program::run::Lane;
+use driver_cuda::program::{
     ChannelShape, Control, Disk, Prepared, Rings, Runtime, Target, launch_control, compile,
 };
 use driver::tensor_ir::DType;
@@ -172,7 +172,7 @@ fn run_both(container: TraceContainer, seed: &[f32]) -> Option<Answers> {
     // real compiled program: it used to hardcode `&[0]` and `&[1]`, which
     // is right for this two-channel epilogue and says nothing about a
     // program whose local slots and global indices differ.
-    let sets = driver_cuda::gpu::program::channel::stage_channels(stage_plan).expect("the plan binds its slots");
+    let sets = driver_cuda::program::channel::stage_channels(stage_plan).expect("the plan binds its slots");
     assert_eq!(sets.need_full, vec![0], "the seeded input");
     assert_eq!(sets.need_empty, vec![1], "the reader");
     assert_eq!(sets.put, vec![1]);
@@ -560,8 +560,8 @@ fn every_lane_binds_its_own_row_of_the_logits() {
 /// disagreement here cannot be rounding.
 #[test]
 fn a_program_fires_from_a_host_mirror_and_publishes_back_into_one() {
-    use driver_cuda::gpu::program::channel::{HostChannel, stage_channels};
-    use driver_cuda::gpu::program::session::{Fired, Session};
+    use driver_cuda::program::channel::{HostChannel, stage_channels};
+    use driver_cuda::program::session::{Fired, Session};
 
     let _gpu = gpu_guard();
     let Some(device) = device_or_skip("PTIR session") else {

@@ -77,11 +77,31 @@ fn repo_root() -> PathBuf {
 /// `&serde_json::Value` and a path it only ever quotes in errors. Reading the
 /// file is the *caller's*, so even the one module allowed to normalize is not
 /// allowed to open.
+///
+/// # The two drivers are walked here now
+///
+/// They were not, and three documents said they were. This file used to hold
+/// a metal half and a cuda half, each walking a `csrc/src` tree; both trees
+/// are deleted, both halves went with them, and what stayed was a Rust walk
+/// over `model` and `engine` only. So the citations naming this test as the
+/// guard on either driver had been pointing at a file that did not look at
+/// them — which is `north-star.md` rule 4's failure mode, in the very test
+/// written to name it.
+///
+/// Both driver trees are Rust now, so the same walk covers them: neither
+/// opens `config.json` today, and adding them costs one line each and turns
+/// "they do not" from a claim into a check. The stronger, family-level guard
+/// each driver needs is its own `no_family_names.rs`.
 #[test]
 fn the_runtime_does_not_read_config_json() {
     let root = repo_root();
     let mut found = Vec::new();
-    for rel in ["crates/model/src", "crates/engine/src"] {
+    for rel in [
+        "crates/model/src",
+        "crates/engine/src",
+        "crates/driver-metal/src",
+        "crates/driver-cuda/src",
+    ] {
         let dir = root.join(rel);
         let mut stack = vec![dir];
         while let Some(dir) = stack.pop() {

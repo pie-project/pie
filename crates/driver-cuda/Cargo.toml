@@ -136,9 +136,31 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 # the Rust normalizer writes it at import, this driver reads it back from the
 # artifact -- which is the whole point of the descriptor (config.hpp's tail
 # comment records the C++ parser's deletion for the same reason). The
-# `config` feature is the crate's declared leaf: serde + serde_json and
-# nothing of the loader, tracer, or kernels table.
-model = { path = "../model", default-features = false, features = ["config"] }
+# `contract` because the library authors a load contract
+# (`model::boot::compile_load_plan` -> `model::contract::author_with_policy`).
+# The `forward` because `model::deployment_cuda` is gated on it AND on
+# `config`, and `gpu/serve/{state,load}.rs` and `gpu/fire/launch.rs` all
+# reach it.
+#
+# THREE features, and getting to three took two wrong answers. It said
+# `config` alone for a while and still built; then `contract` alone, and still
+# built. Both times for the same reason: this crate's DEV-dependency on
+# `model` names all three, and the resolver unifies them back on for every
+# `cargo test` and every `cargo check` that resolves dev targets. So the
+# library declaration is the one thing in this file that NOTHING in the
+# workspace reads -- CI's `cargo test --workspace` excludes this crate, and
+# any build that includes it also builds its tests.
+#
+# `cargo tree -e features,no-dev` is what shows the truth, and
+# `crates/model/tests/declared_features.rs` is what now checks it, because a
+# trap found three times is not going to be remembered the fourth.
+#
+# Not `chat`: the chat templates are not in the load path.
+model = { path = "../model", default-features = false, features = [
+    "config",
+    "contract",
+    "forward",
+] }
 
 # NO `libc`. It was here for `flock` and `open` on the profile cache —
 # the read -> merge -> rename has to be atomic against another process

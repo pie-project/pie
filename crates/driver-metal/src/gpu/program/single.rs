@@ -41,16 +41,16 @@ use std::rc::Rc;
 
 use tensor_ir::op::tags;
 
-use crate::gpu::device::context::Context;
-use crate::gpu::device::encoder::{Stepper, Visibility};
-use crate::gpu::device::external::Externals;
-use crate::gpu::device::handle::Handle;
-use crate::gpu::device::allocator::{Pool, Transient};
-use crate::gpu::program::executable::ProgramExecutable;
-use crate::gpu::device::ring::Ring;
-use crate::gpu::program::cache::Runtime;
-use crate::gpu::device::argtable::Tables;
-use crate::gpu::device::step_cost::Timing;
+use crate::device::context::Context;
+use crate::device::encoder::{Stepper, Visibility};
+use crate::device::external::Externals;
+use crate::device::handle::Handle;
+use crate::device::allocator::{Pool, Transient};
+use crate::program::executable::ProgramExecutable;
+use crate::device::ring::Ring;
+use crate::program::cache::Runtime;
+use crate::device::argtable::Tables;
+use crate::device::step_cost::Timing;
 use crate::channel::{
     DUMMY_BYTES, Extents, LANE_ABI_VERSION, LaneChannelSlot, LaneHeader, LaneRecord, LaneShape,
     NO_TICKET, OpParams, OpRuntime, Readiness, Reason, STATUS_BYTES, Status, StatusOutcome, Ticket,
@@ -702,7 +702,7 @@ fn logits_operand(inputs: &DeviceInputs, intrinsic: u16, output: &ValueDesc) -> 
 
 /// The dense channel a stage-local slot binds, checked.
 fn dense_channel(
-    stage: &crate::gpu::program::executable::ProgramStage,
+    stage: &crate::program::executable::ProgramStage,
     local: u32,
     channels: usize,
 ) -> Result<usize> {

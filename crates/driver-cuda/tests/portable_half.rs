@@ -177,7 +177,7 @@ fn the_kv_geometry_shapes_pages_without_allocating_them() {
 ///
 /// This replaced a `SidebandArena` case, and the swap is worth
 /// recording: the arena's growth rule IS portable arithmetic, but the
-/// arena manages DEVICE memory, so it lives in `gpu/fire/` and the
+/// arena manages DEVICE memory, so it lives in `fire/` and the
 /// portable half cannot see it. That is the boundary working rather
 /// than failing — the test moved to something on the correct side of
 /// it instead of the module moving to the wrong one.

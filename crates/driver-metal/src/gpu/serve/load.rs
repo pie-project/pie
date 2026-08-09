@@ -5,7 +5,7 @@
 //! family's.
 
 use crate::error::{Error, Result};
-use crate::gpu::serve::state::{Shell, elastic_budget_bytes};
+use crate::serve::state::{Shell, elastic_budget_bytes};
 
 impl Shell {
     /// Author the checkpoint's load plan, run it, and stage every tensor.
@@ -43,7 +43,7 @@ impl Shell {
             what: "load_model",
             message: format!("{}: {e}", path.display()),
         })?;
-        let loaded = crate::gpu::weights::load::load(&self.context, &desc.snapshot_dir, &descriptor)?;
+        let loaded = crate::weights::load::load(&self.context, &desc.snapshot_dir, &descriptor)?;
         let facts = crate::facts::ModelFacts::from_descriptor(&descriptor).ok_or_else(|| {
             Error::Unserved {
                 what: "load_model",
@@ -120,7 +120,7 @@ impl Shell {
         // are invalid -- stated rather than left to the fingerprint, which
         // would also catch it but says nothing about why.
         self.recordings.clear();
-        self.regions = crate::gpu::Regions::new();
+        self.regions = crate::Regions::new();
         self.regions.add(&loaded.region);
         self.model = Some(loaded);
         let shape = crate::layout::kv::Shape {
@@ -154,7 +154,7 @@ impl Shell {
         // Committed to its full size here, so a pool that has never been
         // resized behaves exactly as a fixed one -- which is what
         // `device_real_weights.rs` compares it against, bit for bit.
-        let pool = crate::gpu::pools::kv::Pool::allocate_elastic(
+        let pool = crate::pools::kv::Pool::allocate_elastic(
             &self.context,
             &mut self.stepper,
             &self.arena,
@@ -193,8 +193,8 @@ impl Shell {
             // Both are non-zero together or not at all: `bootstrap` starts
             // its trim task only when both are, and a page size with no
             // budget describes a pool that can be measured but not resized.
-            elastic_page_bytes: crate::gpu::PAGE,
-            elastic_budget_pages: crate::gpu::pages_for_bytes(elastic_budget_bytes(&self.context)),
+            elastic_page_bytes: crate::PAGE,
+            elastic_budget_pages: crate::pages_for_bytes(elastic_budget_bytes(&self.context)),
             has_mtp_logits: false,
             has_mtp_drafts: false,
             has_value_head: false,

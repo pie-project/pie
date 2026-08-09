@@ -35,7 +35,7 @@ use objc2_metal::{
     MTLHeapType, MTLResidencySet, MTLResourceOptions, MTLStorageMode,
 };
 
-use crate::gpu::device::context::Context;
+use crate::device::context::Context;
 use crate::layout::bump::Bump;
 use crate::error::{Error, Result};
 

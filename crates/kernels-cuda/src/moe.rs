@@ -129,16 +129,21 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(mxfp4_moe_gemm_w4a16 "marlin_moe::launch_mxfp4_moe_gemm_w4a16_bf16", whole = true),
     kernel!(topk_sqrtsoftplus "moe::topk_sqrtsoftplus_bf16",
         operands = operands![
-            logits: Buf,
-            topk_idx: I32sMut,
-            topk_w: F32sMut,
-            correction_bias: F32s,
-            tokens: I32,
-            num_experts: I32,
-            top_k: I32,
-            renormalize: Bool,
-            routed_scaling_factor: F32,
-            stream: Stream,
+            logits: Buf <- Source::In(0),
+            topk_idx: I32sMut <- Source::Out(0),
+            topk_w: F32sMut <- Source::Out(1),
+            // A FAMILY WITHOUT A CORRECTION BIAS STATES NO FOURTH
+            // OPERAND, and the launcher reads a null as "there is none".
+            correction_bias: F32s <- Source::Or(
+                &Source::Weight(0),
+                &Source::Lit(Lit::Null),
+            ),
+            tokens: I32 <- Source::Rows,
+            num_experts: I32 <- Source::Width(&Source::In(0)),
+            top_k: I32 <- Source::Width(&Source::Out(0)),
+            renormalize: Bool <- Source::Ctx("moe_norm_topk"),
+            routed_scaling_factor: F32 <- Source::Ctx("moe_routed_scaling"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // Expert INDICES from a table keyed by token id -- a route that is a pure
     // function of the token rather than of its activations. The WEIGHTS still
@@ -331,16 +336,21 @@ pub static KERNELS: &[KernelSig] = &[
     // logits row, so this one splits like any elementwise statement.
     kernel!(topk_sigmoid "moe::topk_sigmoid_bf16",
         operands = operands![
-            logits: Buf,
-            topk_idx: I32sMut,
-            topk_w: F32sMut,
-            correction_bias: F32s,
-            tokens: I32,
-            num_experts: I32,
-            top_k: I32,
-            renormalize: Bool,
-            routed_scaling_factor: F32,
-            stream: Stream,
+            logits: Buf <- Source::In(0),
+            topk_idx: I32sMut <- Source::Out(0),
+            topk_w: F32sMut <- Source::Out(1),
+            // A FAMILY WITHOUT A CORRECTION BIAS STATES NO FOURTH
+            // OPERAND, and the launcher reads a null as "there is none".
+            correction_bias: F32s <- Source::Or(
+                &Source::Weight(0),
+                &Source::Lit(Lit::Null),
+            ),
+            tokens: I32 <- Source::Rows,
+            num_experts: I32 <- Source::Width(&Source::In(0)),
+            top_k: I32 <- Source::Width(&Source::Out(0)),
+            renormalize: Bool <- Source::Ctx("moe_norm_topk"),
+            routed_scaling_factor: F32 <- Source::Ctx("moe_routed_scaling"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // The router's top-k, then the decode GEMV leg's two routed
     // projections and its combine. The expert axis rides INSIDE the
@@ -401,7 +411,7 @@ pub static KERNELS: &[KernelSig] = &[
             // The result is `[Tokens, top_k * i_moe]`, so the
             // intermediate is what is left of a row once the routes are
             // divided out — and the routes are the other operand's width.
-            i_moe: I32 <- Source::OutWidthOverIn(0, 0),
+            i_moe: I32 <- Source::Div(&Source::Width(&Source::Out(0)), &Source::Width(&Source::In(0))),
             stream: Stream <- Source::Ctx("stream"),
         ]),
     // The down leg: `h` is what it WRITES per route and `i_moe` what it
@@ -414,7 +424,7 @@ pub static KERNELS: &[KernelSig] = &[
             expert_out: BufMut <- Source::Out(0),
             num_tokens: I32 <- Source::Rows,
             top_k: I32 <- Source::InWidth(0),
-            h: I32 <- Source::OutWidthOverIn(0, 0),
+            h: I32 <- Source::Div(&Source::Width(&Source::Out(0)), &Source::Width(&Source::In(0))),
             i_moe: I32 <- Source::InWidth(1),
             stream: Stream <- Source::Ctx("stream"),
         ]),
@@ -471,35 +481,50 @@ pub static KERNELS: &[KernelSig] = &[
     // BANK, which is a binding question and not a shape one.
     kernel!(mxfp4_moe_gate_up "quant::mxfp4_moe_gate_up_decode_bf16",
         operands = operands![
-            act_fp16: Buf,
-            topk_idx: I32s,
-            gate_up_packed: U8Array,
-            gate_up_scales: U8Array,
-            gate_bias: BufArray,
-            up_bias: BufArray,
-            gate_out_bf16: BufMut,
-            up_out_bf16: BufMut,
-            num_tokens: I32,
-            top_k: I32,
-            hidden: I32,
-            intermediate: I32,
-            stream: Stream,
-            act_out_fp16: BufMut,
-            glu_limit: F32,
-            glu_alpha: F32,
+            act_fp16: Buf <- Source::In(1),
+            topk_idx: I32s <- Source::In(0),
+            // THE BANK ITSELF is a weight slot, not an input. The flat
+            // run is `[in.., out.., weight..]`, and the statement's two
+            // inputs are the index row and the activation — so the
+            // packed bank is `Weight(0)` and reading it as `In(2)` makes
+            // the guard ask for three inputs on a statement with two.
+            gate_up_packed: U8Array <- Source::Weight(0),
+            // The bank's siblings by suffix — the same reach the down
+            // projection makes, and the reason neither needs an arm.
+            gate_up_scales: U8Array <- Source::WeightSuffix("_scales"),
+            gate_bias: BufArray <- Source::WeightSuffix("_gate_bias"),
+            up_bias: BufArray <- Source::WeightSuffix("_up_bias"),
+            gate_out_bf16: BufMut <- Source::Out(0),
+            up_out_bf16: BufMut <- Source::Out(1),
+            num_tokens: I32 <- Source::Rows,
+            top_k: I32 <- Source::InWidth(0),
+            hidden: I32 <- Source::InWidth(1),
+            intermediate: I32 <- Source::Div(&Source::Width(&Source::Out(0)), &Source::Width(&Source::In(0))),
+            stream: Stream <- Source::Ctx("stream"),
+            // The fused activation output the decode path does not use.
+            act_out_fp16: BufMut <- Source::Lit(Lit::Null),
+            glu_limit: F32 <- Source::Ctx("glu_limit"),
+            glu_alpha: F32 <- Source::Ctx("glu_alpha"),
         ]),
     kernel!(mxfp4_moe_down "quant::mxfp4_moe_down_decode_bf16",
         operands = operands![
-            act_fp16: Buf,
-            topk_idx: I32s,
-            down_packed: U8Array,
-            down_scales: U8Array,
-            down_bias: BufArray,
-            out_bf16: BufMut,
-            num_tokens: I32,
-            top_k: I32,
-            hidden: I32,
-            intermediate: I32,
-            stream: Stream,
+            act_fp16: Buf <- Source::In(1),
+            topk_idx: I32s <- Source::In(0),
+            // A weight slot, like the gate/up bank above.
+            down_packed: U8Array <- Source::Weight(0),
+            // THE BANK'S SIBLINGS, by suffix. An MXFP4 bank ships three
+            // tensors under one name and the statement names the bank;
+            // `WeightSuffix` is how a row reaches the other two.
+            down_scales: U8Array <- Source::WeightSuffix("_scales"),
+            down_bias: BufArray <- Source::WeightSuffix("_bias"),
+            out_bf16: BufMut <- Source::Out(0),
+            num_tokens: I32 <- Source::Rows,
+            // TOP-K IS AN OPERAND'S WIDTH — the index row holds one
+            // entry per selected expert — and both widths below divide
+            // by it.
+            top_k: I32 <- Source::InWidth(0),
+            hidden: I32 <- Source::Div(&Source::Width(&Source::Out(0)), &Source::Width(&Source::In(0))),
+            intermediate: I32 <- Source::Div(&Source::Width(&Source::In(1)), &Source::Width(&Source::In(0))),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
 ];

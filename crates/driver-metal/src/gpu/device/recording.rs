@@ -42,8 +42,8 @@ use objc2_metal::{
 };
 
 use crate::error::{Error, Result};
-use crate::gpu::device::context::Context;
-use crate::gpu::device::regions::Regions;
+use crate::device::context::Context;
+use crate::device::regions::Regions;
 
 /// One address bound to one kernel slot.
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
@@ -67,7 +67,7 @@ pub struct Bind {
 ///
 /// What a recording actually needs is a pipeline, some addresses and a grid.
 /// That is this, and none of those three words is a fire's. The translation
-/// lives in [`crate::gpu::bind::encode::commands`], one layer up, where
+/// lives in [`crate::bind::encode::commands`], one layer up, where
 /// `Dispatch`, `Pipelines` and `Params` are already in scope and where the
 /// identical walk is done for encoding.
 ///

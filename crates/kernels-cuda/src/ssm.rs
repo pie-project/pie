@@ -189,27 +189,35 @@ kernel!(nemotron_prepare_mamba_dt_da "ssm::nemotron_prepare_mamba_dt_da",
     // so a row window would resume from the wrong slab.
     kernel!(nemotron_mamba_ssm "ssm::nemotron_mamba_ssm_batched_bf16", whole = true,
         operands = operands![
-            conv_out: Buf,
-            dt: Buf,
-            a: F32s,
-            d: F32s,
-            dt_bias: F32s,
-            dt_precomputed: F32s,
-            da_precomputed: F32s,
-            ssm_state_base: BufMut,
-            slot_ids: I32s,
-            qo_indptr: U32s,
-            y: BufMut,
-            r: I32,
-            num_heads: I32,
-            head_dim: I32,
-            state_size: I32,
-            n_groups: I32,
-            conv_dim: I32,
-            intermediate: I32,
-            time_step_min: F32,
-            sequence_prefill: Bool,
-            stream: Stream,
+            conv_out: Buf <- Source::In(0),
+            // THE JOIN'S FOREIGN VALUES, in its stated order
+            // `[dt_raw, a, d, dt_bias, dt_pre, da_pre]`. The statement
+            // carries three args; these six are the mamba block's
+            // cross-statement wiring, and `Source::Aux` is what lets a
+            // row say so.
+            dt: Buf <- Source::Aux(0),
+            a: F32s <- Source::Aux(1),
+            d: F32s <- Source::Aux(2),
+            dt_bias: F32s <- Source::Aux(3),
+            dt_precomputed: F32s <- Source::In(1),
+            da_precomputed: F32s <- Source::Aux(5),
+            ssm_state_base: BufMut <- Source::GdnSlab("recurrent_state"),
+            slot_ids: I32s <- Source::Gdn("slot_ids_d"),
+            qo_indptr: U32s <- Source::Attn("qo_indptr_d"),
+            y: BufMut <- Source::Out(0),
+            r: I32 <- Source::Attn("num_requests"),
+            num_heads: I32 <- Source::Gdn("v_h"),
+            head_dim: I32 <- Source::Gdn("v_d"),
+            state_size: I32 <- Source::Gdn("k_d"),
+            n_groups: I32 <- Source::Gdn("n_groups"),
+            conv_dim: I32 <- Source::Gdn("conv_dim"),
+            intermediate: I32 <- Source::Mul(&Source::Gdn("v_h"), &Source::Gdn("v_d")),
+            time_step_min: F32 <- Source::Lit(Lit::F32(0.0)),
+            // `rows != num_requests` — a fire carrying more rows than
+            // requests is a prefill. Stated rather than passed, because
+            // it is a fact about the RECTANGLE and both halves are here.
+            sequence_prefill: Bool <- Source::Ne(&Source::Rows, &Source::Attn("num_requests")),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // Advances a slot's conv window in place; a row window advances the
     // wrong slots.
@@ -602,6 +610,16 @@ kernel!(nemotron_prepare_mamba_dt_da "ssm::nemotron_prepare_mamba_dt_da",
         ]),
     kernel!(zamba_rmsnorm_gated "ssm::zamba_rmsnorm_gated_bf16",
         operands = operands![
+            // UNSOURCED, and the reason is a disagreement worth
+            // resolving before guessing. The hand arm reads
+            // `(x, gate, y, w) = args[0..3]` — output at index 2,
+            // weight at 3 — while this row's operand ORDER is
+            // `x, gate, weight, y`. One of the two is describing the
+            // flat run wrongly, and there is no zamba fixture in the
+            // tree to tell which.
+            //
+            // `Source::Div(&Source::Width(&Source::In(0)), &Source::Gdn("n_groups"))` exists for this
+            // row's `group_size` and is ready when the mapping is.
             x: Buf,
             gate: Buf,
             weight: Buf,

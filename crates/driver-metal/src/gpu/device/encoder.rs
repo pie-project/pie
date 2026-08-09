@@ -54,13 +54,13 @@ use objc2_metal::{
     MTLSparseTextureMappingMode, MTLStages,
 };
 
-use crate::gpu::device::context::{Context, describe};
-use crate::gpu::device::elastic::{self, Arena, Elastic, Mappings, Need, Pressure};
-use crate::gpu::device::feedback::Feedbacks;
-use crate::gpu::device::heap::Slot;
-use crate::gpu::device::argtable::Tables;
-use crate::gpu::device::timestamp::{Granularity, Timestamps};
-use crate::gpu::device::step_cost::Timing;
+use crate::device::context::{Context, describe};
+use crate::device::elastic::{self, Arena, Elastic, Mappings, Need, Pressure};
+use crate::device::feedback::Feedbacks;
+use crate::device::heap::Slot;
+use crate::device::argtable::Tables;
+use crate::device::timestamp::{Granularity, Timestamps};
+use crate::device::step_cost::Timing;
 use crate::error::{Error, Result};
 
 /// How long one probe of the completion wait lasts.
@@ -459,7 +459,7 @@ impl<'ctx> Stepper<'ctx> {
 
     /// What the GPU reported about the steps that have finished.
     ///
-    /// Lags by about a step: see [`crate::gpu::device::feedback`]. Clone it to observe
+    /// Lags by about a step: see [`crate::device::feedback`]. Clone it to observe
     /// from elsewhere.
     #[must_use]
     pub const fn feedback(&self) -> &Feedbacks {
@@ -506,7 +506,7 @@ impl<'ctx> Stepper<'ctx> {
     /// # The allocator is why this is bounded
     ///
     /// A step encodes against `context.allocator(committed)`, which alternates
-    /// over [`ALLOCATOR_COUNT`](crate::gpu::device::context::ALLOCATOR_COUNT) = 2, and this
+    /// over [`ALLOCATOR_COUNT`](crate::device::context::ALLOCATOR_COUNT) = 2, and this
     /// RESETS it first. Resetting an allocator whose command buffer is still
     /// executing is a use-after-free, so a caller may have at most
     /// `ALLOCATOR_COUNT - 1` steps outstanding. This checks rather than
@@ -530,7 +530,7 @@ impl<'ctx> Stepper<'ctx> {
         // `ALLOCATOR_COUNT` back. Nothing may reset it while its buffer runs.
         let reused = self
             .committed
-            .checked_sub(crate::gpu::device::context::ALLOCATOR_COUNT as u64);
+            .checked_sub(crate::device::context::ALLOCATOR_COUNT as u64);
         if let Some(value) = reused {
             self.await_value(value)?;
         }

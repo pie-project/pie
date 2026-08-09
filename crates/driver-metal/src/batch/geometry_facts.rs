@@ -387,38 +387,35 @@ pub fn geometry_from_facts(f: &ModelFacts) -> Result<DecodeGeometry, GeometryRef
         // gate, whose first test is one token at position zero, agreed with
         // MLX while this was broken.
         //
-        // The family block first, the top level second: `from_descriptor`
-        // fills `ll_`/`go_`/`g4_` inside the branch it took and also reads the
-        // flat key for every config, so preferring the block gets the value a
-        // family-specific reader validated and falls back to the one every
-        // config states.
-        // Keyed on the MARKER field, not on "which value is non-zero": every
-        // family block's theta has a non-zero DEFAULT (`ll_` is 500000), so
-        // picking the first positive one gives llama's answer to a gpt-oss
-        // config. The marker says which block `from_descriptor` actually
-        // filled, and it is the same question `geometry_from_facts` already
-        // asks three times above to project the shape.
-        rope_theta: if f.go_num_hidden_layers > 0 {
-            f.go_rope_theta
-        } else if f.g4_num_hidden_layers > 0 {
-            // gemma4 alternates a sliding base and a full one per layer. This
-            // is the FULL one; the sliding layers take `rope_theta_sliding`,
-            // and `LlamaLikeMetalFacts::rope_theta_at` picks between them off
-            // the same window list that decides which layers slide.
+        // ONE base, read once from the one key that states it.
+        //
+        // This was a four-arm ladder over `go_`/`g4_`/`ll_` marker fields,
+        // and three of those arms read the same descriptor key as the fourth:
+        // `from_descriptor` read `rope_theta` into `rope_theta`, and again
+        // into `go_rope_theta`, and again into `ll_rope_theta`. Whenever the
+        // key is present -- which the descriptor contract says is always,
+        // being "exhaustive by construction" -- all four arms carried the
+        // same number. They differed only in which value they invented when
+        // it was absent: 150000, 500000, or 1e7, three guesses selected by a
+        // family name.
+        //
+        // The gemma4 arm was NOT a duplicate and is the one that stays, now
+        // asked as a question about the config rather than about the family:
+        // `gemma_per_layer_rope_theta` states a base PER LAYER, so a stack
+        // that carries one has a full-layer base distinct from the flat key.
+        // Non-zero means it was stated -- which it now can, the default
+        // having been the 1e6 that was silently overriding a stated base.
+        rope_theta: if f.g4_rope_theta_full > 0.0 {
             f.g4_rope_theta_full
-        } else if f.ll_num_hidden_layers > 0 {
-            f.ll_rope_theta
         } else {
             f.rope_theta
         },
         // The SLIDING base, where the single-base reading was wrong on fifty
         // of gemma-4-31b's sixty layers. Zero for every stack that states one
-        // base, which `rope_theta_at` reads as "the same everywhere".
-        rope_theta_sliding: if f.g4_num_hidden_layers > 0 {
-            f.g4_rope_theta_sliding
-        } else {
-            0.0
-        },
+        // base, which `rope_theta_at` reads as "the same everywhere" -- and
+        // zero is now also what a stack states by NOT carrying a per-layer
+        // array, rather than the 1e4 it used to be given.
+        rope_theta_sliding: f.g4_rope_theta_sliding,
         // The rope RESCALING, when the config states one. `llama3` is the
         // only kind whose four numbers this reads; a config that states
         // another kind gets a factor of zero, which the derivation treats as
@@ -588,9 +585,12 @@ mod tests {
     /// MLX 4-bit llama ships, so the default was right by coincidence for the
     /// one checkpoint anything ran.
     ///
-    /// Per FAMILY, because each block has its own non-zero default: reading
-    /// "the first positive theta" gives llama's 500000 to a gpt-oss config
-    /// that states 150000. The marker field says which block was filled.
+    /// One field, so no ladder. The doc line that was here said "per FAMILY,
+    /// because each block has its own non-zero default: reading 'the first
+    /// positive theta' gives llama's 500000 to a gpt-oss config that states
+    /// 150000". That hazard was manufactured by the duplication — three
+    /// fields fed by one descriptor key, with three different invented
+    /// defaults — and it goes with it.
     #[test]
     fn the_rope_base_and_the_affine_point_come_from_the_config() {
         let llama = ModelFacts {
@@ -601,18 +601,19 @@ mod tests {
             ll_head_dim: 128,
             ll_vocab_size: 32_000,
             ll_intermediate_size: 3584,
-            ll_rope_theta: 500_000.0,
+            rope_theta: 500_000.0,
             quant_bits: 4,
             quant_group_size: 64,
             ..ModelFacts::default()
         };
         let g = geometry_from_facts(&llama).expect("a llama config");
-        assert_eq!(g.rope_theta, 500_000.0, "the llama block's theta");
+        assert_eq!(g.rope_theta, 500_000.0, "the config's theta");
         assert_eq!(g.quant, AffineFormat { bits: 4, group: 64 });
 
-        // gpt-oss states its own of both, and `ll_rope_theta` still holds its
-        // 500000 default -- so this is the case that "first positive wins"
-        // gets wrong.
+        // The same shape read as gpt-oss. It states a different base and gets
+        // it, and the point of the case is that NOTHING about the geometry's
+        // choice of base differs between the two: both read the field the
+        // descriptor's `rope_theta` key was read into.
         let gptoss = ModelFacts {
             go_num_hidden_layers: 24,
             go_hidden_size: 2880,
@@ -623,17 +624,13 @@ mod tests {
             go_intermediate_size: 2880,
             go_num_local_experts: 32,
             go_num_experts_per_tok: 4,
-            go_rope_theta: 150_000.0,
+            rope_theta: 150_000.0,
             quant_bits: 4,
             quant_group_size: 32,
             ..ModelFacts::default()
         };
         let g = geometry_from_facts(&gptoss).expect("a gpt-oss config");
-        assert_eq!(
-            g.rope_theta, 150_000.0,
-            "gpt-oss got another family's theta, so the marker field is not \
-             deciding"
-        );
+        assert_eq!(g.rope_theta, 150_000.0, "the config's theta");
         assert_eq!(g.quant, AffineFormat { bits: 4, group: 32 });
 
         // A config that states no quantization is DENSE, and the default
@@ -668,7 +665,7 @@ mod tests {
             ll_head_dim: 128,
             ll_vocab_size: 32_000,
             ll_intermediate_size: 3584,
-            ll_rope_theta: 500_000.0,
+            rope_theta: 500_000.0,
             ..ModelFacts::default()
         };
         let g = geometry_from_facts(&llama).expect("a llama config");

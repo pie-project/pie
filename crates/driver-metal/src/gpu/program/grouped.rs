@@ -43,14 +43,14 @@ use std::time::Instant;
 use objc2_metal::MTLComputePipelineState;
 use tensor_ir::op::tags;
 
-use crate::gpu::device::context::Context;
-use crate::gpu::device::encoder::{StepEncoder, Visibility};
-use crate::gpu::device::external::{External, Externals};
-use crate::gpu::program::single::{DeviceInputs, PreparedFire, pod_bytes, write_pod};
-use crate::gpu::device::allocator::{Pool, Transient};
-use crate::gpu::program::executable::{GroupedExecutable, Pso};
-use crate::gpu::program::cache::Runtime;
-use crate::gpu::device::argtable::Tables;
+use crate::device::context::Context;
+use crate::device::encoder::{StepEncoder, Visibility};
+use crate::device::external::{External, Externals};
+use crate::program::single::{DeviceInputs, PreparedFire, pod_bytes, write_pod};
+use crate::device::allocator::{Pool, Transient};
+use crate::program::executable::{GroupedExecutable, Pso};
+use crate::program::cache::Runtime;
+use crate::device::argtable::Tables;
 use crate::channel::{
     ChannelMeta, GroupKey, GroupLayout, LANE_ABI_VERSION, LANE_FLAG_RAGGED, LaneChannelSlot,
     LaneHeader, LaneRecord, LaneShape, MAX_SCRATCH_BYTES, OpParams, OpRuntime, Readiness, RowMeta,
@@ -321,7 +321,7 @@ impl Runtime {
                     logits_base: inputs
                         .logits
                         .as_ref()
-                        .map_or(0, crate::gpu::device::handle::Handle::gpu_address),
+                        .map_or(0, crate::device::handle::Handle::gpu_address),
                     logits_row_offset: inputs.logits_row_offset,
                     logits_row_count: inputs.logits_row_count,
                     kv_len: extents.kv_len,
@@ -561,7 +561,7 @@ impl Runtime {
                     .fire
                     .pending
                     .get(dense as usize)
-                    .map_or(0, crate::gpu::device::handle::Handle::len);
+                    .map_or(0, crate::device::handle::Handle::len);
                 if sink > cell {
                     return Err(program_error(
                         "Metal M3 channel sink exceeds fixed cell size".to_owned(),

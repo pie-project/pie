@@ -5,7 +5,7 @@
 //! applies a plan to the pool this shell holds.
 
 use crate::error::{Error, Result};
-use crate::gpu::serve::state::Shell;
+use crate::serve::state::Shell;
 
 impl Shell {
     /// Move KV pages, and the rows inside them, within this pool.

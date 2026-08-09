@@ -89,9 +89,9 @@ use objc2_metal::{
     MTLResourceOptions, MTLSharedEvent, MTLSize,
 };
 
-use crate::gpu::device::archive::Archives;
-use crate::gpu::device::context::{Context, describe};
-use crate::gpu::program::compile::Compiler;
+use crate::device::archive::Archives;
+use crate::device::context::{Context, describe};
+use crate::program::compile::Compiler;
 use crate::error::{Error, Result};
 
 /// The smallest in-flight depth the keepalive will run at.
@@ -222,7 +222,7 @@ impl Keepalive {
     ///
     /// The spin kernel is compiled HERE, on the calling thread, before the
     /// thread is spawned. That is not incidental: concurrent Metal pipeline
-    /// compilation corrupts the process heap (see [`crate::gpu::program::Compiler`]'s
+    /// compilation corrupts the process heap (see [`crate::program::Compiler`]'s
     /// module docs for the evidence), which is why every compilation in this
     /// crate goes through one process-wide mutex. Compiling through
     /// [`Compiler::compile`] puts this one behind that mutex too, and doing

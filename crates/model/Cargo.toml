@@ -11,8 +11,6 @@ repository = "https://github.com/pie-project/pie"
 name = "model"
 path = "src/lib.rs"
 
-["forward"]
-
 # The Rust half of the descriptor round-trip check; see the module doc.
 [[bin]]
 name = "descriptor"

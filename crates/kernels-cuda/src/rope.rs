@@ -72,8 +72,8 @@ pub static KERNELS: &[KernelSig] = &[
             k_weight: Buf <- Source::Weight(1),
             positions: I32s <- Source::Positions,
             num_tokens: I32 <- Source::Rows,
-            num_q_heads: I32 <- Source::OutWidthOver(0, "head_dim"),
-            num_kv_heads: I32 <- Source::OutWidthOver(1, "head_dim"),
+            num_q_heads: I32 <- Source::Div(&Source::Width(&Source::Out(0)), &Source::CtxNonZero("head_dim")),
+            num_kv_heads: I32 <- Source::Div(&Source::Width(&Source::Out(1)), &Source::CtxNonZero("head_dim")),
             head_dim: I32 <- Source::Ctx("head_dim"),
             theta: F32 <- Source::CtxByLayer("theta"),
             eps: F32 <- Source::Ctx("eps"),
@@ -144,19 +144,31 @@ pub static KERNELS: &[KernelSig] = &[
         in_place = &[(0, 0), (1, 1)],
         operands = operands![
             q: BufMut <- Source::Out(0),
-            // A Q-ONLY site states one result, and the shared arm
-            // passes q for k with `num_kv_heads = 0`. That is arity the
-            // STATEMENT carries, not a source this row can name, so the
-            // q-only spelling stays a hand-written arm and this row
-            // describes the two-operand one.
-            k: BufMut <- Source::Out(1),
+            // A Q-ONLY SITE STATES ONE RESULT and the launcher takes q
+            // for k with `num_kv_heads = 0`. That used to read as arity
+            // the row could not name; it is an `Or`, and what decides is
+            // whether the second result is there.
+            k: BufMut <- Source::Or(&Source::Out(1), &Source::Out(0)),
             positions: I32s <- Source::Positions,
             num_tokens: I32 <- Source::Rows,
-            num_q_heads: I32 <- Source::Ctx("num_q_heads"),
-            num_kv_heads: I32 <- Source::Ctx("num_kv_heads"),
-            head_dim: I32 <- Source::Ctx("head_dim"),
-            rotary_dim: I32 <- Source::Param(0),
-            theta: F32 <- Source::CtxNonZero("rope_theta"),
+            // The head COUNTS off the cache's head dim rather than the
+            // ctx's, because a KV-shared layer's q and k disagree.
+            num_q_heads: I32 <- Source::Div(
+                &Source::Width(&Source::Out(0)),
+                &Source::KvLayerField("head_dim"),
+            ),
+            // ZERO when there is no second result, which is the q-only
+            // form's whole signal to the launcher.
+            num_kv_heads: I32 <- Source::Or(
+                &Source::Div(
+                    &Source::Width(&Source::Out(1)),
+                    &Source::KvLayerField("head_dim"),
+                ),
+                &Source::Lit(Lit::I32(0)),
+            ),
+            head_dim: I32 <- Source::KvLayerField("head_dim"),
+            rotary_dim: I32 <- Source::RotaryWidth,
+            theta: F32 <- Source::CtxByLayer("theta"),
             stream: Stream <- Source::Ctx("stream"),
         ]),
     // The other row the audit was counting as undeclared. It is `rope_partial`
@@ -179,12 +191,31 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(qk_rmsnorm_rope_rounded "rope::qk_rmsnorm_rope_bf16_rounded",
         in_place = &[(0, 0), (1, 1)],
         operands = operands![
-            q: BufMut, k: BufMut,
-            q_weight: Buf, k_weight: Buf,
-            positions: I32s,
-            num_tokens: I32, num_q_heads: I32, num_kv_heads: I32, head_dim: I32,
-            theta: F32, eps: F32,
-            stream: Stream,
+            q: BufMut <- Source::Out(0),
+            // A Q-ONLY SITE STATES ONE RESULT and no k weight, and the
+            // launcher reads the nulls as "there is no k". Same `Or` the
+            // partial rotation makes, and the head count comes off k's
+            // OWN width so that one expression answers both forms.
+            k: BufMut <- Source::Or(&Source::Out(1), &Source::Lit(Lit::Null)),
+            q_weight: Buf <- Source::Weight(0),
+            k_weight: Buf <- Source::Or(&Source::Weight(1), &Source::Lit(Lit::Null)),
+            positions: I32s <- Source::Positions,
+            num_tokens: I32 <- Source::Rows,
+            num_q_heads: I32 <- Source::Div(
+                &Source::Width(&Source::Out(0)),
+                &Source::KvLayerField("head_dim"),
+            ),
+            num_kv_heads: I32 <- Source::Or(
+                &Source::Div(
+                    &Source::Width(&Source::Out(1)),
+                    &Source::KvLayerField("head_dim"),
+                ),
+                &Source::Lit(Lit::I32(0)),
+            ),
+            head_dim: I32 <- Source::KvLayerField("head_dim"),
+            theta: F32 <- Source::CtxByLayer("theta"),
+            eps: F32 <- Source::Ctx("eps"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // YaRN, as its paper spells it. A deployment's scaling is a load-time
     // config answer, so it picks a kernel here rather than an argument.
@@ -197,8 +228,8 @@ pub static KERNELS: &[KernelSig] = &[
             num_tokens: I32 <- Source::Rows,
             // Heads, not width: the kernel rotates per head, and how many
             // fit in a row is the row width over the head dim.
-            num_q_heads: I32 <- Source::OutWidthOver(0, "head_dim"),
-            num_kv_heads: I32 <- Source::OutWidthOver(1, "head_dim"),
+            num_q_heads: I32 <- Source::Div(&Source::Width(&Source::Out(0)), &Source::CtxNonZero("head_dim")),
+            num_kv_heads: I32 <- Source::Div(&Source::Width(&Source::Out(1)), &Source::CtxNonZero("head_dim")),
             head_dim: I32 <- Source::Ctx("head_dim"),
             theta: F32 <- Source::Ctx("rope_theta"),
             // YaRN's four scalars, in the order the config states them.

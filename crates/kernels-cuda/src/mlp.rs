@@ -36,10 +36,14 @@ pub static KERNELS: &[KernelSig] = &[
             stream: Stream <- Source::Ctx("stream"),
             gate_second: Bool <- Source::Lit(Lit::Bool(false)),
         ]),
+    // TWO SPELLINGS OF THE UP PROJECTION. A trace that split the packed
+    // projection states both halves; one that did not leaves `up` to the
+    // join, which collected it as the statement's foreign operand. Same
+    // launch either way.
     kernel!(swiglu "mlp::swiglu_bf16",
         operands = operands![
             gate: Buf <- Source::In(0),
-            up: Buf <- Source::In(1),
+            up: Buf <- Source::Or(&Source::In(1), &Source::Aux(0)),
             y: BufMut <- Source::Out(0),
             num_elements: I32 <- Source::OutElements(0),
             stream: Stream <- Source::Ctx("stream"),
@@ -72,7 +76,7 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(swiglu_clamp "mlp::swiglu_clamp_bf16",
         operands = operands![
             gate: Buf <- Source::In(0),
-            up: Buf <- Source::In(1),
+            up: Buf <- Source::Or(&Source::In(1), &Source::Aux(0)),
             y: BufMut <- Source::Out(0),
             num_elements: I32 <- Source::OutElements(0),
             limit: F32 <- Source::Ctx("glu_limit"),
@@ -99,7 +103,7 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(situ "mlp::situ_bf16",
         operands = operands![
             gate: Buf <- Source::In(0),
-            up: Buf <- Source::In(1),
+            up: Buf <- Source::Or(&Source::In(1), &Source::Aux(0)),
             y: BufMut <- Source::Out(0),
             num_elements: I32 <- Source::OutElements(0),
             beta: F32 <- Source::Ctx("situ_beta"),

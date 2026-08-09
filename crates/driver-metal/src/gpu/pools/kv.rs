@@ -11,7 +11,7 @@
 //! said so.
 
 use crate::error::Result;
-use crate::gpu::{Allocation, Arena, Context, Elastic, Regions, create_elastic};
+use crate::{Allocation, Arena, Context, Elastic, Regions, create_elastic};
 use crate::layout::region::Region as _;
 use crate::layout::kv_move::CellMovePlan;
 
@@ -219,7 +219,7 @@ impl Pool {
     /// Nothing partial survives, as [`allocate`](Self::allocate).
     pub fn allocate_elastic(
         context: &Context,
-        stepper: &mut crate::gpu::Stepper,
+        stepper: &mut crate::Stepper,
         arena: &Arena,
         shape: Shape,
     ) -> Result<Self> {
@@ -242,13 +242,13 @@ impl Pool {
         }
         stepper.ensure_all(
             &mut targets,
-            crate::gpu::Pressure::Normal,
+            crate::Pressure::Normal,
             // Not growth. [`Need`] spells out why: the pool is what makes an
             // admitted model exist, and admission already weighed the machine
             // against the whole budget -- clamping here does not hand a page
             // back, it turns a model that just loaded into one that cannot
             // take a step.
-            crate::gpu::Need::Step,
+            crate::Need::Step,
         )?;
         for (buffer, bytes) in targets {
             stepper.declare_mandatory(buffer, bytes);
@@ -364,7 +364,7 @@ impl Pool {
     /// A fixed pool, which has one allocation and cannot give part of it
     /// back; a target past what was allocated; or an arena without room to
     /// grow into.
-    pub fn resize(&mut self, stepper: &mut crate::gpu::Stepper, target: u32) -> Result<()> {
+    pub fn resize(&mut self, stepper: &mut crate::Stepper, target: u32) -> Result<()> {
         if !matches!(self.layers.first().map(|l| &l.k), Some(Pages::Elastic(_))) {
             return Err(crate::Error::Create {
                 what: "kv resize",
@@ -407,8 +407,8 @@ impl Pool {
             }
             stepper.ensure_all(
                 &mut targets,
-                crate::gpu::Pressure::Normal,
-                crate::gpu::Need::Step,
+                crate::Pressure::Normal,
+                crate::Need::Step,
             )?;
             for (buffer, bytes) in targets {
                 stepper.declare_mandatory(buffer, bytes);

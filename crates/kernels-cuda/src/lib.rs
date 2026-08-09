@@ -104,7 +104,7 @@ const EMPTY: KernelSig = KernelSig {
     whole: false, needs: Prepare::None,
     lacks: &[], sink: None, in_place: &[], depth_prefix_plan: false,
     operands: &[],
-    returns: "", axes: &[], grid_param: None,
+    returns: "", axes: &[], grid_param: None, lowered_as: None,
 };
 
 const fn copy_sig(k: &KernelSig) -> KernelSig {
@@ -114,6 +114,6 @@ const fn copy_sig(k: &KernelSig) -> KernelSig {
         lacks: k.lacks, sink: k.sink, in_place: k.in_place,
         depth_prefix_plan: k.depth_prefix_plan,
         operands: k.operands, returns: k.returns, axes: k.axes,
-        grid_param: k.grid_param,
+        grid_param: k.grid_param, lowered_as: k.lowered_as,
     }
 }

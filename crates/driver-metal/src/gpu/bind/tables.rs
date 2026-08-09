@@ -12,7 +12,7 @@
 //! is the FRAME's data; what this owns is the order.
 
 use crate::error::Result;
-use crate::gpu::{Allocation, Context};
+use crate::{Allocation, Context};
 use crate::lowering::executor::{FireTable, Slice};
 use crate::layout::region::Region as _;
 

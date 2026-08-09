@@ -89,15 +89,20 @@ pub static KERNELS: &[KernelSig] = &[
     // two arities, and a row that pretended one symbol did both would be
     // stating the other one's contract.
     kernel!(gemm_xwt "gemm::act_x_wt_bf16",
+        lowered_as = Some("gemm::act_x_w"),
         operands = operands![
             handle: CublasHandle <- Source::Ctx("cublas"),
             act: Buf <- Source::In(0),
-            w: Buf <- Source::Weight(0),
+            // A DENSE WEIGHT IS THE STATEMENT'S NAME, not a slot in the
+            // run — the lowering does not produce it, it names it. The
+            // slot spelling stays first because a trace that DID stage
+            // one means it.
+            w: Buf <- Source::Or(&Source::Weight(0), &Source::WeightNamed),
             y: BufMut <- Source::Out(0),
             m: I32 <- Source::Rows,
             n: I32 <- Source::OutWidth(0),
             k: I32 <- Source::InWidth(0),
-            beta: F32 <- Source::Lit(Lit::F32(0.0)),
+            beta: F32 <- Source::Beta,
         ]),
     // ── the WEIGHT REPRESENTATION axis ─────────────────────────────
     //

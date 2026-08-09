@@ -62,10 +62,10 @@ use tensor_ir::fnv1a64;
 use tensor_ir::op::tags;
 use tensor_ir::registry::Stage;
 
-use crate::gpu::device::archive::Archives;
-use crate::gpu::device::context::Context;
-use crate::gpu::program::compile::{Compiler, Math};
-use crate::gpu::program::executable::{
+use crate::device::archive::Archives;
+use crate::device::context::Context;
+use crate::program::compile::{Compiler, Math};
+use crate::program::executable::{
     FusedExecutable, GroupedExecutable, ProgramExecutable, ProgramStage, Pso, RegionExecutable,
     StageExecutable,
 };

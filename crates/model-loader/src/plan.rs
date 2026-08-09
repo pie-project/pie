@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::types::{
-    BackendKind, BufferId, CheckpointFormat, DType, FileId, InstrId, QuantGranularity, QuantScheme,
-    RepackSpec, ScaleForm, TensorDecl, TensorId,
+    BackendKind, BufferId, CheckpointFormat, DType, Encoding, FileId, InstrId, QuantGranularity,
+    QuantScheme, RepackSpec, ScaleForm, TensorDecl, TensorId,
 };
 
 pub mod build;
@@ -537,5 +537,131 @@ impl LoadPlan {
             attachments: Vec::new(),
             groups: Vec::new(),
         }
+    }
+
+    /// Does this plan publish ONE tensor for the embedding and the output
+    /// projection?
+    ///
+    /// Decided once, by the contract, and read back here rather than decided
+    /// a second time. The rule is that a shipped `lm_head` beats whatever the
+    /// config says, and the config can be wrong in both directions:
+    /// Qwen3.5-35B-A3B is a multimodal wrapper spelling `tie_word_embeddings`
+    /// at the TOP level, outside the `text_config` its family parses, so the
+    /// facts default to tied; Qwen3-0.6B says `tie_word_embeddings: true` and
+    /// then ships an `lm_head.weight` anyway. Either way the contract staged
+    /// `embed_tokens` and `lm_head` while the DAG asked for
+    /// `shared_embedding`, and the load stopped on "unstaged weight
+    /// shared_embedding.weight" — two opinions about one fact.
+    ///
+    /// The plan's own tensor list is the only opinion that cannot be wrong in
+    /// a way the binding survives, so it is the one every family follows. It
+    /// It is a method here rather than a helper in a driver because a driver
+    /// asking the question had to spell `shared_embedding.weight` to ask it
+    /// — a name four contract authors in `crates/model` produce and no
+    /// driver owns. See [`TIED_EMBEDDING_NAME`] for what this does and does
+    /// not close.
+    #[must_use]
+    pub fn ties_embeddings(&self) -> bool {
+        self.tensors
+            .iter()
+            .any(|tensor| tensor.name == TIED_EMBEDDING_NAME)
+    }
+
+    /// The names of every tensor this plan leaves in MXFP4.
+    ///
+    /// A plan's job is to get bytes onto a device unchanged; what they MEAN
+    /// is the binder's business, and this is how the plan tells it. A set of
+    /// names rather than a flag because **a checkpoint need not be uniform**:
+    /// `mlx-community/gpt-oss-20b-MXFP4-Q4` names 98 tensors as affine/64/4
+    /// in its `quantization` block and leaves the expert banks out, so those
+    /// take the top-level default — mxfp4, group 32.
+    ///
+    /// Reading a bank with the dense format is not a near miss. Every scale
+    /// comes from the wrong offset and bf16 garbage is NaN more often than
+    /// not: measured, a fire bound every name, ran all 484 statements, and
+    /// produced NaNs from the first routed projection of layer 0 onward while
+    /// every structural gate passed.
+    ///
+    /// A driver computing this itself has to match on `Encoding::Quant` and
+    /// on the `QuantScheme` variant — two of this crate's enums, read
+    /// structurally, in a crate that should be reading answers.
+    #[must_use]
+    pub fn mxfp4_tensor_names(&self) -> std::collections::HashSet<String> {
+        self.tensors
+            .iter()
+            .filter(|t| {
+                matches!(
+                    &t.encoding,
+                    Encoding::Quant(spec) if spec.scheme == QuantScheme::Mxfp4E2M1E8M0
+                )
+            })
+            .map(|t| t.name.clone())
+            .collect()
+    }
+}
+
+/// The one name a contract publishes when the embedding and the output
+/// projection are the same tensor.
+///
+/// **This crate does not emit it.** Four contract authors in `crates/model`
+/// do — `llama_3`, `qwen_3_5` and `gemma_4` each `format!` it — and the
+/// dependency runs `model` → `model-loader`, so nothing links their spelling
+/// to this one. A constant here does not fix that; what it fixes is the
+/// smaller thing, that a **driver** asking whether a plan ties its
+/// embeddings no longer has to spell the name to find out.
+///
+/// The larger gap is real and stays open: rename the tied tensor in those
+/// authors and this constant goes quietly stale.
+pub const TIED_EMBEDDING_NAME: &str = "shared_embedding.weight";
+
+#[cfg(test)]
+mod plan_query_tests {
+    use super::*;
+    use crate::types::{QuantSpec, Visibility};
+
+    fn decl(name: &str, encoding: Encoding) -> TensorDecl {
+        TensorDecl {
+            id: TensorId(0),
+            name: name.to_string(),
+            shape: vec![32, 8],
+            encoding,
+            alignment: 256,
+            visibility: Visibility::Public,
+        }
+    }
+
+    #[test]
+    fn tied_embeddings_are_read_off_the_plan_not_the_config() {
+        let mut plan = LoadPlan::empty(StorageTarget::default());
+        assert!(!plan.ties_embeddings());
+        plan.tensors
+            .push(decl(TIED_EMBEDDING_NAME, Encoding::Raw(DType::BF16)));
+        assert!(plan.ties_embeddings());
+    }
+
+    #[test]
+    fn a_mixed_checkpoint_names_only_the_banks_it_left_in_mxfp4() {
+        // The case this exists for: gpt-oss-20b-MXFP4-Q4 quantizes 98 dense
+        // tensors as affine/64/4 and leaves the expert banks at the top-level
+        // mxfp4 default. A flag would have to pick one answer for both.
+        let mut plan = LoadPlan::empty(StorageTarget::default());
+        plan.tensors
+            .push(decl("layer.0.mlp.weight", Encoding::Raw(DType::BF16)));
+        plan.tensors.push(decl(
+            "layer.0.experts.gate_up",
+            Encoding::Quant(
+                QuantSpec {
+                    scheme: QuantScheme::Mxfp4E2M1E8M0,
+                    logical_dtype: DType::BF16,
+                    bits_per_element: 0,
+                    group_size: 0,
+                    channel_axis: None,
+                }
+                .normalized(),
+            ),
+        ));
+        let names = plan.mxfp4_tensor_names();
+        assert_eq!(names.len(), 1, "only the bank is mxfp4: {names:?}");
+        assert!(names.contains("layer.0.experts.gate_up"));
     }
 }

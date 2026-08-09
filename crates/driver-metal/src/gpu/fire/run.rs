@@ -20,8 +20,8 @@
 //! this one owns only the arena, which is the lowering's own number.
 
 use crate::error::Result;
-use crate::gpu::bind::encode::{Params, Pipelines, encode};
-use crate::gpu::{Allocation, ArgumentTable, Compiler, Context, Stepper, Timing};
+use crate::bind::encode::{Params, Pipelines, encode};
+use crate::{Allocation, ArgumentTable, Compiler, Context, Stepper, Timing};
 use crate::layout::region::Region as _;
 use crate::lowering::dispatch::{Dispatch, Geometry, Undispatchable, plan, table, table_width};
 use crate::lowering::executor::{Frame, Resolver, Slice};
@@ -140,7 +140,7 @@ pub fn run_keeping_arena<R: Resolver>(
     lowered: &Lowered,
     geometry: Geometry,
     resolver: &mut R,
-) -> Result<(Timing, crate::gpu::Lease)> {
+) -> Result<(Timing, crate::Lease)> {
     // Its own everything, and that is the whole difference from `submit`.
     //
     // This function USED to reimplement `submit`: allocate, zero, plan,
@@ -157,8 +157,8 @@ pub fn run_keeping_arena<R: Resolver>(
     // recording -- and every one of those is a property of the STATE, which
     // is what `Machine` was extracted to say.
     let mut stepper = Stepper::new(context)?;
-    let scratch = crate::gpu::Scratch::new();
-    let mut regions = crate::gpu::Regions::new();
+    let scratch = crate::Scratch::new();
+    let mut regions = crate::Regions::new();
 
     let began = std::time::Instant::now();
     let fire = submit(
@@ -203,7 +203,7 @@ pub struct InFlight {
     ///
     /// A LEASE: the region goes back to the pool when this drops, which is
     /// what makes the next fire of this shape reuse the same address.
-    pub arena: crate::gpu::Lease,
+    pub arena: crate::Lease,
     /// Held for the GPU, not for the caller.
     _table: ArgumentTable,
     _params: Params,
@@ -238,11 +238,11 @@ pub struct Machine<'c, 's> {
     /// The command timeline and allocator ring.
     pub stepper: &'c mut Stepper<'s>,
     /// The reusable fire regions.
-    pub scratch: &'c crate::gpu::Scratch,
+    pub scratch: &'c crate::Scratch,
     /// Which buffer each address belongs to, for recording. `&mut` because a
     /// fire registers what it leases -- the caller registers the weights and
     /// the pool, and only `submit` knows the arena it took.
-    pub regions: &'c mut crate::gpu::Regions,
+    pub regions: &'c mut crate::Regions,
     /// Fires already recorded, by what they are valid for.
     ///
     /// `None` means **do not try**. A recording binds buffers, so it can only
@@ -252,7 +252,7 @@ pub struct Machine<'c, 's> {
     /// every attempt allocate an ICB, fail to resolve an address and throw
     /// the buffer away, which is a leak dressed as a fallback. Saying so is
     /// one word; discovering it is a residency set that grows per fire.
-    pub recordings: Option<&'c mut crate::gpu::Recordings>,
+    pub recordings: Option<&'c mut crate::Recordings>,
 }
 
 

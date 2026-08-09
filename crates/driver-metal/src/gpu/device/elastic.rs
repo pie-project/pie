@@ -65,7 +65,7 @@ use objc2_metal::{
     MTLStorageMode,
 };
 
-use crate::gpu::device::context::Context;
+use crate::device::context::Context;
 use crate::error::{Error, Result};
 
 /// The sparse page size: the granularity Metal maps at.

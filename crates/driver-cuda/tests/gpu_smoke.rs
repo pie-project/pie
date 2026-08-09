@@ -7,7 +7,7 @@
 //!
 //! Run with `--nocapture` to see what was found.
 
-use driver_cuda::gpu::device::{Allocator, Event, OwnedStream};
+use driver_cuda::device::{Allocator, Event, OwnedStream};
 
 mod common;
 use common::{device_or_skip, gpu_guard};
@@ -114,7 +114,7 @@ fn a_timing_event_pair_measures_something_nonnegative() {
 /// growth returns fresh usable memory.
 #[test]
 fn the_live_arena_carves_grows_and_frees_on_the_device() {
-    use driver_cuda::gpu::fire::sideband_arena::{
+    use driver_cuda::fire::sideband_arena::{
         LiveDeviceMemory, Region, SidebandArena,
     };
 
@@ -150,7 +150,7 @@ fn the_live_arena_carves_grows_and_frees_on_the_device() {
 /// constructor leak) is the cublas oracle's; this is the library saying yes.
 #[test]
 fn the_live_cublas_handle_binds_and_rebinds_its_stream() {
-    use driver_cuda::gpu::device::cublas::{CublasHandle, LiveCublas};
+    use driver_cuda::device::cublas::{CublasHandle, LiveCublas};
 
     let _gpu = gpu_guard();
     let Some(_dev) = device_or_skip("live cublas handle") else { return };
@@ -175,7 +175,7 @@ fn the_live_cublas_handle_binds_and_rebinds_its_stream() {
 /// begin (sync) cycle on the device.
 #[test]
 fn the_live_workspace_pins_stages_and_fences_on_the_device() {
-    use driver_cuda::gpu::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
+    use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
 
     let _gpu = gpu_guard();
     let Some(_dev) = device_or_skip("live attention workspace") else { return };

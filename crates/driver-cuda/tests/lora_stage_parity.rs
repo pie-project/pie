@@ -20,11 +20,11 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::fmt::Write as _;
 
-use driver_cuda::gpu::fire::lora::{
+use driver_cuda::fire::lora::{
     LORA_SITE_K, LORA_SITE_Q, LORA_SITE_V, LoraForm, LoraFireState, LoraLaneView, LoraOps,
     LoraStageArena, LoraStageRows, LoraTable, stage_qkv_adapters,
 };
-use driver_cuda::gpu::fire::sideband_arena::DeviceMemory;
+use driver_cuda::fire::sideband_arena::DeviceMemory;
 
 /// FNV-1a 64 of the C++ oracle's transcript.
 const GOLDEN_FNV1A64: u64 = 0x859d5a2da5642b23;

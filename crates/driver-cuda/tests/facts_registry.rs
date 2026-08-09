@@ -109,7 +109,7 @@ mod fire_class {
     use driver_api::local::{
         PIE_RS_FLAG_BUFFER_WRITE, PIE_RS_FLAG_FOLD, PieStepDesc, PieU8Slice, PieU32Slice,
     };
-    use driver_cuda::gpu::serve::fire_class_of;
+    use driver_cuda::serve::fire_class_of;
     use model_compiler::trace::FireClass;
 
     fn u32s(v: &[u32]) -> PieU32Slice {

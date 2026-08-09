@@ -190,12 +190,27 @@ mod tests {
 ///
 /// ONE conversion, and it lives here rather than at each call site so
 /// that a layer returning `Result<_, i32>` is a layer that has thrown
-/// away what happened. `gpu::serve::status_of` is the only caller that
+/// away what happened. `serve::status_of` is the only caller that
 /// should also LOG — the conversion is the last moment the detail
 /// exists, so the log belongs at the boundary, not at the failure.
 #[cfg(feature = "abi")]
 impl From<Error> for i32 {
     fn from(e: Error) -> Self {
+        // THE LOG IS HERE, not at a boundary function nobody calls.
+        //
+        // `serve::status_of` used to own this, and it had ZERO
+        // callers — every layer reached the ABI through `?` on a
+        // `Result<_, i32>`, which runs this `From` and never that. So
+        // the type carried the detail all the way to the edge and then
+        // dropped it silently, which is a worse version of the defect
+        // §3.4 was written against: before, the reason at least reached
+        // stderr from wherever noticed it.
+        //
+        // Putting it in the conversion makes the two inseparable. There
+        // is one way to turn an `Error` into a status and it is this
+        // one, so there is no path that summarises without saying what
+        // it summarised.
+        eprintln!("[driver-cuda] {e}");
         match e {
             Error::Exhausted { .. } => driver_api::PIE_STATUS_EXHAUSTED,
             Error::Unsupported { .. } => driver_api::PIE_STATUS_UNSUPPORTED,
@@ -213,15 +228,15 @@ impl From<Error> for i32 {
 /// What was wrong was every CALLER translating it to a bare status by
 /// hand, which is where the reason was lost.
 #[cfg(all(feature = "abi", feature = "_cuda"))]
-impl From<crate::gpu::fire::attention_workspace::StagingError> for Error {
-    fn from(e: crate::gpu::fire::attention_workspace::StagingError) -> Self {
+impl From<crate::fire::attention_workspace::StagingError> for Error {
+    fn from(e: crate::fire::attention_workspace::StagingError) -> Self {
         Self::invalid("attention workspace", format!("{e:?}"))
     }
 }
 
 #[cfg(all(feature = "abi", feature = "_cuda"))]
-impl From<crate::gpu::device::cublas::CublasError> for Error {
-    fn from(e: crate::gpu::device::cublas::CublasError) -> Self {
+impl From<crate::device::cublas::CublasError> for Error {
+    fn from(e: crate::device::cublas::CublasError) -> Self {
         Self::invalid("cublas", format!("{e:?}"))
     }
 }
@@ -248,15 +263,15 @@ impl From<std::string::FromUtf8Error> for Error {
 /// that has not been converted — when the last `Result<_, i32>` in
 /// this crate goes, so do these.
 #[cfg(all(feature = "abi", feature = "_cuda"))]
-impl From<crate::gpu::fire::attention_workspace::StagingError> for i32 {
-    fn from(e: crate::gpu::fire::attention_workspace::StagingError) -> Self {
+impl From<crate::fire::attention_workspace::StagingError> for i32 {
+    fn from(e: crate::fire::attention_workspace::StagingError) -> Self {
         Error::from(e).into()
     }
 }
 
 #[cfg(all(feature = "abi", feature = "_cuda"))]
-impl From<crate::gpu::device::cublas::CublasError> for i32 {
-    fn from(e: crate::gpu::device::cublas::CublasError) -> Self {
+impl From<crate::device::cublas::CublasError> for i32 {
+    fn from(e: crate::device::cublas::CublasError) -> Self {
         Error::from(e).into()
     }
 }

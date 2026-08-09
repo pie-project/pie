@@ -4,7 +4,7 @@
 //! [`compile_load_plan`] authors the plan and checks its files;
 //! [`stage_plan_weights`] runs it and stages every tensor into one device
 //! region. This is the call between them, plus the one conversion that makes
-//! the result answer a trace's questions: a [`Handle`](crate::gpu::Handle) map becomes a
+//! the result answer a trace's questions: a [`Handle`](crate::Handle) map becomes a
 //! [`Slice`] map, which is what [`resolve::Store`] reads.
 //!
 //! # Why the conversion is not a wrapper for its own sake
@@ -16,7 +16,7 @@
 //! of addresses whose buffer has been dropped is a map of dangling pointers.
 //!
 //! [`compile_load_plan`]: crate::loader::compile_load_plan
-//! [`stage_plan_weights`]: crate::gpu::stage_plan_weights
+//! [`stage_plan_weights`]: crate::stage_plan_weights
 //! [`resolve::Store`]: crate::lowering::resolve::Store
 
 use std::collections::HashMap;
@@ -24,7 +24,7 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 use crate::loader::{compile_load_plan, metal_storage_target};
-use crate::gpu::{Allocation, Context, stage_plan_weights};
+use crate::{Allocation, Context, stage_plan_weights};
 use crate::lowering::executor::Slice;
 use crate::layout::region::Region as _;
 
@@ -41,19 +41,14 @@ pub struct Loaded {
     pub tensors: HashMap<String, Slice>,
     /// Weights the plan leaves in MXFP4, by name.
     ///
-    /// The load's job is to get the bytes onto the device unchanged; what
-    /// they MEAN is the binder's business (`.wiki/new-driver/next.md`,
-    /// priority 2). This is how the load tells the binder, and it is a set of
-    /// names rather than a flag because a checkpoint need not be uniform:
-    /// `mlx-community/gpt-oss-20b-MXFP4-Q4` names 98 tensors as affine/64/4
-    /// in its `quantization` block and leaves the expert banks out, so they
-    /// take the top-level default -- mxfp4, group 32.
+    /// Read off the plan by [`LoadPlan::mxfp4_tensor_names`], which is where
+    /// the reasoning for it lives — including why it is a set of names and
+    /// not a flag. This driver used to compute it here by matching on
+    /// `Encoding::Quant` and on a `QuantScheme` variant, which is two of the
+    /// loader's enums read structurally by a crate that should be reading
+    /// answers.
     ///
-    /// Reading a bank with the dense format is not a near miss. Every scale
-    /// comes from the wrong offset and bf16 garbage is NaN more often than
-    /// not: measured, the fire bound every name, ran all 484 statements, and
-    /// produced NaNs from the first routed projection of layer 0 onward while
-    /// every structural gate passed.
+    /// [`LoadPlan::mxfp4_tensor_names`]: model_loader::plan::LoadPlan::mxfp4_tensor_names
     pub mxfp4: std::collections::HashSet<String>,
 }
 
@@ -92,7 +87,11 @@ pub fn load(context: &Context, snapshot_dir: &Path, descriptor_json: &str) -> Re
     let (plan, _moe) =
         compile_load_plan(snapshot_dir, &target, descriptor_json).map_err(|err| Error::Create {
             what: "load plan",
-            message: format!("{err:?}"),
+            // `{err}`, not `{err:?}`. `LoadPlanError`'s Display names the
+            // `model_type` no author claims and quotes the compiler's own
+            // words; its Debug prints `Plan(Compile("..."))`. An operator
+            // reads this message.
+            message: err.to_string(),
         })?;
     let (region, staged) = stage_plan_weights(context, &plan, snapshot_dir)?;
     let tensors = staged
@@ -104,18 +103,7 @@ pub fn load(context: &Context, snapshot_dir: &Path, descriptor_json: &str) -> Re
             })
         })
         .collect();
-    let mxfp4 = plan
-        .tensors
-        .iter()
-        .filter(|t| {
-            matches!(
-                &t.encoding,
-                model_loader::types::Encoding::Quant(spec)
-                    if spec.scheme == model_loader::types::QuantScheme::Mxfp4E2M1E8M0
-            )
-        })
-        .map(|t| t.name.clone())
-        .collect();
+    let mxfp4 = plan.mxfp4_tensor_names();
     Ok(Loaded {
         region,
         tensors,

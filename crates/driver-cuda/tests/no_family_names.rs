@@ -17,8 +17,8 @@
 //! - `layout/memory_planner.rs` and `model_costs.rs` size a KV pool per
 //!   architecture, because the COST of a token genuinely differs. That
 //!   is arithmetic about bytes, not a branch about behaviour.
-//! - `gpu/bind/` names kernels, and a kernel's name is its own.
-//! - `gpu/serve/encode.rs` serves gemma-4's towers, which is a real
+//! - `bind/` names kernels, and a kernel's name is its own.
+//! - `serve/encode.rs` serves gemma-4's towers, which is a real
 //!   family-specific ABI entry and the next thing to generalise.
 //!
 //! Each is a separate argument, and collapsing them into one number
@@ -50,16 +50,23 @@ fn budget() -> BTreeMap<&'static str, usize> {
         ("layout/kv_geometry.rs", 1),
         ("layout/profile_cache.rs", 1),
         ("layout/profile_key.rs", 1),
+        
+        
+        
         // A kernel's name is its own.
-        ("gpu/bind/mod.rs", 14),
+        // SYMBOL names, not a family branch: `ssm::nemotron_mamba_split_bf16`
+        // is what the kernel is CALLED, and the join reads its arity. The
+        // budget was fourteen while the arms were hand-written; the ten
+        // that left were the arms.
+        ("bind/mod.rs", 4),
         // gemma-4's towers are a real family-specific ABI entry, and the
         // next thing worth generalising.
-        ("gpu/serve/encode.rs", 7),
-        ("gpu/serve/transfer.rs", 4),
-        ("gpu/serve/load.rs", 3),
-        ("gpu/serve/state.rs", 2),
-        ("gpu/fire/launch.rs", 0),
-        ("gpu/fire/lora.rs", 1),
+        ("serve/encode.rs", 7),
+        ("serve/transfer.rs", 4),
+        ("serve/load.rs", 3),
+        ("serve/state.rs", 2),
+        ("fire/launch.rs", 0),
+        
     ]
     .into_iter()
     .collect()
@@ -107,13 +114,36 @@ fn the_driver_does_not_learn_a_new_family() {
     for f in &files {
         let rel = f.strip_prefix(&root).expect("under src").to_string_lossy().into_owned();
         let n = count(f);
-        if n == 0 {
+        // NOT `if n == 0 { continue }`. A budgeted file that fell to
+        // zero is the good outcome and it still has to be recorded, or
+        // the budget keeps a line that permits a mention nobody is
+        // making.
+        if n == 0 && !budget.contains_key(rel.as_str()) {
             continue;
         }
         match budget.get(rel.as_str()) {
-            Some(&cap) if n <= cap => {}
-            Some(&cap) => over.push(format!("{rel}: {n} > {cap}")),
+            Some(&cap) if n == cap => {}
+            Some(&cap) => over.push(format!("{rel}: {n}, budgeted {cap}")),
             None => unlisted.push(format!("{rel}: {n}")),
+        }
+    }
+    // A LINE THAT LEAVES MUST LOWER THE BUDGET, which is why this is
+    // `==` and not `<=`. A ceiling only ratchets one way: the arm
+    // deletions took ten family names out of `bind/mod.rs` and the
+    // budget kept saying fourteen, so the guard had ten free mentions to
+    // give away and nobody would have noticed. That is §4's own warning
+    // about a grep being "a guard that must be remembered" — a guard
+    // that silently loosens is worse than one that fails, because it
+    // reads as passing.
+    //
+    // The cost is real and it is the point: deleting a family name is a
+    // two-line diff instead of one. The second line is the record that
+    // it happened.
+    for (rel, &cap) in &budget {
+        if cap > 0 && !files.iter().any(|f| {
+            f.strip_prefix(&root).is_ok_and(|r| r.to_string_lossy() == *rel)
+        }) {
+            over.push(format!("{rel}: budgeted {cap}, and the file is gone"));
         }
     }
     assert!(

@@ -5,7 +5,7 @@
 //! flattens it, and `run` walks the result.
 
 use crate::error::{Error, Result};
-use crate::gpu::serve::state::Shell;
+use crate::serve::state::Shell;
 use crate::layout::region::Region;
 
 /// What a frame did, when it did not fail.
@@ -103,7 +103,7 @@ impl Shell {
         // would read it without complaint, so this is a refusal and not a
         // clamp.
         for lane in 0..frame.instance_ids.len() {
-            crate::gpu::pools::kv::translate(
+            crate::pools::kv::translate(
                 pool,
                 &frame.kv_translation,
                 &frame.kv_translation_indptr,
@@ -229,9 +229,9 @@ impl Shell {
             // `uchar`, and a `u32` written little-endian is the same first
             // byte. The narrowing is the kernel's and the width is the
             // frame's, which is the direction that is safe.
-            let staged = crate::gpu::bind::tables::stage(
+            let staged = crate::bind::tables::stage(
                 &self.context,
-                crate::gpu::bind::tables::Frame {
+                crate::bind::tables::Frame {
                     token_ids: &step.plan.token_ids,
                     position_ids: &step.plan.position_ids,
                     req_of_token: &req,
@@ -278,7 +278,7 @@ impl Shell {
                 // answers zero, and a zero seq stride is every step of the
                 // scan reading the same token.
                 .with_pool(pool.shape());
-            let mut machine = crate::gpu::fire::run::Machine {
+            let mut machine = crate::fire::run::Machine {
                 context: &self.context,
                 compiler: &self.compiler,
                 pipelines: &mut self.pipelines,
@@ -287,7 +287,7 @@ impl Shell {
                 regions: &mut self.regions,
                 recordings: Some(&mut self.recordings),
             };
-            let fire = crate::gpu::fire::run::submit(&mut machine, &lowered, geometry, &mut store)
+            let fire = crate::fire::run::submit(&mut machine, &lowered, geometry, &mut store)
                 .map_err(|e| {
                     // A fire that could not bind names them all, because a
                     // checkpoint missing one tensor is usually missing a
@@ -448,7 +448,7 @@ fn run_programs(
 /// f32. Nothing is lost here, and nothing is gained either — the precision
 /// was lost in the kernel.
 fn read_logits(
-    arena: &crate::gpu::Handle,
+    arena: &crate::Handle,
     readout: Option<model_compiler::lower::Readout>,
 ) -> Option<(Vec<f32>, u32, u32)> {
     let r = readout?;

@@ -7,35 +7,95 @@ use kernels::kernel;
 use kernels::{Cap, KernelSig, Prepare, Source, operands};
 
 #[rustfmt::skip]
+
+/// The head count, which nobody carries: a packed row over the head dim.
+///
+/// Named because two rows share it and a subtree written twice is a
+/// subtree that can drift.
+const HEAD_DIM: Source = Source::KvLayerField("head_dim");
+const PACKED_W: Source = Source::Width(&Source::In(0));
+/// The two KV banks the packed row carries beside q.
+const KV_BANKS: Source = Source::Mul(
+    &Source::Lit(kernels::Lit::I32(2)),
+    &Source::Mul(&Source::KvLayerField("num_kv_heads"), &HEAD_DIM),
+);
+
+const PACKED_HEADS_IN: Source =
+    Source::Div(&Source::Width(&Source::In(0)), &Source::CtxNonZero("head_dim"));
+const PACKED_HEADS_OUT: Source =
+    Source::Div(&Source::Width(&Source::Out(0)), &Source::CtxNonZero("head_dim"));
+
 pub static KERNELS: &[KernelSig] = &[
     kernel!(flashinfer_decode "attn::dispatch_attention_flashinfer_decode",
         needs = Prepare::DecodePlan, sink = Some("kv.pages"),
         depth_prefix_plan = true,
+        // THREE ARITIES, ONE ROW. `[q]` leaves the output to the guard,
+        // `[q, o]` states it, and `[q, o, lse]` states the log-sum-exp
+        // too because the fire CONSUMES it downstream (gpt-oss's sink
+        // rescale reads it). `Or` is how one row serves all three: a slot
+        // that is there wins, and a slot that is not falls through to the
+        // context's. Nothing here knows arities exist.
         operands = operands![
-            cache: DecodePlanCache, q: Buf, kv_layer: KvCacheLayerView, o: BufMut,
-            kv_page_indices_d: U32s, kv_page_indptr_d: U32s,
-            kv_last_page_lens_d: U32s, workspace: AttentionWorkspaceView,
-            stream: Stream, window_left: I32, logits_soft_cap: F32, sm_scale: F32,
-            lse_out: F32sMut,
+            cache: DecodePlanCache <- Source::AttnPlan("decode"),
+            q: Buf <- Source::In(0),
+            kv_layer: KvCacheLayerView <- Source::KvLayerView,
+            o: BufMut <- Source::Or(&Source::Out(0), &Source::Attn("o_out")),
+            kv_page_indices_d: U32s <- Source::Attn("kv_page_indices_d"),
+            kv_page_indptr_d: U32s <- Source::Attn("kv_page_indptr_d"),
+            kv_last_page_lens_d: U32s <- Source::Attn("kv_last_page_lens_d"),
+            workspace: AttentionWorkspaceView <- Source::Attn("workspace"),
+            stream: Stream <- Source::Ctx("stream"),
+            window_left: I32 <- Source::AttnWindow,
+            logits_soft_cap: F32 <- Source::Attn("logits_soft_cap"),
+            sm_scale: F32 <- Source::Attn("sm_scale"),
+            lse_out: F32sMut <- Source::Or(&Source::Out(1), &Source::Attn("lse_out_d")),
         ]),
     kernel!(flashinfer_decode_capture "attn::dispatch_attention_flashinfer_decode_capture",
         needs = Prepare::DecodePlan, sink = Some("kv.pages"),
+        // The decode row with two more operands. `AttnNonZero` on both
+        // score buffers is the hand arm's "the fire published no score
+        // buffers" refusal, one layer earlier: a fire that wants no
+        // scores leaves them null, and a branch that would launch into
+        // them declines instead.
         operands = operands![
-            cache: DecodePlanCache, q: Buf, kv_layer: KvCacheLayerView, o: BufMut,
-            kv_page_indices_d: U32s, kv_page_indptr_d: U32s,
-            kv_last_page_lens_d: U32s, workspace: AttentionWorkspaceView,
-            stream: Stream, score_out: F32sMut, score_indptr_d: I32s,
-            window_left: I32, logits_soft_cap: F32, sm_scale: F32,
-            lse_out: F32sMut,
+            cache: DecodePlanCache <- Source::AttnPlan("decode"),
+            q: Buf <- Source::In(0),
+            kv_layer: KvCacheLayerView <- Source::KvLayerView,
+            o: BufMut <- Source::Or(&Source::Out(0), &Source::Attn("o_out")),
+            kv_page_indices_d: U32s <- Source::Attn("kv_page_indices_d"),
+            kv_page_indptr_d: U32s <- Source::Attn("kv_page_indptr_d"),
+            kv_last_page_lens_d: U32s <- Source::Attn("kv_last_page_lens_d"),
+            workspace: AttentionWorkspaceView <- Source::Attn("workspace"),
+            stream: Stream <- Source::Ctx("stream"),
+            score_out: F32sMut <- Source::AttnNonZero("score_out"),
+            score_indptr_d: I32s <- Source::AttnNonZero("score_indptr_d"),
+            window_left: I32 <- Source::AttnWindow,
+            logits_soft_cap: F32 <- Source::Attn("logits_soft_cap"),
+            sm_scale: F32 <- Source::Attn("sm_scale"),
+            lse_out: F32sMut <- Source::Or(&Source::Out(1), &Source::Attn("lse_out_d")),
         ]),
     kernel!(flashinfer_prefill "attn::dispatch_attention_flashinfer_prefill_bf16",
         needs = Prepare::PrefillPlan, sink = Some("kv.pages"),
+        // The PAGES loose rather than the view whole, which is what this
+        // launcher takes. `prefill_workspace` and not `workspace`: a
+        // FlashInfer plan writes its schedule into the workspace it was
+        // raised against, so a prefill reading the decode plan's is one
+        // clobbering the other.
         operands = operands![
-            cache: PrefillPlanCache, q: Buf, k_pages: BufMut, v_pages: BufMut,
-            o: BufMut, qo_indptr_d: U32s, kv_page_indices_d: U32s,
-            kv_page_indptr_d: U32s, kv_last_page_lens_d: U32s,
-            workspace: AttentionWorkspaceView, stream: Stream,
-            logits_soft_cap: F32, sm_scale: F32, lse_out: F32sMut,
+            cache: PrefillPlanCache <- Source::AttnPlan("prefill"),
+            q: Buf <- Source::In(0),
+            k_pages: BufMut <- Source::KvKeys,
+            v_pages: BufMut <- Source::KvValues,
+            o: BufMut <- Source::Or(&Source::Out(0), &Source::Attn("o_out")),
+            qo_indptr_d: U32s <- Source::Attn("qo_indptr_d"),
+            kv_page_indices_d: U32s <- Source::Attn("kv_page_indices_d"),
+            kv_page_indptr_d: U32s <- Source::Attn("kv_page_indptr_d"),
+            kv_last_page_lens_d: U32s <- Source::Attn("kv_last_page_lens_d"),
+            workspace: AttentionWorkspaceView <- Source::Attn("prefill_workspace"),
+            stream: Stream <- Source::Ctx("stream"),
+            logits_soft_cap: F32 <- Source::Attn("logits_soft_cap"),
+            sm_scale: F32 <- Source::Attn("sm_scale"),
+            lse_out: F32sMut <- Source::Attn("lse_out_d"),
         ]),
     // The plan-free prefill wrapper: it builds an R-shaped plan on the
     // way in, so it owes its caller nothing and cannot be handed a row
@@ -43,42 +103,102 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(flashinfer_prefill_planless "attn::attention_flashinfer_prefill",
         whole = true, needs = Prepare::FireWide, sink = Some("kv.pages"),
         operands = operands![
-            q: Buf, kv_layer: KvCacheLayerView, o: BufMut, qo_indptr_d: U32s,
-            kv_page_indices_d: U32s, kv_page_indptr_d: U32s,
-            kv_last_page_lens_d: U32s, qo_indptr_h: U32s, kv_page_indptr_h: U32s,
-            total_tokens: I32, num_requests: I32, num_q_heads: I32,
-            workspace: AttentionWorkspaceView, stream: Stream, window_left: I32,
-            logits_soft_cap: F32, sm_scale: F32, lse_out: F32sMut,
+            q: Buf <- Source::In(0),
+            kv_layer: KvCacheLayerView <- Source::KvLayerView,
+            o: BufMut <- Source::Out(0),
+            qo_indptr_d: U32s <- Source::Attn("qo_indptr_d"),
+            kv_page_indices_d: U32s <- Source::Attn("kv_page_indices_d"),
+            kv_page_indptr_d: U32s <- Source::Attn("kv_page_indptr_d"),
+            kv_last_page_lens_d: U32s <- Source::Attn("kv_last_page_lens_d"),
+            qo_indptr_h: U32s <- Source::Attn("qo_indptr_h"),
+            kv_page_indptr_h: U32s <- Source::Attn("kv_page_indptr_h"),
+            total_tokens: I32 <- Source::Rows,
+            num_requests: I32 <- Source::Attn("num_requests"),
+            // The head COUNT, which nobody carries: the query's width
+            // over the cache's head dim.
+            num_q_heads: I32 <- Source::Div(
+                &Source::Width(&Source::In(0)),
+                &Source::KvLayerField("head_dim"),
+            ),
+            workspace: AttentionWorkspaceView <- Source::Attn("workspace"),
+            stream: Stream <- Source::Ctx("stream"),
+            window_left: I32 <- Source::AttnWindow,
+            logits_soft_cap: F32 <- Source::Attn("logits_soft_cap"),
+            sm_scale: F32 <- Source::Attn("sm_scale"),
+            lse_out: F32sMut <- Source::Attn("lse_out_d"),
         ]),
     // Head dims flashinfer's prefill template rejects (gemma-4's 512)
     // take a naive paged kernel instead. No plan at all; fire-shaped.
     kernel!(attention_naive_paged "attn::attention_naive_paged",
         whole = true, sink = Some("kv.pages"),
         operands = operands![
-            q: Buf, kv_layer: KvCacheLayerView, o: BufMut, qo_indptr_d: U32s,
-            kv_page_indices_d: U32s, kv_page_indptr_d: U32s,
-            kv_last_page_lens_d: U32s, total_tokens: I32, num_requests: I32,
-            num_pages_in_batch: I32, num_q_heads: I32, stream: Stream,
-            window_left: I32, sm_scale: F32,
+            q: Buf <- Source::In(0),
+            kv_layer: KvCacheLayerView <- Source::KvLayerView,
+            o: BufMut <- Source::Out(0),
+            qo_indptr_d: U32s <- Source::Attn("qo_indptr_d"),
+            kv_page_indices_d: U32s <- Source::Attn("kv_page_indices_d"),
+            kv_page_indptr_d: U32s <- Source::Attn("kv_page_indptr_d"),
+            kv_last_page_lens_d: U32s <- Source::Attn("kv_last_page_lens_d"),
+            total_tokens: I32 <- Source::Rows,
+            num_requests: I32 <- Source::Attn("num_requests"),
+            num_pages_in_batch: I32 <- Source::Attn("num_pages_in_batch"),
+            num_q_heads: I32 <- Source::Div(
+                &Source::Width(&Source::In(0)),
+                &Source::KvLayerField("head_dim"),
+            ),
+            stream: Stream <- Source::Ctx("stream"),
+            window_left: I32 <- Source::AttnWindow,
+            sm_scale: F32 <- Source::Attn("sm_scale"),
         ]),
     kernel!(flashinfer_prefill_capture "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
         needs = Prepare::PrefillPlan, sink = Some("kv.pages"),
         operands = operands![
-            cache: PrefillPlanCache, q: Buf, k_pages: BufMut, v_pages: BufMut,
-            o: BufMut, qo_indptr_d: U32s, kv_page_indices_d: U32s,
-            kv_page_indptr_d: U32s, kv_last_page_lens_d: U32s,
-            workspace: AttentionWorkspaceView, stream: Stream, score_out: F32sMut,
-            folded_out: F32sMut, score_indptr_d: I32s, window: I32,
-            logits_soft_cap: F32, sm_scale: F32, lse_out: F32sMut,
+            cache: PrefillPlanCache <- Source::AttnPlan("prefill"),
+            q: Buf <- Source::In(0),
+            k_pages: BufMut <- Source::KvKeys,
+            v_pages: BufMut <- Source::KvValues,
+            o: BufMut <- Source::Or(&Source::Out(0), &Source::Attn("o_out")),
+            qo_indptr_d: U32s <- Source::Attn("qo_indptr_d"),
+            kv_page_indices_d: U32s <- Source::Attn("kv_page_indices_d"),
+            kv_page_indptr_d: U32s <- Source::Attn("kv_page_indptr_d"),
+            kv_last_page_lens_d: U32s <- Source::Attn("kv_last_page_lens_d"),
+            workspace: AttentionWorkspaceView <- Source::Attn("prefill_workspace"),
+            stream: Stream <- Source::Ctx("stream"),
+            score_out: F32sMut <- Source::AttnNonZero("score_out"),
+            folded_out: F32sMut <- Source::Attn("folded_out"),
+            score_indptr_d: I32s <- Source::AttnNonZero("score_indptr_d"),
+            // The OBSERVATION window, not the attention one --
+            // deliberately NOT `AttnWindow`. The launcher refuses `<= 0`
+            // and `window_left` is -1 on a family that attends the whole
+            // context, so the same number reads as "no window" to one
+            // layer and "invalid" to the other.
+            window: I32 <- Source::Attn("score_window"),
+            logits_soft_cap: F32 <- Source::Attn("logits_soft_cap"),
+            sm_scale: F32 <- Source::Attn("sm_scale"),
+            lse_out: F32sMut <- Source::Attn("lse_out_d"),
         ]),
     kernel!(flashinfer_custom "attn::dispatch_attention_flashinfer_prefill_custom",
         needs = Prepare::CustomPlan, sink = Some("kv.pages"),
+        // The mask rides the CONTEXT, not the statement, for the reason
+        // the score sink does: the predicate is folded, so one exec serves
+        // the fire that stages a mask and the fire that does not, and the
+        // address recorded now must still be right when it goes true.
         operands = operands![
-            cache: PrefillPlanCache, q: Buf, kv_layer: KvCacheLayerView, o: BufMut,
-            qo_indptr_d: U32s, kv_page_indices_d: U32s, kv_page_indptr_d: U32s,
-            kv_last_page_lens_d: U32s, mask_d: U8s, mask_indptr_d: I32s,
-            workspace: AttentionWorkspaceView, stream: Stream,
-            logits_soft_cap: F32, sm_scale: F32, lse_out: F32sMut,
+            cache: PrefillPlanCache <- Source::AttnPlan("prefill"),
+            q: Buf <- Source::In(0),
+            kv_layer: KvCacheLayerView <- Source::KvLayerView,
+            o: BufMut <- Source::Or(&Source::Out(0), &Source::Attn("o_out")),
+            qo_indptr_d: U32s <- Source::Attn("qo_indptr_d"),
+            kv_page_indices_d: U32s <- Source::Attn("kv_page_indices_d"),
+            kv_page_indptr_d: U32s <- Source::Attn("kv_page_indptr_d"),
+            kv_last_page_lens_d: U32s <- Source::Attn("kv_last_page_lens_d"),
+            mask_d: U8s <- Source::AttnNonZero("mask_d"),
+            mask_indptr_d: I32s <- Source::AttnNonZero("mask_indptr_d"),
+            workspace: AttentionWorkspaceView <- Source::Attn("prefill_workspace"),
+            stream: Stream <- Source::Ctx("stream"),
+            logits_soft_cap: F32 <- Source::Attn("logits_soft_cap"),
+            sm_scale: F32 <- Source::Attn("sm_scale"),
+            lse_out: F32sMut <- Source::Attn("lse_out_d"),
         ]),
     // XQA: its prepare is fire-wide (R-shaped), so the kernel cannot be
     // given a row window — `whole`. And no capture variant of it
@@ -95,12 +215,31 @@ pub static KERNELS: &[KernelSig] = &[
         ]),
     kernel!(qkv_decode_fused "attn::qkv_decode_qk_norm_rope_write_kv_bf16",
         operands = operands![
-            packed: Buf, q_out: BufMut, k_pages: BufMut, v_pages: BufMut,
-            q_weight: Buf, k_weight: Buf, positions: I32s, rope_table: F32s,
-            kv_page_indices: U32s, kv_page_indptr: U32s, kv_last_page_lens: U32s,
-            w_page: U32s, w_off: U32s, row_valid: U8s, num_requests: I32,
-            num_q_heads: I32, num_kv_heads: I32, head_dim: I32, page_size: I32,
-            hnd_layout: Bool, theta: F32, eps: F32, stream: Stream,
+            packed: Buf <- Source::In(0),
+            q_out: BufMut <- Source::Attn("q_out"),
+            k_pages: BufMut <- Source::KvLayerField("k_pages"),
+            v_pages: BufMut <- Source::KvLayerField("v_pages"),
+            q_weight: Buf <- Source::Weight(0),
+            k_weight: Buf <- Source::Weight(1),
+            positions: I32s <- Source::Positions,
+            rope_table: F32s <- Source::In(1),
+            kv_page_indices: U32s <- Source::Attn("kv_page_indices_d"),
+            kv_page_indptr: U32s <- Source::Attn("kv_page_indptr_d"),
+            kv_last_page_lens: U32s <- Source::Attn("kv_last_page_lens_d"),
+            w_page: U32s <- Source::Attn("w_page_d"),
+            w_off: U32s <- Source::Attn("w_off_d"),
+            row_valid: U8s <- Source::Attn("row_valid_d"),
+            num_requests: I32 <- Source::Rows,
+            // THE PACKED ROW HOLDS Q, K AND V END TO END, so the q heads
+            // are what is left after the two kv banks come off.
+            num_q_heads: I32 <- Source::Div(&Source::Sub(&PACKED_W, &KV_BANKS), &HEAD_DIM),
+            num_kv_heads: I32 <- Source::KvLayerField("num_kv_heads"),
+            head_dim: I32 <- HEAD_DIM,
+            page_size: I32 <- Source::KvLayerField("page_size"),
+            hnd_layout: Bool <- Source::KvLayerField("hnd_layout"),
+            theta: F32 <- Source::CtxByLayer("theta"),
+            eps: F32 <- Source::Ctx("eps"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // The EXPLICIT append: the fire states each token's destination page
     // and offset instead of deriving them from the CSR. Only a fire that
@@ -165,15 +304,35 @@ pub static KERNELS: &[KernelSig] = &[
     // The pair is what `head_dim_padded` COSTS; stating it turns
     // `if (c.head_dim_padded)` in the model body into a fact the trace
     // carries. Row-shaped -- each token's heads pad independently.
+    // THE PACKED SIDE IS WHICHEVER END IS `head_dim` WIDE, which is the
+    // input on the way in and the output on the way out. The head count
+    // divides out of the packed side either way, and the padded head dim
+    // is the other side over that count.
     kernel!(pad_head_dim "attn::pad_head_dim_bf16",
         operands = operands![
-            packed: Buf, padded: BufMut, num_tokens: I32, num_heads: I32,
-            head_dim: I32, head_dim_padded: I32, stream: Stream,
+            packed: Buf <- Source::In(0),
+            padded: BufMut <- Source::Out(0),
+            num_tokens: I32 <- Source::Rows,
+            num_heads: I32 <- PACKED_HEADS_IN,
+            head_dim: I32 <- Source::CtxNonZero("head_dim"),
+            head_dim_padded: I32 <- Source::Div(
+                &Source::Width(&Source::Out(0)),
+                &PACKED_HEADS_IN,
+            ),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     kernel!(strip_head_dim "attn::strip_head_dim_bf16",
         operands = operands![
-            padded: Buf, packed: BufMut, num_tokens: I32, num_heads: I32,
-            head_dim: I32, head_dim_padded: I32, stream: Stream,
+            padded: Buf <- Source::In(0),
+            packed: BufMut <- Source::Out(0),
+            num_tokens: I32 <- Source::Rows,
+            num_heads: I32 <- PACKED_HEADS_OUT,
+            head_dim: I32 <- Source::CtxNonZero("head_dim"),
+            head_dim_padded: I32 <- Source::Div(
+                &Source::Width(&Source::In(0)),
+                &PACKED_HEADS_OUT,
+            ),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // The KV-split's other half: it merges `num_index_sets` partials whose
     // boundaries are the split's, not a row range's.
@@ -379,9 +538,21 @@ pub static KERNELS: &[KernelSig] = &[
     // the right kernel over the wrong rectangle.
     kernel!(attn_res_blend "attn::attn_res_blend_bf16",
         operands = operands![
-            prefix: Buf, blocks: Buf, norm_weight: Buf, proj_weight: Buf,
-            out: BufMut, T: I32, B: I32, H: I32, block_rows: I32, eps: F32,
-            stream: Stream,
+            prefix: Buf <- Source::In(0),
+            blocks: Buf <- Source::In(1),
+            norm_weight: Buf <- Source::In(2),
+            proj_weight: Buf <- Source::In(3),
+            out: BufMut <- Source::Out(0),
+            T: I32 <- Source::Rows,
+            // AN OPERAND OVER AN OPERAND, not a plan dimension. `B` is
+            // how many blocks the packed input holds, which is its width
+            // divided by the output's — the two are in the same
+            // statement, so the row can say it.
+            B: I32 <- Source::Div(&Source::Width(&Source::In(1)), &Source::Width(&Source::Out(0))),
+            H: I32 <- Source::OutWidth(0),
+            block_rows: I32 <- Source::Rows,
+            eps: F32 <- Source::Ctx("eps"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // The unfused counterpart of `mla_prepare`. `tokens` is their only
     // extent, so unlike the fused prepare they are NOT `whole` -- which is
@@ -522,11 +693,31 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(qkv_packed_post "attn::qkv_packed_qk_norm_rope_vnorm_write_kv_bf16",
         sink = Some("kv.pages"),
         operands = operands![
-            packed: Buf, q_out: BufMut, k_pages: BufMut, v_pages: BufMut,
-            q_weight: Buf, k_weight: Buf, positions: I32s, kv_page_indices: U32s,
-            kv_page_indptr: U32s, kv_last_page_lens: U32s, row_valid: U8s,
-            num_rows: I32, num_q_heads: I32, num_kv_heads: I32, head_dim: I32,
-            page_size: I32, hnd_layout: Bool, theta: F32, eps: F32, stream: Stream,
+            packed: Buf <- Source::In(0),
+            q_out: BufMut <- Source::Out(0),
+            // The NATIVE pages, not the bf16 mirrors: this one writes the
+            // cache in whatever the cache is.
+            k_pages: BufMut <- Source::KvLayerField("k_pages"),
+            v_pages: BufMut <- Source::KvLayerField("v_pages"),
+            q_weight: Buf <- Source::Weight(0),
+            k_weight: Buf <- Source::Weight(1),
+            positions: I32s <- Source::Positions,
+            kv_page_indices: U32s <- Source::Attn("kv_page_indices_d"),
+            kv_page_indptr: U32s <- Source::Attn("kv_page_indptr_d"),
+            kv_last_page_lens: U32s <- Source::Attn("kv_last_page_lens_d"),
+            row_valid: U8s <- Source::Attn("row_valid_d"),
+            num_rows: I32 <- Source::Rows,
+            num_q_heads: I32 <- Source::Div(
+                &Source::Width(&Source::Out(0)),
+                &Source::KvLayerField("head_dim"),
+            ),
+            num_kv_heads: I32 <- Source::KvLayerField("num_kv_heads"),
+            head_dim: I32 <- Source::KvLayerField("head_dim"),
+            page_size: I32 <- Source::KvLayerField("page_size"),
+            hnd_layout: Bool <- Source::KvLayerField("hnd_layout"),
+            theta: F32 <- Source::CtxByLayer("theta"),
+            eps: F32 <- Source::Ctx("eps"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // Rescales the attention output IN PLACE against the per-head sink
     // logit; the LSE is read-only. gpt-oss's sink layers state it right

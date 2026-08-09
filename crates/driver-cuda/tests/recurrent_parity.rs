@@ -12,7 +12,7 @@
 
 #![cfg(feature = "_cuda")]
 
-use driver_cuda::gpu::pools::recurrent_state_cache::{
+use driver_cuda::pools::recurrent_state_cache::{
     Buffer, PoolDims, RecurrentStateCache, StateOp, recurrent_state_bf16_default,
     stash_tokens_cap,
 };

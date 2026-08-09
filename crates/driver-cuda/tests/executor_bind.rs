@@ -19,7 +19,7 @@
 use std::collections::BTreeSet;
 use std::ffi::c_void;
 
-use driver_cuda::gpu::bind::{BindRefusal, Frame, Resolver, bind};
+use driver_cuda::bind::{BindRefusal, Frame, Resolver, bind};
 use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
 use model::families::llama_like::forward::llama_like_cuda;
 use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
@@ -123,7 +123,7 @@ fn every_launch_of_the_gemma2_deployment_binds() {
         &model::gemma_2::forward::facts::Gemma2Facts::gemma_2_9b(),
         FireClass::Decode,
     );
-    let dp = driver_cuda::gpu::bind::DispatchPlan::new(&plan, &l);
+    let dp = driver_cuda::bind::DispatchPlan::new(&plan, &l);
     assert!(
         (0..l.launches.len()).any(|i| {
             dp.spec(i).weight.as_deref().is_some_and(|w| !w.starts_with("scale."))
@@ -560,7 +560,7 @@ fn print_all_deployment_vocabularies() {
             for launch in &l.launches {
                 let _ = bind(&l, launch, frame, &mut r);
             }
-            let dp = driver_cuda::gpu::bind::DispatchPlan::new(&plan, &l);
+            let dp = driver_cuda::bind::DispatchPlan::new(&plan, &l);
             for i in 0..l.launches.len() {
                 if let Some(w) = &dp.spec(i).weight {
                     r.weights.insert(w.clone());
@@ -624,7 +624,7 @@ fn print_the_anchor_vocabulary() {
                 let _ = bind(&l, launch, frame, &mut r);
                 let _ = i;
             }
-            let dp = driver_cuda::gpu::bind::DispatchPlan::new(&plan_of(class), &l);
+            let dp = driver_cuda::bind::DispatchPlan::new(&plan_of(class), &l);
             for i in 0..l.launches.len() {
                 if let Some(w) = &dp.spec(i).weight {
                     r.weights.insert(w.clone());
@@ -965,7 +965,7 @@ fn every_mark_lowered(rows: usize) -> Lowered {
 #[test]
 fn every_lowered_symbol_has_an_arm() {
     let src = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/gpu/bind/mod.rs"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bind/mod.rs"),
     )
     .expect("the executor's source");
 
@@ -1004,20 +1004,26 @@ fn every_lowered_symbol_has_an_arm() {
     // stated STRUCTURAL reason, and assert the scan still sees them.
     // `gemm::act_x_w` is the one rename at the ABI — a lowering symbol
     // with no row of its own, so no generated branch can ever key on it.
-    // `mlp::sigmoid_gate_inplace_bf16` serves two arities that differ in
-    // which argument is the destination.
     //
-    // When those two land the scan should find zero, and this assert is
-    // the right thing to delete rather than to weaken.
-    for anchor in ["gemm::act_x_w", "mlp::sigmoid_gate_inplace_bf16"] {
-        assert!(
-            armed.contains(anchor),
-            "the arm scan lost `{anchor}`, which is hand-written for a \
-             structural reason — so the scan's shape assumption broke \
-             rather than the arm having landed. Scan found {} arms.",
-            armed.len()
-        );
-    }
+    // `mlp::sigmoid_gate_inplace_bf16` WAS on this list, for serving two
+    // arities that differ in which argument is the destination. It
+    // landed: the row's `in_place` pairs make the generated branch stage
+    // the three-arg form and no-op the two-arg one, which is the same
+    // thing the arm's `match args.len()` did by hand. Removed here as
+    // this comment instructed rather than weakened, and the same run
+    // retired four more twins the same way.
+    //
+    // `gemm::act_x_w` WAS the anchor this scan asserted on, with the
+    // instruction that "when `act_x_w` lands the scan should find zero,
+    // and this assert is the right thing to delete rather than to
+    // weaken." It landed. What it needed was `Source::Beta` (the
+    // coefficient is a fact about the STATEMENT, not two kernels) and
+    // `lowered_as` (a portable lowering names an operation, a backend
+    // names a symbol, and `gemm::act_x_w` is what `gemm.hpp` defines as
+    // `act_x_wt_bf16` with `WeightView::raw(W, BF16)`).
+    //
+    // Deleted as instructed. The scan below still runs; it just has no
+    // anchor left to pin, which is the outcome the instruction named.
 
     // GENERATED branches count as armed, because they are. `dispatch`
     // runs them first and the hand-written match is the fallthrough, so a
@@ -1052,10 +1058,16 @@ fn every_lowered_symbol_has_an_arm() {
         if !line.trim_start().starts_with('"') || !line.trim_end().ends_with("=> {") {
             continue;
         }
-        if let Some(sym) = line.split('"').nth(1)
-            && sym.contains("::")
-        {
-            armed.insert(sym.to_string());
+        // EVERY quoted name on the line, not the first. A branch may
+        // open with an or-pattern -- `lowered_as` gives one row two
+        // spellings, because a portable lowering names an operation
+        // (`gemm::act_x_w`) and a backend names a symbol
+        // (`gemm::act_x_wt_bf16`), and both reach a text. Taking
+        // `nth(1)` alone reported the alias unarmed.
+        for sym in line.split('"').skip(1).step_by(2) {
+            if sym.contains("::") {
+                armed.insert(sym.to_string());
+            }
         }
     }
 
@@ -1172,7 +1184,11 @@ fn every_lowered_symbol_has_an_arm() {
     // it would scatter the three groups into one alphabetical run.
     let unarmed: BTreeSet<&str> = every.difference(&armed).map(String::as_str).collect();
     let expected: BTreeSet<&str> = UNARMED.iter().copied().collect();
-    assert_eq!(unarmed.len(), UNARMED.len(), "a line in UNARMED is duplicated");
+    assert_eq!(
+        unarmed.len(),
+        UNARMED.len(),
+        "the unarmed count moved. Scan says {unarmed:?}"
+    );
     assert_eq!(
         unarmed, expected,
         "the unarmed set moved. A symbol that LEFT means an arm landed — \
@@ -1219,7 +1235,7 @@ fn print_the_remaining_families_vocabulary() {
 /// silent wrong number on device.
 #[test]
 fn every_pair_form_activation_recovers_its_up_projection() {
-    use driver_cuda::gpu::bind::DispatchPlan;
+    use driver_cuda::bind::DispatchPlan;
 
     let cases: Vec<(&str, model_compiler::trace::ForwardPlan, Lowered)> = vec![
         (

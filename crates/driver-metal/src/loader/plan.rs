@@ -7,27 +7,33 @@
 //! their lifetime rules disappear; what remains is what the driver alone
 //! knows and must state.
 //!
-//! That is two things now. Which backend this is ([`metal_storage_target`],
-//! a call into `StorageTarget::for_backend`), and the loading policy that
-//! makes equal requests author equal contracts ([`compile_load_plan`] states
-//! every field rather than defaulting any).
+//! That is one thing now. Which backend this is ([`metal_storage_target`], a
+//! call into `StorageTarget::for_backend`).
 //!
 //! It was three. The mask of transforms this driver's kernels implement was
 //! stated here AND in `model_loader::plan::passes::tile`, with a test
 //! comparing them; the loader keeps it, because the loader is where the
 //! consequence lands — it decides which plans compile, and it owns the host
 //! fallback every claimed transform must have.
+//!
+//! The loading policy went the same way. [`compile_load_plan`] here used to
+//! state all seven [`model::policy::Policy`] fields, and
+//! `driver-cuda`'s copy stated the same seven, differing in exactly two —
+//! its own comment said the block was carried "bit for bit". Two copies of a
+//! policy is not a spelling problem: a field added to `Policy` gets a
+//! considered value on the copy its author was looking at and a `Default` on
+//! the other, and both still compile and both still boot. The five shared
+//! answers are [`model::boot`]'s now, and what stays here is the two this
+//! driver alone knows — named [`Binding::MLX_IN_PLACE`] — plus the checkpoint
+//! parse `model::boot` deliberately does not do.
 
 use std::path::Path;
 
-use model::facts::ModelFacts;
-use model::policy::{
-    Component, FamilyKnobs, Mxfp4MoePolicy, Mxfp4MoeRequest, Naming, Policy, Projections,
-    RuntimeQuant,
-};
+use model::boot::Binding;
+use model::policy::Mxfp4MoePolicy;
 use model_loader::checkpoint::read::parse_checkpoint_metadata;
-use model_loader::plan::{self, LoadPlan, StorageTarget};
-use model_loader::types::{BackendKind, DType};
+use model_loader::plan::{LoadPlan, StorageTarget};
+use model_loader::types::BackendKind;
 
 /// This device's storage capability.
 ///
@@ -43,28 +49,6 @@ use model_loader::types::{BackendKind, DType};
 #[must_use]
 pub fn metal_storage_target() -> StorageTarget {
     StorageTarget::for_backend(BackendKind::Metal, 0, 1)
-}
-
-/// Did the contract tie the embedding and the head, or ship two tensors?
-///
-/// Decided ONCE, by the contract, and read back rather than decided a
-/// second time. The rule is that a shipped `lm_head` beats whatever the
-/// config says, and the config can be wrong in both directions:
-/// Qwen3.5-35B-A3B is a multimodal wrapper spelling `tie_word_embeddings`
-/// at the TOP level, outside the `text_config` its family parses, so the
-/// facts default to tied; Qwen3-0.6B says `tie_word_embeddings: true` and
-/// then ships an `lm_head.weight` anyway. Either way the contract staged
-/// `embed_tokens` and `lm_head` while the DAG asked for
-/// `shared_embedding`, and the load stopped on "unstaged weight
-/// shared_embedding.weight" — two opinions about one fact.
-///
-/// The plan's own tensor list is the only opinion that cannot be wrong in
-/// a way the binding survives, so it is the one every family follows.
-#[must_use]
-pub fn plan_ties_embeddings(plan: &LoadPlan) -> bool {
-    plan.tensors
-        .iter()
-        .any(|tensor| tensor.name == "shared_embedding.weight")
 }
 
 /// The two or three facts a probe states by hand. See
@@ -111,70 +95,65 @@ pub fn descriptor_for_testing(model_type: &str, facts: TestFacts) -> String {
 }
 
 /// Why a load plan was not produced.
+///
+/// Two variants, and the split says which side refused. [`Self::Checkpoint`]
+/// is this module's own step — reading the snapshot directory, which
+/// [`model::boot`] deliberately leaves to its caller. [`Self::Plan`] is
+/// everything the shared load path can refuse: the descriptor, the family
+/// registry, the compiler, the file check.
 #[derive(Debug)]
 pub enum LoadPlanError {
     /// The snapshot directory did not read as a checkpoint.
     Checkpoint(String),
-    /// The descriptor document was rejected by the facts reader.
-    Descriptor(String),
-    /// No author claims this `model_type`; the value names it.
-    UnknownFamily(String),
-    /// The author or the plan compiler refused; the value says why.
-    ///
-    /// Includes a file the plan declares being absent or the wrong size on
-    /// disk: `plan::compile_checked` raises that, and it is a refusal about
-    /// the checkpoint rather than a second kind of failure here.
-    Compile(String),
+    /// The shared load path refused; the value says why.
+    Plan(model::boot::LoadPlanError),
 }
 
 impl std::fmt::Display for LoadPlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Both arms keep the `load plan: ` prefix the four variants carried,
+        // because it is what a `Error::Create { what }` message reads as at
+        // the boot site.
         match self {
             LoadPlanError::Checkpoint(err) => write!(f, "load plan: {err}"),
-            LoadPlanError::Descriptor(err) => write!(f, "load plan: descriptor: {err}"),
-            LoadPlanError::UnknownFamily(model_type) => write!(
-                f,
-                "load plan: no author for model_type '{model_type}'; every family \
-                 loads through this entry, so an unknown one needs an author in \
-                 model::contract"
-            ),
-            LoadPlanError::Compile(err) => write!(f, "load plan: {err}"),
+            LoadPlanError::Plan(err) => write!(f, "load plan: {err}"),
         }
     }
 }
 
 impl std::error::Error for LoadPlanError {}
 
-/// Compile the plan: the descriptor and policy in, plan out.
+impl From<model::boot::LoadPlanError> for LoadPlanError {
+    fn from(err: model::boot::LoadPlanError) -> Self {
+        LoadPlanError::Plan(err)
+    }
+}
+
+/// Compile the plan: the descriptor in, plan out.
 ///
-/// The driver sends what only it can know — the compiled model descriptor
-/// it was handed, and that this device wants MLX names with in-place
-/// projections — and authoring happens in the same `model::contract`
-/// registry the CUDA boot goes through. An unknown `model_type` comes back
-/// as [`LoadPlanError::UnknownFamily`] naming it, rather than a plan.
+/// This driver reads the snapshot directory itself and then hands the shared
+/// load path everything else. The two answers it contributes are
+/// [`Binding::MLX_IN_PLACE`] — MLX tensor names, projections left as stored
+/// — and they are claims about the lowering rather than preferences: the
+/// bind path looks up MLX names, and the attention and MLP kernels here read
+/// the separate `q`/`k`/`v` tensors, so a fused request would produce
+/// operands this driver cannot find.
 ///
-/// What the policy does NOT carry is anything this driver has no operator
-/// knob for: no MXFP4 MoE lowering choice, no component split, no expert
-/// streaming, and none of the CUDA per-family environment knobs — zeros
-/// and defaults, stated here rather than defaulted there, so equal
-/// requests author equal contracts.
+/// Everything else — the other five policy fields, the author call, the
+/// plan compile, and the check that every declared file is still on disk at
+/// the size the plan states — is [`model::boot::compile_load_plan`]'s, which
+/// `driver-cuda` calls with its own [`Binding`]. That is the point: equal
+/// requests author equal contracts because there is one policy, not two that
+/// happen to agree today.
 ///
-/// `runtime_quant` is `None` for a reason of its own. The MLX authors do
-/// read it (`Int4` encodes a float weight to affine-U4), but this driver
-/// binds what the checkpoint holds: a requantization is a decision about an
-/// artifact, made once by `pie model build --quant int4` and written down,
-/// not one to re-run over every weight on each boot.
+/// The returned [`Mxfp4MoePolicy`] is the author's resolved answer — a family
+/// may override the device rule — handed back rather than recomputed, so the
+/// bind path cannot disagree with the contract it binds.
 ///
-/// The returned [`Mxfp4MoePolicy`] is the author's resolved answer — a
-/// family may override the device rule — handed back rather than recomputed,
-/// so the bind path cannot disagree with the contract it binds.
+/// # Errors
 ///
-/// The C++ called `verify_model` here: a re-author on the far side of the C
-/// ABI, holding the *marshalled* plan to the request — marshalling and
-/// author determinism both in scope. In-process there is no marshalling and
-/// a same-process re-author is a restatement, not a second opinion, so what
-/// survives of it is the part that still checks something real: each file
-/// the plan declares is stat'ed against the snapshot directory.
+/// The snapshot directory does not read as a checkpoint, or the shared load
+/// path refuses; see [`LoadPlanError`].
 pub fn compile_load_plan(
     snapshot_dir: &Path,
     target: &StorageTarget,
@@ -182,34 +161,18 @@ pub fn compile_load_plan(
 ) -> Result<(LoadPlan, Mxfp4MoePolicy), LoadPlanError> {
     let metadata = parse_checkpoint_metadata(snapshot_dir)
         .map_err(|err| LoadPlanError::Checkpoint(err.to_string()))?;
-    let facts = ModelFacts::from_descriptor(descriptor_json.as_bytes())
-        .map_err(|err| LoadPlanError::Descriptor(err.to_string()))?;
-    let policy = Policy {
-        projections: Projections::InPlace, // the MLX lowering
-        naming: Naming::Mlx,               // what this bind path reads
-        runtime_quant: RuntimeQuant::None,
-        moe_request: Mxfp4MoeRequest::Auto,
-        component: Component::Full,
-        stream_routed_experts: false,
-        knobs: FamilyKnobs::default(),
-    };
-    let (contract, resolved_moe) =
-        model::contract::author_with_policy(&facts, &metadata, target, &policy)
-            .map_err(|err| LoadPlanError::Compile(err.to_string()))?
-            .ok_or_else(|| LoadPlanError::UnknownFamily(facts.model_type.clone()))?;
-    let plan = plan::compile(&metadata, &contract, target.clone())
-        .map_err(|err| LoadPlanError::Compile(err.to_string()))?;
-    // The plan names the files and states their sizes, so a snapshot that
-    // moved under a plan compiled against it is the loader's refusal to make.
-    // `driver-cuda` carried the same block, bit for bit.
-    model_loader::checkpoint::read::verify_declared_files(&plan, snapshot_dir)
-        .map_err(|err| LoadPlanError::Compile(err.to_string()))?;
-    Ok((plan, resolved_moe))
+    Ok(model::boot::compile_load_plan(
+        snapshot_dir,
+        &metadata,
+        target,
+        descriptor_json,
+        Binding::MLX_IN_PLACE,
+    )?)
 }
 
 #[cfg(test)]
 mod tests {
-    use model_loader::types::{Encoding, TensorDecl, TensorId, Visibility};
+    use model::facts::ModelFacts;
 
     use super::*;
 
@@ -242,20 +205,5 @@ mod tests {
         assert_eq!(facts.num_hidden_layers, 28);
         assert_eq!(facts.quant_bits, 4);
         assert_eq!(facts.quant_group_size, 64);
-    }
-
-    #[test]
-    fn tied_embeddings_are_read_off_the_plan_not_the_config() {
-        let mut plan = LoadPlan::empty(metal_storage_target());
-        assert!(!plan_ties_embeddings(&plan));
-        plan.tensors.push(TensorDecl {
-            id: TensorId(0),
-            name: "shared_embedding.weight".to_string(),
-            shape: vec![32, 8],
-            encoding: Encoding::Raw(DType::BF16),
-            alignment: 256,
-            visibility: Visibility::Public,
-        });
-        assert!(plan_ties_embeddings(&plan));
     }
 }

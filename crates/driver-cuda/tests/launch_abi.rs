@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use driver_cuda::gpu::bind::abi::{
+use driver_cuda::bind::abi::{
     AttentionWorkspaceView, HopperPrefillPlan, KvCacheLayerView, MlaCacheLayerView,
     YarnOriginalParams,
 };
@@ -697,6 +697,7 @@ fn a_wrong_row_does_not_compile() {
             file: base.file,
             launch: base.launch,
             grid_param: base.grid_param,
+            lowered_as: base.lowered_as,
         }]);
         assert!(
             compile(&rope_shim(row)).is_err(),
@@ -743,6 +744,7 @@ fn renaming_an_operand_is_not_a_mistake() {
         file: base.file,
         launch: base.launch,
         grid_param: base.grid_param,
+        lowered_as: base.lowered_as,
     }]);
     if let Err(err) = compile(&rope_shim(row)) {
         panic!("the control failed to compile, so the mutations prove nothing:\n{err}");
@@ -1393,7 +1395,7 @@ fn collect_files_named(dir: &Path, name: &str, out: &mut String) {
 /// rather than routing gemma-4's experts through qwen's activation.
 #[test]
 fn the_enum_mirrors_carry_the_cpp_discriminants() {
-    use driver_cuda::gpu::bind::abi::{MoeActivation, Mxfp4RowSelect};
+    use driver_cuda::bind::abi::{MoeActivation, Mxfp4RowSelect};
     let tu = format!(
         "#include <cstdint>\n\
          #include \"moe/flashinfer_moe.hpp\"\n\

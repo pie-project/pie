@@ -5,7 +5,7 @@
 //! under two spellings.
 
 use crate::error::Result;
-use crate::gpu::serve::state::Shell;
+use crate::serve::state::Shell;
 
 impl Shell {
     /// Register a PTIR program: its launch package and whatever kernels the

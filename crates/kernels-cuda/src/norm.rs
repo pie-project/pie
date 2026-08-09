@@ -28,8 +28,13 @@ pub static KERNELS: &[KernelSig] = &[
             gate: Buf <- Source::In(1),
             weight: Buf <- Source::Weight(0),
             y: BufMut <- Source::Out(0),
-            num_rows: I32 <- Source::Rows,
-            hidden: I32 <- Source::InWidth(0),
+            // BOTH READINGS. `OpKind::RmsnormPerHead` lowers to this
+            // symbol too, and norms `rows * (width / head_dim)` rows of
+            // `head_dim` where the plain kind norms `rows` of `width`.
+            // A row that said `Rows`/`InWidth(0)` would norm gemma-4's
+            // q/k heads as one row each.
+            num_rows: I32 <- Source::IfPresent(&Source::PerHeadDim, &Source::Mul(&Source::Rows, &Source::Div(&Source::Width(&Source::In(0)), &Source::PerHeadDim)), &Source::Rows),
+            hidden: I32 <- Source::IfPresent(&Source::PerHeadDim, &Source::PerHeadDim, &Source::Width(&Source::In(0))),
             eps: F32 <- Source::Ctx("eps"),
             stream: Stream <- Source::Ctx("stream"),
         ]),
@@ -97,10 +102,22 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(rmsnorm "norm::rmsnorm_bf16",
         operands = operands![
             x: Buf <- Source::In(0),
-            weight: Buf <- Source::Weight(0),
+            // THE SLOT IF THE STATEMENT CARRIES ONE, the named weight
+            // otherwise. Two spellings of this kernel are live: the
+            // semantic `OpKind::Rmsnorm` lowers to `[x, y]` and lets the
+            // weight reach the binder by name, while `dsl::cuda::rmsnorm`
+            // states it as an operand and gives `[x, y, w]`. A row
+            // demanding the slot declines every fire built the first way,
+            // which is what kept this arm hand-written.
+            weight: Buf <- Source::Or(&Source::Weight(0), &Source::WeightNamed),
             y: BufMut <- Source::Out(0),
-            num_rows: I32 <- Source::Rows,
-            hidden: I32 <- Source::InWidth(0),
+            // BOTH READINGS. `OpKind::RmsnormPerHead` lowers to this
+            // symbol too, and norms `rows * (width / head_dim)` rows of
+            // `head_dim` where the plain kind norms `rows` of `width`.
+            // A row that said `Rows`/`InWidth(0)` would norm gemma-4's
+            // q/k heads as one row each.
+            num_rows: I32 <- Source::IfPresent(&Source::PerHeadDim, &Source::Mul(&Source::Rows, &Source::Div(&Source::Width(&Source::In(0)), &Source::PerHeadDim)), &Source::Rows),
+            hidden: I32 <- Source::IfPresent(&Source::PerHeadDim, &Source::PerHeadDim, &Source::Width(&Source::In(0))),
             eps: F32 <- Source::Ctx("eps"),
             stream: Stream <- Source::Ctx("stream"),
         ]),
@@ -109,10 +126,22 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(rmsnorm_gemma "norm::rmsnorm_gemma_bf16",
         operands = operands![
             x: Buf <- Source::In(0),
-            weight: Buf <- Source::Weight(0),
+            // THE SLOT IF THE STATEMENT CARRIES ONE, the named weight
+            // otherwise. Two spellings of this kernel are live: the
+            // semantic `OpKind::Rmsnorm` lowers to `[x, y]` and lets the
+            // weight reach the binder by name, while `dsl::cuda::rmsnorm`
+            // states it as an operand and gives `[x, y, w]`. A row
+            // demanding the slot declines every fire built the first way,
+            // which is what kept this arm hand-written.
+            weight: Buf <- Source::Or(&Source::Weight(0), &Source::WeightNamed),
             y: BufMut <- Source::Out(0),
-            num_rows: I32 <- Source::Rows,
-            hidden: I32 <- Source::InWidth(0),
+            // BOTH READINGS. `OpKind::RmsnormPerHead` lowers to this
+            // symbol too, and norms `rows * (width / head_dim)` rows of
+            // `head_dim` where the plain kind norms `rows` of `width`.
+            // A row that said `Rows`/`InWidth(0)` would norm gemma-4's
+            // q/k heads as one row each.
+            num_rows: I32 <- Source::IfPresent(&Source::PerHeadDim, &Source::Mul(&Source::Rows, &Source::Div(&Source::Width(&Source::In(0)), &Source::PerHeadDim)), &Source::Rows),
+            hidden: I32 <- Source::IfPresent(&Source::PerHeadDim, &Source::PerHeadDim, &Source::Width(&Source::In(0))),
             eps: F32 <- Source::Ctx("eps"),
             stream: Stream <- Source::Ctx("stream"),
         ]),
@@ -152,7 +181,7 @@ pub static KERNELS: &[KernelSig] = &[
             input: Buf <- Source::In(0),
             output: BufMut <- Source::Out(0),
             n: I32 <- Source::Rows,
-            hc_mult: I32 <- Source::OutWidthOverIn(0, 0),
+            hc_mult: I32 <- Source::Div(&Source::Width(&Source::Out(0)), &Source::Width(&Source::In(0))),
             hidden_size: I32 <- Source::InWidth(0),
             stream: Stream <- Source::Ctx("stream"),
         ]),
@@ -205,7 +234,7 @@ pub static KERNELS: &[KernelSig] = &[
         operands = operands![
             q: BufMut <- Source::Out(0),
             n: I32 <- Source::Rows,
-            num_heads: I32 <- Source::OutWidthOver(0, "head_dim"),
+            num_heads: I32 <- Source::Div(&Source::Width(&Source::Out(0)), &Source::CtxNonZero("head_dim")),
             head_dim: I32 <- Source::Ctx("head_dim"),
             eps: F32 <- Source::Ctx("eps"),
             stream: Stream <- Source::Ctx("stream"),
@@ -244,7 +273,7 @@ pub static KERNELS: &[KernelSig] = &[
             // the hidden extent is the result's width over it.
             k: I32 <- Source::Ctx("altup_streams"),
             t: I32 <- Source::Rows,
-            h: I32 <- Source::InWidthOver(0, "altup_streams"),
+            h: I32 <- Source::Div(&Source::Width(&Source::In(0)), &Source::CtxNonZero("altup_streams")),
             stream: Stream <- Source::Ctx("stream"),
         ]),
     kernel!(altup_correct "norm::altup_correct_bf16",
@@ -261,11 +290,13 @@ pub static KERNELS: &[KernelSig] = &[
         ]),
     kernel!(altup_unpack_predict_coefs "norm::altup_unpack_predict_coefs",
         operands = operands![
-            in_bf16: Buf,
-            out_fp32: F32sMut,
-            t: I32,
-            k: I32,
-            stream: Stream,
+            in_bf16: Buf <- Source::In(0),
+            out_fp32: F32sMut <- Source::Out(0),
+            t: I32 <- Source::Rows,
+            // `K*K` packed in one row, so the launcher's `K` is the
+            // width's square root. See `Source::InWidthIsqrt`.
+            k: I32 <- Source::Isqrt(&Source::Width(&Source::In(0))),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     kernel!(altup_unpack_correct_coefs "norm::altup_unpack_correct_coefs",
         operands = operands![
@@ -322,8 +353,13 @@ pub static KERNELS: &[KernelSig] = &[
         operands = operands![
             x: Buf <- Source::In(0),
             y: BufMut <- Source::Out(0),
-            num_rows: I32 <- Source::Rows,
-            hidden: I32 <- Source::InWidth(0),
+            // BOTH READINGS. `OpKind::RmsnormPerHead` lowers to this
+            // symbol too, and norms `rows * (width / head_dim)` rows of
+            // `head_dim` where the plain kind norms `rows` of `width`.
+            // A row that said `Rows`/`InWidth(0)` would norm gemma-4's
+            // q/k heads as one row each.
+            num_rows: I32 <- Source::IfPresent(&Source::PerHeadDim, &Source::Mul(&Source::Rows, &Source::Div(&Source::Width(&Source::In(0)), &Source::PerHeadDim)), &Source::Rows),
+            hidden: I32 <- Source::IfPresent(&Source::PerHeadDim, &Source::PerHeadDim, &Source::Width(&Source::In(0))),
             eps: F32 <- Source::Ctx("eps"),
             stream: Stream <- Source::Ctx("stream"),
         ]),
@@ -335,16 +371,16 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(norm_residual_scale_norm "norm::rmsnorm_residual_add_scale_rmsnorm_bf16",
         in_place = &[(0, 1)],
         operands = operands![
-            x: Buf,
-            weight: Buf,
-            hidden: BufMut,
-            scale: F32,
-            next_weight: Buf,
-            norm_out: BufMut,
-            num_rows: I32,
-            hidden_size: I32,
-            eps: F32,
-            stream: Stream,
+            x: Buf <- Source::In(0),
+            weight: Buf <- Source::Weight(0),
+            hidden: BufMut <- Source::Out(0),
+            scale: F32 <- Source::LayerScale,
+            next_weight: Buf <- Source::Weight(1),
+            norm_out: BufMut <- Source::Out(1),
+            num_rows: I32 <- Source::Rows,
+            hidden_size: I32 <- Source::Width(&Source::In(0)),
+            eps: F32 <- Source::Ctx("eps"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     kernel!(norm_residual_add "norm::rmsnorm_residual_add_bf16", in_place = &[(0, 1)],
         operands = operands![
@@ -365,7 +401,10 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(scalar_mul "norm::scalar_mul_bf16", in_place = &[(0, 0)],
         operands = operands![
             x: BufMut <- Source::Out(0),
-            s: F32 <- Source::ParamF32(0),
+            // A NUMBER when the statement carries one, a NAME otherwise.
+            // The first form is the one a reader can check against the
+            // text; the second is what it replaces.
+            s: F32 <- Source::Or(&Source::ParamF32(0), &Source::NamedScale),
             n: Usize <- Source::OutElements(0),
             stream: Stream <- Source::Ctx("stream"),
         ]),
@@ -405,7 +444,7 @@ pub static KERNELS: &[KernelSig] = &[
             // wall. This asks the BINDER how many head-dims fit in a row
             // whose width it already holds, which is what the hand arm
             // computed.
-            num_heads: I32 <- Source::OutWidthOver(0, "head_dim"),
+            num_heads: I32 <- Source::Div(&Source::Width(&Source::Out(0)), &Source::CtxNonZero("head_dim")),
             head_dim: I32 <- Source::Ctx("head_dim"),
             stream: Stream <- Source::Ctx("stream"),
         ]),

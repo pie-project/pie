@@ -75,8 +75,8 @@ use objc2_metal::{
     MTLMathFloatingPointFunctions, MTLMathMode,
 };
 
-use crate::gpu::device::archive::{Archives, MAX_AGE};
-use crate::gpu::device::context::{Context, describe};
+use crate::device::archive::{Archives, MAX_AGE};
+use crate::device::context::{Context, describe};
 use crate::error::{Error, Result};
 use crate::layout::shader::{Batch, Request};
 

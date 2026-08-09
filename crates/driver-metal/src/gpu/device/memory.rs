@@ -43,7 +43,7 @@ use std::ffi::c_int;
 use libc::{integer_t, mach_msg_type_number_t, mach_port_t, vm_size_t, vm_statistics64};
 use objc2_metal::MTLDevice;
 
-use crate::gpu::device::context::Context;
+use crate::device::context::Context;
 
 // `libc` marks `mach_host_self` deprecated in favour of a crate this
 // workspace does not use, and does not publish `mach_port_deallocate` or

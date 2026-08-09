@@ -99,7 +99,7 @@
 // tested without naming a CUDA runtime they would never load.
 //
 // A dependent that forgets to pick one is still caught, and in a better
-// place — `gpu::serve` is gated, so `driver_cuda::gpu::serve::pie_cuda_create`
+// place — `gpu::serve` is gated, so `driver_cuda::serve::pie_cuda_create`
 // is an unresolved path IN THE CONSUMER, at compile time, naming the
 // symbol it wanted.
 //
@@ -147,19 +147,64 @@ pub mod tensor;
 /// are and `kv_cache` allocates them, and only the second needs a card.
 pub mod layout;
 
-/// THE ONE `#[cfg]`.
+// ── THE ONE `#[cfg]`, and it is this block ────────────────────────────
+//
+// Everything that names a CUDA symbol is declared here and nothing else
+// is. The gate used to run per-file through `store/`, `model/` and
+// `tensor.rs`, and a per-file gate is discipline rather than structure:
+// it holds until someone adds a file, and the cost of it slipping was
+// measured — `memory_planner`, `mla_geometry` and `dsv4_geometry` sat
+// parity-tested with zero callers for months, because the only builds
+// that could have noticed were builds that needed a GPU.
+//
+// A `gpu/` DIRECTORY held this for one era and has been removed. It was
+// a level of nesting that named the same fact twice: `crate::gpu::fire`
+// and `crate::fire` say the same thing, and the second says it without
+// asking a reader to carry a word that means "the part that needs a
+// card" through every path in the crate. What made the gate one thing
+// was never the directory — it is that the declarations are in ONE
+// place, which is here, and a module that forgets its `#[cfg]` fails to
+// build without a card rather than sitting unreachable.
+//
+// Gated on `_cuda` rather than on a version, so a build with no feature
+// selected compiles the portable half instead of reporting an error
+// about a runtime it was not asked to pick.
+//
+// The layers, innermost first.
+
+/// The ONLY place vendor words are correct: stream, event, heap,
+/// allocator, graph. Read alongside CUDA's own documentation.
 ///
-/// Everything that names a CUDA symbol lives under here, and nothing
-/// above here does. That is the whole point of the directory: the gate
-/// used to run per-file through `store/`, `model/` and `tensor.rs`, and
-/// a per-file gate is discipline rather than structure — it holds until
-/// someone adds a file.
-///
-/// Gated on `_cuda` rather than on a version, so a build with no feature
-/// selected compiles the portable half instead of reporting an error
-/// about a runtime it was not asked to pick.
+/// Above it the crate uses one word per concept, because that is where a
+/// reader crosses between this shell and the Metal one.
 #[cfg(feature = "_cuda")]
-pub mod gpu;
+pub mod device;
+
+/// What [`layout`] planned, allocated: KV, recurrent, swap.
+#[cfg(feature = "_cuda")]
+pub mod pools;
+
+/// The checkpoint onto the device. The PLAN half of that is [`layout`]'s.
+#[cfg(all(feature = "_cuda", feature = "abi"))]
+pub mod weights;
+
+/// A lowered launch onto a kernel entry, its arguments and its grid.
+/// Mostly generated from the kernel table.
+#[cfg(feature = "_cuda")]
+pub mod bind;
+
+/// One forward pass: its scratch, its tables, its recordings, its
+/// retirement.
+#[cfg(feature = "_cuda")]
+pub mod fire;
+
+/// User programs: compile, cache, channel, run.
+#[cfg(feature = "_cuda")]
+pub mod program;
+
+/// The door. create / load / launch / transfer / close.
+#[cfg(all(feature = "_cuda", feature = "abi"))]
+pub mod serve;
 
 // `facts.rs`, `config.rs` and `descriptor.rs` are GONE — 1,782 lines
 // into `crates/model` as `deployment_cuda`, `descriptor` and a deleted

@@ -37,13 +37,9 @@ use model_loader::plan::spans::{Span, publish_spans};
 use crate::layout::region::Region as _;
 use crate::{Error, Result};
 
-use crate::gpu::device::context::Context;
-use crate::gpu::device::handle::Handle;
-use crate::gpu::device::allocation::Allocation;
-
-
-
-
+use crate::device::context::Context;
+use crate::device::handle::Handle;
+use crate::device::allocation::Allocation;
 
 /// Whether a model of `bytes` may be staged on this device, and why not.
 ///
@@ -73,7 +69,7 @@ use crate::gpu::device::allocation::Allocation;
 /// Never on a machine that would not answer: `headroom` is TRUE when neither
 /// ceiling could be read, because refusing on silence turns a diagnostic
 /// into an outage.
-fn fits_on_this_gpu(memory: &crate::gpu::device::memory::Memory, bytes: u64) -> Result<()> {
+fn fits_on_this_gpu(memory: &crate::device::memory::Memory, bytes: u64) -> Result<()> {
     if memory.headroom(bytes) {
         return Ok(());
     }
@@ -129,7 +125,7 @@ pub fn stage_plan_weights(
     // in the loader: one answer, or two that differ.
     let published = publish_spans(plan);
     let arena_len = plan.memory.persistent_bytes;
-    fits_on_this_gpu(&crate::gpu::device::memory::Memory::probe(context), arena_len)?;
+    fits_on_this_gpu(&crate::device::memory::Memory::probe(context), arena_len)?;
 
     // The tensors that are NOT in the arena, collected as they finalize. A
     // sink rather than a second pass: the executor publishes each exactly
@@ -202,7 +198,7 @@ pub fn stage_plan_weights(
 #[cfg(test)]
 mod tests {
     use super::fits_on_this_gpu;
-    use crate::gpu::device::memory::Memory;
+    use crate::device::memory::Memory;
 
     /// The guard the port dropped, restored and held to a number.
     ///

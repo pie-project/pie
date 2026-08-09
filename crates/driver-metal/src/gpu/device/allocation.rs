@@ -39,11 +39,11 @@
 //! tables per step and dropped them at the end of the loop iteration, while
 //! the fire itself was not waited for until after the loop. Under the leak
 //! that was invisible and permanent; the fix is that the tables travel with
-//! the fire, which is what [`InFlight`](crate::gpu::fire::run::InFlight)
+//! the fire, which is what [`InFlight`](crate::fire::run::InFlight)
 //! already did for the argument table and the scalars.
 //!
 //! [`Deref`](std::ops::Deref) to `Handle` is deliberate and follows
-//! [`Lease`](crate::gpu::fire::scratch::Lease), which is the same shape one
+//! [`Lease`](crate::fire::scratch::Lease), which is the same shape one
 //! layer up: a thing that owns a region and should read like the region.
 
 use objc2::rc::Retained;
@@ -51,9 +51,9 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLDevice, MTLResidencySet, MTLResourceOptions};
 
 use crate::error::{Error, Result};
-use crate::gpu::device::context::Context;
-use crate::gpu::device::external::{add, remove};
-use crate::gpu::device::handle::Handle;
+use crate::device::context::Context;
+use crate::device::external::{add, remove};
+use crate::device::handle::Handle;
 use crate::layout::region::Region;
 
 /// One shared-storage buffer, resident for exactly as long as this value.
@@ -145,7 +145,7 @@ impl std::fmt::Debug for Allocation {
 // observation.
 mod tests {
     use super::Allocation;
-    use crate::gpu::Context;
+    use crate::Context;
     use objc2_metal::MTLResidencySet;
 
     /// The leak, closed, measured against the device rather than a counter.

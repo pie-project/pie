@@ -17,12 +17,12 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::fmt::Write as _;
 
-use driver_cuda::gpu::fire::attn_score::{
+use driver_cuda::fire::attn_score::{
     AttentionObservation, AttentionScores, LayerPrefillScoreCapture, LayerScoreCapture,
     ScoreHookView, ScoreOps, ScoreScratch, default_attn_score_window_from,
     prepare_decode_score_capture,
 };
-use driver_cuda::gpu::fire::sideband_arena::{DeviceMemory, SidebandArena};
+use driver_cuda::fire::sideband_arena::{DeviceMemory, SidebandArena};
 
 /// FNV-1a 64 of the C++ oracle's transcript.
 const GOLDEN_FNV1A64: u64 = 0x132d0dce71b9a15c;

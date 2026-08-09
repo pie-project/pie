@@ -43,9 +43,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::gpu::device::context::Context;
-use crate::gpu::device::handle::Handle;
-use crate::gpu::device::allocation::Allocation;
+use crate::device::context::Context;
+use crate::device::handle::Handle;
+use crate::device::allocation::Allocation;
 use crate::error::Result;
 
 /// The pool's own state, shared by every outstanding [`Lease`].
@@ -179,7 +179,7 @@ impl std::fmt::Debug for Lease {
 #[cfg(test)]
 mod tests {
     use super::Scratch;
-    use crate::gpu::{Allocation, Context};
+    use crate::{Allocation, Context};
     use objc2_metal::MTLResidencySet;
 
     /// What a pool buys once the leak is closed: **the address**.

@@ -23,7 +23,7 @@
 //! one allocates nothing. [`handle`] is the checked view of a buffer
 //! sub-range that the launch path stores and binds. [`recording`] is one
 //! recorded unit; the cache that keeps them is fire state and lives in
-//! [`crate::gpu::fire::recordings`].
+//! [`crate::fire::recordings`].
 
 pub mod allocation;
 pub mod allocator;

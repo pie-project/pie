@@ -15,7 +15,7 @@
 use std::fmt::Write as _;
 
 use driver_cuda::dtype::DType;
-use driver_cuda::gpu::pools::kv_cache::{self, KvCacheLayout, LayerSlot, PerLayer};
+use driver_cuda::pools::kv_cache::{self, KvCacheLayout, LayerSlot, PerLayer};
 use driver_cuda::layout::kv_geometry::{self, LayerShapes};
 use driver_cuda::layout::{KvCacheFormat, KvCacheScaleLayout, KvCacheScheme};
 use driver_cuda::tensor::TensorSpec;

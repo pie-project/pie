@@ -1,6 +1,6 @@
 //! Recordings, kept by what they are valid for.
 //!
-//! The recorded unit itself is [`crate::gpu::device::recording`] — an ICB and
+//! The recorded unit itself is [`crate::device::recording`] — an ICB and
 //! the count of commands in it, which is device vocabulary. What lives here
 //! is the CACHE: the map from a fire's shape key to the recording that serves
 //! it, which is fire state and has the same field structure as
@@ -8,11 +8,11 @@
 //! §5 names them one concept under two names and asks for this one.
 
 use crate::error::Result;
-use crate::gpu::device::context::Context;
-use crate::gpu::device::recording::{Recording, record};
-use crate::gpu::device::regions::Regions;
+use crate::device::context::Context;
+use crate::device::recording::{Recording, record};
+use crate::device::regions::Regions;
 use crate::lowering::dispatch::Dispatch;
-use crate::gpu::bind::encode::{Params, Pipelines, commands};
+use crate::bind::encode::{Params, Pipelines, commands};
 
 /// Recordings, kept by what they are valid for.
 ///

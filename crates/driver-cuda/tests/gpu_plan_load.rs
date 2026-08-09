@@ -8,8 +8,8 @@
 
 use std::path::PathBuf;
 
-use driver_cuda::gpu::weights::plan::{compile_load_plan, cuda_storage_target};
-use driver_cuda::gpu::weights::stage::stage_plan_weights;
+use driver_cuda::weights::plan::{compile_load_plan, cuda_storage_target};
+use driver_cuda::weights::stage::stage_plan_weights;
 
 /// A cached HF snapshot, or `None` to skip.
 fn snapshot(repo: &str) -> Option<PathBuf> {
@@ -57,7 +57,7 @@ fn a_checkpoint_stages_into_device_memory_through_its_plan() {
         "the plan carries no fused qkv; the driver would have to build them"
     );
 
-    let alloc = driver_cuda::gpu::device::Allocator::new();
+    let alloc = driver_cuda::device::Allocator::new();
     let staged = stage_plan_weights(&plan, &snap, &alloc).expect("the plan executes");
 
     assert!(

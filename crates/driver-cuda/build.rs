@@ -6,7 +6,7 @@
 //! generated from the kernel table at build time and never committed:
 //!
 //! * `launch_bindings.rs` — `emit_rust_bindings` over every family table,
-//!   included by `gpu::bind::abi::ffi`. These are DECLARATIONS, which is why
+//!   included by `bind::abi::ffi`. These are DECLARATIONS, which is why
 //!   they live with their caller: they are spelled in this crate's own
 //!   `#[repr(C)]` mirrors (`WeightView`, `DType`, the workspace views), and
 //!   any number of crates may declare one symbol.
@@ -101,7 +101,7 @@ mod bridge {
         // that build is `cpp(true)` and this needs nvcc. It goes in
         // `driver-cuda` rather than `kernels-cuda` because its argument
         // is a conditional handle — a shell object — not a tensor; see
-        // `src/gpu/device/graph.rs`'s header for the same argument.
+        // `src/device/graph.rs`'s header for the same argument.
         let supergraph = Path::new(env!("CARGO_MANIFEST_DIR")).join("csrc/supergraph.cu");
         println!("cargo:rerun-if-changed=csrc/supergraph.cu");
         cc::Build::new()

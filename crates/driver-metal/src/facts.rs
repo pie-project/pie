@@ -172,8 +172,6 @@ pub struct ModelFacts {
     /// default. Nothing fails: the rotated channels just come out wrong, and
     /// the error compounds layer over layer until the activations saturate.
     pub rope_theta: f32,
-    /// The fraction of each head's channels that rotate.
-    pub partial_rotary_factor: f32,
 
     /// GPT-OSS layer count. Non-zero marks "this config was read as gpt-oss".
     pub go_num_hidden_layers: i32,
@@ -187,28 +185,16 @@ pub struct ModelFacts {
     pub go_num_key_value_heads: i32,
     /// GPT-OSS per-head dimension.
     pub go_head_dim: i32,
-    /// GPT-OSS sliding window.
-    pub go_sliding_window: i32,
     /// GPT-OSS routed expert count.
     pub go_num_local_experts: i32,
     /// GPT-OSS experts per token.
     pub go_num_experts_per_tok: i32,
     /// GPT-OSS FFN width.
     pub go_intermediate_size: i32,
-    /// GPT-OSS YaRN original context.
-    pub go_rope_original_max_position: i32,
     /// GPT-OSS RMSNorm epsilon.
     pub go_rms_norm_eps: f32,
     /// GPT-OSS SwiGLU clamp.
     pub go_swiglu_limit: f32,
-    /// GPT-OSS rope base.
-    pub go_rope_theta: f32,
-    /// GPT-OSS YaRN scale factor.
-    pub go_rope_factor: f32,
-    /// GPT-OSS YaRN fast beta.
-    pub go_rope_beta_fast: f32,
-    /// GPT-OSS YaRN slow beta.
-    pub go_rope_beta_slow: f32,
 
     /// Gemma 4 layer count. Non-zero marks "this config was read as gemma4".
     pub g4_num_hidden_layers: i32,
@@ -234,18 +220,28 @@ pub struct ModelFacts {
     /// -1 for an irregular pattern the geometry refuses rather than
     /// approximates.
     pub g4_full_attn_interval: i32,
-    /// Gemma 4's double-wide MLP variant.
-    pub g4_double_wide_mlp: bool,
     /// Gemma 4 final logit softcap.
     pub g4_final_softcap: f32,
     /// Gemma 4 rope base on the full-attention layers.
+    ///
+    /// Zero until `gemma_per_layer_rope_theta` states one, which is what
+    /// makes it answerable: it was 1e6, and a gemma-4 config carrying a flat
+    /// `rope_theta` and no per-layer array had its stated base DISCARDED for
+    /// that constant, because the geometry chose the base by asking whether
+    /// the gemma4 block had been read rather than whether a per-layer base
+    /// had been stated. A wrong base does not fail, it rotates by a factor
+    /// that grows with position, so a short prompt agrees and a long one
+    /// does not.
     pub g4_rope_theta_full: f32,
     /// Gemma 4 rope base on the sliding layers.
+    ///
+    /// Zero for a stack that states one base everywhere, which is what
+    /// `rope_theta_at` already reads zero as. Same correction as
+    /// [`Self::g4_rope_theta_full`]: the old 1e4 was a value no config had
+    /// asked for.
     pub g4_rope_theta_sliding: f32,
     /// Gemma 4 partial rotary factor on the full-attention layers.
     pub g4_full_partial_rotary: f32,
-    /// Whether this is the mixture release (gemma-4-26B-A4B).
-    pub g4_enable_moe: bool,
     /// Gemma 4 routed expert count.
     pub g4_num_experts: i32,
     /// Gemma 4 experts per token.
@@ -282,8 +278,6 @@ pub struct ModelFacts {
     pub ll_moe_intermediate_size: i32,
     /// Llama-family RMSNorm epsilon.
     pub ll_rms_norm_eps: f32,
-    /// Llama-family rope base.
-    pub ll_rope_theta: f32,
     /// Llama-family rope scale (`factor`), shared by the linear and llama3
     /// schedules.
     pub ll_rope_scale: f32,
@@ -299,8 +293,6 @@ pub struct ModelFacts {
     pub ll_rope_high_freq_factor: f32,
     /// Llama 3.1's original context length.
     pub ll_rope_original_max_position: i32,
-    /// Whether q and k are normalized before the rotation.
-    pub ll_qk_norm: bool,
     /// Whether the unembedding reuses the embedding matrix.
     pub ll_tied_embeddings: bool,
     /// Whether router probabilities are renormalized over the top-k.
@@ -375,7 +367,6 @@ impl Default for ModelFacts {
             arch_name: "llama".to_string(),
             has_linear_attn: false,
             rope_theta: 1.0e7,
-            partial_rotary_factor: 0.25,
 
             go_num_hidden_layers: 0,
             go_hidden_size: 0,
@@ -383,17 +374,11 @@ impl Default for ModelFacts {
             go_num_attention_heads: 0,
             go_num_key_value_heads: 0,
             go_head_dim: 0,
-            go_sliding_window: 0,
             go_num_local_experts: 0,
             go_num_experts_per_tok: 0,
             go_intermediate_size: 0,
-            go_rope_original_max_position: 4096,
             go_rms_norm_eps: 1e-5,
             go_swiglu_limit: 7.0,
-            go_rope_theta: 150_000.0,
-            go_rope_factor: 32.0,
-            go_rope_beta_fast: 32.0,
-            go_rope_beta_slow: 1.0,
 
             g4_num_hidden_layers: 0,
             g4_hidden_size: 0,
@@ -406,12 +391,10 @@ impl Default for ModelFacts {
             g4_num_kv_shared_layers: 0,
             g4_per_layer_emb_dim: 0,
             g4_full_attn_interval: 0,
-            g4_double_wide_mlp: false,
             g4_final_softcap: 0.0,
-            g4_rope_theta_full: 1.0e6,
-            g4_rope_theta_sliding: 1.0e4,
+            g4_rope_theta_full: 0.0,
+            g4_rope_theta_sliding: 0.0,
             g4_full_partial_rotary: 0.25,
-            g4_enable_moe: false,
             g4_num_experts: 0,
             g4_experts_per_token: 0,
             g4_moe_intermediate: 0,
@@ -429,13 +412,11 @@ impl Default for ModelFacts {
             ll_num_experts_per_tok: 0,
             ll_moe_intermediate_size: 0,
             ll_rms_norm_eps: 1e-5,
-            ll_rope_theta: 500_000.0,
             ll_rope_scale: 1.0,
             ll_rope_scaling_kind: String::new(),
             ll_rope_low_freq_factor: 1.0,
             ll_rope_high_freq_factor: 4.0,
             ll_rope_original_max_position: 8192,
-            ll_qk_norm: false,
             ll_tied_embeddings: true,
             ll_norm_topk_prob: true,
 
@@ -495,11 +476,6 @@ impl ModelFacts {
         u32_of(&j, "vocab_size", &mut facts.vocab_size);
         u32_of(&j, "max_position_embeddings", &mut facts.max_model_len);
         f32_of(&j, "rope_theta", &mut facts.rope_theta);
-        f32_of(
-            &j,
-            "partial_rotary_factor",
-            &mut facts.partial_rotary_factor,
-        );
         // The affine width and group. Leaving them zero is not a smaller set
         // of facts, it is a *wrong* one: every geometry defaults to `{4, 64}`
         // and only overrides when these are non-zero, so an 8-bit checkpoint
@@ -535,7 +511,6 @@ impl ModelFacts {
             i32_of(&j, "num_attention_heads", &mut facts.go_num_attention_heads);
             i32_of(&j, "num_key_value_heads", &mut facts.go_num_key_value_heads);
             i32_of(&j, "head_dim", &mut facts.go_head_dim);
-            i32_of(&j, "sliding_window", &mut facts.go_sliding_window);
             // The descriptor folds `num_local_experts` / `num_experts` /
             // `n_routed_experts` into one field at import.
             i32_of(&j, "num_experts", &mut facts.go_num_local_experts);
@@ -543,16 +518,6 @@ impl ModelFacts {
             i32_of(&j, "intermediate_size", &mut facts.go_intermediate_size);
             f32_of(&j, "rms_norm_eps", &mut facts.go_rms_norm_eps);
             f32_of(&j, "swiglu_limit", &mut facts.go_swiglu_limit);
-            f32_of(&j, "rope_theta", &mut facts.go_rope_theta);
-            // YaRN's four, already resolved out of `rope_scaling`.
-            f32_of(&j, "rope_factor", &mut facts.go_rope_factor);
-            f32_of(&j, "rope_beta_fast", &mut facts.go_rope_beta_fast);
-            f32_of(&j, "rope_beta_slow", &mut facts.go_rope_beta_slow);
-            i32_of(
-                &j,
-                "rope_original_max_position",
-                &mut facts.go_rope_original_max_position,
-            );
         }
 
         // Read only when `model_type` names one of the llama-shaped families,
@@ -577,16 +542,8 @@ impl ModelFacts {
                 &mut facts.ll_moe_intermediate_size,
             );
             f32_of(&j, "rms_norm_eps", &mut facts.ll_rms_norm_eps);
-            f32_of(&j, "rope_theta", &mut facts.ll_rope_theta);
             facts.ll_norm_topk_prob = bool_or(&j, "norm_topk_prob", facts.ll_norm_topk_prob);
             facts.ll_tied_embeddings = bool_or(&j, "tie_word_embeddings", facts.ll_tied_embeddings);
-            // `use_qk_norm` is explicit in the descriptor, but import only
-            // infers it for `qwen3` -- not for `qwen3_moe`, which normalizes q
-            // and k just the same. OR in the `model_type` so the two paths
-            // cannot disagree about a checkpoint's numerics.
-            facts.ll_qk_norm = bool_or(&j, "use_qk_norm", false)
-                || facts.model_type == "qwen3"
-                || facts.model_type == "qwen3_moe";
             // Import resolves `rope_scaling` into a kind plus already-
             // defaulted knobs; the driver keys on HF's spelling, so translate
             // back. `none` stays empty, which is the plain geometric series
@@ -727,8 +684,6 @@ impl ModelFacts {
                 "gemma_hidden_size_per_layer_input",
                 &mut facts.g4_per_layer_emb_dim,
             );
-            facts.g4_double_wide_mlp = bool_or(&j, "gemma4_double_wide_mlp", false);
-            facts.g4_enable_moe = bool_or(&j, "gemma4_enable_moe", false);
             facts.g4_attention_k_eq_v = bool_or(&j, "gemma4_attention_k_eq_v", false);
             i32_of(&j, "num_experts", &mut facts.g4_num_experts);
             i32_of(&j, "num_experts_per_tok", &mut facts.g4_experts_per_token);
@@ -927,9 +882,12 @@ mod tests {
         assert_eq!(facts.max_model_len, 8192);
         assert_eq!(facts.arch_name, "llama");
         assert!((facts.rope_theta - 1.0e7).abs() < f32::EPSILON);
-        assert!((facts.partial_rotary_factor - 0.25).abs() < f32::EPSILON);
-        assert!((facts.ll_rope_theta - 500_000.0).abs() < f32::EPSILON);
-        assert!((facts.go_rope_theta - 150_000.0).abs() < f32::EPSILON);
+        // One base, so one default. There were three — 1e7 here, 500000 on
+        // the llama block and 150000 on the gpt-oss one, all three read from
+        // the same `rope_theta` key and told apart by a family name at the
+        // point of use. Which one a descriptor got was decided by its
+        // `model_type` and mattered only when the key was absent, which is a
+        // case the descriptor contract says cannot arise.
         assert!(facts.ll_tied_embeddings);
         assert_eq!(facts.q35_decoder_sparse_step, 1);
         assert!((facts.q35_rms_norm_eps - 1e-6).abs() < f32::EPSILON);
@@ -1010,25 +968,33 @@ mod tests {
         doc["rope_theta"] = json!(1_000_000.0);
         let facts = ModelFacts::from_descriptor(&doc.to_string()).unwrap();
         assert_eq!(facts.ll_num_hidden_layers, 32);
-        assert!((facts.ll_rope_theta - 1_000_000.0).abs() < f32::EPSILON);
         assert_eq!(facts.go_num_hidden_layers, 0);
-        // The gpt-oss rope default is untouched by a llama config.
-        assert!((facts.go_rope_theta - 150_000.0).abs() < f32::EPSILON);
+        // The base is read ONCE, family-free, so there is no longer a
+        // "the other family's theta" to check for contamination. The two
+        // assertions that were here — that a llama config leaves
+        // `go_rope_theta` at 150000 and fills `ll_rope_theta` with the stated
+        // value — were pinning the fact that the same key was read into three
+        // fields.
+        assert!((facts.rope_theta - 1_000_000.0).abs() < f32::EPSILON);
     }
 
-    #[test]
-    fn qk_norm_is_on_for_qwen3_moe_even_without_the_explicit_flag() {
-        let facts = ModelFacts::from_descriptor(&descriptor("qwen3_moe").to_string()).unwrap();
-        assert!(facts.ll_qk_norm);
-        let facts = ModelFacts::from_descriptor(&descriptor("qwen3").to_string()).unwrap();
-        assert!(facts.ll_qk_norm);
-        let facts = ModelFacts::from_descriptor(&descriptor("llama").to_string()).unwrap();
-        assert!(!facts.ll_qk_norm);
-        let mut doc = descriptor("llama");
-        doc["use_qk_norm"] = json!(true);
-        let facts = ModelFacts::from_descriptor(&doc.to_string()).unwrap();
-        assert!(facts.ll_qk_norm);
-    }
+    // `qk_norm_is_on_for_qwen3_moe_even_without_the_explicit_flag` was here.
+    //
+    // It asserted `ll_qk_norm` — that `use_qk_norm`, ORed with
+    // `model_type == "qwen3" || "qwen3_moe"`, came out true. The
+    // REQUIREMENT it encoded is real and still holds; the field it read
+    // was not, because nothing anywhere consumed `ll_qk_norm`.
+    //
+    // What decides qk-norm is `model::text`, and it asks the TENSORS:
+    // `has_tensor("layers.0.self_attn.q_norm.weight")`. That is strictly
+    // the better question — a checkpoint that ships the weight gets the
+    // norm whatever its `model_type` says, and the OR-in-the-family-name
+    // this test was written to pin exists precisely because the config
+    // key could not be trusted. `model/text.rs` covers both directions
+    // (`split.qk_norm == Off`, `fused.qk_norm == PerHead`).
+    //
+    // So this is a test of a dead parallel implementation of a rule that
+    // is met, better, elsewhere. Deleting it removes no coverage.
 
     #[test]
     fn the_rope_kind_is_translated_and_the_factor_is_read_whatever_it_is() {

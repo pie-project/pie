@@ -34,9 +34,9 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
-use crate::gpu::device::context::Context;
-use crate::gpu::device::encoder::ArgumentTable;
-use crate::gpu::device::heap::Slot;
+use crate::device::context::Context;
+use crate::device::encoder::ArgumentTable;
+use crate::device::heap::Slot;
 use crate::error::{Error, Result};
 
 /// The most buffer bindings one dispatch can have.
