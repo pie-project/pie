@@ -277,11 +277,6 @@ private:
         std::memcpy(&factor, &instr.transform_scale_factor_bits, sizeof(factor));
 
         if (instr.has_source) {
-            if (!pie_loader::compact_extent(source.stride)) {
-                throw std::runtime_error(
-                    "rust storage executor: non-compact Scale source is not "
-                    "implemented");
-            }
             DeviceTensor scratch =
                 DeviceTensor::allocate(
                     dtype_from_rust(source.dtype),
@@ -291,16 +286,21 @@ private:
                     "rust storage executor: Scale source byte size mismatch");
             }
 #if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
-            // Stream-0 H2D for the same reason `cast_tile_map` uses one: the
-            // kernel below launches on stream 0 and reads this scratch straight
-            // away, while the batched `queue()` path lands on a private copy
-            // stream with no flush in between.
-            copy_engine_.queue_on_stream(
-                source.file_id,
-                source.file_offset + source.stride.base_offset,
-                source.span_bytes,
-                scratch.data(),
-                /*stream=*/0);
+            if (pie_loader::compact_extent(source.stride)) {
+                // Stream-0 H2D for the same reason `cast_tile_map` uses one: the
+                // kernel below launches on stream 0 and reads this scratch straight
+                // away, while the batched `queue()` path lands on a private copy
+                // stream with no flush in between.
+                copy_engine_.queue_on_stream(
+                    source.file_id,
+                    source.file_offset + source.stride.base_offset,
+                    source.span_bytes,
+                    scratch.data(),
+                    /*stream=*/0);
+            } else {
+                copy_strided_extent_to_device(
+                    loader_, source, scratch.data(), scratch.nbytes());
+            }
 #else
             copy_engine_.queue(
                 source.file_id,
@@ -489,11 +489,6 @@ private:
                 DType::UINT8,
                 {want_bytes});
         }
-        if (!pie_loader::compact_extent(source.stride)) {
-            throw std::runtime_error(
-                "rust storage executor: non-compact Scale source is not "
-                "implemented");
-        }
         if (static_cast<std::int64_t>(source.span_bytes) != want_bytes) {
             throw std::runtime_error(
                 "rust storage executor: per-group Scale source is the wrong "
@@ -502,16 +497,21 @@ private:
         DeviceTensor scratch = DeviceTensor::allocate(
             DType::UINT8, {static_cast<std::int64_t>(source.span_bytes)});
 #if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
-        // Stream-0 H2D for the same reason the uniform path uses one: the
-        // kernel that reads this scratch launches on stream 0 straight away,
-        // while the batched `queue()` path lands on a private copy stream with
-        // no flush in between.
-        copy_engine_.queue_on_stream(
-            source.file_id,
-            source.file_offset + source.stride.base_offset,
-            source.span_bytes,
-            scratch.data(),
-            /*stream=*/0);
+        if (pie_loader::compact_extent(source.stride)) {
+            // Stream-0 H2D for the same reason the uniform path uses one: the
+            // kernel that reads this scratch launches on stream 0 straight away,
+            // while the batched `queue()` path lands on a private copy stream with
+            // no flush in between.
+            copy_engine_.queue_on_stream(
+                source.file_id,
+                source.file_offset + source.stride.base_offset,
+                source.span_bytes,
+                scratch.data(),
+                /*stream=*/0);
+        } else {
+            copy_strided_extent_to_device(
+                loader_, source, scratch.data(), scratch.nbytes());
+        }
 #else
         copy_engine_.queue(
             source.file_id,
