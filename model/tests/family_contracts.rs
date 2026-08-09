@@ -1435,7 +1435,7 @@ fn deepseek_v4_eager_cuda() {
 fn deepseek_v4_eager_imported_mxfp4_metadata_compiles() {
     let checkpoint = deepseek_v4_imported_checkpoint();
     let target = target(0, 4);
-    let contract = author(
+    let (contract, resolved) = author_with_policy(
         &facts("deepseek_v4", 1),
         &checkpoint,
         &target,
@@ -1444,9 +1444,36 @@ fn deepseek_v4_eager_imported_mxfp4_metadata_compiles() {
     .expect("authoring succeeds")
     .expect("deepseek_v4 has an author");
 
+    assert_eq!(resolved, Mxfp4MoePolicy::EagerBf16);
     assert_imported_block_scale_decodes(&contract);
-    compile_load_plan(&checkpoint, &contract, target)
+    let eager = [
+        "layers.0.ffn.experts.gate_up.weight",
+        "layers.0.ffn.experts.down.weight",
+    ];
+    for name in eager {
+        let tensor = contract
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == name)
+            .unwrap_or_else(|| panic!("eager expert stack '{name}' is published"));
+        assert_eq!(tensor.encoding, Encoding::Raw(DType::BF16), "{name}");
+    }
+    assert!(
+        contract
+            .tensors
+            .iter()
+            .all(|tensor| !tensor.name.starts_with("layers.0.ffn.experts.marlin.")),
+        "a non-native target must not publish native Marlin expert banks"
+    );
+
+    let plan = compile_load_plan(&checkpoint, &contract, target)
         .expect("the eager contract compiles against imported MXFP4 metadata");
+    for name in eager {
+        assert!(
+            plan.tensors.iter().any(|tensor| tensor.name == name),
+            "the eager expert stack '{name}' reaches the bindable plan"
+        );
+    }
 }
 
 #[test]
