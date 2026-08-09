@@ -217,7 +217,7 @@ impl RemoteSnapshot {
         let use_xet = match std::env::var("PIE_REMOTE_IMPORT_TRANSPORT") {
             Ok(value) if value == "xet" => true,
             Ok(value) if value == "http" => false,
-            Err(std::env::VarError::NotPresent) => false,
+            Err(std::env::VarError::NotPresent) => true,
             Ok(value) => {
                 bail!("PIE_REMOTE_IMPORT_TRANSPORT must be 'http' or 'xet', got {value:?}")
             }
