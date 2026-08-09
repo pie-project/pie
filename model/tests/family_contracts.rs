@@ -1206,6 +1206,23 @@ fn deepseek_v4_eager_cuda() {
 }
 
 #[test]
+fn deepseek_v4_eager_imported_mxfp4_metadata_compiles() {
+    let checkpoint = deepseek_v4_imported_checkpoint();
+    let target = target(0, 4);
+    let contract = author(
+        &facts("deepseek_v4", 1),
+        &checkpoint,
+        &target,
+        &Policy::default(),
+    )
+    .expect("authoring succeeds")
+    .expect("deepseek_v4 has an author");
+
+    compile_load_plan(&checkpoint, &contract, target)
+        .expect("the eager contract compiles against imported MXFP4 metadata");
+}
+
+#[test]
 fn deepseek_v4_streamed_cuda() {
     let policy = Policy {
         stream_routed_experts: true,
