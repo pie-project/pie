@@ -129,12 +129,14 @@ fn dsv4_shard_axis(name: &str) -> Result<Option<u8>, Error> {
 /// This pass publishes the exponent bytes and nothing more — a rename and a
 /// shard, which shards at any TP degree. The widening to fp32 is the
 /// `scaling(..., F32Factors)` request, answered by the executor once the
-/// tensor is materialised. Declared U8 rather than E8M0 because the
-/// expansion dispatches on the tensor's dtype and knows only UINT8 and BF16.
+/// tensor is materialised. Typed imports expose E8M0, which is renamed to U8
+/// because the expansion dispatches on UINT8 rather than E8M0.
 fn block_scales_to_fp32(b: &mut Builder<'_>) -> Result<(), Error> {
     const SUFFIX: &str = ".scale";
     for raw in b.tensors().to_vec() {
-        if !raw.name.ends_with(SUFFIX) || !is_raw(&raw.encoding, DType::U8) {
+        if !raw.name.ends_with(SUFFIX)
+            || (!is_raw(&raw.encoding, DType::U8) && !is_raw(&raw.encoding, DType::E8M0))
+        {
             continue;
         }
         let weight = format!("{}.weight", &raw.name[..raw.name.len() - SUFFIX.len()]);
@@ -146,7 +148,13 @@ fn block_scales_to_fp32(b: &mut Builder<'_>) -> Result<(), Error> {
         }
         let shape = raw.shape.clone();
         let axis = b.shard_axis(&raw.name)?;
-        let (expr, local) = b.shard(Expr::src(&raw.name), shape.clone(), axis);
+        let expr = Expr::src(&raw.name);
+        let expr = if is_raw(&raw.encoding, DType::E8M0) {
+            expr.transmute(TensorType::new(shape.clone(), Encoding::Raw(DType::U8)))
+        } else {
+            expr
+        };
+        let (expr, local) = b.shard(expr, shape.clone(), axis);
         let id = raw.id;
         let defined = b.define(
             b.output_name(&raw.name),

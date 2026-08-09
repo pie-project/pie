@@ -1161,6 +1161,16 @@ fn deepseek_v4_imported_checkpoint() -> CheckpointMetadata {
     let mut ck = Checkpoint::new();
     ck.push("embed_tokens.weight", &[128, hidden], bf16());
     let p = "layers.0.";
+    ck.push(
+        &format!("{p}attn.wq.weight"),
+        &[64, 64],
+        Encoding::Raw(DType::F8E4M3),
+    );
+    ck.push(
+        &format!("{p}attn.wq.scale"),
+        &[2, 2],
+        Encoding::Raw(DType::E8M0),
+    );
     for expert in 0..2 {
         let e = format!("{p}ffn.experts.{expert}.");
         for half in ["w1", "w3"] {
@@ -1190,6 +1200,19 @@ fn deepseek_v4_imported_checkpoint() -> CheckpointMetadata {
     ck.finish("deepseek_v4_imported")
 }
 
+fn assert_imported_block_scale_decodes(contract: &pie_loader::contract::ModelContract) {
+    let scale = contract
+        .tensors
+        .iter()
+        .find(|tensor| tensor.name == "layers.0.attn.wq.scale")
+        .expect("the imported block scale is published");
+    assert_eq!(scale.encoding, Encoding::Raw(DType::U8));
+    assert_eq!(
+        scale.scales.as_ref().map(|scales| scales.form),
+        Some(ScaleForm::F32Factors)
+    );
+}
+
 #[test]
 fn deepseek_v4_eager_cuda() {
     check(
@@ -1214,6 +1237,7 @@ fn deepseek_v4_eager_imported_mxfp4_metadata_compiles() {
     .expect("authoring succeeds")
     .expect("deepseek_v4 has an author");
 
+    assert_imported_block_scale_decodes(&contract);
     compile_load_plan(&checkpoint, &contract, target)
         .expect("the eager contract compiles against imported MXFP4 metadata");
 }
@@ -1245,6 +1269,7 @@ fn deepseek_v4_streamed_imported_mxfp4_metadata_compiles() {
         .expect("authoring succeeds")
         .expect("deepseek_v4 has an author");
 
+    assert_imported_block_scale_decodes(&contract);
     compile_load_plan(&checkpoint, &contract, target)
         .expect("the streamed contract compiles against imported MXFP4 metadata");
 }
