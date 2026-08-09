@@ -473,7 +473,10 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(logit_softcap "attn::logit_softcap_bf16",
         in_place = &[(0, 0)],
         operands = operands![
-            x: BufMut, cap: F32, n: Usize, stream: Stream,
+            x: BufMut <- Source::Out(0),
+            cap: F32 <- Source::CtxNonZero("final_logit_softcap"),
+            n: Usize <- Source::OutElements(0),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // Six statements in one launch; the only value that survives is q.
     kernel!(qkv_packed_post "attn::qkv_packed_qk_norm_rope_vnorm_write_kv_bf16",

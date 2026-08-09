@@ -80,10 +80,16 @@ impl NhLayerW {
 
 /// nemotron_h's CUDA text for one fire class.
 pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan {
+    // DECODE AND PREFILL, and the difference is one call. This family
+    // served Decode only and PANICKED on anything else — not refused,
+    // panicked, on the first prefill a serving deployment sends. The
+    // class-dependent sites in this text number exactly one, the
+    // attention op, which `dsl::cuda::attention_for` now holds.
     let family = format!(
         "nemotron_h.cuda.{}",
         match class {
             FireClass::Decode => "decode",
+            FireClass::Prefill => "prefill",
             other => panic!("nemotron_h states no {other:?} class yet"),
         }
     );
@@ -156,7 +162,7 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
                     let kv = dsl::Kv::at(t, l);
                     dsl::cuda::write_kv_to_pages(&k, &v, &kv);
                     dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
-                    let o = dsl::cuda::attention_flashinfer_decode(&q, &kv, window_left)
+                    let o = dsl::cuda::attention_for(class, &q, &kv, window_left)
                         .expect("a plain attention statement produces its value");
                     dsl::seam(o.trace(), &dsl::seam::ATTN_OUT, &[&o], Some(l));
                     y += matmul(&o, &w.o_proj);

@@ -3,7 +3,7 @@
 //! a backend call. Most fields are pointer/length views; temporary backing
 //! storage is allocated only where the wire layout requires packing.
 
-use ::driver::{
+use ::driver_api::{
     PIE_DRIVER_ABI_VERSION, PieBytes, PieChannelDesc, PieChannelValueDesc,
     PieChannelValueDescSlice, PieDirectArgmax, PieDirectArgmaxSlice, PieEmittedKernel,
     PieEmittedKernelSlice, PieEncodeDesc, PieInstanceDesc, PieKvCopyDesc, PieKvMoveCellSlice,
@@ -284,9 +284,9 @@ impl<'a> InstanceDescBorrow<'a> {
 fn step_desc<'a>(
     step: &'a StepSubmission,
     masks: &'a MaskWordsStorage,
-) -> ::driver::PieStepDesc {
+) -> ::driver_api::PieStepDesc {
     let plan = &step.plan;
-    ::driver::PieStepDesc {
+    ::driver_api::PieStepDesc {
         roster_rows: u32_slice(&step.roster_rows),
         sub_batch_indptr: u32_slice(&step.sub_batch_indptr),
         sub_batch_class: u32_slice(&step.sub_batch_class),
@@ -361,8 +361,8 @@ fn step_desc<'a>(
 /// the lifetime of the backend call.
 pub struct FrameDescBorrow<'a> {
     _masks: Vec<MaskWordsStorage>,
-    _steps: Vec<::driver::PieStepDesc>,
-    raw: ::driver::PieFrameDesc,
+    _steps: Vec<::driver_api::PieStepDesc>,
+    raw: ::driver_api::PieFrameDesc,
     _submission: &'a FrameSubmission,
 }
 impl<'a> FrameDescBorrow<'a> {
@@ -372,13 +372,13 @@ impl<'a> FrameDescBorrow<'a> {
             .iter()
             .map(|step| MaskWordsStorage::from_plan(&step.plan))
             .collect();
-        let steps: Vec<::driver::PieStepDesc> = submission
+        let steps: Vec<::driver_api::PieStepDesc> = submission
             .steps
             .iter()
             .zip(&masks)
             .map(|(step, masks)| step_desc(step, masks))
             .collect();
-        let raw = ::driver::PieFrameDesc {
+        let raw = ::driver_api::PieFrameDesc {
             abi_version: PIE_DRIVER_ABI_VERSION,
             reserved0: 0,
             instance_ids: u64_slice(&submission.instance_ids),
@@ -386,7 +386,7 @@ impl<'a> FrameDescBorrow<'a> {
             kv_translation_indptr: u32_slice(&submission.kv_translation_indptr),
             required_kv_pages: submission.required_kv_pages,
             reserved1: 0,
-            steps: ::driver::PieStepDescSlice {
+            steps: ::driver_api::PieStepDescSlice {
                 ptr: steps.as_ptr(),
                 len: steps.len(),
             },
@@ -398,18 +398,18 @@ impl<'a> FrameDescBorrow<'a> {
             _submission: submission,
         }
     }
-    pub fn as_raw(&self) -> &::driver::PieFrameDesc {
+    pub fn as_raw(&self) -> &::driver_api::PieFrameDesc {
         &self.raw
     }
 }
 
 pub struct EncodeDescBorrow<'a> {
     raw: PieEncodeDesc,
-    _plan: &'a mut ::driver::MediaEncodePlan,
+    _plan: &'a mut ::driver_api::MediaEncodePlan,
 }
 
 impl<'a> EncodeDescBorrow<'a> {
-    pub fn new(plan: &'a mut ::driver::MediaEncodePlan) -> Self {
+    pub fn new(plan: &'a mut ::driver_api::MediaEncodePlan) -> Self {
         let raw = PieEncodeDesc {
             abi_version: PIE_DRIVER_ABI_VERSION,
             reserved0: 0,

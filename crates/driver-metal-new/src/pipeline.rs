@@ -19,4 +19,31 @@
 //! rename would have made a move that changes no behaviour look like one that
 //! does.
 
-pub use driver_pipeline::*;
+// `driver`, not `driver_api`. The move landed as `crates/driver-pipeline` and
+// then consolidated into `driver`; this file kept pointing at the crate the
+// first draft named, so every one of the twenty-odd `pipeline::` imports in
+// `src/metal/` failed to resolve and the LIBRARY did not build.
+pub use driver::*;
+
+// The re-export points at the RIGHT crate, checked at compile time.
+//
+// `driver` and `driver-api` are one typo apart, and the tree has paid for it
+// once: when `driver-pipeline` became `driver`, this file was pointed at
+// `driver_api` instead, every `pipeline::` import under `src/metal/` stopped
+// resolving, and the Apple-only half of the build was broken while Linux CI
+// could not see it (`31938a2b6`, fixed in `a87693dff`).
+//
+// A glob re-export cannot fail loudly on its own — it succeeds and exports
+// the wrong names — so the check has to name something. `PassInputs` and
+// `Registry` are the channel plane's, they exist ONLY in `driver`, and the
+// engine seam reaches for both by this path.
+//
+// Re-pointing this at `driver_api` produces sixteen errors, and without this
+// assertion every one of them is an unresolved import somewhere else — the
+// symptom, twenty-odd files from the cause. This one fails ON the re-export,
+// which is the line to change.
+const _: fn() = || {
+    fn from_the_pipeline_crate<T>(_: Option<&T>) {}
+    from_the_pipeline_crate::<self::PassInputs<'static>>(None);
+    from_the_pipeline_crate::<self::Registry>(None);
+};

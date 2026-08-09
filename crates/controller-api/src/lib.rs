@@ -26,7 +26,7 @@ pub use ids::{GatewayId, NodeId, WorkerId};
 
 // `DriverCapabilities` is owned by `driver` (`capabilities.rs`);
 // `WorkerInfo.capability` carries it.
-use driver::capabilities::DriverCapabilities;
+use driver_api::capabilities::DriverCapabilities;
 
 // ──────────────────────────── role / health ───────────────────────────
 

@@ -457,6 +457,9 @@ fn rust_bind_expr(op: &kernels::Operand) -> Option<String> {
         Source::In(i) => format!("b.args[{i}].ptr"),
         Source::Out(i) => format!("b.args[n_in + {i}].ptr"),
         Source::Weight(i) => format!("b.args[n_in + n_out + {i}].ptr"),
+        // Resolved ONCE before the match, so the guard below can test it
+        // and so a branch does not re-look-up a name per launch.
+        Source::WeightNamed => "w_named".to_string(),
         Source::Param(i) => format!("i32::try_from(spec.params[{i}]).unwrap_or(0)"),
         Source::ParamF32(i) => format!("f32::from_bits(spec.params[{i}])"),
         // Rows times a param — the MoE aligned path's route count, and
@@ -470,6 +473,21 @@ fn rust_bind_expr(op: &kernels::Operand) -> Option<String> {
         Source::InRows(i) => format!("rows_of(b, {i}, rows)"),
         Source::OutWidth(i) => format!("width_of(b, n_in + {i})"),
         Source::InWidth(i) => format!("width_of(b, {i})"),
+        // The `max(1)` is inside `width_over`, on the driver's side, for
+        // the reason `is_set` is: the row states which value's width to
+        // read and what to divide it by, and what a zero divisor means is
+        // the fire's business. The guard below refuses the branch outright
+        // when the field is unset, so the `max(1)` is belt to that braces.
+        Source::OutWidthOver(i, f) => format!("width_over(b, n_in + {i}, ctx.{f})"),
+        Source::InWidthOver(i, f) => format!("width_over(b, {i}, ctx.{f})"),
+        Source::OutWidthOverIn(o, i) => {
+            format!("width_over(b, n_in + {o}, width_of(b, {i}))")
+        }
+        // An ACCESSOR, not a field: the driver decides whether its
+        // per-layer vector falls back, filters or refuses, and the
+        // generator's claim is only that the statement's layer is the
+        // index.
+        Source::CtxByLayer(f) => format!("ctx.{f}(b.layers.start as usize)"),
         // An element COUNT is a `usize` here and the row decides how wide
         // the launcher wants it — some spell `std::size_t`, some `int`.
         // The C++ emitter can cast unconditionally because C++ narrows
@@ -521,6 +539,11 @@ fn rust_bind_expr(op: &kernels::Operand) -> Option<String> {
         | Source::SamplingIndices
         | Source::RequestCount => return None,
         Source::Ctx(f) | Source::CtxNonZero(f) => format!("ctx.{f}"),
+        // `g_of` is the driver's unwrap, and the guard below is what
+        // makes it total: a branch binding a GDN field is emitted with
+        // `gdn.is_some()` in its guard, so the only way here is through
+        // that test.
+        Source::Gdn(f) => format!("g_of(gdn).{f}"),
         // A NULL is returned fully typed and skips the cast step below:
         // that step turns a slot into the row's pointee, and a null has
         // no slot to turn. `null_mut().cast::<i32>()` leaves the original
@@ -557,6 +580,20 @@ fn rust_bind_expr(op: &kernels::Operand) -> Option<String> {
         kernels::Ty::F32sMut => format!("({e}).cast::<f32>()"),
         kernels::Ty::U16s => format!("({e}).cast_const().cast::<u16>()"),
         kernels::Ty::U16sMut => format!("({e}).cast::<u16>()"),
+        // An ARRAY OF DEVICE POINTERS: the bank of per-expert addresses
+        // the routed GEMVs index. The bind is the same as a scalar
+        // pointer's — the arg holds the bank's address — and only the
+        // pointee type differs, which is a cast the row already states.
+        // Spelled out rather than left to `_` because a `*mut c_void`
+        // reaching a `*const *const i32` parameter is a compile error,
+        // and the whole reason these casts are here is that the error is
+        // better than a stride bug.
+        kernels::Ty::BufArray => format!("({e}).cast_const().cast::<*const ::core::ffi::c_void>()"),
+        kernels::Ty::BufArrayMut => format!("({e}).cast_const().cast::<*mut ::core::ffi::c_void>()"),
+        kernels::Ty::BufArrayOut => format!("({e}).cast::<*const ::core::ffi::c_void>()"),
+        kernels::Ty::BufArrayOutMut => format!("({e}).cast::<*mut ::core::ffi::c_void>()"),
+        kernels::Ty::U8Array => format!("({e}).cast_const().cast::<*const u8>()"),
+        kernels::Ty::I32Array => format!("({e}).cast_const().cast::<*const i32>()"),
         _ => e,
     })
 }
@@ -588,25 +625,6 @@ pub fn emit_rust_dispatch(tables: &[&'static [KernelSig]]) -> String {
          match b.kernel {\n",
     );
     for k in stated(tables) {
-        // AN IN-PLACE ROW NEEDS ITS STAGING, and a generated branch has
-        // none.
-        //
-        // `in_place = &[(0, 0)]` says output 0 aliases input 0 — a fact
-        // about the KERNEL, which reads and writes one buffer. The
-        // lowering honours it where it can, and where it cannot (the
-        // input is live elsewhere) it assigns distinct buffers and the
-        // arm copies before launching. The generated branch binds
-        // `Out(0)` and calls, so the destination holds whatever was
-        // there.
-        //
-        // This is what the qwen3_5 A/B caught and gemma-4's did not:
-        // `norm::residual_add_bf16` is in every layer of both, and the
-        // difference was only whether that fire's buffer assignment
-        // happened to alias. A bug whose reproduction depends on an
-        // allocator is exactly the kind to refuse rather than to test.
-        if !k.in_place.is_empty() {
-            continue;
-        }
         let binds: Option<Vec<String>> =
             k.operands.iter().map(rust_bind_expr).collect();
         let Some(binds) = binds else { continue };
@@ -622,17 +640,64 @@ pub fn emit_rust_dispatch(tables: &[&'static [KernelSig]]) -> String {
                 Source::In(i)
                 | Source::InRows(i)
                 | Source::InElements(i)
+                | Source::InWidthOver(i, _)
                 | Source::InWidth(i) => need_in = need_in.max(i + 1),
                 Source::Out(i)
                 | Source::OutRows(i)
                 | Source::OutWidth(i)
+                | Source::OutWidthOver(i, _)
                 | Source::OutElements(i) => need_out = need_out.max(i + 1),
+                Source::OutWidthOverIn(o, i) => {
+                    need_out = need_out.max(o + 1);
+                    need_in = need_in.max(i + 1);
+                }
                 Source::Weight(i) => need_w = need_w.max(i + 1),
                 Source::Param(i) | Source::ParamF32(i) | Source::RoutesOfParam(i) => {
                     need_ps = need_ps.max(i + 1);
                 }
                 _ => {}
             }
+        }
+        // AN IN-PLACE ROW IS STAGED, and the staging is the row's too.
+        //
+        // `in_place = &[(0, 0)]` says result 0 aliases operand 0 — a fact
+        // about the KERNEL, which reads and writes one buffer. The
+        // lowering honours it where it can, and where it cannot (the
+        // operand is live elsewhere) it assigns distinct buffers and
+        // SOMETHING has to copy before the launch. That something used to
+        // be a hand-written arm, and the row was skipped here for exactly
+        // that reason.
+        //
+        // It is a convention, not a decision: `stage_d2d` is a no-op when
+        // the two already alias, so emitting it is right in both the
+        // honoured and the un-honoured case, and the driver owns what a
+        // copy costs. Which is what makes this generatable at all —
+        // nothing about WHICH buffers alias is knowable here, and nothing
+        // about it needs to be.
+        //
+        // THE PAIR IS ARITY-DEPENDENT, and the runtime test is `lower.rs`'s
+        // verbatim: *"a pair outside this statement's arity is not an
+        // error: one symbol serves a q-only site and a q/k pair, and the
+        // row states the widest form."* `mlp::chunked_swiglu_bf16` is that
+        // case — `swiglu_aligned` states the block-major staging buffer as
+        // its second operand and the activation must land on it, while
+        // plain `swiglu` states one operand and there is nothing to alias.
+        // So the indices are tested and not asserted, which is also why
+        // they must NOT raise the arity guard: a row that demanded its
+        // widest form would decline the narrow site outright.
+        //
+        // This is what the qwen3_5 A/B caught and gemma-4's did not:
+        // `norm::residual_add_bf16` is in every layer of both, and the
+        // difference was only whether that fire's buffer assignment
+        // happened to alias. A bug whose reproduction depends on an
+        // allocator is one to make structurally impossible, which is what
+        // staging every in-place row from the row does.
+        let mut stage = String::new();
+        for (out, inp) in k.in_place {
+            stage.push_str(&format!(
+                "    if n_in > {inp} && n_out > {out} {{\n        \
+                 stage_d2d(ctx, &b.rows, b.args[n_in + {out}], b.args[{inp}]);\n    }}\n"
+            ));
         }
         // THE RECTANGLE, and the guard that is no longer here.
         //
@@ -664,9 +729,38 @@ pub fn emit_rust_dispatch(tables: &[&'static [KernelSig]]) -> String {
         if need_ps > 0 {
             guard.push_str(&format!(" && spec.params.len() >= {need_ps}"));
         }
-        // A field a family zeroes to say "not mine".
+        // A NAME THE STORE LACKS IS DRIFT, not absence, and the right
+        // answer is the hand arm's `UnknownWeight` rather than a null
+        // bound into a kernel. So the branch declines and says nothing;
+        // the fallthrough is what reports.
+        if k.operands.iter().any(|o| o.source == Source::WeightNamed) {
+            guard.push_str(" && !w_named.is_null()");
+        }
+        // A FIRE WITH NO RECURRENT LAYERS CARRIES NO GDN CONTEXT, so a
+        // row reading one declines rather than reading a default. This
+        // is what makes `g_of`'s unwrap total.
+        if k.operands.iter().any(|o| matches!(o.source, Source::Gdn(_))) {
+            guard.push_str(" && gdn.is_some()");
+        }
+        // A field a family zeroes to say "not mine" — and a divisor,
+        // which is the same test for a different reason: a width divided
+        // by an unset field is not a smaller answer, it is a meaningless
+        // one, and the two arms this replaced refused explicitly on it.
+        //
+        // DEDUPED, because two operands may divide by the same field —
+        // `qk_rmsnorm_rope` reads a q head count and a kv head count off
+        // one `head_dim` — and `is_set(x) && is_set(x)` is a guard that
+        // makes a reader look for the difference.
+        let mut guarded: Vec<&str> = Vec::new();
         for o in k.operands {
-            if let Source::CtxNonZero(f) = o.source {
+            if let Source::CtxNonZero(f)
+            | Source::OutWidthOver(_, f)
+            | Source::InWidthOver(_, f) = o.source
+            {
+                if guarded.contains(&f) {
+                    continue;
+                }
+                guarded.push(f);
                 // `is_set` rather than `!= 0`: the emitter does not know
                 // the field's TYPE, and Rust will not compare an `f32` to
                 // an integer literal. The driver implements it for the
@@ -677,9 +771,10 @@ pub fn emit_rust_dispatch(tables: &[&'static [KernelSig]]) -> String {
         }
 
         out.push_str(&format!(
-            "\"{}\"{} => unsafe {{\n    {}(\n        {},\n    );\n    true\n}}\n",
+            "\"{}\"{} => {{\n{}    unsafe {{ {}(\n        {},\n    ) }};\n    true\n}}\n",
             k.symbol,
             guard,
+            stage,
             format!("crate::launch::ffi::{}", entry_name(k.symbol)),
             binds.join(",\n        "),
         ));

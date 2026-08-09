@@ -20,7 +20,7 @@ use crate::core::{
     Completion, Engine, EngineKind, PageSet, RegisteredHandle, TransferId, WorkerId,
 };
 use crate::error::{Result, TransportError};
-use driver::KvHandle;
+use driver_api::KvHandle;
 
 /// The device-copy primitive the local engine drives. A real implementation
 /// issues a same-node device-to-device copy; tests use a recording fake.

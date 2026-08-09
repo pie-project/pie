@@ -187,7 +187,26 @@ impl Names {
             ("q_norm", "self_attn.q_norm"),
             ("k_norm", "self_attn.k_norm"),
             ("attn_norm", "input_layernorm"),
-            ("mlp_norm", "post_attention_layernorm"),
+            // TWO spellings, and which one a checkpoint means is decided by
+            // which one it ships. Under `NormPlacement::Pre` the pre-FFN norm
+            // IS `post_attention_layernorm` — it sits after the attention and
+            // before the MLP, and llama publishes nothing else. gemma splits
+            // that position in two (`post_attention_layernorm` norms the
+            // attention's OUTPUT, `pre_feedforward_layernorm` norms the MLP's
+            // input), so it must take the second.
+            //
+            // Ordered gemma-first because the alternative resolves to the
+            // first spelling the checkpoint HAS: a llama checkpoint ships no
+            // `pre_feedforward_layernorm` and falls through, and a gemma one
+            // would otherwise bind its attention-output norm as the MLP's
+            // input norm and drop two norms entirely.
+            (
+                "mlp_norm",
+                "pre_feedforward_layernorm|post_attention_layernorm",
+            ),
+            // The SANDWICH's output norms, which only a gemma text names.
+            ("post_attn_norm", "post_attention_layernorm"),
+            ("post_mlp_norm", "post_feedforward_layernorm"),
         ]
         .into_iter()
         .map(|(a, b): (&str, &str)| {

@@ -130,10 +130,16 @@ fn altup_coefs(x: &Val, norm: &NormW, router: &MatW, coefs: &MatW, scale: &str) 
 
 /// gemma3n's CUDA text for one fire class.
 pub fn gemma3n_cuda(facts: &Gemma3nFacts, class: FireClass) -> ForwardPlan {
+    // DECODE AND PREFILL, and the difference is one call. This family
+    // served Decode only and PANICKED on anything else — not refused,
+    // panicked, on the first prefill a serving deployment sends. The
+    // class-dependent sites in this text number exactly one, the
+    // attention op, which `dsl::cuda::attention_for` now holds.
     let family = format!(
         "gemma3n.cuda.{}",
         match class {
             FireClass::Decode => "decode",
+            FireClass::Prefill => "prefill",
             other => panic!("gemma3n states no {other:?} class yet"),
         }
     );
@@ -187,7 +193,7 @@ pub fn gemma3n_cuda(facts: &Gemma3nFacts, class: FireClass) -> ForwardPlan {
             let kv = dsl::Kv::at(t, l);
             dsl::cuda::write_kv_to_pages(&kk, &v, &kv);
             dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
-            let o = dsl::cuda::attention_flashinfer_decode(&q, &kv, window_left)
+            let o = dsl::cuda::attention_for(class, &q, &kv, window_left)
                 .expect("a plain attention statement produces its value");
             let o = dsl::attention_landing(&o, &w.o_proj, l);
             let o = dsl::cuda::rmsnorm(&o, &w.post_attn_norm);

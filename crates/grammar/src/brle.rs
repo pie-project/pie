@@ -1,7 +1,7 @@
 //! Binary Run-Length Encoded (BRLE) boolean sequences.
 //!
 //! `RunMask` is part of the wire schema (it appears inside
-//! [`crate::driver::LaunchPlan`] via `Vec<RunMask>`) AND is the type
+//! [`crate::driver_api::LaunchPlan`] via `Vec<RunMask>`) AND is the type
 //! the runtime/drivers manipulate directly. Putting the type and its
 //! operations here keeps the schema single-source: no duplicate `RunMask`
 //! types, no conversion at the wire boundary.

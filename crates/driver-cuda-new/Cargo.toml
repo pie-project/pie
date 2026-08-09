@@ -59,7 +59,7 @@ bridge = ["dep:kernels-cuda"]
 # (retirement plan — "the cutover boundary, measured"). Implies `bridge`
 # (the shell runs the executor). MUTUALLY EXCLUSIVE with linking the C++
 # shell into the same binary: same symbols, one provider.
-abi = ["bridge", "dep:driver", "dep:model-loader", "dep:toml", "model/forward", "model/contract"]
+abi = ["bridge", "dep:driver-api", "dep:model-loader", "dep:toml", "model/forward", "model/contract"]
 
 [dependencies]
 # The CUDA version is pinned EXPLICITLY rather than through
@@ -145,12 +145,12 @@ model-compiler = { path = "../model-compiler" }
 # on a CUDA feature -- none of it names a CUDA symbol, which is the whole
 # reason it is a crate: the C++ carried three hand-written copies of this one
 # golden model, one per backend, and nothing ever checked that they agreed.
-driver-pipeline = { path = "../driver-pipeline" }
+driver = { path = "../driver" }
 
 # The ABI's Rust source of truth: the `#[repr(C)]` descriptors and status
 # codes the thirteen exports speak. Optional — only the `abi` shell needs
 # it.
-driver = { path = "../driver", optional = true }
+driver-api = { path = "../driver-api", optional = true }
 
 # `load_model`'s checkpoint reader — one parse of the snapshot, all three
 # layouts (.zt artifact, HF safetensors, GGUF), and the embedded
@@ -194,7 +194,7 @@ model = { path = "../model", default-features = false, features = ["config", "fo
 # same arrangement `driver-pipeline`'s oracle uses.
 tensor-compiler = { path = "../tensor-compiler" }
 tensor-ir = { path = "../tensor-ir" }
-driver = { path = "../driver" }
+driver-api = { path = "../driver-api" }
 
 # The bridge generator: build.rs reads the SAME tables the tests read and
 # writes both halves of the flat ABI to OUT_DIR. Table-only (`native` off) —

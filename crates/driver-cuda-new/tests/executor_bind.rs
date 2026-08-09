@@ -994,11 +994,33 @@ fn every_lowered_symbol_has_an_arm() {
             }
         }
     }
-    assert!(
-        armed.len() > 60,
-        "the arm scan found {} arms, so its shape assumption broke",
-        armed.len()
-    );
+    // THE SELF-VACUITY CHECK, AND WHY IT IS NOT A COUNT.
+    //
+    // It used to be `armed.len() > 60`, which was right when the arm
+    // count only ever grew and became wrong the moment filling
+    // `Source::` rows started deleting arms — the number this test
+    // exists to help drive down was also the number holding it up. A
+    // floor that fails on SUCCESS is a floor that will be raised by
+    // whoever it inconveniences, which is the opposite of a guard.
+    //
+    // So the check is structural: name arms that are hand-written for a
+    // stated STRUCTURAL reason, and assert the scan still sees them.
+    // `gemm::act_x_w` is the one rename at the ABI — a lowering symbol
+    // with no row of its own, so no generated branch can ever key on it.
+    // `mlp::sigmoid_gate_inplace_bf16` serves two arities that differ in
+    // which argument is the destination.
+    //
+    // When those two land the scan should find zero, and this assert is
+    // the right thing to delete rather than to weaken.
+    for anchor in ["gemm::act_x_w", "mlp::sigmoid_gate_inplace_bf16"] {
+        assert!(
+            armed.contains(anchor),
+            "the arm scan lost `{anchor}`, which is hand-written for a \
+             structural reason — so the scan's shape assumption broke \
+             rather than the arm having landed. Scan found {} arms.",
+            armed.len()
+        );
+    }
 
     // GENERATED branches count as armed, because they are. `dispatch`
     // runs them first and the hand-written match is the fallthrough, so a
@@ -1022,8 +1044,15 @@ fn every_lowered_symbol_has_an_arm() {
         kernels_cuda::driver_internal::DRIVER_KERNELS,
     ]);
     for line in generated.lines() {
-        // A branch opens `"symbol" if ... => unsafe {`.
-        if !line.trim_start().starts_with('"') || !line.contains("=> unsafe") {
+        // A branch opens `"symbol" if ... => {`.
+        //
+        // It used to open `=> unsafe {`, and matching on that is what
+        // this line said. Then the in-place rows gained their staging and
+        // the branch became a block with the `unsafe` inside it — at
+        // which point the scraper matched NOTHING and every generated
+        // symbol looked unarmed. Matching the arrow and the block is the
+        // stable half of the shape; what is inside it is the emitter's.
+        if !line.trim_start().starts_with('"') || !line.trim_end().ends_with("=> {") {
             continue;
         }
         if let Some(sym) = line.split('"').nth(1)

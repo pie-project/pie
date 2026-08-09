@@ -160,6 +160,20 @@ jobs:
       - name: kernel table (every symbol carries its family)
         run: cargo test -p model --features forward --test kernels_table
 
+      # The SEAM between the two vocabularies that name the same tensors:
+      # the trace names a forward pass invents, and the published names a
+      # load contract invents. `weight_names::wire()` is the only bridge,
+      # and it fails SILENTLY by construction -- `Wiring::alias` records a
+      # row only if the name was published, so a name the contract never
+      # published is dropped with no diagnostic and surfaces one at a time
+      # at FIRE time as `UnknownWeight`. Detecting drift one request too
+      # late is what this moves to CI.
+      #
+      # It needs `contract` as well as `forward` because it reaches the
+      # descriptor schema `HfConfig` lives in.
+      - name: weight-name seam (a trace name a checkpoint can never answer)
+        run: cargo test -p model --features forward,contract --test seam_names
+
       # driver-cuda-new is excluded from the two sweeps above because it has no
       # default feature and refuses to build until one of `cuda-12` / `cuda-13`
       # is chosen. That is deliberate: the CUDA runtime API is not ABI-stable
@@ -336,6 +350,50 @@ jobs:
         run: |
           cargo build -p pie \
             --no-default-features --features driver-dummy
+
+  # The Metal driver and the seam that joins it to the engine.
+  #
+  # `driver-metal-new` is an OPTIONAL feature of `engine`, so a plain
+  # `cargo test -p engine` builds its seam OUT. That file once went weeks
+  # without a compiler reading it and accumulated seven type errors; this job
+  # is what catches that on the first push. It was added once and lost in a
+  # rebase, which is its own argument for a job rather than a habit.
+  driver-metal:
+    name: driver-metal-new (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-driver-metal-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: cargo test (driver-metal-new)
+        run: cargo test -p driver-metal-new
+
+      # Type-check AND test: the seam's tests run everything that needs no
+      # checkpoint, and the checkpoint-gated ones state that they skipped.
+      - name: cargo test (engine, driver-metal-new seam)
+        run: cargo test -p engine --features driver-metal-new
+
+      # The worker feature the release build selects on macOS. `driver-metal`
+      # is `worker`'s name for `engine/driver-metal-new`, and nothing else
+      # compiles that composition.
+      - name: cargo build (worker, driver-metal)
+        run: |
+          cargo build -p worker \
+            --no-default-features --features driver-metal,driver-dummy
+
+      - name: cargo clippy (driver-metal-new)
+        run: cargo clippy --no-deps -p driver-metal-new --all-targets -- -D warnings
 
   pie-worker-cuda:
     name: pie-worker (driver-cuda)

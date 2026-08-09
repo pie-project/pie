@@ -2,8 +2,8 @@
 //! transport KV-transfer handshake.
 //!
 //! A backend that can expose its KV cache for remote transfer produces a
-//! [`driver::KvHandle`]: the [`KvRegion`]s backing the cache plus the
-//! paged [`driver::KvLayout`]. Transport's `Engine::register` consumes
+//! [`driver_api::KvHandle`]: the [`KvRegion`]s backing the cache plus the
+//! paged [`driver_api::KvLayout`]. Transport's `Engine::register` consumes
 //! that value by move — the two sides meet only at `KvHandle`, with no trait or
 //! import spanning the driver and transport crates. Remote-access credentials
 //! are mechanism-specific and opaque (e.g. a NIXL agent's metadata blob),
@@ -17,7 +17,7 @@
 //! to export (e.g. metal/vulkan) decline by returning `None`. Real per-backend
 //! device-memory export + RDMA registration is deferred.
 
-use driver::{KvDtype, KvExport, KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};
+use driver_api::{KvDtype, KvExport, KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};
 
 /// The dummy driver's host-DRAM KV-export stub.
 ///

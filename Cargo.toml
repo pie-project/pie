@@ -45,7 +45,7 @@ members = [
     "crates/client-api",
     "crates/controller-api",
     "crates/worker-api",
-    "crates/driver",
+    "crates/driver-api",
 
     # -- driver-*: execution shells ----------------------------------------
     # `driver` is the C++ substrate both shells interpret the ABI with; the two
@@ -57,7 +57,7 @@ members = [
     # did not. A `default-member`, unlike every driver below it: it needs no
     # GPU, no toolkit and no OS, so there is no reason a workspace sweep should
     # not carry its tests.
-    "crates/driver-pipeline",
+    "crates/driver",
     # The Rust rewrite of the CUDA shell, grown beside the C++ one on the same
     # terms `driver-metal-new` is. Unlike either C++ shell it builds ANYWHERE:
     # `cudarc` is pinned to a named CUDA version with `fallback-dynamic-loading`,
@@ -148,9 +148,9 @@ default-members = [
     "crates/client-api",
     "crates/controller-api",
     "crates/worker-api",
-    "crates/driver",
+    "crates/driver-api",
     "crates/driver-dummy",
-    "crates/driver-pipeline",
+    "crates/driver",
     "crates/model",
     "crates/model-compiler",
     "crates/model-loader",

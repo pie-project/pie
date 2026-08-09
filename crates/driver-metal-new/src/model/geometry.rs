@@ -178,7 +178,9 @@ pub fn eval(rule: Rule, dims: Dims) -> Result<Launch, Ungeometric> {
         Rule::SdpaVector => sdpa_rows(dims.q_heads, rows),
         Rule::PerHeadElementwise => shapes::attn_gate(dims.q_heads, dims.head_dim),
         Rule::GatedRms => shapes::gated_rms(dims.kv_heads, dims.head_dim),
-        Rule::RouterLane => shapes::router_topk(dims.n_experts),
+        Rule::RouterLane => shapes::router_topk(dims.n_experts, rows),
+        // ONE threadgroup whatever the rows: see [`Rule::RouterSort`].
+        Rule::RouterSort => shapes::route_sort(dims.n_experts),
         Rule::RouteRows => shapes::route_rows(dims.width, rows),
         Rule::RoutedQmv => shapes::routed_qmv(dims.width, dims.experts_per_token, rows),
     })
@@ -280,7 +282,8 @@ mod tests {
                 shapes::attn_gate(d.q_heads, d.head_dim),
             ),
             (Rule::GatedRms, shapes::gated_rms(d.kv_heads, d.head_dim)),
-            (Rule::RouterLane, shapes::router_topk(d.n_experts)),
+            (Rule::RouterLane, shapes::router_topk(d.n_experts, 1)),
+            (Rule::RouterSort, shapes::route_sort(d.n_experts)),
             (Rule::RouteRows, shapes::route_rows(d.width, 1)),
             (
                 Rule::RoutedQmv,
@@ -325,12 +328,94 @@ mod tests {
                 grid: [d.q_heads * 1024, n, 1],
                 tg: [1024, 1, 1],
             }),
+            // The router, which was NOT in this list and was wrong because of
+            // it. `route.metal` reads its row from `tgid.y` and the rule
+            // returned `grid: [w, 1, 1]`, so a mixture PREFILL routed row 0
+            // only: every other row kept whatever `expert_ids` held from the
+            // last layer, and the FFN then ran those rows through the wrong
+            // experts. A finite, plausible, different model.
+            //
+            // Absent from the M>1 list is exactly how it stayed wrong -- the
+            // M=1 list has it and is right there, so the rule looked covered.
+            (Rule::RouterLane, Launch {
+                grid: [shapes::router_lane_width(d.n_experts), n, 1],
+                tg: [shapes::router_lane_width(d.n_experts), 1, 1],
+            }),
+            // And its twin, which must NOT move. `route_sort` reduces across
+            // every (row, slot) pair through threadgroup atomics; one copy
+            // per row would have each clearing and rewriting the permutation
+            // the others read. The two shared `RouterLane` until the row axis
+            // landed, which is why they are two rows now.
+            (Rule::RouterSort, shapes::route_sort(d.n_experts)),
         ] {
             assert_eq!(
                 eval(rule, d).expect("a stated rule evaluates"),
                 expected,
                 "{rule:?} does not reproduce its M>1 function"
             );
+        }
+    }
+
+    /// **Every rule must either scale with the row count or say why not.**
+    ///
+    /// This is the guard the `RouterLane` defect earned. That rule dropped
+    /// the row axis, so a mixture prefill routed row 0 and ran every other
+    /// row on its experts — and it went unseen because the rule was simply
+    /// *absent* from the batched list above. A list you have to remember to
+    /// add to does not catch the thing you forgot.
+    ///
+    /// So this enumerates the vocabulary instead: a rule whose launch does
+    /// not move between one row and many is a rule that ignores its rows,
+    /// and it has to be on `ROW_INVARIANT` with a reason. Adding a variant
+    /// to `LaunchRule` fails this test until someone answers the question.
+    #[test]
+    fn a_rule_that_ignores_its_rows_has_to_say_so() {
+        /// The rules that genuinely do not move with the row count.
+        const ROW_INVARIANT: &[(Rule, &str)] = &[
+            (
+                Rule::RouterSort,
+                "ONE threadgroup reduces across every (row, slot) pair through \
+                 threadgroup atomics and stripes them over its own lanes; a \
+                 copy per row would clear the permutation the others read",
+            ),
+            (
+                Rule::PerHeadElementwise,
+                "per-head pointwise over the head geometry; no kernel row \
+                 claims it yet, so its row behaviour is unmeasured",
+            ),
+            (
+                Rule::GatedRms,
+                "GDN's gated norm over the value heads; no kernel row claims \
+                 it yet, so its row behaviour is unmeasured",
+            ),
+        ];
+
+        let one = Dims { rows: 1, ..dims() };
+        let many = Dims { rows: 8, ..dims() };
+        for &rule in Rule::ALL {
+            if rule == Rule::Unstated {
+                continue;
+            }
+            let (a, b) = (eval(rule, one), eval(rule, many));
+            let invariant = ROW_INVARIANT.iter().find(|(r, _)| *r == rule);
+            match (a, b) {
+                (Ok(a), Ok(b)) if a == b => assert!(
+                    invariant.is_some(),
+                    "{rule:?} launches the same rectangle for 1 row and 8. \
+                     Either it drops the row axis -- which is the RouterLane \
+                     defect, where every row but the first got the first \
+                     row's answer -- or it is genuinely row-invariant and \
+                     belongs on ROW_INVARIANT with the reason."
+                ),
+                (Ok(_), Ok(_)) => assert!(
+                    invariant.is_none(),
+                    "{rule:?} is on ROW_INVARIANT and its launch moves with \
+                     the row count anyway; the reason there is stale"
+                ),
+                // A rule that refuses one of the two is stating a geometry
+                // question, not ignoring rows. `Qmm` refuses a partial tile.
+                _ => {}
+            }
         }
     }
 

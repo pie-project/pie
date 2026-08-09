@@ -226,8 +226,8 @@ fn register_dummy_driver(
         DriverSpec {
             num_kv_pages,
             limits,
-            device_geometry_port_mask: ::driver::PIE_DEVICE_GEOMETRY_PORTS
-                | ::driver::PIE_DEVICE_PORT_ATTN_MASK,
+            device_geometry_port_mask: ::driver_api::PIE_DEVICE_GEOMETRY_PORTS
+                | ::driver_api::PIE_DEVICE_PORT_ATTN_MASK,
         },
         backend,
     );

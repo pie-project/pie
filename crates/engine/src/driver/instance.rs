@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ::driver::{GeometryClass, PieInstanceBinding};
+use ::driver_api::{GeometryClass, PieInstanceBinding};
 
 use super::channel::ChannelValue;
 
@@ -27,7 +27,7 @@ pub struct InstanceBindingPlan {
 
 impl InstanceBindingPlan {
     pub(crate) fn validate_binding(&self, binding: &PieInstanceBinding) -> anyhow::Result<()> {
-        ::driver::validate_instance_binding(binding)
+        ::driver_api::validate_instance_binding(binding)
             .map_err(|err| anyhow::anyhow!("invalid native instance binding: {err}"))?;
         if self.requested_instance_id != 0 {
             anyhow::ensure!(

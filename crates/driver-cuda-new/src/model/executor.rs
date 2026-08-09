@@ -776,7 +776,14 @@ impl DispatchCtx {
     /// The theta a layer-tagged rope launch fires with: the per-layer
     /// entry when the family splits theta by layer kind, else the
     /// uniform value.
-    fn theta_of(&self, layer: usize) -> f32 {
+    ///
+    /// Named `theta` and not `theta_of` because a row says
+    /// `Source::CtxByLayer("theta")` and the generated branch calls
+    /// `ctx.theta(layer)`. The fallback is deliberately on this side —
+    /// the table states that the value is indexed by the statement's
+    /// layer, which is all it can know, and whether a family's vector is
+    /// short is the driver's to answer.
+    pub(crate) fn theta(&self, layer: usize) -> f32 {
         self.rope_theta_by_layer
             .get(layer)
             .copied()
@@ -978,10 +985,12 @@ pub enum DispatchRefusal {
 /// tables the shim and the bindings come from — one read of one table in
 /// one build script, so the three cannot disagree with each other.
 #[cfg(feature = "bridge")]
-fn dispatch_generated(
+fn dispatch_generated<R: Resolver>(
     b: &BoundLaunch<'_>,
     spec: &LaunchSpec,
     ctx: &DispatchCtx,
+    gdn: Option<&GdnCtx>,
+    resolver: &mut R,
     rows: i32,
 ) -> bool {
     // What a generated branch may read about an operand: its row width,
@@ -1004,6 +1013,19 @@ fn dispatch_generated(
     }
     fn elems_of(b: &BoundLaunch<'_>, i: usize, rows: i32) -> usize {
         (rows.max(0) as usize) * (width_of(b, i).max(0) as usize)
+    }
+    /// `Source::InWidthOver`/`OutWidthOver`: an operand's row width
+    /// divided by a context field — how many head-dims, or PLE layers,
+    /// fit in a row.
+    ///
+    /// The `max(1)` is here rather than in the row for the reason
+    /// [`IsSet`] is: what a fire that states no divisor means is the
+    /// fire's business. It is belt to the guard's braces — a row stating
+    /// this source is refused outright when the field is unset — and
+    /// exists so that a future guard change cannot turn a refusal into a
+    /// division by zero.
+    fn width_over(b: &BoundLaunch<'_>, i: usize, by: i32) -> i32 {
+        width_of(b, i) / by.max(1)
     }
 
     /// `Source::CtxNonZero`'s test: a family zeroes a context field to
@@ -1029,9 +1051,57 @@ fn dispatch_generated(
             self != 0
         }
     }
+    /// A POINTER field a fire leaves null to say "not published".
+    ///
+    /// `attn::split_qkv_bf16_devwin`'s peel window is the case: a fire
+    /// that published none is not one that launcher can run for, and its
+    /// hand arm said exactly that. Null is the pointer spelling of zero,
+    /// so it is the same test and not a new one.
+    impl<T> IsSet for *const T {
+        fn is_set(self) -> bool {
+            !self.is_null()
+        }
+    }
+    impl<T> IsSet for *mut T {
+        fn is_set(self) -> bool {
+            !self.is_null()
+        }
+    }
     fn is_set<T: IsSet>(v: T) -> bool {
         v.is_set()
     }
+
+    /// `Source::Gdn`'s reach into the fire's recurrent geometry.
+    ///
+    /// Total because of the guard, not in spite of it: every generated
+    /// branch that binds a GDN field carries `&& gdn.is_some()`, so the
+    /// only path here has already proved it. The panic message names the
+    /// invariant rather than the symptom, because if it ever fires the
+    /// bug is in the emitter's guard and nowhere near this line.
+    fn g_of<'a>(g: Option<&'a GdnCtx>) -> &'a GdnCtx {
+        g.expect("a generated branch binding a GDN field is guarded on gdn.is_some()")
+    }
+
+    /// `cast_const` for a pointer that is ALREADY const.
+    ///
+    /// A generated bind for a `U32s`/`I32s` operand spells
+    /// `(e).cast_const().cast::<u32>()`, because most sources hand back a
+    /// `*mut` — an arg's `ptr` is one, and so is most of `DispatchCtx`.
+    /// A context field that is already `*const` has no inherent
+    /// `cast_const`, and the generator cannot know which it got without
+    /// the table carrying pointer mutability, which is a fact about the
+    /// DRIVER's struct and not about the launcher.
+    ///
+    /// Inherent methods win over trait methods, so this covers exactly
+    /// the case the inherent one does not and is invisible everywhere
+    /// else.
+    trait AlreadyConst: Copy {
+        #[allow(clippy::wrong_self_convention)]
+        fn cast_const(self) -> Self {
+            self
+        }
+    }
+    impl<T> AlreadyConst for *const T {}
 
     // A JOIN FACT NO `Source` CAN NAME declines the whole branch.
     //
@@ -1061,6 +1131,18 @@ fn dispatch_generated(
 
     let n_in = spec.n_in;
     let n_out = spec.n_out;
+    // `Source::WeightNamed`'s resolve, done ONCE and before the match so
+    // that a branch's guard can test it. Null when the statement names no
+    // weight OR when the store lacks the name — the two are different
+    // situations and the same answer here, because the branch declines in
+    // both and the hand arm below reports the second as `UnknownWeight`.
+    // A `None` from the resolver is DRIFT, not absence, and saying so is
+    // the fallthrough's job.
+    let w_named: *const c_void = spec
+        .weight
+        .as_deref()
+        .and_then(|n| resolver.weight(n))
+        .unwrap_or(core::ptr::null());
     include!(concat!(env!("OUT_DIR"), "/rust_dispatch.rs"))
 }
 
@@ -1096,7 +1178,7 @@ pub fn dispatch<R: Resolver>(
     // needs no arm, and the branch for it is emitted from the row — so
     // the hand-written match below is what is LEFT, not what is normal.
     // It shrinks as rows state their sources, which is a row's work.
-    if dispatch_generated(bound, spec, ctx, rows) {
+    if dispatch_generated(bound, spec, ctx, gdn, resolver, rows) {
         return Ok(());
     }
 
@@ -1166,24 +1248,6 @@ pub fn dispatch<R: Resolver>(
     };
 
     match bound.kernel {
-        // args: [y]. The token ids are the fire's input and the weight is
-        // the op's — both context, neither an arg.
-        "layout::embed_bf16" => {
-            need(1)?;
-            let y = bound.args[0];
-            let w = weight(resolver)?;
-            unsafe {
-                ffi::pie_k_layout_embed_bf16(
-                    ctx.token_ids.cast_const().cast(),
-                    w,
-                    y.ptr,
-                    rows,
-                    i32::try_from(y.width).expect("hidden fits i32"),
-                    ctx.vocab,
-                    ctx.stream,
-                );
-            }
-        }
         // args: [table]; positions are the fire's.
         "rope::rope_standard_table" => {
             need(1)?;
@@ -1279,21 +1343,6 @@ pub fn dispatch<R: Resolver>(
                 );
             }
         }
-        // args: [packed, y].
-        "mlp::chunked_swiglu_bf16" => {
-            need(2)?;
-            let (packed, y) = (bound.args[0], bound.args[1]);
-            unsafe {
-                ffi::pie_k_mlp_chunked_swiglu_bf16(
-                    packed.ptr,
-                    y.ptr,
-                    rows,
-                    i32::try_from(y.width).expect("I fits i32"),
-                    ctx.stream,
-                    ctx.gate_second,
-                );
-            }
-        }
         // args: [packed, rope_table, q_norm_w, k_norm_w]; the q output is
         // the observed-query PIN (outs[0], Named); the KV pages, CSRs and
         // write descriptors are the fire's ([`AttnCtx`]).
@@ -1331,7 +1380,7 @@ pub fn dispatch<R: Resolver>(
                     layer.head_dim,
                     layer.page_size,
                     layer.hnd_layout,
-                    ctx.theta_of(bound.layers.start as usize),
+                    ctx.theta(bound.layers.start as usize),
                     ctx.eps,
                     ctx.stream,
                 );
@@ -1450,96 +1499,6 @@ pub fn dispatch<R: Resolver>(
                     a.logits_soft_cap,
                     a.sm_scale,
                     lse,
-                );
-            }
-        }
-        // args: [packed, q_raw, k_raw, v] — one input, then the op's THREE
-        // outputs stated as args (SplitQkv's outputs are values).
-        // args: [packed, q, k, v] — the same four the host-window form
-        // takes, and the SAME base pointers. The difference is where the
-        // row window comes from: a peel's tail addresses rows at absolute
-        // offsets in a full-N buffer, so the split rides in device memory
-        // and the grid spans every lane, out-of-window rows early-outing
-        // on `win[0]`/`win[1]`. That is what makes the launch replayable
-        // across splits, which is the whole reason the region asks for
-        // this kernel instead of choosing it.
-        //
-        // Note the operands are NOT windowed by the caller here, and that
-        // is the kernel's stated contract ("Buffers are BASE pointers")
-        // rather than an oversight — the binder's base-resolving
-        // behaviour, which §4's fourth decline-rule works around for the
-        // host-window form, is exactly right for this one.
-        "attn::split_qkv_bf16_devwin" => {
-            need(4)?;
-            let (packed, q, k, v) =
-                (bound.args[0], bound.args[1], bound.args[2], bound.args[3]);
-            if ctx.peel_window.is_null() {
-                return Err(DispatchRefusal::NoArm(
-                    "attn::split_qkv_bf16_devwin: the fire published no peel window".into(),
-                ));
-            }
-            unsafe {
-                ffi::pie_k_attn_split_qkv_bf16_devwin(
-                    packed.ptr,
-                    q.ptr,
-                    k.ptr,
-                    v.ptr,
-                    ctx.peel_window,
-                    ctx.rows_total,
-                    i32::try_from(q.width).expect("q width"),
-                    i32::try_from(k.width).expect("kv width"),
-                    ctx.stream,
-                );
-            }
-        }
-        "attn::split_qkv_bf16" => {
-            need(4)?;
-            let (packed, q, k, v) =
-                (bound.args[0], bound.args[1], bound.args[2], bound.args[3]);
-            unsafe {
-                ffi::pie_k_attn_split_qkv_bf16(
-                    packed.ptr,
-                    q.ptr,
-                    k.ptr,
-                    v.ptr,
-                    rows,
-                    i32::try_from(q.width).expect("q width"),
-                    i32::try_from(k.width).expect("kv width"),
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [q_in, k_in, q_out, k_out, q_norm_w, k_norm_w]. The KERNEL
-        // is in-place on (q, k); the lowering assigned separate in/out
-        // buffers, so the arm stages in→out with a d2d copy, then runs the
-        // kernel over the outs — the only reading under which both the
-        // row's signature and the launch's buffer assignment are honest.
-        "rope::qk_rmsnorm_rope_bf16" => {
-            need(6)?;
-            let (q_in, k_in, q_out, k_out, qw, kw) = (
-                bound.args[0],
-                bound.args[1],
-                bound.args[2],
-                bound.args[3],
-                bound.args[4],
-                bound.args[5],
-            );
-            stage_d2d(ctx, &bound.rows, q_out, q_in);
-            stage_d2d(ctx, &bound.rows, k_out, k_in);
-            unsafe {
-                ffi::pie_k_rope_qk_rmsnorm_rope_bf16(
-                    q_out.ptr,
-                    k_out.ptr,
-                    qw.ptr,
-                    kw.ptr,
-                    ctx.positions.cast_const().cast(),
-                    rows,
-                    i32::try_from(q_out.width).expect("q width") / ctx.head_dim.max(1),
-                    i32::try_from(k_out.width).expect("k width") / ctx.head_dim.max(1),
-                    ctx.head_dim,
-                    ctx.theta_of(bound.layers.start as usize),
-                    ctx.eps,
-                    ctx.stream,
                 );
             }
         }
@@ -1749,81 +1708,9 @@ pub fn dispatch<R: Resolver>(
                     i32::try_from(q_out.width).expect("q width") / ctx.head_dim.max(1),
                     i32::try_from(k_out.width).expect("k width") / ctx.head_dim.max(1),
                     ctx.head_dim,
-                    ctx.theta_of(bound.layers.start as usize),
+                    ctx.theta(bound.layers.start as usize),
                     ctx.stream,
                     ctx.rope_interleaved,
-                );
-            }
-        }
-        // args: [act, expert_ids, stage, out] — the grouped expert GEMM,
-        // one launch for every (block, expert) route.
-        //
-        // `stage` is the DESTINATION the pointer build named and `out`
-        // aliases it (`in_place = &[(0, 2)]`), so the arm stages only if
-        // the assignment did not give them one buffer.
-        //
-        // THE PREDICATE IS THE POINT. The launcher opens with
-        // `if (max_blocks <= 0 || !supported(M, N, K)) return;` — it
-        // DECLINES by doing nothing. Qwen3.5-35B-A3B's gate_up is exactly
-        // such a shape (`K = hidden = 2048`, and the kernel bounds
-        // `K <= 512` because past that cuBLAS wins; the measurements are
-        // in `moe_grouped_gemm.cu`'s header). So an arm that just called
-        // it would write nothing for gate_up and the mixture would answer
-        // fluently from an untouched buffer.
-        //
-        // The C++ path reads the same predicate and falls back to a
-        // batched cuBLAS over the pointer arrays `build_moe_ptrs_aligned`
-        // fills. That symbol has no arm yet, so this one REFUSES instead
-        // of guessing — and the two are therefore coupled: the pointer
-        // build is the keystone of the aligned path, not its leftover.
-        "moe::moe_grouped_gemm_bf16" => {
-            need(4)?;
-            let (a_in, expert_ids, stage, out) =
-                (bound.args[0], bound.args[1], bound.args[2], bound.args[3]);
-            let w = weight(resolver)?;
-            #[allow(clippy::cast_possible_wrap)]
-            let block = spec.params.first().copied().unwrap_or(0) as i32;
-            #[allow(clippy::cast_possible_wrap)]
-            let max_blocks = spec.params.get(1).copied().unwrap_or(0) as i32;
-            let n = i32::try_from(out.width).expect("dim");
-            let k = i32::try_from(a_in.width).expect("dim");
-            // Mirrors `moe_grouped_gemm_bf16_supported`. Duplicated on
-            // purpose and marked as such: the alternative is a launcher
-            // that answers "did nothing" the same way it answers "done".
-            const FRAG: i32 = 16;
-            const SHORT_K: i32 = 512;
-            const N_TILE: i32 = 64;
-            if max_blocks <= 0
-                || block != FRAG
-                || k > SHORT_K
-                || n % N_TILE != 0
-                || k % FRAG != 0
-            {
-                return Err(DispatchRefusal::ShapeDeclined {
-                    kernel: "moe::moe_grouped_gemm_bf16".into(),
-                    why: format!(
-                        "the grouped kernel serves M == {FRAG}, K <= {SHORT_K}, \
-                         N % {N_TILE} == 0 and K % {FRAG} == 0; this launch is \
-                         M = {block}, N = {n}, K = {k} over {max_blocks} blocks. \
-                         The batched-cuBLAS fallback needs \
-                         moe::build_moe_ptrs_aligned_bf16, which has no arm yet"
-                    ),
-                });
-            }
-            if stage.ptr != out.ptr {
-                stage_d2d(ctx, &bound.rows, out, stage);
-            }
-            unsafe {
-                ffi::pie_k_moe_moe_grouped_gemm_bf16(
-                    a_in.ptr,
-                    w,
-                    out.ptr,
-                    expert_ids.ptr.cast::<i32>(),
-                    max_blocks,
-                    block,
-                    n,
-                    k,
-                    ctx.stream,
                 );
             }
         }
@@ -1834,84 +1721,6 @@ pub fn dispatch<R: Resolver>(
         // rows already state their sources; staging is the whole
         // difference, and it is `stage_d2d` in both.
 
-        // args: [src, weights, residual, out] — the routed combine that
-        // ACCUMULATES. `out += sum_k(src[t, k] * w[t, k])`, so the
-        // residual is staged into `out` first and the kernel adds onto
-        // it. The plain `token_batched_weighted_sum_bf16` writes instead,
-        // which is why only this spelling is in-place.
-        "moe::token_batched_weighted_sum_add_bf16" => {
-            need(4)?;
-            let (src, weights, resid, out) =
-                (bound.args[0], bound.args[1], bound.args[2], bound.args[3]);
-            stage_d2d(ctx, &bound.rows, out, resid);
-            // `src` is `[Tokens, top_k, hidden]` and `out` is
-            // `[Tokens, hidden]`, so the route count is the ratio of
-            // their row widths. Derived from what the two args SAY
-            // rather than from a config the arm would have to be told.
-            let hidden = i32::try_from(out.width).expect("dim");
-            let top_k = i32::try_from(src.width / out.width.max(1)).unwrap_or(1).max(1);
-            unsafe {
-                ffi::pie_k_moe_token_batched_weighted_sum_add_bf16(
-                    out.ptr,
-                    src.ptr,
-                    weights.ptr.cast::<f32>(),
-                    rows,
-                    top_k,
-                    hidden,
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [x, y, out] — the SHARED expert's landing, and the
-        // operand order is the trap the row's own comment names: `y` is
-        // the ADDEND, not the accumulator. `out = out + sigmoid(x·gate) *
-        // y`, so the routed block's output stages into `out` and the
-        // shared expert's contribution is gated onto it.
-        "mlp::sigmoid_dot_scalar_gate_add_bf16" => {
-            need(3)?;
-            let (x, y, out) = (bound.args[0], bound.args[1], bound.args[2]);
-            let w = weight(resolver)?;
-            stage_d2d(ctx, &bound.rows, out, y);
-            unsafe {
-                ffi::pie_k_mlp_sigmoid_dot_scalar_gate_add_bf16(
-                    x.ptr,
-                    w,
-                    out.ptr,
-                    y.ptr,
-                    rows,
-                    i32::try_from(out.width).expect("dim"),
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [a, b, out] — out = a + b. The kernel is the in-place
-        // `y += x` over flat elements, so: stage a→out, add b.
-        "norm::residual_add_bf16" => {
-            need(3)?;
-            let (a_in, b_in, out_arg) = (bound.args[0], bound.args[1], bound.args[2]);
-            stage_d2d(ctx, &bound.rows, out_arg, a_in);
-            let n = (bound.rows.end - bound.rows.start) as usize * out_arg.width as usize;
-            unsafe {
-                ffi::pie_k_norm_residual_add_bf16(out_arg.ptr, b_in.ptr, n, ctx.stream);
-            }
-        }
-        // args: [x, out] — out = x + bias, the bias being the op's weight.
-        // The kernel is in-place, so: stage x→out, add.
-        "norm::add_bias_bf16" => {
-            need(2)?;
-            let (x_in, out_arg) = (bound.args[0], bound.args[1]);
-            let w = weight(resolver)?;
-            stage_d2d(ctx, &bound.rows, out_arg, x_in);
-            unsafe {
-                ffi::pie_k_norm_add_bias_bf16(
-                    out_arg.ptr,
-                    w,
-                    rows,
-                    i32::try_from(out_arg.width).expect("dim"),
-                    ctx.stream,
-                );
-            }
-        }
         // args: [packed, padded] / [padded, packed]. What
         // `head_dim_padded` COSTS, for a deployment whose logical head
         // width is not one this build instantiated — phi3's 96 rounding
@@ -2087,24 +1896,7 @@ pub fn dispatch<R: Resolver>(
                     kv_heads,
                     layer.head_dim,
                     i32::try_from(rotary).expect("rotary fits i32"),
-                    ctx.theta_of(bound.layers.start as usize),
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [packed, q_out, gate_out] — the 2×-wide gated q pack's
-        // per-head de-interleave.
-        "layout::split_q_gate_bf16" => {
-            need(3)?;
-            let (packed, q_out, gate_out) = (bound.args[0], bound.args[1], bound.args[2]);
-            unsafe {
-                ffi::pie_k_layout_split_q_gate_bf16(
-                    packed.ptr,
-                    q_out.ptr,
-                    gate_out.ptr,
-                    rows,
-                    i32::try_from(q_out.width).expect("q width") / ctx.head_dim.max(1),
-                    ctx.head_dim,
+                    ctx.theta(bound.layers.start as usize),
                     ctx.stream,
                 );
             }
@@ -2378,54 +2170,6 @@ pub fn dispatch<R: Resolver>(
                 ffi::pie_k_norm_scalar_mul_bf16(x_out.ptr, s, n, ctx.stream);
             }
         }
-        // args: [gate, up, y] — gemma's GeGLU (tanh approximation); the
-        // lowering lands y on the gate's bytes (the kernel's in-place
-        // contract), staged when it assigned distinct buffers.
-        //
-        // TWO sites share this symbol and the arm no longer tells them
-        // apart, which is the point. The PLE gate's second operand used
-        // to be the WHOLE `[L, Tokens, ple_dim]` relay, so this arm added
-        // `layer * N * ple_dim` to reach the layer's slice — and to know
-        // WHEN to add it, forked on the out width against `ctx.ple_dim`.
-        // The declaration states a `select` at `l` now; the layer axis
-        // leads, so the slice IS a select, and `Buffers::assign` places it
-        // at `offset(relay) + l · N · ple_dim` without being told. A
-        // select allocates nothing.
-        //
-        // What went with the arithmetic is worth naming: the width fork
-        // was a driver deciding which SITE it was serving from a number,
-        // and the two sites now differ only in which values they name.
-        "mlp::geglu_tanh_bf16" => {
-            need(3)?;
-            let (gate, up, y) = (bound.args[0], bound.args[1], bound.args[2]);
-            stage_d2d(ctx, &bound.rows, y, gate);
-            let n = rows * i32::try_from(y.width).expect("width fits i32");
-            unsafe {
-                ffi::pie_k_mlp_geglu_tanh_bf16(
-                    y.ptr.cast_const(),
-                    up.ptr.cast_const(),
-                    y.ptr,
-                    n,
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [x_in, x_out] — `cap * tanh(x / cap)` over the logits;
-        // the cap is the deployment's final-softcap fact.
-        "attn::logit_softcap_bf16" => {
-            need(2)?;
-            let (x_in, x_out) = (bound.args[0], bound.args[1]);
-            stage_d2d(ctx, &bound.rows, x_out, x_in);
-            let n = (bound.rows.end - bound.rows.start) as usize * x_out.width as usize;
-            unsafe {
-                ffi::pie_k_attn_logit_softcap_bf16(
-                    x_out.ptr,
-                    ctx.final_logit_softcap,
-                    n,
-                    ctx.stream,
-                );
-            }
-        }
         // args: [packed, q_out, q_norm, k_norm] — gemma-4's fused local
         // decode post: split the packed projection, norm q/k, rope them
         // (rounded), norm v, write k/v straight to the pages. Only the
@@ -2459,7 +2203,7 @@ pub fn dispatch<R: Resolver>(
                     layer.head_dim,
                     layer.page_size,
                     layer.hnd_layout,
-                    ctx.theta_of(bound.layers.start as usize),
+                    ctx.theta(bound.layers.start as usize),
                     ctx.eps,
                     ctx.stream,
                 );
@@ -2525,7 +2269,7 @@ pub fn dispatch<R: Resolver>(
                     i32::try_from(q.width).expect("q width") / layer.head_dim.max(1),
                     kv_heads,
                     layer.head_dim,
-                    ctx.theta_of(bound.layers.start as usize),
+                    ctx.theta(bound.layers.start as usize),
                     ctx.eps,
                     ctx.stream,
                 );
@@ -2595,29 +2339,6 @@ pub fn dispatch<R: Resolver>(
                 );
             }
         }
-        // ── gemma-4's arms ───────────────────────────────────────────
-        // args: [src, dst] — the PLE relay: `[N, layers*dim]` transposed
-        // to `[layers, N, dim]` so each layer reads a contiguous slice.
-        "layout::transpose_bf16_nld_to_lnd" => {
-            need(2)?;
-            let (src, dst) = (bound.args[0], bound.args[1]);
-            if ctx.ple_dim <= 0 {
-                return Err(DispatchRefusal::NoArm(format!(
-                    "{}: the fire states no ple_dim",
-                    bound.kernel
-                )));
-            }
-            unsafe {
-                ffi::pie_k_layout_transpose_bf16_nld_to_lnd(
-                    src.ptr.cast_const().cast(),
-                    dst.ptr.cast(),
-                    rows,
-                    i32::try_from(src.width).expect("width") / ctx.ple_dim,
-                    ctx.ple_dim,
-                    ctx.stream,
-                );
-            }
-        }
         // args: [x, hidden_in, hidden_out, norm_out, w, next_w] — FOUR
         // statements in one launch: norm x, land on the stream, scale,
         // norm THAT with the next block's weight. The scale is 1 at the
@@ -2651,106 +2372,6 @@ pub fn dispatch<R: Resolver>(
                     rows,
                     i32::try_from(x.width).expect("hidden fits i32"),
                     ctx.eps,
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [x, hidden_in, hidden_out, w] — the two-statement form:
-        // norm x, land on the stream (gemma-4's post-feedforward norm).
-        "norm::rmsnorm_residual_add_bf16" => {
-            need(4)?;
-            let (x, hid_in, hid_out, w) =
-                (bound.args[0], bound.args[1], bound.args[2], bound.args[3]);
-            stage_d2d(ctx, &bound.rows, hid_out, hid_in);
-            unsafe {
-                ffi::pie_k_norm_rmsnorm_residual_add_bf16(
-                    x.ptr.cast_const(),
-                    w.ptr.cast_const(),
-                    hid_out.ptr,
-                    rows,
-                    i32::try_from(x.width).expect("hidden fits i32"),
-                    ctx.eps,
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [packed, y] — GeGLU over the packed gate‖up bank.
-        "mlp::chunked_geglu_tanh_bf16" => {
-            need(2)?;
-            let (packed, y) = (bound.args[0], bound.args[1]);
-            unsafe {
-                ffi::pie_k_mlp_chunked_geglu_tanh_bf16(
-                    packed.ptr.cast_const(),
-                    y.ptr,
-                    rows,
-                    i32::try_from(y.width).expect("I fits i32"),
-                    ctx.stream,
-                    ctx.gate_second,
-                );
-            }
-        }
-        // args: [x, y] — the weightless per-head V-norm (`v / rms(v)`).
-        "norm::rmsnorm_no_scale_bf16" => {
-            need(2)?;
-            let (x, y) = (bound.args[0], bound.args[1]);
-            let (num_rows, hidden) = match spec.per_head_dim {
-                Some(d) => (
-                    rows * (i32::try_from(x.width).expect("width") / i32::try_from(d).expect("d")),
-                    i32::try_from(d).expect("head_dim fits i32"),
-                ),
-                None => (rows, i32::try_from(x.width).expect("hidden fits i32")),
-            };
-            unsafe {
-                ffi::pie_k_norm_rmsnorm_no_scale_bf16(
-                    x.ptr.cast_const(),
-                    y.ptr,
-                    num_rows,
-                    hidden,
-                    ctx.eps,
-                    ctx.stream,
-                );
-            }
-        }
-        // ── nemotron_h's arms ────────────────────────────────────────
-        // args: [packed, gate, conv_in, dt] — the in-projection's three
-        // riders, split out. Every dim is an arg's width.
-        "ssm::nemotron_mamba_split_bf16" => {
-            need(4)?;
-            let (packed, gate, conv_in, dt) =
-                (bound.args[0], bound.args[1], bound.args[2], bound.args[3]);
-            unsafe {
-                ffi::pie_k_ssm_nemotron_mamba_split_bf16(
-                    packed.ptr.cast_const(),
-                    gate.ptr,
-                    conv_in.ptr,
-                    dt.ptr,
-                    rows,
-                    i32::try_from(packed.width).expect("width"),
-                    i32::try_from(gate.width).expect("width"),
-                    i32::try_from(conv_in.width).expect("width"),
-                    i32::try_from(dt.width).expect("width"),
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [a_out, d_out, bias_out, W a_log, W d, W dt_bias] — the
-        // load-time fp32 tables (`Lw.mamba_A/D_f32/dt_bias_f32`), stated
-        // per fire because the declared trace has no load hook. Heads
-        // come from the fire's mamba geometry.
-        "ssm::nemotron_prepare_mamba_params" => {
-            need(6)?;
-            let g = gdn_ctx()?;
-            let (a, d, bias) = (bound.args[0], bound.args[1], bound.args[2]);
-            let (wa, wd, wb) = (bound.args[3], bound.args[4], bound.args[5]);
-            unsafe {
-                ffi::pie_k_ssm_nemotron_prepare_mamba_params(
-                    wa.ptr.cast_const(),
-                    wd.ptr.cast_const(),
-                    wb.ptr.cast_const(),
-                    a.ptr.cast(),
-                    d.ptr.cast(),
-                    bias.ptr.cast(),
-                    g.v_h,
                     ctx.stream,
                 );
             }
@@ -2845,118 +2466,6 @@ pub fn dispatch<R: Resolver>(
                 );
             }
         }
-        // args: [x, y] — elementwise ReLU²; the total is rows × width
-        // whichever way the shape folded its routes.
-        "mlp::relu2_bf16" => {
-            need(2)?;
-            let (x, y) = (bound.args[0], bound.args[1]);
-            unsafe {
-                ffi::pie_k_mlp_relu2_bf16(
-                    x.ptr.cast_const(),
-                    y.ptr,
-                    rows * i32::try_from(x.width).expect("width"),
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [logits(f32), topk_idx, topk_w, W bias(f32)] — the
-        // sigmoid router. Normalize and the scaling factor are the
-        // deployment's (`cfg.norm_topk_prob`, `routed_scaling_factor`).
-        "moe::topk_sigmoid_bias_fp32" => {
-            need(4)?;
-            let (logits, idx, wts, bias) =
-                (bound.args[0], bound.args[1], bound.args[2], bound.args[3]);
-            unsafe {
-                ffi::pie_k_moe_topk_sigmoid_bias_fp32(
-                    logits.ptr.cast_const().cast(),
-                    bias.ptr.cast_const().cast(),
-                    idx.ptr.cast(),
-                    wts.ptr.cast(),
-                    rows,
-                    i32::try_from(logits.width).expect("experts"),
-                    i32::try_from(idx.width).expect("top_k"),
-                    ctx.moe_norm_topk,
-                    ctx.moe_routed_scaling,
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [topk_idx, norm_x, out, W stacked-expert base] — the
-        // decode GEMV over the routed experts; one warp per output row.
-        "moe::moe_gate_up_decode_gemv_bf16" => {
-            need(4)?;
-            let (idx, x, y, base) =
-                (bound.args[0], bound.args[1], bound.args[2], bound.args[3]);
-            let top_k = i32::try_from(idx.width).expect("top_k");
-            unsafe {
-                ffi::pie_k_moe_moe_gate_up_decode_gemv_bf16(
-                    idx.ptr.cast_const().cast(),
-                    x.ptr.cast_const(),
-                    base.ptr.cast_const(),
-                    y.ptr,
-                    rows,
-                    top_k,
-                    i32::try_from(x.width).expect("hidden"),
-                    i32::try_from(y.width).expect("width") / top_k.max(1),
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [topk_idx, act, out, W stacked-expert base].
-        "moe::moe_down_decode_gemv_bf16" => {
-            need(4)?;
-            let (idx, act, y, base) =
-                (bound.args[0], bound.args[1], bound.args[2], bound.args[3]);
-            let top_k = i32::try_from(idx.width).expect("top_k");
-            unsafe {
-                ffi::pie_k_moe_moe_down_decode_gemv_bf16(
-                    idx.ptr.cast_const().cast(),
-                    act.ptr.cast_const(),
-                    base.ptr.cast_const(),
-                    y.ptr,
-                    rows,
-                    top_k,
-                    i32::try_from(y.width).expect("width") / top_k.max(1),
-                    i32::try_from(act.width).expect("i_moe"),
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [src, weights, out] — the K-expert combine.
-        "moe::token_batched_weighted_sum_bf16" => {
-            need(3)?;
-            let (src, wts, out) = (bound.args[0], bound.args[1], bound.args[2]);
-            unsafe {
-                ffi::pie_k_moe_token_batched_weighted_sum_bf16(
-                    out.ptr,
-                    src.ptr.cast_const(),
-                    wts.ptr.cast_const().cast(),
-                    rows,
-                    i32::try_from(wts.width).expect("top_k"),
-                    i32::try_from(out.width).expect("hidden"),
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [act, y(f32), W] — the fp32-out GEMM the sigmoid router
-        // reads (`act_x_wt_bf16_out_fp32`); the statement carries its
-        // weight as an arg.
-        "gemm::act_x_wt_bf16_out_fp32" => {
-            need(3)?;
-            let (act, y) = (bound.args[0], bound.args[1]);
-            let w = bound.args[2].ptr.cast_const();
-            unsafe {
-                ffi::pie_k_gemm_act_x_wt_bf16_out_fp32(
-                    ctx.cublas,
-                    act.ptr.cast_const(),
-                    w,
-                    y.ptr.cast(),
-                    rows,
-                    i32::try_from(y.width).expect("n"),
-                    i32::try_from(act.width).expect("k"),
-                );
-            }
-        }
         // args: [q, v] in place; qkv_in rides the spec's aux (the same
         // layer's projection input), the staged state + scratch ride the
         // ctx. The LAYER is the op tag's — never `param1`, the bug the
@@ -3000,64 +2509,6 @@ pub fn dispatch<R: Resolver>(
                 );
             }
         }
-        // args: [x_in, x_out, W ""] — the WEIGHTLESS per-head norm; the
-        // third arg is the statement's empty weight slot, and the row
-        // takes no weight at all. In place, so staged.
-        "norm::per_head_rmsnorm_bf16" => {
-            need(3)?;
-            let (x_in, x_out) = (bound.args[0], bound.args[1]);
-            stage_d2d(ctx, &bound.rows, x_out, x_in);
-            unsafe {
-                ffi::pie_k_norm_per_head_rmsnorm_bf16(
-                    x_out.ptr,
-                    rows,
-                    i32::try_from(x_out.width).expect("width") / ctx.head_dim.max(1),
-                    ctx.head_dim,
-                    ctx.eps,
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [x, y, W] — a norm over a WINDOW of a wider row: the
-        // strides are the two operands' own widths, which is the whole
-        // reason this kernel is not the plain one.
-        "norm::rmsnorm_strided_bf16" => {
-            need(3)?;
-            let (x, y, w) = (bound.args[0], bound.args[1], bound.args[2]);
-            unsafe {
-                ffi::pie_k_norm_rmsnorm_strided_bf16(
-                    x.ptr.cast_const(),
-                    w.ptr.cast_const(),
-                    y.ptr,
-                    rows,
-                    i32::try_from(y.width).expect("hidden"),
-                    i32::try_from(x.width).expect("x stride"),
-                    i32::try_from(y.width).expect("y stride"),
-                    ctx.eps,
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [attn_out, lse, out, W sink] — the sink correction, in
-        // place over the dispatch's output (gpt-oss's twin under a
-        // different name and a different LSE convention).
-        "norm::attn_sink_correction_bf16" => {
-            need(4)?;
-            let (o_in, lse, o_out, sink) =
-                (bound.args[0], bound.args[1], bound.args[2], bound.args[3]);
-            stage_d2d(ctx, &bound.rows, o_out, o_in);
-            unsafe {
-                ffi::pie_k_norm_attn_sink_correction_bf16(
-                    o_out.ptr,
-                    lse.ptr.cast_const().cast(),
-                    sink.ptr.cast_const().cast(),
-                    rows,
-                    i32::try_from(o_out.width).expect("width") / ctx.head_dim.max(1),
-                    ctx.head_dim,
-                    ctx.stream,
-                );
-            }
-        }
         // args: [prefix, blocks, out, W norm, W proj] — the residual
         // blend over a block-structured prefix. `B` is how many blocks
         // the prefix holds, `block_rows` how many rows each one spans.
@@ -3083,56 +2534,6 @@ pub fn dispatch<R: Resolver>(
                     hidden,
                     rows,
                     ctx.eps,
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [act_fp16, topk_idx, gate_out, up_out] + the FOUR named
-        // per-expert tables. They were unnamed until the declaration
-        // learned to say what it reads — with no name in the trace an
-        // executor that resolves by name cannot reach them at all, and
-        // the only way in was a family's private layer struct.
-        "quant::wna16_gate_up_decode_bf16" => {
-            need(8)?;
-            let (act, idx, gate_out, up_out) =
-                (bound.args[0], bound.args[1], bound.args[2], bound.args[3]);
-            let top_k = i32::try_from(idx.width).expect("top_k");
-            unsafe {
-                ffi::pie_k_quant_wna16_gate_up_decode_bf16(
-                    act.ptr.cast_const(),
-                    idx.ptr.cast_const().cast(),
-                    bound.args[4].ptr.cast_const().cast(),
-                    bound.args[5].ptr.cast_const().cast(),
-                    bound.args[6].ptr.cast_const().cast(),
-                    bound.args[7].ptr.cast_const().cast(),
-                    gate_out.ptr,
-                    up_out.ptr,
-                    rows,
-                    top_k,
-                    i32::try_from(act.width).expect("hidden"),
-                    i32::try_from(gate_out.width).expect("intermediate"),
-                    ctx.wna16_group_size,
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [act_fp16, topk_idx, out] + the two named down tables.
-        "quant::wna16_down_decode_bf16" => {
-            need(5)?;
-            let (act, idx, out) = (bound.args[0], bound.args[1], bound.args[2]);
-            let top_k = i32::try_from(idx.width).expect("top_k");
-            unsafe {
-                ffi::pie_k_quant_wna16_down_decode_bf16(
-                    act.ptr.cast_const(),
-                    idx.ptr.cast_const().cast(),
-                    bound.args[3].ptr.cast_const().cast(),
-                    bound.args[4].ptr.cast_const().cast(),
-                    out.ptr,
-                    rows,
-                    top_k,
-                    i32::try_from(out.width).expect("hidden"),
-                    i32::try_from(act.width).expect("intermediate"),
-                    ctx.wna16_group_size,
                     ctx.stream,
                 );
             }
@@ -3178,38 +2579,6 @@ pub fn dispatch<R: Resolver>(
                         ctx.stream,
                     ),
                 }
-            }
-        }
-        // args: [packed, y] — the CHUNKED forms need no aux: one packed
-        // operand in, half-width out.
-        "mlp::chunked_swiglu_clamp_bf16" => {
-            need(2)?;
-            let (packed, y) = (bound.args[0], bound.args[1]);
-            unsafe {
-                ffi::pie_k_mlp_chunked_swiglu_clamp_bf16(
-                    packed.ptr.cast_const(),
-                    y.ptr,
-                    rows,
-                    i32::try_from(y.width).expect("i"),
-                    ctx.glu_limit,
-                    ctx.stream,
-                );
-            }
-        }
-        "mlp::chunked_situ_bf16" => {
-            need(2)?;
-            let (packed, y) = (bound.args[0], bound.args[1]);
-            unsafe {
-                ffi::pie_k_mlp_chunked_situ_bf16(
-                    packed.ptr.cast_const(),
-                    y.ptr,
-                    rows,
-                    i32::try_from(y.width).expect("i"),
-                    ctx.situ_beta,
-                    ctx.situ_linear_beta,
-                    ctx.gate_second,
-                    ctx.stream,
-                );
             }
         }
         // args: [logits, idx, w] or [logits, idx, w, W bias] — the two
@@ -3262,45 +2631,6 @@ pub fn dispatch<R: Resolver>(
                 }
             }
         }
-        // args: [act, y, W] — the plain `x · Wᵀ`, weight as an arg.
-        "gemm::act_x_wt_bf16" => {
-            need(3)?;
-            let (act, y, w) = (bound.args[0], bound.args[1], bound.args[2]);
-            unsafe {
-                ffi::pie_k_gemm_act_x_wt_bf16(
-                    ctx.cublas,
-                    act.ptr.cast_const(),
-                    w.ptr.cast_const(),
-                    y.ptr,
-                    rows,
-                    i32::try_from(y.width).expect("n"),
-                    i32::try_from(act.width).expect("k"),
-                    0.0,
-                );
-            }
-        }
-        // ── gpt-oss / mixtral's arms ─────────────────────────────────
-        // args: [act, y, W w, W bias] — the projection with its bias
-        // folded in. The bias may be null; the row says so.
-        "gemm::act_x_wt_bias_bf16" => {
-            need(4)?;
-            let (act, y, w, bias) =
-                (bound.args[0], bound.args[1], bound.args[2], bound.args[3]);
-            unsafe {
-                ffi::pie_k_gemm_act_x_wt_bias_bf16(
-                    ctx.cublas,
-                    act.ptr.cast_const(),
-                    w.ptr.cast_const(),
-                    bias.ptr.cast_const(),
-                    y.ptr,
-                    rows,
-                    i32::try_from(y.width).expect("n"),
-                    i32::try_from(act.width).expect("k"),
-                    ctx.stream,
-                    0.0,
-                );
-            }
-        }
         // args: [q_in, k_in, q_out, k_out] — YaRN over the ORIGINAL
         // context, staged like the other in-place ropes. The four scaling
         // terms and the original context are the deployment's.
@@ -3328,54 +2658,6 @@ pub fn dispatch<R: Resolver>(
                     ctx.yarn_original_max,
                     ctx.stream,
                     ctx.rope_interleaved,
-                );
-            }
-        }
-        // args: [o_in, lse, o_out, W sinks] — the attention sink's
-        // rescale, in place over the dispatch's output.
-        "attn::attention_sink_rescale_bf16" => {
-            need(4)?;
-            let (o_in, lse, o_out, sinks) =
-                (bound.args[0], bound.args[1], bound.args[2], bound.args[3]);
-            stage_d2d(ctx, &bound.rows, o_out, o_in);
-            unsafe {
-                ffi::pie_k_attn_attention_sink_rescale_bf16(
-                    o_out.ptr,
-                    lse.ptr.cast_const().cast(),
-                    sinks.ptr.cast_const(),
-                    rows,
-                    i32::try_from(o_out.width).expect("width") / ctx.head_dim.max(1),
-                    ctx.head_dim,
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [logits, topk_idx, topk_w] — the plain softmax router.
-        "moe::topk_softmax_bf16" => {
-            need(3)?;
-            let (logits, idx, w) = (bound.args[0], bound.args[1], bound.args[2]);
-            unsafe {
-                ffi::pie_k_moe_topk_softmax_bf16(
-                    logits.ptr.cast_const(),
-                    idx.ptr.cast(),
-                    w.ptr.cast(),
-                    rows,
-                    i32::try_from(logits.width).expect("experts"),
-                    i32::try_from(idx.width).expect("top_k"),
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [in_bf16, out_fp16] — the activation the MXFP4 GEMVs read.
-        "quant::bf16_to_fp16" => {
-            need(2)?;
-            let (src, dst) = (bound.args[0], bound.args[1]);
-            unsafe {
-                ffi::pie_k_quant_bf16_to_fp16(
-                    src.ptr.cast_const(),
-                    dst.ptr,
-                    rows as usize * src.width as usize,
-                    ctx.stream,
                 );
             }
         }
@@ -3477,38 +2759,6 @@ pub fn dispatch<R: Resolver>(
                 );
             }
         }
-        // ── gemma3n's arms (AltUp, the rank-K residual) ─────────────
-        // args: [x, y] — one stream broadcast into K. `hc_mult` is the
-        // ratio of the widths, so the expansion states its own K.
-        "norm::hc_expand_bf16" => {
-            need(2)?;
-            let (x, y) = (bound.args[0], bound.args[1]);
-            let hidden = i32::try_from(x.width).expect("hidden");
-            unsafe {
-                ffi::pie_k_norm_hc_expand_bf16(
-                    x.ptr.cast_const(),
-                    y.ptr,
-                    rows,
-                    i32::try_from(y.width).expect("width") / hidden.max(1),
-                    hidden,
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [x_in, x_out] — elementwise, in place; staged because the
-        // lowering assigned distinct buffers.
-        "norm::tanh_bf16" => {
-            need(2)?;
-            let (x_in, x_out) = (bound.args[0], bound.args[1]);
-            stage_d2d(ctx, &bound.rows, x_out, x_in);
-            unsafe {
-                ffi::pie_k_norm_tanh_bf16(
-                    x_out.ptr,
-                    rows * i32::try_from(x_out.width).expect("width"),
-                    ctx.stream,
-                );
-            }
-        }
         // args: [in_bf16, out_fp32] — the PREDICT coefficients are
         // `[K, K]` per token, so `k` is the square root of the width.
         "norm::altup_unpack_predict_coefs" => {
@@ -3581,59 +2831,6 @@ pub fn dispatch<R: Resolver>(
                 );
             }
         }
-        // args: [in_bf16, out_fp32] — the CORRECT coefficients are one
-        // per stream, so the width IS K.
-        "norm::altup_unpack_correct_coefs" => {
-            need(2)?;
-            let (src, dst) = (bound.args[0], bound.args[1]);
-            unsafe {
-                ffi::pie_k_norm_altup_unpack_correct_coefs(
-                    src.ptr.cast_const(),
-                    dst.ptr.cast(),
-                    rows,
-                    i32::try_from(src.width).expect("k"),
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [predictions, activated, coefs, corrected] — correct every
-        // stream from the body's result. `h` is the ACTIVATED value's
-        // width (the `[K, …]` values state none); the active index is the
-        // deployment's.
-        "norm::altup_correct_bf16" => {
-            need(4)?;
-            let (preds, activated, coefs, corrected) =
-                (bound.args[0], bound.args[1], bound.args[2], bound.args[3]);
-            unsafe {
-                ffi::pie_k_norm_altup_correct_bf16(
-                    preds.ptr.cast_const(),
-                    activated.ptr.cast_const(),
-                    coefs.ptr.cast_const().cast(),
-                    corrected.ptr,
-                    i32::try_from(coefs.width).expect("k"),
-                    rows,
-                    i32::try_from(activated.width).expect("hidden"),
-                    ctx.altup_active,
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [reference, target_rms_out] — the magnitude the rescale
-        // below restores. `kAltupEps` is the C++'s own constexpr.
-        "norm::compute_rms_bf16" => {
-            need(2)?;
-            let (reference, out) = (bound.args[0], bound.args[1]);
-            unsafe {
-                ffi::pie_k_norm_compute_rms_bf16(
-                    reference.ptr.cast_const(),
-                    out.ptr.cast(),
-                    rows,
-                    i32::try_from(reference.width).expect("hidden"),
-                    ALTUP_EPS,
-                    ctx.stream,
-                );
-            }
-        }
         // args: [streams, out] — the mean over K. The streams value states
         // no width, so K is the fire's.
         "norm::mean_streams_bf16" => {
@@ -3656,32 +2853,10 @@ pub fn dispatch<R: Resolver>(
                 );
             }
         }
-        // args: [x_in, target_rms, x_out] — in place over the projected
-        // stream, restoring the magnitude `compute_rms` measured.
-        "norm::magnitude_rescale_bf16" => {
-            need(3)?;
-            let (x_in, target, x_out) = (bound.args[0], bound.args[1], bound.args[2]);
-            stage_d2d(ctx, &bound.rows, x_out, x_in);
-            unsafe {
-                ffi::pie_k_norm_magnitude_rescale_bf16(
-                    x_out.ptr,
-                    target.ptr.cast_const().cast(),
-                    rows,
-                    i32::try_from(x_out.width).expect("hidden"),
-                    ALTUP_EPS,
-                    ctx.stream,
-                );
-            }
-        }
         other => return Err(DispatchRefusal::NoArm(other.to_string())),
     }
     Ok(())
 }
-
-/// gemma3n's AltUp epsilon — `constexpr float kAltupEps` in `gemma3n.cpp`,
-/// a family constant rather than a config value.
-#[cfg(feature = "bridge")]
-const ALTUP_EPS: f32 = 1e-5;
 
 /// `sqrt(w)` when `w` is a perfect square — how a `[K, K]` coefficient
 /// block states its K.

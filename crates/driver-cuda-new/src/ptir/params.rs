@@ -40,7 +40,7 @@
 //! offsets here are asserted individually rather than the size being asserted
 //! once — a size check passes under any permutation of same-width fields.
 
-use driver_pipeline::OpParams;
+use driver::OpParams;
 
 /// One op's parameters, in the layout CUDA's generated kernels read.
 ///
@@ -167,7 +167,7 @@ impl CudaOpParams {
     /// The first sixteen words are copied by NAME rather than by a
     /// transmute of the 64-byte prefix. A transmute would be correct today
     /// and would keep being "correct" after a field was inserted in the
-    /// middle of `driver_pipeline::OpParams` — silently, with every op after
+    /// middle of `driver::OpParams` — silently, with every op after
     /// the insertion point reading a neighbour. Copying by name makes that a
     /// compile error.
     #[must_use]
@@ -242,7 +242,7 @@ pub fn params_bytes(params: &[CudaOpParams]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use driver_pipeline::{STATUS_BYTES, ValueDesc};
+    use driver::{STATUS_BYTES, ValueDesc};
 
     /// The two records that ARE byte-identical, asserted here rather than
     /// assumed. If either ever diverges the way `OpParams` did, this is where

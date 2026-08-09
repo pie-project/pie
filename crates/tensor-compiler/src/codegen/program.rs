@@ -25,7 +25,7 @@ use crate::plan::{CompiledStage, LibraryOp, Region, RegionKind};
 /// Kind discriminants. Re-exported from the driver ABI rather than restated:
 /// [`EmittedKernel::kind`] is handed straight to the driver, so a second
 /// spelling of these numbers here would be a second thing to keep right.
-pub use driver::local::{
+pub use driver_api::local::{
     PIE_KERNEL_COMMIT, PIE_KERNEL_FUSED, PIE_KERNEL_GROUPED, PIE_KERNEL_READINESS,
     PIE_KERNEL_SINGLETON,
 };

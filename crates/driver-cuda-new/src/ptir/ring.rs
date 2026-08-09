@@ -9,7 +9,7 @@
 //! * **native**, on the device: one byte per bool lane, four per anything
 //!   else. A kernel indexes a bool cell lane by lane, so it cannot be packed.
 //! * **wire**, on the host: bool packs eight lanes to a byte
-//!   ([`wire_cell_bytes`](driver_pipeline::wire_cell_bytes)); everything else
+//!   ([`wire_cell_bytes`](driver::wire_cell_bytes)); everything else
 //!   is still four bytes per lane.
 //!
 //! Every non-bool channel therefore has the same size in both, which is
@@ -47,7 +47,7 @@
 //! ring that is already mid-sequence, already full, or already poisoned. The
 //! Metal port's `Ring::new` records the same requirement for the same reason.
 
-use driver_pipeline::tensor_ir::DType;
+use driver::tensor_ir::DType;
 
 use crate::cuda::{Allocator, DeviceBuffer, StreamRef};
 use crate::error::{Error, Result};
@@ -58,7 +58,7 @@ use super::control::MAX_RING;
 ///
 /// One byte per bool lane rather than one bit: a kernel indexes a bool cell
 /// lane by lane. The wire form packs, and
-/// [`wire_cell_bytes`](driver_pipeline::wire_cell_bytes) is that one.
+/// [`wire_cell_bytes`](driver::wire_cell_bytes) is that one.
 #[must_use]
 pub fn native_cell_bytes(dtype: DType, numel: usize) -> usize {
     if dtype == DType::Bool {
@@ -213,7 +213,7 @@ impl Rings {
 
     /// The device address of channel `c`'s cell at ring slot `slot`.
     ///
-    /// This is what a [`LaneChannelSlot`](driver_pipeline::LaneChannelSlot)'s
+    /// This is what a [`LaneChannelSlot`](driver::LaneChannelSlot)'s
     /// `committed_cell` and `pending_cell` are: absolute device addresses,
     /// resolved on the host, because the kernel is handed pointers and does no
     /// ring arithmetic of its own.
@@ -391,9 +391,9 @@ mod tests {
     #[test]
     fn a_bool_cell_is_bytes_on_the_device_and_bits_on_the_wire() {
         assert_eq!(native_cell_bytes(DType::Bool, 128), 128);
-        assert_eq!(driver_pipeline::wire_cell_bytes(DType::Bool, 128), 16);
+        assert_eq!(driver::wire_cell_bytes(DType::Bool, 128), 16);
         assert_eq!(native_cell_bytes(DType::F32, 128), 512);
-        assert_eq!(driver_pipeline::wire_cell_bytes(DType::F32, 128), 512);
+        assert_eq!(driver::wire_cell_bytes(DType::F32, 128), 512);
     }
 
     /// The ring is one longer than the capacity, and the extra slot is what

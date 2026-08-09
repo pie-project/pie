@@ -25,11 +25,25 @@ use serde::{Deserialize, Serialize};
 /// a genuinely different op ORDER, which is why it is a fact and not an
 /// emitter choice. Mirrors the driver's `NormPlacement`
 /// (`crates/driver-cuda/csrc/src/model/llama_like/llama_like.hpp`).
+///
+/// `Sandwich` is gemma's, and it is BOTH rather than a third position: the
+/// sub-layer is normed on the way in *and* its output is normed on the way
+/// out, so a gemma block runs four norms where a llama block runs two. The
+/// checkpoint states it plainly — gemma-4 ships `input_layernorm`,
+/// `post_attention_layernorm`, `pre_feedforward_layernorm` and
+/// `post_feedforward_layernorm` per layer, and a `Pre` deployment ships the
+/// first two only.
+///
+/// The distinction is not cosmetic and it does not fail loudly. Reading a
+/// gemma checkpoint as `Pre` binds `pre_feedforward_layernorm` where the
+/// text asked for the post-attention one, drops both output norms, and
+/// returns fluent text that is not the model's.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NormPlacement {
     #[default]
     Pre,
     Post,
+    Sandwich,
 }
 
 /// Which q/k-norm convention the checkpoint ships, if any.

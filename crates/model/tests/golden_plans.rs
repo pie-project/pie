@@ -893,6 +893,44 @@ fn deepseek_v4_cuda_decode() {
     );
 }
 
+/// The PREFILL class these three gained when `dsl::cuda::attention_for`
+/// landed. Each served Decode only and PANICKED on anything else, and the
+/// class-dependent sites in all three numbered exactly one: the attention
+/// op. A golden per family, because "it lowers" is a weaker claim than
+/// "it lowers to this" and the second is what a driver has to bind.
+#[test]
+fn gemma_2_cuda_prefill() {
+    check_plan(
+        "gemma_2.cuda.prefill",
+        &model::gemma_2::forward::gemma2_cuda(
+            &model::gemma_2::forward::facts::Gemma2Facts::gemma_2_9b(),
+            FireClass::Prefill,
+        ),
+    );
+}
+
+#[test]
+fn gemma3n_cuda_prefill() {
+    check_plan(
+        "gemma3n.cuda.prefill",
+        &model::gemma3n::forward::gemma3n_cuda(
+            &model::gemma3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(),
+            FireClass::Prefill,
+        ),
+    );
+}
+
+#[test]
+fn nemotron_h_cuda_prefill() {
+    check_plan(
+        "nemotron_h.cuda.prefill",
+        &model::nemotron_h::forward::nemotron_h_cuda(
+            &model::nemotron_h::forward::facts::NemotronHFacts::nemotron_h_synthetic(),
+            FireClass::Prefill,
+        ),
+    );
+}
+
 #[test]
 fn gemma3n_cuda_decode() {
     check_plan(

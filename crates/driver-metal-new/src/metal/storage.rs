@@ -43,11 +43,49 @@ use super::ring::allocate;
 
 
 
-fn alloc_zeroed(context: &Context, len: u64, what: &'static str) -> Result<Handle> {
-    let handle = allocate(context, len.max(1), what)?;
-    // SAFETY: the buffer is seconds old; no command buffer references it.
-    unsafe { handle.zero(0, handle.len())? };
-    Ok(handle)
+
+/// Whether a model of `bytes` may be staged on this device, and why not.
+///
+/// Asked BEFORE a byte is read, which is the only moment it can be asked
+/// usefully: `persistent_bytes` is the plan's own layout total, known from
+/// the plan, and everything after the call either allocates it or writes
+/// into it.
+///
+/// # Why this had to come back
+///
+/// The C++ had `fits_on_this_gpu` and the port dropped it. The machinery to
+/// answer SURVIVED — `Memory::probe`/`headroom` reads both the device's
+/// `recommendedMaxWorkingSetSize` and the kernel's reclaimable pages, and
+/// `the_tighter_ceiling_wins_and_silence_is_not_a_refusal` has been testing
+/// it the whole time — with no caller anywhere. Implemented, tested, and
+/// unreachable, which is the pattern that makes a capability a caps lie.
+///
+/// What its absence costs is recorded in the tree already:
+/// `device_checkpoint_names.rs` notes that *"the 26B gemma4 on this machine
+/// is SIGKILLed by the staging test"*, and the guard existed to keep a
+/// process from being left hung and unkillable instead. A refusal naming
+/// both numbers is strictly better than the kernel's answer.
+///
+/// # Errors
+///
+/// [`Error::Create`], naming the model's bytes and the device's ceiling.
+/// Never on a machine that would not answer: `headroom` is TRUE when neither
+/// ceiling could be read, because refusing on silence turns a diagnostic
+/// into an outage.
+fn fits_on_this_gpu(memory: &super::memory::Memory, bytes: u64) -> Result<()> {
+    if memory.headroom(bytes) {
+        return Ok(());
+    }
+    Err(Error::Create {
+        what: "weight arena",
+        message: format!(
+            "this checkpoint's resident weights are {bytes} bytes and this \
+             device's ceiling is {} -- refused before staging rather than \
+             after, because the alternative is the kernel deciding and the \
+             process is not reliably killable while it does",
+            memory.ceiling().unwrap_or(0)
+        ),
+    })
 }
 
 /// Stage the plan's weights into one region, each tensor a named slice.
@@ -96,6 +134,7 @@ pub fn stage_plan_weights(
         }
     }
     let arena_len = plan.memory.persistent_bytes;
+    fits_on_this_gpu(&super::memory::Memory::probe(context), arena_len)?;
 
     // The tensors that are NOT in the arena, collected as they finalize. A
     // sink rather than a second pass: the executor publishes each exactly
@@ -172,3 +211,40 @@ pub fn stage_plan_weights(
 
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::fits_on_this_gpu;
+    use crate::metal::memory::Memory;
+
+    /// The guard the port dropped, restored and held to a number.
+    ///
+    /// `Memory::headroom` was implemented AND tested the whole time and had
+    /// no caller — so what this pins is not the arithmetic (which
+    /// `the_tighter_ceiling_wins_and_silence_is_not_a_refusal` already owns)
+    /// but that the staging path consults it, refuses by name, and does not
+    /// refuse on silence.
+    #[test]
+    fn a_model_past_the_ceiling_is_refused_before_a_byte_is_staged() {
+        let device = Memory {
+            device_working_set: 8 << 30,
+            reclaimable: 32 << 30,
+            ..Memory::default()
+        };
+        fits_on_this_gpu(&device, 4 << 30).expect("half the ceiling stages");
+        fits_on_this_gpu(&device, 8 << 30).expect("exactly the ceiling stages");
+
+        let err = fits_on_this_gpu(&device, 26 << 30)
+            .expect_err("a 26 GB model on an 8 GB ceiling must be refused");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("27917287424") && message.contains("8589934592"),
+            "the refusal has to carry BOTH numbers, or the operator learns \
+             nothing the SIGKILL would not have told them: {message}"
+        );
+
+        // A machine that will not answer is not a machine with no memory.
+        fits_on_this_gpu(&Memory::default(), u64::MAX)
+            .expect("an unreadable ceiling must not refuse a load");
+    }
+}

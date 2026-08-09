@@ -178,11 +178,11 @@ mod tests {
 
     fn fixture_caps() -> DriverCapabilities {
         DriverCapabilities {
-            abi_version: driver::PIE_DRIVER_ABI_VERSION,
+            abi_version: driver_api::PIE_DRIVER_ABI_VERSION,
             total_pages: 1024,
             kv_page_size: 32,
             swap_pool_size: 0,
-            kv_copy_domain_mask: driver::KV_COPY_DEVICE_TO_DEVICE,
+            kv_copy_domain_mask: driver_api::KV_COPY_DEVICE_TO_DEVICE,
             max_forward_tokens: 4096,
             max_forward_requests: 512,
             max_page_refs: 262144,
@@ -204,7 +204,7 @@ mod tests {
             has_kv_envelopes: false,
             has_attn_page_mask: false,
             has_attn_score: false,
-            device_geometry_port_mask: driver::PIE_DEVICE_GEOMETRY_PORTS,
+            device_geometry_port_mask: driver_api::PIE_DEVICE_GEOMETRY_PORTS,
             has_lora: false,
             model_site_summary: Default::default(),
             codegen_backend: String::new(),
@@ -293,7 +293,7 @@ arch_name = "qwen3"
         assert!(m.drivers[0].has_mtp_logits);
         assert_eq!(
             m.drivers[0].device_geometry_port_mask,
-            driver::PIE_DEVICE_GEOMETRY_PORTS
+            driver_api::PIE_DEVICE_GEOMETRY_PORTS
         );
     }
 

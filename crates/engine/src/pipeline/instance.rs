@@ -1091,7 +1091,7 @@ mod tests {
                         dtype: decl.dtype.tag(),
                         host_role: decl.host_role as u8,
                         seeded: decl.seeded,
-                        extern_dir: ::driver::PIE_CHANNEL_EXTERN_NONE,
+                        extern_dir: ::driver_api::PIE_CHANNEL_EXTERN_NONE,
                         capacity: decl.capacity,
                         reader_wait_id: 0,
                         writer_wait_id: 0,

@@ -56,7 +56,7 @@ worker-api = { path = "../worker-api" }
 # The runtime <-> driver vocabulary. A direct dep because this crate names
 # those types, not (as it once did) so its build script could receive a C
 # header directory through a `links` handoff.
-driver = { path = "../driver" }
+driver-api = { path = "../driver-api" }
 transport = { path = "../transport", optional = true }
 # Shared id atoms (WorkerId / NodeId / ReqId / SessionId) and the client wire
 # vocabulary (ClientMessage / ServerMessage) the gateway data plane carries.

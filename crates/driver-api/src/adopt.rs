@@ -11,12 +11,12 @@
 //!
 //! A driver's `register_program` entry point receives a
 //! [`local::PieProgramDesc`] and nothing else. Every Rust consumer of a launch
-//! package — `driver_pipeline::adopt_launch_package`, the region and lane
+//! package — `driver::adopt_launch_package`, the region and lane
 //! derivations the CUDA and Metal shells share, the emitted-kernel index —
 //! reads [`plan::LaunchPackage`]. With no bridge between them a Rust driver
 //! could not register a PTIR program at all: it held the package in the one
 //! shape nothing could read. The C++ driver had the bridge
-//! (`pie::driver::launch::adopt`, in `driver/launch/program.hpp`) and Rust did
+//! (`pie::driver_api::launch::adopt`, in `driver/launch/program.hpp`) and Rust did
 //! not.
 //!
 //! # Why it lives here and not in a driver crate

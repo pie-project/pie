@@ -16,13 +16,13 @@
 //!                       L.layers.lo, L.layers.hi, stream);
 //! ```
 //!
-//! **This is what a declared fire runs.** `declared_forward.cpp` builds
-//! the rows, calls `pie_forward_lower`, and executes the result; its
-//! walk over the region IR was deleted in the cutover's step 3, so there
-//! is no second form and no switch between them. The one remaining
-//! consumer of the traced form that does NOT come through here is the
-//! generated `.inc` — an ahead-of-time emission of the same declaration
-//! that also carries the unionized supergraph build.
+//! **This is what a declared fire runs.** A driver builds the rows, calls
+//! [`lower`], and executes the result; the old walk over the region IR
+//! was deleted in the cutover's step 3, so there is no second form and no
+//! switch between them. The one remaining consumer of the traced form
+//! that does NOT come through here is the generated `.inc` — an
+//! ahead-of-time emission of the same declaration that also carries the
+//! unionized supergraph build.
 //!
 //! # Three decisions this module makes, from the doc's amendments
 //!

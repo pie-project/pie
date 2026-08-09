@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use ::driver::PieChannelEndpointBinding;
+use ::driver_api::PieChannelEndpointBinding;
 
 /// One channel's initial (seed) value delivered at bind time — `channel` is
 /// the global channel identity, `bytes` its native-encoded wire payload. No

@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use ::driver::{
+use ::driver_api::{
     PIE_MEMORY_DOMAIN_CUDA_DEVICE, PIE_MEMORY_DOMAIN_HOST_PINNED, PieKvMoveCell, PiePoolRange,
     PieStateCopyRange,
 };
@@ -119,7 +119,7 @@ pub(crate) async fn register_channels_bind_classified(
     requested_instance_id: InstanceId,
     channel_ids: Vec<u64>,
     seed_values: Vec<ChannelValue>,
-    geometry_class: ::driver::GeometryClass,
+    geometry_class: ::driver_api::GeometryClass,
 ) -> Result<(
     Vec<Arc<ChannelEndpoint>>,
     BoundInstance,
@@ -187,7 +187,7 @@ pub(crate) async fn bind_instance(
         requested_instance_id,
         channel_ids,
         seed_values,
-        ::driver::GeometryClass::Host,
+        ::driver_api::GeometryClass::Host,
     )
     .await
 }
@@ -199,7 +199,7 @@ pub(crate) async fn bind_instance_classified(
     requested_instance_id: InstanceId,
     channel_ids: Vec<u64>,
     seed_values: Vec<ChannelValue>,
-    geometry_class: ::driver::GeometryClass,
+    geometry_class: ::driver_api::GeometryClass,
 ) -> Result<BoundInstance> {
     let table = waker::WakerTable::global();
     let pacing_wait_id = table.alloc();

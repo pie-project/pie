@@ -7,7 +7,7 @@
 //! the program computed the right thing, because none of them has a right
 //! answer to compare against.
 //!
-//! This one does. `driver_pipeline::step` is the reference interpreter — the
+//! This one does. `driver::step` is the reference interpreter — the
 //! same code the Metal shell diffs against, itself proven equal to
 //! `tensor_compiler::eval::interp` by `driver-pipeline`'s own oracle — and it
 //! runs the *same adopted plan* over the *same seeds* on the CPU. So the GPU
@@ -22,7 +22,7 @@
 //! # The chain under test
 //!
 //! Author a `TraceContainer` → `bind` → `compile_bound` → `codegen::launch::build`
-//! → `emit_program(Backend::Cuda)` → `driver_pipeline::adopt_launch_package`
+//! → `emit_program(Backend::Cuda)` → `driver::adopt_launch_package`
 //! → `ptir::Runtime::compile` (NVRTC) → `ptir::Prepared::build` → launch.
 //! That is every step the engine takes, with nothing stubbed.
 
@@ -30,8 +30,8 @@ use driver_cuda_new::cuda::{Allocator, OwnedStream};
 use driver_cuda_new::ptir::{
     ChannelShape, Control, Disk, Prepared, Rings, Runtime, Target, launch_control, nvrtc,
 };
-use driver_pipeline::tensor_ir::DType;
-use driver_pipeline::{Extents, Versions, adopt_launch_package};
+use driver::tensor_ir::DType;
+use driver::{Extents, Versions, adopt_launch_package};
 use tensor_compiler::codegen::program::{Backend, emit_program};
 use tensor_compiler::plan::compile_bound;
 use tensor_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
@@ -82,7 +82,7 @@ fn epilogue(out: IrDType, ops: Vec<Op>) -> TraceContainer {
 /// What one case answered, on each side.
 struct Answers {
     device: Vec<u8>,
-    golden: driver_pipeline::Value,
+    golden: driver::Value,
     committed: bool,
 }
 
@@ -101,9 +101,9 @@ fn run_both(container: TraceContainer, seed: &[f32]) -> Option<Answers> {
     let stages = compile_bound(&bound);
     let package = tensor_compiler::codegen::launch::build(&bound, &stages);
     let emitted = emit_program(Backend::Cuda, &stages, &bound);
-    let kernels: Vec<driver::plan::EmittedKernel> = emitted
+    let kernels: Vec<driver_api::plan::EmittedKernel> = emitted
         .iter()
-        .map(|k| driver::plan::EmittedKernel {
+        .map(|k| driver_api::plan::EmittedKernel {
             kind: k.kind,
             stage_index: k.stage_index,
             region_index: k.region_index,
@@ -211,20 +211,20 @@ fn run_both(container: TraceContainer, seed: &[f32]) -> Option<Answers> {
         .expect("read the output");
 
     // ── The golden side: the SAME plan, on the CPU. ──
-    let seeds: std::collections::BTreeMap<u32, driver_pipeline::Value> =
-        [(0u32, driver_pipeline::Value::F32(seed.to_vec()))]
+    let seeds: std::collections::BTreeMap<u32, driver::Value> =
+        [(0u32, driver::Value::F32(seed.to_vec()))]
             .into_iter()
             .collect();
     let mut instance =
-        driver_pipeline::make_host_instance(&plan, &std::collections::BTreeMap::new(), &seeds);
-    let outcome = driver_pipeline::step(&mut instance, &plan, &driver_pipeline::PassInputs::none());
+        driver::make_host_instance(&plan, &std::collections::BTreeMap::new(), &seeds);
+    let outcome = driver::step(&mut instance, &plan, &driver::PassInputs::none());
     assert_eq!(
         outcome,
-        driver_pipeline::StepOutcome::Committed,
+        driver::StepOutcome::Committed,
         "the reference interpreter must commit"
     );
-    let golden = match driver_pipeline::host_take(&instance, &plan, 1) {
-        (driver_pipeline::HostOp::Ok, Some(value)) => value,
+    let golden = match driver::host_take(&instance, &plan, 1) {
+        (driver::HostOp::Ok, Some(value)) => value,
         (op, _) => panic!("the reference must publish a value: {op:?}"),
     };
 
@@ -263,7 +263,7 @@ fn an_argmax_over_a_tie_picks_the_same_lane_on_the_device_as_in_the_golden_model
 
     let device = i32::from_le_bytes(answers.device[..4].try_into().expect("four bytes"));
     let golden = match &answers.golden {
-        driver_pipeline::Value::I32(lanes) => lanes[0],
+        driver::Value::I32(lanes) => lanes[0],
         other => panic!("the golden model answered {other:?}"),
     };
     assert_eq!(
@@ -298,7 +298,7 @@ fn a_reduction_agrees_with_the_golden_model_because_both_fold_in_one_order() {
 
     let device = f32::from_le_bytes(answers.device[..4].try_into().expect("four bytes"));
     let golden = match &answers.golden {
-        driver_pipeline::Value::F32(lanes) => lanes[0],
+        driver::Value::F32(lanes) => lanes[0],
         other => panic!("the golden model answered {other:?}"),
     };
     assert_eq!(
@@ -334,7 +334,7 @@ fn an_elementwise_chain_agrees_with_the_golden_model() {
 
     let device = f32::from_le_bytes(answers.device[..4].try_into().expect("four bytes"));
     let golden = match &answers.golden {
-        driver_pipeline::Value::F32(lanes) => lanes[0],
+        driver::Value::F32(lanes) => lanes[0],
         other => panic!("the golden model answered {other:?}"),
     };
     assert_eq!(

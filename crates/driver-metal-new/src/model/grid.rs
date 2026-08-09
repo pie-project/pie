@@ -20,7 +20,13 @@
 //!
 //! [`Rule`]: super::geometry::Rule
 
-use crate::batch::QMM_BMS;
+/// The GEMM row tiles the shaders are compiled for, narrow first — the same
+/// three `TILE_M` declares in `kernels-metal/src/axes.rs`.
+///
+/// Here rather than in `batch` because this is the only reader left: the
+/// per-family PSO planner that also knew them has retired, and a constant
+/// whose one user is `grid` belongs beside `grid`.
+const QMM_BMS: [u32; 3] = [16, 32, 64];
 
 /// A dispatch's thread grid and threadgroup, in THREADS — the encoder calls
 /// `dispatchThreads`, so a head count multiplies the threadgroup width
@@ -168,10 +174,10 @@ pub fn router_lane_width(n_experts: u32) -> u32 {
 
 /// `moe_route` top-k: every expert a lane, one row per grid.y.
 #[must_use]
-pub fn router_topk(n_experts: u32) -> Launch {
+pub fn router_topk(n_experts: u32, rows: u32) -> Launch {
     let w = router_lane_width(n_experts);
     Launch {
-        grid: [w, 1, 1],
+        grid: [w, rows.max(1), 1],
         tg: [w, 1, 1],
     }
 }

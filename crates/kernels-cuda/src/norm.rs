@@ -6,33 +6,49 @@
 
 use kernels::kernel;
 use kernels::operands;
+use kernels::Lit;
 use kernels::Source;
 use kernels::KernelSig;
+
+/// AltUp's epsilon, which is the ALGORITHM's and not the model's.
+///
+/// Both rows below carried `Source::Ctx("eps")` and both hand arms passed
+/// this constant instead — the arms were right. `ctx.eps` is the
+/// checkpoint's `rms_norm_eps` (1e-6 for gemma-3n), and substituting it
+/// here is a different computation that still runs. A literal is the
+/// honest spelling: nothing about a rank-K residual stream's magnitude
+/// hold reads the model's norm epsilon.
+const ALTUP_EPS: f32 = 1e-5;
 
 #[rustfmt::skip]
 pub static KERNELS: &[KernelSig] = &[
     kernel!(rmsnorm_gated_launch "norm::rmsnorm_gated_bf16",
         operands = operands![
-            x: Buf,
-            gate: Buf,
-            weight: Buf,
-            y: BufMut,
-            num_rows: I32,
-            hidden: I32,
-            eps: F32,
-            stream: Stream,
+            x: Buf <- Source::In(0),
+            gate: Buf <- Source::In(1),
+            weight: Buf <- Source::Weight(0),
+            y: BufMut <- Source::Out(0),
+            num_rows: I32 <- Source::Rows,
+            hidden: I32 <- Source::InWidth(0),
+            eps: F32 <- Source::Ctx("eps"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
+    // The strides are the two values' OWN widths, which is the whole of
+    // what "strided" means here: a row of `x` is `x_row_stride` wide and
+    // only `hidden` of it is read. So `hidden` comes off the RESULT and
+    // the strides off each side, and the row needs nothing the binder
+    // does not already hold.
     kernel!(rmsnorm_strided "norm::rmsnorm_strided_bf16",
         operands = operands![
-            x: Buf,
-            weight: Buf,
-            y: BufMut,
-            num_rows: I32,
-            hidden: I32,
-            x_row_stride: I32,
-            y_row_stride: I32,
-            eps: F32,
-            stream: Stream,
+            x: Buf <- Source::In(0),
+            weight: Buf <- Source::Weight(0),
+            y: BufMut <- Source::Out(0),
+            num_rows: I32 <- Source::Rows,
+            hidden: I32 <- Source::OutWidth(0),
+            x_row_stride: I32 <- Source::InWidth(0),
+            y_row_stride: I32 <- Source::OutWidth(0),
+            eps: F32 <- Source::Ctx("eps"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // gemma-4's end-of-layer shape: the scale sits BETWEEN the add and the
     // norm, which is why it is not `residual_add_rmsnorm` with a multiply
@@ -128,14 +144,17 @@ pub static KERNELS: &[KernelSig] = &[
     // Where a rank-K residual BEGINS: replicate the embedding into K
     // streams. AltUp's equivalent is implicit in gemma-3n's workspace
     // layout; HC states it, which is the one a declaration can read.
+    // The hyper-connection expand: one hidden row in, `hc_mult` of them
+    // out. Both extents come off the two values — the multiplier is what
+    // the result is wider BY — so nothing here is the plan's.
     kernel!(hc_expand "norm::hc_expand_bf16",
         operands = operands![
-            input: Buf,
-            output: BufMut,
-            n: I32,
-            hc_mult: I32,
-            hidden_size: I32,
-            stream: Stream,
+            input: Buf <- Source::In(0),
+            output: BufMut <- Source::Out(0),
+            n: I32 <- Source::Rows,
+            hc_mult: I32 <- Source::OutWidthOverIn(0, 0),
+            hidden_size: I32 <- Source::InWidth(0),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     kernel!(hc_pre "norm::hc_pre_postprocess_bf16",
         operands = operands![
@@ -179,14 +198,17 @@ pub static KERNELS: &[KernelSig] = &[
             stream: Stream,
             hc_eps: F32,
         ]),
-    kernel!(per_head_rmsnorm "norm::per_head_rmsnorm_bf16",
+    // Normalizes q WHERE IT LIES: one operand, one result, the same
+    // bytes — so `q` binds from `Out(0)` and the staging comes off the
+    // `in_place` pair.
+    kernel!(per_head_rmsnorm "norm::per_head_rmsnorm_bf16", in_place = &[(0, 0)],
         operands = operands![
-            q: BufMut,
-            n: I32,
-            num_heads: I32,
-            head_dim: I32,
-            eps: F32,
-            stream: Stream,
+            q: BufMut <- Source::Out(0),
+            n: I32 <- Source::Rows,
+            num_heads: I32 <- Source::OutWidthOver(0, "head_dim"),
+            head_dim: I32 <- Source::Ctx("head_dim"),
+            eps: F32 <- Source::Ctx("eps"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // Residual add + the next block's pre-norm, fused. Numerically the
     // two-kernel sequence (the kernel matches `residual_add`'s bf16 rounding
@@ -224,15 +246,15 @@ pub static KERNELS: &[KernelSig] = &[
         ]),
     kernel!(altup_correct "norm::altup_correct_bf16",
         operands = operands![
-            predictions: Buf,
-            activated: Buf,
-            correction_coefs_plus_one: F32s,
-            corrected: BufMut,
-            k: I32,
-            t: I32,
-            h: I32,
-            active_idx: I32,
-            stream: Stream,
+            predictions: Buf <- Source::In(0),
+            activated: Buf <- Source::In(1),
+            correction_coefs_plus_one: F32s <- Source::In(2),
+            corrected: BufMut <- Source::Out(0),
+            k: I32 <- Source::InWidth(2),
+            t: I32 <- Source::Rows,
+            h: I32 <- Source::InWidth(1),
+            active_idx: I32 <- Source::Ctx("altup_active"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     kernel!(altup_unpack_predict_coefs "norm::altup_unpack_predict_coefs",
         operands = operands![
@@ -244,20 +266,26 @@ pub static KERNELS: &[KernelSig] = &[
         ]),
     kernel!(altup_unpack_correct_coefs "norm::altup_unpack_correct_coefs",
         operands = operands![
-            in_bf16: Buf,
-            out_fp32: F32sMut,
-            t: I32,
-            k: I32,
-            stream: Stream,
+            in_bf16: Buf <- Source::In(0),
+            out_fp32: F32sMut <- Source::Out(0),
+            t: I32 <- Source::Rows,
+            k: I32 <- Source::InWidth(0),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
+    // `k` is a CONTEXT field and not an extent, because the streams
+    // arrive interleaved: `streams` is `[t, k*h]` and only the fire
+    // knows how that row divides. `CtxNonZero` rather than `Ctx` for
+    // the same reason the arm checked it — a fire that states no
+    // stream count is not one this kernel can be run for, and
+    // declining is better than dividing by zero.
     kernel!(mean_streams "norm::mean_streams_bf16",
         operands = operands![
-            streams: Buf,
-            out: BufMut,
-            k: I32,
-            t: I32,
-            h: I32,
-            stream: Stream,
+            streams: Buf <- Source::In(0),
+            out: BufMut <- Source::Out(0),
+            k: I32 <- Source::CtxNonZero("altup_streams"),
+            t: I32 <- Source::Rows,
+            h: I32 <- Source::OutWidth(0),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     kernel!(compute_rms "norm::compute_rms_bf16",
         operands = operands![
@@ -270,7 +298,7 @@ pub static KERNELS: &[KernelSig] = &[
             target_rms_out: F32sMut <- Source::Out(0),
             t: I32 <- Source::Rows,
             h: I32 <- Source::InWidth(0),
-            eps: F32 <- Source::Ctx("eps"),
+            eps: F32 <- Source::Lit(Lit::F32(ALTUP_EPS)),
             stream: Stream <- Source::Ctx("stream"),
         ]),
     // In place on the tensor it holds to a magnitude: the row states one
@@ -283,18 +311,18 @@ pub static KERNELS: &[KernelSig] = &[
             target_rms: F32s <- Source::In(1),
             t: I32 <- Source::Rows,
             h: I32 <- Source::OutWidth(0),
-            eps: F32 <- Source::Ctx("eps"),
+            eps: F32 <- Source::Lit(Lit::F32(ALTUP_EPS)),
             stream: Stream <- Source::Ctx("stream"),
         ]),
     // Weightless per-head norm (the V-norm) — no gamma, so no variant.
     kernel!(rmsnorm_no_scale "norm::rmsnorm_no_scale_bf16", in_place = &[(0, 0)],
         operands = operands![
-            x: Buf,
-            y: BufMut,
-            num_rows: I32,
-            hidden: I32,
-            eps: F32,
-            stream: Stream,
+            x: Buf <- Source::In(0),
+            y: BufMut <- Source::Out(0),
+            num_rows: I32 <- Source::Rows,
+            hidden: I32 <- Source::InWidth(0),
+            eps: F32 <- Source::Ctx("eps"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // Four statements in one launch, and two: gemma-4 fuses the next
     // block's input norm into the previous block's landing, which is why
@@ -366,8 +394,16 @@ pub static KERNELS: &[KernelSig] = &[
             lse: F32s <- Source::In(1),
             sink: F32s <- Source::Weight(0),
             n: I32 <- Source::Rows,
-            num_heads: I32 <- Source::OutDim(0, 1),
-            head_dim: I32 <- Source::OutDim(0, 2),
+            // `OutWidthOver`, not `OutDim(0, 1)`. The two ask different
+            // questions and only one of them is answerable: `OutDim`
+            // asks the PLAN what the second extent of a
+            // `[Tokens, heads, dim]` value is, and the join has never
+            // carried it — which is why this row sat on the generator's
+            // wall. This asks the BINDER how many head-dims fit in a row
+            // whose width it already holds, which is what the hand arm
+            // computed.
+            num_heads: I32 <- Source::OutWidthOver(0, "head_dim"),
+            head_dim: I32 <- Source::Ctx("head_dim"),
             stream: Stream <- Source::Ctx("stream"),
         ]),
 ];

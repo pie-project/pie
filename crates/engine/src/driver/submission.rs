@@ -4,7 +4,7 @@
 //! step; the driver executes the steps as one closed system with a single
 //! completion.
 
-use ::driver::PieTerminalCell;
+use ::driver_api::PieTerminalCell;
 
 use super::command::LaunchPlan;
 

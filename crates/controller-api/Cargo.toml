@@ -16,7 +16,7 @@ path = "src/lib.rs"
 ids = { path = "../ids" }
 # `WorkerInfo.capability` carries `DriverCapabilities`, which lives in
 # `driver` (`capabilities.rs`).
-driver = { path = "../driver" }
+driver-api = { path = "../driver-api" }
 # Plain serde — control vocabulary travels over the control channel.
 serde = { version = "1.0", features = ["derive"] }
 # The RPC mechanism. `serde1` enables the serde derives on the macro-generated

@@ -359,9 +359,9 @@ pub fn build_runtime(user_cfg: &config::Config) -> Result<tokio::runtime::Runtim
 struct LoadedModelDrivers {
     model: String,
     caps: DriverCapabilities,
-    full_identity: driver::ModelIdentity,
-    encode_identity: driver::ModelIdentity,
-    kv_handle: Option<driver::KvHandle>,
+    full_identity: driver_api::ModelIdentity,
+    encode_identity: driver_api::ModelIdentity,
+    kv_handle: Option<driver_api::KvHandle>,
     drivers: ModelDrivers,
     /// The model's compiled metadata, read once while resolving it. Present
     /// for either input form: an artifact carries the descriptor, a snapshot's
@@ -370,9 +370,9 @@ struct LoadedModelDrivers {
 }
 
 struct LoadedPartnerMetadata {
-    full_identity: driver::ModelIdentity,
-    encode_identity: driver::ModelIdentity,
-    kv_handle: Option<driver::KvHandle>,
+    full_identity: driver_api::ModelIdentity,
+    encode_identity: driver_api::ModelIdentity,
+    kv_handle: Option<driver_api::KvHandle>,
     page_size: u32,
     supports_media_encode: bool,
     hidden_size: u32,
@@ -382,8 +382,8 @@ fn model_identity(
     user_cfg: &config::Config,
     caps: &DriverCapabilities,
     artifact_digest: &[u8; 32],
-    component: driver::ModelComponent,
-) -> Result<driver::ModelIdentity> {
+    component: driver_api::ModelComponent,
+) -> Result<driver_api::ModelIdentity> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(user_cfg.model.name.as_bytes());
     hasher.update(artifact_digest);
@@ -409,7 +409,7 @@ fn model_identity(
         }
         config::DriverKind::Metal => {}
     }
-    Ok(driver::ModelIdentity {
+    Ok(driver_api::ModelIdentity {
         hash: *hasher.finalize().as_bytes(),
         component,
     })
@@ -500,7 +500,7 @@ fn model_artifact_digest(snapshot_dir: &Path) -> Result<[u8; 32]> {
 
 fn load_model_drivers(
     user_cfg: &config::Config,
-    component: driver::ModelComponent,
+    component: driver_api::ModelComponent,
 ) -> Result<LoadedModelDrivers> {
     // Process housekeeping, once per boot and before anything writes under
     // `$PIE_HOME/standalone/<pid>`: reclaim the directories left by launches
@@ -624,13 +624,13 @@ fn load_model_drivers(
             user_cfg,
             &caps,
             &artifact_digest,
-            driver::ModelComponent::Full,
+            driver_api::ModelComponent::Full,
         )?,
         encode_identity: model_identity(
             user_cfg,
             &caps,
             &artifact_digest,
-            driver::ModelComponent::Encode,
+            driver_api::ModelComponent::Encode,
         )?,
         caps,
         kv_handle,
@@ -654,7 +654,7 @@ async fn boot_engine(
         kv_handle,
         drivers,
         metadata,
-    } = load_model_drivers(user_cfg, driver::ModelComponent::Full)?;
+    } = load_model_drivers(user_cfg, driver_api::ModelComponent::Full)?;
 
     let boot_cfg = translate::build(user_cfg, drivers, metadata)
         .context("translating to bootstrap::Config")?;
@@ -695,9 +695,9 @@ async fn boot_executor(
         .controller_addr()
         .context("executor boot requires a controller")?;
     let component = if role == Role::Encode {
-        driver::ModelComponent::Encode
+        driver_api::ModelComponent::Encode
     } else {
-        driver::ModelComponent::Full
+        driver_api::ModelComponent::Full
     };
     let loaded = load_model_drivers(user_cfg, component)?;
     let model_identity = if role == Role::Encode {
@@ -1011,7 +1011,7 @@ fn create_driver_group(
     snapshot_dir: &Path,
     descriptor: &[u8],
     tp_degree: usize,
-    component: driver::ModelComponent,
+    component: driver_api::ModelComponent,
 ) -> Result<GroupDriver> {
     #[cfg(feature = "driver-cuda")]
     {
@@ -1298,14 +1298,14 @@ mod tests {
             &config,
             &full_caps,
             &artifact,
-            driver::ModelComponent::Full,
+            driver_api::ModelComponent::Full,
         )
         .unwrap();
         let encode = model_identity(
             &config,
             &encode_caps,
             &artifact,
-            driver::ModelComponent::Encode,
+            driver_api::ModelComponent::Encode,
         )
         .unwrap();
         assert_eq!(full.hash, encode.hash);
@@ -1316,7 +1316,7 @@ mod tests {
             &config,
             &encode_caps,
             &artifact,
-            driver::ModelComponent::Encode,
+            driver_api::ModelComponent::Encode,
         )
         .unwrap();
         assert_ne!(encode.hash, incompatible.hash);

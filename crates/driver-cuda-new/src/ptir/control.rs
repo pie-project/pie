@@ -43,7 +43,7 @@
 
 use std::sync::Arc;
 
-use driver_pipeline::Failure;
+use driver::Failure;
 
 use super::disk::{Disk, disk_key};
 use super::module::Module;

@@ -54,7 +54,7 @@ pub struct MetalDriver {
     /// the context is what lets one outlive a call.
     stepper: driver_metal_new::metal::Stepper<'static>,
     registry: driver_metal_new::pipeline::Registry,
-    device_facts: ::driver::DeviceFacts,
+    device_facts: ::driver_api::DeviceFacts,
     /// The checkpoint, once one is loaded. Held because every address in its
     /// tensor map points into the region it owns.
     model: Option<driver_metal_new::model::load::Loaded>,
@@ -113,7 +113,7 @@ impl MetalDriver {
     ///
     /// No Metal 4 device, or a device whose queue could not be created. Both
     /// are boot conditions, not runtime ones.
-    pub fn create(config_bytes: &[u8]) -> Result<(Self, ::driver::DeviceFacts)> {
+    pub fn create(config_bytes: &[u8]) -> Result<(Self, ::driver_api::DeviceFacts)> {
         let boot_descriptor = std::str::from_utf8(config_bytes)
             .ok()
             .and_then(|text| text.parse::<toml::Table>().ok())
@@ -138,8 +138,8 @@ impl MetalDriver {
         // `unified_memory` is the one that changes scheduling: on Apple
         // silicon the KV pool and the host share physical memory, so a
         // "device is full" question is a different question here.
-        let device_facts = ::driver::DeviceFacts {
-            abi_version: ::driver::PIE_DRIVER_ABI_VERSION,
+        let device_facts = ::driver_api::DeviceFacts {
+            abi_version: ::driver_api::PIE_DRIVER_ABI_VERSION,
             backend: "metal".to_string(),
             unified_memory: true,
             // Metal has no native fp8 path and no MXFP4 MoE kernel; the table
@@ -176,13 +176,13 @@ impl MetalDriver {
 
     /// The device's stated facts.
     #[must_use]
-    pub fn device_facts(&self) -> &::driver::DeviceFacts {
+    pub fn device_facts(&self) -> &::driver_api::DeviceFacts {
         &self.device_facts
     }
 
     /// Metal exports no KV handle: there is no cross-process sharing path.
     #[must_use]
-    pub fn export_kv_handle(&self) -> Option<::driver::KvHandle> {
+    pub fn export_kv_handle(&self) -> Option<::driver_api::KvHandle> {
         None
     }
 
@@ -210,8 +210,8 @@ impl MetalDriver {
     /// not compile or stage.
     pub fn load_model(
         &mut self,
-        descs: Vec<::driver::ModelLoadDesc>,
-    ) -> Result<::driver::DriverCapabilities> {
+        descs: Vec<::driver_api::ModelLoadDesc>,
+    ) -> Result<::driver_api::DriverCapabilities> {
         let [desc] = descs.as_slice() else {
             bail!(
                 "driver-metal-new holds ONE model; got {} descriptors",
@@ -303,6 +303,16 @@ impl MetalDriver {
             page_size: self.device_facts.page_size,
             pages,
             element_bytes: 2,
+            // The FULL-attention layers' own shape, when the checkpoint
+            // states a second one. Zero everywhere but gemma-4, and the pool
+            // reads the zeros as "one shape for the whole stack".
+            //
+            // `full_attn_every` is the same rule `model::text` derives
+            // `window_left` from, so the pool and the text agree about which
+            // layers are full without a second list to keep in step.
+            global_head_dim: geometry.global_head_dim,
+            global_kv_heads: geometry.global_kv_heads,
+            full_attn_every: geometry.full_attn_every,
         };
         self.pool = Some(
             driver_metal_new::model::kv::Pool::allocate(&self.context, shape)
@@ -315,8 +325,8 @@ impl MetalDriver {
         // against what was actually allocated. It read zero while no pool
         // existed, which was the truth then and the reason nothing was
         // admitted.
-        Ok(::driver::DriverCapabilities {
-            abi_version: ::driver::PIE_DRIVER_ABI_VERSION,
+        Ok(::driver_api::DriverCapabilities {
+            abi_version: ::driver_api::PIE_DRIVER_ABI_VERSION,
             total_pages: pages,
             kv_page_size: self.device_facts.page_size,
             swap_pool_size: 0,
@@ -324,6 +334,18 @@ impl MetalDriver {
             rs_cache_required: facts.has_linear_attn,
             rs_cache_slots: 0,
             rs_cache_slot_bytes: 0,
+            // Zero because nothing here GROWS a pool, not because the
+            // machinery is missing. `metal::elastic` is a complete
+            // subsystem -- arena, budget, pressure, `create_elastic` -- with
+            // 452 lines of tests and no production caller: `Pool::allocate`
+            // above takes a fixed page count and never revisits it.
+            //
+            // Stated rather than left blank, because a zero that means "not
+            // wired" and a zero that means "not supported" read identically
+            // to a scheduler and only one of them is a TODO. Advertising a
+            // non-zero budget before the pool can honour it would be the
+            // worse error: the scheduler would admit against pages that
+            // never arrive.
             elastic_page_bytes: 0,
             elastic_budget_pages: 0,
             has_mtp_logits: false,
@@ -338,7 +360,7 @@ impl MetalDriver {
             has_attn_score: false,
             has_attn_page_mask: false,
             has_lora: false,
-            model_site_summary: ::driver::ModelSiteSummary::default(),
+            model_site_summary: ::driver_api::ModelSiteSummary::default(),
             device_geometry_port_mask: 0,
             // The ceilings a scheduler batches under. Stated rather than
             // unbounded: a fire wider than this has no arena sized for it.
@@ -434,7 +456,7 @@ impl MetalDriver {
             .map_err(|e| anyhow!("metal register_channel: {e:?}"))?;
         Ok(RegisteredChannel {
             driver_id: desc.driver_id,
-            binding: ::driver::PieChannelEndpointBinding {
+            binding: ::driver_api::PieChannelEndpointBinding {
                 channel_id: endpoint.channel_id,
                 mirror_base: endpoint.mirror_base,
                 word_base: endpoint.word_base,
@@ -483,7 +505,7 @@ impl MetalDriver {
                 &seeds,
             )
             .map_err(|e| anyhow!("metal bind_instance: {e:?}"))?;
-        let binding = ::driver::PieInstanceBinding {
+        let binding = ::driver_api::PieInstanceBinding {
             instance_id,
             geometry_class: desc.geometry_class as u32,
             reserved0: 0,
@@ -602,27 +624,49 @@ impl MetalDriver {
             // `uchar`, and a `u32` written little-endian is the same first
             // byte. The narrowing is the kernel's and the width is the
             // frame's, which is the direction that is safe.
+            // Every CSR invariant, checked BEFORE the pool is touched.
+            //
+            // The derivation below used `unwrap_or(0)` three times, and the
+            // third one was the defect: a short or mis-sized CSR resolved a
+            // token's physical KV page to **0**, which belongs to some other
+            // request, and the fire wrote this request's keys over that
+            // request's cache. Nothing faults and the damage lands on a
+            // request that did nothing wrong.
+            //
+            // There is no safe fallback page, so the only correct answer is to
+            // refuse the frame — and refusing has to happen here, before
+            // anything is staged, which is the `decide, then move` rule
+            // `store/control.rs` records the cost of breaking.
+            step.plan
+                .validate_geometry()
+                .map_err(|e| anyhow!("this frame's geometry: {e}"))?;
+            step.plan
+                .validate_kv_writes(pool.shape().page_size)
+                .map_err(|e| anyhow!("this frame's KV writes: {e}"))?;
             // Where the paged append writes each token: its physical page and
             // the row inside it. Driver arithmetic over a driver allocation --
             // the frame states a POSITION in a sequence and a page table, and
             // this normalizes the pair. `batch::fire_csr` computes the same
             // two the same way for the retiring path.
+            //
+            // Every lookup is infallible now: `validate_kv_writes` has already
+            // proved each token's virtual page sits inside its own request's
+            // span, so an `expect` here states a checked fact rather than
+            // papering over an unchecked one.
             let (w_page, w_off) = {
                 let page = pool.shape().page_size.max(1);
+                let req = step.plan.req_of_token();
                 let (mut pages, mut offs) = (Vec::new(), Vec::new());
                 for (t, &pos) in step.plan.position_ids.iter().enumerate() {
-                    let r = req_of_token(&step.plan.qo_indptr)
-                        .get(t)
-                        .copied()
-                        .unwrap_or(0) as usize;
-                    let base = step.plan.kv_page_indptr.get(r).copied().unwrap_or(0) as usize;
+                    let r = req[t] as usize;
+                    let base = step.plan.kv_page_indptr[r] as usize;
                     let virt = base + (pos / page) as usize;
-                    pages.push(step.plan.kv_page_indices.get(virt).copied().unwrap_or(0));
+                    pages.push(step.plan.kv_page_indices[virt]);
                     offs.push(pos % page);
                 }
                 (pages, offs)
             };
-            let req = req_of_token(&step.plan.qo_indptr);
+            let req = step.plan.req_of_token();
             let staged = driver_metal_new::model::tables::stage(
                 &self.context,
                 driver_metal_new::model::tables::Frame {
@@ -648,7 +692,12 @@ impl MetalDriver {
                     let h = if values { &l.v } else { &l.k };
                     driver_metal_new::model::executor::Slice {
                         address: h.gpu_address(),
-                        bytes: pool.shape().layer_bytes(),
+                        // THIS layer's, not the pool's: gemma-4's
+                        // full-attention layers hold a different page size
+                        // from its sliding ones, and a slice length that
+                        // over-states the region is one an attention reads
+                        // past the end of.
+                        bytes: pool.shape().layer_bytes_at(u32::from(layer)),
                     }
                 })
             };
@@ -703,16 +752,7 @@ impl MetalDriver {
             // production caller at all, and the interpreter was exercised
             // only by tests that built their own inputs.
             let logits = read_logits(&fire.arena, *readout);
-            let inputs = logits.as_ref().map_or_else(
-                driver_metal_new::pipeline::PassInputs::none,
-                |(v, rows, vocab)| driver_metal_new::pipeline::PassInputs {
-                    logits: Some(v),
-                    rows: *rows,
-                    vocab: *vocab,
-                    mtp_draft_row: None,
-                },
-            );
-            Self::run_programs(&mut self.registry, &frame.instance_ids, step, &inputs)?;
+            Self::run_programs(&mut self.registry, &frame.instance_ids, step, logits.as_ref())?;
         }
 
         let (_raw, completion) = self.broker.launch_completion(1);
@@ -753,13 +793,36 @@ impl MetalDriver {
             kv_total_pages: pool.pages(),
             rs_slots: 0,
         };
-        let work = driver_metal_new::store::plan_kv_copy(desc, caps, pool.shape().grid())
+        // ONE stride for the whole pool, or no copy at all.
+        //
+        // A move plan states byte offsets and applies them to every layer, so
+        // it needs the pool to be page-major at one stride. gemma-4's is not:
+        // its full-attention layers pack their pages at 4 heads x 512 where
+        // its sliding ones use 16 x 256. Planning at either and applying to
+        // both lands a page apart rather than obviously wrong.
+        //
+        // Refused by name rather than approximated. A KV copy is prefix
+        // sharing and forking, which is a feature a deployment can be without
+        // -- a corrupted cache is not.
+        let (Some(grid), Some(page_bytes)) = (pool.shape().grid(), pool.shape().page_bytes())
+        else {
+            bail!(
+                "driver-metal-new: copy_kv needs one page stride for the pool \
+                 and this model has two -- its full-attention layers are \
+                 {} kv heads x {} against {} x {} on the sliding ones. \
+                 Prefix sharing is unavailable on this checkpoint",
+                pool.shape().heads_at(0).0,
+                pool.shape().heads_at(0).1,
+                pool.shape().kv_heads,
+                pool.shape().head_dim,
+            );
+        };
+        let work = driver_metal_new::store::plan_kv_copy(desc, caps, grid)
             .map_err(|why| anyhow!("metal copy_kv: {why:?}"))?;
 
         // Whole-page moves first, as page pairs; then the row cells. Both run
-        // over every layer's K and V, because the pool is page-major at one
-        // stride everywhere.
-        let page_bytes = pool.shape().page_bytes();
+        // over every layer's K and V, which the stride check above is what
+        // makes true.
         let mut cells = Vec::new();
         for &(src, dst) in &work.pages {
             cells.push(driver_metal_new::store::CellCopy {
@@ -822,9 +885,10 @@ impl MetalDriver {
 
     /// Run the channel-plane pass for every program batched into one step.
     ///
-    /// One instance per roster row, in sub-batch order, all over the SAME
-    /// read-out: the fire produced one distribution per request and the
-    /// members of a batch are those requests.
+    /// One instance per roster row, in sub-batch order, each over ITS OWN
+    /// rows of the read-out: the fire produced one distribution per request
+    /// and the members of a batch are those requests, so member `p` reads
+    /// `program_row_indptr[p]..[p+1]` and nothing else.
     ///
     /// A blocked pass is not an error. Readiness is the program's own gate and
     /// missing it means the fire did not happen for that member — the
@@ -841,13 +905,49 @@ impl MetalDriver {
         registry: &mut driver_metal_new::pipeline::Registry,
         instance_ids: &[u64],
         step: &crate::driver::submission::StepSubmission,
-        inputs: &driver_metal_new::pipeline::PassInputs,
+        logits: Option<&(Vec<f32>, u32, u32)>,
     ) -> Result<()> {
-        for &row in &step.roster_rows {
+        for (member, &row) in step.roster_rows.iter().enumerate() {
             let id = *instance_ids
                 .get(row as usize)
                 .ok_or_else(|| anyhow!("roster row {row} is outside the frame's instances"))?;
-            match registry.fire(id, inputs) {
+            // THIS member's rows of the read-out, and nothing else.
+            //
+            // Every instance in the frame used to be handed the whole logits
+            // buffer, and `bind_intrinsic` reads it from `base_row = 0` — so
+            // in an M>1 frame every request sampled the FIRST request's
+            // distribution and returned its token. One fire, N requests, one
+            // answer repeated. Nothing faults, and a single-request frame
+            // (which is what most tests build) cannot tell the difference.
+            //
+            // `program_row_indptr` is the mapping and it was already here:
+            // member `p` owns wire request rows `[indptr[p], indptr[p+1])`.
+            // Slicing rather than passing an offset keeps `base_row = 0`
+            // TRUE for each member instead of making it a parameter every
+            // caller could forget — the interpreter's view is its own rows,
+            // so there is no row it could reach that is not its.
+            let inputs = match logits {
+                None => driver_metal_new::pipeline::PassInputs::none(),
+                Some((values, rows, vocab)) => {
+                    let (start, end) = member_rows(&step.program_row_indptr, member, *rows);
+                    let span = (end - start) as usize * *vocab as usize;
+                    let from = start as usize * *vocab as usize;
+                    if from + span > values.len() {
+                        return Err(anyhow!(
+                            "member {member} claims read-out rows {start}..{end} of {rows}, \
+                             which is past the {} values this fire produced",
+                            values.len()
+                        ));
+                    }
+                    driver_metal_new::pipeline::PassInputs {
+                        logits: Some(&values[from..from + span]),
+                        rows: end - start,
+                        vocab: *vocab,
+                        mtp_draft_row: None,
+                    }
+                }
+            };
+            match registry.fire(id, &inputs) {
                 Ok(driver_metal_new::pipeline::StepOutcome::Committed)
                 | Ok(driver_metal_new::pipeline::StepOutcome::Blocked(_)) => {}
                 Ok(driver_metal_new::pipeline::StepOutcome::Faulted(why)) => {
@@ -946,18 +1046,61 @@ fn shader_tree() -> std::path::PathBuf {
         })
 }
 
-/// Which request owns each token, from the qo CSR.
+
+/// Which rows of a fire's read-out belong to batch member `member`.
 ///
-/// The scheduler states the boundaries — request `r` owns rows
-/// `[qo_indptr[r], qo_indptr[r+1])` — and `sdpa_paged_decode` wants the
-/// inverse, one entry a token. Expanded here rather than asked of the
-/// scheduler, because it is a restatement of what the CSR already says and a
-/// second field would be a second chance to disagree with it.
-fn req_of_token(qo_indptr: &[u32]) -> Vec<u32> {
-    let mut out = Vec::new();
-    for r in 0..qo_indptr.len().saturating_sub(1) {
-        let (start, end) = (qo_indptr[r], qo_indptr[r + 1]);
-        out.resize(out.len() + (end - start) as usize, r as u32);
+/// `program_row_indptr` is the frame's own attribution CSR — member `p` owns
+/// wire request rows `[indptr[p], indptr[p+1])` — and an empty one is the
+/// single-member case, where the whole read-out is that member's.
+///
+/// Split out from `run_programs` so the M>1 case can be held to a number. It
+/// was wrong in a way no single-instance test could see: every member was
+/// handed the WHOLE buffer and `bind_intrinsic` reads from `base_row = 0`, so
+/// each request in a batched frame sampled the first request's distribution.
+fn member_rows(program_row_indptr: &[u32], member: usize, rows: u32) -> (u32, u32) {
+    match (
+        program_row_indptr.get(member),
+        program_row_indptr.get(member + 1),
+    ) {
+        (Some(&s), Some(&e)) if e >= s => (s, e),
+        _ => (0, rows),
     }
-    out
+}
+
+#[cfg(test)]
+mod readout_rows {
+    use super::member_rows;
+
+    /// Three requests batched into one fire, one read-out row each.
+    ///
+    /// The defect this pins: every member used to get `(0, 3)`, so all three
+    /// sampled row 0 and returned the same token. One fire, three requests,
+    /// one answer repeated — and nothing faults.
+    #[test]
+    fn each_member_of_a_batched_frame_reads_its_own_row() {
+        let indptr = [0, 1, 2, 3];
+        assert_eq!(member_rows(&indptr, 0, 3), (0, 1));
+        assert_eq!(member_rows(&indptr, 1, 3), (1, 2));
+        assert_eq!(member_rows(&indptr, 2, 3), (2, 3));
+    }
+
+    /// A member may own several rows — a speculative fire reads out more than
+    /// one row per request — and the span is the CSR's, not one row.
+    #[test]
+    fn a_member_that_owns_several_rows_gets_all_of_them() {
+        let indptr = [0, 4, 5];
+        assert_eq!(member_rows(&indptr, 0, 5), (0, 4));
+        assert_eq!(member_rows(&indptr, 1, 5), (4, 5));
+    }
+
+    /// No attribution CSR is the single-member case, and the whole read-out
+    /// is that member's — the behaviour every frame used to get.
+    #[test]
+    fn an_absent_csr_gives_the_whole_readout_to_the_one_member() {
+        assert_eq!(member_rows(&[], 0, 7), (0, 7));
+        // A CSR too short for this member is the same answer rather than a
+        // panic: it is a frame the scheduler built inconsistently, and the
+        // row-range check in `run_programs` is what refuses it.
+        assert_eq!(member_rows(&[0, 1], 5, 7), (0, 7));
+    }
 }

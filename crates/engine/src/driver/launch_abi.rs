@@ -10,7 +10,7 @@
 //! moves its header, not its heap buffer, so a pointer taken into an inner
 //! vector stays valid when the outer one grows.
 
-use ::driver::local::{
+use ::driver_api::local::{
     PieBytes, PieBytesSlice, PieLaunchChannel, PieLaunchChannelRule, PieLaunchChannelRuleSlice,
     PieLaunchChannelSlice, PieLaunchOp, PieLaunchOpSlice, PieLaunchPackage, PieLaunchPlanValue,
     PieLaunchPlanValueSlice, PieLaunchPort, PieLaunchPortSlice, PieLaunchPut, PieLaunchPutSlice,
@@ -18,7 +18,7 @@ use ::driver::local::{
     PieLaunchStagePlanSlice, PieLaunchStageSlice, PieLaunchValue, PieLaunchValueSlice, PieU8Slice,
     PieU32Slice,
 };
-use ::driver::plan::{LaunchOp, LaunchPackage, LaunchRegion, LaunchStagePlan};
+use ::driver_api::plan::{LaunchOp, LaunchPackage, LaunchRegion, LaunchStagePlan};
 
 fn bytes(slice: &[u8]) -> PieBytes {
     PieBytes {
@@ -87,7 +87,7 @@ impl Arena {
         slice
     }
 
-    fn push_puts(&mut self, puts: &[::driver::plan::LaunchPut]) -> PieLaunchPutSlice {
+    fn push_puts(&mut self, puts: &[::driver_api::plan::LaunchPut]) -> PieLaunchPutSlice {
         let records: Vec<PieLaunchPut> = puts
             .iter()
             .map(|put| PieLaunchPut {

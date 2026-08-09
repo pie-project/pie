@@ -87,11 +87,11 @@ fn load_model_takes_one_descriptor_because_this_backend_holds_one_model() {
         eprintln!("SKIP: no Metal 4 device");
         return;
     };
-    let desc = || ::driver::ModelLoadDesc {
+    let desc = || ::driver_api::ModelLoadDesc {
         snapshot_dir: std::path::PathBuf::from("/nonesuch"),
         runtime_quant: String::new(),
-        mxfp4_moe: ::driver::Mxfp4MoeRequest::Auto,
-        component: ::driver::ModelComponent::Full,
+        mxfp4_moe: ::driver_api::Mxfp4MoeRequest::Auto,
+        component: driver_api::ModelComponent::Full,
     };
     let why = format!(
         "{}",
@@ -173,32 +173,32 @@ fn a_program_a_channel_and_an_instance_all_register() {
     assert!(why.contains("no stages"), "and it says why: {why}");
 
     let program = backend
-        .register_program(&::driver::ProgramRegistration {
+        .register_program(&::driver_api::ProgramRegistration {
             program_hash: 0xABCD,
             launch: package(),
-            ..::driver::ProgramRegistration::default()
+            ..::driver_api::ProgramRegistration::default()
         })
         .expect("a package with a stage registers");
 
     // Memoised by hash: the engine re-registers freely and expects a lookup.
     let again = backend
-        .register_program(&::driver::ProgramRegistration {
+        .register_program(&::driver_api::ProgramRegistration {
             program_hash: 0xABCD,
             launch: package(),
-            ..::driver::ProgramRegistration::default()
+            ..::driver_api::ProgramRegistration::default()
         })
         .expect("the same hash registers again");
     assert_eq!(program, again, "the same hash is the same program");
 
     let channel = backend
-        .register_channel(&::driver::ChannelRegistrationPlan {
+        .register_channel(&::driver_api::ChannelRegistrationPlan {
             driver_id: 0,
             channel_id: 7,
             shape: vec![4],
-            dtype: ::driver::PIE_CHANNEL_DTYPE_U32,
-            host_role: ::driver::PIE_CHANNEL_HOST_ROLE_READER,
+            dtype: driver_api::PIE_CHANNEL_DTYPE_U32,
+            host_role: driver_api::PIE_CHANNEL_HOST_ROLE_READER,
             seeded: false,
-            extern_dir: ::driver::PIE_CHANNEL_EXTERN_EXPORT,
+            extern_dir: driver_api::PIE_CHANNEL_EXTERN_EXPORT,
             capacity: 2,
             reader_wait_id: 11,
             writer_wait_id: 12,
@@ -247,11 +247,11 @@ fn a_program_a_channel_and_an_instance_all_register() {
 /// package is "no stages" and a stage without its plan is a "plan/stage count
 /// mismatch". Both refusals are the point: a program that runs nothing, or one
 /// whose stages and plans disagree, is a registration nobody can use.
-fn package() -> ::driver::plan::LaunchPackage {
-    ::driver::plan::LaunchPackage {
-        stages: vec![::driver::plan::LaunchStage::default()],
-        plans: vec![::driver::plan::LaunchStagePlan::default()],
-        ..::driver::plan::LaunchPackage::default()
+fn package() -> ::driver_api::plan::LaunchPackage {
+    ::driver_api::plan::LaunchPackage {
+        stages: vec![::driver_api::plan::LaunchStage::default()],
+        plans: vec![::driver_api::plan::LaunchStagePlan::default()],
+        ..::driver_api::plan::LaunchPackage::default()
     }
 }
 
@@ -300,17 +300,17 @@ fn a_frame_reaches_the_device_through_the_seam() {
     };
 
     backend
-        .load_model(vec![::driver::ModelLoadDesc {
+        .load_model(vec![::driver_api::ModelLoadDesc {
             snapshot_dir: snapshot.clone(),
             runtime_quant: String::new(),
-            mxfp4_moe: ::driver::Mxfp4MoeRequest::Auto,
-            component: ::driver::ModelComponent::Full,
+            mxfp4_moe: ::driver_api::Mxfp4MoeRequest::Auto,
+            component: driver_api::ModelComponent::Full,
         }])
         .expect("the checkpoint loads through the seam");
 
     // ONE request, TWO tokens at positions 0 and 1: a prefill, and the shape
     // `device_real_weights` holds to MLX.
-    let plan = ::driver::plan::LaunchPlan {
+    let plan = ::driver_api::plan::LaunchPlan {
         token_ids: vec![128_000, 9906],
         position_ids: vec![0, 1],
         kv_page_indices: vec![0],
@@ -318,7 +318,7 @@ fn a_frame_reaches_the_device_through_the_seam() {
         kv_last_page_lens: vec![2],
         qo_indptr: vec![0, 2],
         sampling_indices: vec![1],
-        ..::driver::plan::LaunchPlan::default()
+        ..::driver_api::plan::LaunchPlan::default()
     };
     let frame = engine::driver::submission::FrameSubmission {
         instance_ids: vec![1],

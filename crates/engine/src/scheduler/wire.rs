@@ -7,7 +7,7 @@
 
 use smallvec::{SmallVec, smallvec};
 
-use ::driver::EncodedMask;
+use ::driver_api::EncodedMask;
 use grammar::brle::RunMask;
 
 /// Inline storage for the page-trim bitmap. Sized to cover up to 1024 pages

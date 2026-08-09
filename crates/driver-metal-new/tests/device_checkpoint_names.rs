@@ -284,12 +284,39 @@ fn check_one_snapshot(dir: &std::path::Path) {
     // text states is one this checkpoint's shape actually asks for.
     let model_facts = driver_metal_new::facts::ModelFacts::from_descriptor(&descriptor)
         .expect("the descriptor states the model's facts");
-    let Ok(geometry) = driver_metal_new::batch::geometry_from_facts(&model_facts) else {
-        eprintln!("    SKIP: no decodable shape (an architecture no text serves)");
-        return;
+    // A refusal is a FINDING and not a skip. The message says which fact the
+    // geometry could not express, and swallowing it is how a checkpoint stops
+    // being covered without anyone noticing -- the gate keeps passing and one
+    // fewer model is held to it.
+    let geometry = match driver_metal_new::batch::geometry_from_facts(&model_facts) {
+        Ok(g) => g,
+        Err(why) => {
+            eprintln!("    SKIP: the geometry refuses this checkpoint -- {}", why.0);
+            return;
+        }
     };
-    let (facts, metal) =
-        driver_metal_new::model::text::facts_from(&geometry, |t| published.contains(t));
+    // Which weights the plan leaves in MXFP4, asked the same way the seam
+    // asks it. Without this the text states an AFFINE routed projection at
+    // gpt-oss's real group (32) -- a symbol no `kernel!` row declares, which
+    // the declaration checker refuses by name. That refusal is correct and
+    // the fix is to state the format the bank actually has.
+    let mxfp4: std::collections::HashSet<&str> = plan
+        .tensors
+        .iter()
+        .filter(|t| {
+            matches!(
+                &t.encoding,
+                model_loader::types::Encoding::Quant(spec)
+                    if spec.scheme == model_loader::types::QuantScheme::Mxfp4E2M1E8M0
+            )
+        })
+        .map(|t| t.name.as_str())
+        .collect();
+    let (facts, metal) = driver_metal_new::model::text::facts_from_with(
+        &geometry,
+        |t| published.contains(t),
+        |t| mxfp4.contains(t),
+    );
 
     let tensors = HashMap::new();
     let named = HashMap::new();
@@ -326,5 +353,75 @@ fn check_one_snapshot(dir: &std::path::Path) {
             .copied()
             .collect::<Vec<_>>()
             .join("\n  ")
+    );
+
+    check_projection_widths(dir.as_path(), &plan, &facts, &metal, &store);
+}
+
+/// Every attention projection is as wide as the facts say it is.
+///
+/// # Why names are not enough
+///
+/// The gate above asks whether a name RESOLVES. gemma-4 passed it while
+/// running ten of its sixty layers at the wrong shape, because the tensors
+/// were all present and correctly spelled -- they were simply twice the
+/// width the text was reading. A name gate cannot see that; only a shape
+/// can.
+///
+/// Measured on `gemma-4-31b-it-4bit`: layer 0 (sliding) publishes
+/// `q_proj [8192, ...]` = 32x256 and `k_proj [4096, ...]` = 16x256, while
+/// layer 5 (full) publishes `[16384, ...]` = 32x512 and `[2048, ...]` =
+/// 4x512. A driver holding one head shape read half of each full layer's Q
+/// and ran a quarter past the end of its K.
+///
+/// The first dimension is the OUTPUT width for every layout here, quantized
+/// or not -- the packing is on the input axis.
+fn check_projection_widths(
+    dir: &std::path::Path,
+    plan: &model_loader::plan::LoadPlan,
+    facts: &LlamaLikeFacts,
+    metal: &LlamaLikeMetalFacts,
+    store: &Store,
+) {
+    let shapes: HashMap<&str, &[i64]> = plan
+        .tensors
+        .iter()
+        .map(|t| (t.name.as_str(), t.shape.as_slice()))
+        .collect();
+    let width_of = |role: &str| -> Option<i64> {
+        store
+            .checkpoint_names(role)
+            .iter()
+            .find_map(|c| shapes.get(c.as_str()))
+            .and_then(|s| s.first().copied())
+    };
+
+    let mut wrong = Vec::new();
+    for l in 0..facts.layers {
+        let head_dim = metal.head_dim_at(l, facts.head_dim);
+        let kv_heads = metal.kv_heads_at(l, facts.kv_heads);
+        for (role, heads) in [
+            (format!("layer.{l}.q_proj"), facts.q_heads),
+            (format!("layer.{l}.k_proj"), kv_heads),
+        ] {
+            let Some(got) = width_of(&role) else { continue };
+            let want = i64::from(heads * head_dim);
+            if got != want {
+                wrong.push(format!(
+                    "{role}: the checkpoint publishes {got} and the text reads \
+                     {want} ({heads} heads x {head_dim})"
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{}: {} projection(s) are not the width the text reads them at. This \
+         is the failure a NAME gate cannot see -- every tensor is present and \
+         correctly spelled, and the driver reads the wrong number of bytes out \
+         of it:\n  {}",
+        dir.display(),
+        wrong.len(),
+        wrong.join("\n  ")
     );
 }

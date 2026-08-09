@@ -5,7 +5,7 @@
 //! A PTIR program is a user's decoding logic — sample this, compare that,
 //! push a token onto a channel — traced by `tensor-dsl`, compiled by
 //! `tensor-compiler`, and delivered to this driver through the ABI as
-//! [`PieProgramDesc`](driver::local::PieProgramDesc): a launch package
+//! [`PieProgramDesc`](driver_api::local::PieProgramDesc): a launch package
 //! that says what the program *is*, and a table of emitted CUDA sources that
 //! say how its fusable regions run.
 //!

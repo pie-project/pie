@@ -6,7 +6,7 @@ use std::task::Poll;
 
 use anyhow::{Result, anyhow};
 use crossbeam_queue::SegQueue;
-use ::driver::{
+use ::driver_api::{
     PIE_DRIVER_ABI_VERSION, PIE_TERMINAL_OUTCOME_FAILED, PIE_TERMINAL_OUTCOME_PENDING,
     PIE_TERMINAL_OUTCOME_RETRY, PIE_TERMINAL_OUTCOME_SUCCESS, PieCompletion, PieRuntimeCallbacks,
     PieTerminalCell,

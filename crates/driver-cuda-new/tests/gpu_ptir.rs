@@ -227,7 +227,7 @@ fn the_control_kernels_compile_and_both_entry_points_resolve() {
 fn the_control_kernels_gate_and_advance_the_device_ring() {
     use driver_cuda_new::cuda::{Allocator, OwnedStream};
     use driver_cuda_new::ptir::{ChannelShape, Control, Rings, control, launch_control};
-    use driver_pipeline::tensor_ir::DType;
+    use driver::tensor_ir::DType;
 
     let _gpu = gpu_guard();
     let Some(device) = device_or_skip("PTIR device ring") else {

@@ -10,7 +10,7 @@
 //!
 //! # The key, and the bug it exists to prevent
 //!
-//! The in-memory tiers key on [`cache_identity`](driver_pipeline::cache_identity):
+//! The in-memory tiers key on [`cache_identity`](driver::cache_identity):
 //! backend, device, signature, and four version numbers. The DISK key is that
 //! string plus **a fingerprint of the emitted source bytes**, and the extra
 //! eight bytes are the whole reason this file is worth reading.
@@ -309,10 +309,10 @@ mod tests {
     #[test]
     fn the_fold_is_the_same_fnv1a_the_rest_of_the_workspace_uses() {
         assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
-        assert_eq!(fnv1a64(b"a"), driver_pipeline::tensor_ir::fnv1a64(b"a"));
+        assert_eq!(fnv1a64(b"a"), driver::tensor_ir::fnv1a64(b"a"));
         assert_eq!(
             fnv1a64(b"ptir"),
-            driver_pipeline::tensor_ir::fnv1a64(b"ptir")
+            driver::tensor_ir::fnv1a64(b"ptir")
         );
     }
 

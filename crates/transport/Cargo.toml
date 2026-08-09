@@ -17,7 +17,7 @@ serde = { version = "1.0", features = ["derive"] }
 # KV layout + handle vocabulary live in `driver` (the dependency floor):
 # `driver::{KvLayout, KvDtype, KvLayoutKind, KvHandle, KvRegion,
 # MemoryDomain}` — pure-Rust types (the driver crate is Python-free, no features).
-driver = { path = "../driver", default-features = false }
+driver-api = { path = "../driver-api", default-features = false }
 # `WorkerId` now lives on the interface leaf (`ids`); transport names a
 # transfer's src/dst by it. Plain serde, no internal deps.
 ids = { path = "../ids" }

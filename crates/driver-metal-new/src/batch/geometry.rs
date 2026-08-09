@@ -47,6 +47,55 @@ impl AffineFormat {
     pub const fn is_set(self) -> bool {
         self.bits != 0 && self.group != 0
     }
+
+    /// Whether any Metal kernel is compiled to read this format.
+    ///
+    /// # Why the table is asked rather than a list kept here
+    ///
+    /// `quantized_qmv.metal` stamps one template over
+    /// `(dtype × group × bits)`, so a format is readable exactly when the
+    /// entrypoint carrying its suffix was instantiated. Asking
+    /// `kernels_metal::KERNELS` makes that a fact of the table — a point
+    /// added or dropped there moves this answer with it, where a list here
+    /// would drift and answer for a shader that no longer exists.
+    ///
+    /// The C++ shell refused an unreadable scheme by name at load
+    /// (`heap_bind.cpp:845-890`, *"no metal kernel here reads '<name>'"*) and
+    /// nothing did after the port. Without it the failure moves to the first
+    /// fire, as the runtime compiler declining a symbol — which is loud, but
+    /// arrives after the weights are staged and names a mangled entrypoint
+    /// instead of the config key that chose it.
+    #[must_use]
+    pub fn is_readable(self) -> bool {
+        if !self.is_set() {
+            return false;
+        }
+        let suffix = self.kernel_suffix();
+        // The DENSE projection, which every text names for every layer. A
+        // format it cannot read is a format this driver cannot serve, whatever
+        // else happens to be instantiated.
+        kernels_metal::KERNELS
+            .iter()
+            .filter(|k| k.symbol == "affine_qmv_fast")
+            .flat_map(kernels::KernelSig::entrypoints)
+            .any(|e| e.ends_with(&suffix))
+    }
+
+    /// Every format some Metal kernel reads, for a refusal that can say what
+    /// the alternatives were.
+    #[must_use]
+    pub fn readable() -> Vec<AffineFormat> {
+        let mut out = Vec::new();
+        for group in [32u32, 64, 128] {
+            for bits in [4u32, 8] {
+                let f = AffineFormat { bits, group };
+                if f.is_readable() {
+                    out.push(f);
+                }
+            }
+        }
+        out
+    }
 }
 
 /// The checkpoint-decided shape of the decode step.
@@ -99,6 +148,44 @@ pub struct DecodeGeometry {
     pub sliding_window: u32,
     /// gemma's readout SOFTCAP — `cap * tanh(x / cap)` — or zero for none.
     pub final_logit_softcap: f32,
+    /// The per-head width the FULL-attention layers use, or zero for a stack
+    /// whose layers all share [`Self::head_dim`].
+    ///
+    /// gemma-4's `global_head_dim`. Measured on the 31b's own tensors: layer
+    /// 0 (sliding) has `q_norm [256]`, layer 5 (full) has `q_norm [512]`.
+    pub global_head_dim: u32,
+    /// The key/value head count the FULL-attention layers use, or zero for
+    /// one shape everywhere. Four on the 31b against sixteen sliding, two on
+    /// the 26b against eight. See [`Self::global_head_dim`].
+    pub global_kv_heads: u32,
+    /// The rotary base a SLIDING layer takes, when the config states a second
+    /// one, or zero for a stack whose layers all share [`Self::rope_theta`].
+    ///
+    /// gemma-4 states both, and it is not a corner case: gemma-4-31b slides
+    /// fifty of its sixty layers, so reading one base was wrong on 83% of the
+    /// stack — 1e6 where the config says 1e4.
+    pub rope_theta_sliding: f32,
+    /// Whether the config read as GEMMA, which decides three facts no other
+    /// field carries: the `(1 + w)` norm scale, the four-norm sandwich, and
+    /// the GEGLU activation.
+    ///
+    /// A marker rather than three booleans because they are one fact — a
+    /// checkpoint is gemma or it is not — and because a driver that got two
+    /// of the three right would be silently wrong in a way no shape check
+    /// can see. Every one of the three runs, produces finite numbers, and
+    /// answers a different model.
+    pub gemma: bool,
+    /// gemma's per-layer embedding width (`hidden_size_per_layer_input`), or
+    /// zero for a deployment with no PLE side network.
+    ///
+    /// Zero for gemma-4-31b, which states `hidden_size_per_layer_input: 0` —
+    /// so "gemma" and "has a PLE" are NOT the same question, which is why
+    /// this is read rather than implied by [`Self::gemma`].
+    pub per_layer_emb_dim: u32,
+    /// How many layers share their neighbour's KV pages
+    /// (`num_kv_shared_layers`), or zero for a stack where every layer writes
+    /// its own. Zero for gemma-4-31b.
+    pub kv_shared_layers: u32,
     /// gpt-oss's SwiGLU constants, or zero for a deployment that takes the
     /// plain gated activation.
     ///
@@ -205,6 +292,12 @@ impl Default for DecodeGeometry {
             full_attn_every: 0,
             sliding_window: 0,
             final_logit_softcap: 0.0,
+            global_head_dim: 0,
+            global_kv_heads: 0,
+            rope_theta_sliding: 0.0,
+            gemma: false,
+            per_layer_emb_dim: 0,
+            kv_shared_layers: 0,
             swiglu_limit: 0.0,
             swiglu_alpha: 0.0,
             rope_freq_factor: 0.0,

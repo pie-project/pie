@@ -295,6 +295,15 @@ pub struct Layer {
     pub shared_gate_proj: MatW,
     pub attn_norm: NormW,
     pub mlp_norm: NormW,
+    /// The norm on the ATTENTION's output, before the residual add.
+    ///
+    /// `NormPlacement::Sandwich` only — gemma's `post_attention_layernorm`
+    /// under a placement where `mlp_norm` is already spoken for by
+    /// `pre_feedforward_layernorm`. A `Pre` or `Post` text never names it.
+    pub post_attn_norm: NormW,
+    /// The norm on the FFN's output, before the residual add. gemma's
+    /// `post_feedforward_layernorm`; see [`Layer::post_attn_norm`].
+    pub post_mlp_norm: NormW,
     pub q_norm: NormW,
     pub k_norm: NormW,
     pub kv: Kv,
@@ -465,6 +474,8 @@ impl M {
             shared_gate_proj: mat("shared_gate_proj", 1),
             attn_norm: row_norm("attn_norm"),
             mlp_norm: row_norm("mlp_norm"),
+            post_attn_norm: row_norm("post_attn_norm"),
+            post_mlp_norm: row_norm("post_mlp_norm"),
             q_norm: qk_norm("q_norm"),
             k_norm: qk_norm("k_norm"),
             kv: Kv {
@@ -7247,9 +7258,66 @@ pub mod cuda {
         attn_at(q, kv, "attn::attention_flashinfer_prefill", window_left)
     }
 
-    /// `kernels::attn::dispatch_attention_flashinfer_decode` asked for its LSE.
+    /// The paged attention for a fire CLASS: decode's dispatch, or the
+    /// plan-free prefill.
     ///
-    /// The SAME symbol as [`attention_flashinfer_decode`] and a
+    /// A plain function, deliberately, and this is the same argument
+    /// [`crate::dsl::attention_landing`] makes for itself one screen
+    /// away: the alternative is nine families each hand-writing the same
+    /// two-arm match, and the ORDER of the arms is the contract.
+    ///
+    /// **Why it is worth existing at all.** Seven of eleven declared
+    /// families serve Decode ONLY, and they do not refuse — they
+    /// `panic!("<family> states no {class:?} class yet")` on the first
+    /// prefill. Counting the class-dependent sites in the two families
+    /// that DO serve both says why: `gpt_oss` has four and all four
+    /// select an attention op; `gemma_4` has six and five do. The classes
+    /// differ in almost nothing else, so Prefill was missing from seven
+    /// families because each would have had to hand-write this match —
+    /// not because their bodies diverge.
+    ///
+    /// **What it does not decide.** Which prefill a family fires is a
+    /// contract difference and not a spelling:
+    /// [`attention_flashinfer_prefill`] names the dispatch alone and its
+    /// caller owes it a plan, while [`attention_flashinfer_prefill_planless`]
+    /// owes nothing and cannot be given a row window. This helper takes
+    /// the planless one, which is what a family with no prefill plan of
+    /// its own can state; a family that owes a plan calls the other
+    /// directly and always did.
+    pub fn attention_for(
+        class: crate::trace::FireClass,
+        q: &Val,
+        kv: &Kv,
+        window_left: i32,
+    ) -> Option<Val> {
+        match class {
+            crate::trace::FireClass::Decode => attention_flashinfer_decode(q, kv, window_left),
+            _ => attention_flashinfer_prefill_planless(q, kv, window_left),
+        }
+    }
+
+    /// [`attention_for`], asked for its LSE — the sink families' form.
+    ///
+    /// Its own function rather than an `Option` return on the one above,
+    /// because the LSE spellings return `(Val, Val)` and not
+    /// `Option<Val>`: a dispatch asked for two values cannot decline the
+    /// second half. Two functions with two return types is the honest
+    /// shape; one function returning a tuple of options would make every
+    /// caller unwrap a case that cannot happen.
+    pub fn attention_for_lse(
+        class: crate::trace::FireClass,
+        q: &Val,
+        kv: &Kv,
+        q_heads: u32,
+    ) -> (Val, Val) {
+        match class {
+            crate::trace::FireClass::Decode => attention_flashinfer_decode_lse(q, kv, q_heads),
+            _ => attention_flashinfer_prefill_lse(q, kv, q_heads),
+        }
+    }
+
+    /// `kernels::attn::dispatch_attention_flashinfer_decode` asked for its LSE.
+    ///    /// The SAME symbol as [`attention_flashinfer_decode`] and a
     /// different call: `lse_out` is the last positional argument of
     /// every flashinfer entry point, and the driver passes it only on
     /// layers that carry attention sinks (`layer.attn_sinks != nullptr`,

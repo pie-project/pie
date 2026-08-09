@@ -138,10 +138,10 @@ pub enum Error {
 /// conversion exists so a `?` on a `pipeline::` result lands here without a
 /// match at every call site, which is what makes the extraction of
 /// `src/pipeline/` into its own crate invisible to the code that calls it.
-impl From<driver_pipeline::Error> for Error {
-    fn from(error: driver_pipeline::Error) -> Self {
+impl From<driver::Error> for Error {
+    fn from(error: driver::Error) -> Self {
         match error {
-            driver_pipeline::Error::Program { message } => Self::Program { message },
+            driver::Error::Program { message } => Self::Program { message },
         }
     }
 }

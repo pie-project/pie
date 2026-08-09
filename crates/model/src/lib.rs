@@ -6,14 +6,23 @@
 //! * [`contract`] — `model_type` to the author that writes its load contract.
 //! * [`instruct`] — `arch_name` to the chat template that formats for it.
 //! * `<generation>::forward` — the forward pass, written in
-//!   `model-compiler`'s tracing eDSL, and [`ffi`] the door a driver reaches it
-//!   through. Behind the non-default `forward` feature, because `pie model
-//!   convert` wants the first two and not a tracer.
+//!   `model-compiler`'s tracing eDSL. Behind the non-default `forward`
+//!   feature, because `pie model convert` wants the first two and not a
+//!   tracer.
 //!
 //! The first two are REGISTRIES and the third is not: a forward pass is
-//! reached by the driver naming a family over the C ABI, not by a row. That
+//! reached by a driver naming a family's text directly, not by a row. That
 //! asymmetry is real and is why `forward` sits on the generation module
 //! rather than in a table beside the other two.
+//!
+//! There was a fourth thing here — `ffi`, a `#[repr(C)]` door and a committed
+//! `include/pie_forward.h`, 5,382 lines of it. It existed so the C++ drivers
+//! could trace a declaration across the ABI. Both drivers are Rust now and
+//! call this crate through its own types, so the door had no building behind
+//! it; `worker/src/embedded_driver.rs` had already recorded that when it
+//! dropped the link anchors that kept the entry points alive. It is deleted
+//! rather than kept warm: an ABI with no caller does not stay correct, it
+//! just stays compiling.
 //!
 //! They deliberately partition the model space differently: templates split by
 //! release, contracts by storage schema. So a generation is reached through a
@@ -117,18 +126,6 @@ pub mod instruct;
 // home for what more than one generation binds, whichever aspect binds it.
 #[cfg(any(feature = "chat", feature = "forward"))]
 pub mod families;
-
-/// The `#[repr(C)]` boundary a driver traces a declaration across.
-///
-/// `types` is the published vocabulary, `arena` turns a traced
-/// `ForwardPlan` into it, and `entry` holds the `extern "C"` functions.
-/// The committed `include/pie_forward.h` is the C view of exactly those.
-///
-/// It is here, and not in `model-compiler`, because it is how a DRIVER
-/// reaches a declaration — and a declaration is a model's. The toolchain
-/// that traces one has no business owning the door.
-#[cfg(feature = "forward")]
-pub mod ffi;
 
 /// The committed static-C++ emissions, as one list — `bin/emit-cuda.rs`
 /// writes it, `tests/generated_cuda.rs` checks it, and neither holds a

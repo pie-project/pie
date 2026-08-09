@@ -14,11 +14,11 @@
 
 use std::rc::Rc;
 
-use driver::local::{
+use driver_api::local::{
     PIE_KERNEL_COMMIT, PIE_KERNEL_GROUPED, PIE_KERNEL_READINESS, PIE_KERNEL_SINGLETON,
     PIE_READINESS_NEEDS_FULL,
 };
-use driver::plan::{
+use driver_api::plan::{
     EmittedKernel, LaunchChannel, LaunchOp, LaunchPackage, LaunchPlanValue, LaunchRegion,
     LaunchStage, LaunchStagePlan,
 };

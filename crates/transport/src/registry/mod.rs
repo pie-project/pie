@@ -19,7 +19,7 @@ use crate::core::{
 };
 use crate::engines::local::{D2dCopier, LocalEngine};
 use crate::error::{Result, TransportError};
-use driver::KvHandle;
+use driver_api::KvHandle;
 
 /// Where an outward [`TransferId`] was issued: which engine, and that engine's
 /// own (per-engine) transfer id.

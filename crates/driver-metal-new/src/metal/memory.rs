@@ -395,4 +395,5 @@ mod tests {
             "more memory is reclaimable than is installed"
         );
     }
+
 }

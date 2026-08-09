@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use anyhow::{Result, anyhow, bail, ensure};
-use driver::{
+use driver_api::{
     DeviceFacts, DriverCapabilities, ModelLoadDesc, PIE_CHANNEL_DTYPE_ACT, PIE_CHANNEL_DTYPE_BOOL,
     PIE_CHANNEL_DTYPE_F32, PIE_CHANNEL_DTYPE_I32, PIE_CHANNEL_DTYPE_U32, PIE_CHANNEL_EXTERN_NONE,
     PIE_GEOMETRY_CLASS_DECODE_ENVELOPE, PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY,
@@ -20,7 +20,7 @@ use driver::{
     validate_instance_desc, validate_kv_copy_desc, validate_pool_resize_desc,
     validate_state_copy_desc,
 };
-use driver::plan::ProgramRegistration;
+use driver_api::plan::ProgramRegistration;
 use tensor_compiler::eval::interp::{
     ExternChannel, HostError, Instance as InterpInstance, NoKernels, PassInputs, Value,
 };
@@ -80,7 +80,7 @@ pub struct DummyDriverOptions {
     /// from its traced + validated forward plan (the CUDA driver's
     /// `model_site_summary` capability row). The dummy has no plan to trace,
     /// so the summary is whatever the fixture states — empty by default.
-    pub model_site_summary: driver::ModelSiteSummary,
+    pub model_site_summary: driver_api::ModelSiteSummary,
     pub callback_delay_ms: u64,
     pub reject_launches: bool,
     pub reject_launches_remaining: u32,
@@ -113,7 +113,7 @@ impl Default for DummyDriverOptions {
             has_mtp_drafts: true,
             has_value_head: true,
             has_attn_score: true,
-            model_site_summary: driver::ModelSiteSummary::default(),
+            model_site_summary: driver_api::ModelSiteSummary::default(),
             callback_delay_ms: 0,
             reject_launches: false,
             reject_launches_remaining: 0,
@@ -230,7 +230,7 @@ struct LaunchInstanceResult {
 #[derive(Clone)]
 struct SendableRuntimeCallbacks {
     ctx: usize,
-    notify: driver::PieRuntimeNotifyFn,
+    notify: driver_api::PieRuntimeNotifyFn,
     operation_log: Option<Arc<Mutex<Vec<String>>>>,
 }
 
@@ -305,7 +305,7 @@ impl DummyDriver {
         };
         Self {
             device_facts: DeviceFacts {
-                abi_version: driver::PIE_DRIVER_ABI_VERSION,
+                abi_version: driver_api::PIE_DRIVER_ABI_VERSION,
                 backend: "dummy".to_string(),
                 unified_memory: true,
                 fp8_native: false,
@@ -319,17 +319,17 @@ impl DummyDriver {
                 // The dummy driver interprets PTIR directly; it has no kernels
                 // to compile, so it asks for no generated source.
                 codegen_backend: String::new(),
-                abi_version: driver::PIE_DRIVER_ABI_VERSION,
+                abi_version: driver_api::PIE_DRIVER_ABI_VERSION,
                 total_pages: options.total_pages,
                 kv_page_size: options.kv_page_size,
                 swap_pool_size: options.swap_pool_size,
                 kv_copy_domain_mask: if options.swap_pool_size > 0 {
-                    driver::KV_COPY_DEVICE_TO_DEVICE
-                        | driver::KV_COPY_DEVICE_TO_HOST
-                        | driver::KV_COPY_HOST_TO_DEVICE
-                        | driver::KV_COPY_HOST_TO_HOST
+                    driver_api::KV_COPY_DEVICE_TO_DEVICE
+                        | driver_api::KV_COPY_DEVICE_TO_HOST
+                        | driver_api::KV_COPY_HOST_TO_DEVICE
+                        | driver_api::KV_COPY_HOST_TO_HOST
                 } else {
-                    driver::KV_COPY_DEVICE_TO_DEVICE
+                    driver_api::KV_COPY_DEVICE_TO_DEVICE
                 },
                 rs_cache_required: false,
                 rs_cache_slots: 0,
@@ -349,8 +349,8 @@ impl DummyDriver {
                 // No real projection GEMMs either, so no low-rank delta to
                 // apply: the `lora` sink is not honoured.
                 has_lora: false,
-                device_geometry_port_mask: driver::PIE_DEVICE_GEOMETRY_PORTS
-                    | driver::PIE_DEVICE_PORT_ATTN_MASK,
+                device_geometry_port_mask: driver_api::PIE_DEVICE_GEOMETRY_PORTS
+                    | driver_api::PIE_DEVICE_PORT_ATTN_MASK,
                 max_forward_tokens: options.max_forward_tokens,
                 max_forward_requests: options.max_forward_requests,
                 max_page_refs: options.max_page_refs,
@@ -382,8 +382,8 @@ impl DummyDriver {
         }
     }
 
-    pub fn export_kv_handle(&self) -> Option<driver::KvHandle> {
-        driver::KvExport::export_kv_handle(&self.kv_export)
+    pub fn export_kv_handle(&self) -> Option<driver_api::KvHandle> {
+        driver_api::KvExport::export_kv_handle(&self.kv_export)
     }
 
     fn record_op(&self, name: &str) {
@@ -462,7 +462,7 @@ impl DummyDriver {
         self.record_op("load_model");
         self.capabilities.snapshot_dir = desc.snapshot_dir.display().to_string();
         self.capabilities.supports_media_encode =
-            desc.component != driver::ModelComponent::Text;
+            desc.component != driver_api::ModelComponent::Text;
         self.model_loaded = true;
         Ok(self.capabilities.clone())
     }
@@ -543,7 +543,7 @@ impl DummyDriver {
                 .into_boxed_slice(),
             pulled: 0,
             seed_credit: desc.seeded != 0
-                && desc.host_role == driver::PIE_CHANNEL_HOST_ROLE_WRITER,
+                && desc.host_role == driver_api::PIE_CHANNEL_HOST_ROLE_WRITER,
             attachments: HashMap::new(),
             // A ring exists for every channel that can legally be shared
             // across instances: extern-declared channels AND chainable
@@ -551,7 +551,7 @@ impl DummyDriver {
             // host role, unseeded). Single-attachment channels keep their
             // instance-local interpreter ring.
             shared: if desc.extern_dir != PIE_CHANNEL_EXTERN_NONE
-                || (desc.host_role == driver::PIE_CHANNEL_HOST_ROLE_NONE
+                || (desc.host_role == driver_api::PIE_CHANNEL_HOST_ROLE_NONE
                     && desc.seeded == 0)
             {
                 let dtype = channel_program_dtype(desc.dtype)?;
@@ -1821,7 +1821,7 @@ fn deterministic_drafts(ty: ValueType, base: u64, vocab: u32) -> Value {
 
 fn ensure_abi(abi_version: u32) -> Result<()> {
     ensure!(
-        abi_version == driver::PIE_DRIVER_ABI_VERSION,
+        abi_version == driver_api::PIE_DRIVER_ABI_VERSION,
         "unexpected ABI version {abi_version}"
     );
     Ok(())
@@ -1874,7 +1874,7 @@ fn ensure_unique_launch_members(
 fn ensure_terminal_cell_pending(cell: *mut PieTerminalCell) -> Result<()> {
     let outcome = unsafe { AtomicU32::from_ptr(cell.cast::<u32>()).load(Ordering::Acquire) };
     ensure!(
-        outcome == driver::PIE_TERMINAL_OUTCOME_PENDING,
+        outcome == driver_api::PIE_TERMINAL_OUTCOME_PENDING,
         "terminal cell must be Pending before acceptance"
     );
     ensure!(
@@ -2057,7 +2057,7 @@ fn copy_bytes(bytes: PieBytes, name: &str) -> Result<Vec<u8>> {
     Ok(unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) }.to_vec())
 }
 
-fn copy_u8_slice(slice: driver::PieU8Slice, name: &str) -> Result<Vec<u8>> {
+fn copy_u8_slice(slice: driver_api::PieU8Slice, name: &str) -> Result<Vec<u8>> {
     if slice.len == 0 {
         return Ok(Vec::new());
     }
@@ -2109,7 +2109,7 @@ fn copy_value_descs(slice: PieChannelValueDescSlice, name: &str) -> Result<Vec<O
         .collect()
 }
 
-fn copy_kv_cells(desc: &PieKvCopyDesc) -> Result<Vec<driver::PieKvMoveCell>> {
+fn copy_kv_cells(desc: &PieKvCopyDesc) -> Result<Vec<driver_api::PieKvMoveCell>> {
     if desc.cells.len == 0 {
         return Ok(Vec::new());
     }
@@ -2120,7 +2120,7 @@ fn copy_kv_cells(desc: &PieKvCopyDesc) -> Result<Vec<driver::PieKvMoveCell>> {
     Ok(unsafe { std::slice::from_raw_parts(desc.cells.ptr, desc.cells.len) }.to_vec())
 }
 
-fn copy_state_ranges(desc: &PieStateCopyDesc) -> Result<Vec<driver::PieStateCopyRange>> {
+fn copy_state_ranges(desc: &PieStateCopyDesc) -> Result<Vec<driver_api::PieStateCopyRange>> {
     if desc.slot_ranges.len == 0 {
         return Ok(Vec::new());
     }
@@ -2132,9 +2132,9 @@ fn copy_state_ranges(desc: &PieStateCopyDesc) -> Result<Vec<driver::PieStateCopy
 }
 
 fn copy_pool_ranges(
-    slice: driver::PiePoolRangeSlice,
+    slice: driver_api::PiePoolRangeSlice,
     name: &str,
-) -> Result<Vec<driver::PiePoolRange>> {
+) -> Result<Vec<driver_api::PiePoolRange>> {
     if slice.len == 0 {
         return Ok(Vec::new());
     }
@@ -2282,13 +2282,13 @@ mod tests {
                 ptr: instance_ids.as_ptr(),
                 len: instance_ids.len(),
             },
-            steps: driver::PieStepDescSlice { ptr: &step, len: 1 },
+            steps: driver_api::PieStepDescSlice { ptr: &step, len: 1 },
             ..PieFrameDesc::default()
         };
         driver.launch(&frame, completion)
     }
 
-    use driver::{
+    use driver_api::{
         PIE_CHANNEL_EXTERN_EXPORT, PIE_CHANNEL_HOST_ROLE_NONE, PIE_TERMINAL_OUTCOME_PENDING,
         PieChannelValueDesc,
     };
@@ -2310,8 +2310,8 @@ mod tests {
         let default_driver = DummyDriver::new();
         assert!(default_driver.capabilities().model_site_summary.is_empty());
 
-        let summary = driver::ModelSiteSummary {
-            expert_sites: vec![driver::ExpertSiteSummary {
+        let summary = driver_api::ModelSiteSummary {
+            expert_sites: vec![driver_api::ExpertSiteSummary {
                 experts: 256,
                 top_k: 8,
             }],
@@ -2411,7 +2411,7 @@ mod tests {
                     ..DummyDriverOptions::default()
                 },
                 PieRuntimeCallbacks {
-                    abi_version: driver::PIE_DRIVER_ABI_VERSION,
+                    abi_version: driver_api::PIE_DRIVER_ABI_VERSION,
                     reserved0: 0,
                     ctx: Arc::as_ptr(&state) as *mut c_void,
                     notify: Some(notify),
@@ -2455,8 +2455,8 @@ mod tests {
                 None => (PIE_CHANNEL_EXTERN_NONE, &[][..]),
                 Some(binding) => (
                     match binding.dir {
-                        ExternDir::Import => driver::PIE_CHANNEL_EXTERN_IMPORT,
-                        ExternDir::Export => driver::PIE_CHANNEL_EXTERN_EXPORT,
+                        ExternDir::Import => driver_api::PIE_CHANNEL_EXTERN_IMPORT,
+                        ExternDir::Export => driver_api::PIE_CHANNEL_EXTERN_EXPORT,
                     },
                     container.names[binding.name as usize].as_bytes(),
                 ),
@@ -3628,7 +3628,7 @@ mod tests {
                         ptr: instance_ids.as_ptr(),
                         len: instance_ids.len(),
                     },
-                    steps: driver::PieStepDescSlice { ptr: &step, len: 1 },
+                    steps: driver_api::PieStepDescSlice { ptr: &step, len: 1 },
                     ..PieFrameDesc::default()
                 },
                 PieCompletion {
@@ -3650,7 +3650,7 @@ mod tests {
         let tokens = [10u32, 11];
         let qo_indptr = [0u32, 1, 2];
         let rs_slot_ids = [7u32, 9];
-        let rs_slot_flags = [driver::PIE_RS_FLAG_RESET, 0];
+        let rs_slot_flags = [driver_api::PIE_RS_FLAG_RESET, 0];
         let desc = PieStepDesc {
             token_ids: PieU32Slice {
                 ptr: tokens.as_ptr(),
@@ -3664,7 +3664,7 @@ mod tests {
                 ptr: rs_slot_ids.as_ptr(),
                 len: rs_slot_ids.len(),
             },
-            rs_slot_flags: driver::PieU8Slice {
+            rs_slot_flags: driver_api::PieU8Slice {
                 ptr: rs_slot_flags.as_ptr(),
                 len: rs_slot_flags.len(),
             },
@@ -3679,7 +3679,7 @@ mod tests {
                 ptr: one_slot.as_ptr(),
                 len: one_slot.len(),
             },
-            rs_slot_flags: driver::PieU8Slice {
+            rs_slot_flags: driver_api::PieU8Slice {
                 ptr: one_flag.as_ptr(),
                 len: one_flag.len(),
             },

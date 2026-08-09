@@ -77,10 +77,22 @@ impl G2LayerW {
 
 /// gemma-2's CUDA text for one fire class.
 pub fn gemma2_cuda(facts: &Gemma2Facts, class: FireClass) -> ForwardPlan {
+    // DECODE AND PREFILL, and the difference is one call.
+    //
+    // This family served Decode only and PANICKED on anything else — not
+    // refused, panicked, on the first prefill a serving deployment sends.
+    // The reason was never that the two bodies diverge: counting the
+    // class-dependent sites in this text finds exactly ONE, the attention
+    // op, which is what `dsl::cuda::attention_for` now holds. Everything
+    // else below is class-independent and always was.
+    //
+    // The MTP passes stay unstated, because those genuinely are different
+    // passes and not this one under another name.
     let family = format!(
         "gemma_2.cuda.{}",
         match class {
             FireClass::Decode => "decode",
+            FireClass::Prefill => "prefill",
             other => panic!("gemma_2 states no {other:?} class yet"),
         }
     );
@@ -136,7 +148,7 @@ pub fn gemma2_cuda(facts: &Gemma2Facts, class: FireClass) -> ForwardPlan {
             // The attention logit softcap rides HERE, as a dispatch
             // parameter — see the module doc on why it is not a
             // statement of its own.
-            let o = dsl::cuda::attention_flashinfer_decode(&q, &kv, window_left)
+            let o = dsl::cuda::attention_for(class, &q, &kv, window_left)
                 .expect("a plain attention statement produces its value");
             let o = dsl::attention_landing(&o, &w.o_proj, l);
             // The POST norm, then an explicit add — gemma's pair.

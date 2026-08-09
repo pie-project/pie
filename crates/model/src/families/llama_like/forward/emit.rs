@@ -59,6 +59,7 @@ pub fn facts_digest(facts: &LlamaLikeFacts, cuda: &LlamaLikeCudaFacts) -> String
         match facts.norm_placement {
             NormPlacement::Pre => 0,
             NormPlacement::Post => 1,
+            NormPlacement::Sandwich => 2,
         },
         match facts.qk_norm {
             QkNorm::Off => 0,

@@ -35,7 +35,7 @@
 //! * the **driver** side lowers that same bound trace to a `LaunchPackage`
 //!   through [`tensor_compiler::codegen::launch::build`] — the artefact the
 //!   driver actually receives — adopts it, and runs
-//!   [`driver_pipeline::step`].
+//!   [`driver::step`].
 //!
 //! Both sides therefore start from one program, and a disagreement is a
 //! disagreement about semantics rather than about test setup. The lowering is
@@ -59,7 +59,7 @@
 
 use std::collections::BTreeMap;
 
-use driver_pipeline::{
+use driver::{
     ExecPlan, HostOp, PassInputs, StepOutcome, Value as DriverValue, adopt_launch_package,
     host_take, make_host_instance, step,
 };

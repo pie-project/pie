@@ -25,11 +25,11 @@
 //! `find` returned that entry like any other and the caller compiled `""`.
 //! [`Slot::Malformed`] names it.
 //!
-//! [`ProgramRegistration`]: driver::plan::ProgramRegistration
+//! [`ProgramRegistration`]: driver_api::plan::ProgramRegistration
 
 use std::collections::HashMap;
 
-use driver::plan::EmittedKernel;
+use driver_api::plan::EmittedKernel;
 
 /// What the host left in one `(kind, stage, region)` slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

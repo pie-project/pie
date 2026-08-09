@@ -103,8 +103,23 @@ pub enum LaunchRule {
     PerHeadElementwise,
     /// Gated norm over the value heads.
     GatedRms,
-    /// One threadgroup as wide as the expert count, rounded to a simd multiple.
+    /// One threadgroup as wide as the expert count PER ROW — the router's
+    /// top-k, which `route.metal` indexes with `tgid.y`.
+    ///
+    /// The row axis is load-bearing and was missing: with `grid.y = 1` a
+    /// mixture prefill routed row 0 only, and every other row's expert ids
+    /// were whatever the last layer left there.
     RouterLane,
+    /// ONE threadgroup as wide as the expert count, whatever the row count —
+    /// the counting sort, which reduces across all `(row, slot)` pairs
+    /// through threadgroup atomics and stripes them over its own lanes.
+    ///
+    /// Split from [`LaunchRule::RouterLane`] because they are two different
+    /// rules that shared one name. Giving this one the row axis launches N
+    /// copies of the same sort, each clearing and rewriting the permutation
+    /// the others are reading — the grid is the contract, so two contracts
+    /// need two rows.
+    RouterSort,
     /// One threadgroup per row, as wide as the row, capped at 256.
     RouteRows,
     /// Routed GEMV: [`LaunchRule::Qmv`] per row, per expert slot.
@@ -120,6 +135,70 @@ pub enum LaunchRule {
     /// the M>1 lane a ROW's statement rather than a mode the driver picks.
     Qmm,
 }
+
+impl LaunchRule {
+    /// Every variant, so a caller can enumerate the vocabulary rather than
+    /// remember it.
+    ///
+    /// The `Metal` driver's `a_rule_that_ignores_its_rows_has_to_say_so` is
+    /// what this exists for: the `RouterLane` row-axis defect survived
+    /// because the rule was *absent* from the list that would have caught
+    /// it, and a list you must remember to extend does not catch what you
+    /// forgot. Adding a variant below without adding it here fails to
+    /// compile, because the array's length is checked against the match.
+    pub const ALL: &'static [Self] = &[
+        Self::Unstated,
+        Self::Qmv,
+        Self::Rms,
+        Self::Rope,
+        Self::Elementwise,
+        Self::ElementwiseRows,
+        Self::PerHead,
+        Self::SdpaVector,
+        Self::PerHeadElementwise,
+        Self::GatedRms,
+        Self::RouterLane,
+        Self::RouterSort,
+        Self::RouteRows,
+        Self::RoutedQmv,
+        Self::SplitPacked,
+        Self::Qmm,
+    ];
+
+    /// A discriminant, used only to prove [`Self::ALL`] is complete.
+    const fn index(self) -> usize {
+        match self {
+            Self::Unstated => 0,
+            Self::Qmv => 1,
+            Self::Rms => 2,
+            Self::Rope => 3,
+            Self::Elementwise => 4,
+            Self::ElementwiseRows => 5,
+            Self::PerHead => 6,
+            Self::SdpaVector => 7,
+            Self::PerHeadElementwise => 8,
+            Self::GatedRms => 9,
+            Self::RouterLane => 10,
+            Self::RouterSort => 11,
+            Self::RouteRows => 12,
+            Self::RoutedQmv => 13,
+            Self::SplitPacked => 14,
+            Self::Qmm => 15,
+        }
+    }
+}
+
+// `ALL` is complete and in discriminant order, checked at COMPILE time: a new
+// variant makes `index` non-exhaustive, and forgetting to list it here makes
+// this assertion fail. Neither can be missed by a reviewer.
+const _: () = {
+    assert!(LaunchRule::ALL.len() == 16);
+    let mut i = 0;
+    while i < LaunchRule::ALL.len() {
+        assert!(LaunchRule::ALL[i].index() == i);
+        i += 1;
+    }
+};
 
 /// The host-side plan a kernel's contract obligates: stated so a reader of
 /// the model text can see which prepare a launch drags in, rather than
@@ -548,6 +627,23 @@ pub enum Source {
     /// The `i`-th weight the statement NAMES, resolved through the
     /// binder.
     Weight(u8),
+    /// The weight the statement names on `spec.weight` — a NAME the
+    /// binder resolves, not a slot in the argument run.
+    ///
+    /// The other spelling, and both are live. A weight reaches a launch
+    /// two ways: as an operand the trace placed in the run, which is
+    /// [`Source::Weight`], or as the statement's own named weight, which
+    /// is this. `layout::embed_bf16` only ever has the second — a vocab
+    /// table is not something a trace produces — and it is the first
+    /// launch of every fire.
+    ///
+    /// The cost this admits is that a generated branch now needs the
+    /// RESOLVER, which is the one thing it had been able to do without.
+    /// The resolve happens once before the match rather than inside a
+    /// branch, so the guard can test it: a name the store lacks is
+    /// DRIFT, and declining to a hand arm that will say
+    /// `UnknownWeight` is a better answer than binding null.
+    WeightNamed,
     /// The `i`-th scalar the statement carries (`Launch`'s params).
     Param(u8),
     /// The KEY pages of the layer this statement runs in.
@@ -712,6 +808,74 @@ pub enum Source {
     /// is exactly that operand's element count. A product the table has
     /// no arithmetic for, read off a value that already is it.
     InElements(u8),
+    /// A field of the fire's GDN context, which is the hybrids' recurrent
+    /// geometry: head counts, conv width, group count, slab strides.
+    ///
+    /// Its own source and not a `Ctx` because it comes from a DIFFERENT
+    /// struct and an OPTIONAL one — a fire with no recurrent layers
+    /// carries no GDN context at all, and a row reading one has to
+    /// decline rather than read a default. Ten hand arms open with
+    /// `let g = gdn_ctx()?;` for exactly that reason, which made this the
+    /// largest single blocker in the table once the resolver landed.
+    ///
+    /// Like [`Source::CtxByLayer`], the name is the DRIVER's field and
+    /// the generator's claim is only where to look.
+    Gdn(&'static str),
+    /// The `i`-th result's row width DIVIDED by a context field.
+    ///
+    /// One variant and not two, because "how many head-dims fit in this
+    /// row" and "how many PLE layers fit in this row" are the same
+    /// question asked of different fields, and a `OutHeads` beside a
+    /// `OutPleLayers` would be the repetition this table exists to end.
+    /// Nine hand arms compute `width / ctx.head_dim.max(1)` — rope's q
+    /// and k counts, the attention sink correction, the per-head norms,
+    /// the q/gate split — and one computes `width / ctx.ple_dim`.
+    ///
+    /// Not the same question as [`Source::OutDim`], and that is why it is
+    /// its own source rather than a use of one. `OutDim(i, 1)` asks the
+    /// PLAN what the second extent of a `[Tokens, heads, dim]` value is,
+    /// and the join does not carry it; this asks the BINDER how many of
+    /// something fit in a row it already holds the width of.
+    ///
+    /// A row stating this is guarded on the field being set, because
+    /// dividing a width by an unset field is not a smaller answer, it is
+    /// a meaningless one — the same reason [`Source::CtxNonZero`] guards.
+    /// Two of the arms this replaces refused explicitly on it and the
+    /// rest wrote `max(1)`, which is the same judgment less loudly.
+    OutWidthOver(u8, &'static str),
+    /// The same for the `i`-th operand. See [`Source::OutWidthOver`].
+    InWidthOver(u8, &'static str),
+    /// The `o`-th result's row width divided by the `i`-th OPERAND's.
+    ///
+    /// The divisor is a value the statement already carries, which is the
+    /// only difference from [`Source::OutWidthOver`] — and it is worth a
+    /// variant because three rows want it and none of them can name a
+    /// context field for it. The MoE decode GEMVs read their intermediate
+    /// as `expert_out.width / topk_idx.width`, because the result is
+    /// `[Tokens, top_k * i_moe]` and the routing table IS `[Tokens,
+    /// top_k]`; gemma-3n's hyper-connection expand reads its multiplier
+    /// as `output.width / input.width`.
+    ///
+    /// Unguarded, unlike its context twin: an operand with a zero row
+    /// width is not a fire that states nothing, it is a fire whose
+    /// binding is already wrong, and the arity guard has covered the case
+    /// where the operand is absent. `width_over`'s `max(1)` stands behind
+    /// it either way.
+    OutWidthOverIn(u8, u8),
+    /// A context field the fire holds PER LAYER, read at the statement's
+    /// own layer.
+    ///
+    /// Rope theta is the example that forces it: gemma-4 splits theta by
+    /// layer kind, so `ctx.rope_theta` is right for a uniform family and
+    /// wrong for that one, and six hand arms call a `theta_of(layer)`
+    /// helper to say so. The field is the DRIVER's — the table has no
+    /// business knowing whether a family's per-layer vector has a
+    /// fallback, a filter or a refusal behind it — so this names an
+    /// ACCESSOR the driver implements, exactly as [`Source::CtxNonZero`]
+    /// names an `is_set` the driver implements. The generator's whole
+    /// claim is "this value is indexed by the statement's layer", which
+    /// is the part it can know.
+    CtxByLayer(&'static str),
     /// Dimension `d` of the `i`-th operand. The routed combine reads
     /// `[Tokens, top_k, H]` and both extents come off it.
     InDim(u8, u8),

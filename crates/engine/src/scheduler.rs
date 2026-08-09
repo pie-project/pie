@@ -487,7 +487,7 @@ fn rs_state_copy_plan(
         .into_iter()
         .zip(dst_slots)
         .map(
-            |(src_slot_id, dst_slot_id)| ::driver::PieStateCopyRange {
+            |(src_slot_id, dst_slot_id)| ::driver_api::PieStateCopyRange {
                 src_slot_id,
                 dst_slot_id,
                 src_token_offset: 0,
@@ -537,9 +537,9 @@ pub fn submit_async_with_kv_copy(
     copy_dst: Vec<u32>,
 ) -> Result<()> {
     let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
-        src_domain: ::driver::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        src_domain: ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
         src_device_ordinal: 0,
-        dst_domain: ::driver::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        dst_domain: ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
         dst_device_ordinal: 0,
         src_page_ids: copy_src,
         dst_page_ids: copy_dst,
@@ -585,9 +585,9 @@ pub fn submit_prebuilt_async_with_kv_copy(
     copy_dst: Vec<u32>,
 ) -> Result<()> {
     let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
-        src_domain: ::driver::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        src_domain: ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
         src_device_ordinal: 0,
-        dst_domain: ::driver::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        dst_domain: ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
         dst_device_ordinal: 0,
         src_page_ids: copy_src,
         dst_page_ids: copy_dst,
@@ -616,9 +616,9 @@ pub fn submit_prebuilt_async_with_kv_and_rs_copy(
     rs_copy_dst: Vec<u32>,
 ) -> Result<()> {
     let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
-        src_domain: ::driver::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        src_domain: ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
         src_device_ordinal: 0,
-        dst_domain: ::driver::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        dst_domain: ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
         dst_device_ordinal: 0,
         src_page_ids: copy_src,
         dst_page_ids: copy_dst,
@@ -683,9 +683,9 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
     lora_program: bool,
 ) -> Result<()> {
     let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
-        src_domain: ::driver::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        src_domain: ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
         src_device_ordinal: 0,
-        dst_domain: ::driver::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        dst_domain: ::driver_api::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
         dst_device_ordinal: 0,
         src_page_ids: copy_src,
         dst_page_ids: copy_dst,

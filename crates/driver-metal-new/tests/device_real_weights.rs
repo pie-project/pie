@@ -332,6 +332,9 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
         page_size: 16,
         pages: 64,
         element_bytes: 2,
+        global_head_dim: 0,
+        global_kv_heads: 0,
+        full_attn_every: 0,
     };
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let pages = |layer: u16, values: bool| {
@@ -341,7 +344,7 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
             } else {
                 l.k.gpu_address()
             },
-            bytes: shape.layer_bytes(),
+            bytes: shape.layer_bytes_at(0),
         })
     };
 
@@ -399,7 +402,7 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     // wrote answers zero and looks exactly like an attention that is broken.
     for l in 0..2.min(shape.layers) {
         let layer = pool.layer(l).expect("a layer");
-        let n = shape.layer_bytes() as usize;
+        let n = shape.layer_bytes_at(0) as usize;
         // SAFETY: the command buffer retired.
         let (k, v) = unsafe {
             (
@@ -807,6 +810,9 @@ fn bisect(class: FireClass) {
         page_size: 16,
         pages: 64,
         element_bytes: 2,
+        global_head_dim: 0,
+        global_kv_heads: 0,
+        full_attn_every: 0,
     };
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let pages = |layer: u16, values: bool| {
@@ -816,7 +822,7 @@ fn bisect(class: FireClass) {
             } else {
                 l.k.gpu_address()
             },
-            bytes: shape.layer_bytes(),
+            bytes: shape.layer_bytes_at(0),
         })
     };
     let freqs = driver_metal_new::model::rope::frequencies(
@@ -982,7 +988,7 @@ fn bisect(class: FireClass) {
     // The pool, after the whole prefix: which tensor actually landed where.
     {
         let layer = pool.layer(0).expect("a layer");
-        let n = shape.layer_bytes() as usize;
+        let n = shape.layer_bytes_at(0) as usize;
         // SAFETY: the command buffers retired.
         let (k, v) = unsafe {
             (
@@ -1085,6 +1091,9 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
         page_size: 16,
         pages: 64,
         element_bytes: 2,
+        global_head_dim: 0,
+        global_kv_heads: 0,
+        full_attn_every: 0,
     };
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let freqs = driver_metal_new::model::rope::frequencies(
@@ -1148,7 +1157,7 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
                 } else {
                     l.k.gpu_address()
                 },
-                bytes: shape.layer_bytes(),
+                bytes: shape.layer_bytes_at(0),
             })
         };
         let mut live = Live {
@@ -1341,6 +1350,9 @@ fn one_token_at_position_zero_agrees_with_mlx() {
         page_size: 16,
         pages: 16,
         element_bytes: 2,
+        global_head_dim: 0,
+        global_kv_heads: 0,
+        full_attn_every: 0,
     };
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let pages = |layer: u16, values: bool| {
@@ -1350,7 +1362,7 @@ fn one_token_at_position_zero_agrees_with_mlx() {
             } else {
                 l.k.gpu_address()
             },
-            bytes: shape.layer_bytes(),
+            bytes: shape.layer_bytes_at(0),
         })
     };
     let freqs = driver_metal_new::model::rope::frequencies(
@@ -1543,6 +1555,9 @@ fn a_two_token_prefill_agrees_with_mlx() {
         page_size: 16,
         pages: 16,
         element_bytes: 2,
+        global_head_dim: 0,
+        global_kv_heads: 0,
+        full_attn_every: 0,
     };
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let pages = |layer: u16, values: bool| {
@@ -1552,7 +1567,7 @@ fn a_two_token_prefill_agrees_with_mlx() {
             } else {
                 l.k.gpu_address()
             },
-            bytes: shape.layer_bytes(),
+            bytes: shape.layer_bytes_at(0),
         })
     };
     let freqs = driver_metal_new::model::rope::frequencies(
@@ -1743,6 +1758,9 @@ fn a_generation_agrees_with_mlx_token_for_token() {
         page_size: 16,
         pages: 16,
         element_bytes: 2,
+        global_head_dim: 0,
+        global_kv_heads: 0,
+        full_attn_every: 0,
     };
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let pages = |layer: u16, values: bool| {
@@ -1752,7 +1770,7 @@ fn a_generation_agrees_with_mlx_token_for_token() {
             } else {
                 l.k.gpu_address()
             },
-            bytes: shape.layer_bytes(),
+            bytes: shape.layer_bytes_at(0),
         })
     };
     let freqs = driver_metal_new::model::rope::frequencies(
@@ -1771,7 +1789,7 @@ fn a_generation_agrees_with_mlx_token_for_token() {
     let mut seq: Vec<u32> = vec![128_000, 9906];
     let mut got: Vec<u32> = Vec::new();
 
-    for turn in 0..MLX.len() {
+    for (turn, &want) in MLX.iter().enumerate() {
         // The first fire is the PREFILL of the prompt; every one after is a
         // decode of the last token at its own position.
         let (tokens, first): (Vec<u32>, u32) = if turn == 0 {
@@ -1875,7 +1893,7 @@ fn a_generation_agrees_with_mlx_token_for_token() {
             .map(|(i, _)| i as u32)
             .expect("a readout has an argmax");
 
-        eprintln!("turn {turn}: {next} (MLX {})", MLX[turn]);
+        eprintln!("turn {turn}: {next} (MLX {want})");
         got.push(next);
         seq.push(next);
     }

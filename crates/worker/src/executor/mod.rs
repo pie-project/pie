@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use driver::{
+use driver_api::{
     ExecutorRequest, ExecutorResponse, ExecutorRpc, ExecutorRpcRequest, ExecutorRpcResponse,
     HelloRequest, HelloResponse, InlineKvPayload, MemoryDomain, ModelIdentity,
     PIE_TERMINAL_OUTCOME_FAILED, PIE_TERMINAL_OUTCOME_PENDING, PIE_TERMINAL_OUTCOME_SUCCESS,
@@ -124,7 +124,7 @@ fn append_region_bytes(
     }
 }
 
-fn zero_grant(handle: &driver::KvHandle, grant: ScratchGrant) -> Result<()> {
+fn zero_grant(handle: &driver_api::KvHandle, grant: ScratchGrant) -> Result<()> {
     for region in &handle.regions {
         let offset = (grant.base_page as u64)
             .checked_mul(region.page_stride)
@@ -167,13 +167,13 @@ fn zero_grant(handle: &driver::KvHandle, grant: ScratchGrant) -> Result<()> {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn connect(addr: &str) -> Result<driver::ExecutorRpcClient> {
+pub(crate) async fn connect(addr: &str) -> Result<driver_api::ExecutorRpcClient> {
     Ok(connect_with_local_ip(addr).await?.0)
 }
 
 pub(crate) async fn connect_with_local_ip(
     addr: &str,
-) -> Result<(driver::ExecutorRpcClient, IpAddr)> {
+) -> Result<(driver_api::ExecutorRpcClient, IpAddr)> {
     let tcp_addr = addr.strip_prefix("tcp://").unwrap_or(addr);
     let mut connection = tcp::connect(tcp_addr, Bincode::default);
     connection
@@ -189,7 +189,7 @@ pub(crate) async fn connect_with_local_ip(
             .ip(),
     );
     Ok((
-        driver::ExecutorRpcClient::new(tarpc::client::Config::default(), transport).spawn(),
+        driver_api::ExecutorRpcClient::new(tarpc::client::Config::default(), transport).spawn(),
         local_ip,
     ))
 }
@@ -241,7 +241,7 @@ fn remote_encode_admission_bytes(request: &RemoteEncode) -> std::result::Result<
     })
 }
 
-fn remote_embeddings_bytes(embeddings: &driver::RemoteEmbeddings) -> Option<usize> {
+fn remote_embeddings_bytes(embeddings: &driver_api::RemoteEmbeddings) -> Option<usize> {
     embedding_payload_bytes(
         embeddings.rows.len(),
         embeddings.indptr.len(),
@@ -480,7 +480,7 @@ impl ExecutorServer {
         );
         let group = drivers.groups.pop().expect("one executor driver group");
         let kv_handle = group.backend.export_kv_handle();
-        if model.component == driver::ModelComponent::Encode {
+        if model.component == driver_api::ModelComponent::Encode {
             anyhow::ensure!(
                 group.caps.supports_media_encode,
                 "encode executor backend does not advertise media encoding"
@@ -506,7 +506,7 @@ impl ExecutorServer {
         #[cfg(not(feature = "nixl"))]
         let nixl = {
             anyhow::ensure!(
-                model.component == driver::ModelComponent::Encode
+                model.component == driver_api::ModelComponent::Encode
                     || transfer != crate::config::OffloadTransfer::Nixl,
                 "offload.transfer=nixl requires feature \"nixl\""
             );
@@ -625,7 +625,7 @@ impl ExecutorServer {
 fn build_executor_nixl(
     transfer: crate::config::OffloadTransfer,
     model: &ModelIdentity,
-    kv_handle: &driver::KvHandle,
+    kv_handle: &driver_api::KvHandle,
 ) -> Result<Option<ExecutorNixl>> {
     use transport::Engine;
 
@@ -913,7 +913,7 @@ struct QueuedLaunch {
 
 struct QueuedEncode {
     client_id: ClientId,
-    request: driver::RemoteEncode,
+    request: driver_api::RemoteEncode,
     reservation_id: u64,
     reply: oneshot::Sender<std::result::Result<ExecutorResponse, RemoteError>>,
 }
@@ -958,15 +958,15 @@ struct ClientState {
 }
 
 struct ProgramRecord {
-    registration: driver::ProgramRegistration,
+    registration: driver_api::ProgramRegistration,
     program_id: u64,
 }
 
 struct ExecutorActor {
     backend: DriverBackend,
-    capabilities: driver::DriverCapabilities,
+    capabilities: driver_api::DriverCapabilities,
     model: ModelIdentity,
-    kv_handle: Option<driver::KvHandle>,
+    kv_handle: Option<driver_api::KvHandle>,
     max_clients: usize,
     lease_slots: Vec<bool>,
     clients: HashMap<ClientId, ClientState>,
@@ -982,9 +982,9 @@ struct ExecutorActor {
 impl ExecutorActor {
     fn new(
         backend: DriverBackend,
-        capabilities: driver::DriverCapabilities,
+        capabilities: driver_api::DriverCapabilities,
         model: ModelIdentity,
-        kv_handle: Option<driver::KvHandle>,
+        kv_handle: Option<driver_api::KvHandle>,
         max_clients: usize,
         stats: Arc<ExecutorStats>,
         #[cfg(feature = "nixl")] nixl: Option<ExecutorNixl>,
@@ -1337,7 +1337,7 @@ impl ExecutorActor {
         if request.model != self.model {
             return Err(incompatible("model identity mismatch"));
         }
-        if self.model.component == driver::ModelComponent::Encode {
+        if self.model.component == driver_api::ModelComponent::Encode {
             if !self.capabilities.supports_media_encode {
                 return Err(unsupported(
                     "encode executor backend does not support media encoding",
@@ -1462,7 +1462,7 @@ impl ExecutorActor {
     fn register_program(
         &mut self,
         client_id: ClientId,
-        registration: driver::ProgramRegistration,
+        registration: driver_api::ProgramRegistration,
     ) -> std::result::Result<ExecutorResponse, RemoteError> {
         let program_id = if let Some(existing) = self.programs.get(&registration.program_hash) {
             if existing.registration != registration {
@@ -1605,7 +1605,7 @@ impl ExecutorActor {
         let table = ::engine::driver::waker::WakerTable::global();
         let reader_wait_id = table.alloc();
         let writer_wait_id = table.alloc();
-        let plan = driver::ChannelRegistrationPlan {
+        let plan = driver_api::ChannelRegistrationPlan {
             driver_id: 0,
             channel_id: executor_channel_id,
             shape: request.shape,
@@ -1701,7 +1701,7 @@ impl ExecutorActor {
     fn can_coalesce_encode(
         &self,
         current: &[QueuedEncode],
-        candidate: &driver::RemoteEncode,
+        candidate: &driver_api::RemoteEncode,
     ) -> bool {
         let candidate_modality = encode_modality(&candidate.plan);
         if !candidate.blobs.is_empty()
@@ -2107,7 +2107,7 @@ impl ExecutorActor {
     fn copy_kv(
         &mut self,
         client_id: ClientId,
-        plan: driver::KvCopyPlan,
+        plan: driver_api::KvCopyPlan,
         reply: oneshot::Sender<std::result::Result<ExecutorResponse, RemoteError>>,
         handle: ExecutorCoreHandle,
     ) {
@@ -2284,7 +2284,7 @@ impl ExecutorActor {
             return;
         }
 
-        let mut encode = driver::MediaEncodePlan::default();
+        let mut encode = driver_api::MediaEncodePlan::default();
         match modality {
             Some(EncodeModality::Image) => encode.image_pixel_indptr.push(0),
             Some(EncodeModality::Audio) => encode.audio_feature_indptr.push(0),
@@ -2402,7 +2402,7 @@ impl ExecutorActor {
                     } else {
                         let byte_start = row_start * hidden * 2;
                         let byte_end = row_end * hidden * 2;
-                        let embeddings = driver::RemoteEmbeddings {
+                        let embeddings = driver_api::RemoteEmbeddings {
                             rows: encode.output_rows[byte_start..byte_end].to_vec(),
                             indptr: encode.output_row_indptr[first..=last]
                                 .iter()
@@ -2447,7 +2447,7 @@ impl ExecutorActor {
     fn encode_one(
         &mut self,
         client_id: ClientId,
-        request: driver::RemoteEncode,
+        request: driver_api::RemoteEncode,
         reservation_id: u64,
         reply: oneshot::Sender<std::result::Result<ExecutorResponse, RemoteError>>,
         handle: ExecutorCoreHandle,
@@ -2470,7 +2470,7 @@ impl ExecutorActor {
                 return;
             }
             let response = validate_embeddings(&plan).map(|()| {
-                ExecutorResponse::Embeddings(driver::RemoteEmbeddings {
+                ExecutorResponse::Embeddings(driver_api::RemoteEmbeddings {
                     rows: plan.embed_rows,
                     indptr: plan.embed_indptr,
                     shapes: plan.embed_shapes,
@@ -2510,7 +2510,7 @@ impl ExecutorActor {
                     return;
                 }
             };
-        let mut encode = driver::MediaEncodePlan {
+        let mut encode = driver_api::MediaEncodePlan {
             image_grids: plan.image_grids,
             image_pixels: plan.image_pixels,
             image_pixel_indptr: plan.image_pixel_indptr,
@@ -2553,7 +2553,7 @@ impl ExecutorActor {
                     } else {
                         let rows = *encode.output_row_indptr.last().unwrap() as usize;
                         encode.output_rows.truncate(rows * hidden * 2);
-                        let embeddings = driver::RemoteEmbeddings {
+                        let embeddings = driver_api::RemoteEmbeddings {
                             rows: encode.output_rows,
                             indptr: encode
                                 .output_row_indptr
@@ -2884,8 +2884,8 @@ fn valid_optional_csr(indptr: &[u32], rows: usize, values: usize) -> bool {
 }
 
 fn append_plan(
-    destination: &mut driver::LaunchPlan,
-    source: driver::LaunchPlan,
+    destination: &mut driver_api::LaunchPlan,
+    source: driver_api::LaunchPlan,
 ) -> Result<()> {
     anyhow::ensure!(
         source.kv_len_device.is_empty(),
@@ -3099,9 +3099,9 @@ fn single_step_frame(
             roster_rows: (0..members).collect(),
             sub_batch_indptr: vec![0, members],
             sub_batch_class: vec![if device_resolved {
-                driver::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE
+                driver_api::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE
             } else {
-                driver::PIE_GEOMETRY_CLASS_HOST
+                driver_api::PIE_GEOMETRY_CLASS_HOST
             }],
             terminal_cells,
             program_row_indptr,
@@ -3121,7 +3121,7 @@ fn single_step_frame(
 fn merge_remote_launches(launches: Vec<RemoteLaunch>) -> Result<RemoteLaunch> {
     anyhow::ensure!(!launches.is_empty(), "cannot merge an empty launch set");
     let mut merged = RemoteLaunch {
-        plan: driver::LaunchPlan {
+        plan: driver_api::LaunchPlan {
             single_token_mode: true,
             ..Default::default()
         },
@@ -3198,7 +3198,7 @@ fn merge_remote_launches(launches: Vec<RemoteLaunch>) -> Result<RemoteLaunch> {
     Ok(merged)
 }
 
-fn validate_embeddings(plan: &driver::LaunchPlan) -> std::result::Result<(), RemoteError> {
+fn validate_embeddings(plan: &driver_api::LaunchPlan) -> std::result::Result<(), RemoteError> {
     let blocks = plan.embed_dtypes.len();
     if plan.embed_indptr.len() != blocks + 1
         || plan.embed_shapes.len() != blocks * 2
@@ -3240,7 +3240,7 @@ enum EncodeModality {
     Mixed,
 }
 
-fn encode_modality(plan: &driver::LaunchPlan) -> Option<EncodeModality> {
+fn encode_modality(plan: &driver_api::LaunchPlan) -> Option<EncodeModality> {
     match (
         !plan.image_anchor_rows.is_empty(),
         !plan.audio_anchor_rows.is_empty(),
@@ -3252,12 +3252,12 @@ fn encode_modality(plan: &driver::LaunchPlan) -> Option<EncodeModality> {
     }
 }
 
-fn encode_media_count(plan: &driver::LaunchPlan) -> usize {
+fn encode_media_count(plan: &driver_api::LaunchPlan) -> usize {
     plan.image_anchor_rows.len() + plan.audio_anchor_rows.len()
 }
 
 fn validate_raw_encode_plan(
-    plan: &driver::LaunchPlan,
+    plan: &driver_api::LaunchPlan,
     hidden_size: u32,
 ) -> std::result::Result<(), RemoteError> {
     let images = plan.image_anchor_rows.len();
@@ -3356,7 +3356,7 @@ fn _assert_tarpc_types(_: ExecutorRpcRequest, _: ExecutorRpcResponse) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use driver::{
+    use driver_api::{
         EncodedMask, ExecutorRpcClient, LaunchPlan, ModelComponent, ProgramRegistration,
     };
     use driver_dummy::DummyDriverOptions;
@@ -3367,7 +3367,7 @@ mod tests {
     fn fixture(
         max_clients: usize,
         callback_delay_ms: u64,
-    ) -> (ModelDrivers, ModelIdentity, driver::KvLayout) {
+    ) -> (ModelDrivers, ModelIdentity, driver_api::KvLayout) {
         fixture_with_log(max_clients, callback_delay_ms, None)
     }
 
@@ -3375,7 +3375,7 @@ mod tests {
         max_clients: usize,
         callback_delay_ms: u64,
         operation_log: Option<Arc<std::sync::Mutex<Vec<String>>>>,
-    ) -> (ModelDrivers, ModelIdentity, driver::KvLayout) {
+    ) -> (ModelDrivers, ModelIdentity, driver_api::KvLayout) {
         let options = DummyDriverOptions {
             total_pages: 32,
             kv_page_size: 16,
@@ -3416,7 +3416,7 @@ mod tests {
     async fn hello(
         client: &ExecutorRpcClient,
         model: &ModelIdentity,
-        layout: &driver::KvLayout,
+        layout: &driver_api::KvLayout,
         nonce: u64,
     ) -> HelloResponse {
         let response = rpc(
@@ -3618,8 +3618,8 @@ mod tests {
         assert_eq!(payload.bytes.len() as u64, layout.page_bytes());
         let ExecutorResponse::Embeddings(embeddings) = rpc(
             &a,
-            ExecutorRequest::Encode(driver::RemoteEncode {
-                plan: driver::LaunchPlan {
+            ExecutorRequest::Encode(driver_api::RemoteEncode {
+                plan: driver_api::LaunchPlan {
                     token_ids: vec![4, 5],
                     image_pixels: vec![1, 2, 3, 4],
                     image_grids: vec![1, 1, 1],
@@ -3654,7 +3654,7 @@ mod tests {
                 program_id: program_a,
                 channel_ids: Vec::new(),
                 seed_values: Vec::new(),
-                geometry_class: driver::GeometryClass::Host,
+                geometry_class: driver_api::GeometryClass::Host,
             }),
         )
         .await
@@ -3673,10 +3673,10 @@ mod tests {
             ExecutorRequest::RegisterChannel(RemoteRegisterChannel {
                 local_channel_id: 77,
                 shape: vec![1],
-                dtype: driver::PIE_CHANNEL_DTYPE_U32,
-                host_role: driver::PIE_CHANNEL_HOST_ROLE_NONE,
+                dtype: driver_api::PIE_CHANNEL_DTYPE_U32,
+                host_role: driver_api::PIE_CHANNEL_HOST_ROLE_NONE,
                 seeded: false,
-                extern_dir: driver::PIE_CHANNEL_EXTERN_NONE,
+                extern_dir: driver_api::PIE_CHANNEL_EXTERN_NONE,
                 capacity: 1,
                 extern_name: Vec::new(),
             }),
@@ -3692,7 +3692,7 @@ mod tests {
                 program_id: program_b,
                 channel_ids: vec![channel.executor_channel_id],
                 seed_values: Vec::new(),
-                geometry_class: driver::GeometryClass::Host,
+                geometry_class: driver_api::GeometryClass::Host,
             }),
         )
         .await
@@ -3705,7 +3705,7 @@ mod tests {
                 program_id,
                 channel_ids: Vec::new(),
                 seed_values: Vec::new(),
-                geometry_class: driver::GeometryClass::Host,
+                geometry_class: driver_api::GeometryClass::Host,
             })
         };
         let ExecutorResponse::InstanceBound(bound_a) = rpc(&a, bind(1, program_a)).await.unwrap()
@@ -3874,7 +3874,7 @@ mod tests {
                     pacing_wait_id,
                     channel_ids: Vec::new(),
                     seed_values: Vec::new(),
-                    geometry_class: driver::GeometryClass::Host,
+                    geometry_class: driver_api::GeometryClass::Host,
                 })
                 .unwrap();
             let mut terminal = Box::new(PieTerminalCell {
@@ -3932,7 +3932,7 @@ mod tests {
                     tokio::spawn(request);
                 }),
         );
-        let new_client = driver::ExecutorRpcClient::new(
+        let new_client = driver_api::ExecutorRpcClient::new(
             tarpc::client::Config::default(),
             client_transport,
         );
@@ -3999,7 +3999,7 @@ mod tests {
                     pacing_wait_id,
                     channel_ids: Vec::new(),
                     seed_values: Vec::new(),
-                    geometry_class: driver::GeometryClass::Host,
+                    geometry_class: driver_api::GeometryClass::Host,
                 })
                 .unwrap();
             let mut terminal = Box::new(PieTerminalCell {
@@ -4086,20 +4086,20 @@ mod tests {
     #[test]
     fn grant_zeroing_clears_only_the_leased_range() {
         let mut bytes = vec![0xAAu8; 24];
-        let handle = driver::KvHandle {
-            regions: vec![driver::KvRegion {
+        let handle = driver_api::KvHandle {
+            regions: vec![driver_api::KvRegion {
                 base: bytes.as_mut_ptr() as u64,
                 len: bytes.len() as u64,
                 page_stride: 8,
                 domain: MemoryDomain::HostPinned,
             }],
-            layout: driver::KvLayout {
+            layout: driver_api::KvLayout {
                 num_layers: 1,
                 num_kv_heads: 1,
                 head_dim: 1,
                 page_size: 1,
-                dtype: driver::KvDtype::I8,
-                kind: driver::KvLayoutKind::FusedLatent,
+                dtype: driver_api::KvDtype::I8,
+                kind: driver_api::KvLayoutKind::FusedLatent,
                 storage_format: "test".to_string(),
                 region_page_bytes: vec![8],
             },
@@ -4159,7 +4159,7 @@ mod tests {
                     program_id,
                     channel_ids: Vec::new(),
                     seed_values: Vec::new(),
-                    geometry_class: driver::GeometryClass::Host,
+                    geometry_class: driver_api::GeometryClass::Host,
                 }),
             )
             .await
@@ -4231,7 +4231,7 @@ mod tests {
                     barrier.wait().await;
                     rpc(
                         &client,
-                        ExecutorRequest::Encode(driver::RemoteEncode {
+                        ExecutorRequest::Encode(driver_api::RemoteEncode {
                             plan: LaunchPlan {
                                 token_ids: vec![index as u32],
                                 image_grids: vec![1, 1, 1],
@@ -4303,7 +4303,7 @@ mod tests {
         drop(overflow);
         let error = rpc(
             &client,
-            ExecutorRequest::CopyKv(driver::KvCopyPlan::default()),
+            ExecutorRequest::CopyKv(driver_api::KvCopyPlan::default()),
         )
         .await
         .unwrap_err();

@@ -37,9 +37,9 @@
 //! reads channels, computes, and puts — is what runs, and it is the shape
 //! every decode loop is.
 
-use driver_pipeline::driver::plan::{LaunchOp, LaunchStagePlan};
-use driver_pipeline::tensor_ir::op::tags;
-use driver_pipeline::{
+use driver::driver_api::plan::{LaunchOp, LaunchStagePlan};
+use driver::tensor_ir::op::tags;
+use driver::{
     Diagnosis, Extents, LANE_HEADER_BYTES, LANE_RECORD_BYTES, LANE_SLOT_BYTES, LaneChannelSlot,
     LaneHeader, LaneRecord, LaneShape, NO_TICKET, OpParams, OpRuntime, SCRATCH_ALIGN,
     StatusOutcome, ValueDesc, describe, layout,
@@ -155,7 +155,7 @@ impl Prepared {
         let mut host_table = vec![0u8; table_bytes];
 
         let header = LaneHeader {
-            abi_version: driver_pipeline::LANE_ABI_VERSION,
+            abi_version: driver::LANE_ABI_VERSION,
             lane_count: lanes,
             channel_slots_per_lane: channel_count,
             flags: 0,

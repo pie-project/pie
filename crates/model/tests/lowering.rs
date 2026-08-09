@@ -1043,16 +1043,15 @@ fn every_launch_carries_operands_that_match_the_arena() {
     );
 }
 
-/// The operand slots survive the C ABI, and a weight crosses as an index
-/// into the PLAN's name table.
+/// The operand slots name weights from the PLAN's table, not the
+/// lowering's.
 ///
 /// The confusion this guards is real and easy: a lowering hands back TWO
 /// name tables — its own, holding launcher SYMBOLS, and the plan's,
 /// holding weights. An operand resolved against the wrong one gives the
 /// driver a kernel name where a tensor belongs, and both are valid u32.
 #[test]
-fn the_operand_slots_cross_the_abi_naming_weights_from_the_plan() {
-    use model::ffi::types::PieForwardArgKind;
+fn the_operand_slots_name_weights_from_the_plan() {
     use model_compiler::lower::Arg;
 
     let plan = decode_plan();
@@ -1086,12 +1085,6 @@ fn the_operand_slots_cross_the_abi_naming_weights_from_the_plan() {
             "`{w}` is a LAUNCHER symbol — the two name tables were crossed"
         );
     }
-    // And the wire tags are the three the ABI declares.
-    let _ = (
-        PieForwardArgKind::Arena,
-        PieForwardArgKind::Named,
-        PieForwardArgKind::Weight,
-    );
 }
 
 /// The buffer table crosses beside the operands, and the two AGREE.

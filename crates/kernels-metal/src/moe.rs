@@ -42,7 +42,12 @@ pub static KERNELS: &[KernelSig] = &[
     // the combine reads back. A text that named fewer would leave the combine
     // reading whatever was in the buffer.
     kernel!(route_sort "route_sort", file = Some("moe/route.metal"),
-    launch = kernels::LaunchRule::RouterLane,
+    // ONE threadgroup, whatever the row count: the sort reduces across every
+    // (row, slot) pair through threadgroup atomics and stripes them over its
+    // own lanes. `RouterLane` -- which this shared until the row axis landed
+    // on it -- would launch one copy per row, each clearing and rewriting the
+    // permutation the others are reading.
+    launch = kernels::LaunchRule::RouterSort,
     operands = kernels::operands![
         expert_ids: Buf <- kernels::Source::In(0),
         perm: BufMut <- kernels::Source::Out(0),

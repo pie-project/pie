@@ -26,7 +26,7 @@
 //! # Boundaries
 //!
 //!   * **↔driver (handle boundary):** the driver pins its KV buffers and exports
-//!     a [`driver::KvHandle`]; transport consumes it without owning or
+//!     a [`driver_api::KvHandle`]; transport consumes it without owning or
 //!     interpreting the bytes. The per-backend registration shim lives on the
 //!     driver's export surface. Transport never imports the driver — they meet
 //!     only through the handle type on the schema floor.
@@ -52,7 +52,7 @@ pub use engines::nixl::NixlEngine;
 pub use error::{Result, TransportError};
 pub use registry::Registry;
 
-pub use driver::{KvDtype, KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};
+pub use driver_api::{KvDtype, KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};
 
 #[cfg(test)]
 mod tests {

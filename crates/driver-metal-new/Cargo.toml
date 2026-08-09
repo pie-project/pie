@@ -36,7 +36,7 @@ serde_json = "1.0"
 # members) and the `PIE_*` ABI constants, and `tensor-ir` owns the op table,
 # dtypes, intrinsic ids and the canonical RNG contract. Both are host-portable,
 # so they belong here in the plain (non-Apple) table.
-driver = { path = "../driver" }
+driver-api = { path = "../driver-api" }
 tensor-ir = { path = "../tensor-ir" }
 
 # The PTIR channel plane, which used to be `src/pipeline/` here. It moved out
@@ -44,7 +44,7 @@ tensor-ir = { path = "../tensor-ir" }
 # table and read the same launch package, and the C++ answered that by keeping
 # three hand-written copies of one golden model. `src/pipeline.rs` re-exports
 # it, so every call site in `src/metal/` still spells `crate::pipeline::`.
-driver-pipeline = { path = "../driver-pipeline" }
+driver = { path = "../driver" }
 
 # The kernel contract vocabulary: `LaunchRule` (which grid shape a row states)
 # and `sig_in` (how an instantiated point resolves to its row). Tables only --

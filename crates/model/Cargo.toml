@@ -7,14 +7,6 @@ description = "What a model is: the two registries (model_type -> load-contract 
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
-# `links = "pie_forward"` publishes the committed C header directory to
-# downstream build scripts via `DEP_PIE_FORWARD_INCLUDE` -- the same handoff
-# `model-loader-capi` uses for `pie_loader.h`. It is here rather than on
-# `model-compiler` because the header is how a DRIVER reaches a declaration,
-# and a declaration is a model's, not the toolchain's.
-links = "pie_forward"
-build = "build.rs"
-
 [lib]
 name = "model"
 path = "src/lib.rs"

@@ -12,7 +12,7 @@ name = "driver_dummy"
 crate-type = ["rlib"]
 
 [dependencies]
-driver = { path = "../driver" }
+driver-api = { path = "../driver-api" }
 tensor-ir = { path = "../tensor-ir" }
 tensor-compiler = { path = "../tensor-compiler" }
 anyhow = "1.0"

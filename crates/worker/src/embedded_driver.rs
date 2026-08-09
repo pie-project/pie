@@ -310,7 +310,7 @@ pub fn remove_launch_state() {
 // for the driver ↔ runtime interface). Re-exported here so existing call
 // sites in pie-worker keep working through the
 // `embedded_driver::DriverCapabilities` path.
-pub use driver::DriverCapabilities;
+pub use driver_api::DriverCapabilities;
 
 /// Parse a capability JSON blob into the typed driver-capability struct.
 /// Lives in pie-worker (not bridge) so bridge can stay free of a
@@ -451,11 +451,11 @@ fn model_load_desc(
     snapshot_dir: &Path,
     runtime_quant: &str,
     mxfp4_moe: &str,
-    component: driver::ModelComponent,
-) -> Result<driver::ModelLoadDesc> {
-    let mxfp4_moe = driver::Mxfp4MoeRequest::parse(mxfp4_moe)
+    component: driver_api::ModelComponent,
+) -> Result<driver_api::ModelLoadDesc> {
+    let mxfp4_moe = driver_api::Mxfp4MoeRequest::parse(mxfp4_moe)
         .ok_or_else(|| anyhow!("unknown mxfp4_moe policy '{mxfp4_moe}'"))?;
-    Ok(driver::ModelLoadDesc {
+    Ok(driver_api::ModelLoadDesc {
         snapshot_dir: snapshot_dir.to_path_buf(),
         runtime_quant: runtime_quant.to_string(),
         mxfp4_moe,
@@ -678,7 +678,7 @@ pub(crate) fn create_driver_backend_group(
     descriptor: &[u8],
     group_id: usize,
     tp_launches: &[TpLaunch],
-    component: driver::ModelComponent,
+    component: driver_api::ModelComponent,
 ) -> Result<crate::translate::GroupDriver> {
     validate_snapshot_dir(snapshot_dir)?;
     if rank_options.is_empty() {
@@ -753,7 +753,7 @@ pub(crate) fn create_driver_backend(
     descriptor: &[u8],
     group_id: usize,
     tp: Option<&TpLaunch>,
-    component: driver::ModelComponent,
+    component: driver_api::ModelComponent,
 ) -> Result<crate::translate::GroupDriver> {
     // Each is used only inside a `#[cfg(feature = "driver-…")]` arm below.
     let _ = (group_id, tp, descriptor);
@@ -838,10 +838,10 @@ mod tests {
             "activation_dtype": "bfloat16",
             "snapshot_dir": "/tmp/snap"
         }}"#,
-            driver::PIE_DRIVER_ABI_VERSION
+            driver_api::PIE_DRIVER_ABI_VERSION
         );
         let caps = parse_caps_json(&json).unwrap();
-        assert_eq!(caps.abi_version, driver::PIE_DRIVER_ABI_VERSION);
+        assert_eq!(caps.abi_version, driver_api::PIE_DRIVER_ABI_VERSION);
         assert_eq!(caps.total_pages, 1024);
         assert_eq!(caps.arch_name, "qwen3");
         assert_eq!(caps.snapshot_dir, "/tmp/snap");
@@ -886,7 +886,7 @@ mod tests {
             DESCRIPTOR,
             0,
             None,
-            driver::ModelComponent::Full,
+            driver_api::ModelComponent::Full,
         )
         .unwrap();
         assert_eq!(group.caps.arch_name, "qwen3");
@@ -914,7 +914,7 @@ mod tests {
             &[],
             0,
             None,
-            driver::ModelComponent::Encode,
+            driver_api::ModelComponent::Encode,
         )
         .unwrap();
         assert!(group.caps.supports_media_encode);
@@ -931,7 +931,7 @@ mod tests {
                     patch_positions.extend([x, y]);
                 }
             }
-            driver::MediaEncodePlan {
+            driver_api::MediaEncodePlan {
                 image_grids: vec![1, 3, 3],
                 image_pixels: vec![0; pixel_bytes],
                 image_pixel_indptr: vec![0, pixel_bytes as u32],
@@ -946,7 +946,7 @@ mod tests {
         };
         let audio_frames = 16usize;
         let audio_rows = 4usize;
-        let make_audio = || driver::MediaEncodePlan {
+        let make_audio = || driver_api::MediaEncodePlan {
             image_grids: Vec::new(),
             image_pixels: Vec::new(),
             image_pixel_indptr: Vec::new(),
@@ -977,17 +977,17 @@ mod tests {
         assert!(audio.output_rows.iter().any(|byte| *byte != 0));
         let tower_audio_rows = audio.output_rows;
 
-        let model = driver::ModelIdentity {
+        let model = driver_api::ModelIdentity {
             hash: [9; 32],
-            component: driver::ModelComponent::Encode,
+            component: driver_api::ModelComponent::Encode,
         };
-        let layout = driver::KvLayout {
+        let layout = driver_api::KvLayout {
             num_layers: 0,
             num_kv_heads: 0,
             head_dim: 0,
             page_size: 0,
-            dtype: driver::KvDtype::Bf16,
-            kind: driver::KvLayoutKind::KvSeparate,
+            dtype: driver_api::KvDtype::Bf16,
+            kind: driver_api::KvLayoutKind::KvSeparate,
             storage_format: String::new(),
             region_page_bytes: Vec::new(),
         };
@@ -1005,8 +1005,8 @@ mod tests {
         let hello = client
             .execute(
                 tarpc::context::current(),
-                driver::ExecutorRequest::Hello(driver::HelloRequest {
-                    wire_version: driver::REMOTE_WIRE_VERSION,
+                driver_api::ExecutorRequest::Hello(driver_api::HelloRequest {
+                    wire_version: driver_api::REMOTE_WIRE_VERSION,
                     client_nonce: 1,
                     model,
                     kv_layout: layout,
@@ -1016,7 +1016,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let driver::ExecutorResponse::Hello(hello) = hello else {
+        let driver_api::ExecutorResponse::Hello(hello) = hello else {
             panic!("executor Hello response");
         };
         assert_eq!(hello.grant.num_pages, 0);
@@ -1025,8 +1025,8 @@ mod tests {
         let response = client
             .execute(
                 tarpc::context::current(),
-                driver::ExecutorRequest::Encode(driver::RemoteEncode {
-                    plan: driver::LaunchPlan {
+                driver_api::ExecutorRequest::Encode(driver_api::RemoteEncode {
+                    plan: driver_api::LaunchPlan {
                         token_ids: vec![0],
                         qo_indptr: vec![0, 1],
                         image_grids: image.image_grids,
@@ -1042,7 +1042,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let driver::ExecutorResponse::Embeddings(image) = response else {
+        let driver_api::ExecutorResponse::Embeddings(image) = response else {
             panic!("executor image response");
         };
         assert_eq!(image.rows, tower_rows);
@@ -1051,8 +1051,8 @@ mod tests {
         let response = client
             .execute(
                 tarpc::context::current(),
-                driver::ExecutorRequest::Encode(driver::RemoteEncode {
-                    plan: driver::LaunchPlan {
+                driver_api::ExecutorRequest::Encode(driver_api::RemoteEncode {
+                    plan: driver_api::LaunchPlan {
                         token_ids: vec![0; audio_rows],
                         qo_indptr: vec![0, audio_rows as u32],
                         audio_features: audio.audio_features,
@@ -1066,7 +1066,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let driver::ExecutorResponse::Embeddings(audio) = response else {
+        let driver_api::ExecutorResponse::Embeddings(audio) = response else {
             panic!("executor audio response");
         };
         assert_eq!(audio.rows, tower_audio_rows);
@@ -1085,7 +1085,7 @@ mod tests {
             &[],
             1,
             None,
-            driver::ModelComponent::Full,
+            driver_api::ModelComponent::Full,
         )
         .unwrap();
         assert!(full.caps.supports_media_encode);

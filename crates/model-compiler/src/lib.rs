@@ -10,9 +10,9 @@
 //! fire's extents and weights referenced by declaration name.
 //!
 //! ```text
-//! declaration  ──trace──▶  forward plan  ──(C ABI)──▶  driver executes
-//! (what a pass    (the ops to run,        (model::ffi, and the
-//!  computes)       in what order)          committed header)
+//! declaration  ──trace──▶  forward plan  ──lower──▶  driver executes
+//! (what a pass    (the ops to run,       (rectangles,
+//!  computes)       in what order)         operands, buffers)
 //! ```
 //!
 //! ## The declarations are not here

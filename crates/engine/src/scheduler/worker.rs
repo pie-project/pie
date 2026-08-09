@@ -349,8 +349,8 @@ impl PendingRequest {
                     .get(row + 1)
                     .zip(indptr.get(row))
                     .is_some_and(|(end, begin)| end > begin);
-                span && flags & ::driver::RS_FLAG_FOLD != 0
-                    && flags & ::driver::RS_FLAG_BUFFER_WRITE == 0
+                span && flags & ::driver_api::RS_FLAG_FOLD != 0
+                    && flags & ::driver_api::RS_FLAG_BUFFER_WRITE == 0
             });
         if replays {
             RsBatchKind::Solo
@@ -2242,7 +2242,7 @@ struct SchedulerControl {
     active_senders: AtomicUsize,
     shutdown_wait: Condvar,
     shutdown_gate: Mutex<()>,
-    program_ids: Mutex<HashMap<u64, (u64, ::driver::plan::LaunchPackage)>>,
+    program_ids: Mutex<HashMap<u64, (u64, ::driver_api::plan::LaunchPackage)>>,
     accepting: AtomicBool,
     stats: Arc<SchedulerStats>,
 }
@@ -4828,7 +4828,7 @@ mod tests {
     use crate::driver::{
         self, ChannelValue, DriverSpec, LaunchPlan, ProgramRegistration, SchedulerLimits,
     };
-    use ::driver::{PieInstanceBinding, PieKvMoveCell, PiePoolRange};
+    use ::driver_api::{PieInstanceBinding, PieKvMoveCell, PiePoolRange};
     use driver_dummy::DummyDriverOptions;
     use tensor_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
     use tensor_ir::op::Op;
@@ -4969,10 +4969,10 @@ mod tests {
                         driver_id,
                         channel_id,
                         shape: vec![1],
-                        dtype: ::driver::PIE_CHANNEL_DTYPE_U32,
+                        dtype: ::driver_api::PIE_CHANNEL_DTYPE_U32,
                         host_role: host_role as u8,
                         seeded,
-                        extern_dir: ::driver::PIE_CHANNEL_EXTERN_NONE,
+                        extern_dir: ::driver_api::PIE_CHANNEL_EXTERN_NONE,
                         capacity: 2,
                         reader_wait_id: 0,
                         writer_wait_id: 0,
@@ -5167,10 +5167,10 @@ mod tests {
                     driver_id: 0,
                     channel_id: 91,
                     shape: vec![1],
-                    dtype: ::driver::PIE_CHANNEL_DTYPE_U32,
+                    dtype: ::driver_api::PIE_CHANNEL_DTYPE_U32,
                     host_role: HostRole::None as u8,
                     seeded: false,
-                    extern_dir: ::driver::PIE_CHANNEL_EXTERN_NONE,
+                    extern_dir: ::driver_api::PIE_CHANNEL_EXTERN_NONE,
                     capacity: 1,
                     reader_wait_id,
                     writer_wait_id,
@@ -5194,7 +5194,7 @@ mod tests {
             11,
             PieInstanceBinding {
                 instance_id: 41,
-                geometry_class: ::driver::GeometryClass::Host as u32,
+                geometry_class: ::driver_api::GeometryClass::Host as u32,
                 reserved0: 0,
             },
             pacing_wait_id,
@@ -5622,14 +5622,14 @@ mod tests {
         let completion = WorkItemCompletion::deferred_with_guard(None);
         let state_copy = StateCopyPlan {
             slot_ranges: vec![
-                ::driver::PieStateCopyRange {
+                ::driver_api::PieStateCopyRange {
                     src_slot_id: 3,
                     dst_slot_id: 5,
                     src_token_offset: 0,
                     dst_token_offset: 0,
                     token_count: 0,
                 },
-                ::driver::PieStateCopyRange {
+                ::driver_api::PieStateCopyRange {
                     src_slot_id: 3,
                     dst_slot_id: 6,
                     src_token_offset: 0,
@@ -6438,10 +6438,10 @@ mod tests {
                 driver_id,
                 channel_id: 91,
                 shape: vec![1],
-                dtype: ::driver::PIE_CHANNEL_DTYPE_U32,
+                dtype: ::driver_api::PIE_CHANNEL_DTYPE_U32,
                 host_role: HostRole::None as u8,
                 seeded: false,
-                extern_dir: ::driver::PIE_CHANNEL_EXTERN_EXPORT,
+                extern_dir: ::driver_api::PIE_CHANNEL_EXTERN_EXPORT,
                 capacity: 2,
                 reader_wait_id: 0,
                 writer_wait_id: 0,
@@ -6455,10 +6455,10 @@ mod tests {
                 driver_id,
                 channel_id: 92,
                 shape: vec![1],
-                dtype: ::driver::PIE_CHANNEL_DTYPE_U32,
+                dtype: ::driver_api::PIE_CHANNEL_DTYPE_U32,
                 host_role: HostRole::Reader as u8,
                 seeded: false,
-                extern_dir: ::driver::PIE_CHANNEL_EXTERN_NONE,
+                extern_dir: ::driver_api::PIE_CHANNEL_EXTERN_NONE,
                 capacity: 2,
                 reader_wait_id: 0,
                 writer_wait_id: 0,
@@ -7529,7 +7529,7 @@ mod tests {
                 pacing_wait_id: 0,
                 channel_ids: Vec::new(),
                 seed_values: Vec::new(),
-                geometry_class: ::driver::GeometryClass::Host,
+                geometry_class: ::driver_api::GeometryClass::Host,
             },
             response: tokio::sync::oneshot::channel().0,
         }])

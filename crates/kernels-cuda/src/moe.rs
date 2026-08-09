@@ -38,34 +38,43 @@ pub static KERNELS: &[KernelSig] = &[
     // intact and these are not `whole`.
     kernel!(wna16_gate_up_decode "quant::wna16_gate_up_decode_bf16",
         operands = operands![
-            act_fp16: Buf,
-            topk_idx: I32s,
-            gate_packed: I32Array,
-            gate_scale: BufArray,
-            up_packed: I32Array,
-            up_scale: BufArray,
-            gate_out_bf16: BufMut,
-            up_out_bf16: BufMut,
-            num_tokens: I32,
-            top_k: I32,
-            hidden: I32,
-            intermediate: I32,
-            group_size: I32,
-            stream: Stream,
+            act_fp16: Buf <- Source::In(0),
+            topk_idx: I32s <- Source::In(1),
+            // FOUR weights and the order is the statement's: each bank is
+            // a packed half beside its scales, gate before up. The arm
+            // read `args[4..8]` positionally and said so nowhere.
+            gate_packed: I32Array <- Source::Weight(0),
+            gate_scale: BufArray <- Source::Weight(1),
+            up_packed: I32Array <- Source::Weight(2),
+            up_scale: BufArray <- Source::Weight(3),
+            gate_out_bf16: BufMut <- Source::Out(0),
+            up_out_bf16: BufMut <- Source::Out(1),
+            num_tokens: I32 <- Source::Rows,
+            // `topk_idx` IS `[Tokens, top_k]`, so its row width is the
+            // route count — the same reading the two weighted-sum rows
+            // take, and for the same reason.
+            top_k: I32 <- Source::InWidth(1),
+            hidden: I32 <- Source::InWidth(0),
+            intermediate: I32 <- Source::OutWidth(0),
+            group_size: I32 <- Source::Ctx("wna16_group_size"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
+    // The down leg reads the ACTIVATION's width as its intermediate and
+    // writes the hidden — the mirror of the gate/up row above, which is
+    // why the two extents look swapped beside it.
     kernel!(wna16_down_decode "quant::wna16_down_decode_bf16",
         operands = operands![
-            act_fp16: Buf,
-            topk_idx: I32s,
-            down_packed: I32Array,
-            down_scale: BufArray,
-            out_bf16: BufMut,
-            num_tokens: I32,
-            top_k: I32,
-            hidden: I32,
-            intermediate: I32,
-            group_size: I32,
-            stream: Stream,
+            act_fp16: Buf <- Source::In(0),
+            topk_idx: I32s <- Source::In(1),
+            down_packed: I32Array <- Source::Weight(0),
+            down_scale: BufArray <- Source::Weight(1),
+            out_bf16: BufMut <- Source::Out(0),
+            num_tokens: I32 <- Source::Rows,
+            top_k: I32 <- Source::InWidth(1),
+            hidden: I32 <- Source::OutWidth(0),
+            intermediate: I32 <- Source::InWidth(0),
+            group_size: I32 <- Source::Ctx("wna16_group_size"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     kernel!(apply_per_expert_scale "moe::apply_per_expert_scale_bf16",
         operands = operands![
@@ -152,16 +161,19 @@ pub static KERNELS: &[KernelSig] = &[
         ]),
     kernel!(topk_sigmoid_bias "moe::topk_sigmoid_bias_fp32",
         operands = operands![
-            logits: F32s,
-            correction_bias: F32s,
-            topk_idx: I32sMut,
-            topk_w: F32sMut,
-            n: I32,
-            num_experts: I32,
-            k: I32,
-            normalize: Bool,
-            routed_scaling_factor: F32,
-            stream: Stream,
+            logits: F32s <- Source::In(0),
+            correction_bias: F32s <- Source::Weight(0),
+            topk_idx: I32sMut <- Source::Out(0),
+            topk_w: F32sMut <- Source::Out(1),
+            n: I32 <- Source::Rows,
+            num_experts: I32 <- Source::InWidth(0),
+            k: I32 <- Source::OutWidth(0),
+            // The deployment's, both of them — `norm_topk_prob` and
+            // `routed_scaling_factor` are config values the driver reads
+            // at load, which is why they are context and not params.
+            normalize: Bool <- Source::Ctx("moe_norm_topk"),
+            routed_scaling_factor: F32 <- Source::Ctx("moe_routed_scaling"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // The UNPADDED counterpart of `moe_align`: exact per-expert counts the
     // host reads to build cuBLAS grouped shapes. `whole` for the same reason
@@ -380,22 +392,31 @@ pub static KERNELS: &[KernelSig] = &[
             gate_up_base: Buf <- Source::Weight(0),
             expert_gate_up: BufMut <- Source::Out(0),
             num_tokens: I32 <- Source::Rows,
-            top_k: I32 <- Source::OutDim(0, 1),
+            // `InWidth(0)`, not `OutDim(0, 1)`. The third row in this
+            // table to have sat on the generator's wall asking the PLAN
+            // for a number an operand already states: `topk_idx` IS
+            // `[Tokens, top_k]`. The arm read exactly that.
+            top_k: I32 <- Source::InWidth(0),
             h: I32 <- Source::InWidth(1),
-            i_moe: I32,
+            // The result is `[Tokens, top_k * i_moe]`, so the
+            // intermediate is what is left of a row once the routes are
+            // divided out — and the routes are the other operand's width.
+            i_moe: I32 <- Source::OutWidthOverIn(0, 0),
             stream: Stream <- Source::Ctx("stream"),
         ]),
+    // The down leg: `h` is what it WRITES per route and `i_moe` what it
+    // reads, which is the mirror of the gate/up row above.
     kernel!(moe_down_gemv "moe::moe_down_decode_gemv_bf16",
         operands = operands![
-            topk_idx: I32s,
-            expert_act: Buf,
-            down_base: Buf,
-            expert_out: BufMut,
-            num_tokens: I32,
-            top_k: I32,
-            h: I32,
-            i_moe: I32,
-            stream: Stream,
+            topk_idx: I32s <- Source::In(0),
+            expert_act: Buf <- Source::In(1),
+            down_base: Buf <- Source::Weight(0),
+            expert_out: BufMut <- Source::Out(0),
+            num_tokens: I32 <- Source::Rows,
+            top_k: I32 <- Source::InWidth(0),
+            h: I32 <- Source::OutWidthOverIn(0, 0),
+            i_moe: I32 <- Source::InWidth(1),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // The combine folds the residual when the MoE output lands straight
     // on the stream (tp=1) — one launch where the semantic text has a
@@ -406,8 +427,16 @@ pub static KERNELS: &[KernelSig] = &[
             src: Buf <- Source::In(0),
             weights: F32s <- Source::In(1),
             num_tokens: I32 <- Source::Rows,
-            top_k: I32 <- Source::InDim(0, 1),
-            hidden: I32 <- Source::InDim(0, 2),
+            // NOT `InDim(0, 1)` and `InDim(0, 2)`, which is what these
+            // said and why both rows sat on the generator's wall. A DIM
+            // is the plan's and the join does not carry it — but neither
+            // extent needs the plan: `weights` IS `[Tokens, top_k]`, so
+            // its row width is the route count, and the result IS
+            // `[Tokens, hidden]`. The arms read exactly those two widths.
+            // Asking the plan for a number two operands already state is
+            // an inference pass replacing a one-line answer.
+            top_k: I32 <- Source::InWidth(1),
+            hidden: I32 <- Source::OutWidth(0),
             stream: Stream <- Source::Ctx("stream"),
         ]),
     // The `_add` spelling accumulates into the residual, which the
@@ -424,8 +453,16 @@ pub static KERNELS: &[KernelSig] = &[
             src: Buf <- Source::In(0),
             weights: F32s <- Source::In(1),
             num_tokens: I32 <- Source::Rows,
-            top_k: I32 <- Source::InDim(0, 1),
-            hidden: I32 <- Source::InDim(0, 2),
+            // NOT `InDim(0, 1)` and `InDim(0, 2)`, which is what these
+            // said and why both rows sat on the generator's wall. A DIM
+            // is the plan's and the join does not carry it — but neither
+            // extent needs the plan: `weights` IS `[Tokens, top_k]`, so
+            // its row width is the route count, and the result IS
+            // `[Tokens, hidden]`. The arms read exactly those two widths.
+            // Asking the plan for a number two operands already state is
+            // an inference pass replacing a one-line answer.
+            top_k: I32 <- Source::InWidth(1),
+            hidden: I32 <- Source::OutWidth(0),
             stream: Stream <- Source::Ctx("stream"),
         ]),
     // The routed MXFP4 GEMVs. Like qwen3_5's GEMV leg the expert axis

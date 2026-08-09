@@ -546,10 +546,10 @@ fn emit_driver_test_kernel_fixtures() {
         // longer decodes PTIR, so the one thing it *does* accept has to be
         // handed to them as a fixture. Written as a relocatable image of the
         // very same `#[repr(C)]` records the engine ships (see
-        // `driver::image`), not as a second wire format.
+        // `driver_api::image`), not as a second wire format.
         std::fs::write(
             out_dir.join(format!("{name}.launch")),
-            driver::image::encode(&tensor_compiler::codegen::launch::build(&bound, &stages)),
+            driver_api::image::encode(&tensor_compiler::codegen::launch::build(&bound, &stages)),
         )
         .unwrap();
 

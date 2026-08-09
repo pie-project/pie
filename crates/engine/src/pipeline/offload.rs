@@ -8,7 +8,7 @@ use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, ensure};
-use ::driver::{
+use ::driver_api::{
     ExecutorRequest, ExecutorResponse, InlineKvPayload, MemoryDomain, PushKv, RemoteMediaBlob,
     RemoteMediaKind, RemoteTransferKind,
 };
@@ -28,7 +28,7 @@ pub struct Partner {
     driver_id: Option<usize>,
     role: PartnerRole,
     transfer: RemoteTransferKind,
-    client: Option<::driver::ExecutorRpcClient>,
+    client: Option<::driver_api::ExecutorRpcClient>,
     blob_host: RwLock<Option<IpAddr>>,
     max_outstanding: u32,
     outstanding: AtomicU32,
@@ -134,8 +134,8 @@ impl Partner {
 
     pub async fn encode(
         &self,
-        mut plan: ::driver::LaunchPlan,
-    ) -> Result<::driver::RemoteEmbeddings> {
+        mut plan: ::driver_api::LaunchPlan,
+    ) -> Result<::driver_api::RemoteEmbeddings> {
         let client = self
             .client
             .as_ref()
@@ -178,7 +178,7 @@ impl Partner {
         let response = client
             .execute(
                 context,
-                ExecutorRequest::Encode(::driver::RemoteEncode { plan, blobs }),
+                ExecutorRequest::Encode(::driver_api::RemoteEncode { plan, blobs }),
             )
             .await
             .map_err(|error| anyhow!("encode transport failed: {error}"))?
@@ -255,7 +255,7 @@ pub fn register_partner(
     role: PartnerRole,
     max_outstanding: u32,
     transfer: RemoteTransferKind,
-    client: Option<::driver::ExecutorRpcClient>,
+    client: Option<::driver_api::ExecutorRpcClient>,
 ) -> Arc<Partner> {
     let partner = Arc::new(Partner {
         worker_id,
@@ -672,7 +672,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
-static HOME_KV_HANDLE: LazyLock<RwLock<Option<::driver::KvHandle>>> =
+static HOME_KV_HANDLE: LazyLock<RwLock<Option<::driver_api::KvHandle>>> =
     LazyLock::new(|| RwLock::new(None));
 
 #[cfg(feature = "driver-cuda-new")]
@@ -757,7 +757,7 @@ pub fn configure_encode_injection(enabled: bool, hidden_size: u32) {
     ENCODE_INJECTION_ENABLED.store(enabled, Ordering::Release);
 }
 
-pub fn set_home_kv_handle(handle: ::driver::KvHandle) {
+pub fn set_home_kv_handle(handle: ::driver_api::KvHandle) {
     *HOME_KV_HANDLE.write().unwrap() = Some(handle);
 }
 
@@ -881,7 +881,7 @@ pub fn counters() -> OffloadCounterSnapshot {
     }
 }
 
-pub(crate) async fn try_encode(request: &mut ::driver::LaunchPlan) -> bool {
+pub(crate) async fn try_encode(request: &mut ::driver_api::LaunchPlan) -> bool {
     if !OFFLOAD_ENABLED.load(Ordering::Acquire)
         || !ENCODE_INJECTION_ENABLED.load(Ordering::Acquire)
         || (request.image_pixels.is_empty() && request.audio_features.is_empty())
@@ -949,10 +949,10 @@ pub(crate) async fn try_encode(request: &mut ::driver::LaunchPlan) -> bool {
 }
 
 fn canonicalize_remote_embeddings(
-    request: &::driver::LaunchPlan,
-    embeddings: ::driver::RemoteEmbeddings,
+    request: &::driver_api::LaunchPlan,
+    embeddings: ::driver_api::RemoteEmbeddings,
     hidden_size: u32,
-) -> Option<(::driver::RemoteEmbeddings, Vec<u32>)> {
+) -> Option<(::driver_api::RemoteEmbeddings, Vec<u32>)> {
     let expected_anchors = request
         .image_anchor_rows
         .iter()
@@ -1009,7 +1009,7 @@ fn canonicalize_remote_embeddings(
     }
     indexed.sort_by_key(|&(row, anchor, block)| (row, anchor, block));
 
-    let mut canonical = ::driver::RemoteEmbeddings {
+    let mut canonical = ::driver_api::RemoteEmbeddings {
         rows: Vec::with_capacity(embeddings.rows.len()),
         indptr: vec![0],
         shapes: Vec::with_capacity(embeddings.shapes.len()),
@@ -1118,7 +1118,7 @@ async fn surrogate(
     }
     let program_id = crate::scheduler::register_program(
         driver_id,
-        ::driver::ProgramRegistration {
+        ::driver_api::ProgramRegistration {
             program_hash: program.hash,
             launch: program.launch().clone(),
             reference_ptir: program.bytes.clone(),
@@ -1136,14 +1136,14 @@ async fn surrogate(
         );
         let endpoint = crate::scheduler::register_channel(
             driver_id,
-            ::driver::ChannelRegistrationPlan {
+            ::driver_api::ChannelRegistrationPlan {
                 driver_id,
                 channel_id,
                 shape: declaration.shape.dims().to_vec(),
                 dtype: declaration.dtype.tag(),
                 host_role: declaration.host_role as u8,
                 seeded: declaration.seeded,
-                extern_dir: ::driver::PIE_CHANNEL_EXTERN_NONE,
+                extern_dir: ::driver_api::PIE_CHANNEL_EXTERN_NONE,
                 capacity: declaration.capacity,
                 reader_wait_id: 0,
                 writer_wait_id: 0,
@@ -1223,7 +1223,7 @@ pub(crate) async fn try_prefill(
     home_driver_id: usize,
     home_ws: WorkingSetId,
     page_size: u32,
-    request: &mut ::driver::LaunchPlan,
+    request: &mut ::driver_api::LaunchPlan,
     canonical_tokens: &[u32],
     program: &Arc<RegisteredProgram>,
     home_instance_id: u64,
@@ -1259,12 +1259,12 @@ async fn try_prefill_owned(
     home_driver_id: usize,
     home_ws: WorkingSetId,
     page_size: u32,
-    mut request: ::driver::LaunchPlan,
+    mut request: ::driver_api::LaunchPlan,
     canonical_tokens: Vec<u32>,
     program: Arc<RegisteredProgram>,
     home_instance_id: u64,
     _lifetime_guard: Option<crate::store::kv::working_set::KvFireLease>,
-) -> Option<(OffloadAdoption, ::driver::LaunchPlan)> {
+) -> Option<(OffloadAdoption, ::driver_api::LaunchPlan)> {
     if !SETTINGS.read().unwrap().enabled {
         return None;
     }
@@ -1529,7 +1529,7 @@ pub(crate) fn clear_partners() {
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use ::driver::{
+    use ::driver_api::{
         DriverCapabilities, ExecutorResponse, ExecutorRpc, KvDtype, KvHandle, KvLayout,
         KvLayoutKind, KvRegion, PIE_TERMINAL_OUTCOME_SUCCESS, RemoteBindResponse,
         RemoteChannelBinding, RemoteError, RemoteTerminal, ScratchGrant, TerminalCellState,
@@ -1673,7 +1673,7 @@ mod tests {
                 ExecutorRequest::Launch(launch) => {
                     if self.fail_launch {
                         return Err(RemoteError::new(
-                            ::driver::RemoteErrorKind::Driver,
+                            ::driver_api::RemoteErrorKind::Driver,
                             "injected launch failure",
                         ));
                     }
@@ -1706,7 +1706,7 @@ mod tests {
                         {
                             bytes.extend_from_slice(&(token as u16).to_le_bytes());
                         }
-                        ExecutorResponse::Embeddings(::driver::RemoteEmbeddings {
+                        ExecutorResponse::Embeddings(::driver_api::RemoteEmbeddings {
                             rows: bytes,
                             indptr: vec![0, (rows * 2) as u32],
                             shapes: vec![rows as u32, 1],
@@ -1714,7 +1714,7 @@ mod tests {
                             anchor_rows: vec![0],
                         })
                     } else {
-                        ExecutorResponse::Embeddings(::driver::RemoteEmbeddings {
+                        ExecutorResponse::Embeddings(::driver_api::RemoteEmbeddings {
                             rows: encode.plan.embed_rows,
                             indptr: encode.plan.embed_indptr,
                             shapes: encode.plan.embed_shapes,
@@ -1726,7 +1726,7 @@ mod tests {
                 ExecutorRequest::PushKv(push) => ExecutorResponse::KvPayload(InlineKvPayload {
                     dst_page_ids: if self.fail_push {
                         return Err(RemoteError::new(
-                            ::driver::RemoteErrorKind::Driver,
+                            ::driver_api::RemoteErrorKind::Driver,
                             "injected transfer failure",
                         ));
                     } else {
@@ -1747,11 +1747,11 @@ mod tests {
         DriverCapabilities {
             has_lora: false,
             model_site_summary: Default::default(),
-            abi_version: ::driver::PIE_DRIVER_ABI_VERSION,
+            abi_version: ::driver_api::PIE_DRIVER_ABI_VERSION,
             total_pages: 8,
             kv_page_size: 16,
             swap_pool_size: 0,
-            kv_copy_domain_mask: ::driver::KV_COPY_DEVICE_TO_DEVICE,
+            kv_copy_domain_mask: ::driver_api::KV_COPY_DEVICE_TO_DEVICE,
             rs_cache_required: false,
             rs_cache_slots: 0,
             rs_cache_slot_bytes: 0,
@@ -1832,7 +1832,7 @@ mod tests {
                     tokio::spawn(request);
                 }),
         );
-        let new_client = ::driver::ExecutorRpcClient::new(
+        let new_client = ::driver_api::ExecutorRpcClient::new(
             tarpc::client::Config::default(),
             client_transport,
         );
@@ -1891,7 +1891,7 @@ mod tests {
         };
         let program = empty_registered_program();
         let tokens = (0..33).collect::<Vec<u32>>();
-        let mut request = ::driver::LaunchPlan {
+        let mut request = ::driver_api::LaunchPlan {
             token_ids: tokens.clone(),
             position_ids: (0..33).collect(),
             qo_indptr: vec![0, 33],
@@ -1965,7 +1965,7 @@ mod tests {
                     tokio::spawn(request);
                 }),
         );
-        let new_client = ::driver::ExecutorRpcClient::new(
+        let new_client = ::driver_api::ExecutorRpcClient::new(
             tarpc::client::Config::default(),
             client_transport,
         );
@@ -2019,7 +2019,7 @@ mod tests {
         let home_ws = home_stores.kv.lock().create_working_set();
         let program = empty_registered_program();
         let tokens = (0..33).collect::<Vec<u32>>();
-        let original = ::driver::LaunchPlan {
+        let original = ::driver_api::LaunchPlan {
             token_ids: tokens.clone(),
             position_ids: (0..33).collect(),
             qo_indptr: vec![0, 33],
@@ -2088,7 +2088,7 @@ mod tests {
                     tokio::spawn(request);
                 }),
         );
-        let new_client = ::driver::ExecutorRpcClient::new(
+        let new_client = ::driver_api::ExecutorRpcClient::new(
             tarpc::client::Config::default(),
             client_transport,
         );
@@ -2103,7 +2103,7 @@ mod tests {
             RemoteTransferKind::Inline,
             Some(client),
         );
-        let mut plan = ::driver::LaunchPlan {
+        let mut plan = ::driver_api::LaunchPlan {
             token_ids: vec![7, 8],
             qo_indptr: vec![0, 2],
             image_pixels: vec![1, 2, 3, 4],
@@ -2147,7 +2147,7 @@ mod tests {
                     tokio::spawn(request);
                 }),
         );
-        let new_client = ::driver::ExecutorRpcClient::new(
+        let new_client = ::driver_api::ExecutorRpcClient::new(
             tarpc::client::Config::default(),
             client_transport,
         );
@@ -2163,7 +2163,7 @@ mod tests {
             Some(client),
         );
         let encode = tokio::spawn(async move {
-            let mut plan = ::driver::LaunchPlan {
+            let mut plan = ::driver_api::LaunchPlan {
                 token_ids: vec![7, 8],
                 qo_indptr: vec![0, 2],
                 image_pixels: vec![1, 2, 3, 4],
@@ -2199,14 +2199,14 @@ mod tests {
 
     #[test]
     fn remote_embeddings_require_exact_media_attribution_and_reorder_by_row() {
-        let request = ::driver::LaunchPlan {
+        let request = ::driver_api::LaunchPlan {
             token_ids: vec![1, 2, 3, 4],
             qo_indptr: vec![0, 2, 4],
             image_anchor_rows: vec![2],
             audio_anchor_rows: vec![0],
             ..Default::default()
         };
-        let embeddings = ::driver::RemoteEmbeddings {
+        let embeddings = ::driver_api::RemoteEmbeddings {
             rows: vec![2, 0, 1, 0],
             indptr: vec![0, 2, 4],
             shapes: vec![1, 1, 1, 1],
@@ -2219,7 +2219,7 @@ mod tests {
         assert_eq!(canonical.rows, vec![1, 0, 2, 0]);
         assert_eq!(block_indptr, vec![0, 1, 2]);
 
-        let missing = ::driver::RemoteEmbeddings {
+        let missing = ::driver_api::RemoteEmbeddings {
             rows: vec![2, 0],
             indptr: vec![0, 2],
             shapes: vec![1, 1],

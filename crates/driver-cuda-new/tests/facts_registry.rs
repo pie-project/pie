@@ -106,7 +106,7 @@ fn the_three_live_families_are_openable() {
 /// replay row gathers activations out of its slabs and a computing row
 /// does not, so no single op list serves both.
 mod fire_class {
-    use driver::local::{
+    use driver_api::local::{
         PIE_RS_FLAG_BUFFER_WRITE, PIE_RS_FLAG_FOLD, PieStepDesc, PieU8Slice, PieU32Slice,
     };
     use driver_cuda_new::abi_shell::fire_class_of;

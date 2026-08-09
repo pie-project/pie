@@ -71,10 +71,12 @@ impl Staged {
             FireTable::KvWriteOffset => 6,
             FireTable::RopeFrequencies => 7,
             FireTable::SamplingIndices => 8,
-            // No custom mask on this path yet, and the pool's numbers are
-            // answered by `Resolver::pool` rather than by an address.
+            // The enable flag is staged (zeros: causal), and the mask itself
+            // is not -- a row whose enable is zero never indexes it. The
+            // pool's numbers are answered by `Resolver::pool` rather than by
+            // an address.
+            FireTable::AttentionMaskEnabled => 9,
             FireTable::AttentionMask
-            | FireTable::AttentionMaskEnabled
             | FireTable::KvHeadStride
             | FireTable::KvSeqStride
             | FireTable::KvPageSize => return None,
@@ -111,6 +113,26 @@ pub fn stage(context: &Context, frame: Frame<'_>) -> Result<Staged> {
         spans.push((blob.len(), table.len()));
         blob.extend_from_slice(table);
     }
+    // The attention-mask ENABLE flag, one zero byte per token, always staged.
+    //
+    // The shader reads `attention_mask_enabled[row]` unconditionally -- it is
+    // what decides whether the mask applies -- and an unanswered fire table
+    // binds ADDRESS ZERO. So the branch that decides "is this row masked" was
+    // reading whatever page zero held: usually zero, and a fire that read a
+    // non-zero byte would then index a mask at address zero too and drop
+    // whatever keys it disagreed with. Nothing faults; the answer is just
+    // wrong, occasionally.
+    //
+    // Staged as zeros rather than refused because this driver serves CAUSAL
+    // attention, and "no row is masked" is the true answer for every fire it
+    // can build. A user mask has no path to reach here at all -- `Frame` has
+    // no field for one -- so the flag is not yet a variable.
+    //
+    // One `u32` per token covers `n_tokens` bytes with room to spare, and the
+    // stride is the mask's, which is zero-width here.
+    let enable_words = frame.token_ids.len().max(1);
+    spans.push((blob.len(), enable_words));
+    blob.extend(std::iter::repeat_n(0u32, enable_words));
     let region = allocate(context, ((blob.len() * 4).max(4)) as u64, "fire tables")?;
     // SAFETY: freshly allocated and not yet encoded against.
     unsafe {
@@ -149,6 +171,35 @@ mod tests {
         assert!(
             staged.at(FireTable::SamplingIndices).is_none(),
             "an empty table is a slot nobody fills, not an empty region"
+        );
+
+        // The attention-mask ENABLE flag always resolves, and reads zero.
+        //
+        // `sdpa_paged.metal` reads `attention_mask_enabled[row]`
+        // unconditionally -- it is the branch that decides whether a row is
+        // masked -- and an unanswered fire table binds ADDRESS ZERO. So this
+        // was reading whatever page zero held; a non-zero byte there would
+        // then index a mask at address zero too and drop whatever keys it
+        // disagreed with. Nothing faults and the answer is just wrong,
+        // occasionally, which is the shape of defect this crate keeps finding.
+        let enable = staged
+            .at(FireTable::AttentionMaskEnabled)
+            .expect("the enable flag is always staged, or the shader reads address zero");
+        assert!(enable.bytes >= ids.len() as u64, "one flag per token at least");
+        // SAFETY: the region is host-addressable and nothing is encoded
+        // against it.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (enable.address - staged.region.gpu_address() + staged.region.contents().as_ptr() as u64)
+                    as *const u8,
+                enable.bytes as usize,
+            )
+        };
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "this driver serves CAUSAL attention, so every row's flag must read \
+             zero -- a non-zero byte here masks a row against a mask that does \
+             not exist"
         );
     }
 

@@ -20,7 +20,7 @@
 //! The op projection is [`crate::codegen::op_view::OpView`], the same one the emitters
 //! read, so the kernel and the description of the kernel cannot drift.
 
-use driver::local::{
+use driver_api::local::{
     PIE_CHANNEL_HOST_READER, PIE_CHANNEL_HOST_VISIBLE, PIE_CHANNEL_SEEDED, PIE_EXTENT_STATIC,
     PIE_NO_CHANNEL, PIE_READINESS_NEEDS_EMPTY, PIE_READINESS_NEEDS_FULL, PIE_READINESS_UNTOUCHED,
     PIE_REGION_GENERATED, PIE_REGION_LIBRARY, PIE_STAGE_GROUPED_VALID,
@@ -29,7 +29,7 @@ use driver::local::{
     PIE_STAGE_REQUIRES_QUERY, PIE_VALUE_CHANNEL_READ, PIE_VALUE_CHANNEL_TAKE, PIE_VALUE_CONST,
     PIE_VALUE_INTRINSIC, PIE_VALUE_OP_RESULT,
 };
-use driver::plan::{
+use driver_api::plan::{
     LaunchChannel, LaunchChannelRule, LaunchOp, LaunchPackage, LaunchPlanValue, LaunchPort,
     LaunchPut, LaunchRegion, LaunchStage, LaunchStagePlan, LaunchValue,
 };

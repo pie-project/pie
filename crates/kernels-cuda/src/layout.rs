@@ -110,8 +110,14 @@ pub static KERNELS: &[KernelSig] = &[
             src: U16s <- Source::In(0),
             dst: U16sMut <- Source::Out(0),
             n: I32 <- Source::Rows,
-            layers: I32 <- Source::OutDim(0, 0),
-            dim: I32 <- Source::OutDim(0, 2),
+            // Neither extent is the plan's, which is what put this row on
+            // the generator's wall. The PLE dim is a fire fact the driver
+            // holds, and the layer count is what is left of the operand's
+            // row once that is divided out — which is exactly the
+            // arithmetic the hand arm did, refusal on an unset `ple_dim`
+            // included.
+            layers: I32 <- Source::InWidthOver(0, "ple_dim"),
+            dim: I32 <- Source::Ctx("ple_dim"),
             stream: Stream <- Source::Ctx("stream"),
         ]),
     kernel!(verify_stash_store "qwen35_verify_stash_store"),

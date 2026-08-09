@@ -30,22 +30,22 @@ impl DummyDriver {
         Self { inner, broker }
     }
 
-    pub fn capabilities(&self) -> &::driver::DriverCapabilities {
+    pub fn capabilities(&self) -> &::driver_api::DriverCapabilities {
         self.inner.capabilities()
     }
 
-    pub fn device_facts(&self) -> &::driver::DeviceFacts {
+    pub fn device_facts(&self) -> &::driver_api::DeviceFacts {
         self.inner.device_facts()
     }
 
-    pub fn export_kv_handle(&self) -> Option<::driver::KvHandle> {
+    pub fn export_kv_handle(&self) -> Option<::driver_api::KvHandle> {
         self.inner.export_kv_handle()
     }
 
     pub fn load_model(
         &mut self,
-        desc: &::driver::ModelLoadDesc,
-    ) -> Result<::driver::DriverCapabilities> {
+        desc: &::driver_api::ModelLoadDesc,
+    ) -> Result<::driver_api::DriverCapabilities> {
         self.inner.load_model(desc)
     }
 
@@ -59,7 +59,7 @@ impl DummyDriver {
     ) -> Result<RegisteredChannel> {
         let borrowed = ChannelDescBorrow::new(desc);
         let binding = self.inner.register_channel(borrowed.as_raw())?;
-        ::driver::validate_channel_endpoint_binding(&binding, borrowed.as_raw())
+        ::driver_api::validate_channel_endpoint_binding(&binding, borrowed.as_raw())
             .map_err(|error| anyhow!(error))?;
         Ok(RegisteredChannel {
             driver_id: desc.driver_id,

@@ -6,6 +6,8 @@
 use kernels::kernel;
 use kernels::operands;
 use kernels::KernelSig;
+use kernels::Lit;
+use kernels::Source;
 
 #[rustfmt::skip]
 pub static KERNELS: &[KernelSig] = &[
@@ -81,16 +83,21 @@ pub static KERNELS: &[KernelSig] = &[
             eps: F32,
             stream: Stream,
         ]),
+    // `beta` is a LITERAL zero and not a context field: this symbol
+    // OVERWRITES its destination. The accumulating spelling is
+    // `gemm::act_x_w`, whose arm reads `spec.beta_one` to choose between
+    // two arities, and a row that pretended one symbol did both would be
+    // stating the other one's contract.
     kernel!(gemm_xwt "gemm::act_x_wt_bf16",
         operands = operands![
-            handle: CublasHandle,
-            act: Buf,
-            w: Buf,
-            y: BufMut,
-            m: I32,
-            n: I32,
-            k: I32,
-            beta: F32,
+            handle: CublasHandle <- Source::Ctx("cublas"),
+            act: Buf <- Source::In(0),
+            w: Buf <- Source::Weight(0),
+            y: BufMut <- Source::Out(0),
+            m: I32 <- Source::Rows,
+            n: I32 <- Source::OutWidth(0),
+            k: I32 <- Source::InWidth(0),
+            beta: F32 <- Source::Lit(Lit::F32(0.0)),
         ]),
     // ── the WEIGHT REPRESENTATION axis ─────────────────────────────
     //
@@ -205,13 +212,13 @@ pub static KERNELS: &[KernelSig] = &[
         ]),
     kernel!(gemm_out_fp32 "gemm::act_x_wt_bf16_out_fp32",
         operands = operands![
-            handle: CublasHandle,
-            act: Buf,
-            w: Buf,
-            y: F32sMut,
-            m: I32,
-            n: I32,
-            k: I32,
+            handle: CublasHandle <- Source::Ctx("cublas"),
+            act: Buf <- Source::In(0),
+            w: Buf <- Source::Weight(0),
+            y: F32sMut <- Source::Out(0),
+            m: I32 <- Source::Rows,
+            n: I32 <- Source::OutWidth(0),
+            k: I32 <- Source::InWidth(0),
         ]),
     // The group boundaries (`M_array`) are fire-global, so a row window would
     // cut a group in half.
@@ -245,17 +252,20 @@ pub static KERNELS: &[KernelSig] = &[
     // by an argument, so the kernel that changes is none.
     // A projection with its bias in the EPILOGUE — one launch where a
     // matmul plus an AddBias is two, and a different accumulation order.
+    // TWO weights, and the order is the statement's: the projection
+    // first, then the bias it lands with. A row states that once; the arm
+    // it replaces read `args[2]` and `args[3]` and said so in a comment.
     kernel!(gemm_bias "gemm::act_x_wt_bias_bf16",
         operands = operands![
-            handle: CublasHandle,
-            act: Buf,
-            w: Buf,
-            bias: Buf,
-            y: BufMut,
-            m: I32,
-            n: I32,
-            k: I32,
-            stream: Stream,
-            beta: F32,
+            handle: CublasHandle <- Source::Ctx("cublas"),
+            act: Buf <- Source::In(0),
+            w: Buf <- Source::Weight(0),
+            bias: Buf <- Source::Weight(1),
+            y: BufMut <- Source::Out(0),
+            m: I32 <- Source::Rows,
+            n: I32 <- Source::OutWidth(0),
+            k: I32 <- Source::InWidth(0),
+            stream: Stream <- Source::Ctx("stream"),
+            beta: F32 <- Source::Lit(Lit::F32(0.0)),
         ]),
 ];

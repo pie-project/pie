@@ -211,19 +211,11 @@ pub fn gpt_oss_cuda(
             // takes the one-value dispatch and saves the write.
             dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
             let a = if facts.attn_sinks {
-                let (o, lse) = match class {
-                    FireClass::Decode => {
-                        dsl::cuda::attention_flashinfer_decode_lse(&q, &kv, facts.q_heads)
-                    }
-                    _ => dsl::cuda::attention_flashinfer_prefill_lse(&q, &kv, facts.q_heads),
-                };
+                let (o, lse) = dsl::cuda::attention_for_lse(class, &q, &kv, facts.q_heads);
                 dsl::cuda::attention_sink_rescale(&o, &lse, &w.sinks)
             } else {
-                match class {
-                    FireClass::Decode => dsl::cuda::attention_flashinfer_decode(&q, &kv, window_left),
-                    _ => dsl::cuda::attention_flashinfer_prefill_planless(&q, &kv, window_left),
-                }
-                .expect("the class states its attention")
+                dsl::cuda::attention_for(class, &q, &kv, window_left)
+                    .expect("the class states its attention")
             };
 
             // Post-attention observation. On the sink layers this sees the

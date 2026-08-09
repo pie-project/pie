@@ -53,23 +53,31 @@ pub static KERNELS: &[KernelSig] = &[
     // no destination to give them another. The `_rounded` twin below has
     // said so since gemma-4's conversion; this row had not, and
     // llama_like states it 84 times per decode text.
-    // NOT sourced, and the reason is not that the arguments are
-    // unreachable — every one of them is. It is that llama_like fires a
-    // DIFFERENT launcher for this same stated symbol on a peel's tail
-    // region (`..._devwin`, below), so a generated branch would take the
-    // plain form on a fire that wanted the windowed one. `CtxNonZero`
-    // says "zero means not mine"; what this row needs is the opposite
-    // sense on a pointer, and inventing that for one row before a second
-    // asks for it is how a guard vocabulary stops being readable.
+    // THE DEVWIN CAUTION THIS ROW CARRIED WAS ABOUT A HAZARD THAT DOES
+    // NOT EXIST. It read: llama_like fires a different launcher for this
+    // same stated symbol on a peel's tail, so a generated branch would
+    // take the plain form on a fire that wanted the windowed one. It
+    // does not — `dsl::cuda::qk_rmsnorm_rope_devwin` records
+    // `rope::qk_rmsnorm_rope_bf16_devwin`, a SECOND symbol, so the two
+    // forms never arrive under one key and there is nothing for a guard
+    // to disambiguate. The hand arm this replaces fired the plain
+    // launcher unconditionally, which is the same behaviour and is what
+    // said the caution was stale.
     kernel!(qk_rmsnorm_rope "rope::qk_rmsnorm_rope_bf16",
         in_place = &[(0, 0), (1, 1)],
         operands = operands![
-            q: BufMut, k: BufMut,
-            q_weight: Buf, k_weight: Buf,
-            positions: I32s,
-            num_tokens: I32, num_q_heads: I32, num_kv_heads: I32, head_dim: I32,
-            theta: F32, eps: F32,
-            stream: Stream,
+            q: BufMut <- Source::Out(0),
+            k: BufMut <- Source::Out(1),
+            q_weight: Buf <- Source::Weight(0),
+            k_weight: Buf <- Source::Weight(1),
+            positions: I32s <- Source::Positions,
+            num_tokens: I32 <- Source::Rows,
+            num_q_heads: I32 <- Source::OutWidthOver(0, "head_dim"),
+            num_kv_heads: I32 <- Source::OutWidthOver(1, "head_dim"),
+            head_dim: I32 <- Source::Ctx("head_dim"),
+            theta: F32 <- Source::CtxByLayer("theta"),
+            eps: F32 <- Source::Ctx("eps"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // A hooked pure-decode fire is graph-CAPTURED and its hook split rides a
     // DEVICE word (`win_d`), not a host row range. All four are `whole`, and

@@ -90,6 +90,7 @@ impl<'a> Wiring<'a> {
 pub fn wire<'a>(facts: &'a HfConfig, published: &'a dyn Fn(&str) -> bool) -> Wiring<'a> {
     let mut w = Wiring::new(facts, published);
     llama_like(&mut w);
+    gpt_oss(&mut w);
     gemma4(&mut w);
     qwen3_5(&mut w);
     w
@@ -169,6 +170,66 @@ fn llama_like(w: &mut Wiring<'_>) {
         }
     }
 
+}
+
+/// Build the gpt-oss trace names that [`llama_like`] does not reach.
+///
+/// gpt-oss IS an HF llama-like checkpoint — `model.embed_tokens.weight`,
+/// `input_layernorm`, `self_attn.{q,k,v,o}_proj` — so `llama_like` above
+/// answers its backbone and this adds only the five names it does not:
+/// the sigmoid router and its bias, the attention sinks, and the two MXFP4
+/// expert banks.
+///
+/// **This is the family that BITES.** It is the only one with both a
+/// `FACTS_ROWS` entry in the CUDA shell and a Prefill arm, so before this
+/// builder a gpt-oss checkpoint loaded, reported itself healthy, and died
+/// at its first fire on `UnknownWeight("layer.0.router")` — one name at a
+/// time, at request time. `tests/seam_names.rs` is what turned that into
+/// a list.
+///
+/// # The bank suffixes, and why they are not a convention invented here
+///
+/// `quant::mxfp4_moe_gate_up_decode_bf16` resolves `{bank}_scales`,
+/// `{bank}_gate_bias` and `{bank}_up_bias` off the bank the statement
+/// names; the down twin resolves `{bank}_scales` and `{bank}_bias`. Those
+/// are the DRIVER's spellings and the trace never states them, so they
+/// have to be answered here or the arm refuses.
+///
+/// The two GATE/UP biases are the interesting pair. The routed contract
+/// publishes one fused `gate_up_proj.bias` — gate at even rows, up at odd
+/// — which is a STRIDE and not a rename, and `wire()` can only alias or
+/// join. The native path publishes the two halves separately, already
+/// split. So both spellings are stated and `Wiring::alias`'s
+/// record-only-if-published does the right thing without a branch: on the
+/// native path they resolve, on the routed path they are absent and the
+/// arm's `unwrap_or(null)` takes over, which is what it is written for.
+/// That behaviour is the silent-failure hazard everywhere else in this
+/// file and is exactly correct here.
+fn gpt_oss(w: &mut Wiring<'_>) {
+    // The sinks ARE the family's signature: no other llama-like
+    // checkpoint ships a per-head attention sink beside its projections.
+    if !w.has("model.layers.0.self_attn.sinks") {
+        return;
+    }
+    let layers = usize::try_from(w.facts.num_hidden_layers).unwrap_or(0);
+    for i in 0..layers {
+        let n = |s: &str| format!("model.layers.{i}.{s}");
+        w.alias(format!("layer.{i}.router"), n("mlp.router.weight"));
+        w.alias(format!("layer.{i}.router_bias"), n("mlp.router.bias"));
+        w.alias(format!("layer.{i}.attn_sinks"), n("self_attn.sinks"));
+
+        let gate_up = format!("layer.{i}.expert_gate_up_bank");
+        let experts = n("mlp.experts");
+        w.alias(gate_up.clone(), format!("{experts}.gate_up_proj.weight"));
+        w.alias(format!("{gate_up}_scales"), format!("{experts}.gate_up_proj.weight_scale"));
+        w.alias(format!("{gate_up}_gate_bias"), format!("{experts}.gate_proj.bias"));
+        w.alias(format!("{gate_up}_up_bias"), format!("{experts}.up_proj.bias"));
+
+        let down = format!("layer.{i}.expert_down_bank");
+        w.alias(down.clone(), format!("{experts}.down_proj.weight"));
+        w.alias(format!("{down}_scales"), format!("{experts}.down_proj.weight_scale"));
+        w.alias(format!("{down}_bias"), format!("{experts}.down_proj.bias"));
+    }
 }
 
 /// Build the qwen3_5 hybrid's trace names — the `real_hybrid` A/B's

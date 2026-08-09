@@ -561,13 +561,16 @@ fn the_kv_pool_allocates_at_the_geometry_the_fire_states() {
         page_size: 16,
         pages: 64,
         element_bytes: 2,
+        global_head_dim: 0,
+        global_kv_heads: 0,
+        full_attn_every: 0,
     };
     let pool = Pool::allocate(&context, shape).expect("the pool allocates");
 
     assert_eq!(pool.pages(), 64);
     assert_eq!(
         pool.bytes(),
-        shape.layer_bytes() * 2 * 24,
+        shape.layer_bytes_at(0) * 2 * 24,
         "a K and a V region for every layer"
     );
     let layer = pool.layer(0).expect("layer 0 has pages");
@@ -615,13 +618,16 @@ fn a_move_plan_slides_rows_without_smearing_them() {
         page_size: 2,
         pages: 4,
         element_bytes: 2,
+        global_head_dim: 0,
+        global_kv_heads: 0,
+        full_attn_every: 0,
     };
     let pool = Pool::allocate(&context, shape).expect("the pool allocates");
     let layer = pool.layer(0).expect("layer 0");
-    let row = shape.row_bytes() as usize;
+    let row = shape.row_bytes().expect("a uniform pool") as usize;
 
     // Each row is its own byte, so a misplaced one names itself.
-    let total = shape.layer_bytes() as usize;
+    let total = shape.layer_bytes_at(0) as usize;
     let src: Vec<u8> = (0..total).map(|i| (i / row) as u8).collect();
     unsafe {
         layer.k.write(0, &src).expect("the pattern fits");
@@ -629,7 +635,7 @@ fn a_move_plan_slides_rows_without_smearing_them() {
     }
 
     // Slide page 1 onto page 0 — the overlapping case a compaction makes.
-    let page = shape.page_bytes();
+    let page = shape.page_bytes().expect("a uniform pool");
     pool.apply(&CellMovePlan {
         copies: vec![CellCopy {
             src_off: page,

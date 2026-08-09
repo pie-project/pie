@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 
 use lru::LruCache;
 use tensor_compiler::codegen::program::{Backend, EmittedKernel, emit_program};
-use ::driver::plan::{DirectArgmax, RegionAnalysis};
+use ::driver_api::plan::{DirectArgmax, RegionAnalysis};
 use tensor_ir::container::{self, ContainerDecodeError, PortSource, TraceContainer};
 use tensor_ir::container_hash;
 use tensor_ir::op::Op;
@@ -78,7 +78,7 @@ pub struct RegisteredProgram {
     pub channel_accesses: Vec<(bool, bool)>,
     /// This program in the shape a driver executes it, built on first use.
     /// See [`Self::launch`].
-    launch: std::sync::OnceLock<::driver::plan::LaunchPackage>,
+    launch: std::sync::OnceLock<::driver_api::plan::LaunchPackage>,
     /// Static geometry-derivability taint, and the per-pass shadow fold
     /// schedule derived from it. Both are functions of `bound` alone, and a
     /// program is registered once but instantiated many times — at a cohort
@@ -108,7 +108,7 @@ impl RegisteredProgram {
     /// This is what replaced the container bytes and the PTIB sidecar. A driver
     /// receives typed records instead of PTIR, so it has no wire format to parse and no
     /// plan to re-derive (`ptir-refactor.md` §2.3).
-    pub fn launch(&self) -> &::driver::plan::LaunchPackage {
+    pub fn launch(&self) -> &::driver_api::plan::LaunchPackage {
         self.launch
             .get_or_init(|| tensor_compiler::codegen::launch::build(&self.bound, &self.compiled_stages))
     }
