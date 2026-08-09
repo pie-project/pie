@@ -5,8 +5,8 @@
 
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
-use anyhow::Result;
 use ::model::instruct::{ReasoningDecoder, ReasoningEvent};
+use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
@@ -21,8 +21,7 @@ impl std::fmt::Debug for Decoder {
     }
 }
 
-impl pie::inferlet::reasoning::Host for ProcessCtx {
-}
+impl pie::inferlet::reasoning::Host for ProcessCtx {}
 
 impl pie::inferlet::reasoning::HostDecoder for ProcessCtx {
     async fn new(&mut self) -> Result<Resource<Decoder>> {

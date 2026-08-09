@@ -209,6 +209,14 @@ impl Linker {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one instantiation's whole context: the engine and policy to build \
+                  under, the two caches it must hit rather than rebuild, and the \
+                  process identity it is being built FOR (id, user, program, output \
+                  mode). Folding them into a struct would re-list the same eight \
+                  fields and add a lifetime to the two cache handles"
+    )]
     async fn instantiate(
         engine: Engine,
         policy: InstancePolicy,

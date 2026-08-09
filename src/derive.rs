@@ -46,11 +46,7 @@ pub fn extract_section(combined: &str, section: &str) -> Result<String> {
 /// (golf's `run_standalone` binds ephemeral and cross-wires worker↔gateway).
 pub fn derive_standalone(
     combined: &str,
-) -> Result<(
-    controller::Config,
-    gateway::Config,
-    worker::Config,
-)> {
+) -> Result<(controller::Config, gateway::Config, worker::Config)> {
     // The file IS the worker config now. `[controller]` and `[gateway]` are
     // gone from it -- they were empty in every single-node config and existed
     // only because three role libs each parse their own section, which is

@@ -60,7 +60,7 @@ use crate::geometry::GeometryClass;
 /// driver clamps the resolved value to the row's replay length. No struct
 /// grew, but an older driver rejects the unknown bit, so drivers and workers
 /// ship together.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 24;
+pub const PIE_DRIVER_ABI_VERSION: u32 = 25;
 pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
 pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
 pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
@@ -159,6 +159,15 @@ pub const PIE_MEMORY_DOMAIN_ROCM_DEVICE: PieMemoryDomain = 2;
 pub const PIE_MEMORY_DOMAIN_METAL_SHARED: PieMemoryDomain = 3;
 /// Metal private device memory.
 pub const PIE_MEMORY_DOMAIN_METAL_PRIVATE: PieMemoryDomain = 4;
+/// Vulkan device memory on `*_device_ordinal`.
+///
+/// One arm and not two, unlike Metal's shared/private pair: a Vulkan driver
+/// chooses its heap from the memory types the device reports, and whether
+/// that memory is also host-visible is a property of the DEVICE rather than
+/// of the allocation -- an integrated GPU and a discrete card with resizable
+/// BAR both report host-visible device-local memory. A caller that needs to
+/// know asks the driver's facts for `unified_memory`.
+pub const PIE_MEMORY_DOMAIN_VULKAN_DEVICE: PieMemoryDomain = 5;
 pub const PIE_ELASTIC_POOL_KV: u64 = 0;
 pub const PIE_ELASTIC_POOL_STATE: u64 = 1;
 pub const PIE_ELASTIC_POOL_WORKSPACE: u64 = 2;
@@ -1146,7 +1155,7 @@ pub struct PieInstanceBinding {
 /// small. Frame-invariant tables (roster ids, WorkingSet page translation,
 /// KV admission demand) live on the frame, not the step.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PieStepDesc {
     /// Indices into the frame roster (`PieFrameDesc::instance_ids`), one per
     /// batch member, in sub-batch order.
@@ -1303,73 +1312,6 @@ pub const PIE_MAX_LAYERS_FULL: u32 = u32::MAX;
 /// (zero would mean an all-truncated composed fire, a legal future
 /// value).
 pub const PIE_FULL_DEPTH_UNPLANNED: u32 = u32::MAX;
-
-impl Default for PieStepDesc {
-    fn default() -> Self {
-        Self {
-            roster_rows: PieU32Slice::default(),
-            sub_batch_indptr: PieU32Slice::default(),
-            sub_batch_class: PieU32Slice::default(),
-            terminal_cells: PieTerminalCellPtrSlice::default(),
-            token_ids: PieU32Slice::default(),
-            position_ids: PieU32Slice::default(),
-            kv_page_indices: PieU32Slice::default(),
-            kv_page_indptr: PieU32Slice::default(),
-            kv_last_page_lens: PieU32Slice::default(),
-            qo_indptr: PieU32Slice::default(),
-            rs_slot_ids: PieU32Slice::default(),
-            rs_slot_flags: PieU8Slice::default(),
-            rs_fold_lens: PieU32Slice::default(),
-            rs_buffer_slot_ids: PieU32Slice::default(),
-            rs_buffer_read_slot_ids: PieU32Slice::default(),
-            rs_buffer_read_indptr: PieU32Slice::default(),
-            rs_buffer_read_lens: PieU32Slice::default(),
-            rs_buffer_heads: PieU32Slice::default(),
-            rs_buffer_slot_indptr: PieU32Slice::default(),
-            rs_translation: PieU32Slice::default(),
-            rs_translation_indptr: PieU32Slice::default(),
-            masks: PieMaskWordsDesc::default(),
-            sampling_indices: PieU32Slice::default(),
-            sampling_indptr: PieU32Slice::default(),
-            context_ids: PieU64Slice::default(),
-            single_token_mode: 0,
-            has_user_mask: 0,
-            reserved_flags: [0; 2],
-            reserved0: 0,
-            image_indptr: PieU32Slice::default(),
-            image_grids: PieU32Slice::default(),
-            image_anchor_positions: PieU32Slice::default(),
-            image_pixels: PieBytes::default(),
-            image_pixel_indptr: PieU32Slice::default(),
-            image_mrope_positions: PieU32Slice::default(),
-            image_mrope_indptr: PieU32Slice::default(),
-            image_patch_positions: PieU32Slice::default(),
-            image_anchor_rows: PieU32Slice::default(),
-            audio_features: PieBytes::default(),
-            audio_feature_indptr: PieU32Slice::default(),
-            audio_anchor_rows: PieU32Slice::default(),
-            audio_indptr: PieU32Slice::default(),
-            embed_rows: PieBytes::default(),
-            embed_indptr: PieU32Slice::default(),
-            embed_shapes: PieU32Slice::default(),
-            embed_dtypes: PieU8Slice::default(),
-            embed_anchor_rows: PieU32Slice::default(),
-            embed_block_indptr: PieU32Slice::default(),
-            kv_len: PieU32Slice::default(),
-            kv_len_device: PieU64Slice::default(),
-            ptir_program_row_indptr: PieU32Slice::default(),
-            ptir_kv_write_lower_bounds: PieU64Slice::default(),
-            ptir_kv_write_upper_bounds: PieU64Slice::default(),
-            logical_fire_ids: PieU64Slice::default(),
-            channel_expected_head: PieU64Slice::default(),
-            channel_expected_tail: PieU64Slice::default(),
-            channel_ticket_indptr: PieU32Slice::default(),
-            region_row_indptr: PieU32Slice::default(),
-            region_sig: PieU32Slice::default(),
-            region_k: PieU32Slice::default(),
-        }
-    }
-}
 
 /// Borrowed slice of per-step sections.
 ///
@@ -1620,6 +1562,7 @@ pub const fn pie_memory_domain_is_valid(domain: PieMemoryDomain) -> bool {
             | PIE_MEMORY_DOMAIN_ROCM_DEVICE
             | PIE_MEMORY_DOMAIN_METAL_SHARED
             | PIE_MEMORY_DOMAIN_METAL_PRIVATE
+            | PIE_MEMORY_DOMAIN_VULKAN_DEVICE
     )
 }
 
@@ -1696,7 +1639,7 @@ fn validate_terminal_cell_ptr(
     if ptr.is_null() {
         return Err(invalid_argument(name));
     }
-    if (ptr as usize) % std::mem::align_of::<PieTerminalCell>() != 0 {
+    if !(ptr as usize).is_multiple_of(std::mem::align_of::<PieTerminalCell>()) {
         return Err(invalid_argument(name));
     }
     Ok(())
@@ -1915,6 +1858,12 @@ pub fn validate_program_desc(desc: &PieProgramDesc) -> PieAbiValidationResult {
 }
 
 /// Validates an instance-bind descriptor.
+///
+/// # Safety
+///
+/// This walks the foreign `channel_ids` slice and the nested `seed_values`
+/// descriptors, so every non-null pointer/length pair in `desc` must reference
+/// readable memory for the declared element count.
 pub unsafe fn validate_instance_desc(desc: &PieInstanceDesc) -> PieAbiValidationResult {
     validate_pie_abi_version(desc.abi_version)?;
     validate_reserved_zero("instance reserved0 must be zero", desc.reserved0)?;
@@ -1933,6 +1882,12 @@ pub unsafe fn validate_instance_desc(desc: &PieInstanceDesc) -> PieAbiValidation
 }
 
 /// Validates a persistent channel endpoint registration descriptor.
+///
+/// # Safety
+///
+/// This walks the foreign `shape` and `extern_name` slices, so every non-null
+/// pointer/length pair in `desc` must reference readable memory for the
+/// declared element count.
 pub unsafe fn validate_channel_desc(desc: &PieChannelDesc) -> PieAbiValidationResult {
     validate_pie_abi_version(desc.abi_version)?;
     validate_reserved_zero("channel reserved0 must be zero", desc.reserved0)?;
@@ -2430,13 +2385,13 @@ pub unsafe fn validate_step_desc(desc: &PieStepDesc, roster_len: usize) -> PieAb
     if desc.rs_slot_flags.len != 0 {
         let flags =
             unsafe { std::slice::from_raw_parts(desc.rs_slot_flags.ptr, desc.rs_slot_flags.len) };
-        if flags
-            .iter()
-            .any(|flag| flag & !(PIE_RS_FLAG_RESET
-                    | PIE_RS_FLAG_FOLD
-                    | PIE_RS_FLAG_BUFFER_WRITE
-                    | PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0)
-        {
+        if flags.iter().any(|flag| {
+            flag & !(PIE_RS_FLAG_RESET
+                | PIE_RS_FLAG_FOLD
+                | PIE_RS_FLAG_BUFFER_WRITE
+                | PIE_RS_FLAG_FOLD_LEN_DEVICE)
+                != 0
+        }) {
             return Err(invalid_argument(
                 "launch rs_slot_flags contains unknown bits",
             ));
@@ -2460,7 +2415,7 @@ pub unsafe fn validate_step_desc(desc: &PieStepDesc, roster_len: usize) -> PieAb
         ));
     }
 
-    if desc.image_grids.len % 3 != 0 {
+    if !desc.image_grids.len.is_multiple_of(3) {
         return Err(invalid_argument(
             "launch image_grids length must be divisible by 3",
         ));
@@ -2499,7 +2454,7 @@ pub unsafe fn validate_step_desc(desc: &PieStepDesc, roster_len: usize) -> PieAb
         )?;
     }
 
-    if desc.image_patch_positions.len % 2 != 0 {
+    if !desc.image_patch_positions.len.is_multiple_of(2) {
         return Err(invalid_argument(
             "launch image_patch_positions length must be divisible by 2",
         ));
@@ -2651,7 +2606,10 @@ pub unsafe fn validate_encode_desc(desc: &PieEncodeDesc) -> PieAbiValidationResu
     if images + clips == 0
         || desc.output_row_indptr.len != images + clips + 1
         || desc.output_rows.len == 0
-        || desc.output_rows.len % std::mem::size_of::<u16>() != 0
+        || !desc
+            .output_rows
+            .len
+            .is_multiple_of(std::mem::size_of::<u16>())
     {
         return Err(invalid_argument(
             "encode media descriptor shapes are inconsistent",
@@ -2671,9 +2629,12 @@ pub unsafe fn validate_encode_desc(desc: &PieEncodeDesc) -> PieAbiValidationResu
         if desc.image_grids.len != images.saturating_mul(3)
             || desc.image_pixel_indptr.len != images + 1
             || desc.image_pixels.len == 0
-            || desc.image_pixels.len % std::mem::size_of::<f32>() != 0
+            || !desc
+                .image_pixels
+                .len
+                .is_multiple_of(std::mem::size_of::<f32>())
             || desc.image_patch_positions.len == 0
-            || desc.image_patch_positions.len % 2 != 0
+            || !desc.image_patch_positions.len.is_multiple_of(2)
         {
             return Err(invalid_argument("encode image metadata is inconsistent"));
         }
@@ -2705,7 +2666,10 @@ pub unsafe fn validate_encode_desc(desc: &PieEncodeDesc) -> PieAbiValidationResu
     } else {
         if desc.audio_feature_indptr.len != clips + 1
             || desc.audio_features.len == 0
-            || desc.audio_features.len % std::mem::size_of::<f32>() != 0
+            || !desc
+                .audio_features
+                .len
+                .is_multiple_of(std::mem::size_of::<f32>())
         {
             return Err(invalid_argument("encode audio metadata is inconsistent"));
         }
@@ -2851,22 +2815,6 @@ mod tests {
     const ROSTER: usize = 128;
     use std::ptr::NonNull;
 
-
-
-
-    fn header_block<'a>(header: &'a str, name: &str) -> &'a str {
-        let start = format!("typedef struct {name} {{");
-        let end = format!("}} {name};");
-        let from = header
-            .find(&start)
-            .unwrap_or_else(|| panic!("missing header block start for {name}"));
-        let tail = &header[from..];
-        let to = tail
-            .find(&end)
-            .unwrap_or_else(|| panic!("missing header block end for {name}"));
-        &tail[..to + end.len()]
-    }
-
     unsafe extern "C" fn dummy_notify(_: *mut std::ffi::c_void, _: u64, _: u64) {}
 
     fn valid_runtime_callbacks() -> PieRuntimeCallbacks {
@@ -2963,8 +2911,10 @@ mod tests {
 
     #[test]
     fn instance_geometry_class_is_validated() {
-        let mut instance = PieInstanceDesc::default();
-        instance.geometry_class = u32::MAX;
+        let instance = PieInstanceDesc {
+            geometry_class: u32::MAX,
+            ..Default::default()
+        };
         assert!(unsafe { validate_instance_desc(&instance) }.is_err());
 
         let binding = PieInstanceBinding {
@@ -3645,6 +3595,4 @@ mod tests {
         let err = unsafe { validate_step_desc(&launch, ROSTER) }.unwrap_err();
         assert!(err.message().contains("cover every ticket"));
     }
-
-
 }

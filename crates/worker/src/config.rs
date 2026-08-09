@@ -271,9 +271,9 @@ impl<'de> Deserialize<'de> for Duration {
 impl Serialize for Duration {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         let us = self.as_micros();
-        if us % 1_000_000 == 0 {
+        if us.is_multiple_of(1_000_000) {
             s.serialize_str(&format!("{}s", us / 1_000_000))
-        } else if us % 1_000 == 0 {
+        } else if us.is_multiple_of(1_000) {
             s.serialize_str(&format!("{}ms", us / 1_000))
         } else {
             s.serialize_str(&format!("{us}us"))
@@ -345,11 +345,11 @@ impl Serialize for ByteSize {
         const MIB: u64 = 1024 * 1024;
         const KIB: u64 = 1024;
         let b = self.0;
-        let text = if b % GIB == 0 && b != 0 {
+        let text = if b.is_multiple_of(GIB) && b != 0 {
             format!("{}GiB", b / GIB)
-        } else if b % MIB == 0 && b != 0 {
+        } else if b.is_multiple_of(MIB) && b != 0 {
             format!("{}MiB", b / MIB)
-        } else if b % KIB == 0 && b != 0 {
+        } else if b.is_multiple_of(KIB) && b != 0 {
             format!("{}KiB", b / KIB)
         } else {
             format!("{b}B")

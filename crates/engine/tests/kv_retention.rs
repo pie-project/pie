@@ -186,7 +186,7 @@ fn concurrent_decode_retains_disjoint_kv_pages() {
         *counts.entry(p).or_default() += 1;
     }
     let mut top: Vec<(u32, usize)> = counts.into_iter().collect();
-    top.sort_by(|a, b| b.1.cmp(&a.1));
+    top.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
     eprintln!(
         "[kv-retention] fires={} write_page_samples={} distinct_write_pages={} all_distinct_pages={}",
         fires.len(),

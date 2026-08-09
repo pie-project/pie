@@ -204,25 +204,6 @@ pub fn live_count() -> usize {
     SERVICES.len()
 }
 
-/// The calling thread's OS id, for correlating timing records across threads.
-/// `libc::gettid` is Linux-only; Darwin spells it `pthread_threadid_np`.
-fn os_thread_id() -> u64 {
-    #[cfg(target_os = "linux")]
-    unsafe {
-        libc::gettid() as u64
-    }
-    #[cfg(target_os = "macos")]
-    unsafe {
-        let mut tid: u64 = 0;
-        libc::pthread_threadid_np(0, &mut tid);
-        tid
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        0
-    }
-}
-
 /// Prewarm-conveyor width when execution admission is UNCAPPED. With a cap the
 /// conveyor is one cohort wide instead (see `init_admission`); without one
 /// there is no cohort to size it by, so this flat ladder stands.
@@ -285,32 +266,16 @@ pub fn get_runtime_stats() -> RuntimeProcessStats {
     RuntimeProcessStats {
         completed,
         cumulative_admission_wait_us: admission,
-        avg_admission_wait_us: if completed > 0 {
-            admission / completed
-        } else {
-            0
-        },
+        avg_admission_wait_us: admission.checked_div(completed).unwrap_or(0),
         last_admission_wait_us: PROCESS_LAST_ADMISSION_WAIT_US.load(Relaxed),
         cumulative_instantiate_us: instantiate,
-        avg_instantiate_us: if completed > 0 {
-            instantiate / completed
-        } else {
-            0
-        },
+        avg_instantiate_us: instantiate.checked_div(completed).unwrap_or(0),
         last_instantiate_us: PROCESS_LAST_INSTANTIATE_US.load(Relaxed),
         cumulative_context_register_us: context_register,
-        avg_context_register_us: if completed > 0 {
-            context_register / completed
-        } else {
-            0
-        },
+        avg_context_register_us: context_register.checked_div(completed).unwrap_or(0),
         last_context_register_us: PROCESS_LAST_CONTEXT_REGISTER_US.load(Relaxed),
         cumulative_wasm_run_us: wasm_run,
-        avg_wasm_run_us: if completed > 0 {
-            wasm_run / completed
-        } else {
-            0
-        },
+        avg_wasm_run_us: wasm_run.checked_div(completed).unwrap_or(0),
         last_wasm_run_us: PROCESS_LAST_WASM_RUN_US.load(Relaxed),
     }
 }
@@ -404,10 +369,6 @@ impl Drop for AdmissionQueued {
     fn drop(&mut self) {
         crate::scheduler::worker::notify_admission_dequeued(self.0);
     }
-}
-
-pub(crate) fn execution_admission_is_capped() -> bool {
-    ADMISSION.get().is_some_and(Option::is_some)
 }
 
 /// Bind permits withheld from the pool until the first generation is
@@ -611,6 +572,15 @@ pub fn spawn(
 /// process would be re-chosen immediately and forever. Inheriting the
 /// original position means the restarted run ages exactly as it would have,
 /// eventually becomes the queue head, and the head is never a victim.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one spawn request in full: who is asking, what program on what input, \
+              which client to report to, whether to capture output, where the result \
+              goes, and the two inheritance fields (`inherit_seq`, \
+              `inherit_client_pid`) that are set only when a process spawns a child. \
+              The last two are exactly why a struct would not help — they are \
+              `None` for every top-level spawn"
+)]
 fn spawn_inner(
     username: String,
     program_name: ProgramName,
@@ -697,14 +667,14 @@ pub fn stderr(process_id: ProcessId, content: String) {
 pub async fn get_username(process_id: ProcessId) -> Result<String> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(&process_id, Message::GetUsername { response: tx })?;
-    Ok(rx.await??)
+    rx.await?
 }
 
 /// Get the client ID attached to a process, if any.
 pub async fn get_client_id(process_id: ProcessId) -> Result<Option<ClientId>> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(&process_id, Message::GetClientId { response: tx })?;
-    Ok(rx.await??)
+    rx.await?
 }
 
 /// Returns stats/metadata for a single process.
@@ -792,6 +762,13 @@ struct Process {
 
 impl Process {
     /// Creates a new Process, generating a UUID, and spawns its WASM execution task.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the resolved form of `spawn_inner`'s argument list, one level down: \
+                  both process ids are now known, and the rest is carried through \
+                  unchanged. Introducing a struct here would only move the same \
+                  fields across one call"
+    )]
     fn new(
         process_id: ProcessId,
         client_pid: ProcessId,
@@ -1141,8 +1118,7 @@ mod tests {
     #[test]
     fn run_interface_version_matches_wit() {
         let wit = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../inferlet/wit/world.wit"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../inferlet/wit/world.wit"),
         )
         .expect("read crates/inferlet/wit/world.wit");
 

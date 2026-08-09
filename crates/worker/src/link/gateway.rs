@@ -665,6 +665,11 @@ fn feed_turn(client_id: ClientId, req_id: ReqId, message: ClientMessage) -> Fed 
 /// Stream one already-fed turn's messages back as `Tokens`, terminated by
 /// exactly one `Eos`. Selects against `cancel` so a reverse `cancel` aborts
 /// mid-turn even while the worker is between pushes.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one turn's whole context: identity, transport, cancellation and \
+              inbox are each owned by a different layer above"
+)]
 async fn run_turn(
     client_id: ClientId,
     gateway: &GatewayInboundClient,

@@ -526,10 +526,8 @@ impl StackParser {
                 if !self.expand_rule(RuleId(rule_id as u32), current_level, queue, visited) {
                     // Rule already expanded at this level. If it has already
                     // completed (nullable), advance the parent immediately.
-                    if completed_at_level.contains(&rule_id) {
-                        if visited.insert(parent_after) {
-                            queue.push(parent_after);
-                        }
+                    if completed_at_level.contains(&rule_id) && visited.insert(parent_after) {
+                        queue.push(parent_after);
                     }
                 }
             }
@@ -537,10 +535,10 @@ impl StackParser {
             // Complete: if accepting state, advance parents
             if action.flags.is_accepting() {
                 // Track completion for nullable dedup handling
-                if state.return_level == current_level {
-                    if !completed_at_level.contains(&state.rule_id) {
-                        completed_at_level.push(state.rule_id);
-                    }
+                if state.return_level == current_level
+                    && !completed_at_level.contains(&state.rule_id)
+                {
+                    completed_at_level.push(state.rule_id);
                 }
                 self.complete(&state, queue, visited, returns, accept_stop, extra_returns);
             }
@@ -558,7 +556,7 @@ impl StackParser {
         state: &StackState,
         queue: &mut Vec<StackState>,
         visited: &mut SmallDedup<StackState>,
-        returns: &mut Vec<(u16, StackState)>,
+        returns: &[(u16, StackState)],
         accept_stop: &mut bool,
         extra_returns: &[(u16, StackState)],
     ) {
@@ -613,19 +611,14 @@ impl StackParser {
         // From current (being built) returns + extra returns
         let current_level = self.state_offsets.len();
         if start_pos == current_level {
-            for i in 0..returns.len() {
-                let (expected_rule, parent_after) = returns[i];
-                if expected_rule == rule_id {
-                    if visited.insert(parent_after) {
-                        queue.push(parent_after);
-                    }
+            for &(expected_rule, parent_after) in returns {
+                if expected_rule == rule_id && visited.insert(parent_after) {
+                    queue.push(parent_after);
                 }
             }
             for &(expected_rule, parent_after) in extra_returns {
-                if expected_rule == rule_id {
-                    if visited.insert(parent_after) {
-                        queue.push(parent_after);
-                    }
+                if expected_rule == rule_id && visited.insert(parent_after) {
+                    queue.push(parent_after);
                 }
             }
         }
@@ -651,19 +644,18 @@ impl StackParser {
     ) {
         // Check cache — only valid for consecutive advances (start == last + 1).
         // This ensures the chain is growing from the same context, not a new one.
-        if let Some((cached_rid, cached_dfa, terminal, last_start)) = self.chain_terminal.get() {
-            if cached_rid == chain_rule_id
-                && cached_dfa == chain_dfa_state
-                && start_level == last_start + 1
-                && terminal < self.return_offsets.len()
-            {
-                // Use cached terminal — process its returns directly.
-                // Non-chain parents at start_level are handled by complete()'s normal loop.
-                self.process_terminal_returns(chain_rule_id, terminal, queue, visited, accept_stop);
-                self.chain_terminal
-                    .set(Some((cached_rid, cached_dfa, terminal, start_level)));
-                return;
-            }
+        if let Some((cached_rid, cached_dfa, terminal, last_start)) = self.chain_terminal.get()
+            && cached_rid == chain_rule_id
+            && cached_dfa == chain_dfa_state
+            && start_level == last_start + 1
+            && terminal < self.return_offsets.len()
+        {
+            // Use cached terminal — process its returns directly.
+            // Non-chain parents at start_level are handled by complete()'s normal loop.
+            self.process_terminal_returns(chain_rule_id, terminal, queue, visited, accept_stop);
+            self.chain_terminal
+                .set(Some((cached_rid, cached_dfa, terminal, start_level)));
+            return;
         }
 
         // Walk the chain to find the terminal level.
@@ -765,6 +757,12 @@ impl StackParser {
     /// Probe advance for trie walk: advance states by one byte without committing
     /// to arenas. Returns true if any states survived. Results are appended to
     /// `scanable_buf` and `returns_buf`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the four `_buf` parameters exist so the caller can reuse \
+                  allocations across a trie walk; folding them into a struct \
+                  would hide the borrow that makes the reuse safe"
+    )]
     pub(super) fn probe_advance_reuse(
         &self,
         current_states: &[StackState],

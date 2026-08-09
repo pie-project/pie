@@ -16,17 +16,16 @@ impl pie::inferlet::session::Host for ProcessCtx {
     async fn send(&mut self, message: String) -> Result<()> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let process_id = self.id();
-        if let Ok(Some(client_id)) = process::get_client_id(process_id).await {
-            if let Err(err) =
+        if let Ok(Some(client_id)) = process::get_client_id(process_id).await
+            && let Err(err) =
                 server::send_event(client_id, process_id, &ProcessEvent::Message(message))
-            {
-                tracing::warn!(
-                    client_id,
-                    process_id = %process_id,
-                    error = %err,
-                    "session.send delivery failed"
-                );
-            }
+        {
+            tracing::warn!(
+                client_id,
+                process_id = %process_id,
+                error = %err,
+                "session.send delivery failed"
+            );
         }
         Ok(())
     }

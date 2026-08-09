@@ -177,6 +177,13 @@ pub const AFFINE_GROUP: i64 = 64;
 /// `config.json` states for the whole file) the width is derived, which
 /// reads `mlx_lm`'s per-tensor overrides for free; given the width (gpt-oss
 /// states no quantization at all) the group is derived instead.
+///
+/// The `* 32` in that arithmetic is the one thing the shapes cannot say:
+/// it is the width of a word, and it is only right if the tensor is U32.
+/// The sole caller gates on that before calling, but the function is what
+/// the arithmetic belongs to, so it checks rather than assumes — the same
+/// way [`push_mlx_mxfp4_stacked`] checks its scales are the U8 exponents
+/// it reads them as.
 pub fn push_mlx_affine_stacked(
     b: &mut Builder<'_>,
     raw: &RawTensor,
@@ -190,6 +197,12 @@ pub fn push_mlx_affine_stacked(
     {
         return fail(format!(
             "MLX affine triplet '{}' has incompatible shapes",
+            raw.name
+        ));
+    }
+    if !is_raw(&raw.encoding, DType::U32) {
+        return fail(format!(
+            "MLX affine triplet '{}' is not the U32 words this format packs into",
             raw.name
         ));
     }
@@ -681,5 +694,459 @@ mod tests {
             call("mlp.shared_expert.gate_proj.weight", true).unwrap(),
             Some("mlp.shared_expert.gate_proj.weight".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod quant_tests {
+    use super::*;
+    use crate::catalog::LoadShape;
+    use crate::encoding::Encoding as StoredEncoding;
+    use crate::shared::policy::Policy;
+    use model_loader::checkpoint::CheckpointMetadata;
+    use model_loader::contract::{ModelContract, Visibility};
+    use model_loader::plan::StorageTarget;
+    use model_loader::types::TensorId;
+
+    fn raw(name: &str, shape: Vec<i64>, encoding: Encoding) -> RawTensor {
+        RawTensor {
+            id: TensorId(0),
+            name: name.to_string(),
+            file_id: model_loader::types::FileId(0),
+            file_offset: 0,
+            span_bytes: shape.iter().product::<i64>().max(0) as u64,
+            shape,
+            encoding,
+        }
+    }
+
+    fn u32t(name: &str, shape: Vec<i64>) -> RawTensor {
+        raw(name, shape, Encoding::Raw(DType::U32))
+    }
+
+    fn u8t(name: &str, shape: Vec<i64>) -> RawTensor {
+        raw(name, shape, Encoding::Raw(DType::U8))
+    }
+
+    /// Run `author` against a builder and hand back the contract it wrote.
+    fn author(author: impl FnOnce(&mut Builder<'_>) -> Result<(), Error>) -> ModelContract {
+        try_author(author).expect("the author was expected to succeed")
+    }
+
+    fn try_author(
+        author: impl FnOnce(&mut Builder<'_>) -> Result<(), Error>,
+    ) -> Result<ModelContract, Error> {
+        let meta = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: Vec::new(),
+        };
+        let target = StorageTarget {
+            preferred_alignment: 256,
+            ..StorageTarget::default()
+        };
+        let enc = StoredEncoding::dense();
+        let policy = Policy::default();
+        let shape = LoadShape::dense(1, 128, false);
+        let mut b = Builder::new(&meta, "test-row", shape, &enc, &target, &policy);
+        author(&mut b)?;
+        b.finish()
+    }
+
+    fn declared(contract: &ModelContract, name: &str) -> (Vec<i64>, Encoding) {
+        let t = contract
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("'{name}' was not declared"));
+        (
+            t.shape.clone().expect("a declared shape"),
+            t.encoding.clone(),
+        )
+    }
+
+    fn spec(encoding: &Encoding) -> QuantSpec {
+        match encoding {
+            Encoding::Quant(spec) => spec.clone(),
+            other => panic!("expected a quantized encoding, got {other:?}"),
+        }
+    }
+
+    fn message(err: Error) -> String {
+        match err {
+            Error::Contract(msg) => msg,
+            other => panic!("expected a contract refusal, got {other:?}"),
+        }
+    }
+
+    // ─── The two unknowns ────────────────────────────────────
+
+    /// A config that states its group size fixes the logical width, and the
+    /// bit depth falls out of how many words the file actually holds.
+    #[test]
+    fn a_stated_group_size_derives_the_width() {
+        // 256 logical columns at 4 bits = 32 U32 words; at 8 bits = 64.
+        for (words, bits, scheme) in [
+            (32, 4u8, QuantScheme::MlxAffineU4),
+            (64, 8u8, QuantScheme::Int8Asymmetric),
+        ] {
+            let contract = author(|b| {
+                push_mlx_affine_stacked(
+                    b,
+                    &u32t("w", vec![512, words]),
+                    &u32t("s", vec![512, 4]),
+                    &u32t("bi", vec![512, 4]),
+                    0,
+                    64,
+                    "out".into(),
+                )
+            });
+            let (shape, encoding) = declared(&contract, "out");
+            assert_eq!(shape, vec![512, 256], "{bits} bits");
+            let spec = spec(&encoding);
+            assert_eq!(spec.bits_per_element, bits);
+            assert_eq!(spec.group_size, 64);
+            assert_eq!(spec.scheme, scheme);
+            assert_eq!(spec.channel_axis, Some(Axis(1)));
+        }
+    }
+
+    /// gpt-oss states no quantization at all, so the width is the told
+    /// number and the group is the derived one — the same equation solved
+    /// for the other unknown.
+    #[test]
+    fn a_stated_width_derives_the_group_size() {
+        // 32 words hold 256 logical columns at 4 bits and 128 at 8, so the
+        // same file yields a different group at each width.
+        for (bits, groups, cols, group_size) in [(4i64, 8i64, 256i64, 32u32), (8, 4, 128, 32)] {
+            let contract = author(|b| {
+                push_mlx_affine_stacked(
+                    b,
+                    &u32t("w", vec![512, 32]),
+                    &u32t("s", vec![512, groups]),
+                    &u32t("bi", vec![512, groups]),
+                    bits,
+                    0,
+                    "out".into(),
+                )
+            });
+            let (shape, encoding) = declared(&contract, "out");
+            assert_eq!(shape, vec![512, cols], "{bits} bits");
+            assert_eq!(spec(&encoding).group_size, group_size, "{bits} bits");
+        }
+    }
+
+    /// A config that declares nothing gets 4 bits, which is what every
+    /// published `mlx_lm` affine checkpoint holds.
+    #[test]
+    fn declaring_nothing_means_four_bits() {
+        let stated = author(|b| {
+            push_mlx_affine_declared(
+                b,
+                &u32t("w", vec![512, 32]),
+                &u32t("s", vec![512, 8]),
+                &u32t("bi", vec![512, 8]),
+                0,
+                0,
+                "out".into(),
+            )
+        });
+        let told = author(|b| {
+            push_mlx_affine_stacked(
+                b,
+                &u32t("w", vec![512, 32]),
+                &u32t("s", vec![512, 8]),
+                &u32t("bi", vec![512, 8]),
+                4,
+                0,
+                "out".into(),
+            )
+        });
+        assert_eq!(declared(&stated, "out"), declared(&told, "out"));
+    }
+
+    /// A stacked expert bank folds its leading axes into rows rather than
+    /// declaring a rank-3 tensor.
+    #[test]
+    fn a_stacked_bank_folds_its_leading_axes_into_rows() {
+        let contract = author(|b| {
+            push_mlx_affine_stacked(
+                b,
+                &u32t("w", vec![8, 512, 32]),
+                &u32t("s", vec![8, 512, 8]),
+                &u32t("bi", vec![8, 512, 8]),
+                4,
+                0,
+                "out".into(),
+            )
+        });
+        assert_eq!(declared(&contract, "out").0, vec![8 * 512, 256]);
+    }
+
+    // ─── The refusals ────────────────────────────────────────
+
+    #[test]
+    fn a_triplet_that_does_not_line_up_is_refused_by_name() {
+        let cases: [(&str, RawTensor, RawTensor, RawTensor, i64, i64, &str); 8] = [
+            (
+                "a vector has no group axis",
+                u32t("w", vec![32]),
+                u32t("s", vec![8]),
+                u32t("bi", vec![8]),
+                4,
+                0,
+                "incompatible shapes",
+            ),
+            (
+                // The width of a word is the one number the shapes do
+                // not carry, so a BF16 tensor would be read as holding
+                // twice the columns it holds.
+                "the words are not U32",
+                raw("w", vec![512, 32], Encoding::Raw(DType::BF16)),
+                u32t("s", vec![512, 8]),
+                u32t("bi", vec![512, 8]),
+                4,
+                0,
+                "not the U32 words this format packs into",
+            ),
+            (
+                "the scales are a rank short",
+                u32t("w", vec![512, 32]),
+                u32t("s", vec![512]),
+                u32t("bi", vec![512]),
+                4,
+                0,
+                "incompatible shapes",
+            ),
+            (
+                "the biases do not match the scales",
+                u32t("w", vec![512, 32]),
+                u32t("s", vec![512, 8]),
+                u32t("bi", vec![512, 4]),
+                4,
+                0,
+                "incompatible shapes",
+            ),
+            (
+                "the stacked axes disagree",
+                u32t("w", vec![8, 512, 32]),
+                u32t("s", vec![4, 512, 8]),
+                u32t("bi", vec![4, 512, 8]),
+                4,
+                0,
+                "disagrees with its scales on the stacked axes",
+            ),
+            (
+                "there are no groups",
+                u32t("w", vec![512, 32]),
+                u32t("s", vec![512, 0]),
+                u32t("bi", vec![512, 0]),
+                4,
+                0,
+                "has no groups",
+            ),
+            (
+                "the stated group size does not divide the words",
+                u32t("w", vec![512, 32]),
+                u32t("s", vec![512, 5]),
+                u32t("bi", vec![512, 5]),
+                0,
+                64,
+                "cannot derive a width from groups of 64",
+            ),
+            (
+                "the derived group size does not divide the columns",
+                u32t("w", vec![512, 32]),
+                u32t("s", vec![512, 7]),
+                u32t("bi", vec![512, 7]),
+                4,
+                0,
+                "cannot derive a group size",
+            ),
+        ];
+        for (why, w, s, bi, bits, group, expected) in cases {
+            let err =
+                try_author(|b| push_mlx_affine_stacked(b, &w, &s, &bi, bits, group, "o".into()))
+                    .expect_err(why);
+            let msg = message(err);
+            assert!(msg.contains(expected), "{why}: {msg}");
+            assert!(
+                msg.contains('w'),
+                "{why}: the refusal names the tensor: {msg}"
+            );
+        }
+    }
+
+    /// Only 4 and 8 bits have kernels; a width that derives to anything
+    /// else is refused rather than declared and read wrongly.
+    #[test]
+    fn only_four_and_eight_bit_widths_are_served() {
+        for (words, group, bits) in [(32i64, 128i64, 2i64), (32, 16, 16)] {
+            let err = try_author(|b| {
+                push_mlx_affine_stacked(
+                    b,
+                    &u32t("w", vec![512, words]),
+                    &u32t("s", vec![512, 4]),
+                    &u32t("bi", vec![512, 4]),
+                    0,
+                    group,
+                    "o".into(),
+                )
+            })
+            .expect_err("an unservable width");
+            assert!(
+                message(err).contains(&format!("unsupported width ({bits} bits)")),
+                "{words} words at group {group}"
+            );
+        }
+    }
+
+    // ─── Shipped MXFP4 ───────────────────────────────────────
+
+    /// Eight nibbles to a little-endian word: a 32-element block is four
+    /// words, and the declaration is a transmute of the checkpoint's own
+    /// bytes rather than a decode.
+    #[test]
+    fn a_shipped_mxfp4_pair_is_declared_without_decoding() {
+        let contract = author(|b| {
+            push_mlx_mxfp4_stacked(
+                b,
+                &u32t("w", vec![8, 512, 32]),
+                &u8t("s", vec![8, 512, 8]),
+                "out".into(),
+            )
+        });
+        let (shape, encoding) = declared(&contract, "out");
+        assert_eq!(shape, vec![8 * 512, 256]);
+        let spec = spec(&encoding);
+        assert_eq!(spec.scheme, QuantScheme::Mxfp4E2M1E8M0);
+        assert_eq!(spec.bits_per_element, 4);
+        assert_eq!(spec.group_size, 32);
+        assert_eq!(spec.logical_dtype, DType::BF16);
+    }
+
+    #[test]
+    fn an_mxfp4_pair_that_does_not_line_up_is_refused_by_name() {
+        let cases: [(&str, RawTensor, RawTensor, &str); 4] = [
+            (
+                "a vector has no block axis",
+                u32t("w", vec![32]),
+                u8t("s", vec![8]),
+                "differ in rank",
+            ),
+            (
+                "the scales are not the E8M0 exponents",
+                u32t("w", vec![512, 32]),
+                u32t("s", vec![512, 8]),
+                "not the U8 E8M0 block exponents",
+            ),
+            (
+                "the stacked axes disagree",
+                u32t("w", vec![8, 512, 32]),
+                u8t("s", vec![4, 512, 8]),
+                "disagrees with its scales on the stacked axes",
+            ),
+            (
+                "the words do not cover the blocks",
+                u32t("w", vec![512, 30]),
+                u8t("s", vec![512, 8]),
+                "packs 30 words against 8 blocks",
+            ),
+        ];
+        for (why, w, s, expected) in cases {
+            let err = try_author(|b| push_mlx_mxfp4_stacked(b, &w, &s, "o".into())).expect_err(why);
+            let msg = message(err);
+            assert!(msg.contains(expected), "{why}: {msg}");
+            assert!(
+                msg.contains('w'),
+                "{why}: the refusal names the tensor: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_mxfp4_pair_with_no_blocks_is_refused() {
+        let err = try_author(|b| {
+            push_mlx_mxfp4_stacked(
+                b,
+                &u32t("w", vec![512, 0]),
+                &u8t("s", vec![512, 0]),
+                "o".into(),
+            )
+        })
+        .expect_err("no blocks");
+        assert!(message(err).contains("packs 0 words against 0 blocks"));
+    }
+
+    // ─── Load-time encode ────────────────────────────────────
+
+    /// A projection a checkpoint left in BF16 is quantized on load, not
+    /// transmuted: the contract carries a `cast`, and the encode writes the
+    /// scales and biases beside its output.
+    #[test]
+    fn a_bf16_projection_is_encoded_at_load_time() {
+        let contract = author(|b| push_encoded_affine(b, Expr::src("w"), 512, 256, "out".into()));
+        let (shape, encoding) = declared(&contract, "out");
+        assert_eq!(shape, vec![512, 256]);
+        let spec = spec(&encoding);
+        assert_eq!(spec.group_size, AFFINE_GROUP as u32);
+        assert_eq!(spec.bits_per_element, 4);
+    }
+
+    #[test]
+    fn a_width_these_group_64_kernels_cannot_quantize_is_refused() {
+        let err = try_author(|b| push_encoded_affine(b, Expr::src("w"), 512, 100, "out".into()))
+            .expect_err("100 is not a multiple of 64");
+        let msg = message(err);
+        assert!(msg.contains("'out' has 100 columns"), "{msg}");
+        assert!(msg.contains("group-64"), "{msg}");
+    }
+
+    // ─── MXFP4 values ────────────────────────────────────────
+
+    /// The scales have to be declared before they can be scaled by, so the
+    /// pair leaves an internal tensor behind.
+    #[test]
+    fn mxfp4_values_leaves_its_scales_declared_and_internal() {
+        let mut captured = None;
+        let contract = author(|b| {
+            captured = Some(mxfp4_values(
+                b,
+                Expr::src("blocks"),
+                Expr::src("scales"),
+                512,
+                256,
+                "out.scales".into(),
+            )?);
+            Ok(())
+        });
+        let (shape, encoding) = declared(&contract, "out.scales");
+        assert_eq!(shape, vec![512, 256 / 32]);
+        assert_eq!(encoding, Encoding::Raw(DType::E8M0));
+        assert!(
+            contract
+                .tensors
+                .iter()
+                .any(|t| t.name == "out.scales" && t.visibility == Visibility::Internal),
+            "the scales are an intermediate, not a runtime tensor"
+        );
+        assert!(captured.is_some(), "the values expression came back");
+    }
+
+    #[test]
+    fn a_column_count_that_is_not_whole_blocks_is_refused() {
+        let err = try_author(|b| {
+            mxfp4_values(
+                b,
+                Expr::src("b"),
+                Expr::src("s"),
+                512,
+                100,
+                "out.scales".into(),
+            )?;
+            Ok(())
+        })
+        .expect_err("100 is not a whole number of 32-element blocks");
+        let msg = message(err);
+        assert!(msg.contains("'out.scales' has 100 columns"), "{msg}");
     }
 }

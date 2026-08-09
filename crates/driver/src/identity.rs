@@ -67,6 +67,16 @@ pub enum Backend {
     Cuda = 0,
     /// `BackendKind::Metal`. Compiles pipeline state objects.
     Metal = 1,
+    /// `BackendKind::Vulkan`. Compiles compute pipelines from SPIR-V.
+    ///
+    /// Added with `driver-vulkan`, which does not yet persist a
+    /// `VkPipelineCache` -- it builds its pipelines each run. The
+    /// discriminant is here anyway, and ahead of the need, for the reason the
+    /// byte exists at all: the archives live in one shared `$PIE_HOME/cache`,
+    /// and a Vulkan shell that started writing there under Metal's number
+    /// would hand a `.metallib` request a SPIR-V pipeline blob. A number that
+    /// costs nothing now is cheaper than a collision later.
+    Vulkan = 2,
 }
 
 /// The row bucket this shell compiles for.

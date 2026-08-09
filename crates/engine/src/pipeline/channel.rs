@@ -751,10 +751,10 @@ impl ChannelCell {
         if let Some(reason) = &self.poisoned {
             return Err(ChannelError::Poisoned(reason.clone()));
         }
-        if let Some(role) = self.role {
-            if role != HostRole::Reader {
-                return Err(ChannelError::WrongRole { role, op: "take" });
-            }
+        if let Some(role) = self.role
+            && role != HostRole::Reader
+        {
+            return Err(ChannelError::WrongRole { role, op: "take" });
         }
         let value = self.produced.pop_front().ok_or(ChannelError::Empty)?;
         self.front_override = None;
@@ -771,10 +771,10 @@ impl ChannelCell {
         if let Some(reason) = &self.poisoned {
             return Err(ChannelError::Poisoned(reason.clone()));
         }
-        if let Some(role) = self.role {
-            if role != HostRole::Reader {
-                return Err(ChannelError::WrongRole { role, op: "read" });
-            }
+        if let Some(role) = self.role
+            && role != HostRole::Reader
+        {
+            return Err(ChannelError::WrongRole { role, op: "read" });
         }
         self.produced.front().cloned().ok_or(ChannelError::Empty)
     }
@@ -1427,7 +1427,7 @@ mod tests {
                 mirror_base: mirror.as_ptr() as u64,
                 word_base: words.as_ptr() as u64,
                 mirror_bytes: mirror.len() as u64,
-                word_bytes: (words.len() * std::mem::size_of::<AtomicU64>()) as u64,
+                word_bytes: std::mem::size_of_val(words) as u64,
                 cell_bytes,
                 capacity,
                 head_word_index: 0,
@@ -1465,7 +1465,7 @@ mod tests {
         words[0].store(1, Ordering::Release);
         writer.put(vec![1, 1, 0, 0, 0, 0, 0, 0]).unwrap(); // bits 0,1 → 3
         assert_eq!(words[1].load(Ordering::Acquire), 3);
-        assert_eq!(mirror[2 % 3], 3, "sequence 2 lands at slot 2 of cap1=3");
+        assert_eq!(mirror[2], 3, "sequence 2 lands at slot 2 of cap1=3");
     }
 
     #[test]

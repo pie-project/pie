@@ -56,8 +56,8 @@ use std::time::{Duration, Instant};
 
 use client_api::ClientMessage;
 use ids::{ReqId, SessionId, TenantId, WorkerId};
-use worker_api::{BlobRef, Priority, Request, Tokens};
 use tokio::sync::{mpsc, watch};
+use worker_api::{BlobRef, Priority, Request, Tokens};
 
 /// Default bounded token-pipe capacity (chunks). The pipe is the per-turn
 /// backpressure buffer; a slow consumer fills it and throttles the worker.

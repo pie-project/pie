@@ -282,6 +282,11 @@ impl Instruct for QwenInstruct {
 // Tool Decoder
 // =============================================================================
 
+/// The markers the prompt asks for, the grammar constrains generation to,
+/// and the decoder reads back. Named once so the three cannot drift.
+const TOOL_CALL_OPEN: &str = "<tool_call>";
+const TOOL_CALL_CLOSE: &str = "</tool_call>";
+
 struct QwenToolDecoder {
     decoder: TokenizerDecoder,
     accumulated: String,
@@ -297,25 +302,34 @@ impl ToolDecoder for QwenToolDecoder {
         let text = self.decoder.feed(tokens);
         self.accumulated.push_str(&text);
 
-        if !self.inside {
-            if self.accumulated.contains("<tool_call>") {
+        // Looping matters: a caller is free to hand over a whole
+        // generation at once, and a block that both opens and closes
+        // inside a single feed has to resolve within it.
+        loop {
+            if !self.inside {
+                let Some(pos) = self.accumulated.find(TOOL_CALL_OPEN) else {
+                    return ToolEvent::Start;
+                };
+                self.accumulated = self.accumulated[pos + TOOL_CALL_OPEN.len()..].to_string();
                 self.inside = true;
-                if let Some(pos) = self.accumulated.find("<tool_call>") {
-                    self.accumulated = self.accumulated[pos + "<tool_call>".len()..].to_string();
-                }
+                continue;
+            }
+            let Some(pos) = self.accumulated.find(TOOL_CALL_CLOSE) else {
                 return ToolEvent::Start;
-            }
-        } else if let Some(pos) = self.accumulated.find("</tool_call>") {
+            };
             let call_json = self.accumulated[..pos].trim().to_string();
-            self.accumulated = self.accumulated[pos + "</tool_call>".len()..].to_string();
+            self.accumulated = self.accumulated[pos + TOOL_CALL_CLOSE.len()..].to_string();
             self.inside = false;
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&call_json) {
-                let name = v["name"].as_str().unwrap_or("").to_string();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&call_json)
+                && let Some(name) = v["name"].as_str()
+            {
+                // A `Call` with an empty name is one no dispatcher can
+                // route, so a block naming no function reports nothing.
                 let args = v["arguments"].to_string();
-                return ToolEvent::Call(name, args);
+                return ToolEvent::Call(name.to_string(), args);
             }
+            return ToolEvent::Start;
         }
-        ToolEvent::Start
     }
 
     fn reset(&mut self) {
@@ -376,7 +390,7 @@ mod tests {
     use std::sync::Arc;
     use tokenizer::Tokenizer;
 
-    fn make_tok() -> Arc<Tokenizer> {
+    pub(super) fn make_tok() -> Arc<Tokenizer> {
         let v: Vec<String> = vec![
             "<|im_start|>",
             "<|im_end|>",
@@ -402,7 +416,7 @@ mod tests {
         Arc::new(Tokenizer::from_vocab(&v))
     }
 
-    fn qwen3() -> QwenInstruct {
+    pub(super) fn qwen3() -> QwenInstruct {
         QwenInstruct::new(
             make_tok(),
             ChatMLConfig {
@@ -595,5 +609,365 @@ mod tests {
             }
             other => panic!("expected Call, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_tests {
+    use super::tests::{make_tok, qwen3};
+    use super::*;
+    use crate::instruct::{ChatEvent, ReasoningEvent};
+    use crate::shared::decoders::gbnf_sentence;
+
+    const WRAPPED: &str = r#"{"type":"function","function":{"name":"get_weather"}}"#;
+    const BARE: &str = r#"{"name":"get_time"}"#;
+
+    fn toolless() -> QwenInstruct {
+        QwenInstruct::new(make_tok(), PLAIN_CHATML)
+    }
+
+    fn stream(inst: &QwenInstruct, d: &mut dyn ToolDecoder, parts: &[&str]) -> Vec<ToolEvent> {
+        parts
+            .iter()
+            .map(|p| d.feed(&inst.tokenizer.encode(p)))
+            .collect()
+    }
+
+    fn last_call(events: &[ToolEvent]) -> Option<(String, String)> {
+        events.iter().rev().find_map(|e| match e {
+            ToolEvent::Call(n, a) => Some((n.clone(), a.clone())),
+            ToolEvent::Start => None,
+        })
+    }
+
+    #[test]
+    fn the_test_tokenizer_round_trips_the_markers() {
+        let inst = qwen3();
+        for part in [
+            "<tool_call>",
+            "</tool_call>",
+            r#"{"name":"f","arguments":{}}"#,
+        ] {
+            let ids = inst.tokenizer.encode(part);
+            assert_eq!(inst.tokenizer.decode(&ids, false), part, "part {part:?}");
+        }
+    }
+
+    // ─── Grammar ─────────────────────────────────────────────
+
+    /// The grammar constrains generation and the decoder reads the result
+    /// back; nothing but this test binds them. llama-3 shipped a rule
+    /// admitting text its own decoder rejected, so the binding is checked
+    /// rather than assumed.
+    #[test]
+    fn the_grammar_admits_exactly_what_the_decoder_reads() {
+        let inst = qwen3();
+        let grammar = inst
+            .tool_call_grammar(&[WRAPPED.to_string()])
+            .expect("a tool was offered");
+        let sentence = gbnf_sentence(
+            &grammar.source,
+            "tool-call",
+            &[("json-object", r#"{"city":"Oslo"}"#)],
+        );
+        assert_eq!(
+            sentence,
+            "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\":\"Oslo\"}}\n</tool_call>"
+        );
+
+        let mut decoder = inst.tool_decoder();
+        let events = stream(&inst, decoder.as_mut(), &[&sentence]);
+        assert_eq!(
+            last_call(&events),
+            Some(("get_weather".into(), r#"{"city":"Oslo"}"#.into())),
+            "the grammar admits {sentence:?}, which the decoder did not read as that call"
+        );
+    }
+
+    /// The prompt asks for the markers, the grammar constrains generation
+    /// to them, and the decoder reads them back. They were three separate
+    /// spellings of the same two strings.
+    #[test]
+    fn the_prompt_the_grammar_and_the_decoder_name_the_same_markers() {
+        let inst = qwen3();
+        let grammar = inst
+            .tool_call_grammar(&[WRAPPED.to_string()])
+            .expect("a tool was offered");
+        let prompt = QwenInstruct::build_tool_system_prompt(&[WRAPPED.to_string()]);
+        for marker in [TOOL_CALL_OPEN, TOOL_CALL_CLOSE] {
+            assert!(grammar.source.contains(marker), "grammar lacks {marker}");
+            assert!(prompt.contains(marker), "prompt lacks {marker}");
+        }
+    }
+
+    #[test]
+    fn the_grammar_names_every_tool_in_either_spelling() {
+        let inst = qwen3();
+        let grammar = inst
+            .tool_call_grammar(&[
+                WRAPPED.to_string(),
+                BARE.to_string(),
+                "not json at all".to_string(),
+                r#"{"description":"nameless"}"#.to_string(),
+            ])
+            .expect("two tools are named");
+        assert!(
+            grammar
+                .source
+                .contains(r#"tool-name ::= "get_weather" | "get_time""#)
+        );
+    }
+
+    #[test]
+    fn a_grammar_needs_a_tool_that_names_itself() {
+        let inst = qwen3();
+        assert!(inst.tool_call_grammar(&[]).is_none());
+        assert!(inst.tool_call_grammar(&["not json".to_string()]).is_none());
+        assert!(
+            inst.tool_call_grammar(&[r#"{"description":"x"}"#.to_string()])
+                .is_none()
+        );
+    }
+
+    /// A template without tools must not publish a grammar for them, even
+    /// when the caller offers some.
+    #[test]
+    fn a_toolless_template_publishes_no_grammar() {
+        assert!(
+            toolless()
+                .tool_call_grammar(&[WRAPPED.to_string()])
+                .is_none()
+        );
+    }
+
+    // ─── The prompt ──────────────────────────────────────────
+
+    #[test]
+    fn the_tool_prompt_lists_every_signature_between_the_tags() {
+        let prompt =
+            QwenInstruct::build_tool_system_prompt(&["sig-one".to_string(), "sig-two".to_string()]);
+        // The preamble names `<tools></tools>` before the block itself
+        // opens, so the block is the LAST pair.
+        let inner = prompt
+            .rsplit_once("</tools>")
+            .and_then(|(head, _)| head.rsplit_once("<tools>"))
+            .map(|(_, inner)| inner)
+            .expect("the signatures sit between the tags");
+        assert_eq!(inner, "\nsig-one\nsig-two\n");
+        assert!(prompt.contains("<tool_call></tool_call> XML tags"));
+    }
+
+    #[test]
+    fn a_toolless_template_equips_nothing_and_answers_nothing() {
+        let inst = toolless();
+        assert!(inst.equip(&[WRAPPED.to_string()]).is_empty());
+        assert!(inst.answer("get_weather", "sunny").is_empty());
+    }
+
+    #[test]
+    fn a_tool_result_comes_back_as_a_wrapped_user_turn() {
+        let inst = qwen3();
+        let text = inst
+            .tokenizer
+            .decode(&inst.answer("get_weather", "Hello"), false);
+        assert_eq!(
+            text,
+            "<|im_start|>user\n<tool_response>\nHello\n</tool_response><|im_end|>\n"
+        );
+    }
+
+    #[test]
+    fn an_unknown_role_is_written_as_a_user_turn() {
+        let inst = qwen3();
+        assert_eq!(
+            inst.role_tokens("environment", "Hello"),
+            inst.role_tokens("user", "Hello")
+        );
+    }
+
+    // ─── The decoder ─────────────────────────────────────────
+
+    #[test]
+    fn a_call_may_arrive_across_several_steps() {
+        let inst = qwen3();
+        let mut decoder = inst.tool_decoder();
+        let events = stream(
+            &inst,
+            decoder.as_mut(),
+            &[
+                "Let me check. ",
+                "<tool_call>",
+                "\n",
+                r#"{"name": "get_weather", "arguments": {"city":"Oslo"}}"#,
+                "\n",
+                "</tool_call>",
+            ],
+        );
+        assert_eq!(
+            last_call(&events),
+            Some(("get_weather".into(), r#"{"city":"Oslo"}"#.into()))
+        );
+        // Opening the block is not yet a call.
+        assert!(matches!(events[1], ToolEvent::Start));
+    }
+
+    /// Regression: the decoder made at most one state transition per
+    /// feed, so a block that opened and closed inside one chunk consumed
+    /// its opener, reported `Start`, and dropped the call. The guest
+    /// chooses the chunking, so this was reachable from any caller that
+    /// batched tokens.
+    #[test]
+    fn a_whole_block_in_one_feed_resolves_within_it() {
+        let inst = qwen3();
+        let mut decoder = inst.tool_decoder();
+        let events = stream(
+            &inst,
+            decoder.as_mut(),
+            &[r#"Sure. <tool_call>{"name": "get_weather", "arguments": {}}</tool_call>"#],
+        );
+        assert_eq!(
+            last_call(&events),
+            Some(("get_weather".into(), "{}".into()))
+        );
+    }
+
+    #[test]
+    fn two_blocks_in_a_row_both_resolve() {
+        let inst = qwen3();
+        let mut decoder = inst.tool_decoder();
+        let events = stream(
+            &inst,
+            decoder.as_mut(),
+            &[
+                "<tool_call>",
+                r#"{"name": "first", "arguments": {}}"#,
+                "</tool_call>",
+                "<tool_call>",
+                r#"{"name": "second", "arguments": {}}"#,
+                "</tool_call>",
+            ],
+        );
+        let names: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ToolEvent::Call(n, _) => Some(n.as_str()),
+                ToolEvent::Start => None,
+            })
+            .collect();
+        assert_eq!(names, ["first", "second"]);
+    }
+
+    #[test]
+    fn a_block_naming_no_function_is_not_a_call() {
+        let inst = qwen3();
+        for body in [r#"{"arguments": {}}"#, r#"{"name": 7}"#, "not json", "[]"] {
+            let mut decoder = inst.tool_decoder();
+            let events = stream(
+                &inst,
+                decoder.as_mut(),
+                &["<tool_call>", body, "</tool_call>"],
+            );
+            assert_eq!(last_call(&events), None, "body {body:?}");
+        }
+    }
+
+    #[test]
+    fn a_call_with_no_arguments_key_reports_null() {
+        let inst = qwen3();
+        let mut decoder = inst.tool_decoder();
+        let events = stream(
+            &inst,
+            decoder.as_mut(),
+            &["<tool_call>", BARE, "</tool_call>"],
+        );
+        assert_eq!(last_call(&events), Some(("get_time".into(), "null".into())));
+    }
+
+    #[test]
+    fn a_toolless_template_never_reports_a_call() {
+        let inst = toolless();
+        let mut decoder = inst.tool_decoder();
+        let events = stream(
+            &inst,
+            decoder.as_mut(),
+            &[
+                "<tool_call>",
+                r#"{"name": "get_weather", "arguments": {}}"#,
+                "</tool_call>",
+            ],
+        );
+        assert_eq!(last_call(&events), None);
+    }
+
+    #[test]
+    fn reset_abandons_a_block_in_progress() {
+        let inst = qwen3();
+        let mut decoder = inst.tool_decoder();
+        stream(&inst, decoder.as_mut(), &["<tool_call>"]);
+        decoder.reset();
+        let after = stream(
+            &inst,
+            decoder.as_mut(),
+            &[r#"{"name": "f", "arguments": {}}"#, "</tool_call>"],
+        );
+        assert_eq!(last_call(&after), None);
+    }
+
+    #[test]
+    fn reset_forgets_buffered_text() {
+        let inst = qwen3();
+        let mut decoder = inst.tool_decoder();
+        stream(&inst, decoder.as_mut(), &["thinking about it <tool_"]);
+        decoder.reset();
+        let after = stream(
+            &inst,
+            decoder.as_mut(),
+            &["call>", r#"{"name": "f", "arguments": {}}"#, "</tool_call>"],
+        );
+        assert_eq!(last_call(&after), None);
+    }
+
+    // ─── Reasoning ───────────────────────────────────────────
+
+    /// A template without thinking must not treat a stray `<think>` in
+    /// the answer as the start of a reasoning block.
+    #[test]
+    fn a_template_without_thinking_reports_no_reasoning() {
+        let inst = toolless();
+        let mut decoder = inst.reasoning_decoder();
+        for part in ["<think>", "Hello", "</think>"] {
+            assert!(matches!(
+                decoder.feed(&inst.tokenizer.encode(part)),
+                ReasoningEvent::Delta(t) if t.is_empty()
+            ));
+        }
+        decoder.reset();
+    }
+
+    #[test]
+    fn reasoning_waits_for_the_opening_tag() {
+        let inst = qwen3();
+        let mut decoder = inst.reasoning_decoder();
+        let hello = inst.tokenizer.encode("Hello");
+        assert!(matches!(decoder.feed(&hello), ReasoningEvent::Delta(t) if t.is_empty()));
+        assert!(matches!(
+            decoder.feed(&inst.tokenizer.encode("<think>")),
+            ReasoningEvent::Start
+        ));
+        assert!(matches!(
+            decoder.feed(&inst.tokenizer.encode("</think>")),
+            ReasoningEvent::Complete(t) if t.is_empty()
+        ));
+    }
+
+    #[test]
+    fn the_chat_decoder_stops_on_the_turn_end() {
+        let inst = qwen3();
+        let mut decoder = inst.chat_decoder();
+        let hello = inst.tokenizer.encode("Hello");
+        assert!(matches!(decoder.feed(&hello), ChatEvent::Delta(t) if t == "Hello"));
+        let mut tail = inst.tokenizer.encode(" world");
+        tail.extend(inst.tokenizer.encode("<|im_end|>"));
+        assert!(matches!(decoder.feed(&tail), ChatEvent::Done(t) if t == "Hello world"));
     }
 }

@@ -516,6 +516,87 @@ impl Pool {
         })
     }
 
+    /// Grow or shrink the cache to `pages`, keeping what the pages that
+    /// survive hold.
+    ///
+    /// # Why this reallocates instead of mapping
+    ///
+    /// `driver-metal`'s pool is sparse: it commits and releases pages without
+    /// moving a single address a fire has bound, and it has to be, because
+    /// Metal binds its heap once. Vulkan has sparse binding too, and this
+    /// does not use it -- `sparseBinding` is an optional feature, and the
+    /// whole point of [`crate::device::Tier`] is that this driver runs where
+    /// the optional features are absent.
+    ///
+    /// It does not need to. **Every descriptor in this driver is written
+    /// during the step that uses it** -- `turns::Serving::step` records a
+    /// fresh command buffer and binds the pool's buffers by handle each time
+    /// -- so no address survives a step for a resize to invalidate. That is a
+    /// property of the recording path and not an accident, so a change that
+    /// cached descriptor sets across steps must change this too.
+    ///
+    /// The pages that survive keep their contents, at the same page numbers.
+    /// A shrink drops the tail; the caller owes the check that nobody holds a
+    /// page in it, which [`crate::shell::Shell::resize_pool`] makes.
+    ///
+    /// # Errors
+    ///
+    /// [`Failed`] from the allocation, in which case the pool is UNCHANGED
+    /// and still usable -- the new buffers are all taken before any old one
+    /// is freed, which is why the peak is both sizes at once. A pool that
+    /// half-resized would have some layers at the new page count and some at
+    /// the old, and `Shape::slot` would index every one of them wrongly.
+    ///
+    /// Refuses a target of zero: a cache with no page is not a smaller cache,
+    /// it is one that cannot answer.
+    pub fn resize(&mut self, device: &Device, pages: u32) -> Result<(), Failed> {
+        if pages == 0 {
+            return Err(Failed::Vulkan(
+                "a cache of zero pages cannot hold a conversation".to_string(),
+            ));
+        }
+        if pages == self.shape.pages {
+            return Ok(());
+        }
+        let mut grown = self.shape;
+        grown.pages = pages;
+        let kept = usize::try_from(
+            self.shape.pages.min(pages) as u64
+                * self.shape.page_size as u64
+                * self.shape.row()
+                * self.shape.bytes as u64,
+        )
+        .unwrap_or(usize::MAX);
+        let bytes = usize::try_from(grown.layer_bytes()).unwrap_or(usize::MAX);
+
+        let mut fresh = Vec::with_capacity(self.keys.len() + self.values.len());
+        for old in self.keys.iter().chain(&self.values) {
+            // Read before allocate, so a failure has nothing half-written.
+            let held = device.read(old)?;
+            let mut filled = vec![0u8; bytes];
+            filled[..kept].copy_from_slice(&held[..kept]);
+            match device.buffer(&filled) {
+                Ok(b) => fresh.push(b),
+                Err(e) => {
+                    // Nothing of the pool has changed yet.
+                    for b in fresh {
+                        device.free(b);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let values = fresh.split_off(self.keys.len());
+        for b in std::mem::replace(&mut self.keys, fresh)
+            .into_iter()
+            .chain(std::mem::replace(&mut self.values, values))
+        {
+            device.free(b);
+        }
+        self.shape = grown;
+        Ok(())
+    }
+
     /// What the cache was built to.
     #[must_use]
     pub const fn shape(&self) -> Shape {
@@ -621,6 +702,29 @@ impl Pool {
         self.state(device, FireTable::RopeFrequencies, &words)
     }
 
+    /// Give every buffer back to the device.
+    ///
+    /// Explicit, for the same reason [`Device::free`] is: a `Drop` would need
+    /// the device, and a pool that carried one could not be stored beside it.
+    ///
+    /// A caller that OWNS its device has to call this. The validation layer
+    /// reports the alternative as
+    /// `vkDestroyDevice(): VkBuffer ... has not been destroyed`, and this
+    /// crate treats a layer error as fatal -- which is how the omission was
+    /// found, the first time anything here owned a device rather than
+    /// borrowing a shared one.
+    pub fn release(&mut self, device: &Device) {
+        for buffer in self
+            .keys
+            .drain(..)
+            .chain(self.values.drain(..))
+            .chain(std::mem::take(&mut self.tables).into_values())
+            .chain(self.named.take())
+        {
+            device.free(buffer);
+        }
+    }
+
     /// A single buffer standing in for every weight and seam value.
     ///
     /// A driver that has loaded a model answers those from its own tables;
@@ -644,22 +748,192 @@ impl Pool {
         side.get(layer as usize)
     }
 
+    /// Copy one page's rows onto another page, in every layer.
+    ///
+    /// The unit is a PAGE and not a row range, because a page is the unit the
+    /// book hands out and the only one whose bytes are contiguous:
+    /// [`Shape::slot`] puts a page's rows next to each other, so one page in
+    /// one layer is one `memmove` of `page_size * row()` elements. A row range
+    /// inside a page is contiguous too and would be a second entry point with
+    /// a second off-by-one; a caller that wants rows can copy the page and
+    /// grow the destination to fewer tokens.
+    ///
+    /// Both the key and the value cache, for every layer. Copying one side, or
+    /// all but the last layer, produces a conversation that attends over its
+    /// own history for part of the model and over somebody else's for the
+    /// rest -- which is finite, plausible, and wrong.
+    ///
+    /// # Errors
+    ///
+    /// [`Failed::Vulkan`] if either page is past the pool, or the copy leaves
+    /// a layer's buffer.
+    pub fn copy_page(&self, device: &Device, from: u32, to: u32) -> Result<(), Failed> {
+        if from >= self.shape.pages || to >= self.shape.pages {
+            return Err(Failed::Vulkan(format!(
+                "page {from} to page {to} in a pool of {}",
+                self.shape.pages
+            )));
+        }
+        self.copy_rows(device, (from, 0), (to, 0), self.shape.page_size)
+    }
+
+    /// Copy `tokens` rows from one place in the cache to another.
+    ///
+    /// Each side is `(page, offset in tokens within that page)`. This is what
+    /// [`Pool::copy_page`] is written in terms of, because a whole page and a
+    /// run of rows differ only in the length: [`Shape::slot`] lays a page's
+    /// rows out contiguously, so both are one `memmove` per layer per side.
+    /// One implementation, so a fork and a partial prefix share cannot
+    /// disagree about where a row is.
+    ///
+    /// # Errors
+    ///
+    /// [`Failed::Vulkan`] if a page is past the pool, if a run leaves its
+    /// page, or if a layer has no cache. A run that left its page would land
+    /// in the NEXT page rather than out of bounds, which nothing would
+    /// report.
+    pub fn copy_rows(
+        &self,
+        device: &Device,
+        from: (u32, u32),
+        to: (u32, u32),
+        tokens: u32,
+    ) -> Result<(), Failed> {
+        for (page, offset) in [from, to] {
+            if page >= self.shape.pages {
+                return Err(Failed::Vulkan(format!(
+                    "page {page} in a pool of {}",
+                    self.shape.pages
+                )));
+            }
+            if offset
+                .checked_add(tokens)
+                .is_none_or(|e| e > self.shape.page_size)
+            {
+                return Err(Failed::Vulkan(format!(
+                    "{tokens} rows at offset {offset} in a {}-row page",
+                    self.shape.page_size
+                )));
+            }
+        }
+        // In BYTES, from the same expression the shaders index with. Written
+        // as a slot difference rather than as `page * page_size * row * bytes`
+        // so that a change to the layout reaches this too.
+        let at = |(page, offset): (u32, u32)| {
+            self.shape.slot(page, offset, 0, 0) * self.shape.bytes as u64
+        };
+        let bytes = tokens as u64 * self.shape.row() * self.shape.bytes as u64;
+        for layer in 0..self.shape.layers {
+            for values in [false, true] {
+                let Some(buffer) = self.cache(layer, values) else {
+                    return Err(Failed::Vulkan(format!("layer {layer} has no cache")));
+                };
+                device.copy_within(buffer, at(from), at(to), bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply the engine's `copy_kv` plan: a list of whole-page moves and a
+    /// list of single-row cells.
+    ///
+    /// This is the SHAPE the engine speaks, and [`crate::shell::Shell::fork`] is the shape a
+    /// conversation has; they are different verbs on purpose. The engine's
+    /// prefix cache knows which physical page it wants where and does not have
+    /// a conversation id to name; a fork knows the conversation and not the
+    /// pages. Both end at [`Pool::copy_rows`].
+    ///
+    /// Returns how many copies were made -- pages plus cells.
+    ///
+    /// # What is checked before anything moves
+    ///
+    /// Every page and every cell, against the pool. The C++ this replaces
+    /// applies the pages first and notices a bad cell afterwards, which
+    /// leaves the cache half-moved with no way back; `driver-metal`'s port
+    /// records the same finding. So the plan is walked once for refusals and
+    /// once for work.
+    ///
+    /// # Errors
+    ///
+    /// [`Failed::Vulkan`] naming which page, which cell, or which domain. A
+    /// domain that is not [`driver_api::PIE_MEMORY_DOMAIN_VULKAN_DEVICE`] is
+    /// refused rather than assumed: a plan addressed to another backend's
+    /// memory that this one served would copy the right bytes to the wrong
+    /// device's pages.
+    pub fn copy_plan(
+        &self,
+        device: &Device,
+        plan: &driver_api::KvCopyPlan,
+    ) -> Result<usize, Failed> {
+        let vulkan = driver_api::PIE_MEMORY_DOMAIN_VULKAN_DEVICE;
+        if plan.src_domain != vulkan || plan.dst_domain != vulkan {
+            return Err(Failed::Vulkan(format!(
+                "a copy from domain {} to domain {} was given to the Vulkan driver, \
+                 which serves domain {vulkan}",
+                plan.src_domain, plan.dst_domain
+            )));
+        }
+        if plan.src_page_ids.len() != plan.dst_page_ids.len() {
+            return Err(Failed::Vulkan(format!(
+                "{} source pages and {} destination pages",
+                plan.src_page_ids.len(),
+                plan.dst_page_ids.len()
+            )));
+        }
+        let shape = self.shape;
+        let check = |page: u32, offset: u32, what: &str| -> Result<(), Failed> {
+            if page >= shape.pages || offset >= shape.page_size {
+                return Err(Failed::Vulkan(format!(
+                    "{what} names page {page} row {offset}, and the pool has {} pages \
+                     of {} rows",
+                    shape.pages, shape.page_size
+                )));
+            }
+            Ok(())
+        };
+        for (i, (&src, &dst)) in plan.src_page_ids.iter().zip(&plan.dst_page_ids).enumerate() {
+            check(src, 0, &format!("page move {i}'s source"))?;
+            check(dst, 0, &format!("page move {i}'s destination"))?;
+        }
+        for (i, cell) in plan.cells.iter().enumerate() {
+            check(
+                cell.src_page_id,
+                cell.src_token_offset,
+                &format!("cell {i}'s source"),
+            )?;
+            check(
+                cell.dst_page_id,
+                cell.dst_token_offset,
+                &format!("cell {i}'s destination"),
+            )?;
+        }
+
+        // Nothing above this line moved a byte.
+        for (&src, &dst) in plan.src_page_ids.iter().zip(&plan.dst_page_ids) {
+            self.copy_page(device, src, dst)?;
+        }
+        for cell in &plan.cells {
+            self.copy_rows(
+                device,
+                (cell.src_page_id, cell.src_token_offset),
+                (cell.dst_page_id, cell.dst_token_offset),
+                1,
+            )?;
+        }
+        Ok(plan.src_page_ids.len() + plan.cells.len())
+    }
+
     /// Give every allocation back.
     ///
     /// Not [`Drop`]: freeing a Vulkan buffer needs the device that made it,
     /// and a `Drop` that cannot reach one either stores a handle it must not
     /// outlive or leaks. Stated as a call so the leak is the caller's to
     /// avoid rather than this module's to hide.
-    pub fn close(self, device: &Device) {
-        for b in self
-            .keys
-            .into_iter()
-            .chain(self.values)
-            .chain(self.tables.into_values())
-            .chain(self.named)
-        {
-            device.free(b);
-        }
+    pub fn close(mut self, device: &Device) {
+        // One implementation, because two ways to free the same buffers is
+        // one way to free half of them. `release` exists for the owner that
+        // frees during `Drop` and cannot consume itself.
+        self.release(device);
     }
 }
 
@@ -1336,6 +1610,18 @@ impl Weights {
         self.held.get(name)
     }
 
+    /// Give every held weight and the seam back to the device.
+    ///
+    /// See [`Pool::release`] for why this is not a `Drop`.
+    pub fn release(&mut self, device: &Device) {
+        for buffer in std::mem::take(&mut self.held)
+            .into_values()
+            .chain(self.seam.take())
+        {
+            device.free(buffer);
+        }
+    }
+
     /// One buffer standing in for every value the seam binds by name.
     ///
     /// Unlike the weights these are not distinguished here, because a seam
@@ -1367,13 +1653,9 @@ impl Weights {
     }
 
     /// Give every buffer back.
-    pub fn close(self, device: &Device) {
-        for (_, b) in self.held {
-            device.free(b);
-        }
-        if let Some(b) = self.seam {
-            device.free(b);
-        }
+    pub fn close(mut self, device: &Device) {
+        // See `Pool::close`: one implementation.
+        self.release(device);
     }
 }
 

@@ -867,6 +867,18 @@ impl ExecutorCoreHandle {
     }
 }
 
+/// Not boxed. The 1424 bytes are `Execute`'s, and `Execute` is 1384 of them
+/// because `RemoteLaunch` is -- which is `LaunchPlan` (~1160B) plus eight
+/// `Vec` headers. So the large variant is also the HOT one: `Launch` is sent
+/// once per forward step, while the small variants (`ReleaseBlob`, `Retired`,
+/// `Connect`) are rare. Boxing would buy a cheaper mpsc slot for the rare
+/// messages by adding an allocation to every forward. If this is worth
+/// changing, the place to change it is `LaunchPlan`'s own layout, with a
+/// benchmark -- not here, on a lint's say-so.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the large variant is the hot one"
+)]
 enum Command {
     Connect {
         client_id: ClientId,
@@ -1355,7 +1367,7 @@ impl ExecutorActor {
             client.client_nonce = request.client_nonce;
             client.lease_slot = Some(slot);
             client.transfer = Some(RemoteTransferKind::Inline);
-            return Ok(ExecutorResponse::Hello(HelloResponse {
+            return Ok(ExecutorResponse::Hello(Box::new(HelloResponse {
                 wire_version: REMOTE_WIRE_VERSION,
                 model: self.model.clone(),
                 kv_layout: request.kv_layout,
@@ -1369,7 +1381,7 @@ impl ExecutorActor {
                     handle: None,
                     metadata: Vec::new(),
                 },
-            }));
+            })));
         }
         let kv_handle = self
             .kv_handle
@@ -1429,7 +1441,7 @@ impl ExecutorActor {
         self.stats
             .leased_pages
             .fetch_add(grant.num_pages, Ordering::Relaxed);
-        Ok(ExecutorResponse::Hello(HelloResponse {
+        Ok(ExecutorResponse::Hello(Box::new(HelloResponse {
             wire_version: REMOTE_WIRE_VERSION,
             model: self.model.clone(),
             kv_layout: kv_handle.layout.clone(),
@@ -1456,7 +1468,7 @@ impl ExecutorActor {
                     }
                 },
             },
-        }))
+        })))
     }
 
     fn register_program(
@@ -3000,9 +3012,7 @@ fn append_plan(
         .rs_buffer_slot_ids
         .extend(source.rs_buffer_slot_ids);
     destination.masks.extend(source.masks);
-    destination
-        .sampling_indices
-        .extend(source.sampling_indices.into_iter());
+    destination.sampling_indices.extend(source.sampling_indices);
     destination.context_ids.extend(source.context_ids);
     destination.single_token_mode &= source.single_token_mode;
     destination.has_user_mask |= source.has_user_mask;
@@ -3285,9 +3295,12 @@ fn validate_raw_encode_plan(
             && plan.image_pixel_indptr.last().copied()
                 == u32::try_from(plan.image_pixels.len()).ok()
             && !plan.image_pixels.is_empty()
-            && plan.image_pixels.len() % std::mem::size_of::<f32>() == 0
+            && plan
+                .image_pixels
+                .len()
+                .is_multiple_of(std::mem::size_of::<f32>())
             && !plan.image_patch_positions.is_empty()
-            && plan.image_patch_positions.len() % 2 == 0
+            && plan.image_patch_positions.len().is_multiple_of(2)
             && plan.image_pixel_indptr.windows(2).all(|window| {
                 window[0] <= window[1]
                     && window[0] % std::mem::size_of::<f32>() as u32 == 0
@@ -3302,7 +3315,10 @@ fn validate_raw_encode_plan(
             && plan.audio_feature_indptr.last().copied()
                 == u32::try_from(plan.audio_features.len()).ok()
             && !plan.audio_features.is_empty()
-            && plan.audio_features.len() % std::mem::size_of::<f32>() == 0
+            && plan
+                .audio_features
+                .len()
+                .is_multiple_of(std::mem::size_of::<f32>())
             && plan.audio_feature_indptr.windows(2).all(|window| {
                 window[0] < window[1]
                     && window[0] % std::mem::size_of::<f32>() as u32 == 0
@@ -3434,7 +3450,7 @@ mod tests {
         let ExecutorResponse::Hello(response) = response else {
             panic!("unexpected hello response {response:?}");
         };
-        response
+        *response
     }
 
     #[derive(Clone)]

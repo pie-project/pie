@@ -23,17 +23,17 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result};
-use futures::StreamExt;
 use controller_api::WorkerStatus;
+use futures::StreamExt;
 use ids::{ReqId, WorkerId};
-use worker_api::{
-    Accepted, Control, GatewayInbound, Request, Tokens, WorkerControlClient, accept_gateway_link,
-    dispatch_codec,
-};
 use tarpc::serde_transport::tcp;
 use tarpc::server::{BaseChannel, Channel};
 use tokio::net::ToSocketAddrs;
 use tokio::sync::watch;
+use worker_api::{
+    Accepted, Control, GatewayInbound, Request, Tokens, WorkerControlClient, accept_gateway_link,
+    dispatch_codec,
+};
 
 use crate::session::Sessions;
 

@@ -57,7 +57,11 @@ impl FleetRun {
         if self.lane_latencies.is_empty() {
             return 0;
         }
-        let mut samples: Vec<_> = self.lane_latencies.iter().map(Duration::as_micros).collect();
+        let mut samples: Vec<_> = self
+            .lane_latencies
+            .iter()
+            .map(Duration::as_micros)
+            .collect();
         samples.sort_unstable();
         let index = ((samples.len() - 1) * p).div_ceil(100);
         samples[index]
@@ -102,7 +106,11 @@ fn parse_tokens(json: &str) -> Option<Vec<i64>> {
         .split(',')
         .filter_map(|s| s.trim().parse::<i64>().ok())
         .collect();
-    if tokens.is_empty() { None } else { Some(tokens) }
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens)
+    }
 }
 
 /// Launch every lane at once and wait for all of them.

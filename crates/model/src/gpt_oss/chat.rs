@@ -268,6 +268,8 @@ impl Instruct for GptOssInstruct {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instruct::{ChatEvent, ReasoningEvent, ToolEvent};
+    use serde_json::json;
     use std::sync::Arc;
     use tokenizer::Tokenizer;
 
@@ -321,6 +323,248 @@ mod tests {
         let usr = inst.user("Hello");
         assert!(!usr.is_empty());
         assert_eq!(&usr[..inst.user_prefix.len()], &inst.user_prefix[..]);
+    }
+
+    /// Every branch of the JSON-Schema-to-TypeScript renderer.
+    ///
+    /// It is reached only through [`GptOssInstruct::equip`], and a tool
+    /// schema is the one input to a chat template that a caller supplies
+    /// verbatim -- so an arm that renders the wrong string is a wrong
+    /// tool description handed to the model, not a crash.
+    #[test]
+    fn schema_types_render_as_typescript() {
+        let ts = |v: serde_json::Value| render_typescript_type(&v);
+        assert_eq!(ts(json!({"type": "string"})), "string");
+        assert_eq!(
+            ts(json!({"type": "string", "enum": ["a", "b"]})),
+            "\"a\" | \"b\""
+        );
+        assert_eq!(
+            ts(json!({"type": "string", "nullable": true})),
+            "string | null"
+        );
+        assert_eq!(ts(json!({"type": "number"})), "number");
+        assert_eq!(ts(json!({"type": "integer"})), "number");
+        assert_eq!(ts(json!({"type": "boolean"})), "boolean");
+        assert_eq!(
+            ts(json!({"type": "array", "items": {"type": "boolean"}})),
+            "boolean[]"
+        );
+        assert_eq!(ts(json!({"type": "array"})), "any[]");
+        assert_eq!(ts(json!({"type": "object"})), "object");
+        assert_eq!(
+            ts(json!({"oneOf": [{"type": "string"}, {"type": "number"}]})),
+            "string | number"
+        );
+        assert_eq!(ts(json!({})), "any");
+        // A property not named in `required` is optional, which is the
+        // one place the renderer changes a type's MEANING rather than
+        // its spelling.
+        assert_eq!(
+            ts(json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}, "b": {"type": "number"}},
+                "required": ["a"],
+            })),
+            "{\na: string,\nb?: number\n}"
+        );
+    }
+
+    /// A nested schema recurses on both the array and the object arm.
+    #[test]
+    fn schema_types_nest() {
+        assert_eq!(
+            render_typescript_type(&json!({
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"tag": {"type": "string", "enum": ["x"]}},
+                    "required": ["tag"],
+                },
+            })),
+            "{\ntag: \"x\"\n}[]"
+        );
+    }
+
+    /// No tools is no developer turn, not an empty one.
+    #[test]
+    fn equipping_nothing_emits_nothing() {
+        assert!(gptoss().equip(&[]).is_empty());
+    }
+
+    /// The namespace block, rendered into a developer turn.
+    #[test]
+    fn equip_renders_the_functions_namespace() {
+        let inst = gptoss();
+        let tool = json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string", "description": "Which city"},
+                        "unit": {"type": "string", "enum": ["c", "f"]},
+                    },
+                    "required": ["city"],
+                },
+            },
+        });
+        let text = inst
+            .tokenizer
+            .decode(&inst.equip(&[tool.to_string()]), false);
+        assert_eq!(
+            text,
+            "<|start|>developer<|message|> # Tools\n\n ## functions\n\n\
+             namespace functions {\n\n\
+             // Get the weather\n\
+             type get_weather = (_: {\n\
+             // Which city\n\
+             city: string,\n\
+             unit?: \"c\" | \"f\",\n\
+             }) => any;\n\n\
+             } // namespace functions<|end|>"
+        );
+    }
+
+    /// A tool with no parameters is a nullary call, not a call taking an
+    /// empty object -- the two render differently and mean different
+    /// things to the model.
+    #[test]
+    fn a_tool_without_parameters_is_nullary() {
+        let inst = gptoss();
+        let text = inst.tokenizer.decode(
+            &inst.equip(&[json!({"name": "ping", "description": "d"}).to_string()]),
+            false,
+        );
+        assert!(text.contains("type ping = () => any;"), "{text}");
+    }
+
+    /// The schema may be the function object itself, without the
+    /// OpenAI-style `{"type":"function","function":{...}}` envelope.
+    #[test]
+    fn a_bare_function_object_is_unwrapped_the_same_way() {
+        let inst = gptoss();
+        let bare = json!({"name": "f", "description": "d", "parameters":
+            {"properties": {"x": {"type": "number"}}}});
+        let wrapped = json!({"function": bare});
+        assert_eq!(
+            inst.equip(&[bare.to_string()]),
+            inst.equip(&[wrapped.to_string()])
+        );
+    }
+
+    /// An unparseable tool is skipped, and the ones around it are not.
+    ///
+    /// `equip` takes strings a caller built, so malformed JSON is a
+    /// reachable input rather than a hypothetical one.
+    #[test]
+    fn an_unparseable_tool_does_not_take_the_others_with_it() {
+        let inst = gptoss();
+        let text = inst.tokenizer.decode(
+            &inst.equip(&[
+                "{not json".to_string(),
+                json!({"name": "kept", "description": ""}).to_string(),
+            ]),
+            false,
+        );
+        assert!(text.contains("type kept = "), "{text}");
+    }
+
+    /// A tool missing its name or description still renders, because a
+    /// caller's omission should not silently drop the tool.
+    #[test]
+    fn a_nameless_tool_renders_as_unknown() {
+        let inst = gptoss();
+        let text = inst
+            .tokenizer
+            .decode(&inst.equip(&[json!({"parameters": {}}).to_string()]), false);
+        assert!(text.contains("// \ntype unknown = () => any;"), "{text}");
+    }
+
+    /// A tool result comes back on the commentary channel, addressed
+    /// from the function to the assistant, with the value JSON-encoded.
+    #[test]
+    fn answer_returns_on_the_commentary_channel() {
+        let inst = gptoss();
+        let text = inst
+            .tokenizer
+            .decode(&inst.answer("get_weather", "12C"), false);
+        assert_eq!(
+            text,
+            "<|start|>functions.get_weather to=assistant\
+             <|channel|>commentary<|message|>\"12C\"<|end|>"
+        );
+    }
+
+    /// The value is escaped as JSON, so a quote in a tool result cannot
+    /// end the string early.
+    #[test]
+    fn answer_escapes_the_value() {
+        let inst = gptoss();
+        let text = inst.tokenizer.decode(&inst.answer("f", "a\"b"), false);
+        assert!(text.ends_with("<|message|>\"a\\\"b\"<|end|>"), "{text}");
+    }
+
+    /// The chat decoder ends the turn on a stop token and hands back
+    /// everything before it.
+    #[test]
+    fn the_chat_decoder_stops_on_a_seal_token() {
+        let inst = gptoss();
+        let mut dec = inst.chat_decoder();
+        let hello = inst.tokenizer.encode("Hello");
+        match dec.feed(&hello) {
+            ChatEvent::Delta(d) => assert_eq!(d, "Hello"),
+            other => panic!("expected a delta, got {other:?}"),
+        }
+        let ret = inst.tokenizer.token_to_id("<|return|>").unwrap();
+        match dec.feed(&[ret]) {
+            ChatEvent::Done(text) => assert_eq!(text, "Hello"),
+            other => panic!("expected done, got {other:?}"),
+        }
+    }
+
+    /// Reasoning is a CHANNEL, not a tag pair: the block opens on
+    /// `<|channel|>analysis<|message|>` and closes on `<|end|>`.
+    #[test]
+    fn the_reasoning_decoder_reads_the_analysis_channel() {
+        let inst = gptoss();
+        let mut dec = inst.reasoning_decoder();
+
+        // Before the channel opens there is nothing to report.
+        assert!(matches!(
+            dec.feed(&inst.tokenizer.encode("Hello")),
+            ReasoningEvent::Delta(d) if d.is_empty()
+        ));
+
+        assert!(matches!(
+            dec.feed(&inst.analysis_prefix_ids),
+            ReasoningEvent::Start
+        ));
+        assert!(matches!(
+            dec.feed(&inst.tokenizer.encode("thinking")),
+            ReasoningEvent::Delta(d) if d == "thinking"
+        ));
+        match dec.feed(&inst.end_token) {
+            ReasoningEvent::Complete(text) => assert_eq!(text, "thinking"),
+            other => panic!("expected complete, got {other:?}"),
+        }
+    }
+
+    /// gpt-oss calls tools by stopping on `<|call|>`, so there is no
+    /// in-band tool decoder -- the noop is the statement that the stop
+    /// token carries it.
+    #[test]
+    fn the_tool_decoder_is_a_noop_because_a_stop_token_does_the_work() {
+        let inst = gptoss();
+        assert!(
+            inst.stop_ids
+                .contains(&inst.tokenizer.token_to_id("<|call|>").unwrap())
+        );
+        let mut dec = inst.tool_decoder();
+        assert!(matches!(dec.feed(&[1, 2, 3]), ToolEvent::Start));
+        dec.reset();
     }
 
     #[test]

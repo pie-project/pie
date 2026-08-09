@@ -98,13 +98,40 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Whether `run` — a stretch of spaces inside a string literal — sits
 /// between two pieces of prose.
 ///
-/// `before` ends at the run and `after` begins at it. Prose on the left
-/// is at least three lowercase letters: a word, not a column heading, a
-/// hex digit, or the tail of a `{}`. Prose on the right is a letter or
-/// an opening quote/bracket that would start one.
+/// `before` ends at the run and `after` begins at it. Prose on the right
+/// is a letter or an opening quote/bracket that would start one. Prose
+/// on the left is a lowercase letter with a word of three or more
+/// letters somewhere behind it: the letter rules out a column of `{}`
+/// or hex, and the word rules out a run of single-character cells.
+///
+/// The left test was once "the last three characters are lowercase",
+/// which sounds like the same thing and is not. English wraps at
+/// spaces, so the word before the break is often short — and `no`,
+/// `is`, `a`, `to` and `of` all put a space in that window and turned
+/// the test off. Three of the five sites this file was scanning for
+/// were sitting in `gpt_oss/contract.rs` the whole time, each one
+/// caught by nothing because the word before the swallowed indent was
+/// two letters long.
+///
+/// # The one indent that is not a slip
+///
+/// A literal holding generated source — the C and Metal that
+/// `tensor-compiler` emits — indents its own continuation lines, and
+/// those runs are load-bearing. They are told apart by what precedes
+/// them: an `\n` escape. A newline the author wrote and then indented
+/// under is an indent; a run of spaces with no newline in front of it
+/// is a newline someone deleted.
 fn splits_prose(before: &str, after: &str) -> bool {
-    let tail: Vec<char> = before.chars().rev().take(3).collect();
-    let lhs = tail.len() == 3 && tail.iter().all(|c| c.is_ascii_lowercase());
+    if before.ends_with("\\n") {
+        return false;
+    }
+    let lhs = before
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_ascii_lowercase())
+        && before
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .any(|word| word.len() >= 3);
     let rhs = after
         .chars()
         .next()
@@ -194,9 +221,20 @@ fn the_predicate_tells_prose_from_alignment() {
     // Assembled rather than written: a literal carrying the defect
     // would be a real offender, and the scan above reads this file.
     let gap = " ".repeat(12);
-    let fixture = format!("    \"the row ships no v_proj{gap}and the text projects one\",");
-    let caught = collapsed_literals(&fixture);
-    assert_eq!(caught.len(), 1, "a swallowed indent must be caught");
+    for offender in [
+        format!("    \"the row ships no v_proj{gap}and the text projects one\","),
+        // The shape that went uncaught for three sites: the word before
+        // the break is two letters, so a fixed three-character window
+        // lands on a space and gives up.
+        format!("    \"is a packed weight with no{gap}scales this scheme describes\","),
+        format!("    \"is not quantized in groups of 64, which is{gap}what it reads\","),
+    ] {
+        assert_eq!(
+            collapsed_literals(&offender).len(),
+            1,
+            "a swallowed indent must be caught: {offender}"
+        );
+    }
 
     for benign in [
         // A table: the run follows a heading or a number, not a word.
@@ -206,6 +244,11 @@ fn the_predicate_tells_prose_from_alignment() {
         "    \"  +---+            +---+\",",
         // A short gap: two spaces after a period is not an indent.
         "    \"one sentence.  another sentence.\",",
+        // Generated source: the run follows a newline the author put
+        // there, so it is an indent and not a deletion.
+        "    \"inline ulong salt(uint s) {{\\n  return splitmix64(\\n      ulong(s));\",",
+        // Single-character cells: lowercase, but no word behind them.
+        "    \"a       b       c\",",
     ] {
         assert!(
             collapsed_literals(benign).is_empty(),

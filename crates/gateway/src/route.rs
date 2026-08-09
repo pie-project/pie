@@ -40,8 +40,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use controller_api::{Health, Role, RoutableWorker, RoutingTable};
 use ids::WorkerId;
-use worker_api::{Accepted, Request};
 use tokio::sync::watch;
+use worker_api::{Accepted, Request};
 
 use crate::admission::{AdmissionConfig, AdmissionDecision, admit};
 
@@ -366,8 +366,8 @@ mod tests {
     use client_api::ClientMessage;
     use controller_api::{Role, WorkerStatus};
     use ids::{ReqId, SessionId, TenantId};
-    use worker_api::Priority;
     use std::sync::Mutex;
+    use worker_api::Priority;
 
     // ── fixtures ──
 

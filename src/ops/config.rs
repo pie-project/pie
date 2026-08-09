@@ -17,11 +17,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::ui::Answer;
 use clap::Subcommand;
 
-
 mod template;
 pub mod tune;
-pub use tune::Objective;
 use template::default_config_content;
+pub use tune::Objective;
 
 /// The generated default config, for tests in this module's children that
 /// need a document the schema accepts.
@@ -270,11 +269,7 @@ impl crate::ui::Report for ConfigList {
                 };
                 table.push(crate::ui::Row::new(
                     mark,
-                    [
-                        leaf(&field.key),
-                        field.shown.clone(),
-                        plain(&field.doc),
-                    ],
+                    [leaf(&field.key), field.shown.clone(), plain(&field.doc)],
                 ));
             }
             table.print(palette);
@@ -348,7 +343,6 @@ fn is_set(file: &toml::Value, key: &str) -> bool {
 fn plain(doc: &str) -> String {
     doc.replace("**", "")
 }
-
 
 /// The config file as `show` prints it, or one value out of it.
 ///
@@ -534,11 +528,7 @@ fn set(global: &bootstrap::GlobalArgs, key: String, value: String) -> Result<Ans
 /// set server.port abc` has only a string reading, and `request_timeout 120`
 /// wants the string reading's "not a duration" over the integer's type
 /// mismatch.
-fn typed_by_schema(
-    content: &str,
-    key: &str,
-    value: &str,
-) -> Result<(String, toml::Value)> {
+fn typed_by_schema(content: &str, key: &str, value: &str) -> Result<(String, toml::Value)> {
     // Checked first so a typo reads as a typo. Without it the candidate loop
     // runs to its last (string) reading and reports THAT failure, which for a
     // key that does not exist describes a type mismatch instead.
@@ -557,13 +547,11 @@ fn typed_by_schema(
         let mut root: toml::Value =
             toml::from_str(content).map_err(|e| anyhow!("parse config: {e}"))?;
         set_nested(&mut root, key, candidate.clone())?;
-        let serialized =
-            toml::to_string(&root).map_err(|e| anyhow!("serialize TOML: {e}"))?;
+        let serialized = toml::to_string(&root).map_err(|e| anyhow!("serialize TOML: {e}"))?;
         match crate::derive::derive_standalone(&serialized) {
             Ok(_) => {
-                let mut doc: toml_edit::DocumentMut = content
-                    .parse()
-                    .map_err(|e| anyhow!("parse config: {e}"))?;
+                let mut doc: toml_edit::DocumentMut =
+                    content.parse().map_err(|e| anyhow!("parse config: {e}"))?;
                 set_nested_doc(&mut doc, key, &candidate)?;
                 return Ok((doc.to_string(), candidate));
             }
@@ -683,7 +671,8 @@ fn edit(global: &bootstrap::GlobalArgs) -> Result<Answer> {
         // do it silently, which is worse than never having kept the file.
         println!(
             "{} resuming the edit kept at {}",
-            crate::ui::Mark::Warn.render(&crate::ui::Palette::for_stream(crate::ui::Stream::Stdout)),
+            crate::ui::Mark::Warn
+                .render(&crate::ui::Palette::for_stream(crate::ui::Stream::Stdout)),
             crate::ui::short_path(&scratch)
         );
     } else {
@@ -702,8 +691,7 @@ fn edit(global: &bootstrap::GlobalArgs) -> Result<Answer> {
         bail!("{editor} exited with {status}; config unchanged");
     }
 
-    let edited =
-        std::fs::read_to_string(&scratch).map_err(|e| anyhow!("read {scratch:?}: {e}"))?;
+    let edited = std::fs::read_to_string(&scratch).map_err(|e| anyhow!("read {scratch:?}: {e}"))?;
     if let Err(error) = crate::derive::derive_standalone(&edited) {
         // The edit is kept, not discarded: it may be twenty minutes of work
         // with one typo in it, and deleting that to protect a file the user
@@ -747,8 +735,7 @@ fn unset(global: &bootstrap::GlobalArgs, key: String) -> Result<Answer> {
     // removing a single key.
     let serialized = toml::to_string(&root).map_err(|e| anyhow!("serialize TOML: {e}"))?;
     // A removal can be invalid too -- a required key has no derived form.
-    crate::derive::derive_standalone(&serialized)
-        .with_context(|| format!("unsetting {key}"))?;
+    crate::derive::derive_standalone(&serialized).with_context(|| format!("unsetting {key}"))?;
     let mut doc: toml_edit::DocumentMut = content
         .parse()
         .map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?;
@@ -783,7 +770,7 @@ fn remove_nested_doc(doc: &mut toml_edit::DocumentMut, key: &str) -> Result<bool
     let (last, parents) = parts.split_last().ok_or_else(|| anyhow!("empty key"))?;
     let mut cursor = doc.as_table_mut();
     for part in parents {
-        let Some(next) = cursor.get_mut(*part).and_then(|item| item.as_table_mut()) else {
+        let Some(next) = cursor.get_mut(part).and_then(|item| item.as_table_mut()) else {
             return Ok(false);
         };
         cursor = next;
@@ -879,10 +866,10 @@ pub(crate) fn normalize_key(key: &str) -> String {
         if key == old {
             return new.to_string();
         }
-        if let Some(prefix) = key.strip_suffix(old) {
-            if prefix.ends_with('.') {
-                return format!("{prefix}{new}");
-            }
+        if let Some(prefix) = key.strip_suffix(old)
+            && prefix.ends_with('.')
+        {
+            return format!("{prefix}{new}");
         }
     }
     key.to_string()
@@ -968,9 +955,7 @@ fn edit_item(value: &toml::Value) -> Result<toml_edit::Item> {
     wrapper.insert("value".to_string(), value.clone());
     let text = toml::to_string(&toml::Value::Table(wrapper))
         .map_err(|e| anyhow!("serialize value: {e}"))?;
-    let doc: toml_edit::DocumentMut = text
-        .parse()
-        .map_err(|e| anyhow!("re-parse value: {e}"))?;
+    let doc: toml_edit::DocumentMut = text.parse().map_err(|e| anyhow!("re-parse value: {e}"))?;
     doc.get("value")
         .cloned()
         .ok_or_else(|| anyhow!("value did not round-trip"))
@@ -1008,7 +993,9 @@ mod tests {
         // The old failure mode: `set server.nonexistent 5` ran the candidate
         // loop to its string reading and reported that, which describes a type
         // mismatch on a key that does not exist.
-        let err = schema_field(&file, "server.nonexistent").unwrap_err().to_string();
+        let err = schema_field(&file, "server.nonexistent")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("unknown key"), "got: {err}");
         // A near miss names the real key rather than the whole list.
         let err = schema_field(&file, "serrver.port").unwrap_err().to_string();
@@ -1038,25 +1025,40 @@ mod tests {
         };
         // The file wins over the default.
         assert_eq!(
-            effective(&file, &field("server.port", Some(toml::Value::Integer(8080)), false)),
+            effective(
+                &file,
+                &field("server.port", Some(toml::Value::Integer(8080)), false)
+            ),
             "9090"
         );
         assert_eq!(
-            effective(&file, &field("server.host", Some("127.0.0.1".into()), false)),
+            effective(
+                &file,
+                &field("server.host", Some("127.0.0.1".into()), false)
+            ),
             "127.0.0.1"
         );
         // Two ways to have no value, and they are opposite advice: one says
         // pie works it out, the other says you must.
         assert_eq!(
-            effective(&file, &field("runtime.max_concurrent_processes", None, false)),
+            effective(
+                &file,
+                &field("runtime.max_concurrent_processes", None, false)
+            ),
             "(derived)"
         );
-        assert_eq!(effective(&file, &field("model.name", None, true)), "(must be set)");
+        assert_eq!(
+            effective(&file, &field("model.name", None, true)),
+            "(must be set)"
+        );
     }
 
     #[test]
     fn a_doc_comment_renders_without_its_rustdoc_markup() {
-        assert_eq!(plain("KV page size. **Omit to derive it.**"), "KV page size. Omit to derive it.");
+        assert_eq!(
+            plain("KV page size. **Omit to derive it.**"),
+            "KV page size. Omit to derive it."
+        );
         // Backticks stay: they read as quoting rather than as markup.
         assert_eq!(plain("`auto` follows"), "`auto` follows");
     }
@@ -1100,7 +1102,7 @@ mod tests {
     fn set_nested_creates_intermediate_table() {
         let mut t: toml::Value = toml::from_str("").unwrap();
         set_nested(&mut t, "telemetry.enabled", toml::Value::Boolean(true)).unwrap();
-        assert_eq!(t["telemetry"]["enabled"].as_bool().unwrap(), true);
+        assert!(t["telemetry"]["enabled"].as_bool().unwrap());
     }
 
     #[test]
@@ -1222,16 +1224,14 @@ arch_name = "qwen3"
 
     #[test]
     fn a_unit_bearing_duration_is_accepted_and_a_bare_number_is_not() {
-        let (_, chosen) =
-            typed_by_schema(fixture(), "runtime.request_timeout", "90s").unwrap();
+        let (_, chosen) = typed_by_schema(fixture(), "runtime.request_timeout", "90s").unwrap();
         assert_eq!(chosen, toml::Value::String("90s".into()));
 
         // No candidate validates: integer 120 is not a string, and "120" has
         // no unit. The error should talk about the unit, not about types.
         let err = format!(
             "{:#}",
-            typed_by_schema(fixture(), "runtime.request_timeout", "120")
-                .unwrap_err()
+            typed_by_schema(fixture(), "runtime.request_timeout", "120").unwrap_err()
         );
         assert!(err.contains("unit"), "got: {err}");
     }

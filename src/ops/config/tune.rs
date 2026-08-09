@@ -24,7 +24,6 @@ use super::typed_by_schema;
 use crate::sweep::{self, Knobs};
 use crate::ui::{Align, Mark, Palette, Row, Table};
 
-
 /// The serving shape being optimised for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Objective {
@@ -615,10 +614,9 @@ pub async fn run(global: &bootstrap::GlobalArgs, args: TuneArgs) -> Result<crate
 
     let file: toml::Value =
         toml::from_str(&content).map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?;
-    let configured_profile =
-        worker::config_schema::lookup(&file, "driver.memory_profile")
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_else(|| "auto".to_string());
+    let configured_profile = worker::config_schema::lookup(&file, "driver.memory_profile")
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "auto".to_string());
     let objective = resolve_objective(args.objective, &configured_profile)?;
 
     // The objective is a config value, not just a flag: measuring for one shape
@@ -941,7 +939,10 @@ calibrate_planner = true
     fn a_lower_p95_wins_a_latency_sweep() {
         // Direction matters as much as the quantity: ranked as if higher were
         // better, a latency sweep would pick the slowest candidate.
-        let quicker = Knobs { frame_size: 1, ..BASE };
+        let quicker = Knobs {
+            frame_size: 1,
+            ..BASE
+        };
         let mut base = round(BASE, 1000.0, 0.01);
         base.lane_p95_us = 400_000;
         base.lane_p95_rel_sigma = 0.01;

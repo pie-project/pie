@@ -25,8 +25,7 @@ unsafe impl Sync for DummyDriver {}
 impl DummyDriver {
     pub fn new(options: driver_dummy::DummyDriverOptions) -> Self {
         let broker = CompletionBroker::new();
-        let inner =
-            driver_dummy::DummyDriver::with_runtime(options, broker.runtime_callbacks());
+        let inner = driver_dummy::DummyDriver::with_runtime(options, broker.runtime_callbacks());
         Self { inner, broker }
     }
 
@@ -88,9 +87,7 @@ impl DummyDriver {
         let (raw, completion) = self.broker.launch_completion(1);
         let borrowed = FrameDescBorrow::from_submission(frame);
         match self.inner.launch(borrowed.as_raw(), raw)? {
-            driver_dummy::FrameAdmission::Launched => {
-                Ok(FrameLaunchOutcome::Launched(completion))
-            }
+            driver_dummy::FrameAdmission::Launched => Ok(FrameLaunchOutcome::Launched(completion)),
             driver_dummy::FrameAdmission::Exhausted => Ok(FrameLaunchOutcome::Exhausted),
             driver_dummy::FrameAdmission::Impossible => Ok(FrameLaunchOutcome::Impossible),
         }

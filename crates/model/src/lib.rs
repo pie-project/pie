@@ -134,12 +134,6 @@ pub mod instruct;
 // The root that is left is the catalog and its answers.
 pub mod shared;
 
-/// The committed static-C++ emissions, as one list — `bin/emit-cuda.rs`
-/// writes it, `tests/generated_cuda.rs` checks it, and neither holds a
-/// copy of its own.
-#[cfg(feature = "forward")]
-pub mod emissions;
-
 // ── The registries ───────────────────────────────────────────────────
 //
 // `catalog` is THE registry. There used to be three -- `contract::HF_ROWS`

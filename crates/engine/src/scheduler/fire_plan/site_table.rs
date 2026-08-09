@@ -81,22 +81,38 @@
 //! derivation that can silently diverge from the plan the driver validated
 //! — the exact class of drift this project exists to remove.
 //!
-//! So the wiring landed on the honest route this paragraph used to only
-//! analyze: the driver reports its validated plan's SITE SUMMARY through
-//! the capabilities handshake. The CUDA driver walks its declared plan with
-//! the C++ mirror of [`derive_sites`] (`context.cpp`'s
-//! `derive_expert_site_summary`; this module's tests pin the derivation)
-//! and emits a `model_site_summary` capability row
-//! (`::driver_api::ModelSiteSummary` — empty when `PIE_DECLARED_FORWARD`
-//! is off, the validation refused, or the plan is dense). The summary rides
-//! `DriverCapabilities` → worker `translate` → `bootstrap::DriverConfig` →
-//! `DriverSpec`, where the driver's scheduler picks it up at spawn, maps it
-//! through [`summary_sites`], and `build_frame_submission` merges the
-//! result into every fire via
-//! [`plan_fire_with_model`](super::plan_fire_with_model). An empty/absent
-//! summary is exactly today's behavior. The sites remain INFORMATIONAL
-//! this increment — nothing consumes a fire plan's site vec downstream yet
-//! (same as v0), so a populated summary changes no submission bytes.
+//! That names the honest route, and the route is NOT yet wired. What the
+//! paragraph below described in the past tense is a design, and every one of
+//! its three links is currently open — written out because a plan in the
+//! past tense is worse than no plan at all.
+//!
+//! The design: the driver reports its validated plan's SITE SUMMARY through
+//! the capabilities handshake. The CUDA driver would walk its declared plan
+//! with a C++ mirror of [`derive_sites`] and emit a `model_site_summary`
+//! capability row (`::driver_api::ModelSiteSummary` — empty when
+//! `PIE_DECLARED_FORWARD` is off, the validation refused, or the plan is
+//! dense). The summary would ride `DriverCapabilities` → worker `translate`
+//! → `bootstrap::DriverConfig` → `DriverSpec`, where the scheduler picks it
+//! up at spawn, maps it through [`summary_sites`], and
+//! `build_frame_submission` merges the result into every fire via
+//! [`plan_fire_with_model`](super::plan_fire_with_model).
+//!
+//! Where it stands, measured:
+//!
+//! 1. PRODUCER. `driver-cuda`'s `serve/load.rs` sets
+//!    `model_site_summary: ModelSiteSummary::default()`, and no
+//!    `derive_expert_site_summary` exists in this tree. The C++ mirror is
+//!    unwritten, so the row is always empty at the source.
+//! 2. CARRIER. `worker::translate` does copy `caps.model_site_summary`
+//!    into its config, but [`DriverSpec`](crate::driver::DriverSpec) has
+//!    three fields and none of them is this one. The summary stops there.
+//! 3. CONSUMER. [`summary_sites`] has no caller outside its own tests.
+//!
+//! None of this is a live defect: the doc's last sentence is still true —
+//! sites are INFORMATIONAL this increment, nothing downstream consumes a
+//! fire plan's site vec, and an absent summary is exactly today's behavior.
+//! The tests below pin the derivation so the mapping stays correct until
+//! the three links close, and the empty path is the one that runs.
 
 use model_compiler::{Dim, ForwardPlan, OpKind};
 
@@ -110,6 +126,14 @@ use super::{Site, expert_weights_site};
 /// The summary states ONLY what [`derive_sites`] emits from a traced form
 /// today — distinct `(experts, top_k)` parameterizations — so this map is
 /// total; a summary entry the vocabulary cannot express does not exist.
+#[allow(
+    dead_code,
+    reason = "link 3 of the three open links the module doc enumerates: the \
+              driver-reported summary is empty at the source and dropped at \
+              `DriverSpec`, so nothing calls this yet. Kept because the tests \
+              below pin the derivation against `derive_sites`, which is what \
+              keeps the mapping correct until the spawn path consumes it"
+)]
 pub(crate) fn summary_sites(summary: &::driver_api::ModelSiteSummary) -> Vec<Site> {
     summary
         .expert_sites
@@ -155,9 +179,10 @@ pub(crate) fn derive_sites(plan: &ForwardPlan) -> Vec<Site> {
                 plan.family, producer.kind
             );
         };
-        let logits = *producer.inputs.first().unwrap_or_else(|| {
-            panic!("{}: TopK op consumes the router logits", plan.family)
-        });
+        let logits = *producer
+            .inputs
+            .first()
+            .unwrap_or_else(|| panic!("{}: TopK op consumes the router logits", plan.family));
         let experts = match plan.values[logits as usize].shape.0.last() {
             Some(&Dim::Const(experts)) => experts,
             other => panic!(
@@ -181,9 +206,9 @@ pub(crate) fn derive_sites(plan: &ForwardPlan) -> Vec<Site> {
 mod tests {
     use super::super::{DivClass, Granularity, Lowering, SITE_EXPERT_WEIGHTS};
     use super::*;
-    use model::shared::llama_like::forward::facts::{LlamaLikeFacts};
-use model::qwen_3_5::forward::facts::{Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts};
-    use model_compiler::{StateStore};
+    use model::qwen_3_5::forward::facts::{Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts};
+    use model::shared::llama_like::forward::facts::LlamaLikeFacts;
+    use model_compiler::StateStore;
 
     /// The qwen3_5_moe MLP fragment (256 experts, top-8): the walk finds
     /// the selector-carrying matmuls, resolves k off the TopK op and the
@@ -191,7 +216,8 @@ use model::qwen_3_5::forward::facts::{Qwen35HybridFacts, Qwen35MlpKind, Qwen35Mo
     /// down pair into ONE model-level site of the pinned vocabulary shape.
     #[test]
     fn moe_fragment_derives_the_expert_site() {
-        let plan = model::qwen_3_5::forward::qwen3_5_moe_mlp_block(&Qwen35MoeMlpFacts::qwen3_5_35b_a3b());
+        let plan =
+            model::qwen_3_5::forward::qwen3_5_moe_mlp_block(&Qwen35MoeMlpFacts::qwen3_5_35b_a3b());
         let sites = derive_sites(&plan);
         assert_eq!(sites.len(), 1, "gate_up + down share one selector group");
         let site = &sites[0];
@@ -276,7 +302,8 @@ use model::qwen_3_5::forward::facts::{Qwen35HybridFacts, Qwen35MlpKind, Qwen35Mo
     /// same plan on this side — the handshake loses nothing.
     #[test]
     fn summary_of_a_moe_trace_round_trips_through_the_vocabulary() {
-        let plan = model::qwen_3_5::forward::qwen3_5_moe_mlp_block(&Qwen35MoeMlpFacts::qwen3_5_35b_a3b());
+        let plan =
+            model::qwen_3_5::forward::qwen3_5_moe_mlp_block(&Qwen35MoeMlpFacts::qwen3_5_35b_a3b());
         let derived = derive_sites(&plan);
         let summary = ::driver_api::ModelSiteSummary {
             expert_sites: vec![::driver_api::ExpertSiteSummary {

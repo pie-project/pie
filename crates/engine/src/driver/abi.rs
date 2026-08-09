@@ -66,10 +66,9 @@ struct MaskWordsStorage {
 
 impl MaskWordsStorage {
     fn from_plan(plan: &LaunchPlan) -> Self {
-        let request_count = plan.qo_indptr.len().checked_sub(1).unwrap_or_default() as u32;
+        let request_count = plan.qo_indptr.len().saturating_sub(1) as u32;
         let request_indptr = if plan.mask_indptr.is_empty() {
-            let mut indptr = Vec::with_capacity(request_count as usize + 1);
-            indptr.resize(request_count as usize + 1, 0);
+            let indptr = vec![0; request_count as usize + 1];
             indptr
         } else {
             plan.mask_indptr.clone()

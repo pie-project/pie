@@ -23,6 +23,11 @@ use wasmtime::{Engine, Module};
 
 use super::snapshot;
 
+/// The shared Python modules, compiled: `(full, stripped)`. Every module on
+/// disk is compiled twice — the whole module, and the snapshot-stripped
+/// variant — and each entry is `(module name, compiled module)`.
+type SharedModules = (Vec<(String, Module)>, Vec<(String, Module)>);
+
 struct State {
     /// Wasmtime engine used to compile shared modules lazily.
     engine: Engine,
@@ -30,7 +35,7 @@ struct State {
     py_runtime_dir: Option<PathBuf>,
     /// Lazily compiled shared modules. Startup should not pay CPython
     /// compilation cost for non-Python inferlets.
-    shared_modules: OnceLock<(Vec<(String, Module)>, Vec<(String, Module)>)>,
+    shared_modules: OnceLock<SharedModules>,
     /// Whether to apply the snapshot optimization to Python components.
     snapshot_enabled: bool,
 }
@@ -95,7 +100,7 @@ pub fn is_available() -> bool {
     state().py_runtime_dir.is_some() && !full_modules().is_empty()
 }
 
-fn loaded_modules() -> &'static (Vec<(String, Module)>, Vec<(String, Module)>) {
+fn loaded_modules() -> &'static SharedModules {
     let state = state();
     state.shared_modules.get_or_init(|| {
         let Some(dir) = state.py_runtime_dir.as_ref() else {
@@ -124,10 +129,7 @@ fn loaded_modules() -> &'static (Vec<(String, Module)>, Vec<(String, Module)>) {
 
 /// Loads shared core modules (.wasm files) from a directory, producing both
 /// full and stripped variants of each.
-fn load_shared_modules(
-    engine: &Engine,
-    shared_dir: &Path,
-) -> (Vec<(String, Module)>, Vec<(String, Module)>) {
+fn load_shared_modules(engine: &Engine, shared_dir: &Path) -> SharedModules {
     let mut full = Vec::new();
     let mut stripped = Vec::new();
 

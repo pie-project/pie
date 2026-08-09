@@ -518,11 +518,11 @@ fn normalize_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
     ranges.sort_unstable();
     let mut normalized: Vec<(u32, u32)> = Vec::new();
     for (start, end) in ranges {
-        if let Some(last) = normalized.last_mut() {
-            if start <= last.1.saturating_add(1) {
-                last.1 = last.1.max(end);
-                continue;
-            }
+        if let Some(last) = normalized.last_mut()
+            && start <= last.1.saturating_add(1)
+        {
+            last.1 = last.1.max(end);
+            continue;
         }
         normalized.push((start, end));
     }

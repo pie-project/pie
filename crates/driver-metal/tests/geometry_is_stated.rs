@@ -46,14 +46,19 @@ use std::collections::BTreeSet;
 const FILLED_ELSEWHERE: &[(&str, &str)] = &[
     (
         "alt_quant",
-        "NOT WIRED. The checkpoint's SECOND affine point: mlx_lm quantizes \
-         per tensor and spares the two that decide where a token goes, so a \
-         routed checkpoint ships an 8-bit router gate inside a 4-bit stack. \
-         Reading it at the stack's width produced cosine 0.84 logits rather \
-         than an error. `has_alt_quant()` exists to be asked and nothing \
-         asks it, because no load path solves the format from the staged \
-         tensors yet. The field stays so the fix has a place to land, and \
-         this entry stays so nobody reads the absence as a decision.",
+        "UNSET, and now REFUSED rather than ignored. The checkpoint's \
+         SECOND affine point: mlx_lm quantizes per tensor and spares the \
+         two that decide where a token goes, so a routed checkpoint ships \
+         an 8-bit router gate inside a 4-bit stack. Reading it at the \
+         stack's width produced cosine 0.84 logits rather than an error. \
+         The claim that no load path could solve it was WRONG — \
+         `QuantSpec` carries a `group_size` and a `bits_per_element` per \
+         tensor and nothing was asking. `LoadPlan::affine_points` asks, \
+         `Loaded` carries the answer, and `serve/load.rs` refuses a \
+         checkpoint at two points by name, because `binding::observed` \
+         builds ONE kernel set. The field stays unset because filling it \
+         would need a SECOND kernel set to be worth anything; what changed \
+         is that its absence is now a refusal instead of a wrong answer.",
     ),
     (
         "mxfp4_experts",

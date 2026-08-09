@@ -15,9 +15,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::config::{
-    CudaMemoryProfile, CudaNativeDriverOptions, DummyDriverOptions, MetalDriverOptions,
-};
+#[cfg(any(feature = "driver-cuda", test))]
+use crate::config::{CudaMemoryProfile, CudaNativeDriverOptions};
+use crate::config::{DummyDriverOptions, MetalDriverOptions};
 use crate::driver_ffi::Flavor;
 
 // THE TWO LINK ANCHORS ARE GONE WITH THE C++ THEY SERVED.
@@ -99,6 +99,15 @@ impl DriverOptions {
     }
 }
 
+/// Read only by the startup-TOML writers and the state-dir path, which are
+/// linked only when a real driver is. With no driver feature the descriptor is
+/// still THREADED (`create_driver_backend` takes `Option<&TpLaunch>` in every
+/// build) but never inspected -- so the allow is scoped to exactly that build,
+/// and a field that dies under a driver build is still caught.
+#[cfg_attr(
+    not(any(feature = "driver-cuda", feature = "driver-metal", test)),
+    allow(dead_code, reason = "read by the cfg-gated TOML writers")
+)]
 #[derive(Clone)]
 pub(crate) struct TpLaunch {
     size: usize,
@@ -137,6 +146,9 @@ pub fn set_weight_cache_dir(dir: String) {
     let _ = WEIGHT_CACHE_DIR.set(dir);
 }
 
+/// Read back by `write_cuda_startup_toml`, which is the only thing that
+/// puts this on the wire -- so the reader is gated exactly as the writer is.
+#[cfg(any(feature = "driver-cuda", test))]
 fn weight_cache_dir() -> String {
     WEIGHT_CACHE_DIR.get().cloned().unwrap_or_default()
 }
@@ -353,15 +365,6 @@ pub fn remove_launch_state() {
 // `embedded_driver::DriverCapabilities` path.
 pub use driver_api::DriverCapabilities;
 
-/// Parse a capability JSON blob into the typed driver-capability struct.
-/// Lives in pie-worker (not bridge) so bridge can stay free of a
-/// serde_json dependency.
-fn parse_caps_json(json: &str) -> Result<DriverCapabilities> {
-    let value: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| anyhow::anyhow!("driver caps JSON parse: {e}"))?;
-    serde_json::from_value(value).map_err(|e| anyhow::anyhow!("driver caps schema mismatch: {e}"))
-}
-
 /// Read the DUMMY driver's three defaults out of `<snapshot>/config.json`.
 ///
 /// Used by [`dummy_native_options`] when the operator did not state them
@@ -545,6 +548,10 @@ fn model_load_desc(
 ///
 /// `[distributed]` is emitted only for TP launches; single-rank uses the
 /// cuda driver's default (`tp_size=1, tp_rank=0`).
+// Gated with `test` as well as the feature ON PURPOSE. Emitting the startup
+// TOML is pure string work -- it needs no CUDA, no nvcc and no GPU -- so its
+// tests run on every host, which is the only reason they run at all here.
+#[cfg(any(feature = "driver-cuda", test))]
 pub(crate) fn write_cuda_startup_toml(
     out_path: &Path,
     opts: &CudaNativeDriverOptions,
@@ -656,6 +663,7 @@ pub(crate) fn write_cuda_startup_toml(
 // Native driver creation helpers.
 // -----------------------------------------------------------------------------
 
+#[cfg(any(feature = "driver-cuda", feature = "driver-metal"))]
 fn local_driver_state_dir(group_id: usize, tp: Option<&TpLaunch>) -> Result<PathBuf> {
     let rank_suffix = tp
         .as_ref()
@@ -991,7 +999,7 @@ mod tests {
         }}"#,
             driver_api::PIE_DRIVER_ABI_VERSION
         );
-        let caps = parse_caps_json(&json).unwrap();
+        let caps: DriverCapabilities = serde_json::from_str(&json).unwrap();
         assert_eq!(caps.abi_version, driver_api::PIE_DRIVER_ABI_VERSION);
         assert_eq!(caps.total_pages, 1024);
         assert_eq!(caps.arch_name, "qwen3");
@@ -1388,9 +1396,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("cuda.toml");
         let snap = tmp.path().join("snap");
-        let mut opts = CudaNativeDriverOptions::default();
-        opts.device = "cuda:0".to_string();
-        opts.calibrate_planner = true;
+        let opts = CudaNativeDriverOptions {
+            device: "cuda:0".to_string(),
+            calibrate_planner: true,
+            ..Default::default()
+        };
 
         write_cuda_startup_toml(&out, &opts, &snap, 0, None, CONFIG).unwrap();
         let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
@@ -1422,8 +1432,10 @@ calibrate_planner = true
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("cuda.toml");
         let snap = tmp.path().join("snap");
-        let mut opts = CudaNativeDriverOptions::default();
-        opts.device = "cuda:0".to_string();
+        let opts = CudaNativeDriverOptions {
+            device: "cuda:0".to_string(),
+            ..Default::default()
+        };
 
         write_cuda_startup_toml(&out, &opts, &snap, 0, None, CONFIG).unwrap();
 
@@ -1464,13 +1476,10 @@ calibrate_planner = true
         assert_eq!(val["batching"]["swap_pool_size"].as_integer().unwrap(), 0);
         // Expert streaming is off unless an operator asks for it: for a model
         // that fits it is strictly slower, and it costs graph capture besides.
-        assert_eq!(
-            val["model"]["stream_routed_experts"].as_bool().unwrap(),
-            false
-        );
+        assert!(!val["model"]["stream_routed_experts"].as_bool().unwrap());
         assert!(val["model"].get("expert_cache_gb").is_none());
         assert!(val["model"].get("expert_host_cache_gb").is_none());
-        assert_eq!(val["runtime"]["verbose"].as_bool().unwrap(), false);
+        assert!(!val["runtime"]["verbose"].as_bool().unwrap());
     }
 
     /// Expert streaming is one decision, so it is one setting, and it has to
@@ -1486,28 +1495,30 @@ calibrate_planner = true
         let tmp = tempfile::tempdir().unwrap();
         let snap = tmp.path().join("snap");
 
-        let mut off = MetalDriverOptions::default();
-        off.device = "metal:0".to_string();
+        let off = MetalDriverOptions {
+            device: "metal:0".to_string(),
+            ..Default::default()
+        };
         let out_off = tmp.path().join("off.toml");
         write_metal_startup_toml(&out_off, &off, &snap, 0, CONFIG).unwrap();
         let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out_off).unwrap()).unwrap();
         assert_eq!(val["model"]["backend"].as_str().unwrap(), "metal:0");
-        assert_eq!(
-            val["model"]["stream_routed_experts"].as_bool().unwrap(),
-            false,
+        assert!(
+            !val["model"]["stream_routed_experts"].as_bool().unwrap(),
             "streaming is off unless asked for: it trades resident memory for \
              page faults, which only pays when the weights do not fit"
         );
 
-        let mut on = MetalDriverOptions::default();
-        on.device = "metal:0".to_string();
-        on.stream_routed_experts = true;
+        let on = MetalDriverOptions {
+            device: "metal:0".to_string(),
+            stream_routed_experts: true,
+            ..Default::default()
+        };
         let out_on = tmp.path().join("on.toml");
         write_metal_startup_toml(&out_on, &on, &snap, 0, CONFIG).unwrap();
         let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out_on).unwrap()).unwrap();
-        assert_eq!(
+        assert!(
             val["model"]["stream_routed_experts"].as_bool().unwrap(),
-            true,
             "the operator asked for streaming and the driver never heard about it"
         );
     }
@@ -1527,8 +1538,10 @@ calibrate_planner = true
         let tmp = tempfile::tempdir().unwrap();
         let snap = tmp.path().join("snap");
 
-        let mut off = MetalDriverOptions::default();
-        off.device = "metal:0".to_string();
+        let off = MetalDriverOptions {
+            device: "metal:0".to_string(),
+            ..Default::default()
+        };
         let out_off = tmp.path().join("off.toml");
         write_metal_startup_toml(&out_off, &off, &snap, 0, CONFIG).unwrap();
         let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out_off).unwrap()).unwrap();
@@ -1538,9 +1551,11 @@ calibrate_planner = true
              default is already the derivation"
         );
 
-        let mut on = MetalDriverOptions::default();
-        on.device = "metal:0".to_string();
-        on.expert_slab_bytes = Some(2048 * 1024 * 1024);
+        let on = MetalDriverOptions {
+            device: "metal:0".to_string(),
+            expert_slab_bytes: Some(2048 * 1024 * 1024),
+            ..Default::default()
+        };
         let out_on = tmp.path().join("on.toml");
         write_metal_startup_toml(&out_on, &on, &snap, 0, CONFIG).unwrap();
         let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out_on).unwrap()).unwrap();
@@ -1572,15 +1587,17 @@ calibrate_planner = true
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("cuda.toml");
         let snap = tmp.path().join("snap");
-        let mut opts = CudaNativeDriverOptions::default();
-        opts.device = "cuda:0".to_string();
-        opts.verbose = true;
+        let opts = CudaNativeDriverOptions {
+            device: "cuda:0".to_string(),
+            verbose: true,
+            ..Default::default()
+        };
 
         write_cuda_startup_toml(&out, &opts, &snap, 0, None, CONFIG).unwrap();
 
         let text = std::fs::read_to_string(&out).unwrap();
         let val: toml::Value = toml::from_str(&text).unwrap();
-        assert_eq!(val["runtime"]["verbose"].as_bool().unwrap(), true);
+        assert!(val["runtime"]["verbose"].as_bool().unwrap());
     }
 
     #[test]
@@ -1588,9 +1605,11 @@ calibrate_planner = true
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("cuda.toml");
         let snap = tmp.path().join("snap");
-        let mut opts = CudaNativeDriverOptions::default();
-        opts.device = "cuda:1".to_string();
-        opts.runtime_quant = "fp8".to_string();
+        let opts = CudaNativeDriverOptions {
+            device: "cuda:1".to_string(),
+            runtime_quant: "fp8".to_string(),
+            ..Default::default()
+        };
 
         write_cuda_startup_toml(&out, &opts, &snap, 3, None, CONFIG).unwrap();
 
@@ -1605,9 +1624,11 @@ calibrate_planner = true
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("cuda.toml");
         let snap = tmp.path().join("snap");
-        let mut opts = CudaNativeDriverOptions::default();
-        opts.device = "cuda:0".to_string();
-        opts.mxfp4_moe = "bf16".to_string();
+        let opts = CudaNativeDriverOptions {
+            device: "cuda:0".to_string(),
+            mxfp4_moe: "bf16".to_string(),
+            ..Default::default()
+        };
 
         write_cuda_startup_toml(&out, &opts, &snap, 0, None, CONFIG).unwrap();
 
@@ -1621,8 +1642,10 @@ calibrate_planner = true
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("cuda.toml");
         let snap = tmp.path().join("snap");
-        let mut opts = CudaNativeDriverOptions::default();
-        opts.device = "cuda:1".to_string();
+        let opts = CudaNativeDriverOptions {
+            device: "cuda:1".to_string(),
+            ..Default::default()
+        };
         let tp = TpLaunch {
             size: 2,
             rank: 1,

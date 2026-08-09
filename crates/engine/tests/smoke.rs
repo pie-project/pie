@@ -9,6 +9,10 @@ use common::{MockEnv, create_mock_env, mock_device::EchoBehavior};
 
 /// Shared state: MockEnv + tokio runtime (must outlive the process).
 struct TestState {
+    /// Held, never read: `MockEnv` owns the `TempDir` backing the model cache,
+    /// so dropping it would delete the fixture directory out from under the
+    /// still-running engine.
+    #[allow(dead_code, reason = "liveness guard for the MockEnv-owned TempDir")]
     env: MockEnv,
     #[allow(dead_code)]
     rt: tokio::runtime::Runtime,

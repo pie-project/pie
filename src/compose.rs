@@ -14,9 +14,9 @@ use std::net::{Ipv4Addr, SocketAddr};
 use anyhow::{Context, Result};
 use controller_api::{Ack, GatewayInfo, Neighbors, RoutingTable, WorkerInfo, WorkerStatus};
 use ids::{GatewayId, NodeId, WorkerId};
-use worker::ControlLink;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use worker::ControlLink;
 
 /// In-proc adapter over the embedded controller `Handle`, implementing BOTH the
 /// worker [`ControlLink`] and the gateway [`gateway::GatewayControl`] seams
@@ -112,11 +112,12 @@ pub async fn run_standalone(
     // Overwritten rather than defaulted-from, because two spellings for one
     // bind address is what produced this: whichever loses is a line in a config
     // file that means nothing.
-    let host: std::net::IpAddr = worker
-        .server
-        .host
-        .parse()
-        .with_context(|| format!("[server] host {:?} is not an IP address", worker.server.host))?;
+    let host: std::net::IpAddr = worker.server.host.parse().with_context(|| {
+        format!(
+            "[server] host {:?} is not an IP address",
+            worker.server.host
+        )
+    })?;
     gateway.listen = SocketAddr::new(host, worker.server.port);
     let gw = gateway::bind(gateway, control.clone())
         .await

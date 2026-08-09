@@ -79,6 +79,13 @@ fn state() -> &'static TestState {
     })
 }
 
+#[allow(
+    clippy::async_yields_async,
+    reason = "the oneshot::Receiver is deliberately handed back out of the first \
+              block_on rather than awaited inside it, so the second block_on can \
+              await it under tokio::time::timeout; awaiting it here would drop the \
+              timeout and turn a hung inferlet into a hung test"
+)]
 fn run(name: &str, input: &str) -> Result<String, String> {
     assert!(
         PROGRAMS.contains(&name),

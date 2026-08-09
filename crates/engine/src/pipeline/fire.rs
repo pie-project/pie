@@ -28,12 +28,9 @@
 //! `inferlet/` in the layering while the fire engine still owns every bit of
 //! the algorithm — see [`FireContext`]'s doc for the design rationale.
 
-
 /// tart (0.3 re-port step 1): whether the bound container carries
 /// attention-stage programs — the fire planner's hook divergence fact.
-fn container_has_attention_stages(
-    container: &tensor_ir::container::TraceContainer,
-) -> bool {
+fn container_has_attention_stages(container: &tensor_ir::container::TraceContainer) -> bool {
     use tensor_ir::registry::Stage;
     container
         .stages
@@ -45,24 +42,32 @@ fn container_has_attention_stages(
 /// signature (an adapter fire batches, but its region must say so, so the
 /// driver's plans see the axis).
 fn container_writes_page_mask(container: &tensor_ir::container::TraceContainer) -> bool {
-    container.stages.iter().flat_map(|s| s.ops.iter()).any(|op| {
-        matches!(
-            op,
-            tensor_ir::op::Op::SinkCall { name, .. }
-                if container.names.get(*name as usize).map(String::as_str)
-                    == Some("attn_page_mask")
-        )
-    })
+    container
+        .stages
+        .iter()
+        .flat_map(|s| s.ops.iter())
+        .any(|op| {
+            matches!(
+                op,
+                tensor_ir::op::Op::SinkCall { name, .. }
+                    if container.names.get(*name as usize).map(String::as_str)
+                        == Some("attn_page_mask")
+            )
+        })
 }
 
 fn container_has_lora_sink(container: &tensor_ir::container::TraceContainer) -> bool {
-    container.stages.iter().flat_map(|s| s.ops.iter()).any(|op| {
-        matches!(
-            op,
-            tensor_ir::op::Op::SinkCall { name, .. }
-                if container.names.get(*name as usize).map(String::as_str) == Some("lora")
-        )
-    })
+    container
+        .stages
+        .iter()
+        .flat_map(|s| s.ops.iter())
+        .any(|op| {
+            matches!(
+                op,
+                tensor_ir::op::Op::SinkCall { name, .. }
+                    if container.names.get(*name as usize).map(String::as_str) == Some("lora")
+            )
+        })
 }
 
 pub mod context;
@@ -198,11 +203,11 @@ impl Drop for CopyCompletionGuard {
     }
 }
 
-type PreparedExplicitKv = (Vec<(u64, u32)>, (Vec<u32>, Vec<u32>), Vec<u32>, kv::KvTxn);
+type PreparedExplicitKv = kv::PreparedExplicit;
 
 /// Host-path prepared KV: the pre-launch D2D copy plan plus the open
 /// transaction (`None` when nothing rebased).
-type PreparedHostKv = ((Vec<u32>, Vec<u32>), Option<kv::KvTxn>);
+type PreparedHostKv = kv::RealizedDeclaration;
 
 /// A reserved-path preparation error. `Stale` means the demand grew between
 /// its phase-A computation and this prepare (a peer lane touched the same
@@ -461,13 +466,13 @@ fn rs_plan_for(
     if rows == 0 {
         return Ok(rs::RsPlan::Fold);
     }
-    if let Some(lens) = fold_len {
-        if lens.len() != rows {
-            return Err(format!(
-                "rs-geometry.fold-len supplied {} length(s) for {rows} request row(s)",
-                lens.len()
-            ));
-        }
+    if let Some(lens) = fold_len
+        && lens.len() != rows
+    {
+        return Err(format!(
+            "rs-geometry.fold-len supplied {} length(s) for {rows} request row(s)",
+            lens.len()
+        ));
     }
     let mut row_tokens: Vec<u32> = (0..rows)
         .map(|row| {
@@ -623,8 +628,7 @@ fn rs_plan_for(
     // the linear layers gather already-buffered activations and return before
     // the output projection -- so there is no per-row switch that would let a
     // computing row ride along.
-    if kinds.iter().any(|k| *k == Position::Commit) && !kinds.iter().all(|k| *k == Position::Commit)
-    {
+    if kinds.contains(&Position::Commit) && !kinds.iter().all(|k| *k == Position::Commit) {
         let row = kinds
             .iter()
             .position(|k| *k == Position::Commit)
@@ -683,8 +687,6 @@ fn rs_plan_for(
         },
     })
 }
-
-/// Phase-A RS demand for the acquisition grant.
 
 /// Drop the SYNTHESIZED read-out rows from a fire that replays the BUFFER.
 ///
@@ -925,6 +927,13 @@ pub struct PendingFire {
     failure: PipelineFailure,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one fire's recurrent-state binding context. `ctx`, `stores` and `grant` \
+              are three separate `&mut` borrows of three different owners — bundling \
+              them into one struct would force a single borrow and make the \
+              disjointness the borrow checker currently proves impossible to express"
+)]
 fn prepare_bound_rs<C: FireContext>(
     ctx: &mut C,
     stores: &crate::store::registry::Stores,
@@ -1479,7 +1488,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // launch-ready work.
         let ticket_reservation = TicketReservation::new(&cells, &accesses);
         ticket_reservation.apply_to(&mut req);
-        
+
         let (hook_program, lora_program) = {
             let p = ctx.resources().get(&fwd)?;
             let container = &p.instance.program.bound.container;
@@ -1502,8 +1511,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
             rs_copy_src,
             rs_copy_dst,
             frame,
-        hook_program,
-        lora_program)
+            hook_program,
+            lora_program,
+        )
         .err()
         .map(|error| format!("{error:#}"));
         if let Some(error) = submit_error {
@@ -1797,14 +1807,13 @@ fn validate_frame<C: FireContext>(
         if host_resolved[slot] && first_rs_slot.is_none() {
             first_rs_slot = Some(slot);
         }
-        if first_rs_slot.is_some() {
+        if let Some(blame) = first_rs_slot {
             for (channel, &(consume, _)) in accesses.iter().enumerate() {
                 if !consume {
                     continue;
                 }
                 let key = Arc::as_ptr(&bound.cells[channel]) as usize;
                 if published_before.contains(&key) {
-                    let blame = first_rs_slot.expect("set just above");
                     return Ok(Err(format!(
                         "pipeline: frame slot {slot} consumes channel {channel}, which an \
 earlier slot of the same frame publishes, and slot {} resolves its descriptors \
@@ -1903,26 +1912,24 @@ dense AttnMask cell, is read back per fire"
                 // publishes > 0: *device-advanced* — the program carries an
                 // advance rule for it.
             }
-            Some(HostRole::Reader) => {
-                if entry.publishes > 0 {
-                    // Overflow is prevented statically at submit, never by
-                    // back-pressure: worst-case ring occupancy (reserved by
-                    // accepted unsettled fires, minus host-consumed, plus
-                    // this frame's writes) must fit the capacity.
-                    let (reserved_tail, consumed) = cell.reader_ring_pressure();
-                    let needed = reserved_tail
-                        .saturating_sub(consumed)
-                        .saturating_add(entry.publishes as u64);
-                    if needed > u64::from(cell.capacity) {
-                        return Ok(Err(format!(
-                            "pipeline: channel {}: frame would need {needed} reader \
+            Some(HostRole::Reader) if entry.publishes > 0 => {
+                // Overflow is prevented statically at submit, never by
+                // back-pressure: worst-case ring occupancy (reserved by
+                // accepted unsettled fires, minus host-consumed, plus
+                // this frame's writes) must fit the capacity.
+                let (reserved_tail, consumed) = cell.reader_ring_pressure();
+                let needed = reserved_tail
+                    .saturating_sub(consumed)
+                    .saturating_add(entry.publishes as u64);
+                if needed > u64::from(cell.capacity) {
+                    return Ok(Err(format!(
+                        "pipeline: channel {}: frame would need {needed} reader \
                              cell(s) (capacity {}) — size take-side channels to at \
                              least 2k-1 = {} for frame-size k = {k}",
-                            cell.global_id,
-                            cell.capacity,
-                            2 * k - 1,
-                        )));
-                    }
+                        cell.global_id,
+                        cell.capacity,
+                        2 * k - 1,
+                    )));
                 }
             }
             _ => {
@@ -1995,7 +2002,7 @@ pub async fn copy_into_inner<C: FireContext>(
         let translated = crate::store::registry::with_kv_lock(
             &stores.kv,
             "host-other",
-            |kv_store| -> anyhow::Result<Result<(Vec<u32>, Vec<u32>), String>> {
+            |kv_store| -> anyhow::Result<Result<kv::PageCopies, String>> {
                 let (_, flat) = kv_store
                     .flat_table(ws_handle.id)
                     .map_err(|e| anyhow::anyhow!("copy_into flat table: {e}"))?;
@@ -2022,8 +2029,8 @@ pub async fn copy_into_inner<C: FireContext>(
 
     let cells = kv_move_dst_pages
         .into_iter()
-        .zip(dst_tok_idx.into_iter())
-        .zip(kv_move_src_pages.into_iter().zip(src_tok_idx.into_iter()))
+        .zip(dst_tok_idx)
+        .zip(kv_move_src_pages.into_iter().zip(src_tok_idx))
         .map(
             |((dst_page_id, dst_token_offset), (src_page_id, src_token_offset))| {
                 ::driver_api::PieKvMoveCell {
@@ -2380,10 +2387,10 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
 /// the pass handle already — then there is nothing to mark.
 fn fail_pass<C: FireContext>(ctx: &mut C, fwd_rep: u32, reason: &str) {
     let res: Resource<ForwardPass> = Resource::new_borrow(fwd_rep);
-    if let Ok(p) = ctx.resources().get_mut(&res) {
-        if p.failed.is_none() {
-            p.failed = Some(reason.to_string());
-        }
+    if let Ok(p) = ctx.resources().get_mut(&res)
+        && p.failed.is_none()
+    {
+        p.failed = Some(reason.to_string());
     }
 }
 
@@ -2779,10 +2786,12 @@ async fn fire_device_geometry<C: FireContext>(
         }
     };
 
-    let mut req = crate::driver::LaunchPlan::default();
-    req.qo_indptr = resolved_qo_indptr;
-    req.kv_translation = kv_translation;
-    req.kv_translation_version = kv_translation_version;
+    let mut req = crate::driver::LaunchPlan {
+        qo_indptr: resolved_qo_indptr,
+        kv_translation,
+        kv_translation_version,
+        ..crate::driver::LaunchPlan::default()
+    };
     // The declared writable span is this pass's containment promise, and the
     // host has to state it even though the device picks the exact cells: the
     // driver's device-composed template — the ONLY resolver that can read a
@@ -2807,17 +2816,17 @@ async fn fire_device_geometry<C: FireContext>(
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
     ticket_reservation.apply_to(&mut req);
     let last_page_len = if pages.is_empty() { 0 } else { page_size };
-    
-        let (hook_program, lora_program) = {
-            let p = ctx.resources().get(&fwd)?;
-            let container = &p.instance.program.bound.container;
-            req.hook_page_mask = container_writes_page_mask(container);
-            (
-                container_has_attention_stages(container),
-                container_has_lora_sink(container),
-            )
-        };
-        let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
+
+    let (hook_program, lora_program) = {
+        let p = ctx.resources().get(&fwd)?;
+        let container = &p.instance.program.bound.container;
+        req.hook_page_mask = container_writes_page_mask(container);
+        (
+            container_has_attention_stages(container),
+            container_has_lora_sink(container),
+        )
+    };
+    let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         &scheduler,
         req,
         instance_id,
@@ -2831,7 +2840,8 @@ async fn fire_device_geometry<C: FireContext>(
         rs_copy_dst,
         frame,
         hook_program,
-        lora_program)
+        lora_program,
+    )
     .err()
     .map(|error| format!("{error:#}"));
     if let Some(error) = submit_error {
@@ -2884,12 +2894,12 @@ fn wire_channels_to_pipeline<C: FireContext>(
     fwd: &Resource<ForwardPass>,
     pipe_fires: &PendingFires,
 ) -> Anyhow<Result<(), String>> {
-    if let Some(existing) = &ctx.resources().get(fwd)?.fires {
-        if !Arc::ptr_eq(existing, pipe_fires) {
-            return Ok(Err(
-                "pipeline: a pass cannot submit across different pipelines".into(),
-            ));
-        }
+    if let Some(existing) = &ctx.resources().get(fwd)?.fires
+        && !Arc::ptr_eq(existing, pipe_fires)
+    {
+        return Ok(Err(
+            "pipeline: a pass cannot submit across different pipelines".into(),
+        ));
     }
     let reps = ctx.resources().get(fwd)?.channel_reps.clone();
     for rep in reps {

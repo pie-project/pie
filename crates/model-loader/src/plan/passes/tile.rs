@@ -89,6 +89,24 @@ pub const METAL_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_
 
 /// The transforms `host_executor` implements. Not a device capability, so it is
 /// not part of the C surface.
+/// The transforms a Vulkan plan may carry.
+///
+/// The same three Metal's does, and for the same reason rather than by
+/// imitation: `driver-vulkan` implements neither
+/// [`ArenaBacking::runs_named_kernels`] nor `run_tile_map` either, so every
+/// transform in a Vulkan plan runs on the host, and this is the compile-time
+/// question of which a plan may CONTAIN.
+///
+/// Equal to Metal's today and written out rather than aliased to it. They are
+/// two answers that happen to agree, and the day a load-time compute kernel
+/// is added to one of these drivers is the day an alias would quietly change
+/// the other.
+///
+/// [`ArenaBacking::runs_named_kernels`]: crate::executor::arena::ArenaBacking::runs_named_kernels
+pub const VULKAN_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE;
+
+/// The transforms `host_executor` implements. Not a device capability, so it is
+/// not part of the C surface.
 pub const HOST_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_REBLOCK | TILE_MAP_SCALE;
 
 /// The mask offline conversion compiles against: everything `replay` runs plus
@@ -134,6 +152,7 @@ pub fn compilable_tile_maps(backend: BackendKind) -> u32 {
     match backend {
         BackendKind::Cuda => CUDA_TILE_MAP_MASK,
         BackendKind::Metal => METAL_TILE_MAP_MASK,
+        BackendKind::Vulkan => VULKAN_TILE_MAP_MASK,
         BackendKind::Unknown => HOST_TILE_MAP_MASK,
     }
 }
@@ -157,7 +176,12 @@ mod mask_tests {
     /// the bytes be compared, which is the only check a load-time kernel gets.
     #[test]
     fn every_transform_a_backend_may_lower_has_a_host_implementation() {
-        for backend in [BackendKind::Cuda, BackendKind::Metal, BackendKind::Unknown] {
+        for backend in [
+            BackendKind::Cuda,
+            BackendKind::Metal,
+            BackendKind::Vulkan,
+            BackendKind::Unknown,
+        ] {
             assert_eq!(
                 compilable_tile_maps(backend) & !crate::plan::CONVERT_TILE_MAP_MASK,
                 0,
@@ -166,6 +190,31 @@ mod mask_tests {
                  check a device answer against"
             );
         }
+    }
+
+    /// Vulkan is a backend of its own and not the unknown one.
+    ///
+    /// It matters because `Unknown` is the arm a missing backend falls into,
+    /// and its mask does NOT admit `TILE_MAP_ENCODE` -- a quantised
+    /// checkpoint compiled against it produces a plan that carries no encode
+    /// instruction, which loads and is wrong. `driver-vulkan` asked for
+    /// Metal's target for exactly this reason before it had one of its own,
+    /// with a note saying so; this is that note as a check.
+    #[test]
+    fn the_vulkan_target_admits_what_a_quantised_load_needs() {
+        let vulkan = compilable_tile_maps(BackendKind::Vulkan);
+        assert_ne!(
+            vulkan & TILE_MAP_ENCODE,
+            0,
+            "a Vulkan plan may not carry an encode, so a quantised checkpoint \
+             compiles to a plan that silently skips it"
+        );
+        assert_ne!(
+            vulkan,
+            compilable_tile_maps(BackendKind::Unknown),
+            "the Vulkan arm is the fallback one, which is what having an arm \
+             was supposed to stop"
+        );
     }
 
     /// A kind this crate can name a kernel for is a kind its mask claims.
@@ -296,11 +345,12 @@ fn lower_tile_map(facts: &TileMapFacts, target: &StorageTarget) -> TileLowering 
             kernel: cuda_kernel(facts),
             ..cuda_encode(facts, target)
         },
-        // Metal runs no transforms, and the host executor derives its own
-        // tiling from `max_tile_bytes` at run time — which it is allowed to do
-        // precisely because it is not the thing whose execution the plan is
-        // supposed to determine (`architecture.md` §10.3).
-        BackendKind::Metal | BackendKind::Unknown => TileLowering::default(),
+        // Neither Metal nor Vulkan runs a transform: the host executor
+        // derives its own tiling from `max_tile_bytes` at run time, which it
+        // is allowed to do precisely because it is not the thing whose
+        // execution the plan is supposed to determine (`architecture.md`
+        // §10.3).
+        BackendKind::Metal | BackendKind::Vulkan | BackendKind::Unknown => TileLowering::default(),
     }
 }
 

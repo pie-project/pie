@@ -22,6 +22,23 @@
 //! * a `-sys` suffix, which is a convention rather than a rule but catches
 //!   the ones that predate `links` being required.
 //!
+//! # What this test caught, and what it got wrong
+//!
+//! It fired the first time this crate took a dependency outside its own three
+//! -- `driver-api`, for the `DeviceFacts` the engine's seam is handed -- and
+//! named three crates: `js-sys`, `wasm-bindgen-shared` and `windows-sys`. All
+//! three are real, all three arrive under `tarpc`, and `driver-api` needs
+//! `tarpc` for exactly one trait. So the dependency moved behind a default-on
+//! `rpc` feature there and this crate takes the crate without it.
+//!
+//! The test was also WRONG, in a way worth recording because the fix could
+//! easily have been to weaken it. `cargo metadata` resolves features for the
+//! whole workspace at once, so `tarpc` was an edge out of `driver-api`'s node
+//! whether or not this crate asked for it, and the walk below reported it
+//! either way. `cargo tree -p` resolves for one package; the two are
+//! intersected now, and the control for that narrowing is that turning the
+//! feature back on still fails this test.
+//!
 //! # Why Vulkan does not need one
 //!
 //! It would be reasonable to assume a GPU API needs a C library, and Vulkan
@@ -244,10 +261,71 @@ fn packages(meta: &serde_json::Value) -> BTreeMap<&str, Package<'_>> {
         .collect()
 }
 
+/// The packages `cargo tree` says [`ROOT`] alone needs.
+///
+/// # Why the resolve graph is not enough by itself
+///
+/// `cargo metadata` resolves features for the WHOLE workspace at once. A
+/// dependency of `driver-api` that only `engine` asks for is still an edge out
+/// of `driver-api`'s node, so a walk of that graph reports it as something
+/// this crate needs -- and adding `driver-api` here failed this test for three
+/// crates (`js-sys`, `wasm-bindgen-shared`, `windows-sys`) that `cargo build
+/// -p driver-vulkan` never touches. They arrive under `tarpc`, which this
+/// crate turns off.
+///
+/// Over-approximating is the safe direction for a test like this, but an
+/// over-approximation that cannot be satisfied is a test that gets deleted.
+/// `cargo tree -p` resolves for one package, which is the question actually
+/// being asked, so its answer is intersected with the walk below.
+///
+/// `--target all` because the walk it is narrowing is unfiltered by platform,
+/// and narrowing it to THIS platform as well would quietly drop the
+/// cross-compile half of the claim.
+fn resolved() -> BTreeSet<String> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let out = std::process::Command::new(cargo)
+        .args([
+            "tree",
+            "--features",
+            "native",
+            "--target",
+            "all",
+            "--edges",
+            "normal",
+            "--prefix",
+            "none",
+            "--format",
+            "{p}",
+            "--manifest-path",
+        ])
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+        .output()
+        .expect("cargo is what is running this test");
+    assert!(
+        out.status.success(),
+        "cargo tree failed, so the closure below is the unified one: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let names: BTreeSet<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .collect();
+    // A parse that produced nothing would make the intersection empty and
+    // every claim above vacuous.
+    assert!(
+        names.contains(ROOT),
+        "cargo tree's output does not name the crate it was asked about"
+    );
+    names
+}
+
 /// Every package [`ROOT`] needs in order to build, by id.
 ///
 /// Walked from the resolver's graph rather than read off manifests, because a
-/// manifest states its own dependencies and the question is about all of them.
+/// manifest states its own dependencies and the question is about all of them,
+/// then narrowed by [`resolved`] -- see there for what the walk gets wrong.
 fn closure<'a>(
     meta: &'a serde_json::Value,
     packages: &BTreeMap<&'a str, Package<'a>>,
@@ -294,6 +372,8 @@ fn closure<'a>(
             }
         }
     }
+    let resolved = resolved();
+    seen.retain(|id| packages.get(id).is_some_and(|p| resolved.contains(p.name)));
     seen
 }
 

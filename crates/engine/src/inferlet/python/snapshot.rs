@@ -895,22 +895,18 @@ fn rewrite_init_module_for_snapshot<'a>(
                 Payload::ImportSection(reader) => {
                     for import in reader {
                         let import = import?;
-                        match import {
-                            Imports::Single(_, imp) => {
-                                if let TypeRef::Func(type_idx) = imp.ty {
-                                    let param_count =
-                                        type_params.get(&type_idx).copied().unwrap_or(0);
-                                    func_info.insert(
-                                        func_idx,
-                                        FuncInfo {
-                                            fn_name: imp.name.to_owned(),
-                                            param_count,
-                                        },
-                                    );
-                                    func_idx += 1;
-                                }
-                            }
-                            _ => {}
+                        if let Imports::Single(_, imp) = import
+                            && let TypeRef::Func(type_idx) = imp.ty
+                        {
+                            let param_count = type_params.get(&type_idx).copied().unwrap_or(0);
+                            func_info.insert(
+                                func_idx,
+                                FuncInfo {
+                                    fn_name: imp.name.to_owned(),
+                                    param_count,
+                                },
+                            );
+                            func_idx += 1;
                         }
                     }
                 }
@@ -1010,7 +1006,7 @@ fn strip_module_section<'a>(
     unchecked_range: Range<usize>,
 ) -> Result<EncoderModule> {
     let mut module_buf = EncoderModule::new();
-    while let Some(payload) = outer_parser.next() {
+    for payload in outer_parser.by_ref() {
         let payload = payload?;
         let section = payload.as_section();
         let my_range = section.as_ref().map(|(_, range)| range.clone());
@@ -1159,11 +1155,8 @@ fn apply(measurement: Measurement, component_bytes: &[u8]) -> Result<Vec<u8>> {
 
             Payload::ComponentImportSection(reader) => {
                 for import in reader {
-                    match import?.ty {
-                        ComponentTypeRef::Module(_) => {
-                            module_count += 1;
-                        }
-                        _ => (),
+                    if let ComponentTypeRef::Module(_) = import?.ty {
+                        module_count += 1;
                     }
                 }
                 copy_component_section(section, component_bytes, &mut initialized_component);

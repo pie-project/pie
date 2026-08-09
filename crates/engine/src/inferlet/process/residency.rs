@@ -100,7 +100,7 @@ pub(crate) fn kv_working_set_ids(
         residency
             .kv_working_sets
             .keys()
-            .filter_map(|&(m, d, ws)| (m == model && d as usize == driver).then_some(ws))
+            .filter_map(|&(m, d, ws)| (m == model && d == driver).then_some(ws))
             .collect()
     })
 }
@@ -116,7 +116,7 @@ pub(crate) fn kv_suspend_handles(
         residency
             .kv_working_sets
             .iter()
-            .filter(|((m, d, _), _)| *m == model && *d as usize == driver)
+            .filter(|((m, d, _), _)| *m == model && *d == driver)
             .map(|(_, handle)| handle.clone())
             .collect()
     })
@@ -139,7 +139,7 @@ pub(crate) fn kv_lease_quiescent(pid: uuid::Uuid, model: usize, driver: usize) -
         residency
             .kv_working_sets
             .iter()
-            .filter(|((m, d, _), _)| *m == model && *d as usize == driver)
+            .filter(|((m, d, _), _)| *m == model && *d == driver)
             .all(|(_, handle)| handle.active_leases() == 0)
     })
 }
@@ -170,7 +170,7 @@ pub(crate) fn kv_working_sets_for(
                 residency
                     .kv_working_sets
                     .keys()
-                    .filter_map(|&(m, d, ws)| (m == model && d as usize == driver).then_some(ws))
+                    .filter_map(|&(m, d, ws)| (m == model && d == driver).then_some(ws))
                     .collect(),
             )
         })

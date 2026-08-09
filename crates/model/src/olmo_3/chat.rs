@@ -8,7 +8,7 @@
 //! - Generation prompt adds <|im_start|>assistant\n<think>
 
 use crate::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent};
-use crate::shared::decoders::{GenericChatDecoder, ThinkingDecoder};
+use crate::shared::decoders::{GenericChatDecoder, ThinkingDecoder, keep_tail};
 use std::sync::Arc;
 use tokenizer::{Tokenizer, TokenizerDecoder};
 
@@ -173,8 +173,7 @@ impl ToolDecoder for OlmoToolDecoder {
                         continue;
                     }
                     if self.accumulated.len() > 200 {
-                        let keep = self.accumulated.len() - 50;
-                        self.accumulated = self.accumulated[keep..].to_string();
+                        self.accumulated = keep_tail(&self.accumulated, 50).to_string();
                     }
                     return ToolEvent::Start;
                 }
@@ -185,23 +184,27 @@ impl ToolDecoder for OlmoToolDecoder {
                             self.accumulated[pos + "</function_calls>".len()..].to_string();
                         self.state = ToolState::Outside;
 
-                        // Parse content. Can be JSON list or single object.
-                        // Or just raw string?
-                        // Assuming tool call format: [{"name":..., "arguments":...}]
+                        // The block holds either a single call object or a
+                        // list of them; OLMo emits the list form, but a
+                        // bare object costs nothing to accept.
                         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                            if let Some(arr) = val.as_array() {
-                                if let Some(first) = arr.first() {
-                                    let name = first["name"].as_str().unwrap_or("").to_string();
-                                    let args = first["arguments"].to_string();
-                                    return ToolEvent::Call(name, args);
-                                }
-                            } else if let Some(obj) = val.as_object() {
-                                let name = obj["name"].as_str().unwrap_or("").to_string();
-                                let args = obj["arguments"].to_string();
-                                return ToolEvent::Call(name, args);
+                            let call = match val.as_array() {
+                                Some(arr) => arr.first(),
+                                None if val.is_object() => Some(&val),
+                                None => None,
+                            };
+                            // Indexing a `Value` yields `Null` for a missing
+                            // key, but indexing the `Map` behind it panics,
+                            // so the lookup stays on the `Value`.
+                            if let Some(call) = call
+                                && let Some(name) = call["name"].as_str()
+                            {
+                                let args = call["arguments"].to_string();
+                                return ToolEvent::Call(name.to_string(), args);
                             }
                         }
-                        // Fallback parsing?
+                        // Unparseable, or parsed but naming no function: a
+                        // call no dispatcher could route is not a call.
                         return ToolEvent::Start;
                     }
                     return ToolEvent::Start;
@@ -333,5 +336,386 @@ mod tests {
         let tokens = inst.answer("fn", "Hello");
         let text = inst.tokenizer.decode(&tokens, false);
         assert_eq!(text, "<|im_start|>environment\nHello<|im_end|>\n");
+    }
+}
+
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+    use crate::instruct::{ChatEvent, ReasoningEvent};
+
+    /// A vocabulary carrying the markers plus one non-ASCII syllable.
+    ///
+    /// The syllable has to be enumerated: `Pipeline::RawChar` looks up
+    /// whole characters but falls back per byte, so a non-ASCII character
+    /// absent from the vocabulary is dropped on encode rather than split.
+    fn tok() -> Arc<Tokenizer> {
+        let v: Vec<String> = [
+            "<|im_start|>",
+            "<|im_end|>",
+            "\n",
+            "system",
+            "user",
+            "assistant",
+            "environment",
+            "<|endoftext|>",
+            "<function_calls>",
+            "</function_calls>",
+            "<think>",
+            "</think>",
+            "가",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        Arc::new(Tokenizer::from_vocab(&v))
+    }
+
+    /// Feed each piece as its own step, so the split points are the ones
+    /// the test names rather than whatever the tokenizer chooses.
+    fn stream(inst: &OlmoInstruct, d: &mut dyn ToolDecoder, parts: &[&str]) -> Vec<ToolEvent> {
+        parts
+            .iter()
+            .map(|p| d.feed(&inst.tokenizer.encode(p)))
+            .collect()
+    }
+
+    fn last_call(events: &[ToolEvent]) -> Option<(String, String)> {
+        events.iter().rev().find_map(|e| match e {
+            ToolEvent::Call(n, a) => Some((n.clone(), a.clone())),
+            ToolEvent::Start => None,
+        })
+    }
+
+    /// Guard for every test below: the decoder must actually receive the
+    /// text these tests spell out. A vocabulary that silently dropped a
+    /// marker would leave the tool tests asserting nothing.
+    #[test]
+    fn the_test_tokenizer_round_trips_the_markers() {
+        let inst = OlmoInstruct::new(tok());
+        for part in [
+            "<function_calls>",
+            "</function_calls>",
+            r#"[{"name":"get_weather","arguments":{"city":"Oslo"}}]"#,
+            "가",
+        ] {
+            let ids = inst.tokenizer.encode(part);
+            assert_eq!(inst.tokenizer.decode(&ids, false), part, "part {part:?}");
+        }
+    }
+
+    // ─── The call itself ─────────────────────────────────────
+
+    #[test]
+    fn a_call_arrives_as_a_list_of_one() {
+        let inst = OlmoInstruct::new(tok());
+        let mut d = inst.tool_decoder();
+        let events = stream(
+            &inst,
+            d.as_mut(),
+            &[
+                "<function_calls>",
+                r#"[{"name":"get_weather","arguments":{"city":"Oslo"}}]"#,
+                "</function_calls>",
+            ],
+        );
+        assert_eq!(
+            last_call(&events),
+            Some(("get_weather".into(), r#"{"city":"Oslo"}"#.into()))
+        );
+        // Only the closing marker resolves the call.
+        assert!(matches!(events[0], ToolEvent::Start));
+        assert!(matches!(events[1], ToolEvent::Start));
+    }
+
+    #[test]
+    fn a_bare_object_is_accepted_too() {
+        let inst = OlmoInstruct::new(tok());
+        let mut d = inst.tool_decoder();
+        let events = stream(
+            &inst,
+            d.as_mut(),
+            &[
+                "<function_calls>",
+                r#"{"name":"get_time","arguments":{}}"#,
+                "</function_calls>",
+            ],
+        );
+        assert_eq!(last_call(&events), Some(("get_time".into(), "{}".into())));
+    }
+
+    /// Regression: indexing the `Map` behind a `Value` panics on a missing
+    /// key, so an argument-less call took the process down.
+    #[test]
+    fn a_call_with_no_arguments_key_does_not_panic() {
+        let inst = OlmoInstruct::new(tok());
+        for body in [r#"{"name":"get_time"}"#, r#"[{"name":"get_time"}]"#] {
+            let mut d = inst.tool_decoder();
+            let events = stream(
+                &inst,
+                d.as_mut(),
+                &["<function_calls>", body, "</function_calls>"],
+            );
+            assert_eq!(
+                last_call(&events),
+                Some(("get_time".into(), "null".into())),
+                "body {body:?}"
+            );
+        }
+    }
+
+    /// A `Call` whose name is empty is a call no dispatcher can route, so
+    /// it is not reported as one.
+    #[test]
+    fn a_call_naming_no_function_is_not_a_call() {
+        let inst = OlmoInstruct::new(tok());
+        for body in [
+            r#"{"arguments":{"city":"Oslo"}}"#,
+            r#"[{"arguments":{}}]"#,
+            r#"{"name":7}"#,
+            "[]",
+            "\"just a string\"",
+            "17",
+        ] {
+            let mut d = inst.tool_decoder();
+            let events = stream(
+                &inst,
+                d.as_mut(),
+                &["<function_calls>", body, "</function_calls>"],
+            );
+            assert_eq!(last_call(&events), None, "body {body:?}");
+        }
+    }
+
+    #[test]
+    fn a_block_that_is_not_json_reports_nothing() {
+        let inst = OlmoInstruct::new(tok());
+        let mut d = inst.tool_decoder();
+        let events = stream(
+            &inst,
+            d.as_mut(),
+            &["<function_calls>", "get_weather(Oslo)", "</function_calls>"],
+        );
+        assert_eq!(last_call(&events), None);
+    }
+
+    // ─── Framing ─────────────────────────────────────────────
+
+    #[test]
+    fn prose_before_the_block_is_ignored() {
+        let inst = OlmoInstruct::new(tok());
+        let mut d = inst.tool_decoder();
+        let events = stream(
+            &inst,
+            d.as_mut(),
+            &[
+                "Let me look that up for you. ",
+                "<function_calls>",
+                r#"[{"name":"get_weather","arguments":{}}]"#,
+                "</function_calls>",
+            ],
+        );
+        assert_eq!(
+            last_call(&events),
+            Some(("get_weather".into(), "{}".into()))
+        );
+    }
+
+    #[test]
+    fn a_whole_block_delivered_in_one_step_still_resolves() {
+        let inst = OlmoInstruct::new(tok());
+        let mut d = inst.tool_decoder();
+        let events = stream(
+            &inst,
+            d.as_mut(),
+            &[r#"<function_calls>[{"name":"f","arguments":{"a":1}}]</function_calls>"#],
+        );
+        assert_eq!(last_call(&events), Some(("f".into(), r#"{"a":1}"#.into())));
+    }
+
+    #[test]
+    fn two_blocks_in_a_row_both_resolve() {
+        let inst = OlmoInstruct::new(tok());
+        let mut d = inst.tool_decoder();
+        let first = stream(
+            &inst,
+            d.as_mut(),
+            &[
+                "<function_calls>",
+                r#"[{"name":"first","arguments":{}}]"#,
+                "</function_calls>",
+            ],
+        );
+        assert_eq!(last_call(&first).map(|c| c.0), Some("first".into()));
+        let second = stream(
+            &inst,
+            d.as_mut(),
+            &[
+                "<function_calls>",
+                r#"[{"name":"second","arguments":{}}]"#,
+                "</function_calls>",
+            ],
+        );
+        assert_eq!(last_call(&second).map(|c| c.0), Some("second".into()));
+    }
+
+    #[test]
+    fn text_trailing_the_close_is_carried_into_the_next_search() {
+        let inst = OlmoInstruct::new(tok());
+        let mut d = inst.tool_decoder();
+        let events = stream(
+            &inst,
+            d.as_mut(),
+            &[
+                "<function_calls>",
+                r#"[{"name":"f","arguments":{}}]"#,
+                r#"</function_calls>ok<function_calls>[{"name":"g","arguments":{}}]"#,
+                "</function_calls>",
+            ],
+        );
+        // The first block resolves on step 3, the second on step 4 —
+        // the leftover after the close was not discarded.
+        assert_eq!(last_call(&events[..3]).map(|c| c.0), Some("f".into()));
+        assert_eq!(last_call(&events[3..]).map(|c| c.0), Some("g".into()));
+    }
+
+    #[test]
+    fn reset_abandons_a_block_in_progress() {
+        let inst = OlmoInstruct::new(tok());
+        let mut d = inst.tool_decoder();
+        stream(&inst, d.as_mut(), &["<function_calls>", r#"[{"name":"f","#]);
+        d.reset();
+        // A complete, well-formed body and its close: only a decoder that
+        // still held the block open would resolve one out of it.
+        let after = stream(
+            &inst,
+            d.as_mut(),
+            &[r#"[{"name":"f","arguments":{}}]"#, "</function_calls>"],
+        );
+        assert_eq!(last_call(&after), None);
+    }
+
+    /// The state alone is not enough: a half-received opening marker left
+    /// in the buffer would complete itself against the next request.
+    #[test]
+    fn reset_forgets_buffered_text() {
+        let inst = OlmoInstruct::new(tok());
+        let mut d = inst.tool_decoder();
+        stream(&inst, d.as_mut(), &["thinking about it <function_c"]);
+        d.reset();
+        let after = stream(
+            &inst,
+            d.as_mut(),
+            &[r#"alls>[{"name":"f","arguments":{}}]"#, "</function_calls>"],
+        );
+        assert_eq!(last_call(&after), None);
+    }
+
+    // ─── The sliding window ──────────────────────────────────
+
+    /// Regression: the buffer bound sliced at a byte offset computed by
+    /// arithmetic, which lands inside a character whenever the model has
+    /// been writing anything but ASCII.
+    #[test]
+    fn a_long_non_ascii_preamble_does_not_panic() {
+        let inst = OlmoInstruct::new(tok());
+        let mut d = inst.tool_decoder();
+        // 190 ASCII bytes then 20 three-byte syllables: the cut at
+        // len() - 50 falls strictly inside the fourth of them.
+        let prose = format!("{}{}", "x".repeat(190), "가".repeat(20));
+        assert!(!prose.is_char_boundary(prose.len() - 50));
+        stream(&inst, d.as_mut(), &[&prose]);
+        let events = stream(
+            &inst,
+            d.as_mut(),
+            &[
+                "<function_calls>",
+                r#"[{"name":"f","arguments":{}}]"#,
+                "</function_calls>",
+            ],
+        );
+        assert_eq!(last_call(&events).map(|c| c.0), Some("f".into()));
+    }
+
+    #[test]
+    fn the_window_keeps_a_marker_split_by_the_trim() {
+        let inst = OlmoInstruct::new(tok());
+        let mut d = inst.tool_decoder();
+        // The trim has to happen while the opening marker's own prefix is
+        // sitting at the end of the buffer, so the overflow and the
+        // partial marker must arrive in the same step.
+        let mut over = "y".repeat(240);
+        over.push_str("<function");
+        stream(&inst, d.as_mut(), &[&over]);
+        let events = stream(
+            &inst,
+            d.as_mut(),
+            &[
+                "_calls>",
+                r#"[{"name":"f","arguments":{}}]"#,
+                "</function_calls>",
+            ],
+        );
+        assert_eq!(last_call(&events).map(|c| c.0), Some("f".into()));
+    }
+
+    #[test]
+    fn prose_below_the_bound_is_kept_whole() {
+        assert_eq!(crate::shared::decoders::keep_tail("가나다", 50), "가나다");
+    }
+
+    // ─── The rest of the instruct surface ────────────────────
+
+    #[test]
+    fn no_tools_means_no_preamble() {
+        let inst = OlmoInstruct::new(tok());
+        assert!(inst.equip(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_user_turn_uses_the_user_role() {
+        let inst = OlmoInstruct::new(tok());
+        let text = inst.tokenizer.decode(&inst.user("hi"), false);
+        assert_eq!(text, "<|im_start|>user\nhi<|im_end|>\n");
+    }
+
+    #[test]
+    fn the_seal_stops_on_the_turn_end_and_on_eos() {
+        let inst = OlmoInstruct::new(tok());
+        let seal = inst.seal();
+        assert_eq!(
+            seal,
+            [
+                inst.tokenizer.encode("<|im_end|>"),
+                inst.tokenizer.encode("<|endoftext|>")
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn the_chat_decoder_stops_at_the_turn_end() {
+        let inst = OlmoInstruct::new(tok());
+        let mut d = inst.chat_decoder();
+        let hi = inst.tokenizer.encode("hi");
+        assert!(matches!(d.feed(&hi), ChatEvent::Delta(t) if t == "hi"));
+        let mut tail = inst.tokenizer.encode("!");
+        tail.extend(inst.tokenizer.encode("<|im_end|>"));
+        assert!(matches!(d.feed(&tail), ChatEvent::Done(t) if t == "hi!"));
+    }
+
+    /// `cue()` already emits `<think>`, so the reasoning decoder must
+    /// begin inside the block rather than waiting for an opener that will
+    /// never arrive.
+    #[test]
+    fn reasoning_begins_inside_because_the_cue_opened_it() {
+        let inst = OlmoInstruct::new(tok());
+        let mut d = inst.reasoning_decoder();
+        let step = inst.tokenizer.encode("weighing it up");
+        assert!(matches!(d.feed(&step), ReasoningEvent::Delta(t) if t == "weighing it up"));
+        assert!(matches!(
+            d.feed(&inst.tokenizer.encode("</think>")),
+            ReasoningEvent::Complete(t) if t == "weighing it up"
+        ));
     }
 }

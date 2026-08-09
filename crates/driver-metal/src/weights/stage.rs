@@ -297,7 +297,11 @@ unsafe impl Chunk for Allocation {
     }
 
     fn len(&self) -> u64 {
-        Region::len(self)
+        // `Region` is implemented for `Handle`, not for `Allocation` — the
+        // allocation is the residency, the handle is the span. Spelled
+        // through `handle()` so this reads the span and does not recurse
+        // into the `Chunk::len` being defined here.
+        Region::len(self.handle())
     }
 }
 

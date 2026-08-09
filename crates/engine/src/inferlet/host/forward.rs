@@ -537,7 +537,15 @@ impl ProcessCtx {
         container_bytes: Vec<u8>,
         channels: Vec<Resource<Channel>>,
     ) -> Anyhow<Result<(), String>> {
-        let (embed, attention, readout, rs_working_sets, rs_fold_len, rs_fold_len_rep, pass_max_layers) = {
+        let (
+            embed,
+            attention,
+            readout,
+            rs_working_sets,
+            rs_fold_len,
+            rs_fold_len_rep,
+            pass_max_layers,
+        ) = {
             let pass = self.ctx().table.get(&this)?;
             if pass.is_bound() {
                 return Ok(Err("forward pass program is already attached".to_string()));
@@ -636,14 +644,14 @@ impl ProcessCtx {
             // Optional: a pass that folds everything unconditionally has
             // nothing to compute and claims no port, so the traced program
             // legitimately lacks this binding.
-            if let Some(fold_len) = rs_fold_len_rep {
-                if let Err(error) = validate_optional_descriptor_bindings(
+            if let Some(fold_len) = rs_fold_len_rep
+                && let Err(error) = validate_optional_descriptor_bindings(
                     &prog.bound.container,
                     &channel_reps,
                     &[(Port::RsFoldLen, Some(fold_len))],
-                ) {
-                    return Ok(Err(error));
-                }
+                )
+            {
+                return Ok(Err(error));
             }
             let mut cells: BoundCells = Vec::with_capacity(channels.len());
             for (i, ch) in channels.iter().enumerate() {
@@ -694,7 +702,7 @@ impl ProcessCtx {
             let ws_rep = kv_working_set.rep();
             let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
             let bound_ws = self.ctx().table.get(&ws_res)?.clone();
-            let stores = crate::store::registry::get(bound_ws.model, bound_ws.driver as usize);
+            let stores = crate::store::registry::get(bound_ws.model, bound_ws.driver);
             let page_len =
                 match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
                     kv.page_len(bound_ws.id)
@@ -720,7 +728,7 @@ impl ProcessCtx {
             // falls back to Host and executes serialized, blocking loudly on
             // the first value the host truly cannot know.
             let device_port_mask =
-                crate::driver::get_spec(bound_ws.driver as usize)?.device_geometry_port_mask;
+                crate::driver::get_spec(bound_ws.driver)?.device_geometry_port_mask;
 
             // Device-geometry pass (Track B): the program traces its COMPLETE
             // explicit geometry in-graph (loop-carried pages/write
@@ -735,10 +743,7 @@ impl ProcessCtx {
             // loud Host fallback as a geometry-incapable driver.
             let needs_mask_port = prog.bound.container.ports.iter().any(|binding| {
                 matches!(binding.port, tensor_ir::registry::Port::AttnMask)
-                    && matches!(
-                        binding.source,
-                        tensor_ir::container::PortSource::Channel(_)
-                    )
+                    && matches!(binding.source, tensor_ir::container::PortSource::Channel(_))
             });
             let devgeo_capable = device_port_mask & ::driver_api::PIE_DEVICE_GEOMETRY_PORTS
                 == ::driver_api::PIE_DEVICE_GEOMETRY_PORTS
@@ -884,7 +889,6 @@ impl ProcessCtx {
                 ::driver_api::GeometryClass::Host
             };
             let rs_reps = rs_working_sets.iter().map(Resource::rep).collect();
-
 
             let instance_id = crate::pipeline::instance::next_instance_id();
             for (dense, cell) in cells.iter().enumerate() {

@@ -34,8 +34,8 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use pie::sweep::{self, Knobs};
 use client::client::Client;
+use pie::sweep::{self, Knobs};
 
 const GENERATE: &str = "generate@0.1.0";
 
@@ -54,13 +54,29 @@ const REPEATS: usize = 3;
 /// staging bound (`k * dispatch < 13`) admits both here.
 fn probe_candidates() -> Vec<Knobs> {
     vec![
-        Knobs { frame_size: 2, submit_depth: 3, dispatch_depth: 2 },
-        Knobs { frame_size: 1, submit_depth: 3, dispatch_depth: 2 },
-        Knobs { frame_size: 4, submit_depth: 5, dispatch_depth: 3 },
+        Knobs {
+            frame_size: 2,
+            submit_depth: 3,
+            dispatch_depth: 2,
+        },
+        Knobs {
+            frame_size: 1,
+            submit_depth: 3,
+            dispatch_depth: 2,
+        },
+        Knobs {
+            frame_size: 4,
+            submit_depth: 5,
+            dispatch_depth: 3,
+        },
         // Back to the first one, last. This is the drift check: the same knobs
         // measured at the start and at the end of a sweep have to agree, or
         // every ranking the sweep produces is confounded by round order.
-        Knobs { frame_size: 2, submit_depth: 3, dispatch_depth: 2 },
+        Knobs {
+            frame_size: 2,
+            submit_depth: 3,
+            dispatch_depth: 2,
+        },
     ]
 }
 

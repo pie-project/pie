@@ -5,9 +5,9 @@
 
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
+use ::model::instruct::{ToolDecoder, ToolEvent};
 use anyhow::Result;
 use grammar::matcher::GrammarMatcher;
-use ::model::instruct::{ToolDecoder, ToolEvent};
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
@@ -34,7 +34,6 @@ impl pie::inferlet::tools::Host for ProcessCtx {
     async fn answer(&mut self, name: String, value: String) -> Result<Vec<u32>> {
         Ok(crate::model::model().instruct().answer(&name, &value))
     }
-
 
     async fn format(
         &mut self,

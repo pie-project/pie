@@ -412,6 +412,15 @@ impl KvStore {
 
     /// Exact lookup of an opaque index key. The returned WorkingSet owns its
     /// own terminal anchor and remains valid after index replacement/removal.
+    #[allow(
+        clippy::wrong_self_convention,
+        reason = "not a conversion: `from-index` is the WIT name \
+                  (`crates/inferlet/wit/working-set.wit`, \
+                  `kv-working-set.from-index`), mirrored verbatim by the host \
+                  binding in `inferlet/host/kv_working_set.rs` and down to here. \
+                  Renaming it for the `from_*` convention would break the one \
+                  spelling that ties the guest API to the store"
+    )]
     pub fn from_index(
         &mut self,
         key: &[u8],

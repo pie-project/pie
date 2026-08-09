@@ -370,7 +370,8 @@ pub fn author_gpt_oss_mlx(b: &mut Builder<'_>) -> Result<(), Error> {
             let biases = b.find(&format!("{base}.biases"));
             let Some(scales) = scales else {
                 return fail(format!(
-                    "Metal GptOss: '{}' is a packed weight with no scales, which no                      scheme here describes",
+                    "Metal GptOss: '{}' is a packed weight with no scales, which no \
+                     scheme here describes",
                     raw.name
                 ));
             };
@@ -390,7 +391,8 @@ pub fn author_gpt_oss_mlx(b: &mut Builder<'_>) -> Result<(), Error> {
             let groups = *scales.shape.last().unwrap_or(&0);
             if groups <= 0 || packed_cols % (2 * groups) != 0 {
                 return fail(format!(
-                    "Metal GptOss: '{}' is not quantized in groups of 64, which is                      what these kernels read",
+                    "Metal GptOss: '{}' is not quantized in groups of 64, which is \
+                     what these kernels read",
                     raw.name
                 ));
             }
@@ -493,7 +495,8 @@ fn declare_mxfp4_experts_mlx(b: &mut Builder<'_>, declared: &mut usize) -> Resul
         let fused = base.ends_with("gate_up_proj");
         if !fused && !base.ends_with("down_proj") {
             return fail(format!(
-                "Metal GptOss: MXFP4 tensor '{}' is neither the fused gate/up                  projection nor the down projection",
+                "Metal GptOss: MXFP4 tensor '{}' is neither the fused gate/up \
+                 projection nor the down projection",
                 blocks.name
             ));
         }

@@ -667,17 +667,15 @@ async fn handle_server_message(msg: ServerMessage, inner: &Arc<ClientInner>) {
             // DashMap Ref dropped here (end of `if let` scope)
 
             // Finalize on last chunk — no guards held
-            if is_last {
-                if let Some((_, state_mutex)) = inner.pending_downloads.remove(&file_hash) {
-                    let final_state = state_mutex.into_inner();
-                    if hash_blob(&final_state.buffer) == file_hash {
-                        route_process_event(
-                            inner,
-                            final_state.process_id,
-                            ProcessEvent::File(final_state.buffer),
-                        )
-                        .await;
-                    }
+            if is_last && let Some((_, state_mutex)) = inner.pending_downloads.remove(&file_hash) {
+                let final_state = state_mutex.into_inner();
+                if hash_blob(&final_state.buffer) == file_hash {
+                    route_process_event(
+                        inner,
+                        final_state.process_id,
+                        ProcessEvent::File(final_state.buffer),
+                    )
+                    .await;
                 }
             }
         }

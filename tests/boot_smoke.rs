@@ -34,9 +34,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use pie::derive::derive_standalone;
-use pie::{run_standalone};
 use client::client::Client;
+use pie::derive::derive_standalone;
+use pie::run_standalone;
 
 /// The one standalone TOML (`[controller]`/`[gateway]`/`[worker]` sections); `derive_standalone`
 /// splits + hands each section to its role lib's `Config::parse`. The client edge binds

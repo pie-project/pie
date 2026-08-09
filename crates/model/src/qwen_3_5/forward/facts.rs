@@ -55,15 +55,23 @@ pub struct Qwen35CudaFacts {
     pub cached_max: u32,
     /// The deployment configures the verify hidden stash
     /// (`RecurrentStateCache::configure_verify_hidden_stash`): the
-    /// engine owns that configuration, so — like [`Self::state_bf16`],
-    /// whose dtype the engine likewise decides — the fact is stated here
-    /// and the driver cross-checks its own derivation per fire rather
-    /// than choosing. With the stash live, the CommitAdvance class
+    /// engine owns that configuration, so the fact is stated here and the
+    /// driver cross-checks its own derivation per fire rather than
+    /// choosing. With the stash live, the CommitAdvance class
     /// replays each linear layer's in-proj outputs from the stash
     /// (`cuda::verify_stash_load`) and skips the GEMMs; without it, the
     /// commit pass re-runs the in-projections against whatever the
     /// workspace holds. Serde-defaulted so pre-4c-iv facts JSON reads
     /// back unchanged (the append-only discipline).
+    ///
+    /// NOTHING READS THIS TODAY, and `tests/facts_are_read.rs` says so
+    /// out loud. It used to be stated "like [`Self::state_bf16`]", but
+    /// that comparison broke: `state_bf16` is read by the trace and
+    /// travels to the driver as a lowering argument, while this fact's
+    /// only reader was the static-C++ emission that d91c85bf8 retired.
+    /// Its opposite number, the driver's `configure_verify_hidden_stash`,
+    /// has no production caller either — both ends of the cross-check are
+    /// waiting on the same in-flight Rust port.
     #[serde(default)]
     pub verify_stash: bool,
     /// `Qwen3_5MoeMlpWorkspace::cutlass_max_rows` — `min(max_tokens, 512)`

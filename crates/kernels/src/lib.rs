@@ -1055,7 +1055,6 @@ pub enum Source {
     //
     // `&'static Source` rather than `Box`, because a kernel table is a
     // `const` and a const can hold a reference to another const.
-
     /// An operand's row width.
     Width(&'static Source),
     /// Product.
@@ -1644,7 +1643,7 @@ mod tests {
         // Still not a licence to match anything.
         assert!(sig_in(T, "sdpa_paged_decode_bfloat16_d_256").is_none());
         assert!(sig_in(T, "sdpa_paged_decode_bfloat16").is_none());
-        assert_eq!(T[0].entrypoints().len(), 1 * 2 * 3);
+        assert_eq!(T[0].entrypoints().len(), 2 * 3);
     }
 
     /// `covers` and `entrypoints` are two directions on one relation, and the
@@ -1662,4 +1661,3 @@ mod tests {
         }
     }
 }
-

@@ -255,6 +255,13 @@ pub struct Device {
     /// address a storage buffer from an offset this does not divide, and a
     /// driver that binds a sub-range of an arena is doing nothing else.
     min_storage_offset: u64,
+    /// Is host memory and device memory the same memory?
+    ///
+    /// Read from `deviceType`, not from the heaps. A discrete card exposes a
+    /// small heap that is both DEVICE_LOCAL and HOST_VISIBLE -- the resizable
+    /// BAR -- and a driver that concluded "unified" from finding one would be
+    /// wrong about every allocation that did not fit in it.
+    unified: bool,
     validated: bool,
     /// The tiers this device can actually load, best first.
     ///
@@ -542,6 +549,10 @@ impl Device {
             name,
             max_push: props.limits.max_push_constants_size,
             min_storage_offset: props.limits.min_storage_buffer_offset_alignment,
+            unified: matches!(
+                props.device_type,
+                vk::PhysicalDeviceType::INTEGRATED_GPU | vk::PhysicalDeviceType::CPU
+            ),
             validated,
             tiers,
         })
@@ -612,6 +623,35 @@ impl Device {
     #[must_use]
     pub fn min_storage_offset(&self) -> u64 {
         self.min_storage_offset
+    }
+
+    /// Is host memory and device memory the same memory?
+    ///
+    /// True on an integrated GPU and on a software implementation, false on a
+    /// discrete card. See the field for why the heaps do not answer this.
+    #[must_use]
+    pub fn unified(&self) -> bool {
+        self.unified
+    }
+
+    /// Does the device expose memory the host cannot see?
+    ///
+    /// The second signal for [`Self::unified`], and independent of it: that one
+    /// reads `deviceType`, this one reads the heaps. A part where every
+    /// device-local type is also host-visible has one pool of memory; a part
+    /// with a device-local type the host cannot map has two. They must agree,
+    /// and `tests/device.rs` is where that is held.
+    #[must_use]
+    pub fn device_only_memory(&self) -> bool {
+        self.memory.memory_types[..self.memory.memory_type_count as usize]
+            .iter()
+            .any(|t| {
+                t.property_flags
+                    .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                    && !t
+                        .property_flags
+                        .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+            })
     }
 
     /// A host-visible storage buffer holding `bytes`.
@@ -701,6 +741,65 @@ impl Device {
                 .map_err(|e| Failed::Vulkan(format!("map: {e}")))?
                 .cast::<u8>();
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+            self.device.unmap_memory(buffer.memory);
+        }
+        Ok(())
+    }
+
+    /// Copy one range of a buffer over another range of the SAME buffer.
+    ///
+    /// # Why one buffer and not two
+    ///
+    /// The cache is one buffer per layer holding every page, so moving a
+    /// conversation's history is a move within a buffer and never between two.
+    /// A general two-buffer copy would be a second thing to test for the one
+    /// caller that does not exist.
+    ///
+    /// # Why on the host
+    ///
+    /// Every buffer this driver allocates is host-visible and coherent -- see
+    /// [`Device::buffer`] -- so a `memmove` through a mapping is a copy with
+    /// no command buffer, no barrier and nothing in flight when it returns.
+    /// `driver-metal`'s `copy_kv` says the same thing for the same reason: a
+    /// completion the caller waits on would be waiting for nothing. A device
+    /// with a device-local cache would want `vkCmdCopyBuffer` instead, which
+    /// is why [`crate::facts`] reports whether the memory is unified.
+    ///
+    /// Overlapping ranges are allowed and move correctly: this is a `memmove`,
+    /// not a `memcpy`. Stated rather than left to the reader because a page
+    /// compaction moves pages DOWN, and every such move within one page-size
+    /// stride overlaps.
+    ///
+    /// # Errors
+    ///
+    /// [`Failed::Vulkan`] if either range leaves the buffer, or if the
+    /// mapping fails. A range that left the buffer would otherwise be a write
+    /// past an allocation, which this card does not report.
+    pub fn copy_within(
+        &self,
+        buffer: &Buffer,
+        from: u64,
+        to: u64,
+        bytes: u64,
+    ) -> Result<(), Failed> {
+        let ends = |at: u64| at.checked_add(bytes).is_some_and(|e| e <= buffer.size);
+        if !ends(from) || !ends(to) {
+            return Err(Failed::Vulkan(format!(
+                "{bytes} bytes from {from} to {to} in a {}-byte buffer",
+                buffer.size
+            )));
+        }
+        if bytes == 0 || from == to {
+            return Ok(());
+        }
+        unsafe {
+            let ptr = self
+                .device
+                .map_memory(buffer.memory, 0, buffer.mapped, vk::MemoryMapFlags::empty())
+                .map_err(|e| Failed::Vulkan(format!("map: {e}")))?
+                .cast::<u8>();
+            // `copy`, not `copy_nonoverlapping`: see above.
+            std::ptr::copy(ptr.add(from as usize), ptr.add(to as usize), bytes as usize);
             self.device.unmap_memory(buffer.memory);
         }
         Ok(())

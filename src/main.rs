@@ -158,11 +158,15 @@ async fn run() -> anyhow::Result<ExitCode> {
         Command::Serve => unreachable!("serve returns before the op dispatch"),
 
         // Blocking: HF downloads and multi-gigabyte checkpoint rewrites.
-        Command::Model { cmd } => tokio::task::spawn_blocking(move || ops::model::run(cmd)).await??,
+        Command::Model { cmd } => {
+            tokio::task::spawn_blocking(move || ops::model::run(cmd)).await??
+        }
 
         // Blocking: `cache list` walks the whole of `$PIE_HOME`, and `doctor`
         // shells out to `nvidia-smi`.
-        Command::Cache { cmd } => tokio::task::spawn_blocking(move || ops::cache::run(cmd)).await??,
+        Command::Cache { cmd } => {
+            tokio::task::spawn_blocking(move || ops::cache::run(cmd)).await??
+        }
         Command::Doctor => {
             let global = cli.global.clone();
             tokio::task::spawn_blocking(move || ops::doctor::run(&global)).await??

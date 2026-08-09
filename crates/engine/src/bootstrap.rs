@@ -10,9 +10,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 use crate::driver;
 use crate::inferlet::sandbox::{FsPolicy, NetworkPolicy};
 use crate::inferlet::{linker, process, program, python};
+use crate::model;
 use crate::server;
 use crate::telemetry;
-use crate::model;
 
 static RUNTIME_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -382,8 +382,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         // the 0.3 handshake (driver context.cpp reports it; the worker
         // translate carries it; every driver must honour the sink for
         // the engine to advertise it).
-        has_lora: !driver_configs.is_empty()
-            && driver_configs.iter().all(|d| d.has_lora),
+        has_lora: !driver_configs.is_empty() && driver_configs.iter().all(|d| d.has_lora),
         has_mtp_logits: !driver_configs.is_empty()
             && driver_configs.iter().all(|d| d.has_mtp_logits),
         has_mtp_drafts: !driver_configs.is_empty()
@@ -469,13 +468,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     crate::planner::init_planner(
         arena_model_idx,
         0,
-        crate::planner::ResidencyPlanner::new(
-            std::sync::Arc::new(crate::planner::RegistryPool::new(
-                arena_model_idx,
-                0,
-                kv_swap_capable,
-            )),
-        ),
+        crate::planner::ResidencyPlanner::new(std::sync::Arc::new(
+            crate::planner::RegistryPool::new(arena_model_idx, 0, kv_swap_capable),
+        )),
     );
     // Opt-in stall sampler: `PIE_CONTENTION_TRACE_MS=500` emits one line
     // per tick while anything is queued, so a stalling run reports whether
@@ -647,49 +642,47 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                             unmap_ranges,
                         )
                         .await
+                            && completion.await.is_ok()
                         {
-                            if completion.await.is_ok() {
-                                applied[ordinal][0] = Some(u64::from(target));
-                                let rs_high_water =
-                                    stores.rs.lock().unwrap().committed_high_water_slots();
-                                let page_bytes =
-                                    elastic_page_bytes.get(ordinal).copied().unwrap_or(0);
-                                let slot_bytes = rs_slot_bytes.get(ordinal).copied().unwrap_or(0);
-                                if page_bytes != 0 && slot_bytes != 0 {
-                                    let state_bytes =
-                                        u64::from(rs_high_water).saturating_mul(slot_bytes);
-                                    let state_pages =
-                                        state_bytes.saturating_add(page_bytes - 1) / page_bytes;
-                                    if applied[ordinal][1] != Some(state_pages)
-                                        && let Ok(state) = crate::scheduler::resize_pool(
-                                            driver_id,
-                                            ::driver_api::PIE_ELASTIC_POOL_STATE,
-                                            state_pages,
-                                            Vec::new(),
-                                            Vec::new(),
-                                        )
-                                        .await
-                                        && state.await.is_ok()
-                                    {
-                                        applied[ordinal][1] = Some(state_pages);
-                                    }
-                                }
-                                // The workspace target is the constant 0, so
-                                // after the first successful trim this one is a
-                                // no-op every single tick.
-                                if applied[ordinal][2] != Some(0)
-                                    && let Ok(workspace) = crate::scheduler::resize_pool(
+                            applied[ordinal][0] = Some(u64::from(target));
+                            let rs_high_water =
+                                stores.rs.lock().unwrap().committed_high_water_slots();
+                            let page_bytes = elastic_page_bytes.get(ordinal).copied().unwrap_or(0);
+                            let slot_bytes = rs_slot_bytes.get(ordinal).copied().unwrap_or(0);
+                            if page_bytes != 0 && slot_bytes != 0 {
+                                let state_bytes =
+                                    u64::from(rs_high_water).saturating_mul(slot_bytes);
+                                let state_pages =
+                                    state_bytes.saturating_add(page_bytes - 1) / page_bytes;
+                                if applied[ordinal][1] != Some(state_pages)
+                                    && let Ok(state) = crate::scheduler::resize_pool(
                                         driver_id,
-                                        ::driver_api::PIE_ELASTIC_POOL_WORKSPACE,
-                                        0,
+                                        ::driver_api::PIE_ELASTIC_POOL_STATE,
+                                        state_pages,
                                         Vec::new(),
                                         Vec::new(),
                                     )
                                     .await
-                                    && workspace.await.is_ok()
+                                    && state.await.is_ok()
                                 {
-                                    applied[ordinal][2] = Some(0);
+                                    applied[ordinal][1] = Some(state_pages);
                                 }
+                            }
+                            // The workspace target is the constant 0, so
+                            // after the first successful trim this one is a
+                            // no-op every single tick.
+                            if applied[ordinal][2] != Some(0)
+                                && let Ok(workspace) = crate::scheduler::resize_pool(
+                                    driver_id,
+                                    ::driver_api::PIE_ELASTIC_POOL_WORKSPACE,
+                                    0,
+                                    Vec::new(),
+                                    Vec::new(),
+                                )
+                                .await
+                                && workspace.await.is_ok()
+                            {
+                                applied[ordinal][2] = Some(0);
                             }
                         }
                     }

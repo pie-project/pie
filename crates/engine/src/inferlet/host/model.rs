@@ -5,8 +5,8 @@
 
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
-use anyhow::Result;
 use crate::model;
+use anyhow::Result;
 
 impl pie::inferlet::model::Host for ProcessCtx {
     async fn name(&mut self) -> Result<String> {

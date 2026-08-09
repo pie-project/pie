@@ -11,7 +11,6 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
 
-use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use ::grammar::bitmask;
 use ::grammar::compiled_grammar::CompiledGrammar;
 use ::grammar::compiler::GrammarCompiler;
@@ -19,6 +18,7 @@ use ::grammar::grammar::Grammar;
 use ::grammar::json_schema::{JsonSchemaOptions, json_schema_to_grammar};
 use ::grammar::matcher::GrammarMatcher;
 use ::grammar::regex::regex_to_grammar;
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tokenizer::Tokenizer;
 
 const EBNF: &str = r#"

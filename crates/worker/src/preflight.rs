@@ -45,7 +45,7 @@ pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec
     if tp_degree == 0 {
         anyhow::bail!("tensor_parallel_size must be > 0");
     }
-    if world_size % tp_degree != 0 {
+    if !world_size.is_multiple_of(tp_degree) {
         anyhow::bail!(
             "world_size ({world_size}) must be divisible by \
              tensor_parallel_size ({tp_degree})"

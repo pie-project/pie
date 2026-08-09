@@ -384,6 +384,12 @@ impl KvPageTable {
     }
 
     /// Create a fresh WorkingSet terminal from an opaque-index snapshot.
+    #[allow(
+        clippy::wrong_self_convention,
+        reason = "not a conversion: it mutates the table to seat a new working set, \
+                  and is named for the `from-index` WIT call it serves (see \
+                  `KvStore::from_index`, its only caller)"
+    )]
     pub(super) fn from_index_snapshot(&mut self, snapshot: IndexedWorkingSet) -> WorkingSetId {
         let ws = self.working_sets.insert(WorkingSetEntry::new(
             snapshot.terminal,
@@ -931,7 +937,7 @@ impl KvPageTable {
     }
 
     /// The last committed token-slot hash of an owned page, addressed by node
-    /// + node-local index (CAS lookup validation: owner compaction can shift
+    /// and node-local index (CAS lookup validation: owner compaction can shift
     /// locals, so an index entry must re-prove its content before use).
     pub fn node_page_last_slot_hash(&self, node: NodeId, local: u64) -> Option<Hash256> {
         match self.nodes.get(node).map(|n| &n.pages) {
@@ -2290,11 +2296,11 @@ fn runs_remove(runs: &Runs, a: u64, b: u64) -> Runs {
 }
 
 fn push_coalesced(out: &mut Runs, range: Range<u32>) {
-    if let Some(last) = out.last_mut() {
-        if last.end == range.start {
-            last.end = range.end;
-            return;
-        }
+    if let Some(last) = out.last_mut()
+        && last.end == range.start
+    {
+        last.end = range.end;
+        return;
     }
     out.push(range);
 }

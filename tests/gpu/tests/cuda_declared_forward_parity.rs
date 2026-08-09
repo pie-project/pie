@@ -147,8 +147,7 @@ async fn declared_forward_token_parity() -> Result<()> {
         .await
         .context("launch")?;
     let json = proc.wait_for_return().await.context("wait_for_return")?;
-    let text =
-        parse_text(&json).with_context(|| format!("no text in result: {json}"))?;
+    let text = parse_text(&json).with_context(|| format!("no text in result: {json}"))?;
     eprintln!(
         "[declared-parity] declared={declared} text={:?}",
         &text[..text.len().min(80)]

@@ -108,7 +108,6 @@ fn assert_matches_exactly_when_cached(fixture: &str) {
 }
 
 fn assert_model_matches_exactly(path: &Path, id: &str) {
-    
     let pie = Arc::new(
         Tokenizer::from_file(path)
             .unwrap_or_else(|error| panic!("loading {} with Pie: {error:#}", id)),

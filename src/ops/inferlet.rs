@@ -5,7 +5,6 @@
 //! same cache at boot, so a CLI with its own idea of the layout would be a
 //! CLI that can hide a program from the thing meant to run it.
 
-
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use serde::Deserialize;
@@ -13,7 +12,6 @@ use serde::Deserialize;
 use engine::inferlet::program::{Manifest, ProgramName, Repository};
 
 use crate::ui::{self, Align, Answer, Mark, Palette, Row, Table};
-
 
 #[derive(Subcommand, Debug)]
 pub enum InferletCmd {
@@ -293,7 +291,10 @@ struct Parameter {
 
 impl ui::Report for InferletInfo {
     fn render(&self, palette: &Palette) {
-        println!("{}", palette.bold(format!("{}@{}", self.name, self.version)));
+        println!(
+            "{}",
+            palette.bold(format!("{}@{}", self.name, self.version))
+        );
         if let Some(description) = &self.description {
             println!("{description}");
         }
@@ -337,7 +338,11 @@ impl ui::Report for InferletInfo {
             // misaligned with colour on and aligned with it off.
             let required = format!(
                 "{:<8}",
-                if parameter.optional { "optional" } else { "yes" }
+                if parameter.optional {
+                    "optional"
+                } else {
+                    "yes"
+                }
             );
             let required = if parameter.optional {
                 palette.dim(required).to_string()
@@ -442,7 +447,6 @@ fn validate_bare_inferlet_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-
 fn parameter_type_name(param_type: &engine::inferlet::program::ParameterType) -> &'static str {
     match param_type {
         engine::inferlet::program::ParameterType::String => "string",
@@ -455,7 +459,6 @@ fn parameter_type_name(param_type: &engine::inferlet::program::ParameterType) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn latest_version_from_registry_json_uses_first_version() {

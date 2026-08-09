@@ -198,12 +198,12 @@ fn parse_rule(spec: &str) -> Result<Rule> {
     // CIDR" from re-parsing the whole spec). If the LHS doesn't parse,
     // fall back to the whole string as a CIDR — handles IPv6 forms
     // like `::1/128` or `2001:db8::/32` which contain colons.
-    if let Some((host, port_str)) = spec.rsplit_once(':') {
-        if let Ok(cidr) = parse_cidr(host) {
-            let port = parse_port_filter(port_str)
-                .map_err(|e| anyhow!("network_allowed_hosts: bad port in {spec:?}: {e}"))?;
-            return Ok(Rule { cidr, port });
-        }
+    if let Some((host, port_str)) = spec.rsplit_once(':')
+        && let Ok(cidr) = parse_cidr(host)
+    {
+        let port = parse_port_filter(port_str)
+            .map_err(|e| anyhow!("network_allowed_hosts: bad port in {spec:?}: {e}"))?;
+        return Ok(Rule { cidr, port });
     }
     let cidr = parse_cidr(spec)
         .map_err(|e| anyhow!("network_allowed_hosts: bad CIDR/IP in {spec:?}: {e}"))?;

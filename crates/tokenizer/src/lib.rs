@@ -398,12 +398,7 @@ impl Tokenizer {
         }
     }
 
-    fn split_regex_sequence(
-        &self,
-        text: &str,
-        splitters: &[Splitter],
-        ids: &mut Vec<u32>,
-    ) {
+    fn split_regex_sequence(&self, text: &str, splitters: &[Splitter], ids: &mut Vec<u32>) {
         if let [splitter] = splitters {
             let output_start = ids.len();
             let mut last_end = 0;

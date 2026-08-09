@@ -10,10 +10,10 @@ use std::path::PathBuf;
 /// `$PIE_HOME` if set, else `~/.pie` (falling back to `.pie` in the cwd if the
 /// home directory can't be resolved).
 pub fn pie_home() -> PathBuf {
-    if let Ok(dir) = std::env::var("PIE_HOME") {
-        if !dir.trim().is_empty() {
-            return PathBuf::from(dir);
-        }
+    if let Ok(dir) = std::env::var("PIE_HOME")
+        && !dir.trim().is_empty()
+    {
+        return PathBuf::from(dir);
     }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))

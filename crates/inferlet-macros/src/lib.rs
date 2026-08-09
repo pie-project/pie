@@ -4,7 +4,7 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, FnArg, GenericArgument, ItemFn, PatType, PathArguments, Type};
+use syn::{FnArg, GenericArgument, ItemFn, PatType, PathArguments, Type, parse_macro_input};
 
 /// Returns `true` if `ty` is exactly `String`.
 fn is_string(ty: &Type) -> bool {
@@ -15,8 +15,12 @@ fn is_string(ty: &Type) -> bool {
 fn result_inner(ty: &Type) -> Option<&Type> {
     let Type::Path(p) = ty else { return None };
     let seg = p.path.segments.last()?;
-    if seg.ident != "Result" { return None; }
-    let PathArguments::AngleBracketed(args) = &seg.arguments else { return None };
+    if seg.ident != "Result" {
+        return None;
+    }
+    let PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
     match args.args.first()? {
         GenericArgument::Type(inner) => Some(inner),
         _ => None,
@@ -59,12 +63,16 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // --- Detect input/output conventions ---
 
     let first_param_ty = input_fn.sig.inputs.first().and_then(|arg| {
-        if let FnArg::Typed(PatType { ty, .. }) = arg { Some(ty.as_ref()) } else { None }
+        if let FnArg::Typed(PatType { ty, .. }) = arg {
+            Some(ty.as_ref())
+        } else {
+            None
+        }
     });
-    let typed_input = first_param_ty.map_or(false, |ty| !is_string(ty));
+    let typed_input = first_param_ty.is_some_and(|ty| !is_string(ty));
 
     let typed_output = match &input_fn.sig.output {
-        syn::ReturnType::Type(_, ty) => result_inner(ty).map_or(false, |t| !is_string(t)),
+        syn::ReturnType::Type(_, ty) => result_inner(ty).is_some_and(|t| !is_string(t)),
         _ => false,
     };
 
@@ -118,4 +126,3 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     expanded.into()
 }
-

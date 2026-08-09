@@ -23,8 +23,8 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
 use ::client::client::Client;
+use anyhow::{Context, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {

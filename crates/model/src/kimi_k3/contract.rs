@@ -102,17 +102,20 @@ fn kimi_k3_shard_axis(name: &str) -> Result<Option<u8>, Error> {
     {
         return Ok(Some(0));
     }
-    // Routed experts under K3's `block_sparse_moe` spelling: shard the
-    // intermediate dim inside each expert, w1/w3 on their output axis and w2
-    // on its input axis, and all-reduce the partial expert outputs.
-    if name.contains(".block_sparse_moe.experts.") {
-        if name.ends_with(".w1.weight") || name.ends_with(".w3.weight") {
-            return Ok(Some(0));
-        }
-        if name.ends_with(".w2.weight") {
-            return Ok(Some(1));
-        }
-    }
+    // Routed experts fall through on purpose. This family's spelling is
+    // `block_sparse_moe.experts.N.w{1,2,3}.weight_packed`, and what decides
+    // their axis is the generic rule's companion-suffix step: a
+    // `.weight_packed` or `.weight_scale` is asked about as the `.weight` it
+    // packs, and `.w1`/`.w3` are row-parallel there while `.w2` is
+    // column-parallel — the same intermediate-dim split, for the same
+    // reason, already written down once.
+    //
+    // A branch matching `.w1.weight` used to sit here. It never fired: no
+    // K3 checkpoint contains that name, because every expert ships packed.
+    // It returned the answers the fallback returns anyway, so deleting it
+    // changed nothing except that the rule is now in one place instead of
+    // looking like it is in two.
+    // `a_packed_expert_shards_the_way_its_weight_would` pins the answers.
     Ok(hf_shard_axis(name))
 }
 
@@ -352,9 +355,11 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
             consumed.extend(parts.iter().map(|part| part.id));
         }
 
-        if gate_up.is_empty() {
-            continue;
-        }
+        // No `gate_up.is_empty()` guard here: `experts <= 0` returned above,
+        // so this loop ran at least once, and every path through its body
+        // either returned or pushed. The guard that used to sit here was the
+        // same question asked a second time, from a place that could not see
+        // the answer.
         // Named but not bound: `scale_per_block` takes its factors by output
         // name, and the stacked slab is dequantized here, so nothing reads
         // these again.
@@ -394,4 +399,712 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Erro
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::LoadShape;
+    use crate::encoding::Encoding as StoredEncoding;
+    use crate::shared::policy::{Component, Policy};
+    use model_loader::checkpoint::CheckpointMetadata;
+    use model_loader::contract::ModelContract;
+    use model_loader::plan::StorageTarget;
+    use model_loader::types::FileId;
+
+    const HIDDEN: i64 = 64;
+    const LATENT: i64 = 64;
+    const INTER: i64 = 32;
+    const P: &str = "language_model.model.layers.0.";
+
+    fn bf16() -> Encoding {
+        Encoding::Raw(DType::BF16)
+    }
+    fn u8e() -> Encoding {
+        Encoding::Raw(DType::U8)
+    }
+
+    /// A K3 checkpoint with one KDA layer and two MXFP4 experts.
+    ///
+    /// The same shape `family_contracts.rs` pins the golden against, built
+    /// again here because these tests need to break it one tensor at a time
+    /// and a golden fixture is the wrong place to keep damaged variants.
+    fn checkpoint() -> Vec<RawTensor> {
+        let mut ck = Vec::new();
+        let mut push = |name: String, shape: Vec<i64>, encoding: Encoding| {
+            let elements: i64 = shape.iter().product();
+            ck.push(RawTensor {
+                id: TensorId(u32::try_from(ck.len()).expect("a small fixture")),
+                name,
+                file_id: FileId(0),
+                file_offset: 0,
+                span_bytes: u64::try_from(elements).unwrap_or(0),
+                shape,
+                encoding,
+            });
+        };
+        push(
+            "language_model.model.embed_tokens.weight".into(),
+            vec![128, HIDDEN],
+            bf16(),
+        );
+        // 8 real gate entries in a 16-entry bank: the padding this family
+        // exists to band past.
+        push(
+            format!("{P}self_attn.A_log"),
+            vec![16],
+            Encoding::Raw(DType::F32),
+        );
+        push(
+            format!("{P}self_attn.b_proj.weight"),
+            vec![8, HIDDEN],
+            bf16(),
+        );
+        for expert in 0..2 {
+            let e = format!("{P}block_sparse_moe.experts.{expert}.");
+            for half in ["w1", "w3"] {
+                push(
+                    format!("{e}{half}.weight_packed"),
+                    vec![INTER, LATENT / 2],
+                    u8e(),
+                );
+                push(
+                    format!("{e}{half}.weight_scale"),
+                    vec![INTER, LATENT / 32],
+                    u8e(),
+                );
+            }
+            push(
+                format!("{e}w2.weight_packed"),
+                vec![LATENT, INTER / 2],
+                u8e(),
+            );
+            push(
+                format!("{e}w2.weight_scale"),
+                vec![LATENT, INTER / 32],
+                u8e(),
+            );
+        }
+        push(
+            "language_model.model.norm.weight".into(),
+            vec![HIDDEN],
+            bf16(),
+        );
+        ck
+    }
+
+    fn without(name: &str) -> Vec<RawTensor> {
+        let mut ck = checkpoint();
+        let before = ck.len();
+        ck.retain(|raw| raw.name != name);
+        assert_eq!(before - 1, ck.len(), "'{name}' was not in the fixture");
+        ck
+    }
+
+    fn reshaped(name: &str, shape: Vec<i64>) -> Vec<RawTensor> {
+        let mut ck = checkpoint();
+        let raw = ck
+            .iter_mut()
+            .find(|raw| raw.name == name)
+            .unwrap_or_else(|| panic!("'{name}' was not in the fixture"));
+        raw.shape = shape;
+        ck
+    }
+
+    fn retyped(name: &str, encoding: Encoding) -> Vec<RawTensor> {
+        let mut ck = checkpoint();
+        let raw = ck
+            .iter_mut()
+            .find(|raw| raw.name == name)
+            .unwrap_or_else(|| panic!("'{name}' was not in the fixture"));
+        raw.encoding = encoding;
+        ck
+    }
+
+    fn run(
+        tensors: Vec<RawTensor>,
+        shape: LoadShape,
+        policy: &Policy,
+        author: impl FnOnce(&mut Builder<'_>) -> Result<(), Error>,
+    ) -> Result<ModelContract, Error> {
+        let meta = CheckpointMetadata {
+            files: Vec::new(),
+            tensors,
+        };
+        let target = StorageTarget {
+            preferred_alignment: 256,
+            ..StorageTarget::default()
+        };
+        let enc = StoredEncoding::dense();
+        let mut b = Builder::new(&meta, "kimi-k3-test", shape, &enc, &target, policy);
+        author(&mut b)?;
+        b.finish()
+    }
+
+    /// The whole author, over a checkpoint that may have been damaged.
+    fn author_over(tensors: Vec<RawTensor>) -> Result<ModelContract, Error> {
+        run(
+            tensors,
+            LoadShape::mixture(1, 0, 2, true),
+            &Policy::default(),
+            author_kimi_k3,
+        )
+    }
+
+    fn refusal(result: Result<ModelContract, Error>) -> String {
+        match result {
+            Err(Error::Contract(msg)) => msg,
+            Err(other) => panic!("expected a contract refusal, got {other:?}"),
+            Ok(_) => panic!("expected a refusal, and the author succeeded"),
+        }
+    }
+
+    fn names(contract: &ModelContract) -> Vec<&str> {
+        contract.tensors.iter().map(|t| t.name.as_str()).collect()
+    }
+
+    /// The axis `name` gets on the path a load really walks.
+    ///
+    /// `Builder::shard_axis` is the entry point: it answers `embed_tokens`
+    /// and `lm_head` itself, strips a companion suffix, and only then
+    /// consults the family's rule. Asking `kimi_k3_shard_axis` directly
+    /// skips all three.
+    fn sharded(name: &str) -> Option<u8> {
+        let meta = CheckpointMetadata {
+            files: Vec::new(),
+            tensors: Vec::new(),
+        };
+        let target = StorageTarget {
+            tp_size: 2,
+            preferred_alignment: 256,
+            ..StorageTarget::default()
+        };
+        let enc = StoredEncoding::dense();
+        let policy = Policy::default();
+        let mut b = Builder::new(
+            &meta,
+            "kimi-k3-test",
+            LoadShape::mixture(1, 0, 2, true),
+            &enc,
+            &target,
+            &policy,
+        );
+        b.shard_axis_fn(kimi_k3_shard_axis);
+        b.shard_axis(name).expect("the policy does not refuse")
+    }
+
+    fn declared<'a>(
+        contract: &'a ModelContract,
+        name: &str,
+    ) -> &'a model_loader::contract::TensorContract {
+        contract
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("'{name}' was not declared in {:?}", names(contract)))
+    }
+
+    // ─── the TP axis policy ──────────────────────────────────────────
+
+    /// Every name this family had to state, and the axis it states.
+    ///
+    /// The module comment opens by saying why this table is worth a test:
+    /// getting one of these wrong is *silent*. The model still loads, the
+    /// shapes still line up, and it still emits tokens -- from the wrong
+    /// heads. There is no crash to notice and no golden to diff, because a
+    /// golden pinned at tp_size 1 never calls this function at all.
+    #[test]
+    fn the_axis_of_every_name_this_family_had_to_state() {
+        let cases: &[(&str, Option<u8>, &str)] = &[
+            // Replicated: the latent MoE's three projections live outside
+            // the expert bank, and the latent that enters and leaves the
+            // experts has to be full width on every rank.
+            (".mlp.routed_expert_down_proj.weight", None, "latent tail"),
+            (".mlp.routed_expert_up_proj.weight", None, "latent tail"),
+            (".mlp.routed_expert_norm.weight", None, "latent tail"),
+            // Replicated by shape.
+            (".self_attn.f_a_proj.weight", None, "the shared bottleneck"),
+            (".self_attn.o_norm.weight", None, "per-channel in a head"),
+            (".self_attention_res_proj.weight", None, "one score row"),
+            (".mlp_res_proj.weight", None, "one score row"),
+            (".self_attention_res_norm.weight", None, "one score row"),
+            (".mlp_res_norm.weight", None, "one score row"),
+            // Per-head, following the head split.
+            (".self_attn.g_proj.weight", Some(0), "per head"),
+            (".self_attn.f_b_proj.weight", Some(0), "per head"),
+            (".self_attn.b_proj.weight", Some(0), "one beta row per head"),
+            (".self_attn.dt_bias", Some(0), "per head"),
+            (".self_attn.q_conv1d.weight", Some(0), "per head"),
+            (".self_attn.k_conv1d.weight", Some(0), "per head"),
+            (".self_attn.v_conv1d.weight", Some(0), "per head"),
+            // The generic rules, still reached.
+            (".self_attn.q_b_proj.weight", Some(0), "the generic list"),
+            (".self_attn.o_proj.weight", Some(1), "the generic list"),
+            (".input_layernorm.weight", None, "the generic list"),
+        ];
+        for (tail, axis, why) in cases {
+            let name = format!("language_model.model.layers.3{tail}");
+            assert_eq!(
+                kimi_k3_shard_axis(&name).expect("the policy does not refuse"),
+                *axis,
+                "{name} ({why})"
+            );
+        }
+    }
+
+    /// `b_proj` and `q_b_proj` are one character apart and one is this
+    /// family's own.
+    ///
+    /// Both answer 0, so the assertion is not the axis -- it is that the
+    /// family's list matches the shorter name without swallowing the
+    /// longer one, which a `contains` would.
+    #[test]
+    fn b_proj_does_not_swallow_q_b_proj() {
+        assert!(
+            !".self_attn.q_b_proj.weight".ends_with(".self_attn.b_proj.weight"),
+            "the two names must stay distinguishable by suffix"
+        );
+        assert_eq!(
+            kimi_k3_shard_axis("m.layers.0.self_attn.q_b_proj.weight").expect("no refusal"),
+            Some(0)
+        );
+    }
+
+    /// The latent tail's spelling misses the generic rule by one character.
+    ///
+    /// This is the module comment's third point, and it is why the tail is
+    /// stated rather than inherited: `routed_expert_down_proj.weight` is
+    /// not `down_proj.weight`, so the generic rule -- which would shard it
+    /// on axis 1 -- does not fire, and *neither* does anything else. The
+    /// name would fall through to `None` by accident. Stating it makes the
+    /// same answer mean something.
+    #[test]
+    fn the_latent_tail_is_replicated_on_purpose_and_not_by_a_near_miss() {
+        for tail in [
+            ".mlp.routed_expert_down_proj.weight",
+            ".mlp.routed_expert_up_proj.weight",
+        ] {
+            let name = format!("model.layers.0{tail}");
+            assert_eq!(hf_shard_axis(&name), None, "the generic rule misses {name}");
+            assert_eq!(
+                kimi_k3_shard_axis(&name).expect("no refusal"),
+                None,
+                "and this family agrees, deliberately"
+            );
+        }
+        // The one character that separates them.
+        assert_eq!(
+            hf_shard_axis("model.layers.0.mlp.down_proj.weight"),
+            Some(1)
+        );
+    }
+
+    /// K3's experts ship as `weight_packed`/`weight_scale`, and the axis of
+    /// a companion is the axis of the weight it packs.
+    ///
+    /// Asked through [`Builder::shard_axis`] and not through the policy
+    /// function, because the stripping happens *there* -- once, ahead of
+    /// every family's own rule, which is what makes the pairing
+    /// unforgettable for a family that supplied one. A test calling
+    /// `kimi_k3_shard_axis` with a packed name directly would pass for the
+    /// wrong reason: the generic fallback strips as well, so the answer
+    /// comes out right through a path production never takes.
+    #[test]
+    fn a_packed_expert_shards_the_way_its_weight_would() {
+        let e = "language_model.model.layers.0.block_sparse_moe.experts.1.";
+        let a = "language_model.model.layers.0.self_attn.";
+        for (name, axis) in [
+            (format!("{e}w1.weight_packed"), Some(0)),
+            (format!("{e}w1.weight_scale"), Some(0)),
+            (format!("{e}w3.weight_packed"), Some(0)),
+            (format!("{e}w2.weight_packed"), Some(1)),
+            (format!("{e}w2.weight_scale"), Some(1)),
+            // This family's own names arrive stripped by the same step,
+            // which is the half a family-supplied rule could forget.
+            (format!("{a}g_proj.weight_scale"), Some(0)),
+            (format!("{a}f_a_proj.weight_scale"), None),
+            // A companion whose base is not a `.weight` at all: the strip
+            // asks about `dt_bias.weight`, gets nothing, and has to ask
+            // again about `dt_bias` itself. Without that second question a
+            // scaled bias would replicate while its heads sharded.
+            (format!("{a}dt_bias.scale"), Some(0)),
+        ] {
+            assert_eq!(sharded(&name), axis, "{name} splits like what it packs");
+        }
+    }
+
+    /// The branch that used to state the expert axes said what the generic
+    /// rule already said.
+    #[test]
+    fn the_generic_rule_already_gave_the_expert_axes() {
+        let e = "language_model.model.layers.0.block_sparse_moe.experts.1.";
+        for (tail, axis) in [
+            ("w1.weight", Some(0)),
+            ("w3.weight", Some(0)),
+            ("w2.weight", Some(1)),
+        ] {
+            let name = format!("{e}{tail}");
+            assert_eq!(hf_shard_axis(&name), axis, "{name}");
+            assert_eq!(
+                kimi_k3_shard_axis(&name).expect("no refusal"),
+                axis,
+                "{name}"
+            );
+        }
+    }
+
+    /// Every name this family replicates is one the generic rule is silent
+    /// about -- today.
+    ///
+    /// Stating a replication and falling through to one give the same
+    /// answer, so no edit to that list can be caught by asking it a
+    /// question. What *can* be caught is the generic rule growing an
+    /// opinion that contradicts one of them: this family would still win,
+    /// and the two would have quietly come to mean different things.
+    #[test]
+    fn every_stated_replication_is_one_the_generic_rule_is_silent_about() {
+        for tail in [
+            ".mlp.routed_expert_down_proj.weight",
+            ".mlp.routed_expert_up_proj.weight",
+            ".mlp.routed_expert_norm.weight",
+            ".self_attn.f_a_proj.weight",
+            ".self_attn.o_norm.weight",
+            ".self_attention_res_proj.weight",
+            ".mlp_res_proj.weight",
+            ".self_attention_res_norm.weight",
+            ".mlp_res_norm.weight",
+        ] {
+            let name = format!("model.layers.0{tail}");
+            assert_eq!(
+                hf_shard_axis(&name),
+                None,
+                "{name}: the generic rule now has an opinion this family \
+                 overrides. Decide which is right rather than letting the \
+                 two drift."
+            );
+        }
+    }
+
+    // ─── the A_log band ──────────────────────────────────────────────
+
+    /// The band takes the real heads and leaves the storage padding.
+    ///
+    /// A uniform row shard of the 16-entry bank would hand rank 1 entries
+    /// [8:16) -- every one of them padding -- so the band runs first and the
+    /// shard applies to its result.
+    ///
+    /// The start is asserted and not just the length: a band of 8 taken
+    /// from 1 is also 8 long, and would be off by one head everywhere.
+    #[test]
+    fn a_log_is_banded_to_the_head_count_the_checkpoint_states() {
+        let contract = author_over(checkpoint()).expect("the fixture authors");
+        let banded = declared(&contract, "model.layers.0.self_attn.A_log");
+        assert_eq!(
+            banded.shape,
+            Some(vec![8]),
+            "the 16-entry bank holds 8 real gates"
+        );
+        let expr = format!("{:?}", banded.expr);
+        assert!(
+            expr.contains("start: 0") || expr.contains("start: 0,"),
+            "the band starts at the first real gate: {expr}"
+        );
+    }
+
+    /// The head count comes from `b_proj`, so a `b_proj` that cannot state
+    /// one is refused rather than guessed at.
+    #[test]
+    fn a_gate_bank_whose_head_count_cannot_be_read_is_refused() {
+        for (case, tensors) in [
+            (
+                "A_log is not a vector",
+                reshaped(&format!("{P}self_attn.A_log"), vec![16, 1]),
+            ),
+            (
+                "b_proj is a scalar",
+                reshaped(&format!("{P}self_attn.b_proj.weight"), vec![]),
+            ),
+        ] {
+            let msg = refusal(author_over(tensors));
+            assert!(
+                msg.contains("unexpected A_log / b_proj rank"),
+                "{case}: {msg}"
+            );
+            assert!(msg.contains("layer 0"), "{case} names the layer: {msg}");
+        }
+    }
+
+    /// A bank smaller than the head count is a checkpoint this band cannot
+    /// describe, and taking [0:heads) from it would read past the end.
+    #[test]
+    fn a_gate_bank_shorter_than_its_head_count_is_refused() {
+        let msg = refusal(author_over(reshaped(
+            &format!("{P}self_attn.A_log"),
+            vec![4],
+        )));
+        assert!(
+            msg.contains("4 gate entries for 8 heads"),
+            "the refusal states both numbers: {msg}"
+        );
+    }
+
+    /// An MLA layer has no `A_log` at all, and is passed over rather than
+    /// refused -- K3 mixes KDA and MLA layers in one checkpoint.
+    #[test]
+    fn a_layer_with_no_gate_bank_is_passed_over() {
+        let contract = author_over(without(&format!("{P}self_attn.A_log")))
+            .expect("an MLA layer is not an error");
+        assert!(
+            !names(&contract).iter().any(|name| name.contains("A_log")),
+            "nothing was banded"
+        );
+    }
+
+    // ─── the expert stacks ───────────────────────────────────────────
+
+    /// The two experts become one bf16 slab per projection, plus the
+    /// per-expert pairs the decode GEMV addresses.
+    #[test]
+    fn the_experts_stack_into_one_slab_and_republish_per_expert() {
+        let contract = author_over(checkpoint()).expect("the fixture authors");
+        let moe = "model.layers.0.block_sparse_moe.";
+
+        let gate_up = declared(&contract, &format!("{moe}experts.gate_up_proj"));
+        assert_eq!(gate_up.shape, Some(vec![2, 2 * INTER, LATENT]));
+        assert_eq!(gate_up.encoding, bf16());
+        let down = declared(&contract, &format!("{moe}experts.down_proj"));
+        assert_eq!(down.shape, Some(vec![2, LATENT, INTER]));
+
+        // The factors are named so `scale_per_block` can take them by name,
+        // and internal because nothing else reads them.
+        for tail in ["experts.gate_up.scale", "experts.down.scale"] {
+            let scale = declared(&contract, &format!("{moe}{tail}"));
+            assert_eq!(scale.encoding, Encoding::Raw(DType::E8M0), "{tail}");
+            assert_eq!(
+                scale.visibility,
+                model_loader::contract::Visibility::Internal,
+                "{tail} is named but not bound"
+            );
+        }
+
+        // Gate and up are adjacent rows in the republished pair: [I, 2, ...].
+        let pair = declared(&contract, &format!("{moe}experts.0.gate_up.weight_packed"));
+        assert_eq!(pair.shape, Some(vec![INTER, 2, LATENT / 2]));
+        let dn = declared(&contract, &format!("{moe}experts.1.down.weight_packed"));
+        assert_eq!(dn.shape, Some(vec![LATENT, INTER / 2]));
+    }
+
+    /// `gate_second` reorders the *stack*, and nothing else.
+    ///
+    /// It has to agree with `kimi_k3_moe_gate_up_swapped()` on the forward
+    /// side: a load that swaps the halves and a matmul that does not is
+    /// silently wrong output, which is the whole reason the flag is passed
+    /// explicitly rather than defaulted. The per-expert republish is gate
+    /// over up either way, because that path reads its halves by name.
+    #[test]
+    fn gate_second_reorders_the_stack_and_leaves_the_republish_alone() {
+        let of = |gate_second: bool| {
+            run(
+                checkpoint(),
+                LoadShape::mixture(1, 0, 2, true),
+                &Policy::default(),
+                |b| {
+                    b.source_prefix("language_model.");
+                    bf16_expert_stacks(b, gate_second)
+                },
+            )
+            .expect("the stacks author")
+        };
+        let moe = "model.layers.0.block_sparse_moe.";
+        let (first, second) = (of(false), of(true));
+
+        let expr = |c: &ModelContract, n: &str| format!("{:?}", declared(c, n).expr);
+        assert_ne!(
+            expr(&first, &format!("{moe}experts.gate_up_proj")),
+            expr(&second, &format!("{moe}experts.gate_up_proj")),
+            "the stack is built in the other order"
+        );
+        assert_ne!(
+            expr(&first, &format!("{moe}experts.gate_up.scale")),
+            expr(&second, &format!("{moe}experts.gate_up.scale")),
+            "and so are its factors"
+        );
+        assert_eq!(
+            expr(&first, &format!("{moe}experts.0.gate_up.weight_packed")),
+            expr(&second, &format!("{moe}experts.0.gate_up.weight_packed")),
+            "the republish is gate over up either way"
+        );
+    }
+
+    /// A dense row does no expert work at all.
+    ///
+    /// The observable is `finish`'s own refusal: a contract that declares
+    /// nothing is refused, so "the pass wrote nothing" and "the builder had
+    /// nothing to finish" are one fact.
+    #[test]
+    fn a_row_with_no_experts_stacks_nothing() {
+        let msg = refusal(run(
+            checkpoint(),
+            LoadShape::dense(1, 0, true),
+            &Policy::default(),
+            |b| {
+                b.source_prefix("language_model.");
+                bf16_expert_stacks(b, false)
+            },
+        ));
+        assert!(msg.contains("no contract was authored"), "{msg}");
+    }
+
+    /// A layer with no expert names is passed over: K3's leading layers are
+    /// dense, which is why this probes rather than reading a layer index.
+    #[test]
+    fn a_dense_layer_is_probed_for_and_passed_over() {
+        let contract = author_over(without(&format!(
+            "{P}block_sparse_moe.experts.0.w1.weight_packed"
+        )))
+        .expect("a dense layer is not an error");
+        assert!(
+            !names(&contract).iter().any(|n| n.contains("gate_up_proj")),
+            "nothing was stacked"
+        );
+    }
+
+    /// An expert missing one of its six sources is refused by name.
+    #[test]
+    fn an_expert_missing_a_source_is_refused() {
+        let msg = refusal(author_over(without(&format!(
+            "{P}block_sparse_moe.experts.1.w3.weight_scale"
+        ))));
+        assert!(
+            msg.contains("layer 0 expert 1") && msg.contains("missing a weight or scale"),
+            "{msg}"
+        );
+    }
+
+    /// A checkpoint that packs its experts some other way is left whole.
+    ///
+    /// Not a refusal: this pass declines, the generic publisher takes the
+    /// tensors as they are, and the alternative -- rewriting the experts it
+    /// understood and leaving the rest -- would be half a model.
+    #[test]
+    fn experts_packed_some_other_way_are_left_alone() {
+        for (case, tensors) in [
+            (
+                "not U8",
+                retyped(
+                    &format!("{P}block_sparse_moe.experts.0.w1.weight_packed"),
+                    bf16(),
+                ),
+            ),
+            (
+                "not rank 2",
+                reshaped(
+                    &format!("{P}block_sparse_moe.experts.0.w1.weight_packed"),
+                    vec![1, INTER, LATENT / 2],
+                ),
+            ),
+        ] {
+            let contract =
+                author_over(tensors).unwrap_or_else(|e| panic!("{case} is not a refusal: {e}"));
+            assert!(
+                !names(&contract).iter().any(|n| n.contains("gate_up_proj")),
+                "{case}: nothing was stacked"
+            );
+            // ...and the sources are still published, rather than dropped.
+            assert!(
+                names(&contract)
+                    .iter()
+                    .any(|n| n.ends_with("experts.1.w2.weight_packed")),
+                "{case}: the experts are still in the contract"
+            );
+        }
+    }
+
+    /// The six shapes have to agree with each other, and each disagreement
+    /// is refused by layer and expert.
+    #[test]
+    fn an_expert_whose_shapes_disagree_is_refused() {
+        let e = format!("{P}block_sparse_moe.experts.1.");
+        for (case, tensors) in [
+            (
+                "w2 does not see w1's latent",
+                reshaped(&format!("{e}w2.weight_packed"), vec![LATENT / 2, INTER / 2]),
+            ),
+            (
+                "w2's intermediate is not w1's",
+                reshaped(&format!("{e}w2.weight_packed"), vec![LATENT, INTER]),
+            ),
+            (
+                "w1's factors are not one per group of 32",
+                reshaped(&format!("{e}w1.weight_scale"), vec![INTER, 1]),
+            ),
+            (
+                "w2's factors are not one per group of 32",
+                reshaped(&format!("{e}w2.weight_scale"), vec![LATENT, 2]),
+            ),
+        ] {
+            let msg = refusal(author_over(tensors));
+            assert!(
+                msg.contains("layer 0 expert 1") && msg.contains("inconsistent MXFP4 shapes"),
+                "{case}: {msg}"
+            );
+        }
+    }
+
+    /// One layer's experts have to agree on the latent they read.
+    ///
+    /// Reached only by an expert that is internally consistent and still
+    /// disagrees with expert 0, which is why every one of its four shapes
+    /// moves together here.
+    #[test]
+    fn an_expert_that_changes_the_latent_is_refused() {
+        let e = format!("{P}block_sparse_moe.experts.1.");
+        let mut tensors = checkpoint();
+        let half = LATENT / 2;
+        for raw in &mut tensors {
+            let Some(tail) = raw.name.strip_prefix(&e) else {
+                continue;
+            };
+            raw.shape = match tail {
+                "w1.weight_packed" | "w3.weight_packed" => vec![INTER, half / 2],
+                "w1.weight_scale" | "w3.weight_scale" => vec![INTER, half / 32],
+                "w2.weight_packed" => vec![half, INTER / 2],
+                "w2.weight_scale" => vec![half, INTER / 32],
+                other => panic!("unexpected expert tensor '{other}'"),
+            };
+        }
+        let msg = refusal(author_over(tensors));
+        assert!(
+            msg.contains("layer 0 expert 1") && msg.contains("changes the latent width"),
+            "{msg}"
+        );
+    }
+
+    /// An encode component declares no decoder weight, and the pass runs to
+    /// the end anyway.
+    ///
+    /// `define` answers `None` for everything here, which is what the two
+    /// `if let Some` arms around `mark_internal` are for: that function
+    /// *indexes* the contract, so an index that was never handed out would
+    /// panic rather than be skipped. `allow_encode_scope` gets past the
+    /// first guard in `finish` so the second one — the empty contract — is
+    /// what reports, which is the thing being asserted.
+    #[test]
+    fn an_encode_component_declares_no_expert_factors() {
+        let policy = Policy {
+            component: Component::Encode,
+            ..Policy::default()
+        };
+        let msg = refusal(run(
+            checkpoint(),
+            LoadShape::mixture(1, 0, 2, true),
+            &policy,
+            |b| {
+                b.source_prefix("language_model.");
+                b.allow_encode_scope()?;
+                bf16_expert_stacks(b, false)
+            },
+        ));
+        assert!(msg.contains("no contract was authored"), "{msg}");
+    }
 }

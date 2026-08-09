@@ -4,7 +4,6 @@
 //! never kernels, and one LOWERED text per backend. The semantic arm is what
 //! parity holds the other two to.
 
-pub mod emit;
 pub mod facts;
 
 use self::facts::{

@@ -436,10 +436,6 @@ impl QueuedFireIds {
     pub fn contains(&self, fire_id: &u64) -> bool {
         self.ids.binary_search(fire_id).is_ok()
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.ids.is_empty()
-    }
 }
 
 impl FromIterator<u64> for QueuedFireIds {
@@ -1300,7 +1296,7 @@ impl FramePolicy {
             return;
         }
         self.strict_watchdog_deadline = None;
-            self.idle_dumped = false;
+        self.idle_dumped = false;
     }
 
     fn have_seal_candidate(&self) -> bool {
@@ -1584,10 +1580,7 @@ impl FramePolicy {
             // and defaults to 0, so the dump reports everything unless the
             // analyst asks it not to.
             let seated = self.lanes.values().filter(|lane| lane.awaited).count();
-            if idle >= threshold
-                && !self.idle_dumped
-                && seated >= idle_dump_min_seats()
-            {
+            if idle >= threshold && !self.idle_dumped && seated >= idle_dump_min_seats() {
                 self.idle_dumped = true;
                 let (mut ready, mut empty_owed, mut empty_unowed, mut partial) = (0, 0, 0, 0);
                 let (mut unowed_fresh, mut unowed_between) = (0, 0);
@@ -1618,8 +1611,7 @@ impl FramePolicy {
                             if lane.served {
                                 unowed_between += 1;
                                 if let Some(at) = lane.retired_at {
-                                    let age =
-                                        now.saturating_duration_since(at).as_micros() as u64;
+                                    let age = now.saturating_duration_since(at).as_micros() as u64;
                                     turn_max = turn_max.max(age);
                                     turn_sum += age;
                                     turn_n += 1;
@@ -1662,8 +1654,12 @@ ready_age_newest={}us",
                     self.pending_slots,
                     self.joins_in_flight.len(),
                     self.pending_binds.values().sum::<usize>(),
-                    if turn_n > 0 { turn_sum / turn_n } else { 0 },
-                    if newest_ready_us == u64::MAX { 0 } else { newest_ready_us },
+                    turn_sum.checked_div(turn_n).unwrap_or(0),
+                    if newest_ready_us == u64::MAX {
+                        0
+                    } else {
+                        newest_ready_us
+                    },
                 );
             }
         }
@@ -1740,10 +1736,7 @@ ready_age_newest={}us",
                 // remaining deficit, so what they were waiting for is the
                 // question. Off unless the variable is set.
                 if starved_us >= idle_dump_threshold_us() {
-                    println!(
-                        "[idle-gap] {starved_us}us  {}",
-                        self.debug_summary()
-                    );
+                    println!("[idle-gap] {starved_us}us  {}", self.debug_summary());
                 }
                 return FramePlan::Dispatch(frame.waves);
             }
@@ -1778,7 +1771,7 @@ ready_age_newest={}us",
             if !self.lanes.values().any(|lane| !lane.frames.is_empty()) {
                 // Nothing queued anywhere: no gather episode is running.
                 self.strict_watchdog_deadline = None;
-            self.idle_dumped = false;
+                self.idle_dumped = false;
                 return FramePlan::Park;
             }
             // `missing` counts awaited lanes whose next frame is not fully
@@ -1856,7 +1849,11 @@ ready_age_newest={}us",
                 // the lane is judged by the ordinary ladder below. No measured
                 // run has ever carried a debt this old, so the rule the
                 // campaign measured is unchanged.
-                let debt_since = if owes { self.in_flight_since.get(lane_id).copied() } else { None };
+                let debt_since = if owes {
+                    self.in_flight_since.get(lane_id).copied()
+                } else {
+                    None
+                };
                 let owes_forever = debt_since
                     .is_some_and(|from| now.saturating_duration_since(from) >= silence * 2);
                 // THE gate rule lives in `gate_verdict`. Leashed: already
@@ -1961,7 +1958,7 @@ ready_age_newest={}us",
                     if self.quiesce_mark == Some(self.gather_seq) {
                         self.quiesce_mark = None;
                         self.strict_watchdog_deadline = None;
-            self.idle_dumped = false;
+                        self.idle_dumped = false;
                         match self.seal() {
                             Some(FramePlan::Dispatch(_)) => continue,
                             Some(plan) => return plan,
@@ -3034,7 +3031,10 @@ mod tests {
         }
         let queued: QueuedFireIds = [400, 401, 402, 403].into_iter().collect();
         let now = Instant::now();
-        assert!(matches!(plan(&mut policy, &queued, now), FramePlan::Dispatch(_)));
+        assert!(matches!(
+            plan(&mut policy, &queued, now),
+            FramePlan::Dispatch(_)
+        ));
 
         // b's wave retires and b keeps the fleet working; a's never does.
         let tick = |policy: &mut FramePolicy, seq: u64, at: Instant| -> FramePlan {
@@ -3228,7 +3228,11 @@ mod tests {
         let queued: QueuedFireIds = [10, 20].into_iter().collect();
         let mut sealed = fires(&plan(&mut policy, &queued, Instant::now()));
         sealed.sort_unstable();
-        assert_eq!(sealed, vec![10, 20], "the fleet starts as one dense boundary");
+        assert_eq!(
+            sealed,
+            vec![10, 20],
+            "the fleet starts as one dense boundary"
+        );
         // Deliberately NOT retired: both lanes are now owed a result, which is
         // the state the relaxation is about. `b` answers anyway (its guest had
         // run-ahead); `a` has nothing queued and cannot get any.
@@ -3355,7 +3359,10 @@ mod tests {
         policy.on_fire_enqueued(stamp(a, 0, 0, 1), Some(a), 10, 1, 1);
         let queued: QueuedFireIds = [10].into_iter().collect();
         assert_eq!(fires(&plan(&mut policy, &queued, Instant::now())), vec![10]);
-        assert!(policy.owes_lane(a), "the dispatched frame is an unretired debt");
+        assert!(
+            policy.owes_lane(a),
+            "the dispatched frame is an unretired debt"
+        );
 
         // Exactly what the worker posts for a Terminate leave.
         policy.on_lane_leave(a, Some(a), true);
@@ -3385,6 +3392,9 @@ mod tests {
             "an evicted process's dispatched frame still retires; the debt stands"
         );
         retire(&mut policy, [a]);
-        assert!(!policy.owes_lane(a), "and the retirement clears it normally");
+        assert!(
+            !policy.owes_lane(a),
+            "and the retirement clears it normally"
+        );
     }
 }

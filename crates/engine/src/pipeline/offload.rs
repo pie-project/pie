@@ -7,11 +7,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow, ensure};
 use ::driver_api::{
     ExecutorRequest, ExecutorResponse, InlineKvPayload, MemoryDomain, PushKv, RemoteMediaBlob,
     RemoteMediaKind, RemoteTransferKind,
 };
+use anyhow::{Result, anyhow, ensure};
 
 use crate::pipeline::program::RegisteredProgram;
 use crate::store::kv::page_table::WorkingSetId;
@@ -568,17 +568,14 @@ fn publish_encode_blob(
     let hash = *blake3::hash(&bytes).as_bytes();
     let server = {
         let mut registry = ENCODE_BLOB_REGISTRY.lock().unwrap();
-        if registry.server.is_none() {
-            registry.server = Some(EncodeBlobServer::start(host)?);
-        } else if registry
-            .server
-            .as_ref()
-            .is_some_and(|server| server.host != host)
-        {
-            return Err(anyhow!(
+        if let Some(server) = registry.server.as_ref() {
+            ensure!(
+                server.host == host,
                 "encode blob listener is active on {}, not routed host {host}",
-                registry.server.as_ref().expect("server exists").host
-            ));
+                server.host
+            );
+        } else {
+            registry.server = Some(EncodeBlobServer::start(host)?);
         }
         let entry = registry
             .blobs
@@ -1217,7 +1214,30 @@ fn release_scratch(model_idx: usize, driver_id: usize, ws: WorkingSetId) {
     });
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one prefill's whole offload context: which model/driver/working set \
+              it is leaving, the plan being rewritten, the tokens that must stay \
+              canonical, the program to run remotely, and the home instance whose \
+              lifetime the transfer is pinned to; a struct would just re-list them"
+)]
+#[allow(
+    dead_code,
+    reason = "the prefill-offload path landed in c1e148ef2 (`Implement PTIR fusion`) \
+              together with a wholesale rewrite of its only caller, and that rewrite \
+              dropped the call: on the `bravo` snapshot of the same work \
+              (6276995b9) `pipeline/fire.rs` still called \
+              `offload::try_prefill`, and no call has existed on this branch since. \
+              Kept, not deleted, because the surviving half of the same machinery \
+              (`Surrogate`/`SURROGATES`/`HOME_STATES`, drained by the exported \
+              `close_driver_surrogates` and `close_home_instance`) is still public \
+              API, so removing this root would cascade into deleting the feature. \
+              Rewiring it is a design decision, not a lint fix. NOTE: this allow \
+              also covers the chain reachable only from here \
+              (`try_prefill_owned`, `HomeUse`, `surrogate`, `prefill_threshold`, \
+              `context_extension_program`, `release_scratch`, `OffloadAdoption`), \
+              which rustc treats as live once this root is allowed"
+)]
 pub(crate) async fn try_prefill(
     model_idx: usize,
     home_driver_id: usize,
@@ -1253,7 +1273,12 @@ pub(crate) async fn try_prefill(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the owned twin of `try_prefill` — same whole-offload context, cloned \
+              so the work can run on its own task; the parameter list is the \
+              signature it mirrors"
+)]
 async fn try_prefill_owned(
     model_idx: usize,
     home_driver_id: usize,
@@ -1297,12 +1322,10 @@ async fn try_prefill_owned(
         COUNTERS.user_mask.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    let mutates_context = program
-        .bound
-        .container
-        .stages
-        .iter()
-        .any(|stage| stage.stage != tensor_ir::registry::Stage::Epilogue && !stage.ops.is_empty());
+    let mutates_context =
+        program.bound.container.stages.iter().any(|stage| {
+            stage.stage != tensor_ir::registry::Stage::Epilogue && !stage.ops.is_empty()
+        });
     if mutates_context {
         COUNTERS.channels.fetch_add(1, Ordering::Relaxed);
         return None;
@@ -1526,19 +1549,32 @@ pub(crate) fn clear_partners() {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "`TEST_LOCK` is a test-harness serializer, not a runtime lock: these \
+              tests mutate process-global partner state (`clear_partners`, \
+              `register_partner`, the encode-blob registry), so libtest's threads \
+              have to take turns. It is acquired ONLY on the first line of a test \
+              body and never by anything those bodies spawn, so no task on any of \
+              these runtimes can ever contend for it while a test is suspended at \
+              an await, and it cannot deadlock — including in the four \
+              `flavor = \"multi_thread\"` cases. Holding it across the awaits IS \
+              the serialization; dropping it early would let the next test stomp \
+              the globals mid-await"
+)]
 mod tests {
     use super::*;
-    use futures::StreamExt;
     use ::driver_api::{
         DriverCapabilities, ExecutorResponse, ExecutorRpc, KvDtype, KvHandle, KvLayout,
         KvLayoutKind, KvRegion, PIE_TERMINAL_OUTCOME_SUCCESS, RemoteBindResponse,
         RemoteChannelBinding, RemoteError, RemoteTerminal, ScratchGrant, TerminalCellState,
     };
-    use tensor_ir::container::{StageProgram, TraceContainer};
-    use tensor_ir::registry::{ModelProfile, Stage};
+    use futures::StreamExt;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicU64;
     use tarpc::server::{BaseChannel, Channel};
+    use tensor_ir::container::{StageProgram, TraceContainer};
+    use tensor_ir::registry::{ModelProfile, Stage};
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1699,10 +1735,12 @@ mod tests {
                     if encode.plan.embed_rows.is_empty() {
                         let rows = encode.plan.token_ids.len().max(1);
                         let mut bytes = Vec::with_capacity(rows * 2);
-                        for token in
-                            encode.plan.token_ids.iter().copied().chain(
-                                std::iter::repeat(0).take(rows - encode.plan.token_ids.len()),
-                            )
+                        for token in encode
+                            .plan
+                            .token_ids
+                            .iter()
+                            .copied()
+                            .chain(std::iter::repeat_n(0, rows - encode.plan.token_ids.len()))
                         {
                             bytes.extend_from_slice(&(token as u16).to_le_bytes());
                         }
@@ -1887,8 +1925,8 @@ mod tests {
 
         let home_ws = {
             let stores = crate::store::registry::get(model_idx, 0);
-            let id = stores.kv.lock().create_working_set();
-            id
+
+            stores.kv.lock().create_working_set()
         };
         let program = empty_registered_program();
         let tokens = (0..33).collect::<Vec<u32>>();

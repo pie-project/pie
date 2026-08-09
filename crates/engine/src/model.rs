@@ -16,9 +16,9 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, anyhow};
 
+use ::model::ModelMetadata;
 use ::model::catalog::{self, Deployed, Variant};
 use ::model::instruct::Instruct;
-use ::model::ModelMetadata;
 use tokenizer::Tokenizer;
 
 /// The single model this engine serves. Set once at bootstrap.
@@ -65,6 +65,14 @@ fn loaded_row(model_id: &str) -> Result<&'static dyn Variant> {
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one model row, stated once: its name and architecture, the catalog id \
+              it resolves to, the KV page size, its recurrent-state and PTIR \
+              capability sets, its tokenizer, and the checkpoint metadata. These \
+              come from different sources at the call site, so a struct would need \
+              assembling field-by-field first"
+)]
 pub fn register(
     name: String,
     arch_name: &str,

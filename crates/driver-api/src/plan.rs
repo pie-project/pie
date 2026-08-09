@@ -224,7 +224,11 @@ impl LaunchPlan {
 
         // A read-out row that is not a token row reads whatever follows the
         // logits — the same shape of defect, one buffer over.
-        if let Some(&row) = self.sampling_indices.iter().find(|&&r| r as usize >= tokens) {
+        if let Some(&row) = self
+            .sampling_indices
+            .iter()
+            .find(|&&r| r as usize >= tokens)
+        {
             return bad(format!(
                 "sampling_indices names row {row}, past the {tokens} rows this fire has"
             ));
@@ -648,7 +652,8 @@ mod geometry_tests {
     fn a_sound_frame_passes_both_halves() {
         let p = sound();
         p.validate_geometry().expect("a sound frame");
-        p.validate_kv_writes(16).expect("every write is in its own span");
+        p.validate_kv_writes(16)
+            .expect("every write is in its own span");
         assert_eq!(p.req_of_token(), vec![0, 0, 1, 1]);
     }
 
@@ -678,7 +683,8 @@ mod geometry_tests {
         // And the geometry half is happy with it, which is why the two are
         // separate checks: the CSR is internally consistent and still wrong
         // for these positions.
-        p.validate_geometry().expect("the CSR itself is well-formed");
+        p.validate_geometry()
+            .expect("the CSR itself is well-formed");
     }
 
     #[test]
@@ -686,7 +692,10 @@ mod geometry_tests {
         let mut p = sound();
         p.qo_indptr = vec![0, 2, 3];
         assert!(
-            p.validate_geometry().unwrap_err().0.contains("qo_indptr ends at 3"),
+            p.validate_geometry()
+                .unwrap_err()
+                .0
+                .contains("qo_indptr ends at 3"),
             "the count that disagrees has to be in the message"
         );
 
@@ -706,7 +715,12 @@ mod geometry_tests {
 
         let mut p = sound();
         p.position_ids = vec![0, 1];
-        assert!(p.validate_geometry().unwrap_err().0.contains("position_ids"));
+        assert!(
+            p.validate_geometry()
+                .unwrap_err()
+                .0
+                .contains("position_ids")
+        );
 
         // A read-out row that is not a token row reads whatever follows the
         // logits.
@@ -729,7 +743,8 @@ mod geometry_tests {
             ..LaunchPlan::default()
         };
         p.validate_geometry().expect("an empty CSR is a default");
-        p.validate_kv_writes(16).expect("no KV family, nothing to check");
+        p.validate_kv_writes(16)
+            .expect("no KV family, nothing to check");
         assert_eq!(p.req_of_token(), vec![0, 0, 0]);
     }
 }

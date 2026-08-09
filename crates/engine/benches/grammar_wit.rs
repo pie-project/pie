@@ -6,10 +6,8 @@
 
 #[path = "../tests/common/env.rs"]
 mod env;
-#[allow(dead_code)]
 #[path = "../tests/common/inferlets.rs"]
 mod inferlets;
-#[allow(dead_code)]
 #[path = "../tests/common/mock_device.rs"]
 mod mock_device;
 
@@ -18,10 +16,10 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use env::{MockEnv, create_mock_env};
-use mock_device::EchoBehavior;
 use engine::inferlet::process;
 use engine::inferlet::program::{self, ProgramName};
+use env::{MockEnv, create_mock_env};
+use mock_device::EchoBehavior;
 use tempfile::TempDir;
 
 /// Match production's allocator.
@@ -158,6 +156,13 @@ fn state(vocab_size: usize) -> BenchState {
     }
 }
 
+#[allow(
+    clippy::async_yields_async,
+    reason = "the oneshot::Receiver is deliberately handed back out of the first \
+              block_on rather than awaited inside it, so the second block_on can \
+              await it under tokio::time::timeout; awaiting it here would drop the \
+              timeout and turn a hung inferlet into a hung benchmark"
+)]
 fn run(state: &BenchState, iterations: usize, rounds: usize) -> String {
     let input = serde_json::json!({
         "iterations": iterations,

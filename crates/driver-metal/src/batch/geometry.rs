@@ -494,15 +494,23 @@ fn positive(v: i32) -> Option<u32> {
 /// That refusal's own text named the failure it was standing next to —
 /// "the same class of failure as reading the router's 8-bit gate as
 /// 4-bit ... which produced cosine 0.84 logits rather than an error."
-/// The refusal is gone and THAT failure is not: routed stacks now reach
-/// this driver, [`DecodeGeometry::alt_quant`] is the field the second
-/// width would ride, and nothing fills it. `binding::observed` builds
-/// ONE kernel set from `quant.group`/`quant.bits` for the whole
-/// checkpoint, so a row publishing its gate at another width is read at
-/// the stack's. `geometry_is_stated` holds the field NOT WIRED and
-/// `a_routed_row_reads_one_width_for_every_tensor` below is the
-/// measurement, so this is a gap somebody wrote down rather than one
-/// the lifted refusal quietly inherited.
+/// The refusal is gone and THAT failure was not — routed stacks now
+/// reach this driver, [`DecodeGeometry::alt_quant`] is the field the
+/// second width would ride, and nothing fills it. `binding::observed`
+/// builds ONE kernel set from `quant.group`/`quant.bits` for the whole
+/// checkpoint, so a row publishing its gate at another width was read
+/// at the stack's.
+///
+/// It is a REFUSAL now, and the thing that made it possible is that the
+/// gap was never where it was written down. "No load path solves the
+/// format from the staged tensors" was wrong: `QuantSpec` carries a
+/// `group_size` and a `bits_per_element` for EVERY tensor and nothing
+/// was asking. `LoadPlan::affine_points` asks, and `serve/load.rs`
+/// refuses a checkpoint arriving at two points rather than reading one
+/// of them at the other's width. `alt_quant` stays unset because a
+/// second point needs a second kernel set to be worth filling, and
+/// `a_routed_row_reads_one_width_for_every_tensor` below holds that
+/// state rather than assuming it.
 ///
 /// # Errors
 ///
@@ -1506,9 +1514,11 @@ mod tests {
     ///
     /// [`DecodeGeometry::alt_quant`] is the field that second width
     /// would ride. This asserts it stays UNSET through the routed path,
-    /// which is the honest state: nothing solves it from the staged
-    /// tensors, so `has_alt_quant()` is `false` in production and the
-    /// whole checkpoint is read at `quant`.
+    /// which is the honest state: the geometry is built from ONE stated
+    /// point, so `has_alt_quant()` is `false` and every tensor is read
+    /// at `quant`. What keeps that from being a wrong answer is not this
+    /// file — it is `serve/load.rs`, which asks `LoadPlan::affine_points`
+    /// and refuses a checkpoint that arrives at more than one.
     ///
     /// # Why an assertion and not a `TODO`
     ///

@@ -10,6 +10,11 @@ use half::{bf16, f16};
 use crate::types::DType;
 
 use super::fp8::fp8_e4m3_to_f32;
+// Gated the same way the module is: `mxfp4::avx2` is `#[cfg(x86_64)]`, and
+// its one caller below already sits behind that cfg. Without the gate this
+// import is an unresolved name on every other target — aarch64 included,
+// which is every Metal host.
+#[cfg(target_arch = "x86_64")]
 use super::mxfp4::avx2;
 
 /// How an Encode reads its operand as `BF16` rows.

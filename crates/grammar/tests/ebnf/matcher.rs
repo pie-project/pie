@@ -228,7 +228,7 @@ fn test_character_class_star_utf8() {
 fn test_cyrillic_char_class() {
     // Cyrillic lowercase а-я (U+0430 to U+044F)
     let grammar = "root ::= [\u{0430}-\u{044F}]+";
-    let g = Grammar::from_ebnf(&grammar, "root").unwrap();
+    let g = Grammar::from_ebnf(grammar, "root").unwrap();
 
     // Single Cyrillic characters
     assert!(is_grammar_accept_string_g(&g, "\u{0430}")); // а
@@ -256,7 +256,7 @@ fn test_cyrillic_char_class() {
 fn test_cyrillic_uppercase_char_class() {
     // Uppercase Cyrillic А-Я (U+0410 to U+042F)
     let grammar = "root ::= [\u{0410}-\u{042F}]+";
-    let g = Grammar::from_ebnf(&grammar, "root").unwrap();
+    let g = Grammar::from_ebnf(grammar, "root").unwrap();
 
     assert!(is_grammar_accept_string_g(&g, "\u{0410}")); // А
     assert!(is_grammar_accept_string_g(&g, "\u{042F}")); // Я
@@ -276,7 +276,7 @@ fn test_cyrillic_uppercase_char_class() {
 fn test_cjk_char_class() {
     // CJK Unified Ideographs subset: 一-龥 (U+4E00 to U+9FA5)
     let grammar = "root ::= [\u{4E00}-\u{9FA5}]+";
-    let g = Grammar::from_ebnf(&grammar, "root").unwrap();
+    let g = Grammar::from_ebnf(grammar, "root").unwrap();
 
     assert!(is_grammar_accept_string_g(&g, "\u{4E00}")); // 一
     assert!(is_grammar_accept_string_g(&g, "\u{4E2D}")); // 中
@@ -305,7 +305,7 @@ fn test_cjk_char_class() {
 fn test_hiragana_char_class() {
     // Hiragana: あ-ん (U+3041 to U+3093)
     let grammar = "root ::= [\u{3041}-\u{3093}]+";
-    let g = Grammar::from_ebnf(&grammar, "root").unwrap();
+    let g = Grammar::from_ebnf(grammar, "root").unwrap();
 
     assert!(is_grammar_accept_string_g(&g, "\u{3041}")); // あ
     assert!(is_grammar_accept_string_g(&g, "\u{3093}")); // ん
@@ -322,7 +322,7 @@ fn test_hiragana_char_class() {
 fn test_emoji_char_class() {
     // Emoji range: 😀-😿 (U+1F600 to U+1F63F)
     let grammar = "root ::= [\u{1F600}-\u{1F63F}]+";
-    let g = Grammar::from_ebnf(&grammar, "root").unwrap();
+    let g = Grammar::from_ebnf(grammar, "root").unwrap();
 
     assert!(is_grammar_accept_string_g(&g, "\u{1F600}")); // 😀
     assert!(is_grammar_accept_string_g(&g, "\u{1F603}")); // 😃
@@ -344,7 +344,7 @@ fn test_emoji_char_class() {
 fn test_mixed_utf8_ranges() {
     // ASCII + Cyrillic + CJK
     let grammar = "root ::= [a-z\u{0430}-\u{044F}\u{4E00}-\u{9FA5}]+";
-    let g = Grammar::from_ebnf(&grammar, "root").unwrap();
+    let g = Grammar::from_ebnf(grammar, "root").unwrap();
 
     assert!(is_grammar_accept_string_g(&g, "hello"));
     assert!(is_grammar_accept_string_g(
@@ -368,7 +368,7 @@ fn test_mixed_utf8_ranges() {
 fn test_single_utf8_char_class() {
     // Single Cyrillic character (not a range)
     let grammar = "root ::= [\u{0430}]+";
-    let g = Grammar::from_ebnf(&grammar, "root").unwrap();
+    let g = Grammar::from_ebnf(grammar, "root").unwrap();
 
     assert!(is_grammar_accept_string_g(&g, "\u{0430}")); // а
     assert!(is_grammar_accept_string_g(&g, "\u{0430}\u{0430}\u{0430}")); // ааа
@@ -377,7 +377,7 @@ fn test_single_utf8_char_class() {
 
     // Single CJK character
     let grammar_cjk = "root ::= [\u{4E2D}]+";
-    let g_cjk = Grammar::from_ebnf(&grammar_cjk, "root").unwrap();
+    let g_cjk = Grammar::from_ebnf(grammar_cjk, "root").unwrap();
 
     assert!(is_grammar_accept_string_g(&g_cjk, "\u{4E2D}")); // 中
     assert!(is_grammar_accept_string_g(
@@ -394,7 +394,7 @@ fn test_single_utf8_char_class() {
 #[test]
 fn test_utf8_char_class_with_quantifier() {
     let grammar = "root ::= [a-z\u{0430}-\u{044F}\u{4E00}-\u{9FA5}]{0,2048}";
-    let g = Grammar::from_ebnf(&grammar, "root").unwrap();
+    let g = Grammar::from_ebnf(grammar, "root").unwrap();
 
     // Empty string (min is 0)
     assert!(is_grammar_accept_string_g(&g, ""));
@@ -716,7 +716,7 @@ fn test_json_pressure_deep_nesting() {
 fn test_utf8_comma_char_class() {
     // Chinese comma: ，(U+FF0C)
     let grammar = "root ::= [\u{FF0C}]+";
-    let g = Grammar::from_ebnf(&grammar, "root").unwrap();
+    let g = Grammar::from_ebnf(grammar, "root").unwrap();
 
     assert!(is_grammar_accept_string_g(&g, "\u{FF0C}"));
     assert!(is_grammar_accept_string_g(&g, "\u{FF0C}\u{FF0C}\u{FF0C}"));

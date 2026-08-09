@@ -3,7 +3,6 @@
 //! `list` and `clear` both read `worker::state`, which is the point of the
 //! registry: describing and reclaiming cannot disagree about what exists.
 
-
 use anyhow::{Result, anyhow, bail};
 use clap::Subcommand;
 use worker::state::{self, Reclaim};
@@ -66,7 +65,11 @@ impl ui::Report for CacheReport {
             // An absent entry is reported rather than hidden: "pie has not
             // written this yet" and "pie does not know about this" are
             // different answers, and only the listing can tell them apart.
-            let mark = if row.exists { Mark::Plain } else { Mark::Absent };
+            let mark = if row.exists {
+                Mark::Plain
+            } else {
+                Mark::Absent
+            };
             table.push(Row::new(
                 mark,
                 [
@@ -180,7 +183,10 @@ fn selected(names: &[String]) -> Result<Vec<state::Entry>> {
             .find(|e| e.name == name)
             .ok_or_else(|| {
                 let known: Vec<&str> = all.iter().map(|e| e.name).collect();
-                anyhow!("unknown entry {name:?}; `pie cache list` shows: {}", known.join(", "))
+                anyhow!(
+                    "unknown entry {name:?}; `pie cache list` shows: {}",
+                    known.join(", ")
+                )
             })?
             .clone();
         if entry.reclaim == Reclaim::Never {
@@ -211,7 +217,12 @@ fn clear(names: Vec<String>, skip_confirm: bool) -> Result<Answer> {
 
     let total: u64 = present.iter().map(|(_, size)| *size).sum();
     for (entry, size) in &present {
-        println!("  {:<12} {:>8}  {}", entry.name, ui::bytes(*size), entry.path.display());
+        println!(
+            "  {:<12} {:>8}  {}",
+            entry.name,
+            ui::bytes(*size),
+            entry.path.display()
+        );
     }
     println!();
 
@@ -266,7 +277,10 @@ mod tests {
     fn an_unknown_name_says_what_the_names_are() {
         let err = selected(&["ptir".to_string()]).unwrap_err().to_string();
         assert!(err.contains("unknown entry"), "got: {err}");
-        assert!(err.contains("driver"), "should list the real names; got: {err}");
+        assert!(
+            err.contains("driver"),
+            "should list the real names; got: {err}"
+        );
     }
 
     #[test]
@@ -285,7 +299,11 @@ mod tests {
         // beside them, while `pie cache` reported their size under the store's
         // name. Different directories, different reclaim grades.
         let all = state::entries(None);
-        let by = |n: &str| all.iter().find(|e| e.name == n).unwrap_or_else(|| panic!("no {n}"));
+        let by = |n: &str| {
+            all.iter()
+                .find(|e| e.name == n)
+                .unwrap_or_else(|| panic!("no {n}"))
+        };
         assert_ne!(by("models").path, by("weights").path);
         assert_eq!(by("models").reclaim, Reclaim::OnRequest);
         assert_eq!(by("weights").reclaim, Reclaim::Safe);

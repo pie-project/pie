@@ -97,6 +97,7 @@ pub enum CheckpointFormat {
 pub enum BackendKind {
     Cuda,
     Metal,
+    Vulkan,
     Unknown,
 }
 

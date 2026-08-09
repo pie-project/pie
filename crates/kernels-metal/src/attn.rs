@@ -16,13 +16,13 @@ pub static KERNELS: &[KernelSig] = &[
     // the reorder reads how many values a kernel produces off the row, and a
     // statement writing three states them all after its inputs.
     kernel!(split_qkv_bf16 "split_qkv_bf16", file = Some("attn/split_qkv.metal"), launch = kernels::LaunchRule::SplitPacked,
-        operands = kernels::operands![
-            packed: Buf <- kernels::Source::In(0),
-            q: BufMut <- kernels::Source::Out(0),
-            k: BufMut <- kernels::Source::Out(1),
-            v: BufMut <- kernels::Source::Out(2),
-            params: Buf <- kernels::Source::Param(0),
-        ]),
+    operands = kernels::operands![
+        packed: Buf <- kernels::Source::In(0),
+        q: BufMut <- kernels::Source::Out(0),
+        k: BufMut <- kernels::Source::Out(1),
+        v: BufMut <- kernels::Source::Out(2),
+        params: Buf <- kernels::Source::Param(0),
+    ]),
     // 1 in attn_gate.metal
     kernel!(gate "gate", axes = &[BF16]),
     // 1 in kv_append.metal

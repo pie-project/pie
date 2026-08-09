@@ -228,6 +228,11 @@ use crate::inferlet::ProcessCtx;
 
 /// Proxy marker type for host-defined resources used in dynamic linking.
 /// This is a phantom type used to create host resource handles.
+///
+/// It is also how the host tracks resource handles that are DEFINED in guest
+/// components: when a component exports a resource type, we create
+/// `ProxyResource` instances to manage those resources from the host side,
+/// enabling cross-component resource passing.
 struct ProxyResource;
 
 /// Precomputed metadata for a forwarded function, consolidating all per-call data
@@ -248,21 +253,15 @@ fn type_contains_resource(ty: &Type) -> bool {
         Type::Tuple(tt) => tt.types().any(|t| type_contains_resource(&t)),
         Type::Variant(vt) => vt
             .cases()
-            .any(|c| c.ty.as_ref().map_or(false, type_contains_resource)),
+            .any(|c| c.ty.as_ref().is_some_and(type_contains_resource)),
         Type::Option(ot) => type_contains_resource(&ot.ty()),
         Type::Result(rt) => {
-            rt.ok().map_or(false, |t| type_contains_resource(&t))
-                || rt.err().map_or(false, |t| type_contains_resource(&t))
+            rt.ok().is_some_and(|t| type_contains_resource(&t))
+                || rt.err().is_some_and(|t| type_contains_resource(&t))
         }
         _ => false,
     }
 }
-
-/// Wrapper resource for component-defined resources.
-///
-/// This is used by the host to track resource handles that are defined in guest components.
-/// When a component exports a resource type, we create `ProxyResource` instances to
-/// manage those resources from the host side, enabling cross-component resource passing.
 
 /// Categories of functions in the component model
 enum FuncCategory {
@@ -501,7 +500,7 @@ fn recursive_transform_args_to_callee_view(
                     )));
                 }
                 let mut transformed = Vec::with_capacity(fields.len());
-                for ((name, value), field) in fields.into_iter().zip(field_types.into_iter()) {
+                for ((name, value), field) in fields.into_iter().zip(field_types) {
                     if name != field.name {
                         return Err(wasmtime::Error::msg(format!(
                             "record field name mismatch: got {}, expected {}",
@@ -729,7 +728,7 @@ fn recursive_transform_returns_to_caller_view(
                     )));
                 }
                 let mut transformed = Vec::with_capacity(fields.len());
-                for ((name, value), field) in fields.into_iter().zip(field_types.into_iter()) {
+                for ((name, value), field) in fields.into_iter().zip(field_types) {
                     if name != field.name {
                         return Err(wasmtime::Error::msg(format!(
                             "record field name mismatch: got {}, expected {}",
@@ -958,7 +957,7 @@ fn register_component_exports(
                     ComponentItem::Resource(rt) => {
                         resource_types_by_name.insert(name.to_string(), rt);
                     }
-                    ComponentItem::ComponentFunc(_) => match FuncCategory::from_name(&name) {
+                    ComponentItem::ComponentFunc(_) => match FuncCategory::from_name(name) {
                         FuncCategory::Constructor { resource_name }
                         | FuncCategory::Method { resource_name }
                         | FuncCategory::StaticMethod { resource_name } => {
@@ -971,10 +970,10 @@ fn register_component_exports(
             }
 
             for name in &defined_names {
-                if let Some(rt) = resource_types_by_name.get(name) {
-                    if !component_defined_resource_types.contains(rt) {
-                        component_defined_resource_types.push(*rt);
-                    }
+                if let Some(rt) = resource_types_by_name.get(name)
+                    && !component_defined_resource_types.contains(rt)
+                {
+                    component_defined_resource_types.push(*rt);
                 }
             }
         }
@@ -989,7 +988,7 @@ fn register_component_exports(
                 engine,
                 linker,
                 store,
-                &interface_name,
+                interface_name,
                 &instance_type,
                 library_instance,
                 &component_defined_resource_types,
@@ -1063,7 +1062,7 @@ fn register_interface_exports(
     // Registering a second proxy would create an incompatible resource type, causing
     // handle type mismatches when the caller passes a handle obtained from the original
     // interface.
-    for (resource_name, _resource_type) in &resource_type_by_name {
+    for resource_name in resource_type_by_name.keys() {
         if !defined_resource_names.contains(resource_name) {
             continue;
         }
@@ -1105,7 +1104,7 @@ fn register_interface_exports(
                 ))
             })?;
         let func = library_instance
-            .get_func(&mut *store, &func_idx)
+            .get_func(&mut *store, func_idx)
             .ok_or_else(|| {
                 wasmtime::Error::msg(format!(
                     "Export '{}' in interface '{}' is not a function",

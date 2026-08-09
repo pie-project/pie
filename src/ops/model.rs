@@ -633,7 +633,6 @@ impl ProgressHandler for ProgressBar {
 /// which knows about every snapshot rather than the one beside this artifact,
 /// asks before deleting, and reports what it got back. A command that removes
 /// a model has no business deciding what else its origin is worth keeping.
-
 fn remove(name: String, skip_confirm: bool) -> Result<Answer> {
     let Some(entry) = crate::local::store::find(&name)? else {
         bail!(
@@ -724,5 +723,4 @@ mod tests {
         assert!(!ok);
         assert_eq!(info, "no config");
     }
-
 }

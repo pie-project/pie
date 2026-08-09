@@ -117,7 +117,6 @@ impl DriverBackend {
         Ok((Self::Cuda(driver), facts))
     }
 
-
     pub fn load_model(
         &mut self,
         descs: Vec<::driver_api::ModelLoadDesc>,

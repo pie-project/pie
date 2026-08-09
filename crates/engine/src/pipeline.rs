@@ -77,7 +77,6 @@ pub struct Pipeline {
     // behind `PIE_DEFER_ALLOC` and is off unless asked for. It is recorded
     // here rather than deleted quietly so that reconciling the two designs
     // stays a visible, named piece of work.
-
 }
 
 impl Pipeline {

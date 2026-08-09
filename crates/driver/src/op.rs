@@ -1246,14 +1246,6 @@ mod coverage_tests {
             }
         }
 
-        eprintln!(
-            "{} of {} ops are executed here; {} live elsewhere: {:?}",
-            tensor_ir::op::OP_TABLE.len() - elsewhere.len(),
-            tensor_ir::op::OP_TABLE.len(),
-            elsewhere.len(),
-            elsewhere
-        );
-
         // The catch-all must NAME the op it refuses, which is the property
         // that makes an unservable program diagnosable rather than a failure.
         assert!(

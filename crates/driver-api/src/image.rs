@@ -114,12 +114,12 @@ impl Image {
             return usize::MAX;
         }
         let align = align_of::<T>().max(8);
-        while self.blob.len() % align != 0 {
+        while !self.blob.len().is_multiple_of(align) {
             self.blob.push(0);
         }
         let offset = self.blob.len();
         let bytes = unsafe {
-            core::slice::from_raw_parts(items.as_ptr().cast::<u8>(), size_of::<T>() * items.len())
+            core::slice::from_raw_parts(items.as_ptr().cast::<u8>(), std::mem::size_of_val(items))
         };
         self.blob.extend_from_slice(bytes);
         offset

@@ -93,8 +93,6 @@ macro_rules! ptrace {
 /// Process identity the planner tracks (FCFS clock key, residency key).
 pub type ProcessId = uuid::Uuid;
 
-
-
 /// Minimal physical port the planner drives — pool stats, rung-0 idle
 /// reclaim, and concrete reservations. The planner owns ALL policy; this
 /// port owns only physics. One impl ([`RegistryPool`]); the contention
@@ -145,10 +143,6 @@ impl RegistryPool {
             driver,
             suspend_capable,
         }
-    }
-
-    fn with_kv<R>(&self, operation: impl FnOnce(&mut crate::store::kv::KvStore) -> R) -> R {
-        self.with_kv_tagged("planner", operation)
     }
 
     fn with_kv_tagged<R>(
@@ -347,7 +341,7 @@ impl std::error::Error for PlannerError {}
 /// is global and the contended hot path takes it on EVERY fire (`note_progress`
 /// once `waiters != 0`), so "is this a convoy?" has to be answered by
 /// measurement, not by reading the call graph.
-struct LockCensus {
+pub(crate) struct LockCensus {
     pub n: AtomicU64,
     pub wait_ns: AtomicU64,
     pub hold_ns: AtomicU64,
@@ -587,9 +581,6 @@ struct VictimSet {
     /// committing such a round latches the hysteresis flag.
     runway_grab: u32,
 }
-
-/// Where a registered process stands. Two real states plus the two
-/// transfer-in-flight transients — membership, not negotiation.
 
 impl VictimSet {
     /// Members E6 hysteresis permits evicting right now — the routine
@@ -1194,6 +1185,13 @@ impl Drop for WaitRegistration<'_> {
 /// `Ticket` is the parked case handed back instead of awaited, so the caller
 /// (the deferred-allocation fire path, `PIE_DEFER_ALLOC=1`) can collect the
 /// grant from its own task while the guest keeps running.
+#[allow(
+    dead_code,
+    reason = "same unwired `PIE_DEFER_ALLOC` path as \
+              `ResidencyPlanner::acquire_or_enqueue`, which constructs these \
+              variants; nothing destructures them because the consumer's handle \
+              was not carried by this merge (see `pipeline.rs`)"
+)]
 pub(crate) enum Enqueued {
     Granted(AllocationGrant),
     Ticket(AllocationTicket),
@@ -1224,6 +1222,13 @@ impl AllocationTicket {
     /// [`Acquired::Yield`] when the owner was chosen for eviction while
     /// parked (the caller settles the tail and waits out the eviction, as
     /// the inline path does).
+    #[allow(
+        dead_code,
+        reason = "the collect half of the unwired `PIE_DEFER_ALLOC` path; reached \
+                  only once `acquire_or_enqueue` has a caller again (see \
+                  `pipeline.rs`). This allow also covers the `notify` field, which \
+                  only this loop reads"
+    )]
     pub(crate) async fn collect(mut self) -> Result<Acquired, PlannerError> {
         loop {
             let notified = self.notify.notified();
@@ -1493,9 +1498,9 @@ impl ResidencyPlanner {
             DevicePageReservation::empty()
         };
         let rs = if demand.rs_slots > 0 {
-            match self.port.reserve_rs(demand.rs_slots) {
-                Some(slots) => RsSlotReservation::new(slots, self.port.clone()),
-                None => return None, // kv reservation returns via Drop
+            {
+                let slots = self.port.reserve_rs(demand.rs_slots)?;
+                RsSlotReservation::new(slots, self.port.clone())
             }
         } else {
             RsSlotReservation::empty()
@@ -1649,11 +1654,11 @@ impl ResidencyPlanner {
             Parked::Entry(key, notify)
         });
         match parked {
-            Parked::Gone => return Err(PlannerError::Cancelled),
+            Parked::Gone => Err(PlannerError::Cancelled),
             Parked::NotResident => {
                 // Out of the set (or in transfer): the fire path settles
                 // the process's tail and waits out the eviction.
-                return Ok(Acquired::Yield);
+                Ok(Acquired::Yield)
             }
             Parked::Entry(key, notify) => {
                 self.stats.parks.fetch_add(1, Ordering::Relaxed);
@@ -1704,6 +1709,17 @@ impl ResidencyPlanner {
     /// `acquire` would enter the notified/collect loop this returns the
     /// owned [`AllocationTicket`] instead, to be awaited via
     /// [`AllocationTicket::collect`] from the caller's own task.
+    #[allow(
+        dead_code,
+        reason = "the deferred-allocation park/collect half of `acquire`. Its \
+                  consumer is upstream's `PIE_DEFER_ALLOC` fire path, whose handle \
+                  `pipeline.rs` records as deliberately NOT carried by this merge \
+                  (see the comment on `Pipeline`: reconciling it with this \
+                  branch's kv-contention rewrite is named, visible work rather \
+                  than a conflict resolution). Kept so that work has something to \
+                  reconnect to. This allow also covers `Enqueued` and \
+                  `AllocationTicket::collect`, which are reachable only from here"
+    )]
     pub(crate) fn acquire_or_enqueue(
         self: &Arc<Self>,
         pid: ProcessId,
@@ -1949,8 +1965,7 @@ impl ResidencyPlanner {
             let step = self.with_inner(|inner| {
                 let Some((key, waiter)) = inner.unmet_head() else {
                     if inner.accum.len() > 0 && inner.queue.is_empty() {
-                        let stranded =
-                            std::mem::replace(&mut inner.accum, DevicePageReservation::empty());
+                        let stranded = std::mem::take(&mut inner.accum);
                         return Step::Release(stranded);
                     }
                     return Step::Done;
@@ -1993,9 +2008,7 @@ impl ResidencyPlanner {
                     // An RS-carrying ask keeps the per-step path: its RS
                     // reservation is a port call, and the port is never
                     // touched under the planner lock.
-                    Some(demand) if demand.rs_slots > 0 => {
-                        Step::ServeAllocation { key, demand }
-                    }
+                    Some(demand) if demand.rs_slots > 0 => Step::ServeAllocation { key, demand },
                     Some(_) => Step::ServeAllocationBurst {
                         extra: inner.burst_shortfall(),
                     },
@@ -2557,9 +2570,7 @@ impl ResidencyPlanner {
             // idle-churn case the gate aimed at is bounded by the in-flight
             // latch and the shortfall arithmetic (a restored victim's pages
             // re-enter `free` and close the deficit).
-            if inner.runway_round_in_flight
-                || inner.kill_in_flight()
-                || !rotation_damping_enabled()
+            if inner.runway_round_in_flight || inner.kill_in_flight() || !rotation_damping_enabled()
             {
                 return None;
             }
@@ -2694,12 +2705,11 @@ impl ResidencyPlanner {
             // `supply_stalled` clause that orders it (see there). With the
             // runway off (or latched) `runway_grab` is 0 and the target is
             // exactly the shipped demand-exact arithmetic.
-            let runway_grab =
-                if runway > 0 && !inner.runway_round_in_flight {
-                    runway.saturating_sub(runway_free)
-                } else {
-                    0
-                };
+            let runway_grab = if runway > 0 && !inner.runway_round_in_flight {
+                runway.saturating_sub(runway_free)
+            } else {
+                0
+            };
             let missing = waiter
                 .kv_need()
                 .max(queued_quantum.saturating_add(runway_grab))
@@ -3969,9 +3979,8 @@ fn fast_small_bypass_enabled() -> bool {
 /// an eviction-funded restore could have covered sooner.
 fn rotation_damping_enabled() -> bool {
     static CONFIGURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CONFIGURED.get_or_init(|| {
-        !std::env::var("PIE_ROTATION_DAMPING").is_ok_and(|value| value == "0")
-    })
+    *CONFIGURED
+        .get_or_init(|| !std::env::var("PIE_ROTATION_DAMPING").is_ok_and(|value| value == "0"))
 }
 
 /// `PIE_SUPPLY_RUNWAY=<pages>`: the supply-phase runway target (§10.14).
@@ -4493,10 +4502,12 @@ mod starvation_race_tests {
 
         let served: Vec<bool> = planner.with_inner(|inner| {
             keys.iter()
-                .map(|key| match &inner.queue.get(key).expect("still queued").kind {
-                    WaitKind::Allocation { outcome, .. } => outcome.is_some(),
-                    WaitKind::Restore { .. } => unreachable!(),
-                })
+                .map(
+                    |key| match &inner.queue.get(key).expect("still queued").kind {
+                        WaitKind::Allocation { outcome, .. } => outcome.is_some(),
+                        WaitKind::Restore { .. } => unreachable!(),
+                    },
+                )
                 .collect()
         });
         assert_eq!(

@@ -67,6 +67,11 @@ fn missing_feature_msg(toml_type: &str, feature: &str) -> String {
 
 /// Comma-separated list of flavors compiled into this binary, in
 /// build-priority order. Used by error messages and `pie doctor`.
+#[allow(
+    clippy::vec_init_then_push,
+    reason = "the pushes are `#[cfg]`-gated, and an attribute cannot be \
+              attached to an element inside `vec![]`"
+)]
 pub fn compiled_summary() -> String {
     let mut out = Vec::new();
     #[cfg(feature = "driver-cuda")]

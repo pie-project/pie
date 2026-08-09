@@ -16,9 +16,7 @@ fn active_preemption_swaps_and_restores_an_over_capacity_fleet() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let env = create_mock_env("contention-model", 1, 4, Arc::new(EchoBehavior(42)));
     runtime.block_on(async {
-        engine::bootstrap::bootstrap(env.config())
-            .await
-            .unwrap();
+        engine::bootstrap::bootstrap(env.config()).await.unwrap();
         inferlets::add_and_install("generate").await;
     });
 

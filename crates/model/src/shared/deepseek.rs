@@ -227,6 +227,15 @@ json-array ::= "[" (json-value ("," json-value)*)? "]"
     }
 }
 
+/// The delimiter between the call type and the function name.
+///
+/// Named once because three things have to agree on it: the system prompt
+/// that asks for the format, the grammar that constrains generation to it,
+/// and the decoder that takes it apart. The decoder used to split the
+/// header on a newline instead, and since the header has no newline, every
+/// tool call reported its name as `function<｜tool▁sep｜>the_real_name`.
+const TOOL_SEP: &str = "<｜tool▁sep｜>";
+
 // ─── Decoders ───────────────────────────────────────────────
 
 struct R1ToolDecoder {
@@ -278,12 +287,20 @@ impl ToolDecoder for R1ToolDecoder {
                             let json_start = sep_pos + "\n```json\n".len();
                             if let Some(json_end) = content[json_start..].find("\n```") {
                                 let args = content[json_start..json_start + json_end].to_string();
-                                // Extract name from "type<sep>name" format
-                                let name = header
-                                    .rsplit_once("\n")
-                                    .map_or(header, |(_, n)| n)
-                                    .to_string();
-                                return ToolEvent::Call(name, args);
+                                // `type<｜tool▁sep｜>name`, which is what
+                                // `tool_call_grammar` constrains generation to
+                                // and what `build_tool_system_prompt` asks
+                                // for. Splitting on a newline instead left the
+                                // whole header as the name, because there is
+                                // no newline in it -- see the test.
+                                let name = match header.rsplit_once(TOOL_SEP) {
+                                    Some((_, name)) => name,
+                                    // A model that omits the `function` prefix
+                                    // gives a bare name, possibly on its own
+                                    // line.
+                                    None => header.rsplit_once('\n').map_or(header, |(_, n)| n),
+                                };
+                                return ToolEvent::Call(name.trim().to_string(), args);
                             }
                         }
                     }
@@ -306,6 +323,8 @@ impl ToolDecoder for R1ToolDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instruct::{ChatEvent, ReasoningEvent};
+    use crate::shared::decoders::gbnf_sentence;
     use std::sync::Arc;
     use tokenizer::Tokenizer;
 
@@ -439,5 +458,445 @@ mod tests {
              <｜tool▁output▁end｜>\
              <｜tool▁outputs▁end｜>"
         );
+    }
+
+    // ── The tool-call decoder ────────────────────────────────────────────
+
+    /// A tokenizer whose vocabulary has the tool tokens as single ids, the
+    /// way a real DeepSeek tokenizer does.
+    fn tool_tok() -> Arc<Tokenizer> {
+        make_tok(&[
+            "<｜end▁of▁sentence｜>",
+            "<|EOT|>",
+            "<｜User｜>",
+            "<｜Assistant｜>",
+            "<think>",
+            "</think>",
+            "<｜tool▁calls▁begin｜>",
+            "<｜tool▁calls▁end｜>",
+            "<｜tool▁call▁begin｜>",
+            "<｜tool▁call▁end｜>",
+            TOOL_SEP,
+        ])
+    }
+
+    /// Encode each part on its own and concatenate.
+    ///
+    /// `Tokenizer::from_vocab` matches a vocabulary entry only when it is
+    /// the whole input; a longer string falls through to the byte fallback.
+    /// So a marker spliced into a sentence does NOT come back as its own id,
+    /// and a decoder that matches on ids would see nothing. Splitting the
+    /// stream into the pieces a real tokenizer emits is what makes these
+    /// tests exercise the id-matching path at all.
+    fn stream(tok: &Tokenizer, parts: &[&str]) -> Vec<u32> {
+        parts.iter().flat_map(|p| tok.encode(p)).collect()
+    }
+
+    /// Drive a decoder one token at a time, as a stream arrives, and collect
+    /// the completed calls.
+    fn decode_calls(inst: &R1Instruct, tok: &Tokenizer, parts: &[&str]) -> Vec<(String, String)> {
+        let mut dec = inst.tool_decoder();
+        let mut out = Vec::new();
+        for id in stream(tok, parts) {
+            if let ToolEvent::Call(name, args) = dec.feed(&[id]) {
+                out.push((name, args));
+            }
+        }
+        out
+    }
+
+    const CALL_BEGIN: &str = "<｜tool▁call▁begin｜>";
+    const CALL_END: &str = "<｜tool▁call▁end｜>";
+
+    /// The name is the function's, not the whole header.
+    ///
+    /// The regression: the decoder split the header on a newline, and the
+    /// header -- `function<｜tool▁sep｜>get_weather` -- contains none, so
+    /// `rsplit_once` returned `None` and the fallback handed back the whole
+    /// string. Every DeepSeek-R1 and V4 tool call reported its name as
+    /// `function<｜tool▁sep｜>get_weather`, which no caller dispatching on
+    /// `get_weather` can match, so no tool ever ran.
+    ///
+    /// The file contradicted itself: `tool_call_grammar`, thirty lines up,
+    /// defines `tool-name ::= "get_weather" | ...` and constrains generation
+    /// to emit exactly the header this decoder could not take apart.
+    #[test]
+    fn a_tool_call_reports_the_function_name_alone() {
+        let tok = tool_tok();
+        let inst = R1Instruct::new(tok.clone());
+        let calls = decode_calls(
+            &inst,
+            &tok,
+            &[
+                "<｜tool▁calls▁begin｜>",
+                CALL_BEGIN,
+                "function",
+                TOOL_SEP,
+                "get_weather\n```json\n{\"city\": \"Seoul\"}\n```",
+                CALL_END,
+                "<｜tool▁calls▁end｜>",
+            ],
+        );
+        assert_eq!(calls.len(), 1, "one call: {calls:?}");
+        assert_eq!(calls[0].0, "get_weather", "the name, with no type prefix");
+        assert_eq!(calls[0].1, "{\"city\": \"Seoul\"}");
+    }
+
+    /// Split `text` so every marker is a part of its own.
+    ///
+    /// The fixture tokenizer matches a vocabulary entry only when it is the
+    /// whole input, so a sentence has to be broken at the markers before it
+    /// can be encoded into the ids the decoder matches on.
+    fn split_at_markers<'a>(text: &'a str, markers: &[&str]) -> Vec<&'a str> {
+        let mut parts = Vec::new();
+        let mut rest = text;
+        'scan: while !rest.is_empty() {
+            for offset in 0..rest.len() {
+                if !rest.is_char_boundary(offset) {
+                    continue;
+                }
+                if let Some(marker) = markers.iter().find(|m| rest[offset..].starts_with(**m)) {
+                    if offset > 0 {
+                        parts.push(&rest[..offset]);
+                    }
+                    parts.push(&rest[offset..offset + marker.len()]);
+                    rest = &rest[offset + marker.len()..];
+                    continue 'scan;
+                }
+            }
+            parts.push(rest);
+            break;
+        }
+        parts
+    }
+
+    /// The grammar constrains generation and the decoder reads the result
+    /// back; nothing but this test binds them. llama-3 shipped a rule
+    /// admitting text its own decoder rejected, so the binding is derived
+    /// from the published grammar rather than transcribed by hand.
+    #[test]
+    fn the_grammar_admits_exactly_what_the_decoder_reads() {
+        let tok = tool_tok();
+        let inst = R1Instruct::new(tok.clone());
+        let grammar = inst
+            .tool_call_grammar(&[r#"{"function":{"name":"get_weather"}}"#.to_string()])
+            .expect("a tool was offered");
+        let sentence = gbnf_sentence(
+            &grammar.source,
+            "root",
+            &[("json-object", r#"{"city":"Seoul"}"#)],
+        );
+        let parts = split_at_markers(
+            &sentence,
+            &[
+                "<｜tool▁calls▁begin｜>",
+                "<｜tool▁calls▁end｜>",
+                CALL_BEGIN,
+                CALL_END,
+                TOOL_SEP,
+            ],
+        );
+        let calls = decode_calls(&inst, &tok, &parts);
+        assert_eq!(
+            calls,
+            [("get_weather".to_string(), r#"{"city":"Seoul"}"#.to_string())],
+            "the grammar admits {sentence:?}, which the decoder did not read as that call"
+        );
+    }
+
+    /// The separator the decoder splits on is the one the grammar emits.
+    ///
+    /// These are the two halves of the same protocol and they sat forty
+    /// lines apart with the string written out twice.
+    #[test]
+    fn the_decoder_and_the_grammar_name_the_same_separator() {
+        let inst = r1();
+        let tools = vec![r#"{"function": {"name": "get_weather"}}"#.to_string()];
+        let g = inst
+            .tool_call_grammar(&tools)
+            .expect("a grammar for one tool");
+        assert!(
+            g.source.contains(TOOL_SEP),
+            "the grammar constrains generation to a separator the decoder does not split on"
+        );
+        let prompt = R1Instruct::build_tool_system_prompt(&tools);
+        assert!(
+            prompt.contains(TOOL_SEP),
+            "and the system prompt asks the model for it too"
+        );
+        assert!(
+            !Instruct::equip(&inst, &tools).is_empty(),
+            "the prompt reaches the model as tokens"
+        );
+    }
+
+    /// Two calls in one stream are reported separately.
+    ///
+    /// The decoder is a state machine over `inside`, and the reset of
+    /// `match_pos` and `accumulated` on close is what lets a second call
+    /// start. Without it the second call's content is appended to the
+    /// first's and neither parses.
+    #[test]
+    fn two_calls_in_one_stream_are_both_reported() {
+        let tok = tool_tok();
+        let inst = R1Instruct::new(tok.clone());
+        let calls = decode_calls(
+            &inst,
+            &tok,
+            &[
+                "<｜tool▁calls▁begin｜>",
+                CALL_BEGIN,
+                "function",
+                TOOL_SEP,
+                "a\n```json\n{\"x\": 1}\n```",
+                CALL_END,
+                CALL_BEGIN,
+                "function",
+                TOOL_SEP,
+                "b\n```json\n{\"y\": 2}\n```",
+                CALL_END,
+                "<｜tool▁calls▁end｜>",
+            ],
+        );
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0].0, "a");
+        assert_eq!(calls[0].1, "{\"x\": 1}");
+        assert_eq!(calls[1].0, "b");
+        assert_eq!(calls[1].1, "{\"y\": 2}");
+    }
+
+    /// Ordinary prose reports no call.
+    #[test]
+    fn plain_text_produces_no_call() {
+        let tok = tool_tok();
+        let inst = R1Instruct::new(tok.clone());
+        assert!(decode_calls(&inst, &tok, &["The weather in Seoul is fine."]).is_empty());
+    }
+
+    /// A call whose body never closes its fence produces nothing rather
+    /// than a half-parsed argument string.
+    #[test]
+    fn an_unterminated_json_fence_yields_no_call() {
+        let tok = tool_tok();
+        let inst = R1Instruct::new(tok.clone());
+        let calls = decode_calls(
+            &inst,
+            &tok,
+            &[
+                CALL_BEGIN,
+                "function",
+                TOOL_SEP,
+                "a\n```json\n{\"x\": 1",
+                CALL_END,
+            ],
+        );
+        assert!(calls.is_empty(), "{calls:?}");
+    }
+
+    /// A header with no `json` fence at all yields nothing.
+    #[test]
+    fn a_call_with_no_json_block_yields_no_call() {
+        let tok = tool_tok();
+        let inst = R1Instruct::new(tok.clone());
+        let calls = decode_calls(
+            &inst,
+            &tok,
+            &[CALL_BEGIN, "function", TOOL_SEP, "a", CALL_END],
+        );
+        assert!(calls.is_empty(), "{calls:?}");
+    }
+
+    /// A model that omits the `function<sep>` prefix still dispatches.
+    ///
+    /// This is the branch the old newline split was presumably written for.
+    /// It is kept as the fallback rather than dropped, and pinned here so
+    /// that keeping it is a decision.
+    #[test]
+    fn a_bare_name_with_no_type_prefix_still_parses() {
+        let tok = tool_tok();
+        let inst = R1Instruct::new(tok.clone());
+        let calls = decode_calls(
+            &inst,
+            &tok,
+            &[CALL_BEGIN, "get_weather\n```json\n{}\n```", CALL_END],
+        );
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].0, "get_weather");
+    }
+
+    /// `reset` returns the decoder to its opening state.
+    ///
+    /// A decoder left `inside` after a reset treats the next stream's first
+    /// tokens as the tail of a call that is over.
+    #[test]
+    fn reset_puts_the_decoder_back_at_the_start() {
+        let tok = tool_tok();
+        let inst = R1Instruct::new(tok.clone());
+        let mut dec = inst.tool_decoder();
+        // Open a call and abandon it mid-body.
+        for id in stream(&tok, &[CALL_BEGIN, "function", TOOL_SEP, "a\n```json\n{"]) {
+            dec.feed(&[id]);
+        }
+        dec.reset();
+        // A complete call now parses as if nothing had come before. The
+        // call is deliberately written WITHOUT the `function<sep>` prefix:
+        // with the prefix, a decoder still stuck `inside` produces the
+        // right name anyway, because the separator split discards
+        // everything before it including the leaked opening marker. A bare
+        // name has nothing to discard behind, so a stuck decoder reports
+        // `<｜tool▁call▁begin｜>b` and this test can see it.
+        let mut got = None;
+        for id in stream(&tok, &[CALL_BEGIN, "b\n```json\n{\"y\": 2}\n```", CALL_END]) {
+            if let ToolEvent::Call(n, a) = dec.feed(&[id]) {
+                got = Some((n, a));
+            }
+        }
+        assert_eq!(
+            got,
+            Some(("b".to_string(), "{\"y\": 2}".to_string())),
+            "the abandoned call leaked into the next one"
+        );
+    }
+
+    /// The chat and reasoning decoders are wired to this family's tokens.
+    #[test]
+    fn the_chat_decoder_stops_on_this_familys_eos() {
+        let tok = tool_tok();
+        let inst = R1Instruct::new(tok.clone());
+        let mut dec = inst.chat_decoder();
+        let mut text = String::new();
+        let mut done = false;
+        for id in stream(&tok, &["Hi", "<｜end▁of▁sentence｜>"]) {
+            match dec.feed(&[id]) {
+                ChatEvent::Delta(d) => text.push_str(&d),
+                ChatEvent::Done(all) => {
+                    done = true;
+                    text = all;
+                }
+                ChatEvent::Interrupt(_) => {}
+            }
+        }
+        assert!(done, "the sentence-end token must end the turn");
+        assert_eq!(text, "Hi");
+    }
+
+    /// Thinking is reported as reasoning, and the block is closed off.
+    #[test]
+    fn the_reasoning_decoder_reports_the_thinking_block() {
+        let tok = tool_tok();
+        let inst = R1Instruct::new(tok.clone());
+        let mut dec = inst.reasoning_decoder();
+        let (mut started, mut complete) = (false, None);
+        let mut delta = String::new();
+        for id in stream(&tok, &["<think>\n", "hmm", "</think>\n", "Hello"]) {
+            match dec.feed(&[id]) {
+                ReasoningEvent::Start => started = true,
+                ReasoningEvent::Delta(d) => delta.push_str(&d),
+                ReasoningEvent::Complete(all) => complete = Some(all),
+            }
+        }
+        assert!(started, "the think token opens a reasoning block");
+        let complete = complete.expect("the closing token completes it");
+        assert!(
+            complete.contains("hmm"),
+            "complete={complete:?} delta={delta:?}"
+        );
+        assert!(
+            !complete.contains("Hello"),
+            "the answer was reported as reasoning: {complete:?}"
+        );
+    }
+
+    /// A decoder whose markers span several tokens.
+    ///
+    /// Built directly, because no tokenizer this crate can construct in a
+    /// test will produce a multi-token marker with readable text:
+    /// `Tokenizer::from_vocab` uses the `RawChar` pipeline, whose byte
+    /// fallback is per-byte while its lookup is per-character, so a marker
+    /// absent from the vocabulary does not fall back -- its non-ASCII
+    /// characters are dropped on encode. `<｜tool▁sep｜>` goes in as 18
+    /// bytes and comes back as the 9 ASCII bytes of `<toolsep>`. Decoding
+    /// is unaffected, which is why feeding ids directly works.
+    ///
+    /// With the markers as single ids -- what a real DeepSeek vocabulary
+    /// has -- `match_pos` only ever steps 0 -> 1 and neither rewind is
+    /// reachable. A merged or trimmed vocabulary need not have them.
+    fn multi_token_decoder(tok: &Arc<Tokenizer>) -> R1ToolDecoder {
+        R1ToolDecoder {
+            decoder: tok.decoder(false),
+            tool_call_begin: vec![0, 1, 2], // <A><B><C>
+            tool_call_end: vec![3, 4],      // <X><Y>
+            accumulated: String::new(),
+            inside: false,
+            match_pos: 0,
+        }
+    }
+
+    fn multi_token_vocab() -> Arc<Tokenizer> {
+        make_tok(&[
+            "<A>",
+            "<B>",
+            "<C>",
+            "<X>",
+            "<Y>",
+            "<Z>",
+            "function<｜tool▁sep｜>get_weather\n```json\n{\"n\": 1}",
+            "\n```",
+            "get_weather\n```json\n{\"n\": 1}",
+        ])
+    }
+
+    fn drive(dec: &mut R1ToolDecoder, ids: &[u32]) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for &id in ids {
+            if let ToolEvent::Call(n, a) = dec.feed(&[id]) {
+                out.push((n, a));
+            }
+        }
+        out
+    }
+
+    /// A near-miss on the opening marker is abandoned, not carried forward.
+    ///
+    /// `<A><B><Z>` is two thirds of the marker and then something else. A
+    /// decoder that does not rewind is left at `match_pos == 2`, so the
+    /// very next `<C>` completes a marker that was never sent -- it starts
+    /// a call in the middle of prose, and the header it then accumulates
+    /// begins with the leftover text.
+    ///
+    /// The call is written with a BARE name (token 8, not token 6): with a
+    /// `function<｜tool▁sep｜>` header the separator split discards
+    /// everything ahead of it, leftover marker text included, and the
+    /// spurious start is invisible in the result.
+    #[test]
+    fn a_near_miss_on_the_opening_marker_does_not_carry_forward() {
+        let tok = multi_token_vocab();
+        let mut dec = multi_token_decoder(&tok);
+        // near-miss, then the marker's last token on its own, then a real call.
+        let calls = drive(&mut dec, &[0, 1, 5, 2, 0, 1, 2, 8, 7, 3, 4]);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].0, "get_weather");
+        assert_eq!(calls[0].1, "{\"n\": 1}");
+    }
+
+    /// A near-miss on the closing marker does not close the call.
+    ///
+    /// `<X><Z><Y>` is the end marker with something in the middle. A
+    /// decoder that does not rewind is left at `match_pos == 1`, so the
+    /// `<Y>` closes a call whose body has not arrived -- there is no json
+    /// fence yet, so nothing is reported, and because `inside` is now false
+    /// the rest of the call is read as prose. The tool call is lost
+    /// entirely.
+    #[test]
+    fn a_near_miss_on_the_closing_marker_does_not_close_the_call() {
+        let tok = multi_token_vocab();
+        let mut dec = multi_token_decoder(&tok);
+        let calls = drive(&mut dec, &[0, 1, 2, 3, 5, 4, 6, 7, 3, 4]);
+        assert_eq!(calls.len(), 1, "the call was closed early: {calls:?}");
+        assert_eq!(
+            calls[0].0, "get_weather",
+            "the separator split discards the near-miss text ahead of it"
+        );
+        assert_eq!(calls[0].1, "{\"n\": 1}");
     }
 }

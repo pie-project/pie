@@ -31,15 +31,15 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
+use ::driver_api::plan::{DirectArgmax, RegionAnalysis};
 use lru::LruCache;
 use tensor_compiler::codegen::program::{Backend, EmittedKernel, emit_program};
-use ::driver_api::plan::{DirectArgmax, RegionAnalysis};
+use tensor_compiler::plan::CompiledStage;
 use tensor_ir::container::{self, ContainerDecodeError, PortSource, TraceContainer};
 use tensor_ir::container_hash;
 use tensor_ir::op::Op;
 use tensor_ir::registry::{ModelProfile, Port};
 use tensor_ir::validate::{BoundTrace, ValidateError, bind};
-use tensor_compiler::plan::CompiledStage;
 
 /// Registration-time pricing (thrust-3 P2.3): per-instance costs computed once
 /// per program and attached to its identity (feeds thrust-2's capacity
@@ -109,8 +109,9 @@ impl RegisteredProgram {
     /// receives typed records instead of PTIR, so it has no wire format to parse and no
     /// plan to re-derive (`ptir-refactor.md` §2.3).
     pub fn launch(&self) -> &::driver_api::plan::LaunchPackage {
-        self.launch
-            .get_or_init(|| tensor_compiler::codegen::launch::build(&self.bound, &self.compiled_stages))
+        self.launch.get_or_init(|| {
+            tensor_compiler::codegen::launch::build(&self.bound, &self.compiled_stages)
+        })
     }
 
     /// Whether the host can derive this program's submission geometry, and

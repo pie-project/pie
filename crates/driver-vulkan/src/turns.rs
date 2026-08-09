@@ -14,7 +14,13 @@
 //! 2. A conversation's positions must continue. Every test in this crate
 //!    before this one wrote `(0..n)` and re-fired from scratch, which is a
 //!    prefill repeated, not a decode.
-//! 3. The lowering is per-fire and the pipelines are not. A step that rebuilt
+//! 3. A deployment needs BOTH plans. `llama_like_metal` traced at
+//!    `FireClass::Prefill` states tiled GEMMs where the same text traced at
+//!    `FireClass::Decode` states matrix-vector products, and `Serving` held
+//!    one plan until that was measured -- so a prompt was answered one row at
+//!    a time by the decode kernel. The divergence starts at SIXTEEN rows, the
+//!    tile height; below that the two plans lower identically.
+//! 4. The lowering is per-fire and the pipelines are not. A step that rebuilt
 //!    its pipelines would be correct and unusably slow, and nothing measured
 //!    it.
 //!
@@ -175,8 +181,29 @@ pub struct Step {
 /// mutated by it and a server may well own them elsewhere.
 #[derive(Clone, Copy)]
 pub struct Serving<'a> {
-    /// The text every step lowers.
+    /// The text a one-row step lowers.
     pub plan: &'a ForwardPlan,
+    /// The text a step of more than one row lowers.
+    ///
+    /// **Two plans and not one, because the class is not cosmetic.** This
+    /// struct held a single `plan` until it was measured: `llama_like_metal`
+    /// traced at `FireClass::Decode` states `affine_qmv_fast` for its
+    /// projections, and traced at `FireClass::Prefill` states
+    /// `affine_qmm_t_..._bm_16_bn_32` instead -- the tiled GEMM, the largest
+    /// kernel family in the tree. A deployment carrying only the decode plan
+    /// therefore answered a sixty-four-token prompt with sixty-four
+    /// matrix-VECTOR products, one per row. Correct, and the wrong kernel.
+    ///
+    /// The two plans agree on everything else, measured over qwen3-0.6B: the
+    /// same 452 launches, and the same attention symbol
+    /// (`sdpa_paged_decode_bfloat16_d_128`) in both, because the paged decode
+    /// kernel is what this text uses at every width.
+    ///
+    /// Not an `Option` with a fallback. A fallback would make the slow path
+    /// the quiet default, which is exactly the defect this field exists to
+    /// stop. Tracing a plan is host-side and cheap, so a deployment that only
+    /// ever decodes pays one trace it does not use.
+    pub prefill: &'a ForwardPlan,
     /// The model's shape, for the launch rules that need it.
     pub geometry: Geometry,
     /// The tier every pipeline is built at.
@@ -267,8 +294,18 @@ impl Serving<'_> {
         for row in &mut rows {
             row.samples = true;
         }
+        // One row is a decode, more than one is a prefill -- including a
+        // BATCH of one-token turns, which is not a slip. Four rows want a
+        // tiled GEMM as much as a four-token prompt does; the row count is
+        // what the kernel choice actually depends on, and the name of the
+        // class is only how the text spells it.
+        let plan = if frame.rows() > 1 {
+            self.prefill
+        } else {
+            self.plan
+        };
         let low = lower(
-            self.plan,
+            plan,
             &rows,
             LowerFire {
                 captures_across_splits: false,

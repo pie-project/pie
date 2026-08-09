@@ -56,6 +56,25 @@ pub struct Loaded {
     ///
     /// [`LoadPlan::mxfp4_tensor_names`]: model_loader::plan::LoadPlan::mxfp4_tensor_names
     pub mxfp4: std::collections::HashSet<String>,
+    /// Every DISTINCT affine point the plan's tensors arrive at, sorted.
+    ///
+    /// Read off the plan by [`LoadPlan::affine_points`]. Carried for the
+    /// same reason [`Self::mxfp4`] is and answering the same question from
+    /// the other side: `mxfp4` says which tensors are NOT affine, and this
+    /// says how many affine points the ones that are arrived at.
+    ///
+    /// `binding::observed` builds ONE kernel set, from the point the
+    /// checkpoint's `config.json` states. A checkpoint carrying two — an
+    /// `mlx_lm` routed stack at 4 bits whose ROUTER GATE is 8 — has a
+    /// tensor that will be dequantised at the other one's width, which is
+    /// not a fault but a fluent model routing to almost the right experts.
+    /// `DecodeGeometry::alt_quant` is the field a second point would ride
+    /// if this driver could run two kernel sets. It cannot, so what this
+    /// buys is the REFUSAL: `serve/load.rs` compares this against the
+    /// stated point and says so by name.
+    ///
+    /// [`LoadPlan::affine_points`]: model_loader::plan::LoadPlan::affine_points
+    pub affine_points: Vec<(u32, u32)>,
 }
 
 impl std::fmt::Debug for Loaded {
@@ -133,9 +152,11 @@ pub fn load(
         })
         .collect();
     let mxfp4 = plan.mxfp4_tensor_names();
+    let affine_points = plan.affine_points();
     Ok(Loaded {
         regions,
         tensors,
         mxfp4,
+        affine_points,
     })
 }

@@ -12,7 +12,7 @@
 use crate::instruct::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
 };
-use crate::shared::decoders::{GenericChatDecoder, NoopReasoningDecoder};
+use crate::shared::decoders::{GenericChatDecoder, NoopReasoningDecoder, keep_tail};
 use std::sync::Arc;
 use tokenizer::{Tokenizer, TokenizerDecoder};
 
@@ -128,7 +128,6 @@ impl Instruct for MistralInstruct {
             decoder: self.tokenizer.decoder(false),
             accumulated: String::new(),
             state: ToolState::Outside,
-            current_name: None,
         })
     }
 
@@ -182,14 +181,17 @@ json-array ::= "[" (json-value ("," json-value)*)? "]"
 enum ToolState {
     Outside,
     InsideName,
-    InsideArgs,
+    /// Carries the name already read off the `[TOOL_CALLS]…[ARGS]` header.
+    /// Holding it in the state rather than beside it is what makes "there
+    /// is a name whenever we are reading arguments" a fact rather than a
+    /// convention with an unreachable branch guarding it.
+    InsideArgs(String),
 }
 
 struct MistralToolDecoder {
     decoder: TokenizerDecoder,
     accumulated: String,
     state: ToolState,
-    current_name: Option<String>,
 }
 
 impl ToolDecoder for MistralToolDecoder {
@@ -207,22 +209,20 @@ impl ToolDecoder for MistralToolDecoder {
                         continue;
                     }
                     if self.accumulated.len() > 200 {
-                        let keep = self.accumulated.len() - 50;
-                        self.accumulated = self.accumulated[keep..].to_string();
+                        self.accumulated = keep_tail(&self.accumulated, 50).to_string();
                     }
                     return ToolEvent::Start;
                 }
                 ToolState::InsideName => {
                     if let Some(pos) = self.accumulated.find("[ARGS]") {
                         let name = self.accumulated[..pos].trim().to_string();
-                        self.current_name = Some(name);
                         self.accumulated = self.accumulated[pos + "[ARGS]".len()..].to_string();
-                        self.state = ToolState::InsideArgs;
+                        self.state = ToolState::InsideArgs(name);
                         continue;
                     }
                     return ToolEvent::Start; // Wait for ARGS
                 }
-                ToolState::InsideArgs => {
+                ToolState::InsideArgs(ref name) => {
                     // Check for next marker
                     let mut end_pos = None;
 
@@ -233,14 +233,13 @@ impl ToolDecoder for MistralToolDecoder {
                     }
 
                     if let Some(pos) = end_pos {
+                        let name = name.clone();
                         let args = self.accumulated[..pos].trim().to_string();
-                        // Keep marker for next iteration/state check logic if needed.
+                        // The terminator stays put: a second `[TOOL_CALLS]`
+                        // both ends this call and opens the next one.
                         self.accumulated = self.accumulated[pos..].to_string();
-
-                        if let Some(name) = self.current_name.take() {
-                            self.state = ToolState::Outside;
-                            return ToolEvent::Call(name, args);
-                        }
+                        self.state = ToolState::Outside;
+                        return ToolEvent::Call(name, args);
                     }
                     return ToolEvent::Start;
                 }
@@ -252,7 +251,6 @@ impl ToolDecoder for MistralToolDecoder {
         self.decoder.reset();
         self.accumulated.clear();
         self.state = ToolState::Outside;
-        self.current_name = None;
     }
 }
 
@@ -383,5 +381,238 @@ mod tests {
             }
             other => panic!("expected Call, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use crate::shared::decoders::gbnf_sentence;
+
+    /// The syllable has to be enumerated: `Pipeline::RawChar` looks up
+    /// whole characters but falls back per byte, so a non-ASCII character
+    /// absent from the vocabulary is dropped on encode.
+    fn inst() -> MistralInstruct {
+        let v: Vec<String> = [
+            "<s>",
+            "</s>",
+            "[INST]",
+            "[/INST]",
+            "[SYSTEM_PROMPT]",
+            "[/SYSTEM_PROMPT]",
+            "[AVAILABLE_TOOLS]",
+            "[/AVAILABLE_TOOLS]",
+            "[TOOL_CALLS]",
+            "[ARGS]",
+            "[TOOL_RESULTS]",
+            "[/TOOL_RESULTS]",
+            "가",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        MistralInstruct::new(Arc::new(Tokenizer::from_vocab(&v)))
+    }
+
+    fn stream(inst: &MistralInstruct, d: &mut dyn ToolDecoder, parts: &[&str]) -> Vec<ToolEvent> {
+        parts
+            .iter()
+            .map(|p| d.feed(&inst.tokenizer.encode(p)))
+            .collect()
+    }
+
+    fn last_call(events: &[ToolEvent]) -> Option<(String, String)> {
+        events.iter().rev().find_map(|e| match e {
+            ToolEvent::Call(n, a) => Some((n.clone(), a.clone())),
+            ToolEvent::Start => None,
+        })
+    }
+
+    /// The grammar constrains generation and the decoder reads the result
+    /// back; nothing but this test binds them. llama-3 shipped a rule
+    /// admitting text its own decoder rejected, so the binding is checked
+    /// rather than assumed.
+    #[test]
+    fn the_grammar_admits_exactly_what_the_decoder_reads() {
+        let inst = inst();
+        let grammar = inst
+            .tool_call_grammar(&[r#"{"function":{"name":"get_weather"}}"#.to_string()])
+            .expect("a tool was offered");
+        let sentence = gbnf_sentence(
+            &grammar.source,
+            "tool-call",
+            &[("json-object", r#"{"city":"Oslo"}"#)],
+        );
+        assert_eq!(sentence, r#"[TOOL_CALLS]get_weather[ARGS]{"city":"Oslo"}"#);
+
+        let mut decoder = inst.tool_decoder();
+        // The arguments run to the next marker, so the turn has to end.
+        let events = stream(&inst, decoder.as_mut(), &[&sentence, "</s>"]);
+        assert_eq!(
+            last_call(&events),
+            Some(("get_weather".into(), r#"{"city":"Oslo"}"#.into())),
+            "the grammar admits {sentence:?}, which the decoder did not read as that call"
+        );
+    }
+
+    #[test]
+    fn the_test_tokenizer_round_trips_the_markers() {
+        let inst = inst();
+        for part in ["[TOOL_CALLS]", "[ARGS]", "</s>", "가"] {
+            let ids = inst.tokenizer.encode(part);
+            assert_eq!(inst.tokenizer.decode(&ids, false), part, "part {part:?}");
+        }
+    }
+
+    /// Regression: the buffer bound sliced at a byte offset computed by
+    /// arithmetic, which lands inside a character whenever the model has
+    /// been writing anything but ASCII.
+    #[test]
+    fn a_long_non_ascii_preamble_does_not_panic() {
+        let inst = inst();
+        let mut d = inst.tool_decoder();
+        let prose = format!("{}{}", "x".repeat(190), "가".repeat(20));
+        assert!(!prose.is_char_boundary(prose.len() - 50));
+        stream(&inst, d.as_mut(), &[&prose]);
+        let events = stream(
+            &inst,
+            d.as_mut(),
+            &[
+                "[TOOL_CALLS]",
+                "get_weather",
+                "[ARGS]",
+                r#"{"city":"Oslo"}"#,
+                "</s>",
+            ],
+        );
+        assert_eq!(
+            last_call(&events),
+            Some(("get_weather".into(), r#"{"city":"Oslo"}"#.into()))
+        );
+    }
+
+    #[test]
+    fn the_window_keeps_a_marker_split_by_the_trim() {
+        let inst = inst();
+        let mut d = inst.tool_decoder();
+        let mut over = "y".repeat(240);
+        over.push_str("[TOOL_");
+        stream(&inst, d.as_mut(), &[&over]);
+        let events = stream(&inst, d.as_mut(), &["CALLS]", "f", "[ARGS]", "{}", "</s>"]);
+        assert_eq!(last_call(&events).map(|c| c.0), Some("f".into()));
+    }
+
+    /// A second `[TOOL_CALLS]` closes the previous call's arguments, so
+    /// the marker has to survive into the next round of the search.
+    #[test]
+    fn a_second_call_closes_the_first_and_is_itself_decoded() {
+        let inst = inst();
+        let mut d = inst.tool_decoder();
+        let events = stream(
+            &inst,
+            d.as_mut(),
+            &[
+                "[TOOL_CALLS]",
+                "first",
+                "[ARGS]",
+                r#"{"a":1}"#,
+                "[TOOL_CALLS]",
+                "second",
+                "[ARGS]",
+                r#"{"b":2}"#,
+                "</s>",
+            ],
+        );
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ToolEvent::Call(n, a) => Some((n.as_str(), a.as_str())),
+                ToolEvent::Start => None,
+            })
+            .collect();
+        assert_eq!(calls, [("first", r#"{"a":1}"#), ("second", r#"{"b":2}"#)]);
+    }
+
+    #[test]
+    fn the_name_may_arrive_across_several_steps() {
+        let inst = inst();
+        let mut d = inst.tool_decoder();
+        let events = stream(
+            &inst,
+            d.as_mut(),
+            &[
+                "[TOOL_CALLS]",
+                "get_",
+                "weat",
+                "her",
+                "[ARGS]",
+                "{}",
+                "</s>",
+            ],
+        );
+        assert_eq!(last_call(&events).map(|c| c.0), Some("get_weather".into()));
+    }
+
+    #[test]
+    fn whitespace_around_the_name_and_arguments_is_dropped() {
+        let inst = inst();
+        let mut d = inst.tool_decoder();
+        let events = stream(
+            &inst,
+            d.as_mut(),
+            &[
+                "[TOOL_CALLS]",
+                "\n get_weather \n",
+                "[ARGS]",
+                "  {} ",
+                "</s>",
+            ],
+        );
+        assert_eq!(
+            last_call(&events),
+            Some(("get_weather".into(), "{}".into()))
+        );
+    }
+
+    #[test]
+    fn reset_abandons_a_call_in_progress() {
+        let inst = inst();
+        let mut d = inst.tool_decoder();
+        stream(&inst, d.as_mut(), &["[TOOL_CALLS]", "f", "[ARGS]", "{}"]);
+        d.reset();
+        // Only a decoder still holding the call open would close it here.
+        let after = stream(&inst, d.as_mut(), &["</s>"]);
+        assert_eq!(last_call(&after), None);
+    }
+
+    /// The state alone is not enough: a half-received opening marker left
+    /// in the buffer would complete itself against the next request.
+    #[test]
+    fn reset_forgets_buffered_text() {
+        let inst = inst();
+        let mut d = inst.tool_decoder();
+        stream(&inst, d.as_mut(), &["thinking about it [TOOL_"]);
+        d.reset();
+        let after = stream(&inst, d.as_mut(), &["CALLS]", "f", "[ARGS]", "{}", "</s>"]);
+        assert_eq!(last_call(&after), None);
+    }
+
+    /// The name belongs to the state that reads arguments, so abandoning
+    /// that state cannot leave a name behind for the next call to inherit.
+    #[test]
+    fn a_new_call_cannot_inherit_the_previous_name() {
+        let inst = inst();
+        let mut d = inst.tool_decoder();
+        stream(
+            &inst,
+            d.as_mut(),
+            &["[TOOL_CALLS]", "stale", "[ARGS]", "{}", "</s>"],
+        );
+        let events = stream(
+            &inst,
+            d.as_mut(),
+            &["[TOOL_CALLS]", "fresh", "[ARGS]", "{}", "</s>"],
+        );
+        assert_eq!(last_call(&events).map(|c| c.0), Some("fresh".into()));
     }
 }

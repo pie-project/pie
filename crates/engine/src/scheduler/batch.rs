@@ -4,10 +4,10 @@ use std::collections::HashMap;
 
 use ::driver_api::PieTerminalCell;
 
+use super::fire_plan;
 use super::stats::SchedulerStats;
 use super::wire;
 use super::worker::PendingRequest;
-use super::fire_plan;
 use crate::driver::{FrameSubmission, LaunchPlan, SchedulerLimits, StepSubmission};
 
 /// One step's assembled wire request: the per-batch merge of its member
@@ -218,7 +218,6 @@ pub(crate) fn build_batch_request(
     })
 }
 
-
 /// tart rung ③ (re-ported onto the 0.3 scheduler): the region table —
 /// the seriation's output stated ONCE; the driver derives every planned
 /// split from it (region_plans.hpp). Maximal runs of members sharing an
@@ -229,29 +228,22 @@ fn planned_region_table(
     ordered: &[Box<PendingRequest>],
     row_indptr: &[u32],
 ) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
-    if row_indptr.len() != ordered.len() + 1
-        || row_indptr.windows(2).any(|w| w[1] <= w[0])
-    {
+    if row_indptr.len() != ordered.len() + 1 || row_indptr.windows(2).any(|w| w[1] <= w[0]) {
         return (Vec::new(), Vec::new(), Vec::new());
     }
     let mut indptr: Vec<u32> = vec![row_indptr[0]];
     let mut sigs: Vec<u32> = Vec::new();
     let mut ks: Vec<u32> = Vec::new();
     for (member, req) in ordered.iter().enumerate() {
-        let sig = u32::from(
-            req.request
-                .qo_indptr
-                .windows(2)
-                .any(|w| w[1] - w[0] > 1),
-        ) * ::driver_api::PIE_REGION_SIG_MULTI_TOKEN
-            | u32::from(req.hook_program) * ::driver_api::PIE_REGION_SIG_HOOK
-            | u32::from(req.request.has_user_mask)
-                * ::driver_api::PIE_REGION_SIG_MASK
-            | u32::from(req.request.max_layers.is_some())
-                * ::driver_api::PIE_REGION_SIG_TRUNCATED
-            | u32::from(req.lora_program) * ::driver_api::PIE_REGION_SIG_LORA
-            | u32::from(req.hook_program && req.request.hook_page_mask)
-                * ::driver_api::PIE_REGION_SIG_HOOK_PAGE_MASK;
+        let sig = (u32::from(req.request.qo_indptr.windows(2).any(|w| w[1] - w[0] > 1))
+            * ::driver_api::PIE_REGION_SIG_MULTI_TOKEN)
+            | (u32::from(req.hook_program) * ::driver_api::PIE_REGION_SIG_HOOK)
+            | (u32::from(req.request.has_user_mask) * ::driver_api::PIE_REGION_SIG_MASK)
+            | (u32::from(req.request.max_layers.is_some())
+                * ::driver_api::PIE_REGION_SIG_TRUNCATED)
+            | (u32::from(req.lora_program) * ::driver_api::PIE_REGION_SIG_LORA)
+            | (u32::from(req.hook_program && req.request.hook_page_mask)
+                * ::driver_api::PIE_REGION_SIG_HOOK_PAGE_MASK);
         let k = req
             .request
             .max_layers
@@ -286,6 +278,14 @@ fn planned_region_table(
 ///   frame (the latest overlay — prepared write targets accumulate);
 /// - `required_kv_pages` is the frame-union high-water over every member
 ///   (declared high-water and page-id-derived floors).
+#[allow(
+    clippy::vec_box,
+    reason = "measured: `PendingRequest` is 1408 bytes. This vec is not a store but a \
+              conveyor — requests are moved wave -> step_groups -> deferred -> back \
+              out repeatedly in this function — and the box makes each of those moves \
+              8 bytes instead of 1408. Unboxing would trade one allocation per request \
+              for a 1408-byte memcpy on every shuffle and every Vec regrow"
+)]
 pub(crate) fn build_frame_submission(
     waves: Vec<Vec<Box<PendingRequest>>>,
     limits: SchedulerLimits,
@@ -336,7 +336,7 @@ pub(crate) fn build_frame_submission(
         // fixed-decode compose requires the envelope lanes to be a
         // contiguous program suffix. Stable sort keeps arrival order
         // within each class.
-        let mut group = group;
+        let group = group;
         // tart (0.3 re-port step 1): the fire planner's seriation — the
         // key's PRIMARY term is device_resolved_geometry, so the
         // envelope-suffix invariant this sort used to provide is
@@ -352,18 +352,13 @@ pub(crate) fn build_frame_submission(
                 custom_mask: req.request.has_user_mask,
                 truncated: req.request.max_layers.is_some(),
                 max_layers: req.request.max_layers,
-                multi_token: req
-                    .request
-                    .qo_indptr
-                    .windows(2)
-                    .any(|w| w[1] - w[0] > 1),
+                multi_token: req.request.qo_indptr.windows(2).any(|w| w[1] - w[0] > 1),
                 device_resolved_geometry: req.request.device_resolved_geometry,
                 arrival,
             })
             .collect();
         let plan = fire_plan::plan_fire_with_model(&facts, &[]);
-        let mut slots: Vec<Option<Box<PendingRequest>>> =
-            group.into_iter().map(Some).collect();
+        let mut slots: Vec<Option<Box<PendingRequest>>> = group.into_iter().map(Some).collect();
         let group: Vec<Box<PendingRequest>> = plan
             .member_order
             .iter()
@@ -519,8 +514,7 @@ mod tests {
             pending(dg, 2, true),
             pending(wire_decode(22, 4), 3, false),
         ];
-        let mut requests = requests;
-        let sub = build_batch_request(&mut requests, 16, &SchedulerStats::default());
+        let sub = build_batch_request(&requests, 16, &SchedulerStats::default());
         assert_eq!(sub.program_row_indptr, vec![0, 1, 2, 3]);
         assert_eq!(
             sub.plan.qo_indptr,
@@ -538,9 +532,9 @@ mod tests {
         first.kv_translation = vec![3, 16];
         let mut second = wire_decode(22, 4);
         second.kv_translation = vec![8, 28];
-        let mut requests = [pending(first, 1, false), pending(second, 2, false)];
+        let requests = [pending(first, 1, false), pending(second, 2, false)];
 
-        let sub = build_batch_request(&mut requests, 16, &SchedulerStats::default());
+        let sub = build_batch_request(&requests, 16, &SchedulerStats::default());
 
         assert_eq!(sub.plan.required_kv_pages, 29);
     }
@@ -555,15 +549,15 @@ mod tests {
         two_lane.qo_indptr = vec![0, 1, 2];
         two_lane.rs_slot_ids = vec![31, 32];
         two_lane.rs_slot_flags = vec![0, crate::driver::RS_FLAG_RESET];
-        let mut solo = [pending(two_lane, 1, true)];
-        let sub = build_batch_request(&mut solo, 16, &SchedulerStats::default());
+        let solo = [pending(two_lane, 1, true)];
+        let sub = build_batch_request(&solo, 16, &SchedulerStats::default());
         assert_eq!(sub.program_row_indptr, vec![0, 2]);
         assert_eq!(sub.plan.qo_indptr, vec![0, 1, 2]);
         assert_eq!(sub.plan.rs_slot_ids, vec![31, 32]);
 
         let dg = LaunchPlan::default();
-        let mut solo_dg = [pending(dg, 2, true)];
-        let sub = build_batch_request(&mut solo_dg, 16, &SchedulerStats::default());
+        let solo_dg = [pending(dg, 2, true)];
+        let sub = build_batch_request(&solo_dg, 16, &SchedulerStats::default());
         assert_eq!(sub.program_row_indptr, vec![0, 0]);
     }
 
@@ -583,8 +577,8 @@ mod tests {
         two_lane.rs_slot_flags = vec![crate::driver::RS_FLAG_RESET, 0];
         let expected = two_lane.clone();
 
-        let mut ordinary = [pending(two_lane, 9, false)];
-        let sub = build_batch_request(&mut ordinary, 16, &SchedulerStats::default());
+        let ordinary = [pending(two_lane, 9, false)];
+        let sub = build_batch_request(&ordinary, 16, &SchedulerStats::default());
 
         assert_eq!(sub.instance_ids, vec![9]);
         assert_eq!(sub.program_row_indptr, vec![0, 2]);
@@ -651,11 +645,11 @@ mod tests {
         two_lane.rs_slot_ids = vec![17, 23];
         two_lane.rs_slot_flags = vec![crate::driver::RS_FLAG_RESET, 0];
 
-        let mut requests = [
+        let requests = [
             pending(two_lane, 9, false),
             pending(wire_decode(33, 5), 10, false),
         ];
-        let sub = build_batch_request(&mut requests, 16, &SchedulerStats::default());
+        let sub = build_batch_request(&requests, 16, &SchedulerStats::default());
 
         assert_eq!(sub.program_row_indptr, vec![0, 2, 3]);
         assert_eq!(sub.plan.qo_indptr, vec![0, 1, 2, 3]);
@@ -682,8 +676,8 @@ mod tests {
         request.single_token_mode = false;
         request.device_resolved_geometry = true;
 
-        let mut requests = [pending(request, 12, false)];
-        let sub = build_batch_request(&mut requests, 16, &SchedulerStats::default());
+        let requests = [pending(request, 12, false)];
+        let sub = build_batch_request(&requests, 16, &SchedulerStats::default());
         assert_eq!(sub.plan.kv_page_indices, vec![3, 4, 5]);
         assert!(sub.plan.masks.is_empty());
     }
@@ -695,12 +689,12 @@ mod tests {
         custom.single_token_mode = false;
         custom.masks = vec![crate::driver::command::EncodedMask::new(vec![1], 1)];
         custom.mask_indptr = vec![0, 1];
-        let mut requests = [
+        let requests = [
             pending(custom, 20, false),
             pending(wire_decode(22, 4), 21, false),
         ];
 
-        let sub = build_batch_request(&mut requests, 16, &SchedulerStats::default());
+        let sub = build_batch_request(&requests, 16, &SchedulerStats::default());
         assert_eq!(sub.instance_ids, vec![20, 21]);
         assert_eq!(sub.plan.mask_indptr, vec![0, 1, 2]);
         assert_eq!(sub.plan.masks.len(), 2);
@@ -723,8 +717,8 @@ mod tests {
         request.masks = vec![crate::driver::command::EncodedMask::new(vec![0, 1], 1)];
         request.mask_indptr = vec![0, 1];
 
-        let mut requests = [pending(request, 12, false)];
-        let sub = build_batch_request(&mut requests, 16, &SchedulerStats::default());
+        let requests = [pending(request, 12, false)];
+        let sub = build_batch_request(&requests, 16, &SchedulerStats::default());
         assert_eq!(sub.plan.masks.len(), 1);
         assert_eq!(sub.plan.mask_indptr, vec![0, 1]);
         assert!(sub.plan.has_user_mask);
@@ -745,9 +739,9 @@ mod tests {
         plan.device_resolved_geometry = true;
         plan.kv_write_lower_bounds = vec![7];
         plan.kv_write_upper_bounds = vec![15];
-        let mut requests = [pending(plan.clone(), 20, false), pending(plan, 21, false)];
+        let requests = [pending(plan.clone(), 20, false), pending(plan, 21, false)];
 
-        let sub = build_batch_request(&mut requests, 16, &SchedulerStats::default());
+        let sub = build_batch_request(&requests, 16, &SchedulerStats::default());
         assert_eq!(sub.program_row_indptr, vec![0, 2, 4]);
         assert_eq!(sub.plan.kv_page_indices, Vec::<u32>::new());
         assert_eq!(sub.plan.kv_page_indptr, vec![0, 0, 0, 0, 0]);
@@ -762,9 +756,9 @@ mod tests {
         let mut bounded = wire_decode(22, 4);
         bounded.kv_write_lower_bounds = vec![7];
         bounded.kv_write_upper_bounds = vec![9];
-        let mut requests = [pending(plain, 20, false), pending(bounded, 21, false)];
+        let requests = [pending(plain, 20, false), pending(bounded, 21, false)];
 
-        let sub = build_batch_request(&mut requests, 16, &SchedulerStats::default());
+        let sub = build_batch_request(&requests, 16, &SchedulerStats::default());
         assert_eq!(sub.plan.kv_write_lower_bounds, vec![0, 7]);
         assert_eq!(sub.plan.kv_write_upper_bounds, vec![u64::MAX, 9]);
     }

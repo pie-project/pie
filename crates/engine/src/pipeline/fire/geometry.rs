@@ -90,6 +90,13 @@ impl DecodeEnvelope {
 /// geometry ports falls back to host-evaluated (serialized) execution
 /// rather than erroring — derivability decides class, the driver's port
 /// mask only decides where the class executes.
+///
+/// Test-only: production takes the diagnostic form
+/// ([`classify_decode_envelope_why`], called from `host/forward.rs`) because it
+/// reports the declining rule. This is the "don't care why" half of the pair,
+/// and only the tests below want it. Pure shape work over a `TraceContainer`,
+/// so those tests need no GPU and run on every host.
+#[cfg(test)]
 pub fn classify_decode_envelope(
     container: &TraceContainer,
 ) -> Result<Option<DecodeEnvelope>, String> {
@@ -629,6 +636,10 @@ pub(crate) fn evaluate_attn_mask(
 /// bytes (little-endian, per its dtype), or `None` if unfilled.
 pub type ChannelValues<'a> = &'a [Option<Vec<u8>>];
 
+/// Per-port evaluation outcomes, recorded alongside a mapped geometry: for each
+/// port that was consulted, the value it evaluated to or the reason it declined.
+pub type PortEvaluations = Vec<(Port, Result<tensor_compiler::eval::interp::Value, String>)>;
+
 /// An evaluated-geometry failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EvaluatedGeometryError {
@@ -680,22 +691,17 @@ pub fn map_geometry_evaluated(
     bound: &tensor_ir::validate::BoundTrace,
     known: &mut dyn FnMut(u32) -> Option<tensor_compiler::eval::interp::Value>,
     page_size: u32,
-) -> Result<
-    (
-        ReqGeometry,
-        Vec<(Port, Result<tensor_compiler::eval::interp::Value, String>)>,
-    ),
-    EvaluatedGeometryError,
-> {
+) -> Result<(ReqGeometry, PortEvaluations), EvaluatedGeometryError> {
     use tensor_compiler::eval::interp::Value;
 
     let container = &bound.container;
-    let ports = tensor_compiler::eval::pareval::eval_descriptor_ports(bound, known).map_err(|blocker| {
-        EvaluatedGeometryError::BadValue {
-            port: Port::EmbedTokens,
-            reason: blocker.to_string(),
-        }
-    })?;
+    let ports =
+        tensor_compiler::eval::pareval::eval_descriptor_ports(bound, known).map_err(|blocker| {
+            EvaluatedGeometryError::BadValue {
+                port: Port::EmbedTokens,
+                reason: blocker.to_string(),
+            }
+        })?;
     let port_value = |port: Port| -> Option<Result<Value, String>> {
         ports.iter().find_map(|(p, slot)| {
             (*p == port).then(|| slot.clone().map_err(|blocker| blocker.to_string()))
@@ -719,9 +725,11 @@ pub fn map_geometry_evaluated(
         }
     };
 
-    let mut g = ReqGeometry::default();
-    g.token_ids = required_u32(Port::EmbedTokens)?;
-    g.qo_indptr = required_u32(Port::EmbedIndptr)?;
+    let mut g = ReqGeometry {
+        token_ids: required_u32(Port::EmbedTokens)?,
+        qo_indptr: required_u32(Port::EmbedIndptr)?,
+        ..ReqGeometry::default()
+    };
 
     let kv_len = required_u32(Port::KvLen)?;
     let lanes = g.qo_indptr.len().saturating_sub(1);
@@ -993,7 +1001,7 @@ fn resolve(
 /// Reinterpret a little-endian byte payload as `u32`s (4 bytes each). Token ids
 /// stored `i32` reinterpret bit-for-bit (the driver's `token_ids` is `u32`).
 fn as_u32(port: Port, bytes: &[u8]) -> Result<Vec<u32>, GeometryError> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(GeometryError::BadPayload {
             port,
             bytes: bytes.len(),

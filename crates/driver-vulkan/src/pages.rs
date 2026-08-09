@@ -45,6 +45,24 @@ pub enum Unhoused {
         /// Pages not held by anybody.
         spare: usize,
     },
+    /// A shrink would drop a page somebody is sitting on.
+    ///
+    /// Names the conversation and the page rather than only the counts: the
+    /// caller's next move is to evict that conversation or to pick a larger
+    /// target, and neither is choosable from "it did not fit".
+    Stranded {
+        /// The conversation holding it.
+        who: u64,
+        /// The page it holds that the shrink would drop.
+        page: u32,
+        /// The target the shrink asked for.
+        pages: u32,
+    },
+    /// A fork's source has no seat, or its destination already has one.
+    ///
+    /// Kept apart from [`Unhoused::NoPages`] because waiting does not fix it:
+    /// no amount of eviction gives a conversation a history it never had.
+    Unforkable(Unforkable),
 }
 
 impl std::fmt::Display for Unhoused {
@@ -56,6 +74,38 @@ impl std::fmt::Display for Unhoused {
                     "this growth needs {wanted} more pages and {spare} are free"
                 )
             }
+            Self::Stranded { who, page, pages } => write!(
+                f,
+                "conversation {who} holds page {page}, which a cache of {pages} pages \
+                 does not have"
+            ),
+            Self::Unforkable(why) => write!(f, "{why}"),
+        }
+    }
+}
+
+/// Why a fork could not be made.
+///
+/// An enum and not a message, so that [`Unhoused`] stays `Copy` and a caller
+/// can match on the reason. Each is a different mistake by a different
+/// caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unforkable {
+    /// Source and destination are the same conversation.
+    Itself,
+    /// The destination already holds pages, and taking its seat would drop
+    /// them without telling anybody.
+    Taken,
+    /// The source has no seat, so there is no history to copy.
+    Absent,
+}
+
+impl std::fmt::Display for Unforkable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Itself => write!(f, "a conversation cannot be forked onto itself"),
+            Self::Taken => write!(f, "the destination already holds pages"),
+            Self::Absent => write!(f, "the source has no history to fork"),
         }
     }
 }
@@ -186,6 +236,98 @@ impl Book {
                 .collect(),
             seat.pages.clone(),
         ))
+    }
+
+    /// Seat `to` on fresh pages holding the same history as `from`.
+    ///
+    /// Returns the moves a caller must make, as `(source, destination)` page
+    /// numbers in fill order: the BOOK owns who holds which page and the POOL
+    /// owns what is in it, and neither can do the other's half. A caller that
+    /// takes this list and does not perform it has seated a conversation on
+    /// pages holding somebody else's history -- which is why the pairs come
+    /// back as a value that has to be used rather than as a side effect.
+    ///
+    /// The destination's token count is the source's, so `to` continues where
+    /// `from` is rather than starting empty on a full cache.
+    ///
+    /// # Errors
+    ///
+    /// [`Unhoused::Unforkable`] if `from` has no seat or `to` already has one
+    /// -- overwriting a seated conversation would drop its pages without
+    /// telling anybody. [`Unhoused::NoPages`] if the cache cannot hold a
+    /// second copy, and **nothing is taken when it refuses**, as in
+    /// [`Book::grow`].
+    pub fn fork(&mut self, from: u64, to: u64) -> Result<Vec<(u32, u32)>, Unhoused> {
+        if from == to {
+            return Err(Unhoused::Unforkable(Unforkable::Itself));
+        }
+        if self.seats.contains_key(&to) {
+            return Err(Unhoused::Unforkable(Unforkable::Taken));
+        }
+        let Some(seat) = self.seats.get(&from) else {
+            return Err(Unhoused::Unforkable(Unforkable::Absent));
+        };
+        let wanted = seat.pages.len();
+        if self.free.len() < wanted {
+            return Err(Unhoused::NoPages {
+                wanted,
+                spare: self.free.len(),
+            });
+        }
+        let tokens = seat.tokens;
+        let sources = seat.pages.clone();
+        let mut moves = Vec::with_capacity(wanted);
+        let mut pages = Vec::with_capacity(wanted);
+        for source in sources {
+            // Taken the way `grow` takes them, so a fork and a growth cannot
+            // disagree about which page is next.
+            let page = self.free.pop().expect("checked above");
+            moves.push((source, page));
+            pages.push(page);
+        }
+        self.seats.insert(to, Seat { pages, tokens });
+        Ok(moves)
+    }
+
+    /// Follow the pool to `pages`.
+    ///
+    /// Grows by adding the new page numbers to the free list, shrinks by
+    /// dropping the free ones past the new end.
+    ///
+    /// # Errors
+    ///
+    /// [`Unhoused::Stranded`] if a SEATED conversation holds a page the
+    /// shrink would drop, naming the conversation and the page. Nothing is
+    /// changed when it refuses -- a book that had already dropped half its
+    /// free list would leave the pool smaller than the book believes, and
+    /// every fire after it would bind a page past the buffer, which this card
+    /// answers with zeros rather than an error.
+    ///
+    /// Checked here rather than in the pool because the pool does not know
+    /// who holds what. `Shell::resize_pool` calls this FIRST for exactly that
+    /// reason: a refusal must arrive before any byte moves.
+    pub fn resize(&mut self, pages: u32) -> Result<(), Unhoused> {
+        if let Some((&who, page)) = self.seats.iter().find_map(|(who, seat)| {
+            seat.pages
+                .iter()
+                .find(|p| **p >= pages)
+                .map(|page| (who, *page))
+        }) {
+            return Err(Unhoused::Stranded { who, page, pages });
+        }
+        if pages > self.shape.pages {
+            // Prepended, because the free list is taken from its END and the
+            // low pages should still go out first: a growth that handed out
+            // the new pages first would leave a pool whose used pages are its
+            // last ones, and the next shrink would strand them.
+            let mut fresh: Vec<u32> = (self.shape.pages..pages).rev().collect();
+            fresh.append(&mut self.free);
+            self.free = fresh;
+        } else {
+            self.free.retain(|p| *p < pages);
+        }
+        self.shape.pages = pages;
+        Ok(())
     }
 
     /// Take `who`'s pages back.
@@ -343,5 +485,127 @@ mod tests {
             .map(|who| book.grow(who, 1).expect("room"))
             .collect();
         Frame::of(s, &next).expect("the second fire stages too");
+    }
+
+    #[test]
+    fn a_fork_takes_fresh_pages_and_keeps_the_source_where_it_was() {
+        let mut book = Book::over(shape(8, 4));
+        book.grow(1, 5).expect("a seat");
+        let held = book.pages(1).expect("pages").to_vec();
+        let spare = book.spare();
+
+        let moves = book.fork(1, 2).expect("a fork");
+        assert_eq!(moves.len(), held.len(), "one move per page");
+        // The SOURCE keeps what it had. A fork that handed the source's pages
+        // away would leave two conversations reading one cache.
+        assert_eq!(book.pages(1).expect("pages"), held.as_slice());
+        let taken: Vec<u32> = moves.iter().map(|(_, to)| *to).collect();
+        assert_eq!(book.pages(2).expect("pages"), taken.as_slice());
+        for page in &taken {
+            assert!(!held.contains(page), "page {page} was handed out twice");
+        }
+        assert_eq!(book.tokens(2), book.tokens(1), "the history's length");
+        assert_eq!(book.spare(), spare - held.len(), "pages left");
+    }
+
+    #[test]
+    fn a_fork_that_cannot_fit_takes_nothing() {
+        // Six pages: a five-token conversation at four per page needs two,
+        // and a fork of it needs two more, leaving two. A second fork wants
+        // two and there are two -- so the refusal has to be arranged with a
+        // conversation that needs more than is left.
+        let mut book = Book::over(shape(3, 4));
+        book.grow(1, 9).expect("three pages");
+        let spare = book.spare();
+        assert_eq!(spare, 0, "the premise: nothing is free");
+
+        let refused = book.fork(1, 2).expect_err("no room for a copy");
+        assert!(
+            matches!(
+                refused,
+                Unhoused::NoPages {
+                    wanted: 3,
+                    spare: 0
+                }
+            ),
+            "{refused}"
+        );
+        // Nothing taken, and no half-seat left behind.
+        assert!(book.pages(2).is_none(), "the refused fork seated anyway");
+        assert_eq!(book.spare(), spare);
+    }
+
+    #[test]
+    fn a_fork_will_not_overwrite_a_seat_or_invent_a_history() {
+        let mut book = Book::over(shape(8, 4));
+        book.grow(1, 5).expect("a seat");
+        book.grow(2, 5).expect("a seat");
+        let theirs = book.pages(2).expect("pages").to_vec();
+
+        assert_eq!(
+            book.fork(1, 2).expect_err("2 is seated"),
+            Unhoused::Unforkable(Unforkable::Taken)
+        );
+        // ...and 2 still holds exactly what it did, rather than having been
+        // silently dropped on the floor.
+        assert_eq!(book.pages(2).expect("pages"), theirs.as_slice());
+
+        assert_eq!(
+            book.fork(9, 10).expect_err("9 has no history"),
+            Unhoused::Unforkable(Unforkable::Absent)
+        );
+        assert_eq!(
+            book.fork(1, 1).expect_err("onto itself"),
+            Unhoused::Unforkable(Unforkable::Itself)
+        );
+    }
+
+    #[test]
+    fn a_growth_hands_out_the_pages_that_were_there_first() {
+        let mut book = Book::over(shape(2, 4));
+        book.grow(1, 5).expect("both pages");
+        assert_eq!(book.spare(), 0, "the premise");
+
+        book.resize(6).expect("room to grow into");
+        assert_eq!(book.spare(), 4, "the new pages are free");
+        // The conversation that was seated keeps exactly what it held.
+        assert_eq!(book.pages(1).expect("pages"), &[0, 1]);
+        // ...and the next hand-out is the LOWEST new page, not the highest.
+        // A growth that handed out the top of the range first would leave the
+        // used pages at the end, and the next shrink would strand them.
+        book.grow(2, 1).expect("a page");
+        assert_eq!(book.pages(2).expect("pages"), &[2]);
+    }
+
+    #[test]
+    fn a_shrink_drops_only_free_pages_and_refuses_to_strand_a_seat() {
+        let mut book = Book::over(shape(8, 4));
+        book.grow(1, 9).expect("three pages");
+        assert_eq!(book.pages(1).expect("pages"), &[0, 1, 2]);
+
+        // Down to exactly what is held: allowed, and nothing is left free.
+        book.resize(3).expect("a shrink to the high-water mark");
+        assert_eq!(book.spare(), 0);
+        assert_eq!(book.pages(1).expect("pages"), &[0, 1, 2]);
+
+        // One page further is a refusal that NAMES what is in the way.
+        let refused = book.resize(2).expect_err("page 2 is held");
+        assert_eq!(
+            refused,
+            Unhoused::Stranded {
+                who: 1,
+                page: 2,
+                pages: 2
+            }
+        );
+        // ...and the refusal changed nothing, so the book still agrees with a
+        // pool nobody resized.
+        assert_eq!(book.spare(), 0);
+        // A SECOND conversation, because 1 has three tokens of slack inside
+        // the pages it already holds and would be seated without asking for
+        // one.
+        assert!(book.grow(2, 1).is_err(), "the cache is still full");
+        book.resize(4).expect("room again");
+        book.grow(2, 1).expect("a page to sit on");
     }
 }

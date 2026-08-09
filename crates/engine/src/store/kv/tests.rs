@@ -1,4 +1,11 @@
 //! Unit tests for the KV mapping trie, hashes, pool, and KvStore protocol.
+#![allow(
+    clippy::single_range_in_vec_init,
+    reason = "`discard`/`page_token_hashes` take `&[Range<u64>]` — a genuinely \
+              PLURAL selection (see `discard(b, &[8..9, 2..7])` below), so a \
+              one-element slice literal is a one-range selection, not a range \
+              that was meant to be collected"
+)]
 
 use std::collections::HashSet;
 
@@ -865,7 +872,7 @@ fn store_explicit_index_root_participates_in_cow() {
     );
     store.cancel_prepared(shared);
 
-    assert_eq!(store.remove_index(b"shared").unwrap().0, true);
+    assert!(store.remove_index(b"shared").unwrap().0);
     let private = store.prepare_write(ws, &[1]).unwrap();
     assert!(matches!(
         private.targets(),
@@ -1224,7 +1231,11 @@ fn settling_every_fire_leaves_no_epoch_outstanding() {
     for (ws, _, _) in &live {
         store.discard(*ws, &[0..1], store.current_epoch()).unwrap();
     }
-    assert_eq!(store.available_pages(), 3, "still gated by three live fires");
+    assert_eq!(
+        store.available_pages(),
+        3,
+        "still gated by three live fires"
+    );
 
     // Newest first: each settle may only release what nothing older gates.
     live.reverse();

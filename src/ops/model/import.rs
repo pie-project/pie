@@ -521,8 +521,11 @@ impl ProgressLine {
         if let Some(name) = progress.finalized {
             self.current = name.to_string();
         }
-        self.bar
-            .draw(progress.read_bytes, progress.total_read_bytes, &self.current);
+        self.bar.draw(
+            progress.read_bytes,
+            progress.total_read_bytes,
+            &self.current,
+        );
     }
 
     pub(crate) fn finish(&mut self) {
@@ -616,9 +619,8 @@ fn resolve_snapshot(repo_id: &str) -> Result<PathBuf> {
         // and convert is one command with an argument.
         crate::ops::model::fetch_snapshot(repo_id)?;
     }
-    let entries = std::fs::read_dir(&snapshots).map_err(|_| {
-        anyhow!("{repo_id} is neither a path nor a model any registry has")
-    })?;
+    let entries = std::fs::read_dir(&snapshots)
+        .map_err(|_| anyhow!("{repo_id} is neither a path nor a model any registry has"))?;
     let snapshot = entries
         .filter_map(|entry| entry.ok())
         .find(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))

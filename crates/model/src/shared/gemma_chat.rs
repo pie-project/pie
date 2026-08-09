@@ -2,12 +2,18 @@
 //!
 //! Gemma 3 wrote it down first, which is why it lived in
 //! `gemma_3/chat.rs` — and gemma-3n bound it from there, which is
-//! exactly the reach `tests/sibling_isolation.rs` forbids. Two
+//! exactly the reach `tests/sibling_isolation.rs` forbids. Three
 //! generations bind this template (`Gemma3Variant` has named a gemma-3n
 //! arm since the day it was written), and what more than one generation
-//! binds is not any one generation's property. So it lives here, both
+//! binds is not any one generation's property. So it lives here, all
 //! name it here, and `gemma_3::chat` is the re-export that keeps the old
 //! path meaning what it meant.
+//!
+//! Gemma-2 is the third and arrived last, from its own copy of this
+//! file — the two had drifted apart on the BOS and on where the system
+//! message goes, in the direction that renders a plausible prompt
+//! instead of failing. `gemma_2/chat.rs` records what the difference
+//! was; this is where it stopped being possible.
 //!
 //! The format itself: `<start_of_turn>` / `<end_of_turn>` with a single
 //! BOS at the beginning of the rendered chat. The HF template has no

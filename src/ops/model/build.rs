@@ -137,15 +137,14 @@ fn read_carried_objects(path: &Path) -> Result<CarriedObjects> {
         })?;
     let mut tokenizer = Vec::with_capacity(tokenizer::canonical::OBJECTS.len());
     for name in tokenizer::canonical::OBJECTS {
-        let bytes = model_loader::checkpoint::read::read_meta(&checkpoint, name)?.ok_or_else(
-            || {
+        let bytes =
+            model_loader::checkpoint::read::read_meta(&checkpoint, name)?.ok_or_else(|| {
                 anyhow!(
                     "{} carries a model config but not {name}; an artifact with half \
                      its metadata cannot serve, and this command does not compile the rest",
                     path.display()
                 )
-            },
-        )?;
+            })?;
         tokenizer.push((name.to_string(), bytes));
     }
     Ok(CarriedObjects {

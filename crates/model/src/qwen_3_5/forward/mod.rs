@@ -6,7 +6,6 @@
 //! [`qwen3_5_hybrid`] composes their bodies per layer, so a fragment's test
 //! and the whole model's test read the same ops.
 
-pub mod emit;
 pub mod facts;
 
 /// The MoE aligned path's block size and block ceiling, as the driver picks

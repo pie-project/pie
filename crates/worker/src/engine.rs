@@ -164,10 +164,10 @@ impl EngineHandle {
         // report.
         tracing::info!(worker = ?self.control_plane.worker_id(), "leaving control plane");
         drop(self.control_plane);
-        if let Some(runtime) = self.runtime.take() {
-            if let Err(err) = runtime.shutdown().await {
-                tracing::error!(?err, "runtime shutdown failed");
-            }
+        if let Some(runtime) = self.runtime.take()
+            && let Err(err) = runtime.shutdown().await
+        {
+            tracing::error!(?err, "runtime shutdown failed");
         }
     }
 }
@@ -534,8 +534,7 @@ fn load_model_drivers(
     };
     crate::embedded_driver::set_weight_cache_dir(weight_cache_dir);
 
-    let mut metadata: Option<model::ModelMetadata> = None;
-    let (driver_groups, snapshot_dir) = {
+    let (driver_groups, snapshot_dir, metadata) = {
         let m = &user_cfg.model;
         let resolved = preflight::resolve_flavor(m.driver.kind, &m.name)?;
 
@@ -576,7 +575,6 @@ fn load_model_drivers(
             .metadata()
             .with_context(|| format!("reading the model metadata for {:?}", m.name))?;
         let config = lifted.config.clone();
-        metadata = Some(lifted);
         let snapshot_dir = resolved_model.path().to_path_buf();
         let mut group_drivers: Vec<GroupDriver> = Vec::with_capacity(topology.len());
         for (group_idx, group) in topology.iter().enumerate() {
@@ -597,6 +595,7 @@ fn load_model_drivers(
                 groups: group_drivers,
             },
             snapshot_dir,
+            lifted,
         )
     };
 
@@ -615,9 +614,7 @@ fn load_model_drivers(
         *blake3::hash(user_cfg.model.model.as_bytes()).as_bytes()
     };
     Ok(LoadedModelDrivers {
-        // Set in the block above, which is the only path that reaches here:
-        // a model that could not be resolved never got as far as a driver.
-        metadata: metadata.expect("the model was resolved before its drivers were created"),
+        metadata,
         model: user_cfg.model.name.clone(),
         full_identity: model_identity(
             user_cfg,
@@ -1001,6 +998,11 @@ async fn assemble_distributed<C: ControlLink>(
     ))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "nine independent inputs to one driver launch; a struct here \
+              would be a parameter list with a name"
+)]
 fn create_driver_group(
     m: &config::ModelConfig,
     group_idx: usize,

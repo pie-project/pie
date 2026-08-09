@@ -428,13 +428,7 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
         }
     }
 
-    let avg = |value: u64| {
-        if total_batches > 0 {
-            value / total_batches
-        } else {
-            0
-        }
-    };
+    let avg = |value: u64| value.checked_div(total_batches).unwrap_or(0);
     // Inter-fire is sampled starting at the 2nd batch (first one has
     // no prior to diff against), so divide by max(total_batches-1, 1)
     // to get a stable mean.
@@ -493,16 +487,10 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
                 straggler_fires: q_straggler_fires,
                 straggler_demotions: q_straggler_demotions,
                 readiness_miss: q_readiness_miss,
-                avg_active_pipelines_at_fire: if q_wave_fires > 0 {
-                    q_wave_active_sum / q_wave_fires
-                } else {
-                    0
-                },
-                avg_missing_at_fire: if q_wave_fires > 0 {
-                    q_wave_missing_sum / q_wave_fires
-                } else {
-                    0
-                },
+                avg_active_pipelines_at_fire: q_wave_active_sum
+                    .checked_div(q_wave_fires)
+                    .unwrap_or(0),
+                avg_missing_at_fire: q_wave_missing_sum.checked_div(q_wave_fires).unwrap_or(0),
                 wave_active_sum: q_wave_active_sum,
                 wave_missing_sum: q_wave_missing_sum,
                 wave_fires: q_wave_fires,

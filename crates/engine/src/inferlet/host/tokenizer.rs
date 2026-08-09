@@ -6,8 +6,8 @@
 
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
-use anyhow::Result;
 use crate::model;
+use anyhow::Result;
 
 /// `model` still hands token tables back as two parallel vectors; the WIT
 /// surface names the pairing instead.
@@ -30,10 +30,7 @@ const TOKENIZER_OFFLOAD_THRESHOLD: usize = 64;
 impl pie::inferlet::tokenizer::Host for ProcessCtx {
     async fn encode(&mut self, text: String) -> Result<Vec<u32>> {
         if text.len() >= TOKENIZER_OFFLOAD_THRESHOLD * 4 {
-            return Ok(tokio::task::spawn_blocking(move || {
-                model::model().tokenize(&text)
-            })
-            .await?);
+            return Ok(tokio::task::spawn_blocking(move || model::model().tokenize(&text)).await?);
         }
         let ids = model::model().tokenize(&text);
         Ok(ids)

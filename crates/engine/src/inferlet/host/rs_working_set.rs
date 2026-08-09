@@ -38,15 +38,13 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         Ok(self.ctx().table.push(ws)?)
     }
 
-
     async fn buffer_size(&mut self, this: Resource<RsWorkingSet>) -> Result<u32> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
-        let stores = store_registry::get(ws.model, ws.driver as usize);
+        let stores = store_registry::get(ws.model, ws.driver);
         let size = stores.rs.lock().unwrap().buffer_size(ws.id);
-        Ok(size.map_err(anyhow::Error::from)?)
+        size.map_err(anyhow::Error::from)
     }
-
 
     async fn alloc_buffer(
         &mut self,
@@ -57,7 +55,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         crate::inferlet::process::ensure_bind_admitted(self).await;
         crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
-        let stores = store_registry::get(ws.model, ws.driver as usize);
+        let stores = store_registry::get(ws.model, ws.driver);
         let range = stores.rs.lock().unwrap().alloc_buffer(ws.id, n);
         Ok(range
             .map(|r| WitRange {
@@ -74,7 +72,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
     ) -> Result<Result<(), String>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
-        let stores = store_registry::get(ws.model, ws.driver as usize);
+        let stores = store_registry::get(ws.model, ws.driver);
         let mut rs = stores.rs.lock().unwrap();
         let epoch = rs.current_epoch();
         let out = rs
@@ -91,7 +89,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
     ) -> Result<Result<(), String>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
-        let stores = store_registry::get(ws.model, ws.driver as usize);
+        let stores = store_registry::get(ws.model, ws.driver);
         let out = stores
             .rs
             .lock()
@@ -108,7 +106,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
     ) -> Result<Result<(), String>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
-        let stores = store_registry::get(ws.model, ws.driver as usize);
+        let stores = store_registry::get(ws.model, ws.driver);
         let out = stores
             .rs
             .lock()
@@ -150,7 +148,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
             )));
         }
 
-        let stores = store_registry::get(ws.model, ws.driver as usize);
+        let stores = store_registry::get(ws.model, ws.driver);
         let forked = stores.rs.lock().unwrap().fork(ws.id);
         match forked {
             Ok(id) => {

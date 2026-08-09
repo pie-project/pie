@@ -107,13 +107,16 @@ jobs:
       # RUSTC_WORKSPACE_WRAPPER, which lints every *path* dependency that gets
       # built, not just the selected packages. Without it this step fails on
       # the driver crate's 13 warnings, which are not the compiler's to fix.
-      - name: cargo clippy (compiler crates, deny warnings)
+      - name: cargo clippy (deny warnings)
         run: |
           cargo clippy --no-deps --all-targets \
             -p tensor-ir -p tensor-compiler -p tensor-dsl \
             -p model-loader -p model-compiler \
             -p worker-api -p client-api -p controller-api \
             -p ids -p waker -p transport \
+            -p bootstrap -p client -p controller -p driver -p driver-api \
+            -p driver-dummy -p engine -p gateway -p grammar -p inferlet \
+            -p inferlet-macros -p kernels -p pie -p tokenizer -p worker \
             -- -D warnings
 
       # `model` runs as its own command because it needs `--all-features`.
@@ -161,7 +164,11 @@ jobs:
             -p model-loader -p model -p model-compiler \
             -p worker-api -p client-api -p controller-api \
             -p ids -p waker -p transport \
-            -p driver-metal -p worker
+            -p driver-metal -p engine -p worker \
+            -p bootstrap -p client -p controller -p driver -p driver-api \
+            -p driver-dummy -p gateway -p grammar -p inferlet \
+            -p inferlet-macros -p kernels -p kernels-metal -p kernels-vulkan \
+            -p pie -p pie-gpu-tests -p pie-server-py -p tokenizer
 
   # Full-workspace verification — the guardrail + anti-bitrot net. Closes the
   # gap that let the runtime benches rot unseen: the dedicated jobs only build a
@@ -244,6 +251,42 @@ jobs:
       # this is the other half.
       - name: module reachability audit
         run: python3 scripts/mod-reachability-audit.py
+
+      # The gate lists above are a CLAIM about the workspace, and nothing
+      # checked it. Both ways it can be wrong have already happened here: a
+      # crate listed four times (harmless, but the reason nobody spotted it
+      # is the reason nobody would spot a crate going missing), and sixteen
+      # crates that had never been listed at all and had drifted out of
+      # rustfmt unremarked. A crate that is merely absent from a `-p` list
+      # is indistinguishable, in CI's output, from a crate that passes.
+      - name: gate coverage audit
+        run: python3 scripts/ci-gate-audit.py
+
+      # A `#[cfg(feature = "x")]` whose `x` no package declares is not an
+      # error -- it is a condition that is always false, so the code under
+      # it compiles nowhere while reading as code that is merely off. The
+      # root package lost its `driver-metal` forward when the C++ Metal
+      # driver was retired and never got it back, leaving five dead blocks
+      # in `pie init`'s config template: on a Mac the generated default
+      # named a bf16 repo that Metal's 4-bit-only llama path cannot bind.
+      # `unexpected_cfgs` did fire, into the warnings of a package no gate
+      # lints. This audit needs no compiler, no CUDA and no GPU, so it also
+      # covers the nine crates the gates cannot build here -- which are
+      # exactly the crates that have optional backends to `cfg` on.
+      - name: cfg feature audit
+        run: python3 scripts/cfg-feature-audit.py
+
+      # The three audits above are static, and all three were green on
+      # 3,108 lines of `crates/model` that nothing could reach: the
+      # `emit-cuda` machinery, left behind when the commit that retired
+      # its binary and its check deleted only those two. `dead_code` does
+      # not fire on `pub` items, and the module audit correctly called the
+      # files reachable -- they were, from a `pub mod` nobody called.
+      # Running the tests and asking which files never executed found it
+      # in one line: three at exactly 0.00%, half the crate's uncovered
+      # total. This asks that one question, not for a percentage.
+      - name: coverage audit (no file where nothing runs)
+        run: python3 scripts/coverage-audit.py
 
       - name: kernel table (every symbol carries its family)
         run: cargo test -p model --features forward --test kernels_table

@@ -40,10 +40,10 @@ use anyhow::{Context, Result};
 use axum::Router;
 use controller_api::GatewayInfo;
 use ids::{ReqId, WorkerId};
-use worker_api::Request;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
+use worker_api::Request;
 
 use crate::admission::AdmissionDecision;
 use crate::blob::{BlobStore, GatewayOriginStore};

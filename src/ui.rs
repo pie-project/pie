@@ -357,7 +357,11 @@ impl Table {
             for (i, width) in widths.iter().enumerate() {
                 let raw = row.cells.get(i).map(String::as_str).unwrap_or("");
                 let last = i + 1 == columns;
-                let text = if last { clip(raw, last_room) } else { raw.to_string() };
+                let text = if last {
+                    clip(raw, last_room)
+                } else {
+                    raw.to_string()
+                };
                 let pad = width.saturating_sub(text.chars().count());
                 // Pad first, style second. The padding is inside the styling
                 // and the styling closes itself, so a dimmed column cannot
@@ -498,7 +502,9 @@ fn toml_value(v: &str, p: &Palette) -> String {
 pub fn confirm(question: &str, escape_hatch: &str) -> anyhow::Result<bool> {
     use std::io::Write;
     if !is_interactive(Stream::Stdin) {
-        anyhow::bail!("this needs confirmation and there is no terminal to ask; rerun with `{escape_hatch}`");
+        anyhow::bail!(
+            "this needs confirmation and there is no terminal to ask; rerun with `{escape_hatch}`"
+        );
     }
     // The prompt goes to stderr so that `pie cache clear > log` still shows it
     // to the person being asked.
@@ -574,11 +580,7 @@ impl Bar {
         self.last_draw = std::time::Instant::now();
         self.drew = true;
 
-        let percent = if total == 0 {
-            100
-        } else {
-            (done * 100 / total).min(100)
-        };
+        let percent = (done * 100).checked_div(total).map_or(100, |p| p.min(100));
         let quantity = format!("{}/{}", bytes(done), bytes(total));
         // Everything but the label is fixed-width; the label gets what is left
         // and is padded to it, because a redraw that shrinks the line leaves
@@ -790,8 +792,7 @@ pub fn width() -> usize {
         // SAFETY: `winsize` is plain data and the ioctl only writes into it.
         unsafe {
             let mut size: libc::winsize = std::mem::zeroed();
-            if libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut size) == 0
-                && size.ws_col > 0
+            if libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut size) == 0 && size.ws_col > 0
             {
                 return size.ws_col as usize;
             }

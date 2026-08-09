@@ -239,6 +239,24 @@ pub struct RsGeometryBinding {
     /// rather than be found quietly. Everything else the buffer needs — the
     /// pages a row holds, the tail each token appends at, how far a replay
     /// reaches — is derived from the store's own occupancy.
+    #[allow(
+        dead_code,
+        reason = "written at bind time from the guest's `rs-geometry` record \
+                  (`host/forward.rs`, where `page_span` still rejects a malformed \
+                  span) and read by nothing. That is not a missing check. The WIT \
+                  doc justifies the field by saying a fire needing an ungranted \
+                  page must fail rather than have the runtime quietly find one -- \
+                  and the runtime has no way to find one: `RsStore::alloc_buffer` \
+                  is reachable ONLY from the guest's own `alloc-buffer` call, so \
+                  nothing grows a buffer mid-fire. What could actually overrun is \
+                  a fold, and `validate_fold` refuses that against both physical \
+                  capacity and live occupancy on every `prepare_*` path. So the \
+                  grant is the SEVENTH buffer-addressing channel, not a ceiling: \
+                  the six above it were deleted for exactly this reason -- the \
+                  runtime derives them from the store it is already authoritative \
+                  for. Removing it is a WIT change and wants the deliberation the \
+                  other six got, so it is described here rather than done here"
+    )]
     pub buffer: KvPageSpan,
 }
 
@@ -656,13 +674,13 @@ pub fn validate_seeds(
 mod tests {
     use super::*;
     use crate::pipeline::program::{Registry, register};
+    use std::num::NonZeroUsize;
     use tensor_ir::container::{
         ChanDType, ChannelDecl, PortBinding, PortSource, StageProgram, TraceContainer,
     };
     use tensor_ir::op::{IntrinsicId, Op};
     use tensor_ir::registry::{ModelProfile, Port, Stage};
     use tensor_ir::types::{DType, Shape};
-    use std::num::NonZeroUsize;
 
     const VOCAB: u32 = 32;
 

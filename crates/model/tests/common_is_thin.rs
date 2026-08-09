@@ -155,13 +155,6 @@ const NOT_SHARED: &[(&str, &str)] = &[
         "family-aware by design -- it dispatches on a VisionArch",
     ),
     (
-        "emissions.rs",
-        "a DEPLOYMENT LIST: which families' static forms are committed, from \
-         which fact sets -- shared between the emit-cuda bin and the \
-         regeneration check so neither holds a copy, and per-family by its \
-         nature",
-    ),
-    (
         "shared/weight_names.rs",
         "a MAP between two of this crate's own vocabularies: the trace names \
          the DSL invents and the published names a contract author invents. \
@@ -188,7 +181,8 @@ const NOT_SHARED: &[(&str, &str)] = &[
     ),
     (
         "shared/gemma_chat.rs",
-        "gemma's `<start_of_turn>` template, bound by gemma-3 and gemma-3n",
+        "gemma's `<start_of_turn>` template, bound by gemma-2, gemma-3 and \
+         gemma-3n",
     ),
     (
         "shared/deepseek.rs",

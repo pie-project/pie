@@ -1345,4 +1345,761 @@ mod tests {
         assert!(align_up(256, 0).is_err(), "and neither is a zero alignment");
         assert!(align_up(256, -8).is_err());
     }
+
+    // ── Runtime quantization ─────────────────────────────────────────────
+    //
+    // The whole of `runtime_quant_scheme` / `push_runtime_quant` was unrun.
+    // `boot.rs` sets `RuntimeQuant::None` and nothing else in the workspace
+    // sets anything else, so ~90 lines of the builder -- every refusal, every
+    // QuantSpec, the shape rule -- existed only as an intention.
+
+    /// A checkpoint from `(name, shape, encoding)` triples.
+    fn checkpoint(rows: &[(&str, Vec<i64>, Encoding)]) -> CheckpointMetadata {
+        CheckpointMetadata {
+            files: Vec::new(),
+            tensors: rows
+                .iter()
+                .enumerate()
+                .map(|(i, (name, shape, encoding))| RawTensor {
+                    id: TensorId(i as u32),
+                    name: (*name).to_string(),
+                    file_id: model_loader::types::FileId(0),
+                    file_offset: 0,
+                    span_bytes: shape.iter().product::<i64>().max(0) as u64 * 2,
+                    shape: shape.clone(),
+                    encoding: encoding.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn bf16(shape: Vec<i64>) -> (Vec<i64>, Encoding) {
+        (shape, Encoding::Raw(DType::BF16))
+    }
+
+    /// Author a contract over `rows` under `policy`, running only the
+    /// generic tail -- which is the pass runtime quant lives in.
+    fn publish(
+        rows: &[(&str, Vec<i64>, Encoding)],
+        enc: &StoredEncoding,
+        policy: &Policy,
+        allow: impl FnOnce(&mut Builder<'_>),
+    ) -> Result<ModelContract, Error> {
+        let meta = checkpoint(rows);
+        let target = target();
+        let shape = LoadShape::dense(1, 128, false);
+        let mut b = Builder::new(&meta, "test-row", shape, enc, &target, policy);
+        allow(&mut b);
+        b.publish_remaining()?;
+        b.finish()
+    }
+
+    fn rq(kind: RuntimeQuant) -> Policy {
+        Policy {
+            runtime_quant: kind,
+            ..Policy::default()
+        }
+    }
+
+    /// A family that has not wired runtime quant refuses the request by name.
+    ///
+    /// The refusal is the point. Without it the knob would be silently
+    /// ignored and the caller would get a bf16 contract while believing it
+    /// asked for FP8 -- a difference visible only in memory use.
+    #[test]
+    fn a_family_that_has_not_wired_requant_refuses_it() {
+        let rows = [(
+            "model.layers.0.mlp.gate_proj.weight",
+            bf16(vec![64, 128]).0,
+            Encoding::Raw(DType::BF16),
+        )];
+        for kind in [RuntimeQuant::Fp8, RuntimeQuant::Int8, RuntimeQuant::Mxfp4] {
+            let err = publish(&rows, &StoredEncoding::dense(), &rq(kind), |_| {})
+                .expect_err("no allow_* knob was set");
+            let Error::Contract(msg) = err else {
+                panic!("expected a contract error for {kind:?}");
+            };
+            assert!(msg.contains("not supported for 'test-row'"), "{msg}");
+            assert!(
+                msg.contains(&format!("{kind:?}")),
+                "the message names the request: {msg}"
+            );
+        }
+    }
+
+    /// `RuntimeQuant::None` is not a refusal, it is the ordinary path.
+    #[test]
+    fn no_request_publishes_the_weights_as_they_are() {
+        let rows = [(
+            "model.layers.0.mlp.gate_proj.weight",
+            vec![64, 128],
+            Encoding::Raw(DType::BF16),
+        )];
+        let c = publish(
+            &rows,
+            &StoredEncoding::dense(),
+            &rq(RuntimeQuant::None),
+            |b| {
+                b.allow_bf16_runtime_quant();
+            },
+        )
+        .unwrap();
+        assert_eq!(c.tensors.len(), 1);
+        assert!(
+            matches!(c.tensors[0].encoding, Encoding::Raw(DType::BF16)),
+            "an unrequested requant must not happen: {:?}",
+            c.tensors[0].encoding
+        );
+    }
+
+    /// FP8 and INT8 each get their own spec, and only the listed projections
+    /// are touched.
+    ///
+    /// Both are per-output-channel with no grouping, so the two differ by
+    /// exactly one field -- the logical dtype the consumer sees. A spec that
+    /// copied the wrong one still produces a well-formed contract.
+    #[test]
+    fn bf16_requant_states_a_per_channel_spec_for_the_projections_only() {
+        let rows = [
+            (
+                "model.layers.0.mlp.gate_proj.weight",
+                vec![64, 128],
+                Encoding::Raw(DType::BF16),
+            ),
+            (
+                "model.layers.0.input_layernorm.weight",
+                vec![128],
+                Encoding::Raw(DType::BF16),
+            ),
+        ];
+        for (kind, want_dtype) in [
+            (RuntimeQuant::Fp8, DType::F8E4M3),
+            (RuntimeQuant::Int8, DType::I8),
+        ] {
+            let c = publish(&rows, &StoredEncoding::dense(), &rq(kind), |b| {
+                b.allow_bf16_runtime_quant();
+            })
+            .unwrap();
+            let proj = c
+                .tensors
+                .iter()
+                .find(|t| t.name.ends_with("gate_proj.weight"))
+                .expect("the projection is published");
+            let Encoding::Quant(spec) = &proj.encoding else {
+                panic!("{kind:?}: the projection was not requantized");
+            };
+            assert_eq!(spec.logical_dtype, want_dtype, "{kind:?}");
+            assert_eq!(spec.bits_per_element, 8, "{kind:?}");
+            assert_eq!(spec.group_size, 1, "{kind:?} is per-channel, not grouped");
+            assert_eq!(
+                spec.channel_axis,
+                Some(Axis(0)),
+                "{kind:?} splits by output row"
+            );
+
+            let norm = c
+                .tensors
+                .iter()
+                .find(|t| t.name.ends_with("input_layernorm.weight"))
+                .expect("the norm is published");
+            assert!(
+                matches!(norm.encoding, Encoding::Raw(DType::BF16)),
+                "{kind:?} reached a norm it has no business quantizing: {:?}",
+                norm.encoding
+            );
+        }
+    }
+
+    /// MXFP4 reaches routed experts and nothing else.
+    ///
+    /// The comment on `runtime_quantizable_name` gives the reason -- this
+    /// hardware has no FP4 GEMM for attention -- so a dense projection under
+    /// an Mxfp4 request must come out untouched, not merely un-crashed.
+    #[test]
+    fn mxfp4_requant_reaches_experts_and_leaves_attention_alone() {
+        let rows = [
+            (
+                "model.layers.0.mlp.experts.0.up_proj.weight",
+                vec![64, 128],
+                Encoding::Raw(DType::BF16),
+            ),
+            (
+                "model.layers.0.self_attn.q_proj.weight",
+                vec![64, 128],
+                Encoding::Raw(DType::BF16),
+            ),
+        ];
+        let c = publish(
+            &rows,
+            &StoredEncoding::dense(),
+            &rq(RuntimeQuant::Mxfp4),
+            |b| {
+                b.allow_mxfp4_runtime_quant();
+            },
+        )
+        .unwrap();
+        let expert = c
+            .tensors
+            .iter()
+            .find(|t| t.name.contains("experts"))
+            .unwrap();
+        let Encoding::Quant(spec) = &expert.encoding else {
+            panic!("the expert was not requantized: {:?}", expert.encoding);
+        };
+        assert_eq!(spec.scheme, QuantScheme::Mxfp4E2M1E8M0);
+        assert_eq!(spec.bits_per_element, 4);
+        assert_eq!(
+            spec.group_size, 32,
+            "an MXFP4 block scale covers 32 elements"
+        );
+        assert_eq!(
+            spec.channel_axis,
+            Some(Axis(1)),
+            "grouped along K, not along the output row"
+        );
+        assert_eq!(
+            spec.logical_dtype,
+            DType::BF16,
+            "the consumer still sees bf16"
+        );
+
+        let attn = c
+            .tensors
+            .iter()
+            .find(|t| t.name.contains("q_proj"))
+            .unwrap();
+        assert!(
+            matches!(attn.encoding, Encoding::Raw(DType::BF16)),
+            "FP4 has no GEMM for attention on this hardware: {:?}",
+            attn.encoding
+        );
+    }
+
+    /// The two allow knobs are not interchangeable.
+    ///
+    /// A family that wired BF16->FP8 has not thereby wired FP4 experts, and
+    /// vice versa. Sharing one flag would let either request through on the
+    /// strength of the other's implementation.
+    #[test]
+    fn the_two_requant_knobs_gate_different_requests() {
+        let rows = [(
+            "model.layers.0.mlp.experts.0.up_proj.weight",
+            vec![64, 128],
+            Encoding::Raw(DType::BF16),
+        )];
+        assert!(
+            publish(
+                &rows,
+                &StoredEncoding::dense(),
+                &rq(RuntimeQuant::Mxfp4),
+                |b| {
+                    b.allow_bf16_runtime_quant();
+                }
+            )
+            .is_err(),
+            "the bf16 knob must not admit an FP4 request"
+        );
+        assert!(
+            publish(
+                &rows,
+                &StoredEncoding::dense(),
+                &rq(RuntimeQuant::Fp8),
+                |b| {
+                    b.allow_mxfp4_runtime_quant();
+                }
+            )
+            .is_err(),
+            "the FP4 knob must not admit an FP8 request"
+        );
+    }
+
+    /// An already-quantized checkpoint is re-quantized to FP4 and to nothing
+    /// else.
+    ///
+    /// GLM-5.1 ships FP8 experts and is still asked for FP4. The same
+    /// checkpoint asked for FP8 must fall through to the ordinary path
+    /// rather than re-encoding what is already encoded -- and `Ok(None)`,
+    /// not an error, because there is nothing wrong with the request.
+    #[test]
+    fn a_prequantized_checkpoint_admits_only_the_fp4_request() {
+        let rows = [(
+            "model.layers.0.mlp.experts.0.up_proj.weight",
+            vec![64, 128],
+            Encoding::Raw(DType::F8E4M3),
+        )];
+        let quantized = StoredEncoding {
+            method: "fp8".into(),
+            bits: 8,
+            group_size: 0,
+        };
+
+        let c = publish(&rows, &quantized, &rq(RuntimeQuant::Fp8), |b| {
+            b.allow_bf16_runtime_quant();
+        })
+        .expect("an FP8 request over a quantized checkpoint is declined, not refused");
+        assert!(
+            !matches!(&c.tensors[0].encoding, Encoding::Quant(s) if s.scheme == QuantScheme::Fp8E4M3),
+            "it must not re-encode an already-encoded checkpoint"
+        );
+
+        let c = publish(&rows, &quantized, &rq(RuntimeQuant::Mxfp4), |b| {
+            b.allow_mxfp4_runtime_quant();
+        })
+        .unwrap();
+        let Encoding::Quant(spec) = &c.tensors[0].encoding else {
+            panic!("FP4 over an FP8 checkpoint should still requantize");
+        };
+        assert_eq!(spec.scheme, QuantScheme::Mxfp4E2M1E8M0);
+    }
+
+    /// Sources that cannot be requantized are named, not skipped.
+    #[test]
+    fn a_source_the_requantizer_cannot_read_is_refused_by_name() {
+        // Not 2-D.
+        let rows = [(
+            "model.layers.0.mlp.gate_proj.weight",
+            vec![64],
+            Encoding::Raw(DType::BF16),
+        )];
+        let Err(Error::Contract(msg)) = publish(
+            &rows,
+            &StoredEncoding::dense(),
+            &rq(RuntimeQuant::Fp8),
+            |b| {
+                b.allow_bf16_runtime_quant();
+            },
+        ) else {
+            panic!("a 1-D source should be refused");
+        };
+        assert!(msg.contains("must be 2-D"), "{msg}");
+        assert!(
+            msg.contains("gate_proj"),
+            "the message names the tensor: {msg}"
+        );
+
+        // A dtype the executor has no cast path for.
+        let rows = [(
+            "model.layers.0.mlp.gate_proj.weight",
+            vec![64, 128],
+            Encoding::Raw(DType::I8),
+        )];
+        let Err(Error::Contract(msg)) = publish(
+            &rows,
+            &StoredEncoding::dense(),
+            &rq(RuntimeQuant::Fp8),
+            |b| {
+                b.allow_bf16_runtime_quant();
+            },
+        ) else {
+            panic!("an i8 source should be refused");
+        };
+        assert!(msg.contains("BF16/FP16/FP32/F8E4M3"), "{msg}");
+    }
+
+    /// Every dtype the doc lists as a legal requant source really is one.
+    #[test]
+    fn all_four_documented_source_dtypes_are_accepted() {
+        for dtype in [DType::BF16, DType::F16, DType::F32, DType::F8E4M3] {
+            let rows = [(
+                "model.layers.0.mlp.gate_proj.weight",
+                vec![64, 128],
+                Encoding::Raw(dtype),
+            )];
+            let c = publish(
+                &rows,
+                &StoredEncoding::dense(),
+                &rq(RuntimeQuant::Fp8),
+                |b| {
+                    b.allow_bf16_runtime_quant();
+                },
+            )
+            .unwrap_or_else(|e| panic!("{dtype:?} is documented as a legal source: {e:?}"));
+            assert!(
+                matches!(c.tensors[0].encoding, Encoding::Quant(_)),
+                "{dtype:?} was accepted but not requantized"
+            );
+        }
+    }
+
+    /// An MXFP4 block scale spans 32 columns, so a K that is not a multiple
+    /// of 32 is refused rather than rounded.
+    #[test]
+    fn mxfp4_refuses_a_k_that_does_not_divide_into_blocks() {
+        let rows = [(
+            "model.layers.0.mlp.experts.0.up_proj.weight",
+            vec![64, 130],
+            Encoding::Raw(DType::BF16),
+        )];
+        let Err(Error::Contract(msg)) = publish(
+            &rows,
+            &StoredEncoding::dense(),
+            &rq(RuntimeQuant::Mxfp4),
+            |b| {
+                b.allow_mxfp4_runtime_quant();
+            },
+        ) else {
+            panic!("130 columns is not a whole number of 32-element blocks");
+        };
+        assert!(msg.contains("multiple of 32"), "{msg}");
+        assert!(
+            msg.contains("130"),
+            "the message gives the offending width: {msg}"
+        );
+        // 128 is, and passes.
+        let rows = [(
+            "model.layers.0.mlp.experts.0.up_proj.weight",
+            vec![64, 128],
+            Encoding::Raw(DType::BF16),
+        )];
+        assert!(
+            publish(
+                &rows,
+                &StoredEncoding::dense(),
+                &rq(RuntimeQuant::Mxfp4),
+                |b| {
+                    b.allow_mxfp4_runtime_quant();
+                }
+            )
+            .is_ok()
+        );
+    }
+
+    /// `RuntimeQuant::Int4` resolves a scheme the CUDA push path cannot
+    /// emit.
+    ///
+    /// `runtime_quant_scheme` maps it to `MlxAffineU4`, which then falls to
+    /// `push_runtime_quant`'s catch-all. It is reachable: a family that
+    /// calls `allow_bf16_runtime_quant` -- the knob whose name says FP8/INT8
+    /// -- admits the Int4 request as far as the push. The failure is at
+    /// least loud and names the scheme; this test exists so that if the MLX
+    /// path is ever wired through the shared builder, the change is
+    /// deliberate rather than a silently altered error string.
+    #[test]
+    fn an_int4_request_reaches_the_push_and_is_refused_there() {
+        let rows = [(
+            "model.layers.0.mlp.gate_proj.weight",
+            vec![64, 128],
+            Encoding::Raw(DType::BF16),
+        )];
+        let Err(Error::Contract(msg)) = publish(
+            &rows,
+            &StoredEncoding::dense(),
+            &rq(RuntimeQuant::Int4),
+            |b| {
+                b.allow_bf16_runtime_quant();
+            },
+        ) else {
+            panic!("Int4 has no CUDA push path");
+        };
+        assert!(msg.contains("unsupported runtime_quant scheme"), "{msg}");
+        assert!(msg.contains("MlxAffineU4"), "{msg}");
+    }
+
+    /// A contract nobody authored is refused, rather than handed over empty.
+    #[test]
+    fn an_empty_contract_is_refused() {
+        let Err(Error::Contract(msg)) =
+            publish(&[], &StoredEncoding::dense(), &Policy::default(), |_| {})
+        else {
+            panic!("an empty contract binds nothing");
+        };
+        assert!(msg.contains("no contract was authored"), "{msg}");
+        assert!(msg.contains("test-row"), "the message names the row: {msg}");
+    }
+
+    // ── Shipped block scales ─────────────────────────────────────────────
+    //
+    // `state_shipped_block_scales` runs on every tensor the generic tail
+    // publishes and does nothing for almost all of them. Its whole body was
+    // unrun: no test ever published a `_scale_inv` beside an FP8 weight.
+
+    /// An FP8 weight and its shipped scale are paired, with the block size
+    /// read off the two shapes.
+    ///
+    /// DeepSeek ships `weight` at [N, K] FP8 and `weight_scale_inv` at
+    /// [N, K/128] F32. Nothing declares 128 anywhere; it is the quotient of
+    /// the two trailing dims. A hard-coded block would be right for
+    /// DeepSeek and wrong for the next checkpoint that picks another one.
+    #[test]
+    fn a_shipped_scale_is_paired_with_its_fp8_weight() {
+        let rows = [
+            (
+                "model.layers.0.mlp.down_proj.weight",
+                vec![64, 256],
+                Encoding::Raw(DType::F8E4M3),
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight_scale_inv",
+                vec![64, 2],
+                Encoding::Raw(DType::F32),
+            ),
+        ];
+        let c = publish(&rows, &StoredEncoding::dense(), &Policy::default(), |_| {}).unwrap();
+        let scale = c
+            .tensors
+            .iter()
+            .find(|t| t.name.ends_with("weight_scale_inv"))
+            .expect("the scale is published in its own right");
+        let paired = scale
+            .scales
+            .as_ref()
+            .expect("the scale states what it scales");
+        assert_eq!(paired.of, "model.layers.0.mlp.down_proj.weight");
+        assert_eq!(paired.group_size, 128, "256 columns over 2 scales");
+        assert_eq!(paired.granularity, QuantGranularity::PerGroup);
+        assert_eq!(paired.form, ScaleForm::F32Factors);
+    }
+
+    /// The block size is a quotient, not a constant.
+    #[test]
+    fn the_block_size_comes_from_the_two_shapes() {
+        for (cols, n_scales, want) in [(256i64, 2i64, 128u32), (256, 4, 64), (96, 3, 32)] {
+            let rows = [
+                (
+                    "model.layers.0.mlp.down_proj.weight",
+                    vec![64, cols],
+                    Encoding::Raw(DType::F8E4M3),
+                ),
+                (
+                    "model.layers.0.mlp.down_proj.weight_scale_inv",
+                    vec![64, n_scales],
+                    Encoding::Raw(DType::F32),
+                ),
+            ];
+            let c = publish(&rows, &StoredEncoding::dense(), &Policy::default(), |_| {}).unwrap();
+            let scale = c
+                .tensors
+                .iter()
+                .find(|t| t.name.ends_with("_scale_inv"))
+                .unwrap();
+            assert_eq!(
+                scale.scales.as_ref().unwrap().group_size,
+                want,
+                "{cols} cols over {n_scales} scales"
+            );
+        }
+    }
+
+    /// A scale beside a weight that is not FP8 is left unpaired.
+    ///
+    /// "A companion that is not really FP8 is left alone rather than
+    /// reinterpreted": a bf16 weight with something named `_scale_inv` next
+    /// to it is not a block-scaled tensor, and claiming it is would have the
+    /// loader divide by a factor nobody applied.
+    #[test]
+    fn a_scale_beside_a_bf16_weight_is_not_claimed() {
+        let rows = [
+            (
+                "model.layers.0.mlp.down_proj.weight",
+                vec![64, 256],
+                Encoding::Raw(DType::BF16),
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight_scale_inv",
+                vec![64, 2],
+                Encoding::Raw(DType::F32),
+            ),
+        ];
+        let c = publish(&rows, &StoredEncoding::dense(), &Policy::default(), |_| {}).unwrap();
+        let scale = c
+            .tensors
+            .iter()
+            .find(|t| t.name.ends_with("_scale_inv"))
+            .unwrap();
+        assert!(scale.scales.is_none(), "a bf16 weight is not block-scaled");
+    }
+
+    /// A scale whose weight is not in the checkpoint is left unpaired
+    /// rather than naming a tensor the contract never declares.
+    #[test]
+    fn an_orphan_scale_names_nothing() {
+        let rows = [(
+            "model.layers.0.mlp.down_proj.weight_scale_inv",
+            vec![64, 2],
+            Encoding::Raw(DType::F32),
+        )];
+        let c = publish(&rows, &StoredEncoding::dense(), &Policy::default(), |_| {}).unwrap();
+        assert!(c.tensors[0].scales.is_none());
+    }
+
+    /// An ordinary weight is not mistaken for a scale.
+    #[test]
+    fn a_tensor_that_is_not_a_scale_is_passed_over() {
+        let rows = [(
+            "model.layers.0.mlp.down_proj.weight",
+            vec![64, 256],
+            Encoding::Raw(DType::F8E4M3),
+        )];
+        let c = publish(&rows, &StoredEncoding::dense(), &Policy::default(), |_| {}).unwrap();
+        assert!(
+            c.tensors[0].scales.is_none(),
+            "a weight does not scale itself"
+        );
+    }
+
+    /// A zero-length scale is declined rather than dividing by zero.
+    #[test]
+    fn a_scale_with_no_columns_does_not_divide_by_zero() {
+        let rows = [
+            (
+                "model.layers.0.mlp.down_proj.weight",
+                vec![64, 256],
+                Encoding::Raw(DType::F8E4M3),
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight_scale_inv",
+                vec![64, 0],
+                Encoding::Raw(DType::F32),
+            ),
+        ];
+        let c = publish(&rows, &StoredEncoding::dense(), &Policy::default(), |_| {}).unwrap();
+        let scale = c
+            .tensors
+            .iter()
+            .find(|t| t.name.ends_with("_scale_inv"))
+            .unwrap();
+        assert!(scale.scales.is_none());
+    }
+
+    /// A weight the loader is about to re-quantize gets the loader's own
+    /// scales, not the checkpoint's.
+    ///
+    /// Both would otherwise be stated, and the shipped pairing would
+    /// describe a block layout the re-quantized tensor no longer has.
+    #[test]
+    fn a_requantized_weight_keeps_the_loaders_scales_not_the_shipped_ones() {
+        let rows = [
+            (
+                "model.layers.0.mlp.down_proj.weight",
+                vec![64, 256],
+                Encoding::Raw(DType::F8E4M3),
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight_scale_inv",
+                vec![64, 2],
+                Encoding::Raw(DType::F32),
+            ),
+        ];
+        // Unrequested: the shipped pairing stands.
+        let c = publish(&rows, &StoredEncoding::dense(), &Policy::default(), |_| {}).unwrap();
+        let scale = c
+            .tensors
+            .iter()
+            .find(|t| t.name.ends_with("_scale_inv"))
+            .unwrap();
+        assert!(scale.scales.is_some(), "the baseline pairs them");
+
+        // Requested: `down_proj.weight` is on the requantizable list, so the
+        // shipped pairing is dropped.
+        let c = publish(
+            &rows,
+            &StoredEncoding::dense(),
+            &rq(RuntimeQuant::Fp8),
+            |b| {
+                b.allow_bf16_runtime_quant();
+            },
+        )
+        .unwrap();
+        let scale = c
+            .tensors
+            .iter()
+            .find(|t| t.name.ends_with("_scale_inv"))
+            .unwrap();
+        assert!(
+            scale.scales.is_none(),
+            "the loader writes its own scales for a weight it re-encodes"
+        );
+    }
+
+    /// Under a source prefix, the pairing names the BOUND name.
+    ///
+    /// A prefixed checkpoint publishes `...down_proj.weight`, having
+    /// stripped `language_model.`, but the companion lookup works on raw
+    /// names. If the pairing recorded the raw name it would point at a
+    /// tensor the contract does not declare, and the loader rejects that
+    /// outright. The default prefix is empty, so nothing else here can
+    /// tell the two apart.
+    #[test]
+    fn under_a_prefix_the_pairing_names_the_published_tensor() {
+        let rows = [
+            (
+                "language_model.layers.0.mlp.down_proj.weight",
+                vec![64, 256],
+                Encoding::Raw(DType::F8E4M3),
+            ),
+            (
+                "language_model.layers.0.mlp.down_proj.weight_scale_inv",
+                vec![64, 2],
+                Encoding::Raw(DType::F32),
+            ),
+        ];
+        let meta = checkpoint(&rows);
+        let target = target();
+        let policy = Policy::default();
+        let enc = StoredEncoding::dense();
+        let mut b = Builder::new(
+            &meta,
+            "test-row",
+            LoadShape::dense(1, 128, false),
+            &enc,
+            &target,
+            &policy,
+        );
+        b.source_prefix("language_model.");
+        b.publish_remaining().unwrap();
+        let c = b.finish().unwrap();
+
+        let scale = c
+            .tensors
+            .iter()
+            .find(|t| t.name.ends_with("_scale_inv"))
+            .unwrap();
+        assert_eq!(
+            scale.name, "layers.0.mlp.down_proj.weight_scale_inv",
+            "the prefix is stripped"
+        );
+        let paired = scale.scales.as_ref().expect("still paired under a prefix");
+        assert_eq!(
+            paired.of, "layers.0.mlp.down_proj.weight",
+            "the pairing must name a tensor this contract declares"
+        );
+        assert!(
+            c.tensors.iter().any(|t| t.name == paired.of),
+            "the named weight is in the contract"
+        );
+    }
+
+    /// A tensor outside the prefix is not published at all.
+    #[test]
+    fn a_tensor_outside_the_prefix_is_left_to_another_scope() {
+        let rows = [
+            (
+                "language_model.layers.0.mlp.down_proj.weight",
+                vec![64, 256],
+                Encoding::Raw(DType::BF16),
+            ),
+            (
+                "vision_tower.encoder.0.weight",
+                vec![8, 8],
+                Encoding::Raw(DType::BF16),
+            ),
+        ];
+        let meta = checkpoint(&rows);
+        let target = target();
+        let policy = Policy::default();
+        let enc = StoredEncoding::dense();
+        let mut b = Builder::new(
+            &meta,
+            "test-row",
+            LoadShape::dense(1, 128, false),
+            &enc,
+            &target,
+            &policy,
+        );
+        b.source_prefix("language_model.");
+        b.publish_remaining().unwrap();
+        let c = b.finish().unwrap();
+        assert_eq!(c.tensors.len(), 1, "only the prefixed tensor is bound");
+        assert_eq!(c.tensors[0].name, "layers.0.mlp.down_proj.weight");
+    }
 }

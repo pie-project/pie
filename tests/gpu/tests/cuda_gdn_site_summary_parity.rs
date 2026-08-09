@@ -166,13 +166,9 @@ async fn gdn_site_summary_parity() -> Result<()> {
             if declared { "off" } else { "on" },
             if declared { "on" } else { "off" },
         );
-        eprintln!(
-            "[gdn-site-summary] PARITY OK: {MAX_TOKENS} tokens byte-identical off/on"
-        );
+        eprintln!("[gdn-site-summary] PARITY OK: {MAX_TOKENS} tokens byte-identical off/on");
     } else {
-        eprintln!(
-            "[gdn-site-summary] no counterpart record yet; run the other gate to compare"
-        );
+        eprintln!("[gdn-site-summary] no counterpart record yet; run the other gate to compare");
     }
 
     pie.shutdown().await;

@@ -265,6 +265,53 @@ impl Shell {
         // left in the checkpoint's own format. It decides an ENCODING, not a
         // fact — a checkpoint need not quantize uniformly, and reading an
         // expert bank with the dense format is NaNs rather than a near miss.
+        // ONE KERNEL SET, SO ONE AFFINE POINT — asked rather than assumed.
+        //
+        // `observed` below builds a single kernel set from `geometry.quant`,
+        // which is the point the checkpoint's `config.json` states. The
+        // TENSORS need not agree with it and need not agree with each other:
+        // `mlx_lm` publishes a routed stack at 4 bits and its router gate at
+        // 8, because the gate is small and the whole mixture inherits its
+        // error. Every tensor is then dequantised at the stated width, the
+        // gate included, and the failure is not a fault — it is every token
+        // routed to almost the right experts, measured at cosine 0.84
+        // against the reference logits.
+        //
+        // `DecodeGeometry::alt_quant` is the field that second point would
+        // ride if this driver could instantiate two kernel sets. It cannot,
+        // and inventing one here would put a guess where a fact belongs. So
+        // the honest answer is the refusal, and what makes it possible is
+        // that the LOAD PLAN knew all along: `QuantSpec` carries a
+        // `group_size` and a `bits_per_element` per tensor, and nothing was
+        // asking.
+        //
+        // MXFP4 banks are not in this set. They take their own kernel at
+        // their own group and are never read at an affine point, which is
+        // exactly the case `Loaded::mxfp4` already carries.
+        if loaded.affine_points.len() > 1 {
+            let points = loaded
+                .affine_points
+                .iter()
+                .map(|(g, b)| format!("g{g}/b{b}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::Create {
+                what: "checkpoint",
+                message: format!(
+                    "`{}` arrives at {} affine points ({points}) and this driver \
+                     instantiates ONE kernel set, at the g{}/b{} its config \
+                     states. Every tensor at another point would be dequantised \
+                     at that width — scales read from the wrong offset, and for \
+                     a router gate that is not a fault but a mixture routing to \
+                     almost the right experts. Refused rather than served wrongly",
+                    row.id(),
+                    loaded.affine_points.len(),
+                    geometry.quant.group,
+                    geometry.quant.bits
+                ),
+            });
+        }
+
         self.text_row = Some((
             row,
             crate::model::binding::observed(geometry.quant, |name| loaded.mxfp4.contains(name)),

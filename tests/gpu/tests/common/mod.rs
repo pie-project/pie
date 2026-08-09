@@ -16,7 +16,7 @@
 
 use anyhow::Result;
 use pie::derive::derive_standalone;
-use pie::{run_standalone};
+use pie::run_standalone;
 
 /// Install a `tracing` subscriber driven by `RUST_LOG` so the inproc
 /// forward-path debug probes (`engine::driver::inproc`) and any other `tracing`

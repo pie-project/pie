@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use anyhow::{Result, anyhow, bail, ensure};
+use driver_api::plan::ProgramRegistration;
 use driver_api::{
     DeviceFacts, DriverCapabilities, ModelLoadDesc, PIE_CHANNEL_DTYPE_ACT, PIE_CHANNEL_DTYPE_BOOL,
     PIE_CHANNEL_DTYPE_F32, PIE_CHANNEL_DTYPE_I32, PIE_CHANNEL_DTYPE_U32, PIE_CHANNEL_EXTERN_NONE,
@@ -20,7 +21,6 @@ use driver_api::{
     validate_instance_desc, validate_kv_copy_desc, validate_pool_resize_desc,
     validate_state_copy_desc,
 };
-use driver_api::plan::ProgramRegistration;
 use tensor_compiler::eval::interp::{
     ExternChannel, HostError, Instance as InterpInstance, NoKernels, PassInputs, Value,
 };
@@ -566,8 +566,7 @@ impl DummyDriver {
             // host role, unseeded). Single-attachment channels keep their
             // instance-local interpreter ring.
             shared: if desc.extern_dir != PIE_CHANNEL_EXTERN_NONE
-                || (desc.host_role == driver_api::PIE_CHANNEL_HOST_ROLE_NONE
-                    && desc.seeded == 0)
+                || (desc.host_role == driver_api::PIE_CHANNEL_HOST_ROLE_NONE && desc.seeded == 0)
             {
                 let dtype = channel_program_dtype(desc.dtype)?;
                 let shape = tensor_ir::types::Shape::new(&shape)
@@ -1220,7 +1219,8 @@ fn process_launch_instance(instance: &LaunchInstanceWork) -> LaunchInstanceResul
                 };
             }
         }
-        let outcome = match run_instance_step(
+
+        match run_instance_step(
             &mut inner,
             &instance.instance.program,
             instance.instance.instance_id,
@@ -1240,8 +1240,7 @@ fn process_launch_instance(instance: &LaunchInstanceWork) -> LaunchInstanceResul
                 poison_instance(&mut inner, &mut notify_waits, &err.to_string());
                 PIE_TERMINAL_OUTCOME_FAILED
             }
-        };
-        outcome
+        }
     };
     LaunchInstanceResult {
         outcome,
@@ -1656,8 +1655,8 @@ fn ensure_endpoint_matches_program(
             // instances — the shared ring is ordered by the pipeline FIFO
             // (prefill→decode `tok_in` handoff). Host-visible or seeded
             // channels keep the one-attachment rule.
-            let device_only =
-                endpoint.host_role == tensor_ir::container::HostRole::None as u8 && !endpoint.seeded;
+            let device_only = endpoint.host_role == tensor_ir::container::HostRole::None as u8
+                && !endpoint.seeded;
             ensure!(
                 endpoint.extern_name.is_none() && (endpoint.attachments.is_empty() || device_only),
                 "private channel {} is already attached",
@@ -2307,14 +2306,14 @@ mod tests {
         PIE_CHANNEL_EXTERN_EXPORT, PIE_CHANNEL_HOST_ROLE_NONE, PIE_TERMINAL_OUTCOME_PENDING,
         PieChannelValueDesc,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
     use tensor_ir::container::{
         ChanDType, ChannelDecl, ExternDecl, PortBinding, PortSource, StageProgram, TraceContainer,
     };
     use tensor_ir::expand;
     use tensor_ir::registry::{Port, Stage};
     use tensor_ir::types::{Literal, Shape};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{Duration, Instant};
 
     /// The fixture summary flows into the reported capabilities verbatim —
     /// the dummy half of the driver→engine site-summary handshake (a real

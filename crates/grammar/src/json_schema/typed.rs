@@ -496,8 +496,8 @@ impl<'a> Converter<'a> {
         }
 
         let mut alternatives = Vec::new();
-        if !properties[index].required {
-            if let Some(rest) = self.build_property_state(
+        if !properties[index].required
+            && let Some(rest) = self.build_property_state(
                 hint,
                 properties,
                 index + 1,
@@ -507,9 +507,9 @@ impl<'a> Converter<'a> {
                 additional.clone(),
                 ws.clone(),
                 memo,
-            )? {
-                alternatives.push(rest);
-            }
+            )?
+        {
+            alternatives.push(rest);
         }
         if max.is_none_or(|max| emitted < max) {
             let next_emitted = if min == 0 && max.is_none() {

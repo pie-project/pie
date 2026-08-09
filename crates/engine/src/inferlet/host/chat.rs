@@ -5,8 +5,8 @@
 
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
-use anyhow::Result;
 use ::model::instruct::{ChatDecoder, ChatEvent};
+use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
@@ -53,7 +53,6 @@ impl pie::inferlet::chat::Host for ProcessCtx {
     async fn stop_tokens(&mut self) -> Result<Vec<u32>> {
         Ok(crate::model::model().instruct().seal())
     }
-
 }
 
 impl pie::inferlet::chat::HostDecoder for ProcessCtx {

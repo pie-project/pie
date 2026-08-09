@@ -36,7 +36,7 @@ pub fn spawn(wasm_engine: &WasmEngine, registry_url: String, programs_dir: PathB
     repository.load_program_cache();
 
     SERVICE
-        .spawn(|| ProgramService::new(&wasm_engine, repository))
+        .spawn(|| ProgramService::new(wasm_engine, repository))
         .expect("Program manager already spawned");
 }
 
@@ -498,7 +498,7 @@ impl ProgramService {
                 // Not explicitly installed
                 !self.explicit_installs.contains(*name) &&
                 // No other installed program depends on it
-                reverse_deps.get(*name).map_or(true, |dependents| dependents.is_empty())
+                reverse_deps.get(*name).is_none_or(|dependents| dependents.is_empty())
             })
             .cloned()
             .collect()

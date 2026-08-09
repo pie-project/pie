@@ -285,16 +285,31 @@ impl Session {
                         serde_json::Value::from(inf.fire.quorum.accept_calls),
                     );
                     for (key, value) in [
-                        ("fire.quorum.turnaround_sum_us", inf.fire.quorum.turnaround_sum_us),
-                        ("fire.quorum.turnaround_max_us", inf.fire.quorum.turnaround_max_us),
+                        (
+                            "fire.quorum.turnaround_sum_us",
+                            inf.fire.quorum.turnaround_sum_us,
+                        ),
+                        (
+                            "fire.quorum.turnaround_max_us",
+                            inf.fire.quorum.turnaround_max_us,
+                        ),
                         ("fire.quorum.turnaround_n", inf.fire.quorum.turnaround_n),
                         ("fire.quorum.lane_launch_us", inf.fire.quorum.lane_launch_us),
                         ("fire.quorum.lane_launch_n", inf.fire.quorum.lane_launch_n),
-                        ("fire.quorum.lane_prefill_us", inf.fire.quorum.lane_prefill_us),
+                        (
+                            "fire.quorum.lane_prefill_us",
+                            inf.fire.quorum.lane_prefill_us,
+                        ),
                         ("fire.quorum.lane_prefill_n", inf.fire.quorum.lane_prefill_n),
-                        ("fire.quorum.lane_control_us", inf.fire.quorum.lane_control_us),
+                        (
+                            "fire.quorum.lane_control_us",
+                            inf.fire.quorum.lane_control_us,
+                        ),
                         ("fire.quorum.lane_control_n", inf.fire.quorum.lane_control_n),
-                        ("fire.quorum.lane_control_max_us", inf.fire.quorum.lane_control_max_us),
+                        (
+                            "fire.quorum.lane_control_max_us",
+                            inf.fire.quorum.lane_control_max_us,
+                        ),
                     ] {
                         stats.insert(
                             format!("{model_name}.{key}"),
@@ -310,12 +325,21 @@ impl Session {
                     for (key, value) in [
                         ("process.completed", proc.completed),
                         ("process.avg_admission_wait_us", proc.avg_admission_wait_us),
-                        ("process.last_admission_wait_us", proc.last_admission_wait_us),
+                        (
+                            "process.last_admission_wait_us",
+                            proc.last_admission_wait_us,
+                        ),
                         ("process.avg_instantiate_us", proc.avg_instantiate_us),
                         ("process.last_instantiate_us", proc.last_instantiate_us),
                         ("process.avg_wasm_run_us", proc.avg_wasm_run_us),
-                        ("process.cumulative_instantiate_us", proc.cumulative_instantiate_us),
-                        ("process.cumulative_admission_wait_us", proc.cumulative_admission_wait_us),
+                        (
+                            "process.cumulative_instantiate_us",
+                            proc.cumulative_instantiate_us,
+                        ),
+                        (
+                            "process.cumulative_admission_wait_us",
+                            proc.cumulative_admission_wait_us,
+                        ),
                     ] {
                         stats.insert(
                             format!("{model_name}.{key}"),
@@ -334,10 +358,10 @@ impl Session {
     pub(super) async fn handle_list_processes(&self, corr_id: u32) {
         let mut processes = Vec::new();
         for id in process::list() {
-            if let Ok(stats) = process::get_stats(id).await {
-                if stats.username == self.username {
-                    processes.push(stats);
-                }
+            if let Ok(stats) = process::get_stats(id).await
+                && stats.username == self.username
+            {
+                processes.push(stats);
             }
         }
         let json = serde_json::to_string(&processes).unwrap();
@@ -350,6 +374,14 @@ impl Session {
 // =============================================================================
 
 impl Session {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one add-program frame exactly as it arrives off the wire: the \
+                  correlation id, the program it belongs to, and the chunked-upload \
+                  triple (`chunk_index`, `total_chunks`, `chunk_data`). These are \
+                  decoded fields of a protocol message, so re-bundling them into a \
+                  host-side struct would just re-encode what the wire already framed"
+    )]
     pub(super) async fn handle_add_program(
         &mut self,
         corr_id: u32,
@@ -597,43 +629,6 @@ impl Session {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU32;
-
-    use tokio::sync::mpsc;
-    use uuid::Uuid;
-
-    use super::*;
-    use crate::server::ServerState;
-
-    #[tokio::test]
-    async fn signal_process_routes_into_process_inbox() {
-        inbox::spawn();
-
-        let (out_tx, _out_rx) = mpsc::channel(1);
-        let mut session = Session::new_inproc(
-            1,
-            Arc::new(ServerState {
-                next_client_id: AtomicU32::new(2),
-                max_upload_bytes: 1024,
-            }),
-            out_tx,
-        );
-        let process_id = Uuid::new_v4();
-        session.attached_processes.push(process_id);
-
-        session
-            .handle_signal_process(process_id.to_string(), "hello".to_string())
-            .await;
-
-        let received = inbox::receive(process_id.to_string()).await.unwrap();
-        assert_eq!(received, "hello");
-        let _ = inbox::clear(process_id.to_string());
-    }
-}
-
 // =============================================================================
 // File Transfer Handlers
 // =============================================================================
@@ -718,15 +713,11 @@ impl Session {
     /// Send file chunks from server to client (inferlet → client download).
     pub(super) async fn send_file_download(&mut self, process_id: ProcessId, data: Bytes) {
         let file_hash = blake3::hash(&data).to_hex().to_string();
-        let total_chunks = (data.len() + client::message::CHUNK_SIZE_BYTES - 1)
-            / client::message::CHUNK_SIZE_BYTES;
+        let total_chunks = data.len().div_ceil(client::message::CHUNK_SIZE_BYTES);
 
         let uuid_str = process_id.to_string();
 
-        for (i, chunk) in data
-            .chunks(client::message::CHUNK_SIZE_BYTES)
-            .enumerate()
-        {
+        for (i, chunk) in data.chunks(client::message::CHUNK_SIZE_BYTES).enumerate() {
             self.send(ServerMessage::File {
                 process_id: uuid_str.clone(),
                 file_hash: file_hash.clone(),
@@ -736,5 +727,42 @@ impl Session {
             })
             .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
+
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::server::ServerState;
+
+    #[tokio::test]
+    async fn signal_process_routes_into_process_inbox() {
+        inbox::spawn();
+
+        let (out_tx, _out_rx) = mpsc::channel(1);
+        let mut session = Session::new_inproc(
+            1,
+            Arc::new(ServerState {
+                next_client_id: AtomicU32::new(2),
+                max_upload_bytes: 1024,
+            }),
+            out_tx,
+        );
+        let process_id = Uuid::new_v4();
+        session.attached_processes.push(process_id);
+
+        session
+            .handle_signal_process(process_id.to_string(), "hello".to_string())
+            .await;
+
+        let received = inbox::receive(process_id.to_string()).await.unwrap();
+        assert_eq!(received, "hello");
+        let _ = inbox::clear(process_id.to_string());
     }
 }

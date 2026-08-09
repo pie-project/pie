@@ -10,6 +10,13 @@
 //! model's logits drive the actual tokens). They are unit-tested here against
 //! golf's locked JSON schema so the logic is verified without the GPU; the
 //! stitched harness calls them on real on-GPU output.
+#![allow(
+    dead_code,
+    reason = "this file is compiled into all 14 integration-test binaries (via \
+              `mod common;`), but each one uses a different subset of the harness, \
+              so `dead_code` here only ever means \"unused by *this* binary\" and \
+              never \"unused\""
+)]
 
 use serde::Deserialize;
 

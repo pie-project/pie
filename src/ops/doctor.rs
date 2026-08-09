@@ -22,6 +22,10 @@ use anyhow::Result;
 
 use crate::ui::{Mark, Palette};
 
+/// One section as the checks PRODUCE it: `(label, [(name, detail, status)])`.
+/// [`Section`] is the same thing as the JSON report serializes it.
+type CollectedSection = (&'static str, Vec<(String, String, Status)>);
+
 /// Everything `doctor` checked, and the verdict that follows from it.
 ///
 /// Collected first and rendered second, so the table and the JSON cannot drift
@@ -121,7 +125,7 @@ pub fn run(global: &bootstrap::GlobalArgs) -> Result<crate::ui::Answer> {
     let mut passes = 0usize;
     let mut failures = 0usize;
 
-    let mut sections: Vec<(&'static str, Vec<(String, String, Status)>)> = Vec::new();
+    let mut sections: Vec<CollectedSection> = Vec::new();
 
     sections.push(("system", vec![check_platform(), check_py_runtime()]));
     sections.push(("gpus", check_gpus()));
@@ -214,13 +218,20 @@ fn check_config(path: &Path, origin: bootstrap::Origin) -> Vec<(String, String, 
         return if origin == bootstrap::Origin::Default {
             vec![(
                 "config".into(),
-                format!("none at {} — running on defaults", crate::ui::short_path(path)),
+                format!(
+                    "none at {} — running on defaults",
+                    crate::ui::short_path(path)
+                ),
                 Status::Warn,
             )]
         } else {
             vec![(
                 "config".into(),
-                format!("{} does not exist ({})", crate::ui::short_path(path), origin.describe()),
+                format!(
+                    "{} does not exist ({})",
+                    crate::ui::short_path(path),
+                    origin.describe()
+                ),
                 Status::Fail,
             )]
         };
@@ -228,14 +239,24 @@ fn check_config(path: &Path, origin: bootstrap::Origin) -> Vec<(String, String, 
 
     let combined = match crate::derive::read_config_file(path) {
         Ok(c) => c,
-        Err(e) => return vec![("config".into(), format!("{}: {e}", crate::ui::short_path(path)), Status::Fail)],
+        Err(e) => {
+            return vec![(
+                "config".into(),
+                format!("{}: {e}", crate::ui::short_path(path)),
+                Status::Fail,
+            )];
+        }
     };
     let worker = match crate::derive::derive_standalone(&combined) {
         Ok((_controller, _gateway, worker)) => worker,
         // `{:#}` so the chain reaches the line and column, which is the whole
         // value of being told the config is bad.
         Err(e) => {
-            return vec![("config".into(), format!("{}: {e:#}", crate::ui::short_path(path)), Status::Fail)];
+            return vec![(
+                "config".into(),
+                format!("{}: {e:#}", crate::ui::short_path(path)),
+                Status::Fail,
+            )];
         }
     };
 
@@ -301,8 +322,6 @@ enum Status {
     /// Would stop a boot.
     Fail,
 }
-
-
 
 fn check_platform() -> (String, String, Status) {
     let info = format!(
@@ -400,13 +419,14 @@ fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> 
         .ok()
         .and_then(|content| toml::from_str(&content).ok())
         .unwrap_or_else(|| toml::Value::Table(Default::default()));
-    let set = |key: &str| {
-        worker::config_schema::lookup(&file, key).map(|v| v.to_string())
-    };
+    let set = |key: &str| worker::config_schema::lookup(&file, key).map(|v| v.to_string());
 
     let mut checks = Vec::new();
 
-    match (set("driver.max_forward_tokens"), set("driver.max_forward_requests")) {
+    match (
+        set("driver.max_forward_tokens"),
+        set("driver.max_forward_requests"),
+    ) {
         (Some(tokens), Some(requests)) => checks.push((
             "forward shape".to_string(),
             format!("pinned at {tokens} tokens x {requests} requests"),
@@ -432,8 +452,16 @@ fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> 
         )),
     }
 
-    let frame_knobs = ["runtime.frame_size", "runtime.frame_submit_depth", "runtime.frame_dispatch_depth"];
-    let pinned: Vec<&str> = frame_knobs.iter().copied().filter(|k| set(k).is_some()).collect();
+    let frame_knobs = [
+        "runtime.frame_size",
+        "runtime.frame_submit_depth",
+        "runtime.frame_dispatch_depth",
+    ];
+    let pinned: Vec<&str> = frame_knobs
+        .iter()
+        .copied()
+        .filter(|k| set(k).is_some())
+        .collect();
     checks.push(if pinned.is_empty() {
         (
             "batching".to_string(),

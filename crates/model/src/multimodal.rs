@@ -19,8 +19,17 @@
 //!
 //! Two arch families are modelled: **Gemma 4** (fixed-resolution SigLIP, 1-D
 //! RoPE) and **Qwen 3.6** (native dynamic resolution, 2×2 merge, M-RoPE). All
-//! geometry is unit-tested against the HF processors; the patchify / log-mel
-//! layouts are parity-verified against the reference dumps.
+//! geometry is unit-tested against the HF processors.
+//!
+//! The patchify and log-mel layouts are checked two ways, because they need
+//! two different things. Their **layout** — the channels-last interleave, the
+//! merge-block emission order, which normalization each arch applies — is
+//! unit-tested from synthetic input, since a transposition there produces a
+//! correctly sized buffer the encoder reads as noise. Their **numbers** are
+//! bit-compared against HF dumps by `gemma_patchify_matches_hf_exactly`,
+//! which is `#[ignore]`d: it needs `scripts/gemma4_vision_parity_ref.py`,
+//! which downloads gemma-4 and needs torch. Do not read a green CI run as
+//! that comparison having happened.
 #![allow(dead_code)] // Some geometry/arch-completeness helpers are exercised only by tests.
 
 use image::{DynamicImage, imageops::FilterType};
@@ -1005,6 +1014,143 @@ pub mod audio {
         let pcm16k = resample_to_16k(&pcm, rate);
         Ok(gemma_logmel(&pcm16k))
     }
+
+    #[cfg(test)]
+    mod dsp_tests {
+        use super::*;
+
+        /// Round-trip the HTK mel scale.
+        ///
+        /// `mel_to_hz` is not used to undo `hz_to_mel` anywhere in the
+        /// filterbank -- one maps the band edges in, the other maps the
+        /// interpolated points back out -- so a sign or constant that
+        /// disagreed between them would still produce a plausible bank of
+        /// 128 monotonically rising triangles. Only inverting catches it.
+        #[test]
+        fn the_mel_scale_inverts() {
+            for hz in [0.0, 100.0, 700.0, 1000.0, 4000.0, 8000.0] {
+                let back = mel_to_hz(hz_to_mel(hz));
+                assert!((back - hz).abs() < 1e-6, "{hz} -> {back}");
+            }
+            // 700 Hz is the scale's own break frequency: one mel decade.
+            assert!((hz_to_mel(700.0) - 2595.0 * 2.0f64.log10()).abs() < 1e-9);
+        }
+
+        /// Each triangle peaks at 1.0 at its own centre, and all but the
+        /// lowest carry weight.
+        ///
+        /// Filter 0 is empty, and legitimately so: its triangle spans
+        /// [0, 13.8, 27.9] Hz while the FFT resolves 16000/512 = 31.25 Hz,
+        /// so between DC and its upper edge there is no bin to weigh. This
+        /// is the condition librosa warns about as "empty filters detected
+        /// in mel frequency basis". It is pinned rather than tolerated: if
+        /// a second filter ever goes empty, the bank and the FFT length
+        /// have drifted apart and the bottom of the spectrum is being
+        /// discarded.
+        #[test]
+        fn every_mel_triangle_peaks_at_one_and_is_bounded() {
+            let p = GemmaAudioProc::default();
+            let fb = mel_filterbank(&p);
+            assert_eq!(fb.len(), p.fft_length / 2 + 1);
+            assert_eq!(fb[0].len(), p.n_mels);
+            let empty: Vec<usize> = (0..p.n_mels)
+                .filter(|&m| fb.iter().all(|row| row[m] == 0.0))
+                .collect();
+            assert_eq!(
+                empty,
+                vec![0],
+                "exactly filter 0 is below the FFT resolution"
+            );
+            for m in 0..p.n_mels {
+                let peak = fb.iter().map(|row| row[m]).fold(0.0f64, f64::max);
+                assert!((0.0..=1.0).contains(&peak), "filter {m} peak {peak}");
+                assert!(
+                    fb.iter().all(|row| row[m] >= 0.0),
+                    "filter {m} went negative"
+                );
+            }
+            // Triangles march upward, but only weakly at the bottom. Below
+            // roughly 200 Hz the mel spacing is finer than the FFT's 31.25
+            // Hz, so adjacent filters draw on a single shared bin and have
+            // an identical centre of mass -- filters 1 and 2 both sit
+            // entirely on bin 1, 3 and 4 both on bin 2, and so on. The bank
+            // is oversampled there and carries no more information than the
+            // FFT gave it. Strict advance resumes at filter 16.
+            let centre = |m: usize| -> f64 {
+                let (num, den) = fb.iter().enumerate().fold((0.0, 0.0), |(n, d), (k, row)| {
+                    (n + k as f64 * row[m], d + row[m])
+                });
+                num / den
+            };
+            for m in 2..p.n_mels {
+                assert!(centre(m) >= centre(m - 1), "filter {m} moved backwards");
+            }
+            let tied: Vec<usize> = (2..p.n_mels)
+                .filter(|&m| centre(m) == centre(m - 1))
+                .collect();
+            assert_eq!(
+                tied,
+                vec![2, 4, 6, 8, 10, 15],
+                "the set of mel bands the FFT cannot separate"
+            );
+        }
+
+        /// Above `fmax` there is nothing.
+        ///
+        /// The bank is built over `[fmin, fmax]` = [0, 8000], and 8000 Hz is
+        /// exactly Nyquist for the 16 kHz rate, so the top filter's upper
+        /// edge lands on the last FFT bin. An off-by-one in the edge count
+        /// would either drop that bin or run past the end of `bin_freq`.
+        #[test]
+        fn the_bank_ends_at_nyquist() {
+            let p = GemmaAudioProc::default();
+            let fb = mel_filterbank(&p);
+            let n_freq = p.fft_length / 2 + 1;
+            let top = fb[n_freq - 1].iter().copied().fold(0.0f64, f64::max);
+            assert!(top > 0.0, "the Nyquist bin feeds no filter");
+        }
+
+        /// The FFT against a directly evaluated DFT.
+        ///
+        /// `fft_radix2` is hand-written: bit-reversal permutation, then an
+        /// in-place butterfly with an incrementally rotated twiddle. Every
+        /// one of those has a failure mode that keeps the output the right
+        /// length. The reference here is the definition, O(n^2), so the two
+        /// share no code.
+        #[test]
+        fn the_fft_agrees_with_the_definition() {
+            let n = 64usize;
+            let sig: Vec<f64> = (0..n)
+                .map(|i| (i as f64 * 0.37).sin() + 0.5 * (i as f64 * 1.9).cos())
+                .collect();
+            let (mut re, mut im) = (sig.clone(), vec![0.0f64; n]);
+            fft_radix2(&mut re, &mut im);
+            for k in 0..n {
+                let (mut dr, mut di) = (0.0f64, 0.0f64);
+                for (t, &x) in sig.iter().enumerate() {
+                    let ang = -2.0 * std::f64::consts::PI * (k * t) as f64 / n as f64;
+                    dr += x * ang.cos();
+                    di += x * ang.sin();
+                }
+                assert!((re[k] - dr).abs() < 1e-9, "bin {k} re {} vs {dr}", re[k]);
+                assert!((im[k] - di).abs() < 1e-9, "bin {k} im {} vs {di}", im[k]);
+            }
+        }
+
+        /// A unit impulse transforms to a flat spectrum -- the degenerate
+        /// case the bit-reversal permutation cannot get wrong, kept because
+        /// it localises a failure to the butterfly when the DFT test also
+        /// fails.
+        #[test]
+        fn an_impulse_is_flat() {
+            let n = 32usize;
+            let (mut re, mut im) = (vec![0.0f64; n], vec![0.0f64; n]);
+            re[0] = 1.0;
+            fft_radix2(&mut re, &mut im);
+            assert!(re.iter().all(|&v| (v - 1.0).abs() < 1e-12));
+            assert!(im.iter().all(|&v| v.abs() < 1e-12));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1125,6 +1271,273 @@ mod tests {
         }
     }
 
+    // ── The pixel pipeline, without a checkpoint ─────────────────────────
+    //
+    // The tests below stand in for `gemma_patchify_matches_hf_exactly`,
+    // which is `#[ignore]`d: it reads dumps that only exist after running
+    // `scripts/gemma4_vision_parity_ref.py`, which downloads gemma-4 and
+    // needs torch. That test answers "do these numbers match HF"; these
+    // answer "is the layout the one the encoder is indexed for", which is
+    // where a transposition would land and is checkable from nothing.
+
+    /// The channels-LAST interleave inside a Gemma patch.
+    ///
+    /// `patchify_chw` takes CHW in and writes each patch as
+    /// `(row, col, channel)`. Transposing that produces a same-sized
+    /// buffer the encoder reads as garbage, so the order is the thing to
+    /// pin. A 2-px patch over a 4x4 image makes every index checkable by
+    /// hand: value `100*ch + 10*y + x`.
+    #[test]
+    fn a_gemma_patch_interleaves_channels_last() {
+        let cfg = GemmaImageConfig {
+            patch_size: 2,
+            ..GemmaImageConfig::default()
+        };
+        let (h, w, c) = (4usize, 4usize, 3usize);
+        let mut chw = vec![0.0f32; c * h * w];
+        for ch in 0..c {
+            for y in 0..h {
+                for x in 0..w {
+                    chw[ch * h * w + y * w + x] = (100 * ch + 10 * y + x) as f32;
+                }
+            }
+        }
+        let (pix, pos) = cfg.patchify_chw(&chw, c, h, w);
+        assert_eq!(pos.len(), 4, "a 4x4 image is 2x2 patches of 2px");
+        assert_eq!(pix.len(), 4 * c * 4);
+
+        // Patches are row-major and positions are (x=col, y=row) -- the
+        // opposite of the (row, col) the loop is written in.
+        assert_eq!(pos, vec![[0, 0], [1, 0], [0, 1], [1, 1]]);
+
+        // Patch 1 is the top-right 2x2: image columns 2..4, rows 0..2.
+        // Channels-last means the three channels of ONE pixel are
+        // adjacent, and pixels advance in row-major order within the
+        // patch.
+        let pd = c * 2 * 2;
+        assert_eq!(
+            &pix[pd..2 * pd],
+            &[
+                2.0, 102.0, 202.0, // (y=0, x=2) over c=0,1,2
+                3.0, 103.0, 203.0, // (y=0, x=3)
+                12.0, 112.0, 212.0, // (y=1, x=2)
+                13.0, 113.0, 213.0, // (y=1, x=3)
+            ]
+        );
+    }
+
+    /// Block order across block ROWS, which `qwen_patchify_order_and_norm`
+    /// cannot see.
+    ///
+    /// That test's grid is 32x64: two patch rows, one merge block tall,
+    /// so `bh == 1` and the outer `ih_blk` loop never advances past zero.
+    /// Every patch it checks is in the first block row. This one is two
+    /// blocks by two, so a block walk that only works when there is one
+    /// row of them fails here.
+    #[test]
+    fn qwen_block_order_spans_block_rows_too() {
+        let cfg = QwenVisionConfig {
+            patch_size: 1,
+            merge_size: 2,
+            temporal_patch_size: 1,
+            ..QwenVisionConfig::default()
+        };
+        // 4x4 pixels = 4x4 patches = 2x2 blocks of 2x2.
+        let rgb: Vec<u8> = (0..4 * 4 * 3).map(|i| (i % 256) as u8).collect();
+        let (_, pos) = cfg.qwen_patchify_hwc(&rgb, 4, 4);
+        let xy: Vec<(u32, u32)> = pos.chunks(2).map(|c| (c[0], c[1])).collect();
+        assert_eq!(
+            xy,
+            vec![
+                (0, 0),
+                (1, 0),
+                (0, 1),
+                (1, 1), // block (0,0)
+                (2, 0),
+                (3, 0),
+                (2, 1),
+                (3, 1), // block (0,1)
+                (0, 2),
+                (1, 2),
+                (0, 3),
+                (1, 3), // block (1,0)
+                (2, 2),
+                (3, 2),
+                (2, 3),
+                (3, 3), // block (1,1)
+            ]
+        );
+    }
+
+    /// Qwen normalizes to [-1, 1]; Gemma only rescales to [0, 1].
+    ///
+    /// Both are "divide by 255" to a reader skimming, and a model given
+    /// the wrong one sees a washed-out image rather than an error.
+    #[test]
+    fn the_two_arches_normalize_differently() {
+        let cfg = QwenVisionConfig {
+            patch_size: 1,
+            merge_size: 1,
+            temporal_patch_size: 1,
+            ..QwenVisionConfig::default()
+        };
+        let (pix, _) = cfg.qwen_patchify_hwc(&[0, 128, 255], 1, 1);
+        assert_eq!(pix[0], -1.0, "0 maps to the low end");
+        assert!((pix[1] - 0.003_921_628).abs() < 1e-6, "128 is mid-scale");
+        assert_eq!(pix[2], 1.0, "255 maps to the high end");
+
+        let chw = rgb_hwc_to_chw_f32(&[0, 128, 255], 1, 1);
+        assert_eq!(chw[0], 0.0);
+        assert!((chw[1] - 128.0 / 255.0).abs() < 1e-6);
+        assert_eq!(chw[2], 1.0);
+    }
+
+    /// HWC to CHW is a transpose, and the test that catches a wrong one
+    /// needs more than one pixel and more than one row.
+    #[test]
+    fn rgb_becomes_planar() {
+        // 2x2 RGB, each pixel (r, g, b) = (10p, 10p+1, 10p+2).
+        let rgb: Vec<u8> = (0..4u8)
+            .flat_map(|p| [10 * p, 10 * p + 1, 10 * p + 2])
+            .collect();
+        let out = rgb_hwc_to_chw_f32(&rgb, 2, 2);
+        let plane = |ch: usize| -> Vec<f32> {
+            out[ch * 4..(ch + 1) * 4]
+                .iter()
+                .map(|v| v * 255.0)
+                .collect()
+        };
+        assert_eq!(plane(0), vec![0.0, 10.0, 20.0, 30.0]);
+        assert_eq!(plane(1), vec![1.0, 11.0, 21.0, 31.0]);
+        assert_eq!(plane(2), vec![2.0, 12.0, 22.0, 32.0]);
+    }
+
+    #[test]
+    fn positions_flatten_x_before_y() {
+        assert_eq!(flatten_xy(&[[1, 2], [3, 4]]), vec![1, 2, 3, 4]);
+    }
+
+    fn solid_image(w: u32, h: u32) -> image::DynamicImage {
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+        }))
+    }
+
+    /// The pipeline's output must be the size its own geometry promised.
+    ///
+    /// `token_count()` gates the guest's synchronous `token-count()` query
+    /// and is answered BEFORE the pixels exist; if the buffer that arrives
+    /// later disagrees, the KV reservation and the tensor disagree.
+    #[test]
+    fn a_processed_image_is_the_size_its_geometry_promised() {
+        for arch in [VisionArch::Gemma4, VisionArch::Qwen36] {
+            let p = Processor::for_arch(arch);
+            let out = p.process_image(&solid_image(640, 480));
+            let span = p.layout_image(640, 480);
+            assert_eq!(out.span.token_count, span.token_count, "{arch:?}");
+            assert_eq!(out.positions.len() % 2, 0);
+            let n_patch = out.positions.len() / 2;
+            assert_eq!(
+                n_patch as u32,
+                out.span.token_count * p.pool_factor(),
+                "{arch:?}: patches must pool exactly onto the promised tokens"
+            );
+            assert_eq!(
+                out.pixels.len() % n_patch,
+                0,
+                "{arch:?}: the pixel blob must divide evenly per patch"
+            );
+        }
+    }
+
+    /// Decoding bytes and processing a decoded frame are the same path.
+    #[test]
+    fn encoded_bytes_take_the_same_path_as_a_decoded_frame() {
+        let img = solid_image(64, 48);
+        let mut png = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut png, image::ImageFormat::Png)
+            .expect("encode png");
+        let p = Processor::for_arch(VisionArch::Gemma4);
+        let from_bytes = p
+            .process_image_bytes(png.get_ref())
+            .expect("a png this crate just wrote must decode");
+        let direct = p.process_image(&img);
+        assert_eq!(from_bytes.pixels, direct.pixels);
+        assert_eq!(from_bytes.positions, direct.positions);
+    }
+
+    /// Undecodable bytes are a refusal naming the stage, not a panic.
+    #[test]
+    fn undecodable_bytes_are_refused() {
+        let p = Processor::for_arch(VisionArch::Gemma4);
+        let Err(err) = p.process_image_bytes(b"not an image") else {
+            panic!("twelve bytes of ASCII is not an image");
+        };
+        assert!(err.starts_with("image decode:"), "{err}");
+        let err = decode_gif_frames(b"not a gif").unwrap_err();
+        assert!(err.starts_with("gif decode:"), "{err}");
+    }
+
+    /// Video frames get their own soft-token budget, and the clip's span
+    /// is per-frame times frames.
+    ///
+    /// Gemma has no temporal model, so a clip is N independent stills --
+    /// which is why the per-frame budget is cut to 70: the KV footprint
+    /// is what multiplies.
+    #[test]
+    fn a_video_frame_gets_a_smaller_budget_than_a_still() {
+        let still = Processor::for_arch(VisionArch::Gemma4);
+        let video = Processor::for_arch_video(VisionArch::Gemma4);
+        let (w, h) = (640, 480);
+        assert!(
+            video.layout_image(w, h).token_count < still.layout_image(w, h).token_count,
+            "a video frame must cost fewer tokens than the same still"
+        );
+
+        let clip = video.layout_video(w, h, 4);
+        let per = video.layout_image(w, h);
+        assert_eq!(clip.token_count, per.token_count * 4);
+        assert_eq!(clip.grid.t, 4, "frames are the temporal extent");
+        assert_eq!(clip.grid.w, per.token_count);
+
+        // Qwen keeps one config for both, and folds frames into the grid
+        // rather than repeating the span.
+        let qwen = Processor::for_arch_video(VisionArch::Qwen36);
+        assert_eq!(
+            qwen.layout_image(w, h).token_count,
+            Processor::for_arch(VisionArch::Qwen36)
+                .layout_image(w, h)
+                .token_count
+        );
+
+        // Zero frames is one frame, not an empty span.
+        assert_eq!(
+            video.layout_video(w, h, 0).token_count,
+            per.token_count,
+            "a clip with no stated frame count still lays out one"
+        );
+    }
+
+    /// Only the M-RoPE arch carries the side-channel, and it is the arch
+    /// that says it does.
+    #[test]
+    fn only_mrope_arches_emit_position_triples() {
+        for arch in [VisionArch::Gemma4, VisionArch::Qwen36] {
+            let p = Processor::for_arch(arch);
+            let span = p.layout_image(640, 480);
+            let triples = p.mrope_positions(&span, 7);
+            assert_eq!(
+                triples.is_some(),
+                p.uses_mrope(),
+                "{arch:?}: the side-channel is emitted iff the arch uses M-RoPE"
+            );
+            if let Some(rows) = triples {
+                assert_eq!(rows.len() as u32, span.grid.t * span.grid.h * span.grid.w);
+                assert_eq!(rows[0], [7, 7, 7], "the span begins at the anchor");
+            }
+        }
+    }
+
     // Minimal f32/.npy reader (little-endian, C-order) for parity dumps.
     fn read_npy_f32(path: &str) -> Option<(Vec<usize>, Vec<f32>)> {
         let b = std::fs::read(path).ok()?;
@@ -1148,7 +1561,16 @@ mod tests {
         Some((shape, v))
     }
 
+    /// Bit-exactness against HF, when the dumps exist.
+    ///
+    /// `#[ignore]`d rather than self-skipping: it needs
+    /// `scripts/gemma4_vision_parity_ref.py`, which downloads gemma-4 and
+    /// needs torch, so it cannot run in CI -- and a test that returns
+    /// green when its input is missing reports the same "ok" as one that
+    /// checked something. Run with
+    /// `cargo test -p model -- --ignored gemma_patchify`.
     #[test]
+    #[ignore = "needs /tmp/gemma4_vision_parity from scripts/gemma4_vision_parity_ref.py"]
     fn gemma_patchify_matches_hf_exactly() {
         let dir = "/tmp/gemma4_vision_parity";
         let (rs_shape, resized) = match read_npy_f32(&format!("{dir}/proc_resized_chw.npy")) {
@@ -1427,5 +1849,269 @@ mod tests {
         assert!((pcm[1] - 1000.0 / 32768.0).abs() < 1e-6);
         // Resample to 16k is identity.
         assert_eq!(audio::resample_to_16k(&pcm, sr), pcm);
+    }
+
+    /// Build a WAV around an arbitrary fmt tag / bit depth / channel count.
+    fn wav(fmt_tag: u16, bits: u16, channels: u16, sr: u32, data: &[u8]) -> Vec<u8> {
+        let mut w = Vec::new();
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        w.extend_from_slice(b"WAVE");
+        w.extend_from_slice(b"fmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&fmt_tag.to_le_bytes());
+        w.extend_from_slice(&channels.to_le_bytes());
+        w.extend_from_slice(&sr.to_le_bytes());
+        w.extend_from_slice(&(sr * channels as u32 * bits as u32 / 8).to_le_bytes());
+        w.extend_from_slice(&(channels * bits / 8).to_le_bytes());
+        w.extend_from_slice(&bits.to_le_bytes());
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        w.extend_from_slice(data);
+        w
+    }
+
+    /// Every sample encoding lands on the same value.
+    ///
+    /// `wav_roundtrip_decode` covers 16-bit PCM. The other five arms each
+    /// carry their own full-scale divisor, and 24-bit additionally has to
+    /// sign-extend by hand -- `(v << 8) >> 8` on an i32 that was assembled
+    /// from three little-endian bytes. A divisor that is off by a factor of
+    /// two, or a sign extension that does not happen, produces audio that
+    /// decodes, resamples and patchifies without complaint.
+    ///
+    /// Each case encodes the same two amplitudes, -0.5 and +0.25, so the
+    /// expectation is one number for all of them.
+    #[test]
+    fn every_sample_encoding_decodes_to_the_same_amplitude() {
+        let cases: Vec<(&str, u16, u16, Vec<u8>)> = vec![
+            (
+                "u8 PCM",
+                1,
+                8,
+                vec![64u8, 160u8], // (64-128)/128 = -0.5 ; (160-128)/128 = 0.25
+            ),
+            ("i16 PCM", 1, 16, {
+                let mut v = Vec::new();
+                v.extend_from_slice(&(-16384i16).to_le_bytes());
+                v.extend_from_slice(&8192i16.to_le_bytes());
+                v
+            }),
+            ("i24 PCM", 1, 24, {
+                let mut v = Vec::new();
+                for s in [-4_194_304i32, 2_097_152i32] {
+                    v.extend_from_slice(&s.to_le_bytes()[0..3]);
+                }
+                v
+            }),
+            ("i32 PCM", 1, 32, {
+                let mut v = Vec::new();
+                for s in [-1_073_741_824i32, 536_870_912i32] {
+                    v.extend_from_slice(&s.to_le_bytes());
+                }
+                v
+            }),
+            ("f32", 3, 32, {
+                let mut v = Vec::new();
+                for s in [-0.5f32, 0.25f32] {
+                    v.extend_from_slice(&s.to_le_bytes());
+                }
+                v
+            }),
+            ("f64", 3, 64, {
+                let mut v = Vec::new();
+                for s in [-0.5f64, 0.25f64] {
+                    v.extend_from_slice(&s.to_le_bytes());
+                }
+                v
+            }),
+        ];
+        for (name, tag, bits, data) in cases {
+            let (pcm, rate) = audio::decode_wav(&wav(tag, bits, 1, 16000, &data))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(rate, 16000, "{name}");
+            assert_eq!(pcm.len(), 2, "{name}");
+            assert!((pcm[0] - -0.5).abs() < 1e-6, "{name}: {} != -0.5", pcm[0]);
+            assert!((pcm[1] - 0.25).abs() < 1e-6, "{name}: {} != 0.25", pcm[1]);
+        }
+    }
+
+    /// Channels are averaged, not interleaved through.
+    #[test]
+    fn a_stereo_file_is_averaged_down_to_mono() {
+        let mut data = Vec::new();
+        for (l, r) in [(16384i16, 0i16), (-32768, 32767), (1000, 3000)] {
+            data.extend_from_slice(&l.to_le_bytes());
+            data.extend_from_slice(&r.to_le_bytes());
+        }
+        let (pcm, _) = audio::decode_wav(&wav(1, 16, 2, 16000, &data)).unwrap();
+        assert_eq!(pcm.len(), 3, "three frames, not six samples");
+        assert!((pcm[0] - 0.25).abs() < 1e-6); // (0.5 + 0.0) / 2
+        assert!((pcm[2] - (1000.0 / 32768.0 + 3000.0 / 32768.0) / 2.0).abs() < 1e-6);
+    }
+
+    /// An odd-sized chunk before `data` still leaves the reader word-aligned.
+    ///
+    /// RIFF pads every chunk body to an even length, and the pad byte is not
+    /// counted in the size field. `decode_wav` advances by `sz + (sz & 1)`.
+    /// Without that correction the walk lands one byte inside the next
+    /// chunk header and never recognises `data`, so the file is rejected as
+    /// having no data chunk -- which is exactly what a real file written by
+    /// a tagger looks like.
+    #[test]
+    fn an_odd_sized_chunk_does_not_desynchronise_the_walk() {
+        let payload = 1234i16.to_le_bytes();
+        let mut w = wav(1, 16, 1, 16000, &payload);
+        // Splice a 3-byte LIST chunk (+1 pad) in after the WAVE tag.
+        let mut spliced = w[0..12].to_vec();
+        spliced.extend_from_slice(b"LIST");
+        spliced.extend_from_slice(&3u32.to_le_bytes());
+        spliced.extend_from_slice(b"abc");
+        spliced.push(0); // pad byte, not counted in the size
+        spliced.extend_from_slice(&w[12..]);
+        let total = (spliced.len() - 8) as u32;
+        spliced[4..8].copy_from_slice(&total.to_le_bytes());
+        w = spliced;
+        let (pcm, rate) = audio::decode_wav(&w).expect("the LIST chunk should be skipped");
+        assert_eq!(rate, 16000);
+        assert_eq!(pcm.len(), 1);
+        assert!((pcm[0] - 1234.0 / 32768.0).abs() < 1e-6);
+    }
+
+    /// Malformed containers are refused with a reason, not decoded as noise.
+    #[test]
+    fn a_file_that_is_not_a_wav_is_refused() {
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            ("too short", b"RIFF".to_vec(), "not a RIFF/WAVE"),
+            (
+                "not WAVE",
+                {
+                    let mut v = b"RIFF".to_vec();
+                    v.extend_from_slice(&0u32.to_le_bytes());
+                    v.extend_from_slice(b"AVI ");
+                    v
+                },
+                "not a RIFF/WAVE",
+            ),
+            (
+                "no data chunk",
+                {
+                    let full = wav(1, 16, 1, 16000, &[0, 0]);
+                    full[0..36].to_vec() // everything up to, but not including, "data"
+                },
+                "no data chunk",
+            ),
+            (
+                "unsupported depth",
+                wav(1, 12, 1, 16000, &[0, 0, 0, 0]),
+                "unsupported format tag",
+            ),
+        ];
+        for (name, bytes, want) in cases {
+            let Err(err) = audio::decode_wav(&bytes) else {
+                panic!("{name} was accepted");
+            };
+            assert!(err.contains(want), "{name}: {err}");
+        }
+    }
+
+    /// Resampling changes the length by the rate ratio and interpolates.
+    ///
+    /// `resample_to_16k` short-circuits at 16 kHz, so the interpolation
+    /// arm is only reached by a file that is not already at the model's
+    /// rate -- which is every file a user actually supplies.
+    #[test]
+    fn resampling_scales_the_length_and_interpolates_between_samples() {
+        // 8 kHz -> 16 kHz doubles, and every odd output is the midpoint.
+        let up = audio::resample_to_16k(&[0.0, 1.0, 2.0, 3.0], 8000);
+        assert_eq!(up.len(), 8);
+        assert!((up[1] - 0.5).abs() < 1e-6, "{:?}", up);
+        assert!((up[2] - 1.0).abs() < 1e-6);
+        // The tail extrapolates flat rather than reading off the end.
+        assert!(up.iter().all(|v| v.is_finite()));
+        // 32 kHz -> 16 kHz halves, taking every other sample exactly.
+        let down = audio::resample_to_16k(&[0.0, 9.0, 1.0, 9.0, 2.0, 9.0], 32000);
+        assert_eq!(down, vec![0.0, 1.0, 2.0]);
+        // Empty input is not a division by zero.
+        assert!(audio::resample_to_16k(&[], 44100).is_empty());
+    }
+
+    /// A pure tone lands in the mel bin that covers its frequency.
+    ///
+    /// `logmel_shape_and_subsample_count` feeds one second of silence. Every
+    /// FFT bin is then zero, every mel accumulator is zero, and every output
+    /// is `ln(mel_floor)` -- so that test passes with the FFT replaced by a
+    /// function returning zeros, and says nothing about the transform, the
+    /// window or the filterbank. This one puts energy at a known frequency
+    /// and asks where it came out.
+    #[test]
+    fn a_tone_lands_in_the_mel_bin_that_covers_it() {
+        let sr = 16000.0f32;
+        let tone = |hz: f32| -> Vec<f32> {
+            (0..8000)
+                .map(|i| (2.0 * std::f32::consts::PI * hz * i as f32 / sr).sin())
+                .collect()
+        };
+        // The HTK mel scale, written out here rather than reached for, so
+        // the expectation does not come from the code under test.
+        let h2m = |f: f64| 2595.0 * (1.0 + f / 700.0).log10();
+        let expected_bin = |hz: f64| -> usize {
+            let frac = h2m(hz) / h2m(8000.0);
+            (frac * 129.0).round() as usize - 1
+        };
+        let mut peaks = Vec::new();
+        for hz in [1000.0f64, 3000.0] {
+            let (mel, n) = audio::gemma_logmel(&tone(hz as f32));
+            assert!(n > 0);
+            // Average each mel band over the steady middle of the signal,
+            // away from the zero-padded edges.
+            let mid: Vec<f64> = (0..128)
+                .map(|m| {
+                    let lo = n / 4;
+                    let hi = 3 * n / 4;
+                    (lo..hi).map(|f| mel[f * 128 + m] as f64).sum::<f64>() / (hi - lo) as f64
+                })
+                .collect();
+            let peak = mid
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .unwrap();
+            let want = expected_bin(hz);
+            assert!(
+                peak.abs_diff(want) <= 2,
+                "{hz} Hz peaked at mel bin {peak}, expected about {want}"
+            );
+            // The tone must also be *localised*. A rectangular window puts
+            // the peak in the same bin -- removing the Hann multiply does
+            // not move it at all -- but leaks the tone across the whole
+            // bank. Measured: Hann separates the peak from the loudest
+            // band 20+ bins away by 8.5 nats, a bare rectangle by 3.1.
+            let far = (0..128)
+                .filter(|m: &usize| m.abs_diff(peak) > 20)
+                .map(|m| mid[m])
+                .fold(f64::NEG_INFINITY, f64::max);
+            assert!(
+                mid[peak] - far > 6.0,
+                "{hz} Hz leaked across the bank: peak {:.3}, distant {far:.3}",
+                mid[peak]
+            );
+            peaks.push(peak);
+        }
+        assert!(peaks[0] < peaks[1], "a higher tone must peak higher up");
+    }
+
+    /// Silence is the floor exactly, which is what makes the tone test
+    /// meaningful: the baseline every band sits at is known.
+    #[test]
+    fn silence_sits_exactly_on_the_mel_floor() {
+        let (mel, n) = audio::gemma_logmel(&vec![0.0f32; 4000]);
+        assert!(n > 0);
+        let floor = 0.001f64.ln() as f32;
+        assert!(
+            mel.iter().all(|&v| (v - floor).abs() < 1e-6),
+            "silence should be ln(mel_floor) in every band"
+        );
     }
 }

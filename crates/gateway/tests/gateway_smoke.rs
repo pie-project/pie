@@ -27,16 +27,14 @@ use futures::StreamExt;
 use tokio::sync::watch;
 
 use client_api::{ClientMessage, ServerMessage};
-use controller_api::{
-    Ack, GatewayInfo, Health, Role, RoutableWorker, RoutingTable, WorkerStatus,
-};
+use controller_api::{Ack, GatewayInfo, Health, Role, RoutableWorker, RoutingTable, WorkerStatus};
 use gateway::session::{Affinity, Identity, TurnInput};
 use gateway::{Gateway, GatewayConfig, GatewayControl, bind};
 use ids::{GatewayId, NodeId, ReqId, TenantId, WorkerId};
-use worker_api::{Accepted, Control, Priority, Request, Tokens};
-use worker_api::{GatewayInboundClient, WorkerControl, connect_gateway_link, dispatch_codec};
 use tarpc::serde_transport::tcp;
 use tarpc::server::{BaseChannel, Channel};
+use worker_api::{Accepted, Control, Priority, Request, Tokens};
+use worker_api::{GatewayInboundClient, WorkerControl, connect_gateway_link, dispatch_codec};
 
 /// How many `Tokens::Chunk`s the stub streams before the clean `Eos`.
 const TOKENS_PER_TURN: usize = 3;

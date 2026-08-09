@@ -3,8 +3,8 @@ mod common;
 use std::sync::Arc;
 
 use common::{MergeFormat, byte_level_json, gemma_json};
-use tokenizer::Tokenizer;
 use serde_json::json;
+use tokenizer::Tokenizer;
 use tokenizers::Tokenizer as HfTokenizer;
 
 fn assert_exact(json: &serde_json::Value, texts: &[&str]) {

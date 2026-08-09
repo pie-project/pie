@@ -28,8 +28,8 @@ pub(crate) mod batch;
 // (upstream's assembly does not call it yet); re-declared so the module
 // and its pinned tests stay live while the 0.3 regraft lands
 // (playbook: "0.3 re-port step 1").
-pub(crate) mod fire_plan;
 pub(crate) mod dispatch;
+pub(crate) mod fire_plan;
 pub(crate) mod frame;
 pub(crate) mod probe;
 pub(crate) mod stats;
@@ -660,8 +660,8 @@ pub fn submit_prebuilt_tracked_async_with_kv_and_rs_copy(
         rs_copy_src,
         rs_copy_dst,
         None,
-        /*hook_program=*/false,
-        /*lora_program=*/false,
+        /*hook_program=*/ false,
+        /*lora_program=*/ false,
     )
 }
 
@@ -718,4 +718,3 @@ pub async fn get_stats() -> AggregateStats {
         .collect();
     stats::aggregate(&scheduler_stats)
 }
-

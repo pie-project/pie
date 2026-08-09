@@ -81,7 +81,7 @@ impl KvLifecycle {
         {
             return;
         }
-        let stores = crate::store::registry::get(self.model, self.driver as usize);
+        let stores = crate::store::registry::get(self.model, self.driver);
         crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
             let epoch = kv.current_epoch();
             kv.release_working_set(self.id, epoch);
@@ -241,7 +241,7 @@ impl KvWorkingSet {
         page_size: u32,
         pipeline_scope: Option<crate::store::PipelineScope>,
     ) -> Self {
-        let stores = crate::store::registry::get(model, driver as usize);
+        let stores = crate::store::registry::get(model, driver);
         let (translation, page_len) =
             crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
                 (

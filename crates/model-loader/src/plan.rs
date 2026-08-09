@@ -598,6 +598,50 @@ impl LoadPlan {
             .map(|t| t.name.clone())
             .collect()
     }
+
+    /// Every DISTINCT affine point this plan's tensors arrive at.
+    ///
+    /// `(group_size, bits_per_element)` for each tensor whose encoding is
+    /// affine — which is to say quantized and not MXFP4, since a bank in
+    /// MXFP4 takes its own kernel at its own group and is not read at an
+    /// affine point at all.
+    ///
+    /// # Why a SET, and why the plan is the one that knows
+    ///
+    /// For the same reason [`Self::mxfp4_tensor_names`] is a set of names:
+    /// **a checkpoint need not be uniform.** `mlx_lm` publishes a routed
+    /// stack at 4 bits and its ROUTER GATE at 8, because the gate is a
+    /// small tensor whose error the whole mixture inherits — every token
+    /// routed to almost the right experts. That is not a fault. It is a
+    /// fluent model answering wrongly, measured at cosine 0.84 against the
+    /// reference logits.
+    ///
+    /// A driver cannot see this. It is handed the checkpoint's
+    /// `config.json` point — ONE `(group, bits)` — and builds one kernel
+    /// set from it, so a second point in the tensors is read at the first
+    /// and nothing anywhere says so. The plan is where the per-tensor
+    /// `QuantSpec` lives, so the plan is what can be asked.
+    ///
+    /// Sorted, so a caller comparing two plans or printing a refusal gets
+    /// a stable answer rather than a hash order.
+    #[must_use]
+    pub fn affine_points(&self) -> Vec<(u32, u32)> {
+        let mut points: Vec<(u32, u32)> = self
+            .tensors
+            .iter()
+            .filter_map(|t| match &t.encoding {
+                Encoding::Quant(spec)
+                    if spec.scheme != QuantScheme::Mxfp4E2M1E8M0 && spec.group_size > 0 =>
+                {
+                    Some((spec.group_size, u32::from(spec.bits_per_element)))
+                }
+                _ => None,
+            })
+            .collect();
+        points.sort_unstable();
+        points.dedup();
+        points
+    }
 }
 
 /// The one name a contract publishes when the embedding and the output
@@ -637,6 +681,78 @@ mod plan_query_tests {
         plan.tensors
             .push(decl(TIED_EMBEDDING_NAME, Encoding::Raw(DType::BF16)));
         assert!(plan.ties_embeddings());
+    }
+
+    fn affine(name: &str, group: u32, bits: u8) -> TensorDecl {
+        decl(
+            name,
+            Encoding::Quant(QuantSpec {
+                scheme: QuantScheme::MlxAffineU4,
+                logical_dtype: DType::BF16,
+                bits_per_element: bits,
+                group_size: group,
+                channel_axis: None,
+            }),
+        )
+    }
+
+    /// The router gate published at a width the rest of the stack is not.
+    ///
+    /// `mlx_lm` does this deliberately: the gate is a small tensor whose
+    /// error the WHOLE mixture inherits, so it is published at 8 bits
+    /// inside a 4-bit stack. A driver handed one `(group, bits)` off
+    /// `config.json` reads it at 4 and the mixture routes each token to
+    /// almost the right experts — cosine 0.84 against the reference
+    /// logits, and not one NaN to notice it by.
+    ///
+    /// The plan knew all along; nothing asked. This is the asking.
+    #[test]
+    fn a_stack_that_publishes_its_router_gate_wider_says_so() {
+        let mut plan = LoadPlan::empty(StorageTarget::default());
+        assert!(
+            plan.affine_points().is_empty(),
+            "an empty plan arrives at no affine point"
+        );
+
+        plan.tensors.push(affine("layer.0.q_proj.weight", 64, 4));
+        plan.tensors.push(affine("layer.0.k_proj.weight", 64, 4));
+        assert_eq!(
+            plan.affine_points(),
+            vec![(64, 4)],
+            "a uniform stack is ONE point, however many tensors carry it"
+        );
+
+        plan.tensors.push(affine("layer.0.router.gate", 64, 8));
+        assert_eq!(
+            plan.affine_points(),
+            vec![(64, 4), (64, 8)],
+            "the gate's width is a second point, and sorted so a refusal \
+             prints the same way twice"
+        );
+
+        // An MXFP4 bank is NOT a second affine point: it takes its own
+        // kernel at its own group and is never read at one. Without this
+        // exclusion every gpt-oss checkpoint would refuse.
+        plan.tensors.push(decl(
+            "layer.0.experts.gate_up",
+            Encoding::Quant(QuantSpec {
+                scheme: QuantScheme::Mxfp4E2M1E8M0,
+                logical_dtype: DType::BF16,
+                bits_per_element: 0,
+                group_size: 32,
+                channel_axis: None,
+            }),
+        ));
+        assert_eq!(
+            plan.affine_points(),
+            vec![(64, 4), (64, 8)],
+            "an mxfp4 bank is not read at an affine point"
+        );
+
+        // Nor is an unquantized tensor.
+        plan.tensors
+            .push(decl("layer.0.norm.weight", Encoding::Raw(DType::BF16)));
+        assert_eq!(plan.affine_points(), vec![(64, 4), (64, 8)]);
     }
 
     #[test]

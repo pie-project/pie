@@ -241,6 +241,7 @@ driver-cuda = ["worker/driver-cuda"]
 # macOS/Apple Silicon. Without this the `pie` binary has no way to reach the
 # Metal driver at all: `worker`'s `driver-metal` is what links the archive,
 # and this is the only package that builds a binary.
+driver-metal = ["worker/driver-metal"]
 driver-dummy = ["worker/driver-dummy"]
 # Probe passthroughs to the embedded worker (→ runtime).
 profile-fire = ["worker/profile-fire"]

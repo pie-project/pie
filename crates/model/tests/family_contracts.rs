@@ -363,6 +363,84 @@ fn gemma4_dense_cuda() {
     );
 }
 
+// ── phi-3: fused qkv and gate/up, split source-side ─────────────────
+
+/// Phi-3 is the only family whose contract UNDOES a fusion.
+///
+/// `heads * head_dim == hidden` on purpose: `phi3_qkv_split` reads the
+/// q extent off `shape[1]`, the fused tensor's INPUT dim, so a fixture
+/// where those differ would pass while the arithmetic it pins does not
+/// hold. Phi-3's real rows all satisfy it -- mini is 32x96=3072 and
+/// medium 40x128=5120 -- and this fixture states the same relation at
+/// toy scale.
+fn phi3_checkpoint() -> CheckpointMetadata {
+    let (hidden, heads, kv_heads, head_dim, intermediate) = (64, 4, 2, 16, 96);
+    let mut ck = Checkpoint::new();
+    ck.push("model.embed_tokens.weight", &[128, hidden], bf16());
+    let p = "model.layers.0.";
+    ck.push(&format!("{p}input_layernorm.weight"), &[hidden], bf16());
+    ck.push(
+        &format!("{p}self_attn.qkv_proj.weight"),
+        &[(heads + 2 * kv_heads) * head_dim, hidden],
+        bf16(),
+    );
+    ck.push(
+        &format!("{p}self_attn.o_proj.weight"),
+        &[hidden, heads * head_dim],
+        bf16(),
+    );
+    ck.push(
+        &format!("{p}post_attention_layernorm.weight"),
+        &[hidden],
+        bf16(),
+    );
+    ck.push(
+        &format!("{p}mlp.gate_up_proj.weight"),
+        &[2 * intermediate, hidden],
+        bf16(),
+    );
+    ck.push(
+        &format!("{p}mlp.down_proj.weight"),
+        &[hidden, intermediate],
+        bf16(),
+    );
+    ck.push("model.norm.weight", &[hidden], bf16());
+    ck.finish("phi3")
+}
+
+static PHI3_CUDA: Fixture = Fixture {
+    id: "phi3-fixture",
+    shape: LoadShape::dense(1, 16, false),
+    author: model::phi_3::contract::author_phi3,
+};
+
+#[test]
+fn phi3_fused_cuda() {
+    check(
+        "phi3_fused_cuda",
+        &phi3_checkpoint(),
+        &PHI3_CUDA,
+        &StoredEncoding::dense(),
+        &target(0, 1),
+        &Policy::default(),
+    );
+}
+
+/// The same split under tensor parallelism, which is where a split that
+/// forgot it was sharding shows up: each rank must take its band of the
+/// q/k/v rows, not the whole tensor.
+#[test]
+fn phi3_fused_cuda_tp1_of_2() {
+    check(
+        "phi3_fused_cuda_tp1_of_2",
+        &phi3_checkpoint(),
+        &PHI3_CUDA,
+        &StoredEncoding::dense(),
+        &target(1, 2),
+        &Policy::default(),
+    );
+}
+
 // ── csm: fp32 checkpoint, bf16 kernels ──────────────────────────────
 
 fn csm_checkpoint() -> CheckpointMetadata {
@@ -715,6 +793,81 @@ fn qwen3_5_moe_cuda() {
         &QWEN3_5_MOE_CUDA,
         &StoredEncoding::dense(),
         &target(0, 1),
+        &Policy::default(),
+    );
+}
+
+/// The same experts as a streamed GROUP rather than a stacked tensor.
+///
+/// `shared/moe.rs` writes both layouts and only the stacked one was
+/// pinned: the streamed goldens beside this one belong to gpt-oss and
+/// deepseek, which author their experts themselves. So the plain HF
+/// path -- the one qwen3-moe and GLM-5.2 both take -- had its group
+/// half unrun.
+///
+/// What the golden holds down is the ORDER inside `gate_up_proj`.
+/// `Expr::concat` of `[gate, up]` versus `[up, gate]` is selected by
+/// `gate_second`, produces an identically shaped tensor either way, and
+/// is read by the driver's activation -- so getting it backwards is a
+/// silently wrong model, not a load failure.
+#[test]
+fn qwen3_5_moe_streamed_cuda() {
+    let policy = Policy {
+        stream_routed_experts: true,
+        ..Policy::default()
+    };
+    check(
+        "qwen3_5_moe_streamed_cuda",
+        &qwen3_5_moe_checkpoint(),
+        &QWEN3_5_MOE_CUDA,
+        &StoredEncoding::dense(),
+        &target(0, 1),
+        &policy,
+    );
+}
+
+/// Streamed experts under TP, which is the layout's reason for existing.
+///
+/// A group is sharded BEFORE the halves join: one instance is one
+/// expert, so each half takes its rank's band of the intermediate axis
+/// and the concat happens on the local extents. The stacked path
+/// declines TP entirely -- see the case below -- so this is the only
+/// tensor-parallel expert layout the plain HF source has.
+#[test]
+fn qwen3_5_moe_streamed_cuda_tp1_of_2() {
+    let policy = Policy {
+        stream_routed_experts: true,
+        ..Policy::default()
+    };
+    check(
+        "qwen3_5_moe_streamed_cuda_tp1_of_2",
+        &qwen3_5_moe_checkpoint(),
+        &QWEN3_5_MOE_CUDA,
+        &StoredEncoding::dense(),
+        &target(1, 2),
+        &policy,
+    );
+}
+
+/// The stacked path DECLINES to shard, and the golden records what it
+/// leaves behind instead.
+///
+/// `hf_moe_expert_stacks` returns early when `tp_size != 1`: the stack
+/// joins E slabs along a new leading axis and nothing downstream slices
+/// that join per rank. So no `mlp.experts.gate_up_proj` is built, and
+/// the six per-expert tensors stay published — each sharded on its own,
+/// which is the layout that does survive TP.
+///
+/// Pinned because a contract missing its fused tensor looks exactly
+/// like a pass that failed to run, and here it is the intended output.
+#[test]
+fn qwen3_5_moe_stacked_declines_tp() {
+    check(
+        "qwen3_5_moe_stacked_declines_tp",
+        &qwen3_5_moe_checkpoint(),
+        &QWEN3_5_MOE_CUDA,
+        &StoredEncoding::dense(),
+        &target(1, 2),
         &Policy::default(),
     );
 }

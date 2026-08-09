@@ -78,6 +78,13 @@ fn spawn_and_wait(s: &TestState, name: &str, input: String) -> bool {
 /// `Result<String, String>`), so a test can assert the inferlet ran to a
 /// meaningful result rather than merely exiting. `Err` if the process did not
 /// terminate within the timeout (e.g. a hang on an unresolved host RPC).
+#[allow(
+    clippy::async_yields_async,
+    reason = "the oneshot::Receiver is deliberately handed back out of the first \
+              block_on rather than awaited inside it, so the second block_on can \
+              await it under tokio::time::timeout; awaiting it here would drop the \
+              timeout and turn a hung inferlet into a hung test"
+)]
 fn spawn_and_capture(s: &TestState, name: &str, input: String) -> Result<String, String> {
     let rx = s.rt.block_on(async {
         inferlets::add_and_install(name).await;
@@ -279,7 +286,7 @@ fn concurrent_spawns() {
         let count = 10;
         let pids: Vec<_> = (0..count)
             .map(|i| {
-                let pid = process::spawn(
+                process::spawn(
                     "stress-user".into(),
                     program_name("echo"),
                     format!(r#"{{"batch":"{i}"}}"#),
@@ -287,8 +294,7 @@ fn concurrent_spawns() {
                     false,
                     None,
                 )
-                .unwrap_or_else(|e| panic!("spawn {i} failed: {e}"));
-                pid
+                .unwrap_or_else(|e| panic!("spawn {i} failed: {e}"))
             })
             .collect();
 

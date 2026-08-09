@@ -7,12 +7,11 @@ use ::grammar::regex::{regex_to_ebnf, regex_to_grammar};
 /// Helper: get the EBNF body (everything after "root ::= ").
 fn ebnf_body(pattern: &str) -> String {
     let ebnf = regex_to_ebnf(pattern).unwrap();
-    let body = ebnf
-        .strip_prefix("root ::= ")
+
+    ebnf.strip_prefix("root ::= ")
         .unwrap_or(&ebnf)
         .trim_end()
-        .to_string();
-    body
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------

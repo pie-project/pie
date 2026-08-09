@@ -196,7 +196,10 @@ mod tests {
     fn the_retired_sections_are_gone_from_it() {
         let content = default_config_content();
         for retired in ["[controller]", "[gateway]", "[worker", "[model.driver"] {
-            assert!(!content.contains(retired), "template still writes {retired}");
+            assert!(
+                !content.contains(retired),
+                "template still writes {retired}"
+            );
         }
     }
 

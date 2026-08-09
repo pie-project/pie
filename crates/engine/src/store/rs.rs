@@ -589,7 +589,7 @@ impl RsStore {
             return Err(RsError::FoldZero);
         }
         let granularity = entry.geom.normalized_granularity();
-        if granularity > 1 && tokens % granularity != 0 {
+        if granularity > 1 && !tokens.is_multiple_of(granularity) {
             return Err(RsError::FoldGranularity {
                 tokens,
                 granularity,

@@ -62,9 +62,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use client::client::Client;
 use pie::derive::derive_standalone;
 use pie::run_standalone;
-use client::client::Client;
 
 /// How many times each side is sampled. Four is enough to separate a
 /// warm-up artifact (run 1 differs, runs 2..N agree) from a real
@@ -291,8 +291,7 @@ async fn run_family(family: &Family) -> Result<()> {
     );
 
     let (ws, pkg, wasm, manifest) = if family.hybrid {
-        let ws = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../crates/engine/tests/inferlets");
+        let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
         let wasm = ws.join("target/wasm32-wasip2/release/generate_gdn.wasm");
         let manifest = ws.join("generate-gdn/Pie.toml");
         (ws, "generate-gdn", wasm, manifest)
@@ -313,7 +312,10 @@ async fn run_family(family: &Family) -> Result<()> {
         Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
             .await
             .context("connect")?;
-    client.authenticate("test-user", &None).await.context("auth")?;
+    client
+        .authenticate("test-user", &None)
+        .await
+        .context("auth")?;
     client
         .add_program(&wasm, &manifest, true)
         .await
@@ -377,8 +379,7 @@ async fn run_family(family: &Family) -> Result<()> {
                 .join("\n")
         );
         anyhow::ensure!(
-            driver_log.contains("first DECODE fire")
-                || driver_log.contains("first PREFILL fire"),
+            driver_log.contains("first DECODE fire") || driver_log.contains("first PREFILL fire"),
             "{}: the driver never logged a first-fire line, so the declared \
              drive did not take a single fire. Either eligibility answered \
              false for every one, or the executor is not wired in.",

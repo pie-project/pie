@@ -120,8 +120,7 @@ fn an_incomplete_tokenizer_is_refused_by_name() {
     match read_tokenizer(&artifact) {
         Ok(_) => panic!("an artifact with no merge table produced a tokenizer"),
         Err(err) => assert!(
-            err.to_string()
-                .contains(tokenizer::canonical::MERGE_TABLE),
+            err.to_string().contains(tokenizer::canonical::MERGE_TABLE),
             "unexpected error: {err}"
         ),
     }

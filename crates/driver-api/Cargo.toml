@@ -13,10 +13,25 @@ name = "driver_api"
 crate-type = ["rlib"]
 path = "src/lib.rs"
 
+[features]
+# On by default, so every existing consumer is unaffected by the split.
+default = ["rpc"]
+
+# `remote`: the tarpc service the cross-node transport speaks.
+#
+# Optional because ONE module needs it and the rest of this crate is plain
+# data. `tarpc` brings tokio, and tokio's platform closure reaches `js-sys`,
+# `wasm-bindgen` and `windows-sys` -- none of which compiles C on Linux, but
+# all of which a dependent that checks its closure for native libraries has to
+# either accept or explain away. `driver-vulkan` is that dependent: it is
+# required to be pure Rust and proves it by asking the resolver, and it needs
+# `DeviceFacts` and nothing else from here.
+rpc = ["dep:tarpc"]
+
 [dependencies]
 # `DriverCapabilities` (JSON handshake) + the transfer layout types are plain serde.
 serde = { version = "1.0", features = ["derive"] }
-tarpc = { version = "0.37", features = ["serde1"] }
+tarpc = { version = "0.37", features = ["serde1"], optional = true }
 
 [dev-dependencies]
 serde_json = "1.0"

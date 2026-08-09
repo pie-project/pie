@@ -800,8 +800,7 @@ impl PassWit for wit_attention::ForwardPass {
         wit_attention::ForwardPass::readout(self, indices)
     }
     fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
-        wit_attention::ForwardPass::set_max_layers(self, max_layers)
-            .map_err(|e| e.to_string())
+        wit_attention::ForwardPass::set_max_layers(self, max_layers).map_err(|e| e.to_string())
     }
     fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
         wit_attention::ForwardPass::program(self, bytes, channels)
@@ -826,8 +825,7 @@ impl PassWit for wit_recurrent::ForwardPass {
         wit_recurrent::ForwardPass::readout(self, indices)
     }
     fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
-        wit_recurrent::ForwardPass::set_max_layers(self, max_layers)
-            .map_err(|e| e.to_string())
+        wit_recurrent::ForwardPass::set_max_layers(self, max_layers).map_err(|e| e.to_string())
     }
     fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
         wit_recurrent::ForwardPass::program(self, bytes, channels)
@@ -852,8 +850,7 @@ impl PassWit for wit_hybrid::ForwardPass {
         wit_hybrid::ForwardPass::readout(self, indices)
     }
     fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
-        wit_hybrid::ForwardPass::set_max_layers(self, max_layers)
-            .map_err(|e| e.to_string())
+        wit_hybrid::ForwardPass::set_max_layers(self, max_layers).map_err(|e| e.to_string())
     }
     fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
         wit_hybrid::ForwardPass::program(self, bytes, channels)
@@ -1142,6 +1139,11 @@ mod page_declaration_tests {
     }
 
     #[test]
+    #[allow(
+        clippy::reversed_empty_ranges,
+        reason = "the reversed range IS the input under test; rewriting it \
+                  forwards would test the opposite of what this asserts"
+    )]
     fn rejects_reversed_closed_spans() {
         assert!(PageDeclaration::from_range(5..4).is_err());
     }
@@ -1362,71 +1364,57 @@ impl<W: PassWit> Pass<W> {
         // DoRA: scale(y + mm(b, mm(a, x)), s) — the composite lowers to
         // the low-rank sink THEN the scale sink on the same site (the
         // driver applies every scale after every delta).
-        if let K::Scale(l, inner) = &expr.kind {
-            if let K::Add(lhs, rhs) = &inner.kind {
-                let delta = match (&lhs.kind, &rhs.kind) {
-                    (K::Y, _) => &rhs.kind,
-                    (_, K::Y) => &lhs.kind,
-                    _ => &inner.kind, // falls to the refusal below
-                };
-                if let K::Mm(b, mid) = delta {
-                    if let K::Mm(a, x) = &mid.kind {
-                        if matches!(x.kind, K::X) {
-                            let (a, b, l) = (*a, *b, *l);
-                            {
-                                let mut st = self.inner.borrow_mut();
-                                if (st.adapter_lowrank_sites | st.adapter_scale_sites)
-                                    & site.bit()
-                                    != 0
-                                {
-                                    return Err(format!(
-                                        "adapter: site {site:?} already carries an \
+        if let K::Scale(l, inner) = &expr.kind
+            && let K::Add(lhs, rhs) = &inner.kind
+        {
+            let delta = match (&lhs.kind, &rhs.kind) {
+                (K::Y, _) => &rhs.kind,
+                (_, K::Y) => &lhs.kind,
+                _ => &inner.kind, // falls to the refusal below
+            };
+            if let K::Mm(b, mid) = delta
+                && let K::Mm(a, x) = &mid.kind
+                && matches!(x.kind, K::X)
+            {
+                let (a, b, l) = (*a, *b, *l);
+                {
+                    let mut st = self.inner.borrow_mut();
+                    if (st.adapter_lowrank_sites | st.adapter_scale_sites) & site.bit() != 0 {
+                        return Err(format!(
+                            "adapter: site {site:?} already carries an \
                                          adapter on this pass"
-                                    ));
-                                }
-                                st.adapter_lowrank_sites |= site.bit();
-                                st.adapter_scale_sites |= site.bit();
-                            }
-                            self.prologue(move || {
-                                intrinsics::kernel::lora(
-                                    a.read(),
-                                    b.read(),
-                                    Tensor::constant(site.bit()),
-                                );
-                                intrinsics::kernel::adapter_scale(
-                                    l.read(),
-                                    Tensor::constant(site.bit()),
-                                );
-                            });
-                            return Ok(());
-                        }
+                        ));
                     }
+                    st.adapter_lowrank_sites |= site.bit();
+                    st.adapter_scale_sites |= site.bit();
                 }
+                self.prologue(move || {
+                    intrinsics::kernel::lora(a.read(), b.read(), Tensor::constant(site.bit()));
+                    intrinsics::kernel::adapter_scale(l.read(), Tensor::constant(site.bit()));
+                });
+                return Ok(());
             }
         }
         // The SCALE form (IA3): scale(y, l) — lowered to the 2-argument
         // adapter sink.
-        if let K::Scale(l, inner) = &expr.kind {
-            if matches!(inner.kind, K::Y) {
-                let l = *l;
-                {
-                    let mut inner_state = self.inner.borrow_mut();
-                    if inner_state.adapter_scale_sites & site.bit() != 0 {
-                        return Err(format!(
-                            "adapter: site {site:?} already carries a scale on \
+        if let K::Scale(l, inner) = &expr.kind
+            && matches!(inner.kind, K::Y)
+        {
+            let l = *l;
+            {
+                let mut inner_state = self.inner.borrow_mut();
+                if inner_state.adapter_scale_sites & site.bit() != 0 {
+                    return Err(format!(
+                        "adapter: site {site:?} already carries a scale on \
                              this pass"
-                        ));
-                    }
-                    inner_state.adapter_scale_sites |= site.bit();
+                    ));
                 }
-                self.prologue(move || {
-                    intrinsics::kernel::adapter_scale(
-                        l.read(),
-                        Tensor::constant(site.bit()),
-                    );
-                });
-                return Ok(());
+                inner_state.adapter_scale_sites |= site.bit();
             }
+            self.prologue(move || {
+                intrinsics::kernel::adapter_scale(l.read(), Tensor::constant(site.bit()));
+            });
+            return Ok(());
         }
         let (lhs, rhs) = match expr.kind {
             K::Add(l, r) => (*l, *r),
@@ -1937,6 +1925,7 @@ pub mod shared_prelude {
     /// asks the model for its tokenizer and vocabulary, so both come with the
     /// prelude rather than being imported by hand 34 times over.
     pub use crate::{Context, Result, model};
+    pub use std::ops::ControlFlow;
     /// Only `Stage`: dtypes are spelled `dtype::f32` and friends, one
     /// lowercase spelling for the one thing they name.
     pub use tensor_dsl::Stage;
@@ -1953,7 +1942,6 @@ pub mod shared_prelude {
         scalar_gather, scatter_add, scatter_set, select, sign, sink_window_mask,
         sliding_window_mask, softmax, sort_desc, top_k, transpose,
     };
-    pub use std::ops::ControlFlow;
 }
 
 // ---------------------------------------------------------------------------

@@ -184,7 +184,7 @@ fn distinct_reasons(failures: &[String]) -> String {
             None => counts.push((reason.clone(), 1)),
         }
     }
-    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    counts.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
     let mut out: Vec<String> = counts
         .iter()
         .take(SHOWN)
@@ -267,10 +267,12 @@ pub async fn measure(
     // a shorter list. Delegating rather than repeating the loop keeps ONE
     // definition of what a `Round` means: two aggregations that must agree
     // about medians, spreads and failed lanes is two chances to disagree.
-    Ok(sweep_all(addr, program, inputs, &[knobs], repeats, |_, _| {})
-        .await?
-        .pop()
-        .expect("one candidate in, one round out"))
+    Ok(
+        sweep_all(addr, program, inputs, &[knobs], repeats, |_, _| {})
+            .await?
+            .pop()
+            .expect("one candidate in, one round out"),
+    )
 }
 
 /// Measure every candidate, interleaved.
@@ -319,7 +321,8 @@ pub async fn sweep_all(
         .iter()
         .enumerate()
         .map(|(index, knobs)| {
-            let (throughput_tok_s, throughput_rel_sigma) = median_and_rel_sigma(&throughputs[index]);
+            let (throughput_tok_s, throughput_rel_sigma) =
+                median_and_rel_sigma(&throughputs[index]);
             let (lane_p95, lane_p95_rel_sigma) = median_and_rel_sigma(&p95s[index]);
             Round {
                 knobs: *knobs,
@@ -443,7 +446,11 @@ mod tests {
         }
     }
 
-    const BASE: Knobs = Knobs { frame_size: 2, submit_depth: 3, dispatch_depth: 2 };
+    const BASE: Knobs = Knobs {
+        frame_size: 2,
+        submit_depth: 3,
+        dispatch_depth: 2,
+    };
 
     #[test]
     fn a_gap_smaller_than_the_noise_is_not_a_win() {
@@ -452,12 +459,18 @@ mod tests {
         // other way on the next run.
         let a = round(BASE, 1296.0, 0.06, 0);
         let b = round(BASE, 1265.0, 0.06, 0);
-        assert!(!a.beats(&b, Metric::Throughput), "2.4% gap under 8.5% combined noise");
+        assert!(
+            !a.beats(&b, Metric::Throughput),
+            "2.4% gap under 8.5% combined noise"
+        );
 
         // A 3.4x collapse is not ambiguous, and the rule must not be so
         // conservative that it misses one.
         let slow = round(BASE, 375.0, 0.06, 0);
-        assert!(b.beats(&slow, Metric::Throughput), "k=1 collapse must register");
+        assert!(
+            b.beats(&slow, Metric::Throughput),
+            "k=1 collapse must register"
+        );
     }
 
     #[test]

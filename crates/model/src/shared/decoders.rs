@@ -9,8 +9,101 @@ use crate::instruct::{
 use std::sync::Arc;
 use tokenizer::{Tokenizer, TokenizerDecoder};
 
-// ─── GenericChatDecoder ──────────────────────────────────────
+// ─── Sliding window ──────────────────────────────────────────
 
+/// Discard all but roughly the last `keep` bytes of `text`, snapping the
+/// cut back to a character boundary.
+///
+/// Tool decoders buffer generated text while hunting for an opening
+/// marker, and bound that buffer by dropping its head. The bound is a byte
+/// count computed by arithmetic, but the buffer holds arbitrary model
+/// output, so the offset lands inside a multi-byte character whenever the
+/// tail is not ASCII — one Korean syllable or emoji straddling the cut is
+/// enough. Slicing there panics.
+///
+/// The cut moves backwards, never forwards, so the result is always at
+/// least `keep` bytes: a partially received marker sitting at the end of
+/// the buffer cannot be truncated away by the snap.
+pub fn keep_tail(text: &str, keep: usize) -> &str {
+    if text.len() <= keep {
+        return text;
+    }
+    let mut cut = text.len() - keep;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &text[cut..]
+}
+
+// ─── Grammar/decoder agreement (test support) ────────────────
+
+/// Expand `rule` into the shortest sentence `grammar` admits, taking the
+/// first alternative wherever it branches.
+///
+/// A family publishes a grammar that constrains generation and a decoder
+/// that reads the result back. Nothing binds the two, and a test that
+/// asserts the grammar *contains* some text cannot tell you that text is
+/// wrong: llama-3 shipped a `tool-call` rule admitting `{name: f, …}`,
+/// which is not JSON, so its own decoder rejected every constrained
+/// generation — and a test pinned that rule verbatim.
+///
+/// `subst` supplies the non-terminals that would otherwise recurse
+/// forever (`ws`, `json-object`); everything else is expanded from the
+/// grammar's own rules.
+#[cfg(test)]
+pub(crate) fn gbnf_sentence(grammar: &str, rule: &str, subst: &[(&str, &str)]) -> String {
+    fn expand(grammar: &str, rule: &str, subst: &[(&str, &str)], depth: usize) -> String {
+        assert!(depth < 8, "rule {rule:?} recurses; give it a substitution");
+        let head = format!("{rule} ::=");
+        let line = grammar
+            .lines()
+            .find(|l| l.trim_start().starts_with(&head))
+            .unwrap_or_else(|| panic!("grammar has no rule {rule:?}"));
+        let rhs = line
+            .split_once("::=")
+            .expect("a rule head implies a body")
+            .1;
+        // The first alternative only; `|` never appears inside a literal
+        // in the grammars this crate writes.
+        let rhs = rhs.split_once('|').map_or(rhs, |(first, _)| first);
+        let mut out = String::new();
+        let mut chars = rhs.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '"' {
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => match chars.next() {
+                            Some('n') => out.push('\n'),
+                            Some('t') => out.push('\t'),
+                            Some(escaped) => out.push(escaped),
+                            None => break,
+                        },
+                        _ => out.push(c),
+                    }
+                }
+            } else if c.is_ascii_alphabetic() {
+                let mut ident = String::from(c);
+                while let Some(&n) = chars.peek() {
+                    if n.is_ascii_alphanumeric() || n == '-' || n == '_' {
+                        ident.push(n);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                match subst.iter().find(|(key, _)| *key == ident) {
+                    Some((_, value)) => out.push_str(value),
+                    None => out.push_str(&expand(grammar, &ident, subst, depth + 1)),
+                }
+            }
+        }
+        out
+    }
+    expand(grammar, rule, subst, 0)
+}
+
+// ─── GenericChatDecoder ──────────────────────────────────────
 /// Chat decoder that accumulates tokens, emits incremental text deltas,
 /// and stops on any of the given token IDs.
 ///

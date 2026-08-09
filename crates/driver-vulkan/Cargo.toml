@@ -36,6 +36,15 @@ default = []
 native = ["dep:ash"]
 
 [dependencies]
+# The handshake the engine's seam speaks: `DeviceFacts` and the ABI version.
+# Pure serde and tarpc, so `tests/pure.rs` stays green -- checked rather than
+# assumed, which is the whole point of that test.
+# `default-features = false` drops the tarpc service, which is the only thing
+# in that crate this one does not want: tokio's platform closure carries
+# `windows-sys` and `js-sys`, and `tests/pure.rs` is not going to be taught to
+# ignore a `-sys` crate.
+driver-api = { path = "../driver-api", default-features = false }
+
 # The launch vocabulary. `LaunchRule` is the same enum `driver-metal` matches
 # on, and that sharing is load-bearing rather than tidy: the two shells
 # disagree about the GRID and must not disagree about which rule a row names.
@@ -68,7 +77,18 @@ model-loader = { path = "../model-loader" }
 
 # `tests/arena.rs` only: a real model to lower, so the offsets under test are
 # the ones a compiler actually assigns rather than ones a test invented.
-model = { path = "../model", default-features = false, features = ["forward"] }
+# `contract` is here for `tests/checkpoint.rs` and not for `tests/arena.rs`:
+# it is what carries `catalog::identify`, `contract::author` and
+# `boot::compile_load_plan_for` -- the conversion from a publisher's tensor
+# names to the ones a plan states. Measuring that the conversion already
+# produces this driver's 704 names is the whole content of
+# `the_loader_states_the_names_this_driver_binds`, and it cannot be measured
+# without compiling a real contract. Still dev-only: nothing in `src/` reads
+# a checkpoint.
+model = { path = "../model", default-features = false, features = [
+    "forward",
+    "contract",
+] }
 
 # `tests/pure.rs` only: reading what `cargo metadata` says the resolver did,
 # so that "this crate is pure Rust" is asked of the closure rather than of a

@@ -407,7 +407,10 @@ fn compile_metaspace_profile(hf: &HfTokenizerJson) -> Result<CompiledProfile> {
         "unsupported Metaspace prepend_scheme: {prepend_scheme}"
     );
     ensure!(
-        pre_tokenizer.get("split").and_then(serde_json::Value::as_bool) == Some(false),
+        pre_tokenizer
+            .get("split")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false),
         "Metaspace.split must be false"
     );
     ensure!(
@@ -431,7 +434,6 @@ fn compile_metaspace_profile(hf: &HfTokenizerJson) -> Result<CompiledProfile> {
         normalizes_text: true,
     })
 }
-
 
 fn compile_byte_level_profile(hf: &HfTokenizerJson) -> Result<CompiledProfile> {
     ensure!(

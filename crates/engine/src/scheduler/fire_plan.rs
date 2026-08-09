@@ -404,8 +404,7 @@ pub(crate) fn plan_fire_with_model(members: &[MemberFacts], model_sites: &[Site]
         let hook_ok = contiguous(|m| m.hook_program);
         let trunc_ok = contiguous(|m| m.truncated);
         if !(mask_ok && hook_ok && trunc_ok) {
-            static FIRED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
+            static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !FIRED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!(
                     "[seriation] window axis fragmented under the Act-2 order (mask_ok={mask_ok} hook_ok={hook_ok} trunc_ok={trunc_ok}, order={member_order:?}) — this combination wants the gather fallback"
@@ -570,7 +569,7 @@ mod tests {
         };
         let members = [
             band(8, 0),
-            member(true, false, false, 1),  // hooked, full depth
+            member(true, false, false, 1), // hooked, full depth
             band(12, 2),
             member(false, false, false, 3), // plain, full depth
         ];
@@ -580,11 +579,7 @@ mod tests {
             vec![3, 1, 2, 0],
             "[plain-full, hook-full, k12, k8]"
         );
-        let masked = [
-            band(8, 0),
-            member(true, false, false, 1),
-            masked_member(2),
-        ];
+        let masked = [band(8, 0), member(true, false, false, 1), masked_member(2)];
         let plan = plan_fire_with_model(&masked, &[]);
         assert_eq!(
             plan.member_order,
@@ -842,7 +837,10 @@ mod tests {
             &model::qwen_3_5::forward::facts::Qwen35MoeMlpFacts::qwen3_5_35b_a3b(),
         );
         let model_sites = site_table::derive_sites(&traced);
-        let members = vec![member(false, false, false, 0), member(true, false, false, 1)];
+        let members = vec![
+            member(false, false, false, 0),
+            member(true, false, false, 1),
+        ];
         let plan = plan_fire_with_model(&members, &model_sites);
         assert_eq!(plan.sites.len(), 4);
         let expert = plan

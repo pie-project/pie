@@ -26,6 +26,15 @@ use stack_parser::{SmallDedup, StackParser, StackState};
 // ---------------------------------------------------------------------------
 
 /// Two-variant engine that eliminates all `if single_dfa_mode` dual-path code.
+///
+/// Not boxed despite the 48-vs-376-byte spread: exactly one of these exists per
+/// matcher, built once and then dispatched once per input byte. Boxing would
+/// trade 328 bytes allocated once for a pointer chase in the per-byte loop --
+/// and it is the *large* variant that would pay it.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "constructed once per matcher, dispatched per byte; see above"
+)]
 #[derive(Clone)]
 enum ParserEngine {
     /// Single-DFA fast path: raw byte_table lookups (~2ns/byte).

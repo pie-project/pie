@@ -280,6 +280,13 @@ pub(crate) struct PendingRequest {
 }
 
 impl PendingRequest {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a launch's whole descriptor, and this IS the struct constructor — \
+                  every argument is a field of the `PendingRequest` being built, so \
+                  \"factor it into a struct\" would produce a second struct with the \
+                  same twelve fields"
+    )]
     fn direct(
         request: crate::driver::LaunchPlan,
         instance_id: u64,
@@ -375,14 +382,6 @@ pub(crate) enum RsBatchKind {
     /// A pure commit, which replays buffered activations instead of computing
     /// them. Goes out alone.
     Solo,
-}
-
-fn fire_membership_hash<'a>(logical_fire_ids: impl IntoIterator<Item = &'a u64>) -> u64 {
-    logical_fire_ids
-        .into_iter()
-        .fold(14_695_981_039_346_656_037u64, |hash, logical_fire_id| {
-            (hash ^ logical_fire_id).wrapping_mul(1_099_511_628_211)
-        })
 }
 
 #[derive(Default)]
@@ -541,8 +540,7 @@ impl LaunchGrouping {
         // is still one token per row and the planned mask split gives its
         // region its own attention launch.
         if self.count != 0
-            && ((request.hook_program
-                && (self.has_hook_program || self.has_multi_token))
+            && ((request.hook_program && (self.has_hook_program || self.has_multi_token))
                 || (!one_token_rows(&request.request) && self.has_hook_program))
         {
             return false;
@@ -570,19 +568,16 @@ impl LaunchGrouping {
             };
             let distinct_after = {
                 let k = request.request.max_layers;
-                let known = k.is_none()
-                    || self.finite_ks.iter().any(|slot| *slot == k);
-                self.finite_ks.iter().filter(|slot| slot.is_some()).count()
-                    + usize::from(!known)
+                let known = k.is_none() || self.finite_ks.contains(&k);
+                self.finite_ks.iter().filter(|slot| slot.is_some()).count() + usize::from(!known)
             };
-            let page_mask_hook = self.has_page_mask_hook
-                || (request.hook_program && request.request.hook_page_mask);
+            let page_mask_hook =
+                self.has_page_mask_hook || (request.hook_program && request.request.hook_page_mask);
             let hook_k = self.hook_finite_k.or(joining_hook_k);
             let wire_trunc_after = self.has_wire_trunc
                 || (request.request.max_layers.is_some()
                     && !request.request.device_resolved_geometry);
-            let devgeo_after = self.has_device_geometry
-                || request.request.device_resolved_geometry;
+            let devgeo_after = self.has_device_geometry || request.request.device_resolved_geometry;
             let band_order_holds = !(wire_trunc_after && devgeo_after);
             let clashes = if page_mask_hook {
                 // Track-B hooks keep the pre-band servers: at most one
@@ -636,23 +631,21 @@ impl LaunchGrouping {
         self.has_device_geometry |= request.request.device_resolved_geometry;
         self.has_hook_program |= request.hook_program;
         self.has_multi_token |= !one_token_rows(&request.request);
-        if let Some(k) = request.request.max_layers {
-            if !self.finite_ks.iter().any(|slot| *slot == Some(k)) {
-                if let Some(slot) =
-                    self.finite_ks.iter_mut().find(|slot| slot.is_none())
-                {
-                    *slot = Some(k);
-                } else {
-                    self.finite_k_overflow = true;
-                }
+        if let Some(k) = request.request.max_layers
+            && !self.finite_ks.contains(&Some(k))
+        {
+            if let Some(slot) = self.finite_ks.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(k);
+            } else {
+                self.finite_k_overflow = true;
             }
         }
         if request.hook_program {
             self.hook_finite_k = self.hook_finite_k.or(request.request.max_layers);
             self.has_page_mask_hook |= request.request.hook_page_mask;
         }
-        self.has_wire_trunc |= request.request.max_layers.is_some()
-            && !request.request.device_resolved_geometry;
+        self.has_wire_trunc |=
+            request.request.max_layers.is_some() && !request.request.device_resolved_geometry;
         request.requires_solo_submission()
             || has_dense_device_mask(&request.request)
             || self.count >= limits.max_forward_requests
@@ -661,45 +654,16 @@ impl LaunchGrouping {
     }
 }
 
-/// Mailbox-census buckets (diagnostic; see the epoch-drain loop).
-const ITEM_CENSUS_KINDS: [&str; 12] = [
-    "launch",
-    "reg_chan_bind",
-    "close_instance",
-    "close_channel",
-    "lane_reply",
-    "leave",
-    "slot_released",
-    "slot_consumed",
-    "nudge",
-    "copy",
-    "register_other",
-    "other",
-];
-
-fn item_census_idx(item: &SchedulerItem) -> usize {
-    match item {
-        SchedulerItem::Launch { .. } => 0,
-        SchedulerItem::RegisterChannelsBind { .. } => 1,
-        SchedulerItem::CloseInstance { .. } => 2,
-        SchedulerItem::CloseChannel { .. } | SchedulerItem::CloseChannels { .. } => 3,
-        SchedulerItem::Lane(_) => 4,
-        SchedulerItem::PipelineLeave(..) => 5,
-        SchedulerItem::ExecutionSlotReleased(_) | SchedulerItem::ProcessQuiesced(_) => 6,
-        SchedulerItem::ExecutionSlotConsumed(_) => 7,
-        SchedulerItem::Nudge => 8,
-        SchedulerItem::CopyKv { .. }
-        | SchedulerItem::CopyKvTracked { .. }
-        | SchedulerItem::CopyState { .. }
-        | SchedulerItem::ResizePool { .. } => 9,
-        SchedulerItem::RegisterProgram { .. }
-        | SchedulerItem::RegisterChannel { .. }
-        | SchedulerItem::RegisterChannels { .. }
-        | SchedulerItem::BindInstance { .. } => 10,
-        _ => 11,
-    }
-}
-
+#[allow(
+    clippy::large_enum_variant,
+    reason = "measured: the enum is 1408 bytes and `Launch { pending: PendingRequest }` \
+              IS those 1408 (next largest is `RegisterProgram` at 232). But `Launch` \
+              is the hot variant — one per forward step — and every other variant is \
+              a rare control. Boxing it would put an allocation on the launch path to \
+              shrink messages that are sent orders of magnitude less often, which is \
+              backwards. The cold-variant case is handled the other way: see \
+              `LaneRequest::Control`, which IS boxed"
+)]
 enum SchedulerItem {
     Launch {
         pending: PendingRequest,
@@ -987,10 +951,14 @@ enum LaneRequest {
     },
     /// A control `QueuedItem` (never `Launch`): the lane runs the driver
     /// half of the old `dispatch_ordered_item` arm.
-    Control {
-        token: u64,
-        item: QueuedItem,
-    },
+    ///
+    /// Boxed deliberately. Measured: `QueuedItem` is 376 bytes and the whole
+    /// `LaneRequest` was 384 because of it, while the hot `Launch` variant
+    /// needs only ~120. Controls are the COLD traffic on this lane (binds,
+    /// registers, closes, copies, pool resizes) and launches are the per-
+    /// forward-step traffic, so paying one allocation per control to keep
+    /// every queued launch a third of the size is the right way round.
+    Control { token: u64, item: Box<QueuedItem> },
     /// Drain marker: the lane replies with the driver and its channel set so
     /// the worker can run shutdown teardown with everything already quiesced.
     Shutdown {
@@ -1087,11 +1055,12 @@ impl DriverLane {
         // The lane outlives every poster (shutdown joins it last); a send
         // failure means the lane thread panicked, which the join reports.
         let _ = match &request {
-            LaneRequest::Launch { .. }
-            | LaneRequest::Control {
-                item: QueuedItem::ResizePool { .. },
-                ..
-            } => self.launch_tx.send(request),
+            LaneRequest::Launch { .. } => self.launch_tx.send(request),
+            LaneRequest::Control { item, .. }
+                if matches!(item.as_ref(), QueuedItem::ResizePool { .. }) =>
+            {
+                self.launch_tx.send(request)
+            }
             LaneRequest::Control { .. } | LaneRequest::Shutdown { .. } => {
                 self.control_tx.send(request)
             }
@@ -1181,8 +1150,7 @@ impl DriverLane {
             let lane_began = Instant::now();
             let lane_was_control = matches!(request, LaneRequest::Control { .. });
             let lane_was_prefill = matches!(request, LaneRequest::Launch { prefill: true, .. });
-            let lane_was_work =
-                lane_was_control || matches!(request, LaneRequest::Launch { .. });
+            let lane_was_work = lane_was_control || matches!(request, LaneRequest::Launch { .. });
             let _lane_charge = LaneCharge {
                 stats: &stats,
                 began: lane_began,
@@ -1213,7 +1181,7 @@ impl DriverLane {
                                     }
                                     Ok(crate::driver::FrameLaunchOutcome::Exhausted) => {
                                         attempts += 1;
-                                        if attempts == 1 || attempts % 1000 == 0 {
+                                        if attempts == 1 || attempts.is_multiple_of(1000) {
                                             tracing::warn!(
                                                 attempts,
                                                 "frame admission exhausted; lane retrying"
@@ -1237,13 +1205,11 @@ impl DriverLane {
                         }),
                         None => Err("driver has no backend installed".to_string()),
                     };
-                    let _ = reply_tx.send(SchedulerItem::Lane(LaneReply::LaunchDone {
-                        token,
-                        result,
-                    }));
+                    let _ =
+                        reply_tx.send(SchedulerItem::Lane(LaneReply::LaunchDone { token, result }));
                 }
                 LaneRequest::Control { token, item } => {
-                    let commit = Self::execute_control(&mut driver, &mut channels, item);
+                    let commit = Self::execute_control(&mut driver, &mut channels, *item);
                     let _ = reply_tx.send(SchedulerItem::Lane(LaneReply::ControlDone {
                         token,
                         commit,
@@ -1365,9 +1331,8 @@ impl DriverLane {
                     Err(anyhow!("channel {} is already registered", plan.channel_id))
                 } else {
                     match driver.as_mut() {
-                        Some(driver) => driver.register_channel(&plan).map(|channel| {
+                        Some(driver) => driver.register_channel(&plan).inspect(|_channel| {
                             channels.insert(plan.channel_id);
-                            channel
                         }),
                         None => Err(anyhow!("driver has no backend installed")),
                     }
@@ -1561,18 +1526,16 @@ impl DriverLane {
                     return LaneCommit::BindFinished { pipeline_id };
                 }
                 match driver.bind_instance(&bind) {
-                    Ok(bound) => {
-                        LaneCommit::BindInstance {
-                            pipeline_id,
-                            bound,
-                            respond: BindRespond::ChannelsBind {
-                                registered,
-                                program_id: bind.program_id,
-                                program_registered,
-                                response,
-                            },
-                        }
-                    }
+                    Ok(bound) => LaneCommit::BindInstance {
+                        pipeline_id,
+                        bound,
+                        respond: BindRespond::ChannelsBind {
+                            registered,
+                            program_id: bind.program_id,
+                            program_registered,
+                            response,
+                        },
+                    },
                     Err(error) => {
                         Self::rollback_channel_set(
                             driver,
@@ -1941,6 +1904,13 @@ enum LaunchState {
 
 struct PendingLaunchBatch {
     state: LaunchState,
+    #[allow(
+        clippy::vec_box,
+        reason = "measured: `PendingRequest` is 1408 bytes, and this vec is handed \
+                  straight to `batch::build_frame_submission`, which shuffles its \
+                  elements between wave/step-group/deferred vecs; the box keeps each \
+                  of those moves 8 bytes. Matches that function's signature"
+    )]
     requests: Vec<Box<PendingRequest>>,
     started: Instant,
     batch_size: u64,
@@ -2308,6 +2278,12 @@ impl SchedulerHandle {
         Arc::clone(&self.inner.stats)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a pass-through to `PendingRequest::direct`: every argument is \
+                  forwarded unchanged into that constructor, so the width is that \
+                  struct's field list arriving one call earlier"
+    )]
     pub fn submit_with_identity_and_copy(
         &self,
         request: crate::driver::LaunchPlan,
@@ -2330,8 +2306,8 @@ impl SchedulerHandle {
                 prelaunch_copy,
                 prelaunch_state_copy,
                 None,
-                /*hook_program=*/false,
-                /*lora_program=*/false,
+                /*hook_program=*/ false,
+                /*lora_program=*/ false,
             ),
         })
     }
@@ -2357,8 +2333,9 @@ impl SchedulerHandle {
                 prelaunch_copy,
                 prelaunch_state_copy,
                 None,
-                /*hook_program=*/false,
-                /*lora_program=*/false),
+                /*hook_program=*/ false,
+                /*lora_program=*/ false,
+            ),
         })
     }
 
@@ -2390,7 +2367,8 @@ impl SchedulerHandle {
                 prelaunch_state_copy,
                 frame,
                 hook_program,
-                lora_program),
+                lora_program,
+            ),
         })
     }
 
@@ -2628,14 +2606,14 @@ impl BatchScheduler {
     fn shutdown(&mut self) {
         self.handle.begin_shutdown();
         crate::scheduler::clear_scheduler_handle(self.driver_id);
-        if let Some(thread) = self.thread.take() {
-            if let Err(err) = thread.join() {
-                tracing::error!(
-                    driver_id = self.driver_id,
-                    ?err,
-                    "scheduler thread panicked"
-                );
-            }
+        if let Some(thread) = self.thread.take()
+            && let Err(err) = thread.join()
+        {
+            tracing::error!(
+                driver_id = self.driver_id,
+                ?err,
+                "scheduler thread panicked"
+            );
         }
     }
 
@@ -2874,7 +2852,11 @@ impl BatchScheduler {
                                         match &c.state {
                                             ControlSlotState::Posted { .. } => "posted",
                                             ControlSlotState::Ready(comp) =>
-                                                if comp.is_settled() { "ready-settled" } else { "ready-unsettled" },
+                                                if comp.is_settled() {
+                                                    "ready-settled"
+                                                } else {
+                                                    "ready-unsettled"
+                                                },
                                         }
                                     )
                                 })
@@ -2889,7 +2871,11 @@ impl BatchScheduler {
                             );
                         }
                     } else {
-                        stats.fire.quorum.idle_park_other_us.fetch_add(slept, Relaxed);
+                        stats
+                            .fire
+                            .quorum
+                            .idle_park_other_us
+                            .fetch_add(slept, Relaxed);
                     }
                 }
                 match parked {
@@ -3669,10 +3655,7 @@ impl BatchScheduler {
         // a 59 us driver bind, and the probe found the slot held by a
         // tracked KV copy in 100% of the samples.
         let slot_blocks_lifecycle = in_flight_control.holds_launches();
-        loop {
-            let Some(item) = pending.front() else {
-                break;
-            };
+        while let Some(item) = pending.front() {
             match item {
                 QueuedItem::Launch(_) => {
                     // Launches are dispatched by `dispatch_frame_work` (by
@@ -3821,7 +3804,7 @@ impl BatchScheduler {
         // contention. The queue bounds the depth: only what the planner
         // enqueued can be posted.
         while in_flight_control.admits_copy() {
-            let Some(index) = pending.iter().position(|item| Self::standalone_copy(item)) else {
+            let Some(index) = pending.iter().position(Self::standalone_copy) else {
                 break;
             };
             let Some(item) = pending.remove(index) else {
@@ -3839,25 +3822,6 @@ impl BatchScheduler {
             progress = true;
         }
         (progress, wait_hint)
-    }
-
-    /// Static item-kind label for the control-occupancy fire-timing probe.
-    const fn item_kind(item: &QueuedItem) -> &'static str {
-        match item {
-            QueuedItem::Launch(_) => "launch",
-            QueuedItem::PreLaunchCopy { .. } => "pre_launch_copy",
-            QueuedItem::RegisterProgram { .. } => "register_program",
-            QueuedItem::RegisterChannel { .. } => "register_channel",
-            QueuedItem::RegisterChannels { .. } => "register_channels",
-            QueuedItem::BindInstance { .. } => "bind_instance",
-            QueuedItem::RegisterChannelsBind { .. } => "register_channels_bind",
-            QueuedItem::CopyKv { .. } => "copy_kv",
-            QueuedItem::CopyKvTracked { .. } => "copy_kv_tracked",
-            QueuedItem::CopyState { .. } => "copy_state",
-            QueuedItem::ResizePool { .. } => "resize_pool",
-            QueuedItem::CloseInstance { .. } => "close_instance",
-            QueuedItem::CloseChannels { .. } => "close_channels",
-        }
     }
 
     /// Post a control to the driver lane after the worker-side pre-checks
@@ -4030,7 +3994,10 @@ impl BatchScheduler {
             _ => {}
         }
         *lane_inflight += 1;
-        driver_lane.post(LaneRequest::Control { token, item });
+        driver_lane.post(LaneRequest::Control {
+            token,
+            item: Box::new(item),
+        });
     }
 
     /// One queue pass: the stamped ids still queued, the oldest unstamped
@@ -4086,10 +4053,11 @@ impl BatchScheduler {
                         scan.untracked = Some(launch.fire_id);
                     }
                 }
-                QueuedItem::PreLaunchCopy { pipeline_id, .. } => {
-                    if let Some(pipeline_id) = pipeline_id {
-                        scan.blocked_lanes.insert(*pipeline_id);
-                    }
+                QueuedItem::PreLaunchCopy {
+                    pipeline_id: Some(pipeline_id),
+                    ..
+                } => {
+                    scan.blocked_lanes.insert(*pipeline_id);
                 }
                 _ => {}
             }
@@ -4305,6 +4273,14 @@ impl BatchScheduler {
         true
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the worker loop's state, borrowed piece by piece on purpose: six of \
+                  these are independent `&mut` borrows of fields the caller owns, and \
+                  passing them separately is what lets the borrow checker see they are \
+                  disjoint. Wrapping them in one `&mut` context struct would collapse \
+                  that into a single borrow and stop this from compiling"
+    )]
     fn post_frame(
         slot_buffer: &mut SlotBuffer,
         driver_lane: &DriverLane,
@@ -4769,14 +4745,14 @@ impl BatchScheduler {
     ) {
         let outstanding = std::mem::take(instances);
         for (instance_id, instance) in outstanding {
-            if let Some(driver) = driver.as_mut() {
-                if let Err(err) = driver.close_instance(instance_id) {
-                    tracing::warn!(
-                        instance_id,
-                        ?err,
-                        "scheduler shutdown close_instance failed"
-                    );
-                }
+            if let Some(driver) = driver.as_mut()
+                && let Err(err) = driver.close_instance(instance_id)
+            {
+                tracing::warn!(
+                    instance_id,
+                    ?err,
+                    "scheduler shutdown close_instance failed"
+                );
             }
             instance.close_wait_slots();
         }
@@ -5294,10 +5270,7 @@ mod tests {
         let pacing_wait_id = bound.pacing_wait_id;
         let outstanding = bound.reserve_completion();
 
-        let close_bound = std::thread::spawn({
-            let bound = bound;
-            move || crate::scheduler::close_instance(&bound)
-        });
+        let close_bound = std::thread::spawn(move || crate::scheduler::close_instance(&bound));
 
         std::thread::sleep(Duration::from_millis(10));
         assert!(
@@ -5348,10 +5321,7 @@ mod tests {
         })
         .await?;
 
-        let close_bound = std::thread::spawn({
-            let bound = bound;
-            move || crate::scheduler::close_instance(&bound)
-        });
+        let close_bound = std::thread::spawn(move || crate::scheduler::close_instance(&bound));
         std::thread::sleep(Duration::from_millis(10));
         assert!(
             close_bound.is_finished(),
@@ -5593,8 +5563,9 @@ mod tests {
             None,
             None,
             None,
-                /*hook_program=*/false,
-                /*lora_program=*/false);
+            /*hook_program=*/ false,
+            /*lora_program=*/ false,
+        );
         let mut pending: PendingQueue =
             VecDeque::from([QueuedItem::Launch(QueuedLaunch::new(Box::new(request)))]).into();
         completion.request_cancel();
@@ -5649,8 +5620,9 @@ mod tests {
             None,
             Some(state_copy),
             None,
-                /*hook_program=*/false,
-                /*lora_program=*/false);
+            /*hook_program=*/ false,
+            /*lora_program=*/ false,
+        );
         let mut pending = PendingQueue::default();
         BatchScheduler::queue_attempt(&mut pending, request);
 
@@ -5684,8 +5656,9 @@ mod tests {
             None,
             None,
             None,
-                /*hook_program=*/false,
-                /*lora_program=*/false);
+            /*hook_program=*/ false,
+            /*lora_program=*/ false,
+        );
         assert!(request.preserves_inner_rows());
         assert!(request.requires_solo_submission());
     }
@@ -6802,8 +6775,9 @@ mod tests {
                 None,
                 None,
                 None,
-                /*hook_program=*/false,
-                /*lora_program=*/false)?;
+                /*hook_program=*/ false,
+                /*lora_program=*/ false,
+            )?;
             if pipeline_id == pipeline_b {
                 timeout(Duration::from_secs(5), completion).await??;
             }
@@ -6824,8 +6798,9 @@ mod tests {
             None,
             None,
             None,
-                /*hook_program=*/false,
-                /*lora_program=*/false)?;
+            /*hook_program=*/ false,
+            /*lora_program=*/ false,
+        )?;
         notify_pipeline_close(pipeline_a).await;
         timeout(Duration::from_secs(5), sibling).await??;
 
@@ -6981,8 +6956,9 @@ mod tests {
             None,
             None,
             None,
-                /*hook_program=*/false,
-                /*lora_program=*/false))
+            /*hook_program=*/ false,
+            /*lora_program=*/ false,
+        ))
     }
 
     #[test]
@@ -7205,8 +7181,9 @@ mod tests {
             None,
             None,
             Some(stamp),
-                /*hook_program=*/false,
-                /*lora_program=*/false);
+            /*hook_program=*/ false,
+            /*lora_program=*/ false,
+        );
         let fire_id = request.logical_fire_id;
         // Row budget 1: the single-fire wave is structurally full and seals
         // with no cold hold.
@@ -7291,8 +7268,9 @@ mod tests {
             None,
             None,
             Some(stamp),
-                /*hook_program=*/false,
-                /*lora_program=*/false);
+            /*hook_program=*/ false,
+            /*lora_program=*/ false,
+        );
         let fire_id = request.logical_fire_id;
         // fires=2 with one arrival: the frame is still gathering, so the
         // front launch is immovable.
@@ -7612,8 +7590,9 @@ mod tests {
                     slot: 0,
                     fires: 1,
                 }),
-                /*hook_program=*/false,
-                /*lora_program=*/false)
+                /*hook_program=*/ false,
+                /*lora_program=*/ false,
+            )
         };
         let request_a = stamped(lane_a, 7);
         let request_b = stamped(lane_b, 8);
@@ -7690,8 +7669,9 @@ mod tests {
                 None,
                 None,
                 frame,
-                /*hook_program=*/false,
-                /*lora_program=*/false)
+                /*hook_program=*/ false,
+                /*lora_program=*/ false,
+            )
         };
         let stamped = make(Some(FrameStamp {
             lane,
@@ -7767,8 +7747,9 @@ mod tests {
                 None,
                 None,
                 Some(stamp),
-                /*hook_program=*/false,
-                /*lora_program=*/false);
+                /*hook_program=*/ false,
+                /*lora_program=*/ false,
+            );
             let fire_id = request.logical_fire_id;
             let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
             frame_policy.on_fire_enqueued(stamp, Some(pid), fire_id, 1, 1);

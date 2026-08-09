@@ -64,7 +64,6 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         Ok(self.ctx().table.push(ws)?)
     }
 
-
     async fn page_len(&mut self, this: Resource<KvWorkingSet>) -> Result<u32> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let len = self.ctx().table.get(&this)?.page_len();
@@ -81,7 +80,7 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         crate::inferlet::process::ensure_bind_admitted(self).await;
         crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
-        let stores = store_registry::get(ws.model, ws.driver as usize);
+        let stores = store_registry::get(ws.model, ws.driver);
         let range = store_registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
             kv.reserve(ws.id, pages as u64)
         });
@@ -105,7 +104,7 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
                 "working set cannot be indexed while an operation is in flight".to_string(),
             ));
         }
-        let stores = store_registry::get(ws.model, ws.driver as usize);
+        let stores = store_registry::get(ws.model, ws.driver);
         let result = store_registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
             kv.update_index(key, ws.id)
         });
@@ -184,10 +183,10 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
             kv.retire_idle();
             out
         }); // store lock released before the planner's drain re-locks pools.
-        if out.is_ok() {
-            if let Some(planner) = crate::planner::planner() {
-                planner.pages_freed();
-            }
+        if out.is_ok()
+            && let Some(planner) = crate::planner::planner()
+        {
+            planner.pages_freed();
         }
         Ok(out)
     }

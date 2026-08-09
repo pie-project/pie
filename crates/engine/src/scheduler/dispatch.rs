@@ -20,11 +20,11 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
 use ::driver_api::{
     PIE_MEMORY_DOMAIN_CUDA_DEVICE, PIE_MEMORY_DOMAIN_HOST_PINNED, PieKvMoveCell, PiePoolRange,
     PieStateCopyRange,
 };
+use anyhow::Result;
 
 use crate::driver::{
     BoundInstance, ChannelEndpoint, ChannelRegistrationPlan, ChannelValue, DriverId,
@@ -111,6 +111,15 @@ pub(crate) async fn register_channels(
 /// Register `plans` and bind the instance in ONE scheduler control —
 /// the pair always runs back-to-back at join time with only an ordering
 /// dependency, and two round trips doubled the turnover control convoy.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one combined register-channels-and-bind request: the driver and pipeline \
+              it is for, the channel plans and their ids, the program to register, the \
+              instance id asked for, the seed values to plant, and the geometry class \
+              the bind is classified as. The whole point of this call is that all of \
+              it crosses to the scheduler as ONE item, so the argument list is the \
+              item"
+)]
 pub(crate) async fn register_channels_bind_classified(
     driver_idx: DriverId,
     pipeline_id: Option<ProcessId>,

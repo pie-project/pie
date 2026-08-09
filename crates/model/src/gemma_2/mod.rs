@@ -283,7 +283,7 @@ impl Variant for Gemma2 {
     /// vocabulary does not contain.
     #[cfg(feature = "chat")]
     fn chat(&self, tokenizer: Arc<tokenizer::Tokenizer>) -> Arc<dyn crate::instruct::Instruct> {
-        Arc::new(self::chat::GemmaInstruct::new(tokenizer))
+        Arc::new(crate::shared::gemma_chat::Gemma3Instruct::new(tokenizer))
     }
 }
 

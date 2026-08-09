@@ -20,9 +20,9 @@
 
 use std::process::ExitCode;
 
-use clap::{Parser, ValueEnum};
 use bootstrap::report::Resolved;
 use bootstrap::{BootSpec, GlobalArgs};
+use clap::{Parser, ValueEnum};
 
 /// A single value to print raw, for shell consumption:
 /// `cfg=$(pie-env --role worker --field config)`.

@@ -80,7 +80,7 @@ impl TrimPlan {
         }
 
         let total_seq_len = total_kv;
-        let num_words = ((num_pages as usize) + 63) / 64;
+        let num_words = (num_pages as usize).div_ceil(64);
 
         // Running eligibility: AND-reduction across rows, seeded with the
         // writeable-window mask. SmallVec keeps both bitmaps inline on the

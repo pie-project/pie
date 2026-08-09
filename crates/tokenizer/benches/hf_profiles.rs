@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use common::{MergeFormat, byte_level_json, gemma_json};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use tokenizer::Tokenizer;
 use serde_json::json;
+use tokenizer::Tokenizer;
 
 fn load(value: serde_json::Value) -> (String, Arc<Tokenizer>) {
     let source = value.to_string();

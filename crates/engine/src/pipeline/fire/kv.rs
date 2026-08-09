@@ -204,6 +204,25 @@ fn declaration_overlap(
     Ok(Some((start, indexes, shared)))
 }
 
+/// Physical page copies a realize/prepare emitted, as two parallel vectors in
+/// copy order: `(copy_src, copy_dst)` page ids, fed to
+/// `scheduler::copy_d2d` before the launch.
+pub type PageCopies = (Vec<u32>, Vec<u32>);
+
+/// What realizing one writable declaration resolved to: the CoW page copies it
+/// needs, and the open transaction when the realize had to start one.
+pub type RealizedDeclaration = (PageCopies, Option<KvTxn>);
+
+/// What [`prepare`] resolved to: the append's page projection, the CoW page
+/// copies to run before the launch, the pages it committed, and the open
+/// transaction to hold across the fire.
+pub type PreparedAppend = (KvProjection, PageCopies, Vec<u32>, KvTxn);
+
+/// What [`prepare_explicit_reserved`] resolved to: the `(index, page)` write
+/// targets, the CoW page copies to run before the launch, the pages it
+/// committed, and the open transaction to hold across the fire.
+pub type PreparedExplicit = (Vec<(u64, u32)>, PageCopies, Vec<u32>, KvTxn);
+
 /// Realize the mapped overlap of one writable declaration exactly once.
 /// Shared pages rebase through the existing COW protocol; private pages only
 /// lose transitional implicit-cache identity. Fresh backing is handled
@@ -215,7 +234,7 @@ pub fn realize_declaration(
     store: &mut KvStore,
     ws: WorkingSetId,
     writable: std::ops::Range<u64>,
-) -> Result<((Vec<u32>, Vec<u32>), Option<KvTxn>), KvError> {
+) -> Result<RealizedDeclaration, KvError> {
     realize_declaration_impl(store, ws, writable, None)
 }
 
@@ -272,7 +291,7 @@ pub fn realize_declaration_reserved(
     ws: WorkingSetId,
     writable: std::ops::Range<u64>,
     granted: &mut Vec<PhysicalKvPageId>,
-) -> Result<((Vec<u32>, Vec<u32>), Option<KvTxn>), KvError> {
+) -> Result<RealizedDeclaration, KvError> {
     realize_declaration_impl(store, ws, writable, Some(granted))
 }
 
@@ -281,7 +300,7 @@ fn realize_declaration_impl(
     ws: WorkingSetId,
     writable: std::ops::Range<u64>,
     granted: Option<&mut Vec<PhysicalKvPageId>>,
-) -> Result<((Vec<u32>, Vec<u32>), Option<KvTxn>), KvError> {
+) -> Result<RealizedDeclaration, KvError> {
     let Some((start, indexes, shared)) = declaration_overlap(store, ws, writable)? else {
         return Ok(((Vec::new(), Vec::new()), None));
     };
@@ -385,7 +404,7 @@ pub fn prepare(
     new_tokens: &[u32],
     page_size: u32,
     hash_tokens: Option<&[u32]>,
-) -> Result<(KvProjection, (Vec<u32>, Vec<u32>), Vec<u32>, KvTxn), KvError> {
+) -> Result<PreparedAppend, KvError> {
     debug_assert!(hash_tokens.is_none_or(|t| t.len() == new_tokens.len()));
     let n_new = new_tokens.len() as u32;
     if n_new == 0 {
@@ -521,7 +540,7 @@ pub fn prepare_explicit_reserved(
     ws: WorkingSetId,
     write_indexes: &[u64],
     granted: &mut Vec<PhysicalKvPageId>,
-) -> Result<(Vec<(u64, u32)>, (Vec<u32>, Vec<u32>), Vec<u32>, KvTxn), KvError> {
+) -> Result<PreparedExplicit, KvError> {
     let prepared = store.prepare_write_reserved(ws, write_indexes, granted)?;
     let pages: Vec<(u64, u32)> = prepared
         .targets()
@@ -656,7 +675,7 @@ pub fn canonical_hash_tokens(
     page_size: u32,
 ) -> Option<CanonicalAppend> {
     let n = evidence.tokens.len();
-    if n == 0 || page_size == 0 || evidence.tokens.iter().any(|&t| t == u32::MAX) {
+    if n == 0 || page_size == 0 || evidence.tokens.contains(&u32::MAX) {
         return None;
     }
 
@@ -1535,6 +1554,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::single_range_in_vec_init,
+        reason = "`KvStore::discard` takes `&[Range<u64>]` — a plural selection; \
+                  these two calls each discard exactly one range, which is a \
+                  one-element slice and not a range meant to be collected"
+    )]
     fn front_surgery_breaks_the_chain_but_tail_surgery_continues_it() {
         let mut store = KvStore::new(32, nonce());
         let page = 4u32;

@@ -355,7 +355,6 @@ impl ProcessCtx {
         self.admission_wait_us
     }
 
-
     pub fn get_username(&self) -> String {
         self.username.clone()
     }

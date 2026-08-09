@@ -96,7 +96,9 @@ pub fn target(
         ),
         (Some(inferlet), None) => {
             if manifest.is_some() {
-                bail!("`--manifest` describes a local build, so it only means something with `--path`");
+                bail!(
+                    "`--manifest` describes a local build, so it only means something with `--path`"
+                );
             }
             Ok(Target::Registry(inferlet.to_string()))
         }
@@ -295,7 +297,13 @@ pub async fn run(global: &bootstrap::GlobalArgs, args: RunArgs) -> Result<crate:
     let pie = crate::compose::run_standalone(controller, gateway, worker)
         .await
         .context("boot the engine")?;
-    let outcome = drive(&pie.listen_addr.to_string(), &target, &program, &args.arguments).await;
+    let outcome = drive(
+        &pie.listen_addr.to_string(),
+        &target,
+        &program,
+        &args.arguments,
+    )
+    .await;
     pie.shutdown().await;
     // Quiet, because the inferlet's own output already went to stdout as it
     // was produced -- there is nothing left to render. The status is the
@@ -398,7 +406,10 @@ async fn drive(
     // channel is closed and cannot accept new items", printed after a
     // successful run as though the run had failed.
     drop(process);
-    client.close().await.context("closing the client connection")?;
+    client
+        .close()
+        .await
+        .context("closing the client connection")?;
     Ok(code)
 }
 
@@ -454,19 +465,13 @@ mod tests {
         // `--seed -1` produced `{"seed": true, "1": true}` -- two wrong
         // arguments out of one correct invocation, silently. The leading `-`
         // is not enough to call something a flag when it is a number.
-        assert_eq!(
-            input(&["--seed", "-1"]),
-            serde_json::json!({"seed": -1})
-        );
+        assert_eq!(input(&["--seed", "-1"]), serde_json::json!({"seed": -1}));
         assert_eq!(
             input(&["--temp", "-0.5", "--top-k", "40"]),
             serde_json::json!({"temp": -0.5, "top_k": 40})
         );
         // And a negative number standing alone is still a value.
-        assert_eq!(
-            input(&["-3"]),
-            serde_json::json!({"_positional": [-3]})
-        );
+        assert_eq!(input(&["-3"]), serde_json::json!({"_positional": [-3]}));
     }
 
     #[test]
@@ -479,7 +484,10 @@ mod tests {
         // A single-dash cluster is kept whole rather than invented into three
         // flags -- a spelling this never supported, so guessing at it would be
         // making something up on a person's behalf.
-        assert_eq!(input(&["-abc"]), serde_json::json!({"_positional": ["-abc"]}));
+        assert_eq!(
+            input(&["-abc"]),
+            serde_json::json!({"_positional": ["-abc"]})
+        );
     }
 
     #[test]
@@ -508,9 +516,12 @@ mod tests {
 
     #[test]
     fn a_name_and_a_path_are_not_both_run() {
-        let error = target(Some("chat-completion"), Some(Path::new("/x.wasm")), None, |_| {
-            unreachable!()
-        })
+        let error = target(
+            Some("chat-completion"),
+            Some(Path::new("/x.wasm")),
+            None,
+            |_| unreachable!(),
+        )
         .unwrap_err()
         .to_string();
         assert!(error.contains("one or the other"), "got: {error}");
@@ -533,7 +544,11 @@ mod tests {
         let wasm = dir.join("hello.wasm");
         let manifest = dir.join("Pie.toml");
         std::fs::write(&wasm, b"\0asm").unwrap();
-        std::fs::write(&manifest, "[package]\nname = \"hello\"\nversion = \"0.3.1\"\n").unwrap();
+        std::fs::write(
+            &manifest,
+            "[package]\nname = \"hello\"\nversion = \"0.3.1\"\n",
+        )
+        .unwrap();
 
         let resolved = target(None, Some(&wasm), Some(&manifest), |p| {
             std::fs::read_to_string(p).map_err(Into::into)
@@ -568,9 +583,12 @@ mod tests {
     fn a_missing_file_is_reported_before_anything_boots() {
         // Booting the engine to then discover the file is absent would cost
         // the weight load for nothing.
-        let error = target(None, Some(Path::new("/nope/absent.wasm")), None, |_| {
-            unreachable!()
-        })
+        let error = target(
+            None,
+            Some(Path::new("/nope/absent.wasm")),
+            None,
+            |_| unreachable!(),
+        )
         .unwrap_err()
         .to_string();
         assert!(error.contains("no file at"), "got: {error}");

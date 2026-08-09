@@ -3,12 +3,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, ensure};
 use ::driver_api::{
     ExecutorRequest, ExecutorResponse, ExecutorRpcClient, RemoteBindInstance, RemoteChannelValue,
     RemoteError, RemoteErrorKind, RemoteLaunch, RemoteRegisterChannel, ScratchGrant,
     TerminalCellState,
 };
+use anyhow::{Context, Result, anyhow, ensure};
 
 use crate::driver::FrameLaunchOutcome;
 use crate::driver::channel::RegisteredChannel;
@@ -324,8 +324,10 @@ impl RemoteDriver {
         );
         self.channels
             .insert(desc.channel_id, binding.executor_channel_id);
-        let mut native = ::driver_api::PieChannelEndpointBinding::default();
-        native.channel_id = desc.channel_id;
+        let native = ::driver_api::PieChannelEndpointBinding {
+            channel_id: desc.channel_id,
+            ..Default::default()
+        };
         Ok(RegisteredChannel {
             driver_id: desc.driver_id,
             binding: native,

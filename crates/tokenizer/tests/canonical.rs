@@ -16,9 +16,9 @@
 mod common;
 
 use common::{MergeFormat, TEXTS, byte_level_json, gemma_json};
+use serde_json::json;
 use tokenizer::Tokenizer;
 use tokenizer::canonical::{CanonicalTokenizer, VERSION};
-use serde_json::json;
 
 fn load(json: &serde_json::Value) -> Tokenizer {
     let bytes = serde_json::to_vec(json).unwrap();

@@ -200,7 +200,11 @@ pub enum ExecutorRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutorResponse {
-    Hello(HelloResponse),
+    /// Boxed because it is nearly five times the size of the next-largest
+    /// variant, and it is sent once per connection while the rest are sent
+    /// per request: unboxed, every hot-path response pays for the handshake.
+    /// `Box` is transparent to serde, so the wire format is unchanged.
+    Hello(Box<HelloResponse>),
     LoadedModel(bool),
     ProgramRegistered(u64),
     ChannelRegistered(RemoteChannelBinding),
@@ -246,6 +250,14 @@ impl std::fmt::Display for RemoteError {
 
 impl std::error::Error for RemoteError {}
 
+/// The service, and the only thing in this crate that needs more than serde.
+///
+/// Behind the `rpc` feature -- on by default -- so that a consumer wanting the
+/// VOCABULARY and not the transport can take this crate without tokio beneath
+/// it. Everything else in this module is plain data and stays available: the
+/// request and response types are what a caller round-trips, and gating them
+/// too would mean gating half the crate for one trait.
+#[cfg(feature = "rpc")]
 #[tarpc::service]
 pub trait ExecutorRpc {
     async fn execute(request: ExecutorRequest) -> Result<ExecutorResponse, RemoteError>;

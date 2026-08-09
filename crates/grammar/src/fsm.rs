@@ -95,10 +95,10 @@ impl NfaGraph {
 
         while let Some(s) = queue.pop_front() {
             for edge in &self.edges[s.0 as usize] {
-                if let FsmEdge::Epsilon(target) = edge {
-                    if closure.insert(*target) {
-                        queue.push_back(*target);
-                    }
+                if let FsmEdge::Epsilon(target) = edge
+                    && closure.insert(*target)
+                {
+                    queue.push_back(*target);
                 }
             }
         }
@@ -255,10 +255,11 @@ impl Automaton<NfaGraph> {
             let mut next = BTreeSet::new();
             for &state in &current {
                 for edge in self.fsm.edges(state) {
-                    if let FsmEdge::CharRange { min, max, target } = edge {
-                        if byte >= *min && byte <= *max {
-                            next.insert(*target);
-                        }
+                    if let FsmEdge::CharRange { min, max, target } = edge
+                        && byte >= *min
+                        && byte <= *max
+                    {
+                        next.insert(*target);
                     }
                 }
             }
@@ -438,11 +439,12 @@ impl Automaton<NfaGraph> {
         // Merge adjacent intervals with identical target sets
         let mut merged: Vec<(u8, u8, BTreeSet<StateId>)> = Vec::new();
         for (min, max, targets) in result {
-            if let Some(last) = merged.last_mut() {
-                if last.2 == targets && last.1.checked_add(1) == Some(min) {
-                    last.1 = max;
-                    continue;
-                }
+            if let Some(last) = merged.last_mut()
+                && last.2 == targets
+                && last.1.checked_add(1) == Some(min)
+            {
+                last.1 = max;
+                continue;
             }
             merged.push((min, max, targets));
         }
@@ -513,11 +515,11 @@ fn complement_codepoint_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
     // Merge overlapping ranges
     let mut merged: Vec<(u32, u32)> = Vec::new();
     for (lo, hi) in sorted {
-        if let Some(last) = merged.last_mut() {
-            if lo <= last.1 + 1 {
-                last.1 = last.1.max(hi);
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && lo <= last.1 + 1
+        {
+            last.1 = last.1.max(hi);
+            continue;
         }
         merged.push((lo, hi));
     }
@@ -637,9 +639,7 @@ fn add_utf8_byte_range(
         let s = fsm.add_state();
         fsm.add_char_edge(start, lo[depth], lo[depth], s);
         let mut hi_full = lo.to_vec();
-        for i in depth + 1..lo.len() {
-            hi_full[i] = 0xBF;
-        }
+        hi_full[depth + 1..].fill(0xBF);
         add_utf8_byte_range(fsm, lo, &hi_full, depth + 1, s, end);
     }
 
@@ -649,10 +649,8 @@ fn add_utf8_byte_range(
         fsm.add_char_edge(start, lo[depth] + 1, hi[depth] - 1, s);
         let mut lo_min = lo.to_vec();
         let mut hi_max = hi.to_vec();
-        for i in depth + 1..lo.len() {
-            lo_min[i] = 0x80;
-            hi_max[i] = 0xBF;
-        }
+        lo_min[depth + 1..].fill(0x80);
+        hi_max[depth + 1..].fill(0xBF);
         add_utf8_byte_range(fsm, &lo_min, &hi_max, depth + 1, s, end);
     }
 
@@ -661,9 +659,7 @@ fn add_utf8_byte_range(
         let s = fsm.add_state();
         fsm.add_char_edge(start, hi[depth], hi[depth], s);
         let mut lo_min = hi.to_vec();
-        for i in depth + 1..hi.len() {
-            lo_min[i] = 0x80;
-        }
+        lo_min[depth + 1..].fill(0x80);
         add_utf8_byte_range(fsm, &lo_min, hi, depth + 1, s, end);
     }
 }
@@ -840,6 +836,11 @@ fn build_expr_nfa_inlining(
 }
 
 /// Build an inlined repeat NFA: wire the rule body directly instead of RuleRef edges.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "grammar, graph, body, bounds and endpoints are each independent \
+              inputs to one wiring step; a struct would only rename them"
+)]
 fn build_inlined_repeat(
     grammar: &Grammar,
     fsm: &mut NfaGraph,

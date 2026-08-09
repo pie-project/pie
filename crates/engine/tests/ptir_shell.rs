@@ -28,8 +28,8 @@
 use driver_api::local::{
     PIE_DRIVER_ABI_VERSION, PIE_STATUS_OK, PieBytes, PieChannelEndpointBinding, PieCompletion,
     PieDriverCaps, PieDriverCreateDesc, PieFrameDesc, PieInstanceBinding, PieInstanceDesc,
-    PieModelLoadDesc, PieRuntimeCallbacks, PieStepDesc, PieTerminalCell,
-    PieTerminalCellPtrSlice, PieU32Slice, PieU64Slice,
+    PieModelLoadDesc, PieRuntimeCallbacks, PieStepDesc, PieTerminalCell, PieTerminalCellPtrSlice,
+    PieU32Slice, PieU64Slice,
 };
 use driver_api::plan::{ChannelRegistrationPlan, ProgramRegistration};
 use engine::driver::abi::{ChannelDescBorrow, ProgramDescBorrow};
@@ -104,7 +104,10 @@ fn driver_or_skip(
             ctx: std::ptr::null_mut(),
             notify: Some(bump),
         },
-        config_bytes: PieBytes { ptr: boot.as_ptr(), len: boot.len() },
+        config_bytes: PieBytes {
+            ptr: boot.as_ptr(),
+            len: boot.len(),
+        },
         ..Default::default()
     };
     let driver = driver_cuda::serve::pie_cuda_create(&desc, caps);
@@ -215,8 +218,12 @@ impl Endpoint {
         }
     }
     fn take(&self) -> Option<Vec<u8>> {
-        let (head, tail) =
-            unsafe { (self.words.add(0).read_volatile(), self.words.add(1).read_volatile()) };
+        let (head, tail) = unsafe {
+            (
+                self.words.add(0).read_volatile(),
+                self.words.add(1).read_volatile(),
+            )
+        };
         if head == tail {
             return None;
         }
@@ -265,31 +272,38 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
     // never runs. ──
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
     let mut load_caps = PieDriverCaps::default();
-    let status =
-        driver_cuda::serve::pie_cuda_load_model(driver, &load, &mut load_caps);
+    let status = driver_cuda::serve::pie_cuda_load_model(driver, &load, &mut load_caps);
     assert_eq!(status, PIE_STATUS_OK, "the snapshot loads");
 
     // ── Register the program. ──
     let program = registration(argmax_program());
     let borrow = ProgramDescBorrow::new(&program);
     let mut program_id = 0u64;
-    let status = driver_cuda::serve::pie_cuda_register_program(
-        driver,
-        borrow.as_raw(),
-        &mut program_id,
-    );
+    let status =
+        driver_cuda::serve::pie_cuda_register_program(driver, borrow.as_raw(), &mut program_id);
     assert_eq!(status, PIE_STATUS_OK, "the program registers");
 
     // ── Register its two channels, in the order the program indexes
     // them: 0 is what it takes, 1 is what it puts. ──
     let mut bindings = Vec::new();
     for (index, (shape, dtype, host_role)) in [
-        (vec![LANES], driver_api::local::PIE_CHANNEL_DTYPE_F32, driver_api::local::PIE_CHANNEL_HOST_ROLE_WRITER),
-        (vec![1u32], driver_api::local::PIE_CHANNEL_DTYPE_I32, driver_api::local::PIE_CHANNEL_HOST_ROLE_READER),
+        (
+            vec![LANES],
+            driver_api::local::PIE_CHANNEL_DTYPE_F32,
+            driver_api::local::PIE_CHANNEL_HOST_ROLE_WRITER,
+        ),
+        (
+            vec![1u32],
+            driver_api::local::PIE_CHANNEL_DTYPE_I32,
+            driver_api::local::PIE_CHANNEL_HOST_ROLE_READER,
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -312,11 +326,8 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
         };
         let borrow = ChannelDescBorrow::new(&plan);
         let mut binding = PieChannelEndpointBinding::default();
-        let status = driver_cuda::serve::pie_cuda_register_channel(
-            driver,
-            borrow.as_raw(),
-            &mut binding,
-        );
+        let status =
+            driver_cuda::serve::pie_cuda_register_channel(driver, borrow.as_raw(), &mut binding);
         assert_eq!(status, PIE_STATUS_OK, "channel {index} registers");
         bindings.push(binding);
     }
@@ -332,8 +343,7 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
         ..Default::default()
     };
     let mut instance = PieInstanceBinding::default();
-    let status =
-        driver_cuda::serve::pie_cuda_bind_instance(driver, &inst, &mut instance);
+    let status = driver_cuda::serve::pie_cuda_bind_instance(driver, &inst, &mut instance);
     assert_eq!(status, PIE_STATUS_OK, "the instance binds");
 
     // ── The engine's side: publish the seed the program will take. ──
@@ -341,7 +351,11 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
     let input = Endpoint::of(&bindings[0]);
     let output = Endpoint::of(&bindings[1]);
     let bytes: Vec<u8> = seed.iter().flat_map(|v| v.to_le_bytes()).collect();
-    assert_eq!(input.cell_bytes, bytes.len(), "the wire cell is the seed's width");
+    assert_eq!(
+        input.cell_bytes,
+        bytes.len(),
+        "the wire cell is the seed's width"
+    );
     input.publish(&bytes);
     assert!(output.take().is_none(), "nothing published before the fire");
 
@@ -351,7 +365,10 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
         reserved0: 0,
     };
     let cell_ptr: *mut PieTerminalCell = &mut cell;
-    let u32s = |v: &[u32]| PieU32Slice { ptr: v.as_ptr(), len: v.len() };
+    let u32s = |v: &[u32]| PieU32Slice {
+        ptr: v.as_ptr(),
+        len: v.len(),
+    };
     let (roster, sub_indptr, sub_class) = ([0u32], [0u32, 1], [0u32]);
     let (tokens, positions) = ([7u32], [0u32]);
     let (pages, page_indptr, last_lens, qo) = ([0u32], [0u32, 1], [1u32], [0u32, 1]);
@@ -359,7 +376,10 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
         roster_rows: u32s(&roster),
         sub_batch_indptr: u32s(&sub_indptr),
         sub_batch_class: u32s(&sub_class),
-        terminal_cells: PieTerminalCellPtrSlice { ptr: &cell_ptr, len: 1 },
+        terminal_cells: PieTerminalCellPtrSlice {
+            ptr: &cell_ptr,
+            len: 1,
+        },
         token_ids: u32s(&tokens),
         position_ids: u32s(&positions),
         kv_page_indices: u32s(&pages),
@@ -371,21 +391,29 @@ fn a_registered_program_reads_a_channel_and_publishes_its_answer() {
     let instance_ids: [u64; 1] = [instance.instance_id];
     let frame = PieFrameDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        instance_ids: PieU64Slice { ptr: instance_ids.as_ptr(), len: 1 },
+        instance_ids: PieU64Slice {
+            ptr: instance_ids.as_ptr(),
+            len: 1,
+        },
         required_kv_pages: 1,
         steps: driver_api::local::PieStepDescSlice { ptr: &step, len: 1 },
         ..Default::default()
     };
-    let completion =
-        PieCompletion { wait_id: 0x5E5, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
-    let status =
-        driver_cuda::serve::pie_cuda_launch(driver, &frame, completion);
+    let completion = PieCompletion {
+        wait_id: 0x5E5,
+        target_epoch: 1,
+        terminal_cell: std::ptr::null_mut(),
+    };
+    let status = driver_cuda::serve::pie_cuda_launch(driver, &frame, completion);
     assert_eq!(status, PIE_STATUS_OK, "the frame launches");
 
     // Run-ahead means the call returns with the fire still queued.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while FIRED.load(std::sync::atomic::Ordering::Acquire) == 0 {
-        assert!(std::time::Instant::now() < deadline, "the fire never completed");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fire never completed"
+        );
         std::thread::yield_now();
     }
 
@@ -429,7 +457,10 @@ fn every_request_in_a_frame_samples_its_own_row() {
 
     let snap_str = snap.to_string_lossy().into_owned();
     let load = PieModelLoadDesc {
-        snapshot_dir: PieBytes { ptr: snap_str.as_ptr(), len: snap_str.len() },
+        snapshot_dir: PieBytes {
+            ptr: snap_str.as_ptr(),
+            len: snap_str.len(),
+        },
         ..Default::default()
     };
     let mut load_caps = PieDriverCaps::default();
@@ -443,11 +474,7 @@ fn every_request_in_a_frame_samples_its_own_row() {
     let borrow = ProgramDescBorrow::new(&program);
     let mut program_id = 0u64;
     assert_eq!(
-        driver_cuda::serve::pie_cuda_register_program(
-            driver,
-            borrow.as_raw(),
-            &mut program_id
-        ),
+        driver_cuda::serve::pie_cuda_register_program(driver, borrow.as_raw(), &mut program_id),
         PIE_STATUS_OK,
         "the program registers"
     );
@@ -522,32 +549,48 @@ fn every_request_in_a_frame_samples_its_own_row() {
     }
 
     // DIFFERENT argmaxes, so publishing one answer to both readers fails.
-    let seeds: [[f32; LANES as usize]; 2] =
-        [[2.0, 7.0, 1.0, 3.0, 0.5, 4.0, -3.0, 6.0], [9.0, 1.0, 1.0, 3.0, 0.5, 4.0, -3.0, 6.0]];
+    let seeds: [[f32; LANES as usize]; 2] = [
+        [2.0, 7.0, 1.0, 3.0, 0.5, 4.0, -3.0, 6.0],
+        [9.0, 1.0, 1.0, 3.0, 0.5, 4.0, -3.0, 6.0],
+    ];
     let expected = [1i32, 0i32];
     for (req, (input, output)) in endpoints.iter().enumerate() {
         let bytes: Vec<u8> = seeds[req].iter().flat_map(|v| v.to_le_bytes()).collect();
         input.publish(&bytes);
-        assert!(output.take().is_none(), "request {req} has nothing before the fire");
+        assert!(
+            output.take().is_none(),
+            "request {req} has nothing before the fire"
+        );
     }
 
     // TWO decode tokens, one per request. `qo_indptr` is what says so,
     // and it is what the shell reads to find each request's logits row.
     let mut cells = [
-        PieTerminalCell { outcome: driver_api::local::PIE_TERMINAL_OUTCOME_PENDING, reserved0: 0 },
-        PieTerminalCell { outcome: driver_api::local::PIE_TERMINAL_OUTCOME_PENDING, reserved0: 0 },
+        PieTerminalCell {
+            outcome: driver_api::local::PIE_TERMINAL_OUTCOME_PENDING,
+            reserved0: 0,
+        },
+        PieTerminalCell {
+            outcome: driver_api::local::PIE_TERMINAL_OUTCOME_PENDING,
+            reserved0: 0,
+        },
     ];
     let cell_ptrs: [*mut PieTerminalCell; 2] = [&mut cells[0], &mut cells[1]];
-    let u32s = |v: &[u32]| PieU32Slice { ptr: v.as_ptr(), len: v.len() };
+    let u32s = |v: &[u32]| PieU32Slice {
+        ptr: v.as_ptr(),
+        len: v.len(),
+    };
     let (roster, sub_indptr, sub_class) = ([0u32, 1], [0u32, 2], [0u32]);
     let (tokens, positions) = ([7u32, 11], [0u32, 0]);
-    let (pages, page_indptr, last_lens, qo) =
-        ([0u32, 1], [0u32, 1, 2], [1u32, 1], [0u32, 1, 2]);
+    let (pages, page_indptr, last_lens, qo) = ([0u32, 1], [0u32, 1, 2], [1u32, 1], [0u32, 1, 2]);
     let step = PieStepDesc {
         roster_rows: u32s(&roster),
         sub_batch_indptr: u32s(&sub_indptr),
         sub_batch_class: u32s(&sub_class),
-        terminal_cells: PieTerminalCellPtrSlice { ptr: cell_ptrs.as_ptr(), len: 2 },
+        terminal_cells: PieTerminalCellPtrSlice {
+            ptr: cell_ptrs.as_ptr(),
+            len: 2,
+        },
         token_ids: u32s(&tokens),
         position_ids: u32s(&positions),
         kv_page_indices: u32s(&pages),
@@ -558,14 +601,20 @@ fn every_request_in_a_frame_samples_its_own_row() {
     };
     let frame = PieFrameDesc {
         abi_version: PIE_DRIVER_ABI_VERSION,
-        instance_ids: PieU64Slice { ptr: instances.as_ptr(), len: instances.len() },
+        instance_ids: PieU64Slice {
+            ptr: instances.as_ptr(),
+            len: instances.len(),
+        },
         required_kv_pages: 2,
         steps: driver_api::local::PieStepDescSlice { ptr: &step, len: 1 },
         ..Default::default()
     };
     let before = FIRED.load(std::sync::atomic::Ordering::Acquire);
-    let completion =
-        PieCompletion { wait_id: 0x5E6, target_epoch: 1, terminal_cell: std::ptr::null_mut() };
+    let completion = PieCompletion {
+        wait_id: 0x5E6,
+        target_epoch: 1,
+        terminal_cell: std::ptr::null_mut(),
+    };
     assert_eq!(
         driver_cuda::serve::pie_cuda_launch(driver, &frame, completion),
         PIE_STATUS_OK,
@@ -574,7 +623,10 @@ fn every_request_in_a_frame_samples_its_own_row() {
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while FIRED.load(std::sync::atomic::Ordering::Acquire) == before {
-        assert!(std::time::Instant::now() < deadline, "the fire never completed");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fire never completed"
+        );
         std::thread::yield_now();
     }
 

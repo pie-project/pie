@@ -40,7 +40,7 @@ impl RsLifecycle {
         if self.released.swap(true, Ordering::AcqRel) {
             return;
         }
-        let stores = crate::store::registry::get(self.model, self.driver as usize);
+        let stores = crate::store::registry::get(self.model, self.driver);
         let mut rs = stores.rs.lock().unwrap();
         let epoch = rs.current_epoch();
         rs.release_working_set(self.id, epoch);

@@ -118,6 +118,20 @@ const DECLARED_BUT_UNREAD: &[(&str, &[&str])] = &[
     ("kimi_k2", &["rope_yarn_original"]),
     // KDA's gate floor.
     ("kimi_k3", &["gate_lower_bound_milli"]),
+    // The verify hidden stash. This line is the one entry here that a
+    // DELETION put on the list rather than an unwritten pass: its only
+    // reader was `qwen_3_5/forward/emit.rs`, half of the static-C++
+    // emission that d91c85bf8 retired the bin and the check for while
+    // leaving the library behind. Its doc still says it is stated "like
+    // `state_bf16`", and that comparison no longer holds — `state_bf16`
+    // reaches the driver through the trace (`cuda::gdn_step_batched`
+    // takes it), while this one only ever reached the C++ through a
+    // generated `.inc`. Not deleted, because the CUDA driver's own
+    // `configure_verify_hidden_stash` exists and has no production caller
+    // either: both halves of the cross-check are waiting on the same
+    // in-flight Rust port, and the fact is a measurement of what the
+    // deployment does rather than a guess.
+    ("qwen_3_5", &["verify_stash"]),
 ];
 
 fn crate_src() -> PathBuf {

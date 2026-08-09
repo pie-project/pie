@@ -100,10 +100,10 @@ pub fn to_file_path(internal: &str) -> String {
     // rewritten by the `runtime` -> ... entry that does not apply to it.
     let mut best: Option<(&str, &str)> = None;
     for (file, inner) in MOVES {
-        if internal == *inner || internal.starts_with(&format!("{inner}.")) {
-            if best.is_none_or(|(_, b)| inner.len() > b.len()) {
-                best = Some((file, inner));
-            }
+        if (internal == *inner || internal.starts_with(&format!("{inner}.")))
+            && best.is_none_or(|(_, b)| inner.len() > b.len())
+        {
+            best = Some((file, inner));
         }
     }
     let moved = match best {
@@ -186,10 +186,10 @@ pub fn reshape(file: toml::Table) -> Result<toml::Table> {
 fn to_internal_path(file_path: &str) -> String {
     let mut best: Option<(&str, &str)> = None;
     for (file, inner) in MOVES {
-        if file_path == *file || file_path.starts_with(&format!("{file}.")) {
-            if best.is_none_or(|(b, _)| file.len() > b.len()) {
-                best = Some((file, inner));
-            }
+        if (file_path == *file || file_path.starts_with(&format!("{file}.")))
+            && best.is_none_or(|(b, _)| file.len() > b.len())
+        {
+            best = Some((file, inner));
         }
     }
     match best {
