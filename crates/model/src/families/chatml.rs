@@ -552,3 +552,48 @@ mod tests {
         }
     }
 }
+
+// ── The named templates ──────────────────────────────────────────────
+//
+// A catalog row NAMES its template instead of re-spelling a struct
+// literal, which is what `instruct::create`'s arms did — nine of them,
+// six identical. Naming them also puts the differences where they can
+// be read side by side: nemotron-h opens the assistant turn already
+// inside a `<think>`, and GLM adds two role markers to the stop set.
+
+/// Qwen 2.5 / 3 / 3.5 / 3-VL: thinking, tools, no forced prefix.
+pub const QWEN_CHATML: ChatMLConfig = ChatMLConfig {
+    has_thinking: true,
+    has_tools: true,
+    generation_suffix: "",
+    stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+};
+
+/// Nemotron-H: ChatML that OPENS the assistant turn inside a `<think>`.
+pub const NEMOTRON_CHATML: ChatMLConfig = ChatMLConfig {
+    has_thinking: true,
+    has_tools: false,
+    generation_suffix: "<think>\n",
+    stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+};
+
+/// GLM-5.1: ChatML whose stop set also holds the two role markers.
+pub const GLM_CHATML: ChatMLConfig = ChatMLConfig {
+    has_thinking: true,
+    has_tools: true,
+    generation_suffix: "",
+    stop_tokens: &["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>"],
+};
+
+/// Plain ChatML: no thinking, no tools.
+///
+/// This is the shape `instruct::create`'s `_ =>` arm handed to every
+/// architecture it had never heard of. It is still here because some
+/// rows genuinely are plain ChatML — but a ROW has to ask for it now,
+/// and a row that has not been written cannot ask.
+pub const PLAIN_CHATML: ChatMLConfig = ChatMLConfig {
+    has_thinking: false,
+    has_tools: false,
+    generation_suffix: "",
+    stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+};

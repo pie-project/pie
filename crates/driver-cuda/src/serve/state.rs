@@ -20,6 +20,14 @@ pub(crate) struct Shell {
     /// `[model] descriptor` from the boot TOML, for HF snapshots whose
     /// descriptor does not ride inside the checkpoint.
     pub(crate) boot_descriptor: Option<std::path::PathBuf>,
+    /// `[model] id` from the boot TOML: the operator's answer to "which
+    /// model is this", when they have one.
+    ///
+    /// `None` is the ordinary case and means "read the tensors". It is
+    /// an OVERRIDE and not a replacement for the check — a named row's
+    /// manifest is still matched, so this cannot be used to load a
+    /// checkpoint as something it is not.
+    pub(crate) boot_model_id: Option<String>,
     /// Does this driver hand its completions to a stream callback and
     /// return with the fire still queued? See `runahead_env`.
     pub(crate) runahead: bool,
@@ -77,6 +85,25 @@ pub(crate) struct Shell {
     /// reused. The shell's rather than the fire's because a stream
     /// callback may not free it — see `FireDebt::staging`.
     pub(crate) logits_staging: Option<crate::device::PinnedBuf>,
+    /// STAGING BUFFERS A WIDER FIRE REPLACED, held until nothing is in
+    /// flight.
+    ///
+    /// `PinnedBuf::drop` calls `cudaFreeHost` on the calling thread, and
+    /// it is NOT stream-ordered. Reusing one buffer across fires is safe
+    /// because everything rides one stream; REPLACING it is not — with
+    /// `RUNAHEAD_DEPTH = 2`, fire N's D2H is still queued into that exact
+    /// buffer when fire N+1 widens it, and fire N's `FireDebt::staging`
+    /// holds a `(ptr, len)` that `retire_fire` reads from a CUDA callback
+    /// thread.
+    ///
+    /// `FireDebt::staging`'s own doc says the debt "BORROWS that buffer;
+    /// it does not own it… The buffer is the shell's, reused every fire".
+    /// Reuse holds. Replacement is what it does not cover.
+    ///
+    /// Bounded without any policy: `buf.len()` is the pooled logits value's
+    /// length, which only ever grows, so this collects one entry per
+    /// widening and then stops.
+    pub(crate) retired_staging: Vec<crate::device::PinnedBuf>,
     /// Is this boot MEASURING rather than serving? `[driver]
     /// calibrate_planner`.
     ///
@@ -106,6 +133,20 @@ pub(crate) struct Shell {
     pub(crate) tp_size: u32,
     /// The loaded model, once `load_model` succeeds.
     pub(crate) model: Option<LoadedModel>,
+    /// WHICH LOAD this is, counting from one.
+    ///
+    /// The identity every cache keyed on a "model" actually needs.
+    /// `LoweringKey::model_id` and `BucketKey::model` were both the LAYER
+    /// COUNT — so a shell that loaded a second 32-layer checkpoint would
+    /// hit the first one's lowering and replay the first one's captured
+    /// graph, whose baked addresses point into an arena the first
+    /// `LoadedModel` freed on being replaced.
+    ///
+    /// A counter rather than a path hash because the question is not
+    /// "which checkpoint" but "which residency": reloading the SAME
+    /// checkpoint frees and reallocates just as thoroughly, so the same
+    /// path must not answer the same id.
+    pub(crate) load_generation: u64,
     /// Registered programs by id — the C3 hash is the dedup key, so
     /// re-registering a program answers the id it already has.
     pub(crate) programs: std::collections::BTreeMap<u64, ProgramEntry>,
@@ -244,6 +285,20 @@ pub(crate) struct FireScratch {
     /// geometry; single-kind families never plan it.
     pub(crate) decode_plan_full: crate::bind::DecodePlan,
     pub(crate) prefill_plan: crate::bind::PrefillPlan,
+    /// A peel TAIL's decode plan, and its own workspace.
+    ///
+    /// Its own for the reason `prefill_ws` is its own: a FlashInfer plan
+    /// writes its schedule into the workspace it was raised against, so a
+    /// tail planned into the fire's would clobber the plan the PREFIX is
+    /// about to use — and a peel launches both regions.
+    ///
+    /// `Launch::peel`'s doc says a prepared plan "is found by the
+    /// rectangle's ROW COUNT". A tail serves `[split, N)`, which is a
+    /// different request count and therefore a different schedule.
+    pub(crate) tail_plan: crate::bind::DecodePlan,
+    pub(crate) tail_ws: crate::fire::attention_workspace::AttentionWorkspace<
+        cudarc::runtime::sys::cudaEvent_t,
+    >,
 }
 
 /// The pinned swap pool: `layers × [pages × page_bytes]` per plane.
@@ -1022,7 +1077,14 @@ pub(crate) struct InstanceEntry {
 /// and (for the llama-like family) the fused trace name the executor asks
 /// by.
 pub(crate) struct LoadedModel {
-    pub(crate) hf: model::config::schema::HfConfig,
+    /// The catalog row this checkpoint matched, by id.
+    ///
+    /// `&'static str` because it is borrowed from the `const` table, not
+    /// parsed from anything. This is what leaves the driver in
+    /// `DriverCapabilities::model_id` and reaches the host's chat
+    /// template — the same row, named once, rather than a `model_type`
+    /// string re-interpreted by a second table on the far side.
+    pub(crate) id: &'static str,
     /// What this checkpoint IS, derived ONCE at load.
     ///
     /// It used to be a `Box<dyn PlannedFamily>` built from the
@@ -1064,20 +1126,6 @@ pub(crate) struct LoadedModel {
 }
 
 impl LoadedModel {
-    /// The borrowed view a family derivation reads.
-    ///
-    /// Five references, built per call. It exists so that `model::deployment_cuda`
-    /// names what it reads instead of taking this whole struct — the arena
-    /// and the device buffers below are not facts about a model's shape.
-    pub(crate) fn checkpoint(&self) -> model::deployment_cuda::Checkpoint<'_> {
-        model::deployment_cuda::Checkpoint {
-            hf: &self.hf,
-            tensors: self,
-            gemma_layer_scalars: &self.gemma_layer_scalars,
-            tp_size: self.tp_size,
-        }
-    }
-
     /// The device pointer for a name — the live half of the executor's
     /// `Resolver::weight`. Checkpoint names, fused names and aliases all
     /// answer. `launch` is its caller; until that arm lands it is only
@@ -1089,20 +1137,6 @@ impl LoadedModel {
         }
         let target = self.aliases.get(name)?;
         self.weights.get(target).map(|b| b.ptr.cast_const())
-    }
-}
-
-/// The two load-time answers a family derivation asks for.
-///
-/// Both are plain map reads; they are a trait because `model::deployment_cuda` must
-/// not name `crate::loader`'s types — see that module's doc for why.
-impl model::deployment_cuda::Tensors for LoadedModel {
-    fn bytes(&self, name: &str) -> Option<usize> {
-        self.weights.get(name).map(|w| w.bytes)
-    }
-
-    fn alias(&self, trace: &str) -> Option<&str> {
-        self.aliases.get(trace).map(String::as_str)
     }
 }
 

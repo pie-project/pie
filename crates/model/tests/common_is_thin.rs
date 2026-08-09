@@ -100,29 +100,26 @@ const SHARED: &[&str] = &[
     // `boot.rs` is the load path both drivers walk. It belongs here for the
     // same reason `deployment.rs` does: a driver calls it, so a family name
     // reachable from it is a family name reachable from a driver. It asks
-    // `contract.rs` — which IS a family table — but asking a registry is
-    // not knowing its rows, and that distinction is what this list checks.
+    // `catalog.rs` — which IS the registry — but asking a registry is not
+    // knowing its rows, and that distinction is what this list checks.
     "boot.rs",
+    // `contract.rs` used to be a REGISTRY of its own: `model_type` ->
+    // author, thirty-odd family rows. It is ten lines over a
+    // `&dyn Variant` now, so it holds no family names at all — which is
+    // why it moved from the exceptions below to the perimeter here.
+    "contract.rs",
 ];
 /// Root files that name families ON PURPOSE, with the reason each does.
 const NOT_SHARED: &[(&str, &str)] = &[
     ("lib.rs", "the crate doc, which names the generations it declares"),
     (
-        "deployment_cuda.rs",
-        "THE DISPATCH ITSELF: 33 `model_type` rows and eleven derivations, \
-         moved out of `driver-cuda` so the question is asked in the crate \
-         that is allowed to ask it. Somebody has to switch on `model_type`; \
-         §4's rule is only that a DRIVER must not. What it produces is \
-         `deployment.rs`'s value, which names no family — so the branch \
-         stops here",
+        "catalog.rs",
+        "THE REGISTRY, and the only one. It names every generation because \
+         `GENERATIONS` is the flattening of their tables — that is a list \
+         of MODULES rather than a switch on a string, which is the whole \
+         difference between this and the three `model_type` tables it \
+         replaced",
     ),
-    (
-        "descriptor.rs",
-        "the `pie.model/1` READER. Its whole job is to recognise which \
-         family a descriptor describes, which is the question this crate \
-         exists to answer once",
-    ),
-    ("contract.rs", "a REGISTRY: model_type -> author is a table of family rows"),
     ("multimodal.rs", "family-aware by design -- it dispatches on a VisionArch"),
     (
         "ffi.rs",

@@ -36,19 +36,22 @@
 //! > ungated beside gated siblings and reach across. One gated subtree makes
 //! > that unrepresentable rather than merely discouraged.
 //!
-//! So there are two properties, and the first is what makes the second
+//! So there are three properties, and the first is what makes the rest
 //! cheap:
 //!
-//! 1. **Exactly one module declaration in `src/` carries the gate**, and it
-//!    is [`SHELL`]. An earlier draft of this file had to collect every gated
-//!    module NAME and look for each one, because there were five gates and a
-//!    reference could name any of them. With one, a crossing has exactly one
-//!    spelling.
-//! 2. **No ungated file names that spelling.** One string, not a set.
-//!
-//! Losing assertion 1 makes assertion 2 pass vacuously — a second gate
-//! elsewhere is a boundary this test cannot see — which is why it is an
-//! assertion rather than a comment.
+//! 1. **The gate sits on exactly the modules that need a device**, and the
+//!    set is [`ROOMS`]. An earlier draft asserted the gate sat on exactly
+//!    ONE declaration — the `gpu` module, whose only job was to carry it for
+//!    seven children — because with one gate a crossing has one spelling.
+//!    That module is gone, and the equality is now against a set. What made
+//!    the earlier draft's warning true was not the *count* but staleness: a
+//!    hardcoded set drifts. This asserts the gated set READ from the source
+//!    equals [`ROOMS`], in both directions, so it cannot drift silently.
+//! 2. **Every module is classified**: in [`ROOMS`] or in [`PORTABLE`], never
+//!    neither. This is the only one of the three the portable BUILD cannot
+//!    report, and the only one the old nesting did not cover either.
+//! 3. **No ungated file names a gated room.** One spelling per room, and
+//!    property 1 is what guarantees the list of spellings is complete.
 //!
 //! # Why a scan when the build already answers this
 //!
@@ -157,9 +160,43 @@ fn walk(src: &Path) -> Vec<(PathBuf, bool)> {
 /// sides -- so this scan is the cheap check and the BUILD is the real one.
 const GATE: &str = r#"cfg(feature = "metal-4")"#;
 
-/// The one gated module. Everything Apple-only is under it, and a portable
-/// file that reaches across names it.
-const SHELL: &str = "gpu";
+/// The gated rooms. Everything Apple-only is one of these or under one, and
+/// a portable file that reaches across names one of them.
+///
+/// This was a single `SHELL = "gpu"` while the seven sat under a module
+/// whose only job was to carry one `#[cfg]` for all of them. That module is
+/// gone -- it charged a path segment on every reference in a crate that is
+/// already a Metal driver, where `gpu::device::allocator` says GPU twice and
+/// means it once -- so the claim is now a set. This file's own header
+/// described that as the earlier, worse draft. It was worse for a reason
+/// that no longer applies: the set was *hardcoded* then, so it went stale
+/// silently. The set of gated names is now READ from the source by
+/// [`walk`], and this list is what it must equal -- a disagreement in either
+/// direction is a failure, so the check cannot pass vacuously.
+const ROOMS: &[&str] = &[
+    "bind", "device", "fire", "pools", "program", "serve", "weights",
+];
+
+/// The modules that answer questions no GPU changes.
+///
+/// Named, rather than derived as "everything not in [`ROOMS`]", because the
+/// interesting failure is a module in NEITHER list: a new device module
+/// placed at `src/` beside `layout` and `lowering` -- which is where someone
+/// unfamiliar with the split would put it -- that talks to `objc2` directly
+/// and to no gated sibling. Measured: that compiles clean in the portable
+/// build, because `objc2` is an unconditional dependency of this crate, and
+/// it breaks on Linux. It is also the one case the old nested layout did not
+/// cover either, since a subtree can only protect files placed inside it.
+/// `facts` was here and is DELETED, which is the entry worth a sentence. It
+/// was portable and it passed this audit every time, because "does this need
+/// a device" and "does this belong in a driver at all" are different
+/// questions and only the first was being asked here. It was a second
+/// definition of every model in the workspace -- a `pie.model/1` descriptor
+/// parsed into a private facts struct, plus an enum of family names -- and it
+/// needed no GPU to be wrong.
+const PORTABLE: &[&str] = &[
+    "batch", "channel", "error", "layout", "loader", "lowering", "model",
+];
 
 /// Does `line` name the module path `spelling`, as a whole path segment?
 ///
@@ -201,17 +238,56 @@ fn no_portable_module_names_the_apple_only_half() {
 
     assert_eq!(
         gates,
-        vec![SHELL.to_string()],
-        "the Apple gate must sit on exactly one module declaration, `{SHELL}`. \
-         Found {} instead. `.wiki/driver/real-metal-north-star.md` §6: four \
-         gates inside one module is how `tables` and `resolve` came to sit \
-         ungated beside gated siblings and reach across. A second gate also \
-         makes the reference check below pass vacuously, because a crossing \
-         into it has a spelling this test does not look for.",
-        gates.len()
+        ROOMS.iter().map(|r| (*r).to_string()).collect::<Vec<_>>(),
+        "the Apple gate must sit on exactly the rooms that need a device, \
+         {ROOMS:?}. The source says {gates:?}.\n\nA room missing the gate is \
+         compiled on a machine with no Metal; a name here that the source \
+         does not gate is this list gone stale. `.wiki/driver/\
+         real-metal-north-star.md` §6 asked for one gated subtree so that a \
+         crossing had exactly one spelling -- the subtree is gone and the \
+         spelling is a set, so this equality is what stops the reference \
+         check below from passing vacuously."
     );
 
-    // With one gated subtree, a crossing has exactly one spelling.
+    // Every declared module is in one list or the other. A module in neither
+    // is one nothing checks: it is not required to be gated, and it is not
+    // required to stay portable. That is the one hole the nested layout had
+    // too, and the only one the portable BUILD cannot see -- a self-contained
+    // device module that names no gated sibling compiles clean on a Mac.
+    let roots: Vec<String> = std::fs::read_to_string(src.join("lib.rs"))
+        .expect("lib.rs is beside this test")
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| {
+            l.strip_prefix("pub mod ")
+                .or_else(|| l.strip_prefix("mod "))
+                .and_then(|r| r.strip_suffix(';'))
+                .map(str::to_string)
+        })
+        .collect();
+    let unclassified: Vec<&String> = roots
+        .iter()
+        .filter(|n| !ROOMS.contains(&n.as_str()) && !PORTABLE.contains(&n.as_str()))
+        .collect();
+    assert!(
+        unclassified.is_empty(),
+        "`lib.rs` declares {unclassified:?}, which is in neither ROOMS nor \
+         PORTABLE.\n\nSay which it is. The cut is *does answering this need a \
+         device*, not *is this about the GPU*: `layout::tuning` is entirely \
+         about the GPU and is above the line, because its inputs are two \
+         integers. An unclassified module is the one failure the portable \
+         build cannot report -- if it needs a device and names no gated \
+         sibling, it compiles on this Mac and breaks on Linux."
+    );
+    assert!(
+        roots.len() >= ROOMS.len() + PORTABLE.len(),
+        "read {} root declarations from lib.rs and expected at least {} -- \
+         the scan is not reading lib.rs, and a scan that reads nothing passes",
+        roots.len(),
+        ROOMS.len() + PORTABLE.len()
+    );
+
+    // With the gated set known, a crossing has one spelling per room.
     let mut offences = Vec::new();
     for (file, apple) in &modules {
         if *apple {
@@ -234,7 +310,10 @@ fn no_portable_module_names_the_apple_only_half() {
             if n > 0 && lines[n - 1].contains(GATE) {
                 continue;
             }
-            for spelling in [format!("crate::{SHELL}"), format!("super::{SHELL}")] {
+            for spelling in ROOMS
+                .iter()
+                .flat_map(|r| [format!("crate::{r}"), format!("super::{r}")])
+            {
                 if names_module(line, &spelling) {
                     offences.push(format!("{shown}:{}: {line}", n + 1));
                 }
@@ -247,7 +326,7 @@ fn no_portable_module_names_the_apple_only_half() {
     assert!(
         offences.is_empty(),
         "these files are declared WITHOUT `#[cfg(target_vendor = \"apple\")]` \
-         and name `crate::{SHELL}`, which only exists WITH it, so the crate \
+         and name one of {ROOMS:?}, which only exist WITH it, so the crate \
          does not compile off-Apple and no job in the tree would say so:\n\n  \
          {}\n\nThe portable half is the half that can be tested without a GPU \
          (`src/lib.rs`), and rule 2 of `.wiki/driver/north-star.md` is that \

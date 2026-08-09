@@ -89,6 +89,17 @@ impl Error {
         Self::Invalid { call, reason: reason.into() }
     }
 
+    /// A refusal that names the operation and the reason, for the shape
+    /// that was written by hand 26 times: an `eprintln!` with a message
+    /// and a bare status beside it.
+    ///
+    /// Both halves in one value, so the message cannot go out without
+    /// the status or the status without the message — which is the whole
+    /// of §3.4. `call` is the operation a reader would grep for.
+    pub fn unsupported(call: &str, reason: impl std::fmt::Display) -> Self {
+        Self::Unsupported { what: format!("{call}: {reason}") }
+    }
+
     /// An allocation that could not be made, carrying its size.
     #[must_use]
     pub const fn exhausted(what: &'static str, want: usize) -> Self {
@@ -223,6 +234,36 @@ impl From<Error> for i32 {
 
 /// The staging seam's failures, which are CUDA's under another name.
 ///
+/// The LOADER's failures, which are a different crate's vocabulary and
+/// map cleanly onto this one.
+///
+/// Written because `load_impl` was matching on nothing and returning
+/// `PIE_STATUS_EXHAUSTED` for every staging failure — so a missing
+/// tensor and a full arena reported the same thing, and the message that
+/// said which went to stderr on the other channel.
+///
+/// The mapping is the loader's own distinction kept: a bad CONTRACT or a
+/// bad CHECKPOINT is something the caller declared or shipped, which is
+/// `Invalid`; `Unsupported` is a plan this target has no instruction
+/// for; `Overflow` and `Internal` are this crate's bug, which is
+/// `Invalid` with the reason attached rather than a status that invites
+/// a retry.
+#[cfg(feature = "abi")]
+impl From<model_loader::error::Error> for Error {
+    fn from(e: model_loader::error::Error) -> Self {
+        use model_loader::error::Error as L;
+        match &e {
+            L::Unsupported(_) => Self::Unsupported { what: e.to_string() },
+            L::Contract(_) | L::Shard(_) | L::Checkpoint(_) => {
+                Self::Invalid { call: "load", reason: e.to_string() }
+            }
+            L::Overflow(_) | L::Internal(_) => {
+                Self::Invalid { call: "load", reason: e.to_string() }
+            }
+        }
+    }
+}
+
 /// A `From` rather than a rewrite of `StagingError`: that type is what
 /// the workspace's ops trait returns and it is right for that layer.
 /// What was wrong was every CALLER translating it to a bare status by
@@ -289,7 +330,7 @@ impl From<model::deployment::Refusal> for Error {
         match e {
             // A SHAPE, not a bad argument. The engine did nothing
             // wrong; this driver has no path for the checkpoint.
-            model::deployment::Refusal::Unsupported => {
+            model::deployment::Refusal::Unsupported(_) => {
                 Self::Unsupported { what: e.to_string() }
             }
             model::deployment::Refusal::Malformed(_) => {

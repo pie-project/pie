@@ -2,7 +2,7 @@
 //! overrides that measured them.
 //!
 //! Portable on purpose. The only Apple-specific part of tuning is asking the
-//! device what it is (`crate::DeviceInfo`); everything downstream of
+//! device what it is (`crate::device::DeviceInfo`); everything downstream of
 //! that answer is arithmetic over two integers, so it lives here where it can
 //! be tested on any host. The C++ shell splits the same way, for the same
 //! reason -- `device_tuning_apple.mm` asks and `device_tuning.cpp` decides.

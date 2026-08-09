@@ -208,7 +208,7 @@ fn families() -> Vec<(&'static str, FireClass, ForwardPlan)> {
     out.push((
         "glm5",
         d,
-        glm5::forward::glm5_cuda(&glm5::forward::facts::Glm5Facts::glm5_106b_a12b(), d),
+        glm_5::forward::glm5_cuda(&glm_5::forward::facts::Glm5Facts::glm5_106b_a12b(), d),
     ));
     out.push((
         "kimi_k2",
@@ -240,7 +240,7 @@ fn families() -> Vec<(&'static str, FireClass, ForwardPlan)> {
     out.push((
         "gemma3n",
         d,
-        gemma3n::forward::gemma3n_cuda(&gemma3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(), d),
+        gemma_3n::forward::gemma3n_cuda(&gemma_3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(), d),
     ));
     out.push((
         "gemma_2",

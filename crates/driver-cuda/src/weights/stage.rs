@@ -127,12 +127,21 @@ pub fn stage_plan_weights(
             let offset = usize::try_from(span.offset).unwrap_or(usize::MAX);
             spans.insert(
                 name.clone(),
-                WeightSpan {
-                    // SAFETY: the offset is the plan's own and the arena was
-                    // sized from `persistent_bytes`, which the executor already
-                    // refused to exceed.
-                    ptr: unsafe { base.byte_add(offset) },
-                    bytes: usize::try_from(span.bytes).unwrap_or(0),
+                {
+                    let bytes = usize::try_from(span.bytes).unwrap_or(0);
+                    // CHECKED, not argued. The SAFETY comment here read
+                    // "the offset is the plan's own and the arena was
+                    // sized from `persistent_bytes`, which the executor
+                    // already refused to exceed" — true, and unavailable
+                    // to the compiler. The buffer knows its own length.
+                    let ptr = buf.ptr_at(offset, bytes).ok_or_else(|| {
+                        Error::Internal(format!(
+                            "{name}: span {offset}..{} leaves an arena of \
+                             {arena_len}",
+                            offset + bytes
+                        ))
+                    })?;
+                    WeightSpan { ptr, bytes }
                 },
             );
         }
@@ -171,20 +180,11 @@ fn cuda(e: crate::Error) -> Error {
 pub fn read_span(span: WeightSpan) -> Result<Vec<u8>, Error> {
     let mut out = vec![0u8; span.bytes];
     let stream = OwnedStream::new(0).map_err(cuda)?;
-    // SAFETY: `span` names a live device allocation of `bytes` bytes, and the
-    // destination is a host `Vec` of the same length.
-    let status = unsafe {
-        cudarc::runtime::sys::cudaMemcpyAsync(
-            out.as_mut_ptr().cast(),
-            span.ptr,
-            span.bytes,
-            cudarc::runtime::sys::cudaMemcpyKind::cudaMemcpyDeviceToHost,
-            stream.as_ref().as_raw(),
-        )
-    };
-    if status != cudarc::runtime::sys::cudaError::cudaSuccess {
-        return Err(Error::Contract(format!("read_span: {status:?}")));
-    }
+    // SAFETY: `span` names a live device allocation of `bytes` bytes —
+    // `stage_plan_weights` bounds-checked it against the arena — and
+    // `stream` outlives the copy.
+    unsafe { crate::device::read_raw_span(span.ptr, &mut out, stream.as_ref()) }
+        .map_err(cuda)?;
     stream.as_ref().synchronize().map_err(cuda)?;
     Ok(out)
 }

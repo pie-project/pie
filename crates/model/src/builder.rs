@@ -13,10 +13,11 @@
 //! incidental: a pass that fuses q/k/v into one buffer has to claim those
 //! tensors before the generic tail publishes them separately.
 //!
-//! What the C++ builder read from three places arrives as three arguments:
-//! the checkpoint's own tensor table, the [`ModelFacts`] the caller parsed,
-//! and the [`StorageTarget`] + [`Policy`] pair — the device's measurements
-//! and the caller's decisions, exactly the split
+//! What the C++ builder read from three places arrives as four arguments:
+//! the checkpoint's own tensor table, the [`LoadShape`](crate::catalog::LoadShape)
+//! and [`Encoding`](crate::encoding::Encoding) that replaced the parsed
+//! `ModelFacts`, and the [`StorageTarget`] + [`Policy`] pair — the device's
+//! measurements and the caller's decisions, exactly the split
 //! [`policy`](crate::policy) argues for.
 
 use std::collections::{HashMap, HashSet};
@@ -32,8 +33,7 @@ use model_loader::types::{
     TensorId, Visibility,
 };
 
-use super::facts::ModelFacts;
-use super::policy::{Component, Mxfp4MoePolicy, Mxfp4MoeRequest, Policy, RuntimeQuant};
+use super::policy::{Component, Mxfp4MoePolicy, Mxfp4MoeRequest, Naming, Policy, RuntimeQuant};
 use super::probe;
 
 /// Authoring failures are contract errors: the family's model of the
@@ -125,7 +125,15 @@ pub struct FusedCandidate<'a> {
 
 /// Accumulates one family's declarations against one checkpoint.
 pub struct Builder<'a> {
-    facts: &'a ModelFacts,
+    /// Which model this is, so an error can NAME it.
+    ///
+    /// A row's id, not a `model_type`. The difference matters at the
+    /// two `fail()` sites below: `model_type='qwen3'` named a
+    /// DISPATCH KEY that a dozen checkpoints shared, and `qwen3-30b-a3b`
+    /// names the model whose contract actually failed to author.
+    id: &'static str,
+    shape: crate::catalog::LoadShape,
+    encoding: &'a crate::encoding::Encoding,
     target: &'a StorageTarget,
     policy: &'a Policy,
     mxfp4_moe: Mxfp4MoePolicy,
@@ -146,9 +154,21 @@ pub struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
+    /// A builder for one row against one checkpoint.
+    ///
+    /// It used to take a `&ModelFacts` — eleven fields parsed out of a
+    /// `config.json`, of which the authors read five. The five are
+    /// [`LoadShape`](crate::catalog::LoadShape), which comes from the
+    /// ROW and therefore cannot disagree with what the same row deploys
+    /// and traces; the three quantization fields are
+    /// [`Encoding`](crate::encoding::Encoding), which comes from the
+    /// FILE because that is what an encoding is a property of; and the
+    /// other three are gone with the dispatch they keyed.
     pub fn new(
         metadata: &'a CheckpointMetadata,
-        facts: &'a ModelFacts,
+        id: &'static str,
+        shape: crate::catalog::LoadShape,
+        encoding: &'a crate::encoding::Encoding,
         target: &'a StorageTarget,
         policy: &'a Policy,
     ) -> Self {
@@ -161,7 +181,9 @@ impl<'a> Builder<'a> {
             by_name.insert(raw.name.as_str(), *raw);
         }
         Self {
-            facts,
+            id,
+            shape,
+            encoding,
             target,
             policy,
             mxfp4_moe: resolve_mxfp4_moe(policy.moe_request, target.native_mxfp4_moe),
@@ -187,8 +209,38 @@ impl<'a> Builder<'a> {
 
     // -- what the family is authoring against --------------------------------
 
-    pub fn facts(&self) -> &ModelFacts {
-        self.facts
+    /// The row's id, for a refusal that names a MODEL.
+    #[must_use]
+    pub fn id(&self) -> &'static str {
+        self.id
+    }
+
+    /// The six shape facts no tensor extent carries.
+    #[must_use]
+    pub fn shape(&self) -> crate::catalog::LoadShape {
+        self.shape
+    }
+
+    /// What the checkpoint's files declare about how they are stored.
+    #[must_use]
+    pub fn encoding(&self) -> &crate::encoding::Encoding {
+        self.encoding
+    }
+
+    /// Which tensor names the driver asking for this contract binds.
+    ///
+    /// A ROW reads this, which is the one place the catalog is not a
+    /// pure function of the model: the same Qwen3 authors differently
+    /// for a driver that binds HuggingFace names and one that binds
+    /// MLX's. That used to be two TABLES (`HF_ROWS` and `MLX_ROWS`,
+    /// keyed on the same strings, seventeen rows of the second
+    /// duplicating a subset of the thirty-five of the first), and two
+    /// tables is how a model gets an HF author and no MLX one and
+    /// nobody notices until a Metal boot. One row, one `match`, and the
+    /// arms are exhaustive because `Naming` is an enum.
+    #[must_use]
+    pub fn naming(&self) -> Naming {
+        self.policy.naming
     }
 
     pub fn target(&self) -> &StorageTarget {
@@ -454,7 +506,7 @@ impl<'a> Builder<'a> {
         shape: &[i64],
         axis: Option<u8>,
     ) -> Result<(), Error> {
-        let d = i64::from(self.facts.head_dim);
+        let d = i64::from(self.shape.head_dim);
         let world = i64::from(self.target.tp_size);
         if axis != Some(0) || world <= 1 || d <= 0 || shape.is_empty() {
             return Ok(());
@@ -662,7 +714,7 @@ impl<'a> Builder<'a> {
         let mut gate_up = Vec::new();
         let mut qkv_bytes = 0u64;
         let mut gate_up_bytes = 0u64;
-        let mut modules: Vec<String> = (0..self.facts.num_hidden_layers)
+        let mut modules: Vec<String> = (0..self.shape.layers)
             .map(|layer| format!("{}{layer}.", self.decoder_layer_prefix))
             .collect();
         modules.extend(self.extra_join_modules.iter().cloned());
@@ -937,15 +989,15 @@ impl<'a> Builder<'a> {
     pub fn finish(self) -> Result<ModelContract, Error> {
         if self.policy.component == Component::Encode && !self.encode_scope_allowed {
             return fail(format!(
-                "encode-scoped loading is not supported for model_type='{}'",
-                self.facts.model_type
+                "encode-scoped loading is not supported for '{}'",
+                self.id
             ));
         }
         if self.contract.tensors.is_empty() && self.contract.groups.is_empty() {
             return fail(format!(
-                "no contract was authored for model_type='{}'; the driver must \
+                "no contract was authored for '{}'; the driver must \
                  declare what it binds",
-                self.facts.model_type
+                self.id
             ));
         }
         Ok(self.contract)
@@ -975,7 +1027,7 @@ impl<'a> Builder<'a> {
         // For FP4 a pre-quantized checkpoint is accepted (GLM-5.1 ships FP8
         // experts). For FP8/INT8 only BF16 weights are re-quantized, never an
         // already-quantized checkpoint.
-        if !self.facts.quant_method.is_empty() && scheme != QuantScheme::Mxfp4E2M1E8M0 {
+        if !self.encoding.is_none() && scheme != QuantScheme::Mxfp4E2M1E8M0 {
             return Ok(None);
         }
         let allowed = if scheme == QuantScheme::Mxfp4E2M1E8M0 {
@@ -985,8 +1037,8 @@ impl<'a> Builder<'a> {
         };
         if !allowed {
             return fail(format!(
-                "runtime_quant={:?} is not supported for model_type='{}'",
-                self.policy.runtime_quant, self.facts.model_type
+                "runtime_quant={:?} is not supported for '{}'",
+                self.policy.runtime_quant, self.id
             ));
         }
         Ok(Some(scheme))
@@ -1097,4 +1149,161 @@ pub fn align_up(value: i64, alignment: i64) -> Result<i64, Error> {
         return fail("contract: align_up needs a non-negative value and a positive alignment");
     }
     Ok((value + alignment - 1) / alignment * alignment)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::LoadShape;
+    use crate::encoding::Encoding as StoredEncoding;
+
+    /// A checkpoint with no tensors at all.
+    ///
+    /// Enough for everything below: these test what the builder was
+    /// TOLD, and the tensor table is what the family authors read, not
+    /// what `new` decides from.
+    fn empty_checkpoint() -> CheckpointMetadata {
+        CheckpointMetadata { files: Vec::new(), tensors: Vec::new() }
+    }
+
+    fn target() -> StorageTarget {
+        StorageTarget { preferred_alignment: 256, ..StorageTarget::default() }
+    }
+
+    #[test]
+    fn a_builder_carries_the_row_that_asked_for_it() {
+        let meta = empty_checkpoint();
+        let target = target();
+        let policy = Policy::default();
+        let enc = StoredEncoding::dense();
+        let shape = LoadShape::dense(28, 128, true);
+        let b = Builder::new(&meta, "qwen3-0.6b", shape, &enc, &target, &policy);
+
+        // The id is a MODEL, not a dispatch key: the two `fail()` sites
+        // in this file name it, and `model_type='qwen3'` named a string
+        // a dozen checkpoints shared.
+        assert_eq!(b.id(), "qwen3-0.6b");
+        assert_eq!(b.shape(), shape);
+        assert_eq!(b.shape().layers, 28);
+        assert!(b.shape().tied_embeddings);
+        assert!(b.encoding().is_none(), "an unquantized checkpoint");
+        assert_eq!(b.target().preferred_alignment, 256);
+    }
+
+    /// The `HF_ROWS` / `MLX_ROWS` split, as a `match` a row makes.
+    #[test]
+    fn the_naming_reaches_the_row_that_has_to_branch_on_it() {
+        let meta = empty_checkpoint();
+        let target = target();
+        let enc = StoredEncoding::dense();
+        let shape = LoadShape::dense(28, 128, true);
+
+        for naming in [Naming::Hf, Naming::Mlx] {
+            let policy = Policy { naming, ..Policy::default() };
+            let b = Builder::new(&meta, "qwen3-0.6b", shape, &enc, &target, &policy);
+            assert_eq!(b.naming(), naming);
+        }
+    }
+
+    /// The contract starts aligned to the target, and never to zero —
+    /// an alignment of zero is a division a later stage does not guard.
+    #[test]
+    fn the_contract_opens_at_the_targets_alignment() {
+        let meta = empty_checkpoint();
+        let policy = Policy::default();
+        let enc = StoredEncoding::dense();
+        let shape = LoadShape::dense(1, 64, false);
+
+        let t = StorageTarget { preferred_alignment: 512, ..StorageTarget::default() };
+        let b = Builder::new(&meta, "x", shape, &enc, &t, &policy);
+        assert_eq!(b.contract.alignment, 512);
+
+        let t = StorageTarget { preferred_alignment: 0, ..StorageTarget::default() };
+        let b = Builder::new(&meta, "x", shape, &enc, &t, &policy);
+        assert_eq!(b.contract.alignment, 1, "zero would divide by zero later");
+    }
+
+    /// `Auto` is the ABSENCE of a policy, so the device answers it; the
+    /// three stated requests are carried through unchanged.
+    #[test]
+    fn auto_is_answered_by_the_device_and_the_rest_are_obeyed() {
+        assert_eq!(
+            resolve_mxfp4_moe(Mxfp4MoeRequest::Auto, true),
+            Mxfp4MoePolicy::NativeGemm
+        );
+        assert_eq!(
+            resolve_mxfp4_moe(Mxfp4MoeRequest::Auto, false),
+            Mxfp4MoePolicy::RoutedDecode
+        );
+        for native in [false, true] {
+            assert_eq!(
+                resolve_mxfp4_moe(Mxfp4MoeRequest::NativeGemm, native),
+                Mxfp4MoePolicy::NativeGemm,
+                "a stated request is not the device's to reconsider"
+            );
+            assert_eq!(
+                resolve_mxfp4_moe(Mxfp4MoeRequest::RoutedDecode, native),
+                Mxfp4MoePolicy::RoutedDecode
+            );
+            assert_eq!(
+                resolve_mxfp4_moe(Mxfp4MoeRequest::EagerBf16, native),
+                Mxfp4MoePolicy::EagerBf16
+            );
+        }
+    }
+
+    /// And the builder resolves it once, at construction, so a family
+    /// that asks twice gets the same answer.
+    #[test]
+    fn the_moe_resolution_happens_once_at_construction() {
+        let meta = empty_checkpoint();
+        let enc = StoredEncoding::dense();
+        let shape = LoadShape::dense(1, 64, false);
+        let policy = Policy { moe_request: Mxfp4MoeRequest::Auto, ..Policy::default() };
+
+        let t = StorageTarget { native_mxfp4_moe: true, ..StorageTarget::default() };
+        let b = Builder::new(&meta, "gpt-oss-20b", shape, &enc, &t, &policy);
+        assert_eq!(b.mxfp4_moe(), Mxfp4MoePolicy::NativeGemm);
+        assert_eq!(b.mxfp4_moe(), b.mxfp4_moe());
+
+        let t = StorageTarget { native_mxfp4_moe: false, ..StorageTarget::default() };
+        let b = Builder::new(&meta, "gpt-oss-20b", shape, &enc, &t, &policy);
+        assert_eq!(b.mxfp4_moe(), Mxfp4MoePolicy::RoutedDecode);
+    }
+
+    /// The encoding is the FILE's answer and the shape is the ROW's,
+    /// and they are separate because one model has four downloads.
+    #[test]
+    fn one_row_serves_every_encoding_of_itself() {
+        let meta = empty_checkpoint();
+        let target = target();
+        let policy = Policy::default();
+        let shape = LoadShape::dense(36, 128, false);
+
+        let bf16 = StoredEncoding::dense();
+        let awq = StoredEncoding { method: "awq".into(), bits: 4, group_size: 128 };
+        let mxfp4 = StoredEncoding { method: "mxfp4".into(), bits: 4, group_size: 32 };
+
+        for enc in [&bf16, &awq, &mxfp4] {
+            let b = Builder::new(&meta, "qwen3-8b", shape, enc, &target, &policy);
+            assert_eq!(b.shape(), shape, "the shape does not move with the encoding");
+            assert_eq!(b.id(), "qwen3-8b", "nor does the identity");
+        }
+        assert!(bf16.is_none());
+        assert!(!awq.is_none());
+        assert!(mxfp4.is_mxfp4());
+        assert!(!awq.is_mxfp4());
+    }
+
+    #[test]
+    fn align_up_rounds_up_and_refuses_a_nonsense_alignment() {
+        assert_eq!(align_up(0, 256).expect("zero is aligned"), 0);
+        assert_eq!(align_up(1, 256).expect("rounds up"), 256);
+        assert_eq!(align_up(256, 256).expect("already aligned"), 256);
+        assert_eq!(align_up(257, 256).expect("rounds up"), 512);
+        assert_eq!(align_up(5, 1).expect("everything is 1-aligned"), 5);
+        assert!(align_up(-1, 256).is_err(), "a negative offset is not a rounding question");
+        assert!(align_up(256, 0).is_err(), "and neither is a zero alignment");
+        assert!(align_up(256, -8).is_err());
+    }
 }

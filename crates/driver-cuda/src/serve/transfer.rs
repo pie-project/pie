@@ -67,10 +67,12 @@ pub fn pie_cuda_copy_kv(
         if (host_src || host_dst) && !cells.is_empty() {
             return PIE_STATUS_INVALID_ARGUMENT; // cell moves are device-only
         }
-        let (kv_heads, head_dim) =
-            (model.hf.num_key_value_heads, model.hf.head_dim_kernel.max(model.hf.head_dim));
+        let (kv_heads, head_dim) = (
+            i32::try_from(model.deployment.shape.kv_heads).unwrap_or(0),
+            i32::try_from(model.deployment.shape.head_dim_alloc()).unwrap_or(0),
+        );
         let page_size: i32 = 16;
-        let layers_n = model.hf.num_hidden_layers as usize;
+        let layers_n = model.deployment.layers as usize;
 
         // THE POOL, planned rather than assumed. `page_buffers` answers
         // per layer AND per buffer, so a quantized cache's scale planes and
@@ -229,6 +231,12 @@ pub fn pie_cuda_copy_kv(
                         "[driver-cuda] copy_kv: this cache carries a buffer the \
                          shell cannot address, so the move would be partial"
                     );
+                    // DRAIN WHAT IS ALREADY QUEUED. Earlier buffers of
+                    // this same op enqueued onto `leg`, and a later
+                    // `copy_kv` that finds the pool unusable does
+                    // `swap.take(); old.free()` — a `cudaFreeHost` of
+                    // regions those copies are still reading.
+                    let _ = leg.synchronize();
                     return PIE_STATUS_UNSUPPORTED;
                 }
                 continue;
@@ -249,6 +257,8 @@ pub fn pie_cuda_copy_kv(
                 )
             };
             if code != cudaError::cudaSuccess {
+                // Same reason as the partial-move return above.
+                let _ = leg.synchronize();
                 return PIE_STATUS_DRIVER_ERROR;
             }
         }
@@ -312,7 +322,27 @@ pub fn pie_cuda_copy_kv(
                 }
             }
         }
-        if stream.as_ref().synchronize().is_err() {
+        // BOTH STREAMS, and it synchronized only one.
+        //
+        // A HOST leg rides the pool's own `evict`/`restore` stream — that
+        // is what `leg` selects above — while the cell moves ride this
+        // call's. `OwnedStream::new` asks for `cudaStreamNonBlocking`
+        // precisely so unrelated streams do NOT order against each other,
+        // so synchronizing `stream` said nothing about the page copies.
+        //
+        // The engine was therefore told an evicted process's pages were
+        // back while the H2D was still queued: it schedules a fire, the
+        // fire reads KV pages that are partly unwritten, and the logits
+        // are wrong rather than late. The other direction frees device
+        // pages the D2H is still reading.
+        //
+        // `leg` is `stream` when the pool has no stream for this
+        // direction, so the second synchronize is a no-op in the device
+        // case rather than a special case here.
+        // BOTH, not `||`. Short-circuiting on the first failure left the
+        // pool's stream loaded, which is the state the whole fix is about.
+        let (a, b) = (stream.as_ref().synchronize(), leg.synchronize());
+        if a.is_err() || b.is_err() {
             return PIE_STATUS_DRIVER_ERROR;
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
@@ -422,8 +452,9 @@ pub fn pie_cuda_resize_pool(
         let Some(model) = state.model.as_ref() else {
             return PIE_STATUS_INVALID_ARGUMENT;
         };
-        let (kv_heads, head_dim) =
-            (model.hf.num_key_value_heads, model.hf.head_dim_kernel.max(model.hf.head_dim));
+        // The head dim is per LAYER on the row and no longer needed as a
+        // scalar here: `PerLayer::head_dim` below takes the table.
+        let kv_heads = i32::try_from(model.deployment.shape.kv_heads).unwrap_or(0);
         let page_size: usize = 16;
 
         let stream = match crate::device::OwnedStream::new(0) {
@@ -431,69 +462,57 @@ pub fn pie_cuda_resize_pool(
             Err(_) => return PIE_STATUS_DRIVER_ERROR,
         };
         let alloc = crate::device::Allocator::new();
-        let old = state.kv.take();
-        // Per-layer page bytes: an existing pool states its own stride (the
-        // two-head-dim families' rows disagree); before any pool exists the
-        // config decides — gemma-4 by its layer kinds and shared tail, every
-        // other family uniformly.
-        let is_gemma4 =
-            model.weights.contains_key("model.language_model.embed_tokens_per_layer.weight");
-        let n_layers = model.hf.num_hidden_layers as usize;
-        let first_shared =
-            n_layers.saturating_sub(usize::try_from(model.hf.num_kv_shared_layers).unwrap_or(0));
+        // BORROWED, not taken. This read `state.kv.take()`, and seven
+        // early returns sit between here and the `install_kv` that
+        // repopulates it — each one dropping the cache, freeing every KV
+        // page, and leaving the shell with `kv: None`.
+        //
+        // The realistic one is `materialize` answering
+        // `PIE_STATUS_EXHAUSTED`, which is exactly what an engine asking
+        // to GROW past available VRAM gets and exactly the status it is
+        // meant to treat as retryable. It saw a recoverable "not enough
+        // memory" and an unrecoverably dead driver: every later
+        // `pie_cuda_launch` fails on `state.kv.as_ref()` and every
+        // request's context is gone.
+        //
+        // `old` is only ever READ here — the geometry and the page
+        // contents to copy forward — so a borrow is all it needed.
+        // `install_kv` drops the old one at the end, where the new one is
+        // already in hand. `pie_cuda_copy_kv` in this same file shows the
+        // shape: build the replacement, then release what it replaces.
+        let old = state.kv.as_ref();
+        // Per-layer page bytes: an existing pool states its own stride
+        // (the two-head-dim families' rows disagree); before any pool
+        // exists the DEPLOYMENT decides.
+        //
+        // It used to be re-derived here from `hf.layer_types` — a
+        // gemma-4 sniff on a weight name, a `num_kv_shared_layers`
+        // subtraction, and a reverse scan for the last earlier layer of
+        // the same kind — which is `fire/launch.rs`'s per-layer table
+        // written a second time, from a different source, and required
+        // to come out identical. It is not a hypothetical: a resize that
+        // laid out one stride while the fire path bound another would
+        // read every shared layer's pages at the wrong pitch and emit
+        // plausible tokens.
+        //
+        // The row states the table once. Both readers take it.
+        let dep = &model.deployment;
+        let n_layers = dep.layers as usize;
 
-        // A resize changes the page COUNT and nothing else, so an existing
-        // cache states its own geometry and the config is never re-read.
-        // Before any cache exists there is nothing to ask, and the config
-        // decides: gemma-4 by its layer kinds and shared tail, every other
-        // family uniformly.
+        // A resize changes the page COUNT and nothing else, so an
+        // existing cache states its own geometry and nothing is
+        // re-derived. Before any cache exists there is nothing to ask,
+        // and the deployment answers.
         let layout = match old.as_ref().map(|o| o.cache.layout().with_num_pages(target as i32)) {
             Some(Ok(l)) => l,
             Some(Err(_)) => return PIE_STATUS_INVALID_ARGUMENT,
             None => {
                 let per = crate::pools::kv_cache::PerLayer {
-                    head_dim: (0..n_layers)
-                        .map(|i| {
-                            if !is_gemma4 {
-                                return head_dim as i32;
-                            }
-                            let full = model
-                                .hf
-                                .layer_types
-                                .get(i)
-                                .is_some_and(|t| t == "full_attention");
-                            if full {
-                                model.hf.gemma4_global_head_dim.max(model.hf.head_dim)
-                            } else {
-                                model.hf.head_dim
-                            }
-                        })
-                        .collect(),
-                    // gemma-4's tail attends through the last earlier layer
-                    // of its own kind; every other family owns its pages.
-                    kv_source_layer: (0..n_layers)
-                        .map(|i| {
-                            if !is_gemma4 || i < first_shared {
-                                return i as i32;
-                            }
-                            let mine = model
-                                .hf
-                                .layer_types
-                                .get(i)
-                                .is_some_and(|t| t == "full_attention");
-                            (0..first_shared)
-                                .rev()
-                                .find(|&j| {
-                                    model
-                                        .hf
-                                        .layer_types
-                                        .get(j)
-                                        .is_some_and(|t| t == "full_attention")
-                                        == mine
-                                })
-                                .unwrap_or(i) as i32
-                        })
-                        .collect(),
+                    head_dim: dep.attention.iter().map(|a| a.head_dim as i32).collect(),
+                    // gemma-4's tail attends through the last earlier
+                    // layer of its own kind; every other family owns its
+                    // pages. A fact about a LAYER, and the row says it.
+                    kv_source_layer: dep.attention.iter().map(|a| a.kv_source as i32).collect(),
                     num_kv_heads: vec![kv_heads; n_layers],
                 };
                 if per.check_sharing().is_err() {

@@ -318,7 +318,7 @@ fn make_case(m: &ModelCase, cfg: &mp::PlannerConfig) -> Case {
             num_attention_heads: (m.hidden / 128).max(1),
             num_key_value_heads: m.kv_heads,
             head_dim_kernel: m.head_dim,
-            model_type: m.model_type.to_owned(),
+            model_id: m.model_type.to_owned(),
         },
         fam: m.fam,
         tp: cfg.tp_size,

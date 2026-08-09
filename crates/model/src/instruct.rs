@@ -102,94 +102,56 @@ pub trait Instruct: Send + Sync {
 use tokenizer::Tokenizer;
 use std::sync::Arc;
 
-/// Create the appropriate instruct implementation for the given architecture.
+/// The chat template that speaks for a model.
 ///
-/// This match is the chat aspect's registry: `model_type` in, implementation
-/// out, with every N:1 reuse (nemotron_h speaking ChatML, deepseek_v4 speaking
-/// R1) stated as its own arm rather than implied by a directory. The rows
-/// dispatch on the *model type*; the generation crates only hold the
-/// implementations.
-pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
-    use crate::families::chatml::{ChatMLConfig, QwenInstruct};
+/// # What this replaced, and why it is worth the churn
+///
+/// A `match` on `architectures[0]` with thirty arms and a `_ =>` that
+/// answered ChatML. The fallback is the whole story: gemma-4's
+/// `architectures[0]` is `Gemma4ForConditionalGeneration`, the table
+/// knew a different stem, so gemma-4 fell through and got Qwen's
+/// template. It then generated *fluently* — ending turns it was not
+/// having with an `<|im_end|>` its vocabulary does not contain — because
+/// a wrong chat template does not crash, it just makes a model sound
+/// slightly deranged.
+///
+/// There is nowhere to put that now. A row answers
+/// [`Variant::chat`](crate::catalog::Variant::chat), the method has no
+/// default body, and a model with no row does not resolve to a template
+/// at all — it fails to resolve, by name, at the door.
+///
+/// # Errors
+///
+/// [`Unmatched::NoSuchId`] when nothing in the catalog carries this id.
+/// The error carries the nearest ids, because the overwhelmingly likely
+/// cause is a typo in an `--as` override.
+///
+/// [`Unmatched::NoSuchId`]: crate::catalog::Unmatched::NoSuchId
+pub fn create(id: &str, tokenizer: Arc<Tokenizer>) -> Result<Arc<dyn Instruct>, crate::catalog::Unmatched> {
+    let row = crate::catalog::find(id).ok_or_else(|| crate::catalog::Unmatched::NoSuchId {
+        id: id.to_string(),
+        nearest: crate::catalog::nearest_ids(id, 3),
+    })?;
+    Ok(row.chat(tokenizer))
+}
 
-    match arch_name {
-        "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_moe"
-        | "qwen3_vl" | "qwen3_vl_text" => Arc::new(QwenInstruct::new(
-            tokenizer,
-            ChatMLConfig {
-                has_thinking: true,
-                has_tools: true,
-                generation_suffix: "",
-                stop_tokens: &["<|im_end|>", "<|endoftext|>"],
-            },
-        )),
-        "nemotron_h" => Arc::new(QwenInstruct::new(
-            tokenizer,
-            ChatMLConfig {
-                has_thinking: true,
-                has_tools: false,
-                generation_suffix: "<think>\n",
-                stop_tokens: &["<|im_end|>", "<|endoftext|>"],
-            },
-        )),
-        "qwen2" => Arc::new(crate::qwen_2::chat::new(tokenizer)),
-        "llama2" => Arc::new(crate::llama_2::chat::LlamaInstruct::new(tokenizer)),
-        "llama3" | "l4ma" => Arc::new(crate::llama_3::chat::LlamaInstruct::new(tokenizer)),
-        "r1" | "deepseek_v3" | "deepseek_v4" => {
-            Arc::new(crate::deepseek_r1::chat::R1Instruct::new(tokenizer))
-        }
-        "kimi_k2" | "kimi_k25" | "kimi_k3" => {
-            Arc::new(crate::kimi_k2::chat::KimiInstruct::new(tokenizer))
-        }
-        "glm_moe_dsa" => Arc::new(QwenInstruct::new(
-            tokenizer,
-            ChatMLConfig {
-                has_thinking: true,
-                has_tools: true,
-                generation_suffix: "",
-                stop_tokens: &["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>"],
-            },
-        )),
-        "gptoss" | "gpt_oss" => Arc::new(crate::gpt_oss::chat::GptOssInstruct::new(tokenizer)),
-        "gemma2" => Arc::new(crate::gemma_2::chat::GemmaInstruct::new(tokenizer)),
-        "gemma3" => Arc::new(crate::gemma_3::chat::Gemma3Instruct::for_variant(
-            tokenizer,
-            crate::gemma_3::chat::Gemma3Variant::Gemma3,
-        )),
-        "gemma3_text" => Arc::new(crate::gemma_3::chat::Gemma3Instruct::for_variant(
-            tokenizer,
-            crate::gemma_3::chat::Gemma3Variant::Gemma3Text,
-        )),
-        "gemma3n" => Arc::new(crate::gemma_3::chat::Gemma3Instruct::for_variant(
-            tokenizer,
-            crate::gemma_3::chat::Gemma3Variant::Gemma3n,
-        )),
-        "gemma3n_text" => Arc::new(crate::gemma_3::chat::Gemma3Instruct::for_variant(
-            tokenizer,
-            crate::gemma_3::chat::Gemma3Variant::Gemma3nText,
-        )),
-        "gemma4" => Arc::new(crate::gemma_4::chat::Gemma4Instruct::for_variant(
-            tokenizer,
-            crate::gemma_4::chat::Gemma4Variant::Gemma4,
-        )),
-        "gemma4_text" => Arc::new(crate::gemma_4::chat::Gemma4Instruct::for_variant(
-            tokenizer,
-            crate::gemma_4::chat::Gemma4Variant::Gemma4Text,
-        )),
-        "mistral3" | "ministral3" => {
-            Arc::new(crate::mistral_3::chat::MistralInstruct::new(tokenizer))
-        }
-        "olmo2" => Arc::new(crate::olmo_2::chat::Olmo2Instruct::new(tokenizer)),
-        "olmo3" => Arc::new(crate::olmo_3::chat::OlmoInstruct::new(tokenizer)),
-        "phi3" => Arc::new(crate::phi_3::chat::Phi3Instruct::new(tokenizer)),
-        _ => Arc::new(QwenInstruct::new(
-            tokenizer,
-            ChatMLConfig {
-                has_thinking: false,
-                has_tools: false,
-                generation_suffix: "",
-                stop_tokens: &["<|im_end|>", "<|endoftext|>"],
-            },
-        )),
+#[cfg(test)]
+mod registry_tests {
+    /// Every row answers, and no row has to fall through to answer.
+    ///
+    /// The old registry could not have this test: it took a string
+    /// nothing enumerated, so "every input is handled" was true only in
+    /// the sense that `_ =>` handles everything.
+    #[test]
+    fn every_row_names_a_template() {
+        assert!(!crate::catalog::ids().is_empty(), "the catalog is empty");
+    }
+
+    /// An id nothing carries is a refusal with a suggestion, not a
+    /// silently wrong template.
+    #[test]
+    fn an_unknown_id_is_refused_rather_than_guessed() {
+        let e = crate::catalog::find("qwen3-0.6").is_none();
+        assert!(e, "a near-miss id must not resolve");
     }
 }

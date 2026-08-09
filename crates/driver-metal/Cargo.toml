@@ -48,10 +48,15 @@ default = []
 # one `#[cfg]` -- and every device test target.
 metal-4 = []
 
-# Portable, so it goes in the plain dependency table rather than the Apple one:
-# `facts.rs` reads a descriptor document and needs no GPU to do it.
+# NO `serde_json`. It was here for `facts.rs`, which parsed a `pie.model/1`
+# descriptor into a private facts struct -- a driver reading a JSON document
+# to find out what model it had been given. Nothing in this crate parses JSON
+# any more: a checkpoint's tensors match a `model::catalog` row and the row
+# states the shape, so the one thing still read out of a `config.json` is the
+# declared quantization and `model::encoding` does that reading. The
+# dependency going away is the measurement of the change -- a driver that
+# needs a JSON parser is a driver that is still normalizing something.
 [dependencies]
-serde_json = "1.0"
 
 # The pipeline interpreter is pure CPU logic and reuses the launch/IR source of
 # truth rather than re-porting the C++ `pie::driver::launch` mirror:
@@ -221,9 +226,17 @@ model = { path = "../model", default-features = false, features = ["contract", "
 # reason the same job can run the crate both ways on one runner.
 #
 # The tests NOT listed here are the portable ones -- `portable_half`,
-# `mod_audit`, `model_bind`, `model_dispatch`, `polymorphism`,
-# `family_registry` -- and that list is the claim this file makes about what
-# needs no GPU.
+# `mod_audit`, `model_bind`, `model_dispatch`, `polymorphism`, `layering`,
+# `no_family_names`, `catalog_coverage`, `text_conformance` -- and that list
+# is the claim this file makes about what needs no GPU.
+#
+# `family_registry` and `geometry_from_descriptor` were on that list and are
+# deleted. Both were gates on the SPLIT: one reconciled the two `model_type`
+# tables that decided which family Metal supported, the other pinned a
+# `pie.model/1` descriptor being cut into four family-prefixed blocks and
+# merged back. There is one `model::catalog` row per model now and no
+# document between it and the driver, so neither property is expressible --
+# `catalog_coverage` replaces the first with the claim that survived it.
 
 [[test]]
 name = "device_archive"

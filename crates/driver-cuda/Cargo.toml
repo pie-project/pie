@@ -132,20 +132,23 @@ tracing = "0.1"
 # exists to prevent.
 serde_json = { version = "1.0", features = ["preserve_order"] }
 
-# The `pie.model/1` schema. `HfConfig` is ONE type with two consumers now:
-# the Rust normalizer writes it at import, this driver reads it back from the
-# artifact -- which is the whole point of the descriptor (config.hpp's tail
-# comment records the C++ parser's deletion for the same reason). The
-# `contract` because the library authors a load contract
-# (`model::boot::compile_load_plan` -> `model::contract::author_with_policy`).
-# The `forward` because `model::deployment_cuda` is gated on it AND on
-# `config`, and `gpu/serve/{state,load}.rs` and `gpu/fire/launch.rs` all
-# reach it.
+# The `pie.model/1` schema. Two features now, not three, and the third's
+# disappearance is the refactor in one line: `config` is GONE, because the
+# `HfConfig` this driver used to read back out of the artifact is gone with
+# it. A checkpoint's identity is a `model::catalog` row, linked into both
+# this driver and the worker, so there is nothing to parse and nothing to
+# agree about.
 #
-# THREE features, and getting to three took two wrong answers. It said
-# `config` alone for a while and still built; then `contract` alone, and still
-# built. Both times for the same reason: this crate's DEV-dependency on
-# `model` names all three, and the resolver unifies them back on for every
+# The `contract` because the library authors a load contract
+# (`model::boot::compile_load_plan` -> `model::contract::author_with_policy`),
+# and carries `model::encoding` with it. The `forward` because
+# `model::catalog`'s `deployment`/`trace` are gated on it and
+# `serve/{state,load}.rs` and `fire/launch.rs` all reach them.
+#
+# Getting the OLD list to three took two wrong answers -- it said `config`
+# alone for a while and still built, then `contract` alone, and still built.
+# Both times for the same reason: this crate's DEV-dependency on `model`
+# names every feature, and the resolver unifies them back on for every
 # `cargo test` and every `cargo check` that resolves dev targets. So the
 # library declaration is the one thing in this file that NOTHING in the
 # workspace reads -- CI's `cargo test --workspace` excludes this crate, and
@@ -157,7 +160,6 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 #
 # Not `chat`: the chat templates are not in the load path.
 model = { path = "../model", default-features = false, features = [
-    "config",
     "contract",
     "forward",
 ] }
@@ -221,7 +223,7 @@ kernels-cuda = { path = "../kernels-cuda", default-features = false }
 # The executor's binder test lowers a REAL deployment's traced form —
 # `forward` builds the family texts; the regular dependency above stays
 # `config`-only so the library never carries the tracer.
-model = { path = "../model", default-features = false, features = ["config", "forward", "contract"] }
+model = { path = "../model", default-features = false, features = ["forward", "contract"] }
 # The PRODUCER, for `tests/gpu_ptir_emitted.rs` only: that test authors a
 # trace, runs the host's real bind → compile → lower → emit chain over it, and
 # compiles the result — so it proves the emitter's CUDA and this driver's NVRTC
@@ -248,9 +250,18 @@ cc = "1"
 # auto-discovered target and these do not compile without a device
 # selected — which is the whole point of the featureless build.
 #
-# The four NOT here — `dtoa_parity`, `hf_descriptor_parity`,
-# `profile_cache_parity`, `workspace_parity` — are portable and run in
-# that build, which is coverage the crate did not have before.
+# The three NOT here — `dtoa_parity`, `profile_cache_parity`,
+# `workspace_parity` — are portable and run in that build, which is
+# coverage the crate did not have before.
+#
+# `hf_descriptor_parity` was a fourth. It replayed the C++ reader's
+# 134-field dump of a `pie.model/1` descriptor against the Rust port,
+# byte for byte over the corpus — and both the descriptor and the
+# normalizer that produced it are deleted. What it was really pinning,
+# "the two readers of this document agree", is now answered by there
+# being one document and no readers: a model's numbers are `const` rows
+# in `model::catalog`, checked against the corpus by
+# `model/tests/catalog_differential.rs`.
 [[test]]
 name = "attn_score_parity"
 required-features = ["_cuda"]
@@ -397,7 +408,7 @@ name = "gpu_supergraph"
 required-features = ["_cuda", "bridge"]
 
 [[test]]
-name = "facts_registry"
+name = "catalog_coverage"
 required-features = ["_cuda", "abi"]
 
 [[test]]

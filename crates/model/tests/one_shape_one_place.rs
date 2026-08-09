@@ -15,6 +15,22 @@
 //! It compares FIELD NAMES, not types or docs. Two structs with the same
 //! field names are the same fact whatever they are called, and calling
 //! them different things is exactly how the copies survived.
+//!
+//! # Where a shape lives
+//!
+//! It used to be `<family>/forward/facts.rs` and only that. The catalog
+//! refactor moved the SEMANTIC shape up to `<family>/spec.rs` — ungated,
+//! because a `const` catalog row is written in those words and a row must
+//! exist under every aspect — and left `forward/facts.rs` holding a
+//! re-export plus whatever per-backend facts are genuinely about the
+//! tracer.
+//!
+//! So the scan reads BOTH, and the count assertion below is what caught
+//! that it had to: after the split, a facts-only scan found five structs
+//! where it used to find thirty-one, and the twin check that runs on them
+//! would have passed by having almost nothing left to compare. A test
+//! that quietly stops testing is worse than no test, because the header
+//! keeps claiming the gate is standing.
 
 #![cfg(feature = "forward")]
 
@@ -30,19 +46,41 @@ use std::path::{Path, PathBuf};
 /// "they cannot".
 const ALLOWED_TWINS: &[(&str, &str, &str)] = &[];
 
-fn families_dir() -> Vec<PathBuf> {
+/// Every file a family declares a shape in, in the order they are read.
+///
+/// `spec.rs` and `forward/facts.rs`, unioned. A family may have either or
+/// both: the split is a migration in progress, and a scan that knows
+/// about one half sees half the shapes.
+fn declaring_files() -> Vec<PathBuf> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut out = Vec::new();
     for root in [src.clone(), src.join("families")] {
         let Ok(rd) = std::fs::read_dir(&root) else { continue };
         for e in rd.flatten() {
-            let f = e.path().join("forward/facts.rs");
-            if f.is_file() {
-                out.push(f);
+            let dir = e.path();
+            for f in [dir.join("spec.rs"), dir.join("forward/facts.rs")] {
+                if f.is_file() {
+                    out.push(f);
+                }
             }
         }
     }
     out
+}
+
+/// The family a declaring file belongs to.
+///
+/// One directory up from `spec.rs` and two up from `forward/facts.rs`,
+/// which is the whole difference between the two.
+fn family_of(path: &Path) -> String {
+    let dir = if path.file_name().is_some_and(|f| f == "spec.rs") {
+        path.parent()
+    } else {
+        path.parent().and_then(Path::parent)
+    };
+    dir.and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// `(family::Struct, sorted field names)` for every `pub struct` with at
@@ -53,13 +91,8 @@ fn families_dir() -> Vec<PathBuf> {
 /// numbers, not a description.
 fn shapes() -> Vec<(String, Vec<String>)> {
     let mut out = Vec::new();
-    for path in families_dir() {
-        let family = path
-            .parent()
-            .and_then(Path::parent)
-            .and_then(|p| p.file_name())
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
+    for path in declaring_files() {
+        let family = family_of(&path);
         let src = std::fs::read_to_string(&path).expect("a family's facts");
         let mut name: Option<String> = None;
         let mut fields: Vec<String> = Vec::new();
@@ -99,7 +132,9 @@ fn no_two_families_describe_the_same_shape() {
     let shapes = shapes();
     assert!(
         shapes.len() > 15,
-        "the facts scan found {} structs, so its shape assumption broke",
+        "the shape scan found {} structs, so its layout assumption broke — \
+         the last time this fired, the shapes had moved to `spec.rs` and \
+         the scan was still reading only `forward/facts.rs`",
         shapes.len()
     );
 

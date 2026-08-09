@@ -38,8 +38,8 @@ pub(crate) fn create_impl(
         eprintln!("[driver-cuda] create: the caps out-parameter must be non-null");
         return std::ptr::null_mut();
     }
-    // The boot TOML rides in `config_bytes`. Two keys are read today:
-    // `[model] descriptor` and `[driver] runahead`.
+    // The boot TOML rides in `config_bytes`. Three keys are read today:
+    // `[model] id`, `[model] descriptor` and `[driver] runahead`.
     let boot = (!desc.config_bytes.ptr.is_null())
         .then(|| unsafe {
             std::slice::from_raw_parts(desc.config_bytes.ptr, desc.config_bytes.len)
@@ -51,6 +51,26 @@ pub(crate) fn create_impl(
         .get("model")
         .and_then(|m| m.get("descriptor")?.as_str())
         .map(std::path::PathBuf::from);
+    // WHAT THE PROCESS BOUNDARY CARRIES.
+    //
+    // One string. It used to carry a `pie.model/1` JSON document — the
+    // worker wrote it beside the boot TOML and named the PATH here, and
+    // this driver parsed it back with its own reader while
+    // `driver-metal` parsed the same document with a DIFFERENT reader
+    // into a different struct, under a different failure policy (facts
+    // swallowed a missing field with a default; the descriptor refused).
+    // One document, two readers, two answers.
+    //
+    // An id cannot do that. Both drivers link the same `const` table, so
+    // the worst a bad id can do is fail to resolve — loudly, at the
+    // door, with the nearest ids named. And it is OPTIONAL rather than
+    // required: absent, the driver identifies the checkpoint from its
+    // TENSORS, which is the answer that does not depend on anyone having
+    // written anything down.
+    let boot_model_id = boot
+        .get("model")
+        .and_then(|m| m.get("id")?.as_str())
+        .map(str::to_owned);
     // PER-DRIVER, not per-process, so a caller that wants asynchronous
     // completions can ask for them without deciding for every other
     // driver alive in the same process. The env var is the default the
@@ -149,6 +169,7 @@ pub(crate) fn create_impl(
     let boxed = Box::new(Shell {
         caps: CAPS_JSON.as_bytes().to_vec(),
         boot_descriptor,
+        boot_model_id,
         runahead,
         boot: cfg.clone(),
         kv_format,
@@ -159,9 +180,11 @@ pub(crate) fn create_impl(
         preds: None,
         peel_win: None,
         logits_staging: None,
+        retired_staging: Vec::new(),
         tp_rank,
         tp_size,
         model: None,
+        load_generation: 0,
         programs: std::collections::BTreeMap::new(),
         instances: std::collections::BTreeMap::new(),
         next_id: 1,
@@ -241,34 +264,66 @@ pub(crate) fn destroy_impl(driver: *mut PieDriver) {
 pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result<(), i32> {
     use model_loader::checkpoint::read::{parse_checkpoint_metadata, read_meta};
 
-    let meta = parse_checkpoint_metadata(snapshot).map_err(|e| {
-        eprintln!("[driver-cuda] load_model: checkpoint parse: {e:?}");
-        PIE_STATUS_INVALID_ARGUMENT
-    })?;
+    let meta = parse_checkpoint_metadata(snapshot)
+        .map_err(|e| crate::Error::invalid("load_model: checkpoint parse", format!("{e:?}")))?;
 
-    // The descriptor: embedded in an artifact, else the boot TOML's path.
-    let descriptor_json = match read_meta(&meta, "model/descriptor") {
+    // The checkpoint's own `config.json`: embedded in an artifact, else
+    // the boot TOML's path.
+    //
+    // ONE FIELD IS READ OUT OF IT. This used to be a `pie.model/1`
+    // descriptor — ~40 numbers, normalized by 845 lines from a
+    // 136-field schema — parsed back here into a resident `HfConfig`
+    // that the load path, the launch path, the cost model and the
+    // capability report all read from. Every one of those numbers is a
+    // catalog row's now.
+    //
+    // What is left is the declared quantization, and it stays because
+    // it is the one thing a row genuinely cannot state: Qwen3-8B is one
+    // model and four downloads, and a group size is not an extent of
+    // any tensor.
+    let config_json = match read_meta(&meta, model::encoding::CONFIG_OBJECT) {
         Ok(Some(bytes)) => String::from_utf8(bytes).map_err(|e| i32::from(crate::Error::from(e)))?,
         Ok(None) => {
             let Some(path) = &state.boot_descriptor else {
-                eprintln!(
-                    "[driver-cuda] load_model: no embedded model/descriptor \
-                     and no [model] descriptor in the boot config"
-                );
-                return Err(PIE_STATUS_UNSUPPORTED);
+                return Err(crate::Error::unsupported(
+                    "load_model",
+                    "no embedded model/config and no [model] descriptor in \
+                     the boot config",
+                )
+                .into());
             };
             std::fs::read_to_string(path).map_err(|e| i32::from(crate::Error::from(e)))?
         }
         Err(e) => {
-            eprintln!("[driver-cuda] load_model: read_meta: {e:?}");
-            return Err(PIE_STATUS_DRIVER_ERROR);
+            return Err(crate::Error::invalid("load_model: read_meta", format!("{e:?}")).into());
         }
     };
-    let hf = model::descriptor::parse_pie_model_descriptor(&descriptor_json)
-        .map_err(|e| {
-            eprintln!("[driver-cuda] load_model: descriptor: {e}");
-            PIE_STATUS_INVALID_ARGUMENT
-        })?;
+
+    // WHICH MODEL THIS IS, asked of the TENSORS.
+    //
+    // The config above no longer DECIDES anything: the row that authors
+    // the contract, projects the deployment and speaks the chat template
+    // is matched here, once, against the checkpoint's own tensor names
+    // and extents.
+    //
+    // Identification and validation are the same operation, which is the
+    // point. A config that lies about its geometry used to be believed
+    // by the derivation and contradicted by an assertion several frames
+    // later, if at all. A checkpoint is now a known model or it is not.
+    let chosen = state
+        .boot_model_id
+        .as_ref()
+        .map_or(model::catalog::Override::None, |id| {
+            model::catalog::Override::Id(id.clone())
+        });
+    let row = model::catalog::identify(&meta, &chosen)
+        .map_err(|e| crate::Error::unsupported("load_model: identify", e.to_string()))?;
+
+    // What the FILES say about how the numbers are stored, which is not
+    // part of what model this is: Qwen3-8B is one row and four
+    // downloads.
+    let encoding = model::encoding::Encoding::from_config_json(&config_json)
+        .map_err(|e| crate::Error::invalid("load_model: config", e.to_string()))?;
 
     // THE LOAD IS `model-loader`'s PLAN, EXECUTED ONTO THE DEVICE.
     //
@@ -284,21 +339,21 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
     // mis-bound at launch), and which projections are fused.
     let target = crate::weights::plan::cuda_storage_target(state.tp_rank, state.tp_size);
     let (plan, _moe) =
-        crate::weights::plan::compile_load_plan(snapshot, &meta, &target, &descriptor_json)
-            .map_err(|e| {
-                eprintln!("[driver-cuda] load_model: {e}");
-                PIE_STATUS_UNSUPPORTED
-            })?;
+        crate::weights::plan::compile_load_plan_for(snapshot, &meta, &target, row, &encoding)
+            .map_err(|e| crate::Error::unsupported("load_model: load plan", e))?;
     let alloc = crate::device::Allocator::new();
-    let staged = crate::weights::stage::stage_plan_weights(&plan, snapshot, &alloc).map_err(
-        |e| {
-            eprintln!("[driver-cuda] load_model: staging: {e:?}");
-            PIE_STATUS_EXHAUSTED
-        },
-    )?;
+    // ALREADY an `Error`, and the site was throwing it away: the old
+    // line matched on nothing and returned `PIE_STATUS_EXHAUSTED` for
+    // every staging failure, so a missing tensor and a full arena
+    // reported the same thing.
+    // `Error::from` spelled out because `?` does not chain two of them,
+    // and the orphan rule forbids the shortcut: `From<LoaderError> for
+    // i32` would be an impl on a primitive this crate does not own.
+    let staged = crate::weights::stage::stage_plan_weights(&plan, snapshot, &alloc)
+        .map_err(crate::Error::from)?;
 
     let mut model = LoadedModel {
-        hf,
+        id: row.id(),
         // Filled below, once the checkpoint view can be built — the
         // derivation reads the weight map, which needs the model.
         deployment: model::deployment::Deployment::empty(),
@@ -312,7 +367,17 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
     wire_trace_names(&mut model);
 
     // ONCE, at load, and never again. See `LoadedModel::deployment`.
-    model.deployment = model::deployment_cuda::deployment_from(&model.checkpoint())
+    //
+    // A PROJECTION of the matched row rather than a derivation from a
+    // parsed config. The eleven `*_facts_from_hf` functions this
+    // replaces read the same numbers out of the same checkpoint, one
+    // family at a time, keyed on a `model_type` string that a second
+    // table keyed differently.
+    model.deployment = row
+        .deployment(model::catalog::Deployed {
+            tp_size: state.tp_size,
+            layer_scalars: &model.gemma_layer_scalars,
+        })
         .map_err(|e| i32::from(crate::Error::from(e)))?;
 
     // A KV SHAPE THIS SHELL HAS NO POOL FOR IS REFUSED AT LOAD, not at
@@ -352,6 +417,20 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
         return Err(crate::error::Error::Unsupported { what: what.to_string() }.into());
     }
 
+    // A NEW RESIDENCY, so every cache keyed on the old one is dropped.
+    //
+    // Replacing `state.model` frees the previous `LoadedModel`'s weight
+    // arena, and a captured graph bakes addresses into it. Both caches
+    // were keyed on the LAYER COUNT, so a second 32-layer checkpoint hit
+    // the first one's entries — a replay into freed memory, with every
+    // pointer looking exactly as valid as it did.
+    //
+    // Bumped AND cleared, which is belt to that braces: the counter makes
+    // the key honest for anything that outlives this line, and the clear
+    // returns the memory rather than leaving entries no key can reach.
+    state.load_generation += 1;
+    state.lowerings.clear();
+    state.supergraph = crate::fire::recordings::Recordings::new();
     state.model = Some(model);
     // AFTER the model is stored, because a calibration boot fires through the
     // ordinary path and that path reads `state.model`.
@@ -446,12 +525,16 @@ fn calibrate_planner(state: &mut Shell) {
         sm_count: 0,
         kv_cache_dtype: state.kv_format.name().to_owned(),
         tp_size: i32::try_from(state.tp_size).unwrap_or(1),
-        model_type: model.hf.model_type.clone(),
-        hidden_size: model.hf.hidden_size,
-        num_hidden_layers: model.hf.num_hidden_layers,
-        num_attention_heads: model.hf.num_attention_heads,
-        num_key_value_heads: model.hf.num_key_value_heads,
-        head_dim: model.hf.head_dim_kernel.max(model.hf.head_dim),
+        // THE ROW, not its family. A cache keyed on `"qwen3"` plus a
+        // hidden size was keyed on a shape summary; keyed on the id it
+        // is keyed on the model, and the four extents below stay as a
+        // guard against a build whose row moved under a stale file.
+        model_type: model.id.to_owned(),
+        hidden_size: i32::try_from(model.deployment.shape.hidden).unwrap_or(0),
+        num_hidden_layers: i32::try_from(model.deployment.layers).unwrap_or(0),
+        num_attention_heads: i32::try_from(model.deployment.shape.q_heads).unwrap_or(0),
+        num_key_value_heads: i32::try_from(model.deployment.shape.kv_heads).unwrap_or(0),
+        head_dim: i32::try_from(model.deployment.shape.head_dim_alloc()).unwrap_or(0),
     };
 
     // ONE probe program and as many instances as the widest point needs.
@@ -641,11 +724,14 @@ fn synthetic_fire(
 /// `layer_scalar` is one bf16 on the device; `model` says which tensors they
 /// are and in what order, and the copy is CUDA's.
 fn wire_trace_names(model: &mut LoadedModel) {
+    let Some(row) = model::catalog::find(model.id) else {
+        return; // no row, no names; the load already refused
+    };
     let published: Vec<String> = model.weights.keys().cloned().collect();
     let set: std::collections::BTreeSet<&str> =
         published.iter().map(String::as_str).collect();
     let has = |n: &str| set.contains(n);
-    let wiring = model::weight_names::wire(&model.hf, &has);
+    let wiring = model::weight_names::wire(row.load_shape(), &has);
 
     for (trace, name) in wiring.aliases {
         model.aliases.insert(trace, name);
@@ -722,9 +808,25 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
     use crate::layout::model_costs::{CheckpointCosts, DiskProfiles};
 
     let model = state.model.as_ref().expect("the model is stored");
-    let hf = model.hf.clone();
-    let hf = &hf;
+    // NO `HfConfig` READ ON THIS PATH.
+    //
+    // Three reads used to survive here — `model_type`,
+    // `max_position_embeddings`, and whether the checkpoint carries
+    // `gemma_vision`/`gemma_audio` — and they were the reason the driver
+    // kept a whole parsed `config.json` resident for the life of a load.
+    // They are `Deployment::advertised` now, off the same row that
+    // authored the contract and traced the forward, so the model a
+    // program is told about and the model this driver fires cannot be
+    // two different models.
+    //
+    // CLONED for the same reason `model_tp` and `model_id` are copied:
+    // the planner below wants `state` back.
+    let deployment = model.deployment.clone();
     let model_tp = model.tp_size;
+    // Copied out beside `model_tp` for the same reason: `&'static str`,
+    // so this ends the borrow of `state` rather than extending it across
+    // the planner below.
+    let model_id = model.id;
     let device =
         crate::device::Device::bind(state.device_ordinal)?;
     let (free, total) = device.memory_info()?;
@@ -765,14 +867,19 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
         rs_slot_mult: 1,
         nccl_unique_id_hex: String::new(),
     };
-    let costs = CheckpointCosts::new(hf, model_tp);
+    // THE ROW'S OWN NUMBERS, so the pool the planner sizes and the
+    // pool the fire builds come from one statement of the shape. Both
+    // of these read a resident `HfConfig` — a second parse of the
+    // checkpoint, whose disagreements with the first never surfaced as
+    // an error, only as a KV pool a few thousand pages short.
+    let costs = CheckpointCosts::new(&deployment, model_tp);
     let shape = ModelShape {
-        hidden_size: hf.hidden_size,
-        num_hidden_layers: hf.num_hidden_layers,
-        num_attention_heads: hf.num_attention_heads,
-        num_key_value_heads: hf.num_key_value_heads,
-        head_dim_kernel: hf.head_dim_kernel.max(hf.head_dim),
-        model_type: hf.model_type.clone(),
+        hidden_size: i32::try_from(deployment.shape.hidden).unwrap_or(0),
+        num_hidden_layers: i32::try_from(deployment.layers).unwrap_or(0),
+        num_attention_heads: i32::try_from(deployment.shape.q_heads).unwrap_or(0),
+        num_key_value_heads: i32::try_from(deployment.shape.kv_heads).unwrap_or(0),
+        head_dim_kernel: i32::try_from(deployment.shape.head_dim_alloc()).unwrap_or(0),
+        model_id: model_id.to_owned(),
     };
     let props = DeviceProps {
         name: String::new(),
@@ -841,11 +948,14 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
         max_forward_requests: u32::try_from(planned.plan.capacity.max_forward_requests)
             .unwrap_or(0),
         max_page_refs: u32::try_from(planned.plan.capacity.max_page_refs).unwrap_or(0),
-        arch_name: hf.model_type.clone(),
-        vocab_size: u32::try_from(hf.vocab_size).unwrap_or(0),
-        max_model_len: u32::try_from(hf.max_position_embeddings).unwrap_or(0),
+        arch_name: deployment.advertised.arch.to_owned(),
+        // The catalog id, which `arch_name` above is not: `qwen3` names
+        // twelve checkpoints of six shapes, `qwen3-0.6b` names one.
+        model_id: model_id.to_owned(),
+        vocab_size: deployment.shape.vocab,
+        max_model_len: deployment.advertised.max_model_len,
         activation_dtype: "bf16".to_owned(),
-        hidden_size: u32::try_from(hf.hidden_size).unwrap_or(0),
+        hidden_size: deployment.shape.hidden,
         rs_cache_required: costs.has_linear_state(),
         snapshot_dir: snapshot.display().to_string(),
         // No swap pool, no elastic accounting, no MTP or value head, and no
@@ -890,7 +1000,7 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
         // here — its tower row (`vision::qwen3vl_scatter`) writes into
         // the fire's hidden rows rather than handing host rows back, so
         // it is an in-fire path and not an encode one.
-        supports_media_encode: hf.gemma_vision.is_some() || hf.gemma_audio.is_some(),
+        supports_media_encode: deployment.advertised.media_encode,
         kv_handle: None,
         // This driver compiles its own PTIR through NVRTC; nothing upstream
         // needs to generate a kernel for it.
@@ -911,13 +1021,8 @@ pub(crate) fn adopt_and_compile(
     package: driver::driver_api::plan::LaunchPackage,
     kernels: &[driver_api::EmittedKernel],
 ) -> Result<(), i32> {
-    let plan = match driver::adopt_launch_package(package) {
-        Ok(plan) => plan,
-        Err(error) => {
-            eprintln!("[driver-cuda] register_program: {error}");
-            return Err(PIE_STATUS_UNSUPPORTED);
-        }
-    };
+    let plan = driver::adopt_launch_package(package)
+        .map_err(|error| crate::Error::unsupported("register_program", error))?;
 
     // The compile, when there is a device to compile FOR. `load_model`
     // binds it; a registration that arrives first is not an error, and
@@ -941,13 +1046,15 @@ pub(crate) fn adopt_and_compile(
                 state.ptir_programs.insert(id, compiled);
             }
             Err(failure) => {
-                eprintln!(
-                    "[driver-cuda] register_program: cannot compile program \
-                     {:#018x}: {}",
-                    desc.program_hash,
-                    failure.reason()
-                );
-                return Err(PIE_STATUS_UNSUPPORTED);
+                return Err(crate::Error::unsupported(
+                    "register_program",
+                    format_args!(
+                        "cannot compile program {:#018x}: {}",
+                        desc.program_hash,
+                        failure.reason()
+                    ),
+                )
+                .into());
             }
         }
     } else if !plan.executable {
@@ -975,14 +1082,12 @@ pub(crate) fn adopt_and_compile(
 /// second registration. Caching it would trade nothing for a field that
 /// can go stale against a runtime swap.
 pub(crate) fn ptir_target(ordinal: i32) -> Result<crate::program::Target, i32> {
-    let device = crate::device::Device::bind(ordinal).map_err(|error| {
-        eprintln!("[driver-cuda] register_program: no device to compile for: {error}");
-        PIE_STATUS_DRIVER_ERROR
-    })?;
-    let (major, minor) = device.compute_capability().map_err(|error| {
-        eprintln!("[driver-cuda] register_program: {error}");
-        PIE_STATUS_DRIVER_ERROR
-    })?;
+    // THE CUDA ERROR ALREADY IS one of ours — `Device::bind` and
+    // `compute_capability` return `crate::Error::Driver`, and the old
+    // lines logged it and then replaced it with a status that says
+    // nothing about which call failed.
+    let device = crate::device::Device::bind(ordinal)?;
+    let (major, minor) = device.compute_capability()?;
     let nvrtc = crate::program::compile::version().map_err(|error| {
         eprintln!("[driver-cuda] register_program: {error}");
         PIE_STATUS_DRIVER_ERROR

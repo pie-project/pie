@@ -131,8 +131,14 @@ pub struct ModelShape {
     pub num_key_value_heads: i32,
     /// Head dimension the kernels use for envelopes.
     pub head_dim_kernel: i32,
-    /// Architecture string, e.g. `"qwen3"`.
-    pub model_type: String,
+    /// The catalog id of the loaded row, e.g. `"qwen3-8b"`.
+    ///
+    /// It was `model_type` — `"qwen3"` — which names twelve
+    /// checkpoints of six shapes, so every question asked of it needed
+    /// a second clause to narrow it (`model_type == "qwen3" &&
+    /// hidden_size == 4096`). An id needs none, because it already
+    /// names one model.
+    pub model_id: String,
 }
 
 /// The model layer's cost formulas, which the planner treats as inputs.
@@ -705,7 +711,10 @@ impl ShapePreferences {
     ) -> Self {
         let base = auto_profile && FORCED_PREFILL == 0;
         let wide = prop.sm_count >= 100;
-        let qwen3_8b = hf.model_type == "qwen3" && hf.hidden_size == 4096;
+        // ONE ROW, named. This was `model_type == "qwen3" &&
+        // hidden_size == 4096` — a family string plus a width, standing
+        // in for an identity nobody could state.
+        let qwen3_8b = hf.model_id == "qwen3-8b";
         let ada = prop.major == 8 && prop.minor == 9;
         Self {
             qwen3_8b_prefill: base
@@ -1223,7 +1232,7 @@ fn select(
         sm_count: prop.sm_count,
         kv_cache_dtype: cfg.kv_cache_dtype.clone(),
         tp_size: cfg.tp_size,
-        model_type: hf.model_type.clone(),
+        model_type: hf.model_id.clone(),
         hidden_size: hf.hidden_size,
         num_hidden_layers: hf.num_hidden_layers,
         num_attention_heads: hf.num_attention_heads,

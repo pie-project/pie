@@ -9,7 +9,5 @@
 mod plan;
 mod slab;
 
-pub use plan::{
-    LoadPlanError, TestFacts, compile_load_plan, descriptor_for_testing, metal_storage_target,
-};
+pub use plan::{LoadPlanError, compile_load_plan_for, metal_storage_target};
 pub use slab::{ExpertSlab, SlabError, SlabTensor};

@@ -78,20 +78,48 @@ pub use model::boot::LoadPlanError;
 ///
 /// # Errors
 ///
-/// The descriptor does not parse, no author claims its `model_type`, the
-/// contract does not compile, or a file the plan declares is missing or the
-/// wrong size on disk.
+/// The checkpoint is no model this build serves, an override named a row
+/// that does not exist, the contract does not compile, or a file the plan
+/// declares is missing or the wrong size on disk.
 pub fn compile_load_plan(
     snapshot_dir: &Path,
     metadata: &model_loader::checkpoint::CheckpointMetadata,
     target: &StorageTarget,
-    descriptor_json: &str,
+    chosen: &model::catalog::Override,
+    encoding: &model::encoding::Encoding,
 ) -> Result<(LoadPlan, Mxfp4MoePolicy), LoadPlanError> {
     model::boot::compile_load_plan(
         snapshot_dir,
         metadata,
         target,
-        descriptor_json,
+        chosen,
+        encoding,
+        Binding::HF_FUSED,
+    )
+}
+
+/// The same, for a caller that has already matched its row.
+///
+/// The boot path has: it identifies once and then uses the row for the
+/// contract, the deployment and the trace, so a second `identify` here
+/// would be the same match run twice with the second answer thrown away.
+///
+/// # Errors
+///
+/// As [`compile_load_plan`], minus the identification.
+pub fn compile_load_plan_for(
+    snapshot_dir: &Path,
+    metadata: &model_loader::checkpoint::CheckpointMetadata,
+    target: &StorageTarget,
+    row: &dyn model::catalog::Variant,
+    encoding: &model::encoding::Encoding,
+) -> Result<(LoadPlan, Mxfp4MoePolicy), LoadPlanError> {
+    model::boot::compile_load_plan_for(
+        snapshot_dir,
+        metadata,
+        target,
+        row,
+        encoding,
         Binding::HF_FUSED,
     )
 }

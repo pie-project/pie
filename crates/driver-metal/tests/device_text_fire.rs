@@ -33,12 +33,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use driver_metal::gpu::{Allocation, Compiler, Context};
+use driver_metal::device::{Allocation, Context};
+use driver_metal::program::Compiler;
 use driver_metal::lowering::dispatch::Geometry;
-use driver_metal::gpu::bind::encode::Pipelines;
+use driver_metal::bind::encode::Pipelines;
 use driver_metal::lowering::executor::{Resolver, Slice};
 use driver_metal::lowering::frame::{Step, lower_step};
-use driver_metal::gpu::fire::run::run;
+use driver_metal::fire::run::run;
 use model::families::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
 use model::families::llama_like::forward::llama_like_metal;
 use model_compiler::trace::{FireClass, ValueId};
@@ -550,7 +551,7 @@ fn a_prefill_step_fires_too_so_both_lanes_reach_the_device() {
 /// This is the same allocation with its arguments taken from the frame.
 #[test]
 fn the_kv_pool_allocates_at_the_geometry_the_fire_states() {
-    use driver_metal::gpu::pools::kv::{Pool, translate};
+    use driver_metal::pools::kv::{Pool, translate};
     use driver_metal::layout::kv::Shape;
 
     let Ok(context) = Context::new() else {
@@ -605,7 +606,7 @@ fn the_kv_pool_allocates_at_the_geometry_the_fire_states() {
 /// rows toward the front, so source and destination overlap.
 #[test]
 fn a_move_plan_slides_rows_without_smearing_them() {
-    use driver_metal::gpu::pools::kv::Pool;
+    use driver_metal::pools::kv::Pool;
     use driver_metal::layout::kv::Shape;
     use driver_metal::layout::{CellCopy, CellMovePlan};
 
@@ -648,7 +649,7 @@ fn a_move_plan_slides_rows_without_smearing_them() {
     })
     .expect("the move runs");
 
-    let read = |p: &driver_metal::gpu::pools::kv::Pages| -> Vec<u8> {
+    let read = |p: &driver_metal::pools::kv::Pages| -> Vec<u8> {
         let at = p.host_span(0, total as u64).expect("the pages are addressable");
         unsafe { std::slice::from_raw_parts(at.as_ptr().cast_const(), total) }.to_vec()
     };
@@ -723,18 +724,18 @@ fn two_whole_text_fires_are_in_flight_at_once() {
     // `run_keeping_arena` builds — has no timeline to compare against and no
     // allocator ring to alternate, so it could not pipeline even in
     // principle.
-    let mut stepper = driver_metal::gpu::Stepper::new(&context).expect("a stepper");
+    let mut stepper = driver_metal::device::Stepper::new(&context).expect("a stepper");
     // ONE pool too, for the same reason: reuse across fires is what makes an
     // address stable, and a fresh pool per fire is the allocation it replaces.
-    let scratch = driver_metal::gpu::Scratch::new();
+    let scratch = driver_metal::fire::Scratch::new();
     // No regions registered, so `record` refuses every operand and `submit`
     // falls back to encoding -- which is the behaviour this test wants, and
     // is also the fallback a deployment that has not registered its regions
     // gets. Both fires still commit.
-    let mut regions = driver_metal::gpu::Regions::new();
-    let mut recordings = driver_metal::gpu::Recordings::new();
+    let mut regions = driver_metal::device::Regions::new();
+    let mut recordings = driver_metal::fire::Recordings::new();
 
-    let mut machine = driver_metal::gpu::fire::run::Machine {
+    let mut machine = driver_metal::fire::run::Machine {
         context: &context,
         compiler: &compiler,
         pipelines: &mut pipelines,
@@ -744,13 +745,13 @@ fn two_whole_text_fires_are_in_flight_at_once() {
         recordings: Some(&mut recordings),
     };
     let first =
-        driver_metal::gpu::fire::run::submit(&mut machine, &lowered, geometry(), &mut store)
+        driver_metal::fire::run::submit(&mut machine, &lowered, geometry(), &mut store)
             .expect("the first fire commits");
 
     // Committed, not waited for. The second is planned, staged, bound and
     // committed with the first still outstanding.
     let second =
-        driver_metal::gpu::fire::run::submit(&mut machine, &lowered, geometry(), &mut store)
+        driver_metal::fire::run::submit(&mut machine, &lowered, geometry(), &mut store)
             .expect("the second fire commits while the first is outstanding");
 
     // TWO regions, not one. The pool must not hand the second fire the arena

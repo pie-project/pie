@@ -55,8 +55,8 @@ fn plans() -> Vec<(&'static str, ForwardPlan)> {
         ),
         (
             "glm5",
-            model::glm5::forward::glm5_cuda(
-                &model::glm5::forward::facts::Glm5Facts::glm5_106b_a12b(),
+            model::glm_5::forward::glm5_cuda(
+                &model::glm_5::forward::facts::Glm5Facts::glm5_106b_a12b(),
                 FireClass::Decode,
             ),
         ),

@@ -14,7 +14,8 @@
 
 
 use driver_metal::Error;
-use driver_metal::gpu::{ArgumentTable, Compiler, Context, Heap, Stepper, Visibility};
+use driver_metal::device::{ArgumentTable, Context, Heap, Stepper, Visibility};
+use driver_metal::program::Compiler;
 
 /// Writes `index + 1` to every element, so the check cannot pass on a buffer
 /// that happens to be a constant -- and cannot pass on a dispatch that ran

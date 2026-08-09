@@ -342,6 +342,14 @@ pub struct LoraFireState {
     ptr_slab: *mut c_void,
     slab_stride: usize,
     grouped_enabled: bool,
+    /// EVERYTHING A CAPTURED LORA BODY BAKES, mixed into one number.
+    ///
+    /// `stage_qkv_adapters` computed this and RETURNED it, and the call
+    /// site wrote `let _ = fingerprint`. Carried on the state instead, so
+    /// the value and the thing it describes cannot be separated — the
+    /// bucket key needs it, and a key that has to be given a number
+    /// separately is a key that will one day be given the wrong one.
+    pub(crate) capture_fingerprint: u64,
 }
 
 /// `base + row * width` bf16 elements — the C++ `bf16_row`.
@@ -379,6 +387,9 @@ impl LoraFireState {
             ));
         }
         let mut me = Self {
+            // Filled by `stage_qkv_adapters`, which is the only thing
+            // that knows what the capture will bake.
+            capture_fingerprint: 0,
             lanes: Vec::with_capacity(table.lanes.len()),
             groups: Vec::new(),
             ptr_slab: std::ptr::null_mut(),
@@ -948,7 +959,12 @@ pub fn stage_qkv_adapters<O: DeviceMemory + LoraOps>(
         h64 ^= mix(v.a as u64);
         h64 ^= mix(v.b as u64);
     }
-    Ok((if h64 == 0 { 1 } else { h64 }, Some(staged)))
+    let h64 = if h64 == 0 { 1 } else { h64 };
+    // CARRIED, not merely returned. The bucket key needs it and the call
+    // site used to drop it; a value that travels beside the thing it
+    // describes cannot be dropped without dropping both.
+    let staged = LoraFireState { capture_fingerprint: h64, ..staged };
+    Ok((h64, Some(staged)))
 }
 
 // ── Reading the sink: a plan says WHICH adapter, the caller says where ──
@@ -1306,6 +1322,9 @@ mod sink_tests {
 /// are not ones this session rings. Each of those is an ordinary
 /// adapter-free fire rather than a failure — a program without an
 /// adapter is the common case.
+// Same seam as `fire::launch`: it reads the shell's instance table,
+// which is the door's own state.
+#[cfg(feature = "abi")]
 #[must_use]
 pub fn lane_for_instance(
     programs: &crate::program::Programs,

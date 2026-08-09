@@ -25,7 +25,8 @@ use driver_metal::channel::{
     ExecPlan, NO_TICKET, StatusOutcome, Ticket, Versions, adopt_launch_package,
 };
 use driver_metal::{Error, Region};
-use driver_metal::gpu::{Archives, Context, DeviceInputs, Externals, LaneCandidate, Pool, Prepare, PreparedFire, Ring, Runtime, Stepper, Tables};
+use driver_metal::device::{Archives, Context, Externals, Pool, Ring, Stepper, Tables};
+use driver_metal::program::{DeviceInputs, LaneCandidate, Prepare, PreparedFire, Runtime};
 use tensor_ir::DType;
 use tensor_ir::op::tags;
 use tensor_ir::registry::Stage;

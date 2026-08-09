@@ -8,7 +8,8 @@
 #![allow(clippy::print_stdout)]
 
 use driver_metal::{Error, Region};
-use driver_metal::gpu::{Compiler, Context, Handle, Heap, Pool, Stepper, Tables};
+use driver_metal::device::{Context, Handle, Heap, Pool, Stepper, Tables};
+use driver_metal::program::Compiler;
 
 const HEAP_BYTES: u64 = 1 << 20;
 const SLOT_BYTES: u64 = 4096;

@@ -268,3 +268,114 @@ impl std::error::Error for Error {
         }
     }
 }
+
+/// A checkpoint `crates/model` will not project a deployment for.
+///
+/// THE CONVERSION IS THE BOUNDARY, and it is the same one `driver-cuda`
+/// draws in its own `error.rs`. The eleven `*_facts_from_hf` derivations
+/// this replaces returned `PIE_STATUS_UNSUPPORTED` directly — the ENGINE's
+/// vocabulary, manufactured inside a derivation that has no engine and no
+/// idea what an ABI status is — and every one of nine refusal sites reached
+/// the operator as the same sentence, "no deployment derivation for this
+/// model type", which names neither the model nor the thing that is
+/// missing.
+///
+/// What crosses the crate boundary now is a [`model::deployment::Refusal`]
+/// carrying its own reason, and this is the one place it becomes something
+/// this driver can return.
+///
+/// Both variants land on [`Error::Unserved`] and the `what` is what
+/// separates them, because THE REMEDIATION IS THE SAME FOR BOTH: nothing
+/// was exhausted, nothing failed to compile, and no device declined
+/// anything — the fix is in the deployment. That is the distinction
+/// `Unserved` exists to make and the reason it is not `Create`.
+impl From<model::deployment::Refusal> for Error {
+    fn from(e: model::deployment::Refusal) -> Self {
+        let what = match e {
+            // A statement about this BUILD. The checkpoint is fine and a
+            // differently-configured pie would serve it, which is a
+            // different thing for an operator to do about it.
+            model::deployment::Refusal::Unsupported(_) => "deployment unsupported",
+            model::deployment::Refusal::Malformed(_) => "deployment malformed",
+        };
+        Self::Unserved {
+            what,
+            message: e.to_string(),
+        }
+    }
+}
+
+/// A shape no Metal kernel here can be launched at.
+///
+/// Beside the conversion above because it is the same boundary one step
+/// later: a row projects a `Deployment` and this driver then asks whether
+/// its own kernels can take it. A GDN head that is not a multiple of 32
+/// lanes, an affine point off the instantiation grid, an irregular
+/// interleave — every one is a fact about THIS BUILD's kernels rather than
+/// about the checkpoint, so it lands where `Refusal::Unsupported` lands.
+impl From<crate::batch::GeometryRefused> for Error {
+    fn from(e: crate::batch::GeometryRefused) -> Self {
+        Self::Unserved {
+            what: "decode geometry",
+            message: e.0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both refusals become the variant whose remediation is "change the
+    /// deployment", and neither becomes `Create`.
+    ///
+    /// The point of the assertion is the SHAPE of the answer, not the
+    /// prose: a caller looking at "this build has no text for the row" and
+    /// at "the heap declined a buffer" wants to do opposite things, and
+    /// under one variant the only way to tell them apart is to match on a
+    /// string.
+    #[test]
+    fn a_refusal_becomes_unserved_and_carries_its_own_reason() {
+        let unsupported: Error =
+            model::deployment::Refusal::Unsupported("no latent KV pool in this build").into();
+        let Error::Unserved { what, message } = &unsupported else {
+            panic!("a refusal is not a device failure: {unsupported}");
+        };
+        assert_eq!(*what, "deployment unsupported");
+        assert!(
+            message.contains("no latent KV pool in this build"),
+            "the reason the row gave has to survive the conversion: {message}"
+        );
+
+        let malformed: Error =
+            model::deployment::Refusal::Malformed("32 layers stated, 28 shipped").into();
+        let Error::Unserved { what, message } = &malformed else {
+            panic!("a contradiction is not a device failure: {malformed}");
+        };
+        assert_eq!(*what, "deployment malformed");
+        assert!(message.contains("32 layers stated"), "{message}");
+
+        // The two are distinguishable without matching on prose, which is
+        // the whole reason `what` is carried separately.
+        assert_ne!(unsupported.to_string(), malformed.to_string());
+    }
+
+    /// A geometry refusal keeps its sentence and does not gain a second
+    /// prefix.
+    ///
+    /// `GeometryRefused`'s `Display` already stamps `decode geometry:` on
+    /// the front, and `Error::Unserved` stamps `driver-metal: {what}:`.
+    /// Converting through `Display` would produce `driver-metal: decode
+    /// geometry: decode geometry: ...`, which is why this takes the field.
+    #[test]
+    fn a_geometry_refusal_is_stamped_once() {
+        let refused = crate::batch::GeometryRefused(
+            "linear k_d 96 is not a multiple of 32".to_string(),
+        );
+        let e: Error = refused.into();
+        let text = e.to_string();
+        assert_eq!(text.matches("decode geometry").count(), 1, "{text}");
+        assert!(text.contains("not a multiple of 32"), "{text}");
+    }
+}
+

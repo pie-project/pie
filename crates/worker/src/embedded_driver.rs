@@ -216,6 +216,39 @@ fn write_descriptor_beside(
     Ok(())
 }
 
+/// Name the model in `[model] id`, when the operator named one.
+///
+/// # What crosses the boundary
+///
+/// A string. The document beside it is on its way out: the worker wrote
+/// a `pie.model/1` JSON blob, named its path here, and each driver
+/// parsed it back — `driver-cuda` through `model::descriptor` into an
+/// `HfConfig`, `driver-metal` through its OWN reader into its OWN
+/// `ModelFacts`, with its own defaulting rules. Two readers of one
+/// document, under two failure policies: the facts reader swallowed a
+/// missing field with a default, the descriptor reader refused. So the
+/// two sides could hold different beliefs about one checkpoint and
+/// neither would say anything.
+///
+/// An id cannot do that, because both drivers link the same `const`
+/// table. A wrong id fails to resolve — at the door, with the nearest
+/// ids named — and a right one reaches a row that answers every question
+/// the same way on both sides, because it is the same row.
+///
+/// # Why it is optional
+///
+/// Because the checkpoint can answer for itself. Absent an id, a driver
+/// matches the TENSORS against the catalog, which is the answer that
+/// does not depend on anyone having written anything down. The id is an
+/// OVERRIDE, for the case where a checkpoint is genuinely a known model
+/// under an unknown name — a fine-tune, a re-upload, a mirror that
+/// renamed the directory — and it does not skip the manifest check.
+fn insert_model_id(model: &mut toml::Table, id: Option<&str>) {
+    if let Some(id) = id.filter(|s| !s.is_empty()) {
+        insert_str(model, "id", id);
+    }
+}
+
 fn write_toml_table(out_path: &Path, doc: toml::Table) -> Result<()> {
     let serialized = toml::to_string(&doc).map_err(|e| anyhow!("serialize bootstrap TOML: {e}"))?;
     if let Some(parent) = out_path.parent() {
@@ -321,10 +354,31 @@ fn parse_caps_json(json: &str) -> Result<DriverCapabilities> {
     serde_json::from_value(value).map_err(|e| anyhow::anyhow!("driver caps schema mismatch: {e}"))
 }
 
-/// Read model facts out of `<snapshot>/config.json`.
-/// Used by [`write_dummy_startup_toml`] when the user didn't explicitly
-/// specify them in `[model.driver.options]`. Mirrors the legacy Python
-/// dummy driver's `hf_utils.load_hf_config()`-based discovery.
+/// Read the DUMMY driver's three defaults out of `<snapshot>/config.json`.
+///
+/// Used by [`dummy_native_options`] when the operator did not state them
+/// in `[model.driver.options]`. The dummy driver serves no weights — it
+/// answers with the right SHAPES and the wrong numbers — so a vocabulary
+/// size and a context ceiling read straight off the file are exactly
+/// right for it. A real driver asks the catalog; this one has no
+/// checkpoint to identify.
+///
+/// # The label is CHECKED now, not merely derived
+///
+/// `arch_name` used to be `architectures[0]`, lowercased, with a task
+/// suffix stripped from a list written here — and `driver-metal` had a
+/// SECOND copy of the same idea whose list was one entry shorter. So
+/// `Gemma4ForConditionalGeneration` became `gemma4` on this side and
+/// `gemma4forconditionalgeneration` on that one, where it matched no
+/// chat row and fell through `instruct::create`'s `_ =>` arm to ChatML.
+/// The model then generated fluently and ended turns it was not having
+/// with an `<|im_end|>` its vocabulary does not contain.
+///
+/// The derivation survives, because a `config.json` is the only thing
+/// here to derive from. What is new is that its output is held against
+/// [`model::catalog::arches`] — the labels rows actually advertise — so
+/// a stem no row claims is a REFUSAL naming what it produced and what
+/// was available, instead of a string that travels quietly.
 fn read_hf_config_defaults(snapshot_dir: &Path) -> Result<(u32, String, u32)> {
     let path = snapshot_dir.join("config.json");
     let text = std::fs::read_to_string(&path).map_err(|e| anyhow!("read {path:?}: {e}"))?;
@@ -342,11 +396,9 @@ fn read_hf_config_defaults(snapshot_dir: &Path) -> Result<(u32, String, u32)> {
         .and_then(|a| a.first())
         .and_then(|a| a.as_str())
         .ok_or_else(|| anyhow!("`architectures[0]` missing from {path:?}"))?;
-    // "Qwen3ForCausalLM" → "qwen3" — same heuristic the Python wrapper used,
-    // and the same one `driver/metal`'s `arch_stem` applies. The task suffix
-    // is what comes off: a multimodal release is named
-    // `<Stem>ForConditionalGeneration`, and leaving that whole misses every
-    // registry keyed on the stem.
+    // "Qwen3ForCausalLM" → "qwen3". The task suffix is what comes off: a
+    // multimodal release is named `<Stem>ForConditionalGeneration`, and
+    // leaving that whole misses every label a row advertises.
     //
     // The list is explicit rather than "cut at the first `for`" because
     // `ReformerForCausalLM` has one inside its own stem.
@@ -356,6 +408,19 @@ fn read_hf_config_defaults(snapshot_dir: &Path) -> Result<(u32, String, u32)> {
         .or_else(|| raw_arch_lower.strip_suffix("forcausallm"))
         .unwrap_or(&raw_arch_lower)
         .to_string();
+    // AND THEN CHECKED. See this function's doc for the failure this
+    // catches; the point is that the stem is a guess and the catalog is
+    // the authority, so a guess that names nothing stops here.
+    let known = model::catalog::arches();
+    if !known.iter().any(|a| *a == arch_name) {
+        return Err(anyhow!(
+            "`architectures[0]` in {path:?} is {raw_arch:?}, which reduces to \
+             the family {arch_name:?} — and no catalog row advertises that \
+             family. This build serves {known:?}. State \
+             `[model.driver.options] arch_name` explicitly if the dummy \
+             driver should answer with it anyway."
+        ));
+    }
 
     let max_model_len = v
         .get("max_position_embeddings")
@@ -390,6 +455,7 @@ pub fn write_metal_startup_toml(
     insert_str(&mut model, "hf_path", path_string(snapshot_dir));
     // Same arrangement as the CUDA driver.
     write_descriptor_beside(out_path, descriptor, &mut model)?;
+    insert_model_id(&mut model, options.model_id.as_deref());
     insert_str(&mut model, "backend", &options.device);
     insert_bool(
         &mut model,
@@ -485,6 +551,7 @@ pub(crate) fn write_cuda_startup_toml(
     insert_str(&mut model, "snapshot_dir", path_string(snapshot_dir));
     insert_str(&mut model, "weight_cache_dir", weight_cache_dir());
     write_descriptor_beside(out_path, descriptor, &mut model)?;
+    insert_model_id(&mut model, opts.model_id.as_deref());
     insert_str(&mut model, "device", &opts.device);
     insert_str(&mut model, "dtype", opts.weight_dtype.clone());
     insert_int(&mut model, "mtp_num_drafts", opts.mtp_num_drafts);

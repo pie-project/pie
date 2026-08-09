@@ -38,7 +38,8 @@ use std::path::Path;
 use model_loader::checkpoint::CheckpointMetadata;
 use model_loader::plan::{self, LoadPlan, StorageTarget};
 
-use crate::facts::ModelFacts;
+use crate::catalog::{self, Override, Unmatched, Variant};
+use crate::encoding::Encoding;
 use crate::policy::{
     Component, FamilyKnobs, Mxfp4MoePolicy, Mxfp4MoeRequest, Naming, Policy, Projections,
     RuntimeQuant,
@@ -84,20 +85,19 @@ impl Binding {
 
 /// Why a load plan could not be compiled.
 ///
-/// Three ways, and each is a fact about the request rather than about a
-/// driver: the descriptor did not parse, nothing in the family registry
-/// claims its `model_type`, or the contract did not compile into a plan the
-/// snapshot backs.
+/// Two ways now, where there were three. `Descriptor(String)` is gone
+/// with the document it named: there is no `pie.model/1` blob crossing
+/// the process boundary to fail to parse, because what crosses is an id.
+/// `UnknownFamily(String)` folded into [`Self::Unidentified`], which is
+/// the same refusal made honest — it used to say "no author for
+/// model_type 'x'" after a `find` over a table, and it now says which
+/// rows were CLOSE and by how many tensors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadPlanError {
-    /// The `pie.model/1` document did not read as facts.
-    Descriptor(String),
-    /// No author in the [`contract`] registry claims this `model_type`.
-    ///
-    /// The one refusal a driver could not raise itself: the family registry
-    /// is this crate's, so a `model_type` nothing claims is a fact about that
-    /// registry rather than about the checkpoint.
-    UnknownFamily(String),
+    /// This checkpoint is no model this build serves, or an override
+    /// named a row that does not exist, or — the table defect — two rows
+    /// matched it equally well.
+    Unidentified(Unmatched),
     /// The author refused, the plan did not compile, or a file the plan
     /// declares is absent or the wrong size on disk.
     Compile(String),
@@ -106,15 +106,15 @@ pub enum LoadPlanError {
 impl std::fmt::Display for LoadPlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Descriptor(m) => write!(f, "descriptor: {m}"),
-            Self::UnknownFamily(m) => write!(
-                f,
-                "no author for model_type '{m}'; every family loads through \
-                 this entry, so an unknown one needs an author in \
-                 model::contract"
-            ),
+            Self::Unidentified(u) => write!(f, "{u}"),
             Self::Compile(m) => write!(f, "{m}"),
         }
+    }
+}
+
+impl From<Unmatched> for LoadPlanError {
+    fn from(u: Unmatched) -> Self {
+        Self::Unidentified(u)
     }
 }
 
@@ -168,11 +168,33 @@ pub fn compile_load_plan(
     snapshot_dir: &Path,
     metadata: &CheckpointMetadata,
     target: &StorageTarget,
-    descriptor_json: &str,
+    chosen: &Override,
+    encoding: &Encoding,
     binding: Binding,
 ) -> Result<(LoadPlan, Mxfp4MoePolicy), LoadPlanError> {
-    let facts = ModelFacts::from_descriptor(descriptor_json.as_bytes())
-        .map_err(|e| LoadPlanError::Descriptor(e.to_string()))?;
+    let row = catalog::identify(metadata, chosen)?;
+    compile_load_plan_for(snapshot_dir, metadata, target, row, encoding, binding)
+}
+
+/// The same, for a caller that already knows its row.
+///
+/// Two entries and not a default argument, because the two callers are
+/// genuinely different: a driver boot has a checkpoint and must find out
+/// what it is, and `pie model build --as` has been told. Splitting them
+/// keeps [`catalog::identify`] off the second path entirely rather than
+/// having it run and be ignored.
+///
+/// # Errors
+///
+/// As [`compile_load_plan`], minus the identification.
+pub fn compile_load_plan_for(
+    snapshot_dir: &Path,
+    metadata: &CheckpointMetadata,
+    target: &StorageTarget,
+    row: &dyn Variant,
+    encoding: &Encoding,
+    binding: Binding,
+) -> Result<(LoadPlan, Mxfp4MoePolicy), LoadPlanError> {
     let policy = Policy {
         projections: binding.projections,
         naming: binding.naming,
@@ -182,11 +204,9 @@ pub fn compile_load_plan(
         stream_routed_experts: false,
         knobs: FamilyKnobs::default(),
     };
-    let (contract, resolved_moe) = crate::contract::author_with_policy(
-        &facts, metadata, target, &policy,
-    )
-    .map_err(|e| LoadPlanError::Compile(e.to_string()))?
-    .ok_or_else(|| LoadPlanError::UnknownFamily(facts.model_type.clone()))?;
+    let (contract, resolved_moe) =
+        crate::contract::author_with_policy(row, encoding, metadata, target, &policy)
+            .map_err(|e| LoadPlanError::Compile(e.to_string()))?;
     let plan = plan::compile(metadata, &contract, target.clone())
         .map_err(|e| LoadPlanError::Compile(e.to_string()))?;
     model_loader::checkpoint::read::verify_declared_files(&plan, snapshot_dir)
@@ -218,45 +238,95 @@ mod tests {
         assert_eq!(Binding::MLX_IN_PLACE.projections, Projections::InPlace);
     }
 
+    /// A checkpoint no row matches is refused before anything is
+    /// authored, and the refusal says which rows were CLOSE.
+    ///
+    /// This replaces two tests: one for a descriptor that did not parse
+    /// and one for a `model_type` no author claimed. Both were about a
+    /// STRING failing to place a checkpoint, and the string is gone.
+    /// What is left is the real question — are these tensors any model
+    /// this build serves — and it has one answer.
     #[test]
-    fn an_unparseable_descriptor_says_so_before_anything_is_authored() {
+    fn a_checkpoint_no_row_matches_is_refused_at_the_door() {
         let err = compile_load_plan(
             Path::new("/nonexistent"),
             &empty_checkpoint(),
             &StorageTarget::default(),
-            "{ not json",
+            &Override::None,
+            &Encoding::dense(),
             Binding::MLX_IN_PLACE,
         )
-        .expect_err("a malformed descriptor cannot author a contract");
+        .expect_err("an empty checkpoint is no model");
         assert!(
-            matches!(err, LoadPlanError::Descriptor(_)),
-            "the descriptor is read first, so it is the first thing that can \
+            matches!(err, LoadPlanError::Unidentified(_)),
+            "identification comes first, so it is the first thing that can \
              refuse: {err}"
+        );
+        assert!(
+            err.to_string().contains("matches no model"),
+            "the refusal names what it is: {err}"
         );
     }
 
+    /// An override naming a row that does not exist is a typo, and is
+    /// answered as one.
     #[test]
-    fn a_model_type_no_author_claims_comes_back_named() {
-        let descriptor = serde_json::json!({
-            "version": "pie.model/1",
-            "model_type": "no-such-family-9000",
-            "num_hidden_layers": 1,
-        })
-        .to_string();
+    fn an_override_naming_no_row_suggests_the_nearest() {
         let err = compile_load_plan(
             Path::new("/nonexistent"),
             &empty_checkpoint(),
             &StorageTarget::default(),
-            &descriptor,
+            &Override::Id("no-such-model-9000".into()),
+            &Encoding::dense(),
             Binding::MLX_IN_PLACE,
         )
-        .expect_err("no author claims this model_type");
-        // The message has to name the type: an operator reading it is being
-        // told which family to go add, and "unknown family" alone does not
-        // say which.
+        .expect_err("no row carries this id");
+        // The message has to name the id: an operator reading it is being
+        // told what they asked for could not be found, and "unknown model"
+        // alone does not say which.
         assert!(
-            err.to_string().contains("no-such-family-9000"),
-            "the refusal must name the type it could not place: {err}"
+            err.to_string().contains("no-such-model-9000"),
+            "the refusal must name the id it could not place: {err}"
         );
+        assert!(matches!(err, LoadPlanError::Unidentified(Unmatched::NoSuchId { .. })));
+    }
+
+    /// An override that names a REAL row still gets its manifest
+    /// checked.
+    ///
+    /// The escape hatch is deliberately not a way to load a checkpoint
+    /// as something it is not — that is the failure the whole
+    /// arrangement exists to prevent. An empty checkpoint overridden to
+    /// a real row is refused for the tensors it does not have, not
+    /// accepted because someone asked.
+    #[test]
+    fn an_override_does_not_skip_the_check() {
+        let Some(known) = catalog::ids().first().copied() else {
+            return;
+        };
+        let err = compile_load_plan(
+            Path::new("/nonexistent"),
+            &empty_checkpoint(),
+            &StorageTarget::default(),
+            &Override::Id(known.to_string()),
+            &Encoding::dense(),
+            Binding::MLX_IN_PLACE,
+        )
+        .expect_err("an empty checkpoint is not that row either");
+        assert!(matches!(err, LoadPlanError::Unidentified(Unmatched::NoRow { .. })));
+        assert!(
+            err.to_string().contains(known),
+            "the diff names the row that was asked for: {err}"
+        );
+    }
+
+    /// `From<Unmatched>` is what lets the identification refuse with
+    /// `?`.
+    #[test]
+    fn an_unmatched_converts_without_losing_its_message() {
+        let u = Unmatched::Ambiguous { ids: vec!["a", "b"] };
+        let e: LoadPlanError = u.clone().into();
+        assert_eq!(e, LoadPlanError::Unidentified(u.clone()));
+        assert_eq!(e.to_string(), u.to_string());
     }
 }

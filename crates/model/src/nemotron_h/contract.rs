@@ -92,9 +92,9 @@ fn mamba_tp_shards(b: &mut Builder<'_>) -> Result<(), Error> {
     if b.target().tp_size <= 1 || !b.knobs().nemotron_tp_mamba_sharding {
         return Ok(());
     }
-    for layer in 0..b.facts().num_hidden_layers {
+    for layer in 0..b.shape().layers {
         let mp = b.source_name(&format!("language_model.backbone.layers.{layer}.mixer."));
-        layer_mamba_tp(b, &mp, i64::from(b.facts().mamba_groups))?;
+        layer_mamba_tp(b, &mp, i64::from(b.shape().mamba_groups))?;
     }
     Ok(())
 }
@@ -131,7 +131,9 @@ fn layer_mamba_tp(b: &mut Builder<'_>, mp: &str, groups: i64) -> Result<(), Erro
     };
 
     // Every extent below is read off a tensor. Only `groups` cannot be: see
-    // `ModelFacts::mamba_groups`.
+    // `crate::catalog::LoadShape::mamba_groups`, which the ROW states
+    // because the checkpoint fuses B and C into one bank and a loader
+    // holding it can only see the product.
     let in_shape = in_proj.shape.clone();
     let conv_shape = conv_w.shape.clone();
     let out_shape = out_proj.shape.clone();
@@ -346,10 +348,10 @@ fn layer_mamba_tp(b: &mut Builder<'_>, mp: &str, groups: i64) -> Result<(), Erro
 /// Publish each layer's experts as one packed slab plus per-expert views
 /// into it, which is what the Nemotron-H MoE GEMM addresses.
 fn packed_expert_views(b: &mut Builder<'_>) -> Result<(), Error> {
-    if b.facts().num_experts == 0 {
+    if b.shape().n_experts == 0 {
         return Ok(());
     }
-    for layer in 0..b.facts().num_hidden_layers {
+    for layer in 0..b.shape().layers {
         let base = format!("language_model.backbone.layers.{layer}.mixer.experts");
         if b.find(&format!("{base}.up_proj.packed.weight")).is_some()
             || b.find(&format!("{base}.down_proj.packed.weight")).is_some()
@@ -359,7 +361,7 @@ fn packed_expert_views(b: &mut Builder<'_>) -> Result<(), Error> {
         let mut up = Vec::new();
         let mut down = Vec::new();
         let mut complete = true;
-        for expert in 0..b.facts().num_experts {
+        for expert in 0..b.shape().n_experts {
             let tag = format!("{base}.{expert}.");
             let (Some(u), Some(d)) = (
                 b.find(&format!("{tag}up_proj.weight")),

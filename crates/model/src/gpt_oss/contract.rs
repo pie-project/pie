@@ -256,11 +256,11 @@ fn native_down(
 /// path Marlin-repacks into a layout whose rows are permuted across the
 /// whole bank, so one expert's repacked bytes are not a contiguous band.
 fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
-    let experts = i64::from(b.facts().num_experts);
+    let experts = i64::from(b.shape().n_experts);
     if experts <= 0 {
         return Ok(());
     }
-    for layer in 0..b.facts().num_hidden_layers {
+    for layer in 0..b.shape().layers {
         let bound = format!("model.layers.{layer}.mlp.experts.");
         let prefix = b.source_name(&bound);
 

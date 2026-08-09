@@ -14,7 +14,8 @@
 #![allow(clippy::print_stdout)]
 
 use driver_metal::{Error, Region};
-use driver_metal::gpu::{Compiler, Context, Heap, Stepper, Tables};
+use driver_metal::device::{Context, Heap, Stepper, Tables};
+use driver_metal::program::Compiler;
 
 const SPREAD: &str = r"
 #include <metal_stdlib>

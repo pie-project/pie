@@ -93,19 +93,28 @@ pub mod policy;
 #[cfg(feature = "contract")]
 pub mod probe;
 
-// ── The descriptor aspect ────────────────────────────────────────────
-// `pie.model/1`: HuggingFace `config.json` in, the descriptor out, and
-// nothing but serde behind it. Its own feature rather than `contract`'s
-// because `worker` writes a descriptor for a plain snapshot without
-// authoring anything, and because being reachable with no graph attached is
-// the whole point — see the module doc.
-#[cfg(feature = "config")]
-pub mod config;
+// ── The descriptor aspect is GONE ────────────────────────────────────
+//
+// `config` (1,563 lines), `descriptor` (443) and `facts` (153) are
+// deleted, and so is `deployment_cuda` (1,436): a `pie.model/1`
+// descriptor normalized from a 136-field schema, a reader that parsed it
+// back, a `ModelFacts` projection of the result, and eleven per-family
+// derivations over all of it. That is 3,595 lines whose entire job was
+// to turn strings a checkpoint says about itself into numbers, ONCE PER
+// REPRESENTATION, with nothing holding the representations to each
+// other.
+//
+// The numbers were always the same numbers. They are stated once now, in
+// `catalog`, and the only thing left that a file has to answer is the
+// declared encoding — see `encoding`.
+
 /// Trace names for the weights a checkpoint publishes.
-#[cfg(feature = "config")]
-pub mod weight_names;
+///
+/// Gated on `contract` rather than the deleted `config` feature: a
+/// [`catalog::LoadShape`] is what it reads, and that is the authoring
+/// aspect's vocabulary.
 #[cfg(feature = "contract")]
-pub mod facts;
+pub mod weight_names;
 
 /// What a driver needs to serve a checkpoint, with no family name in it.
 ///
@@ -114,38 +123,6 @@ pub mod facts;
 /// value rather than the `Box<dyn PlannedFamily>` the drivers built per
 /// fire.
 pub mod deployment;
-
-/// The CUDA shell's per-family derivations, moved out of the driver.
-///
-/// The table of `model_type` rows and the eleven functions that read a
-/// checkpoint into per-family facts. It is here rather than in
-/// `driver-cuda` because §4's rule is that **the driver reads the
-/// answer, never the question** — and a table of `model_type` strings
-/// inside a driver is the question.
-///
-/// Gated on BOTH aspects it reads, because it reads both:
-/// `PlannedFamily::trace` returns a `model_compiler::trace::ForwardPlan`
-/// and the rows dispatch into `families::*::forward` (`forward`), while
-/// the derivations take a `crate::config::schema::HfConfig` (`config`).
-///
-/// It was declared ungated, which made `model` fail to build under any
-/// feature set missing either one — including `features = ["config"]`,
-/// exactly what `driver-cuda`'s LIBRARY dependency asked for. It went
-/// unnoticed because that crate's dev-dependency adds the rest, so every
-/// `cargo test` unified the features back on; `cargo tree -e
-/// features,no-dev` is what shows the truth.
-#[cfg(all(feature = "forward", feature = "config"))]
-pub mod deployment_cuda;
-
-/// The `pie.model/1` descriptor reader.
-///
-/// The config aspect's, not a third thing: it reads
-/// `crate::config::schema` and serde_json, and the `config` feature's own
-/// doc describes this module ("HuggingFace `config.json` normalization on
-/// the way in, `ModelFacts` projection on the way out"). Ungated, it made
-/// `model` fail to compile under `chat` alone and under `forward` alone.
-#[cfg(feature = "config")]
-pub mod descriptor;
 
 // ── The shared root: the chat aspect ─────────────────────────────────
 #[cfg(feature = "chat")]
@@ -174,9 +151,36 @@ pub mod families;
 pub mod emissions;
 
 // ── The registries ───────────────────────────────────────────────────
+//
+// `catalog` is THE registry. There used to be three -- `contract::HF_ROWS`
+// keyed on a `config.json` `model_type`, `deployment_cuda::FACTS_ROWS` keyed
+// on the same string, and `instruct::create` keyed on `architectures[0]` --
+// and nothing held them to each other. `qwen3_moe` authored as a GDN mixture
+// and deployed as a dense llama in the same tree; the chat table's `_ =>`
+// arm answered ChatML for a generation that had never heard of `<|im_end|>`.
+//
+// One row now answers all three, so the answers cannot disagree.
+
+/// The tensor manifest: what a checkpoint of a row MUST contain.
+///
+/// Identity and validation are the same operation here, which is the
+/// whole reason a manifest is first-class. Ungated: every aspect that
+/// can name a row can ask what it is made of.
+pub mod manifest;
+
+/// The catalog: one row per model, one row per answer.
+pub mod catalog;
+
+/// What a checkpoint's FILES say about how its numbers are stored.
+///
+/// Beside the catalog rather than in it, because an encoding is a
+/// property of a file and a row is a property of a model. Qwen3-8B is
+/// one row and four downloads.
+pub mod encoding;
+
 #[cfg(feature = "contract")]
 pub mod contract;
-/// The load path itself: descriptor in, plan out, stated once for every
+/// The load path itself: a row in, a plan out, stated once for every
 /// driver. Sits with `contract` because it is that registry's caller.
 #[cfg(feature = "contract")]
 pub mod boot;
@@ -189,17 +193,18 @@ pub mod multimodal;
 // its own aspects, so a generation that implements only one is an empty module
 // under the other.
 //
-// `qwen_3` is absent by the families rule: everything it held was ChatML,
-// which four other generations bind, so it is `families::chatml`.
+// `qwen_3` used to be absent by the families rule -- everything it held was
+// ChatML, which four other generations bind. It is back, because a
+// generation now holds something no family can: its ROWS. `families::chatml`
+// still speaks for it.
 pub mod csm;
 pub mod deepseek_r1;
 pub mod deepseek_v4;
 pub mod gemma_2;
 pub mod gemma_3;
-pub mod gemma3n;
+pub mod gemma_3n;
 pub mod gemma_4;
 pub mod glm_5;
-pub mod glm5;
 pub mod gpt_oss;
 pub mod kimi_k2;
 pub mod kimi_k3;
@@ -211,6 +216,7 @@ pub mod olmo_2;
 pub mod olmo_3;
 pub mod phi_3;
 pub mod qwen_2;
+pub mod qwen_3;
 pub mod qwen_3_5;
 
 // ── Neither aspect ───────────────────────────────────────────────────

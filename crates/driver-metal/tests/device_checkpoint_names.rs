@@ -23,18 +23,27 @@
 //!     reported 308 missing names -- every one a `qkv` or a `q_norm`, which is
 //!     to say the FIXTURE's bindings. It derives facts from the checkpoint
 //!     now, through the chain the seam uses.
-//!   * `geometry_from_facts` read only the `q35_*` block, so a llama config
-//!     -- which `from_descriptor` reads into `ll_*` -- was refused as
-//!     "carrying no decoder shape" while carrying it in the other block. And
-//!     it demanded a linear-attention block of a stack that has no linear
-//!     layers.
+//!   * The projection into `DecodeGeometry` read only the `q35_*` block, so
+//!     a llama config -- which the descriptor reader put in `ll_*` -- was
+//!     refused as "carrying no decoder shape" while carrying it in the other
+//!     block. And it demanded a linear-attention slab of a stack that has no
+//!     linear layers.
+//!
+//! Both of those are structurally impossible now, and saying why is the
+//! point of keeping the paragraph. There is no descriptor, no family-prefixed
+//! block, and no reader that guesses which block was filled: the checkpoint's
+//! TENSORS pick a `model::catalog` row, the row projects one
+//! `model::deployment::Deployment`, and `batch::geometry_from_deployment` is
+//! arithmetic over that one value. A shape cannot be "in the other block"
+//! when there is one block, and a refusal cannot demand a slab of a stack
+//! whose row states none.
 
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use driver_metal::gpu::Context;
-use driver_metal::gpu::weights::load::load;
+use driver_metal::device::Context;
+use driver_metal::weights::load::load;
 use driver_metal::lowering::resolve::{Names, Store};
 use model::families::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
 use model::families::llama_like::forward::llama_like_metal;
@@ -45,25 +54,56 @@ fn snapshot() -> Option<PathBuf> {
     std::env::var_os("PIE_METAL_SMOKE_CHECKPOINT").map(PathBuf::from)
 }
 
-/// The `pie.model/1` descriptor for a snapshot.
+/// WHICH MODEL a snapshot is, and at what affine point it was published.
 ///
-/// A TEST may normalize a checkpoint — `crates/model/tests/one_normalizer.rs`
-/// scans `crates/model/src` and `crates/engine/src`, and the rule it enforces
-/// is that the RUNTIME has one normalizer, not that nothing may call it. The
-/// seam itself takes the descriptor the worker hands over.
-fn descriptor_for(snapshot: &std::path::Path) -> String {
-    let raw = std::fs::read_to_string(snapshot.join("config.json"))
-        .expect("the snapshot has a config.json");
-    let root: serde_json::Value = serde_json::from_str(&raw).expect("config.json parses");
-    model::config::descriptor(&root, snapshot.to_str().expect("utf8 path"))
-        .expect("the config normalizes to a descriptor")
-        .to_string()
+/// This is the same two-step `serve/load.rs` runs, in the same order, and the
+/// order is the whole change. What was here before read `config.json`, handed
+/// it to an 845-line normalizer, and got back a `pie.model/1` document that
+/// everything downstream then re-parsed — so this gate proved the text's
+/// names against whatever THE DOCUMENT said, which is not the same claim as
+/// proving them against the checkpoint. It is now: `identify` matches the
+/// row's manifest against the tensors that are actually in the file, and a
+/// checkpoint that does not match any row fails here rather than binding
+/// half its names.
+///
+/// The config is still read, for ONE field. A row cannot state a
+/// quantization: `mlx-community` publishes the same weights at 4 bits group
+/// 64 and at 8 bits group 32, and the two pack to shapes no tensor's extents
+/// tell apart. Every `affine_qmv_fast_bfloat16_gs_N_b_M` symbol the text
+/// names carries that pair in its name, so a gate that guessed it would
+/// report missing kernels for a checkpoint that is fine.
+fn served(dir: &std::path::Path) -> (&'static dyn model::catalog::Variant, model::encoding::Encoding) {
+    let meta = model_loader::checkpoint::read::parse_checkpoint_metadata(dir)
+        .unwrap_or_else(|e| panic!("{} did not read as a checkpoint: {e:?}", dir.display()));
+    let row = model::catalog::identify(&meta, &model::catalog::Override::None)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+    // The embedded copy when the artifact carries one, the snapshot's own
+    // file when it does not. A converted `.pie` archive has the first; a raw
+    // HuggingFace snapshot -- which is what `PIE_METAL_NAMES_SNAPSHOT`
+    // usually points at -- has only the second.
+    let config = match model_loader::checkpoint::read::read_meta(&meta, model::encoding::CONFIG_OBJECT) {
+        Ok(Some(bytes)) => String::from_utf8(bytes).expect("the embedded config is utf8"),
+        _ => std::fs::read_to_string(dir.join("config.json"))
+            .unwrap_or_else(|e| panic!("{}/config.json: {e}", dir.display())),
+    };
+    let encoding = model::encoding::Encoding::from_config_json(&config)
+        .unwrap_or_else(|e| panic!("{}: the config does not state its encoding: {e}", dir.display()));
+    (row, encoding)
+}
+
+/// The affine point a snapshot's encoding names, as the kernels spell it.
+fn affine(encoding: &model::encoding::Encoding) -> driver_metal::batch::AffineFormat {
+    driver_metal::batch::AffineFormat {
+        bits: encoding.bits,
+        group: encoding.group_size,
+    }
 }
 
 /// Every weight name the Metal text states, over both fire classes.
 ///
 /// The facts come from the CHECKPOINT, through the same chain the seam uses:
-/// descriptor -> `ModelFacts` -> `DecodeGeometry` -> `text::facts_from`. An
+/// tensors -> `catalog` row -> `Deployment` -> `DecodeGeometry` ->
+/// `text::facts_from`. An
 /// earlier draft named `qwen3_0_6b()` here and reported 308 missing names
 /// against a llama-3.2 snapshot -- every one of them a `qkv` or a `q_norm`,
 /// which is to say the fixture's bindings and not the checkpoint's. A gate
@@ -112,18 +152,25 @@ fn the_checkpoint_answers_the_names_the_text_states() {
         eprintln!("SKIP: no Metal 4 device");
         return;
     };
-    let descriptor = descriptor_for(&snapshot);
-    let loaded = load(&context, &snapshot, &descriptor).expect("the checkpoint loads");
+    let (row, encoding) = served(&snapshot);
+    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
     assert!(
         !loaded.tensors.is_empty(),
         "the plan published no tensors at all"
     );
 
-    // The checkpoint's own facts, derived the way the seam derives them.
-    let model_facts = driver_metal::facts::ModelFacts::from_descriptor(&descriptor)
-        .expect("the descriptor states the model's facts");
-    let geometry =
-        driver_metal::batch::geometry_from_facts(&model_facts).expect("a decodable geometry");
+    // The checkpoint's own shape, projected the way the seam projects it:
+    // once, off the row the tensors matched, at the affine point the config
+    // declares.
+    let deployment = row
+        .deployment(model::catalog::Deployed::single())
+        .expect("the matched row deploys");
+    let geometry = driver_metal::batch::geometry_from_deployment(
+        &deployment,
+        row.load_shape(),
+        affine(&encoding),
+    )
+    .expect("a decodable geometry");
     let (facts, metal) =
         driver_metal::model::text::facts_from(&geometry, |t| loaded.tensors.contains_key(t));
 
@@ -166,8 +213,8 @@ fn what_this_checkpoint_published() {
         eprintln!("SKIP: no Metal 4 device");
         return;
     };
-    let descriptor = descriptor_for(&snapshot);
-    let loaded = load(&context, &snapshot, &descriptor).expect("the checkpoint loads");
+    let (row, encoding) = served(&snapshot);
+    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
     let names = loaded.names();
     eprintln!("{} tensors published; layer 0 and the globals:", names.len());
     for name in &names {
@@ -180,9 +227,9 @@ fn what_this_checkpoint_published() {
 /// **Every name a text states, against a checkpoint's PLAN — no device.**
 ///
 /// The same claim as `the_checkpoint_answers_the_names_the_text_states` and a
-/// hundredth of the cost: `compile_load_plan` reads a snapshot's metadata and
-/// a descriptor and publishes every tensor the load WILL stage, without
-/// staging any of it. The 26B gemma4 on this machine is SIGKILLed by the
+/// hundredth of the cost: `compile_load_plan_for` reads a snapshot's metadata
+/// and a catalog row's `LoadShape` and publishes every tensor the load WILL
+/// stage, without staging any of it. The 26B gemma4 on this machine is SIGKILLed by the
 /// staging test — fifteen gigabytes — and answers this one in milliseconds.
 ///
 /// The published names are what matters, and they are NOT the checkpoint's own
@@ -190,8 +237,11 @@ fn what_this_checkpoint_published() {
 /// `safetensors.index.json` was the first draft of this test and it reported
 /// fifty mismatches that were all the rename.
 ///
-/// Gated on `PIE_METAL_NAMES_SNAPSHOT`, and on `PIE_METAL_NAMES_ARCH` saying
-/// which naming convention to read it with.
+/// Gated on `PIE_METAL_NAMES_SNAPSHOT` alone. It used to also want
+/// `PIE_METAL_NAMES_ARCH` saying which naming convention to read a snapshot
+/// with -- an operator hand-typing the answer to a question the checkpoint
+/// already contains. `catalog::identify` reads it off the tensors, so the
+/// variable is gone and with it the run that named the wrong one.
 #[test]
 fn every_name_the_text_states_is_a_tensor_the_load_plan_publishes() {
     let dirs = snapshots_to_check();
@@ -253,25 +303,35 @@ fn snapshots_to_check() -> Vec<PathBuf> {
 /// reporting its every tensor as missing says nothing except that.
 fn check_one_snapshot(dir: &std::path::Path) {
     let dir = dir.to_path_buf();
+    let (row, encoding) = served(&dir);
+    let deployment = row
+        .deployment(model::catalog::Deployed::single())
+        .unwrap_or_else(|e| panic!("{}: the matched row does not deploy -- {e}", dir.display()));
+
     // Whether a text serves this checkpoint at all, asked of the DRIVER
     // rather than of a list kept here. `qwen3_5` interleaves linear
     // attention, which the metal text does not model -- and every one of its
     // tensors would then report as missing for that one reason, which is a
     // page of output saying nothing.
-    let arch = std::fs::read_to_string(dir.join("config.json"))
-        .ok()
-        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-        .and_then(|c| c.get("model_type")?.as_str().map(str::to_string))
-        .unwrap_or_default();
-    if !driver_metal::model::text::serves(&arch) {
-        eprintln!("    SKIP: no metal text serves `{arch}`");
+    //
+    // THE NAME COMES OFF THE ROW NOW, not off `config.json`'s `model_type`.
+    // That is not a tidy-up. This gate read `model_type` while the seam
+    // reduced `architectures[0]` -- lowercase, drop the `ForCausalLM` tail --
+    // so the two held DIFFERENT strings for the same checkpoint, and the two
+    // that differ (`qwen3_moe` against `qwen3moe`, `gpt_oss` against
+    // `gptoss`) are exactly the two the seam refused while this gate reported
+    // them healthy over five checkpoints. One row states one architecture,
+    // so there is nothing left to disagree.
+    let arch = deployment.advertised.arch;
+    if !driver_metal::model::text::serves(arch) {
+        eprintln!("    SKIP: no metal text serves `{arch}` (row `{}`)", row.id());
         return;
     }
 
-    let descriptor = descriptor_for(&dir);
     let target = driver_metal::loader::metal_storage_target();
-    let (plan, _) = driver_metal::loader::compile_load_plan(&dir, &target, &descriptor)
-        .expect("the plan compiles");
+    let (plan, _) =
+        driver_metal::loader::compile_load_plan_for(&dir, &target, row, &encoding)
+            .expect("the plan compiles");
     let published: BTreeSet<&str> = plan.tensors.iter().map(|t| t.name.as_str()).collect();
 
     // ONE map. gemma4 used to need its own, and the arch variable said which
@@ -279,15 +339,18 @@ fn check_one_snapshot(dir: &std::path::Path) {
     // candidates of `Names::mlx` now, so the checkpoint picks and this does
     // not.
     let names = Names::mlx();
-    // The DEPLOYMENT's facts, derived from the same descriptor, so a name the
-    // text states is one this checkpoint's shape actually asks for.
-    let model_facts = driver_metal::facts::ModelFacts::from_descriptor(&descriptor)
-        .expect("the descriptor states the model's facts");
     // A refusal is a FINDING and not a skip. The message says which fact the
     // geometry could not express, and swallowing it is how a checkpoint stops
     // being covered without anyone noticing -- the gate keeps passing and one
-    // fewer model is held to it.
-    let geometry = match driver_metal::batch::geometry_from_facts(&model_facts) {
+    // fewer model is held to it. It is a skip here anyway, for one reason:
+    // `catalog_coverage.rs` holds EVERY row to the rule that a refusal names
+    // something its `Deployment` shows, so the finding has a gate of its own
+    // that runs without a checkpoint on the machine.
+    let geometry = match driver_metal::batch::geometry_from_deployment(
+        &deployment,
+        row.load_shape(),
+        affine(&encoding),
+    ) {
         Ok(g) => g,
         Err(why) => {
             eprintln!("    SKIP: the geometry refuses this checkpoint -- {}", why.0);

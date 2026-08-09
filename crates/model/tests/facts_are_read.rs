@@ -22,6 +22,22 @@
 //! The scan is source-level, like `executor_bind`'s arm scan, and for the
 //! same reason — the question is about what the code SAYS, and there is
 //! no runtime handle on "did this field influence the trace".
+//!
+//! # Where a declaration lives
+//!
+//! It used to be `<family>/forward/facts.rs` and only that. The catalog
+//! refactor moved the SHAPE up to `<family>/spec.rs` — ungated, because a
+//! `const` catalog row is written in those words and a row must exist
+//! under every aspect — and left `forward/facts.rs` behind as a re-export
+//! plus whatever per-backend facts are genuinely about the tracer.
+//!
+//! So the scan reads BOTH, and it has to. A re-export file declares no
+//! `pub struct`, so a scan that still looked only there would find an
+//! empty declared set for every migrated family, agree with an empty
+//! stated list, and pass — which is the same failure as the one this file
+//! exists to catch, wearing the test's own clothes. A test that quietly
+//! stops testing is worse than no test, because the list at the top keeps
+//! claiming the set is known.
 
 #![cfg(feature = "forward")]
 
@@ -30,30 +46,63 @@ use std::path::{Path, PathBuf};
 
 /// Facts declared and not read, by family, with why.
 ///
-/// Every line here belongs to a family in `NOT_YET_OPENABLE` whose TEXT
-/// IS UNFINISHED — not to a family that traces a complete plan and
-/// forgets one axis, which is what gemma-2 did. The distinction is the
-/// whole point of listing them rather than deleting the fields: these
-/// facts were read off a real config and are what the text will need
-/// when someone finishes it. Deleting them would throw away the reading.
-///
-/// kimi-k2's `rope_yarn_original` shows the shape: its text has no rope
+/// Most lines here belong to a family whose TEXT IS UNFINISHED — the
+/// fact was read off a real config and is what the pass will need when
+/// someone writes it. Deleting the field would throw away the reading.
+/// kimi-k2's `rope_yarn_original` shows that shape: its text has no rope
 /// statement at all — `mla_prepare` hands back `q_pe` and `k_pe` and
 /// nothing rotates either, with `k_pe` dropped into `_`. The fact is not
 /// forgotten, the pass is unwritten.
 ///
+/// `gemma_2` and `gemma_4` are the OTHER kind, and they are the reason
+/// this list is a test rather than a note: both trace a complete plan and
+/// silently ignore one axis, which is exactly the defect the file is
+/// named for. They are listed because a listed defect is a known one.
+///
 /// A line LEAVES when the text starts reading the fact. A line JOINS only
 /// with a commit that says which unfinished pass it belongs to.
+///
+/// # Two lines left this list while the catalog landed
+///
+/// `nemotron_h: tied_embeddings` and `deepseek_v4: sliding_window` were
+/// both here, and both are now read — by `project.rs` files that did not
+/// exist when they were written. That is the list working: the entries
+/// are transient by construction, and the test fails just as loudly when
+/// a fact starts being read as when one stops.
 const DECLARED_BUT_UNREAD: &[(&str, &[&str])] = &[
-    // The DSA indexer, hyper-connections and the routed MLP's clamp.
-    (
-        "deepseek_v4",
-        &["hash_routed", "o_groups", "sliding_window", "swiglu_limit_milli"],
-    ),
+    // The Mimi codec's base channel count. csm's `deployment()` and
+    // `trace()` both refuse — its decoder is transcribed and its CODEC is
+    // not — so the convolutional stack this width sizes has no statement
+    // to be read by. It is here rather than deleted because it is a
+    // measurement of `eustlb/csm-1b`'s codec, and the pass that needs it
+    // is unwritten rather than the fact being wrong.
+    ("csm", &["filters"]),
+    // Hash routing, the output projection's grouping and the routed
+    // MLP's clamp. `sliding_window` LEFT this list when `project.rs`
+    // arrived: the deployment's per-layer `window_left` is stated from
+    // it, so a V4 with a window and one without now differ before any
+    // fire — which is the shape every line here is meant to leave by.
+    ("deepseek_v4", &["hash_routed", "o_groups", "swiglu_limit_milli"]),
+    // The ATTENTION cap, not the final one. gemma-2's text reads
+    // `final_logit_softcap` and launches it; the attention cap is
+    // documented as riding "as a dispatch parameter", but
+    // `dsl::cuda::attention_for(class, &q, &kv, window_left)` takes no
+    // cap and nothing branches on the flag. So a gemma-2 with the cap and
+    // one without trace IDENTICALLY today. This line is the honest
+    // statement of that, and it was invisible while the scan counted the
+    // field's own doc comment as a reader.
+    ("gemma_2", &["attn_logit_softcap"]),
+    // The routed MLP's top-k. `gemma_4/forward/mod.rs` contains no
+    // routing pass at all — no gate, no top-k, no expert dispatch — so
+    // the A4B's mixture is declared and untraced. `moe_intermediate`
+    // LEFT this list because the projection carries it to a planner for
+    // sizing; the top-k has no such second reader, which is exactly the
+    // asymmetry that makes it worth stating.
+    ("gemma_4", &["experts_per_token"]),
     // MLA's aligned MoE block. `index_topk` LEFT this list when the
     // indexer's statement started carrying it on the param channel —
     // which is the shape every line here is meant to leave by.
-    ("glm5", &["aligned_block"]),
+    ("glm_5", &["aligned_block"]),
     // The MXFP4 decode leg's route ceiling.
     ("gpt_oss", &["mxfp4_decode_max_routes"]),
     // No rope statement in the MLA text yet; see the header above.
@@ -66,7 +115,11 @@ fn crate_src() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
-/// Every family with a `forward/facts.rs`, and where its sources live.
+/// Every family that declares a shape, and where its sources live.
+///
+/// A family qualifies on `spec.rs` OR `forward/facts.rs`: the first is
+/// where the catalog refactor put the shape, the second is where the
+/// per-backend facts stayed, and a family may have either or both.
 fn families() -> BTreeMap<String, PathBuf> {
     let mut out = BTreeMap::new();
     let mut roots = vec![crate_src(), crate_src().join("families")];
@@ -75,13 +128,24 @@ fn families() -> BTreeMap<String, PathBuf> {
         let Ok(entries) = std::fs::read_dir(&root) else { continue };
         for e in entries.flatten() {
             let dir = e.path();
-            if dir.join("forward/facts.rs").is_file() {
+            if dir.join("spec.rs").is_file() || dir.join("forward/facts.rs").is_file() {
                 let name = dir.file_name().unwrap().to_string_lossy().into_owned();
                 out.insert(name, dir);
             }
         }
     }
     out
+}
+
+/// The files a family's shape is declared in, in the order they are read.
+///
+/// Both, unioned. Splitting the shape across two files is fine; losing
+/// half of it to a scan that knows about one is not.
+fn declaring_files(dir: &Path) -> Vec<PathBuf> {
+    [dir.join("spec.rs"), dir.join("forward/facts.rs")]
+        .into_iter()
+        .filter(|p| p.is_file())
+        .collect()
 }
 
 /// Every `pub` field of every `pub struct` in one facts file.
@@ -113,7 +177,21 @@ fn declared_fields(src: &str) -> BTreeSet<String> {
     out
 }
 
-/// Every `.field` mention across a family's own sources.
+/// Every `.field` mention across a family's own sources, EXCLUDING its
+/// tests and its prose.
+///
+/// Both exclusions are load-bearing, and the catalog refactor is what
+/// proved it. `gpt_oss`'s `mxfp4_decode_max_routes`, `glm_5`'s
+/// `aligned_block` and `kimi_k2`'s `rope_yarn_original` all dropped out
+/// of the unread set when `project.rs` and `spec.rs` arrived — not
+/// because any tracer started reading them, but because a `#[cfg(test)]`
+/// assertion named them. `assert!(m.aligned_block > 0)` keeps no promise
+/// about what a fire does; it is a test of the row, and counting it is
+/// how a fact goes quiet.
+///
+/// Prose is excluded for the same reason one step further out: a doc
+/// comment that says what a field is FOR is the strongest possible signal
+/// that nothing yet does it.
 fn read_fields(dir: &Path) -> BTreeSet<String> {
     let mut text = String::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -124,7 +202,10 @@ fn read_fields(dir: &Path) -> BTreeSet<String> {
             if p.is_dir() {
                 stack.push(p);
             } else if p.extension().is_some_and(|x| x == "rs") {
-                text.push_str(&std::fs::read_to_string(&p).unwrap_or_default());
+                text.push_str(&without_tests_or_prose(
+                    &std::fs::read_to_string(&p).unwrap_or_default(),
+                ));
+                text.push('\n');
             }
         }
     }
@@ -147,6 +228,59 @@ fn read_fields(dir: &Path) -> BTreeSet<String> {
     out
 }
 
+/// One file with every `//`-comment line and every `#[cfg(test)]` item
+/// removed.
+///
+/// The test item is cut by brace matching from the first `{` after the
+/// attribute. A `#[cfg(test)] use …;` is braceless, and is detected by a
+/// `;` arriving before any `{` — without that check the brace search runs
+/// on to the NEXT item's body and deletes a real tracer with it.
+fn without_tests_or_prose(src: &str) -> String {
+    let code: String = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    const ATTR: &str = "#[cfg(test)]";
+    let mut out = String::new();
+    let mut rest = code.as_str();
+    while let Some(at) = rest.find(ATTR) {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + ATTR.len()..];
+        let open = after.find('{');
+        let semi = after.find(';');
+        let Some(open) = open.filter(|o| semi.is_none_or(|s| s > *o)) else {
+            // Braceless: `#[cfg(test)] use …;`. Drop the attribute, keep
+            // everything else, and carry on from just past it.
+            out.push_str(ATTR);
+            rest = after;
+            continue;
+        };
+        let mut depth = 0i32;
+        let mut end = None;
+        for (i, c) in after[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(open + i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match end {
+            Some(e) => rest = &after[e..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 #[test]
 fn every_declared_fact_is_read_by_its_family() {
     let stated: BTreeMap<&str, BTreeSet<&str>> = DECLARED_BUT_UNREAD
@@ -163,10 +297,15 @@ fn every_declared_fact_is_read_by_its_family() {
 
     let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (fam, dir) in &families {
-        let facts = std::fs::read_to_string(dir.join("forward/facts.rs"))
-            .expect("the family's facts");
+        let files = declaring_files(dir);
+        assert!(!files.is_empty(), "{fam} qualified on a file that then vanished");
+        let mut declared = BTreeSet::new();
+        for f in files {
+            let src = std::fs::read_to_string(&f).expect("the family's declaration");
+            declared.extend(declared_fields(&src));
+        }
         let unread: BTreeSet<String> =
-            declared_fields(&facts).difference(&read_fields(dir)).cloned().collect();
+            declared.difference(&read_fields(dir)).cloned().collect();
         if !unread.is_empty() {
             found.insert(fam.clone(), unread);
         }
@@ -188,4 +327,125 @@ fn every_declared_fact_is_read_by_its_family() {
          checkpoint ships. Either read it or say which unfinished pass it \
          belongs to."
     );
+}
+
+/// The scan must actually FIND declarations, in every family it counts.
+///
+/// This is the guard the file lacked when the shape moved to `spec.rs`.
+/// A re-export declares no `pub struct`, so a scan pointed at
+/// `forward/facts.rs` alone found an empty declared set for every
+/// migrated family, subtracted it from a large read set, got an empty
+/// unread set, agreed with an empty stated list, and PASSED — with the
+/// list at the top still claiming the unread set was known.
+///
+/// A test that quietly stops testing is worse than no test. So the shape
+/// of the scan's own input is asserted, not assumed.
+#[test]
+fn the_scan_finds_a_shape_in_every_family_it_counts() {
+    for (fam, dir) in families() {
+        let files = declaring_files(&dir);
+        let mut declared = BTreeSet::new();
+        for f in &files {
+            declared.extend(declared_fields(&std::fs::read_to_string(f).unwrap()));
+        }
+        assert!(
+            declared.len() >= 5,
+            "{fam} declares only {} field(s) across {:?}. Either the family \
+             genuinely has no shape — in which case it should not be in the \
+             scan — or the shape moved to a file this scan does not read, \
+             which is how this test disarmed itself once already.",
+            declared.len(),
+            files.iter().map(|p| p.file_name().unwrap()).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// A test assertion is not a reader, and neither is a doc comment.
+///
+/// Pinned directly because it is the whole difference between the stated
+/// list and an empty one: three facts left the list on a `#[cfg(test)]`
+/// mention alone when `project.rs` and `spec.rs` arrived.
+#[test]
+fn a_test_assertion_does_not_count_as_reading_a_fact() {
+    let src = "\
+fn trace(f: &F) -> u32 { f.traced }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn t() {
+        let m = f();
+        assert!(m.only_asserted > 0);
+        if true { let _ = m.nested_in_a_block; }
+    }
+}
+/// Prose naming `.only_documented`, which reads nothing.
+fn tail(f: &F) -> u32 { f.after_the_test }
+";
+    let kept = without_tests_or_prose(src);
+    assert!(kept.contains("f.traced"), "the tracer's read survives");
+    assert!(kept.contains("f.after_the_test"), "code AFTER the test block survives");
+    assert!(
+        !kept.contains("only_asserted"),
+        "an assertion inside #[cfg(test)] is not a read"
+    );
+    assert!(
+        !kept.contains("nested_in_a_block"),
+        "brace matching must span the test's inner blocks, or the cut ends early \
+         and everything after it counts again"
+    );
+    assert!(
+        !kept.contains("only_documented"),
+        "a doc comment that says what a field is FOR is evidence nothing does it"
+    );
+}
+
+/// A `#[cfg(test)]` with no braces must not eat the rest of the file.
+///
+/// `#[cfg(test)] use …;` is common and reads nothing. Without the
+/// semicolon check the brace search runs past it to the next unrelated
+/// body and deletes a real tracer, which would put a read fact into the
+/// unread list.
+#[test]
+fn a_braceless_cfg_test_attribute_cuts_nothing_after_it() {
+    let src = "#[cfg(test)]\nuse std::x;\nfn trace(f: &F) -> u32 { f.traced }\n";
+    let kept = without_tests_or_prose(src);
+    assert!(
+        kept.contains("f.traced"),
+        "the item after a braceless `#[cfg(test)] use …;` must survive; got {kept:?}"
+    );
+
+    // And the two shapes in one file, in the order they really appear.
+    let mixed = "#[cfg(test)]\nuse std::y;\n#[cfg(test)]\nmod t { fn a(m: &M) { m.asserted; } }\nfn f(x: &X) { x.real; }\n";
+    let kept = without_tests_or_prose(mixed);
+    assert!(kept.contains("x.real"), "the tracer after both survives");
+    assert!(!kept.contains("m.asserted"), "the braced test is still cut");
+}
+
+/// Both declaring files are read, not just one.
+#[test]
+fn a_shape_split_across_spec_and_facts_is_read_whole() {
+    let both: Vec<String> = families()
+        .into_iter()
+        .filter(|(_, d)| d.join("spec.rs").is_file() && d.join("forward/facts.rs").is_file())
+        .map(|(f, _)| f)
+        .collect();
+    assert!(
+        !both.is_empty(),
+        "no family has both files, so the union in `declaring_files` is \
+         untested and the next migration can drop half a shape unnoticed"
+    );
+    for fam in &both {
+        let dir = families().remove(fam).unwrap();
+        let spec = declared_fields(&std::fs::read_to_string(dir.join("spec.rs")).unwrap());
+        let facts =
+            declared_fields(&std::fs::read_to_string(dir.join("forward/facts.rs")).unwrap());
+        let union = declaring_files(&dir)
+            .iter()
+            .flat_map(|f| declared_fields(&std::fs::read_to_string(f).unwrap()))
+            .collect::<BTreeSet<_>>();
+        assert!(
+            union.len() >= spec.len().max(facts.len()),
+            "{fam}: the union lost a field one of its two files declares"
+        );
+    }
 }

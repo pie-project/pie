@@ -14,5 +14,7 @@
 //! and one no second consumer could reach.
 
 pub mod weight_view;
+#[cfg(feature = "abi")]
 pub mod stage;
+#[cfg(feature = "abi")]
 pub mod plan;

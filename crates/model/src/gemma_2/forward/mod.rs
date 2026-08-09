@@ -103,9 +103,10 @@ pub fn gemma2_cuda(facts: &Gemma2Facts, class: FireClass) -> ForwardPlan {
         for l in 0..facts.layers {
             // THIS LAYER's sliding window, `-1` for none — a
             // load-time fact the dispatch statements carry, where four
-            // executors used to re-derive it per launch.
-            let window_left =
-                model_compiler::facts::window_left_at(&facts.window_left, l);
+            // executors used to re-derive it per launch. The shape
+            // answers from the alternation RULE now; it used to index a
+            // per-layer vector that spelled the same rule out.
+            let window_left = facts.window_left_at(l);
             let w = G2LayerW::new(l, facts);
             let x = dsl::cuda::rmsnorm(&y, &w.attn_norm);
 

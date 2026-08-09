@@ -30,6 +30,8 @@
 use std::path::Path;
 
 use model::boot::Binding;
+use model::catalog::Variant;
+use model::encoding::Encoding;
 use model::policy::Mxfp4MoePolicy;
 use model_loader::checkpoint::read::parse_checkpoint_metadata;
 use model_loader::plan::{LoadPlan, StorageTarget};
@@ -49,49 +51,6 @@ use model_loader::types::BackendKind;
 #[must_use]
 pub fn metal_storage_target() -> StorageTarget {
     StorageTarget::for_backend(BackendKind::Metal, 0, 1)
-}
-
-/// The two or three facts a probe states by hand. See
-/// [`descriptor_for_testing`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TestFacts {
-    /// Decoder layer count, or zero for the family default.
-    pub num_hidden_layers: i32,
-    /// Trailing layers whose KV is shared with the last full layer.
-    pub num_kv_shared_layers: i32,
-    /// The config's tie flag; a shipped `lm_head` still beats it.
-    pub tied_embeddings: bool,
-    /// Affine width, or zero for unquantized.
-    pub quant_bits: i32,
-    /// Affine group, or zero for unquantized.
-    pub quant_group_size: i32,
-}
-
-/// Build a `pie.model/1` document from facts assembled by hand.
-///
-/// **Test and tool scaffolding.** A serving boot forwards the descriptor it
-/// was handed; this exists for the probes and numerics tests that point at
-/// a checkpoint directory with no descriptor beside it and state the two or
-/// three facts their family needs.
-///
-/// It writes the schema's own field names, which is the only reason it is
-/// tolerable to spell a descriptor here at all: a name that drifts from the
-/// schema stops being read rather than being read wrong, because
-/// `ModelFacts::from_descriptor` takes what it recognizes and leaves the
-/// rest at its default. The round-trip through the real reader is pinned by
-/// test.
-#[must_use]
-pub fn descriptor_for_testing(model_type: &str, facts: TestFacts) -> String {
-    serde_json::json!({
-        "version": "pie.model/1",
-        "model_type": model_type,
-        "num_hidden_layers": facts.num_hidden_layers,
-        "num_kv_shared_layers": facts.num_kv_shared_layers,
-        "tie_word_embeddings": facts.tied_embeddings,
-        "quant_bits": facts.quant_bits,
-        "quant_group_size": facts.quant_group_size,
-    })
-    .to_string()
 }
 
 /// Why a load plan was not produced.
@@ -129,7 +88,7 @@ impl From<model::boot::LoadPlanError> for LoadPlanError {
     }
 }
 
-/// Compile the plan: the descriptor in, plan out.
+/// Compile the plan: the row and its encoding in, plan out.
 ///
 /// This driver reads the snapshot directory itself and then hands the shared
 /// load path everything else. The two answers it contributes are
@@ -141,10 +100,21 @@ impl From<model::boot::LoadPlanError> for LoadPlanError {
 ///
 /// Everything else — the other five policy fields, the author call, the
 /// plan compile, and the check that every declared file is still on disk at
-/// the size the plan states — is [`model::boot::compile_load_plan`]'s, which
-/// `driver-cuda` calls with its own [`Binding`]. That is the point: equal
-/// requests author equal contracts because there is one policy, not two that
-/// happen to agree today.
+/// the size the plan states — is [`model::boot::compile_load_plan_for`]'s,
+/// which `driver-cuda` calls with its own [`Binding`]. That is the point:
+/// equal requests author equal contracts because there is one policy, not
+/// two that happen to agree today.
+///
+/// # What replaced the descriptor argument
+///
+/// This took a `descriptor_json: &str` — a `pie.model/1` document whose
+/// `model_type` string selected an author out of a registry. It takes the
+/// ROW instead, because the row IS the author: `catalog::identify` matched
+/// it against this checkpoint's own tensor names and extents, so the thing
+/// that authors the contract and the thing the checkpoint actually contains
+/// cannot be two different models any more. The `encoding` is the one fact
+/// a row genuinely cannot state — Qwen3-8B is one model and four downloads,
+/// and a group size is not an extent of any tensor.
 ///
 /// The returned [`Mxfp4MoePolicy`] is the author's resolved answer — a family
 /// may override the device rule — handed back rather than recomputed, so the
@@ -154,26 +124,26 @@ impl From<model::boot::LoadPlanError> for LoadPlanError {
 ///
 /// The snapshot directory does not read as a checkpoint, or the shared load
 /// path refuses; see [`LoadPlanError`].
-pub fn compile_load_plan(
+pub fn compile_load_plan_for(
     snapshot_dir: &Path,
     target: &StorageTarget,
-    descriptor_json: &str,
+    row: &dyn Variant,
+    encoding: &Encoding,
 ) -> Result<(LoadPlan, Mxfp4MoePolicy), LoadPlanError> {
     let metadata = parse_checkpoint_metadata(snapshot_dir)
         .map_err(|err| LoadPlanError::Checkpoint(err.to_string()))?;
-    Ok(model::boot::compile_load_plan(
+    Ok(model::boot::compile_load_plan_for(
         snapshot_dir,
         &metadata,
         target,
-        descriptor_json,
+        row,
+        encoding,
         Binding::MLX_IN_PLACE,
     )?)
 }
 
 #[cfg(test)]
 mod tests {
-    use model::facts::ModelFacts;
-
     use super::*;
 
     #[test]
@@ -186,24 +156,60 @@ mod tests {
         assert_eq!(target.fusion_mask, 0, "no fused transcode kernels here");
     }
 
+    /// The binding this driver contributes, asserted rather than assumed.
+    ///
+    /// It is TWO claims about the lowering — MLX names, projections left as
+    /// stored — and both are load-bearing: the bind path looks up MLX names,
+    /// and the attention and MLP kernels read separate `q`/`k`/`v`, so a
+    /// fused request would author operands this driver cannot find. Stated
+    /// here because [`compile_load_plan_for`] passes the constant and nothing
+    /// else in this crate would notice if the constant changed under it.
     #[test]
-    fn a_testing_descriptor_is_read_back_by_the_real_reader() {
-        let json = descriptor_for_testing(
-            "qwen3",
-            TestFacts {
-                num_hidden_layers: 28,
-                quant_bits: 4,
-                quant_group_size: 64,
-                ..TestFacts::default()
-            },
+    fn this_driver_asks_for_mlx_names_and_unfused_projections() {
+        assert_eq!(
+            Binding::MLX_IN_PLACE.naming,
+            model_loader::types::Naming::Mlx
         );
-        let facts = ModelFacts::from_descriptor(json.as_bytes())
-            .expect("the helper writes the schema's own field names");
-        assert_eq!(facts.model_type, "qwen3");
-        // The names did not drift: what the helper wrote is what the reader
-        // read, which is the helper's whole justification.
-        assert_eq!(facts.num_hidden_layers, 28);
-        assert_eq!(facts.quant_bits, 4);
-        assert_eq!(facts.quant_group_size, 64);
+        assert_eq!(
+            Binding::MLX_IN_PLACE.projections,
+            model::policy::Projections::InPlace
+        );
+    }
+
+    /// A row's LOAD shape is what this path now carries, in place of the
+    /// `TestFacts`/`descriptor_for_testing` pair that used to be here.
+    ///
+    /// Those two built a `pie.model/1` document by hand — `model_type`,
+    /// `num_hidden_layers`, `tie_word_embeddings`, `quant_bits`,
+    /// `quant_group_size` — so a probe could state the two or three facts
+    /// its family needed and have the driver's own reader parse them back.
+    /// The document does not exist any more and neither does the reader:
+    /// `catalog::find` takes the id an operator types and hands back the row
+    /// itself, and the row STATES its shape. There is nothing left to
+    /// round-trip, which is the point — a helper that writes a schema by
+    /// hand is a second statement of that schema, and the two drift.
+    #[test]
+    fn a_row_states_its_own_load_shape_and_needs_no_document_to_carry_it() {
+        let id = model::catalog::ids()
+            .into_iter()
+            .next()
+            .expect("this build serves at least one model");
+        let row = model::catalog::find(id).expect("an id from `ids` finds its row");
+        let shape = row.load_shape();
+        assert_eq!(row.id(), id);
+        assert!(shape.layers > 0, "`{id}` states no layers");
+        assert!(shape.head_dim > 0, "`{id}` states no head dim");
+    }
+
+    /// An id no row claims is refused HERE, where the operator typed it.
+    ///
+    /// The predecessor of this refusal was a `pie.model/1` document with a
+    /// `model_type` no author claimed, which surfaced as
+    /// `LoadPlanError::UnknownFamily` from inside the plan compiler — after
+    /// the checkpoint had been opened and its metadata parsed. A typo in a
+    /// boot file is worth answering before any of that.
+    #[test]
+    fn an_id_no_row_claims_finds_nothing() {
+        assert!(model::catalog::find("qwen3-0.6b-but-spelled-wrong").is_none());
     }
 }

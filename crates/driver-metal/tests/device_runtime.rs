@@ -21,7 +21,8 @@ use driver_api::plan::{
 };
 use driver_metal::channel::{ExecPlan, Failure, Versions, adopt_launch_package};
 use driver_metal::Error;
-use driver_metal::gpu::{Archives, Context, ORDINAL_BASE, Runtime};
+use driver_metal::device::{Archives, Context};
+use driver_metal::program::{ORDINAL_BASE, Runtime};
 use tensor_ir::op::{intrinsic_tags, tags};
 use tensor_ir::registry::Stage;
 

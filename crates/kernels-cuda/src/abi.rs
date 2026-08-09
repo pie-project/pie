@@ -1059,34 +1059,6 @@ pub fn emit_rust_dispatch(tables: &[&'static [KernelSig]]) -> String {
         // bound into a kernel. So the branch declines and says nothing;
         // the fallthrough is what reports.
         for o in k.operands {
-            // THE WHOLE `Or`, not either branch. Guarding a branch would
-            // defeat the point — the row says "either", and what it needs
-            // is that the composition lands on something. So: the left is
-            // PRESENT, or the right RESOLVES.
-            if let Source::Or(a, b) = o.source {
-                let Some(present) = slot_presence(a) else { continue };
-                let resolves = match *b {
-                    Source::NamedScale => "named_scale(ctx, spec).is_some()".to_string(),
-                    // A NULL FALLBACK RESOLVES. `Or(&Out(1), &Lit(Null))`
-                    // is a row saying "the second result, or nothing" --
-                    // the launcher reads the null as "there is no k" --
-                    // so demanding it be non-null refuses the very form
-                    // the row was written to serve.
-                    Source::Lit(Lit::Null) => "true".to_string(),
-                    // A POINTER FALLBACK MAY BE NULL — a fire that
-                    // published no output leaves `o_out` null, and a
-                    // launch into it is a segfault with no CUDA error.
-                    // A scalar fallback is always a value.
-                    _ if o.ty.rust().starts_with('*') => {
-                        match rust_bind_expr_of(b, o.ty) {
-                            Some(e) => format!("!({e}).is_null()"),
-                            None => continue,
-                        }
-                    }
-                    _ => "true".to_string(),
-                };
-                guard.push_str(&format!(" && ({present} || {resolves})"));
-            }
         }
         if any_leaf(k, |s| *s == Source::WeightNamed2) {
             guard.push_str(" && !w_named2.is_null()");
@@ -1139,6 +1111,50 @@ pub fn emit_rust_dispatch(tables: &[&'static [KernelSig]]) -> String {
                 ));
             }
         }
+        // AFTER `attn.is_some()`, and for the reason the `AttnNonZero`
+        // loop below is: `&&` short-circuits left to right, so a clause
+        // that reaches `a_of(attn)` must sit behind the test that makes
+        // it total. This loop was emitted BEFORE it, and an `Or` whose
+        // fallback is an attention field — `Or(&Out(0), &Attn("o_out"))`
+        // is five of the flashinfer rows — put `a_of(attn).o_out` ahead
+        // of `attn.is_some()`. `a_of` is an `expect`, so that is a panic
+        // on a fire with no attention, reachable through `bind::dispatch`
+        // with `None`.
+        //
+        // Moved rather than made null-safe: the order is the rule the
+        // other three loops already follow, and one exception to a rule
+        // three places keep is how the fourth place gets written.
+        for o in k.operands {
+        // THE WHOLE `Or`, not either branch. Guarding a branch would
+        // defeat the point — the row says "either", and what it needs
+        // is that the composition lands on something. So: the left is
+        // PRESENT, or the right RESOLVES.
+        if let Source::Or(a, b) = o.source {
+            let Some(present) = slot_presence(a) else { continue };
+            let resolves = match *b {
+                Source::NamedScale => "named_scale(ctx, spec).is_some()".to_string(),
+                // A NULL FALLBACK RESOLVES. `Or(&Out(1), &Lit(Null))`
+                // is a row saying "the second result, or nothing" --
+                // the launcher reads the null as "there is no k" --
+                // so demanding it be non-null refuses the very form
+                // the row was written to serve.
+                Source::Lit(Lit::Null) => "true".to_string(),
+                // A POINTER FALLBACK MAY BE NULL — a fire that
+                // published no output leaves `o_out` null, and a
+                // launch into it is a segfault with no CUDA error.
+                // A scalar fallback is always a value.
+                _ if o.ty.rust().starts_with('*') => {
+                    match rust_bind_expr_of(b, o.ty) {
+                        Some(e) => format!("!({e}).is_null()"),
+                        None => continue,
+                    }
+                }
+                _ => "true".to_string(),
+            };
+            guard.push_str(&format!(" && ({present} || {resolves})"));
+        }
+        }
+
         // AFTER `attn.is_some()`, and that order is load-bearing: `&&`
         // short-circuits left to right, so `a_of` is only reached once
         // the context is known to be there.
@@ -1212,9 +1228,31 @@ pub fn emit_rust_dispatch(tables: &[&'static [KernelSig]]) -> String {
         // `qk_rmsnorm_rope` reads a q head count and a kv head count off
         // one `head_dim` — and `is_set(x) && is_set(x)` is a guard that
         // makes a reader look for the difference.
+        //
+        // AND WALKED, not matched at the top level. `CtxNonZero` EXISTS
+        // to be a divisor, so it is almost always nested inside a `Div`
+        // — and an `if let` on `o.source` sees `Div` and moves on. Seven
+        // arms divided by a context field with no `is_set` beside it,
+        // which is exactly the failure this variant was introduced to
+        // prevent: `rope::qk_rmsnorm_rope_bf16` among them, and the
+        // variant's own doc says what that costs — "it would have rotated
+        // half of gemma-4 by nothing, silently".
+        //
+        // The sharpest pair was inside one module. `norm::mean_streams`
+        // states `CtxNonZero("altup_streams")` at top level and got its
+        // guard; `norm::altup_predict` states it under a `Div` and did
+        // not. Two rows reading one field, one refusing and one not.
         let mut guarded: Vec<&str> = Vec::new();
+        let mut fields: Vec<&'static str> = Vec::new();
         for o in k.operands {
-            if let Source::CtxNonZero(f) = o.source {
+            for_each_leaf(&o.source, &mut |s| {
+                if let Source::CtxNonZero(f) = *s {
+                    fields.push(f);
+                }
+            });
+        }
+        for f in fields {
+            {
                 if guarded.contains(&f) {
                     continue;
                 }
@@ -1268,6 +1306,199 @@ mod stated_rows {
     ///
     /// Over every table rather than one row, because the next one to
     /// vanish will be a different one.
+
+    /// EVERY DIRECT INDEX IS COVERED BY A GUARD IT CANNOT OUTRUN.
+    ///
+    /// The generated body writes `b.args[0]`, `b.args[n_in + 1]`,
+    /// `b.args[n_in + n_out + 0]` and so on, and the branch's guard is
+    /// what makes each of those in range. Two independent computations
+    /// produce them — `reach` walks the sources for the arity, and
+    /// `rust_bind_expr_of` walks them again for the expression — so
+    /// nothing but this test says they agree.
+    ///
+    /// If they ever disagree the failure is a PANIC inside the executor,
+    /// on a family nobody in the corpus lowers, at the moment a customer
+    /// runs it. That is the one failure mode the generator was supposed
+    /// to remove: a hand-written arm counted its own arguments and this
+    /// is what replaced the counting.
+    ///
+    /// The walk is scope-aware because an `Or` guards its own access
+    /// locally (`if n_out > 1 { b.args[n_in + 1] }`) and the in-place
+    /// staging guards a pair (`if n_in > 0 && n_out > 0`). An index
+    /// inside either is safe however weak the branch guard is, so a
+    /// checker that ignored nesting would report the whole table.
+
+    /// A CLAUSE THAT UNWRAPS SITS BEHIND THE TEST THAT MAKES IT TOTAL.
+    ///
+    /// `a_of` is an `expect`, so every guard clause reaching it must come
+    /// after `attn.is_some()` — `&&` short-circuits left to right and
+    /// that is the only thing making the unwrap safe. Three of the four
+    /// loops that emit such clauses were placed after it deliberately,
+    /// with a comment saying the order is load-bearing. The `Or` loop was
+    /// placed before, and put `a_of(attn).o_out` ahead of the test on
+    /// five flashinfer rows.
+    ///
+    /// One exception to a rule three places keep is how the fourth place
+    /// gets written, so the rule is a test now.
+    #[test]
+    fn nothing_unwraps_the_attention_context_before_testing_it() {
+        let text = super::emit_rust_dispatch(&crate::TABLES);
+        let mut early = Vec::new();
+        for arm in text.split("\n\"").skip(1) {
+            let Some(end) = arm.find(" => {") else { continue };
+            let guard = &arm[..end];
+            let (unwrap, test) = (guard.find("a_of(attn)"), guard.find("attn.is_some()"));
+            if let Some(u) = unwrap {
+                if test.is_none_or(|t| u < t) {
+                    early.push(guard.split('"').next().unwrap_or(guard).to_string());
+                }
+            }
+        }
+        assert!(
+            early.is_empty(),
+            "these guards call `a_of(attn)` before `attn.is_some()`, which is \
+             a panic on a fire with no attention:\n  {}",
+            early.join("\n  ")
+        );
+    }
+
+    /// A DIVISION BY A CONTEXT FIELD CARRIES THAT FIELD'S `is_set`.
+    ///
+    /// `CtxNonZero` exists to be a divisor — a family zeroes the field to
+    /// say "this launch is not mine" — so it is almost always nested
+    /// inside a `Div`, and the guard loop that collected it matched only
+    /// the TOP-LEVEL source. Seven arms divided by a context field with
+    /// no refusal beside it, which is the regression the variant's own
+    /// doc describes: gemma-4's per-layer theta, where "it would have
+    /// rotated half of gemma-4 by nothing, silently".
+    #[test]
+    fn a_division_by_a_context_field_is_guarded_on_it() {
+        let text = super::emit_rust_dispatch(&crate::TABLES);
+        let mut naked = Vec::new();
+        for arm in text.split("\n\"").skip(1) {
+            let Some(end) = arm.find(" => {") else { continue };
+            let (guard, body) = arm.split_at(end);
+            for (i, _) in body.match_indices(").max(1)") {
+                // `(ctx.<field>).max(1)` is what `Div`'s divisor emits.
+                let before = &body[..i];
+                let Some(open) = before.rfind("(ctx.") else { continue };
+                if before[open..].contains(')') {
+                    continue;
+                }
+                let field = &before[open + "(ctx.".len()..];
+                if !guard.contains(&format!("is_set(ctx.{field})")) {
+                    naked.push(format!(
+                        "{}: divides by ctx.{field} with no is_set",
+                        guard.split('"').next().unwrap_or(guard).trim()
+                    ));
+                }
+            }
+        }
+        assert!(
+            naked.is_empty(),
+            "a family that zeroed one of these fields would divide by one \
+             and launch instead of declining:\n  {}",
+            naked.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn every_index_the_body_writes_is_inside_its_guard() {
+        let text = super::emit_rust_dispatch(&crate::TABLES);
+        let mut unguarded: Vec<String> = Vec::new();
+
+        for arm in text.split("\n\"").skip(1) {
+            let Some(head_end) = arm.find(" => {") else { continue };
+            let (head, rest) = arm.split_at(head_end);
+            let guard = head;
+            let body = &rest[" => {".len()..];
+
+            // What the branch's own guard promises.
+            let promise = |needle: &str| -> usize {
+                guard
+                    .match_indices(needle)
+                    .filter_map(|(i, _)| {
+                        guard[i + needle.len()..]
+                            .split(|c: char| !c.is_ascii_digit())
+                            .next()
+                            .and_then(|d| d.parse::<usize>().ok())
+                    })
+                    .max()
+                    .unwrap_or(0)
+            };
+            let base = [
+                promise("n_in >= "),
+                promise("n_out >= "),
+                promise("b.args.len() >= n_in + n_out + "),
+            ];
+
+            // Walk the body, tracking the `if` conditions in scope.
+            let bytes: Vec<char> = body.chars().collect();
+            let (mut stack, mut cur) = (Vec::new(), base);
+            let mut at: Vec<[usize; 3]> = Vec::with_capacity(bytes.len());
+            for (i, &c) in bytes.iter().enumerate() {
+                if c == '{' {
+                    let from = i.saturating_sub(300);
+                    let seg: String = bytes[from..i].iter().collect();
+                    let cond = seg.rsplit("if ").next().unwrap_or("").to_string();
+                    let mut add = cur;
+                    for (k, needle) in
+                        [(0usize, "n_in > "), (1, "n_out > "), (2, "b.args.len() > n_in + n_out + ")]
+                    {
+                        for (j, _) in cond.match_indices(needle) {
+                            if let Some(d) = cond[j + needle.len()..]
+                                .split(|c: char| !c.is_ascii_digit())
+                                .next()
+                                .and_then(|d| d.parse::<usize>().ok())
+                            {
+                                add[k] = add[k].max(d + 1);
+                            }
+                        }
+                    }
+                    stack.push(cur);
+                    cur = add;
+                } else if c == '}' {
+                    cur = stack.pop().unwrap_or(base);
+                }
+                at.push(cur);
+            }
+
+            let body_s: String = bytes.iter().collect();
+            for (i, _) in body_s.match_indices("b.args[") {
+                let Some(end) = body_s[i..].find(']') else { continue };
+                let idx = body_s[i + "b.args[".len()..i + end].trim().to_string();
+                let scope = at.get(body_s[..i].chars().count()).copied().unwrap_or(base);
+                let mut want = |k: usize, n: usize| {
+                    if n >= scope[k] {
+                        unguarded.push(format!(
+                            "{}: b.args[{idx}] needs {} > {n}, guard gives {}",
+                            guard.split('"').next().unwrap_or(guard).trim(),
+                            ["n_in", "n_out", "len-n_in-n_out"][k],
+                            scope[k]
+                        ));
+                    }
+                };
+                if let Ok(n) = idx.parse::<usize>() {
+                    want(0, n);
+                } else if let Some(k) = idx.strip_prefix("n_in + n_out + ") {
+                    if let Ok(n) = k.trim().parse::<usize>() {
+                        want(2, n);
+                    }
+                } else if let Some(k) = idx.strip_prefix("n_in + ") {
+                    if let Ok(n) = k.trim().parse::<usize>() {
+                        want(1, n);
+                    }
+                }
+            }
+        }
+
+        assert!(
+            unguarded.is_empty(),
+            "these generated indexes can run past the argument list:\n  {}",
+            unguarded.join("\n  ")
+        );
+    }
+
     #[test]
     fn a_fully_stated_row_emits_a_branch() {
         let tables: &[&[crate::KernelSig]] = &[

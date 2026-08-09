@@ -1,29 +1,36 @@
-//! The family ladder, and nothing else any more.
+//! The one shape a checkpoint decides, and how a catalog row states it.
 //!
 //! What was here that is family-neutral has left: the launch ABI is
 //! [`crate::lowering::abi`] and the geometry-derived kernel params are
 //! [`crate::lowering::consts`].
 //!
-//! What remains is the thing `.wiki/driver/real-metal-north-star.md` §3
-//! measures and asks to be deleted rather than moved: `geometry` is a
-//! model definition inside the driver, and `geometry_facts` is the
-//! per-family projection ladder that fills it — *"projecting rather than
-//! branching… the per-family ladder this crate is retiring."* Both go to
-//! `crates/model` with `facts.rs`.
+//! What was here that was a MODEL DEFINITION has left too, and that is
+//! the change worth reading. `.wiki/driver/real-metal-north-star.md` §3
+//! measured 2,608 lines across `facts.rs`, `geometry.rs` and
+//! `geometry_facts.rs` and asked for them to be *deleted rather than
+//! moved* — *"projecting rather than branching… the per-family ladder
+//! this crate is retiring."* Two of the three are gone:
 //!
-//! `logits` (bf16 widening) and `timing` (dispatch attribution) were
-//! parked here too, and are gone: **neither had a single caller.** They
-//! were not part of #7's 2,608 lines — that figure is exactly
-//! `facts.rs` + `geometry.rs` + `geometry_facts.rs` — so they were 465
-//! lines waiting to be moved somewhere by a refactor that had no reason
-//! to move them. Deleting code with no caller is not a step toward the
-//! north star; it is removing something that would otherwise have to be
-//! carried through every step.
+//!   * `facts.rs` held a private `ModelFacts` this driver parsed out of a
+//!     `pie.model/1` JSON descriptor, plus an `arch_stem` that lowercased
+//!     `Qwen3MoeForCausalLM` into a dispatch key. The descriptor does not
+//!     exist any more and neither does the dispatch: a checkpoint is
+//!     matched to a `model::catalog` row BY ITS TENSORS.
+//!   * `geometry_facts.rs` was the 888-line projection ladder that merged
+//!     four family-prefixed blocks (`ll_*`, `go_*`, `g4_*`, `q35_*`) back
+//!     into one shape by asking which block had been filled.
+//!
+//! [`geometry`] is what remains, and it is no longer a model definition:
+//! [`DecodeGeometry`] holds the METAL-side numbers — the affine point
+//! that names a kernel symbol, the simdgroup-bounded GDN strides, the
+//! pool capacities an operator sets — and [`geometry_from_deployment`]
+//! fills it from a `model::deployment::Deployment` the row projected. The
+//! refusals moved with it unchanged, because every one of them was always
+//! a Metal limit rather than a statement about a config.
 
 pub(crate) mod geometry;
-pub(crate) mod geometry_facts;
 
-pub use geometry::{AffineFormat, DecodeGeometry};
-pub use geometry_facts::{
-    GeometryRefused, ROUTER_MAX_EXPERTS, ROUTER_MAX_TOP_K, geometry_from_facts,
+pub use geometry::{
+    AffineFormat, DecodeGeometry, GeometryRefused, ROUTER_MAX_EXPERTS, ROUTER_MAX_TOP_K,
+    geometry_from_deployment,
 };

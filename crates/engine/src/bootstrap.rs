@@ -136,6 +136,14 @@ pub struct RuntimeConfig {
 pub struct ModelConfig {
     pub name: String,
     pub arch_name: String,
+    /// Catalog id the driver loaded, as it reported it.
+    ///
+    /// This is what the chat template is chosen by. `arch_name` beside it
+    /// still selects the vision front-end, which is a different question
+    /// on a different axis — a family, not a checkpoint. Empty from a
+    /// driver not yet on the catalog, and `register` says so rather than
+    /// guessing a template.
+    pub model_id: String,
     pub kv_page_size: usize,
     /// The tokenizer file, for a model served from a HuggingFace snapshot.
     ///
@@ -280,6 +288,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let ModelConfig {
         name,
         arch_name,
+        model_id,
         kv_page_size,
         tokenizer_path,
         metadata,
@@ -391,6 +400,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     model::register(
         name.clone(),
         &arch_name,
+        &model_id,
         kv_page_size as u32,
         rs_caps,
         ptir_caps,

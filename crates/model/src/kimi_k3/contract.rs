@@ -124,7 +124,7 @@ fn kimi_k3_shard_axis(name: &str) -> Result<Option<u8>, Error> {
 /// not carry it and `head_dim` there is MLA's 192, not KDA's 128, so the
 /// checkpoint is both the only source and the right one.
 fn a_log_bands(b: &mut Builder<'_>) -> Result<(), Error> {
-    for layer in 0..b.facts().num_hidden_layers {
+    for layer in 0..b.shape().layers {
         let layer_prefix = format!("{}{layer}.self_attn.", b.decoder_layer_prefix_value());
         let (Some(raw), Some(beta)) = (
             b.find(&b.source_name(&format!("{layer_prefix}A_log"))),
@@ -170,12 +170,12 @@ fn a_log_bands(b: &mut Builder<'_>) -> Result<(), Error> {
 /// picks per step, the way Kimi-K2 does.
 fn bf16_expert_stacks(b: &mut Builder<'_>, gate_second: bool) -> Result<(), Error> {
     const GROUP: i64 = 32;
-    let experts = i64::from(b.facts().num_experts);
+    let experts = i64::from(b.shape().n_experts);
     if experts <= 0 {
         return Ok(());
     }
 
-    for layer in 0..b.facts().num_hidden_layers {
+    for layer in 0..b.shape().layers {
         let moe = format!(
             "{}{layer}.block_sparse_moe.",
             b.decoder_layer_prefix_value()

@@ -3261,16 +3261,20 @@ fn a_quantized_checkpoint_loads_through_the_abi() {
         return;
     };
 
-    // The descriptor, built here rather than committed: it is a pure
-    // function of the checkpoint's own config, and generating it is what
-    // `pie model import` does.
+    // The checkpoint's own `config.json`, COPIED rather than normalized.
+    //
+    // This used to call `model::config::descriptor` to turn it into a
+    // `pie.model/1` document — 40 fields resolved from a 136-field
+    // schema — because that is what the driver read. The driver reads
+    // the file itself now, for the one question a `const` row cannot
+    // answer (the declared encoding), so the fixture is a copy.
+    //
+    // Copied rather than pointed at in place because the boot TOML's
+    // path is what a real boot names, and a temp file keeps the
+    // snapshot read-only.
     let raw = std::fs::read_to_string(&config).expect("config.json");
-    let root: serde_json::Value = serde_json::from_str(&raw).expect("config parses");
-    let descriptor =
-        model::config::descriptor(&root, &config.to_string_lossy()).expect("descriptor");
-    let dpath = std::env::temp_dir().join("pie_gpt_oss_descriptor.json");
-    std::fs::write(&dpath, serde_json::to_string_pretty(&descriptor).expect("json"))
-        .expect("write descriptor");
+    let dpath = std::env::temp_dir().join("pie_gpt_oss_config.json");
+    std::fs::write(&dpath, &raw).expect("write config");
 
     unsafe extern "C" fn notify(_ctx: *mut std::ffi::c_void, _wait_id: u64, _epoch: u64) {}
     let boot = format!("[model]\ndescriptor = \"{}\"\n", dpath.display());

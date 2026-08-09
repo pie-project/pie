@@ -58,7 +58,7 @@ pub fn author_llama_mlx(b: &mut Builder<'_>) -> Result<(), Error> {
         .tensors()
         .iter()
         .any(|raw| raw.name.starts_with("lm_head."));
-    let tied = b.facts().tied_embeddings && !has_lm_head;
+    let tied = b.shape().tied_embeddings && !has_lm_head;
     mlx::author_mlx_file(b, "llama", &move |_, raw_name| {
         llama_mlx_name(raw_name, tied)
     })

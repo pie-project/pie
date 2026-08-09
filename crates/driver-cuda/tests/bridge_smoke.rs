@@ -504,10 +504,10 @@ fn the_full_zero_weight_decode_walks_every_launch() {
 /// bit-identical, and a devwin launch reading the wrong window would move
 /// them.
 ///
-/// # Why this is `ignore`d, and what un-ignoring it needs
+/// # What it took, in three layers
 ///
-/// It does not pass yet, and the reason moved once already, which is the
-/// useful part. Two layers came off:
+/// It did not pass for two eras and the reason moved twice, which is the
+/// useful part:
 ///
 /// * the SPLIT — `attn::split_qkv_bf16_devwin` had no arm and no device
 ///   word to read. `cuda::PeelWindowWord` and its arm fixed that.
@@ -517,17 +517,26 @@ fn the_full_zero_weight_decode_walks_every_launch() {
 ///   window once, for the stated args and the op join's placements
 ///   together. §4's fourth decline-rule is gone with it.
 ///
-/// What is left is the PLAN. `Launch::peel`'s own doc says a prepared
-/// plan "is found by the rectangle's ROW COUNT" — and this fire builds
-/// ONE `DecodePlan`, for all four rows, while the tail's attention serves
-/// two. FlashInfer reads a plan that does not describe the launch it was
-/// given and faults.
+/// * the PLAN. `Launch::peel`'s own doc says a prepared plan "is found
+///   by the rectangle's ROW COUNT" — and a fire builds ONE `DecodePlan`,
+///   for all four rows, while the tail's attention serves two.
+///   FlashInfer reads a plan that does not describe the launch it was
+///   given and faults. `AttnRegions::split` hands the tail its own, and
+///   this test built one BY HAND to prove the handing-over worked.
 ///
-/// So un-ignoring needs a plan per row count, which is A4's plan-stability
-/// item arriving from the peel side rather than the capture side. The two
-/// want the same thing: an arm must be HANDED its plan rather than
-/// resolve one, because neither a peel region nor a captured replay can
-/// assume the fire's.
+/// The last layer is why this test kept passing while the feature did
+/// not exist: the harness built the tail state and the DRIVER never did.
+/// `step_impl` said `AttnRegions::whole` unconditionally, so a peel
+/// worked here and nowhere else. `fire::launch::peel_tail_ctx` is that
+/// gap closed — its own plan, its own workspace (a plan writes into the
+/// one it was raised against, and a peel launches both regions), and
+/// CSRs rebased rather than sliced, because FlashInfer reads a prefix
+/// sum that starts at zero.
+///
+/// That is A4's plan-stability item arriving from the peel side rather
+/// than the capture side. The two want the same thing: an arm must be
+/// HANDED its plan rather than resolve one, because neither a peel
+/// region nor a captured replay can assume the fire's.
 #[test]
 fn a_hooked_fire_peels_and_still_lands_the_same_numbers() {
     zero_weight_decode(Leg::Hooked);
@@ -3720,8 +3729,8 @@ fn the_gemma3n_zero_weight_decode_walks_every_launch() {
     use driver_cuda::bind::{
         AttnCtx, AttnRegions, DecodePlan, DispatchCtx, DispatchPlan, Frame, Resolver, bind, dispatch,
     };
-    use model::gemma3n::forward::facts::{Gemma3nAltUpFacts, Gemma3nAttnFacts, Gemma3nFacts};
-    use model::gemma3n::forward::gemma3n_cuda;
+    use model::gemma_3n::forward::facts::{Gemma3nAltUpFacts, Gemma3nAttnFacts, Gemma3nFacts};
+    use model::gemma_3n::forward::gemma3n_cuda;
     use model_compiler::lower::{Arg, Fire, Row, lower};
     use model_compiler::trace::{FireClass, ValueId};
 

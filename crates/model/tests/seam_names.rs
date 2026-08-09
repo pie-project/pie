@@ -36,27 +36,27 @@
 //!
 //! **A name that resolves to the WRONG tensor.** This compares spellings,
 //! so a trace name `wire()` answers is a name it considers answered —
-//! whether or not the tensor behind it is the right one. gemma-2 is the
-//! live instance: it is a SANDWICH-norm family with four norms per layer,
-//! and `llama_like`'s pre-norm branch maps its `mlp_norm` to
+//! whether or not the tensor behind it is the right one. gemma-2 was the
+//! instance: it is a SANDWICH-norm family with four norms per layer, and
+//! `llama_like`'s pre-norm branch mapped its `mlp_norm` to
 //! `post_attention_layernorm` where the forward means
 //! `pre_feedforward_layernorm`. The name resolves; the tensor is wrong.
 //!
-//! It is latent rather than live — `contract::HF_ROWS` has no `gemma2`
-//! row, so the family has a forward and cannot be loaded — which is also
-//! why fixing it would be guessing at a contract nobody has written. It
-//! is written down here instead, because the shape of what a test misses
-//! belongs beside the test.
+//! That one is repaired — `weight_names::wire` branches on the SANDWICH
+//! PAIR rather than on `input_layernorm`, whose presence never told the
+//! two apart, and the repair has its own assertion beside it. The class
+//! is what stays uncaught here, so it is written down: the shape of what
+//! a test misses belongs beside the test.
 //!
 //! Layer indices are normalised to `layer.*`, because a trace at four
 //! layers and a `wire()` at eight would otherwise disagree about
 //! everything for no reason. The question is about SPELLINGS.
 
-#![cfg(all(feature = "forward", feature = "config"))]
+#![cfg(all(feature = "forward", feature = "contract"))]
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use model::config::HfConfig;
+use model::catalog::LoadShape;
 use model_compiler::lower::{Arg, Fire, Row, lower};
 use model_compiler::trace::{FireClass, ForwardPlan};
 
@@ -107,9 +107,14 @@ impl Scheme {
 /// Every trace name `wire()` can emit for a checkpoint of this scheme,
 /// layer-normalised.
 fn answerable(scheme: Scheme) -> BTreeSet<String> {
-    let hf = HfConfig { num_hidden_layers: 4, ..HfConfig::default() };
+    // Four layers and a 128-wide head: enough for the per-layer loops to
+    // run and for a KV-shared tail to be distinguishable from the layers
+    // that project their own. `wire()` reads only the layer count and the
+    // shared-tail length, which is why a `LoadShape` replaced the
+    // 136-field config this used to build.
+    let shape = LoadShape::dense(4, 128, false);
     let published = scheme.published();
-    let w = model::weight_names::wire(&hf, &published);
+    let w = model::weight_names::wire(shape, &published);
     w.aliases
         .iter()
         .map(|(t, _)| normalise(t))
@@ -226,8 +231,8 @@ fn corpus() -> Vec<(&'static str, Scheme, ForwardPlan)> {
         (
             "gemma3n",
             Scheme::LlamaLike,
-            model::gemma3n::forward::gemma3n_cuda(
-                &model::gemma3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(),
+            model::gemma_3n::forward::gemma3n_cuda(
+                &model::gemma_3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(),
                 FireClass::Decode,
             ),
         ),
@@ -242,8 +247,8 @@ fn corpus() -> Vec<(&'static str, Scheme, ForwardPlan)> {
         (
             "glm5",
             Scheme::LlamaLike,
-            model::glm5::forward::glm5_cuda(
-                &model::glm5::forward::facts::Glm5Facts::glm5_106b_a12b(),
+            model::glm_5::forward::glm5_cuda(
+                &model::glm_5::forward::facts::Glm5Facts::glm5_106b_a12b(),
                 FireClass::Decode,
             ),
         ),

@@ -614,17 +614,38 @@ pub fn decode_gif_frames(bytes: &[u8]) -> Result<Vec<(DynamicImage, f32)>, Strin
 }
 
 impl VisionArch {
-    /// Map a registered model's `arch_name` to its vision front-end, or `None`
-    /// for text-only archs. Covers the multimodal checkpoints Pie targets first.
+    /// The vision front-end a registered model's `arch_name` selects, or
+    /// `None` for a text-only family.
+    ///
+    /// # Whole label, because a substring was WRONG
+    ///
+    /// This asked `arch.contains("qwen3")`. The label the Qwen 3 rows
+    /// advertise is `qwen3`, so every text-only Qwen 3 — 0.6B through
+    /// 32B, eight rows — answered with the Qwen3-VL front-end. A guest
+    /// that sent an image to a Qwen3-8B got a patchified tensor and a
+    /// pair of `<|vision_start|>` delimiters instead of the refusal the
+    /// two lines below [`Self::from_arch_name`]'s caller exist to give
+    /// it, and the model then attended over rows no tower had encoded.
+    ///
+    /// The substring was not merely loose, it was UNFIXABLE by widening
+    /// it: `qwen3_5` is `qwen3` plus a suffix, so no `contains` on earth
+    /// admits the VL line and refuses the dense one. Only the whole
+    /// label separates them — which is why this matches the whole label,
+    /// and why the arms below are `==` and not `contains`.
+    ///
+    /// The arms are exactly the labels rows advertise.
+    /// `a_text_only_family_has_no_vision_front_end` holds them against
+    /// [`crate::catalog`], so a generation cannot gain a front-end here
+    /// by accident of spelling or lose one in silence.
+    #[must_use]
     pub fn from_arch_name(arch: &str) -> Option<VisionArch> {
-        let a = arch.to_ascii_lowercase();
-        if a.contains("gemma4") || a.contains("gemma-4") {
-            Some(VisionArch::Gemma4)
-        } else if a.contains("qwen3") {
-            // qwen3_5 / qwen3_6 — the Qwen3-VL line.
-            Some(VisionArch::Qwen36)
-        } else {
-            None
+        match arch.to_ascii_lowercase().as_str() {
+            "gemma4" => Some(VisionArch::Gemma4),
+            // The Qwen3-VL line: Qwen3.5, and the Qwen3.6-27B builds
+            // whose row lives with it because they are a Qwen3.5 by
+            // shape. NOT `qwen3`, which is the text-only generation.
+            "qwen3_5" => Some(VisionArch::Qwen36),
+            _ => None,
         }
     }
 }
@@ -633,11 +654,18 @@ impl VisionArch {
 // Audio (gemma4_audio) — front-end geometry
 // ============================================================================
 
-/// Whether the given `arch_name` has a gemma4 audio front-end. Only Gemma-4
-/// ships the USM/Conformer audio tower today.
+/// Whether the given `arch_name` has a gemma-4 audio front-end. Only
+/// Gemma-4 ships the USM/Conformer audio tower today.
+///
+/// Whole-label for the reason [`VisionArch::from_arch_name`] gives. No
+/// label but `gemma4` contains `gemma4` today, so this arm is not
+/// currently wrong — it is written this way because the vision one WAS
+/// wrong for exactly this reason, and a second `contains` beside it is
+/// an invitation to repeat the defect the next time a generation is
+/// named after an older one.
+#[must_use]
 pub fn audio_arch_supported(arch: &str) -> bool {
-    let a = arch.to_ascii_lowercase();
-    a.contains("gemma4") || a.contains("gemma-4")
+    arch.eq_ignore_ascii_case("gemma4")
 }
 
 /// Delimiter *strings* the model wraps a visual span with — encoded host-side by
@@ -982,6 +1010,82 @@ pub mod audio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── The front-end tables, held against the catalog ───────────────────
+
+    /// A text-only generation answers with no vision front-end.
+    ///
+    /// The regression this pins: [`VisionArch::from_arch_name`] matched
+    /// `arch.contains("qwen3")`, and the Qwen 3 rows advertise exactly
+    /// `qwen3` — so eight text-only checkpoints claimed the Qwen3-VL
+    /// front-end. `image.from_bytes` then returned a patchified tensor
+    /// where it owed the guest a refusal.
+    ///
+    /// The list is the labels rows advertise, not a guess: every entry
+    /// is asserted to be a label some row hands out, so a generation
+    /// that renames itself fails here rather than quietly leaving the
+    /// table.
+    #[cfg(feature = "forward")]
+    #[test]
+    fn a_text_only_family_has_no_vision_front_end() {
+        let advertised = crate::catalog::arches();
+        for arch in ["qwen3", "qwen2", "llama", "mistral", "gemma2", "gemma3", "phi3", "olmo2"] {
+            assert!(
+                advertised.contains(&arch),
+                "`{arch}` is in this test because a row advertises it; no row does \
+                 any more, so the case it pins may have moved"
+            );
+            assert_eq!(
+                VisionArch::from_arch_name(arch),
+                None,
+                "`{arch}` is a text-only family and must not select a vision front-end"
+            );
+            assert!(!audio_arch_supported(arch), "`{arch}` ships no audio tower");
+        }
+    }
+
+    /// And the two that DO have one still get it.
+    ///
+    /// The other half of the same guard: making the match exact is only
+    /// correct if it still admits the labels it is supposed to admit.
+    #[cfg(feature = "forward")]
+    #[test]
+    fn the_two_multimodal_families_still_reach_their_front_ends() {
+        let advertised = crate::catalog::arches();
+        for (arch, want) in [("gemma4", VisionArch::Gemma4), ("qwen3_5", VisionArch::Qwen36)] {
+            assert!(advertised.contains(&arch), "`{arch}` is advertised by a row");
+            assert_eq!(VisionArch::from_arch_name(arch), Some(want));
+        }
+        // Gemma-4 alone ships the USM/Conformer audio tower; the Qwen3-VL
+        // line is vision-only.
+        assert!(audio_arch_supported("gemma4"));
+        assert!(!audio_arch_supported("qwen3_5"));
+    }
+
+    /// The prefix that used to be enough is not enough any more.
+    ///
+    /// Spelled out separately from the table above because it is the
+    /// exact shape of the defect: `qwen3` is a PREFIX of `qwen3_5`, so a
+    /// matcher that accepts prefixes cannot tell the dense line from the
+    /// VL one in either direction.
+    #[test]
+    fn a_label_that_merely_contains_a_multimodal_one_is_refused() {
+        assert_eq!(VisionArch::from_arch_name("qwen3"), None);
+        assert_eq!(VisionArch::from_arch_name("qwen3_5"), Some(VisionArch::Qwen36));
+        // Neither direction of containment leaks.
+        assert_eq!(VisionArch::from_arch_name("qwen3_5_moe"), None);
+        assert_eq!(VisionArch::from_arch_name("gemma4x"), None);
+        assert_eq!(VisionArch::from_arch_name("pregemma4"), None);
+        assert!(!audio_arch_supported("gemma4-audio"));
+        // Case is still forgiven — a driver that upper-cases its label is
+        // spelling the same family.
+        assert_eq!(VisionArch::from_arch_name("GEMMA4"), Some(VisionArch::Gemma4));
+        assert!(audio_arch_supported("Gemma4"));
+        // And an empty label, which is what a row that refuses to deploy
+        // advertises, selects nothing rather than panicking.
+        assert_eq!(VisionArch::from_arch_name(""), None);
+        assert!(!audio_arch_supported(""));
+    }
 
     // ── Gemma ────────────────────────────────────────────────────────────
 

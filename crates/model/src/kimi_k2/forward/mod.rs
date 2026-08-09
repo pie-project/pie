@@ -1,7 +1,7 @@
 //! kimi's forward, declared.
 //!
 //! Transcribed from `driver-cuda/csrc/src/model/kimi/kimi_forward.cpp`.
-//! The second MLA family; what differs from [`crate::glm5`] is worth
+//! The second MLA family; what differs from [`crate::glm_5`] is worth
 //! naming, because the shapes are otherwise the same statement:
 //!
 //! * **No DSA.** kimi's attention reads the whole context; there is no

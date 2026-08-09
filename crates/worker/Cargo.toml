@@ -112,10 +112,12 @@ model-compiler = { path = "../model-compiler" }
 # whole: `model` owns the shape it arrives in, `tokenizer` names the
 # objects that make up a `pie.tokenizer/1`.
 #
-# `config` is what used to be the `model-config` crate: it names `pie.model/1`
-# and the object it lives in, so the worker normalizes a snapshot and reads
-# the descriptor under the same name `convert` writes it under.
-model = { path = "../model", features = ["forward", "config"] }
+# `contract` is what names `model/config` and the `Encoding` read out of
+# it, so the worker lifts a snapshot's own `config.json` and reads it back
+# out of an artifact under the same name `convert` writes it under. It
+# used to ask for `config`, a feature that carried an 845-line normalizer
+# whose whole output the catalog now states as a `const`.
+model = { path = "../model", features = ["forward", "contract"] }
 tokenizer = { path = "../tokenizer" }
 
 # Pie websocket client — used by `pie run` to drive an inferlet against

@@ -52,6 +52,7 @@ fn dummy_driver_backend(
         vocab_size: fixture_vocab_size(),
         max_model_len: 8192,
         arch_name: "test-dummy".into(),
+        model_id: String::new(),
         activation_dtype: "f32".into(),
         snapshot_dir: String::new(),
         max_forward_tokens: 4096,
@@ -207,6 +208,7 @@ impl MockEnv {
             model: ModelConfig {
                 name: self.model_name.clone(),
                 arch_name: String::new(),
+                model_id: String::new(),
                 kv_page_size: 16,
                 tokenizer_path,
                 // A fixture snapshot: the tokenizer is a file on disk, and the

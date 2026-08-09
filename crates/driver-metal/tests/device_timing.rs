@@ -18,7 +18,8 @@
 use std::time::Duration;
 
 use driver_metal::Error;
-use driver_metal::gpu::{Compiler, Context, Pool, Stepper, Tables};
+use driver_metal::device::{Context, Pool, Stepper, Tables};
+use driver_metal::program::Compiler;
 
 /// A loop the compiler cannot fold away: the result is stored, and the trip
 /// count is a specialisation constant substituted into the source.
@@ -92,7 +93,7 @@ fn encoding_and_execution_are_measured_separately() {
 
     let mut run = |pipeline| {
         stepper
-            .run(|step: &mut driver_metal::gpu::StepEncoder<'_>| {
+            .run(|step: &mut driver_metal::device::StepEncoder<'_>| {
                 step.set_argument_table_for(&tables, 0)?;
                 step.set_pipeline(pipeline);
                 step.dispatch([THREADS, 1, 1], [THREADGROUP, 1, 1])
@@ -231,7 +232,7 @@ fn the_gpus_own_report_excludes_the_host_wake_up() {
         ms(timing.gpu_exec)
     );
 
-    let with_report = driver_metal::gpu::Timing {
+    let with_report = driver_metal::device::Timing {
         gpu: Some(gpu),
         ..timing
     };
@@ -260,7 +261,7 @@ fn segments_accumulate_both_host_halves() {
         .expect("bind");
 
     let mut stepper = Stepper::new(&context).expect("stepper");
-    let encode = |step: &mut driver_metal::gpu::StepEncoder<'_>| {
+    let encode = |step: &mut driver_metal::device::StepEncoder<'_>| {
         step.set_argument_table_for(&tables, 0)?;
         step.set_pipeline(&pipeline);
         step.dispatch([THREADS, 1, 1], [THREADGROUP, 1, 1])
@@ -329,11 +330,11 @@ fn a_run_that_encodes_nothing_is_zero_rather_than_a_refusal() {
     let empty = stepper
         .run_parallel(0, |_, _| unreachable!("no buffers were asked for"))
         .expect("empty batch");
-    assert_eq!(empty, driver_metal::gpu::Timing::default());
+    assert_eq!(empty, driver_metal::device::Timing::default());
     assert_eq!(empty.total(), Duration::ZERO);
 
     let none = stepper
         .run_segments(0, |_, _| unreachable!(), |_| unreachable!())
         .expect("no segments");
-    assert_eq!(none, driver_metal::gpu::Timing::default());
+    assert_eq!(none, driver_metal::device::Timing::default());
 }

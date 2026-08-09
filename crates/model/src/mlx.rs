@@ -514,8 +514,8 @@ pub fn author_mlx_file(
     schema: &str,
     rename: RenameRule<'_>,
 ) -> Result<(), Error> {
-    let quant_bits = i64::from(b.facts().quant_bits);
-    let quant_group = i64::from(b.facts().quant_group_size);
+    let quant_bits = i64::from(b.encoding().bits);
+    let quant_group = i64::from(b.encoding().group_size);
     let encode_floats = int4_requested(b, schema)?;
     // These three families bind every projection through Metal's affine-U4
     // path (`push_quant` in `crates/driver-metal/csrc/src/loader/heap_bind.cpp` asks for

@@ -1,84 +1,14 @@
-//! `gpt-oss`'s load-time facts.
+//! `gpt-oss`'s per-backend binding facts.
+//!
+//! The SHAPE moved to `../spec.rs` (ungated: a row is written in it, and
+//! a row must exist under every aspect). What a deployment RESOLVED --
+//! the device's MXFP4 policy, a fused leg's route ceiling, whether the
+//! expert slabs are streamed -- is known only when that backend's aspect
+//! is compiled, so it stays here.
 
-
-/// gpt-oss's shape. The family rides `mixtral.cpp`, so these are the
-/// facts that text reads — not a checkpoint dump.
-///
-/// Two of them are here because the driver ANSWERS them per layer and
-/// the declaration would otherwise have to re-derive them per fire: the
-/// alternating window kind, and whether a layer carries attention sinks.
-/// Both are load-time, so both erase at trace time.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GptOssFacts {
-    pub hidden: u32,
-    pub layers: u32,
-    pub q_heads: u32,
-    pub kv_heads: u32,
-    pub head_dim: u32,
-    /// One expert's MLP width (`intermediate_size`). gpt-oss's is equal
-    /// to `hidden`, which is a coincidence of this checkpoint and not a
-    /// rule the text may lean on.
-    pub intermediate: u32,
-    pub experts: u32,
-    pub top_k: u32,
-    pub vocab: u32,
-    pub tied_embeddings: bool,
-    /// `swiglu_limit`; 0 means the plain SwiGLU. gpt-oss clamps at 7.0,
-    /// and the clamp is a DIFFERENT KERNEL, so this decides which
-    /// activation the text states rather than being a runtime scalar.
-    pub swiglu_limit: f32,
-    /// Whether the checkpoint biases q/k/v/o, the router, and the expert
-    /// projections (`attention_bias`). gpt-oss biases all of them; the
-    /// q/k/v biases FOLD INTO the projection's epilogue and the rest are
-    /// their own launches.
-    pub attention_bias: bool,
-    /// Whether this deployment's rope is the YaRN-paper one. gpt-oss's
-    /// config asks for it (factor 32 over an original 4096 context) and
-    /// the driver resolves it at load, so it is a fact and not a fire's
-    /// question — and a WRONG one here is not a crash but a silently
-    /// unscaled rotation, which is how it went unnoticed.
-    pub rope_yarn_original: bool,
-    /// Every layer carries `attn_sinks` on gpt-oss. The driver asks
-    /// `layer.attn_sinks != nullptr` per layer and only requests an LSE
-    /// from attention where the answer is yes — so this is what decides
-    /// whether the attention statement produces one value or two.
-    pub attn_sinks: bool,
-}
-
-impl GptOssFacts {
-    /// Whether layer `l` attends over the SLIDING window. gpt-oss
-    /// alternates from layer 0 (`layer_types` reads
-    /// sliding, full, sliding, full, …), which the driver reaches
-    /// through `per_layer_window_left` — a scalar the text does not
-    /// state, since the window is an argument and not a kernel.
-    pub fn is_sliding(&self, l: u32) -> bool {
-        l % 2 == 0
-    }
-
-    /// openai/gpt-oss-20b, read from the checkpoint's `config.json`
-    /// (2026-08-06). `layer_types` alternates from sliding; the yarn
-    /// `rope_scaling` is NOT in this list because the driver never
-    /// applies it — `mixtral.cpp:320` passes the plain `rope_theta`, a
-    /// latent bug this declaration must not launder into a fact.
-    pub fn gpt_oss_20b() -> Self {
-        Self {
-            hidden: 2880,
-            layers: 24,
-            q_heads: 64,
-            kv_heads: 8,
-            head_dim: 64,
-            intermediate: 2880,
-            experts: 32,
-            top_k: 4,
-            vocab: 201088,
-            tied_embeddings: false,
-            swiglu_limit: 7.0,
-            attention_bias: true,
-            rope_yarn_original: true,
-            attn_sinks: true,
-        }
-    }
-}
+/// The shape, re-exported so a declaration reaches its facts and the
+/// words they are stated in from one place.
+pub use super::super::spec::GptOssFacts;
 
 /// The CUDA backend's answers for a gpt-oss deployment — the bindings
 /// and the admission thresholds, all resolved at load.
@@ -127,4 +57,3 @@ impl GptOssCudaFacts {
         }
     }
 }
-

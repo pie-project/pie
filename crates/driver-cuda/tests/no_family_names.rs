@@ -10,13 +10,13 @@
 //! # Why a ratchet rather than zero
 //!
 //! The 33-row `model_type` table is gone from this crate — it lives in
-//! `model::deployment_cuda`, which is where the question is allowed to
+//! `model::catalog`, which is where the question is allowed to
 //! be asked — and the fire path reads a `Deployment` with no family
 //! name in it. What is left is not dispatch:
 //!
-//! - `layout/memory_planner.rs` and `model_costs.rs` size a KV pool per
-//!   architecture, because the COST of a token genuinely differs. That
-//!   is arithmetic about bytes, not a branch about behaviour.
+//! - `layout/memory_planner.rs` sizes a KV pool per architecture,
+//!   because the COST of a token genuinely differs. That is arithmetic
+//!   about bytes, not a branch about behaviour.
 //! - `bind/` names kernels, and a kernel's name is its own.
 //! - `serve/encode.rs` serves gemma-4's towers, which is a real
 //!   family-specific ABI entry and the next thing to generalise.
@@ -25,6 +25,17 @@
 //! would hide which is which. So this pins the number per FILE: a file
 //! may not gain family names, and a file that loses them ratchets the
 //! bound down.
+//!
+//! # What the count reads
+//!
+//! Two corrections, both found in `driver-metal` and ported here so the
+//! backends are held to one standard rather than to whichever names each
+//! happened to notice. The count skips `#[cfg(test)]` blocks, because a
+//! test naming the family it covers is an asset; five files left this
+//! table outright once their only mentions were their own fixtures. And
+//! it compares case- and punctuation-blind, which raised
+//! `memory_planner.rs` from 25 to 30 and surfaced `fire/lora.rs`, a file
+//! that had never been listed.
 //!
 //! **A file not in the table may have none at all.** That is the half
 //! that matters — it is what stops a new dispatch site appearing
@@ -44,15 +55,7 @@ fn budget() -> BTreeMap<&'static str, usize> {
     [
         // Cost per token differs by architecture, and that is arithmetic
         // about bytes rather than a branch about behaviour.
-        ("layout/memory_planner.rs", 25),
-        ("layout/model_costs.rs", 14),
-        ("layout/workspace.rs", 7),
-        ("layout/kv_geometry.rs", 1),
-        ("layout/profile_cache.rs", 1),
-        ("layout/profile_key.rs", 1),
-        
-        
-        
+        ("layout/memory_planner.rs", 30),
         // A kernel's name is its own.
         // SYMBOL names, not a family branch: `ssm::nemotron_mamba_split_bf16`
         // is what the kernel is CALLED, and the join reads its arity. The
@@ -65,8 +68,8 @@ fn budget() -> BTreeMap<&'static str, usize> {
         ("serve/transfer.rs", 4),
         ("serve/load.rs", 3),
         ("serve/state.rs", 2),
-        ("fire/launch.rs", 0),
-        
+        // Never listed until the counter learned to read `LoraGemma`.
+        ("fire/lora.rs", 3),
     ]
     .into_iter()
     .collect()
@@ -76,14 +79,50 @@ fn count(path: &std::path::Path) -> usize {
     let Ok(text) = std::fs::read_to_string(path) else {
         return 0;
     };
-    text.lines()
-        .filter(|l| {
-            let t = l.trim_start();
-            // Comments are provenance — "ports gemma_4/forward" — not
-            // dispatch. The claim is about CODE.
-            !t.starts_with("//") && FAMILIES.iter().any(|f| l.contains(f))
-        })
-        .count()
+    // `#[cfg(test)]` opens a block that closes when its braces balance.
+    // A test that names the family it covers is what makes the test
+    // readable; charging it as debt taxes exactly the coverage this rule
+    // needs. Depth, not "the rest of the file": a file may have several
+    // test modules with real code between them.
+    let mut depth = 0i32;
+    let mut armed = false;
+    let mut n = 0;
+    for l in text.lines() {
+        let opens = i32::try_from(l.matches('{').count()).unwrap_or(0);
+        let closes = i32::try_from(l.matches('}').count()).unwrap_or(0);
+        if l.trim_start().starts_with("#[cfg(test)]") {
+            armed = true;
+        }
+        // Comments are provenance -- "ports gemma_4/forward" -- not
+        // dispatch. The claim is about CODE.
+        if depth == 0 && !armed && !l.trim_start().starts_with("//") && names_a_family(l) {
+            n += 1;
+        }
+        if armed {
+            depth += opens - closes;
+            if depth <= 0 && closes > 0 {
+                armed = false;
+                depth = 0;
+            }
+        }
+    }
+    n
+}
+
+/// Whether a line names a family, whatever spelling it wears.
+///
+/// Matching raw text saw `gemma_facts` and missed `GemmaFacts`, which is
+/// where family names actually appear in Rust. Reducing the line the way
+/// `model/text.rs` reduces an architecture string -- drop case and
+/// punctuation, then compare -- makes `GptOss`, `gpt_oss` and `gptoss`
+/// one name.
+fn names_a_family(line: &str) -> bool {
+    let flat: String =
+        line.chars().filter(|c| *c != '_' && *c != '-').flat_map(char::to_lowercase).collect();
+    FAMILIES.iter().any(|f| {
+        let f: String = f.chars().filter(|c| *c != '_').collect();
+        flat.contains(&f)
+    })
 }
 
 fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -164,10 +203,20 @@ fn the_driver_does_not_learn_a_new_family() {
 
 /// The dispatch itself is gone: no `model_type` table remains here.
 ///
-/// This is the strong half of the claim. The 33-row `FACTS_ROWS` and its
-/// eleven derivations moved to `model::deployment_cuda`; what a driver
-/// receives is a `Deployment`, and a value with no family name in it is
-/// a value a driver cannot branch on.
+/// This is the strong half of the claim, and it got stronger. The
+/// 33-row `FACTS_ROWS` and its eleven derivations first MOVED, out of
+/// this driver and into `model::deployment_cuda` — which was the right
+/// first step and still left a table keyed on a `config.json` string,
+/// merely one crate over.
+///
+/// They are DELETED now. There is no `model_type` table anywhere: a
+/// checkpoint is matched to a `model::catalog` row by its TENSORS, and
+/// what a driver receives is a `Deployment`, a value with no family
+/// name in it and therefore nothing to branch on.
+///
+/// So this guard now watches for the table's RETURN rather than for its
+/// escape, which is why the message no longer names a place it could
+/// legitimately live.
 #[test]
 fn no_model_type_table_remains_in_the_driver() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -180,14 +229,48 @@ fn no_model_type_table_remains_in_the_driver() {
             if t.starts_with("//") {
                 continue;
             }
-            assert!(
-                !t.contains("FACTS_ROWS"),
-                "{}:{} names the model_type table, which lives in \
-                 `model::deployment_cuda` — a driver reads the answer, never \
-                 the question",
-                f.display(),
-                i + 1
-            );
+            for banned in ["FACTS_ROWS", "HF_ROWS", "MLX_ROWS"] {
+                assert!(
+                    !t.contains(banned),
+                    "{}:{} names `{banned}`, a table keyed on a `config.json` \
+                     string. There is no such table any more — a checkpoint \
+                     is matched to a `model::catalog` row by its tensors, and \
+                     a driver reads the answer, never the question",
+                    f.display(),
+                    i + 1
+                );
+            }
         }
     }
+}
+
+/// Every budgeted file exists and still spends what it is budgeted.
+///
+/// The other half of the ratchet, ported from `driver-metal`. Without it a
+/// file can be renamed, deleted, or cleaned up and leave its ceiling behind
+/// as a permission nobody is using -- and the next file to need that
+/// permission inherits it silently. A budget that only ever caps is a budget
+/// that only ever grows. Five files left the table the first time this ran.
+#[test]
+fn no_budget_line_outlives_what_it_was_for() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut stale = Vec::new();
+    for (rel, cap) in budget() {
+        let path = root.join(rel);
+        if !path.exists() {
+            stale.push(format!("{rel}: budgeted {cap}, file is gone"));
+            continue;
+        }
+        let n = count(&path);
+        if n < cap {
+            stale.push(format!("{rel}: budgeted {cap}, actually {n} -- lower the ceiling"));
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "the budget is stale. Every line below is a permission larger than \
+         what uses it, and the next file to want that permission gets it for \
+         free:\n  {}",
+        stale.join("\n  ")
+    );
 }

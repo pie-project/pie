@@ -1768,6 +1768,7 @@ mod tests {
             max_forward_requests: 8,
             max_page_refs: 128,
             arch_name: "dummy".to_string(),
+            model_id: String::new(),
             vocab_size: 32,
             max_model_len: 128,
             activation_dtype: "f32".to_string(),

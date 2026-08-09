@@ -23,7 +23,8 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLComputePipelineState, MTLDevice};
 
 use driver_metal::Error;
-use driver_metal::gpu::{Compiler, Context, Math};
+use driver_metal::device::Context;
+use driver_metal::program::{Compiler, Math};
 
 const TRIVIAL: &str = r"
 #include <metal_stdlib>

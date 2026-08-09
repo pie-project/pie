@@ -56,7 +56,7 @@ mod graph;
 mod stream;
 mod vmm;
 
-pub use alloc::{Allocator, CaptureScope, DeviceBuffer};
+pub use alloc::{read_raw_span, Allocator, CaptureScope, DeviceBuffer};
 pub use device::{COMPILED_MAJOR, Device};
 pub use graph::{ConditionalIf, Graph, GraphExec};
 pub use stream::{Event, OwnedStream, PinnedBuf, StreamRef};

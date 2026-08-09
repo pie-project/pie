@@ -1580,27 +1580,7 @@ pub fn dispatch<R: Resolver>(
         // gate is the SPLIT's contiguous copy, so its stride is its own
         // width (the C++ hand pass reads the gate in place inside the
         // packed projection, stride `projection_dim` — same values).
-        "ssm::zamba_rmsnorm_gated_bf16" => {
-            need(4)?;
-            let g = gdn_ctx()?;
-            let (x, gate, y, w) = (bound.args[0], bound.args[1], bound.args[2], bound.args[3]);
-            let hidden = i32::try_from(x.width).expect("width");
-            unsafe {
-                ffi::pie_k_ssm_zamba_rmsnorm_gated_bf16(
-                    x.ptr.cast_const(),
-                    gate.ptr.cast_const(),
-                    w.ptr.cast_const(),
-                    y.ptr,
-                    rows,
-                    hidden,
-                    i32::try_from(gate.width).expect("width"),
-                    hidden / g.n_groups.max(1),
-                    ctx.eps,
-                    ctx.stream,
-                );
-            }
-        }
-        // args: [q, v] in place; qkv_in rides the spec's aux (the same
+                // args: [q, v] in place; qkv_in rides the spec's aux (the same
         // layer's projection input), the staged state + scratch ride the
         // ctx. The LAYER is the op tag's — never `param1`, the bug the
         // C++'s first live A/B caught.

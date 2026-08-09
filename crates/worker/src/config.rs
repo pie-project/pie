@@ -1109,6 +1109,19 @@ where
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetalDriverOptions {
+    /// `[model] id`: the operator's answer to "which model is this".
+    ///
+    /// Absent — the ordinary case — the driver identifies the checkpoint
+    /// from its TENSORS against the catalog every driver links. Present,
+    /// it names a row directly, for a checkpoint that is genuinely a
+    /// known model under an unknown name: a fine-tune, a re-upload, a
+    /// mirror that renamed the directory.
+    ///
+    /// It is an OVERRIDE and not a bypass. The named row's manifest is
+    /// still matched, so this cannot be used to load a checkpoint as
+    /// something it is not — which is the failure the whole arrangement
+    /// exists to prevent.
+    pub model_id: Option<String>,
     /// KV page size in tokens. Used as given -- unlike the CUDA driver, the
     /// Metal driver has no planner to derive one.
     pub kv_page_size: u32,
@@ -1188,6 +1201,7 @@ pub struct MetalDriverOptions {
 impl Default for MetalDriverOptions {
     fn default() -> Self {
         Self {
+            model_id: None,
             kv_page_size: 32,
             total_pages: 1024,
             max_forward_tokens: 10240,
@@ -1241,6 +1255,19 @@ fn default_dummy_ready_timeout() -> Duration {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CudaNativeDriverOptions {
+    /// `[model] id`: the operator's answer to "which model is this".
+    ///
+    /// Absent — the ordinary case — the driver identifies the checkpoint
+    /// from its TENSORS against the catalog every driver links. Present,
+    /// it names a row directly, for a checkpoint that is genuinely a
+    /// known model under an unknown name: a fine-tune, a re-upload, a
+    /// mirror that renamed the directory.
+    ///
+    /// It is an OVERRIDE and not a bypass. The named row's manifest is
+    /// still matched, so this cannot be used to load a checkpoint as
+    /// something it is not — which is the failure the whole arrangement
+    /// exists to prevent.
+    pub model_id: Option<String>,
     /// Fraction of each GPU's memory pie may use, weights included.
     ///
     /// What is left after the weights becomes the KV pool, so this is the
@@ -1425,6 +1452,7 @@ pub enum CudaMemoryProfile {
 impl Default for CudaNativeDriverOptions {
     fn default() -> Self {
         Self {
+            model_id: None,
             gpu_mem_utilization: 0.90,
             memory_profile: CudaMemoryProfile::Auto,
             kv_page_size: None,

@@ -211,6 +211,7 @@ jobs:
           cargo test -p driver-cuda --features cuda-12
           cargo test -p driver-cuda --features cuda-13
 
+
       # The half of driver-cuda that is correct without a GPU. No feature
       # at all now BUILDS rather than refusing — the `compile_error!` is
       # down to the one case it was ever about, both CUDA versions at
@@ -465,6 +466,28 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      # EVERY FEATURE SPELLING, built. Two of the four were broken at once
+      # while the two either side of them were green, and nothing said so —
+      # `--features cuda-13` failed with 58 errors in `fire/launch.rs` and
+      # `--features cuda-13,bridge` failed on `weights/`, both for the same
+      # reason: `abi` is the only spelling that brings `driver_api` and
+      # `model-loader`, so a module reaching for either compiles under
+      # `cuda-13,abi` and under nothing else.
+      #
+      # Here rather than in the no-toolkit job because `bridge` compiles the
+      # generated shim against real headers and asks for nvcc. The first two
+      # are covered by `cargo test` there; these are the two that were not
+      # covered anywhere.
+      #
+      # BUILDING IS ENOUGH: the failure this catches is "does not compile",
+      # which is exactly the failure that hides — a configuration nobody
+      # builds is a configuration nobody checks, which is §7's own argument
+      # for `metal-4` being a feature rather than a `target_vendor`.
+      - name: cargo build (every feature spelling)
+        run: |
+          cargo build -p driver-cuda --features cuda-13,bridge
+          cargo build -p driver-cuda --features cuda-13,abi
 
       - name: cargo build (driver-cuda)
         run: |

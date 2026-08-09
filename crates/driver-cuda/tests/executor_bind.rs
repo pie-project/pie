@@ -671,8 +671,8 @@ fn print_the_lora_vocabulary() {
 /// new vocabulary: predict from the active stream, run the body on the
 /// prediction, correct every stream from the result.
 fn gemma3n_lowered(rows: usize) -> Lowered {
-    let plan = model::gemma3n::forward::gemma3n_cuda(
-        &model::gemma3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(),
+    let plan = model::gemma_3n::forward::gemma3n_cuda(
+        &model::gemma_3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(),
         FireClass::Decode,
     );
     let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
@@ -797,8 +797,8 @@ fn print_the_gpt_oss_vocabulary() {
 /// claims over all four — every launch binds, every kernel has a stated
 /// bridge row — which is what makes the arms writable at all.
 fn glm5_lowered(rows: usize) -> Lowered {
-    let plan = model::glm5::forward::glm5_cuda(
-        &model::glm5::forward::facts::Glm5Facts::glm5_106b_a12b(),
+    let plan = model::glm_5::forward::glm5_cuda(
+        &model::glm_5::forward::facts::Glm5Facts::glm5_106b_a12b(),
         FireClass::Decode,
     );
     let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
@@ -1257,8 +1257,8 @@ fn every_pair_form_activation_recovers_its_up_projection() {
         ),
         (
             "glm5",
-            model::glm5::forward::glm5_cuda(
-                &model::glm5::forward::facts::Glm5Facts::glm5_106b_a12b(),
+            model::glm_5::forward::glm5_cuda(
+                &model::glm_5::forward::facts::Glm5Facts::glm5_106b_a12b(),
                 FireClass::Decode,
             ),
             glm5_lowered(4),

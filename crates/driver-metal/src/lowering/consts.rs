@@ -64,15 +64,15 @@ pub fn qmv_kn(kind: Kernel, g: &DecodeGeometry) -> KN {
         // expert; the expert projections have a K and an N like any other —
         // what makes them routed is which weight slice a row reads, not
         // their shape.
-        Kernel::LlRouter => kn(h, g.n_experts),
-        Kernel::LlExpertGate | Kernel::LlExpertUp => kn(h, g.moe_intermediate),
-        Kernel::LlExpertDown => kn(g.moe_intermediate, h),
+        Kernel::Router => kn(h, g.n_experts),
+        Kernel::ExpertGate | Kernel::ExpertUp => kn(h, g.moe_intermediate),
+        Kernel::ExpertDown => kn(g.moe_intermediate, h),
         // The shared expert: ordinary dense shapes; the gate is
         // `hidden -> 1`, a matvec only in the sense that everything with a
         // K and an N is.
-        Kernel::LlSharedGate | Kernel::LlSharedUp => kn(h, g.shared_intermediate),
-        Kernel::LlSharedDown => kn(g.shared_intermediate, h),
-        Kernel::LlSharedGateProj => kn(h, 1),
+        Kernel::SharedGate | Kernel::SharedUp => kn(h, g.shared_intermediate),
+        Kernel::SharedDown => kn(g.shared_intermediate, h),
+        Kernel::SharedGateProj => kn(h, 1),
         _ => kn(0, 0),
     }
 }
@@ -88,7 +88,7 @@ pub fn is_qmv(kind: Kernel, g: &DecodeGeometry) -> bool {
 pub fn is_routed(kind: Kernel) -> bool {
     matches!(
         kind,
-        Kernel::LlExpertGate | Kernel::LlExpertUp | Kernel::LlExpertDown
+        Kernel::ExpertGate | Kernel::ExpertUp | Kernel::ExpertDown
     )
 }
 
@@ -239,7 +239,7 @@ mod tests {
         // The default-geometry defect: a routed kind asked of a dense
         // geometry answers "not a matvec" — which is why the caller must
         // ask its own.
-        assert!(!is_qmv(Kernel::LlExpertGate, &dense));
+        assert!(!is_qmv(Kernel::ExpertGate, &dense));
         let routed = DecodeGeometry {
             n_experts: 512,
             experts_per_token: 10,
@@ -247,11 +247,11 @@ mod tests {
             ..DecodeGeometry::default()
         };
         assert_eq!(
-            qmv_kn(Kernel::LlExpertGate, &routed),
+            qmv_kn(Kernel::ExpertGate, &routed),
             KN { k: 1024, n: 768 }
         );
-        assert!(is_routed(Kernel::LlExpertDown));
-        assert!(!is_routed(Kernel::LlRouter));
+        assert!(is_routed(Kernel::ExpertDown));
+        assert!(!is_routed(Kernel::Router));
     }
 
     #[test]

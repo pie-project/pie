@@ -36,11 +36,11 @@ pub fn hf_moe_expert_stacks(
     gate_second: bool,
     float_only: bool,
 ) -> Result<(), Error> {
-    let num_experts = i64::from(b.facts().num_experts);
+    let num_experts = i64::from(b.shape().n_experts);
     if num_experts <= 0 {
         return Ok(());
     }
-    for layer in 0..b.facts().num_hidden_layers {
+    for layer in 0..b.shape().layers {
         // `bound` is the name the bind path uses; `prefix` is where the
         // source tensors actually live, which is the same thing unless the
         // family declared a `source_prefix`.

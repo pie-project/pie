@@ -23,7 +23,7 @@
 //! caller decides whether adjacent is good enough, because only it knows
 //! where the bytes actually sit.
 
-use crate::config::HfConfig;
+use crate::catalog::LoadShape;
 
 /// What a caller offers this module, and what it gets back.
 pub struct Wiring<'a> {
@@ -38,19 +38,25 @@ pub struct Wiring<'a> {
     /// Published names holding a load-time host scalar (gemma-4's
     /// `layer_scalar`), in layer order.
     pub scalars: Vec<String>,
-    /// The checkpoint's own shape.
-    pub facts: &'a HfConfig,
+    /// The row's shape.
+    ///
+    /// Two fields are read — the layer count and how many trailing
+    /// layers share KV — and both used to come off a resident
+    /// `HfConfig`, which is why this module took one. A `LoadShape` is
+    /// the same two numbers stated by the ROW, so the names a trace asks
+    /// for and the stack a driver fired come from one place.
+    pub shape: LoadShape,
 }
 
 impl<'a> Wiring<'a> {
     /// A fresh wiring over the names a plan published.
-    pub fn new(facts: &'a HfConfig, published: &'a dyn Fn(&str) -> bool) -> Self {
+    pub fn new(shape: LoadShape, published: &'a dyn Fn(&str) -> bool) -> Self {
         Self {
             published,
             aliases: Vec::new(),
             joins: Vec::new(),
             scalars: Vec::new(),
-            facts,
+            shape,
         }
     }
 
@@ -87,8 +93,8 @@ impl<'a> Wiring<'a> {
 /// checkpoint no family claims comes back empty, and a launch asking for a
 /// trace name then gets the resolver's refusal, which is the honest state.
 #[must_use]
-pub fn wire<'a>(facts: &'a HfConfig, published: &'a dyn Fn(&str) -> bool) -> Wiring<'a> {
-    let mut w = Wiring::new(facts, published);
+pub fn wire<'a>(shape: LoadShape, published: &'a dyn Fn(&str) -> bool) -> Wiring<'a> {
+    let mut w = Wiring::new(shape, published);
     llama_like(&mut w);
     gpt_oss(&mut w);
     gemma4(&mut w);
@@ -109,7 +115,7 @@ fn llama_like(w: &mut Wiring<'_>) {
         // Tied embeddings: the trace's lm_head name IS "embed".
         w.alias("lm_head".into(), "model.embed_tokens.weight".into());
     }
-    let layers = usize::try_from(w.facts.num_hidden_layers).unwrap_or(0);
+    let layers = w.shape.layers as usize;
     for i in 0..layers {
         let n = |s: &str| format!("model.layers.{i}.{s}");
         // THE PLAN ALREADY JOINED THESE. `Projections::Fused` stages
@@ -234,7 +240,7 @@ fn gpt_oss(w: &mut Wiring<'_>) {
     if !w.has("model.layers.0.self_attn.sinks") {
         return;
     }
-    let layers = usize::try_from(w.facts.num_hidden_layers).unwrap_or(0);
+    let layers = w.shape.layers as usize;
     for i in 0..layers {
         let n = |s: &str| format!("model.layers.{i}.{s}");
         w.alias(format!("layer.{i}.router"), n("mlp.router.weight"));
@@ -276,9 +282,9 @@ fn gemma4(w: &mut Wiring<'_>) {
     w.alias("ple_model_proj".into(), format!("{p}.per_layer_model_projection.weight"));
     w.alias("ple_model_norm".into(), format!("{p}.per_layer_projection_norm.weight"));
     w.alias("final_norm".into(), format!("{p}.norm.weight"));
-    let layers = usize::try_from(w.facts.num_hidden_layers).unwrap_or(0);
+    let layers = w.shape.layers as usize;
     let first_shared =
-        layers.saturating_sub(usize::try_from(w.facts.num_kv_shared_layers).unwrap_or(0));
+        layers.saturating_sub(w.shape.kv_shared_layers as usize);
     for i in 0..layers {
         let n = |sfx: &str| format!("{p}.layers.{i}.{sfx}");
         w.alias(format!("layer.{i}.attn_norm"), n("input_layernorm.weight"));
@@ -317,17 +323,20 @@ fn qwen3_5(w: &mut Wiring<'_>) {
     }
     w.alias("embed".into(), format!("{p}.embed_tokens.weight"));
     w.alias("final_norm".into(), format!("{p}.norm.weight"));
-    let layers = usize::try_from(w.facts.num_hidden_layers).unwrap_or(0);
+    let layers = w.shape.layers as usize;
     for i in 0..layers {
         let n = |sfx: &str| format!("{p}.layers.{i}.{sfx}");
         w.alias(format!("layer.{i}.attn_norm"), n("input_layernorm.weight"));
         w.alias(format!("layer.{i}.mlp_norm"), n("post_attention_layernorm.weight"));
         w.alias(format!("layer.{i}.down"), n("mlp.down_proj.weight"));
-        let full = w
-            .facts
-            .layer_types
-            .get(i)
-            .is_some_and(|t| t == "full_attention");
+        // FULL ATTENTION OR LINEAR, asked of the checkpoint.
+        //
+        // This read a `layer_types` list off the config — a per-layer
+        // string array the derivation carried purely so this loop could
+        // index it. A full-attention layer ships `self_attn.q_proj` and
+        // a linear one does not, so the tensors already say which this
+        // is, and saying it twice is how the two answers came apart.
+        let full = w.has(&n("self_attn.q_proj.weight"));
         if full {
             for f in ["q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm"] {
                 w.alias(format!("layer.{i}.{f}"), n(&format!("self_attn.{f}.weight")));
@@ -353,15 +362,14 @@ fn qwen3_5(w: &mut Wiring<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::HfConfig;
 
     /// Which checkpoint tensor a trace name resolves to.
     fn bound(published: &[&str], trace: &str) -> Option<String> {
-        let hf = HfConfig { num_hidden_layers: 1, ..HfConfig::default() };
+        let shape = LoadShape::dense(1, 128, false);
         let set: std::collections::BTreeSet<String> =
             published.iter().map(|s| (*s).to_string()).collect();
         let has = |n: &str| set.contains(n);
-        let w = wire(&hf, &has);
+        let w = wire(shape, &has);
         w.aliases.iter().find(|(t, _)| t == trace).map(|(_, c)| c.clone())
     }
 

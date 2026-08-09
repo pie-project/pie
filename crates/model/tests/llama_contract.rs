@@ -34,7 +34,10 @@ use model_loader::plan::compile as compile_load_plan;
 use model_loader::types::{BackendKind, CheckpointFormat, DType, Encoding, FileId, TensorId};
 use model_loader::verify::ContractView;
 
-use model::facts::ModelFacts;
+use model::builder::Builder;
+use model::catalog::{Deployed, LoadShape, Variant};
+use model::deployment::{Deployment, Refusal};
+use model::encoding::Encoding as StoredEncoding;
 use model::policy::Policy;
 use model::contract::author;
 
@@ -161,12 +164,66 @@ fn llama_checkpoint() -> CheckpointMetadata {
 
 // ── the harness ─────────────────────────────────────────────────────
 
-fn facts() -> ModelFacts {
-    ModelFacts {
-        model_type: "llama3".to_string(),
-        num_hidden_layers: 2,
-        head_dim: 32,
-        ..Default::default()
+/// The row this file authors against.
+///
+/// A test-local row rather than one out of the catalog, and the reason
+/// is the fixture: the checkpoint below is a 2-layer, 32-wide-head
+/// decoder that no published model is. Identity is not what this file
+/// tests — [`catalog::identify`] has its own — so pinning the fixture to
+/// a real row would have coupled 66 goldens to a shipped model's
+/// numbers, and the next time Qwen renamed a size they would all move.
+///
+/// Written as a `Variant` rather than as a loose `LoadShape` because
+/// that is what the author now receives, and because a row that states
+/// its shape and dispatches to `author_llama_like` is exactly the N:1
+/// the deleted `HF_ROWS` table expressed as a column.
+struct LlamaFixture;
+
+impl Variant for LlamaFixture {
+    fn id(&self) -> &'static str {
+        "llama-fixture"
+    }
+
+    fn manifest(&self) -> model::manifest::Manifest {
+        // Empty, and deliberately: the fixture's tensors are stated by
+        // `llama_checkpoint()` below and nothing here matches against
+        // them. This row is reached by being NAMED, never by being
+        // identified — which is why it can sit outside `CATALOG`
+        // without any checkpoint in the world matching it by accident.
+        model::manifest::Manifest::new(2)
+    }
+
+    fn load_shape(&self) -> LoadShape {
+        LoadShape::dense(2, 32, false)
+    }
+
+    fn deployment(&self, _load: Deployed<'_>) -> Result<Deployment, Refusal> {
+        Err(Refusal::Unsupported(
+            "llama-fixture is a contract fixture and is never served",
+        ))
+    }
+
+    fn author(&self, b: &mut Builder<'_>) -> Result<(), model_loader::error::Error> {
+        model::llama_3::contract::author_llama_like(b)
+    }
+
+    #[cfg(feature = "forward")]
+    fn trace(
+        &self,
+        _class: model_compiler::trace::FireClass,
+        _load: Deployed<'_>,
+    ) -> Result<model_compiler::trace::ForwardPlan, Refusal> {
+        Err(Refusal::Unsupported(
+            "llama-fixture is a contract fixture and has no forward text",
+        ))
+    }
+
+    #[cfg(feature = "chat")]
+    fn chat(
+        &self,
+        tokenizer: std::sync::Arc<tokenizer::Tokenizer>,
+    ) -> std::sync::Arc<dyn model::instruct::Instruct> {
+        std::sync::Arc::new(model::llama_3::chat::LlamaInstruct::new(tokenizer))
     }
 }
 
@@ -190,11 +247,14 @@ fn golden_path(name: &str) -> PathBuf {
 /// Author, pin against the golden, then compile and verify what was pinned.
 fn check(name: &str, target: &StorageTarget) {
     let metadata = llama_checkpoint();
-    let facts = facts();
     let policy = Policy::default();
-    let contract = author(&facts, &metadata, target, &policy)
-        .expect("authoring failed")
-        .expect("llama3 must have an author");
+    // No `.expect("llama3 must have an author")` any more, and its
+    // absence is the point: the old registry answered `Ok(None)` for a
+    // `model_type` no row claimed, so every caller carried a second
+    // unwrap for a case that meant "the table is incomplete". A caller
+    // holding a row cannot be in that case.
+    let contract = author(&LlamaFixture, &StoredEncoding::dense(), &metadata, target, &policy)
+        .expect("authoring failed");
 
     let mut fresh = serde_json::to_string_pretty(&contract).expect("serialize contract");
     fresh.push('\n');
@@ -256,9 +316,14 @@ fn llama_dense_cuda_tp1_of_2() {
 #[test]
 fn the_dense_join_publishes_banks_then_views() {
     let metadata = llama_checkpoint();
-    let contract = author(&facts(), &metadata, &target(0, 1), &Policy::default())
-        .unwrap()
-        .unwrap();
+    let contract = author(
+        &LlamaFixture,
+        &StoredEncoding::dense(),
+        &metadata,
+        &target(0, 1),
+        &Policy::default(),
+    )
+    .unwrap();
     let names: Vec<&str> = contract
         .tensors
         .iter()
@@ -297,9 +362,14 @@ fn the_dense_join_publishes_banks_then_views() {
 #[test]
 fn tp_shards_each_part_before_the_join() {
     let metadata = llama_checkpoint();
-    let contract = author(&facts(), &metadata, &target(1, 2), &Policy::default())
-        .unwrap()
-        .unwrap();
+    let contract = author(
+        &LlamaFixture,
+        &StoredEncoding::dense(),
+        &metadata,
+        &target(1, 2),
+        &Policy::default(),
+    )
+    .unwrap();
     let qkv = &contract.tensors[0];
     // (8 q heads + 2 kv heads) of 32, halved: 128 + 32 + 32 = 192 rows.
     assert_eq!(qkv.shape.as_deref(), Some(&[192, 256][..]));

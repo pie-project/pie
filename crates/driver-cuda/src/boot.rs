@@ -1,10 +1,13 @@
 //! Every boot knob this driver reads, parsed once and answered from a
 //! value.
 //!
-//! Named for the BOOT rather than for configuration, because
-//! [`model::config::schema`] next to it is the CHECKPOINT's configuration and
-//! the two are unrelated: one is what a deployment asked this driver to
-//! do, the other is what the weights on disk say they are.
+//! Named for the BOOT rather than for configuration, because the two
+//! things called "config" here are unrelated: one is what a deployment
+//! asked this driver to do, the other is what the weights on disk say
+//! they are. The second no longer has a schema — a checkpoint's identity
+//! is a [`model::catalog`] row now, matched by tensors rather than parsed
+//! from a `config.json` — which makes the distinction easier to keep than
+//! it was when a `model::config::schema` sat next to this file.
 //!
 //! # Why one struct rather than ten call sites
 //!

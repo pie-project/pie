@@ -22,7 +22,7 @@
 //! contexts than the card can hold) or too large (an out-of-memory at the
 //! first wide prefill). That is why each one below names its source.
 
-use model::config::schema::HfConfig;
+use model::deployment::Deployment;
 use crate::layout::workspace::{WorkspaceLayout, WorkspaceShape};
 
 use super::memory_planner::ModelCosts;
@@ -36,19 +36,32 @@ use super::memory_planner::ModelCosts;
 pub const ATTN_FLOAT_WORKSPACE_BYTES: u64 = 32 << 20;
 
 /// One rank's view of what a checkpoint costs.
+///
+/// # Why it holds a `Deployment` and not a config
+///
+/// It held a cloned `HfConfig` and read forty-seven fields off it: the
+/// KV heads, the head dim, the layer count, the MLA lora rank, the
+/// linear-attention widths, the DSv4 compression ratios, the
+/// `layer_types` array. Every one of those is a fact the loaded row
+/// already states, and reading them again here made the planner a
+/// SECOND reader of the checkpoint's `config.json` — deciding how big
+/// the KV pool is from a document the trace was not built from.
+///
+/// The failure that arrangement invites is silent by construction: a
+/// mis-read cost does not crash, it moves bytes between the arena and
+/// the pool. Both allocations succeed and the model just serves fewer
+/// tokens than the card can hold.
 pub struct CheckpointCosts {
-    hf: HfConfig,
+    dep: Deployment,
     tp_size: i32,
 }
 
 impl CheckpointCosts {
-    /// Read the costs off a loaded model's config for a rank of `tp_size`.
+    /// Read the costs off a loaded model's deployment for a rank of
+    /// `tp_size`.
     #[must_use]
-    pub fn new(hf: &HfConfig, tp_size: u32) -> Self {
-        Self {
-            hf: hf.clone(),
-            tp_size: i32::try_from(tp_size).unwrap_or(1).max(1),
-        }
+    pub fn new(dep: &Deployment, tp_size: u32) -> Self {
+        Self { dep: dep.clone(), tp_size: i32::try_from(tp_size).unwrap_or(1).max(1) }
     }
 
     /// This rank's KV head count, floored at one.
@@ -58,33 +71,39 @@ impl CheckpointCosts {
     /// fraction of a head, and the two have to agree or the pool the planner
     /// sized is not the pool the fire builds.
     fn kv_heads(&self) -> u64 {
-        let per_rank = self.hf.num_key_value_heads / self.tp_size.max(1);
+        let per_rank =
+            i32::try_from(self.dep.shape.kv_heads).unwrap_or(0) / self.tp_size.max(1);
         u64::from(per_rank.max(1).unsigned_abs())
     }
 
     fn head_dim(&self) -> u64 {
-        u64::from(self.hf.head_dim_kernel.max(self.hf.head_dim).unsigned_abs())
+        u64::from(self.dep.shape.head_dim_alloc())
     }
 
     fn layers(&self) -> u64 {
-        u64::from(self.hf.num_hidden_layers.unsigned_abs())
+        u64::from(self.dep.layers)
     }
 
     /// This checkpoint's MLA cache shape, or `None` for ordinary attention.
     ///
-    /// `kv_lora_rank` is the signature: a config that states one caches a
-    /// compressed latent instead of K and V. One page and one layer is enough
-    /// to ask for `bytes_per_token`, which is per-token and per-layer and does
-    /// not depend on the pool's size.
+    /// A `match` on the row's stated [`KvStyle`], where it used to be
+    /// `kv_lora_rank > 0` on a parsed config — the same "is this MLA"
+    /// question asked of a number that happened to be present rather
+    /// than of the answer the row gives.
     fn mla_geometry(&self) -> Option<super::mla_geometry::MlaGeometry> {
-        let rank = u32::try_from(self.hf.kv_lora_rank).ok().filter(|r| *r > 0)?;
-        let rope = u32::try_from(self.hf.qk_rope_head_dim).ok().filter(|d| *d > 0)?;
+        let model::deployment::KvStyle::Mla { kv_lora_rank, qk_rope_head_dim } = &self.dep.kv
+        else {
+            return None;
+        };
+        if *kv_lora_rank == 0 || *qk_rope_head_dim == 0 {
+            return None;
+        }
         super::mla_geometry::MlaGeometry::new(
             u32::try_from(self.layers()).unwrap_or(1).max(1),
             1,
             16,
-            rank,
-            rope,
+            *kv_lora_rank,
+            *qk_rope_head_dim,
             crate::dtype::DType::Bf16,
         )
         .ok()
@@ -92,13 +111,11 @@ impl CheckpointCosts {
 
     /// The widest MLP any layer in the stack asks for.
     ///
-    /// `intermediate_size` on a uniform stack; a mixture states its expert
+    /// `intermediate` on a uniform stack; a mixture states its expert
     /// width separately and the workspace has to hold whichever is wider,
     /// because the buffer is one and the layers share it.
     fn max_intermediate(&self) -> i64 {
-        let dense = i64::from(self.hf.intermediate_size);
-        let moe = i64::from(self.hf.moe_intermediate_size);
-        dense.max(moe)
+        i64::from(self.dep.shape.widest_mlp())
     }
 }
 
@@ -128,8 +145,12 @@ impl ModelCosts for CheckpointCosts {
         //
         // A checkpoint that states no ratios adds zero, which is every family
         // but this one.
+        let ratios: &[i32] = match &self.dep.kv {
+            model::deployment::KvStyle::Dsv4 { ratios } => ratios,
+            model::deployment::KvStyle::Paged | model::deployment::KvStyle::Mla { .. } => &[],
+        };
         let compress = super::dsv4_geometry::compress_bytes_per_token(
-            &self.hf.dsv4_compress_ratios,
+            ratios,
             u32::try_from(self.head_dim()).unwrap_or(0),
         );
         if let Some(mla) = self.mla_geometry() {
@@ -150,53 +171,41 @@ impl ModelCosts for CheckpointCosts {
     /// bf16 and the recurrent state is fp32, which is why they are charged
     /// separately rather than as one width.
     fn state_slot_bytes(&self) -> u64 {
-        if !self.has_linear_state() {
+        let Some(r) = self.dep.recurrent.as_ref() else {
             return 0;
-        }
-        // THE SAME TWO STRIDES `gdn_shape` HANDS THE ALLOCATOR, and the same
-        // layer count. Getting either wrong here does not fail: it moves bytes
-        // between the arena and the KV pool, silently.
-        //
-        // `conv_dim` is `2 * key_width + value_width`, not one head's width --
-        // the conv window spans the whole packed in-projection. And the slabs
-        // exist only for LINEAR layers: a hybrid's full-attention layers keep
-        // a KV cache instead, so charging every layer would over-count a
-        // qwen3.5 hybrid by the ratio of its two layer kinds.
-        let key_width = u64::from(self.hf.linear_key_head_dim.unsigned_abs())
-            * u64::from(self.hf.linear_num_key_heads.unsigned_abs());
-        let value_width = u64::from(self.hf.linear_value_head_dim.unsigned_abs())
-            * u64::from(self.hf.linear_num_value_heads.unsigned_abs());
-        let conv = u64::from(self.hf.linear_conv_kernel_dim.unsigned_abs())
-            * (2 * key_width + value_width);
-        let state = u64::from(self.hf.linear_num_value_heads.unsigned_abs())
-            * u64::from(self.hf.linear_key_head_dim.unsigned_abs())
-            * u64::from(self.hf.linear_value_head_dim.unsigned_abs());
-        let linear_layers = if self.hf.layer_types.is_empty() {
-            self.layers()
-        } else {
-            self.hf
-                .layer_types
-                .iter()
-                .filter(|t| *t == "linear_attention")
-                .count() as u64
         };
-        // The conv window is bf16; the recurrent state is fp32 unless the
-        // deployment says otherwise, which is the shell's own default.
-        linear_layers * (conv * 2 + state * 4)
+        // THE SAME TWO STRIDES `gdn_shape` HANDS THE ALLOCATOR, and the
+        // same layer set. Getting either wrong here does not fail: it
+        // moves bytes between the arena and the KV pool, silently.
+        //
+        // Read off the row's `RecurrentShape` rather than recomputed
+        // from six config fields. The old code rebuilt `conv_dim` as
+        // `2 * key_width + value_width` here, which is the third place
+        // in this workspace that product was written down; the row
+        // states it once, as `conv_stride`, and the fire path allocates
+        // from that same field.
+        //
+        // And the slabs exist only for LINEAR layers: a hybrid's
+        // full-attention layers keep a KV cache instead, so charging
+        // every layer would over-count a qwen3.5 hybrid by the ratio of
+        // its two layer kinds.
+        let linear_layers = r.linear_layers.len() as u64;
+        linear_layers * (r.conv_stride as u64 + r.state_stride as u64)
     }
 
     /// The forward workspace at `n` tokens, from the layout that allocates it.
     fn arena_bytes(&self, n: i32, output_rows: i32, mtp_rows: i32) -> u64 {
-        let head_dim = i64::from(self.hf.head_dim);
+        let head_dim = i64::from(self.dep.shape.head_dim);
         WorkspaceLayout::new(WorkspaceShape {
-            hidden_size: i64::from(self.hf.hidden_size),
-            vocab_size: i64::from(self.hf.vocab_size),
+            hidden_size: i64::from(self.dep.shape.hidden),
+            vocab_size: i64::from(self.dep.shape.vocab),
             head_dim,
-            head_dim_kernel: i64::from(self.hf.head_dim_kernel.max(self.hf.head_dim)),
+            head_dim_kernel: i64::from(self.dep.shape.head_dim_alloc()),
             max_tokens: i64::from(n).max(0),
             max_intermediate: self.max_intermediate(),
-            max_hq: i64::from(self.hf.num_attention_heads) * head_dim,
-            max_hk: i64::from(self.hf.num_key_value_heads / self.tp_size.max(1)).max(1) * head_dim,
+            max_hq: i64::from(self.dep.shape.q_heads) * head_dim,
+            max_hk: (i64::from(self.dep.shape.kv_heads) / i64::from(self.tp_size.max(1))).max(1)
+                * head_dim,
             max_output_rows: i64::from(output_rows).max(0),
             max_mtp_draft_rows: i64::from(mtp_rows).max(0),
         })
@@ -238,10 +247,15 @@ impl ModelCosts for CheckpointCosts {
         0
     }
 
-    /// A layer typed `linear_attention` is the signature, the same test
+    /// A stated recurrent shape is the signature, the same test
     /// `capabilities_json` answers `rs_cache_required` with.
+    ///
+    /// It used to scan `layer_types` for the string `"linear_attention"`
+    /// — the config's word for it, and one this crate had to keep
+    /// spelling correctly in three places. The row answers instead:
+    /// `recurrent` is `Some` exactly when there are slabs to allocate.
     fn has_linear_state(&self) -> bool {
-        self.hf.layer_types.iter().any(|t| t == "linear_attention")
+        self.dep.recurrent.as_ref().is_some_and(|r| !r.linear_layers.is_empty())
     }
 }
 
@@ -249,18 +263,60 @@ impl ModelCosts for CheckpointCosts {
 mod tests {
     use super::*;
 
-    fn qwen3_0_6b() -> HfConfig {
-        HfConfig {
-            model_type: "qwen3".to_owned(),
-            hidden_size: 1024,
-            intermediate_size: 3072,
-            num_hidden_layers: 28,
-            num_attention_heads: 16,
-            num_key_value_heads: 8,
+    use model::deployment::{Geometry, KvStyle, LayerAttention, RecurrentShape};
+
+    /// Qwen3-0.6B, as the catalog row projects it.
+    ///
+    /// The fixtures below say the same things the `HfConfig` ones did;
+    /// what changed is that they say them in the vocabulary the PLANNER
+    /// is now given, so a test cannot state a shape the loader could
+    /// never hand it. `kv_lora_rank = 512` on a `Paged` deployment used
+    /// to be expressible here and was not expressible anywhere else.
+    fn qwen3_0_6b() -> Deployment {
+        let mut d = Deployment::empty();
+        d.layers = 28;
+        d.norm_eps = 1e-6;
+        d.shape = Geometry {
+            hidden: 1024,
+            q_heads: 16,
+            kv_heads: 8,
             head_dim: 128,
             head_dim_kernel: 128,
-            vocab_size: 151_936,
-            ..Default::default()
+            intermediate: 3072,
+            moe_intermediate: 0,
+            vocab: 151_936,
+        };
+        d.attention = (0..28)
+            .map(|l| LayerAttention {
+                head_dim: 128,
+                window: -1,
+                kv_source: l,
+                sm_scale: 1.0 / (128.0_f32).sqrt(),
+                rope_theta: 1e6,
+                rotary_dim: 0,
+            })
+            .collect();
+        d
+    }
+
+    /// The GDN slab strides `gdn_shape` hands the allocator, for a
+    /// hybrid whose linear layers are the ones named.
+    fn gdn(linear_layers: Vec<u32>) -> RecurrentShape {
+        let key_width = 128 * 16;
+        let value_width = 128 * 32;
+        RecurrentShape {
+            linear_layers,
+            // The conv window is bf16 and spans the whole packed
+            // in-projection; the recurrent state is fp32.
+            conv_stride: 4 * (2 * key_width + value_width) * 2,
+            state_stride: 32 * 128 * 128 * 4,
+            state_elem: 4,
+            k_h: 16,
+            v_h: 32,
+            k_d: 128,
+            v_d: 128,
+            conv_dim: (2 * key_width + value_width) as i32,
+            conv_k: 4,
         }
     }
 
@@ -314,20 +370,31 @@ mod tests {
     }
 
     #[test]
+    fn a_mixtures_workspace_holds_its_widest_layer() {
+        // The dense width alone under-sizes a mixture whose experts are
+        // wider, and the failure is silent: both allocations succeed and
+        // the bytes come out of the KV pool.
+        let mut d = qwen3_0_6b();
+        d.shape.moe_intermediate = 9216;
+        let c = CheckpointCosts::new(&d, 1);
+        assert_eq!(c.max_intermediate(), 9216);
+        assert!(c.arena_bytes(4096, 0, 0) > CheckpointCosts::new(&qwen3_0_6b(), 1).arena_bytes(4096, 0, 0));
+    }
+
+    #[test]
     fn an_mla_checkpoint_is_charged_its_latent_and_not_a_dense_cache() {
         // DeepSeek-V3's shape: 128 kv heads of 192, but the cache holds a
         // 512-wide latent plus a 64-wide rope key. Charging the dense formula
         // is not a rounding error -- it is 85x per token (5,996,544 bytes
         // against 70,272), and the pool the planner sizes from it is that much
         // too small.
-        let mut hf = qwen3_0_6b();
-        hf.num_hidden_layers = 61;
-        hf.num_key_value_heads = 128;
-        hf.head_dim = 192;
-        hf.head_dim_kernel = 192;
-        hf.kv_lora_rank = 512;
-        hf.qk_rope_head_dim = 64;
-        let c = CheckpointCosts::new(&hf, 1);
+        let mut d = qwen3_0_6b();
+        d.layers = 61;
+        d.shape.kv_heads = 128;
+        d.shape.head_dim = 192;
+        d.shape.head_dim_kernel = 192;
+        d.kv = KvStyle::Mla { kv_lora_rank: 512, qk_rope_head_dim: 64 };
+        let c = CheckpointCosts::new(&d, 1);
 
         let latent = 61 * (512 + 64) * 2;
         assert_eq!(c.per_kv_token_bytes(), latent, "the cache is the latent");
@@ -341,20 +408,29 @@ mod tests {
 
     #[test]
     fn a_checkpoint_without_a_latent_keeps_the_dense_formula() {
-        // `kv_lora_rank` is the signature, and qwen3 states none.
+        // `KvStyle::Paged` is the signature, and qwen3 states that.
         let c = CheckpointCosts::new(&qwen3_0_6b(), 1);
         assert_eq!(c.per_kv_token_bytes(), 28 * 8 * 128 * 2 * 2);
     }
 
     #[test]
-    fn a_v4_checkpoint_pays_for_its_compressor_cache_too() {
-        let mut hf = qwen3_0_6b();
-        hf.kv_lora_rank = 512;
-        hf.qk_rope_head_dim = 64;
-        let plain = CheckpointCosts::new(&hf, 1).per_kv_token_bytes();
+    fn a_latent_of_zero_width_is_not_a_latent() {
+        // A row cannot state this and the loader will not build it, but
+        // dividing by it later would be worse than falling back here.
+        let mut d = qwen3_0_6b();
+        d.kv = KvStyle::Mla { kv_lora_rank: 0, qk_rope_head_dim: 64 };
+        assert_eq!(CheckpointCosts::new(&d, 1).per_kv_token_bytes(), 28 * 8 * 128 * 2 * 2);
+        d.kv = KvStyle::Mla { kv_lora_rank: 512, qk_rope_head_dim: 0 };
+        assert_eq!(CheckpointCosts::new(&d, 1).per_kv_token_bytes(), 28 * 8 * 128 * 2 * 2);
+    }
 
-        hf.dsv4_compress_ratios = vec![4, 4, 4];
-        let with_compressor = CheckpointCosts::new(&hf, 1).per_kv_token_bytes();
+    #[test]
+    fn a_v4_checkpoint_pays_for_its_compressor_cache_too() {
+        let plain = CheckpointCosts::new(&qwen3_0_6b(), 1).per_kv_token_bytes();
+
+        let mut d = qwen3_0_6b();
+        d.kv = KvStyle::Dsv4 { ratios: vec![4, 4, 4] };
+        let with_compressor = CheckpointCosts::new(&d, 1).per_kv_token_bytes();
         assert!(
             with_compressor > plain,
             "the compressor cache is resident and was charged nothing"
@@ -369,15 +445,19 @@ mod tests {
     }
 
     #[test]
+    fn a_stated_recurrence_over_no_layers_is_no_recurrence() {
+        let mut d = qwen3_0_6b();
+        d.recurrent = Some(gdn(Vec::new()));
+        let c = CheckpointCosts::new(&d, 1);
+        assert!(!c.has_linear_state());
+        assert_eq!(c.state_slot_bytes(), 0);
+    }
+
+    #[test]
     fn a_hybrid_charges_for_its_slabs() {
-        let mut hf = qwen3_0_6b();
-        hf.layer_types = vec!["linear_attention".to_owned(), "full_attention".to_owned()];
-        hf.linear_conv_kernel_dim = 4;
-        hf.linear_key_head_dim = 128;
-        hf.linear_num_key_heads = 16;
-        hf.linear_value_head_dim = 128;
-        hf.linear_num_value_heads = 32;
-        let c = CheckpointCosts::new(&hf, 1);
+        let mut d = qwen3_0_6b();
+        d.recurrent = Some(gdn(vec![0]));
+        let c = CheckpointCosts::new(&d, 1);
         assert!(c.has_linear_state());
         // ONE linear layer of the two, and `conv_dim` is the packed
         // in-projection's width -- the same two strides `gdn_shape` hands the
@@ -394,24 +474,23 @@ mod tests {
         // A hybrid's full-attention layers keep a KV cache instead, so
         // charging every layer over-counts by the ratio of the two kinds --
         // which the planner then takes out of the KV pool.
-        let mut hf = qwen3_0_6b();
-        hf.linear_conv_kernel_dim = 4;
-        hf.linear_key_head_dim = 128;
-        hf.linear_num_key_heads = 16;
-        hf.linear_value_head_dim = 128;
-        hf.linear_num_value_heads = 32;
+        let mut d = qwen3_0_6b();
+        d.recurrent = Some(gdn(vec![0, 1, 2, 3]));
+        let all_linear = CheckpointCosts::new(&d, 1).state_slot_bytes();
 
-        hf.layer_types = vec!["linear_attention".to_owned(); 4];
-        let all_linear = CheckpointCosts::new(&hf, 1).state_slot_bytes();
-
-        hf.layer_types = vec![
-            "linear_attention".to_owned(),
-            "full_attention".to_owned(),
-            "linear_attention".to_owned(),
-            "full_attention".to_owned(),
-        ];
-        let half = CheckpointCosts::new(&hf, 1).state_slot_bytes();
+        d.recurrent = Some(gdn(vec![0, 2]));
+        let half = CheckpointCosts::new(&d, 1).state_slot_bytes();
         assert_eq!(half * 2, all_linear, "two of four layers carry slabs");
+    }
+
+    #[test]
+    fn the_workspace_and_the_envelopes_are_what_this_shell_states() {
+        // Constants, and asserted so a change to either has to be a
+        // change to a test that says why.
+        let c = CheckpointCosts::new(&qwen3_0_6b(), 1);
+        assert_eq!(c.attn_float_workspace_bytes(4096, 256), ATTN_FLOAT_WORKSPACE_BYTES);
+        assert_eq!(c.envelope_bytes_per_page(), 0);
+        assert_eq!(c.runtime_quant_scratch_bytes(4096), 0);
     }
 
     #[test]

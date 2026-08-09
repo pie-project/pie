@@ -15,7 +15,7 @@
 //! # What this file is, and what it stopped being
 //!
 //! It is the DOOR, and only the door: it parses the boot config, brokers a
-//! completion, calls one method on [`driver_metal::gpu::serve::Shell`], and
+//! completion, calls one method on [`driver_metal::serve::Shell`], and
 //! turns what comes back into the engine's own nouns. The work is next door,
 //! in the crate that owns the device.
 //!
@@ -67,7 +67,7 @@ use crate::driver::submission::FrameSubmission;
 /// a completion is what a SCHEDULER waits on and a driver has no opinion about
 /// it. `driver-cuda`'s seam holds exactly the same pair.
 pub struct MetalDriver {
-    shell: driver_metal::gpu::serve::Shell,
+    shell: driver_metal::serve::Shell,
     broker: CompletionBroker,
 }
 
@@ -79,19 +79,28 @@ impl MetalDriver {
     /// No Metal 4 device, or a device whose queue could not be created. Both
     /// are boot conditions, not runtime ones.
     pub fn create(config_bytes: &[u8]) -> Result<(Self, ::driver_api::DeviceFacts)> {
-        // `[model] descriptor`, read HERE because a boot TOML is the engine's
-        // format. A driver that parsed it would be the second thing entitled
-        // to an opinion about the file's shape, and the two would drift.
-        let boot_descriptor = std::str::from_utf8(config_bytes)
+        // `[model] descriptor` and `[model] id`, read HERE because a boot
+        // TOML is the engine's format. A driver that parsed it would be the
+        // second thing entitled to an opinion about the file's shape, and the
+        // two would drift.
+        //
+        // The id is an OVERRIDE, not a selector: a checkpoint is matched to a
+        // `model::catalog` row by its tensors, and this exists for the one
+        // case tensors cannot settle — two shape-identical rows where the
+        // operator knows which download this is.
+        let boot = std::str::from_utf8(config_bytes)
             .ok()
-            .and_then(|text| text.parse::<toml::Table>().ok())
-            .and_then(|v| {
-                v.get("model")?
-                    .get("descriptor")?
-                    .as_str()
-                    .map(std::path::PathBuf::from)
-            });
-        let shell = driver_metal::gpu::serve::Shell::open(boot_descriptor)
+            .and_then(|text| text.parse::<toml::Table>().ok());
+        let boot_descriptor = boot.as_ref().and_then(|v| {
+            v.get("model")?
+                .get("descriptor")?
+                .as_str()
+                .map(std::path::PathBuf::from)
+        });
+        let boot_model_id = boot
+            .as_ref()
+            .and_then(|v| Some(v.get("model")?.get("id")?.as_str()?.to_string()));
+        let shell = driver_metal::serve::Shell::open(boot_descriptor, boot_model_id)
             .map_err(|e| anyhow!("metal shell: {e}"))?;
         let facts = shell.device_facts().clone();
         Ok((
@@ -198,9 +207,9 @@ impl MetalDriver {
     /// engine re-posts, or `Impossible` when no eviction could ever make room.
     pub fn launch(&mut self, frame: &FrameSubmission) -> Result<FrameLaunchOutcome> {
         match self.shell.launch(frame)? {
-            driver_metal::gpu::serve::Launched::Exhausted => Ok(FrameLaunchOutcome::Exhausted),
-            driver_metal::gpu::serve::Launched::Impossible => Ok(FrameLaunchOutcome::Impossible),
-            driver_metal::gpu::serve::Launched::Ran { faults } => {
+            driver_metal::serve::Launched::Exhausted => Ok(FrameLaunchOutcome::Exhausted),
+            driver_metal::serve::Launched::Impossible => Ok(FrameLaunchOutcome::Impossible),
+            driver_metal::serve::Launched::Ran { faults } => {
                 // Reported here rather than in the driver, because choosing a
                 // logging backend is not a library's business. A fault poisons
                 // the one instance and does not fail the frame.

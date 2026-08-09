@@ -87,8 +87,8 @@ pub fn author_gemma4_mlx(b: &mut Builder<'_>) -> Result<(), Error> {
     // KV is shared over the tail of the stack:
     // `layer >= num_hidden_layers - num_kv_shared_layers` attends KV an
     // earlier layer wrote, and the checkpoint still ships its dead k/v/k_norm.
-    let first_shared = if b.facts().num_kv_shared_layers > 0 {
-        i64::from(b.facts().num_hidden_layers) - i64::from(b.facts().num_kv_shared_layers)
+    let first_shared = if b.shape().kv_shared_layers > 0 {
+        i64::from(b.shape().layers) - i64::from(b.shape().kv_shared_layers)
     } else {
         -1
     };

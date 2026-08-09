@@ -193,6 +193,20 @@ pub struct DriverCapabilities {
     pub max_page_refs: u32,
     /// Architecture name (e.g. `llama3`, `qwen3`) — used for tokenizer dispatch.
     pub arch_name: String,
+    /// Catalog id of the row the driver loaded (e.g. `qwen3-0.6b`).
+    ///
+    /// This is the identity, and it is a whole answer where `arch_name` is
+    /// a family. `arch_name` came from the checkpoint's `config.json`
+    /// `model_type` and was therefore a string the host had to interpret
+    /// a second time, with its own table, under its own defaults — which
+    /// is how a chat template could be chosen that the model's vocabulary
+    /// did not contain. An id names a row in the `const` catalog that the
+    /// host and the driver both link, so the answer the host reaches is
+    /// the answer the driver used.
+    ///
+    /// Empty from a driver that has not been moved onto the catalog yet.
+    #[serde(default)]
+    pub model_id: String,
     /// Vocabulary size — pinned by the loaded model.
     pub vocab_size: u32,
     /// Maximum model context length (positions). Drives scheduler ceiling.

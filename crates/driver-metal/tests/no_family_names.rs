@@ -1,7 +1,7 @@
 //! The driver must not know what a model is — measured, not asserted.
 //!
 //! `crates/model/tests/one_normalizer.rs` states the rule: *"what a driver
-//! reads is the answer, never the question"*, and three documents cite it as
+//! reads is the answer, never the question"*, and three documents cited it as
 //! the thing enforcing that rule on this crate. **It did not.** Its metal
 //! half walked `crates/driver-metal/csrc/src` and was deleted along with that
 //! tree — honestly, and the file records the deletion — leaving a Rust walk
@@ -16,42 +16,82 @@
 //! `driver-cuda/tests/no_family_names.rs`, which is what the other backend
 //! ended up with after its own §7.
 //!
-//! # This test passes at numbers that are the point
+//! # THE INDICTMENT IS SPENT
 //!
-//! It passes today, at numbers that are an indictment. CUDA's
-//! equivalent guards a driver that already moved its `model_type` table into
-//! `model::deployment_cuda`; this one guards a driver that has not, so the
-//! budget below starts at 150 lines across 10 files and three of those files
-//! hold real dispatch:
+//! This file used to open by saying it "passes today, at numbers that are an
+//! indictment": 189 lines across 8 files, four of which held real dispatch.
+//! Two of those four are DELETED, and they were the two that mattered:
 //!
-//! | file | lines | what it is |
+//! | file | was | what it was |
 //! |---|---|---|
-//! | `facts.rs` | 68 | the `model_type` table itself, 81 fields and four family blocks |
-//! | `model/text.rs` | 46 | per-family text-model construction |
-//! | `batch/geometry_facts.rs` | 24 | the projection from those facts into kernel arguments |
+//! | `facts.rs` | 99 | the `model_type` table — 81 fields in four family blocks, filled by asking a `serde_json::Value` what kind of model it is |
+//! | `batch/geometry_facts.rs` | 25 | the projection out of those four blocks into `DecodeGeometry`'s kernel arguments |
 //!
-//! The point of writing it now, BEFORE north-star #7 moves any of that, is
-//! that #7 is a change with no compile error attached to its failure mode:
-//! the survey found `lowering/consts.rs` binds `hidden`, `intermediate`,
-//! `moe_intermediate`, `n_experts`, `vocab`, `eps`, `gdn_conv_dim` and
-//! `gdn_v_total` off `DecodeGeometry`, and none of those exist on
-//! `Deployment`. A #7 done as "call `deployment_from` and delete `facts.rs`"
-//! produces a **GPU fault, not a compiler message**. A ratchet that has to be
-//! lowered by hand, file by file, is how that move stays honest.
+//! What replaced them is not a smaller table. A checkpoint is matched to a
+//! `model::catalog` row BY ITS TENSORS, the row projects a
+//! `model::deployment::Deployment` — a value with no family name in it and
+//! therefore nothing to branch on — and `batch::geometry_from_deployment` is
+//! arithmetic over that value. There is no `model_type` string anywhere on
+//! the path, which is why the strong half of this file below has been
+//! INVERTED into `driver-cuda`'s form: it watched for the table's continued
+//! existence, and it watches for its RETURN.
+//!
+//! The prediction that file made about the move is worth keeping, because it
+//! was right and it is what made the move survivable: *"#7 is a change with
+//! no compile error attached to its failure mode — `lowering/consts.rs` binds
+//! `hidden`, `intermediate`, `moe_intermediate`, `n_experts`, `vocab`, `eps`,
+//! `gdn_conv_dim` and `gdn_v_total` off `DecodeGeometry`, and none of those
+//! exist on `Deployment`. A #7 done as 'call `deployment_from` and delete
+//! `facts.rs`' produces a GPU FAULT, NOT A COMPILER MESSAGE."* That is
+//! exactly why `DecodeGeometry` survived and only its SOURCE changed, and why
+//! every number it carries that a `Deployment` cannot state is a REFUSAL in
+//! `batch/geometry.rs` rather than a default.
 //!
 //! # Why a ratchet rather than zero
 //!
 //! Not every mention is dispatch, and collapsing them into one number would
-//! hide which is which. Four of the ten files below name a family for a
-//! reason that survives #7 entirely — a refusal's message, a test's name, a
-//! deprecation note — and pinning per FILE keeps those separable from the
-//! three that are the actual question being asked in the wrong crate.
+//! hide which is which. The five files left below name a family for a reason
+//! that survived the move entirely — a refusal's message, a kernel's own
+//! name, a deprecation note, a shared module's path — and pinning per FILE is
+//! what keeps those separable from a new dispatch site.
 //!
 //! **A file not in the table may have none at all.** That is the half that
 //! matters: it is what stops a new dispatch site appearing somewhere quiet
 //! while the loud ones are being cleaned up.
 
 use std::collections::BTreeMap;
+
+/// The abbreviations a family name hides behind once a field is named for it.
+///
+/// `FAMILIES` spells names out, so it counted `model_type == "gpt_oss"` and
+/// every descriptor key with `gemma` in it -- and missed `go_hidden_size`,
+/// `ll_rms_norm_eps`, `g4_num_experts` and `q35_head_dim` entirely. That is
+/// backwards: the spelled-out mentions are mostly key strings this crate
+/// does not choose and test data, while the prefixes ARE north-star #7. A
+/// deletion of 27 such fields moved this guard's number by zero, which is how
+/// the omission was found.
+///
+/// Matched at the start of an identifier, not anywhere in the line: `ll_` is
+/// a substring of `full_attn_interval` and `go_` of `dialog_state`.
+const PREFIXES: &[&str] = &["go_", "ll_", "g4_", "q35_"];
+
+/// Whether a line names a family, spelled out or abbreviated.
+fn names_a_family(line: &str) -> bool {
+    // The same reduction `model/text.rs` applies to an architecture string,
+    // for the same reason: a publisher's capitalisation and punctuation are
+    // not the identity. Matching raw text saw `gemma_facts` and missed
+    // `GemmaFacts`, which is where family names actually appear in Rust.
+    let flat: String =
+        line.chars().filter(|c| *c != '_' && *c != '-').flat_map(char::to_lowercase).collect();
+    if FAMILIES.iter().any(|f| {
+        let f: String = f.chars().filter(|c| *c != '_').collect();
+        flat.contains(&f)
+    }) {
+        return true;
+    }
+    line.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|tok| PREFIXES.iter().any(|p| tok.starts_with(p)))
+}
 
 /// The family names a driver must not be branching on.
 ///
@@ -66,66 +106,95 @@ const FAMILIES: &[&str] =
 /// this test exists to catch.
 fn budget() -> BTreeMap<&'static str, usize> {
     [
-        // ── The three that ARE the question ──────────────────────────
+        // ── The one that is still a question ─────────────────────────
         //
-        // north-star #7 is exactly the work of driving these to zero. Each
-        // number here is a debt, not an allowance.
-        //
-        // `facts.rs` is the `model_type` table: 81 fields, four family
-        // blocks, filled by asking a `serde_json::Value` what kind of model
-        // it is. `model::deployment_cuda` is where the other backend put
-        // its equivalent.
-        ("facts.rs", 68),
-        // Per-family construction of the text model.
-        ("model/text.rs", 46),
-        // The projection from those facts into `DecodeGeometry`'s 60
-        // kernel-argument fields. This is the half `Deployment` cannot
-        // express today, and the reason #7 is not a call swap.
-        ("batch/geometry_facts.rs", 24),
-        // ── The seven that are not ───────────────────────────────────
+        // The list of architectures a Metal text is written for, plus the
+        // `LlamaLikeFacts` synthesis that feeds it. It is a LOOKUP and not a
+        // dispatch — `metal.md`'s test for the whole crate is *does removing
+        // it change which kernels fire*, and it does not — but it is still a
+        // list of family names in a driver, and it stays budgeted until a
+        // catalog row can be asked for a METAL trace the way it can be asked
+        // for a CUDA one. `Variant::trace` has no backend parameter today,
+        // which is the whole reason this file cannot go to zero.
+        ("model/text.rs", 27),
+        // ── The five that are not ────────────────────────────────────
         //
         // A refusal naming the model whose shape caused it: gemma-4 pages
         // two KV geometries, and an operator reading "this pool's layers
         // have two page sizes" needs to know which model does that.
-        ("gpu/pools/kv.rs", 1),
+        ("pools/kv.rs", 1),
         // The same, for a control-path refusal that names where the real
         // check lives.
-        ("gpu/serve/control.rs", 1),
+        ("serve/control.rs", 1),
         // A `#[deprecated]` note pointing at what replaced it.
         ("lowering/resolve.rs", 2),
-        // A TEST's name and a test fixture's `model_type` string. Naming
-        // the family a test covers is what makes the test readable; this
-        // is the one place a family name is an asset.
-        ("model/rope.rs", 1),
-        ("loader/plan.rs", 2),
+        // `model/rope.rs` and `loader/plan.rs` were here for "a TEST's name
+        // and a test fixture's `model_type` string", which the count no
+        // longer sees. Their entries are gone rather than zeroed: a file
+        // whose only mentions were its own coverage was never in debt.
         // Two `use` paths into `model::families::llama_like`, which is
         // `crates/model`'s own cross-generation sharing module. Reading a
         // shared module that happens to be named after the generation that
         // first needed it is not branching on a family — but it is also
         // not nothing, and §5 has the rename as an open item.
-        ("gpu/serve/state.rs", 2),
-        // A bool field named for the family whose attention scaling it
-        // selects. Real dispatch, small enough to have hidden: it belongs
-        // with the other three above and is listed apart only because
-        // `geometry.rs` is otherwise clean.
-        ("batch/geometry.rs", 2),
+        ("serve/state.rs", 2),
+        // `batch/geometry.rs` held `DecodeGeometry::gemma`, a bool named for
+        // the family whose norm convention it selected, and then held the
+        // ladder that filled it. Both are gone and the file has NO entry
+        // here, which is the measurement worth reading: it is fifteen hundred
+        // lines about a checkpoint's shape and it spends zero of this budget,
+        // because every family fact in it is either a refusal's prose or a
+        // comment recording what a real checkpoint measured.
+        // The kernel ABI's family-prefixed kind names. Absent from this
+        // table until `PREFIXES` was added, because every one of its
+        // mentions is an abbreviation: it names no family in full. 62 of
+        // these became 45 when six kinds documented in the same words as a
+        // second family's twin were merged into one. The rest name real
+        // per-architecture kernels -- gemma4's PLE, gpt-oss's attention
+        // sink -- which is a different claim from a duplicated read.
+        ("lowering/abi.rs", 45),
     ]
     .into_iter()
     .collect()
 }
 
+/// Lines of DISPATCH that name a family: comments and tests excluded.
+///
+/// Comments are provenance -- "ports gemma_4/forward" -- not dispatch. Tests
+/// are the opposite of the thing being counted: `assert!(serves("qwen3"))` is
+/// not a driver learning what a model is, it is the guard on the code that
+/// must know. Counting them made writing a test cost budget, which taxes
+/// exactly the work #7 needs; `model/text.rs` was 48 with 37 of them inside
+/// `#[cfg(test)]`, so three quarters of its debt was its own coverage.
 fn count(path: &std::path::Path) -> usize {
     let Ok(text) = std::fs::read_to_string(path) else {
         return 0;
     };
-    text.lines()
-        .filter(|l| {
-            let t = l.trim_start();
-            // Comments are provenance — "ports gemma_4/forward" — not
-            // dispatch. The claim is about CODE.
-            !t.starts_with("//") && FAMILIES.iter().any(|f| l.contains(f))
-        })
-        .count()
+    // `#[cfg(test)]` opens a module; it closes when its braces balance.
+    // Tracking depth rather than assuming the file ends there matters:
+    // `model/text.rs` has two test modules with real code between them.
+    let mut depth = 0i32;
+    let mut armed = false;
+    let mut n = 0;
+    for l in text.lines() {
+        let opens = i32::try_from(l.matches('{').count()).unwrap_or(0);
+        let closes = i32::try_from(l.matches('}').count()).unwrap_or(0);
+        if l.trim_start().starts_with("#[cfg(test)]") {
+            armed = true;
+        }
+        let inside = depth > 0;
+        if !inside && !armed && !l.trim_start().starts_with("//") && names_a_family(l) {
+            n += 1;
+        }
+        if armed {
+            depth += opens - closes;
+            if depth <= 0 && closes > 0 {
+                armed = false;
+                depth = 0;
+            }
+        }
+    }
+    n
 }
 
 fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -229,23 +298,57 @@ fn no_budget_line_outlives_what_it_was_for() {
     );
 }
 
-/// The strong half: `ModelFamily` is the table, and it is still here.
+/// The strong half, INVERTED: no `model_type` table remains here.
 ///
-/// `driver-cuda`'s equivalent asserts `FACTS_ROWS` is ABSENT, because that
-/// driver's move is done. This one asserts the opposite — that the type
-/// north-star #7 deletes still exists — so that #7 cannot be reported as
-/// finished while it is not. When `ModelFamily` goes, this test fails, and
-/// the fix is to invert it into cuda's form.
+/// This test used to assert the opposite. It read `facts.rs` and required
+/// `pub enum ModelFamily` to still be in it, so that north-star #7 could not
+/// be reported as finished while the table it deletes was still standing —
+/// and it said, in its own doc, that when the type went the fix was to invert
+/// it into `driver-cuda`'s form. This is that inversion.
+///
+/// The claim it now makes is the strong one and it got stronger on the way.
+/// The table did not MOVE — `driver-cuda`'s equivalent watched its own
+/// `FACTS_ROWS` leave the driver for `model::deployment_cuda`, which was the
+/// right first step and still left a table keyed on a `config.json` string
+/// one crate over. There is no such table anywhere now: a checkpoint is
+/// matched to a `model::catalog` row BY ITS TENSORS, and what a driver
+/// receives is a `Deployment`, a value with no family name in it and
+/// therefore nothing to branch on.
+///
+/// So this watches for the table's RETURN rather than for its escape, which
+/// is why the message no longer names a place it could legitimately live.
+/// `arch_stem` is in the banned list beside the three table names because it
+/// was the FUNCTION that made a dispatch key: it lowercased
+/// `Qwen3MoeForCausalLM` and dropped the tail, and the two spellings that
+/// produced are how a load gate and the seam came to answer differently about
+/// the same checkpoint.
 #[test]
-fn the_model_type_table_is_still_here_and_this_is_what_number_seven_deletes() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let facts = std::fs::read_to_string(root.join("facts.rs"))
-        .expect("facts.rs is the table north-star #7 removes");
-    assert!(
-        facts.contains("pub enum ModelFamily"),
-        "`ModelFamily` is gone from facts.rs. If north-star #7 landed, this \
-         test has done its job and should be inverted into \
-         `driver-cuda/tests/no_family_names.rs`'s form: assert the table is \
-         ABSENT, and drive the budget above to the four non-dispatch files."
-    );
+fn no_model_type_table_remains_in_the_driver() {
+    // `sources()` asserts it read more than forty files, which is this
+    // scan's own "a broken audit passes" guard: a walk that finds nothing
+    // proves nothing, loudly and forever.
+    let (root, files) = sources();
+    for f in &files {
+        let Ok(text) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        for (i, line) in text.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            for banned in ["FACTS_ROWS", "HF_ROWS", "MLX_ROWS", "ModelFamily", "arch_stem"] {
+                assert!(
+                    !t.contains(banned),
+                    "{}:{} names `{banned}`, which is a table — or the \
+                     reduction that made a key for one — over a `config.json` \
+                     string. There is no such table any more: a checkpoint is \
+                     matched to a `model::catalog` row by its tensors, and a \
+                     driver reads the answer, never the question",
+                    f.strip_prefix(&root).unwrap_or(f).display(),
+                    i + 1
+                );
+            }
+        }
+    }
 }

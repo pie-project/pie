@@ -11,7 +11,8 @@
 
 
 use driver_metal::Error;
-use driver_metal::gpu::{ArgumentTable, Compiler, Context, Granularity, Heap, Stepper, Timestamps, Visibility};
+use driver_metal::device::{ArgumentTable, Context, Granularity, Heap, Stepper, Timestamps, Visibility};
+use driver_metal::program::Compiler;
 
 /// Enough arithmetic that the two marks cannot land in the same tick by the
 /// GPU clock simply not having advanced.

@@ -16,7 +16,8 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, anyhow};
 
-use ::model::instruct::{self, Instruct};
+use ::model::catalog::{self, Deployed, Variant};
+use ::model::instruct::Instruct;
 use ::model::ModelMetadata;
 use tokenizer::Tokenizer;
 
@@ -42,29 +43,32 @@ fn compiled_tokenizer(metadata: &ModelMetadata) -> Option<Result<Tokenizer>> {
     })())
 }
 
-/// The descriptor, parsed once.
+/// The row the driver loaded, or a refusal naming what is close.
 ///
-/// Reading it per field would re-parse the whole document each time — two
-/// fields, two parses — for a document that only grows as architectures land.
-fn parsed_descriptor(metadata: &ModelMetadata) -> Result<serde_json::Value> {
-    serde_json::from_slice(&metadata.descriptor)
-        .map_err(|err| anyhow!("the model descriptor is not JSON: {err}"))
-}
-
-/// One `u32` field of a parsed descriptor. Every field is present by
-/// construction — the writer resolves them all — so a missing one is a broken
-/// artifact rather than a case to default around.
-fn descriptor_field(descriptor: &serde_json::Value, key: &str) -> Result<u32> {
-    descriptor
-        .get(key)
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|n| u32::try_from(n).ok())
-        .ok_or_else(|| anyhow!("the artifact's model descriptor has no {key}"))
+/// Two numbers used to come from a `pie.model/1` descriptor parsed
+/// here — `vocab_size` and `num_hidden_layers` — and a third place
+/// parsed the same document with a different failure policy. The
+/// descriptor was one document with two readers, and this was the
+/// second one.
+///
+/// It is the row now, and the row is the same `const` table the driver
+/// linked to answer with this id. Both sides knowing one fact
+/// differently is not a bug that got fixed; it is a sentence that can
+/// no longer be written.
+fn loaded_row(model_id: &str) -> Result<&'static dyn Variant> {
+    catalog::find(model_id).ok_or_else(|| {
+        anyhow!(
+            "the driver loaded {model_id:?}, which this build's model catalog \
+             does not contain; nearest ids: {:?}",
+            catalog::nearest_ids(model_id, 3)
+        )
+    })
 }
 
 pub fn register(
     name: String,
     arch_name: &str,
+    model_id: &str,
     kv_page_size: u32,
     rs: RsCaps,
     ptir: PtirCaps,
@@ -77,16 +81,24 @@ pub fn register(
     // Getting that wrong is the vocab-padding device fault the note above
     // describes.
     //
-    // Both facts come from the descriptor, for either input form. They used to
-    // come from it only for an artifact; a snapshot got them from two probes
-    // right here, which walked `text_config` nesting and key alternatives by
-    // hand and had to agree with the driver's parser by coincidence. That is
-    // the skew `pie.model/1` exists to remove, and the probes were the last
-    // two instances of it in Rust — the C++ one (`config.cpp`) went with the
-    // driver-side fallback.
-    let descriptor = parsed_descriptor(metadata)?;
-    let vocab_size = descriptor_field(&descriptor, "vocab_size")?;
-    let num_layers = descriptor_field(&descriptor, "num_hidden_layers")?;
+    // Both facts come off the ROW, which is the same table the driver
+    // linked. They used to come from a descriptor parsed here; before
+    // that, a snapshot got them from two probes right here that walked
+    // `text_config` nesting and key alternatives by hand and had to
+    // agree with the driver's parser by coincidence. `pie.model/1`
+    // removed the second parser and left one document with two readers;
+    // this removes the document.
+    let row = loaded_row(model_id)?;
+    let num_layers = row.load_shape().layers;
+    // `vocab` is the LOGICAL width and does not shard, so the single-rank
+    // projection answers it at any tensor-parallel width.
+    let vocab_size = row
+        .deployment(Deployed::single())
+        .map_err(|refusal| {
+            anyhow!("the driver loaded {model_id:?} but this build refuses it: {refusal}")
+        })?
+        .shape
+        .vocab;
     // The tokenizer is the half that genuinely differs: compiled objects from
     // an artifact, a file beside a snapshot.
     let tokenizer = match compiled_tokenizer(metadata) {
@@ -94,7 +106,26 @@ pub fn register(
         None => Tokenizer::from_file(&tokenizer_path)?,
     };
     let tokenizer = Arc::new(tokenizer);
-    let instruct = instruct::create(arch_name, tokenizer.clone());
+    // THE CHAT TEMPLATE, CHOSEN BY THE ROW THE DRIVER LOADED.
+    //
+    // `create` used to take `arch_name` — a `model_type` string off the
+    // checkpoint's `config.json` — and match it against a thirty-arm
+    // table ending in `_ => QwenInstruct`. A model the table did not
+    // know got ChatML, silently: no error, no warning, just a model
+    // generating fluent turns of a conversation it was never trained to
+    // hold, terminated with an `<|im_end|>` its tokenizer does not
+    // contain. The bug was invisible precisely because the output read
+    // well.
+    //
+    // The id names a catalog row, every row answers `chat()`, and there
+    // is no arm left to fall through. An unknown id was already an error
+    // above, at `loaded_row`, with the nearest known ids named — before
+    // the first token rather than after a thousand plausible ones.
+    //
+    // The SAME row that answered the two numbers answers this, which is
+    // the property worth having: a build cannot size its sampler from
+    // one model and format its prompts for another.
+    let instruct = row.chat(tokenizer.clone());
 
     let model = Arc::new(Model {
         name,

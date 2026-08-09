@@ -26,6 +26,33 @@
 //! Passing here is not correctness; it is the floor beneath which correctness
 //! cannot be discussed.
 //!
+//! # Running it
+//!
+//! ```text
+//! PIE_METAL_SMOKE_CHECKPOINT=<an MLX snapshot dir with a config.json> \
+//!   cargo test -p driver-metal --features metal-4 --test device_real_weights \
+//!   -- --include-ignored --test-threads=1
+//! ```
+//!
+//! Both flags are load-bearing. `--test-threads=1` because twelve tests each
+//! mapping an 18 GB checkpoint at once is a SIGKILL, not a slowdown.
+//!
+//! `--include-ignored` because every test here is `#[ignore]`d, and that is a
+//! correction rather than a convenience. Each one used to open by reading the
+//! environment variable and `return`ing with an `eprintln!` when it was
+//! unset -- and libtest swallows a PASSING test's stderr. So the suite
+//! reported `ok. 12 passed` in 0.00s, CI never sets the variable, and the
+//! strongest gate in the crate reported twelve passes of nothing for as long
+//! as it has existed. A test that reports the same result whether or not it
+//! ran is not a test. `ignored` is the one word libtest has for "this did not
+//! run", so the suite says it.
+//!
+//! Running it for the first time found what it was built to find: a real
+//! gemma-4-31b decode leaves nineteen of twenty-two arena regions unwritten
+//! across 1255 non-empty dispatches, and fills three with ~1e27. The same
+//! twelve are green on a real llama, MLX token-for-token agreement included.
+//! See `.wiki/driver/real-metal-north-star.md` §15.
+//!
 //! It found six defects in its first afternoon, and the last two are the ones
 //! that argue for the file:
 //!
@@ -107,17 +134,18 @@
 //! to a tile.
 
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use driver_metal::gpu::{Allocation, Compiler, Context};
+use driver_metal::device::{Allocation, Context};
+use driver_metal::program::Compiler;
 use driver_metal::lowering::dispatch::Geometry;
-use driver_metal::gpu::bind::encode::Pipelines;
+use driver_metal::bind::encode::Pipelines;
 use driver_metal::lowering::executor::{FireTable, Resolver, Slice};
 use driver_metal::lowering::frame::{Step, lower_step};
-use driver_metal::gpu::pools::kv::Pool;
+use driver_metal::pools::kv::Pool;
     use driver_metal::layout::kv::Shape;
-use driver_metal::gpu::weights::load::load;
+use driver_metal::weights::load::load;
 use driver_metal::lowering::resolve::{Names, Store};
 use driver_metal::layout::region::Region as _;
 use model::families::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
@@ -135,15 +163,61 @@ fn snapshot() -> Option<PathBuf> {
     std::env::var_os("PIE_METAL_SMOKE_CHECKPOINT").map(PathBuf::from)
 }
 
-/// The `pie.model/1` descriptor for a snapshot. See
-/// `device_checkpoint_names.rs` — a TEST may normalize a checkpoint.
-fn descriptor_for(snapshot: &Path) -> String {
-    let raw = std::fs::read_to_string(snapshot.join("config.json"))
-        .expect("the snapshot has a config.json");
-    let root: serde_json::Value = serde_json::from_str(&raw).expect("config.json parses");
-    model::config::descriptor(&root, snapshot.to_str().expect("utf8 path"))
-        .expect("the config normalizes to a descriptor")
-        .to_string()
+/// WHICH MODEL a snapshot is, at what affine point, and in what shape.
+///
+/// Eleven tests below open the same checkpoint and every one of them used to
+/// spell the same four lines: normalize `config.json` into a `pie.model/1`
+/// descriptor, parse the descriptor back into a private `ModelFacts`, project
+/// THAT into a `DecodeGeometry`, and hand the descriptor to the loader as
+/// well. Four steps, three intermediate documents, and eleven copies of the
+/// sequence — so a change to any of it was eleven edits and the first one
+/// missed was a test comparing a real GPU's output against the wrong shape.
+///
+/// It is one step now and it is worth naming what that step IS: the
+/// checkpoint's TENSORS pick a `model::catalog` row, and everything else is a
+/// projection of the row. No document is believed, because none is read for
+/// anything except the quantization — which a row genuinely cannot state,
+/// since `mlx-community` publishes the same weights at 4 bits group 64 and at
+/// 8 bits group 32 and the two pack to shapes no extent distinguishes.
+///
+/// A refusal here PANICS rather than skipping. These are the A/B tests: they
+/// are the only place a real Metal device's numbers are compared against
+/// anything, and a skip that prints to stderr is how that comparison quietly
+/// stops happening.
+fn served(
+    snapshot: &Path,
+) -> (
+    &'static dyn model::catalog::Variant,
+    model::encoding::Encoding,
+    driver_metal::batch::DecodeGeometry,
+) {
+    let meta = model_loader::checkpoint::read::parse_checkpoint_metadata(snapshot)
+        .unwrap_or_else(|e| panic!("{} did not read as a checkpoint: {e:?}", snapshot.display()));
+    let row = model::catalog::identify(&meta, &model::catalog::Override::None)
+        .unwrap_or_else(|e| panic!("{}: {e}", snapshot.display()));
+    let config = match model_loader::checkpoint::read::read_meta(
+        &meta,
+        model::encoding::CONFIG_OBJECT,
+    ) {
+        Ok(Some(bytes)) => String::from_utf8(bytes).expect("the embedded config is utf8"),
+        _ => std::fs::read_to_string(snapshot.join("config.json"))
+            .unwrap_or_else(|e| panic!("{}/config.json: {e}", snapshot.display())),
+    };
+    let encoding = model::encoding::Encoding::from_config_json(&config)
+        .unwrap_or_else(|e| panic!("{}: no encoding in the config: {e}", snapshot.display()));
+    let deployment = row
+        .deployment(model::catalog::Deployed::single())
+        .unwrap_or_else(|e| panic!("`{}` does not deploy: {e}", row.id()));
+    let dg = driver_metal::batch::geometry_from_deployment(
+        &deployment,
+        row.load_shape(),
+        driver_metal::batch::AffineFormat {
+            bits: encoding.bits,
+            group: encoding.group_size,
+        },
+    )
+    .unwrap_or_else(|e| panic!("`{}` projects no decodable geometry: {}", row.id(), e.0));
+    (row, encoding, dg)
 }
 
 /// What a run of the whole arena found.
@@ -196,7 +270,7 @@ fn census(bytes: &[u8], element: usize) -> Census {
 /// The checkpoint's weights, the fire's tables, and the pool's geometry.
 struct Live<'a> {
     store: Store<'a>,
-    tables: &'a driver_metal::gpu::bind::tables::Staged,
+    tables: &'a driver_metal::bind::tables::Staged,
     shape: Shape,
     pages: &'a dyn Fn(u16, bool) -> Option<Slice>,
 }
@@ -270,16 +344,16 @@ fn stage_tables(
     step: &Step<'_>,
     page_size: u32,
     freqs: &[f32],
-) -> driver_metal::gpu::bind::tables::Staged {
+) -> driver_metal::bind::tables::Staged {
     let n = step.token_ids.len() as u32;
     let positions: Vec<u32> = (0..n).collect();
     let each: Vec<u32> = (0..n).collect();
     let indptr: Vec<u32> = (0..=n).collect();
     let w_off: Vec<u32> = positions.iter().map(|p| p % page_size.max(1)).collect();
     let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
-    driver_metal::gpu::bind::tables::stage(
+    driver_metal::bind::tables::stage(
         context,
-        driver_metal::gpu::bind::tables::Frame {
+        driver_metal::bind::tables::Frame {
             token_ids: step.token_ids,
             position_ids: &positions,
             req_of_token: &each,
@@ -295,6 +369,7 @@ fn stage_tables(
 }
 
 #[test]
+#[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     let Some(snapshot) = snapshot() else {
         eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
@@ -307,12 +382,8 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let descriptor = descriptor_for(&snapshot);
-    let loaded = load(&context, &snapshot, &descriptor).expect("the checkpoint loads");
-    let model_facts = driver_metal::facts::ModelFacts::from_descriptor(&descriptor)
-        .expect("the descriptor states the model's facts");
-    let dg =
-        driver_metal::batch::geometry_from_facts(&model_facts).expect("a decodable geometry");
+    let (row, encoding, dg) = served(&snapshot);
+    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
     let (facts, metal) =
         driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
 
@@ -377,7 +448,7 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
         n_experts: facts.n_experts,
         experts_per_token: facts.experts_per_token,
     };
-    let (timing, arena) = driver_metal::gpu::fire::run::run_keeping_arena(
+    let (timing, arena) = driver_metal::fire::run::run_keeping_arena(
         &context,
         &compiler,
         &mut pipelines,
@@ -479,15 +550,33 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     // width looks at the first token's slice and calls it the region -- which
     // cannot tell "nothing wrote this" from "the write landed at the wrong
     // offset inside it".
-    let starts: Vec<usize> = regions.iter().map(|(at, _, _)| *at).collect();
-    for (i, (at, len, _)) in regions.iter_mut().enumerate() {
-        let next = starts
-            .iter()
-            .skip(i + 1)
-            .find(|s| **s > *at)
-            .copied()
-            .unwrap_or(read.len());
-        *len = (*len).max(next - *at).min(read.len() - *at);
+    //
+    // An arena REUSES offsets: the same `at` carries different tensors at
+    // different points in the schedule, so the same start appears several
+    // times with different widths, and a stated `width * bytes` can run past
+    // where the next region begins. Counting those descriptors one after
+    // another censuses the same bytes once per descriptor. That is not a
+    // presentation detail -- gemma-4-31b's arena holds 2,496,512 bf16 values
+    // and the run counted 2,673,664 of them, which is how this was found.
+    //
+    // So the census walks DISTINCT starts and gives each the bytes up to the
+    // next one. Each byte is then read exactly once. Where descriptors at one
+    // start disagree about the element width, the widest wins: reading f32 as
+    // bf16 reports the low sixteen bits of every value as a number, and those
+    // bit patterns are NaN about as often as not.
+    let mut by_start: BTreeMap<usize, usize> = BTreeMap::new();
+    for (at, _, bytes) in &regions {
+        let e = by_start.entry(*at).or_insert(*bytes);
+        *e = (*e).max(*bytes);
+    }
+    let starts: Vec<usize> = by_start.keys().copied().collect();
+    let mut regions: Vec<(usize, usize, usize)> = Vec::with_capacity(starts.len());
+    for (i, at) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(read.len()).min(read.len());
+        if *at >= end {
+            continue;
+        }
+        regions.push((*at, end - at, by_start[at]));
     }
 
     // Which statement each arena offset belongs to, and whether it is that
@@ -749,6 +838,7 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
 /// A report, not an assertion: what it prints is a map, and a map that fails
 /// the build is a map nobody reads.
 #[test]
+#[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn the_second_lane_stops_somewhere_and_this_says_where() {
     bisect(FireClass::Decode);
 }
@@ -763,6 +853,7 @@ fn the_second_lane_stops_somewhere_and_this_says_where() {
 ///
 ///   embed 0.361, L0 attn_norm 2.207, L0 q_proj 1.320
 #[test]
+#[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn the_prefill_lane_too() {
     bisect(FireClass::Prefill);
 }
@@ -779,12 +870,8 @@ fn bisect(class: FireClass) {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let descriptor = descriptor_for(&snapshot);
-    let loaded = load(&context, &snapshot, &descriptor).expect("the checkpoint loads");
-    let model_facts = driver_metal::facts::ModelFacts::from_descriptor(&descriptor)
-        .expect("the descriptor states the model's facts");
-    let dg =
-        driver_metal::batch::geometry_from_facts(&model_facts).expect("a decodable geometry");
+    let (row, encoding, dg) = served(&snapshot);
+    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
     let (facts, _metal) =
         driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
     let (_, metal) =
@@ -914,15 +1001,15 @@ fn bisect(class: FireClass) {
         )
         .expect("the fire plans");
         let prefix = &dispatches[..n];
-        let prepared = driver_metal::gpu::fire::run::prepare(&context, &lowered, prefix)
+        let prepared = driver_metal::fire::run::prepare(&context, &lowered, prefix)
             .expect("the prefix prepares");
         pipelines
             .ensure(&context, &compiler, prefix)
             .expect("the pipelines compile");
-        let mut stepper = driver_metal::gpu::Stepper::new(&context).expect("a stepper");
+        let mut stepper = driver_metal::device::Stepper::new(&context).expect("a stepper");
         stepper
             .run(|encoder| {
-                driver_metal::gpu::bind::encode::encode(
+                driver_metal::bind::encode::encode(
                     encoder,
                     &prepared.table,
                     &pipelines,
@@ -1063,6 +1150,7 @@ fn bisect(class: FireClass) {
 /// making it an assertion would fail every green run for the one model that
 /// is not.
 #[test]
+#[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
     let Some(snapshot) = snapshot() else {
         eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
@@ -1075,12 +1163,8 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let descriptor = descriptor_for(&snapshot);
-    let loaded = load(&context, &snapshot, &descriptor).expect("the checkpoint loads");
-    let model_facts = driver_metal::facts::ModelFacts::from_descriptor(&descriptor)
-        .expect("the descriptor states the model's facts");
-    let dg =
-        driver_metal::batch::geometry_from_facts(&model_facts).expect("a decodable geometry");
+    let (row, encoding, dg) = served(&snapshot);
+    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
     let (facts, metal) =
         driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
 
@@ -1197,15 +1281,15 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
         )
         .expect("the fire plans");
         let prefix = &dispatches[..n.min(dispatches.len())];
-        let prepared = driver_metal::gpu::fire::run::prepare(&context, &lowered, prefix)
+        let prepared = driver_metal::fire::run::prepare(&context, &lowered, prefix)
             .expect("the prefix prepares");
         pipelines
             .ensure(&context, &compiler, prefix)
             .expect("the pipelines compile");
-        let mut stepper = driver_metal::gpu::Stepper::new(&context).expect("a stepper");
+        let mut stepper = driver_metal::device::Stepper::new(&context).expect("a stepper");
         stepper
             .run(|encoder| {
-                driver_metal::gpu::bind::encode::encode(
+                driver_metal::bind::encode::encode(
                     encoder,
                     &prepared.table,
                     &pipelines,
@@ -1329,6 +1413,7 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
 /// the fire tables rather than anything a text can state. That is the next
 /// thing this file should be pointed at.
 #[test]
+#[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn one_token_at_position_zero_agrees_with_mlx() {
     let Some(snapshot) = snapshot() else {
         eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
@@ -1341,12 +1426,8 @@ fn one_token_at_position_zero_agrees_with_mlx() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let descriptor = descriptor_for(&snapshot);
-    let loaded = load(&context, &snapshot, &descriptor).expect("the checkpoint loads");
-    let model_facts = driver_metal::facts::ModelFacts::from_descriptor(&descriptor)
-        .expect("the descriptor states the model's facts");
-    let dg =
-        driver_metal::batch::geometry_from_facts(&model_facts).expect("a decodable geometry");
+    let (row, encoding, dg) = served(&snapshot);
+    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
     let (facts, metal) =
         driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
 
@@ -1402,7 +1483,7 @@ fn one_token_at_position_zero_agrees_with_mlx() {
         pages: &pages,
     };
 
-    let (_, arena) = driver_metal::gpu::fire::run::run_keeping_arena(
+    let (_, arena) = driver_metal::fire::run::run_keeping_arena(
         &context,
         &compiler,
         &mut pipelines,
@@ -1528,6 +1609,7 @@ fn one_token_at_position_zero_agrees_with_mlx() {
 ///     gather is the fire's number and it is a FIELD of a packed struct rather
 ///     than an operand.
 #[test]
+#[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn a_two_token_prefill_agrees_with_mlx() {
     let Some(snapshot) = snapshot() else {
         eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
@@ -1540,12 +1622,8 @@ fn a_two_token_prefill_agrees_with_mlx() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let descriptor = descriptor_for(&snapshot);
-    let loaded = load(&context, &snapshot, &descriptor).expect("the checkpoint loads");
-    let model_facts = driver_metal::facts::ModelFacts::from_descriptor(&descriptor)
-        .expect("the descriptor states the model's facts");
-    let dg =
-        driver_metal::batch::geometry_from_facts(&model_facts).expect("a decodable geometry");
+    let (row, encoding, dg) = served(&snapshot);
+    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
     let (facts, metal) =
         driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
 
@@ -1611,7 +1689,7 @@ fn a_two_token_prefill_agrees_with_mlx() {
         pages: &pages,
     };
 
-    let (_, arena) = driver_metal::gpu::fire::run::run_keeping_arena(
+    let (_, arena) = driver_metal::fire::run::run_keeping_arena(
         &context,
         &compiler,
         &mut pipelines,
@@ -1716,6 +1794,7 @@ fn a_two_token_prefill_agrees_with_mlx() {
 /// distribution at the end of twenty-eight layers, and the constants it checks
 /// have to come from somewhere. This reads the rotation's own output.
 #[test]
+#[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn a_prefill_rotates_its_second_row() {
     let Some(snapshot) = snapshot() else {
         eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
@@ -1728,11 +1807,8 @@ fn a_prefill_rotates_its_second_row() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let descriptor = descriptor_for(&snapshot);
-    let loaded = load(&context, &snapshot, &descriptor).expect("the checkpoint loads");
-    let model_facts = driver_metal::facts::ModelFacts::from_descriptor(&descriptor)
-        .expect("the descriptor states the model's facts");
-    let dg = driver_metal::batch::geometry_from_facts(&model_facts).expect("a decodable geometry");
+    let (row, encoding, dg) = served(&snapshot);
+    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
     let (facts, metal) =
         driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
 
@@ -1793,7 +1869,7 @@ fn a_prefill_rotates_its_second_row() {
         pages: &pages,
     };
 
-    driver_metal::gpu::fire::run::run_keeping_arena(
+    driver_metal::fire::run::run_keeping_arena(
         &context,
         &compiler,
         &mut pipelines,
@@ -1860,6 +1936,7 @@ fn a_prefill_rotates_its_second_row() {
 /// lane alone leaves this failing; fixing the axis alone leaves the one above
 /// failing. Neither is visible from a single lane, so both lanes stay.
 #[test]
+#[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn a_prefill_rotates_its_second_row_on_the_base_ladder() {    let Some(snapshot) = snapshot() else {
         eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
@@ -1871,11 +1948,8 @@ fn a_prefill_rotates_its_second_row_on_the_base_ladder() {    let Some(snapshot)
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let descriptor = descriptor_for(&snapshot);
-    let loaded = load(&context, &snapshot, &descriptor).expect("the checkpoint loads");
-    let model_facts = driver_metal::facts::ModelFacts::from_descriptor(&descriptor)
-        .expect("the descriptor states the model's facts");
-    let dg = driver_metal::batch::geometry_from_facts(&model_facts).expect("a decodable geometry");
+    let (row, encoding, dg) = served(&snapshot);
+    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
     let (facts, mut metal) =
         driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
 
@@ -1933,7 +2007,7 @@ fn a_prefill_rotates_its_second_row_on_the_base_ladder() {    let Some(snapshot)
         pages: &pages,
     };
 
-    driver_metal::gpu::fire::run::run_keeping_arena(
+    driver_metal::fire::run::run_keeping_arena(
         &context,
         &compiler,
         &mut pipelines,
@@ -1997,15 +2071,15 @@ fn stage_prefill(
     step: &Step<'_>,
     page_size: u32,
     freqs: &[f32],
-) -> driver_metal::gpu::bind::tables::Staged {
+) -> driver_metal::bind::tables::Staged {
     let n = step.token_ids.len() as u32;
     let positions: Vec<u32> = (0..n).collect();
     let zeros: Vec<u32> = vec![0; n as usize];
     let w_off: Vec<u32> = positions.iter().map(|p| p % page_size.max(1)).collect();
     let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
-    driver_metal::gpu::bind::tables::stage(
+    driver_metal::bind::tables::stage(
         context,
-        driver_metal::gpu::bind::tables::Frame {
+        driver_metal::bind::tables::Frame {
             token_ids: step.token_ids,
             position_ids: &positions,
             req_of_token: &zeros,
@@ -2037,6 +2111,7 @@ fn stage_prefill(
 /// carried on the reference side. A KV bug here cannot hide in a shared
 /// assumption.
 #[test]
+#[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn a_generation_agrees_with_mlx_token_for_token() {
     let Some(snapshot) = snapshot() else {
         eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
@@ -2049,12 +2124,8 @@ fn a_generation_agrees_with_mlx_token_for_token() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let descriptor = descriptor_for(&snapshot);
-    let loaded = load(&context, &snapshot, &descriptor).expect("the checkpoint loads");
-    let model_facts = driver_metal::facts::ModelFacts::from_descriptor(&descriptor)
-        .expect("the descriptor states the model's facts");
-    let dg =
-        driver_metal::batch::geometry_from_facts(&model_facts).expect("a decodable geometry");
+    let (row, encoding, dg) = served(&snapshot);
+    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
     let (facts, metal) =
         driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
 
@@ -2127,9 +2198,9 @@ fn a_generation_agrees_with_mlx_token_for_token() {
         // POSITION, which is what makes each fire land after the last.
         let zeros: Vec<u32> = vec![0; n as usize];
         let w_off: Vec<u32> = positions.iter().map(|p| p % shape.page_size).collect();
-        let staged = driver_metal::gpu::bind::tables::stage(
+        let staged = driver_metal::bind::tables::stage(
             &context,
-            driver_metal::gpu::bind::tables::Frame {
+            driver_metal::bind::tables::Frame {
                 token_ids: &tokens,
                 position_ids: &positions,
                 req_of_token: &zeros,
@@ -2150,7 +2221,7 @@ fn a_generation_agrees_with_mlx_token_for_token() {
             shape,
             pages: &pages,
         };
-        let (_, arena) = driver_metal::gpu::fire::run::run_keeping_arena(
+        let (_, arena) = driver_metal::fire::run::run_keeping_arena(
             &context,
             &compiler,
             &mut pipelines,
@@ -2233,6 +2304,7 @@ fn a_generation_agrees_with_mlx_token_for_token() {
 /// command through `Regions::resolve`, and a resolution to the wrong span is
 /// a kernel reading another layer's cache — silently.
 #[test]
+#[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
     let Some(snapshot) = snapshot() else {
         eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
@@ -2245,11 +2317,8 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let descriptor = descriptor_for(&snapshot);
-    let loaded = load(&context, &snapshot, &descriptor).expect("the checkpoint loads");
-    let model_facts = driver_metal::facts::ModelFacts::from_descriptor(&descriptor)
-        .expect("the descriptor states the model's facts");
-    let dg = driver_metal::batch::geometry_from_facts(&model_facts).expect("a decodable geometry");
+    let (row, encoding, dg) = served(&snapshot);
+    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
     let (facts, metal) =
         driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
 
@@ -2328,7 +2397,7 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
         shape,
         pages: &pages,
     };
-    let (_, arena) = driver_metal::gpu::fire::run::run_keeping_arena(
+    let (_, arena) = driver_metal::fire::run::run_keeping_arena(
         &context,
         &compiler,
         &mut pipelines,
@@ -2351,7 +2420,7 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
     // can turn an address back into a buffer. This is the list a seam builds:
     // the weights, the pool's layers, the tables — and `submit` adds the
     // arena and the scalars it leases.
-    let mut regions = driver_metal::gpu::Regions::new();
+    let mut regions = driver_metal::device::Regions::new();
     regions.add(&loaded.region);
     for l in 0..shape.layers {
         if let Some(layer) = pool.layer(l) {
@@ -2362,9 +2431,9 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
     regions.add(&staged.region);
     regions.set_null(&staged.region);
 
-    let mut recordings = driver_metal::gpu::Recordings::new();
-    let scratch = driver_metal::gpu::Scratch::new();
-    let mut stepper = driver_metal::gpu::Stepper::new(&context).expect("a stepper");
+    let mut recordings = driver_metal::fire::Recordings::new();
+    let scratch = driver_metal::fire::Scratch::new();
+    let mut stepper = driver_metal::device::Stepper::new(&context).expect("a stepper");
     let mut live = Live {
         store: Store::new(Names::mlx(), &loaded.tensors, &named),
         tables: &staged,
@@ -2372,7 +2441,7 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
         pages: &pages,
     };
     let replayed = {
-        let mut machine = driver_metal::gpu::fire::run::Machine {
+        let mut machine = driver_metal::fire::run::Machine {
             context: &context,
             compiler: &compiler,
             pipelines: &mut pipelines,
@@ -2381,7 +2450,7 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
             regions: &mut regions,
             recordings: Some(&mut recordings),
         };
-        let fire = driver_metal::gpu::fire::run::submit(&mut machine, &lowered, geometry, &mut live)
+        let fire = driver_metal::fire::run::submit(&mut machine, &lowered, geometry, &mut live)
             .expect("the replayed fire commits");
         machine
             .stepper
@@ -2442,7 +2511,7 @@ fn stage_prefill_fleet(
     step: &Step<'_>,
     page_size: u32,
     freqs: &[f32],
-) -> driver_metal::gpu::bind::tables::Staged {
+) -> driver_metal::bind::tables::Staged {
     let bounds = step.qo_indptr;
     let requests = bounds.len() as u32 - 1;
     let mut positions = Vec::new();
@@ -2462,9 +2531,9 @@ fn stage_prefill_fleet(
     let page_indices: Vec<u32> = (0..requests).collect();
     let page_indptr: Vec<u32> = (0..=requests).collect();
     let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
-    driver_metal::gpu::bind::tables::stage(
+    driver_metal::bind::tables::stage(
         context,
-        driver_metal::gpu::bind::tables::Frame {
+        driver_metal::bind::tables::Frame {
             token_ids: step.token_ids,
             position_ids: &positions,
             req_of_token: &req_of_token,
@@ -2500,7 +2569,7 @@ fn logits_at(read: &[u8], lowered: &model_compiler::lower::Lowered, row: usize) 
 struct Rig<'a> {
     context: &'a Context,
     compiler: &'a Compiler,
-    loaded: &'a driver_metal::gpu::weights::load::Loaded,
+    loaded: &'a driver_metal::weights::load::Loaded,
     facts: &'a LlamaLikeFacts,
     metal: &'a LlamaLikeMetalFacts,
     dg: &'a driver_metal::batch::DecodeGeometry,
@@ -2556,11 +2625,11 @@ fn prefill_logits_on(
     };
     // The arena outlives the pool: an elastic buffer charges its tiles back
     // on drop, and dropping the arena first would leave nothing to charge.
-    let arena_for_pool = driver_metal::gpu::Arena::new(1024 * 1024 * 1024, 0);
+    let arena_for_pool = driver_metal::device::Arena::new(1024 * 1024 * 1024, 0);
     let pool = match storage {
         Storage::Fixed => Pool::allocate(context, shape).expect("a pool"),
         Storage::Elastic => {
-            let mut stepper = driver_metal::gpu::Stepper::new(context).expect("stepper");
+            let mut stepper = driver_metal::device::Stepper::new(context).expect("stepper");
             Pool::allocate_elastic(context, &mut stepper, &arena_for_pool, shape)
                 .expect("an elastic pool")
         }
@@ -2594,7 +2663,7 @@ fn prefill_logits_on(
         shape,
         pages: &pages,
     };
-    let (_, arena) = driver_metal::gpu::fire::run::run_keeping_arena(
+    let (_, arena) = driver_metal::fire::run::run_keeping_arena(
         context,
         compiler,
         pipelines,
@@ -2642,6 +2711,7 @@ fn prefill_logits_on(
 /// request's distribution, and the fire's own arithmetic is the only thing
 /// that could have moved it.
 #[test]
+#[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn a_request_prefills_the_same_way_beside_another_one() {
     let Some(snapshot) = snapshot() else {
         eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
@@ -2654,11 +2724,8 @@ fn a_request_prefills_the_same_way_beside_another_one() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let descriptor = descriptor_for(&snapshot);
-    let loaded = load(&context, &snapshot, &descriptor).expect("the checkpoint loads");
-    let model_facts = driver_metal::facts::ModelFacts::from_descriptor(&descriptor)
-        .expect("the descriptor states the model's facts");
-    let dg = driver_metal::batch::geometry_from_facts(&model_facts).expect("a decodable geometry");
+    let (row, encoding, dg) = served(&snapshot);
+    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
     let (facts, metal) =
         driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
 
@@ -2752,6 +2819,7 @@ fn a_request_prefills_the_same_way_beside_another_one() {
 /// arithmetic is gated in `device_elastic.rs` instead, where a span past what
 /// is mapped is refused rather than served.
 #[test]
+#[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn an_elastic_pool_answers_exactly_as_a_fixed_one_does() {
     let Some(snapshot) = snapshot() else {
         eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
@@ -2764,11 +2832,8 @@ fn an_elastic_pool_answers_exactly_as_a_fixed_one_does() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let descriptor = descriptor_for(&snapshot);
-    let loaded = load(&context, &snapshot, &descriptor).expect("the checkpoint loads");
-    let model_facts = driver_metal::facts::ModelFacts::from_descriptor(&descriptor)
-        .expect("the descriptor states the model's facts");
-    let dg = driver_metal::batch::geometry_from_facts(&model_facts).expect("a decodable geometry");
+    let (row, encoding, dg) = served(&snapshot);
+    let loaded = load(&context, &snapshot, row, &encoding).expect("the checkpoint loads");
     let (facts, metal) =
         driver_metal::model::text::facts_from(&dg, |t| loaded.tensors.contains_key(t));
 

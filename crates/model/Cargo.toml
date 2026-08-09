@@ -3,7 +3,7 @@ name = "model"
 version = "0.4.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
-description = "What a model is: the two registries (model_type -> load-contract author, arch_name -> chat template), the twenty generations they dispatch to, the vocabulary those share, and host-side multimodal decode."
+description = "What a model is: one const catalog row per model, the twenty generations those rows live in, the vocabulary they share, and host-side multimodal decode."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -11,11 +11,84 @@ repository = "https://github.com/pie-project/pie"
 name = "model"
 path = "src/lib.rs"
 
-# The Rust half of the descriptor round-trip check; see the module doc.
-[[bin]]
-name = "descriptor"
-path = "src/bin/descriptor.rs"
-required-features = ["config"]
+# THE TEST TARGETS THAT NEED AN ASPECT, declared so that `cargo test -p
+# model` runs the ones that do not instead of failing to compile.
+#
+# A target with no `required-features` is auto-discovered and built for
+# EVERY feature set, so eight of these twenty turned `cargo test -p
+# model` into 359 compile errors -- and the twelve that would have
+# passed never ran. That is the same defect the driver's own feature
+# work found: sixteen test targets there had no `required-features`, and
+# four of them were portable and had never been run in a build that
+# could not reach a GPU.
+#
+# A TEST THAT CANNOT BUILD REPORTS NOTHING, and nothing reads as fine.
+# The minimum is what each one actually needs, found by building each
+# against each aspect rather than by reading imports -- the one target
+# that wanted `contract` and not `forward` was `registry_agreement`, and
+# it is deleted: it existed to hold three tables to each other, and the
+# catalog collapsed the three into one row, so there is no agreement left
+# to check. `catalog_differential` took its place and needs both aspects,
+# because a row's answer to "what deploys" is the thing being checked.
+
+[[test]]
+name = "arena_soundness"
+required-features = ["forward"]
+
+[[test]]
+name = "golden_plans"
+required-features = ["forward"]
+
+[[test]]
+name = "kernels_table"
+required-features = ["forward"]
+
+[[test]]
+name = "lowering"
+required-features = ["forward"]
+
+[[test]]
+name = "lowering_cost"
+required-features = ["forward"]
+
+[[test]]
+name = "regions_surface"
+required-features = ["forward"]
+
+[[test]]
+name = "tp_quantized_spec"
+required-features = ["forward"]
+
+# The refactor's safety net. `forward` because the thing it checks is the
+# row's answer to "what deploys"; without it the file's `#![cfg]` empties
+# the target and a green run means nothing was compared.
+[[test]]
+name = "catalog_differential"
+required-features = ["forward"]
+
+[[test]]
+name = "facts_are_read"
+required-features = ["forward"]
+
+[[test]]
+name = "plan_has_two_ends"
+required-features = ["forward"]
+
+[[test]]
+name = "one_shape_one_place"
+required-features = ["forward"]
+
+[[test]]
+name = "family_contracts"
+required-features = ["contract"]
+
+[[test]]
+name = "llama_contract"
+required-features = ["contract"]
+
+[[test]]
+name = "common_is_thin"
+required-features = ["contract"]
 
 [features]
 # One feature per aspect, because the aspects pull different worlds: `chat`
@@ -30,35 +103,50 @@ required-features = ["config"]
 # feature gates modules directly.
 default = ["chat"]
 chat = ["dep:tokenizer", "dep:anyhow", "dep:serde_json", "dep:image"]
-# The `pie.model/1` descriptor: HuggingFace `config.json` normalization on the
-# way in, `ModelFacts` projection on the way out. Its own aspect and its own
-# feature because it is the ONE that carries no graph: serde and nothing else,
-# no loader, no tracer, no kernels table. That is what `model-config` was a
-# separate crate for, and a feature holds it just as well now that the only
-# two consumers are `contract` below and `worker` — which already links this
-# crate for `forward`.
-config = ["dep:serde", "dep:serde_json", "dep:anyhow"]
-# `config` comes with the contract aspect because `ModelFacts` is read out of
-# a `pie.model/1` descriptor, and that module owns the descriptor's schema.
-contract = ["dep:model-loader", "dep:serde_json", "config"]
+# THE `config` FEATURE IS GONE, and so are the 3,595 lines behind it: a
+# `pie.model/1` descriptor normalized out of a 136-field schema by 845
+# lines, a reader that parsed it back, a `ModelFacts` projection of the
+# result, and eleven per-family derivations over all of it.
+#
+# It was its own aspect because it was the ONE that carried no graph —
+# serde and nothing else. That is still true of what replaced it, which
+# is why nothing replaced the FEATURE: a `catalog` row is a `const`, and
+# a const needs no dependency to be read. `encoding` is the only part
+# that still opens a file, and it rides with `contract` because the only
+# thing that asks it is an authoring pass deciding how to store a weight.
+contract = ["dep:model-loader", "dep:serde_json", "dep:anyhow"]
 # The forward aspect: a model's forward pass, written in `model-compiler`'s
 # tracing eDSL, and the `#[repr(C)]` boundary a driver traces it across. NOT
 # default -- `pie model convert` reads a chat template and a load contract and
 # must not drag the tracer in behind them.
-forward = ["dep:model-compiler", "dep:serde"]
+forward = []
 
 [dependencies]
 # The facts a declaration traces against are serialized for the goldens, the
 # same way the traced form is; the descriptor's schema derives on it too.
-serde = { version = "1.0", features = ["derive"], optional = true }
+# Not optional for the reason `model-compiler` is not: a row DERIVES on it
+# (the goldens serialize facts, and `spec.rs` is ungated now).
+serde = { version = "1.0", features = ["derive"] }
 tokenizer = { path = "../tokenizer", optional = true }
 # `default-features = false` drops the loader's testkit half — the authoring
 # side needs the algebra, never the host executor.
 model-loader = { path = "../model-loader", default-features = false, optional = true }
 # The tracing eDSL a declaration is written in, plus the traced form it
-# produces. The dependency runs THIS way: a model names the toolchain, never
-# the reverse.
-model-compiler = { path = "../model-compiler", optional = true }
+# produces, plus -- the reason this one is NOT optional -- the shared shape
+# VOCABULARY (`facts::{NormPlacement, QkNorm}`, `trace::{RopeKind,
+# NormVariant}`) that a catalog row is written in.
+#
+# It used to be `forward`-only, when a row's numbers existed solely to be
+# traced. They are the crate's IDENTITY now: `chat` asks which template
+# speaks for a row and `contract` asks how to author it, and both reach the
+# same `const` the tracer reaches. A struct that only exists when the tracer
+# is compiled in cannot be that.
+#
+# The cost is bounded and was measured before taking it: `kernels`,
+# `kernels-cuda` and `kernels-metal` all arrive `default-features = false`,
+# which is the TABLE and not a `.cu` -- `pie model convert` still builds
+# without nvcc, which is what the `forward` gate was protecting.
+model-compiler = { path = "../model-compiler" }
 anyhow = { version = "1.0", optional = true }
 serde_json = { version = "1.0", features = ["preserve_order"], optional = true }
 # Host-side media decode for the model-agnostic multimodal API.

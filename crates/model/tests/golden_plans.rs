@@ -816,8 +816,8 @@ fn gemma_2_cuda_prefill() {
 fn gemma3n_cuda_prefill() {
     check_plan(
         "gemma3n.cuda.prefill",
-        &model::gemma3n::forward::gemma3n_cuda(
-            &model::gemma3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(),
+        &model::gemma_3n::forward::gemma3n_cuda(
+            &model::gemma_3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(),
             FireClass::Prefill,
         ),
     );
@@ -849,8 +849,8 @@ fn deepseek_v4_cuda_prefill() {
 fn gemma3n_cuda_decode() {
     check_plan(
         "gemma3n.cuda.decode",
-        &model::gemma3n::forward::gemma3n_cuda(
-            &model::gemma3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(),
+        &model::gemma_3n::forward::gemma3n_cuda(
+            &model::gemma_3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(),
             FireClass::Decode,
         ),
     );
@@ -871,8 +871,8 @@ fn gemma_2_cuda_decode() {
 fn glm5_cuda_decode() {
     check_plan(
         "glm5.cuda.decode",
-        &model::glm5::forward::glm5_cuda(
-            &model::glm5::forward::facts::Glm5Facts::glm5_106b_a12b(),
+        &model::glm_5::forward::glm5_cuda(
+            &model::glm_5::forward::facts::Glm5Facts::glm5_106b_a12b(),
             FireClass::Decode,
         ),
     );
@@ -925,8 +925,8 @@ fn kimi_k3_cuda_prefill() {
 fn glm5_cuda_prefill() {
     check_plan(
         "glm5.cuda.prefill",
-        &model::glm5::forward::glm5_cuda(
-            &model::glm5::forward::facts::Glm5Facts::glm5_106b_a12b(),
+        &model::glm_5::forward::glm5_cuda(
+            &model::glm_5::forward::facts::Glm5Facts::glm5_106b_a12b(),
             FireClass::Prefill,
         ),
     );

@@ -185,7 +185,14 @@ pub mod device;
 pub mod pools;
 
 /// The checkpoint onto the device. The PLAN half of that is [`layout`]'s.
-#[cfg(all(feature = "_cuda", feature = "abi"))]
+///
+/// Split at `abi` INSIDE the module rather than at its declaration:
+/// `weight_view` is a descriptor — how a weight is stored, which the
+/// binder reads to pick a GEMM — and it names no loader type. `plan`
+/// and `stage` do, and `model-loader` is an `abi` dependency. Declaring
+/// the whole module behind `abi` made `--features cuda-13,bridge`
+/// unbuildable, which is a spelling §6 promises.
+#[cfg(feature = "_cuda")]
 pub mod weights;
 
 /// A lowered launch onto a kernel entry, its arguments and its grid.

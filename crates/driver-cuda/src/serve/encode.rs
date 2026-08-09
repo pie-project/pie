@@ -32,7 +32,7 @@ fn encode_gemma4_audio_arm(
     out_bytes: usize,
     indptr_ptr: *mut u32,
 ) -> i32 {
-    let Some(ac) = model.hf.gemma_audio.as_ref() else {
+    let Some(ac) = model.deployment.towers.audio.as_ref() else {
         eprintln!("[driver-cuda] encode: this deployment carries no audio tower");
         return PIE_STATUS_UNSUPPORTED;
     };
@@ -60,7 +60,7 @@ fn encode_gemma4_audio_arm(
         (Ok(a), Ok(b), Ok(c), Ok(d), Ok(e), Ok(f), Ok(gp), Ok(h)) => (a, b, c, d, e, f, gp, h),
         _ => return PIE_STATUS_UNSUPPORTED,
     };
-    let depth = usize::try_from(ac.num_hidden_layers).unwrap_or(0);
+    let depth = ac.layers as usize;
     let mut table: Vec<*const std::ffi::c_void> = Vec::with_capacity(depth * 62);
     for l in 0..depth {
         let lp = format!("{ap}.layers.{l}");
@@ -104,7 +104,7 @@ fn encode_gemma4_audio_arm(
     let text_hidden = model
         .weights
         .get("model.embed_audio.embedding_projection.weight")
-        .map_or(0, |b| b.bytes / (usize::try_from(ac.output_proj_dims.max(1)).unwrap_or(1) * 2));
+        .map_or(0, |b| b.bytes / (ac.output_dims.max(1) as usize * 2));
     let Ok(stream) = crate::device::OwnedStream::new(0) else {
         return PIE_STATUS_DRIVER_ERROR;
     };
@@ -119,21 +119,21 @@ fn encode_gemma4_audio_arm(
             out_b,
             embed,
             table.as_ptr(),
-            ac.num_hidden_layers,
-            ac.hidden_size,
-            ac.num_attention_heads,
-            ac.conv_kernel_size,
-            ac.feature_size,
-            ac.subsampling_conv_channels0,
-            ac.subsampling_conv_channels1,
-            ac.output_proj_dims,
+            ac.layers as i32,
+            ac.hidden as i32,
+            ac.heads as i32,
+            ac.conv_kernel as i32,
+            ac.feature_size as i32,
+            ac.subsample_channels_0 as i32,
+            ac.subsample_channels_1 as i32,
+            ac.output_dims as i32,
             i32::try_from(text_hidden).unwrap_or(0),
-            ac.attention_chunk_size,
-            ac.attention_context_left,
-            ac.attention_context_right,
-            ac.attention_logit_cap,
+            ac.chunk_size as i32,
+            ac.context_left as i32,
+            ac.context_right as i32,
+            ac.logit_cap,
             ac.residual_weight,
-            ac.rms_norm_eps,
+            ac.norm_eps,
             desc.audio_features.ptr.cast(),
             desc.audio_feature_indptr.ptr,
             desc.audio_anchor_rows.ptr,
@@ -202,7 +202,7 @@ pub fn pie_cuda_encode(
             notify_done(state);
             return PIE_STATUS_OK;
         }
-        let Some(vc) = model.hf.gemma_vision.as_ref() else {
+        let Some(vc) = model.deployment.towers.vision.as_ref() else {
             eprintln!("[driver-cuda] encode: this deployment carries no vision tower");
             return PIE_STATUS_UNSUPPORTED;
         };
@@ -231,7 +231,7 @@ pub fn pie_cuda_encode(
             Ok(p) => p,
             Err(e) => return e,
         };
-        let depth = usize::try_from(vc.num_hidden_layers).unwrap_or(0);
+        let depth = vc.layers as usize;
         let mut table: Vec<*const std::ffi::c_void> = Vec::with_capacity(depth * 41);
         for l in 0..depth {
             let lp = format!("{vp}.encoder.layers.{l}");
@@ -272,7 +272,7 @@ pub fn pie_cuda_encode(
         }
         // pos_table is `[2, S, hidden]` bf16 — S from the buffer itself; the
         // media row width from the projection (`[text_hidden, hidden]`).
-        let hidden = usize::try_from(vc.hidden_size.max(1)).unwrap_or(1);
+        let hidden = vc.hidden.max(1) as usize;
         let pos_table_size = model
             .weights
             .get(&format!("{vp}.patch_embedder.position_embedding_table"))
@@ -292,14 +292,14 @@ pub fn pie_cuda_encode(
                 pos_table,
                 embed_proj,
                 table.as_ptr(),
-                vc.num_hidden_layers,
-                vc.hidden_size,
-                vc.num_attention_heads,
-                vc.intermediate_size,
+                vc.layers as i32,
+                vc.hidden as i32,
+                vc.heads as i32,
+                vc.intermediate as i32,
                 i32::try_from(pos_table_size).unwrap_or(0),
                 i32::try_from(text_hidden).unwrap_or(0),
-                vc.pooling_kernel_size,
-                vc.rms_norm_eps,
+                vc.pooling_kernel as i32,
+                vc.norm_eps,
                 vc.rope_theta,
                 desc.image_pixels.ptr.cast(),
                 desc.image_pixel_indptr.ptr,

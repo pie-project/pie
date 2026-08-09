@@ -194,6 +194,7 @@ fn register_dummy_driver(
         vocab_size,
         max_model_len: 8192,
         arch_name: "test-dummy".into(),
+        model_id: String::new(),
         activation_dtype: "f32".into(),
         snapshot_dir: String::new(),
         max_forward_tokens: 4096,

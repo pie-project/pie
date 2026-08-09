@@ -90,7 +90,7 @@ fn gdn_kkv_blocked_shards(b: &mut Builder<'_>) -> Result<(), Error> {
     if b.target().tp_size <= 1 {
         return Ok(());
     }
-    for layer in 0..b.facts().num_hidden_layers {
+    for layer in 0..b.shape().layers {
         let la = format!("{}{layer}.linear_attn.", b.decoder_layer_prefix_value());
         let (Some(qkv), Some(z)) = (
             b.find(&b.source_name(&format!("{la}in_proj_qkv.weight"))),
@@ -242,7 +242,7 @@ fn shared_expert_gate_up_join(b: &mut Builder<'_>, layer_prefix: &str) {
 /// the checkpoint ships one, the speculative-decoding block. The MTP layer
 /// is not under `decoder_layer_prefix`, and its bind runs the same fusion.
 fn shared_expert_gate_up_joins(b: &mut Builder<'_>) {
-    for layer in 0..b.facts().num_hidden_layers {
+    for layer in 0..b.shape().layers {
         let prefix = format!("{}{layer}.", b.decoder_layer_prefix_value());
         shared_expert_gate_up_join(b, &prefix);
     }
@@ -256,7 +256,7 @@ pub fn author_qwen3_5_mlx(b: &mut Builder<'_>) -> Result<(), Error> {
     let has_lm_head = b.tensors().iter().any(|raw| {
         raw.name.starts_with("lm_head.") || raw.name.starts_with("language_model.lm_head.")
     });
-    let tied = b.facts().tied_embeddings && !has_lm_head;
+    let tied = b.shape().tied_embeddings && !has_lm_head;
     mlx::author_mlx_file(b, "Qwen3.5", &move |_, raw_name| {
         qwen3_5_mlx_name(raw_name, tied)
     })

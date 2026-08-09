@@ -67,27 +67,36 @@ const LLAMA_LIKE: &[&str] = &[
     "qwen3_moe",
     "gpt_oss",
     "gemma4",
-    // The ARCHITECTURE stems too, and they are not the same strings.
-    //
-    // Two spellings reach this list from two places. A checkpoint's
-    // `config.json` carries both a `model_type` (`qwen3_moe`) and an
-    // `architectures[0]` (`Qwen3MoeForCausalLM`), and `facts::arch_stem`
-    // lowercases the second and drops its `ForCausalLM` tail -- which gives
-    // `qwen3moe`, with no underscore.
-    //
-    // The SEAM passes the stem (`facts.arch_name`). The gate in
-    // `device_checkpoint_names` passed `model_type`. So the gate proved that
-    // every name a text states resolves, over five checkpoints, while the
-    // seam refused two of those checkpoints outright -- the two whose
-    // spellings differ. `llama`, `qwen3` and `gemma4` are the same either
-    // way, which is why nothing noticed.
-    //
-    // Both spellings, because both are real: this list answers "does a text
-    // serve this", and a name that means the same architecture must get the
-    // same answer whichever half of the config it came from.
-    "qwen3moe",
-    "gptoss",
 ];
+
+/// One architecture's name, with the punctuation two spellings disagree
+/// about removed.
+///
+/// A checkpoint's `config.json` carries both a `model_type` (`qwen3_moe`) and
+/// an `architectures[0]` (`Qwen3MoeForCausalLM`), and the driver used to
+/// reduce the second — lowercase it, drop its `ForCausalLM` tail — to reach
+/// `qwen3moe`, the same architecture without the underscore.
+///
+/// The seam passed the reduced stem; the gate in `device_checkpoint_names`
+/// passed `model_type`. So the gate proved that every name a text states
+/// resolves, over five checkpoints, while the seam refused two of those
+/// checkpoints outright — the two whose spellings differ. `llama`, `qwen3`
+/// and `gemma4` are the same either way, which is why nothing noticed.
+///
+/// THE SOURCE OF THAT DISAGREEMENT IS GONE. A catalog row STATES its
+/// architecture (`model::deployment::Advertised::arch`) instead of having one
+/// derived from whichever half of a config the caller happened to hold, so
+/// there is one spelling to reduce rather than two to reconcile. The
+/// reduction stays because a label is still typed by hand in the list below
+/// and in an operator's boot file, and one rule covers a spelling this driver
+/// has never seen where a second table entry would only cover the ones
+/// someone thought to add.
+fn canonical(arch: &str) -> String {
+    arch.chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
 
 /// Every architecture some text serves.
 #[must_use]
@@ -98,8 +107,9 @@ pub fn known() -> Vec<&'static str> {
 /// The text for `arch`, traced for `class`.
 ///
 /// `facts` and `metal` are the deployment's, and they are the caller's to
-/// supply because they come from the checkpoint's descriptor — not from
-/// anything this module could derive.
+/// supply because they come from the row's projected
+/// `model::deployment::Deployment` — not from anything this module could
+/// derive.
 ///
 /// # Errors
 ///
@@ -112,7 +122,7 @@ pub fn plan_for(
     facts: &model::families::llama_like::forward::facts::LlamaLikeFacts,
     metal: &model::families::llama_like::forward::facts::LlamaLikeMetalFacts,
 ) -> Result<ForwardPlan, Unfamiliar> {
-    if LLAMA_LIKE.contains(&arch) {
+    if serves(arch) {
         return Ok(model::families::llama_like::forward::llama_like_metal(
             facts, metal, class,
         ));
@@ -126,7 +136,8 @@ pub fn plan_for(
 /// Whether any text serves `arch`.
 #[must_use]
 pub fn serves(arch: &str) -> bool {
-    LLAMA_LIKE.contains(&arch)
+    let want = canonical(arch);
+    LLAMA_LIKE.iter().any(|known| canonical(known) == want)
 }
 
 #[cfg(test)]
@@ -147,38 +158,61 @@ mod tests {
         assert!(serves("gemma4"));
     }
 
-    /// Both spellings of one architecture get the same answer.
+    /// The row's own spelling is one this list answers for.
     ///
     /// The bug this pins was invisible to everything: a `config.json` carries
     /// a `model_type` (`qwen3_moe`) AND an `architectures[0]`
-    /// (`Qwen3MoeForCausalLM`), `facts::arch_stem` turns the second into
-    /// `qwen3moe`, and the SEAM passes the stem. The load-time name gate
-    /// passed `model_type`. So the gate reported five checkpoints resolving
-    /// every name their texts state, while the seam refused two of them at
-    /// `plan_for` -- and both reports were true, of different questions.
+    /// (`Qwen3MoeForCausalLM`), the driver's `arch_stem` turned the second
+    /// into `qwen3moe`, and the SEAM passed the stem while the load-time name
+    /// gate passed `model_type`. So the gate reported five checkpoints
+    /// resolving every name their texts state, while the seam refused two of
+    /// them at `plan_for` — and both reports were true, of different
+    /// questions.
     ///
-    /// `llama`, `qwen3` and `gemma4` are spelled the same either way, which
-    /// is why the two that are not went unnoticed.
+    /// There is ONE spelling now and it is the row's: a catalog row states
+    /// `Advertised::arch`, and that string is what `serve/load.rs` hands to
+    /// [`plan_for`]. So the question is no longer "do two derivations of a
+    /// name agree" — it is the sharper one this asserts, that the label a row
+    /// hands out is a label this list answers for. A row whose arch nothing
+    /// here serves is a checkpoint that loads and cannot fire, and that is
+    /// exactly what `tests/catalog_coverage.rs` enumerates.
     #[test]
-    fn both_spellings_of_an_architecture_get_the_same_answer() {
-        for (model_type, architecture) in [
-            ("qwen3_moe", "Qwen3MoeForCausalLM"),
-            ("gpt_oss", "GptOssForCausalLM"),
-            ("gemma4", "Gemma4ForConditionalGeneration"),
-            ("llama", "LlamaForCausalLM"),
-            ("qwen3", "Qwen3ForCausalLM"),
-        ] {
-            let stem = crate::facts::arch_stem(architecture);
-            assert_eq!(
-                serves(model_type),
-                serves(&stem),
-                "`{model_type}` and `{architecture}` (stem `{stem}`) are one \
-                 architecture, so a text either serves it or does not. The \
-                 seam asks with the STEM and the load gate asks with the \
-                 model_type, so a disagreement here is a checkpoint that \
-                 passes every gate and is then refused."
+    fn a_row_states_one_arch_so_two_spellings_cannot_disagree() {
+        // Every arch in the list resolves under the punctuation and case a
+        // hand-typed label may carry, which is the whole of what the two
+        // spellings used to differ by.
+        for known in known() {
+            assert!(serves(known), "`{known}` is in the list and must resolve");
+            assert!(
+                serves(&known.to_uppercase()),
+                "`{known}` typed in caps is the same architecture"
+            );
+            assert!(
+                serves(&known.replace('_', "-")),
+                "`{known}` hyphenated is the same architecture"
             );
         }
+    }
+
+    /// A spelling neither half of a config has produced yet still resolves.
+    ///
+    /// The list used to carry `qwen3_moe` AND `qwen3moe` as two entries, so
+    /// it answered for exactly the spellings someone had thought to add. It
+    /// carries one now and reduces before comparing, which is the difference
+    /// between a table of answers and a rule: `Qwen3-Moe` is not in the list
+    /// and never was, and it is the same architecture.
+    #[test]
+    fn a_spelling_the_list_does_not_carry_still_resolves() {
+        for spelling in ["Qwen3_Moe", "QWEN3MOE", "qwen3-moe", "Gpt-Oss", "GPT_OSS"] {
+            assert!(
+                serves(spelling),
+                "{spelling} names an architecture a text serves"
+            );
+        }
+        // The rule reduces punctuation and case, not letters: a different
+        // architecture stays different.
+        assert!(!serves("qwen3_5"));
+        assert!(!serves("qwen35"));
     }
 
     #[test]
@@ -212,7 +246,7 @@ mod tests {
     }
 }
 
-/// The deployment's facts, derived from what the descriptor says.
+/// The deployment's facts, derived from the row's projected shape.
 ///
 /// # Why this is not a fixture
 ///
@@ -272,6 +306,8 @@ pub fn facts_from_with(
     use model::families::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
     use model_compiler::dsl::{ScaleLayout, WeightRepr};
 
+    let sandwich_norms = has_tensor("layers.0.pre_feedforward_layernorm.weight");
+
     let facts = LlamaLikeFacts {
         hidden: geometry.hidden,
         layers: geometry.n_layers,
@@ -287,12 +323,24 @@ pub fn facts_from_with(
         // `serves` and then ran as a llama: the `(1 + w)` became `w`, and the
         // two output norms were dropped while `pre_feedforward_layernorm` was
         // bound where the attention's output norm belonged. Nothing faults.
-        norm_variant: if geometry.gemma {
+        // Decided by which norms the checkpoint SHIPS, the same rule
+        // `lowering/resolve.rs` already uses to bind them: "which one a
+        // checkpoint means is decided by which one it ships." A stack that
+        // norms both ways round each sub-layer publishes a
+        // `pre_feedforward_layernorm`; one that norms once does not, and has
+        // nothing for that name to bind to.
+        //
+        // The two move together on every checkpoint this driver serves, and
+        // that is an observation rather than a law: the `(1 + w)` scaling is
+        // a weight CONVENTION and the sandwich is an architecture. A stack
+        // that published one without the other would break here, loudly --
+        // this comment is the place to look.
+        norm_variant: if sandwich_norms {
             model_compiler::trace::NormVariant::Gemma
         } else {
             model_compiler::trace::NormVariant::Plain
         },
-        norm_placement: if geometry.gemma {
+        norm_placement: if sandwich_norms {
             model::families::llama_like::forward::facts::NormPlacement::Sandwich
         } else {
             model::families::llama_like::forward::facts::NormPlacement::Pre
@@ -334,7 +382,7 @@ pub fn facts_from_with(
         paged_multi_batch: true,
         qmm_multi_batch: true,
         // The checkpoint's own affine format. `AffineFormat` is what the
-        // descriptor stated; a pipeline built for the wrong point returns
+        // checkpoint's `config.json` stated; a pipeline built for the wrong point returns
         // fluent nonsense rather than failing, which is why neither number is
         // inferred from a tensor's shape (g64/b8 and g128/b4 pack identically).
         proj_repr: WeightRepr::Scaled {
@@ -426,13 +474,16 @@ pub fn facts_from_with(
         // read `swiglu_limit > 0.0` and fell through to `SiluMul`, so every
         // gemma checkpoint ran GELU's gate as SiLU. The two agree to about
         // 2% at the origin and diverge from there — finite, plausible, wrong.
-        // `hidden_activation: gelu_pytorch_tanh` is what gemma-4 states.
+        // `hidden_activation: gelu_pytorch_tanh` is what gemma-4 states, and
+        // the driver now READS that instead of inferring it from the family:
+        // the importer used to replace the statement with the `silu` default,
+        // so a family flag was the only signal left.
         activation: if geometry.swiglu_limit > 0.0 {
             model::families::llama_like::forward::facts::Activation::SwiGlu {
                 limit: geometry.swiglu_limit,
                 alpha: geometry.swiglu_alpha,
             }
-        } else if geometry.gemma {
+        } else if geometry.gelu_gate {
             model::families::llama_like::forward::facts::Activation::Geglu
         } else {
             model::families::llama_like::forward::facts::Activation::SiluMul
@@ -487,7 +538,7 @@ mod facts_tests {
     }
 
     #[test]
-    fn the_shape_comes_from_the_descriptor_and_not_from_a_fixture() {
+    fn the_shape_comes_from_the_row_and_not_from_a_fixture() {
         // This replaced `LlamaLikeFacts::qwen3_0_6b()` standing in the seam's
         // `launch` for every checkpoint — a fixture where a fact belongs, and
         // a deployment with other head counts would have traced another
@@ -520,6 +571,34 @@ mod facts_tests {
         assert!(fused.fused_qkv);
         assert_eq!(fused.qk_norm, model_compiler::facts::QkNorm::PerHead);
         assert!(fused.qkv_bias);
+    }
+
+    #[test]
+    fn the_sandwich_is_read_from_the_norms_the_checkpoint_ships() {
+        // Was `geometry.gemma`. The probe name is the load's canonical
+        // spelling -- `language_model.model.layers.0.pre_feedforward_
+        // layernorm.weight` with the prefix stripped, the same form
+        // `layers.0.self_attn.q_norm.weight` takes one field above. A typo
+        // here does not fault: it silently reads every checkpoint as
+        // single-norm and drops two norms per layer, which is the bug this
+        // replaced a family flag to avoid repeating.
+        let one = facts_from(&geometry(), |_| false).0;
+        assert_eq!(
+            one.norm_placement,
+            model::families::llama_like::forward::facts::NormPlacement::Pre
+        );
+        assert_eq!(one.norm_variant, model_compiler::trace::NormVariant::Plain);
+
+        let sandwich =
+            facts_from(&geometry(), |n| n == "layers.0.pre_feedforward_layernorm.weight").0;
+        assert_eq!(
+            sandwich.norm_placement,
+            model::families::llama_like::forward::facts::NormPlacement::Sandwich
+        );
+        assert_eq!(
+            sandwich.norm_variant,
+            model_compiler::trace::NormVariant::Gemma
+        );
     }
 
     #[test]

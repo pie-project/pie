@@ -838,8 +838,8 @@ fn dump_gpt_oss_cuda_kernels() {
 /// next question, not this one.
 #[test]
 fn the_glm5_decode_text_lowers() {
-    let facts = model::glm5::forward::facts::Glm5Facts::glm5_106b_a12b();
-    let plan = model::glm5::forward::glm5_cuda(&facts, FireClass::Decode);
+    let facts = model::glm_5::forward::facts::Glm5Facts::glm5_106b_a12b();
+    let plan = model::glm_5::forward::glm5_cuda(&facts, FireClass::Decode);
     let out = lower(&plan, &sampled(1), Fire::default())
         .unwrap_or_else(|e| panic!("glm5's decode text must lower: {e:?}"));
     assert!(
@@ -954,9 +954,9 @@ fn the_nemotron_h_decode_text_lowers() {
 /// per-layer embedding's K-1 adds landing back in the windows they read.
 #[test]
 fn the_gemma3n_decode_text_lowers() {
-    use model::gemma3n::forward::facts::Gemma3nFacts;
+    use model::gemma_3n::forward::facts::Gemma3nFacts;
     let facts = Gemma3nFacts::gemma3n_synthetic();
-    let plan = model::gemma3n::forward::gemma3n_cuda(&facts, FireClass::Decode);
+    let plan = model::gemma_3n::forward::gemma3n_cuda(&facts, FireClass::Decode);
     let out = lower(&plan, &sampled(1), Fire::default())
         .unwrap_or_else(|e| panic!("gemma3n's decode text must lower: {e:?}"));
     assert!(

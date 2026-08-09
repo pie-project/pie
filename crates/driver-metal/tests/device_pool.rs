@@ -6,9 +6,10 @@
 
 #![allow(clippy::print_stdout)]
 
-use driver_metal::gpu::SMALLEST_CLASS;
+use driver_metal::device::SMALLEST_CLASS;
 use driver_metal::Error;
-use driver_metal::gpu::{Compiler, Context, Pool, Stepper, Tables};
+use driver_metal::device::{Context, Pool, Stepper, Tables};
+use driver_metal::program::Compiler;
 
 const FILL: &str = r"
 #include <metal_stdlib>
@@ -28,7 +29,7 @@ fn context() -> Option<Context> {
     }
 }
 
-fn read_u32s(t: &driver_metal::gpu::Transient, count: usize) -> Vec<u32> {
+fn read_u32s(t: &driver_metal::device::Transient, count: usize) -> Vec<u32> {
     // SAFETY: shared storage, wide enough, and the step that wrote it has
     // signalled.
     unsafe { std::slice::from_raw_parts(t.contents().as_ptr().cast::<u32>(), count) }.to_vec()

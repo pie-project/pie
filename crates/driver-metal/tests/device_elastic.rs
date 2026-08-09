@@ -10,7 +10,7 @@
 #![allow(clippy::print_stdout)]
 
 use driver_metal::Error;
-use driver_metal::gpu::{Arena, Context, Elastic, Need, Pressure, Stepper, TILE, Tables, create_elastic, pages_for_bytes};
+use driver_metal::device::{Arena, Context, Elastic, Need, Pressure, Stepper, TILE, Tables, create_elastic, pages_for_bytes};
 
 /// Writes a known value through the elastic buffer, so a mapping that is not
 /// really there faults rather than passing.
@@ -89,7 +89,7 @@ fn a_kernel_writes_through_the_address_after_it_grows() {
     let mut tables = Tables::new();
     tables.bind_address(&context, 0, 0, address).expect("bind");
 
-    let compiler = driver_metal::gpu::Compiler::new(&context).expect("compiler");
+    let compiler = driver_metal::program::Compiler::new(&context).expect("compiler");
     let pipeline = compiler.compile(&context, TOUCH, "touch").expect("touch");
 
     let mut stepper = Stepper::new(&context).expect("stepper");
@@ -145,7 +145,7 @@ kernel void readback(device const uint* kv [[buffer(0)]],
 }
 ";
 
-fn read_u32s(t: &driver_metal::gpu::Transient, count: usize) -> Vec<u32> {
+fn read_u32s(t: &driver_metal::device::Transient, count: usize) -> Vec<u32> {
     // SAFETY: shared storage, wide enough, and the step that wrote it has
     // signalled -- `Stepper::run` waits.
     unsafe { std::slice::from_raw_parts(t.contents().as_ptr().cast::<u32>(), count) }.to_vec()
@@ -167,7 +167,7 @@ fn what_was_written_before_a_growth_is_still_there_after_it() {
     let mut buffer = create_elastic(&context, &arena, VIRTUAL).expect("sparse buffer");
     let address = buffer.gpu_address();
 
-    let compiler = driver_metal::gpu::Compiler::new(&context).expect("compiler");
+    let compiler = driver_metal::program::Compiler::new(&context).expect("compiler");
     let fill = compiler.compile(&context, SURVIVE, "fill").expect("fill");
     let readback = compiler
         .compile(&context, SURVIVE, "readback")
@@ -201,7 +201,7 @@ fn what_was_written_before_a_growth_is_still_there_after_it() {
         .expect("grow past the pattern");
     assert_eq!(buffer.gpu_address(), address, "the address moved");
 
-    let pool = driver_metal::gpu::Pool::new(4 * 1024 * 1024);
+    let pool = driver_metal::device::Pool::new(4 * 1024 * 1024);
     let out = pool.acquire(&context, BYTES).expect("readback buffer");
     tables
         .bind_address(&context, 0, 1, out.gpu_address())
@@ -242,7 +242,7 @@ fn the_host_alias_and_the_gpu_address_name_the_same_memory() {
     let mut buffer = create_elastic(&context, &arena, VIRTUAL).expect("sparse buffer");
     let address = buffer.gpu_address();
 
-    let compiler = driver_metal::gpu::Compiler::new(&context).expect("compiler");
+    let compiler = driver_metal::program::Compiler::new(&context).expect("compiler");
     let fill = compiler.compile(&context, SURVIVE, "fill").expect("fill");
     let readback = compiler
         .compile(&context, SURVIVE, "readback")
@@ -258,7 +258,7 @@ fn the_host_alias_and_the_gpu_address_name_the_same_memory() {
 
     let mut tables = Tables::new();
     tables.bind_address(&context, 0, 0, address).expect("kv");
-    let pool = driver_metal::gpu::Pool::new(4 * 1024 * 1024);
+    let pool = driver_metal::device::Pool::new(4 * 1024 * 1024);
     let out = pool.acquire(&context, BYTES).expect("readback buffer");
     tables
         .bind_address(&context, 0, 1, out.gpu_address())
@@ -676,7 +676,7 @@ fn a_host_move_over_the_pages_is_what_the_gpu_reads_afterwards() {
     let mut buffer = create_elastic(&context, &arena, VIRTUAL).expect("sparse buffer");
     let address = buffer.gpu_address();
 
-    let compiler = driver_metal::gpu::Compiler::new(&context).expect("compiler");
+    let compiler = driver_metal::program::Compiler::new(&context).expect("compiler");
     let readback = compiler
         .compile(&context, SURVIVE, "readback")
         .expect("readback");
@@ -695,7 +695,7 @@ fn a_host_move_over_the_pages_is_what_the_gpu_reads_afterwards() {
 
     let mut tables = Tables::new();
     tables.bind_address(&context, 0, 0, address).expect("kv");
-    let pool = driver_metal::gpu::Pool::new(4 * 1024 * 1024);
+    let pool = driver_metal::device::Pool::new(4 * 1024 * 1024);
     let out = pool.acquire(&context, BYTES).expect("readback buffer");
     tables
         .bind_address(&context, 0, 1, out.gpu_address())
@@ -753,7 +753,7 @@ fn a_resized_kv_pool_keeps_every_address_it_handed_out() {
     // took it again must be the SAME pool from every bound address's point of
     // view -- otherwise every argument table staged before the resize is
     // pointing at nothing, and the driver has no way to know which ones.
-    use driver_metal::gpu::pools::kv::Pool;
+    use driver_metal::pools::kv::Pool;
     use driver_metal::layout::kv::Shape;
 
     let shape = Shape {
@@ -842,7 +842,7 @@ fn a_fixed_pool_says_it_cannot_be_resized_rather_than_pretending() {
         println!("no Metal device; skipped");
         return;
     };
-    use driver_metal::gpu::pools::kv::Pool;
+    use driver_metal::pools::kv::Pool;
     use driver_metal::layout::kv::Shape;
 
     let shape = Shape {
@@ -888,7 +888,7 @@ fn a_pool_that_gave_memory_back_stops_reserving_it() {
     // budget says it has the same. `declare_mandatory` only ever raises --
     // two callers declaring different floors for one buffer must both be
     // honoured -- so the trim is what has to lower it.
-    use driver_metal::gpu::pools::kv::Pool;
+    use driver_metal::pools::kv::Pool;
     use driver_metal::layout::kv::Shape;
 
     let shape = Shape {

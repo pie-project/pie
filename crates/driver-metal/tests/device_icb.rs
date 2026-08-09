@@ -48,7 +48,8 @@
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use driver_metal::gpu::{Allocation, Compiler, Context};
+use driver_metal::device::{Allocation, Context};
+use driver_metal::program::Compiler;
 use driver_metal::layout::region::Region as _;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
@@ -103,10 +104,10 @@ fn a_fire_can_be_recorded_once_and_replayed() {
     // too, the probe is wrong; if it works and the ICB does not, the ICB is
     // the finding.
     {
-        let table = driver_metal::gpu::ArgumentTable::new(&context, 2).expect("a table");
+        let table = driver_metal::device::ArgumentTable::new(&context, 2).expect("a table");
         table.bind_address(0, a.gpu_address()).expect("binds");
         table.bind_address(1, seven.gpu_address()).expect("binds");
-        let mut stepper = driver_metal::gpu::Stepper::new(&context).expect("a stepper");
+        let mut stepper = driver_metal::device::Stepper::new(&context).expect("a stepper");
         stepper
             .run(|encoder| {
                 encoder.set_pipeline(&pipeline);
@@ -206,7 +207,7 @@ fn execute(
     icb: &ProtocolObject<dyn MTLIndirectCommandBuffer>,
     count: usize,
 ) {
-    let mut stepper = driver_metal::gpu::Stepper::new(context).expect("a stepper");
+    let mut stepper = driver_metal::device::Stepper::new(context).expect("a stepper");
     stepper
         .run(|encoder| {
             encoder.execute_commands(icb, 0..count)
@@ -214,7 +215,7 @@ fn execute(
         .expect("the ICB executes");
 }
 
-fn read(handle: &driver_metal::gpu::Handle) -> Vec<u32> {
+fn read(handle: &driver_metal::device::Handle) -> Vec<u32> {
     // SAFETY: the fire has retired, so the host owns the bytes.
     let bytes = unsafe {
         std::slice::from_raw_parts(handle.contents().as_ptr().cast::<u8>(), 16 * 4)
@@ -234,9 +235,9 @@ fn read(handle: &driver_metal::gpu::Handle) -> Vec<u32> {
 /// The number it prints is the one `.wiki/driver/graph-metal.md` is about.
 #[test]
 fn a_whole_fire_records_and_replays_faster_than_it_encodes() {
-    use driver_metal::gpu::{Regions, Stepper, record};
+    use driver_metal::device::{Regions, Stepper, record};
     use driver_metal::lowering::dispatch::{Geometry, plan};
-    use driver_metal::gpu::bind::encode::{Params, Pipelines, commands, encode};
+    use driver_metal::bind::encode::{Params, Pipelines, commands, encode};
     use driver_metal::lowering::executor::{Frame, Slice};
     use driver_metal::lowering::dispatch::{table, table_width};
     use model::families::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
@@ -307,7 +308,7 @@ fn a_whole_fire_records_and_replays_faster_than_it_encodes() {
         plan(&lowered, table(), frame, geometry, &mut store).expect("the fire plans");
     let params = Params::stage(&context, &dispatches).expect("scalars stage");
     let argtable =
-        driver_metal::gpu::ArgumentTable::new(&context, table_width(&dispatches))
+        driver_metal::device::ArgumentTable::new(&context, table_width(&dispatches))
             .expect("an argument table");
     pipelines
         .ensure(&context, &compiler, &dispatches)

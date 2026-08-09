@@ -9,3 +9,13 @@
 /// and one lowered text per backend.
 #[cfg(feature = "forward")]
 pub mod forward;
+
+/// The SHAPE: the numbers a checkpoint of this family has.
+///
+/// Ungated. A catalog row is written in these words, and a row must
+/// exist under every aspect.
+pub mod spec;
+
+/// The three projections a row of this family makes: its tensor
+/// manifest, its `Deployment`, and its traced text.
+pub mod project;

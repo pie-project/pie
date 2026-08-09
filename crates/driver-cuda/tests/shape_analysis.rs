@@ -87,8 +87,8 @@ fn families() -> Vec<(&'static str, Lowered)> {
         ),
         (
             "glm5",
-            lower_plan(&model::glm5::forward::glm5_cuda(
-                &model::glm5::forward::facts::Glm5Facts::glm5_106b_a12b(),
+            lower_plan(&model::glm_5::forward::glm5_cuda(
+                &model::glm_5::forward::facts::Glm5Facts::glm5_106b_a12b(),
                 FireClass::Decode,
             )),
         ),

@@ -398,6 +398,50 @@ pub struct DeviceBuffer {
     owner: Arc<AllocatorInner>,
 }
 
+/// A device-to-host read from a RAW span — a base and a length that the
+/// caller knows names live device memory.
+///
+/// The `unsafe` for this sat in `weights/stage::read_span`, which is a
+/// module that only wants the bytes back reaching for `cudaMemcpyAsync`
+/// itself. §7: `device/` is the only place vendor vocabulary is
+/// correct, and the way to hold `#![forbid(unsafe_code)]` elsewhere is
+/// for it to OFFER the operation rather than for callers to spell it.
+///
+/// Prefer [`DeviceBuffer::read_at`], which checks the span against a
+/// length it owns. This exists for the case where the caller holds a
+/// span into a buffer it does not have in hand — a published weight,
+/// whose base came from the load plan.
+///
+/// # Safety
+///
+/// `src` must name at least `dst.len()` readable device bytes for the
+/// duration of the copy, and `stream` must outlive it.
+///
+/// # Errors
+///
+/// The copy faulted.
+pub unsafe fn read_raw_span(
+    src: *const c_void,
+    dst: &mut [u8],
+    stream: StreamRef<'_>,
+) -> Result<()> {
+    if dst.is_empty() {
+        return Ok(());
+    }
+    check_rt(
+        unsafe {
+            cudaMemcpyAsync(
+                dst.as_mut_ptr().cast(),
+                src,
+                dst.len(),
+                cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                stream.as_raw(),
+            )
+        },
+        "cudaMemcpyAsync (read_raw_span)",
+    )
+}
+
 impl DeviceBuffer {
     /// The device address, for a launcher argument.
     pub const fn as_ptr(&self) -> *mut c_void {
@@ -412,6 +456,24 @@ impl DeviceBuffer {
     /// Was this a zero-byte allocation?
     pub const fn is_empty(&self) -> bool {
         self.bytes == 0
+    }
+
+    /// The address `offset` bytes in, or `None` if that leaves the
+    /// allocation.
+    ///
+    /// The safe form of `base.byte_add(offset)`, which `weights/stage`
+    /// wrote by hand with a SAFETY comment arguing that "the offset is
+    /// the plan's own and the arena was sized from `persistent_bytes`".
+    /// That argument is true and it is also unavailable to the compiler;
+    /// the buffer knows its own length, so it can just check.
+    ///
+    /// A span is a base and a count, so this takes the count too — an
+    /// offset that is in bounds for a zero-length read and out for the
+    /// read that follows is the interesting case, and answering only the
+    /// first question would miss it.
+    pub fn ptr_at(&self, offset: usize, len: usize) -> Option<*mut c_void> {
+        let end = offset.checked_add(len)?;
+        (end <= self.bytes).then(|| self.ptr.as_raw().wrapping_byte_add(offset))
     }
 
     /// Copy host bytes in, ordered on `stream`.

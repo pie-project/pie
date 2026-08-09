@@ -610,26 +610,37 @@ kernel!(nemotron_prepare_mamba_dt_da "ssm::nemotron_prepare_mamba_dt_da",
         ]),
     kernel!(zamba_rmsnorm_gated "ssm::zamba_rmsnorm_gated_bf16",
         operands = operands![
-            // UNSOURCED, and the reason is a disagreement worth
-            // resolving before guessing. The hand arm reads
-            // `(x, gate, y, w) = args[0..3]` — output at index 2,
-            // weight at 3 — while this row's operand ORDER is
-            // `x, gate, weight, y`. One of the two is describing the
-            // flat run wrongly, and there is no zamba fixture in the
-            // tree to tell which.
+            // THE "DISAGREEMENT" HERE WAS A CONFLATION, recorded across
+            // three sessions and resolved by reading `operands!`'s own
+            // contract: *"spelled the way the C++ declaration reads —
+            // `name: Ty`, in the CALLEE'S PARAMETER ORDER"*.
             //
-            // `Source::Div(&Source::Width(&Source::In(0)), &Source::Gdn("n_groups"))` exists for this
-            // row's `group_size` and is ready when the mapping is.
-            x: Buf,
-            gate: Buf,
-            weight: Buf,
-            y: BufMut,
-            n: I32,
-            hidden: I32,
-            gate_stride: I32,
-            group_size: I32,
-            eps: F32,
-            stream: Stream,
+            // So this list is the launcher's signature, and it says
+            // nothing about the flat argument run. The hand arm read
+            // `(x, gate, y, w) = args[0..3]`, which is
+            // `[in.., out.., weight..]` with n_in=2, n_out=1, n_w=1 —
+            // the ordinary convention. The two were describing DIFFERENT
+            // things and neither was wrong.
+            //
+            // What made it look like a contradiction is that this row
+            // happens to take its weight before its output, so the two
+            // orders differ by a swap. A row whose launcher takes them
+            // the other way round would have raised no question at all,
+            // which is the tell: the confusion was in the reading, not
+            // in either list.
+            x: Buf <- Source::In(0),
+            gate: Buf <- Source::In(1),
+            weight: Buf <- Source::Weight(0),
+            y: BufMut <- Source::Out(0),
+            n: I32 <- Source::Rows,
+            hidden: I32 <- Source::Width(&Source::In(0)),
+            gate_stride: I32 <- Source::Width(&Source::In(1)),
+            group_size: I32 <- Source::Div(
+                &Source::Width(&Source::In(0)),
+                &Source::Gdn("n_groups"),
+            ),
+            eps: F32 <- Source::Ctx("eps"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     kernel!(build_nemotron_moe_ptrs_aligned "ssm::build_nemotron_moe_ptrs_aligned_bf16",
         whole = true,

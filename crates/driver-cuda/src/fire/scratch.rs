@@ -31,9 +31,13 @@ pub(crate) struct Scratch {
     pub(crate) mask: Option<crate::device::DeviceBuffer>,
     /// The driver-owned attention landing buffer — see [`Self::attn_out`].
     pub(crate) attn_out: Option<crate::device::DeviceBuffer>,
+    /// The attention log-sum-exp — see [`Self::lse`].
+    pub(crate) lse: Option<crate::device::DeviceBuffer>,
+    /// The per-row live flags — see [`Self::row_valid`].
+    pub(crate) row_valid: Option<crate::device::DeviceBuffer>,
     pub(crate) named:
         std::collections::BTreeMap<model_compiler::trace::ValueId, crate::device::DeviceBuffer>,
-    /// The small per-fire u32 descriptor arrays, by slot.
+    /// The small per-fire u32 descriptor arrays, by slot — see [`slot`].
     pub(crate) slots: Vec<Option<crate::device::DeviceBuffer>>,
     /// PINNED host staging for those uploads, ONE PER SLOT.
     ///
@@ -49,6 +53,36 @@ pub(crate) struct Scratch {
     /// previous fire's event before it reclaims anything (`InFlight`).
     pub(crate) staging: Vec<Option<crate::device::PinnedBuf>>,
     pub(crate) epoch: crate::fire::recordings::PlanEpoch,
+}
+
+/// WHICH SLOT HOLDS WHAT, in one statement.
+///
+/// These were two private blocks in two functions — `kv_and_arrays` held
+/// 0..8 and `peel_tail_ctx` held 9..12 — which is a numbering nobody can
+/// check from either end. Two slots claiming one index is not a build
+/// error and not a fault: the second upload overwrites the first, and
+/// the fire binds a CSR that describes someone else.
+///
+/// A module of constants because the numbers are the interface. A row of
+/// an enum would be tidier and would also require every caller to import
+/// it; `slot::KV_INDPTR` reads the same and does not.
+pub(crate) mod slot {
+    pub(crate) const IDS: usize = 0;
+    pub(crate) const POS: usize = 1;
+    pub(crate) const KV_INDICES: usize = 2;
+    pub(crate) const KV_INDPTR: usize = 3;
+    pub(crate) const KV_LENS: usize = 4;
+    pub(crate) const QO: usize = 5;
+    pub(crate) const W_PAGE: usize = 6;
+    pub(crate) const W_OFF: usize = 7;
+    pub(crate) const SAMPLED: usize = 8;
+    // A PEEL'S TAIL NEEDS ITS OWN, because the fire's are still live: a
+    // peel launches BOTH regions and the prefix reads the fire's CSRs
+    // after the tail has uploaded its own.
+    pub(crate) const TAIL_INDPTR: usize = 9;
+    pub(crate) const TAIL_LENS: usize = 10;
+    pub(crate) const TAIL_INDICES: usize = 11;
+    pub(crate) const TAIL_QO: usize = 12;
 }
 
 impl Scratch {
@@ -140,6 +174,43 @@ impl Scratch {
         Ok(self.attn_out.as_ref().expect("just grown").as_ptr())
     }
 
+    /// The log-sum-exp the attention dispatches write beside their
+    /// output — POOLED, and it was not.
+    ///
+    /// It was `alloc.alloc(..)` per fire, moved into `InFlight` and freed
+    /// on retire. A captured exec bakes `lse_out_d`, and nothing bumped
+    /// the epoch when the next fire allocated a different one — so a
+    /// replay wrote the log-sum-exp of the fire it was serving into an
+    /// address that fire does not own. The allocator handing back the
+    /// same block for the same size is what made it survive, and that is
+    /// a property of a request pattern rather than of the code.
+    ///
+    /// Pooling makes the address stable and, when it is not, makes the
+    /// move bump the epoch — which is the whole contract `Scratch` exists
+    /// to keep.
+    pub(crate) fn lse(
+        &mut self,
+        alloc: &crate::device::Allocator,
+        bytes: usize,
+    ) -> crate::Result<*mut std::ffi::c_void> {
+        Self::grow(&mut self.lse, &mut self.epoch, alloc, "attention lse", bytes.max(64))?;
+        Ok(self.lse.as_ref().expect("just grown").as_ptr())
+    }
+
+    /// Which rows of the fire are live, for the KV write descriptors.
+    /// Pooled for [`Self::lse`]'s reason: a capture bakes `row_valid_d`.
+    pub(crate) fn row_valid(
+        &mut self,
+        alloc: &crate::device::Allocator,
+        rows: usize,
+        stream: crate::device::StreamRef<'_>,
+    ) -> crate::Result<*mut std::ffi::c_void> {
+        Self::grow(&mut self.row_valid, &mut self.epoch, alloc, "row valid", rows.max(64))?;
+        let b = self.row_valid.as_mut().expect("just grown");
+        b.memset(1, stream)?;
+        Ok(b.as_ptr())
+    }
+
     /// The custom attention mask, pooled like the score sink and for the
     /// same reason. See [`crate::fire::page_mask::element_mask`].
     pub(crate) fn mask(
@@ -220,9 +291,27 @@ impl Scratch {
         // A `BTreeMap` entry rather than an `Option`, so it takes the
         // same path through a temporary: the invariant is that growing
         // is what bumps, and an entry that grew is still a grow.
+        //
+        // THE FAILURE PATH PUTS IT BACK, and it did not. `grow` allocates
+        // BEFORE it assigns, so an `Exhausted` propagated with `held`
+        // still owning the old buffer — which then dropped, freeing an
+        // address a captured exec had baked, with the entry already gone
+        // from the map and the epoch never bumped.
+        //
+        // `Exhausted` is a RETRYABLE answer by design ("an engine
+        // deciding whether to evict, shrink the batch or refuse needs the
+        // figure"), so the next fire lands on the same bucket at the same
+        // epoch and replays into the freed block. Every other `grow`
+        // caller passes `&mut self.<field>`, where a failure leaves the
+        // old buffer exactly where it was; this is the only one that
+        // removes first, so it is the only one that had to say so.
         let mut held = self.named.remove(&v);
-        Self::grow(&mut held, &mut self.epoch, alloc, "named seam buffer", bytes)?;
-        let b = self.named.entry(v).or_insert(held.expect("just grown"));
+        let grown = Self::grow(&mut held, &mut self.epoch, alloc, "named seam buffer", bytes);
+        if let Some(back) = held {
+            self.named.insert(v, back);
+        }
+        grown?;
+        let b = self.named.get_mut(&v).expect("just grown");
         b.memset(0, stream)
     }
 }

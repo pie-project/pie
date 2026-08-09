@@ -5,12 +5,12 @@
 //! `.wiki/driver/real-metal-north-star.md` §9 asks for a tree with a
 //! direction, and the tree had two cycles instead:
 //!
-//! * `gpu/device/recording.rs` imported `lowering::dispatch::Dispatch` while
-//!   `gpu/fire/run.rs` imported `Recordings`. The ICB path knew what a fire
+//! * `device/recording.rs` imported `lowering::dispatch::Dispatch` while
+//!   `fire/run.rs` imported `Recordings`. The ICB path knew what a fire
 //!   was, so recording could not be understood, tested or replaced without
 //!   the model layer in scope.
-//! * `gpu/device/ring.rs` imported `gpu/program/channel.rs` while ten files
-//!   under `gpu/program/` imported `gpu/device/`. That one was worse for
+//! * `device/ring.rs` imported `program/channel.rs` while ten files
+//!   under `program/` imported `device/`. That one was worse for
 //!   reading badly: `channel.rs` is `pub use driver::*` and nothing else, so
 //!   the arrow pointed at an external crate's ABI and *looked* like a
 //!   dependency on the shader compiler.
@@ -22,7 +22,7 @@
 //!
 //! # What it does not check
 //!
-//! Cycles in general. This names ONE edge — out of `gpu/device/`, upward —
+//! Cycles in general. This names ONE edge — out of `device/`, upward —
 //! because that is the edge the crate has actually paid for twice, and a
 //! general cycle detector over `use` lines is a resolver, which is the
 //! compiler's job. If a third layer starts costing something, add its rule
@@ -30,7 +30,7 @@
 //!
 //! # Why it is not gated
 //!
-//! It reads files. `gpu/device/*.rs` is on disk whether or not `metal-4`
+//! It reads files. `device/*.rs` is on disk whether or not `metal-4`
 //! compiles it, so this runs in the portable half too and the no-GPU CI job
 //! catches a re-introduced cycle without a Mac. That is the same reason it
 //! is absent from the `required-features` list in `Cargo.toml`: absence is
@@ -38,9 +38,9 @@
 
 use std::path::Path;
 
-/// Layers above `gpu/device/`, spelled as they appear in a `use`.
+/// Layers above `device/`, spelled as they appear in a `use`.
 ///
-/// `gpu/device/` is the bottom of the Metal half: a context, memory, an
+/// `device/` is the bottom of the Metal half: a context, memory, an
 /// encoder, a queue. Everything here is something built ON that.
 const ABOVE: &[&str] = &[
     "crate::lowering",
@@ -66,12 +66,12 @@ const ABOVE: &[&str] = &[
 const ALLOWED: &[(&str, &str)] = &[("keepalive.rs", "crate::program::compile::Compiler")];
 
 #[test]
-fn gpu_device_does_not_import_the_layers_built_on_it() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/gpu/device");
+fn device_does_not_import_the_layers_built_on_it() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/device");
     let mut scanned = 0usize;
     let mut violations = Vec::new();
 
-    for entry in std::fs::read_dir(&dir).expect("gpu/device is a directory") {
+    for entry in std::fs::read_dir(&dir).expect("device is a directory") {
         let path = entry.expect("a readable entry").path();
         if path.extension().is_none_or(|e| e != "rs") {
             continue;
@@ -105,7 +105,7 @@ fn gpu_device_does_not_import_the_layers_built_on_it() {
                 continue;
             }
             violations.push(format!(
-                "gpu/device/{name}:{} imports {layer}\n    {line}",
+                "device/{name}:{} imports {layer}\n    {line}",
                 number + 1
             ));
         }
@@ -113,7 +113,7 @@ fn gpu_device_does_not_import_the_layers_built_on_it() {
 
     assert!(
         violations.is_empty(),
-        "gpu/device/ is the bottom of the Metal half, and these point up:\n\n{}\n\n\
+        "device/ is the bottom of the Metal half, and these point up:\n\n{}\n\n\
          Either the thing being reached for belongs lower (move it, as \
          `channel.rs` moved to the crate root), or what `device/` needs is a \
          narrower type it can own (as `recording` took `Command` instead of \
@@ -127,19 +127,19 @@ fn gpu_device_does_not_import_the_layers_built_on_it() {
     // for, one directory over.
     assert!(
         scanned > 15,
-        "the scan read only {scanned} files under gpu/device/, which means it \
+        "the scan read only {scanned} files under device/, which means it \
          is not scanning -- a broken audit passes"
     );
 }
 
-/// The crate root names the portable half, and `gpu` — nothing else.
+/// The crate root names the portable half — nothing else.
 ///
 /// # Why this is the same rule as the one above
 ///
 /// A facade is only a facade if the alternative is not also public. Sixty-five
 /// device types used to be re-exported flat from `lib.rs`, so `Stepper` had
-/// two paths — `driver_metal::Stepper` and `driver_metal::gpu::Stepper` — and
-/// the engine could reach past `gpu::serve::Shell` into any of them without
+/// two paths — `driver_metal::device::Stepper` and `driver_metal::device::Stepper` — and
+/// the engine could reach past `serve::Shell` into any of them without
 /// the compiler saying a word. That is §5's "one concept, two names" happening
 /// inside a single crate, and §9's "everything else goes private" is the fix.
 ///
@@ -150,9 +150,18 @@ fn gpu_device_does_not_import_the_layers_built_on_it() {
 fn the_crate_root_exposes_the_portable_half_and_one_door() {
     // What `lib.rs` may re-export at the root. Every one answers a question
     // no GPU changes, so it is the same on a machine with no Metal at all.
+    //
+    // THREE became TWO, and the one that left is the interesting entry.
+    // `facts::{ModelFacts, ModelFamily}` was a MODEL DEFINITION sitting at
+    // the root of a driver — a private normalization of a `pie.model/1`
+    // descriptor plus an enum of family names — and it passed this audit
+    // every time, because "is it portable" and "does it belong here" are
+    // different questions and only the first was being asked. It answered a
+    // question no GPU changes, and it answered it for the second time in the
+    // workspace. It is deleted, not moved: `model::catalog` answers it once,
+    // for every driver.
     const PORTABLE_ROOT: &[&str] = &[
         "error::{Error, Result}",
-        "facts::{ModelFacts, ModelFamily}",
         "layout::{Batch, Region, Request}",
     ];
 
@@ -180,8 +189,8 @@ fn the_crate_root_exposes_the_portable_half_and_one_door() {
     assert!(
         unexpected.is_empty(),
         "the crate root re-exports {unexpected:?}, which is not part of the \
-         portable half.\n\nThe device half is reached through `gpu::`, and \
-         only through it: a second path to a type is a way around the facade \
+         portable half.\n\nThe device half is reached through the room that \
+         owns the name, and only through it: a second path to a type is a way around the facade \
          that the compiler cannot see. If this genuinely belongs at the root, \
          add it to PORTABLE_ROOT here — that is a line a reviewer reads, which \
          appending to a flat re-export list was not."

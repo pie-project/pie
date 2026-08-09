@@ -21,6 +21,14 @@
 //! | `model::descriptor` | ungated | `config` |
 //! | `driver-cuda` -> `model` | `["config"]`, then `["contract"]` | all three |
 //!
+//! Two of those three modules no longer exist and neither does the
+//! `config` feature — the catalog refactor deleted all of it. The table
+//! stays because the LESSON is about the resolver, not about those
+//! modules: the same trap is available to `model::catalog`'s
+//! `forward`-gated methods the moment a consumer forgets to name the
+//! aspect, and the gates are read from `lib.rs` rather than listed here
+//! precisely so this test keeps working across that kind of change.
+//!
 //! The third is the one this file exists for, because it was got wrong
 //! TWICE — once by omission and once by a fix that replaced the missing
 //! feature instead of adding to it — and both times the workspace was green.
@@ -241,16 +249,38 @@ fn the_gate_reader_still_finds_gates() {
         gates.len()
     );
     assert_eq!(
-        gates.get("descriptor").map(BTreeSet::len),
+        gates.get("weight_names").map(BTreeSet::len),
         Some(1),
-        "`descriptor` is gated on `config` alone"
+        "`weight_names` is gated on `contract` alone"
     );
+    // THE `any(..)` CASE, which is the one that decides whether a
+    // consumer gets reported wrong for a gate it satisfies.
+    //
+    // It used to be `deployment_cuda`, gated on `forward` AND `config`,
+    // where collecting both names and demanding both was right. Both
+    // that module and that feature are deleted, and the surviving
+    // multi-name gate is `families`, which is an `any(..)`. The rule
+    // INVERTS: `any(chat, forward)` is satisfied by either name, so
+    // recording it as a requirement of both would report both drivers
+    // wrong for a module they can see — each declares `forward`, and
+    // `driver-metal/src/model/text.rs` names `model::families` today.
+    //
+    // So the assertion is that the reader records it as NO requirement.
+    // `Some(empty)` rather than `None` is the whole point: `None` means
+    // the module was never seen, which reads as "no requirement" at the
+    // call site too and would disarm this module silently.
     assert_eq!(
-        gates.get("deployment_cuda").map(BTreeSet::len),
-        Some(2),
-        "`deployment_cuda` is gated on `forward` AND `config` — the `all(..)` \
-         case, which is the one a reader that only handles a single `feature = \
-         \"..\"` gets wrong"
+        gates.get("families").map(BTreeSet::len),
+        Some(0),
+        "`families` is gated on `chat` OR `forward`; a reader that treats \
+         an `any(..)` as a requirement of every name in it reports a \
+         consumer wrong for a gate it satisfies"
+    );
+    assert!(
+        gates.contains_key("families"),
+        "`families` must be SEEN and recorded as unrequired, not missed — \
+         a module the reader never parsed also has no requirements, and \
+         the two are indistinguishable at the call site"
     );
     assert!(
         gates

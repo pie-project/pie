@@ -5,6 +5,7 @@
 //! capture-or-replay, the GDN context, the KV pools, delivery) are its
 //! parts. `.wiki/driver/graph.md` is about this file.
 
+use crate::fire::scratch::slot;
 use driver_api::local::{
     PIE_STATUS_DRIVER_ERROR,
     PIE_STATUS_EXHAUSTED,
@@ -234,13 +235,38 @@ fn capture_or_replay<R: crate::bind::Resolver>(
     use crate::bind::{DispatchPlan, run};
     use crate::fire::recordings::{BucketKey, fire_predicates, union_eligibility};
 
-    let eligibility = union_eligibility(None);
+    // THE FIRE'S OWN LORA, and this read `None`.
+    //
+    // `union_eligibility` is "deliberately a function over the fire's
+    // staged state rather than a flag someone sets", and it was handed a
+    // literal `None` — so it answered `None` unconditionally and the
+    // `UngroupedLora` refusal never fired. An ungrouped adapter set is a
+    // host-side loop whose launch COUNT follows the adapters, so a
+    // capture of one cannot serve another; that is the whole reason the
+    // variant exists.
+    //
+    // SAFETY: the pointer is the `LoraFireState` `lora_phase` staged for
+    // this fire, alive for the whole call — `step_impl` holds it in
+    // `lora_state` past `capture_or_replay`.
+    let lora = ctx.lora.map(|(s, _)| unsafe { &*s });
+    let eligibility = union_eligibility(lora);
     let key = BucketKey::new(
         u32::try_from(requests).unwrap_or(0),
         u32::try_from(rows).unwrap_or(0),
         class,
         model_id,
-    );
+    )
+    // AND THE ADAPTER SHAPE, which `BucketKey::lora_shape` argues for at
+    // length and which nothing set. A capture bakes the adapter device
+    // pointers, the lane count and the ranks; two fires with the same
+    // requests and tokens but different adapters shared a bucket, so the
+    // second replayed the first's pointers.
+    //
+    // `stage_qkv_adapters` already computes the fingerprint — "the lane
+    // structure, the adapter device pointers, the grouping mode, and the
+    // post-staging arena base" — and the call site discarded it with
+    // `let _ = fingerprint`.
+    .with_lora(lora.map_or(0, |l| l.capture_fingerprint));
 
     // The fire's own bits, and the only thing that differs between two
     // replays of one exec. NOT synchronized after: the upload and the replay
@@ -390,7 +416,8 @@ pub(crate) fn launch_impl(
 /// [`Shell::lowerings`]. Nothing here reads the fire's data; it reads the
 /// shape, which is what makes the answer reusable.
 fn build_lowering(
-    family: &dyn model::deployment_cuda::PlannedFamily,
+    row: &'static dyn model::catalog::Variant,
+    deployed: model::catalog::Deployed<'_>,
     class: model_compiler::trace::FireClass,
     fire_rows: &[model_compiler::lower::Row],
     union_asked: bool,
@@ -398,9 +425,27 @@ fn build_lowering(
     use crate::bind::DispatchPlan;
     use model_compiler::lower::{Fire, GuardMode, lower_with};
 
-    let plan = family.trace(class);
+    let plan = row.trace(class, deployed).map_err(|e| i32::from(crate::Error::from(e)))?;
+    // `captures_across_splits` FOLLOWS THE GUARD MODE, and it did not.
+    //
+    // `lower.rs` states the consequence of getting this wrong, at the
+    // site that reads the flag: with it clear, "the host's counts are
+    // the truth and an empty region emits nothing" — so a capture bakes
+    // THIS fire's split into the graph, which is "a wrong answer no
+    // byte-parity run can see, because it is only wrong on the REPLAY."
+    //
+    // `BucketKey` carries requests, tokens, model and the LoRA shape. It
+    // does NOT carry the split, and it should not have to: under `Union`
+    // both regions lower with `rows_device` launches and each early-outs
+    // on the `PeelWindowWord`, so one exec serves every split. That is
+    // what makes the split a runtime word instead of a key axis — and it
+    // only holds if the flag is set when the mode is `Union`.
+    //
+    // Passing `false` under `Union` was the two halves disagreeing: the
+    // key said "the split does not matter" and the lowering froze it.
     let lower_as = |g: GuardMode| {
-        lower_with(&plan, fire_rows, Fire { captures_across_splits: false }, g).map_err(|e| {
+        let captures_across_splits = g == GuardMode::Union;
+        lower_with(&plan, fire_rows, Fire { captures_across_splits }, g).map_err(|e| {
             eprintln!("[driver-cuda] launch: uncovered: {e:?}");
             PIE_STATUS_UNSUPPORTED
         })
@@ -479,7 +524,7 @@ struct Admitted {
 fn admit(
     state: &Shell,
     step: &driver_api::local::PieStepDesc,
-) -> Result<(Admitted, Box<dyn model::deployment_cuda::PlannedFamily>), i32> {
+) -> Result<(Admitted, &'static dyn model::catalog::Variant), i32> {
     use model_compiler::trace::FireClass;
 
     // A USER MASK IS SERVED NOW, and it used to be refused.
@@ -514,9 +559,21 @@ fn admit(
     let dep = &model.deployment;
     // `trace()` is the one question a `Deployment` does not answer,
     // because a `ForwardPlan` is `model-compiler`'s and the family text
-    // is what produces it. Everything else below is the value.
-    let family = model::deployment_cuda::facts_from_hf(&model.checkpoint())
-            .map_err(|e| i32::from(crate::Error::from(e)))?;
+    // is what produces it. So the ROW comes along — a `&'static` borrow
+    // of a const table, which is the whole cost.
+    //
+    // It used to re-derive a `Box<dyn PlannedFamily>` here, ON EVERY
+    // FIRE: eleven `*_facts_from_hf` functions over a parsed
+    // `config.json`, allocating and cloning per-layer `Vec`s, to feed a
+    // lowering that is cached precisely because it costs 3.3 ms.
+    let Some(row) = model::catalog::find(model.id) else {
+        eprintln!(
+            "[driver-cuda] launch: this build has no catalog row named \
+             {:?}, which cannot happen after a load that matched one",
+            model.id
+        );
+        return Err(PIE_STATUS_INVALID_ARGUMENT);
+    };
 
     let token_ids = slice_of(step.token_ids.ptr, step.token_ids.len);
     let position_ids = slice_of(step.position_ids.ptr, step.position_ids.len);
@@ -655,7 +712,7 @@ fn admit(
         );
         return Err(PIE_STATUS_UNSUPPORTED);
     }
-    Ok((Admitted { class, rows, requests, fire_rows }, family))
+    Ok((Admitted { class, rows, requests, fire_rows }, row))
 }
 
 /// Run the instance's registered program over the fire's logits.
@@ -864,6 +921,7 @@ fn deliver_logits(
     instances: &std::collections::BTreeMap<u64, InstanceEntry>,
     channels: &std::collections::BTreeMap<u64, ChannelState>,
     logits_staging: &mut Option<crate::device::PinnedBuf>,
+    retired_staging: &mut Vec<crate::device::PinnedBuf>,
     frame: &PieFrameDesc,
     model: &LoadedModel,
     lowered: &model_compiler::lower::Lowered,
@@ -902,7 +960,7 @@ let logits_value = (0..lowered.launches.len())
         })
     });
 let instance_ids = slice_of(frame.instance_ids.ptr, frame.instance_ids.len);
-let vocab = usize::try_from(model.hf.vocab_size).unwrap_or(0);
+let vocab = model.deployment.shape.vocab as usize;
 
 // EVERY REQUEST, each its OWN reader channel and its OWN row.
 //
@@ -951,8 +1009,13 @@ if let (Some(lv), false) = (logits_value, readouts.is_empty())
             // The shell's buffer, grown to fit and reused. Not the
             // debt's: see `FireDebt::staging`.
             if logits_staging.as_ref().is_none_or(|p| p.len() < buf.len()) {
-                *logits_staging = Some(
-                    crate::device::PinnedBuf::new(buf.len())?,
+                // PARKED, not dropped. `PinnedBuf::drop` is a
+                // `cudaFreeHost` on this thread and is not stream-ordered,
+                // so freeing here would pull the memory out from under an
+                // earlier fire's queued D2H and under its debt's
+                // `(ptr, len)`. See `Shell::retired_staging`.
+                retired_staging.extend(
+                    logits_staging.replace(crate::device::PinnedBuf::new(buf.len())?),
                 );
             }
             let pin = logits_staging.as_mut().expect("just sized");
@@ -1043,6 +1106,24 @@ fn ready_device_state(state: &mut Shell) -> Result<(), i32> {
     {
         let done = state.in_flight.pop_front().expect("just checked");
         retire(done);
+    }
+    // NOTHING IN FLIGHT IS THE ONLY MOMENT a replaced staging buffer is
+    // certainly unreferenced, and what makes that true is an ORDERING
+    // worth stating because nothing else does:
+    //
+    //   `host_fn(retire_fire, ..)` is enqueued FIRST, then the event
+    //   `InFlight::done` is recorded. Both are stream-ordered, so the
+    //   event cannot complete until the callback has returned.
+    //
+    // So an entry leaving `in_flight` proves its debt is already paid and
+    // dropped, and an EMPTY `in_flight` proves it of every fire. A debt
+    // cannot outlive the entry it belongs to, which is the only thing
+    // this clear needs.
+    //
+    // The two non-runahead paths pay synchronously and never push an
+    // entry at all, so they are covered by the same statement.
+    if state.in_flight.is_empty() {
+        state.retired_staging.clear();
     }
     while state.in_flight.len() >= RUNAHEAD_DEPTH {
         let oldest = state.in_flight.pop_front().expect("nonempty");
@@ -1346,7 +1427,7 @@ fn kv_pools_for(
             return Err(PIE_STATUS_UNSUPPORTED);
         }
     }
-    let kv_heads_i = model.hf.num_key_value_heads;
+    let kv_heads_i = i32::try_from(model.deployment.shape.kv_heads).unwrap_or(0);
     let n = dep.layers;
     // Per-layer geometry, family-decided: gemma-4's two layer kinds
     // disagree on head dim, and its trailing layers own NO pages (they
@@ -1451,7 +1532,7 @@ struct FireInputs {
     d_w_page: *const u32,
     d_w_off: *const u32,
     /// One byte per row, all ones — the mask the sampler ANDs against.
-    d_valid: crate::device::DeviceBuffer,
+    d_valid: *mut core::ffi::c_void,
 }
 
 /// Grow the KV pool to fit the step and upload every descriptor array it
@@ -1495,8 +1576,10 @@ fn kv_and_arrays(
     // attention plans below want the same two numbers and returning them
     // would make the phase's result a tuple whose second half is a
     // restatement of its arguments.
-    let (kv_heads_i, head_dim_i) =
-        (model.hf.num_key_value_heads, model.hf.head_dim_kernel.max(model.hf.head_dim));
+    let (kv_heads_i, head_dim_i) = (
+        i32::try_from(model.deployment.shape.kv_heads).unwrap_or(0),
+        i32::try_from(model.deployment.shape.head_dim_alloc()).unwrap_or(0),
+    );
     let layers = kv_pools_for(
         kv,
         &mut fire_arrays.epoch,
@@ -1513,24 +1596,15 @@ fn kv_and_arrays(
     // reason: a capture bakes an address, so the buffer has to be the same
     // one next fire with only its contents refreshed. Slots are positional
     // and this is the whole list of them.
-    const S_IDS: usize = 0;
-    const S_POS: usize = 1;
-    const S_KV_INDICES: usize = 2;
-    const S_KV_INDPTR: usize = 3;
-    const S_KV_LENS: usize = 4;
-    const S_QO: usize = 5;
-    const S_W_PAGE: usize = 6;
-    const S_W_OFF: usize = 7;
-    const S_SAMPLED: usize = 8;
-    let d_ids = fire_arrays.upload_u32(alloc, S_IDS, token_ids, stream.as_ref())?;
-    let d_pos = fire_arrays.upload_u32(alloc, S_POS, position_ids, stream.as_ref())?;
+    let d_ids = fire_arrays.upload_u32(alloc, slot::IDS, token_ids, stream.as_ref())?;
+    let d_pos = fire_arrays.upload_u32(alloc, slot::POS, position_ids, stream.as_ref())?;
     let d_kv_indices =
-        fire_arrays.upload_u32(alloc, S_KV_INDICES, kv_indices, stream.as_ref())?;
+        fire_arrays.upload_u32(alloc, slot::KV_INDICES, kv_indices, stream.as_ref())?;
     let d_kv_indptr =
-        fire_arrays.upload_u32(alloc, S_KV_INDPTR, kv_indptr, stream.as_ref())?;
+        fire_arrays.upload_u32(alloc, slot::KV_INDPTR, kv_indptr, stream.as_ref())?;
     let d_kv_lens =
-        fire_arrays.upload_u32(alloc, S_KV_LENS, kv_lens, stream.as_ref())?;
-    let d_qo = fire_arrays.upload_u32(alloc, S_QO, qo_indptr, stream.as_ref())?;
+        fire_arrays.upload_u32(alloc, slot::KV_LENS, kv_lens, stream.as_ref())?;
+    let d_qo = fire_arrays.upload_u32(alloc, slot::QO, qo_indptr, stream.as_ref())?;
     // WHICH ROWS the epilogue gathers, from the rows the step described.
     // Derived here rather than taken from `sampling_indices` directly, so
     // the pointer and the guard that produced it cannot disagree: the
@@ -1546,7 +1620,7 @@ fn kv_and_arrays(
         // a launch nobody makes is one more thing to keep in step.
         core::ptr::null()
     } else {
-        fire_arrays.upload_u32(alloc, S_SAMPLED, &sampled_rows, stream.as_ref())?
+        fire_arrays.upload_u32(alloc, slot::SAMPLED, &sampled_rows, stream.as_ref())?
     };
 
     // Write targets: each request appends its NEW tokens at the CSR tail.
@@ -1564,11 +1638,11 @@ fn kv_and_arrays(
             w_off.push(pos % page_size as u32);
         }
     }
-    let d_w_page = fire_arrays.upload_u32(alloc, S_W_PAGE, &w_page, stream.as_ref())?;
-    let d_w_off = fire_arrays.upload_u32(alloc, S_W_OFF, &w_off, stream.as_ref())?;
-    let mut d_valid = alloc.alloc(rows)?;
-    d_valid
-        .copy_from_host(&vec![1u8; rows], stream.as_ref())?;
+    let d_w_page = fire_arrays.upload_u32(alloc, slot::W_PAGE, &w_page, stream.as_ref())?;
+    let d_w_off = fire_arrays.upload_u32(alloc, slot::W_OFF, &w_off, stream.as_ref())?;
+    // POOLED, because a capture bakes `row_valid_d`. See
+    // `Scratch::row_valid`.
+    let d_valid = fire_arrays.row_valid(alloc, rows, stream.as_ref())?;
 
     Ok(FireInputs {
         page_size,
@@ -1642,12 +1716,19 @@ fn raise_attn_plans(
     if scratch_slot.is_none() {
         let ws = AttentionWorkspace::allocate(&mut sops, 32 << 20, 16 << 20, 2)?;
         let prefill_ws = AttentionWorkspace::allocate(&mut sops, 32 << 20, 16 << 20, 2)?;
+        // A THIRD workspace, for the peel tail, and the reason is
+        // `prefill_ws`'s: a plan writes into the workspace it was raised
+        // against, and a peel launches BOTH regions, so the tail cannot
+        // plan into the prefix's.
+        let tail_ws = AttentionWorkspace::allocate(&mut sops, 32 << 20, 16 << 20, 2)?;
         *scratch_slot = Some(FireScratch {
             ws,
             prefill_ws,
+            tail_ws,
             decode_plan: DecodePlan::new(),
             decode_plan_full: DecodePlan::new(),
             prefill_plan: PrefillPlan::new(),
+            tail_plan: DecodePlan::new(),
         });
     }
     let scratch = scratch_slot.as_mut().expect("just ensured");
@@ -1678,13 +1759,17 @@ fn raise_attn_plans(
     // The cost is plan-raise time. It is not runtime waste — the arm a
     // fire does not take is skipped by the conditional, not executed.
     let planless_prefill = dep.prefill == model::deployment::PrefillStyle::Planless;
+    // The four FlashInfer plan raises below all want the same number in
+    // the same width. Bound once so a plan and the buffer it schedules
+    // over cannot come from different readings.
+    let q_heads_i = i32::try_from(model.deployment.shape.q_heads).unwrap_or(0);
     let decode_plan_full_ptr = if let Some((d_sliding, d_full)) = dep.decode_head_dims() {
         // TWO decode plans, one per layer kind — the C++'s
         // `decode_plan_sliding` / `decode_plan_full` pair, because
         // the kinds disagree on head dim and the planner bakes it in.
         decode_plan.plan_decode_variant(
             kv_indptr,
-            model.hf.num_attention_heads,
+            q_heads_i,
             kv_heads,
             d_sliding as i32,
             page_size,
@@ -1696,7 +1781,7 @@ fn raise_attn_plans(
         );
         decode_plan_full.plan_decode_variant(
             kv_indptr,
-            model.hf.num_attention_heads,
+            q_heads_i,
             kv_heads,
             d_full as i32,
             page_size,
@@ -1710,7 +1795,7 @@ fn raise_attn_plans(
     } else {
         decode_plan.plan_decode(
             kv_indptr,
-            model.hf.num_attention_heads,
+            q_heads_i,
             kv_heads,
             head_dim,
             page_size,
@@ -1731,7 +1816,7 @@ fn raise_attn_plans(
             qo_indptr,
             kv_indptr,
             kv_lens,
-            model.hf.num_attention_heads,
+            q_heads_i,
             kv_heads,
             head_dim,
             page_size,
@@ -1830,7 +1915,7 @@ fn publish_seam_pins(
         kv_indptr,
         kv_lens,
         page_size,
-        u32::try_from(model.hf.num_attention_heads).unwrap_or(0),
+        model.deployment.shape.q_heads,
         score_window,
     );
     let (d_scores, d_folded, d_score_indptr) = match sink {
@@ -1906,8 +1991,8 @@ fn publish_seam_pins(
     let d_attn_out = if dep.attn_output == model::deployment::AttnOutput::DriverPinned {
         fire_arrays.attn_out(
             alloc,
-            rows * model.hf.num_attention_heads as usize
-                * usize::try_from(model.hf.head_dim).unwrap_or(0)
+            rows * model.deployment.shape.q_heads as usize
+                * model.deployment.shape.head_dim as usize
                 * 2,
         )?
     } else {
@@ -2116,7 +2201,7 @@ fn run_sampling_programs(
         device_ordinal,
         named_bufs,
     } = sites;
-    let vocab = u32::try_from(model.hf.vocab_size).unwrap_or(0);
+    let vocab = model.deployment.shape.vocab;
     let readout = (0..lowered.launches.len()).rev().find_map(|i| {
         dplan.spec(i).outs.first().and_then(|a| match a {
             Arg::Named { value, .. } => Some(*value),
@@ -2305,7 +2390,7 @@ fn lora_phase(
         core::ptr::null_mut()
     } else {
         scratch
-            .attn_out(alloc, rows * model.hf.intermediate_size.max(1) as usize * 2)
+            .attn_out(alloc, rows * model.deployment.shape.intermediate.max(1) as usize * 2)
             .unwrap_or(core::ptr::null_mut())
     };
     let named_bufs = &scratch.named;
@@ -2343,12 +2428,12 @@ fn lora_phase(
                 &mut ops,
                 lora_arena,
                 Some(&table),
-                model.hf.num_hidden_layers,
+                i32::try_from(model.deployment.layers).unwrap_or(0),
                 i32::try_from(rows).unwrap_or(0),
-                model.hf.hidden_size,
-                model.hf.num_attention_heads,
-                model.hf.num_key_value_heads,
-                model.hf.intermediate_size,
+                i32::try_from(model.deployment.shape.hidden).unwrap_or(0),
+                i32::try_from(model.deployment.shape.q_heads).unwrap_or(0),
+                i32::try_from(model.deployment.shape.kv_heads).unwrap_or(0),
+                i32::try_from(model.deployment.shape.intermediate).unwrap_or(0),
                 i32::try_from(tp_size).unwrap_or(1),
                 post,
                 &stage_rows,
@@ -2359,6 +2444,259 @@ fn lora_phase(
             staged.map(|s| (s, gate))
         });
     lora_state
+}
+
+
+/// A peel TAIL's attention state: its own plan, its own rebased CSRs.
+///
+/// `Launch::peel`'s doc says a prepared plan "is found by the
+/// rectangle's ROW COUNT", and this is where that stops being a
+/// sentence. A peel's tail serves rows `[split, N)` — a different
+/// request count, so FlashInfer's planner produces a different schedule,
+/// and handing it the fire's is handing it a plan that does not describe
+/// the launch. `bridge_smoke`'s hooked leg built this by hand to prove
+/// the HANDING-OVER worked; the driver never built one, so the peel
+/// worked in a test harness and nowhere else.
+///
+/// THE CSRs ARE REBASED, not sliced. FlashInfer reads a prefix sum that
+/// starts at zero, so a sub-batch cannot borrow the fire's — the tail's
+/// `kv_page_indptr` is the fire's suffix minus its own first entry, and
+/// its page indices start where that entry points.
+///
+/// Everything else the tail inherits, because everything else is a fact
+/// about the FIRE rather than about the rectangle: the layers, the
+/// workspace, the landing buffers, the window table.
+#[allow(clippy::too_many_arguments)]
+/// A peel tail's rebased CSRs — the part that needs no device.
+#[derive(Debug, PartialEq, Eq)]
+struct TailCsrs {
+    /// Where the tail's pages begin inside the fire's index array.
+    base: usize,
+    /// The tail's page indptr, starting at zero.
+    indptr: Vec<u32>,
+    /// The tail's token indptr, starting at zero.
+    qo: Vec<u32>,
+}
+
+/// REBASED, not sliced.
+///
+/// FlashInfer reads a prefix sum that starts at zero, so a sub-batch
+/// cannot borrow the fire's: `indptr[i]` must be the count of pages
+/// BEFORE request `split + i` within the tail, which is the fire's entry
+/// minus the fire's entry at `split`.
+///
+/// Extracted from [`peel_tail_ctx`] because it is the half that can be
+/// silently wrong — every value here is a plausible number, and an
+/// off-by-one produces a plan for the wrong requests rather than a
+/// fault. The rest of that function needs an allocator, a stream and a
+/// planner; this needs nothing, so it is the half a test can hold.
+/// The `[start, count]` a `_devwin` launch reads — the only statement of
+/// where a peel splits.
+///
+/// TWO KERNEL FORMS READ IT and they read it differently, which is why
+/// getting it wrong is silent in both directions:
+///
+/// * the PREFIX form (`qkv_fused.cu:42`) runs rows `[0, start)` —
+///   `if (win != nullptr && r >= win[0]) return;`
+/// * the TAIL form (`split_packed.cu:61`, `kv_paged.cu:57`,
+///   `rope.cu:507`) runs rows `[start, start + count)` —
+///   `if (n < w0 || n >= w0 + w1) return;`
+///
+/// So an UNPEELED fire wants `(rows, 0)`: the prefix runs everything and
+/// the tail runs nothing. It used to answer `(0, rows)`, which is the
+/// exact opposite — the hook-free prefix computed NOTHING and the hooked
+/// tail ran over every row. That was harmless while an unpeeled fire
+/// lowered no `_devwin` launches at all, and stopped being harmless when
+/// `captures_across_splits` began following the guard mode, because
+/// under `Union` both regions lower whether this fire marks a row or not.
+fn peel_word(
+    fire_rows: &[model_compiler::lower::Row],
+    axis: Option<model_compiler::trace::PeelWindow>,
+    rows: usize,
+) -> (u32, u32) {
+    let Some(axis) = axis else {
+        // No peel in the lowering at all: one region, every row.
+        return (u32::try_from(rows).unwrap_or(0), 0);
+    };
+    // THE SAME PREDICATE `lower::split_at` USES, because two derivations
+    // of one split is how they drift — and under `Union` the rectangle
+    // cannot be that second derivation, since both regions carry the
+    // whole window by design.
+    let marked: fn(&model_compiler::lower::Row) -> bool = match axis {
+        model_compiler::trace::PeelWindow::HookFreePrefix => |r| r.hooked,
+        model_compiler::trace::PeelWindow::UnmaskedPrefix => |r| r.custom_mask,
+    };
+    let start = fire_rows.iter().position(marked).unwrap_or(fire_rows.len());
+    (
+        u32::try_from(start).unwrap_or(0),
+        u32::try_from(fire_rows.len().saturating_sub(start)).unwrap_or(0),
+    )
+}
+
+fn tail_csrs(kv_indptr: &[u32], qo_indptr: &[u32], split: usize) -> TailCsrs {
+    let page0 = kv_indptr.get(split).copied().unwrap_or(0);
+    let tok0 = qo_indptr.get(split).copied().unwrap_or(0);
+    TailCsrs {
+        base: page0 as usize,
+        indptr: kv_indptr
+            .get(split..)
+            .unwrap_or(&[])
+            .iter()
+            .map(|p| p.saturating_sub(page0))
+            .collect(),
+        qo: qo_indptr
+            .get(split..)
+            .unwrap_or(&[])
+            .iter()
+            .map(|p| p.saturating_sub(tok0))
+            .collect(),
+    }
+}
+
+fn peel_tail_ctx(
+    fire: &crate::bind::AttnCtx,
+    scratch: &mut crate::fire::scratch::Scratch,
+    plan: &mut crate::bind::DecodePlan,
+    ws: &mut crate::fire::attention_workspace::AttentionWorkspace<
+        cudarc::runtime::sys::cudaEvent_t,
+    >,
+    alloc: &crate::device::Allocator,
+    stream: crate::device::StreamRef<'_>,
+    raw_stream: *mut core::ffi::c_void,
+    kv_indptr: &[u32],
+    kv_lens: &[u32],
+    kv_indices: &[u32],
+    qo_indptr: &[u32],
+    // The tail's first ROW, which is what the lowering states.
+    split: usize,
+    // The fire's row count, to tell rows from requests.
+    rows: usize,
+    // Whether the family keeps a second decode plan per layer kind.
+    two_kind: bool,
+    // Bytes per row of the guard-owned attention landing, and of the
+    // log-sum-exp beside it. Both are pinned by the DRIVER, so both are
+    // addressed from a base the tail has to advance past the prefix.
+    o_row_bytes: usize,
+    lse_row_bytes: usize,
+    q_heads: i32,
+    kv_heads: i32,
+    head_dim: i32,
+    page_size: i32,
+) -> Result<Option<crate::bind::AttnCtx>, i32> {
+    // A split at zero is no split.
+    if split == 0 {
+        return Ok(None);
+    }
+    // ONE ROW PER REQUEST, or this function cannot do its arithmetic.
+    //
+    // `split` is a ROW index — `Launch::rows.start` — and everything it
+    // indexes below (`kv_indptr`, `kv_lens`, `qo_indptr`) is per REQUEST.
+    // In a decode fire those coincide and the peel is a decode-shaped
+    // thing. In a prefill they do not, and a silent mis-index would
+    // produce a plan for the wrong requests: real pointers, plausible
+    // numbers, wrong answer.
+    //
+    // So it is a REFUSAL rather than an assumption. A peeled prefill is
+    // not lowered today; when it is, this needs the qo_indptr search that
+    // turns a row into its request, and it should be written then rather
+    // than guessed now.
+    if rows != kv_lens.len() || split >= kv_lens.len() {
+        return Err(PIE_STATUS_UNSUPPORTED);
+    }
+    // A TWO-KIND FAMILY NEEDS TWO TAIL PLANS, and this builds one.
+    //
+    // gemma-4 keeps `decode_plan_full` beside the sliding one because its
+    // layer kinds disagree on head dim, and `attn_plan` picks between
+    // them per layer. A tail with only the sliding plan would serve its
+    // full layers from a plan built for a different head dim — so the
+    // peel refuses the family rather than half-serving it, and the second
+    // plan is the work to do when a peeled gemma-4 exists.
+    if two_kind {
+        return Err(PIE_STATUS_UNSUPPORTED);
+    }
+    let TailCsrs { base, indptr: tail_indptr, qo: tail_qo } =
+        tail_csrs(kv_indptr, qo_indptr, split);
+
+    let d_indptr = scratch.upload_u32(alloc, slot::TAIL_INDPTR, &tail_indptr, stream)?;
+    let d_lens = scratch.upload_u32(alloc, slot::TAIL_LENS, &kv_lens[split..], stream)?;
+    let d_indices =
+        scratch.upload_u32(alloc, slot::TAIL_INDICES, &kv_indices[base.min(kv_indices.len())..], stream)?;
+    let d_qo = scratch.upload_u32(alloc, slot::TAIL_QO, &tail_qo, stream)?;
+
+    let mut sops = crate::fire::attention_workspace::LiveStagingOps;
+    ws.begin_plan_update(&mut sops)?;
+    plan.plan_decode(
+        &tail_indptr,
+        q_heads,
+        kv_heads,
+        head_dim,
+        page_size,
+        ws.view(),
+        raw_stream,
+        false,
+        // `-1`, MATCHING the fire's own `plan_decode`, not
+        // `fire.window_left`. The two are equal today and that is a
+        // coincidence: the window a row uses is per LAYER
+        // (`Source::AttnWindow` reads `window_left_by_layer`), and the
+        // plan is raised unbounded for every layer kind. A tail planned
+        // against a different bound than the prefix is two regions of one
+        // fire disagreeing about the cache.
+        -1,
+    );
+    ws.end_plan_update(&mut sops, raw_stream)?;
+
+    Ok(Some(crate::bind::AttnCtx {
+        decode_plan: plan.as_ptr(),
+        // THE WORKSPACE ITS OWN PLAN WAS RAISED IN, which is the whole
+        // reason `tail_ws` exists and which inheriting `..fire.clone()`
+        // silently undid. A FlashInfer launcher reads the schedule out of
+        // the workspace it is HANDED, so a tail carrying the tail plan's
+        // handle beside the PREFIX's workspace executes the prefix's
+        // schedule — built for all N requests against the fire's CSRs —
+        // while its own sits unread. Every pointer valid, every number
+        // plausible, the wrong answer.
+        //
+        // `AttnCtx::prefill_workspace`'s doc states the rule: "a launcher
+        // must take the workspace its own plan was raised in."
+        workspace: ws.view(),
+        // NULL, so a tail that reaches for either DECLINES.
+        //
+        // `attn_plan` picks `decode_plan_full` on a full-attention layer
+        // of a two-kind family, and `prefill_plan` for a prefill row.
+        // Neither was replanned for this sub-batch, so inheriting them
+        // means the fire's schedule against the tail's rebased CSRs and
+        // request count. The guard `!attn_plan(..).is_null()` turns each
+        // into a refusal instead.
+        decode_plan_full: core::ptr::null_mut(),
+        prefill_plan: core::ptr::null_mut(),
+        kv_page_indptr_d: d_indptr,
+        kv_last_page_lens_d: d_lens,
+        kv_page_indices_d: d_indices,
+        qo_indptr_d: d_qo,
+        num_requests: i32::try_from(kv_lens.len() - split).unwrap_or(0),
+        num_pages_in_batch: i32::try_from(kv_indices.len().saturating_sub(base)).unwrap_or(0),
+        first_token: i32::try_from(split).unwrap_or(0),
+        // THE DRIVER-PINNED OUTPUTS ADVANCE PAST THE PREFIX. These two
+        // are the guard-owned landings — the ones a row reaches through
+        // `Or(&Out(0), &Attn("o_out"))` when the trace states no slot —
+        // so nothing windows them and the tail would otherwise write its
+        // rows over the prefix's. A stated output IS windowed, by
+        // `resolve_arg_windowed`, which is why only these two move.
+        o_out: fire.o_out.wrapping_byte_add(split * o_row_bytes),
+        lse_out_d: fire.lse_out_d.wrapping_byte_add(split * lse_row_bytes),
+        // NULL, so a tail that wants them DECLINES rather than writing
+        // through the fire's. The score CSR and the mask indptr are
+        // indexed by the FIRE's rows; a tail addressing them at
+        // tail-relative indices reads someone else's rows and the answer
+        // is wrong rather than absent. `AttnNonZero` turns each of these
+        // into a per-row guard, so the refusal names the operand.
+        score_out: core::ptr::null_mut(),
+        score_indptr_d: core::ptr::null(),
+        folded_out: core::ptr::null_mut(),
+        mask_d: core::ptr::null(),
+        mask_indptr_d: core::ptr::null(),
+        ..fire.clone()
+    }))
 }
 
 pub(crate) fn step_impl(
@@ -2379,19 +2717,21 @@ pub(crate) fn step_impl(
     use model_compiler::trace::ValueId;
 
     let t_head = std::time::Instant::now();
-    let (Admitted { class, rows, requests, fire_rows }, family) = admit(state, step)?;
+    let (Admitted { class, rows, requests, fire_rows }, row) = admit(state, step)?;
     // THE MUTATION FIRST, AND THEN THE BORROWS. `ready_device_state` takes
     // `&mut Shell`, so every shared borrow this function goes on to hold —
     // `model`, the lowering, the stream, the allocator — has to be taken
-    // after it. Reading the layer count out as a NUMBER rather than
-    // keeping `model` alive across the call is the whole of what that
-    // costs, and it is what lets the phase be a function at all.
-    let layers = state
-        .model
-        .as_ref()
-        .ok_or(PIE_STATUS_INVALID_ARGUMENT)?
-        .hf
-        .num_hidden_layers;
+    // after it. This is the REFUSAL and nothing more: a fire with no model
+    // loaded stops here rather than inside `ready_device_state`, and no
+    // value is carried across, so no borrow is either.
+    //
+    // It used to read `hf.num_hidden_layers` out as a number here, and
+    // that number was shadowed forty lines later by `FireInputs.layers`
+    // without ever being read — a dead binding that was nonetheless the
+    // last thing in this file holding a parsed `config.json` open.
+    if state.model.is_none() {
+        return Err(PIE_STATUS_INVALID_ARGUMENT);
+    }
     ready_device_state(state)?;
     // BEFORE the forward, so a prologue's channel cells have addresses.
     // See `ensure_sessions`.
@@ -2413,14 +2753,23 @@ pub(crate) fn step_impl(
     // Everything between here and `DispatchPlan` is a pure function of the
     // key, and it costs ~3.3 ms on a 0.6B decode. See `Shell::lowerings`.
     let key = LoweringKey {
-        model_id: u64::from(layers.unsigned_abs()),
+        model_id: state.load_generation,
         class,
         rows: u32::try_from(rows).unwrap_or(0),
         rows_digest: digest_rows(&fire_rows),
         union_asked: state.boot.supergraph && dep.recurrent.is_none(),
     };
     if !state.lowerings.contains_key(&key) {
-        let built = build_lowering(family.as_ref(), class, &fire_rows, key.union_asked)?;
+        let built = build_lowering(
+            row,
+            model::catalog::Deployed {
+                tp_size: model.tp_size,
+                layer_scalars: &model.gemma_layer_scalars,
+            },
+            class,
+            &fire_rows,
+            key.union_asked,
+        )?;
         state.lowerings.insert(key, built);
     }
     let LoweredFire { plan, lowered, dplan, union } =
@@ -2553,8 +2902,10 @@ pub(crate) fn step_impl(
             stream,
         )?;
 
-    let lse = alloc
-        .alloc(rows * model.hf.num_attention_heads as usize * 4)?;
+    // POOLED, because a capture bakes `lse_out_d`. See `Scratch::lse`.
+    let lse = state
+        .fire_arrays
+        .lse(alloc, rows * model.deployment.shape.q_heads as usize * 4)?;
 
 
     // The guard-owned attention values, discovered from the lowering as
@@ -2596,6 +2947,11 @@ pub(crate) fn step_impl(
     // the word was wrong, and a wrong word is how the next reader
     // learns to branch on a family again.
     let planless = dep.prefill == model::deployment::PrefillStyle::Planless;
+    // ── The attention state a rectangle executes against. ──
+    //
+    // A struct literal and deliberately left as one: every field is a
+    // fact the phases above already computed, so a function would take
+    // twenty arguments to save naming twenty fields.
     let attn = AttnCtx {
         decode_plan,
         decode_plan_full,
@@ -2632,8 +2988,8 @@ pub(crate) fn step_impl(
         first_token: 0,
         w_page_d: d_w_page.cast(),
         w_off_d: d_w_off.cast(),
-        row_valid_d: d_valid.as_ptr().cast(),
-        lse_out_d: lse.as_ptr().cast(),
+        row_valid_d: d_valid.cast(),
+        lse_out_d: lse.cast(),
         window_left: -1,
         window_left_by_layer: window_by_layer,
         logits_soft_cap: 0.0,
@@ -2664,10 +3020,6 @@ pub(crate) fn step_impl(
         dplan,
         rows,
     );
-
-    // AFTER the adapter phase, which grows the scratch: a shared borrow
-    // of `fire_arrays` taken before it would forbid the growth.
-    let named_bufs = &state.fire_arrays.named;
 
     // ONE HANDLE FOR THE DRIVER, its stream rebound per fire. See
     // `Shell::cublas`: creating and destroying one per fire cost 3.2 ms.
@@ -2708,42 +3060,59 @@ pub(crate) fn step_impl(
     // "all rows" therefore ran the tail's program over the PREFIX rows
     // too, silently, on every peeled fire.
     //
-    // The window is read off the lowering rather than re-derived, because
-    // the lowering already answered: the tail rectangle IS the window its
-    // launches want, and two derivations of one split is how they drift.
+    // RE-DERIVED FROM THE ROWS, and it used to be read off the tail
+    // rectangle. That was right, and then `captures_across_splits` began
+    // following the guard mode — under `Union` BOTH regions get the whole
+    // window as their rectangle, deliberately, because the launches are
+    // full-window grids and this word is what they read.
+    //
+    // So the rectangle stopped carrying the split at the exact moment the
+    // word became the only thing that does. `l.rows.start` read `0`, the
+    // word said "start 0, count ALL", and that is the no-split word the
+    // whole `_devwin` mechanism exists to stop being: the tail's program
+    // over the prefix's rows, and the prefix's over none of them, because
+    // `qkv_fused.cu`'s prefix form early-outs on `r >= win[0]`.
+    //
+    // The comment here used to argue that re-deriving is "how two
+    // derivations of one split drift". It is, and the answer is to derive
+    // it from the SAME PLACE `lower::split_at` does — the fire's rows and
+    // the axis's own predicate — rather than from a rectangle that is
+    // allowed to describe something else.
     if state.peel_win.is_none() {
         state.peel_win = Some(
             crate::device::PeelWindowWord::new(alloc)?,
         );
     }
     let peel_win = state.peel_win.as_mut().expect("just ensured");
-    let (peel_start, peel_count) = lowered
-        .launches
-        .iter()
-        .find(|l| l.peel.is_some_and(|p| p.tail))
-        .map_or_else(
-            // No peel lowered: the whole fire is one region, which is what
-            // an unpeeled fire means.
-            || (0, u32::try_from(rows).unwrap_or(0)),
-            |l| (l.rows.start, l.rows.end.saturating_sub(l.rows.start)),
-        );
+    let peel_axis = lowered.launches.iter().find_map(|l| l.peel.map(|p| p.axis));
+    let (peel_start, peel_count) = peel_word(&fire_rows, peel_axis, rows);
     peel_win.set(peel_start, peel_count);
     peel_win.upload(stream.as_ref())?;
     let peel_window_ptr = peel_win.device_ptr();
 
+    // ── The dispatch context: what every generated branch reads. ──
+    //
+    // The other half of the pair. `AttnCtx` is what an ATTENTION
+    // rectangle reads and this is what any rectangle does — the stream,
+    // the cublas handle, the per-layer tables, the fire's own words.
     let ctx = DispatchCtx {
         sampling_indices: d_sampled.cast::<i32>(),
         sampled_rows: i32::try_from(sampled_rows.len()).unwrap_or(0),
         stream: raw_stream,
         cublas: cublas.handle().expect("created").cast(),
-        eps: model.hf.rms_norm_eps,
-        rope_theta: model.hf.rope_theta,
+        eps: model.deployment.norm_eps,
+        // The FIRST layer's base, which is what a single `rope_theta`
+        // ever meant: the stacks that use one theta throughout repeat
+        // it per layer, and the stacks that do not are read out of
+        // `rope_theta_by_layer` on the next line. Zero for a
+        // deployment with no attention layers at all.
+        rope_theta: model.deployment.attention.first().map_or(0.0, |a| a.rope_theta),
         rope_theta_by_layer: theta_by_layer,
         rotary_by_layer,
-        head_dim: model.hf.head_dim,
-        num_q_heads: model.hf.num_attention_heads,
-        num_kv_heads: model.hf.num_key_value_heads,
-        vocab: model.hf.vocab_size,
+        head_dim: i32::try_from(model.deployment.shape.head_dim).unwrap_or(0),
+        num_q_heads: i32::try_from(model.deployment.shape.q_heads).unwrap_or(0),
+        num_kv_heads: i32::try_from(model.deployment.shape.kv_heads).unwrap_or(0),
+        vocab: i32::try_from(model.deployment.shape.vocab).unwrap_or(0),
         gate_second: false,
         rope_interleaved: false,
         token_ids: d_ids.cast_mut().cast(),
@@ -2783,8 +3152,59 @@ pub(crate) fn step_impl(
     };
 
     lap("bind");
-    let mut resolver = LiveResolver { model, named: &named_bufs };
-    let regions = AttnRegions::whole(Some(&attn));
+    // THE TAIL'S OWN STATE, when the lowering peeled. `peel_start` is
+    // the split the fire already computed for its device word; a tail
+    // serves `[split, N)`, which is a different request count and
+    // therefore a different FlashInfer schedule.
+    //
+    // Built after the adapter phase because it takes the scratch
+    // mutably, and before the resolver for the same reason `named_bufs`
+    // is: a shared borrow held across an upload would forbid the growth.
+    // AN EMPTY TAIL IS NOT A TAIL. Under `Union` both peel regions lower
+    // whether or not this fire marks any rows, so `peel_axis` is `Some`
+    // on an unpeeled fire too and the split lands at `rows` — "the tail
+    // begins after the last row", which is the word for no split. The
+    // context is for a tail that has rows in it.
+    let tail_ctx = if peel_start > 0 && peel_count > 0 && (peel_start as usize) < rows {
+        let fs = state.scratch.as_mut().ok_or(PIE_STATUS_DRIVER_ERROR)?;
+        let (tail_plan, tail_ws) = (&mut fs.tail_plan, &mut fs.tail_ws);
+        peel_tail_ctx(
+            &attn,
+            &mut state.fire_arrays,
+            tail_plan,
+            tail_ws,
+            alloc,
+            stream.as_ref(),
+            raw_stream,
+            &kv_indptr,
+            &kv_lens,
+            &kv_indices,
+            &qo_indptr,
+            peel_start as usize,
+            rows,
+            dep.decode_head_dims().is_some(),
+            // The same two extents `publish_seam_pins` and the LSE
+            // allocation are sized from, so a stride cannot drift from
+            // the buffer it walks.
+            model.deployment.shape.q_heads as usize
+                * model.deployment.shape.head_dim as usize
+                * 2,
+            model.deployment.shape.q_heads as usize * 4,
+            i32::try_from(model.deployment.shape.q_heads).unwrap_or(0),
+            i32::try_from(model.deployment.shape.kv_heads).unwrap_or(0),
+            i32::try_from(model.deployment.shape.head_dim_alloc()).unwrap_or(0),
+            page_size,
+        )?
+    } else {
+        None
+    };
+    let named_bufs = &state.fire_arrays.named;
+    let mut resolver = LiveResolver { model, named: named_bufs };
+    // ── Which prepared state each rectangle gets. ──
+    let regions = match tail_ctx.as_ref() {
+        Some(tail) => AttnRegions::split(&attn, tail),
+        None => AttnRegions::whole(Some(&attn)),
+    };
     // The last use of `alloc` is above, so the shared borrow is dead and the
     // capture can take the same allocator mutably — which is the point: a
     // capture has to be opened on the allocator that owns what the fire
@@ -2800,11 +3220,12 @@ pub(crate) fn step_impl(
         _ => return Err(PIE_STATUS_EXHAUSTED),
     };
     lap("ctx");
+    // ── The walk: capture, replay, or straight onto the stream. ──
     let result = if union {
         capture_or_replay(
             &mut state.supergraph,
             state.fire_arrays.epoch,
-            u64::from(model.hf.num_hidden_layers.unsigned_abs()),
+            state.load_generation,
             &plan, &fire_rows, &lowered, &dplan, exec_frame, &mut resolver, &ctx,
             regions, gdn_ctx.as_ref(), capture_alloc, capture_preds, stream.as_ref(),
             requests, rows, class,
@@ -2845,7 +3266,7 @@ pub(crate) fn step_impl(
     let mut debt = owes.map(|(completion, cells)| FireDebt {
         staging: None,
         readouts: Vec::new(),
-        vocab: usize::try_from(model.hf.vocab_size).unwrap_or(0),
+        vocab: model.deployment.shape.vocab as usize,
         cells,
         completion,
         notify: state.notify,
@@ -2900,6 +3321,7 @@ pub(crate) fn step_impl(
             &state.instances,
             &state.channels,
             &mut state.logits_staging,
+            &mut state.retired_staging,
             frame,
             model,
             lowered,
@@ -2946,11 +3368,30 @@ pub(crate) fn step_impl(
         // device and undoes everything above. The next launch
         // reclaims it — see `InFlight`.
         lap("debt");
-        let done = crate::device::Event::new()?;
-        stream.as_ref().record(&done)?;
+        // A LIVE DEBT WITH NO ENTRY IS THE ONE HOLE in "nothing in flight
+        // proves every debt is paid". `host_fn` has already succeeded
+        // here, so the debt is on the stream; if `Event::new` or `record`
+        // fails and `?` returns, no `InFlight` is ever pushed, the next
+        // `ready_device_state` sees an empty queue, and it clears
+        // `retired_staging` out from under a callback that has not run.
+        //
+        // Paid inline instead, exactly as the `host_fn` failure path
+        // above does — the callback WILL still run, but after a
+        // synchronize it has nothing left to read that is not stable.
+        let done = match crate::device::Event::new()
+            .and_then(|e| stream.as_ref().record(&e).map(|()| e))
+        {
+            Ok(e) => e,
+            Err(_) => {
+                let _ = stream.as_ref().synchronize();
+                return Err(PIE_STATUS_DRIVER_ERROR);
+            }
+        };
         state.in_flight.push_back(InFlight {
             done,
-            scratch: [Some(lse), Some(d_valid), _slot_ids_buf]
+            // `lse` and `d_valid` are POOLED now, so they are not here:
+            // handing a pooled buffer to `InFlight` would free the pool.
+            scratch: [_slot_ids_buf]
                 .into_iter()
                 .flatten()
                 .collect(),
@@ -2961,3 +3402,108 @@ pub(crate) fn step_impl(
     Ok(())
 }
 
+
+#[cfg(test)]
+mod peel_tests {
+    use super::{tail_csrs, TailCsrs};
+
+    use model_compiler::lower::Row;
+    use model_compiler::trace::PeelWindow;
+    use super::peel_word;
+
+    fn rows(hooked: &[bool]) -> Vec<Row> {
+        hooked
+            .iter()
+            .map(|&h| Row { hooked: h, ..Row::default() })
+            .collect()
+    }
+
+    /// The three cases the two kernel forms have to agree on.
+    ///
+    /// PREFIX form runs `[0, start)`; TAIL form runs
+    /// `[start, start + count)`. Read the assertions as "which rows does
+    /// each kernel form execute", because that is the only thing the word
+    /// means.
+    #[test]
+    fn the_peel_word_says_which_rows_each_form_runs() {
+        // NO PEEL IN THE LOWERING: prefix runs all four, tail runs none.
+        assert_eq!(peel_word(&rows(&[false; 4]), None, 4), (4, 0));
+
+        // A PEEL LOWERED AND NO ROW MARKED — which is what `Union` does
+        // to an unpeeled fire, since both regions lower unconditionally.
+        // Same answer: the whole fire is the prefix.
+        assert_eq!(
+            peel_word(&rows(&[false; 4]), Some(PeelWindow::HookFreePrefix), 4),
+            (4, 0),
+            "an unpeeled fire under Union must still run its prefix over \
+             every row — `(0, 4)` would make the prefix form compute \
+             NOTHING and the tail form run over all four"
+        );
+
+        // A CONTIGUOUS MARKED SUFFIX: prefix [0,2), tail [2,4).
+        assert_eq!(
+            peel_word(&rows(&[false, false, true, true]), Some(PeelWindow::HookFreePrefix), 4),
+            (2, 2)
+        );
+
+        // EVERY ROW MARKED: no prefix, the tail is the fire.
+        assert_eq!(peel_word(&rows(&[true; 4]), Some(PeelWindow::HookFreePrefix), 4), (0, 4));
+    }
+
+    /// The axis picks the predicate, and the two axes are different marks.
+    #[test]
+    fn the_axis_decides_which_mark_splits() {
+        let r = rows(&[false, false, true, true]);
+        assert_eq!(peel_word(&r, Some(PeelWindow::HookFreePrefix), 4), (2, 2));
+        // The same rows carry no `custom_mask`, so the mask axis sees no
+        // split at all — a fire hooked but unmasked is one region on the
+        // mask axis and two on the hook axis.
+        assert_eq!(peel_word(&r, Some(PeelWindow::UnmaskedPrefix), 4), (4, 0));
+    }
+
+
+    /// The tail's prefix sums start at zero, and its pages start where
+    /// the split's entry points.
+    #[test]
+    fn the_tail_csrs_are_rebased_not_sliced() {
+        // Four requests holding 2, 1, 3, 1 pages; tokens 1 each (decode).
+        let kv_indptr = [0u32, 2, 3, 6, 7];
+        let qo_indptr = [0u32, 1, 2, 3, 4];
+
+        let got = tail_csrs(&kv_indptr, &qo_indptr, 2);
+        assert_eq!(
+            got,
+            TailCsrs { base: 3, indptr: vec![0, 3, 4], qo: vec![0, 1, 2] },
+            "requests 2..4 hold 3 then 1 pages, and their pages begin at \
+             index 3 — the value `kv_indptr[2]` holds"
+        );
+
+        // A SLICE would have been `[3, 6, 7]` and `[2, 3, 4]`, which
+        // FlashInfer reads as a batch whose first request already has
+        // three pages behind it. Real pointers, plausible numbers, a plan
+        // for requests that are not these.
+        assert_ne!(got.indptr, kv_indptr[2..].to_vec());
+    }
+
+    /// A split at the last request leaves one, not zero.
+    #[test]
+    fn the_last_request_is_a_tail_of_one() {
+        let kv_indptr = [0u32, 2, 3];
+        let qo_indptr = [0u32, 1, 2];
+        let got = tail_csrs(&kv_indptr, &qo_indptr, 1);
+        assert_eq!(got.indptr, vec![0, 1], "one request holding one page");
+        assert_eq!(got.base, 2);
+    }
+
+    /// A split past the array answers empty rather than panicking.
+    ///
+    /// `peel_tail_ctx` refuses that case before it gets here, and this
+    /// pins that the arithmetic does not depend on the refusal — a
+    /// bounds check in one place and a panic in the other is how the
+    /// second one gets reached by a caller nobody expected.
+    #[test]
+    fn a_split_past_the_end_is_empty_not_a_panic() {
+        let got = tail_csrs(&[0, 2], &[0, 1], 9);
+        assert_eq!(got, TailCsrs { base: 0, indptr: Vec::new(), qo: Vec::new() });
+    }
+}

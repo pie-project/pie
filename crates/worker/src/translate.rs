@@ -144,6 +144,7 @@ fn build_model(
     Ok(::engine::bootstrap::ModelConfig {
         name: m.name.clone(),
         arch_name: group0_caps.arch_name,
+        model_id: group0_caps.model_id,
         kv_page_size: group0_caps.kv_page_size as usize,
         tokenizer_path,
         metadata,
@@ -187,6 +188,7 @@ mod tests {
             max_forward_requests: 512,
             max_page_refs: 262144,
             arch_name: "qwen3".into(),
+            model_id: "qwen3-0.6b".into(),
             vocab_size: 151936,
             max_model_len: 4096,
             activation_dtype: "bfloat16".into(),

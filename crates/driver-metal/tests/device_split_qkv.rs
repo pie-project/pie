@@ -8,9 +8,10 @@
 
 use std::path::PathBuf;
 
-use driver_metal::gpu::{Allocation, ArgumentTable, Compiler, Context, Stepper};
+use driver_metal::device::{Allocation, ArgumentTable, Context, Stepper};
+use driver_metal::program::Compiler;
 use driver_metal::lowering::dispatch::Dispatch;
-use driver_metal::gpu::bind::encode::{Params, Pipelines, encode};
+use driver_metal::bind::encode::{Params, Pipelines, encode};
 use driver_metal::layout::region::Region as _;
 
 fn kernels_dir() -> PathBuf {
@@ -94,7 +95,7 @@ fn the_split_puts_every_channel_where_its_width_says() {
         .run(|encoder| encode(encoder, &table, &pipelines, &staged, std::slice::from_ref(&dispatch)))
         .expect("the fire runs");
 
-    let read = |region: &driver_metal::gpu::Handle, n: u32| -> Vec<f32> {
+    let read = |region: &driver_metal::device::Handle, n: u32| -> Vec<f32> {
         let mut out = vec![0u16; n as usize];
         let bytes = unsafe {
             core::slice::from_raw_parts(region.contents().as_ptr().cast::<u16>(), n as usize)

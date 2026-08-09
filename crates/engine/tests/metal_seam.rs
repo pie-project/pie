@@ -277,8 +277,10 @@ fn package() -> ::driver_api::plan::LaunchPackage {
 ///
 /// Gated on `PIE_METAL_SMOKE_CHECKPOINT` **and** on a descriptor: model facts
 /// come from the one the worker hands over, never from a checkpoint this seam
-/// re-normalizes (`crates/model/tests/one_normalizer.rs`). The test writes one
-/// beside the snapshot rather than reaching for a boot TOML.
+/// re-normalizes — and `crates/model/tests/one_normalizer.rs` now guards the
+/// stronger property, that NOTHING in the runtime or either driver opens a
+/// `config.json` at all. The test writes one beside the snapshot rather than
+/// reaching for a boot TOML.
 #[test]
 fn a_frame_reaches_the_device_through_the_seam() {
     let Some(snapshot) = std::env::var_os("PIE_METAL_SMOKE_CHECKPOINT") else {
@@ -287,17 +289,21 @@ fn a_frame_reaches_the_device_through_the_seam() {
     };
     let snapshot = std::path::PathBuf::from(snapshot);
 
-    // The descriptor, normalized ONCE and handed over as a worker would.
+    // The checkpoint's own `config.json`, handed over VERBATIM as a
+    // worker would.
+    //
+    // It used to be normalized here, into a `pie.model/1` descriptor,
+    // because that is what a driver read. Nothing normalizes now: what a
+    // model is made of is a `model::catalog` row matched to the
+    // checkpoint's tensors, and the file crosses only so the driver can
+    // read the declared encoding out of it — the one question a `const`
+    // cannot answer, because a group size is not an extent of anything.
     let raw = std::fs::read_to_string(snapshot.join("config.json"))
         .expect("the snapshot has a config.json");
-    let root: serde_json::Value = serde_json::from_str(&raw).expect("it parses");
-    let descriptor = model::config::descriptor(&root, snapshot.to_str().expect("utf8"))
-        .expect("it normalizes")
-        .to_string();
-    let dir = std::env::temp_dir().join("pie-metal-seam-descriptor");
+    let dir = std::env::temp_dir().join("pie-metal-seam-config");
     std::fs::create_dir_all(&dir).expect("a scratch dir");
-    let path = dir.join("descriptor.json");
-    std::fs::write(&path, &descriptor).expect("it writes");
+    let path = dir.join("config.json");
+    std::fs::write(&path, &raw).expect("it writes");
 
     // TOML, which is what the boot config is — `[model] descriptor`.
     let config = format!("[model]\ndescriptor = \"{}\"\n", path.display());

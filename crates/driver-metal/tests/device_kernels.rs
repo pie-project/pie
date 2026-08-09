@@ -18,7 +18,8 @@
 use std::path::PathBuf;
 
 use driver_metal::Error;
-use driver_metal::gpu::{Compiler, Context};
+use driver_metal::device::Context;
+use driver_metal::program::Compiler;
 
 /// An entry point no kernel defines.
 ///

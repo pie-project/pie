@@ -26,14 +26,24 @@
 //! table indexed through [`Kernel::index`] cannot be indexed past, because
 //! the index is the discriminant of a value that exists.
 //!
-//! ## The values are ABI
+//! ## The values were ABI with a peer that is gone
 //!
-//! The C++ says "APPEND ONLY" five separate times: the numeric values of
-//! `Kernel`, `IoSlot` and `Region` are part of the M=1 argument-table ABI
-//! and the serialized surfaces. The anchor tests at the bottom pin the
-//! block boundaries, so an insertion anywhere upstream of one moves a
-//! pinned value and fails loudly instead of renumbering forty kinds
-//! silently.
+//! The C++ said "APPEND ONLY" five separate times: the numeric values of
+//! `Kernel`, `IoSlot` and `Region` were part of the M=1 argument-table ABI
+//! and the serialized surfaces it shared with `decode_abi.hpp`. **That
+//! header no longer exists**, and nothing outside this module reads a
+//! discriminant: `Kernel::index` is called only by these tests, `COUNT`
+//! only by this module's own tables, and no `Kernel` is serialized, cached
+//! to disk or sent on a wire. The append-only rule was a contract with one
+//! reader, and that reader was deleted with the C++ tree.
+//!
+//! So the anchors below are kept for a narrower reason than the one they
+//! were written for. They no longer protect a cross-language agreement;
+//! they catch an insertion in the middle of the list, which would silently
+//! shift every table this module indexes. When a renumbering IS intended --
+//! merging two kinds that were one operation under two family prefixes --
+//! they fail loudly and the anchor is moved deliberately, which is what
+//! happened to the four values above 84.
 
 /// One fixed region of the decode heap.
 ///
@@ -345,29 +355,29 @@ kernels! {
         /// gpt-oss's clamped SwiGLU variant.
         GoSwiGlu = "go_swi_glu",
         /// The weighted sum of the k experts' outputs.
-        GoExpertCombine = "go_expert_combine",
+        ExpertCombine = "expert_combine",
         /// Qwen-MoE router (`mlp.gate`, no bias).
-        LlRouter = "ll_router",
+        Router = "router",
         /// Qwen-MoE stacked expert gate projections.
-        LlExpertGate = "ll_expert_gate",
+        ExpertGate = "expert_gate",
         /// Qwen-MoE stacked expert up projections.
-        LlExpertUp = "ll_expert_up",
+        ExpertUp = "expert_up",
         /// Qwen-MoE stacked expert down projections.
-        LlExpertDown = "ll_expert_down",
+        ExpertDown = "expert_down",
         /// The batched mixture's expert-major sort.
-        LlMoeSort = "ll_moe_sort",
+        MoeSort = "moe_sort",
         /// The sorted-row gather.
-        LlMoeGather = "ll_moe_gather",
+        MoeGather = "moe_gather",
         /// The sorted-results combine, through the sort's inverse.
         LlMoeCombine = "ll_moe_combine",
         /// Shared expert gate projection (`mlp.shared_expert.gate_proj`).
-        LlSharedGate = "ll_shared_gate",
+        SharedGate = "shared_gate",
         /// Shared expert up projection.
-        LlSharedUp = "ll_shared_up",
+        SharedUp = "shared_up",
         /// Shared expert down projection.
-        LlSharedDown = "ll_shared_down",
+        SharedDown = "shared_down",
         /// `mlp.shared_expert_gate` — hidden to one logit a token.
-        LlSharedGateProj = "ll_shared_gate_proj",
+        SharedGateProj = "shared_gate_proj",
         /// `routed + sigmoid(gate) * shared`.
         LlSharedCombine = "ll_shared_combine",
         /// The mixture's SwiGLU over the sorted stack — split from
@@ -386,20 +396,8 @@ kernels! {
         G4DenseBranchNorm = "g4_dense_branch_norm",
         /// gemma4 `post_feedforward_layernorm_2`.
         G4MoeBranchNorm = "g4_moe_branch_norm",
-        /// gemma4 stacked expert gate projections.
-        G4ExpertGate = "g4_expert_gate",
-        /// gemma4 stacked expert up projections.
-        G4ExpertUp = "g4_expert_up",
-        /// gemma4 stacked expert down projections.
-        G4ExpertDown = "g4_expert_down",
         /// GeGLU over the sorted stack — gemma's activation.
         G4ExpertGeglu = "g4_expert_geglu",
-        /// gemma4's expert-major sort.
-        G4MoeSort = "g4_moe_sort",
-        /// gemma4's sorted-row gather.
-        G4MoeGather = "g4_moe_gather",
-        /// gemma4's expert combine.
-        G4ExpertCombine = "g4_expert_combine",
         /// The dense and mixture branches meeting.
         G4BranchAdd = "g4_branch_add",
         /// gpt-oss paged decode attention with the per-head sink (M>1).
@@ -489,16 +487,22 @@ mod tests {
             "the variant the wrong count once ended at"
         );
         assert_eq!(Kernel::LmHeadUntied.index(), 58);
-        assert_eq!(Kernel::LlRouter.index(), 71);
+        assert_eq!(Kernel::Router.index(), 71);
         assert_eq!(Kernel::G4Router.index(), 84);
-        assert_eq!(Kernel::G4BranchAdd.index(), 97);
+        // 91, not 97: six kinds between `G4Router` and here were the same
+        // operation under a second family's prefix -- `g4_moe_sort` beside
+        // `ll_moe_sort`, documented in the same words -- and merging them
+        // moved everything downstream by six. Every anchor at or below
+        // `G4Router` is unchanged, which is the point of pinning block
+        // boundaries rather than one number at the end.
+        assert_eq!(Kernel::G4BranchAdd.index(), 91);
         assert_eq!(
             Kernel::GoSdpaSinkPaged.index(),
-            98,
+            92,
             "appended, nothing renumbered"
         );
-        assert_eq!(Kernel::G4VNormFromK.index(), 99);
-        assert_eq!(Kernel::COUNT, 100);
+        assert_eq!(Kernel::G4VNormFromK.index(), 93);
+        assert_eq!(Kernel::COUNT, 94);
         // The bug the count fix answers: the short spelling reached 54 of
         // 98, and psos[LmHeadUntied] at 58 indexed past it.
         assert!(Kernel::LmHeadUntied.index() > Kernel::G4PleResidual.index() + 1);
