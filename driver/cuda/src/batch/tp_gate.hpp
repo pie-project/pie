@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -16,6 +17,43 @@ inline bool tp_cpu_gate_consume_one(
     ++consumed;
     return true;
 }
+
+class TpFollowerAcks {
+  public:
+    void mark(int rank, std::uint64_t sequence) noexcept {
+        if (rank <= 0 || rank >= kMaxRanks) return;
+        consumed_[static_cast<std::size_t>(rank)].store(
+            sequence, std::memory_order_release);
+    }
+
+    bool all_consumed(int world_size, std::uint64_t sequence) const noexcept {
+        if (world_size <= 1) return true;
+        if (world_size > kMaxRanks) return false;
+        for (int rank = 1; rank < world_size; ++rank) {
+            if (consumed_[static_cast<std::size_t>(rank)].load(
+                    std::memory_order_acquire) < sequence) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::uint64_t oldest_consumed(int world_size) const noexcept {
+        if (world_size <= 1) return 0;
+        if (world_size > kMaxRanks) return 0;
+        std::uint64_t oldest = consumed_[1].load(std::memory_order_acquire);
+        for (int rank = 2; rank < world_size; ++rank) {
+            const auto consumed = consumed_[static_cast<std::size_t>(rank)].load(
+                std::memory_order_acquire);
+            if (consumed < oldest) oldest = consumed;
+        }
+        return oldest;
+    }
+
+  private:
+    static constexpr int kMaxRanks = 64;
+    std::array<std::atomic<std::uint64_t>, kMaxRanks> consumed_{};
+};
 
 class TpSequenceGate {
   public:

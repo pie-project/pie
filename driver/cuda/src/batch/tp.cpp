@@ -298,7 +298,7 @@ struct TpFireMailbox {
     // header and planner views into locals before posting any collective, so
     // it always releases a slot without needing rank 0 to progress first —
     // that is what makes the reserve below deadlock-free).
-    std::atomic<std::uint64_t> consumed_fires{0};
+    TpFollowerAcks consumed_fires;
     // Set by rank 0 immediately before the gate notify; the follower diffs it
     // on wake to separate "how long the wake took" from "how long my own work
     // takes". Plain store/load: the gate's release/acquire pair orders it.
@@ -306,28 +306,36 @@ struct TpFireMailbox {
     std::uint64_t fire_seq = 0;   // rank 0 only
 };
 
-// Set `PIE_TP_WATCHDOG=1` to have rank 0 report the publish/consume cursors
-// whenever they stop advancing. A TP hang is otherwise silent: both ranks are
-// parked and neither reports anything, and this says immediately whether the
-// follower fell behind, ran ahead, or never woke.
+// Report the publish/consume cursors whenever in-flight TP work stops advancing.
+// A TP hang is otherwise silent, and per-rank cursors say which follower never
+// reached the matching fire or collective.
 struct TpStallWatchdog {
     std::atomic<std::uint64_t> published{0};
-    std::atomic<std::uint64_t> consumed{0};
-    std::atomic<int> rank0_phase{-1};   // 0=publish 1=broadcast 2=settle
+    std::array<std::atomic<std::uint64_t>, 8> consumed{};
+    // 0=publish 1=broadcast 2=enqueue_done 3=in_settle 4=settle_done
+    std::atomic<int> rank0_phase{-1};
     std::atomic<std::uint64_t> follower_forwards{0};
     std::array<std::atomic<std::uint64_t>, 8> collectives{};
+    std::atomic<int> world_size{1};
     std::atomic<std::uint64_t> rank0_phase_seq{0};
     std::atomic<bool> running{false};
     std::thread thread;
-    static constexpr bool enabled() { return false; }
+    static constexpr bool enabled() { return true; }
     static TpStallWatchdog& instance() {
         static TpStallWatchdog w;
         return w;
     }
-    void start() {
+    void start(int tp_size) {
+        world_size.store(std::min<int>(tp_size, consumed.size()),
+                         std::memory_order_release);
         if (!enabled() || running.exchange(true)) return;
         thread = std::thread([this] {
-            std::uint64_t last_pub = ~0ull, last_con = ~0ull;
+            std::uint64_t last_pub = ~0ull;
+            std::uint64_t last_forwards = ~0ull;
+            std::array<std::uint64_t, 8> last_consumed;
+            std::array<std::uint64_t, 8> last_collectives;
+            last_consumed.fill(~0ull);
+            last_collectives.fill(~0ull);
             int stuck = 0;
             static const char* kPhase[] = {"publish", "broadcast",
                                            "enqueue_done", "in_settle",
@@ -335,36 +343,52 @@ struct TpStallWatchdog {
             while (running.load(std::memory_order_acquire)) {
                 std::this_thread::sleep_for(std::chrono::seconds(5));
                 const auto p = published.load(std::memory_order_acquire);
-                const auto c = consumed.load(std::memory_order_acquire);
-                if (p == last_pub && c == last_con) {
-                    const int ph = rank0_phase.load(std::memory_order_acquire);
-                    // Every rank, not just the first two: at tp>2 the whole
-                    // question is *which* rank stopped arriving, and a pair of
-                    // counters cannot name it.
-                    char coll[256];
-                    int off = 0;
-                    for (std::size_t r = 0; r < collectives.size(); ++r) {
-                        const auto n = collectives[r].load();
-                        if (n == 0) continue;
-                        off += std::snprintf(coll + off, sizeof(coll) - off,
-                                             "%sr%zu=%llu", off ? " " : "", r,
-                                             (unsigned long long)n);
+                const auto forwards =
+                    follower_forwards.load(std::memory_order_acquire);
+                const int ranks = world_size.load(std::memory_order_acquire);
+                const int ph = rank0_phase.load(std::memory_order_acquire);
+                bool unchanged = p == last_pub && forwards == last_forwards;
+                char con[256]{};
+                char coll[256]{};
+                int con_off = 0;
+                int coll_off = 0;
+                for (int rank = 0; rank < ranks; ++rank) {
+                    const auto c = consumed[static_cast<std::size_t>(rank)].load(
+                        std::memory_order_acquire);
+                    const auto n = collectives[static_cast<std::size_t>(rank)].load(
+                        std::memory_order_acquire);
+                    unchanged = unchanged && c == last_consumed[rank] &&
+                                n == last_collectives[rank];
+                    if (rank > 0) {
+                        con_off += std::snprintf(
+                            con + con_off, sizeof(con) - con_off,
+                            "%sr%d=%llu", con_off ? " " : "", rank,
+                            (unsigned long long)c);
                     }
+                    coll_off += std::snprintf(
+                        coll + coll_off, sizeof(coll) - coll_off,
+                        "%sr%d=%llu", coll_off ? " " : "", rank,
+                        (unsigned long long)n);
+                    last_consumed[rank] = c;
+                    last_collectives[rank] = n;
+                }
+                const bool work_in_flight = ph >= 0 && ph < 4;
+                if (work_in_flight && unchanged) {
                     std::fprintf(stderr,
-                        "[tp-watchdog] STALLED %ds: published=%llu consumed=%llu "
-                        "(delta=%lld) rank0_last_phase=%s seq=%llu "
+                        "[tp-watchdog] STALLED %ds: published=%llu "
+                        "consumed=[%s] rank0_last_phase=%s seq=%llu "
                         "follower_forwards=%llu collectives=[%s]\n",
                         (++stuck) * 5,
-                        (unsigned long long)p, (unsigned long long)c,
-                        (long long)(p - c),
+                        (unsigned long long)p, con,
                         (ph >= 0 && ph < 5) ? kPhase[ph] : "none",
                         (unsigned long long)rank0_phase_seq.load(),
-                        (unsigned long long)follower_forwards.load(),
+                        (unsigned long long)forwards,
                         coll);
                 } else {
                     stuck = 0;
                 }
-                last_pub = p; last_con = c;
+                last_pub = p;
+                last_forwards = forwards;
             }
         });
         thread.detach();
@@ -436,16 +460,17 @@ bool tp_cpu_gate_stopped(const std::string& key) {
     return tp_cpu_gate_for(key)->stopped();
 }
 
-void tp_mailbox_reserve_slot(TpFireMailbox& box, const std::string& key) {
+void tp_mailbox_reserve_slot(TpFireMailbox& box, const std::string& key,
+                             int tp_size) {
     if (box.fire_seq < kTpMailboxRing) return;  // ring not full yet
     const std::uint64_t oldest_live = box.fire_seq - kTpMailboxRing + 1;
-    if (box.consumed_fires.load(std::memory_order_acquire) >= oldest_live) {
+    if (box.consumed_fires.all_consumed(tp_size, oldest_live)) {
         return;
     }
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(30);
     for (int spin = 0;; ++spin) {
-        if (box.consumed_fires.load(std::memory_order_acquire) >= oldest_live) {
+        if (box.consumed_fires.all_consumed(tp_size, oldest_live)) {
             return;
         }
         // A stopped gate means the follower is gone (teardown, or a failed
@@ -462,7 +487,7 @@ void tp_mailbox_reserve_slot(TpFireMailbox& box, const std::string& key) {
                 "tp: mailbox ring stalled - the follower stopped consuming "
                 "fires (published " + std::to_string(box.fire_seq) +
                 ", consumed " +
-                std::to_string(box.consumed_fires.load()) + ")");
+                std::to_string(box.consumed_fires.oldest_consumed(tp_size)) + ")");
         }
     }
 }
@@ -470,6 +495,7 @@ void tp_mailbox_reserve_slot(TpFireMailbox& box, const std::string& key) {
 }  // namespace
 
 void tp_publish_fire(const std::string& cpu_gate_key,
+                     int tp_size,
                      const TpFirePlanViews& views,
                      int N, int R, bool is_pure_decode,
                      int kv_indices_count,
@@ -488,8 +514,8 @@ void tp_publish_fire(const std::string& cpu_gate_key,
     // that has lost a rank can never complete.
     tp_check_ranks_alive();
     auto box = tp_mailbox_for(cpu_gate_key);
-    TpStallWatchdog::instance().start();
-    tp_mailbox_reserve_slot(*box, cpu_gate_key);
+    TpStallWatchdog::instance().start(tp_size);
+    tp_mailbox_reserve_slot(*box, cpu_gate_key, tp_size);
     TpFireSlot& fire = box->slots[box->fire_seq % kTpMailboxRing];
     fire.header = TpFireHeader{
         TP_FIRE_MAGIC, N, R, is_pure_decode ? 1 : 0,
@@ -729,13 +755,14 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
 // read the wrong slot — a stale header, or a zeroed one that trips the
 // "unexpected header magic" abort and kills the follower thread.
 void tp_publish_mtp(const std::string& cpu_gate_key,
+                    int tp_size,
                     int rows,
                     int draft_step,
                     int max_global_tokens) {
     if (cpu_gate_key.empty()) return;
     tp_check_ranks_alive();
     auto box = tp_mailbox_for(cpu_gate_key);
-    tp_mailbox_reserve_slot(*box, cpu_gate_key);
+    tp_mailbox_reserve_slot(*box, cpu_gate_key, tp_size);
     TpFireSlot& fire = box->slots[box->fire_seq % kTpMailboxRing];
     fire.header = TpFireHeader{};
     fire.header.magic = TP_MTP_MAGIC;
@@ -987,10 +1014,10 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
             // collectives below, or rank 0 (which is what unblocks them) could
             // be waiting on this very slot.
             if (mailbox != nullptr) {
-                mailbox->consumed_fires.store(cpu_gate_seq,
-                                              std::memory_order_release);
-                TpStallWatchdog::instance().consumed.store(
-                    cpu_gate_seq, std::memory_order_release);
+                mailbox->consumed_fires.mark(comm.rank(), cpu_gate_seq);
+                TpStallWatchdog::instance().consumed[
+                    static_cast<std::size_t>(comm.rank())].store(
+                        cpu_gate_seq, std::memory_order_release);
             }
             const int rows = hdr.total_tokens;
             NCCL_CHECK(ncclGroupStart());
@@ -1265,10 +1292,10 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
             // Everything this fire's slot carries now lives in locals, so rank
             // 0 may reuse it. Released before the payload collectives below for
             // the same reason as the MTP branch.
-            mailbox->consumed_fires.store(cpu_gate_seq,
-                                          std::memory_order_release);
+            mailbox->consumed_fires.mark(comm.rank(), cpu_gate_seq);
             auto& wd_ = TpStallWatchdog::instance();
-            wd_.consumed.store(cpu_gate_seq, std::memory_order_release);
+            wd_.consumed[static_cast<std::size_t>(comm.rank())].store(
+                cpu_gate_seq, std::memory_order_release);
             wd_.follower_forwards.fetch_add(1, std::memory_order_release);
             // Recurrent-state metadata still comes back from device; those
             // paths are cold and not worth widening the mailbox for.
