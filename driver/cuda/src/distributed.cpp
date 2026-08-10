@@ -266,9 +266,12 @@ NcclComm::NcclComm(int world_size, int rank, const ncclUniqueId& uid)
     // the matching call. Non-blocking mode returns ncclInProgress instead; the
     // wrappers below poll the communicator without holding NCCL's launch path.
     config.blocking = 0;
-    NCCL_CHECK_ASYNC(
-        ncclCommInitRankConfig(&comm_, world_size, uid, rank, &config),
-        comm_);
+    // Keep the output write sequenced before the communicator is handed to
+    // the async poller. Function-argument evaluation order cannot guarantee
+    // that when both expressions live inside one NCCL_CHECK_ASYNC invocation.
+    const ncclResult_t init_result =
+        ncclCommInitRankConfig(&comm_, world_size, uid, rank, &config);
+    NCCL_CHECK_ASYNC(init_result, comm_);
     register_live_comm(this);
 }
 
