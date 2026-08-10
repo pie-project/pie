@@ -267,6 +267,131 @@
   }
 }
 
+/* Engine series. Colour encodes the engine and nothing else, and the
+   mapping holds for every figure in Performance. Hues are held at a
+   similar lightness so no engine reads as heavier than another. */
+.preview-page svg .pv-pie {
+  fill: #c25e3d;
+}
+
+.preview-page svg .pv-vllm {
+  fill: #4a6d9c;
+}
+
+.preview-page svg .pv-sglang {
+  fill: #b8801f;
+}
+
+.preview-page svg .pv-mlx {
+  fill: #33393f;
+}
+
+.preview-page svg .pv-llama {
+  fill: #6b7a30;
+}
+
+.preview-page[data-theme='dark'] svg .pv-pie {
+  fill: #e08a6f;
+}
+
+.preview-page[data-theme='dark'] svg .pv-vllm {
+  fill: #86a6d4;
+}
+
+.preview-page[data-theme='dark'] svg .pv-sglang {
+  fill: #d4a45c;
+}
+
+.preview-page[data-theme='dark'] svg .pv-mlx {
+  fill: #d3d8dd;
+}
+
+.preview-page[data-theme='dark'] svg .pv-llama {
+  fill: #b8c47a;
+}
+
+/* Machine series, used only where no engine is being compared. Outlined
+   rather than solid, so a reader can see the encoding has changed. */
+.preview-page svg .pv-m1 {
+  fill: var(--ifm-color-emphasis-200);
+  stroke: var(--ifm-color-emphasis-600);
+  stroke-width: 1;
+}
+
+.preview-page svg .pv-m2 {
+  fill: var(--ifm-color-emphasis-400);
+  stroke: var(--ifm-color-emphasis-600);
+  stroke-width: 1;
+}
+
+.preview-page svg .pv-m3 {
+  fill: var(--ifm-color-emphasis-600);
+  stroke: var(--ifm-color-emphasis-700);
+  stroke-width: 1;
+}
+
+/* Line series, same engine mapping as the bars. */
+.preview-page svg .pv-ln-pie {
+  stroke: #c25e3d;
+  stroke-width: 1.6;
+  fill: none;
+}
+
+.preview-page svg .pv-ln-vllm {
+  stroke: #4a6d9c;
+  stroke-width: 1.6;
+  fill: none;
+}
+
+.preview-page svg .pv-ln-sglang {
+  stroke: #b8801f;
+  stroke-width: 1.6;
+  stroke-dasharray: 5 4;
+  fill: none;
+}
+
+.preview-page[data-theme='dark'] svg .pv-ln-pie {
+  stroke: #e08a6f;
+}
+
+.preview-page[data-theme='dark'] svg .pv-ln-vllm {
+  stroke: #86a6d4;
+}
+
+.preview-page[data-theme='dark'] svg .pv-ln-sglang {
+  stroke: #d4a45c;
+}
+
+/* Reference line marking the best baseline in the normalised figures. */
+.preview-page svg .pv-ref {
+  stroke: var(--ifm-color-emphasis-600);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+}
+
+.preview-page svg .tsm {
+  font-size: 11px;
+  fill: var(--ifm-color-emphasis-700);
+}
+
+.preview-page svg .tsh {
+  font-size: 12px;
+  fill: var(--ifm-font-color-base);
+  font-weight: 600;
+}
+
+/* Measurement printed at the end of each bar. The halo keeps it legible
+   where it crosses the dashed baseline. */
+.preview-page svg .pv-val {
+  font-size: 12px;
+  fill: var(--ifm-font-color-base);
+  font-variant-numeric: tabular-nums;
+  paint-order: stroke;
+  stroke: var(--ifm-background-color);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
 /* Bar series for the benchmark charts. Three steps of the same
    emphasis ramp, so they invert with the theme. */
 .preview-page svg .pv-bar1 {

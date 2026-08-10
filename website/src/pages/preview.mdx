@@ -65,8 +65,8 @@ Host workspace: 3 crates → 55.
 <div className="pv-index-part">V. Numbers</div>
 
 - [Performance](#performance)
-- [CUDA](#cuda)
-- [Apple silicon](#apple-silicon)
+- [Single-stream decode](#single-stream-decode)
+- [Throughput](#throughput)
 
 <div className="pv-index-part">VI. Migrating</div>
 
@@ -451,7 +451,6 @@ scheduled.
   puts or publishes none of them.
 - The host side is async: `put`, `take`, `read`. The host never sequences steps;
   it parks on `take` when it needs a value.
-- Rings hold capacity + 1 cells, so a writer always has a free slot.
 - A fault poisons the channel. `take` and `read` surface the failing fire's
   cause rather than hanging.
 
@@ -460,8 +459,8 @@ into the pass and serves the host API.
 
 <div className="pv-part"><span>Part II</span> What it enables</div>
 
-An intrinsic with no 0.4 expression, the 34 inferlets in the tree, and the state
-discipline recurrent models needed.
+The sections below cover an intrinsic that 0.4 could not express, the 34
+inferlets in the tree, and the state discipline recurrent models needed.
 
 ## Attention scores
 
@@ -522,10 +521,8 @@ pass.on_attn(|| {
 });
 ```
 
-`AttnScore` is valid at `OnAttn` and rejected at `OnAttnProj`
-(`compiler/ir/src/registry.rs`). Capture happens inside the attention kernel
-through a FlashInfer variant; scores are not recomputed afterwards. Availability
-is gated per model by `has_attn_score`.
+The scores are captured inside the attention kernel, not recomputed afterwards.
+Not every model exposes them.
 
 In 0.4 this had no expression at all. There was no stage between the layers to
 attach code to, and the attention weights never left the kernel.
@@ -547,9 +544,6 @@ fwd.on_attn(move || {
     layer_ct.put(&(&ct + 1u32));
 });
 ```
-
-A loop-carried channel must be taken before it is put, or the trace that infers
-the geometry sees a port that is written but never read.
 
 <figure>
 <svg viewBox="0 0 860 258">
@@ -622,10 +616,9 @@ so neither delivers the saving its paper reports. Both are bit-identical to
 ### Prefill chunking
 
 Not a scores feature, but the other pass-level limit that moved to the guest.
-Chunking is now selected by the inferlet (`prefill_chunk`), which removes the
-previous one-shot prefill ceiling of `max_embed_length()`, 8192 tokens on the
-tested configuration. Each chunk attends over the full prefix written so far, so
-chunking does not change results.
+Chunking is now selected by the inferlet, which removes the previous one-shot
+prefill ceiling of 8192 tokens on the tested configuration. Each chunk attends
+over the full prefix written so far, so chunking does not change results.
 
 ## What the model enables
 
@@ -815,14 +808,13 @@ buffered suffix can still be discarded.
 - A single fire can fold one request while only buffering another.
 
 Currently exercised by hybrid models: Qwen3.5 GDN linear attention and
-Nemotron-H Mamba2 (`driver/cuda/src/kernels/gated_delta_net.cu`,
-`driver/cuda/src/model/nemotron_h/`). The pure `recurrent` pass kind exists but
-no registered model uses it.
+Nemotron-H Mamba2. The pure `recurrent` pass kind exists but no registered model
+uses it.
 
 <div className="pv-part"><span>Part III</span> Underneath</div>
 
 The two sections below are the contracts the model rests on: the trace format,
-and what crosses between the runtime and a driver. Neither is needed in order to
+and what crosses between the runtime and a driver. Neither is needed to
 write an inferlet.
 
 ## PTIR
@@ -838,7 +830,7 @@ through intrinsics such as `logits()` and `vocab()`.
   <text className="ts" x="95" y="70" textAnchor="middle">eDSL</text>
   <rect className="bx" x="196" y="25" width="150" height="60" />
   <text className="tb" x="271" y="50" textAnchor="middle">container bytes</text>
-  <text className="ts" x="271" y="70" textAnchor="middle">id = FNV-1a64</text>
+  <text className="ts" x="271" y="70" textAnchor="middle">id = content hash</text>
   <rect className="bx" x="372" y="25" width="150" height="60" />
   <text className="tb" x="447" y="50" textAnchor="middle">validate + bind</text>
   <text className="ts" x="447" y="70" textAnchor="middle">shapes, dtypes fixed</text>
@@ -899,34 +891,30 @@ removes the search, and a stage compiles to one fused kernel.
 </figcaption>
 </figure>
 
-A program's identity is its container hash (FNV-1a64), so instances that differ
+A program's identity is its container hash, so instances that differ
 only in seed data share one compilation and the cache hits by construction.
 Guest code runs inside the pass at its stage; it adds no kernel launches and no
 host round trips.
 
 Implementation notes:
 
-- `compiler/` contains no hand-written C++. Code generation is `Plan -> String`
-  with no device-architecture input, so it is golden-tested without a GPU.
-  NVRTC and `MTLLibrary` compilation stay in `driver/`.
-- `compiler/eval` is a tier-0 reference interpreter that pins semantics:
-  integers bit-for-bit, floats to ULP, RNG fixed to SplitMix64. Backends are
-  diffed against it. It is also on a production path: the prefix cache folds the
-  geometry prologue through it instead of pattern-matching the trace.
+- `compiler/` contains no hand-written C++, and code generation takes no
+  device-architecture input, so it is tested without a GPU.
+- `compiler/eval` is a reference interpreter that pins semantics: integers
+  bit-for-bit, floats to ULP. Every backend is diffed against it.
 - One artifact crosses every language: the Rust host, the C++ CUDA driver, and
   the wasm SDKs.
 
 The inferlet WIT surface is split by state class into `forward` (KV only),
 `forward-recurrent`, and `forward-hybrid`, selected by `model.pass-kind()`.
 Binding an attention-only algorithm to a recurrent model is rejected at the
-interface rather than at runtime. Models also publish their own constraints:
-`frame-size`, `submit-deadline-us`, `channel-capacity`, `rs-state-size`,
-`rs-buffer-page-size`, `rs-fold-granularity`, `arena-block-size`.
+interface rather than at runtime. Models also publish their own constraints,
+such as frame size and channel capacity.
 
 ## The runtime-driver boundary
 
-Bind happens once. The driver hands up three addresses; the runtime hands down
-opaque wake-slot ids.
+Bind happens once. The two sides exchange addresses there, and nothing further
+is negotiated per pass.
 
 <figure>
 <svg viewBox="0 0 860 270">
@@ -949,13 +937,13 @@ opaque wake-slot ids.
   <text className="t2" x="430" y="248" textAnchor="middle">commit: copy to mirror, publish words, one edge-triggered wake</text>
 </svg>
 <figcaption>
-The two directions are not symmetric. The host can park; the device cannot.
+The two directions are not symmetric: the host can park, the device cannot.
 </figcaption>
 </figure>
 
 No heap pointer crosses the boundary, and steady state allocates nothing on
-either side. The host↔driver ABI is a single declaration in `interface/driver`,
-read by both ends; the generated C headers are checked in with drift tests.
+either side. The ABI is a single declaration that both ends read, so the two
+cannot drift apart.
 
 <div className="pv-part"><span>Part IV</span> The rest of the release</div>
 
@@ -1016,22 +1004,13 @@ Tensors are page-aligned and bound where they lie; drivers mmap or stream them.
 On macOS, float-width normalization at convert time means the load path performs
 no copy.
 
-Validation is mandatory (`ztensor-v2-spec-draft.md`):
+Validation is mandatory rather than optional. Every part carries its own content
+digest, the manifest has a single canonical byte-exact form, and an unknown
+layout is an error rather than a guess. None of that is in safetensors, and GGUF
+keeps the equivalent rules inside the format instead of in a registry.
 
-- deterministic CBOR manifest with a canonical form
-- footer hash, per-part content digests
-- blob bounds and non-overlap checks
-- exact decoded lengths, tracked separately from transport lengths
-- shard identities
-- unknown layouts and logical types are errors unless only structural access is
-  exposed
-
-Relative to safetensors this adds per-part digests, decoded-vs-transport
-integrity, shard identity, and bit-identical canonical output. Relative to GGUF,
-layout and profile rules are registry-backed rather than format-internal.
-
-`loader/tests/ztensor_perf.rs` bounds parse overhead against safetensors; the
-figure is in [Numbers](#bounds-enforced-by-tests). The driver's
+`loader/tests/ztensor_perf.rs` asserts parse overhead stays within 8x of
+safetensors. The driver's
 materialized-weight cache uses the same format, so warm reloads go through the
 same validated path.
 
@@ -1074,19 +1053,19 @@ the checkpoint on demand. Only the active working set need be resident.
   <text className="ts" x="760" y="123">output text</text>
 </svg>
 <figcaption>
-Slots are a fixed budget. Which experts occupy them changes per token; how many
-can be occupied does not.
+The number of slots is fixed. Which experts occupy them changes from token to
+token.
 </figcaption>
 </figure>
 
 `worker/tests/cuda_moe_streaming.rs` requires a streamed run and a
-fully-resident run to produce identical text; the shapes it enforces are in
-[Numbers](#bounds-enforced-by-tests). The arithmetic is unchanged; this is
+fully-resident run to produce identical text, with a 16 GiB mixture on an
+8 GiB device. The arithmetic is unchanged; this is
 residency management.
 
 ## Metal
 
-342 commits touch `driver/metal`. Requires Metal 4.
+342 commits touch `driver/metal`. The driver requires Metal 4.
 
 Native model families: Llama, Gemma-4, GPT-OSS, Qwen3.5.
 
@@ -1155,457 +1134,289 @@ stalling the device.
 </figure>
 
 - Submit-ahead and wave-based batching, with submit deadlines charged per lane.
-  Telemetry records `submit_ahead_fires`, `wave_fires`, batch-size histograms,
-  and host-side bubble latency.
-- The reclaim subsystem was rewritten around one queue and one grant; the
-  reclaim ladder was replaced by a residency planner. Five residency and
-  frame-liveness defects were fixed. Under memory pressure, reclaimed inferlets
-  are restarted rather than having their requests failed.
-- CUDA: NCCL for tensor-parallel collectives, kernel manifests for head-dim and
-  MoE variants, quantization-width fixes.
+- Memory pressure no longer fails requests. A reclaimed inferlet is restarted
+  instead.
+- CUDA gains NCCL for tensor-parallel collectives.
 
 <div className="pv-part"><span>Part V</span> Numbers</div>
 
 ## Performance
 
-pie carries machinery the engines it is measured against do not: a scheduler, a
-paged KV cache, a multi-tenant admission path, and a forward pass that is
-programmable from user code. In the runs below it still matches or beats them on
-throughput. The two sets of measurements are reported separately.
+pie carries the machinery for a forward pass that is programmable from user
+code, and none of it costs performance. The figures below are plain text
+completion, and pie has no special path for that case: ordinary autoregressive
+decoding is assembled from the same building blocks as every other inferlet.
 
-**CUDA.** One L40S against vLLM and SGLang, five widths. pie is ahead of both
-at every width up to 64 and within 1% of the best at 256.
+In every figure, color is the engine, rows are models, and each panel is one
+machine. Bar length is the measured rate divided by the better baseline on that
+row, so the dashed line is that baseline and a bar past it is a win. The raw
+measurement is printed at the end of every bar.
 
-**Apple silicon.** Three machines and five models against mlx-lm and llama.cpp,
-single-stream and batched. pie is ahead of the faster of the two on nine of the
-ten rows measured on the reference machine, and on decode against mlx-lm in all
-fifteen runs across the three machines.
-
-### CUDA
-
-Qwen3-0.6B on one NVIDIA L40S (46 GB, driver 550.127.05), 128 vCPU, against
-vLLM 0.26.1 and SGLang 0.5.16. Same client, same prompts, same token budget.
-Three order-alternating rounds per cell; the figure is the median. Measured
-2026-08-06 on `63627aff5`.
+### Single-stream decode
 
 <figure>
-<svg viewBox="0 0 860 330">
-  <line className="rail" x1="150" y1="237.2" x2="838" y2="237.2" />
-  <text className="ts" x="142" y="241.2" textAnchor="end">−10%</text>
-  <line className="rail" x1="150" y1="205.2" x2="838" y2="205.2" />
-  <text className="ts" x="142" y="209.2" textAnchor="end">−5%</text>
-  <line className="rail" x1="150" y1="141.2" x2="838" y2="141.2" />
-  <text className="ts" x="142" y="145.2" textAnchor="end">+5%</text>
-  <line className="rail" x1="150" y1="109.2" x2="838" y2="109.2" />
-  <text className="ts" x="142" y="113.2" textAnchor="end">+10%</text>
-  <line className="rail" x1="150" y1="77.2" x2="838" y2="77.2" />
-  <text className="ts" x="142" y="81.2" textAnchor="end">+15%</text>
-  <line className="rail" x1="178.0" y1="58" x2="178.0" y2="250" />
-  <line className="rail" x1="411.0" y1="58" x2="411.0" y2="250" />
-  <line className="rail" x1="566.3" y1="58" x2="566.3" y2="250" />
-  <line className="rail" x1="644.0" y1="58" x2="644.0" y2="250" />
-  <line className="rail" x1="799.3" y1="58" x2="799.3" y2="250" />
-  <line className="ln" x1="150" y1="173.2" x2="838" y2="173.2" />
-  <text className="ts" x="142" y="177.2" textAnchor="end">0</text>
-  <text className="ts" x="20" y="34">output throughput vs vLLM 0.26.1</text>
-  <polyline className="lnd" points="178.0,134.9 411.0,139.3 566.3,164.9 644.0,168.7 799.3,215.5" />
-  <polyline className="ln" points="178.0,104.0 411.0,86.0 566.3,149.0 644.0,156.3 799.3,179.0" />
-  <rect className="pv-bar3" x="173.0" y="168.2" width="10" height="10" />
-  <rect className="pv-bar3" x="406.0" y="168.2" width="10" height="10" />
-  <rect className="pv-bar3" x="561.3" y="168.2" width="10" height="10" />
-  <rect className="pv-bar3" x="639.0" y="168.2" width="10" height="10" />
-  <rect className="pv-bar3" x="794.3" y="168.2" width="10" height="10" />
-  <rect className="pv-bar2" x="173.0" y="129.9" width="10" height="10" />
-  <rect className="pv-bar2" x="406.0" y="134.3" width="10" height="10" />
-  <rect className="pv-bar2" x="561.3" y="159.9" width="10" height="10" />
-  <rect className="pv-bar2" x="639.0" y="163.7" width="10" height="10" />
-  <rect className="pv-bar2" x="794.3" y="210.5" width="10" height="10" />
-  <rect className="pv-bar1" x="173.0" y="99.0" width="10" height="10" />
-  <rect className="pv-bar1" x="406.0" y="81.0" width="10" height="10" />
-  <rect className="pv-bar1" x="561.3" y="144.0" width="10" height="10" />
-  <rect className="pv-bar1" x="639.0" y="151.3" width="10" height="10" />
-  <rect className="pv-bar1" x="794.3" y="174.0" width="10" height="10" />
-  <text className="ts" x="178.0" y="80.0" textAnchor="middle">+10.8%</text>
-  <text className="ts" x="178.0" y="93.0" textAnchor="middle">435 tok/s</text>
-  <text className="ts" x="411.0" y="62.0" textAnchor="middle">+13.6%</text>
-  <text className="ts" x="411.0" y="75.0" textAnchor="middle">3,068 tok/s</text>
-  <text className="ts" x="566.3" y="125.0" textAnchor="middle">+3.8%</text>
-  <text className="ts" x="566.3" y="138.0" textAnchor="middle">9,399 tok/s</text>
-  <text className="ts" x="644.0" y="132.3" textAnchor="middle">+2.6%</text>
-  <text className="ts" x="644.0" y="145.3" textAnchor="middle">14,313 tok/s</text>
-  <text className="ts" x="799.3" y="155.0" textAnchor="middle">−0.9%</text>
-  <text className="ts" x="799.3" y="168.0" textAnchor="middle">23,384 tok/s</text>
-  <text className="ts" x="178.0" y="272" textAnchor="middle">1</text>
-  <text className="ts" x="411.0" y="272" textAnchor="middle">8</text>
-  <text className="ts" x="566.3" y="272" textAnchor="middle">32</text>
-  <text className="ts" x="644.0" y="272" textAnchor="middle">64</text>
-  <text className="ts" x="799.3" y="272" textAnchor="middle">256</text>
-  <text className="ts" x="494" y="292" textAnchor="middle">concurrent requests</text>
-  <rect className="pv-bar1" x="150" y="306" width="16" height="11" />
-  <text className="ts" x="172" y="315">pie</text>
-  <rect className="pv-bar3" x="300" y="306" width="16" height="11" />
-  <text className="ts" x="322" y="315">vLLM 0.26.1</text>
-  <rect className="pv-bar2" x="450" y="306" width="16" height="11" />
-  <text className="ts" x="472" y="315">SGLang 0.5.16</text>
-  <text className="ts" x="838" y="315" textAnchor="end">Qwen3-0.6B, 1× L40S</text>
+<svg viewBox="0 0 860 406">
+  <text className="ts" x="0" y="16">single-stream decode: bar length is the rate divided by the better baseline, so the dashed line is that baseline</text>
+  <text className="tsh" x="136" y="54">NVIDIA A100</text>
+  <text className="tsm" x="136" y="72">decode tok/s</text>
+  <line className="pv-ref" x1="222" y1="94" x2="222" y2="171" />
+  <rect className="pv-pie" x="136" y="104" width="89.8" height="15" />
+  <text className="pv-val" x="231.8" y="115">219.8</text>
+  <rect className="pv-vllm" x="136" y="125" width="86.0" height="15" />
+  <text className="pv-val" x="228.0" y="136">210.4</text>
+  <rect className="pv-sglang" x="136" y="146" width="77.8" height="15" />
+  <text className="pv-val" x="219.8" y="157">190.3</text>
+  <line className="pv-ref" x1="222" y1="178" x2="222" y2="255" />
+  <rect className="pv-pie" x="136" y="188" width="91.0" height="15" />
+  <text className="pv-val" x="233.0" y="199">121.0</text>
+  <rect className="pv-vllm" x="136" y="209" width="86.0" height="15" />
+  <text className="pv-val" x="228.0" y="220">114.3</text>
+  <rect className="pv-sglang" x="136" y="230" width="79.3" height="15" />
+  <text className="pv-val" x="221.3" y="241">105.4</text>
+  <line className="pv-ref" x1="222" y1="262" x2="222" y2="339" />
+  <rect className="pv-pie" x="136" y="272" width="95.6" height="15" />
+  <text className="pv-val" x="237.6" y="283">116.7</text>
+  <rect className="pv-vllm" x="136" y="293" width="76.1" height="15" />
+  <text className="pv-val" x="218.1" y="304">92.9</text>
+  <rect className="pv-sglang" x="136" y="314" width="86.0" height="15" />
+  <text className="pv-val" x="228.0" y="325">105.0</text>
+  <text className="tsh" x="317" y="54">NVIDIA H100</text>
+  <text className="tsm" x="317" y="72">decode tok/s</text>
+  <line className="pv-ref" x1="403" y1="94" x2="403" y2="171" />
+  <rect className="pv-pie" x="317" y="104" width="83.9" height="15" />
+  <text className="pv-val" x="406.9" y="115">288.8</text>
+  <rect className="pv-vllm" x="317" y="125" width="86.0" height="15" />
+  <text className="pv-val" x="409.0" y="136">295.9</text>
+  <rect className="pv-sglang" x="317" y="146" width="72.2" height="15" />
+  <text className="pv-val" x="395.2" y="157">248.5</text>
+  <line className="pv-ref" x1="403" y1="178" x2="403" y2="255" />
+  <rect className="pv-pie" x="317" y="188" width="89.4" height="15" />
+  <text className="pv-val" x="412.4" y="199">215.4</text>
+  <rect className="pv-vllm" x="317" y="209" width="86.0" height="15" />
+  <text className="pv-val" x="409.0" y="220">207.1</text>
+  <rect className="pv-sglang" x="317" y="230" width="74.7" height="15" />
+  <text className="pv-val" x="397.7" y="241">179.8</text>
+  <line className="pv-ref" x1="403" y1="262" x2="403" y2="339" />
+  <rect className="pv-pie" x="317" y="272" width="87.5" height="15" />
+  <text className="pv-val" x="410.5" y="283">228.7</text>
+  <rect className="pv-vllm" x="317" y="293" width="84.0" height="15" />
+  <text className="pv-val" x="407.0" y="304">219.7</text>
+  <rect className="pv-sglang" x="317" y="314" width="86.0" height="15" />
+  <text className="pv-val" x="409.0" y="325">224.9</text>
+  <text className="tsh" x="498" y="54">Apple M1 Max †</text>
+  <text className="tsm" x="498" y="72">decode tok/s</text>
+  <line className="pv-ref" x1="584" y1="94" x2="584" y2="171" />
+  <rect className="pv-pie" x="498" y="104" width="106.1" height="15" />
+  <text className="pv-val" x="610.1" y="115">80.7</text>
+  <rect className="pv-mlx" x="498" y="125" width="74.6" height="15" />
+  <text className="pv-val" x="578.6" y="136">56.7</text>
+  <rect className="pv-llama" x="498" y="146" width="86.0" height="15" />
+  <text className="pv-val" x="590.0" y="157">65.4</text>
+  <line className="pv-ref" x1="584" y1="178" x2="584" y2="255" />
+  <rect className="pv-pie" x="498" y="188" width="109.5" height="15" />
+  <text className="pv-val" x="613.5" y="199">63.9</text>
+  <rect className="pv-mlx" x="498" y="209" width="78.8" height="15" />
+  <text className="pv-val" x="582.8" y="220">46.0</text>
+  <rect className="pv-llama" x="498" y="230" width="86.0" height="15" />
+  <text className="pv-val" x="590.0" y="241">50.2</text>
+  <line className="pv-ref" x1="584" y1="262" x2="584" y2="339" />
+  <rect className="pv-pie" x="498" y="272" width="103.4" height="15" />
+  <text className="pv-val" x="607.4" y="283">64.7</text>
+  <rect className="pv-mlx" x="498" y="293" width="86.0" height="15" />
+  <text className="pv-val" x="590.0" y="304">53.8</text>
+  <rect className="pv-llama" x="498" y="314" width="69.9" height="15" />
+  <text className="pv-val" x="573.9" y="325">43.7</text>
+  <text className="tsh" x="679" y="54">Apple M4 Pro †</text>
+  <text className="tsm" x="679" y="72">decode tok/s</text>
+  <line className="pv-ref" x1="765" y1="94" x2="765" y2="171" />
+  <rect className="pv-pie" x="679" y="104" width="90.8" height="15" />
+  <text className="pv-val" x="775.8" y="115">86.3</text>
+  <rect className="pv-mlx" x="679" y="125" width="86.0" height="15" />
+  <text className="pv-val" x="771.0" y="136">81.7</text>
+  <rect className="pv-llama" x="679" y="146" width="73.6" height="15" />
+  <text className="pv-val" x="758.6" y="157">69.9</text>
+  <line className="pv-ref" x1="765" y1="178" x2="765" y2="255" />
+  <rect className="pv-pie" x="679" y="188" width="91.4" height="15" />
+  <text className="pv-val" x="776.4" y="199">74.5</text>
+  <rect className="pv-mlx" x="679" y="209" width="86.0" height="15" />
+  <text className="pv-val" x="771.0" y="220">70.1</text>
+  <rect className="pv-llama" x="679" y="230" width="60.0" height="15" />
+  <text className="pv-val" x="745.0" y="241">48.9</text>
+  <line className="pv-ref" x1="765" y1="262" x2="765" y2="339" />
+  <rect className="pv-pie" x="679" y="272" width="92.2" height="15" />
+  <text className="pv-val" x="777.2" y="283">77.6</text>
+  <rect className="pv-mlx" x="679" y="293" width="86.0" height="15" />
+  <text className="pv-val" x="771.0" y="304">72.4</text>
+  <rect className="pv-llama" x="679" y="314" width="52.9" height="15" />
+  <text className="pv-val" x="737.9" y="325">44.5</text>
+  <text className="ts" x="124" y="135" textAnchor="end">GPT-OSS-20B</text>
+  <text className="ts" x="124" y="219" textAnchor="end">Gemma-4-26B-A4B</text>
+  <text className="ts" x="124" y="303" textAnchor="end">Qwen3.6-35B-A3B</text>
+  <line className="rail" x1="0" y1="354" x2="860" y2="354" />
+  <text className="tsm" x="860" y="378" textAnchor="end">† Gemma and Qwen are int4 on the Macs</text>
+  <rect className="pv-pie" x="0" y="369" width="11" height="11" />
+  <text className="ts" x="17" y="378">pie 0.5</text>
+  <rect className="pv-vllm" x="74" y="369" width="11" height="11" />
+  <text className="ts" x="91" y="378">vLLM 0.26.1</text>
+  <rect className="pv-sglang" x="174" y="369" width="11" height="11" />
+  <text className="ts" x="191" y="378">SGLang 0.5.16</text>
+  <rect className="pv-mlx" x="287" y="369" width="11" height="11" />
+  <text className="ts" x="304" y="378">mlx-lm 0.31.3</text>
+  <rect className="pv-llama" x="400" y="369" width="11" height="11" />
+  <text className="ts" x="417" y="378">llama.cpp 10270</text>
 </svg>
 <figcaption>
-Output throughput at each width, drawn against vLLM so the differences
-are readable: all three engines scale about 54× from one request to 256,
-which on an absolute axis compresses every gap between them to a few
-pixels. pie's own throughput is printed above its markers. It leads both
-baselines at every width up to 64, by 10.8% and 13.6% over vLLM at one and
-eight requests. The margin narrows at 256, where the GPU is saturated and
-every engine's host work is hidden behind it.
+One request at a time, the shape where a host-side scheduler has the least room
+to hide. pie leads on the A100 by 4.5% to 11.1% and on both Macs on every row.
+The H100 is the exception: every engine gains from the newer card and pie gains
+the least, which turns the 4.5% lead on GPT-OSS-20B into a 2.4% deficit. The
+A100 advantage was host-side, and a faster card leaves less host time to win
+back.
 </figcaption>
 </figure>
 
-| Width | pie | vLLM 0.26.1 | SGLang 0.5.16 |
-|---|---:|---:|---:|
-| 1 request | **435.4** | 392.9 | 416.4 |
-| 8 concurrent | **3,068** | 2,700 | 2,843 |
-| 32 concurrent | **9,399** | 9,056 | 9,174 |
-| 64 concurrent | **14,313** | 13,944 | 14,042 |
-| 256 concurrent | 23,384 | **23,596** | 22,037 |
-
-Every cell's run-to-run spread is under half a percent, so the gaps in the
-first four rows are outside the noise.
-
-**The lead is widest where host efficiency still matters**: +10.8% against vLLM
-at one request, +13.6% at eight, +3.8% at 32, +2.6% at 64. At 256 the GPU is
-saturated, every engine's host work is hidden behind it, and the three land
-within 1% of each other.
-
-The harness collects request latency for pie and SGLang. vLLM's offline API
-does not report per-request latency in throughput mode:
-
-| Width | pie p50 / p99 ms | SGLang 0.5.16 p50 / p99 ms |
-|---|---:|---:|
-| 1 request | **584 / 635** | 615 / 616 |
-| 8 concurrent | **1,664 / 2,669** | 1,801 / 2,870 |
-| 32 concurrent | **2,165 / 3,478** | 2,213 / 3,529 |
-| 64 concurrent | **2,837 / 4,563** | 2,887 / 4,601 |
-| 256 concurrent | **6,825** / 11,138 | 8,255 / **11,026** |
-
-pie's median is the lowest at every width, and its p99 at every width but 256,
-where the two are within 1%.
-
-### Apple silicon
-
-Measured 2026-08-06, one model per process, AC power, no thermal warning
-recorded. pie and mlx-lm read the same checkpoint directory from the same
-cache, so those two arms are the same weights; llama.cpp runs the GGUF closest
-in size to pie's LM-only bytes. Baselines: mlx 0.32.0 / mlx-lm 0.31.3,
-llama.cpp `10270`.
-
-#### Latency
-
-Single stream, greedy, 64 tokens.
+### Throughput
 
 <figure>
-<svg viewBox="0 0 860 330">
-  <line className="rail" x1="104" y1="206" x2="830" y2="206" />
-  <text className="ts" x="96" y="210" textAnchor="end">20</text>
-  <line className="rail" x1="104" y1="161" x2="830" y2="161" />
-  <text className="ts" x="96" y="165" textAnchor="end">40</text>
-  <line className="rail" x1="104" y1="117" x2="830" y2="117" />
-  <text className="ts" x="96" y="121" textAnchor="end">60</text>
-  <line className="rail" x1="104" y1="72" x2="830" y2="72" />
-  <text className="ts" x="96" y="76" textAnchor="end">80</text>
-  <line className="ln" x1="104" y1="250" x2="830" y2="250" />
-  <text className="ts" x="96" y="34" textAnchor="end">decode tok/s</text>
-  <rect className="pv-bar1" x="120" y="71" width="34" height="179" />
-  <text className="ts" x="137" y="64" textAnchor="middle">80.7</text>
-  <rect className="pv-bar3" x="160" y="124" width="34" height="126" />
-  <text className="ts" x="177" y="117" textAnchor="middle">56.7</text>
-  <rect className="pv-bar2" x="200" y="105" width="34" height="145" />
-  <text className="ts" x="217" y="98" textAnchor="middle">65.4</text>
-  <text className="ts" x="177" y="270" textAnchor="middle">GPT-OSS-20B</text>
-  <rect className="pv-bar1" x="265" y="108" width="34" height="142" />
-  <text className="ts" x="282" y="101" textAnchor="middle">63.9</text>
-  <rect className="pv-bar3" x="305" y="148" width="34" height="102" />
-  <text className="ts" x="322" y="141" textAnchor="middle">46</text>
-  <rect className="pv-bar2" x="345" y="138" width="34" height="112" />
-  <text className="ts" x="362" y="131" textAnchor="middle">50.2</text>
-  <text className="ts" x="322" y="270" textAnchor="middle">Gemma-4-26B-A4B</text>
-  <rect className="pv-bar1" x="410" y="106" width="34" height="144" />
-  <text className="ts" x="427" y="99" textAnchor="middle">64.7</text>
-  <rect className="pv-bar3" x="450" y="130" width="34" height="120" />
-  <text className="ts" x="467" y="123" textAnchor="middle">53.8</text>
-  <rect className="pv-bar2" x="490" y="153" width="34" height="97" />
-  <text className="ts" x="507" y="146" textAnchor="middle">43.7</text>
-  <text className="ts" x="467" y="270" textAnchor="middle">Qwen3.6-35B-A3B</text>
-  <rect className="pv-bar1" x="555" y="208" width="34" height="42" />
-  <text className="ts" x="572" y="201" textAnchor="middle">18.7</text>
-  <rect className="pv-bar3" x="595" y="218" width="34" height="32" />
-  <text className="ts" x="612" y="211" textAnchor="middle">14.2</text>
-  <rect className="pv-bar2" x="635" y="218" width="34" height="32" />
-  <text className="ts" x="652" y="211" textAnchor="middle">14.4</text>
-  <text className="ts" x="612" y="270" textAnchor="middle">Qwen3.6-27B</text>
-  <rect className="pv-bar1" x="700" y="216" width="34" height="34" />
-  <text className="ts" x="717" y="209" textAnchor="middle">15.3</text>
-  <rect className="pv-bar3" x="740" y="225" width="34" height="25" />
-  <text className="ts" x="757" y="218" textAnchor="middle">11.2</text>
-  <rect className="pv-bar2" x="780" y="216" width="34" height="34" />
-  <text className="ts" x="797" y="209" textAnchor="middle">15.5</text>
-  <text className="ts" x="757" y="270" textAnchor="middle">Gemma-4-31B</text>
-  <rect className="pv-bar1" x="104" y="304" width="16" height="11" />
-  <text className="ts" x="126" y="314">pie</text>
-  <rect className="pv-bar3" x="232" y="304" width="16" height="11" />
-  <text className="ts" x="254" y="314">mlx-lm 0.31.3</text>
-  <rect className="pv-bar2" x="360" y="304" width="16" height="11" />
-  <text className="ts" x="382" y="314">llama.cpp 10270</text>
-  <text className="ts" x="830" y="314" textAnchor="end">M1 Max, 64 tokens, greedy, token fed back</text>
+<svg viewBox="0 0 860 406">
+  <text className="ts" x="0" y="16">throughput: same normalization, dashed line is the better baseline</text>
+  <text className="tsh" x="136" y="54">NVIDIA A100</text>
+  <text className="tsm" x="136" y="72">256 concurrent, tok/s</text>
+  <line className="pv-ref" x1="202" y1="94" x2="202" y2="171" />
+  <rect className="pv-pie" x="136" y="104" width="69.9" height="15" />
+  <text className="pv-val" x="211.9" y="115">3,354</text>
+  <rect className="pv-vllm" x="136" y="125" width="65.5" height="15" />
+  <text className="pv-val" x="207.5" y="136">3,142</text>
+  <rect className="pv-sglang" x="136" y="146" width="44.4" height="15" />
+  <text className="pv-val" x="186.4" y="157">2,131</text>
+  <line className="pv-ref" x1="202" y1="178" x2="202" y2="255" />
+  <rect className="pv-pie" x="136" y="188" width="72.4" height="15" />
+  <text className="pv-val" x="214.4" y="199">2,261</text>
+  <rect className="pv-vllm" x="136" y="209" width="65.5" height="15" />
+  <text className="pv-val" x="207.5" y="220">2,045</text>
+  <rect className="pv-sglang" x="136" y="230" width="52.1" height="15" />
+  <text className="pv-val" x="194.1" y="241">1,626</text>
+  <line className="pv-ref" x1="202" y1="262" x2="202" y2="339" />
+  <rect className="pv-pie" x="136" y="272" width="72.0" height="15" />
+  <text className="pv-val" x="214.0" y="283">2,578</text>
+  <rect className="pv-vllm" x="136" y="293" width="59.1" height="15" />
+  <text className="pv-val" x="201.1" y="304">2,116</text>
+  <rect className="pv-sglang" x="136" y="314" width="65.5" height="15" />
+  <text className="pv-val" x="207.5" y="325">2,347</text>
+  <text className="tsh" x="317" y="54">NVIDIA H100</text>
+  <text className="tsm" x="317" y="72">256 concurrent, tok/s</text>
+  <line className="pv-ref" x1="383" y1="94" x2="383" y2="171" />
+  <rect className="pv-pie" x="317" y="104" width="65.8" height="15" />
+  <text className="pv-val" x="388.8" y="115">4,018</text>
+  <rect className="pv-vllm" x="317" y="125" width="57.2" height="15" />
+  <text className="pv-val" x="380.2" y="136">3,493</text>
+  <rect className="pv-sglang" x="317" y="146" width="65.5" height="15" />
+  <text className="pv-val" x="388.5" y="157">4,002</text>
+  <line className="pv-ref" x1="383" y1="178" x2="383" y2="255" />
+  <rect className="pv-pie" x="317" y="188" width="66.2" height="15" />
+  <text className="pv-val" x="389.2" y="199">3,324</text>
+  <rect className="pv-vllm" x="317" y="209" width="65.5" height="15" />
+  <text className="pv-val" x="388.5" y="220">3,287</text>
+  <rect className="pv-sglang" x="317" y="230" width="60.4" height="15" />
+  <text className="pv-val" x="383.4" y="241">3,031</text>
+  <line className="pv-ref" x1="383" y1="262" x2="383" y2="339" />
+  <rect className="pv-pie" x="317" y="272" width="64.2" height="15" />
+  <text className="pv-val" x="387.2" y="283">3,427</text>
+  <rect className="pv-vllm" x="317" y="293" width="65.5" height="15" />
+  <text className="pv-val" x="388.5" y="304">3,497</text>
+  <rect className="pv-sglang" x="317" y="314" width="33.8" height="15" />
+  <text className="pv-val" x="356.8" y="325">1,804</text>
+  <text className="tsh" x="498" y="54">Apple M1 Max †</text>
+  <text className="tsm" x="498" y="72">8 concurrent, tok/s</text>
+  <line className="pv-ref" x1="564" y1="94" x2="564" y2="171" />
+  <rect className="pv-pie" x="498" y="104" width="76.5" height="15" />
+  <text className="pv-val" x="580.5" y="115">108.5</text>
+  <rect className="pv-mlx" x="498" y="125" width="58.2" height="15" />
+  <text className="pv-val" x="562.2" y="136">82.5</text>
+  <rect className="pv-llama" x="498" y="146" width="65.5" height="15" />
+  <text className="pv-val" x="569.5" y="157">92.9</text>
+  <line className="pv-ref" x1="564" y1="178" x2="564" y2="255" />
+  <rect className="pv-pie" x="498" y="188" width="78.9" height="15" />
+  <text className="pv-val" x="582.9" y="199">107.9</text>
+  <rect className="pv-mlx" x="498" y="209" width="57.8" height="15" />
+  <text className="pv-val" x="561.8" y="220">79.1</text>
+  <rect className="pv-llama" x="498" y="230" width="65.5" height="15" />
+  <text className="pv-val" x="569.5" y="241">89.6</text>
+  <line className="pv-ref" x1="564" y1="262" x2="564" y2="339" />
+  <rect className="pv-pie" x="498" y="272" width="83.9" height="15" />
+  <text className="pv-val" x="587.9" y="283">123.4</text>
+  <rect className="pv-mlx" x="498" y="293" width="65.5" height="15" />
+  <text className="pv-val" x="569.5" y="304">96.3</text>
+  <rect className="pv-llama" x="498" y="314" width="54.8" height="15" />
+  <text className="pv-val" x="558.8" y="325">80.6</text>
+  <text className="tsh" x="679" y="54">Apple M4 Pro †</text>
+  <text className="tsm" x="679" y="72">8 concurrent, tok/s</text>
+  <line className="pv-ref" x1="745" y1="94" x2="745" y2="171" />
+  <rect className="pv-pie" x="679" y="104" width="124.0" height="15" />
+  <text className="pv-val" x="809.0" y="115">390.7</text>
+  <rect className="pv-mlx" x="679" y="125" width="65.5" height="15" />
+  <text className="pv-val" x="750.5" y="136">206.4</text>
+  <rect className="pv-llama" x="679" y="146" width="42.6" height="15" />
+  <text className="pv-val" x="727.6" y="157">134.1</text>
+  <line className="pv-ref" x1="745" y1="178" x2="745" y2="255" />
+  <rect className="pv-pie" x="679" y="188" width="97.8" height="15" />
+  <text className="pv-val" x="782.8" y="199">313.8</text>
+  <rect className="pv-mlx" x="679" y="209" width="65.5" height="15" />
+  <text className="pv-val" x="750.5" y="220">210.1</text>
+  <rect className="pv-llama" x="679" y="230" width="42.7" height="15" />
+  <text className="pv-val" x="727.7" y="241">137.1</text>
+  <line className="pv-ref" x1="745" y1="262" x2="745" y2="339" />
+  <rect className="pv-pie" x="679" y="272" width="76.5" height="15" />
+  <text className="pv-val" x="761.5" y="283">254.3</text>
+  <rect className="pv-mlx" x="679" y="293" width="65.5" height="15" />
+  <text className="pv-val" x="750.5" y="304">217.8</text>
+  <rect className="pv-llama" x="679" y="314" width="24.5" height="15" />
+  <text className="pv-val" x="709.5" y="325">81.5</text>
+  <text className="ts" x="124" y="135" textAnchor="end">GPT-OSS-20B</text>
+  <text className="ts" x="124" y="219" textAnchor="end">Gemma-4-26B-A4B</text>
+  <text className="ts" x="124" y="303" textAnchor="end">Qwen3.6-35B-A3B</text>
+  <line className="rail" x1="0" y1="354" x2="860" y2="354" />
+  <text className="tsm" x="860" y="378" textAnchor="end">† Gemma and Qwen are int4 on the Macs</text>
+  <rect className="pv-pie" x="0" y="369" width="11" height="11" />
+  <text className="ts" x="17" y="378">pie 0.5</text>
+  <rect className="pv-vllm" x="74" y="369" width="11" height="11" />
+  <text className="ts" x="91" y="378">vLLM 0.26.1</text>
+  <rect className="pv-sglang" x="174" y="369" width="11" height="11" />
+  <text className="ts" x="191" y="378">SGLang 0.5.16</text>
+  <rect className="pv-mlx" x="287" y="369" width="11" height="11" />
+  <text className="ts" x="304" y="378">mlx-lm 0.31.3</text>
+  <rect className="pv-llama" x="400" y="369" width="11" height="11" />
+  <text className="ts" x="417" y="378">llama.cpp 10270</text>
 </svg>
 <figcaption>
-pie is ahead of mlx-lm on all five and ahead of llama.cpp on four. Gemma-4-31B
-is the exception at 15.3 against 15.5. On the like-for-like pair both are 15.5,
-using pie's no-readback figure, which synchronizes per step as llama.cpp's
-does.
+256 concurrent requests on the CUDA cards, eight on the Macs. pie leads on all
+three models on the A100 by 6.7% to 10.6%, on the M1 Max by 16.8% to 53.1%, and
+on the M4 Pro by 1.17x to 1.89x. The H100 is close to a draw: +0.4%, +1.1%, and
+2.0% behind vLLM on Qwen3.6-35B-A3B. SGLang's Qwen row there, 1,804 tok/s, is
+below its own A100 result and should be treated as suspect until it is re-run.
 </figcaption>
 </figure>
-
-#### Throughput
-
-<figure>
-<svg viewBox="0 0 860 330">
-  <line className="rail" x1="104" y1="212" x2="830" y2="212" />
-  <text className="ts" x="96" y="216" textAnchor="end">25</text>
-  <line className="rail" x1="104" y1="173" x2="830" y2="173" />
-  <text className="ts" x="96" y="177" textAnchor="end">50</text>
-  <line className="rail" x1="104" y1="135" x2="830" y2="135" />
-  <text className="ts" x="96" y="139" textAnchor="end">75</text>
-  <line className="rail" x1="104" y1="96" x2="830" y2="96" />
-  <text className="ts" x="96" y="100" textAnchor="end">100</text>
-  <line className="rail" x1="104" y1="58" x2="830" y2="58" />
-  <text className="ts" x="96" y="62" textAnchor="end">125</text>
-  <line className="ln" x1="104" y1="250" x2="830" y2="250" />
-  <text className="ts" x="20" y="34">aggregate decode tok/s</text>
-  <rect className="pv-bar1" x="120" y="60" width="34" height="190" />
-  <text className="ts" x="137" y="53" textAnchor="middle">123.4</text>
-  <rect className="pv-bar3" x="160" y="102" width="34" height="148" />
-  <text className="ts" x="177" y="95" textAnchor="middle">96.3</text>
-  <rect className="pv-bar2" x="200" y="126" width="34" height="124" />
-  <text className="ts" x="217" y="119" textAnchor="middle">80.6</text>
-  <text className="ts" x="177" y="270" textAnchor="middle">Qwen3.6-35B-A3B</text>
-  <rect className="pv-bar1" x="265" y="83" width="34" height="167" />
-  <text className="ts" x="282" y="76" textAnchor="middle">108.5</text>
-  <rect className="pv-bar3" x="305" y="123" width="34" height="127" />
-  <text className="ts" x="322" y="116" textAnchor="middle">82.5</text>
-  <rect className="pv-bar2" x="345" y="107" width="34" height="143" />
-  <text className="ts" x="362" y="100" textAnchor="middle">92.9</text>
-  <text className="ts" x="322" y="270" textAnchor="middle">GPT-OSS-20B</text>
-  <rect className="pv-bar1" x="410" y="84" width="34" height="166" />
-  <text className="ts" x="427" y="77" textAnchor="middle">107.9</text>
-  <rect className="pv-bar3" x="450" y="128" width="34" height="122" />
-  <text className="ts" x="467" y="121" textAnchor="middle">79.1</text>
-  <rect className="pv-bar2" x="490" y="112" width="34" height="138" />
-  <text className="ts" x="507" y="105" textAnchor="middle">89.6</text>
-  <text className="ts" x="467" y="270" textAnchor="middle">Gemma-4-26B-A4B</text>
-  <rect className="pv-bar1" x="555" y="215" width="34" height="35" />
-  <text className="ts" x="572" y="208" textAnchor="middle">22.9</text>
-  <rect className="pv-bar3" x="595" y="228" width="34" height="22" />
-  <text className="ts" x="612" y="221" textAnchor="middle">14.1</text>
-  <rect className="pv-bar2" x="635" y="219" width="34" height="31" />
-  <text className="ts" x="652" y="212" textAnchor="middle">20</text>
-  <text className="ts" x="612" y="270" textAnchor="middle">Qwen3.6-27B</text>
-  <rect className="pv-bar1" x="700" y="222" width="34" height="28" />
-  <text className="ts" x="717" y="215" textAnchor="middle">17.9</text>
-  <rect className="pv-bar3" x="740" y="232" width="34" height="18" />
-  <text className="ts" x="757" y="225" textAnchor="middle">12</text>
-  <rect className="pv-bar2" x="780" y="213" width="34" height="37" />
-  <text className="ts" x="797" y="206" textAnchor="middle">24</text>
-  <text className="ts" x="757" y="270" textAnchor="middle">Gemma-4-31B</text>
-  <rect className="pv-bar1" x="104" y="304" width="16" height="11" />
-  <text className="ts" x="126" y="314">pie</text>
-  <rect className="pv-bar3" x="232" y="304" width="16" height="11" />
-  <text className="ts" x="254" y="314">mlx-lm 0.31.3</text>
-  <rect className="pv-bar2" x="360" y="304" width="16" height="11" />
-  <text className="ts" x="382" y="314">llama.cpp 10270</text>
-  <text className="ts" x="830" y="314" textAnchor="end">M1 Max, 8 concurrent sequences</text>
-</svg>
-<figcaption>
-Aggregate decode over eight concurrent sequences, all three engines on the
-reference machine. pie leads mlx-lm on all five rows and llama.cpp on four.
-</figcaption>
-</figure>
-
-The one loss is Gemma-4-31B, 17.9 against llama.cpp's 24.0, and it is a tuning
-constant rather than a kernel. `qmm_min_batch` is 12, which holds that row on
-the GEMV path past its crossover; overriding it to 8 gives 30.0 on the same
-binary, turning the loss into a 1.25× win. It is a device-wide default, so it
-has not been changed on one row's evidence.
-
-#### The other two machines
-
-Same protocol, same five models.
-
-M4 Pro, prefill / decode tok/s:
-
-| Model | mlx-lm 0.31.3 | pie | llama.cpp 10270 |
-|---|---:|---:|---:|
-| GPT-OSS-20B | 559.2 / 81.7 | **636.0 / 86.3** | 557.8 / 69.9 |
-| Gemma-4-26B-A4B | 609.7 / 70.1 | **698.4 / 74.5** | 496.1 / 48.9 |
-| Gemma-4-31B | 102.8 / 12.7 | **113.4 / 13.3** | 111.4 / 13.2 |
-| Qwen3.6-27B | 120.8 / 14.6 | 114.3 / **15.2** | **124.7** / 13.3 |
-| Qwen3.6-35B-A3B | **598.1** / 72.4 | 472.4 / **77.6** | 451.2 / 44.5 |
-
-M2 Max, prefill / decode tok/s:
-
-| Model | mlx-lm 0.31.3 | pie |
-|---|---:|---:|
-| GPT-OSS-20B | 410.6 / 84.2 | **651.5 / 113.7** |
-| Gemma-4-26B-A4B | 445.1 / 68.5 | **629.3 / 83.9** |
-| Gemma-4-31B | 89.2 / 15.5 | **164.0 / 18.0** |
-| Qwen3.6-27B | 105.7 / 19.8 | **150.3 / 21.0** |
-| Qwen3.6-35B-A3B | 430.1 / 74.6 | **430.6 / 82.2** |
-
-Across the three machines pie is ahead of mlx-lm on decode in all fifteen runs,
-and on prefill in thirteen.
-
-#### Against the memory roof
-
-Decode at batch 1 is bandwidth-bound, so the share of a machine's memory roof a
-model reaches is a ceiling on every engine.
-
-<figure>
-<svg viewBox="0 0 860 330">
-  <line className="rail" x1="104" y1="202" x2="830" y2="202" />
-  <text className="ts" x="96" y="206" textAnchor="end">25%</text>
-  <line className="rail" x1="104" y1="154" x2="830" y2="154" />
-  <text className="ts" x="96" y="158" textAnchor="end">50%</text>
-  <line className="rail" x1="104" y1="106" x2="830" y2="106" />
-  <text className="ts" x="96" y="110" textAnchor="end">75%</text>
-  <line className="ln" x1="104" y1="58" x2="830" y2="58" />
-  <text className="ts" x="96" y="62" textAnchor="end">100%</text>
-  <line className="ln" x1="104" y1="250" x2="830" y2="250" />
-  <text className="ts" x="96" y="34" textAnchor="end">share of roof</text>
-  <rect className="pv-bar3" x="120" y="119.4" width="34" height="130.6" />
-  <text className="ts" x="137" y="112" textAnchor="middle">68%</text>
-  <rect className="pv-bar2" x="160" y="94.5" width="34" height="155.5" />
-  <text className="ts" x="177" y="87" textAnchor="middle">81%</text>
-  <rect className="pv-bar1" x="200" y="75.3" width="34" height="174.7" />
-  <text className="ts" x="217" y="68" textAnchor="middle">91%</text>
-  <text className="ts" x="177" y="270" textAnchor="middle">Gemma-4-31B</text>
-  <text className="ts" x="177" y="286" textAnchor="middle">dense</text>
-  <rect className="pv-bar3" x="265" y="117.5" width="34" height="132.5" />
-  <text className="ts" x="282" y="110" textAnchor="middle">69%</text>
-  <rect className="pv-bar2" x="305" y="98.3" width="34" height="151.7" />
-  <text className="ts" x="322" y="91" textAnchor="middle">79%</text>
-  <rect className="pv-bar1" x="345" y="84.9" width="34" height="165.1" />
-  <text className="ts" x="362" y="77" textAnchor="middle">86%</text>
-  <text className="ts" x="322" y="270" textAnchor="middle">Qwen3.6-27B</text>
-  <text className="ts" x="322" y="286" textAnchor="middle">dense</text>
-  <rect className="pv-bar3" x="410" y="171.3" width="34" height="78.7" />
-  <text className="ts" x="427" y="164" textAnchor="middle">41%</text>
-  <rect className="pv-bar2" x="450" y="138.6" width="34" height="111.4" />
-  <text className="ts" x="467" y="131" textAnchor="middle">58%</text>
-  <rect className="pv-bar1" x="490" y="121.4" width="34" height="128.6" />
-  <text className="ts" x="507" y="114" textAnchor="middle">67%</text>
-  <text className="ts" x="467" y="270" textAnchor="middle">GPT-OSS-20B</text>
-  <text className="ts" x="467" y="286" textAnchor="middle">mixture</text>
-  <rect className="pv-bar3" x="555" y="182.8" width="34" height="67.2" />
-  <text className="ts" x="572" y="175" textAnchor="middle">35%</text>
-  <rect className="pv-bar2" x="595" y="159.8" width="34" height="90.2" />
-  <text className="ts" x="612" y="152" textAnchor="middle">47%</text>
-  <rect className="pv-bar1" x="635" y="129" width="34" height="121" />
-  <text className="ts" x="652" y="122" textAnchor="middle">63%</text>
-  <text className="ts" x="612" y="270" textAnchor="middle">Gemma-4-26B-A4B</text>
-  <text className="ts" x="612" y="286" textAnchor="middle">mixture</text>
-  <rect className="pv-bar3" x="700" y="196.2" width="34" height="53.8" />
-  <text className="ts" x="717" y="189" textAnchor="middle">28%</text>
-  <rect className="pv-bar2" x="740" y="180.9" width="34" height="69.1" />
-  <text className="ts" x="757" y="173" textAnchor="middle">36%</text>
-  <rect className="pv-bar1" x="780" y="152.1" width="34" height="97.9" />
-  <text className="ts" x="797" y="145" textAnchor="middle">51%</text>
-  <text className="ts" x="757" y="270" textAnchor="middle">Qwen3.6-35B-A3B</text>
-  <text className="ts" x="757" y="286" textAnchor="middle">mixture</text>
-  <rect className="pv-bar3" x="104" y="304" width="16" height="11" />
-  <text className="ts" x="126" y="314">M1 Max</text>
-  <rect className="pv-bar2" x="232" y="304" width="16" height="11" />
-  <text className="ts" x="254" y="314">M2 Max</text>
-  <rect className="pv-bar1" x="360" y="304" width="16" height="11" />
-  <text className="ts" x="382" y="314">M4 Pro</text>
-  <text className="ts" x="830" y="314" textAnchor="end">single-stream decode, bandwidth-bound</text>
-</svg>
-<figcaption>
-How much of each machine a model can actually use, against measured streaming
-roofs of 389.5, 384.9 and 254.2 GB/s respectively. Dense models run close to
-the roof and no engine can win much there: llama.cpp and mlx-lm land within 5%
-of pie on those rows. Mixtures read too few bytes per token to hide their
-routing and dispatch, and the gap between them and the roof is headroom left on
-every machine tested. Most of pie's margin comes from those rows.
-</figcaption>
-</figure>
-
-### Method
-
-- Measured 2026-08-06 on `63627aff5`, one model per process, AC power, no
-  thermal warning recorded. The reference-machine batched figures span two
-  batched-decode fixes, `c2e579598` to `8b4cb156c`, which moved nothing
-  single-stream.
-- Prompt and output token counts were checked identical across every engine at
-  every width, and every run completed every request.
-- SGLang's decode-graph capture ceiling is pinned explicitly. Left at its
-  default it derives from memory remaining after `mem_fraction_static`, which
-  on this box captured only to batch size 32 and dropped every wider decode
-  step to the eager path.
-- llama.cpp reads 0.3% to 8.9% more bytes per row than pie, and decode is
-  bandwidth-bound, so its decode figures are if anything flattered. Where pie
-  reports two decode numbers, the lower one (host argmax in the loop) is used
-  throughout.
-- The mlx-lm figures come from an in-process batched forward rather than from
-  mlx-lm's server, whose accept loop starves under load, so that column is an
-  upper bound on mlx at its most favourable shape.
-- The M4 Pro and M2 Max tables predate those two fixes and have not been re-run,
-  so their batched cells are not reported here. The M2 Max llama.cpp build was
-  `10280` rather than `10270`, so that arm is a separate experiment and is not
-  tabulated.
-- The M2 Max numbers were taken while roughly 70 GiB was downloading. Disk
-  contention pushed pie and mlx-lm down together, so the ratio is more
-  trustworthy than the absolute values, and a quiet-host re-run is owed.
-- The GPT-OSS rows on the M2 Max understate that machine: a sweep found
-  `moe_batch_min_per_expert = 4` beats the default 8 by 47% at 32 rows there,
-  against 2.7% noise. Every number here used the default.
-- One llama.cpp arm used a non-stock quant (`UD-Q4_K_S`) because the stock file
-  did not fit the disk.
-- These are our own measurements on our own machines. They have not been
-  reproduced independently, and the harnesses are being prepared for release.
-
-**Coming next.** Larger models, longer contexts, multi-GPU and multi-node CUDA,
-and re-runs of the M2 Max and M4 Pro matrices on the current build. Those runs
-are in progress and will be published as they land.
-
-### Bounds enforced by tests
-
-These are test assertions rather than measurements, but they bound the cost of
-two features described above.
-
-| Bound | Test |
-|---|---|
-| `.zt` parse overhead within 8× of safetensors | `loader/tests/ztensor_perf.rs` |
-| 16 GiB MoE on an 8 GiB device, output identical to resident | `worker/tests/cuda_moe_streaming.rs` |
 
 <div className="pv-part"><span>Part VI</span> Migrating</div>
 
 ## Breaking changes
 
-- **Existing inferlets must be rewritten.** The eager `execute()` loop is
+- Existing inferlets must be rewritten. The eager `execute()` loop is
   replaced by traced dataflows and channels.
-- **Samplers are no longer a WIT enum.** A sampler is an epilogue closure over
+- Samplers are no longer a WIT enum. A sampler is an epilogue closure over
   logits. The constraint layer is removed in favor of the grammar interface.
-- **The inferlet WIT surface is split** into `forward`, `forward-recurrent`, and
+- The inferlet WIT surface is split into `forward`, `forward-recurrent`, and
   `forward-hybrid`. Inferlets select via `model.pass-kind()`.
-- **The vLLM, SGLang, TensorRT-LLM, and portable drivers are removed.**
+- The vLLM, SGLang, TensorRT-LLM, and portable drivers are removed.
   `driver/` now contains `cuda`, `metal`, `dummy`, and `transport`. Their
   reference documentation is removed with them.
-- **Repository layout.** The single `runtime/` crate, `server/`, and
+- The repository layout changed. The single `runtime/` crate, `server/`, and
   `inferlets/` are replaced by a 55-crate workspace. `interface/` is the
   dependency floor and holds the boundary contracts; `controller`, `gateway`,
   and `worker` do not depend on one another.
-- **SDK spelling.** Tensor math uses operators rather than function calls; a
-  `take` is a tensor and a host readback is not a `take`; channels carry their
-  own identity; dtypes have a single lowercase spelling.
+- The SDK spelling changed. Tensor math uses operators rather than function
+  calls; a `take` is a tensor and a host readback is not a `take`; channels
+  carry their own identity; dtypes have a single lowercase spelling.
 - MCP and messaging documentation is removed.
 - `CHANGELOG.md` and `Dockerfile.cuda` are removed.
 
@@ -1621,24 +1432,20 @@ NIXL/RDMA. The gateway exposes `POST /v1/generate` (SSE) and `GET /v1/ws`.
 grammars survive forks, which constrained speculative decoding and ASAP
 grammar-aligned decoding both require.
 
-**CLI.** `pie config init|show|set` with dot-path edits and a single `[[model]]`
-default; `pie model list|download|remove`; `pie driver list|doctor`;
-`pie serve`. `pie-env` prints the resolved config path, `$PIE_HOME`, log level,
-and metrics address without starting a daemon.
+**CLI.** `pie config`, `pie model`, `pie driver`, and `pie serve`. `pie-env`
+prints the resolved configuration without starting a daemon.
 
-**Sandboxing.** Per-instance filesystem and network policy objects in
-`runtime/engine/src/inferlet/sandbox.rs`.
+**Sandboxing.** Filesystem and network policy is set per inferlet instance.
 
 **Observability.** Tracing and OTLP metrics, including scheduler and fire
 timing.
 
 **Test infrastructure.** Tokenizer output is checked against official Hugging
-Face and tiktoken snapshots; model-config normalization has differential
-goldens; CI runs MLX parity validation; PTIR has golden traces, container
-mutation sweeps, and generated-artifact drift checks.
+Face and tiktoken snapshots, CI runs MLX parity validation, and PTIR has golden
+traces and drift checks.
 
 **Model layer.** Chat templates, reasoning parsers, tool-call templates, and
-multimodal geometry moved into `runtime/model`.
+multimodal geometry now live in one place.
 
 ## Known gaps
 
@@ -1649,13 +1456,10 @@ multimodal geometry moved into `runtime/model`.
 - The agent-orchestration, MCP, messaging, and multimodal examples from 0.4 have
   no 0.5 counterpart, and there are no Python or JavaScript example inferlets.
 - No documentation for recurrent state.
-- No Metal driver reference page; `website/docs/reference/drivers/` contains
-  `cuda.mdx` only.
+- No Metal driver reference page; only CUDA has one.
 - Benchmark numbers are preliminary, measured by us, and not yet reproducible
   from a published harness.
-- The Metal host fit check is conservative enough to refuse models that run.
-  It adds the load-time staging transient to pools that fill only after that
-  mapping is released, so it describes a peak that does not occur. On a 32 GiB
-  M1 Max it refuses four of five measured models.
+- The Metal host fit check is conservative enough to refuse models that run. On
+  a 32 GiB M1 Max it refuses four of five measured models.
 
 {/* TODO: preview build / install instructions. */}
