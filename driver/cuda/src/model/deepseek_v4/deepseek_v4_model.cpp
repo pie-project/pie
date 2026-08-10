@@ -57,7 +57,9 @@ DsV4Model::DsV4Model(
         // rather than into a lost optimisation.
         bool capturable = on;
         for (const auto& L : weights_.layers) {
-            if (L.expert_cache != nullptr) {
+            // Streamed and per-expert dequantized weights share the host-routing
+            // branch, whose device-to-host read requires a stream synchronize.
+            if (L.expert_cache != nullptr || !L.experts.empty()) {
                 capturable = false;
                 break;
             }
