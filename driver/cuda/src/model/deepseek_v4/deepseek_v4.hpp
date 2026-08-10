@@ -108,6 +108,19 @@ struct DsV4LayerWeights {
     const DeviceTensor* moe_gate_up_bf16 = nullptr;  // [E, 2*moe_I, H] BF16
     const DeviceTensor* moe_down_bf16    = nullptr;  // [E, H, moe_I] BF16
 
+    // Or resident native MXFP4 banks for the expert-indexed Marlin MoE.
+    // The weights are FE2M1 in Marlin tile order and the companion scales are
+    // raw E8M0 in Marlin scale order. Gate/up use the padded intermediate as
+    // N; down uses it as K. The logical (unpadded) width remains
+    // `moe_intermediate_size / tp_size` and the activation ignores the tail.
+    const DeviceTensor* moe_gate_mxfp4       = nullptr;  // [E, Ip, H]
+    const DeviceTensor* moe_gate_mxfp4_scale = nullptr;  // [E, Ip, H/32]
+    const DeviceTensor* moe_up_mxfp4         = nullptr;  // [E, Ip, H]
+    const DeviceTensor* moe_up_mxfp4_scale   = nullptr;  // [E, Ip, H/32]
+    const DeviceTensor* moe_down_mxfp4       = nullptr;  // [E, H, Ip]
+    const DeviceTensor* moe_down_mxfp4_scale = nullptr;  // [E, H, Ip/32]
+    int moe_intermediate_padded = 0;
+
     // Or a third form: not here at all, but in a slab this layer shares with
     // every other, holding whichever experts were routed to recently. Same
     // bf16 layout as the stacks and the same dequantize produced it -- only

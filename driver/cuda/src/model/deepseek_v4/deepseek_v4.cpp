@@ -209,8 +209,62 @@ DsV4Weights bind_deepseek_v4(const LoadedModel& engine) {
         // stacks -- never both, so there is no second copy to pay for.
         L.moe_gate_up_bf16 = maybe(engine, fp + "experts.gate_up.weight");
         L.moe_down_bf16 = maybe(engine, fp + "experts.down.weight");
+        L.moe_gate_mxfp4 = maybe(engine, fp + "experts.marlin.gate.weight");
+        L.moe_gate_mxfp4_scale = maybe(engine, fp + "experts.marlin.gate.scale");
+        L.moe_up_mxfp4 = maybe(engine, fp + "experts.marlin.up.weight");
+        L.moe_up_mxfp4_scale = maybe(engine, fp + "experts.marlin.up.scale");
+        L.moe_down_mxfp4 = maybe(engine, fp + "experts.marlin.down.weight");
+        L.moe_down_mxfp4_scale = maybe(engine, fp + "experts.marlin.down.scale");
+        const bool any_native =
+            L.moe_gate_mxfp4 != nullptr || L.moe_gate_mxfp4_scale != nullptr ||
+            L.moe_up_mxfp4 != nullptr || L.moe_up_mxfp4_scale != nullptr ||
+            L.moe_down_mxfp4 != nullptr || L.moe_down_mxfp4_scale != nullptr;
+        if (any_native) {
+            if (L.moe_gate_up_bf16 != nullptr ||
+                !L.moe_gate_mxfp4 || !L.moe_gate_mxfp4_scale ||
+                !L.moe_up_mxfp4 || !L.moe_up_mxfp4_scale ||
+                !L.moe_down_mxfp4 || !L.moe_down_mxfp4_scale) {
+                throw std::runtime_error(
+                    "deepseek_v4: native MXFP4 experts must provide exactly "
+                    "gate/up/down weight and scale banks");
+            }
+            const int T = std::max(1, engine.distributed().tp_size);
+            const int H = cfg.hidden_size;
+            if (cfg.moe_intermediate_size <= 0 ||
+                cfg.moe_intermediate_size % T != 0) {
+                throw std::runtime_error(
+                    "deepseek_v4: native MXFP4 intermediate width must divide "
+                    "evenly across tensor-parallel ranks");
+            }
+            const int I = cfg.moe_intermediate_size / T;
+            const int Ip = ((I + 127) / 128) * 128;
+            const std::vector<std::int64_t> gu_scale_shape = {E, Ip, H / 32};
+            const std::vector<std::int64_t> dn_scale_shape = {E, H, Ip / 32};
+            const std::size_t gu_bytes =
+                static_cast<std::size_t>(E) * Ip * H / 2;
+            const std::size_t dn_bytes =
+                static_cast<std::size_t>(E) * H * Ip / 2;
+            if (I <= 0 || H % 32 != 0 || I % 128 != 0 || Ip != I ||
+                L.moe_gate_mxfp4->dtype() != DType::UINT8 ||
+                L.moe_up_mxfp4->dtype() != DType::UINT8 ||
+                L.moe_down_mxfp4->dtype() != DType::UINT8 ||
+                L.moe_gate_mxfp4_scale->dtype() != DType::UINT8 ||
+                L.moe_up_mxfp4_scale->dtype() != DType::UINT8 ||
+                L.moe_down_mxfp4_scale->dtype() != DType::UINT8 ||
+                L.moe_gate_mxfp4->nbytes() != gu_bytes ||
+                L.moe_up_mxfp4->nbytes() != gu_bytes ||
+                L.moe_down_mxfp4->nbytes() != dn_bytes ||
+                L.moe_gate_mxfp4_scale->shape() != gu_scale_shape ||
+                L.moe_up_mxfp4_scale->shape() != gu_scale_shape ||
+                L.moe_down_mxfp4_scale->shape() != dn_scale_shape) {
+                throw std::runtime_error(
+                    "deepseek_v4: native MXFP4 expert tensor shape or dtype mismatch at layer " +
+                    std::to_string(li));
+            }
+            L.moe_intermediate_padded = Ip;
+        }
         if (GroupStreamCache* cache = engine.group_cache();
-            cache != nullptr && L.moe_gate_up_bf16 == nullptr) {
+            cache != nullptr && L.moe_gate_up_bf16 == nullptr && !any_native) {
             const std::string group_name = fp + "experts";
             const std::size_t g = cache->find_group(group_name);
             if (g != GroupStreamCache::kNoGroup) {
@@ -224,7 +278,7 @@ DsV4Weights bind_deepseek_v4(const LoadedModel& engine) {
                 L.expert_group = g;
             }
         }
-        if (L.moe_gate_up_bf16 == nullptr && L.expert_cache == nullptr) {
+        if (L.moe_gate_up_bf16 == nullptr && L.expert_cache == nullptr && !any_native) {
             L.experts.resize(static_cast<std::size_t>(E));
             for (int e = 0; e < E; ++e) {
                 const std::string ep =

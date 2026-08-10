@@ -939,12 +939,24 @@ if(PIE_CUDA_BUILD_MARLIN)
   # would double-define every template.
   target_sources(pie_driver_cuda_lib PRIVATE
     third_party/marlin/marlin.cu
-    third_party/marlin/gptq_marlin_repack.cu
     third_party/marlin/awq_marlin_repack.cu
     third_party/marlin/marlin_wrapper.cpp)
   target_include_directories(pie_driver_cuda_lib PRIVATE
     third_party/marlin)
   target_compile_definitions(pie_driver_cuda_lib PRIVATE PIE_CUDA_HAS_MARLIN=1)
+endif()
+
+# Native MXFP4 MoE weights use Marlin's tile layout even though they never call
+# the dense Marlin GEMM.  Keep the small W4 repacker independent of that costly
+# kernel so the default MoE-only build can execute the load plan it advertises.
+if(PIE_CUDA_BUILD_MARLIN OR PIE_CUDA_BUILD_MARLIN_MOE)
+  target_sources(pie_driver_cuda_lib PRIVATE
+    third_party/marlin/gptq_marlin_repack.cu
+    third_party/marlin/marlin_repack.cpp)
+  target_include_directories(pie_driver_cuda_lib PRIVATE
+    third_party/marlin)
+  target_compile_definitions(pie_driver_cuda_lib PRIVATE
+    PIE_CUDA_HAS_MARLIN_MXFP4_REPACK=1)
 endif()
 
 # The expert-indexed MoE variant of the same kernel. Separate directory and
@@ -1134,6 +1146,14 @@ pie_add_cuda_target(test_swap_pool
 pie_add_cuda_target(test_mxfp4_marlin
   SOURCES tests/test_mxfp4_marlin.cu src/kernels/mxfp4_marlin.cu
   LIBS CUDA::cudart)
+if(PIE_CUDA_BUILD_MARLIN OR PIE_CUDA_BUILD_MARLIN_MOE)
+  pie_add_cuda_target(test_marlin_mxfp4_repack
+    SOURCES tests/marlin_mxfp4_repack_test.cu
+    INCLUDE_DIRS ${PIE_LOADER_INCLUDE_DIR} third_party/marlin
+    LIBS pie_driver_cuda_lib CUDA::cudart)
+  target_compile_definitions(test_marlin_mxfp4_repack PRIVATE
+    PIE_CUDA_HAS_MARLIN_MXFP4_REPACK=1)
+endif()
 pie_add_cuda_target(test_transcode_fused
   SOURCES tests/test_transcode_fused.cu
   LIBS pie_driver_cuda_lib)
@@ -1366,8 +1386,14 @@ if(PIE_LOADER_STATICLIB)
   pie_add_cuda_target(test_model_registry
     SOURCES tests/model_registry_test.cpp
     LIBS pie_driver_cuda_lib ${PIE_LOADER_STATICLIB} dl pthread)
+  # Real DeepSeek-V4 binder, metadata-only borrowed tensors: proves the eager
+  # gate_up/down pair remains bindable without touching a CUDA device.
+  pie_add_cuda_target(test_deepseek_v4_expert_binding
+    SOURCES tests/deepseek_v4_expert_binding_test.cpp
+    LIBS pie_driver_cuda_lib ${PIE_LOADER_STATICLIB} dl pthread)
 else()
   message(STATUS
-    "test_model_registry: skipped (no libpie_loader_capi.a; build one with "
+    "test_model_registry and test_deepseek_v4_expert_binding: skipped "
+    "(no libpie_loader_capi.a; build one with "
     "`cargo rustc -p pie-loader-capi --lib --crate-type staticlib`)")
 endif()

@@ -22,6 +22,9 @@
 #include "kernels/gather_rows.hpp"
 #include "kernels/kv_paged.hpp"
 #include "kernels/moe_dispatch.hpp"
+#ifdef PIE_CUDA_HAS_MARLIN_MOE
+  #include "marlin_moe_wrapper.hpp"
+#endif
 #include "kernels/residual_add.hpp"
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
@@ -1160,7 +1163,102 @@ void dsv4_forward_paged(
         // any dispatch, so what used to be the fallback's penalty is now noise
         // against the transfer it exists to serve.
         const bool streamed = Lw.expert_cache != nullptr;
-        if (stacked || streamed ||
+        const bool native_mxfp4 = Lw.moe_gate_mxfp4 != nullptr;
+        if (native_mxfp4) {
+#ifdef PIE_CUDA_HAS_MARLIN_MOE
+            // Native lowering is exclusive: the contract consumed the source
+            // tensors while repacking these banks, so there is no BF16 or
+            // routed-dequant copy to fall back to. Marlin therefore serves
+            // every batch shape, including single-token decode. Operators who
+            // want the eager path opt out before load via
+            // PIE_CUDA_NATIVE_MXFP4_MOE=0, which changes the contract itself.
+            const int Ip = Lw.moe_intermediate_padded;
+            constexpr int marlin_block = 16;
+            const int routes = N * K;
+            const int active_expert_cap = std::min(E, routes);
+            const int max_blocks =
+                (routes + active_expert_cap * (marlin_block - 1) +
+                 marlin_block - 1) /
+                marlin_block;
+            const int aligned_rows = max_blocks * marlin_block;
+            const int aligned_capacity =
+                static_cast<int>(ws.aligned_gate_up.shape()[0]);
+            if (Ip < local_moe_I || Ip % 128 != 0 ||
+                max_blocks > ws.aligned_max_blocks ||
+                aligned_rows > aligned_capacity) {
+                throw std::runtime_error(
+                    "deepseek_v4: native MXFP4 Marlin scratch geometry mismatch");
+            }
+            const std::size_t marlin_workspace_bytes =
+                marlin_moe::marlin_moe_workspace_bytes(std::max(Ip, H), 16);
+            if (Ip != local_moe_I ||
+                ws.expert_gate_w.nbytes() < marlin_workspace_bytes) {
+                throw std::runtime_error(
+                    "deepseek_v4: native MXFP4 Marlin workspace mismatch");
+            }
+            // These BF16 fallback buffers are unreachable when the contract
+            // publishes native banks. Reuse them so native support adds no
+            // workspace bytes to the BF16 or streamed configurations.
+            void* marlin_workspace = ws.expert_gate_w.data();
+            auto* marlin_num_tokens_past_padded =
+                static_cast<std::int32_t*>(ws.route_idx.data());
+            CUDA_CHECK(cudaMemsetAsync(
+                marlin_workspace, 0, marlin_workspace_bytes, stream));
+            kernels::launch_moe_align_decode(
+                static_cast<const std::int32_t*>(ws.topk_idx.data()),
+                static_cast<std::int32_t*>(ws.aligned_route_ids.data()),
+                static_cast<std::int32_t*>(ws.aligned_expert_ids.data()),
+                /*route_to_aligned_row=*/nullptr,
+                routes, E, marlin_block, max_blocks,
+                marlin_num_tokens_past_padded,
+                stream);
+
+            auto* gate_out =
+                static_cast<std::uint16_t*>(ws.aligned_gate_up.data());
+            auto* up_out = gate_out +
+                static_cast<std::size_t>(aligned_capacity) * Ip;
+            const auto moe_gemm = [&](const void* act, const void* packed,
+                                      const void* scales, void* out,
+                                      int prob_m, int top_k, int prob_n,
+                                      int prob_k) {
+                marlin_moe::launch_mxfp4_moe_gemm_w4a16_bf16(
+                    act, packed, scales, /*bias=*/nullptr, out,
+                    /*reduce_scratch=*/nullptr,
+                    marlin_workspace,
+                    static_cast<const std::int32_t*>(
+                        ws.aligned_route_ids.data()),
+                    static_cast<const std::int32_t*>(
+                        ws.aligned_expert_ids.data()),
+                    marlin_num_tokens_past_padded,
+                    /*topk_weights=*/nullptr,
+                    marlin_block, E, top_k,
+                    /*mul_topk_weights=*/false,
+                    prob_m, prob_n, prob_k, stream);
+            };
+            moe_gemm(
+                ws.norm_y.data(), Lw.moe_gate_mxfp4->data(),
+                Lw.moe_gate_mxfp4_scale->data(), gate_out,
+                N, K, Ip, H);
+            moe_gemm(
+                ws.norm_y.data(), Lw.moe_up_mxfp4->data(),
+                Lw.moe_up_mxfp4_scale->data(), up_out,
+                N, K, Ip, H);
+            kernels::launch_gpt_oss_glu_strided_bf16(
+                gate_out, up_out, ws.aligned_act.data(),
+                routes, local_moe_I, Ip, Ip, stream, cfg.swiglu_limit);
+            moe_gemm(
+                ws.aligned_act.data(), Lw.moe_down_mxfp4->data(),
+                Lw.moe_down_mxfp4_scale->data(), ws.aligned_out.data(),
+                routes, /*top_k=*/1, H, Ip);
+            kernels::launch_token_batched_weighted_sum_bf16(
+                ws.moe_out.data(), ws.aligned_out.data(),
+                static_cast<const float*>(ws.topk_weights.data()),
+                N, K, H, stream);
+#else
+            throw std::runtime_error(
+                "deepseek_v4: native MXFP4 weights loaded without Marlin MoE");
+#endif
+        } else if (stacked || streamed ||
             (!Lw.experts.empty() && Lw.experts[0].w1 != nullptr)) {
             // Either the contract published dense bf16 stacks or it left the
             // experts packed, and exactly one of the two is bound. cuBLAS
