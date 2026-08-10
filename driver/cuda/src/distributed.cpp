@@ -261,11 +261,11 @@ NcclComm::NcclComm(int world_size, int rank, const ncclUniqueId& uid)
         }
     });
     ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
-    // TP ranks are threads inside one process. Blocking NCCL calls can wedge
-    // when one rank waits inside NCCL while another rank still needs to enter
-    // the matching call. Non-blocking mode returns ncclInProgress instead; the
-    // wrappers below poll the communicator without holding NCCL's launch path.
-    config.blocking = 0;
+    // TP ranks initialize communicators from independent threads. On NCCL
+    // 2.27.7 the production-shaped threaded non-blocking control returns
+    // ncclInvalidArgument (and can fault in NCCL/libcuda), while the identical
+    // threaded blocking control completes on all ranks.
+    config.blocking = 1;
     // Keep the output write sequenced before the communicator is handed to
     // the async poller. Function-argument evaluation order cannot guarantee
     // that when both expressions live inside one NCCL_CHECK_ASYNC invocation.
