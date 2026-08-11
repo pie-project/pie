@@ -77,12 +77,49 @@ pub fn author_deepseek_v4(b: &mut Builder<'_>) -> Result<(), Error> {
         }
     }
     block_scales_to_fp32(b)?;
+    hc_tensors_to_fp32(b)?;
     // The dense tail, stated rather than bundled: a family's contract is
     // its pass sequence, and hiding three of them behind a helper meant
     // six families' contracts could not be read where they live.
     b.fused_moe_gate_up_tp_slices(false)?;
     b.dense_fused_projection_joins()?;
     b.publish_remaining()
+}
+
+fn hc_tensors_to_fp32(b: &mut Builder<'_>) -> Result<(), Error> {
+    for raw in b.tensors().to_vec() {
+        if ![
+            "hc_attn_base",
+            "hc_attn_fn",
+            "hc_attn_scale",
+            "hc_ffn_base",
+            "hc_ffn_fn",
+            "hc_ffn_scale",
+            "hc_head_base",
+            "hc_head_fn",
+            "hc_head_scale",
+        ]
+            .iter()
+            .any(|tail| raw.name.ends_with(tail))
+        {
+            continue;
+        }
+        let bf16 = is_raw(&raw.encoding, DType::BF16);
+        if !bf16 && !is_raw(&raw.encoding, DType::F32) {
+            continue;
+        }
+        let axis = b.shard_axis(&raw.name)?;
+        let (expr, local) = b.shard(Expr::src(&raw.name), raw.shape.clone(), axis);
+        let f32enc = Encoding::Raw(DType::F32);
+        let expr = if bf16 {
+            expr.cast(f32enc.clone())
+        } else {
+            expr
+        };
+        b.define(b.output_name(&raw.name), expr, f32enc, Some(local));
+        b.consume(raw.id);
+    }
+    Ok(())
 }
 
 /// Repack each layer's routed experts into the resident layout consumed by
