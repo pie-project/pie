@@ -424,12 +424,27 @@ pie_cuda_has_arch(PIE_HAS_SM90 90)
 pie_cuda_has_arch(PIE_HAS_SM100 100)
 pie_cuda_has_arch(PIE_HAS_SM120 120)
 
+# This is a build/numerics policy, not a runtime tuning flag: NCCL and the
+# FlashInfer peer kernel accumulate in different orders. Image publishers may
+# select OFF for one qualified hardware lineage, but an absent value preserves
+# Pie's upstream architecture default.
+set(PIE_CUDA_CUSTOM_ALL_REDUCE "$ENV{PIE_CUDA_CUSTOM_ALL_REDUCE}")
+if(PIE_CUDA_CUSTOM_ALL_REDUCE STREQUAL "")
+  set(PIE_CUDA_CUSTOM_ALL_REDUCE ON)
+endif()
+string(TOUPPER "${PIE_CUDA_CUSTOM_ALL_REDUCE}" PIE_CUDA_CUSTOM_ALL_REDUCE)
+if(NOT PIE_CUDA_CUSTOM_ALL_REDUCE MATCHES "^(ON|OFF)$")
+  message(FATAL_ERROR
+    "PIE_CUDA_CUSTOM_ALL_REDUCE must be ON or OFF, got '${PIE_CUDA_CUSTOM_ALL_REDUCE}'")
+endif()
+
 # Blackwell (sm100/120) has no custom-all-reduce kernel yet; stub it out.
-if(PIE_HAS_SM100 OR PIE_HAS_SM120)
+if(NOT PIE_CUDA_CUSTOM_ALL_REDUCE OR PIE_HAS_SM100 OR PIE_HAS_SM120)
   set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/kernels/custom_all_reduce_stub.cpp)
-  message(STATUS "Disabling FlashInfer custom all-reduce for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
+  message(STATUS "Disabling FlashInfer custom all-reduce (policy=${PIE_CUDA_CUSTOM_ALL_REDUCE}, CUDA architecture ${CMAKE_CUDA_ARCHITECTURES})")
 else()
   set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/kernels/custom_all_reduce.cu)
+  message(STATUS "Enabling FlashInfer custom all-reduce (policy=${PIE_CUDA_CUSTOM_ALL_REDUCE}, CUDA architecture ${CMAKE_CUDA_ARCHITECTURES})")
 endif()
 
 # Hopper/FA3 attention + the SM90 XQA GQA8 kernel are SM90-only; every other
