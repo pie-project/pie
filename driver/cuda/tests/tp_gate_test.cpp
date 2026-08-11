@@ -2,13 +2,85 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
+#include <string>
 #include <thread>
 #include <vector>
 
 #include "batch/tp_gate.hpp"
+#include "batch/tp_fire_receipts.hpp"
 #include "batch/rs_metadata.hpp"
 
 int main() {
+    {
+        using pie_cuda_driver::TpFireKind;
+        const auto root = pie_cuda_driver::make_tp_fire_identity(
+            7, TpFireKind::MtpDraft, 16, 2, -1, 4096);
+        int follower_requests = 2;
+#if defined(PIE_TP_TEST_PERTURB_FIRE_RECEIPT)
+        ++follower_requests;
+#endif
+        const auto follower = pie_cuda_driver::make_tp_fire_identity(
+            7, TpFireKind::MtpDraft, 16, follower_requests, -1, 4096);
+        if (!(root == follower)) {
+            std::fputs(
+                "TP fire receipts detected divergent logical identities\n",
+                stderr);
+            return 1;
+        }
+        const auto fire_line =
+            pie_cuda_driver::tp_fire_receipt_line(3, "consume", follower);
+        if (fire_line.find("rank=3 seq=7 kind=mtp_draft") ==
+                std::string::npos ||
+            fire_line.find("requests=2") == std::string::npos) {
+            std::fputs("TP fire receipt omitted logical identity fields\n", stderr);
+            return 1;
+        }
+
+        pie_cuda_driver::TpReceiptBudget budget(2);
+        if (!budget.take(0) || !budget.take(0) || budget.take(0) ||
+            !budget.take(1) || !budget.take(1) || budget.take(1)) {
+            std::fputs("TP fire receipt budget is not bounded per rank\n", stderr);
+            return 1;
+        }
+        pie_cuda_driver::TpReceiptBudget launch_budget(1);
+        const bool launch_reserved = launch_budget.take(0);
+        if (!launch_reserved || launch_budget.take(0)) {
+            std::fputs("Context launch receipt was not budgeted as one pair\n", stderr);
+            return 1;
+        }
+        const auto launch_entry = pie_cuda_driver::tp_launch_receipt_line(
+            0, 9, "entry", 2, std::numeric_limits<int>::min());
+        const auto launch_return = pie_cuda_driver::tp_launch_receipt_line(
+            0, 9, "return", 2, 0);
+        if (launch_entry.find("status=") != std::string::npos ||
+            launch_return.find("status=0") == std::string::npos) {
+            std::fputs("Context launch receipt pair is ambiguous\n", stderr);
+            return 1;
+        }
+
+        unsetenv("PIE_TP_FIRE_RECEIPTS");
+        if (pie_cuda_driver::tp_fire_receipt_limit() != 0) {
+            std::fputs("TP fire receipts did not default off\n", stderr);
+            return 1;
+        }
+        setenv("PIE_TP_FIRE_RECEIPTS", "17", 1);
+        if (pie_cuda_driver::tp_fire_receipt_limit() != 17) {
+            std::fputs("TP fire receipt limit was not read\n", stderr);
+            return 1;
+        }
+        setenv("PIE_TP_FIRE_RECEIPTS", "999999", 1);
+        if (pie_cuda_driver::tp_fire_receipt_limit() != 4096) {
+            std::fputs("TP fire receipt hard ceiling was not enforced\n", stderr);
+            return 1;
+        }
+        setenv("PIE_TP_FIRE_RECEIPTS", "-1", 1);
+        if (pie_cuda_driver::tp_fire_receipt_limit() != 0) {
+            std::fputs("TP fire receipt limit accepted a signed value\n", stderr);
+            return 1;
+        }
+        unsetenv("PIE_TP_FIRE_RECEIPTS");
+    }
     {
         // Production sequence: one ordinary forward followed by two MTP draft
         // fires. All four ranks reuse the same persistent payload/workspace.

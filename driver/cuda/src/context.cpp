@@ -43,6 +43,7 @@
 #include "batch/forward.hpp"
 #include "batch/planner_calibration.hpp"
 #include "batch/tp.hpp"
+#include "batch/tp_fire_receipts.hpp"
 #include "kernels/kv_paged.hpp"
 #include "store/kv_cache.hpp"
 #include "store/elastic.hpp"
@@ -571,6 +572,8 @@ class Context::Impl {
         return tp_size_ > 1 && tp_rank_ > 0;
     }
 
+    int launch_body(const PieFrameDesc& frame, PieCompletion completion);
+
     int validate_finalized_launch(
         const pie::driver::fire::StepLaunch& launch,
         std::vector<pie_cuda_driver::pipeline::InstanceRecord>* instances,
@@ -620,6 +623,7 @@ class Context::Impl {
     cudaStream_t media_stream_ = nullptr;
     pie_cuda_driver::abi::MultimodalLimits multimodal_limits_;
     std::atomic<bool> tp_follower_stop_{false};
+    std::atomic<std::uint64_t> launch_receipt_seq_{0};
     std::thread tp_follower_thread_;
     std::vector<std::unique_ptr<PendingAsyncResources>> pending_async_resources_;
 
@@ -2185,6 +2189,19 @@ class StepPhaseTimer {
 }  // namespace
 
 int Context::Impl::launch(const PieFrameDesc& frame, PieCompletion completion) {
+    const std::uint64_t sequence =
+        launch_receipt_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool receipt_enabled = pie_cuda_driver::begin_tp_launch_receipt(
+        tp_rank_, sequence, frame.steps.len);
+    const int status = launch_body(frame, completion);
+    pie_cuda_driver::end_tp_launch_receipt(
+        receipt_enabled, tp_rank_, sequence, frame.steps.len, status);
+    return status;
+}
+
+int Context::Impl::launch_body(
+    const PieFrameDesc& frame,
+    PieCompletion completion) {
     pie_cuda_driver::ops::ScopedRuntimeQuantContext quant_scope(
         runtime_quant_context_);
     const PieStepDesc* steps = frame.steps.ptr;
