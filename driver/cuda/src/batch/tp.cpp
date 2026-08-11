@@ -1664,7 +1664,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                     /*logits_argmax_chunk_tokens=*/0);
                 engine.graph_cache->put(key, exec);
             }
-            CUDA_CHECK(cudaGraphLaunch(exec, /*stream=*/nullptr));
+            CUDA_CHECK(cudaGraphLaunch(exec, engine.cublas.stream()));
         } else {
             pie_cuda_driver::ForwardFn::ForwardInputs fwd_in;
             fwd_in.token_ids = reinterpret_cast<const std::int32_t*>(pi.tokens.data());
@@ -1744,6 +1744,9 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                 fwd_in);
         }
         forward_timer.stop();
+        // Rank 0 admits only one TP fire at a time. Followers must retire the
+        // same fire before accepting payloads that reuse its device buffers.
+        CUDA_CHECK(cudaStreamSynchronize(engine.cublas.stream()));
         if (mailbox != nullptr && TpProfile::enabled()) {
             const auto now = std::chrono::steady_clock::now();
             auto& prof = TpProfile::instance();

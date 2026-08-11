@@ -2203,6 +2203,10 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             *s.staged, s.dispatch_view, s.program_token_starts);
     }
 
+    if (engine.tp_comm != nullptr && !s.empty_step) {
+        tp_runahead::wait_for_slot();
+    }
+
     // Wake the follower FIRST, before this rank's uploads, compose and payload
     // broadcast, so it gets that window as a head start. Rank 0 pre-enqueues
     // its whole step and its forward starts ~17 us after the payload broadcast
@@ -2375,7 +2379,6 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                 ? 0
                 : static_cast<std::size_t>(tp_kv_indices_count),
         };
-        tp_runahead::wait_for_slot();
         tp_broadcast_inputs(*engine.tp_comm, pi,
                             engine.tp_cpu_gate_key,
                             tp_views,
