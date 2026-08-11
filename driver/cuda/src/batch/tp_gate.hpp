@@ -8,31 +8,6 @@
 
 namespace pie_cuda_driver {
 
-enum class TpFollowerPhase : int {
-    GateWait = 0,
-    Header = 1,
-    PayloadEnqueue = 2,
-    GroupEnd = 3,
-    AsyncPoll = 4,
-    PayloadDone = 5,
-    HostViews = 6,
-    Consumed = 7,
-};
-
-inline const char* tp_follower_phase_name(TpFollowerPhase phase) noexcept {
-    switch (phase) {
-        case TpFollowerPhase::GateWait: return "gate_wait";
-        case TpFollowerPhase::Header: return "header";
-        case TpFollowerPhase::PayloadEnqueue: return "payload_enqueue";
-        case TpFollowerPhase::GroupEnd: return "group_end";
-        case TpFollowerPhase::AsyncPoll: return "async_poll";
-        case TpFollowerPhase::PayloadDone: return "payload_done";
-        case TpFollowerPhase::HostViews: return "host_views";
-        case TpFollowerPhase::Consumed: return "consumed";
-    }
-    return "unknown";
-}
-
 // Consume exactly one published gate epoch. Advancing directly to `published`
 // would collapse a burst of MTP notifications into one follower receive.
 inline bool tp_cpu_gate_consume_one(

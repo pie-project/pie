@@ -2397,7 +2397,6 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                             static_cast<int>(s.rs_buf_read_id_view.size()),
                             /*stream=*/nullptr);
         tp_commit.completed = true;
-        pie_cuda_driver::tp_watchdog_mark_phase(2);
         // One TP fire in flight on the device at a time.
         //
         // The persistent input buffers (`pi.*`) and the NCCL communicator are

@@ -2,32 +2,13 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
-#include <string_view>
 #include <thread>
-#include <utility>
 #include <vector>
 
 #include "batch/tp_gate.hpp"
 #include "batch/rs_metadata.hpp"
 
 int main() {
-    using pie_cuda_driver::TpFollowerPhase;
-    for (const auto [phase, expected] : {
-             std::pair{TpFollowerPhase::GateWait, "gate_wait"},
-             std::pair{TpFollowerPhase::Header, "header"},
-             std::pair{TpFollowerPhase::PayloadEnqueue, "payload_enqueue"},
-             std::pair{TpFollowerPhase::GroupEnd, "group_end"},
-             std::pair{TpFollowerPhase::AsyncPoll, "async_poll"},
-             std::pair{TpFollowerPhase::PayloadDone, "payload_done"},
-             std::pair{TpFollowerPhase::HostViews, "host_views"},
-             std::pair{TpFollowerPhase::Consumed, "consumed"},
-         }) {
-        if (std::string_view(pie_cuda_driver::tp_follower_phase_name(phase)) !=
-            expected) {
-            std::fputs("TP follower phase telemetry is mislabeled\n", stderr);
-            return 1;
-        }
-    }
     {
         pie_cuda_driver::TpFollowerAcks acks;
         acks.mark(2, 8);
