@@ -67,6 +67,11 @@ Host workspace: 3 crates → 55.
 - [Performance](#performance)
 - [Single-stream decode](#single-stream-decode)
 - [Throughput](#throughput)
+- [Install size](#install-size)
+- [Install size](#install-size)
+- [Install size](#install-size)
+- [Install size](#install-size)
+- [Install size](#install-size)
 
 <div className="pv-index-part">VI. Migrating</div>
 
@@ -1394,6 +1399,48 @@ three models on the A100 by 6.7% to 10.6%, on the M1 Max by 16.8% to 53.1%, and
 on the M4 Pro by 1.17x to 1.89x. The H100 is close to a draw: +0.4%, +1.1%, and
 2.0% behind vLLM on Qwen3.6-35B-A3B. SGLang's Qwen row there, 1,804 tok/s, is
 below its own A100 result and should be treated as suspect until it is re-run.
+</figcaption>
+</figure>
+
+### Install size
+
+<figure>
+<svg viewBox="0 0 860 380">
+  <text className="tsh" x="0" y="44">CUDA</text>
+  <text className="tsm" x="860" y="44" textAnchor="end">compressed download, linux/amd64</text>
+  <text className="ts" x="138" y="84" textAnchor="end">pie</text>
+  <rect className="pv-pie" x="150" y="66" width="3.5" height="26" />
+  <text className="pv-val" x="161.5" y="84">92 MB</text>
+  <text className="tsm" x="860" y="84" textAnchor="end">one binary</text>
+  <text className="ts" x="138" y="128" textAnchor="end">vLLM 0.26</text>
+  <rect className="pv-vllm" x="150" y="110" width="336.2" height="26" />
+  <text className="pv-val" x="494.2" y="128">8.9 GB</text>
+  <text className="tsm" x="860" y="128" textAnchor="end">container image</text>
+  <text className="ts" x="138" y="172" textAnchor="end">SGLang 0.5.16</text>
+  <rect className="pv-sglang" x="150" y="154" width="510.0" height="26" />
+  <text className="pv-val" x="668.0" y="172">13.5 GB</text>
+  <text className="tsm" x="860" y="172" textAnchor="end">container image</text>
+  <line className="rail" x1="0" y1="184" x2="860" y2="184" />
+  <text className="tsh" x="0" y="214">Apple silicon</text>
+  <text className="tsm" x="860" y="214" textAnchor="end">compressed download, arm64 macOS</text>
+  <text className="ts" x="138" y="254" textAnchor="end">pie</text>
+  <rect className="pv-pie" x="150" y="236" width="86.9" height="26" />
+  <text className="pv-val" x="244.9" y="254">15 MB</text>
+  <text className="tsm" x="860" y="254" textAnchor="end">one binary</text>
+  <text className="ts" x="138" y="298" textAnchor="end">llama.cpp 10270</text>
+  <rect className="pv-llama" x="150" y="280" width="63.8" height="26" />
+  <text className="pv-val" x="221.8" y="298">11 MB</text>
+  <text className="tsm" x="860" y="298" textAnchor="end">one binary</text>
+  <text className="ts" x="138" y="342" textAnchor="end">mlx-lm 0.31.3</text>
+  <rect className="pv-mlx" x="150" y="324" width="510.0" height="26" />
+  <text className="pv-val" x="668.0" y="342">88 MB</text>
+  <text className="tsm" x="860" y="342" textAnchor="end">34 Python wheels</text>
+</svg>
+<figcaption>
+Compressed download for a working install. For mlx-lm that is the whole
+dependency closure, 34 wheels including transformers and numpy. The images carry
+their own CUDA runtime, where pie links against the one already on the host. On
+the Mac, llama.cpp ships less than pie does.
 </figcaption>
 </figure>
 
