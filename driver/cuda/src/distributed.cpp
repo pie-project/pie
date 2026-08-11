@@ -1,7 +1,5 @@
 #include "distributed.hpp"
 
-#include "batch/tp.hpp"
-
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -314,12 +312,10 @@ void NcclComm::all_reduce_bf16(void* sendrecv, std::size_t count,
     if (custom_ar_ != nullptr && op == ncclSum) {
         const std::size_t bytes = count * sizeof(std::uint16_t);
         if (custom_ar_->can_handle(sendrecv, bytes, stream)) {
-            pie_cuda_driver::tp_watchdog_count_collective(rank_);
             custom_ar_->all_reduce_bf16(sendrecv, sendrecv, count, stream);
             return;
         }
     }
-    pie_cuda_driver::tp_watchdog_count_collective(rank_);
     NCCL_CHECK_ASYNC(ncclAllReduce(sendrecv, sendrecv, count, ncclBfloat16,
                                    op, comm_, stream),
                      comm_);
@@ -335,7 +331,6 @@ void NcclComm::all_reduce_bf16_out(const void* send, void* recv,
             return;
         }
     }
-    pie_cuda_driver::tp_watchdog_count_collective(rank_);
     NCCL_CHECK_ASYNC(ncclAllReduce(send, recv, count, ncclBfloat16, op,
                                    comm_, stream),
                      comm_);
@@ -343,7 +338,6 @@ void NcclComm::all_reduce_bf16_out(const void* send, void* recv,
 
 void NcclComm::all_reduce_fp32(void* sendrecv, std::size_t count,
                                ncclRedOp_t op, cudaStream_t stream) {
-    pie_cuda_driver::tp_watchdog_count_collective(rank_);
     NCCL_CHECK_ASYNC(ncclAllReduce(sendrecv, sendrecv, count, ncclFloat32,
                                    op, comm_, stream),
                      comm_);
@@ -352,7 +346,6 @@ void NcclComm::all_reduce_fp32(void* sendrecv, std::size_t count,
 void NcclComm::all_gather_bf16(const void* send, void* recv,
                                std::size_t count_per_rank,
                                cudaStream_t stream) {
-    pie_cuda_driver::tp_watchdog_count_collective(rank_);
     NCCL_CHECK_ASYNC(ncclAllGather(send, recv, count_per_rank, ncclBfloat16,
                                    comm_, stream),
                      comm_);
@@ -360,7 +353,6 @@ void NcclComm::all_gather_bf16(const void* send, void* recv,
 
 void NcclComm::broadcast_bytes(void* sendrecv, std::size_t bytes, int root,
                                cudaStream_t stream) {
-    pie_cuda_driver::tp_watchdog_count_collective(rank_);
     NCCL_CHECK_ASYNC(ncclBroadcast(sendrecv, sendrecv, bytes, ncclChar, root,
                                    comm_, stream),
                      comm_);
@@ -369,7 +361,6 @@ void NcclComm::broadcast_bytes(void* sendrecv, std::size_t bytes, int root,
 void NcclComm::all_gather_bytes(const void* send, void* recv,
                                 std::size_t count_per_rank,
                                 cudaStream_t stream) {
-    pie_cuda_driver::tp_watchdog_count_collective(rank_);
     NCCL_CHECK_ASYNC(ncclAllGather(send, recv, count_per_rank, ncclChar,
                                    comm_, stream),
                      comm_);

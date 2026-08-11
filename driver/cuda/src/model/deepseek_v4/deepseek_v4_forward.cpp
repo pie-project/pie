@@ -1243,9 +1243,15 @@ void dsv4_forward_paged(
                 ws.norm_y.data(), Lw.moe_up_mxfp4->data(),
                 Lw.moe_up_mxfp4_scale->data(), up_out,
                 N, K, Ip, H);
-            kernels::launch_gpt_oss_glu_strided_bf16(
-                gate_out, up_out, ws.aligned_act.data(),
-                routes, local_moe_I, Ip, Ip, stream, cfg.swiglu_limit);
+            if (cfg.swiglu_limit > 0.f) {
+                kernels::launch_swiglu_clamp_bf16(
+                    gate_out, up_out, ws.aligned_act.data(),
+                    routes * local_moe_I, cfg.swiglu_limit, stream);
+            } else {
+                kernels::launch_swiglu_bf16(
+                    gate_out, up_out, ws.aligned_act.data(),
+                    routes * local_moe_I, stream);
+            }
             moe_gemm(
                 ws.aligned_act.data(), Lw.moe_down_mxfp4->data(),
                 Lw.moe_down_mxfp4_scale->data(), ws.aligned_out.data(),

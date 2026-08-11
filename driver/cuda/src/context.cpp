@@ -2342,10 +2342,8 @@ int Context::Impl::launch(const PieFrameDesc& frame, PieCompletion completion) {
             }
             {
                 StepPhaseTimer timer(StepProfile::kSettle);
-                pie_cuda_driver::tp_watchdog_mark_phase(3);   // entering settle
                 pie_cuda_driver::settle_step(
                     *executor_, runtime_, step_completion, prepared[i]);
-                pie_cuda_driver::tp_watchdog_mark_phase(4);   // settle returned
             }
         } catch (const std::exception& e) {
             return fail_frame(i, "launch", e, i, i);

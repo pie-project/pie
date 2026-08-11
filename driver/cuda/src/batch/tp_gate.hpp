@@ -8,29 +8,17 @@
 
 namespace pie_cuda_driver {
 
-enum class TpFollowerPhase : int {
-    GateWait = 0,
-    Header = 1,
-    PayloadEnqueue = 2,
-    GroupEnd = 3,
-    AsyncPoll = 4,
-    PayloadDone = 5,
-    HostViews = 6,
-    Consumed = 7,
+enum class TpFireKind : std::uint8_t {
+    Forward,
+    MtpDraft,
 };
 
-inline const char* tp_follower_phase_name(TpFollowerPhase phase) noexcept {
-    switch (phase) {
-        case TpFollowerPhase::GateWait: return "gate_wait";
-        case TpFollowerPhase::Header: return "header";
-        case TpFollowerPhase::PayloadEnqueue: return "payload_enqueue";
-        case TpFollowerPhase::GroupEnd: return "group_end";
-        case TpFollowerPhase::AsyncPoll: return "async_poll";
-        case TpFollowerPhase::PayloadDone: return "payload_done";
-        case TpFollowerPhase::HostViews: return "host_views";
-        case TpFollowerPhase::Consumed: return "consumed";
-    }
-    return "unknown";
+// Every TP fire reuses the same persistent inputs, model workspace, stream,
+// and communicator. A fire kind that returned false here could publish its
+// successor while another rank still consumes the previous fire, making the
+// ranks execute different logical collectives at the same peer-barrier epoch.
+constexpr bool tp_fire_requires_device_retirement(TpFireKind) noexcept {
+    return true;
 }
 
 // Consume exactly one published gate epoch. Advancing directly to `published`

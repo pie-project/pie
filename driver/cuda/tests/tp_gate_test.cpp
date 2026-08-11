@@ -2,29 +2,66 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
-#include <string_view>
 #include <thread>
-#include <utility>
 #include <vector>
 
 #include "batch/tp_gate.hpp"
 #include "batch/rs_metadata.hpp"
 
 int main() {
-    using pie_cuda_driver::TpFollowerPhase;
-    for (const auto [phase, expected] : {
-             std::pair{TpFollowerPhase::GateWait, "gate_wait"},
-             std::pair{TpFollowerPhase::Header, "header"},
-             std::pair{TpFollowerPhase::PayloadEnqueue, "payload_enqueue"},
-             std::pair{TpFollowerPhase::GroupEnd, "group_end"},
-             std::pair{TpFollowerPhase::AsyncPoll, "async_poll"},
-             std::pair{TpFollowerPhase::PayloadDone, "payload_done"},
-             std::pair{TpFollowerPhase::HostViews, "host_views"},
-             std::pair{TpFollowerPhase::Consumed, "consumed"},
-         }) {
-        if (std::string_view(pie_cuda_driver::tp_follower_phase_name(phase)) !=
-            expected) {
-            std::fputs("TP follower phase telemetry is mislabeled\n", stderr);
+    {
+        // Production sequence: one ordinary forward followed by two MTP draft
+        // fires. All four ranks reuse the same persistent payload/workspace.
+        // A direct all-reduce loop cannot reproduce this because it never
+        // overwrites a fire's inputs while another rank still consumes them.
+        constexpr int kWorld = 4;
+        constexpr std::uint64_t kFires = 3;
+        pie_cuda_driver::TpFollowerAcks retired;
+        pie_cuda_driver::TpSequenceGate gate;
+        std::atomic<std::uint64_t> shared_payload{0};
+        std::atomic<bool> stop{false};
+        std::atomic<bool> diverged{false};
+        std::vector<std::thread> followers;
+        for (int rank = 1; rank < kWorld; ++rank) {
+            followers.emplace_back([&, rank] {
+                std::uint64_t seen = 0;
+                while (seen < kFires && gate.wait_one(seen, stop)) {
+                    // Force the rank skew seen in Pie rather than relying on
+                    // scheduler luck: rank 1 is still consuming fire N when
+                    // rank 0 is ready to publish fire N+1.
+                    if (rank == 1) {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(2));
+                    }
+                    if (shared_payload.load(std::memory_order_acquire) != seen) {
+                        diverged.store(true, std::memory_order_release);
+                    }
+                    retired.mark(rank, seen);
+                }
+            });
+        }
+
+        for (std::uint64_t fire = 1; fire <= kFires; ++fire) {
+            const auto kind = fire == 1
+                ? pie_cuda_driver::TpFireKind::Forward
+                : pie_cuda_driver::TpFireKind::MtpDraft;
+            if (pie_cuda_driver::tp_fire_requires_device_retirement(kind) &&
+                fire > 1) {
+                while (!retired.all_consumed(kWorld, fire - 1)) {
+                    std::this_thread::yield();
+                }
+            }
+            shared_payload.store(fire, std::memory_order_release);
+            gate.publish();
+        }
+        while (!retired.all_consumed(kWorld, kFires)) {
+            std::this_thread::yield();
+        }
+        for (auto& follower : followers) follower.join();
+        if (diverged.load(std::memory_order_acquire)) {
+            std::fputs(
+                "successive TP fires reused device state before all four ranks retired\n",
+                stderr);
             return 1;
         }
     }

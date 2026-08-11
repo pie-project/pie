@@ -142,11 +142,6 @@ void tp_broadcast_mtp_step(
     int max_global_tokens,
     cudaStream_t stream);
 
-// Notify TP followers waiting on the CPU gate keyed by `key` that rank 0 has
-// begun broadcasting a new fire. No-op when `key` is empty (CPU gate off).
-void tp_watchdog_mark_phase(int phase);
-void tp_watchdog_count_collective(int rank);
-
 void tp_cpu_gate_notify(const std::string& key);
 
 // Release every waiter parked on the CPU gate keyed by `key` and mark the gate

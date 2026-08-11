@@ -1166,9 +1166,9 @@ fn deepseek_v4_imported_checkpoint() -> CheckpointMetadata {
     let mut ck = Checkpoint::new();
     ck.push("embed.weight", &[129280, hidden], bf16());
     ck.push("head.weight", &[129280, hidden], bf16());
-    ck.push("hc_head_base", &[4], f32enc());
-    ck.push("hc_head_fn", &[4, 16384], f32enc());
-    ck.push("hc_head_scale", &[1], f32enc());
+    ck.push("hc_head_base", &[4], bf16());
+    ck.push("hc_head_fn", &[4, 16384], bf16());
+    ck.push("hc_head_scale", &[1], bf16());
     let p = "layers.0.";
     ck.push(&format!("{p}attn_norm.weight"), &[hidden], bf16());
     ck.push(&format!("{p}ffn_norm.weight"), &[hidden], bf16());
@@ -1203,9 +1203,9 @@ fn deepseek_v4_imported_checkpoint() -> CheckpointMetadata {
         Encoding::Raw(DType::I64),
     );
     for stem in ["hc_attn", "hc_ffn"] {
-        ck.push(&format!("{p}{stem}_base"), &[24], f32enc());
-        ck.push(&format!("{p}{stem}_fn"), &[24, 16384], f32enc());
-        ck.push(&format!("{p}{stem}_scale"), &[3], f32enc());
+        ck.push(&format!("{p}{stem}_base"), &[24], bf16());
+        ck.push(&format!("{p}{stem}_fn"), &[24, 16384], bf16());
+        ck.push(&format!("{p}{stem}_scale"), &[3], bf16());
     }
     for expert in 0..2 {
         let e = format!("{p}ffn.experts.{expert}.");
@@ -1328,13 +1328,13 @@ fn deepseek_v4_imported_checkpoint() -> CheckpointMetadata {
         Encoding::Raw(DType::E8M0),
     );
     for stem in ["hc_attn", "hc_ffn"] {
-        ck.push(&format!("{m}{stem}_base"), &[24], f32enc());
-        ck.push(&format!("{m}{stem}_fn"), &[24, 16384], f32enc());
-        ck.push(&format!("{m}{stem}_scale"), &[3], f32enc());
+        ck.push(&format!("{m}{stem}_base"), &[24], bf16());
+        ck.push(&format!("{m}{stem}_fn"), &[24, 16384], bf16());
+        ck.push(&format!("{m}{stem}_scale"), &[3], bf16());
     }
-    ck.push(&format!("{m}hc_head_base"), &[4], f32enc());
-    ck.push(&format!("{m}hc_head_fn"), &[4, 16384], f32enc());
-    ck.push(&format!("{m}hc_head_scale"), &[1], f32enc());
+    ck.push(&format!("{m}hc_head_base"), &[4], bf16());
+    ck.push(&format!("{m}hc_head_fn"), &[4, 16384], bf16());
+    ck.push(&format!("{m}hc_head_scale"), &[1], bf16());
     ck.push("norm.weight", &[hidden], bf16());
     ck.finish("deepseek_v4_imported")
 }
@@ -1522,6 +1522,24 @@ fn deepseek_v4_native_cuda_keeps_imported_mxfp4_packed() {
         !tensor.name.starts_with("layers.0.ffn.experts.")
             || tensor.encoding != Encoding::Raw(DType::BF16)
     }));
+    for name in [
+        "hc_head_base",
+        "hc_head_fn",
+        "hc_head_scale",
+        "layers.0.hc_attn_base",
+        "layers.0.hc_attn_fn",
+        "layers.0.hc_attn_scale",
+        "layers.0.hc_ffn_base",
+        "layers.0.hc_ffn_fn",
+        "layers.0.hc_ffn_scale",
+    ] {
+        let tensor = contract
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == name)
+            .unwrap_or_else(|| panic!("HC function '{name}' is published"));
+        assert_eq!(tensor.encoding, Encoding::Raw(DType::F32), "{name}");
+    }
 
     let plan = compile_load_plan(&checkpoint, &contract, target)
         .expect("the native contract compiles against imported E8M0 metadata");

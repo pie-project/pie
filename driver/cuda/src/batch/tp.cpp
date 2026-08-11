@@ -306,124 +306,6 @@ struct TpFireMailbox {
     std::uint64_t fire_seq = 0;   // rank 0 only
 };
 
-// Report the publish/consume cursors whenever in-flight TP work stops advancing.
-// A TP hang is otherwise silent, and per-rank cursors say which follower never
-// reached the matching fire or collective.
-struct TpStallWatchdog {
-    std::atomic<std::uint64_t> published{0};
-    std::array<std::atomic<std::uint64_t>, 8> consumed{};
-    // 0=publish 1=broadcast 2=enqueue_done 3=in_settle 4=settle_done
-    std::atomic<int> rank0_phase{-1};
-    std::atomic<std::uint64_t> follower_forwards{0};
-    std::array<std::atomic<std::uint64_t>, 8> collectives{};
-    // Follower progress inside one fire. These are diagnostics only: no
-    // control-flow decision reads them.
-    std::array<std::atomic<int>, 8> follower_phase{};
-    std::array<std::atomic<std::uint64_t>, 8> follower_phase_seq{};
-    std::atomic<int> world_size{1};
-    std::atomic<std::uint64_t> rank0_phase_seq{0};
-    std::atomic<bool> running{false};
-    std::thread thread;
-    static constexpr bool enabled() { return true; }
-    static TpStallWatchdog& instance() {
-        static TpStallWatchdog w;
-        return w;
-    }
-    void start(int tp_size) {
-        world_size.store(std::min<int>(tp_size, consumed.size()),
-                         std::memory_order_release);
-        if (!enabled() || running.exchange(true)) return;
-        thread = std::thread([this] {
-            std::uint64_t last_pub = ~0ull;
-            std::uint64_t last_forwards = ~0ull;
-            std::array<std::uint64_t, 8> last_consumed;
-            std::array<std::uint64_t, 8> last_collectives;
-            std::array<int, 8> last_follower_phase;
-            std::array<std::uint64_t, 8> last_follower_phase_seq;
-            last_consumed.fill(~0ull);
-            last_collectives.fill(~0ull);
-            last_follower_phase.fill(-1);
-            last_follower_phase_seq.fill(~0ull);
-            int stuck = 0;
-            static const char* kPhase[] = {"publish", "broadcast",
-                                           "enqueue_done", "in_settle",
-                                           "settle_done"};
-            while (running.load(std::memory_order_acquire)) {
-                std::this_thread::sleep_for(std::chrono::seconds(5));
-                const auto p = published.load(std::memory_order_acquire);
-                const auto forwards =
-                    follower_forwards.load(std::memory_order_acquire);
-                const int ranks = world_size.load(std::memory_order_acquire);
-                const int ph = rank0_phase.load(std::memory_order_acquire);
-                bool unchanged = p == last_pub && forwards == last_forwards;
-                char con[256]{};
-                char coll[256]{};
-                char follower[512]{};
-                int con_off = 0;
-                int coll_off = 0;
-                int follower_off = 0;
-                for (int rank = 0; rank < ranks; ++rank) {
-                    const auto c = consumed[static_cast<std::size_t>(rank)].load(
-                        std::memory_order_acquire);
-                    const auto n = collectives[static_cast<std::size_t>(rank)].load(
-                        std::memory_order_acquire);
-                    const auto fp = follower_phase[static_cast<std::size_t>(rank)].load(
-                        std::memory_order_acquire);
-                    const auto fps = follower_phase_seq[static_cast<std::size_t>(rank)].load(
-                        std::memory_order_acquire);
-                    unchanged = unchanged && c == last_consumed[rank] &&
-                                n == last_collectives[rank] &&
-                                fp == last_follower_phase[rank] &&
-                                fps == last_follower_phase_seq[rank];
-                    if (rank > 0) {
-                        con_off += std::snprintf(
-                            con + con_off, sizeof(con) - con_off,
-                            "%sr%d=%llu", con_off ? " " : "", rank,
-                            (unsigned long long)c);
-                    }
-                    coll_off += std::snprintf(
-                        coll + coll_off, sizeof(coll) - coll_off,
-                        "%sr%d=%llu", coll_off ? " " : "", rank,
-                        (unsigned long long)n);
-                    if (rank > 0) {
-                        follower_off += std::snprintf(
-                            follower + follower_off,
-                            sizeof(follower) - follower_off,
-                            "%sr%d=%s@%llu", follower_off ? " " : "", rank,
-                            tp_follower_phase_name(
-                                static_cast<TpFollowerPhase>(fp)),
-                            (unsigned long long)fps);
-                    }
-                    last_consumed[rank] = c;
-                    last_collectives[rank] = n;
-                    last_follower_phase[rank] = fp;
-                    last_follower_phase_seq[rank] = fps;
-                }
-                const bool work_in_flight = ph >= 0 && ph < 4;
-                if (work_in_flight && unchanged) {
-                    std::fprintf(stderr,
-                        "[tp-watchdog] STALLED %ds: published=%llu "
-                        "consumed=[%s] rank0_last_phase=%s seq=%llu "
-                        "follower_phases=[%s] follower_forwards=%llu "
-                        "collectives=[%s]\n",
-                        (++stuck) * 5,
-                        (unsigned long long)p, con,
-                        (ph >= 0 && ph < 5) ? kPhase[ph] : "none",
-                        (unsigned long long)rank0_phase_seq.load(),
-                        follower,
-                        (unsigned long long)forwards,
-                        coll);
-                } else {
-                    stuck = 0;
-                }
-                last_pub = p;
-                last_forwards = forwards;
-            }
-        });
-        thread.detach();
-    }
-};
-
 std::mutex g_tp_mailboxes_mu;
 std::unordered_map<std::string, std::shared_ptr<TpFireMailbox>> g_tp_mailboxes;
 
@@ -543,7 +425,6 @@ void tp_publish_fire(const std::string& cpu_gate_key,
     // that has lost a rank can never complete.
     tp_check_ranks_alive();
     auto box = tp_mailbox_for(cpu_gate_key);
-    TpStallWatchdog::instance().start(tp_size);
     tp_mailbox_reserve_slot(*box, cpu_gate_key, tp_size);
     TpFireSlot& fire = box->slots[box->fire_seq % kTpMailboxRing];
     fire.header = TpFireHeader{
@@ -567,20 +448,6 @@ void tp_publish_fire(const std::string& cpu_gate_key,
     assign_span(fire.kv_page_indices, views.kv_page_indices,
                 views.kv_page_indices_len);
     ++box->fire_seq;
-    {
-        auto& wd = TpStallWatchdog::instance();
-        wd.published.store(box->fire_seq, std::memory_order_release);
-        wd.rank0_phase.store(0, std::memory_order_release);
-        wd.rank0_phase_seq.store(box->fire_seq, std::memory_order_release);
-    }
-    if (TpStallWatchdog::enabled()) {
-        std::fprintf(stderr,
-            "[tp-hdr] R0 seq=%llu N=%d R=%d pure=%d kvidx=%d mask=%d "
-            "mask_indptr=%d slots=%d logit_rows=%d rs=%d\n",
-            (unsigned long long)box->fire_seq, N, R, is_pure_decode ? 1 : 0,
-            kv_indices_count, mask_bytes, mask_indptr_count,
-            has_slot_ids ? 1 : 0, logit_rows, static_cast<int>(rs_mode));
-    }
     box->notify_time = std::chrono::steady_clock::now();
     // Release/acquire on the gate publishes everything written above.
     tp_cpu_gate_notify(cpu_gate_key);
@@ -801,10 +668,6 @@ void tp_publish_mtp(const std::string& cpu_gate_key,
     fire.header.structured_window_left = -2;
     fire.header.transport = TP_TRANSPORT_NCCL;
     ++box->fire_seq;
-    auto& wd = TpStallWatchdog::instance();
-    wd.published.store(box->fire_seq, std::memory_order_release);
-    wd.rank0_phase.store(0, std::memory_order_release);
-    wd.rank0_phase_seq.store(box->fire_seq, std::memory_order_release);
     box->notify_time = std::chrono::steady_clock::now();
     tp_cpu_gate_notify(cpu_gate_key);
 }
@@ -850,19 +713,6 @@ void tp_broadcast_mtp_step(
             ncclChar, 0, comm.comm(), stream));
     }
     NCCL_CHECK_ASYNC(ncclGroupEnd(), comm.comm());
-}
-
-void tp_watchdog_count_collective(int rank) {
-    if (!TpStallWatchdog::enabled()) return;
-    if (rank < 0 || rank >= 8) return;
-    TpStallWatchdog::instance().collectives[
-        static_cast<std::size_t>(rank)].fetch_add(1,
-            std::memory_order_relaxed);
-}
-
-void tp_watchdog_mark_phase(int phase) {
-    TpStallWatchdog::instance().rank0_phase.store(
-        phase, std::memory_order_release);
 }
 
 void tp_cpu_gate_notify(const std::string& key) {
@@ -1017,24 +867,6 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
             }
         }
 
-        if (TpStallWatchdog::enabled() && hdr.magic == TP_FIRE_MAGIC) {
-            std::fprintf(stderr,
-                "[tp-hdr] R%d seq=%llu N=%d R=%d pure=%d kvidx=%d mask=%d "
-                "mask_indptr=%d slots=%d logit_rows=%d rs=%d slot=%llu\n",
-                comm.rank(), (unsigned long long)cpu_gate_seq, hdr.total_tokens,
-                hdr.num_requests, hdr.is_pure_decode, hdr.kv_indices_count,
-                hdr.mask_bytes, hdr.mask_indptr_count, hdr.has_slot_ids,
-                hdr.logit_rows, hdr.rs_mode,
-                (unsigned long long)fire_slot);
-        }
-        if (mailbox != nullptr && hdr.magic == TP_FIRE_MAGIC) {
-            auto& wd = TpStallWatchdog::instance();
-            wd.follower_phase[static_cast<std::size_t>(comm.rank())].store(
-                static_cast<int>(TpFollowerPhase::Header),
-                std::memory_order_release);
-            wd.follower_phase_seq[static_cast<std::size_t>(comm.rank())].store(
-                cpu_gate_seq, std::memory_order_release);
-        }
         {
             static const std::uint64_t kill_at = [] {
                 const char* v = std::getenv("PIE_TP_TEST_KILL_FOLLOWER_AT_FIRE");
@@ -1052,9 +884,6 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
             // be waiting on this very slot.
             if (mailbox != nullptr) {
                 mailbox->consumed_fires.mark(comm.rank(), cpu_gate_seq);
-                TpStallWatchdog::instance().consumed[
-                    static_cast<std::size_t>(comm.rank())].store(
-                        cpu_gate_seq, std::memory_order_release);
             }
             const int rows = hdr.total_tokens;
             NCCL_CHECK(ncclGroupStart());
@@ -1087,6 +916,9 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                 rows,
                 hdr.num_requests,
                 hdr.is_pure_decode);
+            if (tp_fire_requires_device_retirement(TpFireKind::MtpDraft)) {
+                CUDA_CHECK(cudaStreamSynchronize(engine.cublas.stream()));
+            }
             continue;
         }
         if (hdr.magic != TP_FIRE_MAGIC) {
@@ -1168,12 +1000,6 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
             !state_only_fold && hdr.mask_indptr_count > 0;
         const bool have_slot_ids = (hdr.has_slot_ids != 0) && R > 0;
         TpStageTimer payload_timer(TpProfile::kPayloadRecv);
-        if (mailbox != nullptr) {
-            TpStallWatchdog::instance().follower_phase[
-                static_cast<std::size_t>(comm.rank())].store(
-                    static_cast<int>(TpFollowerPhase::PayloadEnqueue),
-                    std::memory_order_release);
-        }
         NCCL_CHECK(ncclGroupStart());
         if (!state_only_fold) {
             NCCL_CHECK(ncclBroadcast(pi.tokens.data(), pi.tokens.data(),
@@ -1295,27 +1121,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                                      static_cast<std::size_t>(logit_rows) * 4,
                                      ncclChar, 0, comm.comm(), stream));
         }
-        if (mailbox != nullptr) {
-            TpStallWatchdog::instance().follower_phase[
-                static_cast<std::size_t>(comm.rank())].store(
-                    static_cast<int>(TpFollowerPhase::GroupEnd),
-                    std::memory_order_release);
-        }
-        const ncclResult_t group_end_result = ncclGroupEnd();
-        if (mailbox != nullptr) {
-            TpStallWatchdog::instance().follower_phase[
-                static_cast<std::size_t>(comm.rank())].store(
-                    static_cast<int>(TpFollowerPhase::AsyncPoll),
-                    std::memory_order_release);
-        }
-        nccl_check_async(group_end_result, comm.comm(), "ncclGroupEnd()",
-                         __FILE__, __LINE__);
-        if (mailbox != nullptr) {
-            TpStallWatchdog::instance().follower_phase[
-                static_cast<std::size_t>(comm.rank())].store(
-                    static_cast<int>(TpFollowerPhase::PayloadDone),
-                    std::memory_order_release);
-        }
+        NCCL_CHECK_ASYNC(ncclGroupEnd(), comm.comm());
         payload_timer.stop();
 
         // 3. Host views of the qo/KV layout for the per-arch attention planner
@@ -1324,12 +1130,6 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
         // mailbox: no readback, no synchronize, and both ranks provably plan
         // from the same numbers.
         TpStageTimer host_views_timer(TpProfile::kHostViews);
-        if (mailbox != nullptr) {
-            TpStallWatchdog::instance().follower_phase[
-                static_cast<std::size_t>(comm.rank())].store(
-                    static_cast<int>(TpFollowerPhase::HostViews),
-                    std::memory_order_release);
-        }
         h_qo.resize(R + 1);
         h_kvpp.resize(R + 1);
         std::vector<std::uint32_t> h_kvpi(
@@ -1362,13 +1162,6 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
             // 0 may reuse it. Released before the payload collectives below for
             // the same reason as the MTP branch.
             mailbox->consumed_fires.mark(comm.rank(), cpu_gate_seq);
-            auto& wd_ = TpStallWatchdog::instance();
-            wd_.consumed[static_cast<std::size_t>(comm.rank())].store(
-                cpu_gate_seq, std::memory_order_release);
-            wd_.follower_forwards.fetch_add(1, std::memory_order_release);
-            wd_.follower_phase[static_cast<std::size_t>(comm.rank())].store(
-                static_cast<int>(TpFollowerPhase::Consumed),
-                std::memory_order_release);
             // Recurrent-state metadata still comes back from device; those
             // paths are cold and not worth widening the mailbox for.
             if (have_slot_ids) {
@@ -1664,7 +1457,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                     /*logits_argmax_chunk_tokens=*/0);
                 engine.graph_cache->put(key, exec);
             }
-            CUDA_CHECK(cudaGraphLaunch(exec, /*stream=*/nullptr));
+            CUDA_CHECK(cudaGraphLaunch(exec, engine.cublas.stream()));
         } else {
             pie_cuda_driver::ForwardFn::ForwardInputs fwd_in;
             fwd_in.token_ids = reinterpret_cast<const std::int32_t*>(pi.tokens.data());
@@ -1744,6 +1537,9 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                 fwd_in);
         }
         forward_timer.stop();
+        // Rank 0 admits only one TP fire at a time. Followers must retire the
+        // same fire before accepting payloads that reuse its device buffers.
+        CUDA_CHECK(cudaStreamSynchronize(engine.cublas.stream()));
         if (mailbox != nullptr && TpProfile::enabled()) {
             const auto now = std::chrono::steady_clock::now();
             auto& prof = TpProfile::instance();

@@ -349,13 +349,20 @@ void enqueue_mtp_draft_logits(
         cudaMemcpyDeviceToDevice,
         stream));
     for (const MtpDraftWork& item : plan.work) {
-        kernels::launch_argmax_bf16(
-            logits + static_cast<std::size_t>(item.seed_row) * vocab,
-            reinterpret_cast<std::int32_t*>(engine.inputs.sampled.data()),
-            1,
-            vocab,
-            stream);
         for (std::uint32_t draft = 0; draft < item.drafts; ++draft) {
+            if (engine.tp_comm != nullptr &&
+                tp_fire_requires_device_retirement(TpFireKind::MtpDraft)) {
+                tp_runahead::wait_for_slot();
+            }
+            if (draft == 0) {
+                kernels::launch_argmax_bf16(
+                    logits + static_cast<std::size_t>(item.seed_row) * vocab,
+                    reinterpret_cast<std::int32_t*>(
+                        engine.inputs.sampled.data()),
+                    1,
+                    vocab,
+                    stream);
+            }
             const std::int32_t position = static_cast<std::int32_t>(
                 item.source_position +
                 std::max(0, engine.system_drafter.draft_position_offset) +
@@ -449,6 +456,10 @@ void enqueue_mtp_draft_logits(
                 static_cast<std::size_t>(vocab) * sizeof(std::uint16_t),
                 cudaMemcpyDeviceToDevice,
                 stream));
+            if (engine.tp_comm != nullptr &&
+                tp_fire_requires_device_retirement(TpFireKind::MtpDraft)) {
+                tp_runahead::record_slot(stream);
+            }
             ++scalar_index;
         }
     }
@@ -2203,6 +2214,11 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             *s.staged, s.dispatch_view, s.program_token_starts);
     }
 
+    if (engine.tp_comm != nullptr && !s.empty_step &&
+        tp_fire_requires_device_retirement(TpFireKind::Forward)) {
+        tp_runahead::wait_for_slot();
+    }
+
     // Wake the follower FIRST, before this rank's uploads, compose and payload
     // broadcast, so it gets that window as a head start. Rank 0 pre-enqueues
     // its whole step and its forward starts ~17 us after the payload broadcast
@@ -2375,7 +2391,6 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                 ? 0
                 : static_cast<std::size_t>(tp_kv_indices_count),
         };
-        tp_runahead::wait_for_slot();
         tp_broadcast_inputs(*engine.tp_comm, pi,
                             engine.tp_cpu_gate_key,
                             tp_views,
@@ -2394,7 +2409,6 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                             static_cast<int>(s.rs_buf_read_id_view.size()),
                             /*stream=*/nullptr);
         tp_commit.completed = true;
-        pie_cuda_driver::tp_watchdog_mark_phase(2);
         // One TP fire in flight on the device at a time.
         //
         // The persistent input buffers (`pi.*`) and the NCCL communicator are
@@ -2598,14 +2612,15 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         s.timing.begin_breakdown = s.staged->begin_breakdown();
         s.timing.forward_enqueue_end = fire_timing::Clock::now();
     }
-    if (!s.rs_is_fold) {
-        enqueue_mtp_draft_logits(engine, s.mtp_plan);
-    }
     // Close this fire's slot in the bounded TP pipeline: everything this fire
     // puts on the communicator and the shared `pi.*` buffers is now enqueued,
     // so a later fire may reuse the slot once this event retires.
-    if (engine.tp_comm != nullptr && !s.empty_step) {
+    if (engine.tp_comm != nullptr && !s.empty_step &&
+        tp_fire_requires_device_retirement(TpFireKind::Forward)) {
         tp_runahead::record_slot(cublas.stream());
+    }
+    if (!s.rs_is_fold) {
+        enqueue_mtp_draft_logits(engine, s.mtp_plan);
     }
 }
 
