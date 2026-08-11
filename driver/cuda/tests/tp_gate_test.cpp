@@ -2,6 +2,8 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -12,17 +14,26 @@
 int main() {
     {
         using pie_cuda_driver::TpFireKind;
-        using pie_cuda_driver::TpLogicalFireIdentity;
-        const TpLogicalFireIdentity root{
-            7, TpFireKind::MtpDraft, 16, 2, -1, 4096};
-        auto follower = root;
+        const auto root = pie_cuda_driver::make_tp_fire_identity(
+            7, TpFireKind::MtpDraft, 16, 2, -1, 4096);
+        int follower_requests = 2;
 #if defined(PIE_TP_TEST_PERTURB_FIRE_RECEIPT)
-        ++follower.num_requests;
+        ++follower_requests;
 #endif
+        const auto follower = pie_cuda_driver::make_tp_fire_identity(
+            7, TpFireKind::MtpDraft, 16, follower_requests, -1, 4096);
         if (!(root == follower)) {
             std::fputs(
                 "TP fire receipts detected divergent logical identities\n",
                 stderr);
+            return 1;
+        }
+        const auto fire_line =
+            pie_cuda_driver::tp_fire_receipt_line(3, "consume", follower);
+        if (fire_line.find("rank=3 seq=7 kind=mtp_draft") ==
+                std::string::npos ||
+            fire_line.find("requests=2") == std::string::npos) {
+            std::fputs("TP fire receipt omitted logical identity fields\n", stderr);
             return 1;
         }
 
@@ -30,6 +41,21 @@ int main() {
         if (!budget.take(0) || !budget.take(0) || budget.take(0) ||
             !budget.take(1) || !budget.take(1) || budget.take(1)) {
             std::fputs("TP fire receipt budget is not bounded per rank\n", stderr);
+            return 1;
+        }
+        pie_cuda_driver::TpReceiptBudget launch_budget(1);
+        const bool launch_reserved = launch_budget.take(0);
+        if (!launch_reserved || launch_budget.take(0)) {
+            std::fputs("Context launch receipt was not budgeted as one pair\n", stderr);
+            return 1;
+        }
+        const auto launch_entry = pie_cuda_driver::tp_launch_receipt_line(
+            0, 9, "entry", 2, std::numeric_limits<int>::min());
+        const auto launch_return = pie_cuda_driver::tp_launch_receipt_line(
+            0, 9, "return", 2, 0);
+        if (launch_entry.find("status=") != std::string::npos ||
+            launch_return.find("status=0") == std::string::npos) {
+            std::fputs("Context launch receipt pair is ambiguous\n", stderr);
             return 1;
         }
 

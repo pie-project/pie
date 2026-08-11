@@ -8,6 +8,8 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <sstream>
+#include <string>
 #include <unordered_map>
 
 namespace pie_cuda_driver {
@@ -25,6 +27,23 @@ struct TpLogicalFireIdentity {
 
     bool operator==(const TpLogicalFireIdentity&) const = default;
 };
+
+inline TpLogicalFireIdentity make_tp_fire_identity(
+    std::uint64_t sequence,
+    TpFireKind kind,
+    int total_tokens,
+    int num_requests,
+    int required_kv_pages,
+    int detail) {
+    return TpLogicalFireIdentity{
+        sequence,
+        kind,
+        total_tokens,
+        num_requests,
+        required_kv_pages,
+        detail,
+    };
+}
 
 // A separate budget is used for fire and launch receipts, so a burst of one
 // kind cannot suppress the other. The environment value is a PER-RANK limit;
@@ -83,42 +102,78 @@ inline const char* tp_fire_kind_name(TpFireKind kind) {
     return "unknown";
 }
 
-inline void emit_tp_fire_receipt(
+inline std::mutex& tp_receipt_output_mutex() {
+    static std::mutex mu;
+    return mu;
+}
+
+inline std::string tp_fire_receipt_line(
     int rank,
     const char* phase,
     const TpLogicalFireIdentity& identity) {
-    if (!tp_fire_receipt_budget().take(rank)) return;
-    static std::mutex output_mu;
-    std::lock_guard<std::mutex> lock(output_mu);
-    std::cerr << "[pie-driver-cuda] tp_fire_receipt"
-              << " phase=" << phase
-              << " rank=" << rank
-              << " seq=" << identity.sequence
-              << " kind=" << tp_fire_kind_name(identity.kind)
-              << " tokens=" << identity.total_tokens
-              << " requests=" << identity.num_requests
-              << " required_kv_pages=" << identity.required_kv_pages
-              << " detail=" << identity.detail << '\n';
+    std::ostringstream line;
+    line << "[pie-driver-cuda] tp_fire_receipt"
+         << " phase=" << phase
+         << " rank=" << rank
+         << " seq=" << identity.sequence
+         << " kind=" << tp_fire_kind_name(identity.kind)
+         << " tokens=" << identity.total_tokens
+         << " requests=" << identity.num_requests
+         << " required_kv_pages=" << identity.required_kv_pages
+         << " detail=" << identity.detail;
+    return line.str();
 }
 
-inline void emit_tp_launch_receipt(
+inline std::string tp_launch_receipt_line(
     int rank,
     std::uint64_t sequence,
     const char* phase,
     std::size_t step_count,
     int status) {
-    if (!tp_launch_receipt_budget().take(rank)) return;
-    static std::mutex output_mu;
-    std::lock_guard<std::mutex> lock(output_mu);
-    std::cerr << "[pie-driver-cuda] context_launch_receipt"
-              << " phase=" << phase
-              << " rank=" << rank
-              << " seq=" << sequence
-              << " steps=" << step_count;
+    std::ostringstream line;
+    line << "[pie-driver-cuda] context_launch_receipt"
+         << " phase=" << phase
+         << " rank=" << rank
+         << " seq=" << sequence
+         << " steps=" << step_count;
     if (status != std::numeric_limits<int>::min()) {
-        std::cerr << " status=" << status;
+        line << " status=" << status;
     }
-    std::cerr << '\n';
+    return line.str();
+}
+
+inline void emit_tp_receipt_line(const std::string& line) {
+    std::lock_guard<std::mutex> lock(tp_receipt_output_mutex());
+    std::cerr << line << '\n';
+}
+
+inline void emit_tp_fire_receipt(
+    int rank,
+    const char* phase,
+    const TpLogicalFireIdentity& identity) {
+    if (!tp_fire_receipt_budget().take(rank)) return;
+    emit_tp_receipt_line(tp_fire_receipt_line(rank, phase, identity));
+}
+
+inline bool begin_tp_launch_receipt(
+    int rank,
+    std::uint64_t sequence,
+    std::size_t step_count) {
+    if (!tp_launch_receipt_budget().take(rank)) return false;
+    emit_tp_receipt_line(tp_launch_receipt_line(
+        rank, sequence, "entry", step_count, std::numeric_limits<int>::min()));
+    return true;
+}
+
+inline void end_tp_launch_receipt(
+    bool enabled,
+    int rank,
+    std::uint64_t sequence,
+    std::size_t step_count,
+    int status) {
+    if (!enabled) return;
+    emit_tp_receipt_line(
+        tp_launch_receipt_line(rank, sequence, "return", step_count, status));
 }
 
 }  // namespace pie_cuda_driver

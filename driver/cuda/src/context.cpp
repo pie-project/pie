@@ -2191,12 +2191,11 @@ class StepPhaseTimer {
 int Context::Impl::launch(const PieFrameDesc& frame, PieCompletion completion) {
     const std::uint64_t sequence =
         launch_receipt_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
-    pie_cuda_driver::emit_tp_launch_receipt(
-        tp_rank_, sequence, "entry", frame.steps.len,
-        std::numeric_limits<int>::min());
+    const bool receipt_enabled = pie_cuda_driver::begin_tp_launch_receipt(
+        tp_rank_, sequence, frame.steps.len);
     const int status = launch_body(frame, completion);
-    pie_cuda_driver::emit_tp_launch_receipt(
-        tp_rank_, sequence, "return", frame.steps.len, status);
+    pie_cuda_driver::end_tp_launch_receipt(
+        receipt_enabled, tp_rank_, sequence, frame.steps.len, status);
     return status;
 }
 
