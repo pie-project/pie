@@ -8,6 +8,19 @@
 
 namespace pie_cuda_driver {
 
+enum class TpFireKind : std::uint8_t {
+    Forward,
+    MtpDraft,
+};
+
+// Every TP fire reuses the same persistent inputs, model workspace, stream,
+// and communicator. A fire kind that returned false here could publish its
+// successor while another rank still consumes the previous fire, making the
+// ranks execute different logical collectives at the same peer-barrier epoch.
+constexpr bool tp_fire_requires_device_retirement(TpFireKind) noexcept {
+    return true;
+}
+
 // Consume exactly one published gate epoch. Advancing directly to `published`
 // would collapse a burst of MTP notifications into one follower receive.
 inline bool tp_cpu_gate_consume_one(

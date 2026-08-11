@@ -916,6 +916,9 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                 rows,
                 hdr.num_requests,
                 hdr.is_pure_decode);
+            if (tp_fire_requires_device_retirement(TpFireKind::MtpDraft)) {
+                CUDA_CHECK(cudaStreamSynchronize(engine.cublas.stream()));
+            }
             continue;
         }
         if (hdr.magic != TP_FIRE_MAGIC) {
