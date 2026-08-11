@@ -25,6 +25,7 @@
 #include "batch/forward.hpp"
 #include "batch/forward_graph.hpp"
 #include "batch/tp.hpp"
+#include "batch/tp_gate.hpp"
 #include "cuda_check.hpp"
 #include "device_buffer.hpp"
 #include "kernels/argmax.hpp"
