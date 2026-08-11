@@ -3,6 +3,7 @@
 #include "batch/forward.hpp"
 #include "batch/graph_variant.hpp"
 #include "batch/tp_gate.hpp"
+#include "batch/tp_fire_receipts.hpp"
 #include "pipeline/batch_compose.hpp"
 #include "store/recurrent_state_cache.hpp"
 
@@ -35,6 +36,8 @@ namespace {
 std::mutex g_tp_cpu_gates_mu;
 std::unordered_map<std::string, std::shared_ptr<TpSequenceGate>>
     g_tp_cpu_gates;
+
+thread_local std::uint64_t g_tp_direct_root_fire_seq = 0;
 
 std::shared_ptr<TpSequenceGate> tp_cpu_gate_for(const std::string& key) {
     std::lock_guard<std::mutex> lk(g_tp_cpu_gates_mu);
@@ -441,6 +444,17 @@ void tp_publish_fire(const std::string& cpu_gate_key,
         TP_TRANSPORT_NCCL,
         0,
     };
+    emit_tp_fire_receipt(
+        0,
+        "publish",
+        TpLogicalFireIdentity{
+            box->fire_seq + 1,
+            TpFireKind::Forward,
+            N,
+            R,
+            required_kv_pages,
+            structured_window_left,
+        });
     const std::size_t requests = static_cast<std::size_t>(std::max(R, 0));
     assign_span(fire.qo_indptr, views.qo_indptr, requests + 1);
     assign_span(fire.kv_page_indptr, views.kv_page_indptr, requests + 1);
@@ -494,6 +508,17 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
     };
     const bool via_mailbox = !cpu_gate_key.empty();
     if (!via_mailbox) {
+        emit_tp_fire_receipt(
+            0,
+            "publish",
+            TpLogicalFireIdentity{
+                ++g_tp_direct_root_fire_seq,
+                TpFireKind::Forward,
+                N,
+                R,
+                required_kv_pages,
+                structured_window_left,
+            });
         // Gate off: the follower is parked inside `ncclBroadcast`, so the
         // header still has to travel through the device.
         auto* d_hdr = tp_hdr_dev_buf();
@@ -667,6 +692,17 @@ void tp_publish_mtp(const std::string& cpu_gate_key,
     fire.header.is_pure_decode = max_global_tokens;
     fire.header.structured_window_left = -2;
     fire.header.transport = TP_TRANSPORT_NCCL;
+    emit_tp_fire_receipt(
+        0,
+        "publish",
+        TpLogicalFireIdentity{
+            box->fire_seq + 1,
+            TpFireKind::MtpDraft,
+            rows,
+            draft_step,
+            -1,
+            max_global_tokens,
+        });
     ++box->fire_seq;
     box->notify_time = std::chrono::steady_clock::now();
     tp_cpu_gate_notify(cpu_gate_key);
@@ -684,6 +720,17 @@ void tp_broadcast_mtp_step(
     // liveness check before the collectives below.
     tp_check_ranks_alive();
     if (cpu_gate_key.empty()) {
+        emit_tp_fire_receipt(
+            0,
+            "publish",
+            TpLogicalFireIdentity{
+                ++g_tp_direct_root_fire_seq,
+                TpFireKind::MtpDraft,
+                rows,
+                draft_step,
+                -1,
+                max_global_tokens,
+            });
         // Gate off: the follower is parked inside the header broadcast.
         auto* device_header = tp_hdr_dev_buf();
         TpFireHeader* header = tp_hdr_host_buf();
@@ -802,6 +849,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
     auto* d_hdr   = tp_hdr_dev_buf();
     cudaStream_t stream = nullptr;
     std::uint64_t cpu_gate_seq = 0;
+    std::uint64_t direct_fire_seq = 0;
     if (engine.runtime_quant_context == nullptr) {
         throw std::runtime_error(
             "TP follower has no runtime-quant context");
@@ -867,6 +915,22 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
             }
         }
 
+        if (hdr.magic == TP_STOP_MAGIC) break;
+        const std::uint64_t logical_sequence =
+            mailbox != nullptr ? cpu_gate_seq : ++direct_fire_seq;
+        const bool is_mtp = hdr.magic == TP_MTP_MAGIC;
+        emit_tp_fire_receipt(
+            comm.rank(),
+            "consume",
+            TpLogicalFireIdentity{
+                logical_sequence,
+                is_mtp ? TpFireKind::MtpDraft : TpFireKind::Forward,
+                hdr.total_tokens,
+                hdr.num_requests,
+                is_mtp ? -1 : hdr.required_kv_pages,
+                is_mtp ? hdr.is_pure_decode : hdr.structured_window_left,
+            });
+
         {
             static const std::uint64_t kill_at = [] {
                 const char* v = std::getenv("PIE_TP_TEST_KILL_FOLLOWER_AT_FIRE");
@@ -876,7 +940,6 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                 throw std::runtime_error("injected follower fault");
             }
         }
-        if (hdr.magic == TP_STOP_MAGIC) break;
         if (hdr.magic == TP_MTP_MAGIC) {
             // Header is already copied out, and an MTP fire carries no planner
             // views, so the slot is free here. Release it BEFORE the

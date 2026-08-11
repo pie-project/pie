@@ -6,9 +6,55 @@
 #include <vector>
 
 #include "batch/tp_gate.hpp"
+#include "batch/tp_fire_receipts.hpp"
 #include "batch/rs_metadata.hpp"
 
 int main() {
+    {
+        using pie_cuda_driver::TpFireKind;
+        using pie_cuda_driver::TpLogicalFireIdentity;
+        const TpLogicalFireIdentity root{
+            7, TpFireKind::MtpDraft, 16, 2, -1, 4096};
+        auto follower = root;
+#if defined(PIE_TP_TEST_PERTURB_FIRE_RECEIPT)
+        ++follower.num_requests;
+#endif
+        if (!(root == follower)) {
+            std::fputs(
+                "TP fire receipts detected divergent logical identities\n",
+                stderr);
+            return 1;
+        }
+
+        pie_cuda_driver::TpReceiptBudget budget(2);
+        if (!budget.take(0) || !budget.take(0) || budget.take(0) ||
+            !budget.take(1) || !budget.take(1) || budget.take(1)) {
+            std::fputs("TP fire receipt budget is not bounded per rank\n", stderr);
+            return 1;
+        }
+
+        unsetenv("PIE_TP_FIRE_RECEIPTS");
+        if (pie_cuda_driver::tp_fire_receipt_limit() != 0) {
+            std::fputs("TP fire receipts did not default off\n", stderr);
+            return 1;
+        }
+        setenv("PIE_TP_FIRE_RECEIPTS", "17", 1);
+        if (pie_cuda_driver::tp_fire_receipt_limit() != 17) {
+            std::fputs("TP fire receipt limit was not read\n", stderr);
+            return 1;
+        }
+        setenv("PIE_TP_FIRE_RECEIPTS", "999999", 1);
+        if (pie_cuda_driver::tp_fire_receipt_limit() != 4096) {
+            std::fputs("TP fire receipt hard ceiling was not enforced\n", stderr);
+            return 1;
+        }
+        setenv("PIE_TP_FIRE_RECEIPTS", "-1", 1);
+        if (pie_cuda_driver::tp_fire_receipt_limit() != 0) {
+            std::fputs("TP fire receipt limit accepted a signed value\n", stderr);
+            return 1;
+        }
+        unsetenv("PIE_TP_FIRE_RECEIPTS");
+    }
     {
         // Production sequence: one ordinary forward followed by two MTP draft
         // fires. All four ranks reuse the same persistent payload/workspace.
