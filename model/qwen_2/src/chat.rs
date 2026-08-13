@@ -9,7 +9,7 @@
 // `QwenInstruct` is vendor-shared chat: Qwen3 owns it, and Qwen2, Qwen3.5,
 // GLM-5 and Nemotron-H bind it. The generation that implements a thing keeps
 // it; the others name it.
-use pie_model_qwen_3::chat::{ChatMLConfig, QwenInstruct};
+use pie_model_qwen_3::chat::{ChatMLConfig, QwenInstruct, ToolCallFormat};
 use pie_tokenizer::Tokenizer;
 use std::sync::Arc;
 
@@ -28,6 +28,9 @@ pub fn new(tokenizer: Arc<Tokenizer>) -> QwenInstruct {
         ChatMLConfig {
             has_thinking: false,
             has_tools: true,
+            // Qwen2.5's template teaches the Hermes-style JSON body, as the
+            // doc above says; the XML surface arrives with Qwen3.5.
+            tool_call_format: ToolCallFormat::Json,
             generation_suffix: "",
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],
         },

@@ -20,10 +20,27 @@ use std::sync::Arc;
 // the verbatim copy that used to sit here as a static was never read — the
 // checkpoint's own `chat_template` is the reference.
 
+/// Which tool-call surface a checkpoint's own `chat_template` teaches.
+///
+/// This is not a preference. The template is what the checkpoint was trained
+/// and evaluated against, so a generation whose template demonstrates the XML
+/// form will emit XML however it is prompted; constraining it to the other form
+/// masks it into a protocol it never learned, and decoding the other form
+/// silently yields no call at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolCallFormat {
+    /// `<tool_call>{"name": ..., "arguments": {...}}</tool_call>` — Qwen3.
+    Json,
+    /// `<tool_call>\n<function=NAME>\n<parameter=P>\nv\n</parameter>\n</function>\n</tool_call>`
+    /// — Qwen3.5 and later, including the `qwen3_5`-architected Qwen3.6.
+    Qwen35Xml,
+}
+
 /// Feature flags for ChatML-family models.
 pub struct ChatMLConfig {
     pub has_thinking: bool,
     pub has_tools: bool,
+    pub tool_call_format: ToolCallFormat,
     pub generation_suffix: &'static str,
     /// Stop token strings (vary per sub-architecture)
     pub stop_tokens: &'static [&'static str],
@@ -127,8 +144,13 @@ impl QwenInstruct {
     }
 
     /// Build the tool system prompt matching the Qwen reference format.
-    /// Both Qwen3 and Qwen2.5 use identical `<tools>` XML + `<tool_call>` format.
-    fn build_tool_system_prompt(tools: &[String]) -> String {
+    ///
+    /// The demonstrated call MUST be the same surface the grammar admits. A
+    /// prompt teaching one form while the mask enforces the other puts the
+    /// model's instructions and its token constraint in direct conflict, and
+    /// the constraint wins silently -- so the model spends the turn being
+    /// steered away from what it was just told to do.
+    fn build_tool_system_prompt(tools: &[String], format: ToolCallFormat) -> String {
         let mut prompt = String::from(
             " # Tools\n\n\
              You may call one or more functions to assist with the user query.\n\n\
@@ -139,19 +161,36 @@ impl QwenInstruct {
             prompt.push('\n');
             prompt.push_str(tool);
         }
-        prompt.push_str(
-            "\n</tools>\n\n\
-             For each function call, return a json object with function name and arguments \
-             within <tool_call></tool_call> XML tags:\n\
-             <tool_call>\n\
-             {\"name\": <function-name>, \"arguments\": <args-json-object>}\n\
-             </tool_call>",
-        );
+        prompt.push_str("\n</tools>\n\n");
+        prompt.push_str(match format {
+            ToolCallFormat::Json => {
+                "For each function call, return a json object with function name and arguments \
+                 within <tool_call></tool_call> XML tags:\n\
+                 <tool_call>\n\
+                 {\"name\": <function-name>, \"arguments\": <args-json-object>}\n\
+                 </tool_call>"
+            }
+            ToolCallFormat::Qwen35Xml => {
+                "If you choose to call a function ONLY reply in the following format with NO \
+                 suffix:\n\
+                 <tool_call>\n\
+                 <function=example_function_name>\n\
+                 <parameter=example_parameter_1>\n\
+                 value_1\n\
+                 </parameter>\n\
+                 </function>\n\
+                 </tool_call>"
+            }
+        });
         prompt
     }
 
     /// Build an EBNF grammar for constrained Qwen tool-call generation.
-    fn build_tool_call_grammar(tools: &[String]) -> Option<String> {
+    fn build_tool_call_grammar(
+        tools: &[String],
+        format: ToolCallFormat,
+        has_thinking: bool,
+    ) -> Option<String> {
         let mut names: Vec<String> = Vec::new();
         for tool in tools {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tool) {
@@ -170,9 +209,9 @@ impl QwenInstruct {
         }
 
         let name_alt = names.join(" | ");
-        let grammar = format!(
-            r#"root ::= tool-call ("\n" tool-call)*
-tool-call ::= "<tool_call>\n" tool-json "\n</tool_call>"
+        let tool_grammar = match format {
+            ToolCallFormat::Json => format!(
+                r#"tool-call ::= "<tool_call>\n" tool-json "\n</tool_call>"
 tool-json ::= "{{"  "\"name\": \"" tool-name "\", \"arguments\": " json-object "}}"
 tool-name ::= {name_alt}
 json-object ::= "{{" json-members? "}}"
@@ -185,9 +224,35 @@ json-char ::= [^"\\] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA
 json-number ::= "-"? [0-9]+ ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
 json-array ::= "[" (json-value ("," json-value)*)? "]"
 "#,
-            name_alt = name_alt
-        );
-        Some(grammar)
+                name_alt = name_alt
+            ),
+            ToolCallFormat::Qwen35Xml => format!(
+                r#"tool-call ::= "<tool_call>\n<function=" tool-name ">\n" parameter* "</function>\n</tool_call>"
+tool-name ::= {name_alt}
+parameter ::= "<parameter=" parameter-name ">\n" parameter-value "\n</parameter>\n"
+parameter-name ::= [A-Za-z_][A-Za-z0-9_-]*
+parameter-value ::= parameter-char*
+parameter-char ::= [^<]
+"#,
+                name_alt = name_alt
+            ),
+        };
+        // A thinking model reaches its action THROUGH deliberation. A root that
+        // admits only the call masks the reasoning block out of existence, so
+        // the turn cannot contain a thought or a word of plan -- which is not a
+        // constraint on the tool syntax at all, it is a constraint on the model
+        // being itself. Reasoning syntax stays here in the model formatter;
+        // inferlets request the native matcher and remain family-agnostic.
+        let root = if has_thinking {
+            r#"root ::= reasoning-block? tool-call ("\n" tool-call)*
+reasoning-block ::= "<think>" reasoning-content "</think>" "\n"*
+reasoning-content ::= reasoning-piece*
+reasoning-piece ::= [^<] | "<" [^/] | "</" [^t] | "</t" [^h] | "</th" [^i] | "</thi" [^n] | "</thin" [^k] | "</think" [^>]
+"#
+        } else {
+            "root ::= tool-call (\"\\n\" tool-call)*\n"
+        };
+        Some(format!("{root}{tool_grammar}"))
     }
 }
 
@@ -224,7 +289,7 @@ impl Instruct for QwenInstruct {
         if !self.config.has_tools {
             return Vec::new();
         }
-        let prompt = Self::build_tool_system_prompt(tools);
+        let prompt = Self::build_tool_system_prompt(tools, self.config.tool_call_format);
         self.system(&prompt)
     }
 
@@ -266,6 +331,7 @@ impl Instruct for QwenInstruct {
             accumulated: String::new(),
             inside: false,
             has_tools: self.config.has_tools,
+            format: self.config.tool_call_format,
         })
     }
 
@@ -273,7 +339,11 @@ impl Instruct for QwenInstruct {
         if !self.config.has_tools || tools.is_empty() {
             return None;
         }
-        let source = Self::build_tool_call_grammar(tools)?;
+        let source = Self::build_tool_call_grammar(
+            tools,
+            self.config.tool_call_format,
+            self.config.has_thinking,
+        )?;
         Some(ToolGrammar { source })
     }
 }
@@ -287,6 +357,76 @@ struct QwenToolDecoder {
     accumulated: String,
     inside: bool,
     has_tools: bool,
+    format: ToolCallFormat,
+}
+
+impl QwenToolDecoder {
+    fn parse_json_tool_call(call: &str) -> Option<(String, String)> {
+        let value = serde_json::from_str::<serde_json::Value>(call).ok()?;
+        let name = value.get("name")?.as_str()?.to_string();
+        if name.is_empty() {
+            return None;
+        }
+        Some((name, value["arguments"].to_string()))
+    }
+
+    /// Parses the surface the Qwen3.5+ `chat_template` demonstrates:
+    /// `<function=NAME>` wrapping `<parameter=KEY>value</parameter>` pairs.
+    ///
+    /// Every value arrives as a JSON string. The surface carries no types, so
+    /// inferring them here would be this decoder guessing at a schema it cannot
+    /// see; the tool boundary validates against the real one.
+    fn parse_xml_tool_call(call: &str) -> Option<(String, String)> {
+        let call = call.trim();
+        let function_prefix = "<function=";
+        let function_start = call.find(function_prefix)? + function_prefix.len();
+        let function_name_end = call[function_start..].find('>')? + function_start;
+        let name = call[function_start..function_name_end].trim().to_string();
+        if name.is_empty() {
+            return None;
+        }
+        let function_body_start = function_name_end + 1;
+        let function_close = "</function>";
+        let function_body_end =
+            call[function_body_start..].find(function_close)? + function_body_start;
+        let mut rest = &call[function_body_start..function_body_end];
+        let mut args = serde_json::Map::new();
+
+        while let Some(parameter_pos) = rest.find("<parameter=") {
+            let name_start = parameter_pos + "<parameter=".len();
+            let name_end = rest[name_start..].find('>')? + name_start;
+            let param_name = rest[name_start..name_end].trim();
+            if param_name.is_empty() {
+                return None;
+            }
+            let value_start = name_end + 1;
+            let value_close = "</parameter>";
+            let value_end = rest[value_start..].find(value_close)? + value_start;
+            let value = rest[value_start..value_end].trim_matches('\n').to_string();
+            args.insert(param_name.to_string(), serde_json::Value::String(value));
+            rest = &rest[value_end + value_close.len()..];
+        }
+
+        Some((name, serde_json::Value::Object(args).to_string()))
+    }
+
+    /// Tries the configured surface first and the other one second.
+    ///
+    /// The fallback is not indecision: a checkpoint's template teaches one form,
+    /// but a model prompted with the other -- or replaying a history written in
+    /// it -- can emit either, and dropping a call it plainly made is the worse
+    /// failure. Silence here is indistinguishable from "the model said nothing",
+    /// which is what made the mismatch invisible for so long.
+    fn parse_tool_call(&self, call: &str) -> Option<(String, String)> {
+        match self.format {
+            ToolCallFormat::Json => {
+                Self::parse_json_tool_call(call).or_else(|| Self::parse_xml_tool_call(call))
+            }
+            ToolCallFormat::Qwen35Xml => {
+                Self::parse_xml_tool_call(call).or_else(|| Self::parse_json_tool_call(call))
+            }
+        }
+    }
 }
 
 impl ToolDecoder for QwenToolDecoder {
@@ -309,9 +449,7 @@ impl ToolDecoder for QwenToolDecoder {
             let call_json = self.accumulated[..pos].trim().to_string();
             self.accumulated = self.accumulated[pos + "</tool_call>".len()..].to_string();
             self.inside = false;
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&call_json) {
-                let name = v["name"].as_str().unwrap_or("").to_string();
-                let args = v["arguments"].to_string();
+            if let Some((name, args)) = self.parse_tool_call(&call_json) {
                 return ToolEvent::Call(name, args);
             }
         }
@@ -330,6 +468,61 @@ mod tests {
     use super::*;
     use pie_tokenizer::Tokenizer;
     use std::sync::Arc;
+
+    /// The exact surface `Qwen/Qwen3.6-27B-FP8`'s own `chat_template` tells the
+    /// model to emit. Decoding it silently yielded no call at all, which is
+    /// indistinguishable from the model having said nothing.
+    const QWEN36_TEMPLATE_SURFACE: &str =
+        "<function=bash>\n<parameter=cmd>\nls -la\n</parameter>\n</function>";
+
+    #[test]
+    fn the_xml_surface_the_checkpoint_teaches_decodes_to_its_call() {
+        assert_eq!(
+            QwenToolDecoder::parse_xml_tool_call(QWEN36_TEMPLATE_SURFACE),
+            Some(("bash".to_string(), r#"{"cmd":"ls -la"}"#.to_string()))
+        );
+    }
+
+    /// Each format leads with its own surface and still accepts the other, so a
+    /// call the model plainly made is never dropped for being in the other one.
+    #[test]
+    fn either_configured_format_accepts_both_surfaces() {
+        let json_body = r#"{"name": "bash", "arguments": {"cmd": "ls -la"}}"#;
+        let expected = Some(("bash".to_string(), r#"{"cmd":"ls -la"}"#.to_string()));
+
+        for format in [ToolCallFormat::Json, ToolCallFormat::Qwen35Xml] {
+            let decoder = QwenToolDecoder {
+                decoder: make_tok().decoder(false),
+                accumulated: String::new(),
+                inside: false,
+                has_tools: true,
+                format,
+            };
+
+            assert_eq!(decoder.parse_tool_call(QWEN36_TEMPLATE_SURFACE), expected);
+            assert_eq!(decoder.parse_tool_call(json_body), expected);
+        }
+    }
+
+    /// A thinking model reaches its action through deliberation. A root that
+    /// admits only the call masks the reasoning block out of existence, so the
+    /// turn cannot hold a thought or a word of plan.
+    #[test]
+    fn a_thinking_model_may_reason_before_it_acts() {
+        let tools = [r#"{"name": "bash"}"#.to_string()];
+
+        let thinking =
+            QwenInstruct::build_tool_call_grammar(&tools, ToolCallFormat::Qwen35Xml, true)
+                .expect("a named tool yields a grammar");
+        assert!(thinking.starts_with("root ::= reasoning-block? tool-call"));
+        assert!(thinking.contains(r#"tool-call ::= "<tool_call>\n<function=""#));
+
+        // A model with no reasoning channel gains no prefix it cannot fill.
+        let plain = QwenInstruct::build_tool_call_grammar(&tools, ToolCallFormat::Json, false)
+            .expect("a named tool yields a grammar");
+        assert!(plain.starts_with("root ::= tool-call"));
+        assert!(plain.contains("tool-json"));
+    }
 
     fn make_tok() -> Arc<Tokenizer> {
         let v: Vec<String> = vec![
@@ -361,6 +554,7 @@ mod tests {
         QwenInstruct::new(
             make_tok(),
             ChatMLConfig {
+                tool_call_format: ToolCallFormat::Qwen35Xml,
                 has_thinking: true,
                 has_tools: true,
                 generation_suffix: "",
@@ -373,6 +567,7 @@ mod tests {
         QwenInstruct::new(
             make_tok(),
             ChatMLConfig {
+                tool_call_format: ToolCallFormat::Qwen35Xml,
                 has_thinking: false,
                 has_tools: true,
                 generation_suffix: "",
@@ -385,6 +580,7 @@ mod tests {
         QwenInstruct::new(
             make_tok(),
             ChatMLConfig {
+                tool_call_format: ToolCallFormat::Qwen35Xml,
                 has_thinking: true,
                 has_tools: false,
                 generation_suffix: "",
@@ -450,7 +646,7 @@ mod tests {
 
     #[test]
     fn equip_format_matches_reference() {
-        let prompt = QwenInstruct::build_tool_system_prompt(&["{}".to_string()]);
+        let prompt = QwenInstruct::build_tool_system_prompt(&["{}".to_string()], ToolCallFormat::Json);
         assert!(prompt.contains("# Tools"));
         assert!(prompt.contains("<tools>"));
         assert!(prompt.contains("</tools>"));
@@ -532,6 +728,7 @@ mod tests {
         let inst = QwenInstruct::new(
             tok,
             ChatMLConfig {
+                tool_call_format: ToolCallFormat::Qwen35Xml,
                 has_thinking: true,
                 has_tools: true,
                 generation_suffix: "",

@@ -18,15 +18,26 @@ use std::sync::Arc;
 /// dispatch on the *model type*; the generation crates only hold the
 /// implementations.
 pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
-    use pie_model_qwen_3::chat::{ChatMLConfig, QwenInstruct};
+    use pie_model_qwen_3::chat::{ChatMLConfig, QwenInstruct, ToolCallFormat};
 
     match arch_name {
-        "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_moe"
-        | "qwen3_vl" | "qwen3_vl_text" => Arc::new(QwenInstruct::new(
+        "qwen3" | "qwen3_moe" => Arc::new(QwenInstruct::new(
             tokenizer,
             ChatMLConfig {
                 has_thinking: true,
                 has_tools: true,
+                tool_call_format: ToolCallFormat::Json,
+                generation_suffix: "",
+                stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+            },
+        )),
+        "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6"
+        | "qwen3_6_moe" | "qwen3_vl" | "qwen3_vl_text" => Arc::new(QwenInstruct::new(
+            tokenizer,
+            ChatMLConfig {
+                has_thinking: true,
+                has_tools: true,
+                tool_call_format: ToolCallFormat::Qwen35Xml,
                 generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -36,6 +47,7 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
             ChatMLConfig {
                 has_thinking: true,
                 has_tools: false,
+                tool_call_format: ToolCallFormat::Json,
                 generation_suffix: "<think>\n",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -54,6 +66,7 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
             ChatMLConfig {
                 has_thinking: true,
                 has_tools: true,
+                tool_call_format: ToolCallFormat::Json,
                 generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>"],
             },
@@ -95,6 +108,7 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
             ChatMLConfig {
                 has_thinking: false,
                 has_tools: false,
+                tool_call_format: ToolCallFormat::Json,
                 generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
