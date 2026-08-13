@@ -36,7 +36,7 @@ use crate::contract::{
     Expr, ModelContract, Partition, ScaleFactor, TensorContract, TensorType, Visibility,
 };
 use crate::error::{Error, OrOverflow, Result};
-use crate::extent::Extent;
+use crate::extent::{Dim, Extent};
 use crate::plan::geometry::{
     full_dest_extent, repack_stage_bytes, storage_extent_for_shape, strided_physical_source_bytes,
 };
@@ -426,11 +426,14 @@ impl Builder<'_> {
                     // dim counts times the dtype width would over-allocate and
                     // trip its span check. Hand it the element-typed dense
                     // extent instead; packed encodings keep their byte-run form
-                    // via `storage_extent_for_shape`'s fallback.
+                    // via `storage_extent_for_shape`'s fallback. A *strided*
+                    // rect has the same problem one level down — `split` hoists
+                    // each contiguous run into `element_bytes` — so its runs
+                    // are re-split into elements by `element_typed`.
                     let stride = if rect.is_byte_run() {
                         storage_extent_for_shape(&decl.shape, &decl.encoding)?
                     } else {
-                        rect.split()?.0
+                        element_typed(rect.split()?.0, &decl.encoding)
                     };
                     return Ok(Value::Source(SourceView {
                         tensor_id: source.tensor_id,
@@ -1293,6 +1296,36 @@ fn block_sizes(operand: &[i64], factors: &[i64]) -> Result<Vec<i64>> {
             Ok(extent / count)
         })
         .collect()
+}
+
+/// Re-express a run-folded extent in elements of `encoding`.
+///
+/// `Rect::split` hoists each contiguous run into `element_bytes`, which is
+/// right for a copy but wrong for a *typed* source view: both executors size
+/// a TileMap source from the dim counts times the dtype width, so a bf16 view
+/// whose "element" is a whole 4-byte row counts half its elements. Splitting
+/// the run back into an innermost dim keeps the byte walk identical and makes
+/// the counts mean elements again. A packed encoding — or a run that is not a
+/// whole number of elements — is left in byte form, which is the form its
+/// consumers expect.
+fn element_typed(mut extent: Extent, encoding: &Encoding) -> Extent {
+    let Some(width) = encoding_dense_element_bytes(encoding) else {
+        return extent;
+    };
+    let Ok(width) = u32::try_from(width) else {
+        return extent;
+    };
+    if width == 0 || extent.element_bytes == width || extent.element_bytes % width != 0 {
+        return extent;
+    }
+    let run = i64::from(extent.element_bytes / width);
+    extent.dims.push(Dim {
+        count: run,
+        src_stride: i64::from(width),
+        dst_stride: i64::from(width),
+    });
+    extent.element_bytes = width;
+    extent
 }
 
 fn source_scheme(encoding: &Encoding) -> Option<QuantScheme> {

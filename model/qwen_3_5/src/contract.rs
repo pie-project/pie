@@ -8,9 +8,9 @@
 //! stacks.
 
 use pie_loader::checkpoint::RawTensor;
-use pie_loader::contract::Expr;
+use pie_loader::contract::{Expr, TensorType};
 use pie_loader::error::Error;
-use pie_loader::types::{DType, Encoding, QuantScheme};
+use pie_loader::types::{Axis, DType, Encoding, QuantScheme, QuantSpec};
 
 use pie_model_common::builder::{Builder, is_raw};
 use pie_model_common::mlx;
@@ -23,7 +23,7 @@ pub fn author_qwen3_5(b: &mut Builder<'_>) -> Result<(), Error> {
     // do not. Both are this row, so the prefix is asked for rather than
     // declared.
     b.decoder_layer_prefix_any_of(&["model.language_model.layers.", "model.layers."]);
-    refuse_gdn_fp8(b)?;
+    gdn_fp8_dequant(b)?;
     gdn_kkv_blocked_shards(b)?;
     gdn_fp32_parameters(b)?;
     // The speculative-decoding head is a full-attention layer with the same
@@ -47,7 +47,7 @@ pub fn author_qwen3_5(b: &mut Builder<'_>) -> Result<(), Error> {
 pub fn author_qwen3_5_moe(b: &mut Builder<'_>) -> Result<(), Error> {
     b.allow_bf16_runtime_quant();
     b.decoder_layer_prefix_any_of(&["model.language_model.layers.", "model.layers."]);
-    refuse_gdn_fp8(b)?;
+    gdn_fp8_dequant(b)?;
     gdn_kkv_blocked_shards(b)?;
     gdn_fp32_parameters(b)?;
     // The MoE decode runs through flashinfer's CUTLASS grouped GEMM, which
@@ -62,31 +62,185 @@ pub fn author_qwen3_5_moe(b: &mut Builder<'_>) -> Result<(), Error> {
     b.publish_remaining()
 }
 
-/// Refuse an FP8 Gated DeltaNet checkpoint before it decodes garbage.
+/// Dequantize the FP8 Gated DeltaNet projections to bf16 at load time.
 ///
-/// Two gaps, either one fatal. The CUDA forward feeds every `linear_attn`
-/// projection to `gemm_act_x_w` as a bare tensor — the layer struct has
-/// `QuantMeta` ports for the attention and MLP projections only — so a
-/// shipped F8E4M3 GDN weight runs with null scale data at *every* tp. And
-/// at tp > 1, `gdn_kkv_blocked_shards` consumes `in_proj_qkv.weight` and
-/// republishes the `[K|K|V]` join without its `weight_scale_inv` companion
-/// (the bands need not align to the 128-element scale blocks, so the scales
-/// cannot simply follow), which drops the pairing before the driver could
-/// even ask. Until both are implemented, refuse at authoring time rather
-/// than load a checkpoint that serves noise.
-fn refuse_gdn_fp8(b: &Builder<'_>) -> Result<(), Error> {
-    for raw in b.tensors() {
-        if raw.name.contains(".linear_attn.") && is_raw(&raw.encoding, DType::F8E4M3) {
-            return Err(Error::Contract(format!(
-                "model_type='{}' tp_size={}: '{}' ships F8E4M3, but the Gated \
-                 DeltaNet path has no quant-scale port (and tp > 1 would drop \
-                 its block-scale pairing); FP8 GDN weights are unsupported — \
-                 use a BF16 checkpoint",
+/// The CUDA forward feeds every `linear_attn` projection to `gemm_act_x_w`
+/// as a bare bf16 tensor — the layer struct has `QuantMeta` ports for the
+/// attention and MLP projections only — so a shipped F8E4M3 GDN weight
+/// cannot serve quantized. It can serve *dequantized*: the checkpoint pairs
+/// each projection with a 2-D `weight_scale_inv` block-scale tensor, and
+/// `Expr::Scale`/`ScaleFactor::PerBlock` is exactly `weight = fp8 * scale`
+/// executed by the load-time dequant kernel both executors implement. The
+/// factors are declared as an `Internal` F32 tensor (the FP8 dequant kernel
+/// reads F32 factors), so the driver's bind table sees only the bf16 weight
+/// under its usual name.
+///
+/// Sharding folds in *before* the multiply, on scale-block boundaries only.
+/// `in_proj_qkv` stacks `[K | K | V]` on axis 0 and each band splits per
+/// rank, so its rows keep their scale rows only when `K` and `V` are whole
+/// multiples of `row_block * tp`; the other projections split on their usual
+/// axis, which keeps its blocks only when tp divides the scale extent. A
+/// split that lands inside a 128-row block has no representable scale slice,
+/// so it is refused rather than approximated — as is a projection whose
+/// scale companion is missing altogether.
+fn gdn_fp8_dequant(b: &mut Builder<'_>) -> Result<(), Error> {
+    let tp = i64::from(b.target().tp_size.max(1));
+    for raw in b.tensors().to_vec() {
+        if !raw.name.contains(".linear_attn.") || !is_raw(&raw.encoding, DType::F8E4M3) {
+            continue;
+        }
+        let refuse = |b: &Builder<'_>, why: String| -> Result<(), Error> {
+            Err(Error::Contract(format!(
+                "model_type='{}' tp_size={}: '{}' ships F8E4M3, and the Gated \
+                 DeltaNet path runs bf16 (no quant-scale port), but the weight \
+                 cannot be dequantized at load: {why}",
                 b.facts().model_type,
                 b.target().tp_size,
                 raw.name,
-            )));
+            )))
+        };
+        if !raw.name.ends_with(".weight") || raw.shape.len() != 2 {
+            return refuse(
+                b,
+                "only 2-D `.weight` projections have a block-scale pairing".to_string(),
+            );
         }
+        let scale_name = format!("{}_scale_inv", raw.name);
+        let Some(scale) = b.find(&scale_name) else {
+            return refuse(b, "its `weight_scale_inv` companion is missing".to_string());
+        };
+        if scale.shape.len() != 2
+            || !(is_raw(&scale.encoding, DType::BF16)
+                || is_raw(&scale.encoding, DType::F16)
+                || is_raw(&scale.encoding, DType::F32))
+        {
+            return refuse(
+                b,
+                format!(
+                    "'{scale_name}' must be a 2-D F32/F16/BF16 scale tensor, \
+                     got {:?} {:?}",
+                    scale.encoding, scale.shape
+                ),
+            );
+        }
+        let mut block = [0i64; 2];
+        for axis in 0..2 {
+            let (w, s) = (raw.shape[axis], scale.shape[axis]);
+            if s <= 0 || w % s != 0 {
+                return refuse(
+                    b,
+                    format!(
+                        "scale shape {:?} is not a whole blocking of weight \
+                         shape {:?}",
+                        scale.shape, raw.shape
+                    ),
+                );
+            }
+            block[axis] = w / s;
+        }
+        // The payload's bytes reread as a block-scaled scheme: what tells the
+        // planner this `Scale` also *decodes* (`TransformSpec::from`), and the
+        // executors to unpack E4M3 before the multiply.
+        let fp8 = Encoding::Quant(QuantSpec {
+            scheme: QuantScheme::Fp8E4M3,
+            logical_dtype: DType::BF16,
+            bits_per_element: 8,
+            group_size: u32::try_from(block[1]).unwrap_or(0),
+            channel_axis: Some(Axis(1)),
+        });
+        let is_qkv = raw.name.ends_with(".in_proj_qkv.weight");
+        let (wexpr, wshape, sexpr, sshape) = if is_qkv && tp > 1 {
+            // The [K|K|V] bands, from the same sibling `gdn_kkv_blocked_shards`
+            // reads them off.
+            let base = &raw.name[..raw.name.len() - "in_proj_qkv.weight".len()];
+            let z_dim = b
+                .find(&format!("{base}in_proj_z.weight"))
+                .and_then(|z| z.shape.first().copied());
+            let conv_dim = raw.shape[0];
+            let Some(v_dim) =
+                z_dim.filter(|&v| v > 0 && conv_dim > v && (conv_dim - v) % 2 == 0)
+            else {
+                return refuse(
+                    b,
+                    "the [K|K|V] split needs `in_proj_z.weight` to state V, \
+                     and it does not"
+                        .to_string(),
+                );
+            };
+            let k_dim = (conv_dim - v_dim) / 2;
+            let rb = block[0];
+            if k_dim % (rb * tp) != 0 || v_dim % (rb * tp) != 0 {
+                return refuse(
+                    b,
+                    format!(
+                        "the [K|K|V] bands (K={k_dim}, V={v_dim}) split {tp} \
+                         ways do not fall on {rb}-row scale-block boundaries; \
+                         use a tp_size where {rb}*tp divides both, or a BF16 \
+                         checkpoint"
+                    ),
+                );
+            }
+            let w = || Expr::src(&raw.name).transmute(TensorType::new(raw.shape.clone(), fp8.clone()));
+            let (key_lo, key_rows) = b.band(w(), 0, 0, k_dim);
+            let (key_hi, _) = b.band(w(), 0, k_dim, k_dim);
+            let (value, value_rows) = b.band(w(), 0, 2 * k_dim, v_dim);
+            let s = || Expr::src(&scale.name);
+            let (skey_lo, skey_rows) = b.band(s(), 0, 0, k_dim / rb);
+            let (skey_hi, _) = b.band(s(), 0, k_dim / rb, k_dim / rb);
+            let (svalue, svalue_rows) = b.band(s(), 0, 2 * (k_dim / rb), v_dim / rb);
+            (
+                Expr::concat(0, vec![key_lo, key_hi, value]),
+                vec![2 * key_rows + value_rows, raw.shape[1]],
+                Expr::concat(0, vec![skey_lo, skey_hi, svalue]),
+                vec![2 * skey_rows + svalue_rows, scale.shape[1]],
+            )
+        } else {
+            let axis = b.shard_axis(&raw.name)?;
+            if let Some(axis) = axis {
+                let index = usize::from(axis);
+                if scale.shape[index] % tp != 0 {
+                    return refuse(
+                        b,
+                        format!(
+                            "axis {axis} holds {} scale blocks of {}, which \
+                             tp_size {tp} does not divide; the split would land \
+                             inside a block",
+                            scale.shape[index], block[index]
+                        ),
+                    );
+                }
+            }
+            let wexpr = Expr::src(&raw.name)
+                .transmute(TensorType::new(raw.shape.clone(), fp8.clone()));
+            let (wexpr, wshape) = b.shard(wexpr, raw.shape.clone(), axis);
+            let (sexpr, sshape) = b.shard(Expr::src(&scale.name), scale.shape.clone(), axis);
+            (wexpr, wshape, sexpr, sshape)
+        };
+        // The factors must be a declared tensor, and the CUDA dequant kernel
+        // reads them as F32; a checkpoint that ships them F32 already may not
+        // be handed an identity cast.
+        let sexpr = if is_raw(&scale.encoding, DType::F32) {
+            sexpr
+        } else {
+            sexpr.cast(Encoding::Raw(DType::F32))
+        };
+        let scale_out = b.output_name(&scale.name);
+        if let Some(index) = b.define(
+            scale_out.clone(),
+            sexpr,
+            Encoding::Raw(DType::F32),
+            Some(sshape),
+        ) {
+            b.mark_internal(index);
+        }
+        b.define(
+            b.output_name(&raw.name),
+            wexpr.scale_per_block(Expr::out(&scale_out)),
+            Encoding::Raw(DType::BF16),
+            Some(wshape),
+        );
+        b.consume(raw.id);
+        b.consume(scale.id);
     }
     Ok(())
 }
@@ -143,6 +297,11 @@ fn gdn_kkv_blocked_shards(b: &mut Builder<'_>) -> Result<(), Error> {
                 continue;
             };
             if raw.shape.is_empty() || raw.shape[0] != conv_dim {
+                continue;
+            }
+            // An FP8 `in_proj_qkv` was already banded — with its scales —
+            // by `gdn_fp8_dequant`, and its raw tensor is consumed.
+            if is_raw(&raw.encoding, DType::F8E4M3) {
                 continue;
             }
             let (expr, shape) = gdn_kkv_blocked(b, raw, k_dim, v_dim);

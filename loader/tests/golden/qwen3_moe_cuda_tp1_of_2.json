@@ -1332,12 +1332,17 @@
           "span_bytes": 16384,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 128,
+            "element_bytes": 2,
             "dims": [
               {
                 "count": 128,
                 "src_stride": 256,
                 "dst_stride": 128
+              },
+              {
+                "count": 64,
+                "src_stride": 2,
+                "dst_stride": 2
               }
             ]
           },
@@ -1410,12 +1415,17 @@
           "span_bytes": 32768,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 256,
+            "element_bytes": 2,
             "dims": [
               {
                 "count": 128,
                 "src_stride": 512,
                 "dst_stride": 256
+              },
+              {
+                "count": 128,
+                "src_stride": 2,
+                "dst_stride": 2
               }
             ]
           },
@@ -1474,12 +1484,17 @@
           "span_bytes": 32768,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 256,
+            "element_bytes": 2,
             "dims": [
               {
                 "count": 128,
                 "src_stride": 512,
                 "dst_stride": 256
+              },
+              {
+                "count": 128,
+                "src_stride": 2,
+                "dst_stride": 2
               }
             ]
           },
@@ -1538,12 +1553,17 @@
           "span_bytes": 32768,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 256,
+            "element_bytes": 2,
             "dims": [
               {
                 "count": 128,
                 "src_stride": 512,
                 "dst_stride": 256
+              },
+              {
+                "count": 128,
+                "src_stride": 2,
+                "dst_stride": 2
               }
             ]
           },
@@ -1602,12 +1622,17 @@
           "span_bytes": 32768,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 256,
+            "element_bytes": 2,
             "dims": [
               {
                 "count": 128,
                 "src_stride": 512,
                 "dst_stride": 256
+              },
+              {
+                "count": 128,
+                "src_stride": 2,
+                "dst_stride": 2
               }
             ]
           },

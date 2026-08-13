@@ -21,12 +21,13 @@ use std::path::PathBuf;
 
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
 use pie_loader::plan::{
-    CUDA_TILE_MAP_MASK, METAL_TILE_MAP_MASK, StorageInstr, StorageTarget, TileMapKind,
+    CUDA_TILE_MAP_MASK, HOST_TILE_MAP_MASK, METAL_TILE_MAP_MASK, StorageInstr, StorageTarget,
+    TileMapKind,
     compile as compile_load_plan,
 };
 use pie_loader::types::{
-    BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantGranularity, RepackLayout,
-    ScaleForm, TensorId, Visibility,
+    BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantGranularity, QuantScheme,
+    RepackLayout, ScaleForm, TensorId, Visibility,
 };
 use pie_loader::verify::ContractView;
 
@@ -500,23 +501,276 @@ fn qwen3_5_dense_cuda_tp1_of_2() {
     );
 }
 
-/// An FP8 GDN weight has no quant-scale port in the CUDA forward, and at
-/// tp > 1 the `[K|K|V]` join would also drop the block-scale pairing — so the
+/// An FP8 GDN weight *without* its `weight_scale_inv` companion cannot be
+/// dequantized, and the CUDA forward has no quant-scale port for it — so the
 /// author must refuse the checkpoint rather than let it load and serve noise.
 #[test]
-fn qwen3_5_refuses_fp8_gdn_weights() {
+fn qwen3_5_refuses_fp8_gdn_without_scales() {
     let mut facts = facts("qwen3_5", 2);
     facts.head_dim = 16;
     let checkpoint = qwen3_5_checkpoint_with(Encoding::Raw(DType::F8E4M3), "qwen3_5_fp8");
     for tp_size in [1, 2] {
         let err = author(&facts, &checkpoint, &target(0, tp_size), &Policy::default())
-            .expect_err(&format!("tp={tp_size}: an FP8 GDN weight must be refused"));
+            .expect_err(&format!("tp={tp_size}: an unpaired FP8 GDN weight must be refused"));
         let msg = err.to_string();
         assert!(
-            msg.contains("FP8 GDN weights are unsupported"),
+            msg.contains("weight_scale_inv") && msg.contains("cannot be dequantized"),
             "tp={tp_size}: unexpected error: {msg}"
         );
     }
+}
+
+// ── qwen3_5: FP8 GDN load-time dequantization ───────────────────────
+
+/// The E4M3 byte for a small positive value that E4M3 represents exactly.
+fn fp8_e4m3(value: f64) -> u8 {
+    let exponent = value.log2().floor() as i32;
+    let mantissa = (value / f64::from(exponent).exp2() - 1.0) * 8.0;
+    (((exponent + 7) as u8) << 3) | (mantissa.round() as u8)
+}
+
+/// f32 → bf16 bits, round to nearest even. The fixture values are chosen so
+/// the products are exact in bf16, so the rounding never actually fires — it
+/// is here so a wrong fixture value fails loudly instead of subtly.
+fn bf16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) as u16
+}
+
+/// The FP8 payload element at flat index `i`: 1..=7, exactly representable in
+/// E4M3. Period 7 stays out of phase with the 4-wide scale blocks, so a
+/// misindexed block cannot reproduce the right sequence.
+fn gdn_value(i: usize) -> f32 {
+    (i % 7 + 1) as f32
+}
+
+/// The block scale at flat index `j`: powers of two, so `value * scale` is
+/// exact in bf16 and any factor applied to the wrong block is off by at
+/// least a factor of two.
+fn gdn_scale(j: usize) -> f32 {
+    [0.5, 2.0, 4.0, 0.25, 8.0][j % 5]
+}
+
+/// An FP8-GDN checkpoint with *real bytes*: every `linear_attn` projection
+/// ships E4M3 beside a bf16 `weight_scale_inv` in 4x4 blocks, and the file
+/// holds the values `gdn_value`/`gdn_scale` state so the host executor can be
+/// checked against arithmetic done here. K = V = 8 with 4-row blocks keeps
+/// every tp=2 band on a block boundary; everything else is zero-filled bf16.
+fn qwen3_5_fp8_gdn_checkpoint() -> CheckpointMetadata {
+    let hidden = 8i64;
+    let (k_dim, v_dim) = (8i64, 8i64);
+    let conv_dim = 2 * k_dim + v_dim;
+    let block = 4i64;
+    let fp8 = Encoding::Raw(DType::F8E4M3);
+    let mut ck = Checkpoint::new();
+    ck.push("model.embed_tokens.weight", &[16, hidden], bf16());
+    let la = "model.layers.0.linear_attn.";
+    ck.push(
+        &format!("{la}in_proj_qkv.weight"),
+        &[conv_dim, hidden],
+        fp8.clone(),
+    );
+    ck.push(
+        &format!("{la}in_proj_qkv.weight_scale_inv"),
+        &[conv_dim / block, hidden / block],
+        bf16(),
+    );
+    ck.push(&format!("{la}in_proj_z.weight"), &[v_dim, hidden], fp8.clone());
+    ck.push(
+        &format!("{la}in_proj_z.weight_scale_inv"),
+        &[v_dim / block, hidden / block],
+        bf16(),
+    );
+    ck.push(&format!("{la}in_proj_b.weight"), &[2, hidden], bf16());
+    ck.push(&format!("{la}in_proj_a.weight"), &[2, hidden], bf16());
+    ck.push(&format!("{la}conv1d.weight"), &[conv_dim, 1, 4], bf16());
+    ck.push(&format!("{la}conv1d.bias"), &[conv_dim], bf16());
+    ck.push(&format!("{la}out_proj.weight"), &[hidden, v_dim], fp8);
+    ck.push(
+        &format!("{la}out_proj.weight_scale_inv"),
+        &[hidden / block, v_dim / block],
+        bf16(),
+    );
+    ck.push(&format!("{la}A_log"), &[2], bf16());
+    ck.push(&format!("{la}dt_bias"), &[2], bf16());
+    ck.push(&format!("{la}norm.weight"), &[v_dim], f32enc());
+    dense_layer(&mut ck, "model.layers.1.", hidden, 2, 2, 4, 16);
+    ck.push("model.norm.weight", &[hidden], bf16());
+    let metadata = ck.finish("qwen3_5_fp8_gdn");
+
+    let mut data = vec![0u8; usize::try_from(metadata.files[0].size_bytes).unwrap()];
+    for raw in &metadata.tensors {
+        let start = usize::try_from(raw.file_offset).unwrap();
+        if raw.encoding == Encoding::Raw(DType::F8E4M3) {
+            for i in 0..usize::try_from(raw.span_bytes).unwrap() {
+                data[start + i] = fp8_e4m3(f64::from(gdn_value(i)));
+            }
+        } else if raw.name.ends_with(".weight_scale_inv") {
+            for j in 0..usize::try_from(raw.span_bytes / 2).unwrap() {
+                let bits = bf16_bits(gdn_scale(j));
+                data[start + 2 * j..start + 2 * j + 2].copy_from_slice(&bits.to_le_bytes());
+            }
+        }
+    }
+    // Staged and renamed, not written in place: two tests build this fixture
+    // concurrently, and a truncate-then-write under a concurrent reader is a
+    // short read.
+    let path = std::path::Path::new(&metadata.files[0].path);
+    let staging = path.with_extension(format!("{:?}.partial", std::thread::current().id()));
+    std::fs::write(&staging, &data).expect("stage fp8 GDN fixture bytes");
+    std::fs::rename(&staging, path).expect("publish fp8 GDN fixture bytes");
+    metadata
+}
+
+/// The bf16 bytes the dequant must produce for the local tensor whose
+/// element (r, c) reads global element (rows[r], cols[c]) of a full
+/// `[_, full_cols]` FP8 weight with `[_, full_cols / 4]`-shaped scales.
+fn gdn_expected(rows: &[i64], cols: &[i64], full_cols: i64) -> Vec<u8> {
+    let block = 4i64;
+    let scale_cols = full_cols / block;
+    let mut out = Vec::with_capacity(rows.len() * cols.len() * 2);
+    for &gr in rows {
+        for &gc in cols {
+            let value = gdn_value(usize::try_from(gr * full_cols + gc).unwrap());
+            let scale =
+                gdn_scale(usize::try_from((gr / block) * scale_cols + gc / block).unwrap());
+            out.extend_from_slice(&bf16_bits(value * scale).to_le_bytes());
+        }
+    }
+    out
+}
+
+/// The load plan dequantizes FP8 GDN weights to the mathematically expected
+/// bf16 values — `weight = fp8 * block_scale` — at tp=1 and on both ranks of
+/// tp=2, executed end to end by the host executor over real checkpoint
+/// bytes. The tp=2 ranks also prove the `[K|K|V]` bands and the row/column
+/// shards slice the *scales* consistently with the weights.
+#[test]
+fn qwen3_5_fp8_gdn_dequantizes_to_expected_bf16() {
+    let mut facts = facts("qwen3_5", 2);
+    facts.head_dim = 4;
+    let checkpoint = qwen3_5_fp8_gdn_checkpoint();
+    let la = "model.layers.0.linear_attn.";
+    let all8: Vec<i64> = (0..8).collect();
+
+    for (tp_rank, tp_size) in [(0, 1), (0, 2), (1, 2)] {
+        let target = target(tp_rank, tp_size);
+        let contract = author(&facts, &checkpoint, &target, &Policy::default())
+            .expect("authoring failed")
+            .expect("no author for qwen3_5");
+        for leaf in ["in_proj_qkv", "in_proj_z", "out_proj"] {
+            let entry = contract
+                .tensors
+                .iter()
+                .find(|t| t.name == format!("{la}{leaf}.weight"))
+                .unwrap_or_else(|| panic!("{leaf}: no published weight"));
+            assert_eq!(
+                entry.encoding,
+                Encoding::Raw(DType::BF16),
+                "{leaf}: the GDN path binds bf16"
+            );
+            let scales = contract
+                .tensors
+                .iter()
+                .find(|t| t.name == format!("{la}{leaf}.weight_scale_inv"))
+                .unwrap_or_else(|| panic!("{leaf}: no declared scale factors"));
+            assert_eq!(
+                scales.visibility,
+                Visibility::Internal,
+                "{leaf}: factors are load-time only, not a bind name"
+            );
+        }
+        let plan = compile_load_plan(&checkpoint, &contract, target.clone())
+            .expect("compiling failed");
+        if let Err(violations) = pie_loader_capi::view::verify_marshalled(
+            &plan,
+            Some(&ContractView::of(&contract)),
+        ) {
+            let listed: Vec<String> = violations.iter().map(ToString::to_string).collect();
+            panic!("tp{tp_size} rank {tp_rank}: {}", listed.join("\n  "));
+        }
+        let scaled: Vec<_> = plan
+            .instrs
+            .iter()
+            .filter_map(|instr| match instr {
+                StorageInstr::TileMap {
+                    kind: TileMapKind::Scale,
+                    transform,
+                    ..
+                } => Some(transform),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            scaled.len(),
+            3,
+            "tp{tp_size} rank {tp_rank}: one per-block Scale per FP8 projection"
+        );
+        for transform in scaled {
+            assert_eq!(transform.scale_blocks, vec![4, 4]);
+            assert_eq!(transform.from, Some(QuantScheme::Fp8E4M3));
+        }
+
+        // The CUDA plan above pins what the driver will run; the host replay
+        // executes the same contract compiled against the host's own mask.
+        let mut host_target = target.clone();
+        host_target.tile_map_mask = HOST_TILE_MAP_MASK;
+        let host_plan = compile_load_plan(&checkpoint, &contract, host_target)
+            .expect("compiling host plan failed");
+        let storage = pie_loader::executor::host::execute_plan(
+            &host_plan,
+            std::path::Path::new(""),
+        )
+        .expect("host execution failed");
+        // This rank's global rows/cols per projection: at tp=2 the qkv rows
+        // are the rank's half of each of the [K|K|V] bands, z splits rows,
+        // out_proj splits columns.
+        let half = |base: i64| -> Vec<i64> {
+            (base + i64::from(tp_rank) * 4..base + i64::from(tp_rank) * 4 + 4).collect()
+        };
+        let (qkv_rows, z_rows, out_cols) = if tp_size == 1 {
+            ((0..24).collect::<Vec<i64>>(), all8.clone(), all8.clone())
+        } else {
+            (
+                [half(0), half(8), half(16)].concat(),
+                half(0),
+                half(0),
+            )
+        };
+        for (leaf, rows, cols, full_cols) in [
+            ("in_proj_qkv", &qkv_rows, &all8, 8),
+            ("in_proj_z", &z_rows, &all8, 8),
+            ("out_proj", &all8, &out_cols, 8),
+        ] {
+            let name = format!("{la}{leaf}.weight");
+            let bytes = storage
+                .tensors
+                .get(&name)
+                .unwrap_or_else(|| panic!("{name}: not materialized"));
+            assert_eq!(
+                bytes,
+                &gdn_expected(rows, cols, full_cols),
+                "tp{tp_size} rank {tp_rank}: {name} dequantized wrong"
+            );
+        }
+    }
+}
+
+/// A tp that splits inside a scale block has no representable scale slice —
+/// K = V = 8 in 4-row blocks cannot split 4 ways — and must be refused
+/// rather than approximated.
+#[test]
+fn qwen3_5_fp8_gdn_refuses_misaligned_tp() {
+    let mut facts = facts("qwen3_5", 2);
+    facts.head_dim = 4;
+    let checkpoint = qwen3_5_fp8_gdn_checkpoint();
+    let err = author(&facts, &checkpoint, &target(0, 4), &Policy::default())
+        .expect_err("tp=4 splits inside a 4-row scale block and must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("scale-block boundaries"),
+        "unexpected error: {msg}"
+    );
 }
 
 /// The GDN fp32 widening casts a rank slice of `A_log` at tp > 1, and the

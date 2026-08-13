@@ -460,12 +460,17 @@
           "span_bytes": 4096,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 32,
+            "element_bytes": 1,
             "dims": [
               {
                 "count": 128,
                 "src_stride": 64,
                 "dst_stride": 32
+              },
+              {
+                "count": 32,
+                "src_stride": 1,
+                "dst_stride": 1
               }
             ]
           },
@@ -530,12 +535,17 @@
           "span_bytes": 256,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 2,
+            "element_bytes": 1,
             "dims": [
               {
                 "count": 128,
                 "src_stride": 4,
                 "dst_stride": 2
+              },
+              {
+                "count": 2,
+                "src_stride": 1,
+                "dst_stride": 1
               }
             ]
           },
@@ -660,12 +670,17 @@
           "span_bytes": 4096,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 32,
+            "element_bytes": 1,
             "dims": [
               {
                 "count": 128,
                 "src_stride": 64,
                 "dst_stride": 32
+              },
+              {
+                "count": 32,
+                "src_stride": 1,
+                "dst_stride": 1
               }
             ]
           },
@@ -730,12 +745,17 @@
           "span_bytes": 256,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 2,
+            "element_bytes": 1,
             "dims": [
               {
                 "count": 128,
                 "src_stride": 4,
                 "dst_stride": 2
+              },
+              {
+                "count": 2,
+                "src_stride": 1,
+                "dst_stride": 1
               }
             ]
           },
