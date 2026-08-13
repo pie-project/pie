@@ -430,6 +430,12 @@ fn gpt_oss_streamed_cuda() {
 // ── qwen3_5: GDN blocked shards + fp32 widening ─────────────────────
 
 fn qwen3_5_checkpoint() -> CheckpointMetadata {
+    qwen3_5_checkpoint_with(bf16(), "qwen3_5")
+}
+
+/// `file_tag` keys the fixture's temp file: two variants of this checkpoint
+/// have different sizes, so sharing one name would race the other tests.
+fn qwen3_5_checkpoint_with(qkv_encoding: Encoding, file_tag: &str) -> CheckpointMetadata {
     let (hidden, heads, kv_heads, head_dim) = (64, 4, 2, 16);
     let (k_dim, v_dim) = (32, 32);
     let conv_dim = 2 * k_dim + v_dim;
@@ -440,7 +446,7 @@ fn qwen3_5_checkpoint() -> CheckpointMetadata {
     ck.push(
         &format!("{la}in_proj_qkv.weight"),
         &[conv_dim, hidden],
-        bf16(),
+        qkv_encoding,
     );
     ck.push(&format!("{la}in_proj_z.weight"), &[v_dim, hidden], bf16());
     ck.push(&format!("{la}in_proj_b.weight"), &[8, hidden], bf16());
@@ -463,7 +469,7 @@ fn qwen3_5_checkpoint() -> CheckpointMetadata {
         96,
     );
     ck.push("model.norm.weight", &[hidden], bf16());
-    ck.finish("qwen3_5")
+    ck.finish(file_tag)
 }
 
 #[test]
@@ -492,6 +498,69 @@ fn qwen3_5_dense_cuda_tp1_of_2() {
         &target(1, 2),
         &Policy::default(),
     );
+}
+
+/// An FP8 GDN weight has no quant-scale port in the CUDA forward, and at
+/// tp > 1 the `[K|K|V]` join would also drop the block-scale pairing — so the
+/// author must refuse the checkpoint rather than let it load and serve noise.
+#[test]
+fn qwen3_5_refuses_fp8_gdn_weights() {
+    let mut facts = facts("qwen3_5", 2);
+    facts.head_dim = 16;
+    let checkpoint = qwen3_5_checkpoint_with(Encoding::Raw(DType::F8E4M3), "qwen3_5_fp8");
+    for tp_size in [1, 2] {
+        let err = author(&facts, &checkpoint, &target(0, tp_size), &Policy::default())
+            .expect_err(&format!("tp={tp_size}: an FP8 GDN weight must be refused"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("FP8 GDN weights are unsupported"),
+            "tp={tp_size}: unexpected error: {msg}"
+        );
+    }
+}
+
+/// The GDN fp32 widening casts a rank slice of `A_log` at tp > 1, and the
+/// executor sizes a Cast's file source from the extent's dim counts times the
+/// dtype width. A byte-run stride handed to a dtype-typed source view makes
+/// that product double `span_bytes` and the driver throws
+/// "Cast source byte size mismatch" — so measure it the executor's way here.
+#[test]
+fn qwen3_5_tp2_cast_source_extents_match_their_span() {
+    let mut facts = facts("qwen3_5", 2);
+    facts.head_dim = 16;
+    let checkpoint = qwen3_5_checkpoint();
+    for rank in 0..2 {
+        let target = target(rank, 2);
+        let contract = author(&facts, &checkpoint, &target, &Policy::default())
+            .expect("authoring failed")
+            .expect("no author for qwen3_5");
+        let plan =
+            compile_load_plan(&checkpoint, &contract, target).expect("compiling failed");
+        let mut casts = 0;
+        for instr in &plan.instrs {
+            let StorageInstr::TileMap {
+                kind: TileMapKind::Cast,
+                source: Some(source),
+                ..
+            } = instr
+            else {
+                continue;
+            };
+            casts += 1;
+            let elements: i64 = source.stride.dims.iter().map(|dim| dim.count).product();
+            let extent_bytes = u64::try_from(elements).unwrap() * source.dtype.bytes();
+            assert_eq!(
+                extent_bytes, source.span_bytes,
+                "rank {rank}: Cast source extent is {extent_bytes} bytes but \
+                 span_bytes is {}",
+                source.span_bytes
+            );
+        }
+        assert!(
+            casts > 0,
+            "rank {rank}: fixture no longer produces a Cast with a file source"
+        );
+    }
 }
 
 // ── qwen3_5_moe: shared-expert join + per-expert stacks ─────────────

@@ -23,6 +23,7 @@ pub fn author_qwen3_5(b: &mut Builder<'_>) -> Result<(), Error> {
     // do not. Both are this row, so the prefix is asked for rather than
     // declared.
     b.decoder_layer_prefix_any_of(&["model.language_model.layers.", "model.layers."]);
+    refuse_gdn_fp8(b)?;
     gdn_kkv_blocked_shards(b)?;
     gdn_fp32_parameters(b)?;
     // The speculative-decoding head is a full-attention layer with the same
@@ -46,6 +47,7 @@ pub fn author_qwen3_5(b: &mut Builder<'_>) -> Result<(), Error> {
 pub fn author_qwen3_5_moe(b: &mut Builder<'_>) -> Result<(), Error> {
     b.allow_bf16_runtime_quant();
     b.decoder_layer_prefix_any_of(&["model.language_model.layers.", "model.layers."]);
+    refuse_gdn_fp8(b)?;
     gdn_kkv_blocked_shards(b)?;
     gdn_fp32_parameters(b)?;
     // The MoE decode runs through flashinfer's CUTLASS grouped GEMM, which
@@ -58,6 +60,35 @@ pub fn author_qwen3_5_moe(b: &mut Builder<'_>) -> Result<(), Error> {
     shared_expert_gate_up_joins(b);
     hf_moe_expert_stacks(b, GATE_SECOND, false)?;
     b.publish_remaining()
+}
+
+/// Refuse an FP8 Gated DeltaNet checkpoint before it decodes garbage.
+///
+/// Two gaps, either one fatal. The CUDA forward feeds every `linear_attn`
+/// projection to `gemm_act_x_w` as a bare tensor — the layer struct has
+/// `QuantMeta` ports for the attention and MLP projections only — so a
+/// shipped F8E4M3 GDN weight runs with null scale data at *every* tp. And
+/// at tp > 1, `gdn_kkv_blocked_shards` consumes `in_proj_qkv.weight` and
+/// republishes the `[K|K|V]` join without its `weight_scale_inv` companion
+/// (the bands need not align to the 128-element scale blocks, so the scales
+/// cannot simply follow), which drops the pairing before the driver could
+/// even ask. Until both are implemented, refuse at authoring time rather
+/// than load a checkpoint that serves noise.
+fn refuse_gdn_fp8(b: &Builder<'_>) -> Result<(), Error> {
+    for raw in b.tensors() {
+        if raw.name.contains(".linear_attn.") && is_raw(&raw.encoding, DType::F8E4M3) {
+            return Err(Error::Contract(format!(
+                "model_type='{}' tp_size={}: '{}' ships F8E4M3, but the Gated \
+                 DeltaNet path has no quant-scale port (and tp > 1 would drop \
+                 its block-scale pairing); FP8 GDN weights are unsupported — \
+                 use a BF16 checkpoint",
+                b.facts().model_type,
+                b.target().tp_size,
+                raw.name,
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// This rank's `[K/T | K/T | V/T]` view of a `[2K + V, ...]` tensor.

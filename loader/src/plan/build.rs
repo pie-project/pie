@@ -420,7 +420,18 @@ impl Builder<'_> {
         {
             match self.leaf(lowering, rect.leaf)? {
                 Value::Source(source) if source_is_dense(&source)? => {
-                    let (stride, _) = rect.split()?;
+                    // A contiguous rect splits into a byte-run (`element_bytes`
+                    // of 1, count in bytes), but the view is typed by
+                    // `decl.encoding`: an executor that sizes the source from
+                    // dim counts times the dtype width would over-allocate and
+                    // trip its span check. Hand it the element-typed dense
+                    // extent instead; packed encodings keep their byte-run form
+                    // via `storage_extent_for_shape`'s fallback.
+                    let stride = if rect.is_byte_run() {
+                        storage_extent_for_shape(&decl.shape, &decl.encoding)?
+                    } else {
+                        rect.split()?.0
+                    };
                     return Ok(Value::Source(SourceView {
                         tensor_id: source.tensor_id,
                         shape: decl.shape.clone(),

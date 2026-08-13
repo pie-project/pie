@@ -185,8 +185,13 @@ private:
                     dtype_from_rust(source.dtype),
                     pie_loader::extent_shape(source.stride));
             if (scratch.nbytes() != source.span_bytes) {
+                const auto& source_info = plan_index_.source(source.tensor_id);
                 throw std::runtime_error(
-                    "rust storage executor: Cast source byte size mismatch");
+                    "rust storage executor: Cast source byte size mismatch for '" +
+                    pie_loader::bytes_to_string(source_info.name) +
+                    "': extent is " + std::to_string(scratch.nbytes()) +
+                    " bytes, span_bytes is " +
+                    std::to_string(source.span_bytes));
             }
 #if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
             // Stream-0 H2D: `cast_tensor_to_ptr` launches on stream 0 and reads
