@@ -28,6 +28,8 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 has_tools: true,
                 tool_call_format: ToolCallFormat::Json,
                 generation_suffix: "",
+                thinking_off_suffix: "",
+                trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )),
@@ -38,7 +40,14 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 has_thinking: true,
                 has_tools: true,
                 tool_call_format: ToolCallFormat::Qwen35Xml,
-                generation_suffix: "",
+                // The template opens the model's turn INSIDE a reasoning block
+                // (`<|im_start|>assistant\n<think>\n`), and closes an empty one
+                // when the caller turns thinking off. An empty suffix here made
+                // every sampled first token come from a position the checkpoint
+                // was never trained to generate at.
+                generation_suffix: "<think>\n",
+                thinking_off_suffix: "<think>\n\n</think>\n\n",
+                trim_content: true,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )),
@@ -49,6 +58,8 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 has_tools: false,
                 tool_call_format: ToolCallFormat::Json,
                 generation_suffix: "<think>\n",
+                thinking_off_suffix: "<think>\n",
+                trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )),
@@ -68,6 +79,8 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 has_tools: true,
                 tool_call_format: ToolCallFormat::Json,
                 generation_suffix: "",
+                thinking_off_suffix: "",
+                trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>"],
             },
         )),
@@ -110,6 +123,8 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 has_tools: false,
                 tool_call_format: ToolCallFormat::Json,
                 generation_suffix: "",
+                thinking_off_suffix: "",
+                trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )),

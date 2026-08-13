@@ -7,7 +7,7 @@ use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use anyhow::Result;
 use pie_grammar::matcher::GrammarMatcher;
-use pie_model::instruct::{ToolDecoder, ToolEvent};
+use pie_model::instruct::{ToolDecoder, ToolEvent, ToolObservation};
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
@@ -31,8 +31,33 @@ impl pie::inferlet::tools::Host for ProcessCtx {
         Ok(Ok(tokens))
     }
 
+    async fn equip_into_system(
+        &mut self,
+        system: String,
+        tools: Vec<String>,
+    ) -> Result<Result<Vec<u32>, pie::inferlet::types::Error>> {
+        let tokens = crate::model::model()
+            .instruct()
+            .equip_into_system(&system, &tools);
+        Ok(Ok(tokens))
+    }
+
     async fn answer(&mut self, name: String, value: String) -> Result<Vec<u32>> {
         Ok(crate::model::model().instruct().answer(&name, &value))
+    }
+
+    async fn answer_all(
+        &mut self,
+        observations: Vec<pie::inferlet::tools::Observation>,
+    ) -> Result<Vec<u32>> {
+        let observations: Vec<ToolObservation> = observations
+            .into_iter()
+            .map(|observation| ToolObservation {
+                name: observation.name,
+                value: observation.value,
+            })
+            .collect();
+        Ok(crate::model::model().instruct().answer_all(&observations))
     }
 
 

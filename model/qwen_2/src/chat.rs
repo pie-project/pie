@@ -32,6 +32,8 @@ pub fn new(tokenizer: Arc<Tokenizer>) -> QwenInstruct {
             // doc above says; the XML surface arrives with Qwen3.5.
             tool_call_format: ToolCallFormat::Json,
             generation_suffix: "",
+            thinking_off_suffix: "",
+            trim_content: false,
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],
         },
     )

@@ -15,11 +15,33 @@ interface tools {
         call(tool-call),
     }
 
+    /// One tool result, as the caller replays it.
+    record observation {
+        name: string,
+        value: string,
+    }
+
     /// Register available tools (list of JSON schema strings)
     equip: func(tools: list<string>) -> result<list<u32>, error>;
 
+    /// Declare tools and the caller's system content as ONE opening turn.
+    ///
+    /// Some templates nest the system content inside the tool declaration
+    /// rather than rendering it as its own turn; there, `system` followed by
+    /// `equip` is a different prompt, not a formatting variant. A template
+    /// that keeps them separable returns exactly those two turns.
+    equip-into-system: func(system: string, tools: list<string>) -> result<list<u32>, error>;
+
     /// Provide a tool result (after a tool-call reply)
     answer: func(name: string, value: string) -> list<u32>;
+
+    /// Provide a RUN of consecutive tool results.
+    ///
+    /// The Qwen3.5+ templates batch a run into a single user turn holding one
+    /// `<tool_response>` block each; calling `answer` per result emits a turn
+    /// each, which is a different prompt. A template that does not batch
+    /// returns the same tokens either way.
+    answer-all: func(observations: list<observation>) -> list<u32>;
 
     /// Returns the grammar that constrains well-formed tool-call output for
     /// this model and toolset, or none if the model has no enforceable format.
