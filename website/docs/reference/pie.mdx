@@ -87,7 +87,10 @@ pie run [OPTIONS] [INFERLET] [-- ARGS...]
 | `-m`, `--manifest <PATH>` | Path to the inferlet's `Pie.toml` manifest. **Required** with `--path`. |
 | `-c`, `--config <PATH>` | Path to a TOML config file. |
 | `--port <PORT>` | Override `[server].port`. |
-| `--log <PATH>` | Write logs to this file. |
+| `--input <JSON>` | Inferlet input as a JSON string (default: `{}`). Mutually exclusive with the trailing `--` args. |
+| `--stdout` | Stream inferlet stdout/stderr as it is produced. Without this flag, only the final return value is printed. |
+| `--debug` | Show engine, driver, server, and inferlet diagnostics. |
+| `-q`, `--quiet` | Suppress `pie run` progress chatter on stderr. |
 | `ARGS...` | Inferlet input after `--`. CLI flags become JSON keys (e.g., `-- --prompt foo` → `{"prompt": "foo"}`). |
 
 If the inferlet name has no `@version`, the latest version is resolved from the registry.
