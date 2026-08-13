@@ -44,6 +44,7 @@ fn dummy_driver_backend(
     behavior: Arc<dyn Behavior>,
     operation_log: Arc<std::sync::Mutex<Vec<String>>>,
     callback_delay_ms: u64,
+    impossible_above_kv_pages: u32,
 ) -> DriverBackend {
     let (backend, _) = DriverBackend::dummy(pie_driver_dummy_lib::DummyDriverOptions {
         total_pages: num_pages as u32,
@@ -68,7 +69,7 @@ fn dummy_driver_backend(
         retry_launches_remaining: 0,
         elastic_admission: false,
         prepare_exhaustions_remaining: 0,
-        prepare_impossible_above_kv_pages: 0,
+        prepare_impossible_above_kv_pages: impossible_above_kv_pages,
         operation_log: Some(operation_log),
         launch_observer: Some(launch_observer(behavior)),
     })
@@ -106,6 +107,10 @@ pub struct MockEnv {
     /// totals plus per-program token spans) for geometry
     /// assertions.
     operation_log: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Dummy-driver folded-admission ceiling: frames whose union KV demand
+    /// exceeds this return `Impossible` (0 disables). This is the CPU stand-in
+    /// for the CUDA driver's "frame commit impossible" budget ceiling.
+    impossible_above_kv_pages: u32,
 }
 
 impl MockEnv {
@@ -141,6 +146,15 @@ impl MockEnv {
     #[allow(dead_code)]
     pub fn with_callback_delay_ms(mut self, delay: u64) -> Self {
         self.callback_delay_ms = delay;
+        self
+    }
+
+    /// Arm the dummy driver's folded-admission ceiling (frames demanding more
+    /// KV pages than this are `Impossible`). Must be called before
+    /// [`MockEnv::config`].
+    #[allow(dead_code)]
+    pub fn with_impossible_above_kv_pages(mut self, pages: u32) -> Self {
+        self.impossible_above_kv_pages = pages;
         self
     }
 
@@ -185,6 +199,7 @@ impl MockEnv {
                     self.behavior.clone(),
                     Arc::clone(&self.operation_log),
                     self.callback_delay_ms,
+                    self.impossible_above_kv_pages,
                 ),
             })
             .collect();
@@ -255,13 +270,29 @@ pub fn create_mock_env(
     num_pages: usize,
     behavior: Arc<dyn Behavior>,
 ) -> MockEnv {
+    create_mock_env_with_admission_ceiling(model_name, num_devices, num_pages, behavior, 0)
+}
+
+/// [`create_mock_env`] with the dummy driver's folded-admission ceiling armed
+/// (see [`MockBackend::with_admission_ceiling`]). A constructor rather than a
+/// builder because the ceiling must reach the driver the model serves on,
+/// which registers here.
+#[allow(dead_code)]
+pub fn create_mock_env_with_admission_ceiling(
+    model_name: &str,
+    num_devices: usize,
+    num_pages: usize,
+    behavior: Arc<dyn Behavior>,
+    impossible_above_kv_pages: u32,
+) -> MockEnv {
     let operation_log = Arc::new(std::sync::Mutex::new(Vec::new()));
     MockEnv {
-        backend: MockBackend::new(
+        backend: MockBackend::with_admission_ceiling(
             num_devices,
             behavior.clone(),
             fixture_vocab_size(),
             Arc::clone(&operation_log),
+            impossible_above_kv_pages,
         ),
         model_name: model_name.to_string(),
         num_devices,
@@ -275,5 +306,6 @@ pub fn create_mock_env(
         frame_submit_depth: 3,
         frame_dispatch_depth: 2,
         operation_log,
+        impossible_above_kv_pages,
     }
 }

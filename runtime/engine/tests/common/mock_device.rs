@@ -182,6 +182,7 @@ fn register_dummy_driver(
     behavior: Arc<dyn Behavior>,
     vocab_size: u32,
     operation_log: Arc<Mutex<Vec<String>>>,
+    impossible_above_kv_pages: u32,
 ) -> (usize, BatchScheduler) {
     let (backend, _) = DriverBackend::dummy(pie_driver_dummy_lib::DummyDriverOptions {
         total_pages: num_kv_pages as u32,
@@ -210,7 +211,7 @@ fn register_dummy_driver(
         retry_launches_remaining: 0,
         elastic_admission: false,
         prepare_exhaustions_remaining: 0,
-        prepare_impossible_above_kv_pages: 0,
+        prepare_impossible_above_kv_pages: impossible_above_kv_pages,
         operation_log: Some(operation_log),
         launch_observer: Some(launch_observer(behavior)),
     })
@@ -247,6 +248,22 @@ impl MockBackend {
         vocab_size: u32,
         operation_log: Arc<Mutex<Vec<String>>>,
     ) -> Self {
+        Self::with_admission_ceiling(num_devices, behavior, vocab_size, operation_log, 0)
+    }
+
+    /// Like [`MockBackend::new`] with the dummy driver's folded-admission
+    /// ceiling armed: frames demanding more KV pages than the ceiling are
+    /// rejected `Impossible` — the CPU stand-in for the CUDA driver's
+    /// "frame commit impossible" elastic-budget refusal. Must be used at
+    /// construction: this backend registers the driver the model actually
+    /// serves on (driver 0), so a later rebuild cannot re-arm it.
+    pub fn with_admission_ceiling(
+        num_devices: usize,
+        behavior: Arc<dyn Behavior>,
+        vocab_size: u32,
+        operation_log: Arc<Mutex<Vec<String>>>,
+        impossible_above_kv_pages: u32,
+    ) -> Self {
         let recorder = Arc::new(CallRecorder::new());
         let (driver_ids, schedulers) = (0..num_devices)
             .map(|driver_idx| {
@@ -256,6 +273,7 @@ impl MockBackend {
                     behavior.clone(),
                     vocab_size,
                     Arc::clone(&operation_log),
+                    impossible_above_kv_pages,
                 )
             })
             .unzip();
