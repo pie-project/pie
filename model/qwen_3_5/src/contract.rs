@@ -71,9 +71,9 @@ pub fn author_qwen3_5_moe(b: &mut Builder<'_>) -> Result<(), Error> {
 /// each projection with a 2-D `weight_scale_inv` block-scale tensor, and
 /// `Expr::Scale`/`ScaleFactor::PerBlock` is exactly `weight = fp8 * scale`
 /// executed by the load-time dequant kernel both executors implement. The
-/// factors are declared as an `Internal` F32 tensor (the FP8 dequant kernel
-/// reads F32 factors), so the driver's bind table sees only the bf16 weight
-/// under its usual name.
+/// factors are declared as an `Internal` tensor at their checkpoint dtype
+/// (BF16 or F32; the CUDA engine widens BF16 factors itself), so the
+/// driver's bind table sees only the bf16 weight under its usual name.
 ///
 /// Sharding folds in *before* the multiply, on scale-block boundaries only.
 /// `in_proj_qkv` stacks `[K | K | V]` on axis 0 and each band splits per
@@ -109,15 +109,17 @@ fn gdn_fp8_dequant(b: &mut Builder<'_>) -> Result<(), Error> {
         let Some(scale) = b.find(&scale_name) else {
             return refuse(b, "its `weight_scale_inv` companion is missing".to_string());
         };
+        // BF16 or F32 only: the factors ship at their checkpoint dtype (a
+        // cast in the plan would hand the CUDA engine an operand it cannot
+        // type — a staged buffer is untyped bytes to it), and its dequant
+        // reads exactly these two.
         if scale.shape.len() != 2
-            || !(is_raw(&scale.encoding, DType::BF16)
-                || is_raw(&scale.encoding, DType::F16)
-                || is_raw(&scale.encoding, DType::F32))
+            || !(is_raw(&scale.encoding, DType::BF16) || is_raw(&scale.encoding, DType::F32))
         {
             return refuse(
                 b,
                 format!(
-                    "'{scale_name}' must be a 2-D F32/F16/BF16 scale tensor, \
+                    "'{scale_name}' must be a 2-D F32/BF16 scale tensor, \
                      got {:?} {:?}",
                     scale.encoding, scale.shape
                 ),
@@ -216,21 +218,17 @@ fn gdn_fp8_dequant(b: &mut Builder<'_>) -> Result<(), Error> {
             let (sexpr, sshape) = b.shard(Expr::src(&scale.name), scale.shape.clone(), axis);
             (wexpr, wshape, sexpr, sshape)
         };
-        // The factors must be a declared tensor, and the CUDA dequant kernel
-        // reads them as F32; a checkpoint that ships them F32 already may not
-        // be handed an identity cast.
-        let sexpr = if is_raw(&scale.encoding, DType::F32) {
-            sexpr
-        } else {
-            sexpr.cast(Encoding::Raw(DType::F32))
-        };
+        // The factors keep their checkpoint dtype, deliberately. A `.cast`
+        // here compiled to a TileMap whose operand — the gathered bands — is
+        // an anonymous staging buffer, which the CUDA executor types as u8
+        // ("unsupported TileMap Cast u8 -> fp32" on the real checkpoint at
+        // tp 2), and whose strided single-source form its cast path refuses
+        // as non-compact. An `Internal` declaration is always a *typed*
+        // buffer on both executors, so the Scale kernel is handed BF16
+        // factors and widens them itself.
         let scale_out = b.output_name(&scale.name);
-        if let Some(index) = b.define(
-            scale_out.clone(),
-            sexpr,
-            Encoding::Raw(DType::F32),
-            Some(sshape),
-        ) {
+        if let Some(index) = b.define(scale_out.clone(), sexpr, scale.encoding.clone(), Some(sshape))
+        {
             b.mark_internal(index);
         }
         b.define(
