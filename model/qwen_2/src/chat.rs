@@ -39,6 +39,9 @@ pub fn new(tokenizer: Arc<Tokenizer>) -> QwenInstruct {
             // Qwen2.5's template renders `messages[0].content` and then the
             // tool block, the same order Qwen3's does.
             system_before_tools: true,
+            // One newline before the first call, as Qwen3 does; the blank line
+            // arrives with Qwen3.5.
+            content_call_separator: "\n",
             trim_content: false,
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],
         },

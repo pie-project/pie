@@ -115,6 +115,21 @@ pub struct ChatMLConfig {
     /// Qwen3.5 and later lead with the declaration and nest the system text
     /// after it. Same two pieces, opposite order, and the order is the prompt.
     pub system_before_tools: bool,
+    /// What separates non-empty assistant content from the FIRST replayed call.
+    ///
+    /// Qwen3 and Qwen2.5 write a single newline, and the same one before every
+    /// later call:
+    ///
+    /// ```jinja
+    /// {%- if (loop.first and content) or (not loop.first) %}
+    ///     {{- '\n' }}
+    /// {%- endif %}
+    /// ```
+    ///
+    /// Qwen3.5 and later open the first call after a blank line instead. Later
+    /// calls are one newline apart in every generation, so only this one
+    /// separator varies.
+    pub content_call_separator: &'static str,
     /// Whether the checkpoint's template applies `|trim` to message content.
     ///
     /// Qwen3.5 and later do; Qwen3 and Qwen2 emit `message.content` verbatim.
@@ -339,11 +354,11 @@ impl QwenInstruct {
         }
         body.push_str(content);
         for (index, call) in calls.iter().enumerate() {
-            // The template separates the first call from non-empty content by a
-            // blank line and every later call by a single newline.
+            // The template separates the first call from non-empty content by
+            // `content_call_separator` and every later call by a newline.
             if index == 0 {
                 if !content.trim().is_empty() {
-                    body.push_str("\n\n");
+                    body.push_str(self.config.content_call_separator);
                 }
             } else {
                 body.push('\n');
@@ -1015,6 +1030,7 @@ mod tests {
                 thinking_off_suffix: "",
                 empty_reasoning_header: true,
                 system_before_tools: false,
+                content_call_separator: "\n\n",
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -1032,6 +1048,7 @@ mod tests {
                 thinking_off_suffix: "",
                 empty_reasoning_header: true,
                 system_before_tools: false,
+                content_call_separator: "\n\n",
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -1049,6 +1066,7 @@ mod tests {
                 thinking_off_suffix: "",
                 empty_reasoning_header: true,
                 system_before_tools: false,
+                content_call_separator: "\n\n",
                 trim_content: false,
                 stop_tokens: &["<|im_end|>"],
             },
@@ -1130,6 +1148,7 @@ mod tests {
                 thinking_off_suffix: "<think>\n\n</think>\n\n",
                 empty_reasoning_header: true,
                 system_before_tools: false,
+                content_call_separator: "\n\n",
                 trim_content: true,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -1153,6 +1172,7 @@ mod tests {
                 thinking_off_suffix: "<think>\n\n</think>\n\n",
                 empty_reasoning_header: false,
                 system_before_tools: true,
+                content_call_separator: "\n",
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -1167,7 +1187,7 @@ mod tests {
     fn an_empty_reasoning_header_is_rendered_only_where_the_template_renders_one() {
         let call = ToolCall { name: "f".into(), arguments_json: "{}".into() };
         let qwen3 = qwen3_arm();
-        let bare = qwen3.assistant_turn_body("", std::slice::from_ref(&call), true);
+        let bare = qwen3.assistant_turn_body("", &[call.clone()], true);
         assert!(!bare.starts_with("<think>"), "{bare}");
         // Reasoning present: the block is the template's in both generations.
         assert!(
@@ -1248,8 +1268,14 @@ mod tests {
         );
         // Content and a call are separated by a blank line, later calls by one.
         assert_eq!(
-            inst.assistant_turn_body("<think>\nwhy\n</think>\n\nok", &[call.clone(), call], true),
+            inst.assistant_turn_body("<think>\nwhy\n</think>\n\nok", &[call.clone(), call.clone()], true),
             "<think>\nwhy\n</think>\n\nok\n\n<tool_call>\n<function=f>\n</function>\n</tool_call>\n<tool_call>\n<function=f>\n</function>\n</tool_call>"
+        );
+        // Qwen3's template writes ONE newline there, and the same one before
+        // every later call.
+        assert_eq!(
+            qwen3_arm().assistant_turn_body("<think>\nwhy\n</think>\n\nok", &[call.clone(), call], true),
+            "<think>\nwhy\n</think>\n\nok\n<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call>\n<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call>"
         );
         // Before the boundary the header is dropped, which is what `assistant`
         // has always rendered.
@@ -1422,6 +1448,7 @@ mod tests {
                 thinking_off_suffix: "",
                 empty_reasoning_header: true,
                 system_before_tools: false,
+                content_call_separator: "\n\n",
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
