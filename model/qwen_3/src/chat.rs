@@ -100,6 +100,21 @@ pub struct ChatMLConfig {
     /// renders an empty one -- the rarer of the two cases, and the one that
     /// cannot be fixed without widening the trait every generation implements.
     pub empty_reasoning_header: bool,
+    /// Where the caller's system text sits in the turn that declares tools.
+    ///
+    /// Qwen3 and Qwen2.5 open the turn with it and put the declaration after:
+    ///
+    /// ```jinja
+    /// {{- '<|im_start|>system\n' }}
+    /// {%- if messages[0].role == 'system' %}
+    ///     {{- messages[0].content + '\n\n' }}
+    /// {%- endif %}
+    /// {{- "# Tools\n\n..." }}
+    /// ```
+    ///
+    /// Qwen3.5 and later lead with the declaration and nest the system text
+    /// after it. Same two pieces, opposite order, and the order is the prompt.
+    pub system_before_tools: bool,
     /// Whether the checkpoint's template applies `|trim` to message content.
     ///
     /// Qwen3.5 and later do; Qwen3 and Qwen2 emit `message.content` verbatim.
@@ -247,14 +262,15 @@ impl QwenInstruct {
     /// the constraint wins silently -- so the model spends the turn being
     /// steered away from what it was just told to do.
     fn build_tool_system_prompt(tools: &[String], format: ToolCallFormat) -> String {
-        // The opening differs per template generation. Qwen3.5+ is transcribed
-        // from the checkpoint's own `chat_template`; the Json opening is the
-        // pre-existing Qwen3 text, including its leading space, because no
-        // reference for those checkpoints was read here and rewording a prompt
-        // on a hunch is the failure this file exists to stop.
+        // The opening differs per template generation, and both are transcribed
+        // from a checkpoint's own `chat_template`. The Json one used to carry a
+        // leading space that no template has: Qwen3 and Qwen2.5 both write
+        // `# Tools` at the very start of the block, whether or not a system
+        // message precedes it. One character, one token, on every prompt that
+        // declares a tool.
         let mut prompt = String::from(match format {
             ToolCallFormat::Json => {
-                " # Tools\n\n\
+                "# Tools\n\n\
                  You may call one or more functions to assist with the user query.\n\n\
                  You are provided with function signatures within <tools></tools> XML tags:\n\
                  <tools>"
@@ -283,18 +299,21 @@ impl QwenInstruct {
 
     /// The system turn a tool-declaring conversation opens with.
     ///
-    /// The Qwen3.5+ template does not render the caller's system message as its
-    /// own turn when tools are present: it emits ONE system turn that leads
-    /// with the declaration and nests the system content after it. Two turns
-    /// are a different prompt, not a formatting variant.
+    /// No Qwen template renders the caller's system message as its own turn
+    /// when tools are present: they emit ONE system turn holding both pieces.
+    /// Two turns are a different prompt, not a formatting variant. Which piece
+    /// leads is the template's to say -- see `system_before_tools`.
     fn tool_system_body(&self, system: &str, tools: &[String]) -> String {
-        let mut body = Self::build_tool_system_prompt(tools, self.config.tool_call_format);
+        let declaration = Self::build_tool_system_prompt(tools, self.config.tool_call_format);
         let system = system.trim();
-        if !system.is_empty() {
-            body.push_str("\n\n");
-            body.push_str(system);
+        if system.is_empty() {
+            return declaration;
         }
-        body
+        if self.config.system_before_tools {
+            format!("{system}\n\n{declaration}")
+        } else {
+            format!("{declaration}\n\n{system}")
+        }
     }
 
     /// The `<tool_call>` surface for one replayed call, without its separator.
@@ -975,6 +994,7 @@ mod tests {
                 generation_suffix: "",
                 thinking_off_suffix: "",
                 empty_reasoning_header: true,
+                system_before_tools: false,
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -991,6 +1011,7 @@ mod tests {
                 generation_suffix: "",
                 thinking_off_suffix: "",
                 empty_reasoning_header: true,
+                system_before_tools: false,
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -1007,6 +1028,7 @@ mod tests {
                 generation_suffix: "",
                 thinking_off_suffix: "",
                 empty_reasoning_header: true,
+                system_before_tools: false,
                 trim_content: false,
                 stop_tokens: &["<|im_end|>"],
             },
@@ -1087,6 +1109,7 @@ mod tests {
                 generation_suffix: "<think>\n",
                 thinking_off_suffix: "<think>\n\n</think>\n\n",
                 empty_reasoning_header: true,
+                system_before_tools: false,
                 trim_content: true,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -1109,6 +1132,7 @@ mod tests {
                 generation_suffix: "",
                 thinking_off_suffix: "<think>\n\n</think>\n\n",
                 empty_reasoning_header: false,
+                system_before_tools: true,
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -1249,11 +1273,33 @@ mod tests {
         assert!(body.contains("<IMPORTANT>"));
         // No system content, no separator and no empty tail.
         assert!(inst.tool_system_body("  ", &["{}".to_string()]).ends_with("</IMPORTANT>"));
-        // The Json-format templates keep the declaration they had; nothing here
-        // was measured against those checkpoints.
+    }
+
+    /// Qwen3 and Qwen2.5 write the caller's system text FIRST and the
+    /// declaration after it; Qwen3.5+ do the reverse. Same two pieces, and the
+    /// order is the prompt.
+    #[test]
+    fn the_declaration_and_the_system_text_are_ordered_as_the_template_writes_them() {
+        let tools = ["{}".to_string()];
+        let qwen3 = qwen3_arm();
+        let body = qwen3.tool_system_body("You are a helpful assistant.", &tools);
+        assert!(body.starts_with("You are a helpful assistant.\n\n# Tools\n\n"), "{body}");
+        // The declaration opens with `# Tools` and no leading space -- no
+        // template has one, and it cost a token on every tool-declaring prompt.
         assert!(
-            QwenInstruct::build_tool_system_prompt(&["{}".to_string()], ToolCallFormat::Json)
-                .starts_with(" # Tools")
+            QwenInstruct::build_tool_system_prompt(&tools, ToolCallFormat::Json)
+                .starts_with("# Tools")
+        );
+        // With no system text the turn is the declaration alone, either way up.
+        assert_eq!(
+            qwen3.tool_system_body("  ", &tools),
+            QwenInstruct::build_tool_system_prompt(&tools, ToolCallFormat::Json)
+        );
+        // And the Qwen3.5+ arm still leads with the declaration.
+        assert!(
+            qwen3_6()
+                .tool_system_body("You are a helpful assistant.", &tools)
+                .starts_with("# Tools")
         );
     }
 
@@ -1347,6 +1393,7 @@ mod tests {
                 generation_suffix: "",
                 thinking_off_suffix: "",
                 empty_reasoning_header: true,
+                system_before_tools: false,
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
