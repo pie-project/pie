@@ -557,6 +557,83 @@ impl QwenToolDecoder {
         Some((name, value["arguments"].to_string()))
     }
 
+    /// Locates the opening tag naming the function, and returns its name and the
+    /// byte offset of that tag's `>`.
+    ///
+    /// The template teaches `<function=NAME>`, and that is tried first. But a
+    /// model that closes with `</function>` while having opened with a bare
+    /// `<NAME>` has still plainly named a function, and refusing it loses an
+    /// action the model unambiguously took. Observed live from this very
+    /// checkpoint, on a surface that was otherwise complete and correct:
+    ///
+    ///     <tool_call>\n<list_files>\n<parameter=recursive>false</parameter>\n</function>\n</tool_call>
+    ///
+    /// vLLM's `qwen3_xml` parser accepts that; refusing it cost us the call and
+    /// reported it as malformed syntax, which sends an agent into re-issuing the
+    /// action rather than acting on its result.
+    ///
+    /// The bare form is accepted only under conditions that make a false
+    /// positive implausible: the tag must be the FIRST tag in the call, it must
+    /// not be one of the surface's own structural tags, and -- enforced by the
+    /// caller -- the body must still close with `</function>`. Prose cannot
+    /// reach here; this only ever sees the inside of a `<tool_call>` block.
+    fn parse_xml_function_opener(call: &str) -> Option<(String, usize)> {
+        let function_prefix = "<function=";
+        if let Some(position) = call.find(function_prefix) {
+            let name_start = position + function_prefix.len();
+            let name_end = call[name_start..].find('>')? + name_start;
+            return Some((call[name_start..name_end].trim().to_string(), name_end));
+        }
+
+        // Take the first tag and nothing later, so a `<parameter=...>` deeper in
+        // the body can never be mistaken for the function name.
+        let open = call.find('<')?;
+        let name_end = call[open + 1..].find('>')? + open + 1;
+        let inner = call[open + 1..name_end].trim();
+
+        // `<function>NAME`: the tag is right and the name follows it as text.
+        // Observed at 3 of 29 live calls. Read the name from after the tag,
+        // bounded by the first whitespace or `<`, so it cannot swallow the body.
+        if inner == "function" {
+            let rest = &call[name_end + 1..];
+            let name = rest
+                .trim_start()
+                .split(|c: char| c.is_whitespace() || c == '<')
+                .next()
+                .unwrap_or("");
+            if !name.is_empty() && Self::is_plausible_function_name(name) {
+                return Some((name.to_string(), name_end));
+            }
+            return None;
+        }
+
+        // Bare `<NAME>`.
+        if !Self::is_plausible_function_name(inner)
+            || matches!(inner, "tool_call" | "parameter")
+        {
+            return None;
+        }
+        Some((inner.to_string(), name_end))
+    }
+
+    /// Whether a run of text can be a function name at all.
+    ///
+    /// `<` is rejected explicitly, and that rejection is the whole point. An
+    /// earlier version of this fallback checked for `=`, whitespace and the
+    /// structural tag names but not for `<`, so the live surface
+    /// `<function<bash>` parsed to the NAME `function<bash` with correct
+    /// arguments and no error at all. A sentinel is a bad outcome; a
+    /// confidently wrong tool name is a worse one, because nothing downstream
+    /// can tell it from a real call.
+    fn is_plausible_function_name(name: &str) -> bool {
+        !name.is_empty()
+            && !name.starts_with('/')
+            && !name.contains('=')
+            && !name.contains('<')
+            && !name.contains('>')
+            && !name.contains(char::is_whitespace)
+    }
+
     /// Parses the surface the Qwen3.5+ `chat_template` demonstrates:
     /// `<function=NAME>` wrapping `<parameter=KEY>value</parameter>` pairs.
     ///
@@ -565,10 +642,7 @@ impl QwenToolDecoder {
     /// see; the tool boundary validates against the real one.
     fn parse_xml_tool_call(call: &str) -> Option<(String, String)> {
         let call = call.trim();
-        let function_prefix = "<function=";
-        let function_start = call.find(function_prefix)? + function_prefix.len();
-        let function_name_end = call[function_start..].find('>')? + function_start;
-        let name = call[function_start..function_name_end].trim().to_string();
+        let (name, function_name_end) = Self::parse_xml_function_opener(call)?;
         if name.is_empty() {
             return None;
         }
@@ -583,7 +657,14 @@ impl QwenToolDecoder {
             let name_start = parameter_pos + "<parameter=".len();
             let name_end = rest[name_start..].find('>')? + name_start;
             let param_name = rest[name_start..name_end].trim();
-            if param_name.is_empty() {
+            // The same screen the function name gets, and for the same reason.
+            // A model that writes `<parameter=command=` with no `>` sends this
+            // scan hunting for the next `>` in the document -- which, in a shell
+            // command, is the redirect in `2>/dev/null`. That yielded a
+            // parameter NAME ninety characters long containing newlines, quotes
+            // and pipes, paired with the value `/dev/null | head -20`, and no
+            // error anywhere. Observed live on django__django-10914.
+            if !Self::is_plausible_function_name(param_name) {
                 return None;
             }
             let value_start = name_end + 1;
@@ -667,6 +748,131 @@ mod tests {
         assert_eq!(
             QwenToolDecoder::parse_xml_tool_call(QWEN36_TEMPLATE_SURFACE),
             Some(("bash".to_string(), r#"{"cmd":"ls -la"}"#.to_string()))
+        );
+    }
+
+    /// Captured verbatim from this checkpoint on 2026-08-14, decoding
+    /// `tool_call_bash` against the BF16 weights. The model opened with a bare
+    /// `<list_files>` instead of `<function=list_files>` and still closed with
+    /// `</function>`. The surface was otherwise complete and correct -- not
+    /// truncated -- and refusing it reported `__ttb_malformed_tool_call__`,
+    /// which is what makes an agent re-issue its action instead of acting on
+    /// the result.
+    const QWEN36_BARE_OPENER_SURFACE: &str =
+        "<list_files>\n<parameter=recursive>false</parameter>\n</function>";
+
+    #[test]
+    fn a_bare_opening_tag_still_names_the_function_the_model_called() {
+        assert_eq!(
+            QwenToolDecoder::parse_xml_tool_call(QWEN36_BARE_OPENER_SURFACE),
+            Some((
+                "list_files".to_string(),
+                r#"{"recursive":"false"}"#.to_string()
+            ))
+        );
+    }
+
+    /// Captured live on 2026-08-14 across 29 tool calls from this checkpoint.
+    /// 8 of 29 openers (27.6%) did not conform to the template. These are the
+    /// exact bytes of the two remaining forms.
+    #[test]
+    fn the_live_non_conforming_openers_parse_to_their_real_names() {
+        // `<function>NAME`, 3 of 29. The tag is right; the name follows as text.
+        assert_eq!(
+            QwenToolDecoder::parse_xml_tool_call(
+                "<function>bash\n<parameter=command>\ndu -sh .\n</parameter>\n</function>"
+            ),
+            Some(("bash".to_string(), r#"{"command":"du -sh ."}"#.to_string()))
+        );
+    }
+
+    /// `<function<bash>` produced the NAME `function<bash`, with correct
+    /// arguments and no error, because the first version of this fallback
+    /// screened for `=`, whitespace and the structural tag names but not for
+    /// `<`. A sentinel loses an action; a confidently wrong name INVENTS one,
+    /// and nothing downstream can tell it from a real call.
+    #[test]
+    fn a_malformed_opener_never_becomes_a_confidently_wrong_tool_name() {
+        let live = "<function<bash>\n<parameter=command>\nhead -n 40 README.md\n</parameter>\n</function>";
+        let parsed = QwenToolDecoder::parse_xml_tool_call(live);
+        assert_ne!(
+            parsed.as_ref().map(|(name, _)| name.as_str()),
+            Some("function<bash"),
+            "a tag name containing '<' must never be accepted as a function name"
+        );
+        assert_eq!(parsed, None);
+    }
+
+    /// Captured live on django__django-10914, turn 1. The model wrote
+    /// `<parameter=command=` with no `>`, so the scan for the parameter name ran
+    /// on to the next `>` in the document -- the shell redirect in
+    /// `2>/dev/null`. The old code produced a call whose argument KEY was
+    /// ninety characters of shell text and whose VALUE was `/dev/null | head
+    /// -20`, silently, and the agent executed nothing useful.
+    #[test]
+    fn a_parameter_name_that_swallowed_a_shell_redirect_is_refused() {
+        let live = concat!(
+            "<function=bash>\n",
+            "<parameter=command=\n",
+            "find /testbed -type f -name \"*.py\" | xargs grep -l \"FILE_UPLOAD_PERMISSION\" 2>/dev/null | head -20\n",
+            "</parameter>\n</function>"
+        );
+        let parsed = QwenToolDecoder::parse_xml_tool_call(live);
+        assert_eq!(
+            parsed, None,
+            "a parameter name containing whitespace or quotes is not a name"
+        );
+
+        // The well-formed version of the very same call still parses, so the
+        // screen rejects the malformation and not the command's content --
+        // `2>/dev/null` inside a VALUE is ordinary shell and must survive.
+        let repaired = concat!(
+            "<function=bash>\n",
+            "<parameter=command>\n",
+            "find /testbed -type f -name \"*.py\" | xargs grep -l \"FILE_UPLOAD_PERMISSION\" 2>/dev/null | head -20\n",
+            "</parameter>\n</function>"
+        );
+        let (name, args) = QwenToolDecoder::parse_xml_tool_call(repaired).expect("repaired parses");
+        assert_eq!(name, "bash");
+        assert!(args.contains("2>/dev/null"), "{args}");
+    }
+
+    /// The fallback must not turn the surface's own structure, or an unclosed
+    /// body, into a call. Each of these would be a false action -- worse than
+    /// the dropped one it exists to recover, because a wrong tool call executes.
+    #[test]
+    fn the_bare_opener_fallback_refuses_what_is_not_a_call() {
+        for surface in [
+            // Structural tags of the surface itself.
+            "<tool_call>\n<parameter=x>1</parameter>\n</function>",
+            "<parameter=x>1</parameter>\n</function>",
+            // A closing tag leading.
+            "</function>",
+            // No `</function>` at all: genuinely incomplete, and the caller's
+            // completeness requirement is what rejects it.
+            "<list_files>\n<parameter=recursive>false</parameter>",
+            // Not a tag at all.
+            "just some prose about functions",
+            // An empty tag names nothing.
+            "<>\n</function>",
+        ] {
+            assert_eq!(
+                QwenToolDecoder::parse_xml_tool_call(surface),
+                None,
+                "should not parse: {surface}"
+            );
+        }
+    }
+
+    /// The conforming surface must keep winning when both could match, so this
+    /// leniency cannot change what a well-formed call decodes to.
+    #[test]
+    fn the_conforming_opener_is_preferred_over_a_bare_one() {
+        assert_eq!(
+            QwenToolDecoder::parse_xml_tool_call(
+                "<wrong>\n<function=right>\n<parameter=k>v</parameter>\n</function>"
+            ),
+            Some(("right".to_string(), r#"{"k":"v"}"#.to_string()))
         );
     }
 

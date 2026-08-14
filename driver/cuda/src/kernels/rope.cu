@@ -637,19 +637,40 @@ namespace {
 
 // Proportional RoPE (Gemma-4 full-attention layers, HF reference).
 //
-// HF builds the frequency table as `freq[k] = 1 / theta^(2k/head_dim)`
-// for k ∈ [0, rotary_dim/2), then pads the rest of the head's lower-
-// half dim entries with `cos=1 / sin=0` (identity). The pair offset
-// is the *full* `head_dim/2`, NOT `rotary_dim/2` — every dim in the
-// lower half rotates with its mate in the upper half, but the
-// rotation angle is zero for k ≥ rotary_dim/2 (so those pairs pass
-// through unchanged).
+// Partial rotary rotates ONLY the first `rotary_dim` channels and leaves
+// `[rotary_dim, head_dim)` untouched. HF applies `rotate_half` to the
+// slice `x[..., :rotary_dim]`, so the pair offset is `rotary_dim/2` and
+// the frequency denominator is `rotary_dim`:
 //
-// Two ways the previous draft of this kernel got it wrong:
-//   1. used `rotary_dim` as the frequency denominator instead of
-//      `head_dim` — wrong angle progression.
-//   2. used `rotary_dim/2` as the pair offset instead of
-//      `head_dim/2` — paired the wrong dims with each other.
+//     freq[j] = theta^(-2j/rotary_dim),  pair (j, j + rotary_dim/2)
+//
+// The comment that stood here previously asserted the opposite — a
+// `head_dim` denominator with a `head_dim/2` pair offset, on the theory
+// that HF pads the table with identity rotations — and called the correct
+// form "the previous draft [that] got it wrong". That is backwards, and
+// for `head_dim=256, rotary_dim=64` it is not a small error:
+//
+//   * dims 32..63 were left UNROTATED; they are the second half of each
+//     pair and must rotate.
+//   * dims 128..159 were OVERWRITTEN; they are pass-through.
+//   * the frequency denominator was 4x too large, so the angle
+//     progression was wrong by up to 1.2e5 at j=31.
+//
+// Three independent references agree on the form above. HF's
+// `modeling_qwen3_5.py` rotate_half's the `rotary_dim` slice. THIS REPO's
+// own Metal driver (`driver/metal/src/kernels/rope.metal`) uses
+// `half = rope_dims/2` and documents "Channels [rope_dims, head_dim) are
+// pass-through (untouched)", citing MLX `fast::rope(traditional=false,
+// dims=rope_dims)`. And numerically, against a double-precision HF
+// reference at head_dim=256/rotary_dim=64/theta=1e7, this form reproduces
+// it to 4.4e-16 while the previous form was off by 3.1.
+//
+// Only partial-rotary models were affected: both errors vanish when
+// `rotary_dim == head_dim`. Qwen3.6-27B sets partial_rotary_factor=0.25,
+// and its 16 full-attention layers are the ones that carry position — the
+// 48 GDN layers take no position embeddings at all. The observable was a
+// systematic ~2.2 nat logit disagreement against vLLM that grows with
+// relative distance and is exactly zero at distance 0.
 __global__ void rope_partial_bf16_kernel(
     __nv_bfloat16* __restrict__ q,
     __nv_bfloat16* __restrict__ k,
@@ -663,41 +684,38 @@ __global__ void rope_partial_bf16_kernel(
 {
     const int n = blockIdx.x;
     const int total_heads = num_q_heads + num_kv_heads;
-    const int half = head_dim / 2;
     const int rope_angles = rotary_dim / 2;
     const int pos = positions[n] + position_delta;
 
-    for (int t = threadIdx.x; t < total_heads * half; t += blockDim.x) {
-        const int head_idx = t / half;
-        const int dim_pair = t % half;
+    // One thread per rotated pair. Channels [rotary_dim, head_dim) are never
+    // visited, which is what "pass-through" means -- writing them back
+    // unchanged would be equivalent but this cannot touch them by accident.
+    for (int t = threadIdx.x; t < total_heads * rope_angles; t += blockDim.x) {
+        const int head_idx = t / rope_angles;
+        const int dim_pair = t % rope_angles;
 
-        float cos_v = 1.f, sin_v = 0.f;
-        if (dim_pair < rope_angles) {
-            const float freq = powf(theta,
-                -2.f * static_cast<float>(dim_pair) /
-                       static_cast<float>(head_dim));
-            const float ang = static_cast<float>(pos) * freq;
-            __sincosf(ang, &sin_v, &cos_v);
-        }
-        // Skip identity rotations entirely — `dim_pair ≥ rope_angles`
-        // multiplies the pair by [[1,0],[0,1]] which is a no-op.
-        if (dim_pair >= rope_angles) continue;
+        const float freq = powf(theta,
+            -2.f * static_cast<float>(dim_pair) /
+                   static_cast<float>(rotary_dim));
+        const float ang = static_cast<float>(pos) * freq;
+        float cos_v, sin_v;
+        __sincosf(ang, &sin_v, &cos_v);
 
         if (head_idx < num_q_heads) {
             __nv_bfloat16* qp = q +
                 (static_cast<long long>(n) * num_q_heads + head_idx) * head_dim;
             const float a = __bfloat162float(qp[dim_pair]);
-            const float b = __bfloat162float(qp[dim_pair + half]);
+            const float b = __bfloat162float(qp[dim_pair + rope_angles]);
             qp[dim_pair]        = __float2bfloat16(a * cos_v - b * sin_v);
-            qp[dim_pair + half] = __float2bfloat16(b * cos_v + a * sin_v);
+            qp[dim_pair + rope_angles] = __float2bfloat16(b * cos_v + a * sin_v);
         } else {
             const int kv_h = head_idx - num_q_heads;
             __nv_bfloat16* kp = k +
                 (static_cast<long long>(n) * num_kv_heads + kv_h) * head_dim;
             const float a = __bfloat162float(kp[dim_pair]);
-            const float b = __bfloat162float(kp[dim_pair + half]);
+            const float b = __bfloat162float(kp[dim_pair + rope_angles]);
             kp[dim_pair]        = __float2bfloat16(a * cos_v - b * sin_v);
-            kp[dim_pair + half] = __float2bfloat16(b * cos_v + a * sin_v);
+            kp[dim_pair + rope_angles] = __float2bfloat16(b * cos_v + a * sin_v);
         }
     }
 }
