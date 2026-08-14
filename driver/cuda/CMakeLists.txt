@@ -1113,6 +1113,13 @@ pie_add_cuda_target(gdn_recurrent_step_parity
   SOURCES tests/gdn_recurrent_step_parity.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
   LIBS pie_driver_cuda_lib CUDA::cudart)
+# Partial rotary must rotate [0, rotary_dim) with pair offset rotary_dim/2 and
+# leave [rotary_dim, head_dim) bit-identical. Both halves were wrong and shipped,
+# because nothing built a test for this launcher.
+pie_add_cuda_target(rope_partial_parity
+  SOURCES tests/rope_partial_parity.cu
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  LIBS pie_driver_cuda_lib CUDA::cudart)
 pie_add_cuda_target(test_attn_score_capture
   SOURCES tests/test_attn_score_capture.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
