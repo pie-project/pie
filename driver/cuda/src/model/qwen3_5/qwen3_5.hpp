@@ -75,8 +75,9 @@ struct Qwen3_5LayerWeights {
     const DeviceTensor* gate_up_proj_fused = nullptr;  // [2*I, H] bf16
     // Optional QuantMeta companions for the GEMM-fed projections. The
     // materialized WeightStore owns this metadata after LoadPlan execution.
-    // Linear-attn weights stay bf16 for now (their fused [K1|K2|V] block
-    // layout needs per-block scale handling that isn't wired yet).
+    // The linear-attn projections carry them too: the contract republishes
+    // the [K1|K2|V]-banded in_proj_qkv with its block scales banded by the
+    // same offsets, so an FP8 checkpoint's GDN GEMMs run natively.
     std::optional<QuantMeta> fa_q_proj_quant;
     std::optional<QuantMeta> fa_k_proj_quant;
     std::optional<QuantMeta> fa_v_proj_quant;
@@ -84,6 +85,9 @@ struct Qwen3_5LayerWeights {
     std::optional<QuantMeta> gate_proj_quant;
     std::optional<QuantMeta> up_proj_quant;
     std::optional<QuantMeta> down_proj_quant;
+    std::optional<QuantMeta> la_in_proj_qkv_quant;
+    std::optional<QuantMeta> la_in_proj_z_quant;
+    std::optional<QuantMeta> la_out_proj_quant;
 
     // KV cache slot for full-attn layers; -1 for linear-attn layers
     // (their state lives in the recurrent/conv rs_cache slabs).
