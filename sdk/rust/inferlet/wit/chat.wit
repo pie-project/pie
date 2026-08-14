@@ -1,5 +1,6 @@
 interface chat {
     use types.{error};
+    use tools.{tool-call};
 
     variant event {
         /// Generated text chunk
@@ -17,8 +18,26 @@ interface chat {
     system-user: func(system: string, user: string) -> list<u32>;
     assistant: func(message: string) -> list<u32>;
 
+    /// Replay an assistant turn that called tools.
+    ///
+    /// `reasoning-header` answers a question no single turn can: the Qwen3.5+
+    /// templates keep a reasoning header on every assistant turn AFTER the last
+    /// real user query, and only the holder of the message list knows where
+    /// that boundary is. Models whose template has no tool-call surface render
+    /// `message` alone.
+    assistant-call: func(message: string, calls: list<tool-call>, reasoning-header: bool) -> list<u32>;
+
     /// Cue the model to generate (fills generation header)
     cue: func() -> list<u32>;
+
+    /// Cue the model to generate WITHOUT thinking.
+    ///
+    /// A template that can close the reasoning block in its generation header
+    /// does so here. One that cannot returns the same header as `cue`, which is
+    /// the honest answer: injecting a control phrase as a user turn puts words
+    /// in the user's mouth and, for a template with no handling for it, lands
+    /// in the prompt as a real message.
+    cue-without-thinking: func() -> list<u32>;
 
     /// Seal the current turn (insert stop token)
     seal: func() -> list<u32>;

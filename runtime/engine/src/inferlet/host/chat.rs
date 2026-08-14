@@ -6,7 +6,7 @@
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use anyhow::Result;
-use pie_model::instruct::{ChatDecoder, ChatEvent};
+use pie_model::instruct::{ChatDecoder, ChatEvent, ToolCall};
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
@@ -42,8 +42,30 @@ impl pie::inferlet::chat::Host for ProcessCtx {
         Ok(crate::model::model().instruct().assistant(&message))
     }
 
+    async fn assistant_call(
+        &mut self,
+        message: String,
+        calls: Vec<pie::inferlet::tools::ToolCall>,
+        reasoning_header: bool,
+    ) -> Result<Vec<u32>> {
+        let calls: Vec<ToolCall> = calls
+            .into_iter()
+            .map(|call| ToolCall {
+                name: call.name,
+                arguments_json: call.arguments_json,
+            })
+            .collect();
+        Ok(crate::model::model()
+            .instruct()
+            .assistant_call(&message, &calls, reasoning_header))
+    }
+
     async fn cue(&mut self) -> Result<Vec<u32>> {
         Ok(crate::model::model().instruct().cue())
+    }
+
+    async fn cue_without_thinking(&mut self) -> Result<Vec<u32>> {
+        Ok(crate::model::model().instruct().cue_without_thinking())
     }
 
     async fn seal(&mut self) -> Result<Vec<u32>> {

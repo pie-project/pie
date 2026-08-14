@@ -7,7 +7,8 @@
 
 use pie_model_common::decoders::{GenericChatDecoder, NoopReasoningDecoder, ThinkingDecoder};
 use pie_model_common::instruct::{
-    ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
+    ChatDecoder, Instruct, ReasoningDecoder, ToolCall, ToolDecoder, ToolEvent, ToolGrammar,
+    ToolObservation,
 };
 use pie_tokenizer::{Tokenizer, TokenizerDecoder};
 use std::sync::Arc;
@@ -36,12 +37,54 @@ pub enum ToolCallFormat {
     Qwen35Xml,
 }
 
+/// What the Qwen3.5+ `chat_template` says after the `<tools>` block, verbatim.
+///
+/// A raw literal, not a `\`-continued one: every space and blank line here is
+/// the checkpoint's, and a continuation would let rustfmt's indentation into a
+/// prompt whose bytes are the contract.
+const QWEN35_XML_CALL_INSTRUCTION: &str = r#"If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>"#;
+
 /// Feature flags for ChatML-family models.
 pub struct ChatMLConfig {
     pub has_thinking: bool,
     pub has_tools: bool,
     pub tool_call_format: ToolCallFormat,
     pub generation_suffix: &'static str,
+    /// What opens the model's turn when the caller asked for no thinking.
+    ///
+    /// Separate from `generation_suffix` because for the Qwen3.5+ templates the
+    /// two are different strings — `<think>\n` opens a reasoning block, while
+    /// `<think>\n\n</think>\n\n` closes an empty one — and one field cannot
+    /// carry both. A template with no thinking-off form repeats
+    /// `generation_suffix` here.
+    pub thinking_off_suffix: &'static str,
+    /// Whether the checkpoint's template applies `|trim` to message content.
+    ///
+    /// Qwen3.5 and later do; Qwen3 and Qwen2 emit `message.content` verbatim.
+    /// Trimming unconditionally would change the prompt of every checkpoint
+    /// whose template does not, so the template says which.
+    pub trim_content: bool,
     /// Stop token strings (vary per sub-architecture)
     pub stop_tokens: &'static [&'static str],
 }
@@ -59,6 +102,7 @@ pub struct QwenInstruct {
     assistant_prefix: Vec<u32>,
     turn_suffix: Vec<u32>,
     generation_header: Vec<u32>,
+    thinking_off_header: Vec<u32>,
     stop_ids: Vec<u32>,
     // Thinking delimiters
     think_prefix_ids: Vec<u32>,
@@ -102,12 +146,15 @@ impl QwenInstruct {
 
         let mut generation_header = make_prefix("assistant");
         generation_header.extend(encode(config.generation_suffix));
+        let mut thinking_off_header = make_prefix("assistant");
+        thinking_off_header.extend(encode(config.thinking_off_suffix));
 
         Self {
             system_prefix: make_prefix("system"),
             user_prefix: make_prefix("user"),
             assistant_prefix: make_prefix("assistant"),
             generation_header,
+            thinking_off_header,
             turn_suffix,
             stop_ids,
             think_prefix_ids: think_prefix,
@@ -127,20 +174,48 @@ impl QwenInstruct {
             _ => &self.user_prefix,
         };
         let mut tokens = prefix.clone();
-        tokens.extend(self.tokenizer.encode(msg));
+        tokens.extend(self.tokenizer.encode(self.rendered(msg)));
         tokens.extend(&self.turn_suffix);
         tokens
+    }
+
+    /// A message's content as the template renders it, before any role framing.
+    fn rendered<'a>(&self, msg: &'a str) -> &'a str {
+        if self.config.trim_content {
+            msg.trim()
+        } else {
+            msg
+        }
     }
 
     /// Strips `<think>...</think>` content from an assistant message for replay.
     /// If `</think>` is present, keeps only the content after the last `</think>`,
     /// with leading newlines stripped (matching the reference template).
     fn strip_thinking(msg: &str) -> &str {
-        if let Some(pos) = msg.rfind("</think>") {
-            msg[pos + "</think>".len()..].trim_start_matches('\n')
-        } else {
-            msg
-        }
+        Self::split_thinking(msg).1
+    }
+
+    /// Splits a replayed assistant message into (reasoning, content).
+    ///
+    /// The template's own arithmetic: the reasoning is what sits before the
+    /// FIRST `</think>` and after the LAST `<think>` before it, and the content
+    /// is what follows the LAST `</think>`. The two indices differ, so this
+    /// cannot be one `split`.
+    fn split_thinking(msg: &str) -> (&str, &str) {
+        const CLOSE: &str = "</think>";
+        let Some(first_close) = msg.find(CLOSE) else {
+            return ("", msg);
+        };
+        let head = msg[..first_close].trim_end_matches('\n');
+        let reasoning = match head.rfind("<think>") {
+            Some(open) => &head[open + "<think>".len()..],
+            None => head,
+        };
+        let last_close = msg.rfind(CLOSE).unwrap_or(first_close);
+        (
+            reasoning.trim_start_matches('\n').trim(),
+            msg[last_close + CLOSE.len()..].trim_start_matches('\n'),
+        )
     }
 
     /// Build the tool system prompt matching the Qwen reference format.
@@ -151,12 +226,22 @@ impl QwenInstruct {
     /// the constraint wins silently -- so the model spends the turn being
     /// steered away from what it was just told to do.
     fn build_tool_system_prompt(tools: &[String], format: ToolCallFormat) -> String {
-        let mut prompt = String::from(
-            " # Tools\n\n\
-             You may call one or more functions to assist with the user query.\n\n\
-             You are provided with function signatures within <tools></tools> XML tags:\n\
-             <tools>",
-        );
+        // The opening differs per template generation. Qwen3.5+ is transcribed
+        // from the checkpoint's own `chat_template`; the Json opening is the
+        // pre-existing Qwen3 text, including its leading space, because no
+        // reference for those checkpoints was read here and rewording a prompt
+        // on a hunch is the failure this file exists to stop.
+        let mut prompt = String::from(match format {
+            ToolCallFormat::Json => {
+                " # Tools\n\n\
+                 You may call one or more functions to assist with the user query.\n\n\
+                 You are provided with function signatures within <tools></tools> XML tags:\n\
+                 <tools>"
+            }
+            ToolCallFormat::Qwen35Xml => {
+                "# Tools\n\nYou have access to the following functions:\n\n<tools>"
+            }
+        });
         for tool in tools {
             prompt.push('\n');
             prompt.push_str(tool);
@@ -170,19 +255,86 @@ impl QwenInstruct {
                  {\"name\": <function-name>, \"arguments\": <args-json-object>}\n\
                  </tool_call>"
             }
-            ToolCallFormat::Qwen35Xml => {
-                "If you choose to call a function ONLY reply in the following format with NO \
-                 suffix:\n\
-                 <tool_call>\n\
-                 <function=example_function_name>\n\
-                 <parameter=example_parameter_1>\n\
-                 value_1\n\
-                 </parameter>\n\
-                 </function>\n\
-                 </tool_call>"
-            }
+            ToolCallFormat::Qwen35Xml => QWEN35_XML_CALL_INSTRUCTION,
         });
         prompt
+    }
+
+    /// The system turn a tool-declaring conversation opens with.
+    ///
+    /// The Qwen3.5+ template does not render the caller's system message as its
+    /// own turn when tools are present: it emits ONE system turn that leads
+    /// with the declaration and nests the system content after it. Two turns
+    /// are a different prompt, not a formatting variant.
+    fn tool_system_body(&self, system: &str, tools: &[String]) -> String {
+        let mut body = Self::build_tool_system_prompt(tools, self.config.tool_call_format);
+        let system = system.trim();
+        if !system.is_empty() {
+            body.push_str("\n\n");
+            body.push_str(system);
+        }
+        body
+    }
+
+    /// The `<tool_call>` surface for one replayed call, without its separator.
+    ///
+    /// Arguments arrive as a JSON object — the same string the decoder reports
+    /// in [`ToolEvent::Call`]. String values are written raw and everything
+    /// else as JSON, which is the template's `args_value | string if ... else
+    /// args_value | tojson`; a value that is a bare string would otherwise come
+    /// back quoted and no longer be the value the tool was called with.
+    /// A replayed assistant turn's body: reasoning header, content, calls.
+    fn assistant_turn_body(
+        &self,
+        msg: &str,
+        calls: &[ToolCall],
+        reasoning_header: bool,
+    ) -> String {
+        let msg = self.rendered(msg);
+        let (reasoning, content) = if self.config.has_thinking {
+            Self::split_thinking(msg)
+        } else {
+            ("", msg)
+        };
+
+        let mut body = String::new();
+        if reasoning_header && self.config.has_thinking {
+            body.push_str("<think>\n");
+            body.push_str(reasoning);
+            body.push_str("\n</think>\n\n");
+        }
+        body.push_str(content);
+        for (index, call) in calls.iter().enumerate() {
+            // The template separates the first call from non-empty content by a
+            // blank line and every later call by a single newline.
+            if index == 0 {
+                if !content.trim().is_empty() {
+                    body.push_str("\n\n");
+                }
+            } else {
+                body.push('\n');
+            }
+            body.push_str(&Self::tool_call_surface(call));
+        }
+        body
+    }
+
+    fn tool_call_surface(call: &ToolCall) -> String {
+        let mut surface = format!("<tool_call>\n<function={}>\n", call.name);
+        if let Ok(serde_json::Value::Object(arguments)) =
+            serde_json::from_str::<serde_json::Value>(&call.arguments_json)
+        {
+            for (name, value) in &arguments {
+                surface.push_str(&format!("<parameter={name}>\n"));
+                match value {
+                    serde_json::Value::String(text) => surface.push_str(text),
+                    other => surface.push_str(&other.to_string()),
+                }
+                surface.push_str("\n</parameter>\n");
+            }
+        }
+        surface.push_str("</function>\n</tool_call>");
+        surface
     }
 
     /// Build an EBNF grammar for constrained Qwen tool-call generation.
@@ -276,9 +428,23 @@ impl Instruct for QwenInstruct {
         self.role_tokens("assistant", stripped)
     }
 
+    fn assistant_call(&self, msg: &str, calls: &[ToolCall], reasoning_header: bool) -> Vec<u32> {
+        let mut tokens = self.assistant_prefix.clone();
+        tokens.extend(
+            self.tokenizer
+                .encode(&self.assistant_turn_body(msg, calls, reasoning_header)),
+        );
+        tokens.extend(&self.turn_suffix);
+        tokens
+    }
+
     fn cue(&self) -> Vec<u32> {
-        // Reference: <|im_start|>assistant\n
+        // Reference: <|im_start|>assistant\n + the template's generation suffix.
         self.generation_header.clone()
+    }
+
+    fn cue_without_thinking(&self) -> Vec<u32> {
+        self.thinking_off_header.clone()
     }
 
     fn seal(&self) -> Vec<u32> {
@@ -293,16 +459,37 @@ impl Instruct for QwenInstruct {
         self.system(&prompt)
     }
 
-    fn answer(&self, _name: &str, value: &str) -> Vec<u32> {
-        if !self.config.has_tools {
+    fn equip_into_system(&self, system: &str, tools: &[String]) -> Vec<u32> {
+        if !self.config.has_tools || tools.is_empty() {
+            return self.system(system);
+        }
+        self.role_tokens("system", &self.tool_system_body(system, tools))
+    }
+
+    fn answer(&self, name: &str, value: &str) -> Vec<u32> {
+        self.answer_all(std::slice::from_ref(&ToolObservation {
+            name: name.to_string(),
+            value: value.to_string(),
+        }))
+    }
+
+    fn answer_all(&self, observations: &[ToolObservation]) -> Vec<u32> {
+        if !self.config.has_tools || observations.is_empty() {
             return Vec::new();
         }
-        // Reference: tool responses go in a user turn with <tool_response> wrapper
-        // Format: <|im_start|>user\n<tool_response>\ncontent\n</tool_response><|im_end|>\n
+        // Reference: a RUN of consecutive tool results is ONE user turn holding
+        // one <tool_response> block each — `<|im_start|>user` is emitted only
+        // when the previous message was not a tool result, and `<|im_end|>` only
+        // when the next one is not.
         let mut tokens = self.user_prefix.clone();
-        tokens.extend(&self.tool_response_prefix_tokens);
-        tokens.extend(self.tokenizer.encode(value));
-        tokens.extend(&self.tool_response_suffix_tokens);
+        for (index, observation) in observations.iter().enumerate() {
+            if index > 0 {
+                tokens.extend(self.tokenizer.encode("\n"));
+            }
+            tokens.extend(&self.tool_response_prefix_tokens);
+            tokens.extend(self.tokenizer.encode(self.rendered(&observation.value)));
+            tokens.extend(&self.tool_response_suffix_tokens);
+        }
         tokens.extend(&self.turn_suffix);
         tokens
     }
@@ -558,6 +745,8 @@ mod tests {
                 has_thinking: true,
                 has_tools: true,
                 generation_suffix: "",
+                thinking_off_suffix: "",
+                trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )
@@ -571,6 +760,8 @@ mod tests {
                 has_thinking: false,
                 has_tools: true,
                 generation_suffix: "",
+                thinking_off_suffix: "",
+                trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )
@@ -584,6 +775,8 @@ mod tests {
                 has_thinking: true,
                 has_tools: false,
                 generation_suffix: "",
+                thinking_off_suffix: "",
+                trim_content: false,
                 stop_tokens: &["<|im_end|>"],
             },
         )
@@ -642,6 +835,147 @@ mod tests {
     fn strip_thinking_works() {
         assert_eq!(QwenInstruct::strip_thinking("plain text"), "plain text");
         assert_eq!(QwenInstruct::strip_thinking("<think>foo</think>bar"), "bar");
+        // The reasoning half is taken at DIFFERENT indices from the content
+        // half -- before the first `</think>`, after the last `<think>` -- so a
+        // message carrying either delimiter twice must not fold into one split.
+        assert_eq!(
+            QwenInstruct::split_thinking("<think>\na\n</think>\n\nb </think> c"),
+            ("a", " c")
+        );
+    }
+
+    /// The `qwen3_6` arm `pie_model::instruct::create` selects: the Qwen3.5+
+    /// template's own generation headers, and its `|trim`.
+    fn qwen3_6() -> QwenInstruct {
+        QwenInstruct::new(
+            make_tok(),
+            ChatMLConfig {
+                tool_call_format: ToolCallFormat::Qwen35Xml,
+                has_thinking: true,
+                has_tools: true,
+                generation_suffix: "<think>\n",
+                thinking_off_suffix: "<think>\n\n</think>\n\n",
+                trim_content: true,
+                stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+            },
+        )
+    }
+
+    /// The template opens the model's turn INSIDE a reasoning block, and closes
+    /// an empty one when the caller asked for no thinking. Two different
+    /// strings, so one `generation_suffix` cannot carry both -- and the
+    /// thinking-off answer is a header, never an injected user turn.
+    ///
+    /// The bytes are pinned end to end by the checkpoint-tokenizer parity
+    /// fixture; what is checkable against this vocabulary is that the two
+    /// headers are wired to different suffixes and share the assistant prefix.
+    #[test]
+    fn the_generation_header_is_the_templates_cue_in_both_thinking_modes() {
+        let inst = qwen3_6();
+        assert_eq!(inst.config.generation_suffix, "<think>\n");
+        assert_eq!(inst.config.thinking_off_suffix, "<think>\n\n</think>\n\n");
+        assert_ne!(inst.cue(), inst.cue_without_thinking());
+        for header in [inst.cue(), inst.cue_without_thinking()] {
+            assert!(header.starts_with(&inst.assistant_prefix));
+            assert!(header.len() > inst.assistant_prefix.len());
+        }
+        // A template with no thinking-off header answers with its only one.
+        let plain = qwen3();
+        assert_eq!(plain.cue_without_thinking(), plain.cue());
+        assert_eq!(plain.cue(), plain.assistant_prefix);
+    }
+
+    /// `|trim` is per-template: Qwen3.5+ trims every message, Qwen3 and Qwen2
+    /// emit `message.content` verbatim.
+    #[test]
+    fn content_is_trimmed_only_where_the_template_trims() {
+        assert_eq!(qwen3_6().rendered("\n  Hello  \n"), "Hello");
+        assert_eq!(qwen3().rendered("\n  Hello  \n"), "\n  Hello  \n");
+    }
+
+    /// A run of consecutive results is ONE turn in the template. One turn each
+    /// is a different prompt, and it is what `answer` alone could express.
+    #[test]
+    fn consecutive_tool_results_share_a_turn() {
+        let inst = qwen3();
+        let run = [
+            ToolObservation { name: "a".into(), value: "Hello".into() },
+            ToolObservation { name: "b".into(), value: " world".into() },
+        ];
+        assert_eq!(
+            inst.tokenizer.decode(&inst.answer_all(&run), false),
+            "<|im_start|>user\n<tool_response>\nHello\n</tool_response>\n\
+             <tool_response>\n world\n</tool_response><|im_end|>\n"
+        );
+        // A single result is the same turn `answer` has always produced.
+        assert_eq!(inst.answer("a", "Hello"), inst.answer_all(&run[..1]));
+    }
+
+    /// An assistant turn after the last user query keeps a reasoning header,
+    /// empty when the replayed message carried no reasoning.
+    #[test]
+    fn a_post_query_assistant_turn_keeps_its_reasoning_header() {
+        let inst = qwen3_6();
+        let call = ToolCall { name: "f".into(), arguments_json: "{}".into() };
+        // An empty header when the replayed message carried no reasoning, and
+        // the call surface `encoded_turns` used to drop entirely.
+        assert_eq!(
+            inst.assistant_turn_body("", &[call.clone()], true),
+            "<think>\n\n</think>\n\n<tool_call>\n<function=f>\n</function>\n</tool_call>"
+        );
+        // Content and a call are separated by a blank line, later calls by one.
+        assert_eq!(
+            inst.assistant_turn_body("<think>\nwhy\n</think>\n\nok", &[call.clone(), call], true),
+            "<think>\nwhy\n</think>\n\nok\n\n<tool_call>\n<function=f>\n</function>\n</tool_call>\n<tool_call>\n<function=f>\n</function>\n</tool_call>"
+        );
+        // Before the boundary the header is dropped, which is what `assistant`
+        // has always rendered.
+        assert_eq!(inst.assistant_call("Hello", &[], false), inst.assistant("Hello"));
+    }
+
+    /// The surface the checkpoint's template demonstrates, byte for byte --
+    /// `encoded_turns` used to render a replayed call as an EMPTY turn.
+    #[test]
+    fn a_replayed_call_renders_the_surface_the_template_teaches() {
+        let call = ToolCall {
+            name: "get_weather".into(),
+            arguments_json: r#"{"city":"Paris","days":3}"#.into(),
+        };
+        assert_eq!(
+            QwenInstruct::tool_call_surface(&call),
+            "<tool_call>\n<function=get_weather>\n\
+             <parameter=city>\nParis\n</parameter>\n\
+             <parameter=days>\n3\n</parameter>\n\
+             </function>\n</tool_call>"
+        );
+    }
+
+    /// Six ways the declaration used to differ from the checkpoint's own
+    /// template: a stray leading space, the wording, the call instruction's
+    /// blank line, one example parameter instead of two, no `<IMPORTANT>`
+    /// block, and the caller's system content as a SECOND turn.
+    #[test]
+    fn the_tool_declaration_is_the_checkpoints_own_system_turn() {
+        let inst = qwen3_6();
+        let body = inst.tool_system_body("You are a helpful assistant.", &["{}".to_string()]);
+        assert_eq!(
+            body,
+            format!(
+                "# Tools\n\nYou have access to the following functions:\n\n\
+                 <tools>\n{{}}\n</tools>\n\n{QWEN35_XML_CALL_INSTRUCTION}\n\n\
+                 You are a helpful assistant."
+            )
+        );
+        assert!(body.contains("<parameter=example_parameter_2>"));
+        assert!(body.contains("<IMPORTANT>"));
+        // No system content, no separator and no empty tail.
+        assert!(inst.tool_system_body("  ", &["{}".to_string()]).ends_with("</IMPORTANT>"));
+        // The Json-format templates keep the declaration they had; nothing here
+        // was measured against those checkpoints.
+        assert!(
+            QwenInstruct::build_tool_system_prompt(&["{}".to_string()], ToolCallFormat::Json)
+                .starts_with(" # Tools")
+        );
     }
 
     #[test]
@@ -732,6 +1066,8 @@ mod tests {
                 has_thinking: true,
                 has_tools: true,
                 generation_suffix: "",
+                thinking_off_suffix: "",
+                trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         );
