@@ -591,13 +591,13 @@ void linear_attn_layer_body(
                 static_cast<std::size_t>(src0) * H;
             // mixed_qkv [rows, conv_dim] = norm_x @ in_proj_qkv.T
             ops::gemm_act_x_w(cublas.handle(),
-                x, *Lw.la_in_proj_qkv,
+                x, make_weight_view(Lw.la_in_proj_qkv, Lw.la_in_proj_qkv_quant),
                 la.mixed_qkv.data() +
                     static_cast<std::size_t>(dst0) * conv_dim,
                 rows, conv_dim, H);
             // z [rows, V_dim] = norm_x @ in_proj_z.T
             ops::gemm_act_x_w(cublas.handle(),
-                x, *Lw.la_in_proj_z,
+                x, make_weight_view(Lw.la_in_proj_z, Lw.la_in_proj_z_quant),
                 la.z.data() + static_cast<std::size_t>(src0) * V_dim,
                 rows, V_dim, H);
             // a [rows, V_h] = norm_x @ in_proj_a.T   (b symmetric)
@@ -1264,11 +1264,13 @@ void linear_attn_layer_body(
     profile_forward_stage_ptr(profile, &ForwardProfile::linear_out_ms, stream, [&] {
         if (T == 1) {
             ops::gemm_act_x_w(cublas.handle(),
-                la.core_out_bf16.data(), *Lw.la_out_proj,
+                la.core_out_bf16.data(),
+                make_weight_view(Lw.la_out_proj, Lw.la_out_proj_quant),
                 ws.y.data(), N_new, H, V_dim, /*beta=*/1.f);
         } else {
             ops::gemm_act_x_w(cublas.handle(),
-                la.core_out_bf16.data(), *Lw.la_out_proj,
+                la.core_out_bf16.data(),
+                make_weight_view(Lw.la_out_proj, Lw.la_out_proj_quant),
                 ws.norm_y.data(), N_new, H, V_dim, /*beta=*/0.f);
             tp->all_reduce_bf16(ws.norm_y.data(),
                 static_cast<std::size_t>(N_new) * H, ncclSum, stream);

@@ -102,6 +102,11 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
             Lw.la_in_proj_z = maybe(engine, la + "in_proj_z.weight");
             Lw.la_in_proj_b = maybe(engine, la + "in_proj_b.weight");
             Lw.la_in_proj_a = maybe(engine, la + "in_proj_a.weight");
+            // FP8 checkpoints publish these raw with paired block scales;
+            // bf16 checkpoints have no attachment and the meta stays empty.
+            Lw.la_in_proj_qkv_quant = engine.quant_meta(la + "in_proj_qkv.weight");
+            Lw.la_in_proj_z_quant = engine.quant_meta(la + "in_proj_z.weight");
+            Lw.la_out_proj_quant = engine.quant_meta(la + "out_proj.weight");
             // This rank's `[K/T | K/T | V/T]`: the contract states the
             // per-block shard, so the whole tensor is never resident here.
             Lw.la_conv1d_w = &must(engine, la + "conv1d.weight");
