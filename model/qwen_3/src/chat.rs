@@ -657,7 +657,14 @@ impl QwenToolDecoder {
             let name_start = parameter_pos + "<parameter=".len();
             let name_end = rest[name_start..].find('>')? + name_start;
             let param_name = rest[name_start..name_end].trim();
-            if param_name.is_empty() {
+            // The same screen the function name gets, and for the same reason.
+            // A model that writes `<parameter=command=` with no `>` sends this
+            // scan hunting for the next `>` in the document -- which, in a shell
+            // command, is the redirect in `2>/dev/null`. That yielded a
+            // parameter NAME ninety characters long containing newlines, quotes
+            // and pipes, paired with the value `/dev/null | head -20`, and no
+            // error anywhere. Observed live on django__django-10914.
+            if !Self::is_plausible_function_name(param_name) {
                 return None;
             }
             let value_start = name_end + 1;
@@ -794,6 +801,40 @@ mod tests {
             "a tag name containing '<' must never be accepted as a function name"
         );
         assert_eq!(parsed, None);
+    }
+
+    /// Captured live on django__django-10914, turn 1. The model wrote
+    /// `<parameter=command=` with no `>`, so the scan for the parameter name ran
+    /// on to the next `>` in the document -- the shell redirect in
+    /// `2>/dev/null`. The old code produced a call whose argument KEY was
+    /// ninety characters of shell text and whose VALUE was `/dev/null | head
+    /// -20`, silently, and the agent executed nothing useful.
+    #[test]
+    fn a_parameter_name_that_swallowed_a_shell_redirect_is_refused() {
+        let live = concat!(
+            "<function=bash>\n",
+            "<parameter=command=\n",
+            "find /testbed -type f -name \"*.py\" | xargs grep -l \"FILE_UPLOAD_PERMISSION\" 2>/dev/null | head -20\n",
+            "</parameter>\n</function>"
+        );
+        let parsed = QwenToolDecoder::parse_xml_tool_call(live);
+        assert_eq!(
+            parsed, None,
+            "a parameter name containing whitespace or quotes is not a name"
+        );
+
+        // The well-formed version of the very same call still parses, so the
+        // screen rejects the malformation and not the command's content --
+        // `2>/dev/null` inside a VALUE is ordinary shell and must survive.
+        let repaired = concat!(
+            "<function=bash>\n",
+            "<parameter=command>\n",
+            "find /testbed -type f -name \"*.py\" | xargs grep -l \"FILE_UPLOAD_PERMISSION\" 2>/dev/null | head -20\n",
+            "</parameter>\n</function>"
+        );
+        let (name, args) = QwenToolDecoder::parse_xml_tool_call(repaired).expect("repaired parses");
+        assert_eq!(name, "bash");
+        assert!(args.contains("2>/dev/null"), "{args}");
     }
 
     /// The fallback must not turn the surface's own structure, or an unclosed
