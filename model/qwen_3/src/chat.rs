@@ -557,6 +557,51 @@ impl QwenToolDecoder {
         Some((name, value["arguments"].to_string()))
     }
 
+    /// Locates the opening tag naming the function, and returns its name and the
+    /// byte offset of that tag's `>`.
+    ///
+    /// The template teaches `<function=NAME>`, and that is tried first. But a
+    /// model that closes with `</function>` while having opened with a bare
+    /// `<NAME>` has still plainly named a function, and refusing it loses an
+    /// action the model unambiguously took. Observed live from this very
+    /// checkpoint, on a surface that was otherwise complete and correct:
+    ///
+    ///     <tool_call>\n<list_files>\n<parameter=recursive>false</parameter>\n</function>\n</tool_call>
+    ///
+    /// vLLM's `qwen3_xml` parser accepts that; refusing it cost us the call and
+    /// reported it as malformed syntax, which sends an agent into re-issuing the
+    /// action rather than acting on its result.
+    ///
+    /// The bare form is accepted only under conditions that make a false
+    /// positive implausible: the tag must be the FIRST tag in the call, it must
+    /// not be one of the surface's own structural tags, and -- enforced by the
+    /// caller -- the body must still close with `</function>`. Prose cannot
+    /// reach here; this only ever sees the inside of a `<tool_call>` block.
+    fn parse_xml_function_opener(call: &str) -> Option<(String, usize)> {
+        let function_prefix = "<function=";
+        if let Some(position) = call.find(function_prefix) {
+            let name_start = position + function_prefix.len();
+            let name_end = call[name_start..].find('>')? + name_start;
+            return Some((call[name_start..name_end].trim().to_string(), name_end));
+        }
+
+        // Bare `<NAME>` fallback. Take the first tag and nothing later, so a
+        // `<parameter=...>` deeper in the body can never be mistaken for the
+        // function name.
+        let open = call.find('<')?;
+        let name_end = call[open + 1..].find('>')? + open + 1;
+        let name = call[open + 1..name_end].trim();
+        if name.is_empty()
+            || name.starts_with('/')
+            || name.contains('=')
+            || name.contains(char::is_whitespace)
+            || matches!(name, "tool_call" | "function" | "parameter")
+        {
+            return None;
+        }
+        Some((name.to_string(), name_end))
+    }
+
     /// Parses the surface the Qwen3.5+ `chat_template` demonstrates:
     /// `<function=NAME>` wrapping `<parameter=KEY>value</parameter>` pairs.
     ///
@@ -565,10 +610,7 @@ impl QwenToolDecoder {
     /// see; the tool boundary validates against the real one.
     fn parse_xml_tool_call(call: &str) -> Option<(String, String)> {
         let call = call.trim();
-        let function_prefix = "<function=";
-        let function_start = call.find(function_prefix)? + function_prefix.len();
-        let function_name_end = call[function_start..].find('>')? + function_start;
-        let name = call[function_start..function_name_end].trim().to_string();
+        let (name, function_name_end) = Self::parse_xml_function_opener(call)?;
         if name.is_empty() {
             return None;
         }
@@ -667,6 +709,66 @@ mod tests {
         assert_eq!(
             QwenToolDecoder::parse_xml_tool_call(QWEN36_TEMPLATE_SURFACE),
             Some(("bash".to_string(), r#"{"cmd":"ls -la"}"#.to_string()))
+        );
+    }
+
+    /// Captured verbatim from this checkpoint on 2026-08-14, decoding
+    /// `tool_call_bash` against the BF16 weights. The model opened with a bare
+    /// `<list_files>` instead of `<function=list_files>` and still closed with
+    /// `</function>`. The surface was otherwise complete and correct -- not
+    /// truncated -- and refusing it reported `__ttb_malformed_tool_call__`,
+    /// which is what makes an agent re-issue its action instead of acting on
+    /// the result.
+    const QWEN36_BARE_OPENER_SURFACE: &str =
+        "<list_files>\n<parameter=recursive>false</parameter>\n</function>";
+
+    #[test]
+    fn a_bare_opening_tag_still_names_the_function_the_model_called() {
+        assert_eq!(
+            QwenToolDecoder::parse_xml_tool_call(QWEN36_BARE_OPENER_SURFACE),
+            Some((
+                "list_files".to_string(),
+                r#"{"recursive":"false"}"#.to_string()
+            ))
+        );
+    }
+
+    /// The fallback must not turn the surface's own structure, or an unclosed
+    /// body, into a call. Each of these would be a false action -- worse than
+    /// the dropped one it exists to recover, because a wrong tool call executes.
+    #[test]
+    fn the_bare_opener_fallback_refuses_what_is_not_a_call() {
+        for surface in [
+            // Structural tags of the surface itself.
+            "<tool_call>\n<parameter=x>1</parameter>\n</function>",
+            "<parameter=x>1</parameter>\n</function>",
+            // A closing tag leading.
+            "</function>",
+            // No `</function>` at all: genuinely incomplete, and the caller's
+            // completeness requirement is what rejects it.
+            "<list_files>\n<parameter=recursive>false</parameter>",
+            // Not a tag at all.
+            "just some prose about functions",
+            // An empty tag names nothing.
+            "<>\n</function>",
+        ] {
+            assert_eq!(
+                QwenToolDecoder::parse_xml_tool_call(surface),
+                None,
+                "should not parse: {surface}"
+            );
+        }
+    }
+
+    /// The conforming surface must keep winning when both could match, so this
+    /// leniency cannot change what a well-formed call decodes to.
+    #[test]
+    fn the_conforming_opener_is_preferred_over_a_bare_one() {
+        assert_eq!(
+            QwenToolDecoder::parse_xml_tool_call(
+                "<wrong>\n<function=right>\n<parameter=k>v</parameter>\n</function>"
+            ),
+            Some(("right".to_string(), r#"{"k":"v"}"#.to_string()))
         );
     }
 
