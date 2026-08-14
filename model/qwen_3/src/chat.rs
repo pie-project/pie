@@ -585,21 +585,53 @@ impl QwenToolDecoder {
             return Some((call[name_start..name_end].trim().to_string(), name_end));
         }
 
-        // Bare `<NAME>` fallback. Take the first tag and nothing later, so a
-        // `<parameter=...>` deeper in the body can never be mistaken for the
-        // function name.
+        // Take the first tag and nothing later, so a `<parameter=...>` deeper in
+        // the body can never be mistaken for the function name.
         let open = call.find('<')?;
         let name_end = call[open + 1..].find('>')? + open + 1;
-        let name = call[open + 1..name_end].trim();
-        if name.is_empty()
-            || name.starts_with('/')
-            || name.contains('=')
-            || name.contains(char::is_whitespace)
-            || matches!(name, "tool_call" | "function" | "parameter")
+        let inner = call[open + 1..name_end].trim();
+
+        // `<function>NAME`: the tag is right and the name follows it as text.
+        // Observed at 3 of 29 live calls. Read the name from after the tag,
+        // bounded by the first whitespace or `<`, so it cannot swallow the body.
+        if inner == "function" {
+            let rest = &call[name_end + 1..];
+            let name = rest
+                .trim_start()
+                .split(|c: char| c.is_whitespace() || c == '<')
+                .next()
+                .unwrap_or("");
+            if !name.is_empty() && Self::is_plausible_function_name(name) {
+                return Some((name.to_string(), name_end));
+            }
+            return None;
+        }
+
+        // Bare `<NAME>`.
+        if !Self::is_plausible_function_name(inner)
+            || matches!(inner, "tool_call" | "parameter")
         {
             return None;
         }
-        Some((name.to_string(), name_end))
+        Some((inner.to_string(), name_end))
+    }
+
+    /// Whether a run of text can be a function name at all.
+    ///
+    /// `<` is rejected explicitly, and that rejection is the whole point. An
+    /// earlier version of this fallback checked for `=`, whitespace and the
+    /// structural tag names but not for `<`, so the live surface
+    /// `<function<bash>` parsed to the NAME `function<bash` with correct
+    /// arguments and no error at all. A sentinel is a bad outcome; a
+    /// confidently wrong tool name is a worse one, because nothing downstream
+    /// can tell it from a real call.
+    fn is_plausible_function_name(name: &str) -> bool {
+        !name.is_empty()
+            && !name.starts_with('/')
+            && !name.contains('=')
+            && !name.contains('<')
+            && !name.contains('>')
+            && !name.contains(char::is_whitespace)
     }
 
     /// Parses the surface the Qwen3.5+ `chat_template` demonstrates:
@@ -731,6 +763,37 @@ mod tests {
                 r#"{"recursive":"false"}"#.to_string()
             ))
         );
+    }
+
+    /// Captured live on 2026-08-14 across 29 tool calls from this checkpoint.
+    /// 8 of 29 openers (27.6%) did not conform to the template. These are the
+    /// exact bytes of the two remaining forms.
+    #[test]
+    fn the_live_non_conforming_openers_parse_to_their_real_names() {
+        // `<function>NAME`, 3 of 29. The tag is right; the name follows as text.
+        assert_eq!(
+            QwenToolDecoder::parse_xml_tool_call(
+                "<function>bash\n<parameter=command>\ndu -sh .\n</parameter>\n</function>"
+            ),
+            Some(("bash".to_string(), r#"{"command":"du -sh ."}"#.to_string()))
+        );
+    }
+
+    /// `<function<bash>` produced the NAME `function<bash`, with correct
+    /// arguments and no error, because the first version of this fallback
+    /// screened for `=`, whitespace and the structural tag names but not for
+    /// `<`. A sentinel loses an action; a confidently wrong name INVENTS one,
+    /// and nothing downstream can tell it from a real call.
+    #[test]
+    fn a_malformed_opener_never_becomes_a_confidently_wrong_tool_name() {
+        let live = "<function<bash>\n<parameter=command>\nhead -n 40 README.md\n</parameter>\n</function>";
+        let parsed = QwenToolDecoder::parse_xml_tool_call(live);
+        assert_ne!(
+            parsed.as_ref().map(|(name, _)| name.as_str()),
+            Some("function<bash"),
+            "a tag name containing '<' must never be accepted as a function name"
+        );
+        assert_eq!(parsed, None);
     }
 
     /// The fallback must not turn the surface's own structure, or an unclosed
