@@ -33,6 +33,7 @@ pub fn new(tokenizer: Arc<Tokenizer>) -> QwenInstruct {
             tool_call_format: ToolCallFormat::Json,
             generation_suffix: "",
             thinking_off_suffix: "",
+            empty_reasoning_header: true,
             trim_content: false,
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],
         },

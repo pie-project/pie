@@ -79,6 +79,27 @@ pub struct ChatMLConfig {
     /// carry both. A template with no thinking-off form repeats
     /// `generation_suffix` here.
     pub thinking_off_suffix: &'static str,
+    /// Whether a replayed assistant turn past the last user query opens a
+    /// reasoning block even when it carried no reasoning.
+    ///
+    /// Qwen3's template renders one only when the turn is the last message or
+    /// carries `reasoning_content`:
+    ///
+    /// ```jinja
+    /// {%- if loop.index0 > ns.last_query_index %}
+    ///     {%- if loop.last or (not loop.last and reasoning_content) %}
+    /// ```
+    ///
+    /// Qwen3.5 and later dropped the inner condition and open one on every
+    /// post-query turn, so this cannot be one behaviour for both.
+    ///
+    /// The `loop.last` half is a fact about the message LIST and does not reach
+    /// this crate: `assistant_call` is told which side of the last user query
+    /// its turn sits on and nothing else. A conversation whose final message is
+    /// an assistant turn therefore renders no block where Qwen3's template
+    /// renders an empty one -- the rarer of the two cases, and the one that
+    /// cannot be fixed without widening the trait every generation implements.
+    pub empty_reasoning_header: bool,
     /// Whether the checkpoint's template applies `|trim` to message content.
     ///
     /// Qwen3.5 and later do; Qwen3 and Qwen2 emit `message.content` verbatim.
@@ -298,7 +319,8 @@ impl QwenInstruct {
         };
 
         let mut body = String::new();
-        if reasoning_header && self.config.has_thinking {
+        let renders_header = self.config.empty_reasoning_header || !reasoning.is_empty();
+        if reasoning_header && self.config.has_thinking && renders_header {
             body.push_str("<think>\n");
             body.push_str(reasoning);
             body.push_str("\n</think>\n\n");
@@ -952,6 +974,7 @@ mod tests {
                 has_tools: true,
                 generation_suffix: "",
                 thinking_off_suffix: "",
+                empty_reasoning_header: true,
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -967,6 +990,7 @@ mod tests {
                 has_tools: true,
                 generation_suffix: "",
                 thinking_off_suffix: "",
+                empty_reasoning_header: true,
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -982,6 +1006,7 @@ mod tests {
                 has_tools: false,
                 generation_suffix: "",
                 thinking_off_suffix: "",
+                empty_reasoning_header: true,
                 trim_content: false,
                 stop_tokens: &["<|im_end|>"],
             },
@@ -1061,10 +1086,58 @@ mod tests {
                 has_tools: true,
                 generation_suffix: "<think>\n",
                 thinking_off_suffix: "<think>\n\n</think>\n\n",
+                empty_reasoning_header: true,
                 trim_content: true,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )
+    }
+
+    /// The `qwen3` arm `pie_model::instruct::create` selects, field for field.
+    ///
+    /// A separate helper from `qwen3()` above, which is a generic ChatML
+    /// fixture and does not claim to be any checkpoint: the four fields this
+    /// one restates are the ones Qwen3's template answers differently from
+    /// Qwen3.5's, so a test that means "the Qwen3 checkpoint" has to say them.
+    fn qwen3_arm() -> QwenInstruct {
+        QwenInstruct::new(
+            make_tok(),
+            ChatMLConfig {
+                tool_call_format: ToolCallFormat::Json,
+                has_thinking: true,
+                has_tools: true,
+                generation_suffix: "",
+                thinking_off_suffix: "<think>\n\n</think>\n\n",
+                empty_reasoning_header: false,
+                trim_content: false,
+                stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+            },
+        )
+    }
+
+    /// Qwen3's template renders the reasoning block on a post-query turn only
+    /// when the turn is last or carries reasoning; Qwen3.5's renders one either
+    /// way. Pie emitted an empty block for both, which is 19 characters the
+    /// Qwen3 checkpoint never sees in that position.
+    #[test]
+    fn an_empty_reasoning_header_is_rendered_only_where_the_template_renders_one() {
+        let call = ToolCall { name: "f".into(), arguments_json: "{}".into() };
+        let qwen3 = qwen3_arm();
+        let bare = qwen3.assistant_turn_body("", std::slice::from_ref(&call), true);
+        assert!(!bare.starts_with("<think>"), "{bare}");
+        // Reasoning present: the block is the template's in both generations.
+        assert!(
+            qwen3
+                .assistant_turn_body("<think>\nwhy\n</think>\n\nok", &[], true)
+                .starts_with("<think>\nwhy\n</think>\n\n")
+        );
+        // And the Qwen3.5+ arm is unmoved: still an empty block on a turn that
+        // carried no reasoning.
+        assert!(
+            qwen3_6()
+                .assistant_turn_body("", &[call], true)
+                .starts_with("<think>\n\n</think>\n\n")
+        );
     }
 
     /// The template opens the model's turn INSIDE a reasoning block, and closes
@@ -1273,6 +1346,7 @@ mod tests {
                 has_tools: true,
                 generation_suffix: "",
                 thinking_off_suffix: "",
+                empty_reasoning_header: true,
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },

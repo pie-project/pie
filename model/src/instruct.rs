@@ -35,6 +35,10 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 // `<think>` block the caller had just declined.
                 generation_suffix: "",
                 thinking_off_suffix: "<think>\n\n</think>\n\n",
+                // Qwen3's template renders the block for a post-query turn only
+                // when that turn is last or carries reasoning; Qwen3.5's renders
+                // one either way.
+                empty_reasoning_header: false,
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -53,6 +57,7 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 // was never trained to generate at.
                 generation_suffix: "<think>\n",
                 thinking_off_suffix: "<think>\n\n</think>\n\n",
+                empty_reasoning_header: true,
                 trim_content: true,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -65,6 +70,7 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 tool_call_format: ToolCallFormat::Json,
                 generation_suffix: "<think>\n",
                 thinking_off_suffix: "<think>\n",
+                empty_reasoning_header: true,
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -86,6 +92,7 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 tool_call_format: ToolCallFormat::Json,
                 generation_suffix: "",
                 thinking_off_suffix: "",
+                empty_reasoning_header: true,
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>"],
             },
@@ -130,6 +137,7 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 tool_call_format: ToolCallFormat::Json,
                 generation_suffix: "",
                 thinking_off_suffix: "",
+                empty_reasoning_header: true,
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
