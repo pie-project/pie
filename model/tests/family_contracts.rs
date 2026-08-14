@@ -812,6 +812,148 @@ fn qwen3_5_fp8_gdn_dequantizes_to_expected_bf16() {
     }
 }
 
+/// The GDN fixture with the full-attention layer *also* FP8: every dense
+/// projection ships E4M3 beside a BF16 `weight_scale_inv` in 4x4 blocks,
+/// which is what Qwen3.6-27B-FP8 actually looks like layer for layer.
+fn qwen3_5_fp8_full_checkpoint() -> CheckpointMetadata {
+    let hidden = 8i64;
+    let (k_dim, v_dim) = (8i64, 16i64);
+    let conv_dim = 2 * k_dim + v_dim;
+    let block = 4i64;
+    let fp8 = Encoding::Raw(DType::F8E4M3);
+    let mut ck = Checkpoint::new();
+    ck.push("model.embed_tokens.weight", &[16, hidden], bf16());
+    let la = "model.layers.0.linear_attn.";
+    ck.push(
+        &format!("{la}in_proj_qkv.weight"),
+        &[conv_dim, hidden],
+        fp8.clone(),
+    );
+    ck.push(
+        &format!("{la}in_proj_qkv.weight_scale_inv"),
+        &[conv_dim / block, hidden / block],
+        bf16(),
+    );
+    ck.push(&format!("{la}in_proj_z.weight"), &[v_dim, hidden], fp8.clone());
+    ck.push(
+        &format!("{la}in_proj_z.weight_scale_inv"),
+        &[v_dim / block, hidden / block],
+        bf16(),
+    );
+    ck.push(&format!("{la}in_proj_b.weight"), &[2, hidden], bf16());
+    ck.push(&format!("{la}in_proj_a.weight"), &[2, hidden], bf16());
+    ck.push(&format!("{la}conv1d.weight"), &[conv_dim, 1, 4], bf16());
+    ck.push(&format!("{la}conv1d.bias"), &[conv_dim], bf16());
+    ck.push(&format!("{la}out_proj.weight"), &[hidden, v_dim], fp8.clone());
+    ck.push(
+        &format!("{la}out_proj.weight_scale_inv"),
+        &[hidden / block, v_dim / block],
+        bf16(),
+    );
+    ck.push(&format!("{la}A_log"), &[2], bf16());
+    ck.push(&format!("{la}dt_bias"), &[2], bf16());
+    ck.push(&format!("{la}norm.weight"), &[v_dim], f32enc());
+    // Eight full-attention layers, FP8 with block scales throughout. Eight,
+    // because tp >= 2 runs `coalesce_direct_row_shards`, which rewrites any
+    // 16-or-more equally-shaped row shards into a bank plus views — 8 layers
+    // of q/k/v/o make a 32-member `[8, 8]` bucket, gate/up a 16-member
+    // `[16, 8]` one, and their scale tensors two more — and that rewrite is
+    // where Qwen3.6-27B-FP8 lost 230 of its 263 pairings on the pod.
+    // `down_proj` shards on axis 1, so it stays out of every bucket: both
+    // the rewritten and the untouched paths are asserted below.
+    let (heads, head_dim, inter) = (2i64, 4i64, 16i64);
+    for layer in 1..9 {
+        let p = format!("model.layers.{layer}.");
+        ck.push(&format!("{p}input_layernorm.weight"), &[hidden], bf16());
+        for (leaf, rows, cols) in [
+            ("self_attn.q_proj", heads * head_dim, hidden),
+            ("self_attn.k_proj", heads * head_dim, hidden),
+            ("self_attn.v_proj", heads * head_dim, hidden),
+            ("self_attn.o_proj", hidden, heads * head_dim),
+            ("mlp.gate_proj", inter, hidden),
+            ("mlp.up_proj", inter, hidden),
+            ("mlp.down_proj", hidden, inter),
+        ] {
+            ck.push(&format!("{p}{leaf}.weight"), &[rows, cols], fp8.clone());
+            ck.push(
+                &format!("{p}{leaf}.weight_scale_inv"),
+                &[rows / block, cols / block],
+                bf16(),
+            );
+        }
+        ck.push(&format!("{p}self_attn.q_norm.weight"), &[head_dim], bf16());
+        ck.push(&format!("{p}self_attn.k_norm.weight"), &[head_dim], bf16());
+        ck.push(
+            &format!("{p}post_attention_layernorm.weight"),
+            &[hidden],
+            bf16(),
+        );
+    }
+    ck.push("model.norm.weight", &[hidden], bf16());
+    ck.finish("qwen3_5_fp8_full")
+}
+
+/// Every F8E4M3 tensor the contract publishes reaches `gemm_act_x_w` through
+/// a QuantMeta port, and that port is null unless the plan carries a scale
+/// attachment for it — so each one must be paired, at tp=1 and on both ranks
+/// of tp=2. This is the structural half of the pod failure
+/// `gemm_act_x_w[FP8_E4M3]: quant scale data is null`.
+#[test]
+fn qwen3_5_fp8_quant_weights_carry_scale_attachments() {
+    let mut facts = facts("qwen3_5", 9);
+    facts.head_dim = 4;
+    let checkpoint = qwen3_5_fp8_full_checkpoint();
+    for (tp_rank, tp_size) in [(0, 1), (0, 2), (1, 2)] {
+        let target = target(tp_rank, tp_size);
+        let contract = author(&facts, &checkpoint, &target, &Policy::default())
+            .expect("authoring failed")
+            .expect("no author for qwen3_5");
+        let plan = compile_load_plan(&checkpoint, &contract, target)
+            .expect("compiling failed");
+        // Resolved by name through the plan's own tensor table — the same
+        // arithmetic the driver's `resolve_quant_attachments` runs — because
+        // the row-shard coalesce may rewrite the contract before the plan is
+        // built, and contract indices do not survive that.
+        let name_of: std::collections::HashMap<_, _> = plan
+            .tensors
+            .iter()
+            .map(|decl| (decl.id, decl.name.as_str()))
+            .collect();
+        let mut fp8_weights = 0;
+        for tensor in &contract.tensors {
+            if tensor.encoding != Encoding::Raw(DType::F8E4M3) {
+                continue;
+            }
+            fp8_weights += 1;
+            let attachment = plan
+                .attachments
+                .iter()
+                .find(|attachment| {
+                    name_of.get(&attachment.tensor).copied() == Some(tensor.name.as_str())
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "tp{tp_size} rank {tp_rank}: '{}' is published F8E4M3 \
+                         with no scale attachment — its QuantMeta port binds \
+                         null and the GEMM throws",
+                        tensor.name
+                    )
+                });
+            assert_eq!(
+                name_of.get(&attachment.scale_tensor).copied(),
+                Some(format!("{}_scale_inv", tensor.name).as_str()),
+                "tp{tp_size} rank {tp_rank}: '{}' is paired with the wrong scales",
+                tensor.name
+            );
+        }
+        assert_eq!(
+            fp8_weights, 56,
+            "tp{tp_size} rank {tp_rank}: eight full-attention layers of seven \
+             projections stay FP8 (the GDN ones dequantize to bf16)"
+        );
+    }
+}
+
 /// A tp that splits inside a scale block has no representable scale slice —
 /// K = 8 in 4-row blocks cannot split 4 ways — and must be refused rather
 /// than approximated.
