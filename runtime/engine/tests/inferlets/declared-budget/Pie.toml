@@ -1,0 +1,4 @@
+[package]
+name = "declared-budget"
+version = "0.1.0"
+description = "Test inferlet: declares a large output budget but decodes a few tokens (admission-demand probe)"
