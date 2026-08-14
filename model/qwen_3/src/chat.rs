@@ -316,13 +316,6 @@ impl QwenInstruct {
         }
     }
 
-    /// The `<tool_call>` surface for one replayed call, without its separator.
-    ///
-    /// Arguments arrive as a JSON object — the same string the decoder reports
-    /// in [`ToolEvent::Call`]. String values are written raw and everything
-    /// else as JSON, which is the template's `args_value | string if ... else
-    /// args_value | tojson`; a value that is a bare string would otherwise come
-    /// back quoted and no longer be the value the tool was called with.
     /// A replayed assistant turn's body: reasoning header, content, calls.
     fn assistant_turn_body(
         &self,
@@ -355,12 +348,39 @@ impl QwenInstruct {
             } else {
                 body.push('\n');
             }
-            body.push_str(&Self::tool_call_surface(call));
+            body.push_str(&self.tool_call_surface(call));
         }
         body
     }
 
-    fn tool_call_surface(call: &ToolCall) -> String {
+    /// The `<tool_call>` surface for one replayed call, without its separator.
+    ///
+    /// In the surface the checkpoint's own template teaches -- the same
+    /// `ToolCallFormat` the declaration demonstrates, the grammar admits and
+    /// the decoder parses. This was the one of those five sites that ignored
+    /// the field, so a Qwen3 or Qwen2.5 conversation was replayed to the model
+    /// in a syntax its template never shows and its own next call will not use.
+    ///
+    /// Arguments arrive as a JSON object — the same string the decoder reports
+    /// in [`ToolEvent::Call`]. `Json` writes it through, which is the
+    /// template's `tool_call.arguments` verbatim when it is a string. `Qwen35Xml`
+    /// writes string values raw and everything else as JSON, which is that
+    /// template's `args_value | string if ... else args_value | tojson`; a value
+    /// that is a bare string would otherwise come back quoted and no longer be
+    /// the value the tool was called with.
+    fn tool_call_surface(&self, call: &ToolCall) -> String {
+        if self.config.tool_call_format == ToolCallFormat::Json {
+            // `{"name": "NAME", "arguments": {...}}`, the Hermes-style body
+            // Qwen3's and Qwen2.5's templates write between the tags.
+            let arguments = match call.arguments_json.trim() {
+                "" => "{}",
+                arguments => arguments,
+            };
+            return format!(
+                "<tool_call>\n{{\"name\": \"{}\", \"arguments\": {arguments}}}\n</tool_call>",
+                call.name
+            );
+        }
         let mut surface = format!("<tool_call>\n<function={}>\n", call.name);
         if let Ok(serde_json::Value::Object(arguments)) =
             serde_json::from_str::<serde_json::Value>(&call.arguments_json)
@@ -1237,19 +1257,27 @@ mod tests {
     }
 
     /// The surface the checkpoint's template demonstrates, byte for byte --
-    /// `encoded_turns` used to render a replayed call as an EMPTY turn.
+    /// `encoded_turns` used to render a replayed call as an EMPTY turn, and
+    /// then to render every arm's in the Qwen3.5 XML one.
     #[test]
     fn a_replayed_call_renders_the_surface_the_template_teaches() {
         let call = ToolCall {
             name: "get_weather".into(),
-            arguments_json: r#"{"city":"Paris","days":3}"#.into(),
+            arguments_json: r#"{"city": "Paris", "days": 3}"#.into(),
         };
         assert_eq!(
-            QwenInstruct::tool_call_surface(&call),
+            qwen3_6().tool_call_surface(&call),
             "<tool_call>\n<function=get_weather>\n\
              <parameter=city>\nParis\n</parameter>\n\
              <parameter=days>\n3\n</parameter>\n\
              </function>\n</tool_call>"
+        );
+        // The Json arms get the body their own template writes, arguments
+        // through as they arrived.
+        assert_eq!(
+            qwen3_arm().tool_call_surface(&call),
+            "<tool_call>\n{\"name\": \"get_weather\", \
+             \"arguments\": {\"city\": \"Paris\", \"days\": 3}}\n</tool_call>"
         );
     }
 
