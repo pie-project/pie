@@ -121,6 +121,7 @@ KvCache KvCache::allocate(int num_layers,
     if (envelopes_requested()) {
         c.allocate_envelopes_();
     }
+    c.zero_storage_();
     return c;
 }
 
@@ -241,6 +242,7 @@ KvCache KvCache::allocate_per_layer(int num_layers,
     if (envelopes_requested()) {
         c.allocate_envelopes_();
     }
+    c.zero_storage_();
     return c;
 }
 
@@ -301,6 +303,25 @@ void KvCache::enable_envelopes() {
         "kv envelopes are not enabled on this cache; set "
         "PIE_CUDA_KV_ENVELOPES=1 so the memory planner reserves them "
         "(costs 2/page_size of the KV pool)");
+}
+
+void KvCache::zero_storage_() {
+    // Synchronous, and only on the allocation path: this runs once when the
+    // pool is created, not per fire, so the cost is a single pass over the KV
+    // arena at startup rather than anything a decode pays.
+    const auto zero_all = [](std::vector<DeviceTensor>& layers) {
+        for (auto& t : layers) {
+            if (t.data() != nullptr && t.nbytes() > 0) {
+                CUDA_CHECK(cudaMemset(t.data(), 0, t.nbytes()));
+            }
+        }
+    };
+    zero_all(k_layers_);
+    zero_all(v_layers_);
+    zero_all(k_scale_layers_);
+    zero_all(v_scale_layers_);
+    zero_all(k_bf16_layers_);
+    zero_all(v_bf16_layers_);
 }
 
 void KvCache::allocate_envelopes_() {
