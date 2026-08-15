@@ -338,6 +338,30 @@ void CudaArena::grow_reserved(std::size_t bytes) {
                     cuMemSetAccess(address, map_unit_bytes_, access.data(),
                                    access.size()),
                     "cuMemSetAccess");
+                // Hand out mapped memory in a known state.
+                //
+                // Nothing writes a KV page before attention reads it, so
+                // whatever this memory already held becomes part of the
+                // arithmetic the first time a sequence grows into a page it has
+                // not written yet -- and a decode then depends on the requests
+                // that preceded it. Measured on Qwen3.6-27B: six draws of one
+                // prompt in one warm process agreed while the sequence fit the
+                // pages it started with, and diverged as soon as decode needed
+                // another page (6/6 identical at 121 tokens, 3/4 at 129, 1/4 at
+                // 201). Replaying the same request sequence reproduced every
+                // draw bit for bit, so this is state dependence, not a race.
+                //
+                // Here rather than at KvCache::allocate, which is where the
+                // obvious version of this fix goes and where it faults: the
+                // arena is a VIRTUAL reservation, so `nbytes()` spans address
+                // space no page backs yet. This is the first point at which the
+                // memory exists to be written.
+                //
+                // Covers recycled handles too, which is the case that actually
+                // produces the divergence: `cached_handles_` above hands back a
+                // handle that still holds an earlier request's KV.
+                check_cu(cuMemsetD8(address, 0, map_unit_bytes_),
+                         "cuMemsetD8");
             } catch (...) {
                 if (mapped) {
                     cuMemUnmap(address, map_unit_bytes_);
