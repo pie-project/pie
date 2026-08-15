@@ -83,25 +83,6 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.driver as usize);
         let range = store_registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
-            // Settle what is already retirable before choosing page ids.
-            //
-            // Recycling is lazy and retirement is opportunistic: `retire_idle`
-            // runs on discard, on fire completion, and from the planner, but
-            // nothing ran it here. So the free set a reservation draws from
-            // reflects the fire/settle timing of whatever came before, and two
-            // runs of the SAME request get different physical pages. Measured
-            // on Qwen3.6-27B: six draws of one prompt in one warm process, only
-            // 2/6 identical, diverging once decode grows past the pages it
-            // started with -- and the draws that coincide do so on a PERIOD
-            // ({0,2} baseline, {0,3} with graph capture off), which is the pool
-            // cycling rather than anything numerical.
-            //
-            // This does not force anything unsafe. `retire_idle` returns the
-            // whole pool only when `in_flight == 0`, and otherwise retires no
-            // further than `oldest - 1`, so a page a live fire could still name
-            // is never handed back. It is the same call the discard path
-            // already makes, moved to the point where the choice is made.
-            kv.retire_idle();
             kv.reserve(ws.id, pages as u64)
         });
         Ok(range
