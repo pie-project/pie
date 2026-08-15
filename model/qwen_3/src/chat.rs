@@ -625,6 +625,43 @@ impl QwenToolDecoder {
     /// arguments and no error at all. A sentinel is a bad outcome; a
     /// confidently wrong tool name is a worse one, because nothing downstream
     /// can tell it from a real call.
+    /// Finds a `<function=NAME>` opener that can stand in for a missing
+    /// `<tool_call>`, returning its byte offset.
+    ///
+    /// WHY THIS EXISTS. The checkpoint itself sometimes emits a corrupted token
+    /// where `<tool_call>` belongs. Measured on 201 replayed SWE-agent turns,
+    /// the word `THOUGHT:` came back mangled -- as `THO`, `THOFT` or `THOTH` --
+    /// on 12 of them, and vLLM produced the SAME mangling at the same rate (11
+    /// of the same 201), so this is a property of the weights, not of this
+    /// engine. When the mangling lands on the opener the surface reads:
+    ///
+    ///     </think>\n\nTHO<function=bash>\n<parameter=command>\n...\n</parameter>\n</function>\n</tool_call>
+    ///
+    /// Everything needed to execute the call is present and unambiguous.
+    /// vLLM's `qwen3_xml` parser recovers it; refusing it cost 9 of 201 turns
+    /// (4.5%), reported as `__ttb_malformed_tool_call__`, which sends the agent
+    /// into re-issuing an action instead of acting on its result -- the exact
+    /// read-only-trajectory failure this investigation started from.
+    ///
+    /// SAFETY. Only the explicit `<function=` form is recovered, never the bare
+    /// `<NAME>` form: outside a `<tool_call>` wrapper there is nothing to
+    /// distinguish a bare tag from ordinary prose or from a code block the
+    /// model is quoting. The name must additionally pass
+    /// `is_plausible_function_name`, and the CALLER only attempts recovery once
+    /// `</tool_call>` has arrived, so a partially streamed prose fragment can
+    /// never open a call that then swallows a real one.
+    fn recoverable_function_opener(text: &str) -> Option<usize> {
+        let prefix = "<function=";
+        let position = text.find(prefix)?;
+        let name_start = position + prefix.len();
+        let name_end = text[name_start..].find('>')? + name_start;
+        if Self::is_plausible_function_name(text[name_start..name_end].trim()) {
+            Some(position)
+        } else {
+            None
+        }
+    }
+
     fn is_plausible_function_name(name: &str) -> bool {
         !name.is_empty()
             && !name.starts_with('/')
@@ -713,6 +750,22 @@ impl ToolDecoder for QwenToolDecoder {
                 }
                 return ToolEvent::Start;
             }
+            // No opener -- but the checkpoint corrupts that very token often
+            // enough to matter (see `recoverable_function_opener`). Wait for the
+            // CLOSER before deciding: once `</tool_call>` has arrived the whole
+            // block is in hand and can be judged complete, so recovery can never
+            // half-open on a prose fragment and swallow a later real call.
+            let recovered = self.accumulated.find("</tool_call>").and_then(|end| {
+                Self::recoverable_function_opener(&self.accumulated[..end])
+                    .map(|start| (start, end))
+            });
+            if let Some((start, end)) = recovered {
+                let call = self.accumulated[start..end].trim().to_string();
+                self.accumulated = self.accumulated[end + "</tool_call>".len()..].to_string();
+                if let Some((name, args)) = self.parse_tool_call(&call) {
+                    return ToolEvent::Call(name, args);
+                }
+            }
         } else if let Some(pos) = self.accumulated.find("</tool_call>") {
             let call_json = self.accumulated[..pos].trim().to_string();
             self.accumulated = self.accumulated[pos + "</tool_call>".len()..].to_string();
@@ -770,6 +823,57 @@ mod tests {
                 r#"{"recursive":"false"}"#.to_string()
             ))
         );
+    }
+
+    /// Captured verbatim on 2026-08-15 from `django__django-11039` turn 1 of a
+    /// 201-turn SWE-agent replay. The checkpoint mangled the token where
+    /// `<tool_call>` belongs into `THO` -- the truncated head of the `THOUGHT:`
+    /// it meant to write. vLLM produced the same mangling on 11 of the same 201
+    /// turns to this engine's 12, so the corruption is in the weights, not here;
+    /// what differed is that vLLM's parser recovered the call and this one did
+    /// not, losing 9 of 201 turns (4.5%) to `__ttb_malformed_tool_call__`.
+    const QWEN36_CORRUPTED_OPENER_SURFACE: &str = concat!(
+        "</think>\n\nTHO<function=bash>\n<parameter=command>\n",
+        "find /testbed -type f -name \"*.py\"\n</parameter>\n</function>\n</tool_call>"
+    );
+
+    #[test]
+    fn a_corrupted_tool_call_opener_still_yields_the_call_the_model_made() {
+        let end = QWEN36_CORRUPTED_OPENER_SURFACE.find("</tool_call>").unwrap();
+        let start =
+            QwenToolDecoder::recoverable_function_opener(&QWEN36_CORRUPTED_OPENER_SURFACE[..end])
+                .expect("a plausible <function=NAME> opener must be recoverable");
+        assert_eq!(
+            QwenToolDecoder::parse_xml_tool_call(
+                QWEN36_CORRUPTED_OPENER_SURFACE[start..end].trim()
+            ),
+            Some((
+                "bash".to_string(),
+                r#"{"command":"find /testbed -type f -name \"*.py\""}"#.to_string()
+            ))
+        );
+    }
+
+    /// The recovery must not invent a call out of prose. Without the
+    /// `<tool_call>` wrapper there is no structural signal left, so the name
+    /// screen is the only thing standing between a recovered action and a
+    /// hallucinated one.
+    #[test]
+    fn prose_that_merely_mentions_a_function_tag_is_not_recovered_as_a_call() {
+        for text in [
+            "the helper is written <function=two words> in the docs",
+            "see <function=> for details",
+            "<function=a<b>",
+            "compare <function=x=y> against",
+        ] {
+            assert_eq!(
+                QwenToolDecoder::recoverable_function_opener(text),
+                None,
+                "must not recover a call from {text:?}"
+            );
+        }
+        // The legitimate form is still recovered.
+        assert!(QwenToolDecoder::recoverable_function_opener("noise<function=bash>x").is_some());
     }
 
     /// Captured live on 2026-08-14 across 29 tool calls from this checkpoint.
@@ -1288,6 +1392,61 @@ mod tests {
                 assert_eq!(args, "{}");
             }
             other => panic!("expected Call, got {:?}", other),
+        }
+    }
+
+    /// The recovery must work through `feed`, not merely in the helper.
+    ///
+    /// This streams the live `django__django-11039` turn-1 shape: a mangled
+    /// `THO` where `<tool_call>` belongs, and NO opener token at any point. A
+    /// helper-only test would pass while the decoder still returned
+    /// `ToolEvent::Start` forever and the call stayed lost.
+    #[test]
+    fn feed_recovers_a_call_whose_tool_call_opener_never_arrived() {
+        let v: Vec<String> = vec![
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|endoftext|>",
+            "\n",
+            "</think>",
+            "THO",
+            "<function=bash>",
+            "<parameter=command>",
+            "ls -la",
+            "</parameter>",
+            "</function>",
+            "</tool_call>",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let tok = Arc::new(Tokenizer::from_vocab(&v));
+        let inst = QwenInstruct::new(
+            tok,
+            ChatMLConfig {
+                tool_call_format: ToolCallFormat::Qwen35Xml,
+                has_thinking: true,
+                has_tools: true,
+                generation_suffix: "",
+                thinking_off_suffix: "",
+                trim_content: false,
+                stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+            },
+        );
+        let mut dec = inst.tool_decoder();
+        // </think> \n THO <function=bash> <parameter=command> ls -la </parameter> </function>
+        for id in [4u32, 3, 5, 6, 7, 8, 9, 10] {
+            assert!(
+                matches!(dec.feed(&[id]), ToolEvent::Start),
+                "nothing may resolve before the closer arrives"
+            );
+        }
+        match dec.feed(&[11]) {
+            ToolEvent::Call(name, args) => {
+                assert_eq!(name, "bash");
+                assert_eq!(args, r#"{"command":"ls -la"}"#);
+            }
+            other => panic!("expected the recovered Call, got {other:?}"),
         }
     }
 }
