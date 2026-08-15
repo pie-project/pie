@@ -1231,6 +1231,11 @@ pie_add_cuda_target(test_flashinfer_decode_head_dim_guard
   SOURCES tests/test_flashinfer_decode_head_dim_guard.cpp
   LIBS pie_driver_cuda_lib)
 pie_add_cuda_target(test_graph_variant SOURCES tests/graph_variant_test.cpp)
+# PIE_GEMM_DETERMINISTIC is still read from the environment. Names no src/ file
+# because the switch is header-only, and no device because it is host C++; it
+# re-execs itself, so it must stay a standalone executable.
+pie_add_cuda_target(test_gemm_determinism
+  SOURCES tests/gemm_determinism_test.cpp)
 # Reaches `pie/driver/fire/descriptor.hpp`, which pulls in `launch/program.hpp`
 # and so `pie_driver_abi.h` — the ABI include dir is not optional here even
 # though nothing in the test names it directly.

@@ -410,9 +410,10 @@ jobs:
             -path '*/out/cuda/build' -print -quit)"
           test -n "$CUDA_BUILD_DIR"
           cmake --build "$CUDA_BUILD_DIR" \
-            --target test_entry_validation test_pipeline_dispatch_bind
+            --target test_entry_validation test_pipeline_dispatch_bind \
+                    test_gemm_determinism
           ctest --test-dir "$CUDA_BUILD_DIR" --output-on-failure \
-            -R '^(entry_validation|pipeline_dispatch_bind)$'
+            -R '^(entry_validation|pipeline_dispatch_bind|gemm_determinism)$'
 
       - name: Verify no CUDA shared deps
         run: |

@@ -24,6 +24,7 @@
 #include "kernels/gemv.hpp"
 #include "kernels/quant_bf16_to_fp8.hpp"
 #include "kernels/residual_add.hpp"
+#include "ops/gemm_determinism.hpp"
 #include "ops/tuning_cache.hpp"
 
 #ifdef PIE_CUDA_HAS_MARLIN
@@ -819,6 +820,29 @@ DenseTactic tune_dense(cublasHandle_t caller, const Bf16LtPlan* plan,
 bool dense_tactic_for(cublasHandle_t caller, const void* W, int M, int N,
                       int K, float beta, cudaStreamCaptureStatus capturing,
                       const Bf16LtPlan** out_plan, DenseTactic* out) {
+    // PIE_GEMM_DETERMINISTIC declines every shape here: nothing is measured,
+    // nothing is read back from `dense_gemm.txt`, and nothing is written to
+    // it. The caller then takes the shape ladder at the bottom of
+    // `gemm_bf16_impl`, which is what this file did before the tuner existed
+    // and is a pure function of (M, N, K, beta): the GEMV at M=1, cuBLASLt's
+    // shape-derived algorithm above the `min_m`/`min_n`/`min_k` thresholds,
+    // `cublasGemmEx` otherwise. A cold cache then decodes what a warm one
+    // does, a fresh pod what an old one does, and -- because the `seen`
+    // counter below is skipped too -- a shape's first occurrence what its
+    // second does. See ops/gemm_determinism.hpp for why that is worth a knob.
+    //
+    // What this deliberately does not do is make a token independent of the
+    // batch it decoded in. `dense_key` hashes M, so a peer joining the batch
+    // still moves the shape; dropping M from the key would not fix that and
+    // would break the cache, because a tactic's `algo` is an index into
+    // `Bf16LtPlan::heuristics` and that plan is built per (M, N, K) -- index 3
+    // at M=1 and index 3 at M=8 are different algorithms, and a key shared
+    // across M would replay whichever one happened to be measured first. M is
+    // a real axis of the arithmetic in any case: an M=8 GEMM tiles its K
+    // reduction differently from an M=1 GEMV whatever tactic either is handed.
+    // Batch-invariant logits are a larger change than this one.
+    if (dense_gemm_deterministic()) return false;
+
     // The arena allocates an M x N output. Tuning a shape whose output alone
     // would rival the KV cache is not worth the memory; those shapes are large
     // enough that cuBLAS's own choice is close to optimal anyway.
