@@ -156,23 +156,6 @@ public:
 private:
     void allocate_envelopes_();
 
-    /// Zero every byte of KV storage this cache owns.
-    ///
-    /// The pool is handed out and recycled page by page across requests, and
-    /// nothing else writes a page before attention reads it, so whatever the
-    /// device memory happened to hold becomes part of the arithmetic the first
-    /// time a sequence grows into a page it has not written yet. That makes a
-    /// decode depend on what ran BEFORE it: measured on Qwen3.6-27B, six draws
-    /// of one prompt in one warm process agreed while the sequence fit the
-    /// pages it started with (6/6 identical at 121 tokens) and diverged as soon
-    /// as decode needed another page (3/4 at 129, 1/4 at 201). Replaying the
-    /// same request sequence reproduced every draw bit-for-bit, which is the
-    /// signature of state dependence rather than a race.
-    ///
-    /// The recurrent-state cache already does this for its own slots; the KV
-    /// pool was the half that did not.
-    void zero_storage_();
-
     int resolve_(int layer) const noexcept {
         return kv_source_layer_.empty() ? layer : kv_source_layer_[layer];
     }
