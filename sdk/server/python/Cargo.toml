@@ -34,6 +34,10 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
+# TLS backend selection, not TLS use: the engine's HTTPS clients are built on
+# reqwest's `rustls-no-provider`, so *something* in the process has to name a
+# provider. The CLI has `bootstrap` for that; the wheel has this.
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"] }
 # `worker` is the engine library — we link the same `serve::start_engine`
 # the CLI uses, so the CLI and the pyo3 wheel can never drift in their boot
 # behavior.
@@ -47,7 +51,6 @@ worker = { path = "../../../crates/worker", default-features = false }
 pyo3 = { version = "0.29", features = ["extension-module"] }
 tokio = { version = "1.53", features = ["rt-multi-thread"] }
 toml = "1.1"
-anyhow = "1.0"
 # The embedded engine emits `tracing` events exactly as the CLI does, but a
 # `tracing` event with no subscriber installed is discarded silently. Without
 # this the wheel is mute: an engine-side WARN explaining why a request failed

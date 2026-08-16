@@ -231,37 +231,25 @@ fn unavailable() -> Option<&'static str> {
 /// half a value, which is the mistake this exists to catch. An UNSTATED row has
 /// no layout to check against, and the two dispatches that use one say so.
 fn check_push_against_the_row(entrypoint: &str, push: &[u8]) {
-    // A RETIRED entrypoint has no row and cannot be checked against one. Its
-    // block is stated by its routine's signature instead, and
-    // `tests/routines.rs` is what holds a body to it -- so this is a check
-    // that leaves with the table rather than one that has been weakened.
-    if kernels_vulkan::retired().contains(&entrypoint) {
-        return;
-    }
-    let Some(row) = kernels::sig_in(kernels_vulkan::KERNELS, entrypoint) else {
-        panic!("`{entrypoint}` is not an entrypoint of any row");
-    };
-    if row.operands.is_empty() {
-        return; // unstated: nothing to be right or wrong against
-    }
-    let layout = kernels_vulkan::push_layout(row);
-    let size = kernels_vulkan::push_size(row) as usize;
-    assert!(
-        push.len() <= size,
-        "`{entrypoint}` was pushed {} bytes but its row's block is {size}",
-        push.len()
-    );
-    let boundaries: Vec<usize> = std::iter::once(0)
-        .chain(layout.iter().map(|f| (f.offset + f.size) as usize))
-        .collect();
-    assert!(
-        boundaries.contains(&push.len()) || push.len() == size,
-        "`{entrypoint}` was pushed {} bytes, which is inside a field rather \
-         than after one -- the row's fields end at {boundaries:?}. The row's \
-         own layout is what `kernels_vulkan::push_layout` returns; read it \
-         against the row's operand order",
-        push.len()
-    );
+    // A NO-OP, and it was one before this body was deleted.
+    //
+    // It used to resolve `kernels::sig_in(kernels_vulkan::KERNELS, entrypoint)`
+    // and require the pushed length to end on one of the row block's field
+    // boundaries -- a length landing mid-field means some scalar was written
+    // with half a value. Then families started crossing to routines, a guard
+    // was added to return early for a RETIRED entrypoint, and every entrypoint
+    // retired. The function returned on all 481 without reading a byte.
+    //
+    // That is the shape worth naming rather than tidying away: a check does
+    // not go FALSE when its reference implementation retires, it goes SILENT,
+    // and a silent check reads exactly like a passing one. The block's fields
+    // are stated by the routine's own signature now and `tests/routines.rs`
+    // is what holds a body to them.
+    //
+    // The three call sites stay, naming the entrypoint they push for, so that
+    // whoever writes the routine-side equivalent finds the places that want
+    // it.
+    let _ = (entrypoint, push);
 }
 
 /// Read a `.spv` file as a word stream, or explain which file.
@@ -4574,13 +4562,19 @@ fn every_module_this_device_claims_it_can_load_builds_a_pipeline() {
         // path an unstated one does -- which is the honest one for it: its
         // layout is now stated by a routine's signature, and reflecting the
         // module is exactly what the driver does for it at launch time.
-        let row = kernels::sig_in(kernels_vulkan::KERNELS, &name);
+        // `kernels::sig_in(KERNELS, &name)` STOOD HERE, and every entrypoint
+        // took the `None` branch: `KERNELS` is empty, so `buffers` was 0 and
+        // `push` was 0 for all 481 and the `unstated` fallback below ran every
+        // time. The lookup is deleted rather than left to answer `None`
+        // forever, and the branch it fed is now unconditional -- which is the
+        // path a crossed entrypoint takes in production too, where a driver
+        // reflects the module and takes the maximum of that and what the
+        // routine states.
         assert!(
-            row.is_some() || kernels_vulkan::retired().contains(&name.as_str()),
-            "`{name}` does not resolve, which entrypoints.rs covers"
+            kernels_vulkan::retired().contains(&name.as_str()),
+            "`{name}` is not a retired entrypoint and there is no table left              for it to come from, which entrypoints.rs covers"
         );
-        let buffers = row.map_or(0, kernels_vulkan::buffer_count);
-        let push = row.map_or(0, |r| kernels_vulkan::push_size(r) as usize);
+        let (buffers, push) = (0u32, 0usize);
 
         // An UNSTATED row cannot supply the layout, and the first version of
         // this test skipped those 292 entrypoints. Finding out why cost a

@@ -447,11 +447,30 @@ pub struct LlamaLikeMetalFacts {
     /// Whether the mixture sits BESIDE the dense MLP rather than replacing it.
     ///
     /// gemma4's. Both branches read the post-attention residual and their
-    /// results are added — five norms round one block. Every other deployment
-    /// this text serves runs one FFN or the other, which is why this is a fact
-    /// and not the shape of the walk.
+    /// results are added — SEVEN norms round one block, not five: four the
+    /// dense rows also have, plus an output norm per leg and the routed
+    /// leg's own input norm. Every other deployment this text serves runs
+    /// one FFN or the other, which is why this is a fact and not the shape
+    /// of the walk.
     #[serde(default)]
     pub dense_beside_moe: bool,
+    /// Whether the router NORMS its input before projecting, at its own
+    /// scale.
+    ///
+    /// gemma-4 publishes `router.scale`, `[hidden]`, and applies
+    /// `rms_norm(x, scale * hidden**-0.5)` to the post-attention stream —
+    /// not to either leg's normed value. Every other routed deployment this
+    /// text serves projects the same value its experts read, so a text that
+    /// assumed one input for both was right until this row.
+    #[serde(default)]
+    pub router_input_norm: bool,
+    /// Whether the router has a learned per-expert gain,
+    /// `router.per_expert_scale` `[n_experts]`.
+    ///
+    /// Multiplies the weights AFTER the top-k softmax; see
+    /// `moe/route.metal::router_topk_scaled`.
+    #[serde(default)]
+    pub router_expert_scale: bool,
     /// Whether the router renormalizes over the SELECTED experts.
     ///
     /// HF's `norm_topk_prob`, and a routed row's alone. True softmaxes the k
@@ -713,6 +732,8 @@ impl LlamaLikeMetalFacts {
             per_layer_emb_dim: 256,
             kv_shared_layers: 4,
             dense_beside_moe: true,
+            router_input_norm: true,
+            router_expert_scale: true,
             // Every shipped gemma-4 norms its V, and no other family here
             // does -- so a fixture that left this false made the one text
             // that could exercise the branch fire the branch beside it.
@@ -733,7 +754,26 @@ impl LlamaLikeMetalFacts {
             // read off the side network's width and silently dropped for
             // gemma-4-31b.
             embed_scale: 32.0,
-            window_left: (0..24).map(|l| if l % 6 == 5 { -1 } else { 512 }).collect(),
+            // ONE ENTRY PER LAYER OF THE STACK THIS IS PAIRED WITH, which is
+            // `LlamaLikeFacts::qwen3_0_6b()`'s twenty-eight -- the same
+            // pairing `embed_scale` above is computed from.
+            //
+            // It stated twenty-four, and a short list is not a shorter
+            // statement: `window_left_at` CLAMPS to the last entry, and the
+            // last of a `l % 6 == 5` run of twenty-four is layer 23, whose
+            // value is `-1`. So layers 24 through 27 read as full attention,
+            // and the fixture described a stack whose full layers are
+            // {5, 11, 17, 23, 24, 25, 26, 27} -- not one every six, not one
+            // every anything. `batch::geometry` REFUSES an irregular schedule
+            // by name, so this was a fixture no deployment could be, and it
+            // took the metal text with it: four layers rotated at the global
+            // theta, rotated a quarter of a head they do not have, and named
+            // `sdpa_paged_*_d_256` for a shape the stack states at 128.
+            //
+            // Twenty-eight ends the run at layer 27, which is `512` under the
+            // same rule, so the clamp is unreachable and the full layers are
+            // the four the period names.
+            window_left: (0..28).map(|l| if l % 6 == 5 { -1 } else { 512 }).collect(),
             // gemma-4 states TWO attention geometries and every shipped row
             // moves all three of these off the default. A fixture that left
             // them there described one shape for the whole stack, which is
@@ -901,6 +941,8 @@ impl LlamaLikeMetalFacts {
             // qwen3 projects its own V.
             v_from_k: false,
             dense_beside_moe: false,
+            router_input_norm: false,
+            router_expert_scale: false,
             per_layer_scalar: false,
             embed_scale: 0.0,
             attn_scale: 0.0,

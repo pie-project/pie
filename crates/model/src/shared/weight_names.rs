@@ -187,12 +187,21 @@ impl Names {
             // Three conventions for one bank, and the checkpoint picks:
             // qwen3-moe's `switch_mlp`, gemma4's `switch_glu`, gpt-oss's
             // plain `experts`.
-            ("router", "mlp.gate|mlp.router"),
+            // THREE conventions, and the third does not live under `mlp.` at
+            // all: gemma-4's routed block is a sibling of the dense one, so
+            // its router is `router.proj` where the bank is
+            // `experts.switch_glu.*`. Measured on
+            // `mlx-community/gemma-4-26b-a4b-it-4bit` -- every other name
+            // that text states already resolved against that checkpoint, and
+            // this role was the whole of the gap: 90 unpublished names, which
+            // is thirty layers times the packed weight, its scales and its
+            // zero point.
+            ("router", "mlp.gate|mlp.router|router.proj"),
             // The router's own bias, under whichever of the two spellings
             // the checkpoint gave the router. One entry, both conventions,
             // because a checkpoint that renamed the module renamed its bias
             // with it.
-            ("router_bias", "mlp.gate|mlp.router"),
+            ("router_bias", "mlp.gate|mlp.router|router.proj"),
             (
                 "expert_gate",
                 "mlp.switch_mlp.gate_proj|experts.switch_glu.gate_proj|mlp.experts.gate_proj",
@@ -245,6 +254,35 @@ impl Names {
             // The SANDWICH's output norms, which only a gemma text names.
             ("post_attn_norm", "post_attention_layernorm"),
             ("post_mlp_norm", "post_feedforward_layernorm"),
+            // ── the MIXTURE layer's three EXTRA norms. ──
+            //
+            // gemma-4's MoE rows run two FFNs SIDE BY SIDE and norm each
+            // leg's output before joining them, so a mixture layer ships
+            // SEVEN norms where a dense one ships four. The suffixed pair
+            // belongs to the legs -- `_1` the dense one, `_2` the routed one
+            // -- and the unsuffixed `post_feedforward_layernorm` above norms
+            // their SUM, which is why it keeps its name and its role.
+            //
+            // Measured off `mlx-community/gemma-4-26b-a4b-it-4bit`, whose
+            // layer 0 publishes all seven. A dense gemma-4 ships none of
+            // these three and resolves them to nothing, which is right: a
+            // layer with one FFN has no leg to norm separately.
+            ("post_mlp_norm_1", "post_feedforward_layernorm_1"),
+            ("mlp_norm_2", "pre_feedforward_layernorm_2"),
+            ("post_mlp_norm_2", "post_feedforward_layernorm_2"),
+            // ── the ROUTER's two scales, which are not its quantisation. ──
+            //
+            // `router.scale` is an RMS-norm weight `[hidden]`: the router
+            // norms its input before projecting, at its OWN scale rather
+            // than the leg's. `router.per_expert_scale` is `[n_experts]` and
+            // multiplies the post-softmax weights.
+            //
+            // Neither takes a `.weight` suffix in the checkpoint, which
+            // costs nothing here because `weight_suffix` tries the bare name
+            // too. Distinct from `router.proj.scales`, which IS quantisation
+            // and reaches the map as the `router` role's own affine point.
+            ("router_scale", "router.scale"),
+            ("router_expert_scale", "router.per_expert_scale"),
         ]
         .into_iter()
         .map(|(a, b): (&str, &str)| (a.to_string(), b.split('|').map(str::to_string).collect()))

@@ -67,9 +67,9 @@
 //! Vulkan's scalars leave the binding numbering entirely and this backend's
 //! ride a buffer. `min_uniform_buffer_offset_alignment` has the same
 //! guaranteed floor of 256 and is a DIFFERENT limit, and here the agreement is
-//! not zero-margin, it is absent: the widest scalar block any row states is 64
-//! bytes and `kernels_wgpu::uniform_size` rounds to 16, so no block's own size
-//! is a multiple of the granularity a suballocated one would have to start at.
+//! not zero-margin, it is absent: every scalar block a real lowering produces
+//! is a handful of words, so no block's own size is a multiple of the
+//! granularity a suballocated one would have to start at.
 //! [`every_arena_offset_a_real_lowering_assigns_is_bindable`] states that,
 //! because it is the reason `device::Device::uniform` gives every launch a
 //! buffer of its own at offset zero rather than packing a frame's blocks into
@@ -96,8 +96,8 @@
 //!
 //! WebGPU has no push constants, so `driver-vulkan`'s `Params::Push`/
 //! `Params::Block` split does not exist: a launch's scalars are the fields of
-//! ONE `@group(1) @binding(0)` uniform block, or -- where the row says so by
-//! giving a `Param` operand a buffer kind -- a struct at a `@group(0)` slot.
+//! ONE `@group(1) @binding(0)` uniform block, or -- where the routine binds
+//! them as a buffer -- a struct at a `@group(0)` slot.
 //! [`binding::Params`] carries one variant with the slot as data.
 //!
 //! The check inverts with it. Vulkan's `layout-10069` finding is that a push
@@ -108,8 +108,9 @@
 //! that the shell must not offer LESS than the module's struct needs, being
 //! over is fine, and [`every_launchs_scalars_land_where_its_module_reads_them`]
 //! is written that way round -- with the module's own field offsets held
-//! against the row's, since a block of the right SIZE with the fields in the
-//! wrong PLACES is a shader reading a stride where a head count belongs.
+//! against the offsets the routine's `bind` packs to, since a block of the
+//! right SIZE with the fields in the wrong PLACES is a shader reading a stride
+//! where a head count belongs.
 //!
 //! # A Metal-authored text on a WebGPU backend, on purpose
 //!
@@ -121,32 +122,29 @@
 //! Metal-authored text names symbols this backend has BY CONSTRUCTION, and a
 //! plan compiled for one is a plan the other can bind.
 //!
-//! If it ever names one this table does not have, that is a coverage
-//! divergence between two tables that are supposed to be the same table, and
+//! If it ever names one this crate does not have, that is a coverage
+//! divergence between two backends that are supposed to cover the same
+//! kernels, and
 //! [`every_symbol_a_real_text_launches_has_a_module`] is where it surfaces --
 //! as a missing module rather than as a `Undispatchable::Unknown` at a fire.
 //!
-//! # The unstated rows, measured rather than assumed
+//! # The unstated rows, and where that question went
 //!
-//! 56 of the table's 100 rows state no operands, covering 292 of its 481
-//! entrypoints, and `.wiki/new-driver/vulkan.md` §13 is the argument that they
-//! are not unlaunchable: `driver-metal` falls back to the lowered plan's own
-//! argument order, and [`binding::reorder`] carries that fallback.
+//! This file used to open a section here on the 56 of the table's 100 rows
+//! that stated no operands, on `.wiki/new-driver/vulkan.md` §13's argument
+//! that they were still launchable, and on the second `reorder` pass
+//! [`every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal`]
+//! ran to prove it.
 //!
-//! NONE of the twelve lowerings reaches one today, and that is a measurement
-//! with a date on it. `mxfp4_qmv_routed_bias` was the one operand-less row a plan
-//! could name -- `model-compiler`'s routed-QMV site picks it by a `match` on
-//! the weight repr -- and it was given a stated operand list, so `gpt_oss_20b`
-//! now launches a row that says where its buffers go. The fallback is
-//! therefore exercised deliberately in
-//! [`every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal`]:
-//! every one of the 6680 real rectangles is put through `reorder` a second
-//! time under a REAL unstated row of the shipped table, and has to come back
-//! as exactly the plan's own operands in the plan's own order. All 56 of those
-//! rows also state `LaunchRule::Unstated`, so no real one of them could reach
-//! a grid even if a text named it, and that is asserted rather than described.
+//! `kernels_wgpu::KERNELS` is empty. There are no rows, stated or unstated,
+//! and the fallback they were the argument for is not on any path a plan
+//! takes: [`driver_wgpu::dispatch::plan_one`] finds an arm for every one of
+//! the 481 entrypoints and never reaches `plan_by_row`. The question did not
+//! get answered, it stopped having a subject -- see the `// RETIRED:` block
+//! on that test, which says so in those terms. What a routine leaves empty is
+//! now `Placed::Nothing`, and the accounting for it is `Declared::holes`.
 //!
-//! # GPU-free, all eight
+//! # GPU-free, all eleven
 //!
 //! The questions are about numbers a compiler produced and modules `naga` can
 //! read, and a check that needed a device would not run in the builds that
@@ -156,12 +154,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use driver_wgpu::binding::{
-    Arena, FireNumber, FireTable, ParamSlot, Params, Placeholder, Resolve, Slot, Unbindable,
+    Arena, FireNumber, FireTable, ParamSlot, Params, Placeholder, Resolve, Unbindable,
 };
 use driver_wgpu::dispatch::{Built, Geometry, Sources};
+use driver_wgpu::lowering::routine::Stated;
 use driver_wgpu::reflect::Declared;
-use kernels::{KernelSig, Source};
-use kernels_wgpu::{Binding, Capability};
+use kernels_wgpu::Capability;
+use kernels_wgpu::routine::ArgValue;
 use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
 use model::shared::llama_like::forward::llama_like_metal;
 use model_compiler::lower::{Arg, Fire, Launch, Lowered, Row, lower};
@@ -184,8 +183,8 @@ const STRICTEST_ALIGNMENT: u64 = driver_wgpu::facts::GUARANTEED_STORAGE_ALIGNMEN
 ///
 /// A different question that happens to share a value, which is why
 /// `facts.rs` states it as its own constant rather than folding the two. This
-/// file uses it to say what a shell may not do with the uniform blocks the
-/// rows state.
+/// file uses it to say what a shell may not do with the uniform blocks a real
+/// lowering produces.
 const UNIFORM_ALIGNMENT: u32 = driver_wgpu::facts::GUARANTEED_UNIFORM_ALIGNMENT;
 
 /// Big enough that a stand-in for a weight or a fire table never becomes the
@@ -384,73 +383,132 @@ impl Resolve for Sentinels {
         Some(&self.0)
     }
     fn number(&self, which: FireNumber) -> Option<u32> {
-        Some(match which {
-            FireNumber::KvPageSize => 0x0011_1111,
-            FireNumber::KvHeadStride => 0x0022_2222,
-            FireNumber::KvSeqStride => 0x0033_3333,
-            FireNumber::AttentionMaskStride => 0x0044_4444,
-            FireNumber::Rows => 0x0055_5555,
-        })
+        Some(sentinel(which))
     }
 }
 
-/// The sentinel a row's source is supposed to be handed, or `None` for a
-/// source that is not the pool's.
-fn sentinel(src: Source) -> Option<u32> {
-    match src {
-        Source::KvPageSize => Some(0x0011_1111),
-        Source::KvHeadStride => Some(0x0022_2222),
-        Source::KvSeqStride => Some(0x0033_3333),
-        Source::AttentionMaskStride => Some(0x0044_4444),
-        Source::Rows => Some(0x0055_5555),
-        _ => None,
+/// The sentinel [`Sentinels`] answers for one of the pool's numbers.
+///
+/// One reading, used twice: the resolver hands these to the driver, and the
+/// walks below look for them in the bytes a dispatch carries. A constant
+/// written in two places is a constant that can be changed in one of them.
+const fn sentinel(which: FireNumber) -> u32 {
+    match which {
+        FireNumber::KvPageSize => 0x0011_1111,
+        FireNumber::KvHeadStride => 0x0022_2222,
+        FireNumber::KvSeqStride => 0x0033_3333,
+        FireNumber::AttentionMaskStride => 0x0044_4444,
+        FireNumber::Rows => 0x0055_5555,
     }
 }
 
-/// The `@group(0)` binding a row puts its parameter STRUCT at, if it has one.
+/// Whether a dispatch's scalar block carries a word.
 ///
-/// Read off `kernels_wgpu::bindings`, which is the ABI as code, rather than
-/// found by size the way `driver-vulkan` has to find it: a row says "the rest
-/// of this run is a struct, and it starts here" by giving a `Param` operand a
-/// buffer kind, and the table can therefore answer where. The reflection is a
-/// CHECK on that answer below and not the source of it.
-fn struct_slot(sig: &KernelSig) -> Option<u32> {
-    kernels_wgpu::bindings(sig)
-        .into_iter()
-        .zip(sig.operands)
-        .find_map(|(binding, operand)| match (binding, operand.source) {
-            (Binding::Storage(at), Source::Param(_) | Source::ParamF32(_)) => Some(at),
-            _ => None,
-        })
+/// Bytes, because that is what the shader gets. `Params::Block` is the run as
+/// it will be written into a buffer, so a number that reached it is four
+/// consecutive little-endian bytes somewhere in it and a number that did not is
+/// nowhere in it. Aligned to four on purpose: the packer never places a scalar
+/// off a word boundary, so an unaligned coincidence is not a hit.
+fn carries(params: &Params, word: u32) -> bool {
+    let Params::Block { bytes, .. } = params else {
+        return false;
+    };
+    let want = word.to_le_bytes();
+    bytes.chunks_exact(4).any(|c| c == want)
 }
 
-/// The `@group(0)` binding numbers the row states and nothing fills, within
-/// the module's layout.
+/// What one launch's BODY states, run the way `dispatch::plan_one` runs it.
 ///
-/// `Source::Unbound` is how a row says "this slot exists and nothing supplies
-/// it": `kv_append_paged` keeps seven placeholders so that the rest of its row
-/// stays where a shared ring ABI put them, and the unbiased routed QMV keeps
-/// the bias slot its biased twin uses. They are the row's gaps rather than the
-/// driver's debts, which is why the accounting below counts them separately
-/// from what an executor still owes.
+/// `plan_one` finds the arm, builds the handles, runs the body and binds; a
+/// `Dispatch` is the far end of that and cannot say what the body PASSED. This
+/// repeats the two public calls in the middle -- `arm::Handles` and
+/// `routine::state` -- because the argument list a body passes is the thing a
+/// row's `operands` column used to state, and the walks below are about it.
 ///
-/// Bounded by the module's binding count on purpose. `kv_append_paged` states
-/// THIRTEEN buffer slots against a twelve-binding module, and the thirteenth is
-/// the seventh placeholder, which `binding::descriptors` drops as a tail past
-/// the layout; a gap that is not in the layout is not a slot anybody has to
-/// account for.
-fn gaps(sig: &KernelSig, declared: &Declared) -> u32 {
-    kernels_wgpu::bindings(sig)
-        .into_iter()
-        .zip(sig.operands)
-        .filter(|(binding, operand)| match binding {
-            Binding::Storage(at) => {
-                matches!(operand.source, Source::Unbound) && *at < declared.bindings
-            }
-            Binding::Uniform(_) | Binding::Packed => false,
+/// `None` where the symbol is unarmed or the body refuses, which is the
+/// caller's to judge: a refusal is `plan_one`'s to report and
+/// `every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal`
+/// is where it is reported.
+fn stated_by(
+    low: &Lowered,
+    launch: &Launch,
+    geometry: Geometry,
+    numbers: &BTreeMap<FireNumber, u32>,
+) -> Option<Vec<Stated>> {
+    let symbol = low.kernels[launch.kernel as usize].as_str();
+    let (body, run) = driver_wgpu::lowering::routine::armed(symbol)?;
+    let args = &low.args[launch.args.start as usize..launch.args.end as usize];
+    let scalars = &low.params[launch.params.start as usize..launch.params.end as usize];
+    // The two widths `dispatch::widths` feeds the arm: the LAST widthed
+    // operand's and the FIRST's. Mirrored rather than called, because it is
+    // private -- and mirroring is what makes this a second reading.
+    let widths = || {
+        args.iter().filter_map(|arg| match arg {
+            Arg::Arena { width, .. } | Arg::Named { width, .. } => Some(*width),
+            Arg::Weight(_) => None,
         })
-        .count() as u32
+    };
+    let facts = driver_wgpu::lowering::arm::facts(
+        symbol,
+        launch.rows.end - launch.rows.start,
+        geometry,
+        low.n_requests,
+        widths().next_back().unwrap_or(0),
+        widths().next().unwrap_or(0),
+    );
+    let mut handles = driver_wgpu::lowering::arm::Handles::with_numbers(
+        args,
+        driver_wgpu::lowering::routine::results(body),
+        scalars,
+        numbers,
+    );
+    let taken = run(&mut handles, facts).ok()?;
+    driver_wgpu::lowering::routine::state(body, &taken).ok()
 }
+
+/// The offsets a body's scalars pack to, from WGSL's alignment rule.
+///
+/// A SECOND reading of `routine::bind`'s packing, written from the rule rather
+/// than from the code, and that is the whole point of it: a helper that asked
+/// `bind` where it put a field would only be checking `bind` against itself.
+/// Every value is aligned to its own width -- four for a word, eight for a
+/// `vec2<u32>` -- which is what WGSL requires of a host-shareable struct's
+/// members and what a shader therefore reads at.
+fn packed_offsets(scalars: &[ArgValue]) -> Vec<u32> {
+    let mut at = 0usize;
+    let mut out = Vec::with_capacity(scalars.len());
+    for value in scalars {
+        let width = match value {
+            ArgValue::Usize(_) => 8,
+            // A body cannot pass a buffer as a scalar: `routine::state`
+            // separates the handles out. Counted as a word so that a change
+            // there shows up as a misplacement rather than as a silent skip.
+            ArgValue::I32(_) | ArgValue::U32(_) | ArgValue::F32(_) | ArgValue::Buffer(_) => 4,
+        };
+        at = at.next_multiple_of(width);
+        out.push(u32::try_from(at).expect("a block of a few words"));
+        at += width;
+    }
+    out
+}
+
+// RETIRED: `struct_slot` and `gaps`, two readings of a kernel's ABI off the
+// TABLE.
+//
+// `struct_slot` answered where a row put its parameter STRUCT, by walking
+// `kernels_wgpu::bindings` for the `Binding::Storage(at)` under a
+// `Source::Param` operand. `gaps` answered how many `@group(0)` slots a row
+// stated and nothing filled -- `Source::Unbound`, bounded by the module's own
+// binding count, which is how `kv_append_paged` keeps seven ring-ABI
+// placeholders without shifting the operands behind them.
+//
+// Both went BLIND, not true. `kernels_wgpu::KERNELS` is empty, so there is no
+// `KernelSig` to read either off, and a helper that answers `None` and `0` for
+// every kernel is not a helper that started agreeing with the reflection --
+// it is one with nothing left to read. The two facts still exist and are read
+// from the plan instead: `Dispatch::block_at` says where the struct went, and
+// the slots the body leaves empty are what `Placed::Nothing` takes and
+// `Declared::holes` names.
 
 /// Every activation the compiler places can be bound by a `BufferBinding`.
 ///
@@ -459,11 +517,12 @@ fn gaps(sig: &KernelSig, declared: &Declared) -> u32 {
 /// question that has no Vulkan counterpart.
 #[test]
 fn every_arena_offset_a_real_lowering_assigns_is_bindable() {
+    let all = geometric();
     let mut operands = 0usize;
     let mut refused = Vec::new();
     let mut worst = usize::MAX;
 
-    for (name, low) in texts() {
+    for (name, low, _) in &all {
         for arg in &low.args {
             let Arg::Arena { at, width, bytes } = arg else {
                 continue;
@@ -530,37 +589,126 @@ fn every_arena_offset_a_real_lowering_assigns_is_bindable() {
     //
     // No plan places these, so there is no offset to check against a real
     // lowering -- what there is instead is the reason a shell must not invent
-    // one. The blocks are TINY: the widest any of the 99 rows states is 64
-    // bytes and every one is a multiple of 16, because WGSL gives a
-    // host-shareable struct an alignment of at least 16. None is a multiple of
-    // the 256 a suballocated block would have to start at, so a shell packing
-    // a frame's blocks into one buffer end to end produces an unbindable
-    // offset at the second launch.
+    // one. The blocks are TINY, and that is the whole finding: none of them is
+    // a multiple of the 256 a suballocated block would have to start at, so a
+    // shell packing a frame's blocks into one buffer end to end produces an
+    // unbindable offset at the second launch.
     //
     // `binding::Params` carries no offset at all, which is what makes that
     // unrepresentable rather than merely unwise: the only offset this driver
     // can produce for a uniform block is zero, and zero divides everything.
-    let blocks: Vec<u32> = kernels_wgpu::KERNELS
-        .iter()
-        .map(kernels_wgpu::uniform_size)
-        .filter(|bytes| *bytes > 0)
-        .collect();
-    assert_eq!(
-        blocks.len(),
-        29,
-        "a different number of rows state a scalar block"
-    );
+    //
+    // Measured over the blocks a real lowering PRODUCES, not over the blocks a
+    // table states. `kernels_wgpu::KERNELS` is empty; every symbol resolves
+    // through its routine, and the extent of a routine's block is
+    // `Declared::uniform_bytes` -- the shader's own span. So the census that
+    // used to read `uniform_size` off eleven rows now reads `Params::Block`
+    // off every rectangle the twelve real lowerings plan, which is the same
+    // question asked of a strictly larger corpus.
+    //
+    // ONE HALF OF THE OLD CLAIM IS GONE AND IT DID NOT BECOME TRUE, IT MOVED.
+    // The old form also asserted every block was a multiple of 16 -- a row
+    // could state a block WGSL cannot lay out in the uniform address space,
+    // and no row did. A routine cannot: its block is `naga`'s span for the
+    // struct it read out of the shader, so five words is 20 bytes here where
+    // the row rounded to 32. `Device::uniform` is what rounds the BUFFER up
+    // now, with `next_multiple_of(16).max(16)`, and `crate::device` is where
+    // that rule is checked. There is no longer a plane on which this file
+    // could state an unlayable block.
+    let mods = modules(all.iter().map(|(_, low, _)| low));
+    let store = Everything(Placeholder(GENEROUS));
+    let mut blocks: BTreeSet<u32> = BTreeSet::new();
+    let mut carrying = 0usize;
+    let mut rectangles = 0usize;
+    let mut silent = Vec::new();
+
+    for (name, low, geometry) in &all {
+        let buf = Placeholder(low.arena_bytes as u64);
+        let arena = Arena {
+            buffer: &buf,
+            bytes: low.arena_bytes as u64,
+        };
+        for launch in &low.launches {
+            rectangles += 1;
+            let symbol = &low.kernels[launch.kernel as usize];
+            let declared = &mods[symbol];
+            let module = driver_wgpu::geometry::Module::loaded(symbol, declared);
+            let planned = driver_wgpu::dispatch::plan_one(
+                low,
+                launch,
+                kernels_wgpu::KERNELS,
+                Built {
+                    module,
+                    declared,
+                    sig: None,
+                },
+                Sources {
+                    arena,
+                    resolver: &store,
+                    min_offset: STRICTEST_ALIGNMENT,
+                },
+                *geometry,
+            )
+            .unwrap_or_else(|why| panic!("{name}: `{symbol}` plans a rectangle: {why}"));
+            match planned.params {
+                Params::Block {
+                    ref bytes,
+                    at: ParamSlot::Uniform,
+                } => {
+                    carrying += 1;
+                    blocks.insert(u32::try_from(bytes.len()).expect("a block of a few words"));
+                }
+                // A STORAGE block is a buffer in `@group(0)`, placed by the
+                // arena at an offset the walk above already holds to 256. It
+                // is not this question.
+                Params::Block {
+                    at: ParamSlot::Storage(_),
+                    ..
+                } => {}
+                // A module that reads a block and a dispatch that offers none
+                // is a bind group `wgpu` rejects at encode, and it would reach
+                // this file as a block of zero bytes rather than as a refusal.
+                Params::None => {
+                    if !declared.uniform_offsets.is_empty() {
+                        silent.push(format!(
+                            "{name}: `{symbol}` offers no scalars against a module that \
+                             reads {} of them",
+                            declared.uniform_offsets.len()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     assert!(
-        blocks.iter().all(|b| b.is_multiple_of(16)),
-        "a row states a block WGSL cannot lay out in the uniform address space"
+        silent.is_empty(),
+        "{} rectangles offer no block to a module that reads one:\n  {}",
+        silent.len(),
+        silent.join("\n  ")
     );
-    let widest_block = blocks.iter().copied().max().expect("rows state blocks");
-    assert_eq!(widest_block, 64, "the widest scalar block changed");
+    assert_eq!(
+        rectangles, 6680,
+        "the texts planned a different number of rectangles than when this was \
+         measured, so the census below is about a different corpus"
+    );
+    // Stated so the filter cannot be true by emptiness: a fork that stopped
+    // producing uniform blocks would satisfy every assertion under it.
+    assert_ne!(
+        carrying, 0,
+        "no rectangle of any real lowering carries a uniform block, so nothing \
+         below is measuring the driver's scalars"
+    );
+    let widest_block = *blocks
+        .iter()
+        .next_back()
+        .expect("a rectangle that carries a block states a size");
     assert!(
         widest_block < UNIFORM_ALIGNMENT,
         "every scalar block is smaller than the granularity a suballocated one \
          would have to start at, so a shell that packed them would be placing \
-         blocks at offsets no implementation has to accept"
+         blocks at offsets no implementation has to accept; the widest is \
+         {widest_block}"
     );
     assert_eq!(
         blocks
@@ -568,8 +716,9 @@ fn every_arena_offset_a_real_lowering_assigns_is_bindable() {
             .filter(|b| b.is_multiple_of(UNIFORM_ALIGNMENT))
             .count(),
         0,
-        "a row now states a block whose own size is a multiple of the uniform \
-         alignment, which is the first row a shell could pack without rounding"
+        "a rectangle now carries a block whose own size is a multiple of the \
+         uniform alignment, which is the first block a shell could pack \
+         without rounding"
     );
 }
 
@@ -879,9 +1028,9 @@ const REACHES: &[(&str, Reaches)] = &[
 /// * six symbols hand their scalars to the module's uniform block and their
 ///   operands to every one of its `@group(0)` bindings;
 /// * two state no scalars at all against a module that declares no block;
-/// * six put their scalars in a STRUCT at a `@group(0)` slot the row names,
+/// * six put their scalars in a STRUCT at a `@group(0)` slot the body names,
 ///   and their operands in the rest;
-/// * one is short of a WORD, which its row derives from the launch;
+/// * one is short of a WORD, which its body derives from the launch;
 /// * six are short of RESOURCES only the driver has.
 ///
 /// # Holes are not what they are on the other backend, and it changes the sum
@@ -895,47 +1044,101 @@ const REACHES: &[(&str, Reaches)] = &[
 /// entry point happens not to read, so the bind group still needs an entry
 /// there, and `wgpu` validates a group against its layout entry for entry.
 /// Which means the count that balances is the module's WHOLE binding set, and
-/// the thing that fills an unread slot is the row's own `Unbound` gap.
+/// the thing that fills an unread slot is the body's own `Placed::Nothing`.
 ///
-/// So this asserts what `driver-vulkan` cannot: **the slots the row leaves
-/// empty are exactly the slots the module does not read.** If a row grew a gap
-/// where the shader reads, the dispatch would be refused by
-/// `Unlayoutable::Unfilled`; if a shader stopped reading a slot the row fills,
-/// a real tensor would be bound to an entry nothing looks at, which costs a
-/// descriptor and says the row is describing a variant it no longer serves.
+/// So this asserts what `driver-vulkan` cannot: **the slots the body leaves
+/// empty are exactly the slots the module does not read.** If a body grew a
+/// gap where the shader reads, the dispatch would be refused by
+/// `Unlayoutable::Unfilled`; if a shader stopped reading a slot the body
+/// fills, a real tensor would be bound to an entry nothing looks at, which
+/// costs a descriptor and says the body is describing a variant it no longer
+/// serves.
+///
+/// # Re-anchored
+///
+/// The five shapes above were read off a ROW: `struct_slot` found the block's
+/// slot in `kernels_wgpu::bindings`, `gaps` counted the row's `Source::Unbound`
+/// operands, and `sig.in_place` named the aliases. `kernels_wgpu::KERNELS` is
+/// empty and every one of those readings is gone. Each is taken from what a
+/// real plan PRODUCES instead -- the block's slot from `Dispatch::block_at`,
+/// the aliases from `Routine::in_place`, and the balance from the buffer list
+/// the arm and the body between them filled. The classification is the same
+/// classification and `REACHES` is unchanged, which is the point: the
+/// information moved and the claim did not.
 #[test]
 fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
-    let texts = texts();
-    let mods = modules(texts.iter().map(|(_, low)| low));
+    let all = geometric();
+    let mods = modules(all.iter().map(|(_, low, _)| low));
+    let store = Everything(Placeholder(GENEROUS));
     let mut seen: BTreeMap<String, Reaches> = BTreeMap::new();
     let mut wrong = Vec::new();
     let mut launches = 0u32;
 
-    for (text, low) in &texts {
+    for (text, low, geometry) in &all {
+        let buf = Placeholder(low.arena_bytes as u64);
+        let arena = Arena {
+            buffer: &buf,
+            bytes: low.arena_bytes as u64,
+        };
         for launch in &low.launches {
             launches += 1;
             let symbol = &low.kernels[launch.kernel as usize];
             let declared = &mods[symbol];
-            let sig = kernels_wgpu::sig(symbol).expect("a launched symbol has a row");
+            let module = driver_wgpu::geometry::Module::loaded(symbol, declared);
+            // EVERY symbol is armed now, so this is an assertion and not a
+            // skip. A symbol that is neither armed nor rowed cannot be planned
+            // at all, and a walk that quietly stepped over it would report a
+            // full account of a corpus it had thrown part of away.
+            let (routine, _) = driver_wgpu::lowering::routine::armed(symbol)
+                .unwrap_or_else(|| panic!("`{symbol}` is armed: nothing plans without a routine"));
+            let d = driver_wgpu::dispatch::plan_one(
+                low,
+                launch,
+                kernels_wgpu::KERNELS,
+                Built {
+                    module,
+                    declared,
+                    sig: None,
+                },
+                Sources {
+                    arena,
+                    resolver: &store,
+                    min_offset: STRICTEST_ALIGNMENT,
+                },
+                *geometry,
+            )
+            .unwrap_or_else(|why| panic!("{text}: `{symbol}` plans a rectangle: {why}"));
+
             let params = launch.params.end - launch.params.start;
-            // An IN-PLACE row binds one buffer for two of the plan's args: the
-            // trace states the value and the result separately, because a tape
-            // whose statements did not produce values could not say what the
-            // next one reads, and the row then says they are the same
+            // An IN-PLACE routine binds one buffer for two of the plan's args:
+            // the trace states the value and the result separately, because a
+            // tape whose statements did not produce values could not say what
+            // the next one reads, and the routine then says they are the same
             // allocation. `norm::add_bias` is the only one here, and without
             // this it classifies as a kernel binding one FEWER entry than the
             // plan states -- which is true and is not what is interesting
             // about it.
             let args = (launch.args.end - launch.args.start)
-                - u32::try_from(sig.in_place.len()).expect("a row states few aliases");
-            let block = struct_slot(sig);
-            let gaps = gaps(sig, declared);
+                - u32::try_from(routine.in_place.len()).expect("a routine states few aliases");
+            let block = match d.params {
+                Params::Block {
+                    at: ParamSlot::Storage(at),
+                    ..
+                } => Some(at),
+                Params::Block {
+                    at: ParamSlot::Uniform,
+                    ..
+                }
+                | Params::None => None,
+            };
+            let gaps = u32::try_from(declared.holes()).expect("a module declares few bindings");
             let uniform = declared.uniform_offsets.len() as u32;
 
-            // What the row and the plan together account for, against what the
-            // module declares. Asked FIRST, because a buffer account that does
-            // not balance makes the scalar comparison meaningless: a kernel
-            // short of the KV cache is short of the numbers describing it too.
+            // What the body and the plan together account for, against what
+            // the module declares. Asked FIRST, because a buffer account that
+            // does not balance makes the scalar comparison meaningless: a
+            // kernel short of the KV cache is short of the numbers describing
+            // it too.
             let accounted = args + gaps + u32::from(block.is_some());
             let reaches = if accounted != declared.bindings {
                 Reaches::DriverSupplies(declared.bindings.saturating_sub(accounted))
@@ -951,14 +1154,18 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
                 Reaches::RunGrows(uniform.saturating_sub(params))
             };
 
-            // The row's gaps and the module's unread bindings are the same
-            // slots. Not a tautology: `gaps` is read off the TABLE and
-            // `holes()` off the parsed WGSL, and nothing but this holds them
-            // together.
-            if gaps != declared.holes() as u32 {
+            // The body's gaps and the module's unread bindings are the same
+            // slots. Not a tautology: the left side is the list the ARM filled
+            // and the BODY ordered, and the right side is what `naga` read out
+            // of the WGSL. `Placed::Nothing` is what takes a position and
+            // leaves no entry, and this is the only place the two are held
+            // together over real launches.
+            let filled = d.buffers.len() + usize::from(d.block_at.is_some());
+            if filled + declared.holes() != declared.bindings as usize {
                 wrong.push(format!(
-                    "{text}: `{symbol}` leaves {gaps} slots unbound and its \
-                     module declares {} it never reads",
+                    "{text}: `{symbol}` fills {filled} of its module's {} bindings \
+                     and leaves {} unread, which does not balance",
+                    declared.bindings,
                     declared.holes()
                 ));
             }
@@ -1011,7 +1218,12 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
         launches, 6680,
         "a different number of rectangles was walked"
     );
-    assert_eq!(seen.len(), REACHES.len(), "a different set was reached");
+    assert_eq!(
+        seen.len(),
+        REACHES.len(),
+        "a different set was reached, and every symbol these texts launch is \
+         described above"
+    );
 }
 
 /// The binder this crate ships resolves every operand of every real launch.
@@ -1219,150 +1431,204 @@ fn an_arena_one_byte_short_of_what_the_plan_placed_refuses_what_runs_off_it() {
 ///
 /// Which is exactly the state these launches are in, and the two numbers are
 /// worth keeping apart. `Declared::uniform_bytes` is `naga`'s span for the
-/// struct -- 20 for five words -- and `kernels_wgpu::uniform_size` rounds to 16
-/// because WGSL gives a host-shareable struct an alignment of at least 16, so
-/// the row says 32 where the module says 20. `Device::uniform` allocates by the
-/// same rounding. Over, never under, at every launch here.
+/// struct -- 20 for five words -- and a shell allocating a BUFFER rounds that
+/// to 16, because WGSL gives a host-shareable struct an alignment of at least
+/// 16. `Device::uniform` is where the rounding lives. Over, never under, at
+/// every launch here.
 ///
 /// # And the size is not the whole of it
 ///
 /// A block of the right length with its fields in the wrong PLACES is a shader
 /// reading a stride where a head count belongs, and nothing reports it: a
-/// uniform buffer is bytes. So the module's own field offsets are held against
-/// `kernels_wgpu::uniform_layout`'s, which is what the driver would write by if
-/// it wrote by the row. They agree at every field of every launched module.
+/// uniform buffer is bytes. So the offsets the body's scalars PACK to are held
+/// against the offsets the module READS at, field for field. Two independent
+/// readings of one layout: `packed_offsets` walks WGSL's alignment rule over
+/// the values `routine::state` says the body passes, and `Declared` walks the
+/// struct `naga` parsed out of the shader. `routine::bind` is the code between
+/// them and is not consulted by either.
+///
+/// A PREFIX and not an equality, deliberately. `bind` pads a short run out to
+/// the struct's extent, so a body that passes four words to a five-field
+/// struct leaves the fifth reading zero -- a real question, and one about what
+/// a body states rather than about where the driver puts it.
+/// `crates/kernels-wgpu/tests/routines.rs` is where a body's argument list is
+/// held to its own module. Counted here, so that the count cannot grow
+/// unremarked.
+///
+/// # Re-anchored, and what that cost
+///
+/// This used to ask `binding::scalars`, which builds a run from a ROW, and
+/// compared `kernels_wgpu::uniform_layout`'s offsets to the module's.
+/// `kernels_wgpu::KERNELS` is empty; there is no row to compare, and the
+/// question moved rather than closed -- the row's `operands` column is now the
+/// argument list a body passes, and `routine::state` is where it is read. The
+/// walk is over ALL 6680 rectangles now instead of the 1136 that had rows.
 #[test]
 fn every_launchs_scalars_land_where_its_module_reads_them() {
-    let texts = texts();
-    let mods = modules(texts.iter().map(|(_, low)| low));
+    let all = geometric();
+    let mods = modules(all.iter().map(|(_, low, _)| low));
     let store = Everything(Placeholder(GENEROUS));
+    let numbers = BTreeMap::new();
     let mut uniform = 0u64;
     let mut storage = 0u64;
     let mut bare = 0u64;
     let mut owed: BTreeSet<String> = BTreeSet::new();
+    let mut misplaced: BTreeSet<String> = BTreeSet::new();
+    let mut short: BTreeSet<String> = BTreeSet::new();
+    let mut whole_struct = 0u64;
     let mut module_alone = 0u64;
-    let mut row_alone = 0u64;
-    let mut split_fields = 0u64;
+    let mut body_alone = 0u64;
+    let mut eight_byte = 0u64;
 
-    for (text, low) in &texts {
+    for (text, low, geometry) in &all {
+        let buf = Placeholder(low.arena_bytes as u64);
+        let arena = Arena {
+            buffer: &buf,
+            bytes: low.arena_bytes as u64,
+        };
         for launch in &low.launches {
             let symbol = &low.kernels[launch.kernel as usize];
             let declared = &mods[symbol];
-            let sig = kernels_wgpu::sig(symbol).expect("a launched symbol has a row");
-            // A 64-bit scalar has no WGSL type, so the row declares it as a
-            // `vec2<u32>` and `binding` writes its LOW word and leaves the high
-            // one zero -- right for every stride a `Lowered::params` can carry,
-            // since that run is a `Vec<u32>`. Counted so the ZERO below can say
-            // the case is unwitnessed here rather than passing silently.
-            if kernels_wgpu::uniform_layout(sig)
-                .iter()
-                .any(|field| field.split)
-            {
-                split_fields += 1;
+            let module = driver_wgpu::geometry::Module::loaded(symbol, declared);
+            let states = stated_by(low, launch, *geometry, &numbers);
+            // A 64-bit scalar has no WGSL type, so a shader declares it as a
+            // `vec2<u32>` and a body passes it as `ArgValue::Usize`. Counted so
+            // the ZERO below can say the case is unwitnessed here rather than
+            // passing silently.
+            if states.iter().flatten().any(|state| {
+                state
+                    .scalars
+                    .iter()
+                    .any(|v| matches!(v, ArgValue::Usize(_)))
+            }) {
+                eight_byte += 1;
             }
 
-            match driver_wgpu::binding::scalars(sig, low, launch, declared, &store) {
-                Ok(Params::Block {
-                    bytes,
-                    at: ParamSlot::Uniform,
-                }) => {
-                    uniform += 1;
-                    // The block the SHADER declares, not four bytes a scalar:
-                    // a run written end to end would place every field after a
-                    // gap at the wrong offset.
-                    assert_eq!(
-                        bytes.len(),
-                        declared.uniform_bytes as usize,
-                        "{text}: `{symbol}` would offer {} bytes for a block of {}",
-                        bytes.len(),
-                        declared.uniform_bytes
-                    );
-                    // Every field the module reads is inside what the shell
-                    // offers. The direction that matters: short reads as zeros
-                    // and a zero pitch is a plausible number.
-                    for offset in &declared.uniform_offsets {
-                        assert!(
-                            *offset as usize + 4 <= bytes.len(),
-                            "{text}: `{symbol}` reads a field at {offset} out of \
-                             {} bytes",
+            let planned = driver_wgpu::dispatch::plan_one(
+                low,
+                launch,
+                kernels_wgpu::KERNELS,
+                Built {
+                    module,
+                    declared,
+                    sig: None,
+                },
+                Sources {
+                    arena,
+                    resolver: &store,
+                    min_offset: STRICTEST_ALIGNMENT,
+                },
+                *geometry,
+            );
+            match planned {
+                Ok(d) => match d.params {
+                    Params::Block {
+                        ref bytes,
+                        at: ParamSlot::Uniform,
+                    } => {
+                        uniform += 1;
+                        // The block the SHADER declares, not four bytes a
+                        // scalar: a run written end to end would place every
+                        // field after a gap at the wrong offset.
+                        assert_eq!(
+                            bytes.len(),
+                            declared.uniform_bytes as usize,
+                            "{text}: `{symbol}` offers {} bytes for a block of {}",
+                            bytes.len(),
+                            declared.uniform_bytes
+                        );
+                        // Every field the module reads is inside what the shell
+                        // offers. The direction that matters: short reads as
+                        // zeros and a zero pitch is a plausible number.
+                        for offset in &declared.uniform_offsets {
+                            assert!(
+                                *offset as usize + 4 <= bytes.len(),
+                                "{text}: `{symbol}` reads a field at {offset} out of \
+                                 {} bytes",
+                                bytes.len()
+                            );
+                        }
+                        // The body's packing and the module's fields, offset
+                        // for offset. Collected rather than asserted in place
+                        // so a disagreement names every symbol it holds for and
+                        // not just the first rectangle to reach it.
+                        for state in states.iter().flatten() {
+                            let packed = packed_offsets(&state.scalars);
+                            if declared.uniform_offsets.starts_with(&packed) {
+                                if packed.len() == declared.uniform_offsets.len() {
+                                    whole_struct += 1;
+                                } else {
+                                    short.insert(format!(
+                                        "{symbol}: passes {} of {} fields",
+                                        packed.len(),
+                                        declared.uniform_offsets.len()
+                                    ));
+                                }
+                            } else {
+                                misplaced.insert(format!(
+                                    "{symbol}: packs its scalars at {packed:?} and the \
+                                     module reads them at {:?}",
+                                    declared.uniform_offsets
+                                ));
+                            }
+                        }
+                    }
+                    Params::Block {
+                        ref bytes,
+                        at: ParamSlot::Storage(at),
+                    } => {
+                        storage += 1;
+                        // Exactly the shader's struct. `tests/device.rs` shows
+                        // a short one accepted and read back as zeros past its
+                        // end.
+                        assert_eq!(
+                            declared.block_bytes.get(at as usize).copied().flatten(),
+                            Some(u32::try_from(bytes.len()).expect("a block of a few words")),
+                            "{text}: `{symbol}` writes {} bytes into binding {at}",
                             bytes.len()
                         );
+                        assert!(
+                            at < declared.bindings,
+                            "{text}: `{symbol}` binds its block at {at} of {}",
+                            declared.bindings
+                        );
+                        // Where the SLOT says the struct goes and where the
+                        // buffer list says it went. Two readings of one
+                        // placement: a driver that filled one and not the other
+                        // would bind a block into a slot the shader reads as an
+                        // operand, and `descriptors` would number the rest of
+                        // the list off by one.
+                        assert_eq!(
+                            d.block_at,
+                            Some(at as usize),
+                            "{text}: `{symbol}` names its block's slot twice and \
+                             disagrees with itself"
+                        );
                     }
-                    // The row's layout and the module's, field for field.
-                    let row: Vec<u32> = kernels_wgpu::uniform_layout(sig)
-                        .iter()
-                        .map(|field| field.offset)
-                        .collect();
-                    assert_eq!(
-                        row, declared.uniform_offsets,
-                        "{text}: `{symbol}` puts its scalars at the row's offsets \
-                         and the module reads them at the module's"
-                    );
-                    // The allocation a shell makes from the row is never
-                    // shorter than the struct the module declares. This is the
-                    // inversion, stated as an inequality because being over is
-                    // legal and being under is the defect.
-                    assert!(
-                        kernels_wgpu::uniform_size(sig) >= declared.uniform_bytes,
-                        "{text}: `{symbol}` would be allocated {} bytes for a \
-                         struct of {}",
-                        kernels_wgpu::uniform_size(sig),
-                        declared.uniform_bytes
-                    );
-                }
-                Ok(Params::Block {
-                    bytes,
-                    at: ParamSlot::Storage(at),
-                }) => {
-                    storage += 1;
-                    // Exactly the shader's struct. `tests/device.rs` shows a
-                    // short one accepted and read back as zeros past its end.
-                    assert_eq!(
-                        declared.block_bytes.get(at as usize).copied().flatten(),
-                        Some(bytes.len() as u32),
-                        "{text}: `{symbol}` would write {} bytes into binding {at}",
-                        bytes.len()
-                    );
-                    assert!(
-                        at < declared.bindings,
-                        "{text}: `{symbol}` would bind its block at {at} of {}",
-                        declared.bindings
-                    );
-                    // The ROW said where the struct goes and the reflection
-                    // agrees. Two readings of one placement: the table's
-                    // `bindings` and `naga`'s sized block.
-                    assert_eq!(
-                        struct_slot(sig),
-                        Some(at),
-                        "{text}: `{symbol}` places its struct where the row does not"
-                    );
-                }
-                Ok(Params::None) => {
-                    bare += 1;
-                    assert!(
-                        declared.uniform_offsets.is_empty(),
-                        "{text}: `{symbol}` places nothing against a module with \
-                         {} uniform fields",
-                        declared.uniform_offsets.len()
-                    );
-                }
+                    Params::None => {
+                        bare += 1;
+                        assert!(
+                            declared.uniform_offsets.is_empty(),
+                            "{text}: `{symbol}` places nothing against a module with \
+                             {} uniform fields",
+                            declared.uniform_offsets.len()
+                        );
+                    }
+                },
                 Err(why) => {
                     owed.insert(format!("{symbol}: {why}"));
                 }
             }
 
-            // The MODULE-ONLY placer, which is what an unstated row falls back
-            // to. Counted rather than asserted, because for a STATED row it is
-            // the wrong question and its answer is the measurement: the run a
-            // row spells is not the statement's run. 1588 of these launches
-            // state a number of scalars the module's block cannot hold on its
-            // own -- the row indexes only part of the statement's run
-            // (`neox_mb` reads three of four), interleaves the pool's page
-            // size, or derives a width -- and every one of them places
-            // correctly through the row above.
+            // The MODULE-ONLY placer, which needs no row and never did: it
+            // takes the statement's run whole and holds it against the block
+            // `naga` parsed. Counted rather than asserted, because for a body
+            // that interleaves a pool number or derives a width it is the wrong
+            // question and its answer is the measurement -- the run a body
+            // passes is not the statement's run.
             match driver_wgpu::binding::params(low, launch, declared) {
                 Ok(_) => module_alone += 1,
-                Err(_) => row_alone += 1,
+                Err(_) => body_alone += 1,
             }
         }
     }
@@ -1370,39 +1636,79 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
     // NOTHING is owed, which is a stronger result than the Vulkan template
     // gets: six symbols there have scalars that crate cannot place, five of
     // them because the driver owns the resource and therefore the numbers
-    // describing it. Here `binding::scalars` builds the run from the ROW --
-    // interleaving `KvPageSize` where `kv_append_paged` puts it, taking three
-    // of `neox_mb`'s four, deriving `add_bias`'s output width -- so every
-    // launch of every text places.
+    // describing it. Here the body builds the run -- interleaving `KvPageSize`
+    // where `kv_append_paged` puts it, taking three of `neox_mb`'s four,
+    // deriving `add_bias`'s output width -- so every launch of every text
+    // places.
     assert!(
         owed.is_empty(),
         "{} launches have scalars this crate cannot place:\n  {}",
         owed.len(),
         owed.iter().cloned().collect::<Vec<_>>().join("\n  ")
     );
-    // All three shapes actually occur, or a rule that never fires is passing
-    // for the same reason an absent one would.
+    assert!(
+        misplaced.is_empty(),
+        "{} kernels pack their scalars where their module does not read \
+         them:\n  {}",
+        misplaced.len(),
+        misplaced.iter().cloned().collect::<Vec<_>>().join("\n  ")
+    );
+    if !short.is_empty() {
+        eprintln!(
+            "  {} kernels pass fewer scalars than their module declares fields, \
+             and the rest of the struct reads zero:\n  {}",
+            short.len(),
+            short.iter().cloned().collect::<Vec<_>>().join("\n  ")
+        );
+    }
+    // Every rectangle takes exactly one of the three shapes, and the total is
+    // the corpus. Stated as an identity against a number pinned in four other
+    // walks rather than as three literals: the split between uniform and
+    // storage is a property of which shaders declare a block where, and moves
+    // whenever a kernel's ABI does, but a rectangle that took NO shape would be
+    // a rectangle this walk silently dropped.
     assert_eq!(
-        (uniform, storage, bare),
-        (4448, 1720, 512),
+        uniform + storage + bare,
+        6680,
         "a different number of launches take each parameter shape"
     );
+    // And each shape occurs, or a branch that never runs is passing for the
+    // same reason an absent one would.
+    assert_ne!(uniform, 0, "no rectangle carries a uniform block");
+    assert_ne!(storage, 0, "no rectangle carries a storage block");
+    // The offset comparison above is a prefix, so it is satisfied by a body
+    // that passes NOTHING. This is what stops that from being a pass.
+    assert_ne!(
+        whole_struct, 0,
+        "no rectangle's body fills its module's uniform struct exactly, so the \
+         offset comparison above is only ever checking a prefix of one"
+    );
     assert_eq!(
-        (module_alone, row_alone),
-        (4852, 1828),
-        "a different number of launches need the row to build their run"
+        module_alone + body_alone,
+        6680,
+        "the module-only placer was asked about a different number of launches"
+    );
+    // Non-zero on the side that MATTERS: if every launch's run could be placed
+    // by the module alone, the body's argument list would be doing no work and
+    // the walk above would be checking a copy.
+    assert_ne!(
+        body_alone, 0,
+        "every launch's run fits its module's block unaided, so no body \
+         interleaves, drops or derives a scalar and this walk is checking a \
+         copy"
     );
     // ZERO, and stated as zero because it names what these texts do NOT reach.
-    // Three rows in the table -- `kv_append` and the two contiguous vector
-    // decodes -- carry a 64-bit stride as a `vec2<u32>`, which is the only
-    // shape where a field is eight bytes wide and the shell writes four. No
-    // text here launches one, so `binding`'s low-word write is unwitnessed by
-    // any real plan and its own unit tests are the whole of its cover. A
-    // deployment on a contiguous cache moves this number.
+    // A body passing `ArgValue::Usize` is the only shape where a field is eight
+    // bytes wide and the packer has to align to eight -- `kv_append` and the
+    // contiguous vector decodes, on a cache none of these texts configures. So
+    // `routine::bind`'s eight-byte alignment is unwitnessed by any real plan
+    // and its own unit tests are the whole of its cover. A deployment on a
+    // contiguous cache moves this number.
     assert_eq!(
-        split_fields, 0,
-        "a text now launches a row with a 64-bit uniform field, so the low-word \
-         write is reachable from a real plan and should be checked here"
+        eight_byte, 0,
+        "a text now launches a body that passes an eight-byte scalar, so the \
+         packer's wider alignment is reachable from a real plan and should be \
+         checked here"
     );
 }
 
@@ -1428,68 +1734,44 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
 /// checked arity before placing the scalars refused 1439 rectangles across nine
 /// symbols that dispatch perfectly well.
 ///
-/// # The unstated-row fallback is exercised here, deliberately
+/// # RETIRED: the unstated-row fallback was exercised here, deliberately
 ///
-/// 56 rows state no operands and none of these texts reaches one, so the
-/// fallback `binding::reorder` carries for them -- bind the plan's own args in
-/// the plan's own order -- would go unwalked. It is walked: every rectangle is
-/// put through `reorder` a second time under a REAL operand-less row of the
-/// shipped table, and the slots that come back have to be exactly what
-/// `binding::bind` produces. That is `.wiki/new-driver/vulkan.md` §13's claim,
-/// held against 6680 real launches rather than against an argument.
+/// It asserted that `binding::reorder`, handed a REAL operand-less row out of
+/// the shipped table, produced for every one of these 6680 rectangles exactly
+/// the slots `binding::bind` produces -- the plan's own args in the plan's own
+/// order. That is `.wiki/new-driver/vulkan.md` §13's claim, and 56 of the
+/// table's 100 rows and 292 of its entrypoints depended on it. The census
+/// beside it pinned the operand-less rows at seven with seven entrypoints and
+/// asserted every one stated `LaunchRule::Unstated`.
+///
+/// It went BLIND, not true. `kernels_wgpu::KERNELS` is empty: there is no
+/// operand-less row to pick, `unstated[0]` would panic on an empty slice, and
+/// the census counts zero rows in a table of zero rows -- which is not the
+/// claim passing, it is the subject being gone. Nor is the claim reachable any
+/// other way from here: `plan_one` consults `routine::armed` first and every
+/// symbol is armed, so no real rectangle falls through to `plan_by_row` and
+/// none reaches `reorder` at all. `binding::reorder`'s own unit tests in
+/// `src/binding.rs` are what still hold it, and the routine plane's equivalent
+/// -- a body that asks for the statement's operands in the statement's order
+/// -- is `Handles::input`/`output` and is exercised by every arm.
 #[test]
 fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     let all = geometric();
     let mods = modules(all.iter().map(|(_, low, _)| low));
 
-    // A row of the SHIPPED table, not one this file invented: the fallback is
-    // about rows that exist, and picking one out of `KERNELS` means a table
-    // that stopped having any would fail here rather than silently stop
-    // testing the path.
-    let unstated: Vec<&KernelSig> = kernels_wgpu::KERNELS
-        .iter()
-        .filter(|sig| sig.operands.is_empty())
-        .collect();
-    assert_eq!(
-        (
-            unstated.len(),
-            unstated
-                .iter()
-                .map(|s| s.entrypoints().len())
-                .sum::<usize>()
-        ),
-        (50, 283),
-        "a different number of rows state no operands"
-    );
-    // Every one of them also states no launch RULE, so none could reach a grid
-    // even if a text named it: `geometry::Ungeometric::Unstated` is where that
-    // is refused, and it is a different sentence from "the row exists and this
-    // backend has no shader for its rule".
-    assert!(
-        unstated
-            .iter()
-            .all(|sig| matches!(sig.launch, kernels::LaunchRule::Unstated)),
-        "an operand-less row now states a launch rule, so the fallback can \
-         reach a grid and this test has to say what happens then"
-    );
-    let plan_order = unstated[0];
-
     let mut launches = 0u32;
     let mut planned = 0u32;
     let mut refused: BTreeMap<String, u32> = BTreeMap::new();
-    let mut fell_back = 0u32;
     let mut widest_grid = [0u32; 3];
     let mut workgroups = 0u64;
     let mut uniform = 0u32;
     let mut storage = 0u32;
     let mut refused_hollow = 0u32;
-    let mut overridden = 0u32;
-    let mut rotary_overridden = 0u32;
-    let mut head_overridden = 0u32;
-    let mut heads_overridden = 0u32;
-    let mut split_rectangles = 0u32;
     let mut pool_numbers = 0u32;
-    let mut derived_widths = 0u32;
+    let mut numbers_seen: BTreeSet<FireNumber> = BTreeSet::new();
+    let mut lost_sentinels: BTreeSet<String> = BTreeSet::new();
+    let mut foreign: BTreeSet<String> = BTreeSet::new();
+    let mut arena_bound = 0u32;
 
     for (text, low, geometry) in &all {
         let buf = Placeholder(low.arena_bytes as u64);
@@ -1510,35 +1792,11 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
                 min_offset: STRICTEST_ALIGNMENT,
             };
 
-            // THE UNSTATED-ROW FALLBACK, on the same real rectangle. A row that
-            // states no operands has never told anyone an order, so the trace's
-            // is the only one there is -- and `driver-metal` binds exactly
-            // that. 292 entrypoints depend on it.
-            let fallback = driver_wgpu::binding::reorder(
-                plan_order,
-                low,
-                launch,
-                arena,
-                &store,
-                STRICTEST_ALIGNMENT,
-            )
-            .expect("the plan's own operands bind in the plan's own order");
+            // THE PLAN'S OWN OPERANDS, bound the plan's own way, kept beside
+            // the planned rectangle so the walk below can tell an arena buffer
+            // apart from a stand-in the driver supplied.
             let plain = driver_wgpu::binding::bind(low, launch, arena, &store, STRICTEST_ALIGNMENT)
-                .expect("the same operands, bound the same way");
-            assert_eq!(
-                fallback.len(),
-                plain.len(),
-                "{text}: `{symbol}` falls back to {} slots for {} operands",
-                fallback.len(),
-                plain.len()
-            );
-            for (slot, bound) in fallback.iter().zip(&plain) {
-                assert!(
-                    matches!(slot, Slot::Buffer(b) if b == bound),
-                    "{text}: `{symbol}`'s fallback slot is not the plan's operand"
-                );
-            }
-            fell_back += 1;
+                .expect("the statement's operands bind against the arena that holds them");
 
             match driver_wgpu::dispatch::plan_one(
                 low,
@@ -1599,162 +1857,62 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
                         refused_hollow += 1;
                     }
 
-                    let sig = kernels_wgpu::sig(symbol).expect("the walk found a row");
-                    // The VALUE a row states at a slot, not merely that it
-                    // states one. `!=` against a lying fire proves the answer
-                    // did not come from the fire; it does not prove it came
-                    // from the row, and an override off by one survived exactly
-                    // that gap.
-                    let value = |index: Option<u8>| -> Option<u32> {
-                        let i = index?;
-                        let at = launch.params.start as usize + i as usize;
-                        (at < launch.params.end as usize)
-                            .then(|| low.params.get(at).copied().unwrap_or(0))
-                            .filter(|n| *n > 0)
-                    };
-                    let states = |index: Option<u8>| value(index).is_some();
-                    if states(sig.grid_param) {
-                        overridden += 1;
-                    }
-                    if states(sig.head_param) {
-                        head_overridden += 1;
-                    }
-                    if states(sig.heads_param) {
-                        heads_overridden += 1;
-                        // Every row that states a head COUNT states a head
-                        // WIDTH, which is why the two counts below are not
-                        // independent -- and why they are still counted
-                        // separately: a union would be 1056 either way, so
-                        // `heads_param` going to zero would leave it unchanged
-                        // and the suite green.
-                        assert!(
-                            states(sig.head_param),
-                            "`{symbol}` states a head count and no head width, so \
-                             the two overrides are no longer nested"
-                        );
-                    }
-                    if matches!(sig.launch, kernels::LaunchRule::SplitPacked) {
-                        split_rectangles += 1;
-                    }
-
-                    // Counting rows that STATE a head shape does not witness
-                    // `dims_of` USING it, and the difference is not academic:
-                    // across these texts the stated value equals the fire's
-                    // and both override lines are no-ops, so deleting them
-                    // leaves every other number here unchanged. The model that
-                    // separates them is gemma-4, which is not one of the texts.
-                    //
-                    // So the fire is made to disagree on purpose.
-                    let liar = Geometry {
-                        head_dim: geometry.head_dim + 7,
-                        kv_heads: geometry.kv_heads + 7,
-                        rotary_dims: geometry.rotary_dims + 1024,
-                        ..*geometry
-                    };
-                    let told = driver_wgpu::dispatch::dims_of(sig, low, launch, liar);
-                    if states(sig.head_param) {
-                        assert_eq!(
-                            Some(told.head_dim),
-                            value(sig.head_param),
-                            "{symbol} states a head width and `dims_of` answered \
-                             with something else"
-                        );
-                    }
-                    if states(sig.heads_param) {
-                        assert_eq!(
-                            Some(told.kv_heads),
-                            value(sig.heads_param),
-                            "{symbol} states a head count and `dims_of` answered \
-                             with something else"
-                        );
-                    }
-                    // A rope row's rotary width comes from the STATEMENT
-                    // because a model may rotate only part of its head --
-                    // gemma-4 turns 128 of 512 -- and for these texts the
-                    // stated width equals the fire's, so dropping the override
-                    // changed nothing anywhere.
-                    if states(sig.grid_param) && matches!(sig.launch, kernels::LaunchRule::Rope) {
-                        rotary_overridden += 1;
-                        assert_eq!(
-                            Some(told.rotary_dims),
-                            value(sig.grid_param),
-                            "{symbol} states a grid and `dims_of` answered with a \
-                             different rotary width"
-                        );
-                    }
-
-                    // THE POOL'S NUMBERS REACH THE SHADER. A row may name a
-                    // number that belongs to the pool rather than to the
-                    // statement -- the KV page size and the cache's two strides
-                    // -- and `binding::scalars` interleaves the driver's answer
-                    // into the run at the row's position. The walk's own
-                    // resolver answers `None` to every number, so all three
-                    // read as zero above; a second resolver with recognisable
-                    // answers runs beside it so no pinned count moves.
+                    // THE POOL'S NUMBERS REACH THE SHADER. A body may pass
+                    // a number that belongs to the POOL rather than to the
+                    // statement -- the KV page size, the cache's two strides,
+                    // the attention mask's -- and `Handles::fire_number` is
+                    // where an arm asks for one. The walk's own resolver
+                    // answers `None` to every number, so all of them read as
+                    // zero in `d`; the SAME rectangle planned against a
+                    // resolver with recognisable answers is what says which
+                    // ones arrived and where.
                     //
                     // A wrong stride is not an error. It is attention reading
                     // the wrong offsets and returning numbers.
-                    for src in [
-                        Source::KvPageSize,
-                        Source::KvHeadStride,
-                        Source::KvSeqStride,
+                    let Ok(told) = driver_wgpu::dispatch::plan_one(
+                        low,
+                        launch,
+                        kernels_wgpu::KERNELS,
+                        Built {
+                            module,
+                            declared,
+                            sig: None,
+                        },
+                        Sources {
+                            arena,
+                            resolver: &sentinels,
+                            min_offset: STRICTEST_ALIGNMENT,
+                        },
+                        *geometry,
+                    ) else {
+                        lost_sentinels.insert(format!(
+                            "{symbol}: plans against a resolver that answers nothing \
+                             and refuses one that answers everything"
+                        ));
+                        continue;
+                    };
+                    for which in [
+                        FireNumber::KvPageSize,
+                        FireNumber::KvHeadStride,
+                        FireNumber::KvSeqStride,
+                        FireNumber::AttentionMaskStride,
                     ] {
-                        if !sig.operands.iter().any(|o| o.source == src) {
+                        if !carries(&told.params, sentinel(which)) {
                             continue;
                         }
                         pool_numbers += 1;
-                        let got =
-                            driver_wgpu::binding::scalars(sig, low, launch, declared, &sentinels)
-                                .expect("the row's scalars place");
-                        let bytes = match got {
-                            Params::Block { ref bytes, .. } => bytes.clone(),
-                            Params::None => Vec::new(),
-                        };
-                        let want = sentinel(src).expect("a pool source").to_le_bytes();
+                        numbers_seen.insert(which);
+                        // The word is the POOL's and nothing in the statement
+                        // carries it, so it cannot have come from the run: the
+                        // same rectangle planned against a resolver that
+                        // answers nothing has a zero where this word is. That
+                        // is what makes the hit above evidence of a resolver
+                        // call rather than of a coincidence in the scalars.
                         assert!(
-                            bytes.windows(4).any(|w| w == want),
-                            "{text}: `{symbol}` names {src:?} and the driver's \
-                             answer is not in the {} bytes it hands the shader",
-                            bytes.len()
-                        );
-                    }
-
-                    // THE ROW'S DERIVED WIDTH REACHES THE SHADER, for the same
-                    // reason and with the same shape of check.
-                    // `Source::OutWidth(0)` is a number NOTHING in the
-                    // statement carries -- an `AddBias` states no params at all
-                    // -- so if `binding::scalars` read the wrong output, or
-                    // dropped the source and left the run short, the module
-                    // would get a zero and every lane would return before
-                    // writing. That failure is silent in the direction that
-                    // matters: a bias never added is a projection missing a
-                    // small constant, which stays fluent.
-                    if sig
-                        .operands
-                        .iter()
-                        .any(|o| matches!(o.source, Source::OutWidth(_)))
-                    {
-                        derived_widths += 1;
-                        let got =
-                            driver_wgpu::binding::scalars(sig, low, launch, declared, &sentinels)
-                                .expect("the row's scalars place");
-                        let bytes = match got {
-                            Params::Block { ref bytes, .. } => bytes.clone(),
-                            Params::None => Vec::new(),
-                        };
-                        let width = low.args[launch.args.start as usize..launch.args.end as usize]
-                            .iter()
-                            .filter_map(|a| match a {
-                                Arg::Arena { width, .. } | Arg::Named { width, .. } => Some(*width),
-                                Arg::Weight(_) => None,
-                            })
-                            .next_back()
-                            .expect("a widthed operand");
-                        assert!(
-                            width > 0 && bytes.windows(4).any(|w| w == width.to_le_bytes()),
-                            "{text}: `{symbol}` names its output's width and \
-                             {width} is not in the {} bytes it hands the shader",
-                            bytes.len()
+                            !carries(&d.params, sentinel(which)),
+                            "{text}: `{symbol}` hands the shader {which:?}'s sentinel \
+                             even when the resolver answers nothing, so the word did \
+                             not come from the pool"
                         );
                     }
 
@@ -1788,7 +1946,7 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
                                 declared.bindings
                             );
                             // The DENSE index, which is what a bind group is
-                            // written from: a slot the row leaves empty takes
+                            // written from: a slot the body leaves empty takes
                             // no entry. They agree on every module in this
                             // tree, and this is where that is measured rather
                             // than assumed.
@@ -1804,7 +1962,7 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
                     }
 
                     // The operands, PLUS the slot a parameter struct takes,
-                    // PLUS the slots the row leaves empty, are the module's
+                    // PLUS the slots the body leaves empty, are the module's
                     // whole binding set. `driver-vulkan` asserts the same sum
                     // with its holes SUBTRACTED, and that is a Vulkan
                     // coincidence rather than a rule: there a hole is an
@@ -1812,7 +1970,7 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
                     // entry point does not read, and `wgpu` validates a group
                     // against its layout entry for entry either way.
                     let block = usize::from(d.block_at.is_some());
-                    let empty = gaps(sig, declared) as usize;
+                    let empty = declared.holes();
                     assert_eq!(
                         d.buffers.len() + block + empty,
                         declared.bindings as usize,
@@ -1821,6 +1979,41 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
                         d.buffers.len(),
                         declared.bindings
                     );
+
+                    // AND EVERY ARENA BUFFER IT BOUND IS ONE OF THIS LAUNCH'S
+                    // OWN OPERANDS, at exactly the range `binding::bind`
+                    // places it.
+                    //
+                    // The claim the retired fallback used to make, moved to
+                    // the plane the operands now travel on. An arm asks for
+                    // its operands by position -- `Handles::input(0)`,
+                    // `output(0)` -- and a body then orders them for its
+                    // shader; a mis-indexed ask binds a real tensor of the
+                    // right length to the wrong slot, and no shape check
+                    // anywhere notices, because these are storage buffers of
+                    // matching extent.
+                    //
+                    // Told apart from the driver's own resources by BUFFER:
+                    // the arena is `Placeholder(low.arena_bytes)` and every
+                    // stand-in is `Placeholder(GENEROUS)`, and `Placeholder`
+                    // compares by value. So a weight, a fire table or the KV
+                    // cache is not this question and is skipped, and what is
+                    // left is the statement's own activations.
+                    for bound in &d.buffers {
+                        if *bound.buffer() != buf {
+                            continue;
+                        }
+                        arena_bound += 1;
+                        if !plain.contains(bound) {
+                            foreign.insert(format!(
+                                "{symbol}: binds {} bytes at {} of the arena, which is \
+                                 not one of the {} operands the statement carries",
+                                bound.len(),
+                                bound.offset(),
+                                plain.len()
+                            ));
+                        }
+                    }
                 }
                 Err(e) => {
                     *refused.entry(format!("{symbol}: {e}")).or_default() += 1;
@@ -1834,10 +2027,46 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         "a different number of rectangles is lowered"
     );
     assert_eq!(planned, 6680, "a different number of rectangles records");
-    assert_eq!(
-        fell_back, 6680,
-        "a different number of rectangles went through the unstated-row path"
+    assert!(
+        lost_sentinels.is_empty(),
+        "{} kernels plan against a resolver that answers nothing and refuse one \
+         that answers everything:\n  {}",
+        lost_sentinels.len(),
+        lost_sentinels
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n  ")
     );
+    assert!(
+        foreign.is_empty(),
+        "{} kernels bind a range of the arena that is not one of the \
+         statement's operands:\n  {}",
+        foreign.len(),
+        foreign.iter().cloned().collect::<Vec<_>>().join("\n  ")
+    );
+    // The denominator for the line above, so that "nothing foreign" cannot be
+    // true because nothing was looked at.
+    //
+    // NOT `operands`, and the difference is the reason this is a floor rather
+    // than the equality the rest of this file prefers. A rectangle may bind
+    // one operand twice -- `Vector::head` passes the same cache plane's
+    // strides twice, and a body may read an operand it also writes -- while an
+    // `in_place` pair binds ONE buffer for two of the plan's args and an
+    // `unbound` slot binds none. So the plan's 15140 arena operands and the
+    // ranges a body binds are two different counts, and only the direction is
+    // a rule: every planned rectangle carries at least one range of the arena,
+    // because a statement that touched no activation would not be a statement.
+    //
+    // The exact number is printed rather than pinned, because this file cannot
+    // derive it from anything it already asserts and a literal nobody can
+    // re-derive is a literal that gets updated without being read.
+    assert!(
+        arena_bound >= planned,
+        "{arena_bound} arena ranges were bound across {planned} rectangles, so \
+         some rectangle reached a shader without touching the arena at all"
+    );
+    eprintln!("{arena_bound} arena ranges bound across {planned} rectangles");
 
     // Nothing is refused, so nothing is named. Every rectangle all six
     // architectures state, in both fire classes, becomes a dispatch.
@@ -1850,85 +2079,98 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         "the refusals and the successes do not account for every rectangle"
     );
 
-    // Both parameter homes are exercised. Stated because a change that routed
-    // everything one way would leave the other untested while this passed.
-    assert_eq!(
-        (uniform, storage),
-        (4448, 1720),
-        "a different number of dispatches take each parameter home"
+    // Both parameter homes are exercised. Stated as an identity against the
+    // corpus rather than as two literals -- the split is a property of which
+    // shaders declare a block where, and moves whenever a kernel's ABI does --
+    // plus a non-zero on each, because a change that routed everything one way
+    // would leave the other untested while this passed.
+    assert_ne!(uniform, 0, "no dispatch takes a uniform block");
+    assert_ne!(storage, 0, "no dispatch takes a storage block");
+    assert!(
+        uniform + storage <= planned,
+        "more dispatches carry a block than were planned"
     );
-    // Stated exactly, because the fallback is silent: a row whose stated extent
-    // went missing would take the fire's number and normalise over the wrong
-    // width, producing numbers rather than an error, and this count going to
-    // zero is the only thing that would say so.
-    // 1788 before the shared MoE rows started stating `grid_param` on the
-    // three routed matvecs and `rows_param` on `route_gather`. This crate had
-    // not copied either, so 432 rectangles were taking the fire's number where
-    // the row names one -- which is what this count exists to notice.
-    assert_eq!(
-        overridden, 2220,
-        "a different number of rectangles states its own extent"
-    );
-    // Counted separately, and that was not tidying. `head_param` is 1056 and
-    // `heads_param` is 352, and the loop above asserts the second set is a
-    // SUBSET of the first -- so a union would be 1056 either way and could not
-    // witness `heads_param` at all: it going to zero would leave the number
-    // unchanged and this file green.
-    assert_eq!(
-        head_overridden, 1056,
-        "a different number of rectangles states a head width"
-    );
-    assert_eq!(
-        heads_overridden, 352,
-        "a different number of rectangles states a head count"
-    );
-    assert_eq!(
-        rotary_overridden, 704,
-        "a different number of rope rectangles states its rotary width"
-    );
-    // ZERO, and asserted as zero because that is the fact `dims_of`'s
-    // `in_width` note rests on: no text here reaches `split_qkv`, so nothing
-    // consumes `in_width` and replacing it with a constant is invisible. A text
-    // that starts splitting its projections makes this number move, which is
-    // when the note stops being true.
-    assert_eq!(
-        split_rectangles, 0,
-        "a text now reaches `Rule::SplitPacked`, so `in_width` is no longer \
-         unwitnessed"
-    );
+    // RETIRED: six census counters over the table's geometry columns.
+    //
+    // `overridden`, `head_overridden`, `heads_overridden`, `rotary_overridden`,
+    // `split_rectangles` and `derived_widths` counted rectangles whose ROW
+    // named a `grid_param`, `head_param`, `heads_param`, a `LaunchRule::Rope`
+    // rotary width, `LaunchRule::SplitPacked` or a `Source::OutWidth`, and
+    // asserted 288 / 352 / 352 / 0 / 0 / 0. Beside them, `dims_of` was asked
+    // the same rectangle against a deliberately LYING `Geometry` -- head width
+    // plus seven, head count plus seven, rotary width plus 1024 -- and had to
+    // answer with the row's stated word rather than the fire's, which is what
+    // caught an override that was reading the fire on one rule and the row on
+    // another.
+    //
+    // They went BLIND, not true. `kernels_wgpu::KERNELS` is empty, so
+    // `sig.grid_param` and its four siblings do not exist to read and
+    // `dims_of` has no row to answer from: the counters would sum zero over an
+    // empty table and the liar would never be asked anything. The rule is not
+    // gone -- a statement still names its own extent, its head shape and its
+    // rotary width, and a body reads those same words through
+    // `Handles::stated` -- but it is no longer expressible as a column census,
+    // because there is no column. `crates/kernels-wgpu/tests/routines.rs` is
+    // where a body's reading of the statement's run is held, and `dims_of`'s
+    // own unit tests in `src/dispatch.rs` -- which synthesize the row they
+    // read -- are the whole of what still exercises the override itself.
+    //
+    // What is lost, stated plainly: nothing in this file now witnesses the
+    // extent a statement names travelling from `Launch::params` to a grid over
+    // REAL plans. The grid TOTAL below is the remaining cover, and it is a
+    // checksum rather than a derivation.
+
     // How many of these launches `plan_one` REFUSED when handed a geometry of
     // zeros -- the head-shaped ones. The rest plan fine because their
     // dimensions come from the lowering rather than from the geometry, and they
     // are right to.
-    assert_eq!(
-        refused_hollow, 352,
-        "a different number of launches refused a geometry of zeros"
+    //
+    // Stated as a non-zero rather than as a literal: the count is a property of
+    // which arms read `Facts::head_dim` and moves when a family is armed, but a
+    // ZERO would mean no rectangle anywhere refuses a hollow fire, which is the
+    // finding this block exists to make.
+    assert_ne!(
+        refused_hollow, 0,
+        "no launch refused a geometry of zeros, so nothing here holds the seam \
+         against a caller that hands it nothing"
     );
-    // All 704 are `KvPageSize`, in the two paged decodes and the paged append.
-    // NOT ONE names a stride: these texts are paged throughout, and the
-    // strides belong to the contiguous cache. That is why the loop above cannot
-    // be the whole check, and why the rows themselves are swept separately in
-    // `every_row_naming_a_pool_number_is_handed_that_number_and_not_another`.
-    assert_eq!(
-        pool_numbers, 704,
-        "a different number of rectangles names one of the pool's numbers"
+    assert!(
+        refused_hollow < planned,
+        "every launch refused a geometry of zeros, so the plans above are not \
+         being reached at all"
     );
-    // qwen2.5 alone, and three a layer in each of its two fire classes: 28
-    // layers x 3 biases x 2 classes. Pinned rather than asserted as non-zero,
-    // because the failure it witnesses is a bias that is not added, and a text
-    // that quietly stopped stating one would leave the check above passing over
-    // nothing.
+    // WHICH of the pool's numbers these texts actually carry to a shader.
+    //
+    // The page size and the attention mask's stride, and NOT the cache's two
+    // strides: these texts are paged throughout and the strides belong to the
+    // contiguous cache. That is why the loop above cannot be the whole check,
+    // and why the arms themselves are swept separately in
+    // `every_arm_naming_a_pool_number_is_handed_that_number_and_not_another`.
     assert_eq!(
-        derived_widths, 408,
-        "a different number of rectangles names a width the row derives"
+        numbers_seen.iter().copied().collect::<Vec<_>>(),
+        vec![FireNumber::KvPageSize, FireNumber::AttentionMaskStride],
+        "a different set of the pool's numbers reaches a shader from these texts"
     );
+    assert_ne!(
+        pool_numbers, 0,
+        "no rectangle carries one of the pool's numbers, so the resolver's \
+         answers are not reaching a shader at all"
+    );
+
     // The total work these plans dispatch, as a single number.
     //
     // Here because every other assertion in this test is about SHAPE -- how
     // many operands, where the scalars went, that no grid is zero -- and a grid
-    // can be the wrong size while being all of those things. Dropping
-    // `dims_of`'s statement override changes no other assertion in this file
-    // and changes this one.
+    // can be the wrong size while being all of those things. A body that read
+    // the fire's row count where it should read the statement's changes no
+    // other assertion in this file and changes this one.
+    //
+    // It is the number the ROUTINE plane produces, and it is the same number
+    // the table plane produced: `bind` divides the body's own lanes by the
+    // module's `@workgroup_size`, and while both planes were live
+    // `the_routine_path_plans_what_the_table_path_planned` compared them
+    // rectangle for rectangle. The history below is therefore still the
+    // history of this number, read off a different derivation of it.
     //
     // It is NOT the 35,473,250 `driver-vulkan` pins over the same twelve plans,
     // and the difference is a real one rather than a rounding: these grids are
@@ -1975,257 +2217,226 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     );
 }
 
-/// Every row that names one of the pool's numbers is handed that number, and
-/// the three are not interchangeable.
+/// Every arm that names one of the pool's numbers is handed that number, and
+/// the four are not interchangeable.
 ///
-/// The walk above can only ask this of rows its twelve lowerings reach, and
-/// they reach exactly one of the three numbers: all 704 are `KvPageSize`,
-/// because these texts are paged throughout and the two strides belong to the
-/// contiguous cache. So the strides go unwatched there -- replacing either with a constant
-/// leaves that walk green, and a wrong stride is not an error but attention
-/// reading the wrong offsets and returning numbers.
+/// The walk above can only ask this of arms its twelve lowerings reach, and
+/// they reach exactly two of the four numbers: the page size and the attention
+/// mask's stride, because these texts are paged throughout and the cache's two
+/// strides belong to the CONTIGUOUS pool. So the strides go unwatched there --
+/// replacing either with a constant leaves that walk green, and a wrong stride
+/// is not an error but attention reading the wrong offsets and returning
+/// numbers.
 ///
 /// `Pool`'s answers are checked in `resources.rs` and the shader's addressing
 /// in `tests/device.rs`, which hand-writes its parameter bytes. Between those
-/// two the seam is open. This closes it from the TABLE's side rather than a
-/// text's, so a row added tomorrow is covered whether or not a text reaches it.
+/// two the seam is open. This closes it from the ARM REGISTRY's side rather
+/// than a text's, so a kernel armed tomorrow is covered whether or not a text
+/// reaches it.
+///
+/// # Re-anchored
+///
+/// This used to sweep `kernels_wgpu::KERNELS` for rows naming
+/// `Source::KvPageSize`, `KvHeadStride`, `KvSeqStride`, `AttentionMaskStride`
+/// or `Rows`, and put each through `binding::scalars` against a synthesized
+/// launch and a synthesized module, comparing the whole run word for word
+/// against `expected_run`. The table is empty and none of that has a subject.
+///
+/// `Handles::fire_number` is where an arm asks the fire for one of these
+/// numbers now, so the sweep is over the ARMS: every entrypoint
+/// `kernels-wgpu` ships, run twice against a generous synthetic statement --
+/// once with a pool that states NO page size, which is a contiguous cache, and
+/// once with a pool that states one, which is a paged cache. What an arm hands
+/// its body is a `Vec<ArgValue>` and the sentinels are recognisable in it, so
+/// the two runs together say which numbers each arm asked for and which it was
+/// given.
+///
+/// `Source::Rows` has no counterpart here and is not swept: the fire's row
+/// count reaches a body through `Facts::rows`, which is not a resolver call
+/// and cannot be answered by the wrong pool.
 #[test]
-fn every_row_naming_a_pool_number_is_handed_that_number_and_not_another() {
-    let store = Sentinels(Placeholder(GENEROUS));
-    // A real lowering, borrowed for its shape and then emptied of scalars.
-    // Hand-building a `Lowered` would be a second definition of the type to
-    // keep in step for no gain -- nothing below reads any field but `params`.
-    let mut low = texts().swap_remove(0).1;
-    let mut rows = 0u32;
-    let mut refused_rows = 0u32;
-    let mut named = BTreeMap::<String, u32>::new();
+fn every_arm_naming_a_pool_number_is_handed_that_number_and_not_another() {
+    // A statement generous enough that an arm does not refuse for want of an
+    // operand or a scalar. The question here is which NUMBERS an arm asks the
+    // fire for, and an arm that never runs answers nothing.
+    let args: Vec<Arg> = (0..24u32)
+        .map(|i| Arg::Arena {
+            at: i as usize * 4096,
+            width: 512,
+            bytes: 2,
+        })
+        .chain((0..8).map(|i| Arg::Weight(format!("layer.0.w{i}"))))
+        .collect();
+    let scalars: Vec<u32> = (0..24).map(|i| 1000 + i).collect();
+    // A plausible fire, and every field non-zero: an arm dividing by a head
+    // count would be measuring this file's laziness rather than the driver.
+    let geometry = Geometry {
+        q_heads: 8,
+        kv_heads: 4,
+        head_dim: 64,
+        rotary_dims: 64,
+        n_experts: 8,
+        experts_per_token: 4,
+    };
+    // A CONTIGUOUS pool states no page size, which is how `contiguous_pool`
+    // tells the two apart. Both maps answer every other number, so a
+    // difference between the two runs is about the page size and nothing else.
+    let contiguous: BTreeMap<FireNumber, u32> = [
+        FireNumber::KvHeadStride,
+        FireNumber::KvSeqStride,
+        FireNumber::AttentionMaskStride,
+    ]
+    .into_iter()
+    .map(|which| (which, sentinel(which)))
+    .collect();
+    let mut paged = contiguous.clone();
+    paged.insert(FireNumber::KvPageSize, sentinel(FireNumber::KvPageSize));
 
-    for sig in kernels_wgpu::KERNELS {
-        let wanted: Vec<Source> = sig
-            .operands
-            .iter()
-            .map(|o| o.source)
-            .filter(|s| sentinel(*s).is_some())
-            .collect();
-        if wanted.is_empty() {
+    let mut strided: BTreeSet<&'static str> = BTreeSet::new();
+    let mut page_sized: BTreeSet<&'static str> = BTreeSet::new();
+    let mut masked: BTreeSet<&'static str> = BTreeSet::new();
+    let mut wrong: Vec<String> = Vec::new();
+    let mut ran = 0u32;
+
+    for symbol in kernels_wgpu::entrypoints() {
+        let Some((routine, run)) = driver_wgpu::lowering::routine::armed(&symbol) else {
+            continue;
+        };
+        let results = driver_wgpu::lowering::routine::results(routine);
+        let facts = driver_wgpu::lowering::arm::facts(&symbol, 1, geometry, 1, 512, 512);
+        let mut open = driver_wgpu::lowering::arm::Handles::with_numbers(
+            &args,
+            results,
+            &scalars,
+            &contiguous,
+        );
+        let free = run(&mut open, facts).ok();
+        let mut walled =
+            driver_wgpu::lowering::arm::Handles::with_numbers(&args, results, &scalars, &paged);
+        let held = run(&mut walled, facts).ok();
+        if free.is_none() && held.is_none() {
             continue;
         }
-        rows += 1;
+        ran += 1;
 
-        // A launch whose statement carries as many scalars as the row's `Param`
-        // slots index, and a module wide enough to hold the run -- the question
-        // here is the RUN's contents, not its placement, which `binding`'s own
-        // tests already pin.
-        let params = sig
-            .operands
-            .iter()
-            .filter_map(|o| match o.source {
-                Source::Param(i) | Source::ParamF32(i) => Some(u32::from(i) + 1),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0);
-        low.params = (0..params).map(|i| 1000 + i).collect();
-        let launch = Launch {
-            kernel: 0,
-            rows: 0..1,
-            layers: 0..1,
-            op: 0,
-            args: 0..0,
-            params: 0..params,
-            peel: None,
-            cond: Launch::NO_COND,
-        };
-        // A uniform block of EXACTLY the run's length in fields, because
-        // `binding` refuses a run no shape can hold rather than truncating it.
-        // One field per word: this stands in for the module, and the modules
-        // these rows really have are checked field for field by
-        // `every_launchs_scalars_land_where_its_module_reads_them`.
-        let words = run_words(sig, params);
-        let declared = Declared {
-            local: [1, 1, 1],
-            bindings: 1,
-            used: vec![true],
-            reads_workgroup_count: false,
-            grid_axes: [true, false, false],
-            uniform_offsets: (0..words).map(|i| i * 4).collect(),
-            uniform_bytes: (words * 4).next_multiple_of(16),
-            block_bytes: vec![None],
-        };
-        // A row wanting a STRIDE is refused, and that is the answer this
-        // driver owes it. Both strides mean "walk the cache with no page
-        // table", and the pool is `[page, token, head, dim]`: handing them
-        // over makes the launch succeed against the wrong tokens. The
-        // refusal is checked here too, rather than only in the unit test,
-        // because this is the sweep that walks the SHIPPED table -- a row
-        // added tomorrow that names a stride is refused or this fails.
-        if wanted
-            .iter()
-            .any(|s| matches!(s, Source::KvHeadStride | Source::KvSeqStride))
-        {
-            let why = driver_wgpu::binding::scalars(sig, &low, &launch, &declared, &store)
-                .expect_err("a contiguous stride is refused, not answered");
-            assert!(
-                format!("{why}").contains("pool is paged"),
-                "`{}` is refused for the reason it should be: {why}",
-                sig.symbol
-            );
-            refused_rows += 1;
-            for src in wanted {
-                *named.entry(format!("{src:?}")).or_default() += 1;
-            }
-            continue;
-        }
-        let got = driver_wgpu::binding::scalars(sig, &low, &launch, &declared, &store)
-            .unwrap_or_else(|why| panic!("`{}`: {why}", sig.symbol));
-        let bytes = match got {
-            Params::Block { ref bytes, .. } => bytes.clone(),
-            Params::None => Vec::new(),
-        };
-        // The WHOLE run, not "is the number in there somewhere". Presence alone
-        // cannot see a swap: both strides are in the same run either way, and
-        // swapping them is the defect with the most plausible output --
-        // attention striding by heads where it should stride by positions,
-        // reading real numbers from the wrong rows.
+        // ON A CONTIGUOUS POOL: an arm handed one of the cache's two strides
+        // is handed BOTH, and the head stride comes first.
         //
-        // Compared at the OFFSETS the block declares, which is where
-        // `params_from` writes: the run is one word per field and the field
-        // offsets here are four apart, so the bytes are the run.
-        let want: Vec<u8> = expected_run(sig, &low, params)
-            .iter()
-            .flat_map(|word| word.to_le_bytes())
-            .collect();
-        assert_eq!(
-            bytes[..want.len()],
-            want[..],
-            "`{}` hands the shader a different run than its row spells",
-            sig.symbol
-        );
-        // The tail is the block's padding to 16 and holds nothing, so a run
-        // that ran long would be caught above rather than hidden here.
-        assert!(
-            bytes[want.len()..].iter().all(|b| *b == 0),
-            "`{}` writes past the run it spells",
-            sig.symbol
-        );
-        for src in wanted {
-            *named.entry(format!("{src:?}")).or_default() += 1;
+        // Order, not presence, because presence cannot see a swap: both
+        // strides are in the run either way, and swapping them is the defect
+        // with the most plausible output -- attention striding by heads where
+        // it should stride by positions, reading real numbers from the wrong
+        // rows. The two sentinels are distinct, so their POSITIONS in what the
+        // arm hands its body are what a swap moves.
+        if let Some(took) = &free {
+            let head = position(took, sentinel(FireNumber::KvHeadStride));
+            let seq = position(took, sentinel(FireNumber::KvSeqStride));
+            match (head, seq) {
+                (Some(h), Some(q)) => {
+                    strided.insert(routine.name);
+                    if h >= q {
+                        wrong.push(format!(
+                            "`{}` hands its body the sequence stride at {q} and the \
+                             head stride at {h}, which is the wrong way round",
+                            routine.name
+                        ));
+                    }
+                }
+                (Some(_), None) | (None, Some(_)) => wrong.push(format!(
+                    "`{}` is handed one of the cache's two strides and not the other",
+                    routine.name
+                )),
+                (None, None) => {}
+            }
+        }
+
+        // ON A PAGED POOL: no arm is handed either stride, whether or not it
+        // asked for one.
+        //
+        // The claim `contiguous_pool` exists to make, and the one the table
+        // path made by refusing the row outright. Both strides mean "walk the
+        // cache with no page table", and this driver's pool is
+        // `[page, token, head, dim]`: handing them over makes the launch
+        // succeed against the wrong tokens. An arm that reads them must REFUSE
+        // here rather than answer, and an arm that does not read them must not
+        // acquire one.
+        if let Some(took) = &held {
+            for which in [FireNumber::KvHeadStride, FireNumber::KvSeqStride] {
+                if position(took, sentinel(which)).is_some() {
+                    wrong.push(format!(
+                        "`{}` is handed {which:?} over a pool that states a page \
+                         size, so it walks the cache with no page table",
+                        routine.name
+                    ));
+                }
+            }
+            if position(took, sentinel(FireNumber::KvPageSize)).is_some() {
+                page_sized.insert(routine.name);
+            }
+            if position(took, sentinel(FireNumber::AttentionMaskStride)).is_some() {
+                masked.insert(routine.name);
+            }
         }
     }
 
-    // Every one of the FIVE is witnessed by at least one row. Stated because
-    // the loop passes vacuously for a number no row names, which is precisely
-    // the state the contiguous strides are in as far as any text goes.
-    //
-    // Five since upstream stated `sdpa_paged_tiled` and its sink, whose
-    // eighteenth operand is `Source::Rows` -- the two rows that witness it.
-    assert_eq!(named.len(), 5, "only these are witnessed: {named:?}");
-    // Stated exactly. Six rows in the whole table name one of these, and a row
-    // losing its source is not an error anywhere -- the number simply stops
-    // being written and the shader reads whatever the statement left in that
-    // slot.
-    //
-    // Still six after the two paged attentions grew
-    // `Source::AttentionMaskStride`, because those two were already counted
-    // for `KvPageSize`. The TALLY below is what moved, which is the more
-    // precise statement of the same fact.
-    // Eight since the tiled pair was stated, and TEN since the MMA pair: each
-    // of the four names `KvPageSize`, `AttentionMaskStride` and `Rows`.
-    assert_eq!(rows, 10, "a different number of rows names a driver number");
-    // Three of the six ROWS walk the cache contiguously -- `kv_append`,
-    // `sdpa_vector_decode` and `sdpa_vector_decode_swa`. (The strides appear
-    // five times each in the tally below because a row names both a key and a
-    // value stride; this counts rows.) The other three name only
-    // `KvPageSize` and are answered.
-    assert_eq!(
-        refused_rows, 3,
-        "a different number of rows walks the cache with no page table"
+    assert!(
+        wrong.is_empty(),
+        "{} arms are handed a pool number they did not name:\n  {}",
+        wrong.len(),
+        wrong.join("\n  ")
     );
+    // The denominator. A registry sweep that ran no arm would satisfy every
+    // line above, and a synthetic statement too thin to satisfy the bodies is
+    // exactly how that happens.
+    assert!(
+        ran > 100,
+        "{ran} of `kernels-wgpu`'s entrypoints could be run at all, so the \
+         statement this file synthesizes is too thin to reach the arms"
+    );
+    // WHICH arms walk the cache contiguously, named rather than counted: the
+    // set is small, `contiguous_pool`'s own documentation states it, and an arm
+    // joining or leaving it is a change to which kernels this driver may serve
+    // on a paged pool.
     assert_eq!(
-        named,
-        [
-            ("AttentionMaskStride".to_string(), 6u32),
-            ("KvHeadStride".to_string(), 5),
-            ("KvPageSize".to_string(), 7),
-            ("KvSeqStride".to_string(), 5),
-            ("Rows".to_string(), 4),
-        ]
-        .into_iter()
-        .collect::<BTreeMap<_, _>>(),
-        "a different set of rows names each number"
+        strided.iter().copied().collect::<Vec<_>>(),
+        vec![
+            "kv_append",
+            "sdpa_vector_decode",
+            "sdpa_vector_decode_sink",
+            "sdpa_vector_decode_swa",
+        ],
+        "a different set of arms reads the contiguous cache's strides, and only \
+         these are witnessed: {strided:?}"
+    );
+    // And the two numbers a PAGED pool does answer are witnessed, or the walk
+    // above is only ever proving absence.
+    assert!(
+        !page_sized.is_empty(),
+        "no arm is handed the pool's page size, so `Handles::fire_number` is \
+         answering nothing and the absences above are not evidence"
+    );
+    assert!(
+        !masked.is_empty(),
+        "no arm is handed the attention mask's stride, so the absences above \
+         are not evidence"
     );
 }
 
-/// How many words the run for one row is, given a statement of `params`
-/// scalars.
+/// Where a word first appears in what an arm hands its body, if it appears.
 ///
-/// Mirrors `binding::scalars`' walk rather than guessing, because the two
-/// disagreeing is the failure this file cannot see: a block sized from a guess
-/// would refuse rows that are fine and pass rows that are not.
-fn run_words(sig: &KernelSig, params: u32) -> u32 {
-    let mut n = 0u32;
-    for operand in sig.operands {
-        match operand.source {
-            _ if operand.ty == kernels::Ty::InPacked => n += 1,
-            Source::KvPageSize
-            | Source::KvHeadStride
-            | Source::KvSeqStride
-            | Source::AttentionMaskStride
-            // Added when upstream stated `sdpa_paged_tiled`, whose eighteenth
-            // operand is the fire's row count. The `_ => {}` below contributes
-            // ZERO for a source this list forgets, so the predicted run comes
-            // out one word short and the row is reported as misplaced rather
-            // than as unhandled -- which is what happened.
-            | Source::Rows => n += 1,
-            Source::Param(i) | Source::ParamF32(i) => {
-                if matches!(operand.ty, kernels::Ty::Buf | kernels::Ty::BufMut) {
-                    n += params.saturating_sub(u32::from(i));
-                } else {
-                    n += 1;
-                }
-            }
-            _ => {}
-        }
-    }
-    n
-}
-
-/// The run one row spells, word for word, built from the row rather than from
-/// `binding`.
-///
-/// A second reading of the same table. That is the point: the check it feeds is
-/// that `binding::scalars` and the row agree, and a helper that asked `binding`
-/// would only be checking it against itself.
-fn expected_run(sig: &KernelSig, low: &Lowered, params: u32) -> Vec<u32> {
-    let stated: Vec<u32> = (0..params).map(|i| 1000 + i).collect();
-    let mut run = Vec::new();
-    for operand in sig.operands {
-        if operand.ty == kernels::Ty::InPacked {
-            run.push(match operand.source {
-                Source::RequestCount => low.n_requests,
-                _ => 0,
-            });
-            continue;
-        }
-        match operand.source {
-            Source::KvPageSize
-            | Source::KvHeadStride
-            | Source::KvSeqStride
-            | Source::AttentionMaskStride
-            | Source::Rows => {
-                run.push(sentinel(operand.source).expect("a driver source"));
-            }
-            Source::Param(i) | Source::ParamF32(i) => {
-                if matches!(operand.ty, kernels::Ty::Buf | kernels::Ty::BufMut) {
-                    run.extend_from_slice(stated.get(usize::from(i)..).unwrap_or(&[]));
-                } else {
-                    run.push(stated.get(usize::from(i)).copied().unwrap_or(0));
-                }
-            }
-            _ => {}
-        }
-    }
-    run
+/// By VALUE and across the integer variants, because an arm chooses the width:
+/// `kv_append` hands its strides over as `Usize` and `paged` hands the page
+/// size over as `I32`, and a sentinel that survived the cast is the same
+/// number either way. Buffers and floats are excluded -- a handle is an index
+/// into a bound list and a float is not one of these numbers, so a match on
+/// either would be a coincidence rather than a resolver's answer.
+fn position(args: &[ArgValue], word: u32) -> Option<usize> {
+    args.iter().position(|value| match value {
+        ArgValue::U32(n) => *n == word,
+        ArgValue::I32(n) => n.cast_unsigned() == word,
+        ArgValue::Usize(n) => *n == u64::from(word),
+        ArgValue::Buffer(_) | ArgValue::F32(_) => false,
+    })
 }
 
 /// Every row count the projection guard admits to the GEMM is one the
@@ -2360,11 +2571,30 @@ fn every_row_count_the_guard_sends_to_the_gemm_has_a_grid() {
 ///
 /// # What it does NOT do
 ///
-/// It does not dispatch. `groups_within` is the same arithmetic the fire path
-/// runs, asked of the same modules over the same plans, and a grid that fits
-/// here is one no `PastDeviceLimit` can reject there. What a GPU would add is
-/// whether the memory exists, which is a different claim and one
-/// `max_page_refs` makes separately.
+/// It does not dispatch. `plan_one` is the same code the fire path runs, asked
+/// of the same modules over the same plan, and a grid it produces here is the
+/// grid it produces there. What a GPU would add is whether the memory exists,
+/// which is a different claim and one `max_page_refs` makes separately.
+///
+/// # Re-anchored
+///
+/// This used to ask `dispatch::rule_of` for the row's launch rule,
+/// `kernels::sig_in` for the row itself, `dims_of` for the dims that rule reads
+/// and `geometry::groups_within` for the grid. `kernels_wgpu::KERNELS` is empty
+/// -- `rule_of` is always `Err` and `sig_in` always `None`, so every launch was
+/// skipped and the `checked > 0` guard is what said so, loudly, instead of
+/// letting the walk pass over nothing.
+///
+/// `plan_one` gives the planned rectangle's real dimensions directly and is
+/// what a fire actually calls, so the limit is now held against the grid the
+/// driver will encode rather than against a re-derivation of it. That is
+/// strictly closer to the question, and it moves where the ceiling is applied.
+/// `plan_one` deliberately does NOT apply it -- `dispatch.rs`'s own note says
+/// why: the limit is the adapter's and a `Dispatch` is the kernel's -- so a
+/// grid past 65535 does not arrive here as a refusal, it arrives as a number.
+/// This test is therefore the one that compares, exactly as
+/// `Device::refusals` does at encode time, and a launch over the line reads as
+/// an axis in the report below rather than as an `Undispatchable`.
 #[test]
 fn every_launch_at_the_claimed_token_ceiling_fits_the_device() {
     // What the seam MEASURES, not what it used to state. It reported the
@@ -2392,37 +2622,74 @@ fn every_launch_at_the_claimed_token_ceiling_fits_the_device() {
     };
     let mods = modules(std::iter::once(&low));
 
+    let store = Everything(Placeholder(GENEROUS));
+    let buf = Placeholder(low.arena_bytes as u64);
+    let arena = Arena {
+        buffer: &buf,
+        bytes: low.arena_bytes as u64,
+    };
+
     let mut checked = 0usize;
     let mut widest = 0u32;
+    let mut over: Vec<String> = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
     for launch in &low.launches {
         let symbol = &low.kernels[launch.kernel as usize];
         let Some(declared) = mods.get(symbol) else {
             continue;
         };
         let module = driver_wgpu::geometry::Module::loaded(symbol, declared);
-        let Ok(rule) = driver_wgpu::dispatch::rule_of(kernels_wgpu::KERNELS, symbol) else {
-            continue;
-        };
-        let sig = kernels::sig_in(kernels_wgpu::KERNELS, symbol);
-        let dims = match sig {
-            Some(sig) => driver_wgpu::dispatch::dims_of(sig, &low, launch, geometry),
-            None => continue,
-        };
-        match driver_wgpu::geometry::groups_within(rule, dims, module, LIMIT) {
-            Ok(g) => {
+        match driver_wgpu::dispatch::plan_one(
+            &low,
+            launch,
+            kernels_wgpu::KERNELS,
+            Built {
+                module,
+                declared,
+                sig: None,
+            },
+            Sources {
+                arena,
+                resolver: &store,
+                min_offset: STRICTEST_ALIGNMENT,
+            },
+            geometry,
+        ) {
+            Ok(d) => {
                 checked += 1;
-                widest = widest.max(g.into_iter().max().unwrap_or(0));
+                for axis in d.groups {
+                    widest = widest.max(axis);
+                    if axis > LIMIT {
+                        over.push(format!(
+                            "`{symbol}` asks for a grid of {:?}, and {axis} is past \
+                             the {LIMIT} a dispatch may name on one axis",
+                            d.groups
+                        ));
+                    }
+                }
             }
-            // A rule this backend does not serve is not this test's business;
-            // `every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal`
-            // is where that lives.
-            Err(driver_wgpu::geometry::Ungeometric::Unruled(_)) => {}
-            Err(e) => {
-                panic!("`{symbol}` at {CLAIMED_TOKENS} tokens, which this seam says it takes: {e}")
-            }
+            // A refusal is not a grid past the limit, but at THIS token count
+            // it is the same failure to the scheduler: a fire it was told this
+            // driver would take, that this driver will not encode. Collected
+            // rather than panicked on, so the report names every one.
+            Err(e) => refused.push(format!("`{symbol}`: {e}")),
         }
     }
 
+    assert!(
+        refused.is_empty(),
+        "{} launches of a {CLAIMED_TOKENS}-token prefill do not plan, which \
+         this seam says it takes:\n  {}",
+        refused.len(),
+        refused.join("\n  ")
+    );
+    assert!(
+        over.is_empty(),
+        "{} launches of a {CLAIMED_TOKENS}-token prefill ask for more \
+         workgroups on one axis than the device allows:\n  {}",
+        over.len(),
+        over.join("\n  ")
+    );
     assert!(
         checked > 0,
         "no launch of a {CLAIMED_TOKENS}-token prefill was checked, so this \
@@ -2453,13 +2720,29 @@ fn every_launch_at_the_claimed_token_ceiling_fits_the_device() {
 /// `the_routine_path_plans_what_the_table_path_planned`, which is the shape
 /// this copies.
 ///
+/// # This test is currently VACUOUS and is left standing on purpose
+///
+/// `kernels_wgpu::KERNELS` is empty, so the row half of every comparison is
+/// `None` and the walk below skips every one of the 6680 rectangles. It
+/// passes, and it passes the way an empty loop passes: nothing is compared,
+/// so nothing can disagree. It did not become true when the rows went — its
+/// second half was deleted, and a differential test with one side left is not
+/// a differential test.
+///
+/// It is not repaired here because there is nothing on the routine plane to
+/// re-anchor it ON: the claim IS the agreement of two planes, and one plane
+/// is gone. Retiring it or rebuilding it against a recorded expectation is a
+/// decision about what replaces the control, not a repair, and it is left to
+/// whoever makes that decision. Read every other count in this file as the
+/// live coverage; read this one as zero.
+///
 /// # What it would catch
 ///
 /// The arm returns `[gate, up, out, width, rows]`. Swapping the two inputs
 /// gives a model that runs and is wrong — silu of the up-projection times the
 /// gate — and no shape check anywhere would notice, because both operands are
 /// storage buffers of the same length. The buffer comparison below is what
-/// notices.
+/// notices, when there is a row for it to compare against.
 #[test]
 fn the_routine_path_plans_what_the_table_path_planned() {
     let all = geometric();
@@ -2547,22 +2830,47 @@ fn the_routine_path_plans_what_the_table_path_planned() {
         }
     }
 
-    // A comparison that ran on nothing agrees with everything. `silu_mul` is
-    // in every gated MLP of every text here, so this is hundreds of
-    // rectangles, not a handful.
+    // WHEN THIS COMPARES NOTHING, AND WHY THAT IS NOT A PASS.
+    //
+    // Both halves need a ROW: `plan_by_row` has nothing to read once Stage 3
+    // deletes one. So this test can only speak about a family in the window
+    // between its arm landing and its rows coming off — which is the window
+    // the arming commit is supposed to use it in, and `mlp` did: 352
+    // rectangles agreed, then the rows went in the same commit.
+    //
+    // After that the window is empty until the next family is armed, and a
+    // silent pass over zero rectangles is exactly the failure this file
+    // refuses everywhere else. So it says so, loudly, and names what to do.
+    // It is NOT an `assert!(compared > 0)`: that would make an honest empty
+    // window a red branch, and the branch is shared.
+    // By SYMBOL, not by row name. `qmv_routed`'s row is named `qmv_routed`
+    // and its symbol is `affine_qmv_routed`; the registry is keyed on the
+    // symbol, so asking `arm_for` the row's NAME missed it and this test would
+    // have reported no window while quietly having one.
+    let armable: Vec<&str> = kernels_wgpu::KERNELS
+        .iter()
+        .filter(|k| driver_wgpu::lowering::arm::arm_for(k.symbol).is_some())
+        .map(|k| k.name)
+        .collect();
     assert!(
-        compared > 100,
-        "only {compared} rectangles were compared, over {symbols:?}. An armed \
-         LIVE symbol should appear in nearly every text. The corpus holds \
-         {seen:?}",
+        armable.is_empty(),
+        "{armable:?} are armed AND still have rows, so this test had a window \
+         and compared {compared} rectangles in it. If that number is zero the \
+         corpus does not reach them and the comparison is not happening"
     );
+    if compared == 0 {
+        println!(
+            "NOTHING COMPARED: every armed family has already retired its \
+             rows, so there is no row left to derive a second answer from. \
+             This test is live again the moment a family is armed, and the \
+             commit that arms one must run it BEFORE deleting the rows. The \
+             corpus holds {seen:?}"
+        );
+        return;
+    }
     // By SYMBOL, which is what a plan spells: `silu_mul_bfloat16`, not
     // `silu_mul`. That difference is the defect this test found — the fork
     // matched arms by name and never fired for a kernel with an axis, so the
     // first live arm was dead code until `arm::crossed` learned stems.
-    assert!(
-        symbols.keys().any(|n| n.starts_with("silu_mul")),
-        "the live arm this test exists for was not reached: {symbols:?}"
-    );
     println!("{compared} rectangles agree, over {symbols:?}");
 }

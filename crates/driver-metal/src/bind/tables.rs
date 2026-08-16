@@ -51,6 +51,13 @@ pub struct Frame<'a> {
     /// [`crate::lowering::frame::sampled_rows`] is the translation, and the
     /// only one; nothing else may fill this.
     pub sampling_indices: &'a [u32],
+    /// Per token: which recurrent-state slot its request occupies.
+    ///
+    /// Empty for every stack with no linear-attention layers, which is every
+    /// row this backend serves today, and `Staged::at` answers `None` for an
+    /// empty table rather than an address -- so a GDN symbol that reached a
+    /// fire without one refuses instead of indexing a slab at zero.
+    pub recurrent_slots: &'a [u32],
 }
 
 /// One region holding every table, and where each one starts.
@@ -102,6 +109,7 @@ impl Staged {
             FireTable::KvWriteOffset => 6,
             FireTable::RopeFrequencies => 7,
             FireTable::SamplingIndices => 8,
+            FireTable::RecurrentSlots => 10,
             // The enable flag is staged (zeros: causal), and the mask itself
             // is not -- a row whose enable is zero never indexes it. The
             // pool's numbers are answered by `Resolver::pool` rather than by
@@ -164,6 +172,11 @@ pub fn stage(context: &Context, scratch: &Scratch, frame: Frame<'_>) -> Result<S
     let enable_words = frame.token_ids.len().max(1);
     spans.push((blob.len(), enable_words));
     blob.extend(std::iter::repeat_n(0u32, enable_words));
+    // Index TEN: the recurrent slot per token, after the enable flag because
+    // the flag took nine and the order here is the contract `Staged::at`
+    // reads. Empty for a stack with no linear layers.
+    spans.push((blob.len(), frame.recurrent_slots.len()));
+    blob.extend_from_slice(frame.recurrent_slots);
     let region = scratch.take(context, ((blob.len() * 4).max(4)) as u64, "fire tables")?;
     // SAFETY: leased for this fire, and no fire that could still be reading a
     // previous lease of it is in flight -- `Scratch` hands a region back only

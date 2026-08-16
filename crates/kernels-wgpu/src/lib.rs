@@ -271,7 +271,18 @@ pub fn entrypoints() -> Vec<String> {
 /// crosses, `KERNELS` is empty and this is the whole census. That is
 /// `.wiki/kernel-x/refactor-bigplan.md` §7 Stage 4, and it is why this is a
 /// list of families rather than one flat slice.
-const RETIRED: &[&[&str]] = &[sample::ENTRYPOINTS, ptir::ENTRYPOINTS];
+const RETIRED: &[&[&str]] = &[
+    sample::ENTRYPOINTS,
+    ptir::ENTRYPOINTS,
+    mlp::ENTRYPOINTS,
+    norm::ENTRYPOINTS,
+    layout::ENTRYPOINTS,
+    rope::ENTRYPOINTS,
+    quant::ENTRYPOINTS,
+    moe::ENTRYPOINTS,
+    ssm::ENTRYPOINTS,
+    attn::ENTRYPOINTS,
+];
 
 /// The rows that have been retired, by the name their `kernel!` call had.
 ///
@@ -282,7 +293,108 @@ const RETIRED: &[&[&str]] = &[sample::ENTRYPOINTS, ptir::ENTRYPOINTS];
 /// rows have no counterpart here on purpose.
 #[must_use]
 pub fn retired_rows() -> &'static [&'static str] {
-    &["argmax_logits", "copy_logits_bf16"]
+    &[
+        "argmax_logits",
+        "copy_logits_bf16",
+        "geglu_tanh",
+        "geglu_tanh_strided",
+        "gptoss_swiglu",
+        "silu_mul",
+        "silu_mul_strided",
+        "encode_u4_bf16",
+        "encode_u4_f32",
+        "mxfp4_dequant_bf16",
+        "add_bias",
+        "gated_rms",
+        "gated_rms_strided",
+        "layer_scalar_mul",
+        "residual_add",
+        "residual_add_strided",
+        "rms_residual",
+        "rms_residual_scaled",
+        "rms_single_row",
+        "rms_strided_head_row",
+        "rms_strided_row",
+        "vnorm_single_row",
+        "embed_gather_4bit",
+        "embed_gather_mb_4bit",
+        "embed_gather_scaled_4bit",
+        "embed_gather_scaled_mb_4bit",
+        "ple_combine",
+        "row_gather",
+        "neox_decode",
+        "neox_freqs_decode",
+        "neox_freqs_mb",
+        "neox_mb",
+        "neox_prop_decode",
+        "neox_prop_mb",
+        "neox_strided",
+        "cast_qmm_input_bfloat16_to_float16",
+        "cast_qmm_input_strided_bfloat16_to_float16",
+        "combine_sorted",
+        "gdn_core",
+        "gdn_core_recurrent",
+        "gdn_core_recurrent_prefill",
+        "gdn_core_recurrent_slotted",
+        "gdn_core_slotted",
+        "gdn_prep",
+        "gdn_prep_prefill",
+        "gdn_prep_slotted",
+        "logit_softcap",
+        "mxfp4_qmm_t_routed_bias",
+        "mxfp4_qmv_routed_bias",
+        "gate",
+        "kv_append",
+        "kv_append_paged",
+        "sdpa_paged_decode",
+        "sdpa_paged_decode_sink",
+        "sdpa_paged_mma",
+        "sdpa_paged_mma_sink",
+        "sdpa_paged_tiled",
+        "sdpa_paged_tiled_sink",
+        "sdpa_paged_tiled_strided",
+        "sdpa_vector_decode",
+        "sdpa_vector_decode_sink",
+        "sdpa_vector_decode_swa",
+        "router_topk",
+        "qmv_routed",
+        "q_gate_split",
+        "qmm_splitk_reduce",
+        "qmm_splitk_reduce_f32",
+        "qmm_t",
+        "qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
+        "qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
+        "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
+        "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
+        "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
+        "qmm_t_bias",
+        "qmm_t_bias_fp16_precast",
+        "qmm_t_fp16_precast",
+        "qmm_t_residual",
+        "qmm_t_residual_fp16_precast",
+        "qmm_t_routed",
+        "qmm_t_routed_fp16",
+        "qmm_t_splitk",
+        "qmm_t_splitk_f32",
+        "qmm_t_splitk_fp16_precast",
+        "qmm_t_splitk_fp16_precast_f32",
+        "qmm_t_strided",
+        "qmm_t_strided_fp16_precast",
+        "qmm_t_strided_fp16_precast_residual",
+        "qmm_t_strided_residual",
+        "qmv_fast",
+        "qmv_fast_residual",
+        "qmv_routed_bias",
+        "qmv_tail",
+        "qmv_tail_bias",
+        "qmv_wide_strided",
+        "route_gather",
+        "route_sort",
+        "router_topk_scaled",
+        "shared_expert_combine",
+        "shared_expert_combine_strided",
+        "split_qkv_bf16",
+    ]
 }
 
 /// Every entrypoint whose row is gone and whose routine now answers for it.
@@ -529,7 +641,7 @@ fn uniform_width(ty: kernels::Ty) -> u32 {
 /// there is no stream and no cuBLAS handle in WebGPU — so they answer `false`,
 /// and a row that used one would put a plan cache in a uniform: a failure at
 /// the row, where it can be read, rather than a silent binding.
-const fn is_buffer(ty: kernels::Ty) -> bool {
+pub const fn is_buffer(ty: kernels::Ty) -> bool {
     use kernels::Ty;
     matches!(
         ty,
@@ -560,87 +672,52 @@ const fn is_buffer(ty: kernels::Ty) -> bool {
 mod tests {
     use super::*;
 
-    /// The two runs number independently, and neither one skips.
-    ///
-    /// `sdpa_paged_decode` is the row this is written for: its operands
-    /// ALTERNATE, so the runs interleave, and a backend that numbered scalars
-    /// alongside buffers would put every binding after the first scalar one
-    /// too high. Nothing static catches that — only a number does.
-    #[test]
-    fn the_two_runs_are_numbered_apart() {
-        let sig = sig("sdpa_paged_decode_bfloat16_d_64")
-            .expect("the table covers the decode step's attention");
-        let bindings = bindings(sig);
+    // RETIRED: `sdpa_paged_decode` was the example and `attn` has retired.
+    //
+    // It asserted the launch ABI's central claim — that a row's STORAGE
+    // bindings and its UNIFORM fields are two independent numberings, so an
+    // operand in one does not shift a field in the other.
+    // `every_row_places_every_operand_exactly_once` makes the same claim over
+    // every row that remains rather than over one example, and the routine
+    // plane's `bind` keeps the two apart structurally: buffers come from the
+    // body's handles and scalars from its `ArgValue`s, and neither can
+    // renumber the other.
 
-        let mut storages = 0;
-        let mut uniforms = 0;
-        for (at, binding) in bindings.iter().enumerate() {
-            match binding {
-                Binding::Storage(n) => {
-                    assert_eq!(*n, storages, "operand {at} is out of the storage run");
-                    storages += 1;
-                }
-                Binding::Uniform(n) => {
-                    assert_eq!(*n, uniforms, "operand {at} is out of the uniform run");
-                    uniforms += 1;
-                }
-                Binding::Packed => {}
-            }
-        }
-        assert_eq!(storages, storage_count(sig));
-        assert_eq!(uniforms as usize, uniform_layout(sig).len());
-        assert!(
-            storages > 1 && uniforms > 1,
-            "this row was chosen because it has both runs; it now has \
-             {storages} buffers and {uniforms} scalars, so it no longer \
-             tests the interleaving and another row should be picked",
-        );
-    }
-
-    /// A packed operand consumes neither run.
-    ///
-    /// `row_gather`'s `count` is the case: the shader declares no uniform block
-    /// and the row states the operand, because the value is a FIELD of the
-    /// params struct an earlier buffer binds.
-    #[test]
-    fn a_packed_operand_takes_no_slot_of_its_own() {
-        let sig = sig("row_gather_bfloat16").expect("the table covers the row gather");
-        let bindings = bindings(sig);
-
-        let packed = bindings
-            .iter()
-            .filter(|b| matches!(b, Binding::Packed))
-            .count();
-        assert_eq!(packed, 1, "row_gather states exactly one packed operand");
-
-        assert!(
-            uniform_layout(sig).is_empty(),
-            "row_gather's only scalar is packed, so it declares no uniform block",
-        );
-        assert_eq!(uniform_size(sig), 0);
-    }
-
-    /// An unstated row answers with nothing rather than with a nullary layout.
-    ///
-    /// `sdpa_paged_tiled` is one of the 56 rows that carry axes and a name and
-    /// no operands. Such a row is not unlaunchable — a shell falls back to the
-    /// lowered plan's own argument order, which is what `driver-metal` does —
-    /// but it is not launchable from HERE, and the difference is the whole
-    /// content of this check.
-    #[test]
-    fn an_unstated_row_has_no_bindings() {
-        // `sdpa_paged_tiled` was this row until upstream stated its eighteen
-        // operands in `kernels-metal` and this table followed. `gdn_core` is
-        // the replacement and is unstated in all three tables.
-        let sig = sig("gdn_core_bfloat16").expect("the table covers the GDN core");
-        assert!(
-            sig.operands.is_empty(),
-            "this row is chosen for being unstated; state it and pick another",
-        );
-        assert!(bindings(sig).is_empty());
-        assert_eq!(storage_count(sig), 0);
-        assert_eq!(uniform_size(sig), 0);
-    }
+    // RETIRED: `row_gather` was the only row stating a PACKED operand, and
+    // `layout` has crossed.
+    //
+    // The test asserted that a `Ty::InPacked` operand takes no `@group(0)`
+    // slot of its own — it is a FIELD of the params struct an earlier buffer
+    // binds — and `row_gather_bfloat16` was the one row in the table it could
+    // ask about. `bindings()` still answers `Binding::Packed` and
+    // `every_row_places_every_operand_exactly_once` still walks every row it
+    // returns, so the function is not unchecked; what is gone is the one
+    // example, and inventing a synthetic row to keep the sentence would be
+    // asserting that this file can build a struct, not that the table does.
+    //
+    // The claim lives on the routine side now: `layout::row_gather` passes
+    // `InPacked(count)` as a scalar and
+    // `driver-wgpu::lowering::routine::bind` appends it to the storage
+    // block's run rather than giving it a binding.
+    //
+    // RETIRED: THE TABLE IS EMPTY, so there is no unstated row to pick.
+    //
+    // It asserted that a row carrying axes and a name and no operands answers
+    // with nothing rather than with a nullary layout — not unlaunchable (a
+    // shell falls back to the lowered plan's own argument order, which is what
+    // `driver-metal` does) but not launchable from HERE, and the difference
+    // was the whole content of the check.
+    //
+    // The row it picked was replaced four times as each became armable:
+    // `sdpa_paged_tiled`, then `gdn_core`, then `gate`, then
+    // `silu_mul_strided` — which the comment above called "the LAST: it has no
+    // routine on any backend, so no arm can ever retire it". That was
+    // inherited from metal and it was wrong here; see `mlp::KERNELS`.
+    //
+    // The rule survives where it is now reachable: `driver-wgpu`'s
+    // `lowering::routine::bind` builds the same two numberings from a body's
+    // handles and `ArgValue`s, and `driver-wgpu::tests::arena`'s walks assert
+    // it over every rectangle of every real lowering rather than over one row.
 
     /// The table is `kernels-metal`'s coverage, and these are the numbers.
     ///
@@ -657,97 +734,54 @@ mod tests {
         );
         assert_eq!(entrypoints().len(), 481, "the product of every row's axes");
         assert_eq!(
-            KERNELS.iter().filter(|k| k.operands.is_empty()).count(),
-            50,
-            "the rows that state no operands. THIS TABLE IS SHORTER THAN THE \
-             FLEET'S: `sample` and `ptir` came off as their arms landed, so a \
-             sibling's count differs by the families each has retired rather \
-             than by a disagreement. It was 52 with both rows in."
+            KERNELS.len(),
+            0,
+            "THE TABLE IS EMPTY. Every one of the hundred kernels this crate \
+             carries is reached through a ROUTINE and an ARM, and nothing in \
+             this crate describes a launch positionally any more. It was 100 \
+             rows over 481 entrypoints when the port landed, 52 of them \
+             unstated. `refactor-bigplan.md` §7 Stage 3 is COMPLETE for wgpu, \
+             which was the last backend holding rows."
         );
     }
 
-    /// A uniform member is aligned to its own alignment, and the block to 16.
-    ///
-    /// `kv_append` is the shape that proves it: a four-byte `head_dim` followed
-    /// by two eight-byte strides. The naive sum is 20 bytes; the real block is
-    /// 24 bytes of fields rounded to 32 by the uniform address space, with four
-    /// bytes of padding after the first field.
-    #[test]
-    fn a_wide_field_after_a_narrow_one_is_padded() {
-        let sig = sig("kv_append_bfloat16").expect("the table covers the KV append");
-        let fields = uniform_layout(sig);
+    // RETIRED: `kv_append` was the last row here with a 64-bit uniform field
+    // after a narrow one, and `attn` has retired.
+    //
+    // It asserted WGSL's alignment on a real row: a `Usize` is declared
+    // `vec2<u32>`, so it is eight-aligned as well as eight wide and a `u32`
+    // before it leaves four bytes of padding. The rule itself is not gone —
+    // `uniform_layout` still applies it and
+    // `every_row_places_every_operand_exactly_once` still walks every row it
+    // returns — and the routine plane makes the same run in
+    // `driver-wgpu::lowering::routine::bind`, whose own packer states the rule
+    // and is exercised by every armed kernel that carries a scalar.
 
-        let named: Vec<_> = fields.iter().map(|f| (f.name, f.offset, f.size)).collect();
-        assert_eq!(
-            named,
-            vec![
-                ("head_dim", 0, 4),
-                ("k_head_stride", 8, 8),
-                ("k_seq_stride", 16, 8),
-            ],
-            "the eight-byte strides align to eight, not to four",
-        );
-        assert!(
-            fields[1].split && fields[2].split,
-            "a 64-bit operand crosses as vec2<u32>: WGSL has no u64",
-        );
-        assert_eq!(uniform_size(sig), 32, "24 bytes of fields, rounded to 16");
-    }
+    // RETIRED: THE TABLE IS EMPTY, so `max()` has nothing to take.
+    //
+    // It asserted that no row's uniform block exceeds what WebGPU guarantees,
+    // and — because 16 KiB is not a real constraint here, unlike the 128 bytes
+    // `kernels-vulkan` pins — that the widest row was far under it, so the
+    // ceiling would stop being decorative before it stopped being true.
+    //
+    // It refused to go vacuous (`.expect("the table is not empty")`) and that
+    // is how it announced itself when the last three rows went, rather than
+    // passing over an empty iterator. The rule now lives where the bytes are
+    // actually built: `Ceiling::UniformBinding` refuses a block over the
+    // ADAPTER's real limit at run time, and
+    // `driver-wgpu::lowering`'s walk asserts `call.uniform.len() <=
+    // DOWNLEVEL_UNIFORM_BYTES` over every rectangle every real lowering
+    // produces — which is a stronger statement than this one made, since a
+    // routine's block is packed per call and a row's was a static shape.
 
-    /// No row's uniform block exceeds what WebGPU guarantees.
-    ///
-    /// Cheap, and the failure it prevents is a pipeline that refuses to build
-    /// on the one device that mattered. `kernels-vulkan` pins the same ceiling
-    /// at 128 bytes, which is a real constraint there; 16 KiB is not one here,
-    /// and the test says so by also asserting the widest row is far under it.
-    #[test]
-    fn no_row_asks_for_a_uniform_block_webgpu_will_not_bind() {
-        let widest = KERNELS
-            .iter()
-            .map(|sig| (uniform_size(sig), sig.symbol))
-            .max()
-            .expect("the table is not empty");
-
-        assert!(
-            widest.0 <= DOWNLEVEL_UNIFORM_BYTES,
-            "`{}` asks for {} bytes of uniform, over WebGPU's {DOWNLEVEL_UNIFORM_BYTES}",
-            widest.1,
-            widest.0,
-        );
-        assert!(
-            widest.0 < 256,
-            "the widest block is now {} bytes (`{}`), which is close enough to \
-             a real limit that the ceiling above stopped being decorative",
-            widest.0,
-            widest.1,
-        );
-    }
-
-    /// The rows that need more than WebGPU's floor are NAMED, not tolerated.
-    ///
-    /// A shell reads this to decide what limits to request. The assertion is
-    /// that the answer is a small, known set — if it grows, a person should
-    /// look, because the alternative to raising a limit is splitting a row.
-    #[test]
-    fn the_rows_over_the_storage_floor_are_the_ones_we_know_about() {
-        let over = over_downlevel_storage_limit();
-        let mut names: Vec<_> = over.iter().map(|sig| sig.symbol).collect();
-        names.sort_unstable();
-        names.dedup();
-
-        assert!(
-            !names.is_empty(),
-            "attention alone binds eleven buffers, so an empty answer means \
-             `storage_count` stopped counting",
-        );
-        for sig in &over {
-            assert!(
-                storage_count(sig) <= 16,
-                "`{}` binds {} storage buffers, past what a mainstream adapter \
-                 reports; this row needs splitting rather than a bigger limit",
-                sig.symbol,
-                storage_count(sig),
-            );
-        }
-    }
+    // RETIRED: every row over the downlevel storage floor was an attention
+    // row, and `attn` has retired.
+    //
+    // It named the rows binding more than eight storage buffers — the
+    // WebGPU downlevel limit — so that a NEW one could not appear unnoticed.
+    // `Ceiling::StorageBinding` is where that is refused at run time against
+    // the adapter's real limit, which is the check that matters and is not
+    // keyed on the table; and `driver-wgpu::device`'s
+    // `every_entrypoint_in_the_tree_builds_a_pipeline_on_this_adapter` builds all 481
+    // entrypoints, so a kernel the adapter cannot lay out fails there by name.
 }

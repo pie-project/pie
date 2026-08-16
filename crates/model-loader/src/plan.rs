@@ -43,6 +43,7 @@ pub const TILE_MAP_REBLOCK: u32 = 1 << 4;
 // under two names. The bit stays reserved so the numbering below it is stable.
 pub const TILE_MAP_REPACK: u32 = 1 << 6;
 pub const TILE_MAP_SCALE: u32 = 1 << 7;
+pub const TILE_MAP_BIAS: u32 = 1 << 8;
 
 /// Transform chains a backend can collapse into one kernel.
 pub const FUSION_FP8_TO_MXFP4: u32 = 1 << 0;
@@ -369,6 +370,12 @@ pub struct DestExtent {
     pub stride: Extent,
 }
 
+/// Serde helper: a zero addend is the resting value and is skipped, so every
+/// plan written before `Bias` existed still serializes byte-identically.
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TileMapKind {
     Cast,
@@ -378,6 +385,7 @@ pub enum TileMapKind {
     Reblock,
     Repack,
     Scale,
+    Bias,
 }
 
 impl TileMapKind {
@@ -390,6 +398,7 @@ impl TileMapKind {
             Self::Reblock => TILE_MAP_REBLOCK,
             Self::Repack => TILE_MAP_REPACK,
             Self::Scale => TILE_MAP_SCALE,
+            Self::Bias => TILE_MAP_BIAS,
         }
     }
 }
@@ -453,6 +462,17 @@ pub struct TransformSpec {
     /// same 32 bits the contract named rather than a widened value that would
     /// have to be narrowed again.
     pub scale_factor_bits: u32,
+    /// The addend for a [`TileMapKind::Bias`], as [`f32::to_bits`]; zero on
+    /// every other kind.
+    ///
+    /// A field of its own rather than a reuse of
+    /// [`scale_factor_bits`](TransformSpec::scale_factor_bits) under a
+    /// different kind. The two would never be set at once, so sharing would
+    /// work -- and would mean that reading a spec required knowing the kind to
+    /// know what the number meant, which is exactly the property that makes a
+    /// misplaced field silent instead of loud.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub bias_bits: u32,
     /// Elements of the operand per factor, on each axis, for a per-block
     /// [`TileMapKind::Scale`]; empty when the factor is the uniform constant in
     /// [`scale_factor_bits`](TransformSpec::scale_factor_bits).

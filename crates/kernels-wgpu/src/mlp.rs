@@ -4,64 +4,36 @@
 //! name: it bakes gpt-oss's asymmetric clamp, its `alpha` and its `(up + 1)`
 //! term, and its own first line says so.
 
-use kernels::{KernelSig, kernel};
+use kernels::KernelSig;
 
-use crate::axes::*;
+/// EMPTY: this family's rows have been RETIRED.
+///
+/// `refactor-bigplan.md` §7 Stage 3. `mlp` was the first LIVE family to lose
+/// its rows on this backend, and — one kernel later — the last family in the
+/// crate to hold one. `silu_mul_strided` stayed because every backend had
+/// inherited metal's finding that its entrypoint leaves a buffer slot empty
+/// and so cannot take a positional argument list. That is true of MSL's flat
+/// argument table and not of `gated.wgsl`, which numbers its three buffers
+/// densely and gives the pitch a uniform of its own. Reading this backend's
+/// own shader is what emptied the table.
+///
+/// Originally: `mlp` is the first LIVE family to lose its rows — every gated MLP names `silu_mul`, and the three
+/// activations beside it are what gemma and gpt-oss run — so unlike `sample`
+/// and `ptir` the crossing had to be MEASURED rather than argued.
+/// `driver-wgpu`'s `the_routine_path_plans_what_the_table_path_planned`
+/// derives every field of every rectangle twice, by the row and by the arm,
+/// and compares.
+pub static KERNELS: &[KernelSig] = &[];
 
-pub static KERNELS: &[KernelSig] = &[
-    // 1 in geglu_tanh.wgsl
-    // gemma's activation: `gelu_tanh(gate) * up`, where the gelu is the tanh
-    // approximation and not the erf one. A third symbol beside `silu_mul` and
-    // `gptoss_swiglu`, and a text names which.
-    kernel!(geglu_tanh "geglu_tanh", file = Some("mlp/gated.wgsl"),
-        launch = kernels::LaunchRule::Elementwise,
-        operands = kernels::operands![
-            gate: Buf <- kernels::Source::In(0),
-            up: Buf <- kernels::Source::In(1),
-            out: BufMut <- kernels::Source::Out(0),
-            // `GegluParams`: the element count, packed.
-            params: Buf <- kernels::Source::Param(0),
-        ],
-        axes = &[BF16]),
-    // 1 in geglu_tanh.wgsl
-    // The same activation over rows that are not contiguous: gemma's PLE
-    // reads a narrow gate out of a wide buffer, so each of the three operands
-    // states its own pitch.
-    kernel!(geglu_tanh_strided "geglu_tanh_strided", file = Some("mlp/gated.wgsl"),
-        launch = kernels::LaunchRule::Elementwise,
-        operands = kernels::operands![
-            gate: Buf <- kernels::Source::In(0),
-            up: Buf <- kernels::Source::In(1),
-            out: BufMut <- kernels::Source::Out(0),
-            // `GegluStridedParams`: width, rows and the three pitches.
-            params: Buf <- kernels::Source::Param(0),
-        ],
-        axes = &[BF16]),
-    // 1 in gptoss.wgsl
-    // gpt-oss's activation, which is not anyone else's: the gate is clamped
-    // ABOVE only, the linear branch is clamped both ways and carries a `+1`.
-    // `silu_mul` cannot serve it -- dropping either produces a model that runs
-    // and is wrong -- so it is a symbol a text names, not a flag.
-    kernel!(gptoss_swiglu "gptoss_swiglu", file = Some("mlp/gated.wgsl"),
-        launch = kernels::LaunchRule::Elementwise,
-        operands = kernels::operands![
-            gate: Buf <- kernels::Source::In(0),
-            up: Buf <- kernels::Source::In(1),
-            out: BufMut <- kernels::Source::Out(0),
-            // `GptOssSwiGluParams`: n, limit, alpha -- packed.
-            params: Buf <- kernels::Source::Param(0),
-        ],
-        axes = &[BF16]),
-    // 1 in silu_mul.wgsl
-    kernel!(silu_mul "silu_mul", file = Some("mlp/gated.wgsl"), launch = kernels::LaunchRule::Elementwise,
-        operands = kernels::operands![
-            gate: Buf <- kernels::Source::In(0),
-            up: Buf <- kernels::Source::In(1),
-            out: BufMut <- kernels::Source::Out(0),
-        ],
-        axes = &[BF16]),
-    // 1 in silu_mul.wgsl
-    kernel!(silu_mul_strided "silu_mul_strided", axes = &[BF16]),
+/// The entrypoints this family's routines spell, now that its rows are gone.
+///
+/// See [`crate::sample::ENTRYPOINTS`].
+pub static ENTRYPOINTS: &[&str] = &[
+    "geglu_tanh_bfloat16",
+    "geglu_tanh_strided_bfloat16",
+    "gptoss_swiglu_bfloat16",
+    "silu_mul_bfloat16",
+    "silu_mul_strided_bfloat16",
 ];
 
 use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, Routine};
@@ -188,9 +160,48 @@ pub fn gptoss_swiglu(
     )
 }
 
+/// [`silu_mul`] over rows a `row_pitch` apart.
+///
+/// # The last kernel in the fleet to get a routine, and it did not need to be
+///
+/// `kernels-metal` calls this one DARK and `model-ir` carries a named
+/// exception for it: on that backend the entrypoint leaves a buffer slot
+/// empty, so it cannot be given a positional argument list at all. THAT IS A
+/// FACT ABOUT MSL'S FLAT ARGUMENT TABLE, not about the kernel. Here
+/// `gated.wgsl` declares `gate`, `up` and `out_` densely at `@group(0)` 0..2
+/// and puts the pitch in a `@group(1)` uniform of its own, so there is no hole
+/// and nothing to work around.
+///
+/// It was the fleet's last `kernel!` row for that reason — every backend had
+/// inherited metal's conclusion. Reading this backend's own shader is what
+/// says otherwise.
+///
+/// # Errors
+///
+/// [`kernels::shader::elementwise_rows`]'s.
+pub fn silu_mul_strided(
+    ctx: &Ctx<'_>,
+    gate: Buf,
+    up: Buf,
+    out: BufMut,
+    row_pitch: i32,
+    width: Env<i32>,
+    rows: Env<i32>,
+) -> Result<(), Refusal> {
+    ctx.dispatch(
+        Fire {
+            module: "mlp/gated.wgsl",
+            entrypoint: "silu_mul_strided_bfloat16",
+            lanes: kernels::shader::elementwise_rows(*width, *rows)?,
+        },
+        &[gate.v(), up.v(), out.v(), row_pitch.v()],
+    )
+}
+
 pub static ROUTINES: &[Routine] = &[
     crate::routine!(geglu_tanh),
     crate::routine!(geglu_tanh_strided),
     crate::routine!(gptoss_swiglu),
     crate::routine!(silu_mul),
+    crate::routine!(silu_mul_strided),
 ];

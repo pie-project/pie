@@ -442,6 +442,32 @@ fn an_adapter_opens_and_reports_what_it_offers() {
     assert!(limits.storage_buffers >= kernels_wgpu::DOWNLEVEL_STORAGE_BUFFERS);
 }
 
+/// The launch rule for a kernel whose family has RETIRED its rows.
+///
+/// `groups_for` takes a `Rule`, and these two kernels no longer have a row to
+/// read one from. The rule is the same fact the ROUTINE now states as its
+/// `lanes` — `norm/rms.wgsl` reduces one row per workgroup and
+/// `norm/residual_add.wgsl` walks a flat run — and stating it here keeps two
+/// real device checks alive rather than deleting them with the table.
+///
+/// Not derived from the routine because a body needs a `Ctx` to state
+/// anything and that is the whole plan path; these tests are about what the
+/// SHADER computes.
+fn rule_of(name: &str) -> kernels::LaunchRule {
+    match name {
+        "rms_single_row_bfloat16" => kernels::LaunchRule::Rms,
+        "residual_add_bfloat16" => kernels::LaunchRule::Elementwise,
+        // `kv_append_paged`'s row said `PerHead`, which is `[1, kv_heads,
+        // rows]` -- the shape this file's paged-append test asserts.
+        "kv_append_paged_bfloat16" => kernels::LaunchRule::PerHead,
+        other => {
+            kernels_wgpu::sig(other)
+                .unwrap_or_else(|| panic!("no row and no stated rule for `{other}`"))
+                .launch
+        }
+    }
+}
+
 /// 2a. A real `rms_single_row_bfloat16` produces the right numbers.
 ///
 /// The clearest row in the table to check: `out = w * x / rms(x)` has an
@@ -450,6 +476,7 @@ fn an_adapter_opens_and_reports_what_it_offers() {
 /// and its grid is one workgroup per row, so an undershoot drops a whole row
 /// rather than a lane.
 #[test]
+
 fn a_norm_computes_what_its_closed_form_says() {
     let Some((device, _held)) = adapter() else {
         return;
@@ -476,7 +503,7 @@ fn a_norm_computes_what_its_closed_form_says() {
     let groups = driver_wgpu::device::groups_for(
         &device,
         pipeline,
-        kernels_wgpu::sig(name).expect("the row").launch,
+        rule_of(name),
         Dims {
             rows: ROWS,
             width: WIDTH,
@@ -539,7 +566,7 @@ fn a_residual_add_is_the_sum_of_what_it_was_given() {
     let groups = driver_wgpu::device::groups_for(
         &device,
         pipeline,
-        kernels_wgpu::sig(name).expect("the row").launch,
+        rule_of(name),
         Dims {
             rows: ROWS,
             width: WIDTH,
@@ -1051,17 +1078,29 @@ fn a_paged_append_lands_where_the_layout_says_and_leaves_the_rest_alone() {
     let k_dst = device.buffer(&fill).expect("k cache");
     let v_dst = device.buffer(&fill).expect("v cache");
 
-    // The uniform block, at the offsets `kernels_wgpu::uniform_layout` states
-    // rather than packed end to end -- which for this row is the same thing and
-    // is asked of the table anyway, because the row after it is not.
-    let sig = kernels_wgpu::sig(name).expect("the row");
-    let layout = kernels_wgpu::uniform_layout(sig);
-    let mut uniform = vec![0u8; kernels_wgpu::uniform_size(sig) as usize];
-    for (field, value) in layout
+    // The uniform block, at the offsets the SHADER declares rather than packed
+    // end to end. This asked `kernels_wgpu::uniform_layout` for the row's
+    // offsets until the table emptied; the module's own `@group(1)` struct is
+    // where the numbers were always coming from, and reading them here is
+    // strictly closer to the thing being tested -- a mismatch between the two
+    // is what `reflect`'s own layout check exists to catch, and this test
+    // should not depend on the answer it is meant to be independent of.
+    let declared = driver_wgpu::reflect::entrypoint(name, Capability::Baseline)
+        .expect("the module declares this entrypoint");
+    let end = declared
+        .uniform_offsets
         .iter()
-        .zip([shape.head_dim, shape.page_size, shape.kv_heads])
+        .copied()
+        .max()
+        .map_or(0, |at| at as usize + 4);
+    let mut uniform = vec![0u8; end.next_multiple_of(16)];
+    for (at, value) in
+        declared
+            .uniform_offsets
+            .iter()
+            .zip([shape.head_dim, shape.page_size, shape.kv_heads])
     {
-        let at = field.offset as usize;
+        let at = *at as usize;
         uniform[at..at + 4].copy_from_slice(&value.to_le_bytes());
     }
     assert_eq!(uniform.len(), 16, "three words, rounded to WGSL's 16");
@@ -1069,7 +1108,7 @@ fn a_paged_append_lands_where_the_layout_says_and_leaves_the_rest_alone() {
     let groups = driver_wgpu::device::groups_for(
         &device,
         pipeline,
-        sig.launch,
+        rule_of(name),
         Dims {
             rows,
             head_dim: shape.head_dim,
@@ -1331,8 +1370,8 @@ fn a_module_that_is_not_wgsl_is_a_named_refusal_and_not_a_panic() {
     device.forget_errors();
 }
 
-/// The rows an adapter at the WebGPU floor could not run are named, and this one
-/// can run all of them.
+/// The ENTRYPOINTS an adapter at the WebGPU floor could not run are named, and
+/// this one can run all of them.
 ///
 /// [`Failed::Unreachable`] cannot be produced on a desktop adapter — it needs a
 /// device that reports the guaranteed minimum of 8 storage buffers per stage —
@@ -1341,16 +1380,37 @@ fn a_module_that_is_not_wgsl_is_a_named_refusal_and_not_a_panic() {
 /// which is the fact a deployment on this machine depends on.
 #[test]
 fn the_rows_a_floor_adapter_could_not_bind_are_named() {
-    let over = kernels_wgpu::over_downlevel_storage_limit();
+    // Counted off the MODULES and not the table. `over_downlevel_storage_limit`
+    // walked `KERNELS` and answered from `storage_count(sig)`; with the table
+    // empty it answers "none", which would have turned this whole argument off
+    // in silence and left the assertion below passing over an empty adapter
+    // list for the wrong reason.
+    //
+    // `Declared::bindings` is one past the highest `@group(0)` binding the
+    // module declares, which is the number a layout must cover -- a variant may
+    // leave HOLES, and `wgpu` checks a bind group entry for entry -- so it is
+    // the same quantity the row's `storage_count` was standing in for, read
+    // from the shader that has to be bound rather than from a description of
+    // it.
+    let over: Vec<String> = kernels_wgpu::entrypoints()
+        .into_iter()
+        .filter(|name| {
+            driver_wgpu::reflect::entrypoint(name, Capability::Baseline)
+                .is_ok_and(|d| d.bindings > kernels_wgpu::DOWNLEVEL_STORAGE_BUFFERS)
+        })
+        .collect();
     assert!(
-        over.iter().any(|sig| sig.name == "sdpa_paged_decode"),
-        "the row this whole limit argument is about is no longer over the floor"
+        over.iter()
+            .any(|name| name.starts_with("sdpa_paged_decode")),
+        "the kernel this whole limit argument is about is no longer over the \
+         floor. {} entrypoints are: {over:?}",
+        over.len(),
     );
     println!(
-        "at the guaranteed {} storage buffers, {} rows are unreachable: {:?}",
+        "at the guaranteed {} storage buffers, {} entrypoints are unreachable: {:?}",
         kernels_wgpu::DOWNLEVEL_STORAGE_BUFFERS,
         over.len(),
-        over.iter().map(|s| s.name).collect::<Vec<_>>()
+        over,
     );
 
     let Some((device, _held)) = adapter() else {

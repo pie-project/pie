@@ -107,7 +107,7 @@ tracing = "0.1"
 # worker pulls `GET {origin}/blob/{hash}` for multimodal inputs during
 # inference (design §9). Provisioning downloads (weights, py-runtime) live in
 # `bin/pie`, so no `blocking` here — blob fetch is async.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
 
 # Always-linked Rust dummy driver — random tokens, no model load.
 # `default-features = false` drops the loader's testkit (oracle, contract

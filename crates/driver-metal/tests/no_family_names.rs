@@ -201,6 +201,19 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // per-architecture kernels -- gemma4's PLE, gpt-oss's attention
         // sink -- which is a different claim from a duplicated read.
         ("lowering/abi.rs", 45),
+        // ONE each, and both are the SHADER's own entrypoint name.
+        // `mlp/gated.metal` publishes `gptoss_swiglu` -- a clamped,
+        // alpha-scaled SwiGLU no other family's activation matches -- and a
+        // driver that dispatches it has to spell it. `routine.rs` names the
+        // row, `arm.rs` binds its operands.
+        //
+        // This is the same claim `abi.rs` carries above and not a new one:
+        // the string is a compiled entrypoint's identity, not a fact about
+        // which model is running. Nothing here branches on it. Renaming the
+        // kernel would move the mention rather than remove it, since the
+        // activation really is one deployment's.
+        ("lowering/routine.rs", 1),
+        ("lowering/arm.rs", 1),
     ]
     .into_iter()
     .collect()

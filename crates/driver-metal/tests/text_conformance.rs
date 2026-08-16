@@ -21,10 +21,10 @@
 //! this file holds the ones that are answerable on the host, and
 //! `tests/device_text_fire.rs` holds the rest.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use driver_metal::lowering::dispatch::{Geometry, Undispatchable, plan_launch};
-use driver_metal::lowering::executor::{Frame, Resolver, Slice};
+use driver_metal::lowering::executor::{FireTable, Frame, Resolver, Slice};
 use driver_metal::lowering::resolve::{Names, Store};
 use model_compiler::lower::{Arg, Fire, Lowered, Row, lower};
 use model_ir::trace::{FireClass, ForwardPlan, ValueId};
@@ -38,6 +38,40 @@ struct Text {
     /// The fire geometry the rules evaluate at.
     geometry: Geometry,
 }
+
+/// The quantisation every text in this file is traced at, as the base every
+/// entry spreads.
+///
+/// It used to spread `Geometry::default()`, which is zeros — honest for a
+/// type the driver fills from a binding, and a statement that this deployment
+/// quantises to groups of zero at zero bits. Every trace here names
+/// `..._gs_64_b_4`, so every quant routine refused `Narrow { what: "the group
+/// size", at: 0 }` before a rectangle was ever computed, and the walk that
+/// checks grids reported those refusals as if they were the driver's.
+///
+/// The two numbers match `dispatch.rs`'s own fixtures, and `plan_routine`
+/// checks the spelling a routine composes from them against the one the trace
+/// states — so a text traced at some other quantisation fails here by name
+/// rather than silently agreeing.
+const QUANTISED: Geometry = Geometry {
+    q_heads: 0,
+    kv_heads: 0,
+    head_dim: 0,
+    rotary_dims: 0,
+    n_experts: 0,
+    experts_per_token: 0,
+    group: 64,
+    bits: 4,
+    // Zero is "one attention shape", which is every text here but the two
+    // gemma ones -- and those state their own beside their first.
+    global_head_dim: 0,
+    global_kv_heads: 0,
+    full_attn_every: 0,
+    // Zero is "one affine point", which is every text here but gpt-oss,
+    // whose router gates arrived at their own width.
+    router_group: 0,
+    router_bits: 0,
+};
 
 /// Every Metal text that exists.
 ///
@@ -64,7 +98,7 @@ fn texts() -> Vec<Text> {
                 rotary_dims: 128,
                 n_experts: 0,
                 experts_per_token: 0,
-                ..Geometry::default()
+                ..QUANTISED
             },
         },
         // The same text at the WIDTH the device gates actually run. Every
@@ -93,7 +127,7 @@ fn texts() -> Vec<Text> {
                 rotary_dims: 64,
                 n_experts: 0,
                 experts_per_token: 0,
-                ..Geometry::default()
+                ..QUANTISED
             },
         },
         // The SAME text at a different fact, which is what a second entry here is
@@ -120,7 +154,7 @@ fn texts() -> Vec<Text> {
                 rotary_dims: 128,
                 n_experts: 128,
                 experts_per_token: 8,
-                ..Geometry::default()
+                ..QUANTISED
             },
         },
         // The SAME mixture with the dense expert a mixture may also have.
@@ -160,7 +194,7 @@ fn texts() -> Vec<Text> {
                 rotary_dims: 128,
                 n_experts: 128,
                 experts_per_token: 8,
-                ..Geometry::default()
+                ..QUANTISED
             },
         },
         // The BIAS seam, and the reason is NOT that the symbol was
@@ -209,7 +243,7 @@ fn texts() -> Vec<Text> {
                 rotary_dims: 128,
                 n_experts: 0,
                 experts_per_token: 0,
-                ..Geometry::default()
+                ..QUANTISED
             },
         },
         // gpt-oss, and it joins the same way: attention SINKS, its own SwiGLU and
@@ -234,7 +268,18 @@ fn texts() -> Vec<Text> {
                 rotary_dims: 64,
                 n_experts: 32,
                 experts_per_token: 4,
-                ..Geometry::default()
+                // The SECOND affine point, which is the whole reason this
+                // row needed `build_kernels_at`. `gpt-oss-20b-MXFP4-Q4`
+                // lists 98 tensors at group 64 / 4 bits and its 24
+                // `mlp.router` gates at group 64 / EIGHT, and this text
+                // names `affine_qmv_fast_bfloat16_gs_64_b_8` for the gate
+                // beside `_b_4` for everything else.
+                //
+                // A production load reads it off the checkpoint by name --
+                // `model::binding::observed`, and only when it differs.
+                router_group: 64,
+                router_bits: 8,
+                ..QUANTISED
             },
         },
         // The three gemma facts that ARE facts. NOT gemma4 — its per-layer
@@ -261,7 +306,19 @@ fn texts() -> Vec<Text> {
                 rotary_dims: 128,
                 n_experts: 0,
                 experts_per_token: 0,
-                ..Geometry::default()
+                // The SECOND attention shape, which is the whole reason this
+                // fixture is named for gemma. `LlamaLikeMetalFacts::gemma_like`
+                // states `global_head_dim: 256` over `global_kv_heads: 4`
+                // against the paired `qwen3_0_6b`'s 128 over 8, and its
+                // `window_left` is `-1` at `l % 6 == 5` -- one full layer
+                // every six, spelled the way the KV pool spells it.
+                //
+                // A production load reads all three off the pool's `Shape`,
+                // which `batch::geometry` derived from the same windows.
+                global_head_dim: 256,
+                global_kv_heads: 4,
+                full_attn_every: 6,
+                ..QUANTISED
             },
         },
         // The SAME shape at the OTHER affine width. `mlx-community`
@@ -293,7 +350,8 @@ fn texts() -> Vec<Text> {
                 rotary_dims: 128,
                 n_experts: 0,
                 experts_per_token: 0,
-                ..Geometry::default()
+                bits: 8,
+                ..QUANTISED
             },
         },
         // The SAME family without its side network, which is not a smaller
@@ -331,7 +389,19 @@ fn texts() -> Vec<Text> {
                 rotary_dims: 128,
                 n_experts: 0,
                 experts_per_token: 0,
-                ..Geometry::default()
+                // The SECOND attention shape, which is the whole reason this
+                // fixture is named for gemma. `LlamaLikeMetalFacts::gemma_like`
+                // states `global_head_dim: 256` over `global_kv_heads: 4`
+                // against the paired `qwen3_0_6b`'s 128 over 8, and its
+                // `window_left` is `-1` at `l % 6 == 5` -- one full layer
+                // every six, spelled the way the KV pool spells it.
+                //
+                // A production load reads all three off the pool's `Shape`,
+                // which `batch::geometry` derived from the same windows.
+                global_head_dim: 256,
+                global_kv_heads: 4,
+                full_attn_every: 6,
+                ..QUANTISED
             },
         },
     ]
@@ -351,6 +421,37 @@ impl Resolver for Anything {
         Some(Slice {
             address: 0x2000_0000,
             bytes: 1 << 30,
+        })
+    }
+    // The four questions that arrived with DEFAULTS, and a default is `None`.
+    // This fixture's whole promise is in its name, and it stopped keeping it
+    // the moment the trait grew a method it did not implement -- so
+    // `sdpa_paged_decode` refused for want of a page size and `gdn_core` for
+    // want of a slab, in a test about whether a grid is legal. A refusal is
+    // not a grid, so the walk below reported the fixture and called it the
+    // driver.
+    fn kv(&mut self, _: u16, _: bool) -> Option<Slice> {
+        Some(Slice {
+            address: 0x3000_0000,
+            bytes: 1 << 30,
+        })
+    }
+    fn slab(&mut self, _: u16, _: &'static str) -> Option<Slice> {
+        Some(Slice {
+            address: 0x4000_0000,
+            bytes: 1 << 30,
+        })
+    }
+    fn fire(&mut self, _: FireTable) -> Option<Slice> {
+        Some(Slice {
+            address: 0x5000_0000,
+            bytes: 1 << 20,
+        })
+    }
+    fn pool(&mut self, which: FireTable) -> Option<u32> {
+        Some(match which {
+            FireTable::KvPageSize => 16,
+            _ => 1 << 12,
         })
     }
 }
@@ -697,46 +798,91 @@ fn the_harness_covers_every_family_that_has_a_text() {
 
 /// How many buffers a shader's entry point declares.
 ///
+/// What a shader declares at every buffer index it uses.
+///
 /// # Why this is parsed rather than declared
 ///
 /// `KernelSig` has an `operands` field and the CUDA table uses it. When this
-/// was written **no Metal row declared one** — the C++ shell bound by hand
+/// was written **no Metal row declared one** -- the C++ shell bound by hand
 /// from tables that are retiring, so nothing ever needed the arity written
 /// down. Forty-eight rows came to state their operands, and then every row on
 /// this backend retired.
 ///
 /// It is still parsed, and for a better reason than the original: a routine
-/// and its shader are two statements of the same arity in two languages, and
-/// the only way one can check the other is if this side is read rather than
-/// declared. The shader is the ABI; the signature is a claim about it — and
-/// unlike a row, the signature is what the driver actually binds from, so a
+/// and its shader are two statements of the same call in two languages, and
+/// the only way one can check the other is if this side is READ rather than
+/// declared. The shader is the ABI; the routine is a claim about it -- and
+/// unlike a row, the routine is what the driver actually binds from, so a
 /// disagreement found here is a misbinding rather than a stale comment.
 ///
-/// The parse is deliberately crude and *conservative*: find the template body
-/// by its stem, take its parameter list, and count distinct `[[buffer(N)]]`
-/// indices. A kernel it cannot find contributes nothing, so this never invents
-/// a gap.
-fn declared_buffers(root: &std::path::Path, file: &str, stem: &str) -> Option<usize> {
-    let params = param_list(root, file, stem)?;
-    let mut seen = BTreeSet::new();
+/// # The four kinds
+///
+/// MSL says what a buffer is for in its declaration and the distinctions are
+/// not decoration:
+///
+/// * `device T* y` -- writable. The kernel's result.
+/// * `const device T* x` -- readable. An input, a weight, or a device-side
+///   scalar the host never sees.
+/// * `const constant int& k` -- a scalar, bound to a buffer all the same.
+///   Counting only POINTERS as buffers was tried first and read `add_bias`,
+///   `affine_qmv_fast` and `kv_append` as short when all three were right.
+/// * `const constant Params& p` -- a struct by reference, which a routine
+///   binds as one opaque handle. It is a buffer of BYTES and asking whether
+///   the routine put a pointer or a scalar there answers nothing, so it is
+///   the one kind this does not compare.
+///
+/// The parse is deliberately crude and *conservative*: find the declaration
+/// that names the buffers, take its parameter list, and read the kind out of
+/// the text before each `[[buffer(N)]]`. A kernel it cannot find contributes
+/// nothing, so this never invents a gap.
+fn shader_slots(
+    root: &std::path::Path,
+    file: &str,
+    stem: &str,
+    entry: &str,
+) -> Option<BTreeMap<usize, &'static str>> {
+    let params = param_list(root, file, stem, entry)?;
+    let mut slots = BTreeMap::new();
     let mut rest = params.as_str();
     while let Some(i) = rest.find("[[buffer(") {
-        rest = &rest[i + 9..];
-        if let Some(j) = rest.find(')')
-            && let Ok(n) = rest[..j].trim().parse::<usize>()
-        {
-            seen.insert(n);
-        }
+        // The declaration for THIS buffer is the text since the last comma.
+        let decl = rest[..i].rsplit(',').next().unwrap_or(&rest[..i]);
+        let after = &rest[i + 9..];
+        let j = after.find(')')?;
+        let index: usize = after[..j].trim().parse().ok()?;
+        let kind = if decl.contains('&') {
+            let base = decl
+                .split('&')
+                .next()
+                .unwrap_or(decl)
+                .split_whitespace()
+                .filter(|w| *w != "const" && *w != "constant" && *w != "device")
+                .next_back()
+                .unwrap_or("");
+            if PRIMITIVE.contains(&base) {
+                "scalar"
+            } else {
+                "packed"
+            }
+        } else if decl.contains("device") && !decl.contains("const") {
+            "out"
+        } else {
+            "in"
+        };
+        slots.insert(index, kind);
+        rest = &after[j..];
     }
-    // The HIGHEST index plus one, not the count. A row is positional — its
-    // n-th operand is buffer n — so a kernel with gaps in its indices needs a
-    // row that covers them, and `kv_append_paged` has gaps: it declares
-    // 0,1,2,3,5,10,12..15 and leaves the rest to a ring ABI it does not read.
-    // `Source::Unbound` is what a row says in a gap, and the operands doc
-    // already asks for exactly that: *"a row lists every operand the callee
-    // has, defaulted or not"*.
-    seen.iter().next_back().map(|&n| n + 1)
+    (!slots.is_empty()).then_some(slots)
 }
+
+/// The MSL types a `&` parameter has to be for the slot to hold ONE number.
+///
+/// Anything else behind a reference is a struct, and a struct arrives as
+/// bytes the routine hands over as a single handle.
+const PRIMITIVE: &[&str] = &[
+    "int", "uint", "float", "half", "bool", "short", "char", "long", "bfloat", "uint32_t",
+    "int32_t", "uint8_t", "size_t", "ushort", "uchar",
+];
 
 /// A shader entry's parameter list, by its template stem.
 ///
@@ -750,47 +896,176 @@ fn declared_buffers(root: &std::path::Path, file: &str, stem: &str) -> Option<us
 /// `quant/qmv.metal`'s `instantiate_gptoss_qmv(<entrypoint>, <template>, ..)`:
 /// `affine_qmv_routed`, `affine_qmv_routed_bias`, `mxfp4_qmv_routed_bias`,
 /// `affine_qmv_tail` and `affine_qmv_tail_bias`. The first three a text names
-/// and all three agree. The two nothing names are exactly what the widening
-/// added to `SHORT`, and nothing new landed in `MISBOUND`. Every widening so
-/// far has had that shape -- the named kernels hold, the unnamed ones do not
-/// -- which is the reason to keep widening.
-fn param_list(root: &std::path::Path, file: &str, stem: &str) -> Option<String> {
+/// and all three agreed on arrival. The two nothing names did not, and were
+/// found to be short of their shader's twelve buffers by the check below --
+/// which is the shape every widening so far has had, and the reason to keep
+/// widening: the named kernels hold, the unnamed ones are where the faults
+/// have been sitting unread.
+fn param_list(root: &std::path::Path, file: &str, stem: &str, entry: &str) -> Option<String> {
     let src = std::fs::read_to_string(root.join(file)).ok()?;
     macro_param_list(&src, stem, 0)
+        .or_else(|| quoted_macro(&src, stem).and_then(|f| declaration(&src, &f)))
+        .or_else(|| host_name_alias(&src, entry).and_then(|f| declaration(&src, &f)))
 }
 
-/// Where a shader's first WRITABLE buffer sits, and where the trace's first
-/// output sits.
+/// The parameter list of `void <name>(..)`, taking the first that names its
+/// buffers.
 ///
-/// A `device T*` with no `const` is an output; `const device` is an input and
-/// `constant` is a scalar. So the index of the first writable buffer is the
-/// index the kernel expects its first output at — and the trace states inputs,
-/// then outputs, then weights, so its first output sits right after its
-/// inputs.
-///
-/// When those two disagree, **every operand of that launch is bound at the
-/// wrong slot**.
-fn first_writable(root: &std::path::Path, file: &str, stem: &str) -> Option<usize> {
-    let params = param_list(root, file, stem)?;
-    let mut best: Option<usize> = None;
-    let mut rest = params.as_str();
-    let mut cursor = 0usize;
-    while let Some(i) = rest.find("[[buffer(") {
-        let decl = &rest[..i];
-        let after = &rest[i + 9..];
-        let j = after.find(')')?;
-        let index: usize = after[..j].trim().parse().ok()?;
-        // The declaration for THIS buffer is the text since the last comma.
-        let decl = decl.rsplit(',').next().unwrap_or(decl);
-        let writable = decl.contains("device") && !decl.contains("const");
-        if writable && best.is_none_or(|b| index < b) {
-            best = Some(index);
+/// A template is written TWICE in these files: once as a definition, whose
+/// parameters are named and carry `[[buffer(N)]]`, and once per instantiation
+/// as a declaration, whose parameters are bare types. Only the first says
+/// anything, and which comes first in the file is not fixed, so this walks
+/// every occurrence rather than the first.
+fn declaration(src: &str, name: &str) -> Option<String> {
+    let needle = format!("void {name}(");
+    let mut at = 0usize;
+    while let Some(i) = src[at..].find(&needle) {
+        let start = at + i;
+        if let Some(list) = between_parens(src, start)
+            && list.contains("[[buffer(")
+        {
+            return Some(list);
         }
-        cursor += i + 9 + j;
-        let _ = cursor;
-        rest = &after[j..];
+        at = start + 1;
     }
-    best
+    None
+}
+
+/// The C++ name behind a macro invocation whose first argument is the stem AS
+/// A STRING.
+///
+/// `instantiate_sdpa_tiled_impl("sdpa_paged_tiled_sink", bfloat16, ..)` is the
+/// only way this entrypoint's name appears anywhere: the `[[host_name]]` that
+/// consumes it is `fn "_" #name "_d_" #d`, so the literal in the source is a
+/// macro PARAMETER and no text in the file spells the entrypoint except the
+/// call. [`macro_param_list`] already follows unquoted invocations; this is
+/// the same step for a quoted one, and it stops at the `#define`'s `void`
+/// rather than at its parameters, because a stamping macro's parameters are
+/// bare types.
+fn quoted_macro(src: &str, stem: &str) -> Option<String> {
+    let quoted = format!("\"{stem}\"");
+    for line in src.lines() {
+        let head = line.split("//").next().unwrap_or(line).trim();
+        if head.starts_with('#') {
+            continue;
+        }
+        let Some(open) = head.find('(') else { continue };
+        let call = head[..open].trim();
+        if call.is_empty() || !call.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            continue;
+        }
+        if head[open + 1..].split(',').next().map(str::trim) != Some(quoted.as_str()) {
+            continue;
+        }
+        if let Some(define) = src.find(&format!("#define {call}(")) {
+            return void_name(&src[define..]);
+        }
+    }
+    None
+}
+
+/// The C++ name behind the longest `[[host_name]]` literal the ENTRY starts
+/// with.
+///
+/// A stem is not a C++ function name. `rope/neox.metal` stamps its kernels as
+/// `[[host_name("neox_decode_" #name)]] void rope_neox_decode<itype>`, so the
+/// entrypoint the census carries and the declaration that names the buffers
+/// have different names and only the census joins them.
+///
+/// LONGEST, because the literals nest: `router_topk_` is a prefix of
+/// `router_topk_scaled_` and both are prefixes of the scaled entry. NON-EMPTY,
+/// because a literal built entirely from macro parameters is a prefix of
+/// everything and would match whichever such kernel came first in the file --
+/// that is how `sdpa_paged_tiled_sink` was read against a twenty-buffer
+/// `sdpa_paged_tiled_strided` it has nothing to do with, and reported as short
+/// by two.
+fn host_name_alias(src: &str, entry: &str) -> Option<String> {
+    let mut best: Option<(usize, String)> = None;
+    let mut at = 0usize;
+    while let Some(i) = src[at..].find("[[host_name(") {
+        let start = at + i + "[[host_name(".len();
+        at = start;
+        let mut cursor = start;
+        let mut literal = String::new();
+        loop {
+            let bytes = src.as_bytes();
+            while cursor < bytes.len() && matches!(bytes[cursor], b' ' | b'\t' | b'\\' | b'\n') {
+                cursor += 1;
+            }
+            if src[cursor..].starts_with('"') {
+                let Some(j) = src[cursor + 1..].find('"') else {
+                    break;
+                };
+                literal.push_str(&src[cursor + 1..cursor + 1 + j]);
+                cursor += j + 2;
+            } else {
+                break;
+            }
+        }
+        if literal.is_empty() || !entry.starts_with(&literal) {
+            continue;
+        }
+        if best.as_ref().is_some_and(|(len, _)| *len >= literal.len()) {
+            continue;
+        }
+        let window = &src[start..floor_boundary(src, start + 400)];
+        if let Some(name) = void_name(window) {
+            best = Some((literal.len(), name));
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
+/// A byte index at or before `at` that `src` may be sliced at.
+///
+/// A window is arithmetic — *four hundred bytes past the macro* — and a byte
+/// count is not a position. These shaders' comments are ruled with box
+/// drawing, so `start + 400` lands inside a three-byte `─` and the slice
+/// panics rather than answering. `str::floor_char_boundary` is the same
+/// walk and is unstable, so this is it written out.
+fn floor_boundary(src: &str, at: usize) -> usize {
+    let mut at = at.min(src.len());
+    while at > 0 && !src.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// The identifier after the next `void` in `src`.
+///
+/// Any whitespace, not a space. These stamping lines wrap between the return
+/// type and the name — `template [[host_name("qmm_splitk_reduce_f32_bfloat16")]]
+/// [[kernel]] void` ends a line and `qmm_splitk_reduce<bfloat, float>(` starts
+/// the next — so a needle of `"void "` finds nothing there and the stem was
+/// dropped from the comparison silently. And `void` must be a word: `avoid`
+/// ends in it.
+fn void_name(src: &str) -> Option<String> {
+    let mut at = 0usize;
+    while let Some(i) = src[at..].find("void") {
+        let start = at + i;
+        let after = start + "void".len();
+        at = after;
+        let word = src[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        if !word || !src[after..].starts_with(char::is_whitespace) {
+            continue;
+        }
+        let rest = src[after..].trim_start();
+        let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_')?;
+        if end > 0 {
+            return Some(rest[..end].to_owned());
+        }
+    }
+    None
+}
+
+/// The text between the parentheses opened at or after `at`, depth-counted.
+fn between_parens(src: &str, at: usize) -> Option<String> {
+    let open = at + src[at..].find('(')?;
+    let close = balanced(src.as_bytes(), open)?;
+    Some(src[open + 1..close].to_owned())
 }
 
 /// **The routine's signature agrees with its shader.**
@@ -822,83 +1097,203 @@ fn first_writable(root: &std::path::Path, file: &str, stem: &str) -> Option<usiz
 ///   with the absence of `const`. A routine that puts its output where the
 ///   shader put an input does not fault; it writes over its own input and
 ///   returns something plausible.
-/// Stems whose signature accounts for FEWER slots than their shader declares.
+/// The index of the bracket that closes the one at `start`.
+fn balanced(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    for (at, byte) in bytes.iter().enumerate().skip(start) {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A comma-separated list, split where the commas are not inside anything.
+fn split_top(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for c in text.chars() {
+        match c {
+            '<' | '(' | '[' | '{' => depth += 1,
+            '>' | ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+        if c == ',' && depth == 0 {
+            out.push(cur.trim().to_owned());
+            cur = String::new();
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_owned());
+    }
+    out
+}
+
+/// The declared type of every entry in a routine's DISPATCH LIST, in order.
 ///
-/// Not a fault by itself. A body may pad -- `moe::qmm_t_routed` repeats one
-/// argument five times to push its last operand out to slot 12 -- and padding
-/// is invisible to a signature, so this is the set where the signature alone
-/// cannot decide. It is written down so that it cannot grow quietly, which is
-/// the only guarantee available without running the body.
+/// Not the signature. A routine's signature is a lower bound on what its body
+/// binds, because a body may PAD: `moe::qmm_t_routed` names nine arguments and
+/// dispatches thirteen values, repeating `pad` five times to push
+/// `tile_expert` out to slot 12 where its shader declares it. Reading the
+/// signature, that routine is indistinguishable from one that binds nine
+/// values and never reaches slot 12 -- which is the actual defect, and which
+/// several routines here had.
 ///
-/// Every entry is a quantized GEMM, a precast, a split-K, or the gated
-/// DeltaNet prefill pair, and every one of them is a kernel whose shader
-/// numbers its buffers from a SHARED argument table: `affine_qmm_t` binds
-/// `w, scales, biases, x, y` at 0..4 and its variants keep those numbers
-/// while adding operands at 8, 12 or 13. The C++ shell encoded them into one
-/// table and ran several kernels against it. A positional list reaches those
-/// indices only by padding up to them.
+/// The list is right there in the body, so this reads it: the parameter list
+/// for the name-to-type map, then the last `&[..]` in the body, which is the
+/// slice handed to `ctx.dispatch`. Every routine has exactly one dispatch, so
+/// "the last" is "the only".
 ///
-/// No text names any of them: the census of quant symbols a `model-dsl` text
-/// can spell is `affine_qmm_t`, `affine_qmm_t_residual`, `affine_qmv_fast`,
-/// `affine_qmv_fast_residual`, `affine_qmv_routed`, `affine_qmv_routed_bias`
-/// and `mxfp4_qmv_routed_bias`, and none of these is one. They are
-/// transcriptions of rows that stated no `operands` -- and a row that stated
-/// none was bound positionally too, so the row and the shader were wrong in
-/// the same way and agreed. This is the first statement of the pair that can
-/// be checked against the other.
-const SHORT: &[&str] = &[
-    "affine_qmm_t_bias_fp16_precast",
-    "affine_qmm_t_fp16_precast",
-    "affine_qmm_t_residual_fp16_precast",
-    "affine_qmm_t_routed",
-    "affine_qmm_t_routed_fp16",
-    "affine_qmm_t_splitk_fp16_precast",
-    "affine_qmm_t_strided",
-    "affine_qmm_t_strided_fp16_precast",
-    "affine_qmv_tail",
-    "affine_qmv_tail_bias",
-    "affine_qmv_wide_strided",
-    "cast_qmm_input_bfloat16_to_float16",
-    "cast_qmm_input_strided_bfloat16_to_float16",
-    "gdn_core_recurrent_prefill",
-    "gdn_prep_prefill",
-    "mxfp4_qmm_t_routed_bias",
-    "qmm_splitk_reduce",
+/// A `Ctx` that RECORDED instead of encoding would be exact where this is a
+/// parse, and it is not available: a `Fire` is built inside a dispatch, and
+/// calling every routine means inventing arguments for every routine.
+fn dispatch_list(name: &str) -> Option<Vec<(String, String)>> {
+    let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/")
+        .join("kernels-metal/src");
+    for family in FAMILIES {
+        let text = std::fs::read_to_string(src.join(format!("{family}.rs")))
+            .unwrap_or_else(|e| panic!("cannot read {family}.rs: {e}"));
+        let Some(at) = text.find(&format!("\npub fn {name}(")) else {
+            continue;
+        };
+        let open = at + format!("\npub fn {name}").len();
+        let close = balanced(text.as_bytes(), open)?;
+        let mut types: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for part in split_top(&text[open + 1..close]) {
+            if let Some((field, ty)) = part.split_once(':') {
+                types.insert(field.trim().to_owned(), ty.trim().to_owned());
+            }
+        }
+        let body = close + text[close..].find('{')?;
+        let end = balanced(text.as_bytes(), body)?;
+        let body = &text[body..end];
+        let list = body.rfind("&[")?;
+        let list_end = balanced(body.as_bytes(), list + 1)?;
+        return Some(
+            split_top(&body[list + 2..list_end])
+                .iter()
+                .map(|item| {
+                    let head = item.split('.').next().unwrap_or(item).trim();
+                    (
+                        head.to_owned(),
+                        types.get(head).cloned().unwrap_or_default(),
+                    )
+                })
+                .collect(),
+        );
+    }
+    None
+}
+
+/// The families whose modules carry routine bodies.
+const FAMILIES: &[&str] = &[
+    "attn", "layout", "mlp", "moe", "norm", "ptir", "quant", "rope", "sample", "ssm",
 ];
 
-/// Stems whose first WRITABLE argument is not at the position their shader
-/// declares its first writable buffer at.
+/// What a routine's argument type is, in the vocabulary [`shader_slots`]
+/// answers in.
 ///
-/// This one is a fault, and padding cannot explain it: `qmm_t_fp16_precast`
-/// names `w, scales, biases, y, half_in, k, n`, so its result is the fourth
-/// bound position, and `affine_qmm_t_fp16_precast` declares
-/// `device bfloat* y [[buffer(4)]]` with buffer 3 not declared at all. Bound
-/// as written, the GEMM writes its result where the shader reads `x` and
-/// reads its activation from buffer 12, which nothing binds.
-/// `cast_qmm_input_bfloat16_to_float16` is the sharpest: three buffers, at 3,
-/// 12 and 13, against a six-value list that starts at 0.
+/// Both mutable pointer kinds count as `out`, because the shader says
+/// "writable" with the ABSENCE of `const` and does not distinguish an opaque
+/// buffer from a typed one. `gdn_prep` writes four `F32sMut` and no `BufMut`
+/// at all, so asking only about `BufMut` would read it as a kernel that
+/// writes nothing.
 ///
-/// Listed rather than fixed because the fix is not local. There is no `Ty`
-/// meaning "bind nothing here" -- that absence is why
-/// `driver-metal`'s `DARK` exists at all, for `silu_mul_strided`, whose
-/// entrypoint leaves a slot empty -- so a routine reaches slot 12 only by
-/// naming twelve arguments and having its arm supply the ones the kernel
-/// ignores, which is what `attn::kv_append_paged`'s `ring_*` arguments are.
-/// Every entry here is unreached by any text, so the list costs nothing that
-/// runs; what it must not do is stay unsaid.
-const MISBOUND: &[&str] = &[
-    "affine_qmm_t_bias_fp16_precast",
-    "affine_qmm_t_fp16_precast",
-    "affine_qmm_t_residual_fp16_precast",
-    "affine_qmm_t_splitk",
-    "affine_qmm_t_splitk_fp16_precast",
-    "affine_qmm_t_strided_fp16_precast",
-    "cast_qmm_input_bfloat16_to_float16",
-    "cast_qmm_input_strided_bfloat16_to_float16",
-    "gdn_core_recurrent_prefill",
-    "qmm_splitk_reduce",
-];
+/// `Env<T>` is a number the environment supplies rather than the trace, which
+/// changes where it comes from and not what the slot holds. `InPacked` is a
+/// field of a struct an earlier argument binds and returns [`None`]: it
+/// occupies a position without binding one.
+fn routine_kind(ty: &str) -> Option<&'static str> {
+    const OUT: &[&str] = &["BufMut", "F32sMut", "I32sMut", "U32sMut", "U8sMut"];
+    const IN: &[&str] = &["Buf", "F32s", "I32s", "U32s", "U8s"];
+    const SCALAR: &[&str] = &["i32", "u32", "f32", "usize"];
+    if OUT.contains(&ty) {
+        Some("out")
+    } else if IN.contains(&ty) {
+        Some("in")
+    } else if SCALAR.contains(&ty)
+        || ty
+            .strip_prefix("Env<")
+            .and_then(|rest| rest.strip_suffix('>'))
+            .is_some_and(|inner| SCALAR.contains(&inner))
+    {
+        Some("scalar")
+    } else {
+        None
+    }
+}
 
+/// **Every routine's dispatch list, held against its shader's buffers.**
+///
+/// This check kept two ledgers and now keeps none, and the emptying is the
+/// result rather than a tidy-up.
+///
+/// `SHORT` held stems whose list was shorter than their shader's buffer
+/// count. It could not be an assertion while the check read the SIGNATURE, because a
+/// signature does not state padding: `moe::qmm_t_routed` takes nine arguments
+/// and dispatches thirteen, repeating one `pad` into the holes, so from the
+/// signature a body that reaches slot 12 correctly and a body that stops at
+/// slot 7 read alike. Seventeen stems were collected and seven of them were
+/// right. Reading the dispatch list -- the list `lay_out` actually walks, and
+/// which is written out in the body -- separated the two, and left ten faults.
+///
+/// `MISBOUND` held a sharper half, which no length check can see: a list of
+/// the right LENGTH whose first writable value lands where the shader declares
+/// an input. `affine_qmm_t_splitk` dispatched eleven against eleven and put
+/// its output at 4 where the shader writes at 8, so bound as written it wrote
+/// its partials over an activation and returned something plausible.
+///
+/// All seventeen were one defect. The quant shaders number their buffers from
+/// a SHARED argument table -- `affine_qmm_t` binds `w, scales, biases, x, y`
+/// at 0..4, and its precast, strided, split-K and tail variants keep those
+/// numbers while moving the activation to 12 and adding operands at 7, 8 and
+/// 13. A positional list reaches index 12 only by passing through 3..11, so
+/// each of them takes a `pad` argument bound at every index its shader leaves
+/// undeclared, which is the idiom `qmm_t_routed` already documents. Nothing
+/// was reading garbage on purpose; the holes were simply not addressable from
+/// a list that stopped early, and an unbound index on this driver is not an
+/// error, it is whatever the previous step wrote at that address.
+///
+/// Nothing caught them because they were transcriptions of rows that stated no
+/// `operands`, and a row that stated none was bound positionally too: the row
+/// and the shader were wrong in the same way and agreed. No `model-dsl` text
+/// names any of the seventeen, which is why they could be survived at all.
+///
+/// With both ledgers empty, all three axes fail. A stem arriving in the
+/// failure means one of three things and none is allowed: a value bound past
+/// the last declared buffer, which the kernel cannot read; a declared buffer
+/// the list never reaches, which nothing binds; or a slot whose KIND is
+/// wrong -- a pointer where the shader reads a number, a number where it
+/// reads a pointer, or a read where it writes.
+///
+/// The kind axis is the one that found `affine_qmm_t_bias` and
+/// `affine_qmm_t_strided_residual`, and it is the only one that could have.
+/// Both dispatched exactly as many values as their shaders declare buffers,
+/// and both put their result at buffer 4 where the shader writes. What they
+/// got wrong was the ORDER of the three values after it: they bound the extra
+/// pointer at 5 and `K, N` at 6 and 7, where the shader reads `K, N` at 5 and
+/// 6 and the pointer at 7. `qmm_t_strided_residual` even carried a doc
+/// asserting the wrong order as a fact about the shader.
+///
+/// A routine may STATE a hole, and where it does the kind axis steps back.
+/// `pad` and `kv_append_paged`'s `ring_4`..`ring_15` are arguments whose whole
+/// content is "the shader declares something here and this caller has nothing
+/// for it"; asking whether such a slot holds the right kind asks about a value
+/// nobody reads. Naming the hole is what earns the exemption, which is why the
+/// idiom is a named argument rather than a repeated one.
 #[test]
 fn every_routine_agrees_with_the_shader_its_stem_names() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -908,7 +1303,7 @@ fn every_routine_agrees_with_the_shader_its_stem_names() {
 
     let mut disagrees: Vec<String> = Vec::new();
     let mut unrouted: Vec<String> = Vec::new();
-    let mut short: Vec<&str> = Vec::new();
+    let mut unresolved: Vec<String> = Vec::new();
     let mut compared = 0usize;
 
     // The census, keyed by STEM. This walked `kernels_metal::KERNELS`, taking
@@ -918,16 +1313,26 @@ fn every_routine_agrees_with_the_shader_its_stem_names() {
     // and the file is what `ENTRYPOINTS` carries beside each instantiated
     // name. A stem's file is the file of any symbol it claims; they agree,
     // because a template and its instantiations are one declaration.
+    //
+    // The ENTRY matters too, and only for the stems whose declaration is
+    // written under another name -- `host_name_alias` needs a name the census
+    // carries to join on. The SHORTEST claimed entry is the stem's own: a
+    // stem claims every entry it prefixes, so `affine_qmm_t` claims
+    // `affine_qmm_t_fp16_precast_bfloat16_..` as well as its own
+    // instantiations, and taking whichever came first read it against the
+    // precast's thirteen buffers. The shortest is the one with the least name
+    // that is not the stem's.
     let shaders = kernels_metal::shaders();
-    let file_of = |stem: &str| {
+    let claim = |stem: &str| {
         shaders
             .iter()
-            .find(|(_, entry)| {
+            .filter(|(_, entry)| {
                 entry
                     .strip_prefix(stem)
                     .is_some_and(|rest| rest.is_empty() || rest.starts_with('_'))
             })
-            .map(|(file, _)| *file)
+            .min_by_key(|(_, entry)| entry.len())
+            .copied()
     };
 
     // A DARK stem answers nothing on purpose and the registry states the
@@ -935,95 +1340,93 @@ fn every_routine_agrees_with_the_shader_its_stem_names() {
     // kernel nothing can reach, which is a louder fault than a signature that
     // disagrees.
     for (stem, _) in driver_metal::lowering::routine::DARK {
-        if file_of(stem).is_none() {
+        if claim(stem).is_none() {
             unrouted.push(format!("  {stem} is dark and its shader is gone"));
         }
     }
 
     for (symbol, routine) in driver_metal::lowering::routine::stems() {
-        let Some(file) = file_of(symbol) else {
+        let Some((file, entry)) = claim(symbol) else {
             unrouted.push(format!("  {symbol} names no shader in the census"));
             continue;
         };
-        // The SLOTS the signature accounts for, which is not the number of
-        // its pointers.
+        // THE SLOTS THE BODY BINDS, read from the dispatch list.
         //
-        // This counted pointers, on the reasoning that "only the pointers are
-        // buffers". MSL does not agree: `add_bias` declares
-        // `const constant int& width [[buffer(2)]]`, so its third slot is a
-        // scalar bound to a buffer, and a rule that skips scalars reads that
-        // kernel as two-slotted against a three-slotted shader. It reads
-        // `affine_qmv_fast` as five against seven and `kv_append` as five
-        // against eight -- all three of which are live, load-bearing and
-        // right. A slot is a POSITION in the argument list `lay_out` walks,
-        // whatever rides in it.
+        // Two readings of this were wrong before it was read from the body.
+        // The first counted POINTERS, on the reasoning that only pointers are
+        // buffers; MSL does not agree, since `add_bias` declares
+        // `const constant int& width [[buffer(2)]]` and its third slot is a
+        // scalar bound to a buffer. That rule read `affine_qmv_fast` as five
+        // against seven and `kv_append` as five against eight, all of which
+        // are live and right.
         //
-        // `Env` arguments are supplied by the environment and never bound, so
-        // they take no position. A TRAILING `InPacked` is a field of the
-        // struct an earlier argument binds and binds nothing itself, so the
-        // last position that binds is the last one that is not one --
-        // `layout::row_gather` names five arguments, the fifth is the packed
-        // count, and its shader declares four buffers.
-        let bound: Vec<kernels::Ty> = routine
-            .args
+        // The second counted SIGNATURE POSITIONS, which is the right unit and
+        // the wrong list: a body may pad, padding is not in the signature, and
+        // so `slots < buffers` had to be collected rather than failed. Ten of
+        // the seventeen it collected were real and seven were bodies that
+        // padded correctly. The dispatch list is what `lay_out` walks, so it
+        // is what this walks.
+        //
+        // A TRAILING `InPacked` is a field of the struct an earlier value
+        // binds and binds nothing itself, so the last position that binds is
+        // the last one that is not one -- `layout::row_gather` dispatches five
+        // values, the fifth is the packed count, and its shader declares four
+        // buffers.
+        let Some(dispatched) = dispatch_list(routine.name) else {
+            unrouted.push(format!(
+                "  {symbol} -> `{}` has no readable dispatch list",
+                routine.name
+            ));
+            continue;
+        };
+        let slots = dispatched
             .iter()
-            .filter(|(_, prov)| *prov != kernels::routine::Provenance::Env)
-            .map(|(ty, _)| *ty)
-            .collect();
-        let slots = bound
-            .iter()
-            .rposition(|ty| *ty != kernels::Ty::InPacked)
+            .rposition(|(_, ty)| ty != "InPacked")
             .map_or(0, |at| at + 1);
-        if let Some(buffers) = declared_buffers(&root, file, symbol) {
-            compared += 1;
-            // ONE DIRECTION IS A FAULT AND THE OTHER IS NOT DECIDABLE HERE.
-            //
-            // A body may PAD, and `moe::qmm_t_routed` does: nine arguments,
-            // and a dispatch list of thirteen because `pad` is repeated five
-            // times to push `tile_expert` out to slot 12, which is where its
-            // shader declares it. So the signature's count is a LOWER bound
-            // on what the body binds, and a signature naming fewer slots than
-            // the shader declares may be padding correctly.
-            //
-            // More is never padding. A value bound past the last declared
-            // buffer is a value the kernel cannot read.
-            if slots > buffers {
-                disagrees.push(format!(
-                    "  {symbol} -> `{}`: signature binds {slots} slot(s), \
-                     shader declares {buffers}",
-                    routine.name
-                ));
-            } else if slots < buffers {
-                short.push(symbol);
-            }
+        let Some(shader) = shader_slots(&root, file, symbol, entry) else {
+            unresolved.push(format!(
+                "  {symbol} -> `{}`: nothing in {file} declares buffers under \
+                 `{symbol}`, under the shortest entry it claims (`{entry}`), \
+                 or under the name that entry's `host_name` aliases",
+                routine.name
+            ));
+            continue;
+        };
+        compared += 1;
+        let buffers = shader.keys().next_back().map_or(0, |&n| n + 1);
+        // BOTH DIRECTIONS ARE FAULTS.
+        //
+        // More is a value bound past the last declared buffer, which the
+        // kernel cannot read. Fewer is a declared buffer the list never
+        // reaches, which nothing binds -- and an unbound index on this driver
+        // is not a fault either, it is whatever the previous step left at
+        // that address.
+        if slots != buffers {
+            disagrees.push(format!(
+                "  {symbol} -> `{}`: dispatches {slots} slot(s), shader \
+                 declares {buffers}",
+                routine.name
+            ));
         }
-        if let Some(writes) = first_writable(&root, file, symbol) {
-            // Both mutable pointer kinds, because the shader says "writable"
-            // with the absence of `const` and does not distinguish an opaque
-            // buffer from a typed one. `gdn_prep` writes four `F32sMut` and
-            // no `BufMut` at all, so asking only about `BufMut` would read it
-            // as a kernel that writes nothing.
-            //
-            // Positions among BOUND arguments, for the reason above -- and
-            // unlike the count, this one padding cannot rescue: a repeated
-            // pad before the output moves the output's position too, so the
-            // signature and the body agree about which position it is unless
-            // the pad comes after it, which would put the output where the
-            // shader does not declare one either way.
-            let by_routine = bound.iter().position(|ty| {
-                matches!(
-                    ty,
-                    kernels::Ty::BufMut
-                        | kernels::Ty::F32sMut
-                        | kernels::Ty::I32sMut
-                        | kernels::Ty::U32sMut
-                        | kernels::Ty::U8sMut
-                )
-            });
-            if by_routine != Some(writes) && !MISBOUND.contains(&symbol) {
+        for (at, (held, ty)) in dispatched.iter().enumerate() {
+            // A STATED HOLE. The argument's name is the statement, and it is
+            // why `kv_append_paged` spells six of them out instead of
+            // repeating one handle: three other backends declare the same
+            // sixteen slots, and a folded pad would make this port's call a
+            // different call from theirs.
+            if held == "pad" || held.starts_with("ring_") {
+                continue;
+            }
+            let (Some(&want), Some(got)) = (shader.get(&at), routine_kind(ty)) else {
+                continue;
+            };
+            // `packed` is a struct behind a reference. It arrives as one
+            // opaque handle and answers nothing about pointers or numbers.
+            if want != "packed" && want != got {
                 disagrees.push(format!(
-                    "  {symbol} -> `{}`: shader writes buffer {writes}, the \
-                     signature puts its first writable at {by_routine:?}",
+                    "  {symbol} -> `{}`: slot {at} holds `{held}: {ty}`, \
+                     which is an {got}, and the shader declares an {want} \
+                     there",
                     routine.name
                 ));
             }
@@ -1034,17 +1437,6 @@ fn every_routine_agrees_with_the_shader_its_stem_names() {
     disagrees.dedup();
     unrouted.sort();
     unrouted.dedup();
-    short.sort_unstable();
-    short.dedup();
-
-    assert_eq!(
-        short, SHORT,
-        "the set of routines whose signature accounts for fewer slots than \
-         their shader declares has moved. A line arriving is a routine that \
-         cannot reach its shader's last buffer unless its body pads to it; a \
-         line leaving is one that no longer needs to, and its entry has to go \
-         with it."
-    );
 
     assert!(
         unrouted.is_empty(),
@@ -1052,39 +1444,50 @@ fn every_routine_agrees_with_the_shader_its_stem_names() {
          can be built:\n{}",
         unrouted.join("\n")
     );
+    // Named rather than counted. This used to be the arithmetic below alone,
+    // and when the parser lost a stem the failure said `98 != 99` and left
+    // the reader to find which -- so the diagnosis of a narrowed parser was
+    // strictly worse than the diagnosis of a wrong argument.
+    unresolved.sort();
+    unresolved.dedup();
+    assert!(
+        unresolved.is_empty(),
+        "a routine stem was not compared against a shader at all, which is a \
+         declaration this can no longer FIND rather than a declaration that \
+         agrees:\n{}",
+        unresolved.join("\n")
+    );
     assert!(
         disagrees.is_empty(),
         "a routine describes a kernel it does not match, and the arm fills it \
          anyway:\n{}",
         disagrees.join("\n")
     );
-    // SEVENTY-THREE of ninety-nine, and the gap is the point of writing the
-    // number down rather than a floor.
+    // NINETY-NINE of ninety-nine. This read sixty-eight when it was first
+    // written and seventy-three after one widening, and the number was kept
+    // as a floor precisely because the gap was the interesting part.
     //
-    // `param_list` finds a declaration by `void <stem>(`, or by a macro
-    // invocation whose first argument is the stem. Twenty-six stems are
-    // neither, because MSL kernels here are STAMPED and a stamped kernel's
-    // parameter list is written under a name that is not the entrypoint's:
+    // The gap closed in two steps, both of them the same realisation: a stem
+    // is not a C++ function name. MSL kernels here are STAMPED, and a stamped
+    // kernel's parameters are written under whatever name the template has:
     //
     // * `[[host_name("neox_decode_" #name)]] void rope_neox_decode<itype>` --
-    //   the entrypoint and the declaration have different names, and only the
-    //   declaration carries buffers.
-    // * `instantiate_sdpa_tiled_impl("sdpa_paged_tiled_sink", ...)` -- the
-    //   entrypoint arrives as a STRING argument, and the `[[host_name]]` that
-    //   consumes it is built from a macro parameter.
+    //   the entrypoint and the declaration disagree on the name, and only the
+    //   declaration carries buffers. `host_name_alias` joins them through the
+    //   census, which is the only thing that knows both.
+    // * `instantiate_sdpa_tiled_impl("sdpa_paged_tiled_sink", ..)` -- the
+    //   entrypoint is a STRING argument and appears nowhere else in the file.
+    //   `quoted_macro` follows the invocation to the `#define`.
     //
-    // A parser that follows the census back to the longest `[[host_name]]`
-    // literal a stem claims reaches 98 of 99; it was written and measured
-    // before this sentence, against `scripts/metal-kernel-audit.py`'s expanded
-    // census. Landing it widens the COMPARISON by thirty-one stems, and
-    // `SHORT` and `MISBOUND` are what the sixty-eight already here had to say
-    // before that is worth doing -- a widening onto an unsettled comparison
-    // reads as a wall of noise and gets excused wholesale.
-    assert!(
-        compared >= 73,
-        "only {compared} symbol(s) were compared against a shader, which is \
-         fewer than this has ever reached -- the loop is no longer reading \
-         the sources it claims to."
+    // The widening was worth doing only once the comparison was settled, and
+    // it paid immediately: the twenty-six stems it added carried five faults,
+    // which is a higher rate than the seventy-three that came before.
+    assert_eq!(
+        compared,
+        driver_metal::lowering::routine::stems().count(),
+        "a routine stem was not compared against a shader at all, which \
+         means a declaration this can no longer find rather than a \
+         declaration that agrees"
     );
 }
 
@@ -1323,15 +1726,13 @@ fn prefill_tiles_the_attention_decode_walks_row_by_row() {
 /// and may have gaps -- `kv_append_paged` declares 0,1,2,3,5,10,12,13,14,15 --
 /// so the vector is sized by the HIGHEST index and a gap is a name of `""`.
 ///
-/// # Why this does not replace [`declared_buffers`]
+/// # Why this is not [`shader_slots`]
 ///
-/// It resolves one level of MACRO, which that does not, so it reaches the
-/// stamped kernels that are most of this tree. Widening `declared_buffers`
-/// the same way would put sixty more signatures under
-/// `every_routine_agrees_with_the_shader_its_stem_names` in one commit, which
-/// is a good change and a separate one: that test compares COUNTS and a new
-/// disagreement there is a real finding to be read, not a parser change to be
-/// landed alongside it.
+/// It asks a narrower question -- what a slot is CALLED -- and answers it for
+/// the stems [`macro_param_list`] alone can reach, which is no longer all of
+/// them. `shader_slots` resolves two further ways and reaches every stem;
+/// this does not need to, because the names it checks are the ones a `Row`
+/// spells and those come from the unstamped declarations.
 fn buffer_names(root: &std::path::Path, file: &str, stem: &str) -> Option<Vec<String>> {
     let src = std::fs::read_to_string(root.join(file)).ok()?;
     let list = macro_param_list(&src, stem, 0)?;

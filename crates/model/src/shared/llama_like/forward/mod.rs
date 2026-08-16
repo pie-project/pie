@@ -462,20 +462,36 @@ fn llama_like_metal_text(
         // mixture was wrong, and nothing said so, because no mixture had ever
         // been held to a checkpoint. `owes_down` below is the fact the sites
         // now ask instead of assuming.
-        let gated = |x: &Val, w: &dsl::Layer| {
-            // WHICH activation, and it is a symbol rather than a flag:
-            // gpt-oss clamps the gate above only, clamps the linear branch
-            // both ways and adds one to it, and dropping either produces a
-            // model that runs and is wrong.
-            let activate = |gate: &Val, up: &Val, width: u32| match metal.activation {
-                Activation::SiluMul => dsl::metal::silu_mul(gate, up, width),
-                Activation::SwiGlu { limit, alpha } => {
-                    dsl::metal::swiglu(gate, up, width, limit, alpha)
-                }
-                Activation::Geglu => dsl::metal::geglu(gate, up, width),
-            };
+        // `router_in` is the value the ROUTER projects, which need not be the
+        // one the experts read. For every routed family but gemma-4 it is the
+        // same value and the two arguments are handed the same `Val`; gemma-4
+        // routes off the post-attention stream and feeds its experts a
+        // separately-normed copy of it, so a text with one argument here
+        // could only be right for one of them.
+        // WHICH activation, and it is a symbol rather than a flag:
+        // gpt-oss clamps the gate above only, clamps the linear branch
+        // both ways and adds one to it, and dropping either produces a
+        // model that runs and is wrong.
+        let activate = |gate: &Val, up: &Val, width: u32| match metal.activation {
+            Activation::SiluMul => dsl::metal::silu_mul(gate, up, width),
+            Activation::SwiGlu { limit, alpha } => {
+                dsl::metal::swiglu(gate, up, width, limit, alpha)
+            }
+            Activation::Geglu => dsl::metal::geglu(gate, up, width),
+        };
+        // The DENSE FFN's gate, up and activation, WITHOUT the down
+        // projection -- see `owes_down` below for why that is the caller's.
+        //
+        // Hoisted out of `gated` because a `dense_beside_moe` layer needs
+        // both this and the routed path in the SAME layer, and `gated`
+        // returns one or the other. It was reachable only as `gated`'s
+        // `n_experts == 0` arm, which a mixture row can never take.
+        let dense_ffn = |x: &Val, w: &dsl::Layer| {
+            activate(&gemm(x, &w.gate_proj), &gemm(x, &w.up_proj), f.intermediate)
+        };
+        let gated = |x: &Val, router_in: &Val, w: &dsl::Layer| {
             if f.n_experts == 0 {
-                return activate(&gemm(x, &w.gate_proj), &gemm(x, &w.up_proj), f.intermediate);
+                return dense_ffn(x, w);
             }
             let k = f.experts_per_token.max(1);
             // The router's logits, biased if the checkpoint publishes one.
@@ -494,10 +510,28 @@ fn llama_like_metal_text(
             // `qmv` directly rather than through `gemm`: the gate is
             // `[hidden, n_experts]` and no GEMM tile is that narrow, so the
             // guard `gemm` builds would have an arm that can never run.
+            // The router's input, normed at its OWN scale when the
+            // checkpoint publishes one. gemma-4 does: `router.scale` is a
+            // `[hidden]` RMS weight and the reference folds `hidden**-0.5`
+            // into it, which `rms_norm` already applies.
+            let router_x = if metal.router_input_norm {
+                // `hidden**-0.5` folded into the gain, which is where the
+                // reference has it: `rms_norm(x, self.scale * root, eps)`.
+                // The scalar is nowhere in the checkpoint.
+                dsl::metal::rms_norm_gain(
+                    router_in,
+                    &w.router_scale,
+                    f.hidden,
+                    metal.rms_eps,
+                    (f.hidden as f32).powf(-0.5),
+                )
+            } else {
+                router_in.clone()
+            };
             let logits = match metal.router_repr {
-                None => gemm(x, &w.router),
+                None => gemm(&router_x, &w.router),
                 Some(repr) => gemm_at(
-                    x,
+                    &router_x,
                     &dsl::MatW {
                         repr,
                         ..w.router.clone()
@@ -511,8 +545,15 @@ fn llama_like_metal_text(
             } else {
                 logits
             };
-            let (ids, weights) =
-                dsl::metal::router_topk(&logits, f.n_experts, k, false, metal.norm_topk_prob);
+            let (ids, weights) = dsl::metal::router_topk(
+                &logits,
+                f.n_experts,
+                k,
+                metal
+                    .router_expert_scale
+                    .then_some(&w.router_expert_scale),
+                metal.norm_topk_prob,
+            );
             // The SORTED stack: one row per `(token, expert-slot)` route,
             // grouped so that consecutive rows read the same expert bank.
             // Its height is a function of the FIRE, which is why nothing
@@ -606,6 +647,29 @@ fn llama_like_metal_text(
         // Whether the caller still owes the down projection after `gated` --
         // see the note on its two widths.
         let owes_down = f.n_experts == 0;
+
+        // Whether this deployment's layers run BOTH FFNs. gemma-4's mixture
+        // rows do; every other routed family replaces the dense MLP with the
+        // routed one, and `f.n_experts > 0` is then enough to know which ran.
+        let mixture_beside_dense = metal.dense_beside_moe && f.n_experts > 0;
+        // And it is written in the SANDWICH arm only, because the reference
+        // that defines it is a sandwich block: the two legs are joined
+        // between `post_feedforward_layernorm` and the residual, and under
+        // `Pre` or `Post` there is no such position. The branch used to sit
+        // after all three arms and apply to any placement, which read as
+        // generality and was arithmetic no reference states -- under `Pre`
+        // it appended a second routed FFN to a layer that had already run
+        // one, which is what
+        // `gemmas_mixture_runs_beside_the_dense_mlp_rather_than_instead_of_it`
+        // was asserting when it counted two routers.
+        assert!(
+            !mixture_beside_dense || sandwich,
+            "a mixture beside the dense MLP is a SANDWICH block's shape and \
+             this row states {:?}: there is no position under it for the \
+             join, so a text that ran the branch anyway would be inventing \
+             one",
+            f.norm_placement
+        );
 
         // The embedding, with gemma's `sqrt(hidden)` scale folded into the
         // gather when this deployment wants one. The scale is the statement's
@@ -900,7 +964,7 @@ fn llama_like_metal_text(
             if post_norm {
                 let o = dsl::metal::rms_norm(&land(&a), &w.attn_norm, f.hidden, metal.rms_eps);
                 y = dsl::metal::residual_add(&o, &y);
-                let h = gated(&y, &w);
+                let h = gated(&y, &y, &w);
                 let ffn = if owes_down { gemm(&h, &w.down) } else { h };
                 let d = dsl::metal::rms_norm(&ffn, &w.mlp_norm, f.hidden, metal.rms_eps);
                 y = dsl::metal::residual_add(&d, &y);
@@ -922,11 +986,50 @@ fn llama_like_metal_text(
                 // not a missed optimisation.
                 let o = dsl::metal::rms_norm(&land(&a), &w.post_attn_norm, f.hidden, metal.rms_eps);
                 y = dsl::metal::residual_add(&o, &y);
-                let x = dsl::metal::rms_norm(&y, &w.mlp_norm, f.hidden, metal.rms_eps);
-                let h = gated(&x, &w);
-                let ffn = if owes_down { gemm(&h, &w.down) } else { h };
-                let d = dsl::metal::rms_norm(&ffn, &w.post_mlp_norm, f.hidden, metal.rms_eps);
-                y = dsl::metal::residual_add(&d, &y);
+                if mixture_beside_dense {
+                    // ── gemma-4's MIXTURE layer: two FFNs, side by side. ──
+                    //
+                    // `mlx_lm/models/gemma4_text.py::DecoderLayer.__call__`:
+                    //
+                    //     h1 = post_ffn_norm_1(mlp(pre_ffn_norm(h)))
+                    //     h2 = post_ffn_norm_2(experts(pre_ffn_norm_2(h),
+                    //                                 router(h)))
+                    //     h  = post_ffn_norm(h1 + h2) + residual
+                    //
+                    // THREE values read the post-attention stream `y`: each
+                    // leg's input norm and the ROUTER. The routed leg does
+                    // not route off its own normed input — a text that fed
+                    // the router `x2` would pick different experts and stay
+                    // fluent, which is the failure mode this whole family of
+                    // facts exists to make impossible to write by accident.
+                    //
+                    // Nothing fuses. `owes_down` is not asked: the dense
+                    // leg's down projection lands in `post_mlp_norm_1`, not
+                    // in the residual, so the fused `gemm_add` the dense
+                    // rows take would skip a norm.
+                    let x1 = dsl::metal::rms_norm(&y, &w.mlp_norm, f.hidden, metal.rms_eps);
+                    let g1 = gemm(&dense_ffn(&x1, &w), &w.down);
+                    let h1 = dsl::metal::rms_norm(&g1, &w.post_mlp_norm_1, f.hidden, metal.rms_eps);
+
+                    let x2 = dsl::metal::rms_norm(&y, &w.mlp_norm_2, f.hidden, metal.rms_eps);
+                    let g2 = gated(&x2, &y, &w);
+                    let h2 = dsl::metal::rms_norm(&g2, &w.post_mlp_norm_2, f.hidden, metal.rms_eps);
+
+                    // The JOIN, then the norm, then the residual. Each of
+                    // the three is a different statement and the order is
+                    // the reference's: norming before the add would norm
+                    // two values that are meant to be normed as a sum.
+                    let joined = dsl::metal::residual_add(&h1, &h2);
+                    let d =
+                        dsl::metal::rms_norm(&joined, &w.post_mlp_norm, f.hidden, metal.rms_eps);
+                    y = dsl::metal::residual_add(&d, &y);
+                } else {
+                    let x = dsl::metal::rms_norm(&y, &w.mlp_norm, f.hidden, metal.rms_eps);
+                    let h = gated(&x, &x, &w);
+                    let ffn = if owes_down { gemm(&h, &w.down) } else { h };
+                    let d = dsl::metal::rms_norm(&ffn, &w.post_mlp_norm, f.hidden, metal.rms_eps);
+                    y = dsl::metal::residual_add(&d, &y);
+                }
             } else {
                 // The one arm that FUSES the residual into the landing, so
                 // the bias cannot ride the same gemm. Added afterwards, which
@@ -938,7 +1041,7 @@ fn llama_like_metal_text(
                     y = dsl::metal::add_bias(&y, &w.o_bias);
                 }
                 let x = dsl::metal::rms_norm(&y, &w.mlp_norm, f.hidden, metal.rms_eps);
-                let h = gated(&x, &w);
+                let h = gated(&x, &x, &w);
                 // Dense FUSES the down projection into the residual add, which
                 // is one kernel instead of two over the widest activation in
                 // the block. A mixture cannot: its rows were already projected
@@ -950,48 +1053,6 @@ fn llama_like_metal_text(
                 };
             }
 
-            // ── gemma's BRANCH. UNREACHABLE, and known to be unfinished. ──
-            //
-            // A mixture that sits BESIDE the dense MLP rather than replacing
-            // it. Every other family in this text runs one FFN or the other.
-            //
-            // `Gemma4::untraced` refuses every row that has a mixture, so
-            // nothing reaches these three statements today, and the refusal
-            // carries the measurement that says why they are not yet right.
-            // Two of its findings are about the lines just below.
-            //
-            // `mlx_lm/models/gemma4_text.py::DecoderLayer.__call__` is the
-            // reference, and it is a JOIN, not an append:
-            //
-            //     h1 = post_ffn_norm_1(mlp(pre_ffn_norm(h)))
-            //     h2 = post_ffn_norm_2(experts(pre_ffn_norm_2(h), router(h)))
-            //     h  = post_ffn_norm(h1 + h2) + residual
-            //
-            // Four ways these three lines are not that. They read `y`, which
-            // the dense FFN reassigned a few lines up, so the branch chains
-            // off the post-dense value where both legs take the same
-            // post-attention `h`. They reuse `mlp_norm` for the routed
-            // pre-norm on the argument that it is "at the same width, so no
-            // new statement" -- same width, different weights, and the
-            // checkpoint ships `pre_feedforward_layernorm_2` to prove it.
-            // They state no post-norm, where the reference has one per leg.
-            // And they `residual_add` into `y` where the reference adds the
-            // legs to each other, norms the sum, and only then rejoins.
-            //
-            // The dense FFN above is wrong for these rows too, and more
-            // quietly: it fuses the down projection into the residual add,
-            // which is the right call when nothing sits between them. In a
-            // mixture layer `post_feedforward_layernorm_1` does, and a dense
-            // layer does not even have that tensor. The mixture changes the
-            // dense leg, so `owes_down` cannot stay the only question asked.
-            //
-            // Width is what a shape check can see; provenance is not, which
-            // is how an assumption like `mlp_norm` survives one.
-            if metal.dense_beside_moe && f.n_experts > 0 {
-                let branch = dsl::metal::rms_norm(&y, &w.mlp_norm, f.hidden, metal.rms_eps);
-                let mixed = gated(&branch, &w);
-                y = dsl::metal::residual_add(&mixed, &y);
-            }
 
             // ── gemma's per-layer tail. ──
             //
@@ -1806,6 +1867,14 @@ mod tests {
         metal_kernels(plan).iter().filter(|k| *k == kernel).count()
     }
 
+    /// Whether any statement in the plan names this weight.
+    fn binds(plan: &ForwardPlan, weight: &str) -> bool {
+        plan.ops.iter().any(|op| match &op.kind {
+            OpKind::Launch { weights, .. } => weights.iter().any(|w| w == weight),
+            _ => false,
+        })
+    }
+
     /// The three activations are three different kernels, and the fact is
     /// the only thing that picks between them.
     ///
@@ -2053,24 +2122,67 @@ mod tests {
     /// is not: both read the post-attention residual and both are added
     /// back, and a build that took it for a variant would drop one of the
     /// two terms the layer is defined as.
+    ///
+    /// This used to assert TWO routers, which is what the branch produced
+    /// and not what the model is. The old text ran the routed FFN in the
+    /// placement arm and then ran it AGAIN in the branch, so "beside" was
+    /// measured as "routes twice" -- a count that the defect satisfies and
+    /// the reference does not. What beside means is ONE router and, in the
+    /// same layer, a DENSE gate/up/down, which is what this asserts now.
     #[test]
     fn gemmas_mixture_runs_beside_the_dense_mlp_rather_than_instead_of_it() {
         let mut f = LlamaLikeFacts::qwen3_0_6b();
         f.n_experts = 4;
         f.experts_per_token = 2;
+        f.norm_placement = NormPlacement::Sandwich;
         let beside = LlamaLikeMetalFacts {
             dense_beside_moe: true,
+            router_input_norm: true,
+            router_expert_scale: true,
             ..LlamaLikeMetalFacts::synthetic()
         };
         let instead = LlamaLikeMetalFacts::synthetic();
         let two = llama_like_metal(&f, &beside, FireClass::Decode);
         let one = llama_like_metal(&f, &instead, FireClass::Decode);
         assert_eq!(
-            runs(&two, "router_topk_bfloat16"),
-            2 * runs(&one, "router_topk_bfloat16"),
-            "the branch did not route a second time:\n  beside: {:?}",
+            runs(&two, "router_topk_scaled_bfloat16"),
+            runs(&one, "router_topk_bfloat16"),
+            "beside is not routing twice:\n  beside: {:?}",
             metal_kernels(&two)
         );
+        // The DENSE leg, which the routed-instead row does not have. Its
+        // down projection is bound explicitly rather than fused, because
+        // `post_feedforward_layernorm_1` sits between it and the residual.
+        for w in ["layer.0.gate_proj", "layer.0.up_proj", "layer.0.down"] {
+            assert!(binds(&two, w), "the dense leg binds {w}");
+            assert!(!binds(&one, w), "the routed-instead row does not bind {w}");
+        }
+        // SEVEN norms a layer, against the sandwich's four: `post_mlp_norm_1`,
+        // `mlp_norm_2`, `post_mlp_norm_2` and the ROUTER's. A count, because
+        // the tensors are the only thing that distinguishes them and a text
+        // that reused one would still be at the right width.
+        assert_eq!(
+            runs(&two, "rms_single_row_bfloat16") - runs(&one, "rms_single_row_bfloat16"),
+            4,
+            "the two legs' extra norms and the router's:\n  beside: {:?}",
+            metal_kernels(&two)
+        );
+        for w in [
+            "layer.0.post_mlp_norm_1",
+            "layer.0.mlp_norm_2",
+            "layer.0.post_mlp_norm_2",
+            "layer.0.router_scale",
+            "layer.0.router_expert_scale",
+        ] {
+            assert!(binds(&two, w), "the mixture layer binds {w}");
+            assert!(!binds(&one, w), "a routed-instead layer does not bind {w}");
+        }
+        // And the per-expert gain reaches the kernel that reads it. Naming
+        // `router_topk_scaled_bfloat16` while binding four operands is the
+        // shape this used to have; the weight and the symbol move together
+        // now.
+        assert_eq!(runs(&two, "router_topk_scaled_bfloat16"), 1);
+        assert_eq!(runs(&two, "router_topk_bfloat16"), 0);
         // A ROW WITH NO EXPERTS takes no branch however the fact reads, so
         // `n_experts > 0` is load-bearing rather than a restatement.
         f.n_experts = 0;

@@ -31,6 +31,15 @@ anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }
 # Path/dir resolution (home dir for `$PIE_HOME` fallback).
 dirs = "6.0"
+# TLS: not used here, *selected* here. Every HTTP client in the process
+# (reqwest in the engine, the worker's blob fetch, `pie model import`) is built
+# on `rustls-no-provider`, which refuses to pick a crypto backend on its own —
+# so process boot installs one, and installing it once beside the panic hook is
+# what keeps every bin from having to remember. `ring` rather than the aws-lc
+# default: it is already in the graph for `wasmtime-wasi-http` and the client
+# crate's signing, and the aws-lc build script was the most expensive unit in a
+# cold build.
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"] }
 # Observability: structured logs + env-filter level control.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

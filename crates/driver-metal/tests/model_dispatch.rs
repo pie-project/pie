@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use driver_metal::lowering::dispatch::{
     Dispatch, Geometry, Undispatchable, facts_of, named_tile, pipelines_needed, plan_launch,
 };
-use driver_metal::lowering::executor::{Frame, Resolver, Slice};
+use driver_metal::lowering::executor::{FireTable, Frame, Resolver, Slice};
 use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
 use model::shared::llama_like::forward::llama_like_metal;
 use model_compiler::lower::{Fire, Lowered, Row, lower};
@@ -40,6 +40,31 @@ impl Resolver for Sentinels {
             bytes: 1 << 30,
         })
     }
+    /// The KV pages, and the pool's three strides.
+    ///
+    /// A stub that declined these read as a driver that CANNOT DISPATCH the
+    /// paged statements -- `kv_append_paged` and both `sdpa_paged` legs
+    /// refused as *"the KV page size: the pool has none"*, which is the
+    /// driver answering correctly about a rig that had not been asked to
+    /// hold a pool. The refusal is right and the rig was wrong, so the rig
+    /// answers now.
+    ///
+    /// qwen3-0.6b's own numbers, matching [`geometry`], because a stride
+    /// invented here would let a grid that reads past a page pass.
+    fn kv(&mut self, _: u16, _: bool) -> Option<Slice> {
+        Some(Slice {
+            address: 0x3000_0000,
+            bytes: 1 << 30,
+        })
+    }
+    fn pool(&mut self, which: FireTable) -> Option<u32> {
+        Some(match which {
+            FireTable::KvHeadStride => 128,
+            FireTable::KvSeqStride => 8 * 128,
+            FireTable::KvPageSize => 256,
+            _ => return None,
+        })
+    }
 }
 
 /// qwen3-0.6b's geometry, which is the checkpoint the smokes use.
@@ -54,6 +79,10 @@ fn geometry() -> Geometry {
         // qwen3-0.6b's checkpoint is 4-bit over groups of 64.
         group: 64,
         bits: 4,
+        // A dense row with one head width and one affine point states none
+        // of the five axes a row can hold twice, and zero is what
+        // `geometry_from_deployment` puts there for such a row.
+        ..Geometry::default()
     }
 }
 
@@ -241,8 +270,8 @@ fn a_statement_that_states_scalars_carries_them_to_its_dispatch() {
     // separate matvecs and there is nothing to split.
     //
     // Paged decode attention makes the point harder. Two of its six scalars
-    // could not come off a shape even in principle: `params[2]` is a f32
-    // BIT-CAST into a u32 slot, and `params[4]` is `u32::MAX` standing for
+    // could not come off a shape even in principle: `params[3]` is a f32
+    // BIT-CAST into a u32 slot, and `params[5]` is `u32::MAX` standing for
     // "no sliding window" -- a sentinel, not a measurement. A driver that
     // reconstructed scalars from operand extents would have to invent both.
     let low = lowered(FireClass::Decode, 1);
@@ -253,15 +282,21 @@ fn a_statement_that_states_scalars_carries_them_to_its_dispatch() {
         .find(|d| d.symbol.starts_with("sdpa_paged_decode"))
         .expect("the text states a paged decode attention");
 
+    // The SHADER's order, not the statement's: `sdpa_paged.metal` numbers
+    // its constants gqa_factor(4), page_size(9), n_kv_heads(10), scale(11),
+    // attention_mask_stride(13), window(15), and the packed array follows
+    // the buffer numbers. `page_size` sits second and comes off the POOL,
+    // which is the one scalar here that no statement states.
     assert_eq!(sdpa.params.len(), 6, "the statement's six scalars");
     assert_eq!(
         sdpa.params[0],
         facts.q_heads / facts.kv_heads,
         "the GQA group, 16 query heads over 8 KV heads"
     );
-    assert_eq!(sdpa.params[1], facts.kv_heads, "the KV head count");
+    assert_eq!(sdpa.params[1], 256, "the page size, off the pool");
+    assert_eq!(sdpa.params[2], facts.kv_heads, "the KV head count");
 
-    let scale = f32::from_bits(sdpa.params[2]);
+    let scale = f32::from_bits(sdpa.params[3]);
     let want = 1.0 / (facts.head_dim as f32).sqrt();
     assert!(
         (scale - want).abs() < 1e-9,
@@ -269,7 +304,7 @@ fn a_statement_that_states_scalars_carries_them_to_its_dispatch() {
     );
 
     assert_eq!(
-        sdpa.params[4],
+        sdpa.params[5],
         u32::MAX,
         "no sliding window, said as a sentinel rather than as an absence"
     );
@@ -601,10 +636,32 @@ mod the_map {
 mod state {
     use std::collections::HashMap;
 
+    use driver_metal::layout::kv::Shape;
     use driver_metal::lowering::executor::{Resolver, Slice};
     use driver_metal::lowering::resolve::{Names, Store};
 
     use super::*;
+
+    /// qwen3-0.6b's pool, matching [`geometry`].
+    ///
+    /// `kv_append_paged` and both `sdpa_paged` legs read a page size, so a
+    /// store without one refuses them -- correctly, because a page size of
+    /// zero would send the ring's arithmetic through the wrong rows. These
+    /// tests are about the PAGES, so the pool is stated and the refusal they
+    /// would otherwise all take is out of the way.
+    fn pool() -> Shape {
+        Shape {
+            layers: 28,
+            kv_heads: 8,
+            head_dim: 128,
+            page_size: 256,
+            pages: 64,
+            element_bytes: 2,
+            global_head_dim: 0,
+            global_kv_heads: 0,
+            full_attn_every: 0,
+        }
+    }
 
     /// Distinct addresses per (layer, side), so a wrong one names itself.
     fn pages(layer: u16, values: bool) -> Option<Slice> {
@@ -620,7 +677,9 @@ mod state {
         let low = lowered(FireClass::Decode, 1);
         let (tensors, named) = (HashMap::new(), HashMap::new());
         let kv = |l: u16, v: bool| pages(l, v);
-        let mut store = Store::new(Names::mlx(), &tensors, &named).with_kv(&kv);
+        let mut store = Store::new(Names::mlx(), &tensors, &named)
+            .with_kv(&kv)
+            .with_pool(pool());
 
         // Answer the weights too, so a refusal is about state and nothing else.
         assert!(store.weight("layer.0.attn_norm").is_none());
@@ -686,13 +745,20 @@ mod state {
 
     #[test]
     fn a_resolver_with_no_pool_binds_a_region_that_addresses_nothing() {
-        // The default. A binder's own tests have no pool and must not need
-        // one, and a statement that asks and gets nothing binds a region
+        // A statement that asks for pages and gets nothing binds a region
         // addressing nothing — the same honest answer a missing scale gets,
         // and not a skipped slot, which would shift every operand after it.
+        //
+        // The POOL is stated and the PAGES are not, which is the split this
+        // test used to miss: it held neither and read the resulting refusal
+        // as a plan. A page POINTER is a buffer, and a buffer nothing hands
+        // out is bindable as nothing; a page SIZE is arithmetic, and there
+        // is no value that stands for "unknown" in a multiply. So the pages
+        // bind empty here and the size refuses in
+        // `a_paged_write_with_no_page_size_refuses_rather_than_reading_row_zero`.
         let low = lowered(FireClass::Decode, 1);
         let (tensors, named) = (HashMap::new(), HashMap::new());
-        let mut store = Store::new(Names::mlx(), &tensors, &named);
+        let mut store = Store::new(Names::mlx(), &tensors, &named).with_pool(pool());
         let launch = low
             .launches
             .iter()
@@ -709,6 +775,26 @@ mod state {
         // arithmetic -- and the paged row is positional over a shared ring ABI
         // it does not read, which is where most of the sixteen go.
         assert_eq!(d.args.len(), 16, "and every other slot is still in place");
+    }
+
+    /// The other half of the split above: the SIZE has no empty answer.
+    #[test]
+    fn a_paged_write_with_no_page_size_refuses_rather_than_reading_row_zero() {
+        let low = lowered(FireClass::Decode, 1);
+        let (tensors, named) = (HashMap::new(), HashMap::new());
+        let kv = |l: u16, v: bool| pages(l, v);
+        let mut store = Store::new(Names::mlx(), &tensors, &named).with_kv(&kv);
+        let launch = low
+            .launches
+            .iter()
+            .find(|l| low.kernels[l.kernel as usize].starts_with("kv_append"))
+            .expect("the text writes KV");
+        let why = plan_launch(&low, launch, frame(&low), geometry(), &mut store)
+            .expect_err("a write with no page size cannot be planned");
+        assert!(
+            format!("{why:?}").contains("the KV page size"),
+            "and says which number is missing: {why:?}"
+        );
     }
 }
 
@@ -768,18 +854,34 @@ fn a_row_can_say_its_grid_extent_comes_from_the_statement() {
         rotary_dims: 256,
         group: 64,
         bits: 4,
+        // The SECOND head width, and how often a layer takes it. Without
+        // these the geometry knows of no full layer at all, `is_full_attention`
+        // answers false everywhere, and every layer rotates the fire's 256 --
+        // which is this test's own bug, passing before the axis existed
+        // because there was then nothing to state.
+        global_head_dim: 512,
+        global_kv_heads: 4,
+        full_attn_every: 6,
         ..Geometry::default()
     };
+    // The PLANNED grid, not `facts_of`. `Facts::rotary_dims` is the fire's
+    // number by construction -- it is the FALLBACK `stated` takes when a
+    // statement carries none -- so reading it back could only ever return
+    // what was put in, and this test read it and proved nothing. `rope_grid`
+    // puts the resolved count in `grid[0]` as pairs, which is where a rope
+    // told the wrong extent stops covering its channels.
+    let frame = frame(&low);
+    let mut store = Sentinels;
     let mut by_layer: BTreeSet<(u16, u32)> = BTreeSet::new();
     for launch in &low.launches {
         let symbol = &low.kernels[launch.kernel as usize];
         if !symbol.starts_with("neox") {
             continue;
         }
-        by_layer.insert((
-            launch.layers.start,
-            facts_of(&low, launch, geometry).rotary_dims,
-        ));
+        let d = plan_launch(&low, launch, frame, geometry, &mut store)
+            .map(|d| d.into_iter().next().expect("one statement, one dispatch"))
+            .expect("a rotation plans");
+        by_layer.insert((launch.layers.start, d.grid[0] * 2));
     }
     assert!(!by_layer.is_empty(), "the text states rope launches");
     for (layer, rotary) in &by_layer {
@@ -855,6 +957,14 @@ fn the_mxfp4_expert_bank_reads_a_bias_and_is_handed_one() {
         // gpt-oss's MXFP4: blocks of 32, four bits.
         group: 32,
         bits: 4,
+        // The router gate arrives at its own point -- see the same two
+        // numbers in `text_conformance`'s gpt-oss row. Not read by the
+        // assertions below, which plan only the expert bank's leg, but a
+        // geometry that understated it would compose the gate's symbol
+        // wrong for anything that did.
+        router_group: 64,
+        router_bits: 8,
+        ..Geometry::default()
     };
     let frame = frame(&low);
     // The kernel's own parameter names, by slot. This asked the ROW, whose

@@ -109,7 +109,7 @@ impl ui::Report for CacheReport {
 }
 
 fn list() -> Result<Answer> {
-    let entries = state::entries(Some(hf_hub::resolve_cache_dir()));
+    let entries = state::entries(Some(crate::local::hf::resolve_cache_dir()));
     let home = worker::paths::pie_home();
 
     // Measured once and reused: the size is what decides whether a row is
@@ -169,7 +169,7 @@ fn list() -> Result<Answer> {
 /// flag that sweeps them in -- a single character should not stand between a
 /// person and deleting weight-sized artifacts.
 fn selected(names: &[String]) -> Result<Vec<state::Entry>> {
-    let all = state::entries(Some(hf_hub::resolve_cache_dir()));
+    let all = state::entries(Some(crate::local::hf::resolve_cache_dir()));
     if names.is_empty() {
         return Ok(all
             .into_iter()

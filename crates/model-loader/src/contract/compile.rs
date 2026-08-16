@@ -246,25 +246,76 @@ impl Lowering {
 /// boundaries. The checker's block-alignment rules (`spec.md` §3.2) are what
 /// make this conversion total in practice, and a violation is reported rather
 /// than silently rounded.
-struct ByteScale {
-    bits: i64,
+///
+/// # Why a blocked scheme is not just a bit width
+///
+/// A GGUF block carries its own scale INSIDE the payload: Q4_0 spends 18
+/// bytes on 32 elements, of which 2 are the F16 scale and 16 are the codes.
+/// Reading that as "4 bits per element" prices the codes and forgets the
+/// scale, so element 32 -- the start of row 1 -- lands at byte 16 instead of
+/// byte 18, two bytes short, and every row after it drifts further.
+///
+/// Measured before this existed, on a four-row Q4_0 tensor: a band of rows 1
+/// and 2 came back the right length (36 bytes, exactly two blocked rows) and
+/// entirely wrong (it read from byte 16, the tail of row 0). Nothing refused
+/// it. A whole-tensor copy hid this completely, because offset zero is right
+/// under either rule, and a whole-tensor copy was all a GGUF had ever asked
+/// for.
+enum ByteScale {
+    /// Elements are `bits` wide and pay for nothing else.
+    Bits(i64),
+    /// Elements come in blocks that cost `bytes` per `elems`, scale included.
+    ///
+    /// Only whole blocks have addresses. That is stricter than the bit rule --
+    /// which admits any byte-aligned element -- and it is the truth: half a
+    /// block is codes with no scale to read them by.
+    Blocked { elems: i64, bytes: i64 },
 }
 
 impl ByteScale {
     fn of(encoding: &Encoding) -> Self {
-        Self {
-            bits: i64::from(bits_per_element(encoding)),
+        if let Encoding::Quant(spec) = encoding
+            && let Some((elems, bytes)) = spec.scheme.block_layout()
+        {
+            return Self::Blocked {
+                elems: i64::try_from(elems).unwrap_or(0),
+                bytes: i64::try_from(bytes).unwrap_or(0),
+            };
         }
+        Self::Bits(i64::from(bits_per_element(encoding)))
     }
 
     fn scaled(&self, elems: i64, what: &str) -> Result<i64, Error> {
+        let (bits, block) = match *self {
+            Self::Bits(bits) => (bits, None),
+            Self::Blocked {
+                elems: per,
+                bytes: cost,
+            } => (0, Some((per, cost))),
+        };
+        if let Some((per, cost)) = block {
+            if per == 0 {
+                return Err(Error::Internal(
+                    "blocked encoding with no block".to_string(),
+                ));
+            }
+            if elems % per != 0 {
+                return Err(Error::Contract(format!(
+                    "{what} of {elems} elements does not land on a {per}-element \
+                     block boundary; a blocked payload carries its scale inside \
+                     the block, so a partial block has no byte address"
+                )));
+            }
+            return (elems / per)
+                .checked_mul(cost)
+                .or_overflow("byte offset overflows");
+        }
         let total = elems
-            .checked_mul(self.bits)
+            .checked_mul(bits)
             .or_overflow("byte offset overflows")?;
         if total % 8 != 0 {
             return Err(Error::Contract(format!(
-                "{what} of {elems} elements is not byte-aligned under a {} -bit encoding",
-                self.bits
+                "{what} of {elems} elements is not byte-aligned under a {bits} -bit encoding"
             )));
         }
         Ok(total / 8)
@@ -684,7 +735,7 @@ impl Builder<'_> {
             // something no arrangement of byte runs can express, so lowering
             // them is `plan::build`'s job and reaching here means a kernel node
             // was nested where only the affine fragment fits.
-            Expr::Repack { .. } | Expr::Cast { .. } | Expr::Scale { .. } => {
+            Expr::Repack { .. } | Expr::Cast { .. } | Expr::Scale { .. } | Expr::Bias { .. } => {
                 Err(Error::Contract(format!(
                     "{} needs a kernel and cannot be lowered to byte runs",
                     expr.node_name()
@@ -1417,6 +1468,7 @@ mod tests {
             | Expr::Repack { .. }
             | Expr::Cast { .. }
             | Expr::Scale { .. }
+            | Expr::Bias { .. }
             | Expr::Shard { .. }
             | Expr::SrcIndexed(_)
             | Expr::Select { .. } => {
@@ -1861,5 +1913,57 @@ mod tests {
             })
             .collect();
         assert_eq!(starts, vec![0, 2048 * 2048, 3072 * 2048]);
+    }
+
+    /// A blocked payload is addressed in blocks, not in bits.
+    ///
+    /// The two numbers that must not be confused: Q4_0 spends 18 bytes on 32
+    /// elements, while "4 bits per element" prices the same 32 at 16. The gap
+    /// is the F16 scale that lives inside the block, and it compounds -- row
+    /// 1 is off by 2 bytes, row 100 by 200.
+    ///
+    /// Pinned at the boundaries rather than at one value, because an
+    /// off-by-one-block error and a correct answer agree at zero.
+    #[test]
+    fn a_blocked_element_offset_counts_whole_blocks() {
+        let q4_0 = Encoding::Quant(QuantSpec {
+            scheme: QuantScheme::GgufQ4_0,
+            logical_dtype: DType::BF16,
+            bits_per_element: 4,
+            group_size: 32,
+            channel_axis: None,
+        });
+        let scale = ByteScale::of(&q4_0);
+        for (elems, bytes) in [(0i64, 0u64), (32, 18), (64, 36), (2048, 1152)] {
+            assert_eq!(
+                scale.offset(elems, "test").unwrap(),
+                bytes,
+                "{elems} elements"
+            );
+        }
+        // Under the bit rule these would have been 4, 16 and 20 bytes.
+        for partial in [8i64, 31, 33] {
+            let why = scale.offset(partial, "test").unwrap_err().to_string();
+            assert!(why.contains("block boundary"), "{partial}: {why}");
+        }
+    }
+
+    /// The bit rule still applies to everything that is not blocked.
+    #[test]
+    fn an_unblocked_encoding_is_still_priced_by_its_bits() {
+        assert_eq!(
+            ByteScale::of(&Encoding::Raw(DType::BF16))
+                .offset(32, "test")
+                .unwrap(),
+            64
+        );
+        let awq = Encoding::Quant(QuantSpec {
+            scheme: QuantScheme::AwqInt4,
+            logical_dtype: DType::BF16,
+            bits_per_element: 4,
+            group_size: 128,
+            channel_axis: None,
+        });
+        assert_eq!(ByteScale::of(&awq).offset(32, "test").unwrap(), 16);
     }
 }

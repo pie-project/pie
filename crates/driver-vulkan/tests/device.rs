@@ -412,13 +412,27 @@ fn a_grid_one_workgroup_short_leaves_the_tail_as_it_found_it() {
     cache.clear(&device);
 }
 
-/// A pipeline's layout comes from the MODULE, so an unstated row still loads.
+/// A pipeline's layout comes from the MODULE and from nothing else.
 ///
-/// 292 of the 480 entrypoints name no operands, including `affine_qmm_t` and
+/// 292 of the 481 entrypoints named no operands, including `affine_qmm_t` and
 /// most of what a model actually runs. A layout built from such a row has no
 /// descriptors, and that is not an error return — it is a segfault inside
 /// `vkCreateComputePipelines`. Building from the module's own declared bindings
 /// is what makes them loadable, and this fires a sample of them.
+///
+/// This used to SELECT its sample by asking each entrypoint's row for
+/// `Rule::Unstated`, which is how "names no operands" was said while there was
+/// a table. There is no table: `KERNELS` is empty, the ask answered `None`
+/// every time, and the loop loaded nothing while still reporting a pass shape
+/// — it failed only because the sample size is asserted, which is the reason
+/// that assertion is here.
+///
+/// The filter is gone rather than repointed, and the test is STRONGER for it:
+/// what it was ever about is that the row has no say in the layout, so the
+/// honest sample is "the first forty entrypoints this build produced", stated
+/// with no reference to a row at all. A routine states operands the way every
+/// other one does, so there is no longer a category of entrypoint that names
+/// none — the category was a column.
 #[test]
 fn an_entrypoint_whose_row_names_no_operands_still_builds_a_pipeline() {
     let (device, dir) = gpu!();
@@ -426,20 +440,14 @@ fn an_entrypoint_whose_row_names_no_operands_still_builds_a_pipeline() {
 
     let mut unstated = 0;
     for name in kernels_vulkan::entrypoints() {
-        let Some(row) = kernels::sig_in(kernels_vulkan::KERNELS, &name) else {
-            continue;
-        };
-        if row.launch != Rule::Unstated {
-            continue;
-        }
         let path = dir.join(format!("{name}.spv"));
         if !path.exists() {
             continue;
         }
         let code = std::fs::read(&path).expect("readable");
-        // The row states no scalars, so the widest legal range is the only
-        // safe one: any block the module declares fits inside it, and a range
-        // narrower than what the shader reads is rejected.
+        // Nothing here states the scalars, so the widest legal range is the
+        // only safe one: any block the module declares fits inside it, and a
+        // range narrower than what the shader reads is rejected.
         let push = device.max_push();
         let pipeline = cache
             .get(&device, &name, &code, push, 0, Capability::Baseline)
@@ -602,6 +610,88 @@ fn a_grid_past_what_this_device_dispatches_is_refused_and_one_at_the_limit_is_no
     cache.clear(&device);
 }
 
+/// Plan one rectangle the way a fire plans it: through the arm registry.
+///
+/// Four checks below used to call `dispatch::plan_one` with
+/// `kernels_vulkan::KERNELS` and a hand-built `Module`, because that WAS the
+/// launch path. It is not any more -- `serve::fire` looks the symbol up in the
+/// arm registry and calls `serve::plan_routine`, and it only falls back to the
+/// table for a family that has not crossed. Every family has crossed, so the
+/// table call answers `Undispatchable::Unknown` for every symbol a real text
+/// names.
+///
+/// So the calls are repointed rather than deleted: what each of them is about
+/// -- which buffer landed in which slot, which scalar the driver supplied,
+/// which rows the gather moved -- is a property of the DISPATCH, and the
+/// dispatch is still there. What changes is only how it is reached.
+///
+/// The module store is a `BTreeMap`, which `serve::Modules` is implemented
+/// for, holding just the entrypoints the routine might name. A routine may
+/// dispatch an entrypoint the plan does not carry, so the whole build
+/// directory is offered rather than the one symbol.
+fn plan_by_routine<'a, R: driver_vulkan::binding::Resolve>(
+    symbol: &str,
+    low: &model_compiler::lower::Lowered,
+    launch: &model_compiler::lower::Launch,
+    modules: &std::collections::BTreeMap<String, Vec<u8>>,
+    arena: driver_vulkan::binding::Arena<'a>,
+    resolver: &'a R,
+    geometry: driver_vulkan::dispatch::Geometry,
+    min_offset: u64,
+) -> Result<Vec<driver_vulkan::dispatch::Dispatch<'a>>, driver_vulkan::dispatch::Undispatchable> {
+    let (routine, arm) = driver_vulkan::arm::arm_for(symbol)
+        .unwrap_or_else(|| panic!("`{symbol}` reaches no arm, so no plan can be made for it"));
+    let reflection = driver_vulkan::serve::Reflection::new(modules, Capability::Baseline);
+    driver_vulkan::serve::plan_routine(
+        low,
+        launch,
+        symbol,
+        routine,
+        arm,
+        arena,
+        resolver,
+        geometry,
+        &reflection,
+        min_offset,
+    )
+}
+
+/// Every `.spv` in a build directory, keyed the way `Modules` keys them.
+fn store_of(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(stem) = name.strip_suffix(".spv") else {
+            continue;
+        };
+        if let Ok(code) = std::fs::read(e.path()) {
+            out.insert(stem.to_owned(), code);
+        }
+    }
+    out
+}
+
+// `mod rows` STOOD HERE: two `KernelSig` values written down verbatim,
+// `norm::layer_scalar_mul` and `attn::kv_append`, recovered from the commits
+// that deleted their `kernel!` rows so that the two GPU tests below kept
+// exercising the exact cases each was found against.
+//
+// They are gone because `driver-vulkan` no longer names `KernelSig` anywhere
+// -- `src/lowering.rs` and `kernels_vulkan::{bindings, buffer_count,
+// push_layout, push_size}` were the last readers and are deleted -- and a
+// fixture is not worth being the reason a whole vocabulary has to stay
+// compiled. `kernels-wgpu` is the last crate with rows, and Stage 5 deletes
+// the macro; a driver holding two rows in a test module would block it.
+//
+// Both numbers each test took from a row are TRANSCRIBED at the use site now,
+// beside the shader line they come from, which is the same trade
+// `rules.rs`'s `PARAM_BLOCKS` makes and for the same reason: a number read
+// off the source and checked on a device is evidence, and a number derived
+// the way the thing under test derives it is not.
+
 /// A row that lists a buffer its shader never reads still gets a layout for it.
 ///
 /// `layer_scalar_mul_bfloat16` is one of the eleven entrypoints where the two
@@ -625,8 +715,10 @@ fn a_buffer_the_shader_never_reads_is_still_given_a_descriptor() {
         eprintln!("skipped: `{name}` was not built");
         return;
     }
-    let row = kernels::sig_in(kernels_vulkan::KERNELS, name).expect("the row resolves");
-    let stated = kernels_vulkan::buffer_count(row);
+    // Four, from the row this entrypoint was stated with:
+    // `x <- In(0)`, `scalar <- Weight(0)`, `out <- Out(0)`, `params <-
+    // Param(0)`. The module decorates three, which is the whole point.
+    let stated = 4u32;
     let code = std::fs::read(&path).expect("readable");
 
     let mut cache = Pipelines::new();
@@ -635,7 +727,9 @@ fn a_buffer_the_shader_never_reads_is_still_given_a_descriptor() {
             &device,
             name,
             &code,
-            kernels_vulkan::push_size(row),
+            // `norm/layer_scalar.slang` declares no push block; every
+            // scalar rides the `params` buffer.
+            0,
             stated,
             Capability::Baseline,
         )
@@ -659,7 +753,7 @@ fn a_buffer_the_shader_never_reads_is_still_given_a_descriptor() {
         .map(|_| device.buffer(&vec![0u8; 256]).expect("buffer"))
         .collect();
     let refs: Vec<Bound<'_>> = buffers.iter().map(Bound::whole).collect();
-    let push = vec![0u8; kernels_vulkan::push_size(row) as usize];
+    let push: Vec<u8> = Vec::new();
     device
         .run(pipeline, &refs, &push, [1, 1, 1])
         .expect("a dispatch binding every buffer the row lists is accepted");
@@ -738,24 +832,26 @@ fn the_tier_this_device_selects_is_one_it_can_actually_load() {
     let mut failures: Vec<String> = Vec::new();
 
     for name in kernels_vulkan::entrypoints().into_iter().take(40) {
-        let Some(row) = kernels::sig_in(kernels_vulkan::KERNELS, &name) else {
-            continue;
-        };
         let Some((path, tier)) = device.module_for(dir, &name) else {
             continue;
         };
         let code = std::fs::read(&path).expect("readable");
-        // The row's own numbers when it has them. An unstated row supplies no
-        // layout, so the module's own declarations are all there is -- which
-        // is why `get` takes the maximum of the two rather than either.
-        let (push, descriptors) = if row.operands.is_empty() {
-            (device.max_push(), 0)
-        } else {
-            (
-                kernels_vulkan::push_size(row),
-                kernels_vulkan::buffer_count(row),
-            )
-        };
+        // Nothing outside the module states a layout for these forty.
+        //
+        // This asked each entrypoint's row for a push size and a buffer count
+        // and SKIPPED the entrypoint when there was no row -- which, once
+        // `KERNELS` emptied, was every one of them: the loop built nothing and
+        // the run reported `only 0 pipelines were built`.
+        //
+        // The row is not repointed at the arm registry, because the number an
+        // arm would give is the number the module already declares and
+        // comparing a thing to itself proves nothing. What this test is about
+        // is the TIER -- that the module `module_for` picks is one this device
+        // can really load -- so it now states the widest legal push and no
+        // descriptors, and `get` takes the maximum of that and the module's
+        // own declarations, which is the path a crossed symbol takes in
+        // production too.
+        let (push, descriptors) = (device.max_push(), 0);
         match cache.get(&device, &name, &code, push, descriptors, tier) {
             Ok(_) => built += 1,
             Err(e) => failures.push(format!("`{name}` at {}: {e}", tier.tag())),
@@ -788,8 +884,6 @@ fn the_scalars_this_crate_packs_are_the_ones_the_shader_addresses_with() {
         eprintln!("skipped: `{entrypoint}` was not built");
         return;
     }
-    let row = kernels::sig_in(kernels_vulkan::KERNELS, "kv_append").expect("the row is stated");
-
     // A cache of `kv_heads` heads, each `seq` slots of `head_dim`. The append
     // writes ONE position, which is what this kernel is: `pos[0]` is a scalar
     // slot and not a per-row table.
@@ -814,22 +908,35 @@ fn the_scalars_this_crate_packs_are_the_ones_the_shader_addresses_with() {
         device.buffer(&pos.to_le_bytes()).expect("pos"),
     ];
 
-    // The values in the ROW's order. `pack` decides which of them is a
-    // descriptor and which is a push field, and where each lands.
-    let call = driver_vulkan::pack(
-        row,
-        &[
-            driver_vulkan::Value::Buffer(0),
-            driver_vulkan::Value::Buffer(1),
-            driver_vulkan::Value::Buffer(2),
-            driver_vulkan::Value::Buffer(3),
-            driver_vulkan::Value::Buffer(4),
-            driver_vulkan::Value::I32(head_dim as i32),
-            driver_vulkan::Value::Usize((seq * head_dim) as u64),
-            driver_vulkan::Value::Usize(head_dim as u64),
-        ],
-    )
-    .expect("every operand is the kind the row wants");
+    // `driver_vulkan::pack(row, &[Value::Buffer(0), .., Value::I32(head_dim),
+    // Value::Usize(seq * head_dim), Value::Usize(head_dim)])` STOOD HERE. It
+    // read a `KernelSig`'s operand kinds and decided which value was a
+    // descriptor and which a push field. `src/lowering.rs` is deleted -- there
+    // is no row to read -- and what packs a routine's scalars now is
+    // `binding::params_from` feeding `encode::Encoder`, which `binding.rs`'s
+    // and `encode.rs`'s own tests check and which
+    // `a_rectangle_a_real_plan_states_records_and_submits` submits.
+    //
+    // So the block is TRANSCRIBED, from `attn/kv_write.slang`'s
+    // `struct Push { int head_dim; PIE_STRIDE k_head_stride; PIE_STRIDE
+    // k_seq_stride; }` and `PIE_STRIDE` being `uint2`: an `int` at 0, four
+    // bytes of padding to the 8-byte alignment a `uint2` wants, and two
+    // eight-byte strides at 8 and 16. Twenty-four bytes.
+    //
+    // That is the point of keeping this test at all rather than folding it
+    // into the walk. A layout DERIVED the same way as the thing it checks
+    // agrees with itself; this one is read off the shader source, handed to a
+    // real GPU, and judged by where the write landed. A stride four bytes
+    // early is not an approximate answer, it is a write to somewhere else, and
+    // the assertions below are exact on both the slot written and the ones
+    // that must not be.
+    let mut push = Vec::new();
+    push.extend_from_slice(&(head_dim as i32).to_le_bytes());
+    push.extend_from_slice(&[0u8; 4]);
+    push.extend_from_slice(&((seq * head_dim) as u64).to_le_bytes());
+    push.extend_from_slice(&(head_dim as u64).to_le_bytes());
+    assert_eq!(push.len(), 24, "`Push` is an int, a pad, and two `uint2`");
+    let call_buffers: [u32; 5] = [0, 1, 2, 3, 4];
 
     let code = std::fs::read(&path).expect("readable");
     let mut cache = Pipelines::new();
@@ -838,8 +945,8 @@ fn the_scalars_this_crate_packs_are_the_ones_the_shader_addresses_with() {
             &device,
             entrypoint,
             &code,
-            kernels_vulkan::push_size(row),
-            kernels_vulkan::buffer_count(row),
+            push.len() as u32,
+            call_buffers.len() as u32,
             Capability::Baseline,
         )
         .expect("the pipeline builds");
@@ -852,16 +959,14 @@ fn the_scalars_this_crate_packs_are_the_ones_the_shader_addresses_with() {
     };
     let groups = groups_for(entrypoint, Rule::PerHead, dims, pipeline).expect("a geometry");
 
-    // The descriptor order `pack` chose, and not the order the buffers were
-    // created in. They agree here, and the test would still be worth writing
-    // if they did not -- that is the mapping being exercised.
-    let bound: Vec<Bound<'_>> = call
-        .buffers
+    // Densely numbered from zero in the shader's own binding order:
+    // `k_new`, `v_new`, `k_dst`, `v_dst`, `pos`.
+    let bound: Vec<Bound<'_>> = call_buffers
         .iter()
         .map(|i| Bound::whole(&bufs[*i as usize]))
         .collect();
     device
-        .run(pipeline, &bound, &call.push, groups)
+        .run(pipeline, &bound, &push, groups)
         .expect("dispatch");
 
     let got = bf16_read(&device.read(&bufs[2]).expect("read k_cache back"));
@@ -1526,10 +1631,16 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
         }
     }
     let store = Zeros(&weights);
+    let spv = store_of(dir);
 
     let mut cache = Pipelines::new();
     let mut ran = 0u32;
     let mut crossed = 0u32;
+    // The symbols that would not plan, NAMED. They used to be dropped by a
+    // `let Ok(..) else { continue }`, which is why a refactor that made five
+    // of them unplannable showed up here as a count that was five short and
+    // said nothing about which five.
+    let mut short: Vec<String> = Vec::new();
     let mut refused = Vec::new();
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
@@ -1603,40 +1714,31 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
                 if !seen.insert(symbol.to_owned()) {
                     continue;
                 }
-                // A CROSSED symbol is not reached this way any more. This
-                // walk is the table path, spelled out: `plan_one` against a
-                // `kernel!` row, spliced and submitted by hand. A symbol
-                // whose family has landed has no row, so it is counted
-                // separately rather than dropped -- the total below is still
-                // every symbol these six texts reach, and it still moves only
-                // when a text does.
-                if driver_vulkan::arm::arm_for(symbol).is_some() {
-                    crossed += 1;
-                    continue;
-                }
+                // Planned the way a fire plans it: the arm registry, then
+                // `serve::plan_routine`.
+                //
+                // This was `dispatch::plan_one` against a `kernel!` row, with
+                // a branch above that COUNTED a crossed symbol and skipped it
+                // -- correct while families were crossing one at a time, and
+                // useless once the last one landed: every symbol took the
+                // skip, nothing was recorded, and the test's own total still
+                // added up because the skipped ones were counted. It asserted
+                // twenty-six symbols and reached the device with none of them.
+                //
+                // So the walk plans through the routine path instead, and the
+                // submit below is real again. What it is about is unchanged:
+                // a rectangle a real plan states becomes a dispatch this card
+                // accepts.
                 let Ok(code) = std::fs::read(dir.join(format!("{symbol}.spv"))) else {
                     continue;
                 };
-                let words = driver_vulkan::spirv::words(&code).expect("whole words");
-                let declared = driver_vulkan::spirv::declared(&words).expect("well formed");
-                let module = driver_vulkan::geometry::Module::named(
+                let planned = plan_by_routine(
                     symbol,
-                    [declared.local[0], declared.local[1], declared.local[2]],
-                );
-                let planned = driver_vulkan::dispatch::plan_one(
                     &low,
                     launch,
-                    kernels_vulkan::KERNELS,
-                    driver_vulkan::dispatch::Built {
-                        sig: None,
-                        module,
-                        declared: &declared,
-                    },
-                    driver_vulkan::dispatch::Sources {
-                        arena,
-                        resolver: &store,
-                        min_offset: device.min_storage_offset(),
-                    },
+                    &spv,
+                    arena,
+                    &store,
                     driver_vulkan::dispatch::Geometry {
                         q_heads: facts.q_heads,
                         kv_heads: facts.kv_heads,
@@ -1645,56 +1747,69 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
                         n_experts: facts.n_experts,
                         experts_per_token: facts.experts_per_token,
                     },
+                    device.min_storage_offset(),
                 );
-                // The six symbols the GPU-free walk already names as short of a
+                // The symbols the GPU-free walk already names as short of a
                 // driver-owned resource. Skipped rather than asserted about, because
                 // `tests/arena.rs` names them one at a time with counts; repeating
                 // that here would give two places to update and one of them would
                 // rot.
-                let Ok(d) = planned else {
-                    continue;
-                };
-
-                // The parameter block is the CALLER's to allocate -- `plan_one` is
-                // arithmetic and a buffer needs a device. This is the splice, and it
-                // is the only thing between a planned dispatch and a submitted one.
-                // Spliced at `block_at`, not at the `Params::Block` slot:
-                // the first is an index into the DENSE list a descriptor set
-                // is written from, and the second is a binding number. They
-                // agree on every module in this tree and would not on a
-                // module with a hole below its block.
-                let block = match (&d.params, d.block_at) {
-                    (driver_vulkan::binding::Params::Block { bytes, .. }, Some(at)) => {
-                        Some((device.buffer(bytes).expect("the block allocates"), at))
+                let made = match planned {
+                    Ok(made) => made,
+                    Err(why) => {
+                        short.push(format!("{symbol}: {why:?}"));
+                        continue;
                     }
-                    _ => None,
                 };
-                let mut buffers: Vec<Bound<'_>> = d.buffers.clone();
-                if let Some((buf, at)) = &block {
-                    buffers.insert(*at, Bound::whole(buf));
-                }
-                let push: &[u8] = match &d.params {
-                    driver_vulkan::binding::Params::Push(b) => b,
-                    _ => &[],
-                };
+                crossed += 1;
+                for d in &made {
+                    // The parameter block is the CALLER's to allocate -- planning is
+                    // arithmetic and a buffer needs a device. This is the splice, and it
+                    // is the only thing between a planned dispatch and a submitted one.
+                    // Spliced at `block_at`, not at the `Params::Block` slot:
+                    // the first is an index into the DENSE list a descriptor set
+                    // is written from, and the second is a binding number. They
+                    // agree on every module in this tree and would not on a
+                    // module with a hole below its block.
+                    let block = match (&d.params, d.block_at) {
+                        (driver_vulkan::binding::Params::Block { bytes, .. }, Some(at)) => {
+                            Some((device.buffer(bytes).expect("the block allocates"), at))
+                        }
+                        _ => None,
+                    };
+                    let mut buffers: Vec<Bound<'_>> = d.buffers.clone();
+                    if let Some((buf, at)) = &block {
+                        buffers.insert(*at, Bound::whole(buf));
+                    }
+                    let push: &[u8] = match &d.params {
+                        driver_vulkan::binding::Params::Push(b) => b,
+                        _ => &[],
+                    };
 
-                let pipeline = cache
-                    .get(
-                        &device,
-                        symbol,
-                        &code,
-                        push.len() as u32,
-                        buffers.len() as u32,
-                        Capability::Baseline,
-                    )
-                    .expect("the pipeline builds");
+                    // The module the ROUTINE named, which need not be the plan's
+                    // symbol: a body composes its own entrypoint out of the axes
+                    // it was handed. `d.symbol` is what was dispatched.
+                    let fired = spv
+                        .get(d.symbol.as_ref())
+                        .map_or(code.as_slice(), Vec::as_slice);
+                    let pipeline = cache
+                        .get(
+                            &device,
+                            &d.symbol,
+                            fired,
+                            push.len() as u32,
+                            buffers.len() as u32,
+                            Capability::Baseline,
+                        )
+                        .expect("the pipeline builds");
 
-                match device.run(pipeline, &buffers, push, d.groups) {
-                    Ok(()) => ran += 1,
-                    Err(e) => refused.push(format!("{symbol}: {e}")),
-                }
-                if let Some((buf, _)) = block {
-                    device.free(buf);
+                    match device.run(pipeline, &buffers, push, d.groups) {
+                        Ok(()) => ran += 1,
+                        Err(e) => refused.push(format!("{symbol}: {e}")),
+                    }
+                    if let Some((buf, _)) = block {
+                        device.free(buf);
+                    }
                 }
             }
 
@@ -1765,11 +1880,65 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
     //
     // Equality rather than a floor: twenty-six is all of them, so this
     // number moving in either direction is news.
+    //
+    // Counted off `crossed`, which is now "the symbol planned", where it used
+    // to be `ran + crossed` -- `ran` for the ones this loop submitted through
+    // the table and `crossed` for the ones it could only count because their
+    // family had landed. Every family has landed, so `crossed` is all of them
+    // and it means something stronger than it did: not "this symbol has an
+    // arm" but "this symbol's rectangle became a dispatch".
     assert_eq!(
-        ran + crossed,
+        seen.len(),
         26,
-        "a different number of distinct symbols reached the device: {}",
+        "a different number of distinct symbols reached the walk: {}",
         seen.iter().cloned().collect::<Vec<_>>().join(", ")
+    );
+    // The five this walk cannot plan, NAMED rather than counted.
+    //
+    // They are the paged rows, and what they are short of is a POOL: this
+    // walk's resolver is `Zeros`, a weight store with no page table and no
+    // strides, so `Handles::number` refuses and the arm refuses with it. That
+    // was always true -- the loop has always skipped them -- but it was a
+    // `let Ok(..) else { continue }` and the skip was silent, so a refactor
+    // that made five MORE symbols unplannable would have read as the same
+    // pass.
+    //
+    // `tests/arena.rs` is where the shortfall is described one symbol at a
+    // time; this only pins the set, so that a sixth joining it is news.
+    let mut names: Vec<&str> = short
+        .iter()
+        .map(|s| s.split(':').next().expect("a name"))
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "kv_append_paged_bfloat16",
+            "sdpa_paged_decode_bfloat16_d_128",
+            "sdpa_paged_decode_sink_bfloat16_d_64",
+            "sdpa_paged_mma_sink_bfloat16_d_64",
+            "sdpa_paged_tiled_bfloat16_d_128",
+        ],
+        "a different set of symbols would not plan:\n  {}",
+        short.join("\n  ")
+    );
+    assert_eq!(
+        crossed as usize + short.len(),
+        26,
+        "every symbol the walk saw either planned or is named above"
+    );
+    // And every one of those dispatches was SUBMITTED. Separate from the count
+    // above because they are separate failures: a planner that stopped
+    // planning moves the first, and a routine that plans a dispatch this card
+    // will not take moves neither -- it lands in `refused`.
+    //
+    // A floor rather than an equality: a routine may split one rectangle into
+    // several dispatches, so this is at least one per symbol and not exactly
+    // one.
+    assert!(
+        ran >= crossed,
+        "{ran} dispatches were submitted for {crossed} symbols that planned, \
+         so a symbol planned and reached the device with nothing"
     );
 }
 
@@ -1872,29 +2041,22 @@ fn a_norm_a_real_plan_states_computes_what_a_host_reference_computes() {
     }
     weights.seam(&device, 1 << 16).expect("the seam");
 
-    let code = std::fs::read(dir.join(format!("{symbol}.spv"))).expect("the module is built");
-    let words = driver_vulkan::spirv::words(&code).expect("whole words");
-    let declared = driver_vulkan::spirv::declared(&words).expect("well formed");
-    let d = driver_vulkan::dispatch::plan_one(
+    let store = store_of(dir);
+    let made = plan_by_routine(
+        symbol,
         &low,
         launch,
-        kernels_vulkan::KERNELS,
-        driver_vulkan::dispatch::Built {
-            sig: None,
-            module: driver_vulkan::geometry::Module::named(
-                symbol,
-                [declared.local[0], declared.local[1], declared.local[2]],
-            ),
-            declared: &declared,
-        },
-        driver_vulkan::dispatch::Sources {
-            arena,
-            resolver: &weights,
-            min_offset: device.min_storage_offset(),
-        },
+        &store,
+        arena,
+        &weights,
         driver_vulkan::dispatch::Geometry::default(),
+        device.min_storage_offset(),
     )
     .expect("the rectangle plans");
+    // One rectangle, one dispatch: a routine that split this one would be a
+    // different kernel and the reference below would not describe it.
+    assert_eq!(made.len(), 1, "the norm is one dispatch");
+    let d = &made[0];
 
     // What the row chose, read back so the reference and the device see the
     // same bytes. Three buffers: x, w, out -- in the module's order, which is
@@ -1967,11 +2129,13 @@ fn a_norm_a_real_plan_states_computes_what_a_host_reference_computes() {
     buffers.insert(d.block_at.expect("a block slot"), Bound::whole(&params));
 
     let mut cache = Pipelines::new();
+    // The module the ROUTINE named, which need not be the plan's symbol.
+    let fired = &store[d.symbol.as_ref()];
     let pipeline = cache
         .get(
             &device,
-            symbol,
-            &code,
+            &d.symbol,
+            fired,
             0,
             buffers.len() as u32,
             Capability::Baseline,
@@ -3507,26 +3671,14 @@ fn a_real_plans_kv_append_puts_the_row_where_the_page_table_says() {
         .expect("the text appends to a paged cache");
     let layer = launch.layers.start;
 
-    let code = module(dir, symbol);
-    let words = driver_vulkan::spirv::words(&code).expect("whole words");
-    let declared = driver_vulkan::spirv::declared(&words).expect("well formed");
-    let d = driver_vulkan::dispatch::plan_one(
+    let store = store_of(dir);
+    let made = plan_by_routine(
+        symbol,
         &low,
         launch,
-        kernels_vulkan::KERNELS,
-        driver_vulkan::dispatch::Built {
-            sig: None,
-            module: driver_vulkan::geometry::Module::named(
-                symbol,
-                [declared.local[0], declared.local[1], declared.local[2]],
-            ),
-            declared: &declared,
-        },
-        driver_vulkan::dispatch::Sources {
-            arena,
-            resolver: &pool,
-            min_offset: device.min_storage_offset(),
-        },
+        &store,
+        arena,
+        &pool,
         driver_vulkan::dispatch::Geometry {
             q_heads: facts.q_heads,
             kv_heads: facts.kv_heads,
@@ -3535,8 +3687,11 @@ fn a_real_plans_kv_append_puts_the_row_where_the_page_table_says() {
             n_experts: facts.n_experts,
             experts_per_token: facts.experts_per_token,
         },
+        device.min_storage_offset(),
     )
     .expect("the rectangle plans");
+    assert_eq!(made.len(), 1, "the append is one dispatch");
+    let d = &made[0];
 
     // The row's scalar run, read back rather than assumed: the shader's push
     // block is `head_dim, page_size, n_kv_heads` and the row is `Param(0),
@@ -3565,11 +3720,12 @@ fn a_real_plans_kv_append_puts_the_row_where_the_page_table_says() {
     };
 
     let mut cache = Pipelines::new();
+    let fired = &store[d.symbol.as_ref()];
     let pipeline = cache
         .get(
             &device,
-            symbol,
-            &code,
+            &d.symbol,
+            fired,
             push.len() as u32,
             d.buffers.len() as u32,
             Capability::Baseline,
@@ -4755,29 +4911,20 @@ fn the_rows_the_frame_reads_out_are_the_rows_the_gather_moves() {
         .find(|l| low.kernels[l.kernel as usize] == symbol)
         .expect("the text gathers");
 
-    let code = module(dir, symbol);
-    let words = driver_vulkan::spirv::words(&code).expect("whole words");
-    let declared = driver_vulkan::spirv::declared(&words).expect("well formed");
-    let d = driver_vulkan::dispatch::plan_one(
+    let store = store_of(dir);
+    let made = plan_by_routine(
+        symbol,
         &low,
         launch,
-        kernels_vulkan::KERNELS,
-        driver_vulkan::dispatch::Built {
-            sig: None,
-            module: driver_vulkan::geometry::Module::named(
-                symbol,
-                [declared.local[0], declared.local[1], declared.local[2]],
-            ),
-            declared: &declared,
-        },
-        driver_vulkan::dispatch::Sources {
-            arena,
-            resolver: &pool,
-            min_offset: device.min_storage_offset(),
-        },
+        &store,
+        arena,
+        &pool,
         driver_vulkan::dispatch::Geometry::default(),
+        device.min_storage_offset(),
     )
     .expect("the rectangle plans");
+    assert_eq!(made.len(), 1, "the gather is one dispatch");
+    let d = &made[0];
 
     // The scalars, from the driver's own binding rather than from this test.
     // Both of them: the width the plan states and the count the DRIVER
@@ -4802,6 +4949,10 @@ fn the_rows_the_frame_reads_out_are_the_rows_the_gather_moves() {
     );
     // Nothing rode a push word. The module declares no push block at all, so a
     // count that went there would be dropped in silence.
+    let declared = {
+        let words = driver_vulkan::spirv::words(&store[d.symbol.as_ref()]).expect("whole words");
+        driver_vulkan::spirv::declared(&words).expect("well formed")
+    };
     assert!(
         declared.push_offsets.is_empty(),
         "`row_gather` declares no push constants, so a scalar sent there is lost"
@@ -4828,11 +4979,13 @@ fn the_rows_the_frame_reads_out_are_the_rows_the_gather_moves() {
     );
 
     let mut cache = Pipelines::new();
+    // The module the ROUTINE named, which need not be the plan's symbol.
+    let fired = &store[d.symbol.as_ref()];
     let pipeline = cache
         .get(
             &device,
-            symbol,
-            &code,
+            &d.symbol,
+            fired,
             0,
             buffers.len() as u32,
             Capability::Baseline,

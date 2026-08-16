@@ -17,22 +17,45 @@
 //! | `embed`                 | `shared_embedding.weight`               |
 //!
 //! So a driver that binds by the traced name finds nothing. This is the
-//! translation, and without it no real weight ever reaches this crate.
+//! translation, and without it no real weight ever reaches a shell.
+//!
+//! # Why it is here and not in a shell
+//!
+//! It stood in `driver-vulkan/src/names.rs`, and `driver-wgpu/src/names.rs`
+//! held the same 412 lines byte for byte -- the second hand-written copy of
+//! one golden table, which is the failure this crate's own `lib.rs` opens by
+//! naming about the C++ interpreters. Of the nineteen files in each shell
+//! those two were among the only two that matched exactly, so it was
+//! duplication rather than two crates being one fork.
+//!
+//! Sharing is right here for a reason that does NOT generalise, and the
+//! contrast is worth stating because this repository refuses the same move
+//! elsewhere: `model`'s per-family import tables have nine rows that look
+//! identical across four families and are deliberately not shared, because
+//! they are identical by coincidence of two naming schemes agreeing and
+//! nothing keeps them agreeing. This table is not that. It describes exactly
+//! one thing -- the names `model::boot::compile_load_plan_for` publishes --
+//! and every shell that reads it is reading the same producer. One producer
+//! with N consumers is a substrate; N producers that currently agree is a
+//! coincidence, and only the first one belongs in a crate named for what
+//! every driver shares.
 //!
 //! # Why a table and not a decision
 //!
-//! `lib.rs` says nothing in this crate may choose a kernel. A table does not:
-//! it answers `layer.3.down` with a string. Removing it does not change which
-//! kernels fire, only whether they find their operands -- and that is the
-//! difference between translating a spelling and making a decision.
+//! A shell may not choose a kernel. A table does not: it answers
+//! `layer.3.down` with a string. Removing it does not change which kernels
+//! fire, only whether they find their operands -- and that is the difference
+//! between translating a spelling and making a decision.
 //!
-//! `driver-metal` has the same table, in `src/lowering/resolve.rs`. It is
-//! **not** shared and this is not a copy of it: that one is entangled with
-//! Metal's `Slice` and its `Resolver` trait, and depending on it would put
-//! `objc` in this crate's closure, which `tests/pure.rs` forbids. What is
-//! reproduced here is only the data, and only the roles the six texts this
-//! crate can lower actually bind -- measured, twenty-two of them, rather than
-//! every role that exists.
+//! `driver-metal` has the same table again, in `src/lowering/resolve.rs`, and
+//! it stays where it is. That one is entangled with Metal's `Slice` and its
+//! `Resolver` trait, so folding it in would put `objc` in this crate's
+//! closure and `driver-vulkan/tests/pure.rs` forbids that -- which is a
+//! statement about that copy's ENTANGLEMENT and not about its data. What is
+//! reproduced here is only the data, and only the roles the texts these
+//! shells can lower actually bind -- measured, twenty-two of them, rather
+//! than every role that exists.
+
 //!
 //! # A role has SEVERAL spellings and the checkpoint picks
 //!

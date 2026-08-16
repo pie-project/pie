@@ -154,6 +154,7 @@ impl Shell {
                           consumer reads that projection."
                     .to_string(),
             })?;
+            let shape = pool.shape();
             crate::lowering::dispatch::Geometry {
                 q_heads: d.shape.q_heads,
                 kv_heads: d.shape.kv_heads,
@@ -168,6 +169,31 @@ impl Shell {
                 // tensors and refuses a checkpoint that answers twice.
                 group: binding.quant_group,
                 bits: binding.quant_bits,
+                // gemma-4's SECOND attention shape, read off the POOL rather
+                // than re-derived. `batch::geometry` derives it once, with a
+                // refusal for an irregular schedule, and `load` hands the
+                // result to the pool -- which has sized its pages per layer
+                // from it ever since that stack was supported. The lowering
+                // read one width for the whole fire, so half the attention
+                // layers composed a symbol the trace had not stated and
+                // refused `Misspelled`: pages laid out at one width, read by
+                // a kernel instantiated at the other.
+                //
+                // `metal_kernel_refusal` checks BOTH widths against this
+                // backend's SDPA axis at load, so a stack that reaches here
+                // has two dispatchable ones and nothing is left to decline.
+                //
+                // Every other deployment leaves all three zero, which
+                // `Geometry::heads_at` reads as "one shape".
+                global_head_dim: shape.global_head_dim,
+                global_kv_heads: shape.global_kv_heads,
+                full_attn_every: shape.full_attn_every,
+                // The gate's own affine point, which `observed` read off the
+                // checkpoint by name and states only when it differs. Zero
+                // on every row but gpt-oss, and zero is what `facts_of`
+                // reads as "one point serves this fire".
+                router_group: binding.router_quant_group,
+                router_bits: binding.router_quant_bits,
             }
         };
         let named = std::collections::HashMap::new();
@@ -319,6 +345,17 @@ impl Shell {
                     // The FIRE's rows, translated from the request-local
                     // numbering the wire uses. See `sampled_rows`.
                     sampling_indices: &sampled,
+                    // EMPTY, and that is the whole of the recurrent slab's
+                    // absence stated in one place. No row this backend serves
+                    // has linear-attention layers, nothing allocates a slab,
+                    // and `Staged::at` answers `None` for an empty table --
+                    // so a GDN symbol that reached a fire would refuse for
+                    // want of the table rather than index slot zero.
+                    //
+                    // It is a FIELD rather than a missing argument because
+                    // the slot assignment is the scheduler's answer, and the
+                    // place it has to arrive is now named.
+                    recurrent_slots: &[],
                 },
             )?;
             // The fire's tables, and the stand-in for an operand that

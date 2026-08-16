@@ -6,139 +6,39 @@
 //! carries no information today; it is declared rather than baked into the
 //! symbol so that a second activation dtype is a point, not eleven new names.
 
-use kernels::{KernelSig, kernel};
+use kernels::KernelSig;
 
-use crate::axes::*;
+/// EMPTY: this family's rows have been RETIRED.
+///
+/// `refactor-bigplan.md` §7 Stage 3. Twelve kernels, every one of them live —
+/// `rms_single_row` is 1084 rectangles of the corpus on its own, one per layer
+/// of every model — so the crossing was measured before the rows went:
+/// `the_routine_path_plans_what_the_table_path_planned` derived 1700
+/// rectangles twice, by the row and by the arm, and compared every field.
+///
+/// It found one on its first run. [`residual_add`] asked for a
+/// `[width, rows, 1]` grid and its shader reads `gid.x` alone, so 63 rows of
+/// 64 would have gone untouched with the dispatch reporting success. The body
+/// had never fired — nothing was armed, so every real `residual_add` went
+/// through the row, which said `LaunchRule::Elementwise` and was right.
+pub static KERNELS: &[KernelSig] = &[];
 
-pub static KERNELS: &[KernelSig] = &[
-    // 1 in norm/add_bias.wgsl
-    // Qwen-2's attention biases. Ported operand for operand from
-    // `kernels-metal`'s row, which is `kernels-cuda`'s and
-    // `kernels-vulkan`'s, so that the backends read one statement the same
-    // way: IN PLACE over the value it biases (`out` from `Out(0)`, the same
-    // bytes as `In(0)`), the bias off the statement's named weight, and the
-    // row width derived rather than stated -- an `AddBias` carries no scalars,
-    // because a bias vector's length is the projection's width and the trace
-    // knows it.
-    //
-    // Stated on this side because coverage is defined as parity: the shared
-    // text can only name an op some kernel implements, and until this row none
-    // did on Metal, so `qkv_bias` models were served without their biases --
-    // which is not a crash and not a NaN, it is fluent, wrong text.
-    kernel!(add_bias "add_bias", file = Some("norm/add_bias.wgsl"),
-        launch = kernels::LaunchRule::RouteRows,
-        in_place = &[(0, 0)],
-        operands = kernels::operands![
-            out: BufMut <- kernels::Source::Out(0),
-            bias: Buf <- kernels::Source::Weight(0),
-            width: I32 <- kernels::Source::OutWidth(0),
-        ],
-        axes = &[BF16]),
-    // 1 in gated_rms.wgsl
-    kernel!(gated_rms "gated_rms", axes = &[BF16]),
-    // 1 in gated_rms.wgsl
-    kernel!(gated_rms_strided "gated_rms_strided", axes = &[BF16]),
-    // 1 in layer_scalar.wgsl
-    // gemma's per-layer scale: one number per layer, read from a buffer
-    // rather than stated, because which layer is running is the FIRE's.
-    kernel!(layer_scalar_mul "layer_scalar_mul", file = Some("norm/layer_scalar.wgsl"),
-        launch = kernels::LaunchRule::Elementwise,
-        operands = kernels::operands![
-            x: Buf <- kernels::Source::In(0),
-            scalar: Buf <- kernels::Source::Weight(0),
-            out: BufMut <- kernels::Source::Out(0),
-            // `LayerScalarParams`: the hidden width.
-            params: Buf <- kernels::Source::Param(0),
-        ],
-        axes = &[BF16]),
-    // 1 in residual_add.wgsl
-    // Three buffers and no scalars: `out = x + residual`, elementwise, and
-    // `out` may alias `x`. Filled because a MIXTURE demands it -- a routed
-    // FFN's rows are already down-projected and combined, so all the block
-    // owes is the add, where a dense FFN fuses the add into its down
-    // projection (`gemm_add`) and never states this symbol.
-    kernel!(residual_add "residual_add", file = Some("norm/residual_add.wgsl"),
-        launch = kernels::LaunchRule::Elementwise,
-        operands = kernels::operands![
-            x: Buf <- kernels::Source::In(0),
-            residual: Buf <- kernels::Source::In(1),
-            out: BufMut <- kernels::Source::Out(0),
-        ],
-        axes = &[BF16]),
-    // 1 in residual_add.wgsl
-    kernel!(residual_add_strided "residual_add_strided", axes = &[BF16]),
-    // 1 in rms_norm.wgsl
-    // `rms_single_row` with the block residual folded into its epilogue.
-    kernel!(rms_residual "rms_residual", file = Some("norm/rms.wgsl"),
-        launch = kernels::LaunchRule::Rms,
-        operands = kernels::operands![
-            x: Buf <- kernels::Source::In(0),
-            w: Buf <- kernels::Source::Weight(0),
-            out: BufMut <- kernels::Source::Out(0),
-            params: Buf <- kernels::Source::Param(0),
-            r: Buf <- kernels::Source::In(1),
-        ],
-        axes = &[BF16]),
-    // 1 in rms_norm.wgsl
-    // The same, with a per-layer gain beside the residual.
-    kernel!(rms_residual_scaled "rms_residual_scaled", file = Some("norm/rms.wgsl"),
-        launch = kernels::LaunchRule::Rms,
-        operands = kernels::operands![
-            x: Buf <- kernels::Source::In(0),
-            w: Buf <- kernels::Source::Weight(0),
-            out: BufMut <- kernels::Source::Out(0),
-            params: Buf <- kernels::Source::Param(0),
-            r: Buf <- kernels::Source::In(1),
-            s: Buf <- kernels::Source::In(2),
-        ],
-        axes = &[BF16]),
-    // 1 in rms_norm.wgsl
-    // The first row of the sibling tables to state its OPERANDS, and the
-    // reason is the finding that made them necessary: the trace states inputs,
-    // outputs then weights, and this kernel declares `x, w, out, params`.
-    // Binding positionally puts the output where the norm weight belongs.
-    // Nothing reported it on Metal, which does not validate a binding, and
-    // nothing reports it here either: every one of these is a storage buffer,
-    // so a bind group typed by the LAYOUT accepts them in any order.
-    //
-    // `source` is what makes the row a thing a call can be GENERATED from:
-    // `<- Source::In(0)` says this buffer takes the statement's first operand,
-    // wherever the statement chose to put it.
-    kernel!(rms_single_row "rms_single_row", file = Some("norm/rms.wgsl"), launch = kernels::LaunchRule::Rms,
-        // `RmsParams.axis_size`, which is what the kernel strides by.
-        grid_param = Some(1),
-        operands = kernels::operands![
-            x: Buf <- kernels::Source::In(0),
-            w: Buf <- kernels::Source::Weight(0),
-            out: BufMut <- kernels::Source::Out(0),
-            params: Buf <- kernels::Source::Param(0),
-        ],
-        axes = &[BF16]),
-    // 1 in rms_norm.wgsl
-    kernel!(rms_strided_head_row "rms_strided_head_row", axes = &[BF16]),
-    // 1 in rms_norm.wgsl
-    kernel!(rms_strided_row "rms_strided_row", axes = &[BF16]),
-    // 1 in vnorm.wgsl
-    // A norm with no GAIN: the row divided by its own RMS and nothing else.
-    // gemma's value norm, and the absence of a weight is the whole difference
-    // from `rms_single_row`.
-    kernel!(vnorm_single_row "vnorm_single_row", file = Some("norm/vector.wgsl"),
-        launch = kernels::LaunchRule::Rms,
-        // `VNormParams.axis_size`, for the reason `rms_single_row` states it:
-        // this kernel gives threadgroup `gid` the span `gid * axis_size`, so
-        // the grid needs one threadgroup per AXIS. A value norm's axis is the
-        // HEAD and its row is every head, so without this the fire's width
-        // would be taken for the axis and the whole row reduced as one --
-        // which is not a smaller normalization, it is a different number in
-        // every channel.
-        grid_param = Some(1),
-        operands = kernels::operands![
-            x: Buf <- kernels::Source::In(0),
-            out: BufMut <- kernels::Source::Out(0),
-            // `VNormParams`: eps then axis_size, packed.
-            params: Buf <- kernels::Source::Param(0),
-        ],
-        axes = &[BF16]),
+/// The entrypoints this family's routines spell, now that its rows are gone.
+///
+/// See [`crate::sample::ENTRYPOINTS`].
+pub static ENTRYPOINTS: &[&str] = &[
+    "add_bias_bfloat16",
+    "gated_rms_bfloat16",
+    "gated_rms_strided_bfloat16",
+    "layer_scalar_mul_bfloat16",
+    "residual_add_bfloat16",
+    "residual_add_strided_bfloat16",
+    "rms_residual_bfloat16",
+    "rms_residual_scaled_bfloat16",
+    "rms_single_row_bfloat16",
+    "rms_strided_head_row_bfloat16",
+    "rms_strided_row_bfloat16",
+    "vnorm_single_row_bfloat16",
 ];
 
 use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, Routine};
@@ -499,7 +399,22 @@ pub fn residual_add(
         Fire {
             module: "norm/residual_add.wgsl",
             entrypoint: "residual_add_bfloat16",
-            lanes: kernels::shader::elementwise_rows(*width, *rows)?,
+            // FLAT, not `elementwise_rows`. The non-strided variant of
+            // `residual_add.wgsl` reads `gid.x` alone; a `[width, rows, 1]`
+            // grid would run every y over the SAME first `width` elements and
+            // leave the rest of the buffer as the projection wrote it —
+            // 63 rows of 64 untouched, with the dispatch reporting success.
+            //
+            // `kernels-metal` and `kernels-vulkan` both say `elementwise` here
+            // and `elementwise_rows` in the strided form below, which is the
+            // shape of the shader. This body said `elementwise_rows` in both
+            // and had never fired: nothing was armed, so every real
+            // `residual_add` went through the row, which states
+            // `LaunchRule::Elementwise` and is right.
+            // `the_routine_path_plans_what_the_table_path_planned` caught it
+            // on the first run after `norm` was armed, `[12, 64, 1]` against
+            // the row's `[720, 1, 1]`.
+            lanes: kernels::shader::elementwise(*width, *rows)?,
         },
         &[x.v(), residual.v(), out.v()],
     )

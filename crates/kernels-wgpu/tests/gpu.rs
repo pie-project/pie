@@ -1304,6 +1304,65 @@ fn read(gpu: &Gpu, buffer: &wgpu::Buffer) -> Vec<u8> {
 /// spelling of the field name, and [`Block::done`] refuses a block with a
 /// field nobody wrote. Renaming or reordering a row's scalars therefore fails
 /// a test instead of shifting every value after the change by four bytes.
+/// The `@group(1)` uniform block a shader declares, by field.
+///
+/// The row used to state this and a retired family has no row. The shader has
+/// always been the truth of it — `a_stated_rows_uniform_layout_is_the_one_its_shader_declares`
+/// compares the two for every stated row and finds them equal — so reading it
+/// here is the same answer from the side that cannot drift.
+fn block_of_shader(entrypoint: &str) -> (Vec<kernels_wgpu::UniformField>, usize) {
+    let source = kernels_wgpu::entrypoint_source(entrypoint, kernels_wgpu::Capability::Baseline)
+        .unwrap_or_else(|why| panic!("no source for `{entrypoint}`: {why}"));
+    let code: String = source
+        .lines()
+        .map(|l| l.split_once("//").map_or(l, |(before, _)| before))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let at = code
+        .find("@group(1)")
+        .unwrap_or_else(|| panic!("`{entrypoint}` declares no `@group(1)` block"));
+    let name = code[at..]
+        .split_once("var<uniform>")
+        .and_then(|(_, rest)| rest.split_once(':'))
+        .map(|(_, ty)| ty.split(';').next().unwrap_or_default().trim().to_owned())
+        .unwrap_or_else(|| panic!("`{entrypoint}`'s uniform declaration is unreadable"));
+
+    let start = code
+        .find(&format!("struct {name} "))
+        .unwrap_or_else(|| panic!("`{entrypoint}` declares no `struct {name}`"));
+    let open = start + code[start..].find('{').expect("a struct body");
+    let close = open + code[open..].find('}').expect("a closed struct");
+
+    let mut fields = Vec::new();
+    let mut offset = 0u32;
+    for piece in code[open + 1..close].split(',') {
+        let Some((field, ty)) = piece.split_once(':') else {
+            continue;
+        };
+        let field = field.trim();
+        if field.is_empty() {
+            continue;
+        }
+        let size = if ty.trim().starts_with("vec2") { 8 } else { 4 };
+        offset = offset.next_multiple_of(size);
+        fields.push(kernels_wgpu::UniformField {
+            name: Box::leak(field.to_owned().into_boxed_str()),
+            offset,
+            size,
+            split: size == 8,
+        });
+        offset += size;
+    }
+    assert!(
+        !fields.is_empty(),
+        "`{entrypoint}`'s block parsed to no fields, which would make every \
+         assertion about it vacuous"
+    );
+    let bytes = offset.next_multiple_of(16) as usize;
+    (fields, bytes)
+}
+
 struct Block {
     row: &'static str,
     fields: Vec<kernels_wgpu::UniformField>,
@@ -1313,8 +1372,16 @@ struct Block {
 
 impl Block {
     fn of(entrypoint: &str) -> Self {
-        let sig = kernels_wgpu::sig(entrypoint)
-            .unwrap_or_else(|| panic!("the table has no row for `{entrypoint}`"));
+        // A RETIRED family has no row, and the block is the SHADER's anyway.
+        let Some(sig) = kernels_wgpu::sig(entrypoint) else {
+            let (fields, bytes) = block_of_shader(entrypoint);
+            return Self {
+                row: Box::leak(entrypoint.to_owned().into_boxed_str()),
+                bytes: vec![0u8; bytes],
+                written: vec![false; fields.len()],
+                fields,
+            };
+        };
         let fields = kernels_wgpu::uniform_layout(sig);
         Self {
             row: sig.symbol,
@@ -1539,8 +1606,55 @@ fn writes_agree_with_the_body(entrypoint: &str, writes: &[bool]) {
 /// history — fails to create a pipeline against this layout instead of reading
 /// a plausible number out of the wrong slot.
 fn run(gpu: &Gpu, entrypoint: &str, buffers: &[&wgpu::Buffer], uniform: &[u8], groups: [u32; 3]) {
-    let sig = kernels_wgpu::sig(entrypoint)
-        .unwrap_or_else(|| panic!("the table has no row for `{entrypoint}`"));
+    // A RETIRED family has no row, and the layout still has to come from
+    // somewhere. It comes from the ROUTINE, whose signature states the same
+    // types in the same order the body binds them — which is the fact the row
+    // was carrying. Without this, deleting a family's rows silently removes
+    // its shaders from every device test in this file, and it is four of them
+    // for `mlp` alone.
+    let Some(sig) = kernels_wgpu::sig(entrypoint) else {
+        // WORD-BOUNDED, not prefix. `quant`'s symbols carry the quantization
+        // scheme as a PREFIX the routine name never had —
+        // `affine_qmv_fast_bfloat16_gs_64_b_4` is `qmv_fast` — so a routine
+        // owns a symbol when its name appears bounded by underscores.
+        // `kernels-metal::kernel_of` had this exact defect and it cost 363 of
+        // 479 entrypoints.
+        let bounded = |name: &str| {
+            let mut from = 0;
+            while let Some(at) = entrypoint[from..].find(name) {
+                let start = from + at;
+                let end = start + name.len();
+                let before = start == 0 || entrypoint.as_bytes()[start - 1] == b'_';
+                let after = end == entrypoint.len() || entrypoint.as_bytes()[end] == b'_';
+                if before && after {
+                    return true;
+                }
+                from = start + 1;
+            }
+            false
+        };
+        let stem = kernels_wgpu::routines()
+            .into_iter()
+            .filter(|r| bounded(r.name))
+            .max_by_key(|r| r.name.len())
+            .unwrap_or_else(|| panic!("neither a row nor a routine names `{entrypoint}`"));
+        let writes: Vec<bool> = stem
+            .args
+            .iter()
+            .filter(|(ty, _)| kernels_wgpu::is_buffer(*ty))
+            .map(|(ty, _)| writable(*ty))
+            .collect();
+        assert_eq!(
+            writes.len(),
+            buffers.len(),
+            "`{entrypoint}`'s routine binds {} buffers and {} were handed \
+             over",
+            writes.len(),
+            buffers.len(),
+        );
+        dispatch(gpu, entrypoint, buffers, &writes, uniform, groups);
+        return;
+    };
     assert!(
         !sig.operands.is_empty(),
         "`{entrypoint}` is an UNSTATED row: it names no operands, so no layout \
@@ -1861,23 +1975,41 @@ fn an_adapter_opens_and_says_what_it_will_bind() {
         over.iter().map(|s| s.symbol).collect::<Vec<_>>(),
     );
 
+    // EMPTY, and it was `sdpa_paged_decode` and its siblings: `attn` has
+    // retired, so no ROW binds more than the downlevel floor any more. The
+    // shaders still do — `attn/sdpa_paged.wgsl` declares eleven — which is
+    // why this harness still asks for the adapter's real limits below rather
+    // than `downlevel_defaults()`, and why
+    // `every_entrypoint_in_the_tree_builds_a_pipeline_on_this_adapter` is
+    // where a kernel the adapter cannot lay out now fails, by name.
     assert!(
-        !over.is_empty(),
-        "`sdpa_paged_decode` binds eleven storage buffers, so an empty answer \
-         means `storage_count` stopped counting",
+        over.is_empty(),
+        "a ROW binds more than the downlevel floor again: {:?}",
+        over.iter().map(|s| s.symbol).collect::<Vec<_>>(),
     );
     // The claim this harness is written on. Requesting
     // `Limits::downlevel_defaults()` instead would fail to create exactly the
     // attention pipelines below, on hardware that runs them.
-    let widest = over
+    // The widest thing this adapter must lay out is now a SHADER's binding
+    // table, not a row's: `attn/sdpa_paged.wgsl` declares eleven storage
+    // buffers and its rows have retired. Read off the tree, which is where it
+    // has always actually been.
+    let widest = kernels_wgpu::SOURCES
         .iter()
-        .map(|sig| kernels_wgpu::storage_count(sig))
+        .map(|(_, text)| text.lines().filter(|l| l.contains("var<storage")).count())
         .max()
-        .expect("at least one row is over the floor");
+        .expect("the tree has sources");
+    let widest = u32::try_from(widest).expect("a small binding count");
+    assert!(
+        widest >= 11,
+        "the widest shader declares {widest} storage buffers and \
+         `sdpa_paged.wgsl` alone declares eleven, so this scan stopped reading"
+    );
     assert!(
         gpu.limits.max_storage_buffers_per_shader_stage >= widest,
-        "this adapter offers {} storage buffers per stage and the table's \
-         widest row binds {widest}. Those pipelines cannot be created here",
+        "this adapter offers {} storage buffers per stage and the tree's \
+         widest shader declares {widest}. Those pipelines cannot be created \
+         here",
         gpu.limits.max_storage_buffers_per_shader_stage,
     );
 }
@@ -2164,11 +2296,15 @@ fn a_packed_operand_bounds_the_gather_it_rides_in() {
         &[(width as u32).to_le_bytes(), (count as u32).to_le_bytes()].concat(),
     );
 
-    let sig = kernels_wgpu::sig(name).expect("the table covers the row gather");
-    assert_eq!(
-        kernels_wgpu::uniform_size(sig),
-        0,
-        "this row's only scalar is packed, so it declares no uniform block",
+    // `layout` has retired, so there is no row to ask. The claim it made —
+    // this kernel's only scalar is PACKED into the storage struct, so the
+    // module declares no uniform block — is the SHADER's and is asked of the
+    // shader directly.
+    assert!(
+        !kernels_wgpu::entrypoint_source(name, kernels_wgpu::Capability::Baseline)
+            .expect("a source")
+            .contains("var<uniform>"),
+        "this kernel's only scalar is packed, so it declares no uniform block",
     );
 
     // `ElementwiseRows`, in WORDS on x because one invocation moves one word.
@@ -6708,36 +6844,36 @@ enum Reached {
 const COVERAGE: &[(&str, Reached)] = &[
     ("add_bias", Reached::By("add_bias_bfloat16")),
     (
-        "affine_qmm_t",
+        "qmm_t",
         Reached::ByTemplate(
             "affine_qmm_t_bfloat16_gs_{group}_b_{bits}_bm_{bm}_bn_{bn}",
             "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32",
         ),
     ),
     (
-        "affine_qmm_t_residual",
+        "qmm_t_residual",
         Reached::ByTemplate(
             "affine_qmm_t_residual_bfloat16_gs_{group}_b_{bits}_bm_{bm}_bn_{bn}",
             "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
         ),
     ),
     (
-        "affine_qmv_fast",
+        "qmv_fast",
         Reached::By("affine_qmv_fast_bfloat16_gs_64_b_4"),
     ),
     (
-        "affine_qmv_fast_residual",
+        "qmv_fast_residual",
         Reached::ByTemplate(
             "affine_qmv_fast_residual_bfloat16_gs_{group}_b_{bits}",
             "affine_qmv_fast_residual_bfloat16_gs_64_b_4",
         ),
     ),
     (
-        "affine_qmv_routed",
+        "qmv_routed",
         Reached::By("affine_qmv_routed_bfloat16_gs_64_b_4"),
     ),
     (
-        "affine_qmv_routed_bias",
+        "qmv_routed_bias",
         Reached::By("affine_qmv_routed_bias_bfloat16_gs_64_b_4"),
     ),
     ("combine_sorted", Reached::By("combine_sorted")),
@@ -6890,10 +7026,43 @@ fn is_claimed(symbol: &str) -> bool {
 /// build box too.
 #[test]
 fn every_stated_row_is_dispatched_or_named() {
+    // Rows that state operands, PLUS crossed routines whose rows are gone.
+    //
+    // The set this suite can dispatch, which is what `COVERAGE` classifies. It
+    // was the rows alone until Stage 3 deleted `mlp`'s: `run` now derives a
+    // retired family's layout from its ROUTINE's signature, so those four are
+    // dispatchable again and belong here — and a check reading only rows would
+    // have let them fall out of `COVERAGE` unnoticed, which is the same class
+    // of silence the retirement caused everywhere else.
     let mut stated: Vec<&str> = kernels_wgpu::KERNELS
         .iter()
         .filter(|row| !row.operands.is_empty())
         .map(|row| row.symbol)
+        .chain(
+            kernels_wgpu::routines()
+                .into_iter()
+                .map(|r| r.name)
+                // By ROW NAME, not through `sig`, which resolves an
+                // ENTRYPOINT: `sig("qmm_t")` is `None` because `qmm_t` is a
+                // row's name and its symbol is spelled differently, and
+                // filtering that way pulled in half the table.
+                .filter(|n| !kernels_wgpu::KERNELS.iter().any(|row| row.name == *n))
+                // The two dark families are dispatched by no test here and
+                // never were: their rows stated no operands, so `COVERAGE`
+                // never claimed them, and losing the row does not change that.
+                .filter(|n| {
+                    kernels_wgpu::retired().iter().any(|e| {
+                        e.split('_')
+                            .collect::<Vec<_>>()
+                            .windows(n.split('_').count())
+                            .any(|w| w.join("_") == **n)
+                    })
+                })
+                // ...and that `COVERAGE` claims. A retired routine this suite
+                // does not dispatch is not a gap in the bookkeeping, it is
+                // `NEWLY_DISPATCHABLE` below.
+                .filter(|n| is_claimed(n)),
+        )
         .collect();
     stated.sort_unstable();
     stated.dedup();
@@ -6922,13 +7091,21 @@ fn every_stated_row_is_dispatched_or_named() {
                 continue;
             }
         };
-        let sig = kernels_wgpu::sig(named)
-            .unwrap_or_else(|| panic!("`{row}` names `{named}`, which is no entrypoint"));
-        assert_eq!(
-            sig.symbol, *row,
-            "`{named}` belongs to row `{}` and is filed under `{row}`",
-            sig.symbol,
-        );
+        // A RETIRED family's entrypoint resolves through the census rather
+        // than through a row, and the "is it filed under the right row"
+        // question has no row to ask about. What still holds — and is the
+        // half that matters — is that the name is a real entrypoint.
+        match kernels_wgpu::sig(named) {
+            Some(sig) => assert_eq!(
+                sig.symbol, *row,
+                "`{named}` belongs to row `{}` and is filed under `{row}`",
+                sig.symbol,
+            ),
+            None => assert!(
+                kernels_wgpu::entrypoints().iter().any(|e| e == named),
+                "`{row}` names `{named}`, which is no entrypoint"
+            ),
+        }
         assert!(
             body.contains(must_appear),
             "`{row}` is dispatched as `{must_appear}`, and that string appears \
@@ -6944,6 +7121,68 @@ fn every_stated_row_is_dispatched_or_named() {
         "{} stated rows are not dispatched: {excluded:?}",
         excluded.len(),
     );
+
+    // KERNELS THIS SUITE COULD DISPATCH AND DOES NOT, which is a set a
+    // retirement GREW rather than shrank.
+    //
+    // Each of these had a row that stated no operands: no layout could be
+    // derived from it and `run` refused. Their ROUTINES state the same types,
+    // so `run` builds a layout from the signature now and every one of them
+    // became reachable the moment `norm` and `mlp` retired.
+    //
+    // Pinned as a set so that it can only be emptied deliberately — writing a
+    // fixture deletes a line, and a family retiring adds one. A capability
+    // nobody wrote a test for is exactly what an unstated row used to hide,
+    // and it should not become invisible again on the way out.
+    const NEWLY_DISPATCHABLE: &[&str] = &[
+        "cast_qmm_input_bfloat16_to_float16",
+        "cast_qmm_input_strided_bfloat16_to_float16",
+        "gate",
+        "gated_rms",
+        "gated_rms_strided",
+        "gdn_core",
+        "gdn_core_recurrent",
+        "gdn_core_recurrent_prefill",
+        "gdn_core_recurrent_slotted",
+        "gdn_core_slotted",
+        "gdn_prep",
+        "gdn_prep_prefill",
+        "gdn_prep_slotted",
+        "mxfp4_dequant_bf16",
+        "mxfp4_qmm_t_routed_bias",
+        "neox_prop_mb",
+        "neox_strided",
+        "q_gate_split",
+        "qmm_splitk_reduce",
+        "qmm_splitk_reduce_f32",
+        "residual_add_strided",
+        "rms_strided_head_row",
+        "rms_strided_row",
+        "sdpa_paged_tiled_strided",
+        "sdpa_vector_decode_sink",
+        "silu_mul_strided",
+    ];
+    let mut reachable: Vec<&str> = kernels_wgpu::routines()
+        .into_iter()
+        .map(|r| r.name)
+        .filter(|n| !kernels_wgpu::KERNELS.iter().any(|row| row.name == *n))
+        .filter(|n| kernels_wgpu::retired().iter().any(|e| e.starts_with(*n)))
+        .filter(|n| !is_claimed(n))
+        .filter(|n| *n != "argmax_logits" && *n != "copy_logits_bf16")
+        .collect();
+    // `silu_mul_strided` used to reach this list from the other direction --
+    // it had no ROUTINE either, so nothing above found it, and its bare row
+    // was the last one `mlp` left, so it was PUSHED by name. It has a routine
+    // now and the derivation above finds it, which is why the push is gone:
+    // left in, it counted the kernel twice.
+    reachable.sort_unstable();
+    assert_eq!(
+        reachable, NEWLY_DISPATCHABLE,
+        "the kernels this suite could dispatch and does not are not the ones \
+         written down. A retirement ADDS to this set -- an unstated row that \
+         `run` refused becomes a routine `run` can build a layout for -- and \
+         a fixture removes from it."
+    );
     assert_eq!(
         dispatched.len(),
         48,
@@ -6954,17 +7193,23 @@ fn every_stated_row_is_dispatched_or_named() {
         dispatched.len(),
         stated.len(),
     );
-    // The other 50 rows of the table are UNSTATED: they carry axes and a name
-    // and no operands, so no layout can be derived from them and this harness
-    // cannot bind one. That is not a gap in the testing, it is a row with no
-    // ABI — see `.wiki/new-driver/vulkan.md` §13.
-    assert_eq!(
-        kernels_wgpu::KERNELS.len() - stated.len(),
-        50,
-        "the unstated rows are the ones `run` structurally cannot reach, and \
-         there are supposed to be 50 of them -- it was 56 until upstream stated \
-         `sdpa_paged_tiled` and its sink in `kernels-metal`, then 54 until it \
-         stated `sdpa_paged_mma` and ITS sink, and this table followed both",
+    // THE TABLE IS EMPTY, and this asserts that rather than dropping the
+    // check. It counted the rows `run` structurally could not reach: a row
+    // carrying axes and a name and no operands has no layout to derive and no
+    // ABI at all -- see `.wiki/new-driver/vulkan.md` §13. There were 56 when
+    // Stage 3 began, then 4, and now none, because there are no rows.
+    //
+    // Kept as an EQUALITY at zero so that a row re-appearing is a failure and
+    // not a silence. Counted off `KERNELS` directly rather than as
+    // `len() - stated.len()`: `stated` holds routine names too, and a family
+    // retiring more routines than the table had rows left made that
+    // subtraction underflow.
+    assert!(
+        kernels_wgpu::KERNELS.is_empty(),
+        "the table is supposed to be EMPTY: every kernel this crate carries is \
+         reached through a routine and an arm, and `run` builds its layout \
+         from the signature. {} rows came back.",
+        kernels_wgpu::KERNELS.len(),
     );
 }
 

@@ -123,18 +123,6 @@ const DRIFTED: &[(&str, &str)] = &[
         "As `sdpa_paged_decode`: the mask stride is a fire fact and metal \
          reads a text scalar that is zero.",
     ),
-    (
-        "route_gather",
-        "SETTLED, and vulkan is the wrong one. wgpu states `rows_param = \
-         Some(4)` because this statement's rows are the SORTED STACK -- \
-         `MoeRouteParams::padded` -- and not the fire's tokens; given the \
-         fire's count the gather covers a quarter of its own output at \
-         `top_k = 4` and leaves the rest whatever the arena held. \
-         `driver-vulkan` cannot state it: it reads `rows_param` in ZERO places \
-         and its `Dims.rows` is unconditionally `launch.rows.end - \
-         launch.rows.start`. The fix is two-part and is that crate's -- the \
-         column on the row, and the driver reading it. Stays here until then.",
-    ),
 ];
 
 /// Everything about a row that is a fact about the KERNEL rather than a fact
@@ -351,13 +339,13 @@ fn the_three_tables_disagree_only_where_it_is_written_down() {
 /// somebody builds that seam, and until then every crossed family is stated
 /// twice.
 ///
-/// Which makes a COUNT the wrong instrument. `<= DUAL` cannot tell a family
-/// crossing from a family being un-crossed while another crosses, and a bare
-/// number does not say which kernels are living in two planes -- which is the
-/// thing a person reading a failure actually needs. So the list is written
-/// out. Adding a family is one edit that names it; removing a family's rows
-/// is one edit that deletes it; and a name appearing in both planes without
-/// anybody writing it down is a failure, which is what the count was for.
+/// A bare `<= N` would not tell a family crossing from a family being
+/// UN-crossed while another crosses, which is why this was a written-out list
+/// of names for a long time. It is a per-backend equality now, for the reason
+/// `WINDOW` gives: the names are derivable and the list charged every agent
+/// for every other backend's work. Equality keeps the ratchet -- the number
+/// may only fall, and the fall is the record -- and the failure message
+/// prints the names, so a reader still gets what the list gave them.
 #[test]
 fn the_kernels_stated_twice_are_the_ones_written_down() {
     /// Names held by BOTH a table and a routine set, per backend.
@@ -375,246 +363,27 @@ fn the_kernels_stated_twice_are_the_ones_written_down() {
     /// finished: a name is stated twice only while a family's rows and its
     /// routines both exist, and metal has no rows. That is what this list
     /// measures, and reaching zero is what it was counting toward.
-    const DUAL: &[(&str, &[&str])] = &[
-        (
-            "wgpu",
-            &[
-                // SORTED, because the test compares this against a sorted set
-                // and an out-of-order name reads as a mismatch of twenty
-                // against twenty.
-                //
-                // `norm` is the first LIVE family on this backend -- every
-                // layer of every model names `rms_single_row`, and a mixture
-                // names `residual_add`. The rest are the two DARK families
-                // and `layout`, crossed for the reason `kernels-metal` gives
-                // at its own crossing of the same pair: no text names those
-                // symbols here, so a mistake in the entrypoint, the grid or
-                // the argument order cannot change what any model computes.
-                "add_bias",
-                // NEITHER `argmax_logits` NOR `copy_logits_bf16` is here any
-                // more: Stage 3 took both rows off as their arms landed, so
-                // each is stated once, by its routine, and this list is the
-                // names stated TWICE. The two dark families, on all three
-                // backends now.
-                "cast_qmm_input_bfloat16_to_float16",
-                "cast_qmm_input_strided_bfloat16_to_float16",
-                "combine_sorted",
-                "embed_gather_4bit",
-                "embed_gather_mb_4bit",
-                "embed_gather_scaled_4bit",
-                "embed_gather_scaled_mb_4bit",
-                "encode_u4_bf16",
-                "encode_u4_f32",
-                "gate",
-                "gated_rms",
-                "gated_rms_strided",
-                "gdn_core",
-                "gdn_core_recurrent",
-                "gdn_core_recurrent_prefill",
-                "gdn_core_recurrent_slotted",
-                "gdn_core_slotted",
-                "gdn_prep",
-                "gdn_prep_prefill",
-                "gdn_prep_slotted",
-                "geglu_tanh",
-                "geglu_tanh_strided",
-                "gptoss_swiglu",
-                "kv_append",
-                "kv_append_paged",
-                "layer_scalar_mul",
-                "logit_softcap",
-                "mxfp4_dequant_bf16",
-                "mxfp4_qmm_t_routed_bias",
-                "mxfp4_qmv_routed_bias",
-                "neox_decode",
-                "neox_freqs_decode",
-                "neox_freqs_mb",
-                "neox_mb",
-                "neox_prop_decode",
-                "neox_prop_mb",
-                "neox_strided",
-                "ple_combine",
-                "q_gate_split",
-                "qmm_splitk_reduce",
-                "qmm_splitk_reduce_f32",
-                "qmm_t",
-                "qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
-                "qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
-                "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
-                "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
-                "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
-                "qmm_t_bias",
-                "qmm_t_bias_fp16_precast",
-                "qmm_t_fp16_precast",
-                "qmm_t_residual",
-                "qmm_t_residual_fp16_precast",
-                "qmm_t_routed",
-                "qmm_t_routed_fp16",
-                "qmm_t_splitk",
-                "qmm_t_splitk_f32",
-                "qmm_t_splitk_fp16_precast",
-                "qmm_t_splitk_fp16_precast_f32",
-                "qmm_t_strided",
-                "qmm_t_strided_fp16_precast",
-                "qmm_t_strided_fp16_precast_residual",
-                "qmm_t_strided_residual",
-                "qmv_fast",
-                "qmv_fast_residual",
-                "qmv_routed",
-                "qmv_routed_bias",
-                "qmv_tail",
-                "qmv_tail_bias",
-                "qmv_wide_strided",
-                "residual_add",
-                "residual_add_strided",
-                "rms_residual",
-                "rms_residual_scaled",
-                "rms_single_row",
-                "rms_strided_head_row",
-                "rms_strided_row",
-                "route_gather",
-                "route_sort",
-                "router_topk",
-                "router_topk_scaled",
-                "row_gather",
-                "sdpa_paged_decode",
-                "sdpa_paged_decode_sink",
-                "sdpa_paged_mma",
-                "sdpa_paged_mma_sink",
-                "sdpa_paged_tiled",
-                "sdpa_paged_tiled_sink",
-                "sdpa_paged_tiled_strided",
-                "sdpa_vector_decode",
-                "sdpa_vector_decode_sink",
-                "sdpa_vector_decode_swa",
-                "shared_expert_combine",
-                "shared_expert_combine_strided",
-                "silu_mul",
-                "split_qkv_bf16",
-                "vnorm_single_row",
-            ],
-        ),
-        (
-            "vulkan",
-            &[
-                "add_bias",
-                // `argmax_logits` and `copy_logits_bf16` are NOT here any
-                // more: `7d2945eac` took their rows off, so they are stated
-                // once, by the routine. Vulkan is the fleet's first.
-                "cast_qmm_input_bfloat16_to_float16",
-                "cast_qmm_input_strided_bfloat16_to_float16",
-                "combine_sorted",
-                "embed_gather_4bit",
-                "embed_gather_mb_4bit",
-                "embed_gather_scaled_4bit",
-                "embed_gather_scaled_mb_4bit",
-                "encode_u4_bf16",
-                "encode_u4_f32",
-                "gate",
-                "gated_rms",
-                "gated_rms_strided",
-                "gdn_core",
-                "gdn_core_recurrent",
-                "gdn_core_recurrent_prefill",
-                "gdn_core_recurrent_slotted",
-                "gdn_core_slotted",
-                "gdn_prep",
-                "gdn_prep_prefill",
-                "gdn_prep_slotted",
-                "kv_append",
-                "kv_append_paged",
-                "layer_scalar_mul",
-                "logit_softcap",
-                "mxfp4_dequant_bf16",
-                "mxfp4_qmm_t_routed_bias",
-                "mxfp4_qmv_routed_bias",
-                "neox_decode",
-                "neox_freqs_decode",
-                "neox_freqs_mb",
-                "neox_mb",
-                "neox_prop_decode",
-                "neox_prop_mb",
-                "neox_strided",
-                "ple_combine",
-                "q_gate_split",
-                "qmm_splitk_reduce",
-                "qmm_splitk_reduce_f32",
-                "qmm_t",
-                "qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
-                "qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
-                "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
-                "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
-                "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
-                "qmm_t_bias",
-                "qmm_t_bias_fp16_precast",
-                "qmm_t_fp16_precast",
-                "qmm_t_residual",
-                "qmm_t_residual_fp16_precast",
-                "qmm_t_routed",
-                "qmm_t_routed_fp16",
-                "qmm_t_splitk",
-                "qmm_t_splitk_f32",
-                "qmm_t_splitk_fp16_precast",
-                "qmm_t_splitk_fp16_precast_f32",
-                "qmm_t_strided",
-                "qmm_t_strided_fp16_precast",
-                "qmm_t_strided_fp16_precast_residual",
-                "qmm_t_strided_residual",
-                "qmv_fast",
-                "qmv_fast_residual",
-                "qmv_routed",
-                "qmv_routed_bias",
-                "qmv_tail",
-                "qmv_tail_bias",
-                "qmv_wide_strided",
-                "residual_add",
-                "residual_add_strided",
-                "rms_residual",
-                "rms_residual_scaled",
-                "rms_single_row",
-                "rms_strided_head_row",
-                "rms_strided_row",
-                "route_gather",
-                "route_sort",
-                "router_topk",
-                "router_topk_scaled",
-                "row_gather",
-                "sdpa_paged_decode",
-                "sdpa_paged_decode_sink",
-                "sdpa_paged_mma",
-                "sdpa_paged_mma_sink",
-                "sdpa_paged_tiled",
-                "sdpa_paged_tiled_sink",
-                "sdpa_paged_tiled_strided",
-                "sdpa_vector_decode",
-                "sdpa_vector_decode_sink",
-                "sdpa_vector_decode_swa",
-                "shared_expert_combine",
-                "shared_expert_combine_strided",
-                "split_qkv_bf16",
-                "vnorm_single_row",
-            ],
-        ),
-        // Metal's two first crossings are both kernels no text names —
-        // `argmax_logits` and `copy_logits_bf16` are dark on that backend, so
-        // the crossing could not change what any model computes. That is the
-        // property to pick a first family for, and it is why these are the
-        // first two rather than the ones a driver leans on.
-        (
-            "metal",
-            // EMPTY, and it is the milestone. Every metal family has retired
-            // its `kernel!` rows, so no name on this backend is stated twice
-            // any more -- the routine is the only statement of every one of
-            // the hundred. Ninety-eight names were deleted from this list in
-            // one commit, which is `refactor-bigplan.md` §7 Stage 4 finished
-            // here, and the countdown above fell by the same ninety-eight.
-            //
-            // The entry stays rather than being dropped: the loop below
-            // requires every backend it reads to appear, and an absent
-            // backend and a crossed one would otherwise look the same.
-            &[],
-        ),
-    ];
+    /// The most a backend may still state twice, per backend. It may only fall.
+    ///
+    /// This WAS the list itself — all 93 names, per backend, sorted. The list
+    /// answered "which kernels live in two planes", which is what a reader of
+    /// a failure needs, and the edit that deleted a family's names was the
+    /// record of its retirement.
+    ///
+    /// It cost more than it paid. The set is DERIVABLE — rows ∩ routines —
+    /// so writing it down asserts only that someone typed it, and the someone
+    /// was whichever agent noticed: a sibling backend crossing a family left
+    /// `origin/rewrite` failing here until an unrelated branch edited a list
+    /// about a crate it does not touch. That happened four times in a day,
+    /// twice within an hour.
+    ///
+    /// What the list actually protected is below and is not derivable: the
+    /// union is still the hundred (a port that LOSES a name loses it
+    /// silently), and the window only ever narrows. The ceiling is one number
+    /// per backend and lowering it is still the record — but only the backend
+    /// that crossed the family has to make that edit, which is the property
+    /// the list did not have.
+    const WINDOW: &[(&str, usize)] = &[("wgpu", 0), ("vulkan", 0), ("metal", 0)];
 
     // JOINING THIS GATE, for the next backend to port a family: expose
     //
@@ -684,135 +453,66 @@ fn the_kernels_stated_twice_are_the_ones_written_down() {
         );
 
         let both: Vec<&str> = names.intersection(rows).copied().collect();
-        let written: Vec<&str> = DUAL
+        let ceiling = WINDOW
             .iter()
             .find(|(b, _)| b == what)
-            .map_or(&[][..], |(_, names)| names)
-            .to_vec();
-        assert_eq!(
-            both,
-            written,
-            "{what} states {} kernels in both a table and a routine set, and \
-             DUAL above writes down {}. Both directions are a real event and \
-             neither is a formality: a name here that is not there is a \
-             family ported without anyone recording that it now lives in two \
-             places at once, and a name there that is not here is a family \
-             whose rows came off -- delete the line, because that edit is the \
-             record of it.",
+            .unwrap_or_else(|| panic!("`{what}` has no entry in WINDOW"))
+            .1;
+        assert!(
+            both.len() <= ceiling,
+            "{what} states {} kernels in both a table and a routine set and \
+             WINDOW allows {ceiling}. The window only NARROWS: a family that \
+             gained a routine without losing its rows is a real event, and it \
+             is one this test refuses rather than records. {both:?}",
             both.len(),
-            written.len()
+        );
+        assert_eq!(
+            both.len(),
+            ceiling,
+            "{what} states {} kernels in both planes, down from {ceiling}. \
+             Lower the entry -- that edit is the record of the retirement, \
+             and it is the crossing backend's own edit to make.",
+            both.len(),
         );
     }
 
     let crossed_backends: BTreeSet<&str> = crossed.iter().map(|(w, _, _)| *w).collect();
-    for (what, _) in DUAL {
+    for (what, _) in WINDOW {
         assert!(
             crossed_backends.contains(what),
-            "DUAL writes down `{what}`, which is not in the list of backends \
+            "WINDOW writes down `{what}`, which is not in the list of backends \
              this gate reads. A backend cannot be checked by being mentioned."
         );
     }
 }
 
-/// A ported routine takes exactly the operands its row states.
-///
-/// `refactor-bigplan.md` §3's cross-backend gate compares `Routine::args`
-/// between backends, and cannot run until two of them have ported the same
-/// family. This is the same comparison turned inward, where it is available
-/// today: **while a kernel is stated twice, the routine's TRACE-provenance
-/// arguments, in order, must be exactly the row's operand types.**
-///
-/// It is the check the port itself most needs. A body that drops an operand,
-/// or takes two in the other order, still compiles, still dispatches and still
-/// returns `Ok` — it binds the wrong buffer to the wrong slot and computes
-/// nonsense. Nothing else in either plane compares them.
-///
-/// `Env` arguments are excluded on purpose and are the interesting half: they
-/// are the facts a row POINTED AT and did not carry — `width` and `rows` were
-/// `LaunchRule::Elementwise` reading the rectangle, `group` and `bits` were an
-/// axis suffix on the entrypoint name. That a signature states them and a row
-/// could not is the whole reason for the refactor, so the gate requires the
-/// trace half to match and says nothing about the rest.
-#[test]
-fn a_ported_routine_takes_exactly_the_operands_its_row_states() {
-    let backends: Vec<(&str, Vec<kernels::routine::Declared>, &[KernelSig])> = vec![
-        ("wgpu", kernels_wgpu::declared(), kernels_wgpu::KERNELS),
-        (
-            "vulkan",
-            kernels_vulkan::declared(),
-            kernels_vulkan::KERNELS,
-        ),
-        ("metal", kernels_metal::declared(), kernels_metal::KERNELS),
-    ];
-
-    let mut compared = 0usize;
-    for (what, declared, table) in backends {
-        let rows: BTreeMap<&str, &KernelSig> = table.iter().map(|r| (r.name, r)).collect();
-        for d in declared {
-            let Some(row) = rows.get(d.name) else {
-                // Its rows are gone: the family has fully crossed, and §3's
-                // cross-backend gate is what covers it from then on.
-                continue;
-            };
-            // An UNSTATED row makes no claim to compare against. 285 of
-            // `kernels-vulkan`'s 481 entrypoints are dispatched through the
-            // plan's own operand order rather than through a stated list --
-            // `vulkan-refactor.md` §8, deferred deliberately -- and
-            // `sample::argmax_logits` is one of them. Comparing a body's four
-            // buffers against an empty list would fail on the one thing that is
-            // not a disagreement: there is no second statement to disagree with.
-            //
-            // This is not a hole the gate leaves open. A row with no operands
-            // never protected anything, and the body is now the ONLY statement of
-            // the binding order, which is strictly more than the row said.
-            if row.operands.is_empty() {
-                continue;
-            }
-            let stated: Vec<kernels::Ty> = row.operands.iter().map(|o| o.ty).collect();
-            let taken: Vec<kernels::Ty> = d
-                .args
-                .iter()
-                .filter(|(_, prov)| *prov == kernels::routine::Provenance::Trace)
-                .map(|(ty, _)| *ty)
-                .collect();
-            assert_eq!(
-                taken, stated,
-                "{what}'s `{}` takes {taken:?} where its row states {stated:?}. A \
-             body that drops an operand or reorders two still compiles, still \
-             dispatches and still returns Ok -- it binds the wrong buffer to \
-             the wrong slot. In this tree that is not hypothetical: the shader \
-             binds `rms_single_row` as 0=x, 1=w, 2=out and the trace hands \
-             over In(0), Out(0), Weight(0), so a positional bind reads the \
-             output as the weight.",
-                d.name
-            );
-            assert_eq!(
-                d.whole, row.whole,
-                "{what}'s `{}` disagrees with its row about `whole`",
-                d.name
-            );
-            assert_eq!(
-                d.in_place, row.in_place,
-                "{what}'s `{}` disagrees with its row about `in_place`",
-                d.name
-            );
-            assert_eq!(
-                d.depth_prefix_plan, row.depth_prefix_plan,
-                "{what}'s `{}` disagrees with its row about `depth_prefix_plan`",
-                d.name
-            );
-            compared += 1;
-        }
-        let _ = what;
-    }
-    assert!(
-        compared > 0,
-        "no kernel is stated twice, so this compared nothing. When that is \
-         true because every family has crossed, delete this test -- §3's \
-         cross-backend gate is its successor."
-    );
-    println!("{compared} ported routines compared against their rows");
-}
+// THREE TESTS STOOD HERE, and each of them said in its own failure message
+// exactly when to delete it. All three now say it.
+//
+// * `a_ported_routine_takes_exactly_the_operands_its_row_states` compared a
+//   crossed routine's signature against the ROW of the same name on the same
+//   backend -- the strongest check in the fleet while a family was mid-
+//   crossing, because it held the new plane to the old one, on the same
+//   kernel, in the same crate. Its message: *"no kernel is stated twice, so
+//   this compared nothing."*
+// * `a_kernel_crossed_on_one_backend_is_compared_against_the_row_on_another`
+//   did the same across backends, so a family that crossed on vulkan could
+//   still be checked against metal's row. Its message: *"nothing was
+//   compared."*
+// * `the_crossed_routines_with_no_row_to_check_are_counted` existed to notice
+//   the other two going quiet, and it is the one that fired first: *"0 of 99
+//   crossed have a row to check"*, on every backend.
+//
+// ALL THREE now hold an empty `KERNELS`: `kernels-wgpu` was the last, and its
+// final row was `silu_mul_strided` -- a kernel every backend had recorded as
+// unable to take a positional argument list, which was true of MSL's flat
+// argument table and false of `gated.wgsl`. There is no row left to hold a
+// routine to, anywhere.
+//
+// What carries the signatures from here is
+// `two_backends_that_crossed_the_same_kernel_agree_on_its_signature`, which is
+// the same claim between two ROUTINE planes with the tables taken out of the
+// middle -- and which grew as these shrank, which is the trade §3 was for.
 
 /// The two settled drifts say something about a DRIVER, and this is what
 /// keeps those sentences true.
@@ -874,14 +574,14 @@ fn the_two_settled_drifts_are_still_true_of_the_drivers_they_name() {
         metal.display()
     );
 
-    assert_eq!(
-        mentions(&vulkan, "rows_param"),
-        0,
-        "`driver-vulkan` has learned to read `rows_param`. That is the defect \
-         `DRIFTED[\"route_gather\"]` names being half-fixed — check whether \
-         `kernels-vulkan`'s row now states `rows_param = Some(4)` too, and if \
-         it does, delete the entry."
-    );
+    // `driver-vulkan`'s half of `DRIFTED["route_gather"]` STOOD HERE and is
+    // gone because the defect is fixed. `arm::route_gather` reads
+    // `stated(o, 4, f.rows)` now — the padded extent off the statement, with
+    // the fire's count as the fallback — which is exactly what this asserted
+    // it did not do. The entry above went with it, as its own message
+    // instructed.
+    //
+    // `driver-metal`'s half remains below, and its defect remains too.
 
     assert_eq!(
         mentions(&metal, "AttentionMaskStride"),
@@ -951,91 +651,6 @@ fn retiring_a_row_does_not_shrink_a_backends_census() {
     assert_eq!(reference.len(), 481, "the shared shader census");
 }
 
-/// A kernel one backend has crossed and another has not is still compared.
-///
-/// This closes the hand-off between the two gates above, which had a hole in
-/// it. `the_three_tables_disagree_only_where_it_is_written_down` skips a
-/// kernel that only one table still holds, because the others may have
-/// crossed; `two_backends_that_crossed_the_same_kernel_agree_on_its_signature`
-/// only sees kernels that TWO backends have crossed. So a kernel that backend
-/// A has crossed and backend B has not was compared by nothing at all — and
-/// crossing a family is exactly the act that moves kernels into that state,
-/// eleven at a time.
-///
-/// It is not hypothetical. `neox_freqs_mb`'s vulkan row was BARE, and its
-/// crossing records what that cost: a statement had nothing to name and named
-/// the DECODE symbol instead, whose shader assigns `row = 0`, so a prefill
-/// rotated row zero once per row and left the rest exactly as they arrived.
-/// The wgpu row for the same kernel states its operands. Had vulkan crossed
-/// rope one commit earlier, that difference would have left the tables and
-/// entered nothing.
-///
-/// The two planes ARE comparable: a routine's TRACE-provenance arguments, in
-/// order, are the row's operand list — which is what
-/// `a_ported_routine_takes_exactly_the_operands_its_row_states` asserts within
-/// a backend. This asserts it across two.
-#[test]
-fn a_kernel_crossed_on_one_backend_is_compared_against_the_row_on_another() {
-    let crossed: Vec<(&str, Vec<kernels::routine::Declared>)> = vec![
-        ("wgpu", kernels_wgpu::declared()),
-        ("vulkan", kernels_vulkan::declared()),
-        ("metal", kernels_metal::declared()),
-    ];
-
-    let mut compared = 0usize;
-    let mut report = Vec::new();
-    for (what, declared) in &crossed {
-        for d in declared {
-            let taken: Vec<kernels::Ty> = d
-                .args
-                .iter()
-                .filter(|(_, prov)| *prov == kernels::routine::Provenance::Trace)
-                .map(|(ty, _)| *ty)
-                .collect();
-
-            for t in tables() {
-                if t.what == *what {
-                    continue;
-                }
-                let Some(row) = t.rows.iter().find(|r| r.name == d.name) else {
-                    continue;
-                };
-                // An unstated row makes no claim -- there is nothing to
-                // disagree with, and the signature is now the only statement
-                // of the binding order this kernel has ever had.
-                if row.operands.is_empty() {
-                    continue;
-                }
-                let stated: Vec<kernels::Ty> = row.operands.iter().map(|o| o.ty).collect();
-                if taken != stated {
-                    report.push(format!(
-                        "`{}`: {what}'s routine takes {taken:?}, {}'s row \
-                         states {stated:?}",
-                        d.name, t.what
-                    ));
-                }
-                compared += 1;
-            }
-        }
-    }
-
-    assert!(
-        report.is_empty(),
-        "a crossed routine and a table row describe the same kernel \
-         differently. One of the two is wrong about what the shader binds, and \
-         the crossing is what would have hidden it -- a ported row leaves the \
-         table and stops being compared:\n  {}",
-        report.join("\n  ")
-    );
-    assert!(
-        compared > 0,
-        "nothing was compared. Either every backend has crossed the same \
-         kernels, in which case the test above covers them and this can go, or \
-         the plane lookup has stopped finding rows."
-    );
-    println!("{compared} routine-against-row pairs compared across backends");
-}
-
 /// The countdown: `REMAINING` rows to 0.
 ///
 /// `refactor-bigplan.md` §8. `KERNELS.len()` summed across the three, against
@@ -1058,7 +673,17 @@ fn the_three_tables_only_ever_lose_rows() {
     /// that no reader of an `operands`, `launch` or `*_param` column is left
     /// on this backend. Stage 5 deletes those columns, and it can only run
     /// once the LAST backend is here.
-    const REMAINING: usize = 192;
+    ///
+    /// 19 → 0. THE COUNTDOWN IS OVER. wgpu retired its remaining rows — it was
+    /// the last backend holding any — and vulkan's last row went in the same
+    /// window, so all three tables are empty slices and no reader of an
+    /// `operands`, `launch` or `*_param` column is left anywhere in the tree.
+    ///
+    /// Stage 5, the only stage that pays for the other four, is unblocked:
+    /// those columns and then the `kernel!` macro itself can go. This test
+    /// asserts EQUALITY at zero rather than being deleted, so that a row
+    /// re-appearing in any of the three is a failure and not a silence.
+    const REMAINING: usize = 0;
 
     let total: usize = tables().iter().map(|t| t.rows.len()).sum();
     assert!(
@@ -1072,123 +697,6 @@ fn the_three_tables_only_ever_lose_rows() {
         "the three tables hold {total} rows, down from {REMAINING}. Lower the \
          constant: that edit is the progress bar."
     );
-}
-
-/// How many crossed routines have NO row to be checked against, per backend.
-///
-/// [`a_ported_routine_takes_exactly_the_operands_its_row_states`] skips a row
-/// whose `operands` list is empty, and its comment argues — correctly — that
-/// an unstated row never protected anything and the body is now the only
-/// statement of the binding order.
-///
-/// What that argument does not do is say HOW MANY. The answer was FIFTY-ONE,
-/// the same fifty-one names on all three backends, which is over half of
-/// what each has crossed. metal's is NINETY-NINE now, which is every routine
-/// it has: its table is empty, so there is no row to compare against for any
-/// of them and the row check is inert on that backend entirely. The rise is
-/// the retirement, not a regression -- see the second cause below. I went looking because wgpu's `ssm` crossed with
-/// all eight of its rows unfilled and I had just written "all eight
-/// signatures matched vulkan's on the first gate run" — true, and true via a
-/// DIFFERENT test than the one I had in mind. The row check compared nothing
-/// for those eight; what compared them was
-/// [`two_backends_that_crossed_the_same_kernel_agree_on_its_signature`],
-/// which is routine-against-routine and is independent.
-///
-/// The number being identical three ways is the useful part: it is a property
-/// of the shared TABLE — `vulkan-refactor.md` §8's deferral, where 285 of 481
-/// entrypoints are dispatched through the plan's own operand order — and not
-/// of any backend's port.
-///
-/// So the number is asserted. It is not a defect and it does not have to
-/// reach zero — filling a row for a symbol no text names would be inventing a
-/// claim to check against. It has to be VISIBLE, because "this check ran"
-/// and "this check compared something" are different facts and only one of
-/// them was being reported.
-///
-/// What covers those eight instead is real and worth naming: `kernels-wgpu`'s
-/// `every_routine_binds_a_buffer_for_every_binding_its_module_declares`
-/// measures each dispatch against the parsed `naga` module, which is this
-/// backend's own shader rather than a sibling's signature.
-#[test]
-fn the_crossed_routines_with_no_row_to_check_are_counted() {
-    /// Per backend: how many crossed routines have an unstated row.
-    ///
-    /// May fall freely. A RISE means either a family crossed against rows
-    /// that state nothing, or a family retired its rows -- both allowed, both
-    /// deliberate, and the second is the end state. metal is at its own
-    /// routine count because it has finished: 99 unchecked out of 99 crossed.
-    const UNCHECKED: &[(&str, usize)] = &[("metal", 99), ("vulkan", 55), ("wgpu", 51)];
-
-    let backends = [
-        ("wgpu", kernels_wgpu::declared(), kernels_wgpu::KERNELS),
-        (
-            "vulkan",
-            kernels_vulkan::declared(),
-            kernels_vulkan::KERNELS,
-        ),
-        ("metal", kernels_metal::declared(), kernels_metal::KERNELS),
-    ];
-    for (what, declared, table) in backends {
-        let rows: BTreeMap<&str, &KernelSig> = table.iter().map(|r| (r.name, r)).collect();
-        let mut blind: Vec<&str> = Vec::new();
-        let mut retired: Vec<&str> = Vec::new();
-        for d in declared {
-            match rows.get(d.name) {
-                Some(row) if row.operands.is_empty() => blind.push(d.name),
-                // Stage 3 took the row off. The row check has nothing to
-                // compare for the same reason, so it belongs in the same
-                // count — but it is tracked separately because this cause is
-                // PERMANENT and the other one is a row waiting to be filled in.
-                None => {
-                    blind.push(d.name);
-                    retired.push(d.name);
-                }
-                Some(_) => {}
-            }
-        }
-        blind.sort_unstable();
-        retired.sort_unstable();
-        let want = UNCHECKED
-            .iter()
-            .find(|(n, _)| *n == what)
-            .unwrap_or_else(|| panic!("`{what}` has no entry in UNCHECKED"))
-            .1;
-        assert_eq!(
-            blind.len(),
-            want,
-            "{what} has {} crossed routines the row check cannot compare -- \
-             the row states no operands, or Stage 3 already took the row off \
-             -- and this test writes down {want}. Those routines pass the row \
-             check without it comparing anything. {blind:?}",
-            blind.len()
-        );
-
-        // The check `d2f5c6330` wanted and could not run: metal's retirements
-        // were in a private `RETIRED` with no accessor. Every crate has
-        // `retired_rows()` now, so a routine whose row is gone must be one
-        // the crate SAYS it gave up. Subset, not equality -- a retired row
-        // with no routine at all is legal and metal has one, `silu_mul_
-        // strided`, which is dark. What this forbids is the other direction:
-        // a row deleted and not recorded, which reads here as a crossing that
-        // happened and everywhere else as a kernel that never existed.
-        let recorded: BTreeSet<&str> = tables()
-            .iter()
-            .find(|t| t.what == what)
-            .map_or(BTreeSet::new(), |t| t.retired.iter().copied().collect());
-        let unrecorded: Vec<&str> = retired
-            .iter()
-            .copied()
-            .filter(|n| !recorded.contains(n))
-            .collect();
-        assert!(
-            unrecorded.is_empty(),
-            "{what} has crossed routines whose rows are gone from `KERNELS` \
-             and absent from `retired_rows()`: {unrecorded:?}. The row was \
-             deleted without the deletion being stated, so every sweep that \
-             folds the retirements back in -- the census, the union above -- \
-             is short by exactly these."
-        );
-    }
 }
 
 /// Two backends that crossed the same kernel state the same signature.
@@ -1226,6 +734,140 @@ fn the_crossed_routines_with_no_row_to_check_are_counted() {
 /// needs a sentence, and it may only be deleted — when the two agree, the
 /// entry is stale and this test says so.
 const DIVERGED: &[(&str, &str)] = &[
+    // THREE transcode kernels, and this one is wgpu's own shape rather than a
+    // slot metal reserves.
+    //
+    // The pair `{groups, group_size}` (`{blocks, block_size}` for mxfp4) is a
+    // params BUFFER on the other two backends: `driver-metal`'s arm mints it
+    // with `o.params_block()` and passes the handle positionally.
+    // `transcode.wgsl` has nowhere to put it — `@group(0)` holds only the
+    // three or four data buffers, densely numbered, and the pair is the two
+    // `u32` fields of the `@group(1) @binding(0)` uniform, which `bind` fills
+    // from the scalars a body forwards. So the divergence is not a slot one
+    // backend reserves; it is the same two numbers travelling as scalars
+    // instead of as a buffer.
+    //
+    // These bodies previously took a `_params: Buf` they could not use and
+    // forwarded NO scalars at all, so the uniform arrived empty and the shader
+    // read zero groups — a loop that runs no iterations and reports success.
+    // Nothing caught it because all three rows were UNSTATED and no model
+    // fires them: `encode_u4` appears in no lowering in this tree.
+    (
+        "encode_u4_bf16",
+        "metal and vulkan hand the scalar pair over as a synthesized params BUFFER in the argument list; `transcode.wgsl` declares no such slot — its `@group(0)` bindings are dense and the pair is the two fields of the `@group(1)` uniform, which is built from the scalars a body forwards — so wgpu passes the two scalars and no buffer",
+    ),
+    (
+        "encode_u4_f32",
+        "metal and vulkan hand the scalar pair over as a synthesized params BUFFER in the argument list; `transcode.wgsl` declares no such slot — its `@group(0)` bindings are dense and the pair is the two fields of the `@group(1)` uniform, which is built from the scalars a body forwards — so wgpu passes the two scalars and no buffer",
+    ),
+    (
+        "mxfp4_dequant_bf16",
+        "metal and vulkan hand the scalar pair over as a synthesized params BUFFER in the argument list; `transcode.wgsl` declares no such slot — its `@group(0)` bindings are dense and the pair is the two fields of the `@group(1)` uniform, which is built from the scalars a body forwards — so wgpu passes the two scalars and no buffer",
+    ),
+    // SEVENTEEN quant kernels, all the same shape, all metal's `pad: Buf`.
+    //
+    // `0fc54bedb` ("Seventeen quant kernels were reading whatever the last
+    // step left") added a padding buffer to metal's signatures. It is not a
+    // fix wgpu needs and copying it would BREAK this backend.
+    //
+    // Metal has one flat, POSITIONAL `[[buffer(n)]]` table shared by every
+    // variant of a shader, so a variant that does not read a slot still has to
+    // reserve it or the numbering shifts under the ones that do — `pad` is
+    // that reservation. WGSL is preprocessed per variant here and numbered
+    // densely from the row, and
+    // `every_routine_binds_a_buffer_for_every_binding_its_module_declares`
+    // machine-checks the density against the parsed module. Adding a pad would
+    // make every one of these seventeen bind one buffer more than its shader
+    // declares.
+    //
+    // Written down as seventeen entries rather than one, because a rule with
+    // an exception list is a rule and a waiver is not: if one of these ever
+    // stops diverging, that entry goes stale and this gate says so.
+    (
+        "cast_qmm_input_bfloat16_to_float16",
+        "metal reserves a positional `pad` slot its flat argument table needs \
+         and wgpu numbers each preprocessed variant densely instead",
+    ),
+    (
+        "cast_qmm_input_strided_bfloat16_to_float16",
+        "metal reserves a positional `pad` slot its flat argument table needs \
+         and wgpu numbers each preprocessed variant densely instead",
+    ),
+    (
+        "qmm_splitk_reduce",
+        "metal reserves a positional `pad` slot its flat argument table needs \
+         and wgpu numbers each preprocessed variant densely instead",
+    ),
+    (
+        "qmm_splitk_reduce_f32",
+        "metal reserves a positional `pad` slot its flat argument table needs \
+         and wgpu numbers each preprocessed variant densely instead",
+    ),
+    (
+        "qmm_t_bias_fp16_precast",
+        "metal reserves a positional `pad` slot its flat argument table needs \
+         and wgpu numbers each preprocessed variant densely instead",
+    ),
+    (
+        "qmm_t_fp16_precast",
+        "metal reserves a positional `pad` slot its flat argument table needs \
+         and wgpu numbers each preprocessed variant densely instead",
+    ),
+    (
+        "qmm_t_residual_fp16_precast",
+        "metal reserves a positional `pad` slot its flat argument table needs \
+         and wgpu numbers each preprocessed variant densely instead",
+    ),
+    (
+        "qmm_t_splitk",
+        "metal reserves a positional `pad` slot its flat argument table needs \
+         and wgpu numbers each preprocessed variant densely instead",
+    ),
+    (
+        "qmm_t_splitk_f32",
+        "metal reserves a positional `pad` slot its flat argument table needs \
+         and wgpu numbers each preprocessed variant densely instead",
+    ),
+    (
+        "qmm_t_splitk_fp16_precast",
+        "metal reserves a positional `pad` slot its flat argument table needs \
+         and wgpu numbers each preprocessed variant densely instead",
+    ),
+    (
+        "qmm_t_splitk_fp16_precast_f32",
+        "metal reserves a positional `pad` slot its flat argument table needs \
+         and wgpu numbers each preprocessed variant densely instead",
+    ),
+    (
+        "qmm_t_strided",
+        "metal reserves a positional `pad` slot its flat argument table needs \
+         and wgpu numbers each preprocessed variant densely instead",
+    ),
+    (
+        "qmm_t_strided_fp16_precast",
+        "metal reserves a positional `pad` slot its flat argument table needs \
+         and wgpu numbers each preprocessed variant densely instead",
+    ),
+    (
+        "qmm_t_strided_fp16_precast_residual",
+        "metal reserves a positional `pad` slot its flat argument table needs \
+         and wgpu numbers each preprocessed variant densely instead",
+    ),
+    (
+        "qmv_tail",
+        "metal reserves a positional `pad` slot its flat argument table needs \
+         and wgpu numbers each preprocessed variant densely instead",
+    ),
+    (
+        "qmv_tail_bias",
+        "metal reserves a positional `pad` slot its flat argument table needs \
+         and wgpu numbers each preprocessed variant densely instead",
+    ),
+    (
+        "qmv_wide_strided",
+        "metal reserves a positional `pad` slot its flat argument table needs \
+         and wgpu numbers each preprocessed variant densely instead",
+    ),
     // Vulkan's descriptor set holds buffers and its push block holds scalars,
     // and they are two namespaces: `sdpa_sliding.slang` gives `sinks` binding
     // 4, right behind `out_`, because a buffer cannot sit past a push
@@ -1490,72 +1132,28 @@ fn two_backends_that_crossed_the_same_kernel_agree_on_its_signature() {
     // bodies and the 303 instantiation names are spelled identically. Every
     // one of them agreed.
     assert_eq!(
-        compared, 198,
+        compared, 199,
         "{compared} kernels are crossed by more than one backend and compared \
-         here, and this test expects 198. It may only RISE: a fall means a name \
+         here, and this test expects 199. It may only RISE: a fall means a name \
          stopped matching its counterpart, which is how a comparison stops \
          happening without anybody deleting it."
     );
 }
 
-/// `kernels-metal::kernel_of` answers what a table with ROWS still answers.
-///
-/// Metal finished Stage 4 first, so its `KERNELS` is empty and every symbol
-/// now resolves through the retired-row fallback instead of through a row's
-/// own axis expansion. That fallback is a text rule over names, and a text
-/// rule can be wrong in a way nothing on that backend can see any more —
-/// there is no table left to check it against.
-///
-/// `kernels-wgpu` still has 98 rows, and `kernels::sig_in` resolves the same
-/// 481 entrypoints through them. So the check is available exactly once, from
-/// here, while at least one backend is behind: the two answers must be the
-/// same name for every point of the shared census.
-///
-/// # What it caught
-///
-/// The fallback matched a row name only as a PREFIX. That is right for
-/// `rms_single_row_bfloat16` and wrong for `affine_qmv_fast_bfloat16_gs_64_b_4`,
-/// where the row is `qmv_fast` and `affine_` is a qualifier the row name does
-/// not carry — so every `quant` and `moe` symbol resolved to `None`, and
-/// `model-ir`'s load-time check refused to build ANY metal text. The first
-/// families to retire were the ones whose rows happen to be prefixes, which is
-/// why it surfaced only at the last one.
-#[test]
-fn metals_symbol_lookup_agrees_with_a_table_that_still_has_rows() {
-    let census = kernels_wgpu::entrypoints();
-    assert_eq!(census.len(), 481, "the shared shader census");
-
-    let mut checked = 0u32;
-    let mut wrong = Vec::new();
-    for point in &census {
-        let Some(row) = kernels::sig_in(kernels_wgpu::KERNELS, point) else {
-            // A family wgpu has retired too. Neither side has a row, so
-            // there is nothing to compare — and the count below is what
-            // keeps that from quietly becoming everything.
-            continue;
-        };
-        checked += 1;
-        match kernels_metal::kernel_of(point) {
-            Some(name) if name == row.name => {}
-            other => wrong.push(format!(
-                "`{point}`: wgpu says `{}`, metal says {other:?}",
-                row.name
-            )),
-        }
-    }
-
-    assert!(
-        wrong.is_empty(),
-        "{} of {checked} entrypoints resolve to a different kernel on the two \
-         backends:\n  {}",
-        wrong.len(),
-        wrong.join("\n  "),
-    );
-    assert!(
-        checked > 400,
-        "only {checked} entrypoints were compared. This check is only \
-         available while a backend is BEHIND metal's Stage 4, and it stops \
-         being available family by family as wgpu catches up — when it reads \
-         nothing, delete it rather than letting it pass on an empty loop",
-    );
-}
+// RETIRED, exactly as its own failure message instructed.
+//
+// It compared `kernels-metal::kernel_of`'s retired-row fallback against
+// `kernels::sig_in` over `kernels-wgpu`'s rows — available only while a
+// backend was BEHIND metal's Stage 4, and it caught the defect it was written
+// for: the fallback matched a row name as a PREFIX, and 363 of 479
+// entrypoints resolved to `None`, which refused every metal text at load
+// time.
+//
+// `kernels-wgpu` is down to 19 rows over 31 entrypoints, so the comparison
+// reads a fourteenth of the census. The assertion said to delete it rather
+// than let it pass on a nearly empty loop, and this is that edit.
+//
+// What holds the rule now: `kernel_of`'s own `at_word_boundary`, which is
+// unit-tested in `kernels-metal`, and `model-ir`'s load-time check, which
+// refuses any text naming a symbol no backend resolves. Both are on the
+// side that has the rows.

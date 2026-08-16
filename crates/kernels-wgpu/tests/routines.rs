@@ -363,6 +363,18 @@ fn recipe(name: &str) -> Option<Vec<Vec<ArgValue>>> {
             ArgValue::I32(2048),
             ArgValue::I32(7),
         ]),
+        // gate, up, out, row_pitch, width, rows. An EVEN pitch, and wider than
+        // the row: `gated.wgsl` indexes `gid.y * row_pitch / 2 + gid.x` in
+        // WORDS, so an odd pitch would put two rows in one word and no store
+        // granularity there could make that safe.
+        "silu_mul_strided" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            ArgValue::I32(4096),
+            ArgValue::I32(2048),
+            ArgValue::I32(7),
+        ]),
 
         // ---- rope ----
         //
@@ -601,9 +613,12 @@ fn quant(name: &str) -> Option<Vec<Vec<ArgValue>>> {
         ("qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2", &[64]), // m
         ("qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1", &[64]), // m
         ("qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4", &[64]), // m
-        ("encode_u4_bf16", &[8]),                   // groups
-        ("encode_u4_f32", &[8]),                    // groups
-        ("mxfp4_dequant_bf16", &[8]),               // blocks
+        // NO `Env` values: the transcode encoders state their group/block
+        // count as a TRACE scalar, because `transcode.wgsl` reads it to bound
+        // its own loop and an `Env` argument is not forwarded to the shader.
+        ("encode_u4_bf16", &[]),
+        ("encode_u4_f32", &[]),
+        ("mxfp4_dequant_bf16", &[]),
     ];
 
     let envs = ENVS.iter().find(|(n, _)| *n == name)?.1;

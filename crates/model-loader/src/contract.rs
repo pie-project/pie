@@ -357,6 +357,30 @@ pub enum Expr {
     /// is the only variant in the algebra with two children — outbound, a
     /// quantized tensor's scales are its outputs; inbound they are inputs.
     Scale { src: Box<Expr>, factor: ScaleFactor },
+    /// Escape hatch: elementwise add of one constant. `out[i] = src[i] + by`,
+    /// as [`f32::to_bits`] for the reason [`ScaleFactor::Uniform`] gives.
+    ///
+    /// The second of the two operators that change a value, and it exists
+    /// because a checkpoint format can disagree with pie about where a
+    /// constant lives rather than about what it is. Gemma is the case: its
+    /// rmsnorm is `x * (1 + w)`, HuggingFace publishes `w`, and llama.cpp
+    /// folds the one in and publishes `w + 1`. Both files describe the same
+    /// model; only one of them matches the kernel pie runs. Nothing in a
+    /// placement algebra can undo that, and the alternative to saying it here
+    /// is an importer that copies the tensor to the host, subtracts, and
+    /// writes the result outside the plan -- which is the thing this whole
+    /// module exists to stop.
+    ///
+    /// Deliberately NOT a second field on [`Expr::Scale`]. An affine node
+    /// whose two constants are both optional has four states, two of which
+    /// are the identity written two ways, and every reader would have to
+    /// check both to know what it is holding. Composing the two nodes says
+    /// the same thing and each one still denotes exactly one operation.
+    ///
+    /// No per-block form. A per-block *scale* is dequantization, a real thing
+    /// a scheme defines; a per-block bias is not a thing any format publishes,
+    /// and a node with no caller is a claim nobody has checked.
+    Bias { src: Box<Expr>, by: u32 },
 }
 
 /// What [`Expr::Scale`] multiplies by.
@@ -746,6 +770,7 @@ impl Expr {
             Expr::Repack { .. } => "Repack",
             Expr::Cast { .. } => "Cast",
             Expr::Scale { .. } => "Scale",
+            Expr::Bias { .. } => "Bias",
             Expr::SrcIndexed(_) => "SrcIndexed",
             Expr::Select { .. } => "Select",
         }
@@ -848,6 +873,14 @@ impl Expr {
         }
     }
 
+    /// Add `by` to every element.
+    pub fn bias(self, by: f32) -> Self {
+        Expr::Bias {
+            src: Box::new(self),
+            by: by.to_bits(),
+        }
+    }
+
     /// Multiply by `by`, one factor per block, blocked by the shape ratio.
     ///
     /// Over a quantized `self` this is dequantization, and the result is the
@@ -877,7 +910,9 @@ impl Expr {
             | Expr::Transmute { src, .. } => src.is_affine(),
             Expr::Concat { parts, .. } => parts.iter().all(Expr::is_affine),
             Expr::Shard { src, .. } | Expr::Select { src, .. } => src.is_affine(),
-            Expr::Repack { .. } | Expr::Cast { .. } | Expr::Scale { .. } => false,
+            Expr::Repack { .. } | Expr::Cast { .. } | Expr::Scale { .. } | Expr::Bias { .. } => {
+                false
+            }
         }
     }
 
@@ -920,7 +955,8 @@ impl Expr {
             | Expr::Repack { src, .. }
             | Expr::Shard { src, .. }
             | Expr::Select { src, .. }
-            | Expr::Cast { src, .. } => src.visit(seen),
+            | Expr::Cast { src, .. }
+            | Expr::Bias { src, .. } => src.visit(seen),
             Expr::Scale { src, factor } => {
                 src.visit(seen);
                 if let ScaleFactor::PerBlock { by } = factor {
@@ -1014,6 +1050,10 @@ impl Expr {
                     ScaleFactor::PerBlock { by } => ScaleFactor::PerBlock { by: boxed(by)? },
                     uniform => uniform,
                 },
+            },
+            Expr::Bias { src, by } => Expr::Bias {
+                src: boxed(src)?,
+                by,
             },
             Expr::Shard { src, axis } => Expr::Shard {
                 src: boxed(src)?,

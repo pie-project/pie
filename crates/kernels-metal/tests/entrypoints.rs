@@ -27,7 +27,7 @@
 //! or a row whose axes over-generate one no shader stamps, is green
 //! everywhere.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 /// Every entrypoint the TABLE declares — its axis product, expanded.
@@ -351,5 +351,239 @@ fn every_entrypoint_a_quantised_projection_can_name_is_one_the_table_declares() 
         named.len(),
         303,
         "every table above, and the twelve literals"
+    );
+}
+
+/// This crate's Rust modules, where routine bodies and census lists both live.
+fn module_sources() -> Vec<PathBuf> {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&src).expect("a src directory") {
+        let path = entry.expect("a readable entry").path();
+        if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+    out.sort();
+    assert!(
+        out.len() > 5,
+        "expected this crate's modules, found {out:?}"
+    );
+    out
+}
+
+/// Every entrypoint AXIS in this crate, by name: `PAGED_DECODE`, `AFFINE_QMM`,
+/// `MXFP4_QMM` and the thirty-odd others the bodies index.
+///
+/// A declaration qualifies when its type names `&str` and is a list. The
+/// census lists are `&[(&str, &str)]` and are excluded by the parenthesis:
+/// they are what the axes are compared AGAINST, and reading them as axes would
+/// make the comparison compare a list to itself.
+///
+/// Both spellings are read, because both are in the tree: `[&str; 1]` on one
+/// line (`PAGED_TILED_SINK`) and `&[&str]` over many (`AFFINE_QMM`). The wgpu
+/// sibling reads only the second and would silently return an EMPTY list for
+/// the first, which is the worse failure — an empty axis fires nothing and
+/// agrees with everything.
+fn entrypoint_tables() -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let push = |out: &mut BTreeMap<String, Vec<String>>,
+                    open: &mut Option<(String, Vec<String>)>,
+                    text: &str| {
+        let (name, mut acc) = open.take().expect("an open declaration");
+        acc.extend(text.split('"').skip(1).step_by(2).map(str::to_owned));
+        if text.trim_end().ends_with("];") {
+            out.insert(name, acc);
+        } else {
+            *open = Some((name, acc));
+        }
+    };
+    for path in module_sources() {
+        let text = std::fs::read_to_string(&path).expect("a readable module");
+        let mut open: Option<(String, Vec<String>)> = None;
+        for line in text.lines() {
+            let code = line.split_once("//").map_or(line, |(before, _)| before);
+            if open.is_some() {
+                push(&mut out, &mut open, code);
+                continue;
+            }
+            let trimmed = code.trim();
+            let trimmed = trimmed.strip_prefix("pub ").unwrap_or(trimmed);
+            let Some(rest) = trimmed
+                .strip_prefix("static ")
+                .or_else(|| trimmed.strip_prefix("const "))
+            else {
+                continue;
+            };
+            let Some((name, tail)) = rest.split_once(':') else {
+                continue;
+            };
+            let Some((ty, init)) = tail.split_once('=') else {
+                continue;
+            };
+            if !ty.contains("&str") || !ty.contains('[') || ty.contains('(') {
+                continue;
+            }
+            open = Some((name.trim().to_owned(), Vec::new()));
+            push(&mut out, &mut open, init);
+        }
+    }
+    assert!(
+        out.len() > 20,
+        "expected this crate's entrypoint axes, found {:?}",
+        out.keys().collect::<Vec<_>>(),
+    );
+    out
+}
+
+/// The entrypoints one `Fire`'s `entrypoint:` expression can name, or `None`
+/// if no static reading can tell.
+///
+/// Two shapes, and the plane forbids a third: a literal names itself, and
+/// `TABLE[point(..)]` names every string in `TABLE`, because the index picks a
+/// head dimension or a quantisation point and every point on the axis is a
+/// real entrypoint. A name ASSEMBLED from a template — `format!` on a dtype
+/// suffix — is the defect this whole plane exists to prevent, so it is a panic
+/// below rather than a skip.
+fn fired_names(value: &str, tables: &BTreeMap<String, Vec<String>>) -> Option<Vec<String>> {
+    if let Some(rest) = value.strip_prefix('"') {
+        return Some(vec![rest.split('"').next()?.to_owned()]);
+    }
+    let (name, _) = value.split_once('[')?;
+    tables.get(name.trim()).cloned()
+}
+
+/// Census names that no body in this crate fires.
+///
+/// Each is compiled by `device_kernels.rs` and dispatched by nothing, which is
+/// a real cost — a pipeline built per device for a shader that never runs —
+/// and each is deliberate. All four are explained where they are:
+///
+/// - `sdpa_paged_decode_bfloat16_d_{64,128}_p32` and `_d_64_p32_sg8` set
+///   `FAST_FULL`, which deletes the window and all three mask operands from
+///   the body; `attn.rs`'s [`PAGED_DECODE`] omits them and a test beside it
+///   asserts the omission, so a fire that reached one would pass masks to a
+///   kernel that has none.
+/// - `silu_mul_strided_bfloat16` is the one of `mlp.rs`'s five that did not
+///   cross. The reason was once the argument vocabulary — it declares
+///   `row_pitch` at buffer 4 with buffer 3 empty, and a positional list could
+///   not express a hole — and `pad` answered that; twenty-one routines now bind
+///   an address at an index their shader does not declare. What keeps it dark
+///   is that no text names it and no statement produces a row pitch, which is
+///   what `driver-metal`'s `DARK` says.
+///
+/// The list being SHORT is the point. Every name on it is a shader compiled on
+/// every device for nothing, so it should shrink as the vocabulary grows, and
+/// a name arriving here without a reason written down is a routine that was
+/// deleted while its census row stayed.
+const UNFIRED: &[&str] = &[
+    "sdpa_paged_decode_bfloat16_d_128_p32",
+    "sdpa_paged_decode_bfloat16_d_64_p32",
+    "sdpa_paged_decode_bfloat16_d_64_p32_sg8",
+    "silu_mul_strided_bfloat16",
+];
+
+/// A retired family's stated census is exactly what its bodies FIRE.
+///
+/// Every row is retired, so `ENTRYPOINTS` is no longer a check on the table —
+/// it IS the table. `entrypoints()` returns nothing else, `device_kernels.rs`
+/// compiles what it returns, and `driver-metal` resolves stems against it. A
+/// row could not drift this way: its `axes` GENERATED its entrypoints. Ten
+/// hand-written lists totalling 481 lines can, and every sweep keyed on
+/// `entrypoints()` would follow the drift rather than fail on it.
+///
+/// The sibling tests above ask a related but different question: they rebuild
+/// an axis product with `format!` in the test and check the census carries it,
+/// which catches a census missing a point. This reads what the bodies LITERALLY
+/// SPELL, which catches the other three ways the pair can part — a typo in a
+/// census line, a routine firing a name nothing compiles, and an axis entry
+/// deleted from under a fire.
+#[test]
+fn every_entrypoint_a_body_fires_is_one_the_census_carries() {
+    // One line per retired family, mirroring `lib.rs`'s `RETIRED`. The sum is
+    // asserted against `entrypoints()` below, so a family added there and not
+    // here is red rather than unswept.
+    let families: &[(&str, &[(&str, &str)])] = &[
+        ("attn.rs", kernels_metal::attn::ENTRYPOINTS),
+        ("layout.rs", kernels_metal::layout::ENTRYPOINTS),
+        ("mlp.rs", kernels_metal::mlp::ENTRYPOINTS),
+        ("moe.rs", kernels_metal::moe::ENTRYPOINTS),
+        ("norm.rs", kernels_metal::norm::ENTRYPOINTS),
+        ("ptir.rs", kernels_metal::ptir::ENTRYPOINTS),
+        ("quant.rs", kernels_metal::quant::ENTRYPOINTS),
+        ("rope.rs", kernels_metal::rope::ENTRYPOINTS),
+        ("sample.rs", kernels_metal::sample::ENTRYPOINTS),
+        ("ssm.rs", kernels_metal::ssm::ENTRYPOINTS),
+    ];
+    let stated: usize = families.iter().map(|(_, e)| e.len()).sum();
+    assert_eq!(
+        stated,
+        kernels_metal::entrypoints().len(),
+        "the families swept here do not add up to what `entrypoints()` \
+         returns, so a family is retired and unread",
+    );
+
+    let tables = entrypoint_tables();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let unfired: BTreeSet<&str> = UNFIRED.iter().copied().collect();
+    let mut swept = 0usize;
+    for (module, census) in families {
+        let path = root.join(module);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let mut fired: BTreeSet<String> = BTreeSet::new();
+        for (n, line) in text.lines().enumerate() {
+            let code = line.split_once("//").map_or(line, |(before, _)| before);
+            let Some(value) = code.trim().strip_prefix("entrypoint:") else {
+                continue;
+            };
+            let value = value.trim().trim_end_matches(',').trim();
+            match fired_names(value, &tables) {
+                Some(names) => fired.extend(names),
+                None => panic!(
+                    "{module}:{}: `{value}` is neither a literal nor an index \
+                     into an axis of literals, so no static reading of this \
+                     crate can say which entrypoints it fires",
+                    n + 1,
+                ),
+            }
+        }
+        let named: BTreeSet<String> = census.iter().map(|(_, e)| (*e).to_owned()).collect();
+        assert_eq!(
+            census.len(),
+            named.len(),
+            "`{module}`'s census names a shader twice, so its length is \
+             counting one shader as two",
+        );
+
+        let uncompiled: Vec<&String> = fired.difference(&named).collect();
+        assert!(
+            uncompiled.is_empty(),
+            "`{module}` fires {} entrypoints its census does not name, and \
+             `newFunctionWithName:` answers nil for those on a device rather \
+             than failing here: {uncompiled:#?}",
+            uncompiled.len(),
+        );
+
+        let idle: Vec<&String> = named
+            .difference(&fired)
+            .filter(|name| !unfired.contains(name.as_str()))
+            .collect();
+        assert!(
+            idle.is_empty(),
+            "`{module}`'s census names {} entrypoints no body fires. Either a \
+             routine was deleted and its census line stayed, or the shader is \
+             genuinely idle and belongs in `UNFIRED` with the reason: \
+             {idle:#?}",
+            idle.len(),
+        );
+        swept += fired.len();
+    }
+    assert_eq!(
+        swept + UNFIRED.len(),
+        stated,
+        "the fires read cover a different number of names than the census \
+         states, which means this read every family and agreed with each \
+         while disagreeing with the whole",
     );
 }

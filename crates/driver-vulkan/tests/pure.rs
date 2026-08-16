@@ -130,13 +130,19 @@ fn nothing_this_crate_needs_to_build_compiles_c() {
     let want: BTreeSet<&str> = [
         // Reads `DEP_PIE_KERNELS_VULKAN_SPV_DIR`. No compiler, no C.
         "driver-vulkan",
-        // The CUDA table crate `model-compiler` reads its rows from. Its
-        // script writes into `OUT_DIR` and declares no `links`, because it
-        // builds no archive -- unlike the ahead-of-time archive crate it
-        // replaced in this closure and whose name it now carries, which was
-        // deleted at `85c6c674b`. The swap is why this list is compared as a
-        // SET and not counted.
-        "kernels-cuda",
+        // `kernels-cuda` STOOD HERE, described as *"the CUDA table crate
+        // `model-compiler` reads its rows from"*, whose script wrote into
+        // `OUT_DIR` and declared no `links`. It is still in this closure --
+        // `cargo tree -e normal,build -p driver-vulkan` still names it, by way
+        // of `model-compiler` and `model-ir` -- and it no longer has a BUILD
+        // SCRIPT: `crates/kernels-cuda/build.rs` was deleted at `bac4fa327`,
+        // when a launch stopped being reached through a generated `static
+        // ROOT` and started naming its file and its symbol outright. Nothing
+        // is generated, so nothing generates it.
+        //
+        // The row leaves because the fact left, not because the edge did, and
+        // that distinction is the whole point of this list: it is the crates
+        // whose builds could compile C, not the crates that are depended on.
         // The Metal shader build, behind `native`, and macOS-only besides.
         "kernels-metal",
         // slangc over the shader tree, behind `native`. This crate depends on

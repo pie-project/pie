@@ -47,7 +47,7 @@ use model_compiler::lower::Lowered;
 
 use crate::binding::{Arena, Params, Resolve};
 use crate::device::{Bound, Device, Failed, Pipelines, Recorded};
-use crate::dispatch::{Built, Geometry, Sources, Undispatchable};
+use crate::dispatch::{Geometry, Undispatchable};
 use kernels_vulkan::Capability;
 
 /// Where the SPIR-V for a symbol comes from.
@@ -341,21 +341,18 @@ pub fn fire<R: Resolve, M: Modules>(
     // device addresses a storage buffer from, so 3624 bytes of scalars take
     // rather more room than that. Room is not what was scarce.
     let mut planned = Vec::with_capacity(lowered.launches.len());
-    // Per SYMBOL: the reflection, and the kernel table's row. Both are walks
-    // over something whose size is the tree's and not the fire's -- a few
-    // thousand SPIR-V words, and a hundred kernel rows with axis points --
-    // and both used to happen once per LAUNCH.
-    let mut read: std::collections::BTreeMap<
-        &str,
-        (crate::spirv::Declared, &'static kernels::KernelSig),
-    > = std::collections::BTreeMap::new();
-    // Counted where the parse happens rather than taken from `read.len()` at
-    // the end. The map's size is the number of distinct symbols whether the
-    // cache is consulted or not -- measured: a mutation that dropped every
-    // entry before looking it up reported the same number and passed the test
-    // that exists to catch it. This counts the walk.
-    let mut parsed = 0usize;
-    let mut tiered = 0usize;
+    // A `read` MAP STOOD HERE, keyed by symbol, holding the module's
+    // `Declared` beside the table row -- two walks over something whose size
+    // is the tree's and not the fire's, cached so that neither happened once
+    // per LAUNCH. The row half has no table to come from, and the `Declared`
+    // half is `Reflection`'s job: it caches by ENTRYPOINT, which is the finer
+    // key of the two, because a routine composes entrypoints its plan symbol
+    // does not name.
+    //
+    // `parsed` and `tiered` counters stood here too, incremented at this
+    // map's cache miss. Both are derived from `reflection.seen` now, at the
+    // `Fired` below, which says why.
+
     let mut spans: Vec<Option<(u64, u64)>> = Vec::with_capacity(planned.capacity());
     let mut scalars: Vec<u8> = Vec::new();
     let give_back = |device: &Device, block: Option<crate::device::Buffer>| {
@@ -367,11 +364,7 @@ pub fn fire<R: Resolve, M: Modules>(
     // it by the PLAN's symbol; a routine names its own entrypoint, which the
     // plan need not carry at all, so the routine path needs a cache that can
     // still miss. Both walk the same SPIR-V exactly once per name.
-    let reflection = Reflection {
-        modules,
-        tier,
-        seen: core::cell::RefCell::new(BTreeMap::new()),
-    };
+    let reflection = Reflection::new(modules, tier);
     for (at, launch) in lowered.launches.iter().enumerate() {
         let symbol = lowered.kernels[launch.kernel as usize].as_str();
         // The ROUTINE path, when the symbol's family has arms.
@@ -425,7 +418,7 @@ pub fn fire<R: Resolve, M: Modules>(
                 resolver,
                 geometry,
                 &reflection,
-                device,
+                device.min_storage_offset(),
             )
             .map_err(|why| Unfired::Unplannable {
                 at,
@@ -438,93 +431,34 @@ pub fn fire<R: Resolve, M: Modules>(
             }
             continue;
         }
-        let Some(code) = modules.code(symbol, tier) else {
-            return Err(Unfired::NoModule {
-                at,
+        // THE TABLE PATH STOOD HERE.
+        //
+        // Nine hundred lines of it across `serve` and `dispatch`: read the
+        // module, resolve `kernels::sig_in(kernels_vulkan::KERNELS, symbol)`,
+        // hand the row's `Rule` and `operands` to `dispatch::plan_one`, and
+        // let a declarative column say which of a launch's arguments was a
+        // buffer, which a scalar, and how wide a grid to launch.
+        //
+        // `kernels_vulkan::KERNELS` has no rows. Every one of the 481
+        // entrypoints this build produces is reached by an arm above --
+        // `arm::every_entrypoint_a_plan_can_name_finds_an_arm` is the sweep
+        // that says so, over `kernels_vulkan::entrypoints()` rather than over
+        // a list this file keeps. So the fallback could only ever be taken by
+        // a symbol a PLAN named that this driver does not build, and for that
+        // symbol the table path's own answer was `Undispatchable::Unknown`.
+        //
+        // It says it directly now, which is the only behaviour change: a
+        // symbol with no arm is refused by name instead of being carried
+        // through a module read and a row lookup to arrive at the same word.
+        // The read is skipped too, so an unknown name no longer costs a
+        // SPIR-V walk to be told it is unknown.
+        return Err(Unfired::Unplannable {
+            at,
+            symbol: symbol.to_owned(),
+            why: crate::dispatch::Undispatchable::Unknown {
                 symbol: symbol.to_owned(),
-            });
-        };
-        // Read once per SYMBOL, not once per launch.
-        //
-        // This was the other way round, and the note here said that reading a
-        // module is a walk over a few thousand words which does not show
-        // against the pipeline builds. That was measured, and it stopped
-        // being true when the pipelines started being cached: a fire whose
-        // pipelines are all built spends its time here instead. Measured on a
-        // qwen3 decode, 452 rectangles over 9 distinct symbols, with the
-        // parse timed separately -- 22 milliseconds of the 24 this pass cost
-        // were the same nine modules being read four hundred and fifty-two
-        // times.
-        //
-        // The map is keyed by a borrow of the plan's own symbol, which is why
-        // it costs no lifetime the signature did not already have: `Declared`
-        // is owned, and `plan_one` borrows it only for the call.
-        let (declared, sig) = match read.entry(symbol) {
-            std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::btree_map::Entry::Vacant(e) => {
-                parsed += 1;
-                if modules
-                    .resolved(symbol, tier)
-                    .is_some_and(|c| c != Capability::Baseline)
-                {
-                    tiered += 1;
-                }
-                let Some(sig) = kernels::sig_in(kernels_vulkan::KERNELS, symbol) else {
-                    return Err(Unfired::Unplannable {
-                        at,
-                        symbol: symbol.to_owned(),
-                        why: crate::dispatch::Undispatchable::Unknown {
-                            symbol: symbol.to_owned(),
-                        },
-                    });
-                };
-                match crate::spirv::words(code).and_then(|w| crate::spirv::declared(&w)) {
-                    Ok(d) => e.insert((d, sig)),
-                    Err(why) => {
-                        return Err(Unfired::Unreadable {
-                            at,
-                            symbol: symbol.to_owned(),
-                            why,
-                        });
-                    }
-                }
-            }
-        };
-        let planned_one = crate::dispatch::plan_one(
-            lowered,
-            launch,
-            kernels_vulkan::KERNELS,
-            Built {
-                module: crate::geometry::Module::named(
-                    symbol,
-                    [declared.local[0], declared.local[1], declared.local[2]],
-                ),
-                declared,
-                sig: Some(sig),
             },
-            Sources {
-                arena,
-                resolver,
-                min_offset: device.min_storage_offset(),
-            },
-            geometry,
-        );
-        let d = match planned_one {
-            Ok(d) => d,
-            Err(why) => {
-                return Err(Unfired::Unplannable {
-                    at,
-                    symbol: symbol.to_owned(),
-                    why,
-                });
-            }
-        };
-        push_scalars(device, &d, &mut spans, &mut scalars);
-        // The `Dispatch` already borrows the plan's symbol -- see
-        // `Dispatch::symbol` -- so the owned copy this used to push beside it
-        // was a `String` allocation per rectangle, 452 of them in a decode,
-        // for a name the tuple's other half was already holding.
-        planned.push(d);
+        });
     }
 
     // One allocation, or none when no rectangle in this fire states a block.
@@ -565,8 +499,31 @@ pub fn fire<R: Resolve, M: Modules>(
         // a two-pass reduction names two for one statement -- but a miss is a
         // miss, and the invariant this number exists for is "one walk of the
         // SPIR-V per module, not one per rectangle".
-        parsed: parsed + reflection.seen.borrow().len(),
-        tiered,
+        parsed: reflection.seen.borrow().len(),
+        // The tier, for the entrypoints the ROUTINE path reached.
+        //
+        // `tiered` was incremented only in the table path's cache miss,
+        // because that was once the only path, and it went to ZERO the moment
+        // the last family crossed. That is not a lost statistic:
+        // `the_default_tile_reaches_the_tier_in_production` reads this number
+        // to check that a real prefill REACHES the cooperative-matrix build,
+        // and a zero is indistinguishable from a driver that silently serves
+        // baseline everywhere -- which is the exact defect the test exists
+        // for, so the check had gone blind rather than false.
+        //
+        // Counted off the reflection's keys, beside `parsed` and for the same
+        // reason: those are the entrypoints that were really dispatched, which
+        // a routine composes and the plan's symbol need not name.
+        tiered: reflection
+            .seen
+            .borrow()
+            .keys()
+            .filter(|e| {
+                modules
+                    .resolved(e, tier)
+                    .is_some_and(|c| c != Capability::Baseline)
+            })
+            .count(),
         ..f
     });
     // After the fence and not before: `run_all` waits, so by here the queue
@@ -970,10 +927,26 @@ fn push_scalars(
 /// produce costs one lookup rather than one parse per launch.
 type Reflected = (crate::geometry::Module, std::rc::Rc<crate::spirv::Declared>);
 
-struct Reflection<'m, M: Modules> {
+/// A module store's SPIR-V, read at most once per entrypoint.
+///
+/// See [`Reflected`]: this is the cache that guarantee lives in, and it is
+/// public so a walk with no GPU can hand one to [`plan_routine`].
+pub struct Reflection<'m, M: Modules> {
     modules: &'m M,
     tier: Capability,
     seen: core::cell::RefCell<BTreeMap<String, Option<Reflected>>>,
+}
+
+impl<'m, M: Modules> Reflection<'m, M> {
+    /// A reflection over `modules`, reading each entrypoint at most once.
+    #[must_use]
+    pub fn new(modules: &'m M, tier: Capability) -> Self {
+        Self {
+            modules,
+            tier,
+            seen: core::cell::RefCell::new(BTreeMap::new()),
+        }
+    }
 }
 
 impl<M: Modules> crate::encode::Reflect for Reflection<'_, M> {
@@ -1005,6 +978,78 @@ impl<M: Modules> crate::encode::Reflect for Reflection<'_, M> {
     }
 }
 
+/// The three routines whose INPUT is taller than their rectangle.
+///
+/// `.wiki/kernel-x/vulkan-refactor.md` §10, and it is a real wrong-answer path
+/// rather than a tidiness: `binding::extent` sizes every arena operand by
+/// `launch.rows.end - launch.rows.start`. That is right for every elementwise
+/// and per-row kernel in the tree, and false for exactly the kernels whose
+/// input and output have different row counts.
+///
+/// `layout::row_gather` is the one a test caught. A prefill of six tokens
+/// serving four requests states a rectangle of FOUR rows -- the readouts --
+/// and reads the rows the sampling table names, which are token indices and
+/// run to five. The source was bound to four rows, so the read of row 5 fell
+/// off the descriptor range and came back as whatever `robustBufferAccess`
+/// gives, which is zeros, SILENTLY: the validation layer does not report
+/// storage-buffer overruns and the fire completed.
+///
+/// `moe::route_gather` and `moe::combine_sorted` have the same shape -- the
+/// sorted extent against the token count -- and their rectangle is the taller
+/// of the two, so neither has been seen to lose data. They are named here
+/// because being right by accident is not a property to rely on.
+///
+/// The proper fix is a field: `Arg::Arena` states its own rows and `extent`
+/// stops asking the launch. That is a `model-compiler` schema change with
+/// construction sites in every backend, and this is the interim: bind the
+/// source from its own offset to the END of the plan's arena.
+///
+/// A LOOSER bound and not a wrong one. The arena is the plan's own
+/// allocation, so nothing outside it becomes readable; what is lost is the
+/// tight range check on one operand of three kernels. A range that is too
+/// SHORT is the dangerous direction -- it answers zeros and reports success,
+/// which is what this exists to stop.
+///
+/// # Errors
+///
+/// [`Undispatchable::Operand`] if the widened range is one the device cannot
+/// address from, which is the refusal the original binding would have given.
+fn widen_a_gathers_source<'a>(
+    bound: &mut [crate::device::Bound<'a>],
+    routine: &str,
+    lowered: &Lowered,
+    launch: &model_compiler::lower::Launch,
+    arena: Arena<'a>,
+    min_offset: u64,
+) -> Result<(), Undispatchable> {
+    if !matches!(routine, "row_gather" | "route_gather" | "combine_sorted") {
+        return Ok(());
+    }
+    let args = &lowered.args[launch.args.start as usize..launch.args.end as usize];
+    // Operand 0 in all three: the activation the gather reads. The results
+    // and the permutations are in the rectangle's own space and stay as bound.
+    let Some(model_compiler::lower::Arg::Arena { at, .. }) = args.first() else {
+        return Ok(());
+    };
+    let at = *at as u64;
+    let Some(rest) = arena.bytes.checked_sub(at) else {
+        return Ok(());
+    };
+    let Some(slot) = bound.first_mut() else {
+        return Ok(());
+    };
+    if rest <= slot.len() {
+        return Ok(());
+    }
+    *slot = crate::device::Bound::within(arena.buffer, at, rest, min_offset).map_err(|why| {
+        Undispatchable::Operand {
+            at: 0,
+            why: crate::binding::Unbindable::Unaddressable(why),
+        }
+    })?;
+    Ok(())
+}
+
 /// One launch of a crossed routine, as the dispatches its body asked for.
 ///
 /// The ARM resolves the statement's operands into handles and states the
@@ -1019,8 +1064,14 @@ impl<M: Modules> crate::encode::Reflect for Reflection<'_, M> {
 /// and [`Undispatchable::Refused`] for anything the routine or the encoder
 /// would not launch -- an empty extent, an entrypoint this build did not
 /// produce, an argument list the module's bindings do not fit.
+///
+/// `min_offset` is the device's storage-buffer alignment. It is a NUMBER
+/// rather than a `&Device` so that a walk with no GPU in it can ask this
+/// question: `tests/arena.rs` puts every rectangle of six real texts through
+/// here, which is the coverage that used to run against `KERNELS` and has
+/// nowhere else to go now that the table is empty.
 #[allow(clippy::too_many_arguments)]
-fn plan_routine<'a, R: Resolve, M: Modules>(
+pub fn plan_routine<'a, R: Resolve, M: Modules>(
     lowered: &Lowered,
     launch: &model_compiler::lower::Launch,
     symbol: &str,
@@ -1030,7 +1081,7 @@ fn plan_routine<'a, R: Resolve, M: Modules>(
     resolver: &'a R,
     geometry: Geometry,
     reflection: &Reflection<'_, M>,
-    device: &Device,
+    min_offset: u64,
 ) -> Result<Vec<crate::dispatch::Dispatch<'a>>, Undispatchable> {
     // A conditional rectangle's guard was NOT answered by the lowering, and
     // this walk has no way to answer it -- recording every arm would run
@@ -1041,24 +1092,14 @@ fn plan_routine<'a, R: Resolve, M: Modules>(
             cond: launch.cond,
         });
     }
-    let bound = crate::binding::bind(
-        lowered,
-        launch,
-        arena,
-        resolver,
-        device.min_storage_offset(),
-    )
-    .map_err(|(at, why)| Undispatchable::Operand { at, why })?;
+    let mut bound = crate::binding::bind(lowered, launch, arena, resolver, min_offset)
+        .map_err(|(at, why)| Undispatchable::Operand { at, why })?;
+    widen_a_gathers_source(&mut bound, routine.name, lowered, launch, arena, min_offset)?;
 
-    // How many of the widthed operands are RESULTS: the ROUTINE says, by
-    // counting the `BufMut` in its own signature. The table path read this off
-    // a row's `Out` sources, which is the same fact stated in a place the
-    // compiler cannot check against the kernel.
-    let results = routine
-        .args
-        .iter()
-        .filter(|(ty, _)| *ty == kernels::Ty::BufMut)
-        .count();
+    // How many of the widthed operands are RESULTS. Mostly the count of
+    // `BufMut` in the routine's own signature, and `traced_results` says which
+    // two routines that count is wrong for and why.
+    let results = crate::arm::traced_results(routine);
     let args = &lowered.args[launch.args.start as usize..launch.args.end as usize];
     let (ins, outs, weights) = crate::arm::split(args, results);
     let params: Vec<Option<u32>> = (launch.params.start as usize..launch.params.end as usize)

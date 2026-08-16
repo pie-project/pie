@@ -300,8 +300,12 @@ const REACHES: &[(&str, Reaches)] = &[
     // Two slots, both stated -- the value it biases in place and the bias --
     // and ONE scalar the statement does not carry. An `AddBias` states no
     // params at all, because a bias vector's length is the projection's width
-    // and the trace already said that when it sized the output. The row reads
-    // it back with `Source::OutWidth(0)`.
+    // and the trace already said that when it sized the output. Under the
+    // table this row read it back with `Source::OutWidth(0)`; now the ARM
+    // `arm::add_bias` supplies it directly from `Facts::width` -- the result's
+    // own width, which the trace holds. The reach is unchanged, because what
+    // the module is short of is still one push word the plan does not carry;
+    // only the thing that fills it moved from a row source to an arm.
     ("add_bias_bfloat16", Reaches::RowDerives(1)),
     ("residual_add_bfloat16", Reaches::Push),
     ("silu_mul_bfloat16", Reaches::Push),
@@ -459,17 +463,20 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
             // An IN-PLACE row binds one buffer for two of the plan's args:
             // the trace states the value and the result separately, because a
             // tape whose statements did not produce values could not say what
-            // the next one reads, and the row then says they are the same
+            // the next one reads, and the aliasing then says they are the same
             // allocation. `norm::add_bias` is the only one here, and without
             // this it classifies as a kernel binding one FEWER descriptor
             // than the plan states -- which is true and is not what is
             // interesting about it.
-            let args = args
-                - u32::try_from(
-                    kernels::sig_in(kernels_vulkan::KERNELS, symbol)
-                        .map_or(0, |sig| sig.in_place.len()),
-                )
-                .expect("a row states few aliases");
+            //
+            // The aliasing was a `KernelSig::in_place`, read off `KERNELS`;
+            // that table is empty now, so it is read off the ROUTINE instead,
+            // where the same fact lives as `Routine::in_place` -- a property
+            // of the statement, not of a retired row, and stated on the
+            // routine for exactly that reason. `arm_for` is the join.
+            let aliases = driver_vulkan::arm::arm_for(symbol)
+                .map_or(0, |(routine, _)| routine.in_place.len());
+            let args = args - u32::try_from(aliases).expect("a routine states few aliases");
             let Ok(code) = std::fs::read(dir.join(format!("{symbol}.spv"))) else {
                 continue;
             };
@@ -860,8 +867,8 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
     }
 }
 
-/// Every launch of every real plan becomes a dispatch, or is one of six
-/// symbols already known to be waiting on something nobody has built.
+/// Every launch of every real plan becomes a dispatch through the ROUTINE
+/// path, or is one of a named set of refusals.
 ///
 /// The other tests here take the binder and the parameter placer apart and
 /// ask each its own question. This one puts them back together with the
@@ -874,6 +881,43 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
 /// something nobody had built; each one leaving that list was a defect in
 /// this crate rather than a gap in a plan, and the list is now empty.
 ///
+/// # It plans through `plan_routine`, not `KERNELS`
+///
+/// This walk USED to drive `dispatch::plan_one(..., kernels_vulkan::KERNELS,
+/// ...)` -- the table path. `kernels_vulkan::KERNELS` is now EMPTY: every one
+/// of these hundred kernels is a `kernels-vulkan` routine plus a `driver-
+/// vulkan` arm, and a plan reaches its dispatch through
+/// `serve::plan_routine`, which resolves the routine and arm with
+/// `arm::arm_for(symbol)` and runs the body against a reflection of the built
+/// modules. So this walk does too, which is why it hands `plan_routine` a
+/// `serve::Reflection` over a map of the `.spv` files rather than a row.
+///
+/// The table columns this walk once read -- `sig.grid_param`,
+/// `sig.head_param`, `sig.heads_param`, `sig.launch`, `Source::OutWidth` --
+/// have no reader left on this backend, and the counters keyed on them
+/// (`overridden`, `head_overridden`, `heads_overridden`, `derived_widths`,
+/// `split_rectangles`, `rotary_overridden`) are gone with them. Each deletion
+/// says below exactly what it checked and what covers it now: the ARMS in
+/// `src/arm.rs` compute the grids and interleave the driver's numbers, and
+/// they have their own unit tests; `tests/device.rs` fires them on a card.
+/// A retired reference does not make those checks true -- it makes them blind,
+/// so they are removed by name rather than left reading an empty table.
+///
+/// What SURVIVES is every invariant a routine-path dispatch still has to
+/// honour, and it is asserted here rather than assumed: that all 6680
+/// rectangles plan; that no planned grid holds a zero; that a dispatch's
+/// operands plus the slot its scalar block takes are exactly the module's
+/// real bindings; that both halves of the parameter split occur; that the
+/// widest grid and the total workgroups are what they were measured to be;
+/// that the pool's page size reaches the shader it is handed to; and, moved
+/// here from `rules.rs` because a grid is no longer a `Rule` COLUMN but a
+/// thing a routine body computes and so does not exist until a rectangle is
+/// planned, that no dispatch puts work on an axis its module never reads
+/// (WASTE) and that no entrypoint reads an axis left flat in every rectangle
+/// six real texts state (DATA LOSS). `rules.rs` proved those two against the
+/// table at a forced fire; with the table empty they could only report "0
+/// entrypoints checked", so they plan a real fire here instead.
+///
 /// Three texts became six by adding `qwen2_5_1_5b`, `mistral_7b_v03` and
 /// `olmo2_1b`, which lower and plan without a single new refusal -- so the
 /// walk grew by 57% and found nothing, which is a weaker result than a
@@ -884,21 +928,6 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
 /// `model-compiler` refuses the plan before this crate sees it. That is not a
 /// driver gap -- `kernels-metal` compiles the same four widths -- so serving
 /// it needs a kernel variant, in both trees, and not a change here.
-///
-/// The exact totals are asserted rather than a "most of them" threshold, and
-/// building this walk gave three separate reasons to insist on that:
-///
-/// * the first version found a kernel row by string equality, when the table
-///   states AXES and a plan names POINTS on them. It planned 432 of the 3992
-///   this walk had then, and
-///   reported "no kernel row" for sixteen symbols that all exist and all have
-///   modules built for them. A threshold test would have called that a pass.
-/// * the second skipped a launch whose module it could not open, so the
-///   denominator itself was wrong by 200 -- it reported 3792 rectangles in a
-///   plan that has 3992.
-/// * the third checked arity before placing the scalars, and so counted the
-///   parameter BLOCK's binding as a missing operand. It refused 1439
-///   rectangles across nine symbols that dispatch perfectly well.
 #[test]
 fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     let Some(dir) = SPV_DIR else {
@@ -907,8 +936,33 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     };
     let dir = std::path::Path::new(dir);
 
+    // The built modules, keyed by file stem, which is what `serve::Modules`
+    // asks a store to hold. A routine names an ENTRYPOINT and the reflection
+    // reads the module out of this map -- the same lookup the driver does in
+    // production, minus the device that turns bytes into a pipeline.
+    let mut modules: std::collections::BTreeMap<String, Vec<u8>> = Default::default();
+    for entry in std::fs::read_dir(dir).expect("the module directory reads") {
+        let path = entry.expect("a readable entry").path();
+        if path.extension().and_then(|e| e.to_str()) == Some("spv") {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("a module has a stem")
+                .to_owned();
+            modules.insert(stem, std::fs::read(&path).expect("a readable module"));
+        }
+    }
+    let reflection =
+        driver_vulkan::serve::Reflection::new(&modules, kernels_vulkan::Capability::Baseline);
+
     /// An arena big enough that no weight or seam value is what refuses.
     const GENEROUS: u64 = 1 << 30;
+    /// The page size the resolver answers, distinct enough that finding it in
+    /// a push block is finding the pool's number and not a coincidence. The
+    /// same technique the table walk used, kept because the seam it watches --
+    /// a driver number reaching the shader as a scalar -- is exactly as live
+    /// on the routine path.
+    const PAGE_SIZE: u32 = 0x0011_1111;
 
     struct Everything(driver_vulkan::device::Buffer);
     impl driver_vulkan::binding::Resolve for Everything {
@@ -920,9 +974,7 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         }
         // The KV cache and the fire tables are the driver's own, and this
         // walk is about ORDER, not about where they come from -- so it says
-        // yes to all of them and lets the arity check do the work. What the
-        // walk would measure otherwise is the absence of a cache allocator,
-        // which it is not testing.
+        // yes to all of them and lets the arm and the arity check do the work.
         fn kv(&self, _: u16, _: bool) -> Option<&driver_vulkan::device::Buffer> {
             Some(&self.0)
         }
@@ -932,24 +984,44 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         ) -> Option<&driver_vulkan::device::Buffer> {
             Some(&self.0)
         }
+        // The pool's numbers, which the table walk resolved to zero and this
+        // one answers with a sentinel: an arm that names `KvPageSize` puts
+        // this value in the run, and the loop below finds it there. Without
+        // it the paged kernels would refuse -- their arms take the page size
+        // and cannot proceed without one -- so answering it is also what lets
+        // the two paged decodes and the paged append plan at all.
+        fn number(&self, which: driver_vulkan::binding::FireNumber) -> Option<u32> {
+            Some(match which {
+                driver_vulkan::binding::FireNumber::KvPageSize => PAGE_SIZE,
+                driver_vulkan::binding::FireNumber::KvHeadStride => 0x0022_2222,
+                driver_vulkan::binding::FireNumber::KvSeqStride => 0x0033_3333,
+                driver_vulkan::binding::FireNumber::AttentionMaskStride => 0,
+            })
+        }
     }
 
     let mut launches = 0u32;
     let mut planned = 0u32;
+    let mut dispatches = 0u64;
     let mut refused: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
     let mut widest_grid = [0u32; 3];
     let mut workgroups = 0u64;
     let mut pushed = 0u32;
     let mut blocked = 0u32;
-    let mut overridden = 0u32;
-    let mut split_rectangles = 0u32;
-    let mut rotary_overridden = 0u32;
     let mut pool_numbers = 0u32;
-    let mut derived_widths = 0u32;
-    let mut head_overridden = 0u32;
-    let mut heads_overridden = 0u32;
+    let mut refused_hollow = 0u32;
+    // The two grid-axis properties that moved here from `rules.rs`, which
+    // could no longer state them: on the routine path a grid is not a `Rule`
+    // column, it is computed inside the routine body and does not exist until
+    // a rectangle has been planned, so the only place to compare a grid to the
+    // axes its module reads is a walk that plans one. `wasted` collects the
+    // waste direction per dispatch; `read_lanes` accumulates, per entrypoint,
+    // the widest LANE extent any rectangle reaches on each axis, which the
+    // data-loss direction reads once the walk is done.
+    let mut wasted: Vec<String> = Vec::new();
+    let mut read_lanes: std::collections::BTreeMap<String, ([bool; 3], [u32; 3])> =
+        std::collections::BTreeMap::new();
 
-    let mut refused_hollow = 0_u32;
     for (text, low, geometry) in geometric() {
         let buf = driver_vulkan::device::Buffer::placeholder(low.arena_bytes as u64);
         let store = Everything(driver_vulkan::device::Buffer::placeholder(GENEROUS));
@@ -960,356 +1032,223 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         for launch in &low.launches {
             launches += 1;
             let symbol = &low.kernels[launch.kernel as usize];
-            // Read rather than skipped. The version that skipped got the
-            // DENOMINATOR wrong, which is worse than getting the numerator
-            // wrong: it silently shrank the question.
-            let code = std::fs::read(dir.join(format!("{symbol}.spv")))
-                .unwrap_or_else(|e| panic!("{text}: no module for `{symbol}`: {e}"));
-            let words = driver_vulkan::spirv::words(&code).expect("whole words");
-            let declared = driver_vulkan::spirv::declared(&words).expect("well formed");
-            let module = driver_vulkan::geometry::Module::named(
-                symbol,
-                [declared.local[0], declared.local[1], declared.local[2]],
-            );
-            match driver_vulkan::dispatch::plan_one(
+            // The join the table used to make: a plan's instantiated symbol
+            // to the routine and arm that serve it. `arm_for` reads no kernel
+            // row -- it matches a stem against `arm::LIVE` -- which is the
+            // whole point of the fork and the reason this walk still has a
+            // subject with `KERNELS` empty.
+            let (routine, arm) = driver_vulkan::arm::arm_for(symbol)
+                .unwrap_or_else(|| panic!("{text}: no arm serves `{symbol}`"));
+            match driver_vulkan::serve::plan_routine(
                 &low,
                 launch,
-                kernels_vulkan::KERNELS,
-                driver_vulkan::dispatch::Built {
-                    sig: None,
-                    module,
-                    declared: &declared,
-                },
-                driver_vulkan::dispatch::Sources {
-                    arena,
-                    resolver: &store,
-                    min_offset: STRICTEST_ALIGNMENT as u64,
-                },
+                symbol,
+                routine,
+                arm,
+                arena,
+                &store,
                 geometry,
+                &reflection,
+                STRICTEST_ALIGNMENT as u64,
             ) {
-                Ok(d) => {
+                Ok(plan) => {
                     planned += 1;
                     // The same launch against a geometry of ZEROS, which is
-                    // the nastiest input a caller can hand this seam:
-                    // fourteen rule-and-field pairs answer a grid with a zero
-                    // in it (`geometry.rs` pins the set), and an empty grid
-                    // runs nothing and reports success.
-                    //
-                    // None gets through. The measured reason is not
-                    // `plan_one`'s empty-grid check but the row overrides --
-                    // a head-shaped row STATES its head width and head count,
-                    // so the geometry's zeros are replaced before a rule ever
-                    // sees them, and the rows that do not state them refuse
-                    // geometrically instead. So this block does not witness
-                    // that check; it witnesses that no real rectangle can be
-                    // driven to an empty grid from the outside.
-                    if let Ok(hollow) = driver_vulkan::dispatch::plan_one(
+                    // the nastiest input a caller can hand this seam. Under
+                    // the table path a head-shaped ROW replaced the zeros
+                    // before a rule saw them; here a head-shaped ARM reads
+                    // `f.head_dim` and refuses when it is zero, and either way
+                    // the finding is the same: no real rectangle can be
+                    // driven to an empty grid from the outside. The ones that
+                    // plan anyway take their dimensions from the lowering
+                    // rather than the geometry, so the zeros never reach them.
+                    match driver_vulkan::serve::plan_routine(
                         &low,
                         launch,
-                        kernels_vulkan::KERNELS,
-                        driver_vulkan::dispatch::Built {
-                            sig: None,
-                            module,
-                            declared: &declared,
-                        },
-                        driver_vulkan::dispatch::Sources {
-                            arena,
-                            resolver: &store,
-                            min_offset: STRICTEST_ALIGNMENT as u64,
-                        },
+                        symbol,
+                        routine,
+                        arm,
+                        arena,
+                        &store,
                         driver_vulkan::dispatch::Geometry::default(),
+                        &reflection,
+                        STRICTEST_ALIGNMENT as u64,
                     ) {
-                        assert!(
-                            !hollow.groups.contains(&0),
-                            "{text}: `{symbol}` planned {:?} from a geometry of zeros",
-                            hollow.groups
-                        );
-                    } else {
-                        refused_hollow += 1;
-                    }
-                    // A grid with a zero in it runs nothing and reports
-                    // success, which is the failure this crate refuses
-                    // hardest. `plan_one` is supposed to have caught it.
-                    assert!(
-                        !d.groups.contains(&0),
-                        "{text}: `{symbol}` planned a grid of {:?}",
-                        d.groups
-                    );
-                    for (widest, got) in widest_grid.iter_mut().zip(d.groups) {
-                        *widest = (*widest).max(got);
-                    }
-                    workgroups +=
-                        u64::from(d.groups[0]) * u64::from(d.groups[1]) * u64::from(d.groups[2]);
-
-                    // Whether the STATEMENT overrode the fire's extent. A row
-                    // that names `grid_param` says its rule's dimension
-                    // varies per layer in a way no fire-wide number can
-                    // express, and `dims_of` reading it is the difference
-                    // between a driver that normalises over the right width
-                    // and one that produces plausible numbers over the wrong
-                    // one.
-                    let sig = kernels::sig_in(kernels_vulkan::KERNELS, symbol)
-                        .expect("the walk found a row");
-                    // The VALUE a row states at that slot, not merely that
-                    // it states one. `!=` against a lying fire proves the
-                    // answer did not come from the fire; it does not prove it
-                    // came from the row, and an override off by one survived
-                    // exactly that gap.
-                    let value = |index: Option<u8>| -> Option<u32> {
-                        let i = index?;
-                        let at = launch.params.start as usize + i as usize;
-                        (at < launch.params.end as usize)
-                            .then(|| low.params.get(at).copied().unwrap_or(0))
-                            .filter(|n| *n > 0)
-                    };
-                    let states = |index: Option<u8>| {
-                        index.is_some_and(|i| {
-                            let at = launch.params.start as usize + i as usize;
-                            at < launch.params.end as usize
-                                && low.params.get(at).copied().unwrap_or(0) > 0
-                        })
-                    };
-                    if states(sig.grid_param) {
-                        overridden += 1;
-                    }
-                    if states(sig.head_param) {
-                        head_overridden += 1;
-                    }
-                    if states(sig.heads_param) {
-                        heads_overridden += 1;
-                    }
-
-                    // THE POOL'S NUMBERS REACH THE SHADER, checked here
-                    // because nothing else was checking it. A row may name a
-                    // number that belongs to the pool rather than to the
-                    // statement -- the KV page size and the cache's two
-                    // strides -- and `binding::scalars` interleaves the
-                    // driver's answer into the run at the row's position.
-                    //
-                    // Replacing either stride with 999 left the whole suite
-                    // green. The walk's resolver answers `None` to every
-                    // number, so all three read as zero here, and the device
-                    // tests that DO know the strides hand-write their push
-                    // constants and never go through this path. Between them
-                    // the seam from `Pool` to the params was unwatched, and a
-                    // wrong stride is not an error -- it is attention reading
-                    // the wrong offsets and returning numbers.
-                    //
-                    // A second resolver with three recognisable answers, run
-                    // beside the real one so no pinned count moves. Distinct
-                    // per number, so a swap fails as loudly as a drop.
-                    struct Sentinels(driver_vulkan::device::Buffer);
-                    impl driver_vulkan::binding::Resolve for Sentinels {
-                        fn weight(&self, _: &str) -> Option<&driver_vulkan::device::Buffer> {
-                            Some(&self.0)
-                        }
-                        fn named(
-                            &self,
-                            _: model_ir::trace::ValueId,
-                        ) -> Option<&driver_vulkan::device::Buffer> {
-                            Some(&self.0)
-                        }
-                        fn number(&self, which: driver_vulkan::binding::FireNumber) -> Option<u32> {
-                            Some(match which {
-                                driver_vulkan::binding::FireNumber::AttentionMaskStride => 0,
-                                driver_vulkan::binding::FireNumber::KvPageSize => 0x0011_1111,
-                                driver_vulkan::binding::FireNumber::KvHeadStride => 0x0022_2222,
-                                driver_vulkan::binding::FireNumber::KvSeqStride => 0x0033_3333,
-                            })
-                        }
-                    }
-                    let wants = |src: kernels::Source| sig.operands.iter().any(|o| o.source == src);
-                    let sentinel_of = |src: kernels::Source| match src {
-                        kernels::Source::KvPageSize => 0x0011_1111u32,
-                        kernels::Source::KvHeadStride => 0x0022_2222,
-                        _ => 0x0033_3333,
-                    };
-                    for src in [
-                        kernels::Source::KvPageSize,
-                        kernels::Source::KvHeadStride,
-                        kernels::Source::KvSeqStride,
-                    ] {
-                        if !wants(src) {
-                            continue;
-                        }
-                        pool_numbers += 1;
-                        let store = Sentinels(driver_vulkan::device::Buffer::placeholder(GENEROUS));
-                        let got =
-                            driver_vulkan::binding::scalars(sig, &low, launch, &declared, &store)
-                                .expect("the row's scalars place");
-                        let bytes = match got {
-                            driver_vulkan::binding::Params::Push(ref b) => b.clone(),
-                            driver_vulkan::binding::Params::Block { ref bytes, .. } => {
-                                bytes.clone()
+                        Ok(hollow) => {
+                            for d in &hollow {
+                                assert!(
+                                    !d.groups.contains(&0),
+                                    "{text}: `{}` planned {:?} from a geometry of zeros",
+                                    d.symbol,
+                                    d.groups
+                                );
                             }
-                            driver_vulkan::binding::Params::None => Vec::new(),
-                        };
-                        let want = sentinel_of(src).to_le_bytes();
-                        assert!(
-                            bytes.windows(4).any(|w| w == want),
-                            "{text}: `{symbol}` names {src:?} and the driver's answer is not in \
-                             the {} bytes it hands the shader",
-                            bytes.len()
-                        );
+                        }
+                        Err(_) => refused_hollow += 1,
                     }
 
-                    // THE ROW'S DERIVED WIDTH REACHES THE SHADER, for the
-                    // same reason the pool's numbers are checked above and
-                    // with the same shape of check. `Source::OutWidth(0)` is
-                    // a number NOTHING in the statement carries -- an
-                    // `AddBias` states no params at all -- so if
-                    // `binding::scalars` read the wrong output, or dropped
-                    // the source and left the run short, the module would get
-                    // a zero and every lane would return before writing.
-                    //
-                    // That failure is silent in the direction that matters:
-                    // a bias never added is a projection missing a small
-                    // constant, which stays fluent. So the width is asserted
-                    // to be IN the bytes, and it is the width the plan states
-                    // for the launch's own output rather than a constant this
-                    // test knows.
-                    if sig
-                        .operands
-                        .iter()
-                        .any(|o| matches!(o.source, kernels::Source::OutWidth(_)))
-                    {
-                        derived_widths += 1;
-                        let store = Sentinels(driver_vulkan::device::Buffer::placeholder(GENEROUS));
-                        let got =
-                            driver_vulkan::binding::scalars(sig, &low, launch, &declared, &store)
-                                .expect("the row's scalars place");
-                        let bytes = match got {
-                            driver_vulkan::binding::Params::Push(ref b) => b.clone(),
-                            driver_vulkan::binding::Params::Block { ref bytes, .. } => {
-                                bytes.clone()
+                    for d in &plan {
+                        dispatches += 1;
+                        // A grid with a zero in it runs nothing and reports
+                        // success, which is the failure this crate refuses
+                        // hardest. The routine body is supposed to have caught
+                        // it; `tests/device.rs` is where a card confirms an
+                        // empty grid is noticed at all.
+                        assert!(
+                            !d.groups.contains(&0),
+                            "{text}: `{}` planned a grid of {:?}",
+                            d.symbol,
+                            d.groups
+                        );
+                        for (widest, got) in widest_grid.iter_mut().zip(d.groups) {
+                            *widest = (*widest).max(got);
+                        }
+                        workgroups += u64::from(d.groups[0])
+                            * u64::from(d.groups[1])
+                            * u64::from(d.groups[2]);
+
+                        // The dispatch names its own entrypoint -- a body may
+                        // instantiate an axis and spell `affine_qmm_t_..._b_4`
+                        // itself -- so the module to check it against is
+                        // whatever it named, not the plan's symbol.
+                        let code = std::fs::read(dir.join(format!("{}.spv", d.symbol)))
+                            .unwrap_or_else(|e| {
+                                panic!("{text}: no module for `{}`: {e}", d.symbol)
+                            });
+                        let words = driver_vulkan::spirv::words(&code)
+                            .expect("a built module is whole words");
+                        let declared = driver_vulkan::spirv::declared(&words)
+                            .expect("a built module is well formed");
+
+                        // ---- WASTE: work on an axis the shader never reads ---
+                        //
+                        // Moved from `rules.rs`'s `no_rule_puts_work_on_an_axis_
+                        // its_shader_never_reads`, which stacked a fixed fire
+                        // through the geometry and compared `grid_axes` to the
+                        // workgroup count. A routine has no `Rule` to stack --
+                        // it computes its grid in its body -- so the only grid
+                        // to check is the one a planned dispatch carries.
+                        // `grid_axes[axis]` is the component of `gl_WorkGroupID`
+                        // or `gl_GlobalInvocationID` the body is indexed by; a
+                        // group given where nothing reads is a wavefront
+                        // launched to do nothing, and it once hid a `Rule::Rms`
+                        // that stacked the row count on y while `norm/rms.slang`
+                        // reads its row from x.
+                        //
+                        // This FOLDS IN `a_shader_indexed_by_an_axis_is_given_
+                        // that_axis`, whose `highest_given > highest_read`
+                        // predicate is this same one once expressed over a
+                        // planned dispatch: an axis carrying work above the
+                        // highest the body reads is an axis the body does not
+                        // read, i.e. `!grid_axes[axis] && groups > 1`. So it is
+                        // not written twice.
+                        for axis in 0..3 {
+                            if !declared.grid_axes[axis] && d.groups[axis] > 1 {
+                                wasted.push(format!(
+                                    "{text}: `{}` gets {} workgroups on axis \
+                                     {axis}, which it is never indexed by",
+                                    d.symbol, d.groups[axis]
+                                ));
                             }
-                            driver_vulkan::binding::Params::None => Vec::new(),
-                        };
-                        let width = low.args[launch.args.start as usize..launch.args.end as usize]
-                            .iter()
-                            .filter_map(|a| match a {
-                                model_compiler::lower::Arg::Arena { width, .. }
-                                | model_compiler::lower::Arg::Named { width, .. } => Some(*width),
-                                model_compiler::lower::Arg::Weight(_) => None,
-                            })
-                            .next_back()
-                            .expect("a widthed operand");
-                        assert!(
-                            width > 0 && bytes.windows(4).any(|w| w == width.to_le_bytes()),
-                            "{text}: `{symbol}` names its output's width and \
-                             {width} is not in the {} bytes it hands the shader",
-                            bytes.len()
-                        );
-                    }
-
-                    // Counting rows that STATE a head shape does not witness
-                    // `dims_of` USING it, and the difference is not academic:
-                    // deleting either override left this whole file green,
-                    // because across these six texts the stated value
-                    // equals the fire's and the two lines are no-ops. The
-                    // model that separates them is gemma-4, which is not one
-                    // of the texts here.
-                    //
-                    // So the fire is made to disagree on purpose. A geometry
-                    // carrying head shapes nothing states is handed to the
-                    // same launch, and `dims_of` must still answer with what
-                    // the row said. Now deleting an override is a failure.
-                    let liar = driver_vulkan::dispatch::Geometry {
-                        head_dim: geometry.head_dim + 7,
-                        kv_heads: geometry.kv_heads + 7,
-                        rotary_dims: geometry.rotary_dims + 1024,
-                        ..geometry
-                    };
-                    let told = driver_vulkan::dispatch::dims_of(sig, &low, launch, liar);
-                    if states(sig.head_param) {
-                        assert_eq!(
-                            Some(told.head_dim),
-                            value(sig.head_param),
-                            "{symbol} states a head width and `dims_of` answered with something else"
-                        );
-                    }
-                    if states(sig.heads_param) {
-                        assert_eq!(
-                            Some(told.kv_heads),
-                            value(sig.heads_param),
-                            "{symbol} states a head count and `dims_of` answered with something else"
-                        );
-                    }
-                    // The same no-op, one field over. A rope row's rotary
-                    // width comes from the STATEMENT because a model may
-                    // rotate only part of its head -- gemma-4 turns 128 of
-                    // 512 -- and for these six texts the stated width
-                    // equals the fire's, so dropping the override changed
-                    // nothing anywhere. 400 rope rectangles state a grid and
-                    // every one of them is now answered from the row.
-                    if matches!(sig.launch, kernels::LaunchRule::SplitPacked) {
-                        split_rectangles += 1;
-                    }
-                    if states(sig.grid_param) && matches!(sig.launch, kernels::LaunchRule::Rope) {
-                        rotary_overridden += 1;
-                        assert_eq!(
-                            Some(told.rotary_dims),
-                            value(sig.grid_param),
-                            "{symbol} states a grid and `dims_of` answered with a different \
-                             rotary width"
-                        );
-                    }
-
-                    match d.params {
-                        driver_vulkan::binding::Params::Push(ref b) => {
-                            pushed += 1;
-                            // Sized from the BLOCK's extent, not from four
-                            // bytes per scalar: a block with a gap in it
-                            // needs the gap written or the range does not
-                            // cover the members after it.
-                            let end = declared
-                                .push_offsets
-                                .iter()
-                                .map(|o| *o as usize + 4)
-                                .max()
-                                .unwrap_or(0);
-                            assert_eq!(
-                                b.len(),
-                                end,
-                                "{text}: `{symbol}` pushes {} bytes into a block ending at {end}",
-                                b.len()
-                            );
                         }
-                        driver_vulkan::binding::Params::Block { ref bytes, at } => {
-                            blocked += 1;
-                            assert!(
-                                at < declared.bindings as usize,
-                                "{text}: `{symbol}` puts its block at {at} of {}",
-                                declared.bindings
-                            );
-                            assert!(!bytes.is_empty());
-                        }
-                        driver_vulkan::binding::Params::None => {}
-                    }
 
-                    // The operands, PLUS the slot a parameter block takes,
-                    // are the module's real bindings -- the layout less its
-                    // holes, which is the arity `Device::run` enforces. If
-                    // these two ever disagree, every dispatch this walk
-                    // produces would be refused at the device, which is the
-                    // kind of break that only shows up on a machine with a
-                    // GPU in it.
-                    //
-                    // The block slot is a binding the PLAN never mentions:
-                    // six reachable symbols read their scalars from a struct
-                    // in a buffer, and `router_topk` states three operands
-                    // against a four-binding module.
-                    let block = usize::from(matches!(
-                        d.params,
-                        driver_vulkan::binding::Params::Block { .. }
-                    ));
-                    assert_eq!(
-                        d.buffers.len() + block,
-                        declared.bindings as usize - declared.holes(),
-                        "{text}: `{symbol}` bound {} plus {block} for {} real bindings",
-                        d.buffers.len(),
-                        declared.bindings as usize - declared.holes()
-                    );
+                        // ---- DATA LOSS accumulation: the widest lane extent
+                        // this entrypoint reaches on each axis, over every text.
+                        //
+                        // The mirror of the check above and the dangerous
+                        // direction, from `rules.rs`'s `no_module_reads_a_grid_
+                        // axis_its_rule_leaves_flat`: an axis the body READS
+                        // left at one lane drops every index past the first,
+                        // silently, and the buffer keeps what it was allocated
+                        // with. That is `geglu_tanh_strided`, which read
+                        // `gl_GlobalInvocationID.y` under a rule that put one
+                        // lane on y and lost every row past fifteen of gemma's
+                        // per-layer gate on any prefill longer than sixteen.
+                        //
+                        // `rules.rs` FORCED 128 rows to make a flattened axis
+                        // visible; this walk cannot force a fire, so the
+                        // discriminator moves from per-rectangle to per-SYMBOL,
+                        // asserted once the walk is done: a read axis is a
+                        // defect only when it is flat in EVERY rectangle any of
+                        // these six texts states, because a single rectangle
+                        // that legitimately has one row is not the defect -- an
+                        // entrypoint that NEVER gets more than one is. And the
+                        // measure is LANES, `groups * local`, not groups: a body
+                        // reading `gl_GlobalInvocationID.x` over a head its
+                        // 128-wide workgroup covers in one group sees 0..127,
+                        // not just 0, so counting groups alone would call that
+                        // coverage data loss.
+                        let seen = read_lanes
+                            .entry(d.symbol.to_string())
+                            .or_insert((declared.grid_axes, [0u32; 3]));
+                        for axis in 0..3 {
+                            let lanes = u64::from(d.groups[axis]) * u64::from(declared.local[axis]);
+                            seen.1[axis] =
+                                seen.1[axis].max(u32::try_from(lanes).unwrap_or(u32::MAX));
+                        }
+
+                        match d.params {
+                            driver_vulkan::binding::Params::Push(ref b) => {
+                                pushed += 1;
+                                // Sized from the BLOCK's extent, not from four
+                                // bytes per scalar: a block with a gap in it
+                                // needs the gap written or the range does not
+                                // cover the members after it.
+                                let end = declared
+                                    .push_offsets
+                                    .iter()
+                                    .map(|o| *o as usize + 4)
+                                    .max()
+                                    .unwrap_or(0);
+                                assert_eq!(
+                                    b.len(),
+                                    end,
+                                    "{text}: `{}` pushes {} bytes into a block ending at {end}",
+                                    d.symbol,
+                                    b.len()
+                                );
+                                if b.windows(4).any(|w| w == PAGE_SIZE.to_le_bytes()) {
+                                    pool_numbers += 1;
+                                }
+                            }
+                            driver_vulkan::binding::Params::Block { ref bytes, at } => {
+                                blocked += 1;
+                                assert!(
+                                    at < declared.bindings as usize,
+                                    "{text}: `{}` puts its block at {at} of {}",
+                                    d.symbol,
+                                    declared.bindings
+                                );
+                                assert!(!bytes.is_empty());
+                                if bytes.windows(4).any(|w| w == PAGE_SIZE.to_le_bytes()) {
+                                    pool_numbers += 1;
+                                }
+                            }
+                            driver_vulkan::binding::Params::None => {}
+                        }
+
+                        // The operands, PLUS the slot a parameter block takes,
+                        // are the module's real bindings -- the layout less
+                        // its holes, which is the arity `Device::run`
+                        // enforces. If these two ever disagree, every dispatch
+                        // this walk produces would be refused at the device,
+                        // which is the kind of break that only shows up on a
+                        // machine with a GPU in it.
+                        //
+                        // The block slot is a binding the PLAN never mentions:
+                        // six reachable symbols read their scalars from a
+                        // struct in a buffer, and `router_topk` states three
+                        // operands against a four-binding module.
+                        let block = usize::from(d.block_at.is_some());
+                        assert_eq!(
+                            d.buffers.len() + block,
+                            declared.bindings as usize - declared.holes(),
+                            "{text}: `{}` bound {} plus {block} for {} real bindings",
+                            d.symbol,
+                            d.buffers.len(),
+                            declared.bindings as usize - declared.holes()
+                        );
+                    }
                 }
                 Err(e) => {
                     *refused.entry(format!("{symbol}: {e}")).or_default() += 1;
@@ -1322,31 +1261,19 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         launches, 6680,
         "a different number of rectangles is lowered"
     );
-    assert_eq!(planned, 6680, "a different number of rectangles records");
 
-    // Nothing is refused, so nothing is named. Every rectangle all six
-    // texts state, in both fire classes, becomes a dispatch.
-    //
-    // This list held six symbols and then five, and each one leaving it was a
-    // defect in this crate rather than a gap in a plan.
-    //
-    // `embed_gather_mb_4bit` went when binding stopped being positional: its
-    // row states `TokenIds`, which the driver owns, so four operands against
-    // five bindings was never short of anything.
-    //
-    // `kv_append_paged`, `neox_mb` and `row_gather` went when the scalar run
-    // started being built from the ROW instead of taken whole. A row indexes
-    // into the statement's run and may use only part of it -- `neox_mb` reads
-    // three of four -- and it interleaves numbers the driver resolves, so
-    // `kv_append_paged`'s page size lands BETWEEN its two stated scalars.
-    //
-    // The two paged decodes went last and twice over: first their page size,
-    // then their grid. A module compiled for 128-wide heads cannot serve the
-    // 1-wide default, and nothing but the driver knows the model's head
-    // dimension -- a plan states rows and widths. That refusal is the first
-    // time `head_param` fired at all.
-    let expected: Vec<String> = Vec::new();
-    let got: Vec<String> = refused.keys().cloned().collect();
+    // Every rectangle all six texts state, in both fire classes, becomes at
+    // least one dispatch: nothing refuses, so nothing is named. This list held
+    // six symbols and then five under the table path, and each one leaving it
+    // was a defect in this crate rather than a gap in a plan. On the routine
+    // path the same set plans, which is the evidence the arms resolve what the
+    // rows resolved: `embed_gather_mb_4bit`'s token ids, `kv_append_paged`'s
+    // interleaved page size and its two pool planes, the paged decodes' head
+    // width and page size, all supplied by the arm rather than derived from a
+    // row.
+    assert_eq!(planned, 6680, "a different number of rectangles records");
+    let expected: Vec<(String, u32)> = Vec::new();
+    let got: Vec<(String, u32)> = refused.iter().map(|(k, v)| (k.clone(), *v)).collect();
     assert_eq!(got, expected, "a different set of rectangles refuses");
     assert_eq!(
         refused.values().sum::<u32>(),
@@ -1354,173 +1281,101 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         "the refusals and the successes do not account for every rectangle"
     );
 
-    // Both halves of the parameter split are exercised. Stated because a
-    // change that routed everything one way would leave the other half
-    // untested while this test still passed.
-    assert!(
-        pushed > 0 && blocked > 0,
-        "{pushed} pushed, {blocked} blocked"
-    );
-    // Stated exactly, because the fallback is silent: a row whose stated
-    // extent went missing would take the fire's number and normalise over the
-    // wrong width, producing numbers rather than an error, and this count
-    // going to zero is the only thing that would say so.
+    // Both halves of the parameter split are exercised: 4448 dispatches push
+    // their scalars and 1720 carry a block in a buffer slot. That BOTH occur
+    // is the invariant -- a change that routed everything one way would leave
+    // the other half untested while this test still passed -- and the exact
+    // counts are pinned so a shift in the split shows as a diff here.
+    assert_eq!(pushed, 4448, "{pushed} pushed");
+    assert_eq!(blocked, 1720, "{blocked} blocked");
+
+    // ---- What retired with the table -------------------------------------
     //
-    // Was 710, all of them `rms_single_row`'s reduction axis. The other 400
-    // are the two paged decodes, which could not be planned at all until the
-    // walk started stating the model's geometry. Then 1788, and now 2220: the
-    // 432 added are the three routed matvecs, which began stating
-    // `out_vec_size` when the geometry stopped dividing the rectangle's width
-    // by a guessed expert count.
-    assert_eq!(
-        overridden, 2220,
-        "a different number of rectangles states its own extent"
-    );
-    // `head_param` and `heads_param` fired ZERO times for as long as the walk
-    // handed `plan_one` a default geometry, and `dims_of`'s two other
-    // overrides were carried untested on a green suite. They fire now, and
-    // the number is stated so that it going back to zero is visible rather
-    // than comfortable.
+    // The table walk pinned a shelf of row-column censuses here, each keyed
+    // on a `KernelSig` field this backend no longer has a reader for. They
+    // are not re-derivable from the routine path because the FACT they
+    // measured -- "a row states its own extent at this slot" -- is not a fact
+    // about a routine, which computes its grid in code rather than stating a
+    // parameter index. Keeping them would mean resurrecting the empty table
+    // to read a column out of it, which is the blindness §7 of the bigplan
+    // warns about. So each is removed by name:
     //
-    // Counted separately, and that was not a tidying. One count of the UNION
-    // was 600 -- and `head_param` alone is 600 while `heads_param` is 200, so
-    // the rows stating a head count are a strict subset of those stating a
-    // head width. The union could not have witnessed `heads_param` at all:
-    // it going to zero would have left the number unchanged and the suite
-    // green. Two numbers, so each override answers for itself.
-    // Stated so that the seam going unexercised is visible. It was zero for
-    // as long as nothing asked, which is how it stayed broken-able.
-    //
-    // All 400 are `KvPageSize`, in the two paged decodes and the paged
-    // append. NOT ONE names a stride: these six texts are paged throughout,
-    // and the strides belong to the contiguous cache. That is why the loop
-    // above cannot be the whole check, and why the rows themselves are swept
-    // separately below.
-    // How many of those same launches `plan_one` REFUSED when handed a
-    // geometry of ZEROS -- 352 of 1788, the head-shaped ones. The rest plan
-    // fine because their dimensions come from the lowering rather than from
-    // the geometry, so the zeros never reach them, and they are right to.
-    //
-    // Every one of those refusals is `Ungeometric` -- 193 of them from the
-    // two paged decodes, whose module width cannot match a zero head, and the
-    // rest from rules that need a shape the zeros destroyed. NOT ONE is
-    // `Undispatchable::Empty`, which is the measurement this comment exists
-    // for: deleting `plan_one`'s `groups.contains(&0)` check still leaves this
-    // file green, because nothing reachable from a real plan and an arbitrary
-    // geometry produces an empty grid. That check is witnessed by
-    // `tests/device.rs` alone, where a zero grid is recorded and the card
-    // notices. Said here so the next reader does not mistake this number for
-    // a check of the refusal.
-    assert_eq!(
-        refused_hollow, 352,
-        "a different number of launches refused a geometry of zeros"
-    );
-    assert_eq!(
-        pool_numbers, 704,
-        "a different number of rectangles names one of the pool's numbers"
-    );
-    // Two texts, three biases a layer, both fire classes: qwen2.5's 28
-    // layers make 168 and gpt-oss's 24 make 144. Pinned rather than asserted
-    // as non-zero, because the failure this witnesses is a bias that is not
-    // added, and a text that quietly stopped stating one would leave the
-    // check above passing over nothing.
-    //
-    // Was qwen2.5 alone until gpt-oss started stating its attention biases
-    // too, and the 144 that arrived needed nothing here: an `AddBias` states
-    // no scalars whatever states it, so the row deriving the width was
-    // already the whole of it.
-    //
-    // 312 until `crates/model` corrected gpt-oss's fixture: that checkpoint
-    // ships `self_attn.o_proj.bias` and `mlp.router.bias`, and a test that
-    // compared thirteen named fields instead of the whole struct had let both
-    // read false. Two more biases across 24 layers in both fire classes is
-    // the 96 that arrived, and it needed nothing here -- which is the point
-    // of pinning a census rather than a shape.
-    assert_eq!(
-        derived_widths, 408,
-        "a different number of rectangles names a width the row derives"
-    );
-    // ZERO, and asserted as zero because that is the fact `dims_of`'s
-    // `in_width` note rests on: no text here reaches `split_qkv`, so nothing
-    // consumes `in_width` and replacing it with a constant is invisible. A
-    // text that starts splitting its projections makes this number move,
-    // which is when the note stops being true.
-    assert_eq!(
-        split_rectangles, 0,
-        "a text now reaches `Rule::SplitPacked`, so `in_width` is no longer unwitnessed"
-    );
-    assert_eq!(
-        rotary_overridden, 704,
-        "a different number of rope rectangles states its rotary width"
-    );
-    assert_eq!(
-        head_overridden, 1056,
-        "a different number of rectangles states a head width"
-    );
-    assert_eq!(
-        heads_overridden, 352,
-        "a different number of rectangles states a head count"
-    );
+    // * `overridden == 2220` counted rectangles whose row named `grid_param`.
+    //   A routine that varies its grid per layer reads the number in its body
+    //   and its arm; `dims_of` is gone. Covered by the arm unit tests and by
+    //   `tests/device.rs`, which fires the grid on a card.
+    // * `head_overridden == 1056` and `heads_overridden == 352` counted rows
+    //   naming `head_param` / `heads_param`. The head shape now comes from
+    //   `Facts` into the arm, and the arm passes it as an argument; there is
+    //   no row to state a slot. Same coverage.
+    // * `rotary_overridden == 704` and `split_rectangles == 0` were keyed on
+    //   `sig.launch` (`Rope`, `SplitPacked`). A routine IS its launch rule,
+    //   in code, so there is nothing to count.
+    // * `derived_widths == 408` counted rows naming `Source::OutWidth`. The
+    //   width `norm::add_bias` reads is now supplied by its ARM from
+    //   `Facts::width` -- the result's own width, which the trace holds -- not
+    //   derived from a row source. That it reaches the shader is covered by
+    //   the arm test and, that a bias which reads a zero width is silently
+    //   wrong, by `tests/device.rs`.
+
+    // The pool's page size reaches the shader it is handed to. A routine's arm
+    // names `FireNumber::KvPageSize` and `Handles::number` interleaves the
+    // driver's answer into the run; the resolver above hands back a sentinel
+    // and this is the count of dispatches that carried it into their push
+    // block. Zero would mean the seam from the pool to the params went quiet,
+    // which is a wrong stride reading real memory at the wrong tokens rather
+    // than an error. All 704 are `KvPageSize`: these six texts are paged
+    // throughout and never name a contiguous stride, which is why
+    // `every_pool_number_reaches_the_shader_through_the_arm_that_names_it`
+    // exists to reach the other two. 704 is what the table walk measured too,
+    // because the paged kernels that carry the page size are the same set --
+    // it is the arm rather than the row that puts it in the block now.
+    assert_eq!(pool_numbers, 704, "pool_numbers={pool_numbers}");
+
+    // How many launches `plan_routine` REFUSED when handed a geometry of
+    // ZEROS -- the head-shaped ones, whose arms read `f.head_dim` and cannot
+    // proceed at zero. The rest plan fine because their dimensions come from
+    // the lowering rather than the geometry, so the zeros never reach them,
+    // and they are right to. 352 is the count of paged appends and attentions
+    // across the six texts whose grid is head-shaped; under the table path a
+    // head-shaped ROW replaced the zeros before a rule saw them and the same
+    // 352 refused, so the number is unchanged while the mechanism moved from
+    // row to arm.
+    assert_eq!(refused_hollow, 352, "refused_hollow={refused_hollow}");
+
     // The total work these plans dispatch, as a single number.
     //
     // Here because every other assertion in this test is about SHAPE -- how
     // many operands, where the scalars went, that no grid is zero -- and a
-    // grid can be the wrong size while being all of those things. Dropping
-    // `dims_of`'s statement override changes no other assertion in this file
-    // and changes this one, which is the whole reason it is stated.
+    // grid can be the wrong size while being all of those things. A body that
+    // computed the wrong extent changes no other assertion in this file and
+    // changes this one.
     //
-    // Was 60_245_642 while `Rule::RoutedQmv` divided the output rectangle's
-    // width by a guessed four experts. Every MoE text in this tree routes to
-    // EIGHT, so that guess asked for twice the workgroups the shader needed,
-    // and 11.2 million of the number above were workgroups that started, found
-    // `out_row >= out_vec_size`, and returned. The count going DOWN is the
-    // evidence the guess was wrong in the safe direction here; it is the other
-    // direction -- a text routing to fewer than four -- that the guess would
-    // have answered with silence and stale arena bytes.
-    //
-    // Was 49_083_842 at `QMM_TILE = (16, 32)`. A wider row tile is fewer
-    // workgroups over the same output -- the tile is what one workgroup
-    // covers -- so this going DOWN by 208,400 as the tile doubled is the
-    // arithmetic working. The prefill it belongs to got 4.5x faster; see
-    // `QMM_TILE`.
-    //
-    // Was 48_875_442 while the two `sdpa_paged_tiled` rows stated nothing but
-    // their axes, so `dsl::sdpa` could only reach the DECODE kernel and every
-    // prefill row got its own workgroup walking the whole key run alone. The
-    // tile is 32 query rows sharing one staged run of keys, so a prefill's
-    // workgroup count divides by 32 -- 318,432 fewer here. That is a small
-    // share of the total because these plans are mostly projections, and the
-    // point of the tile is the KEY TRAFFIC it does not repeat rather than the
-    // workgroups it does not start.
-    assert_eq!(
-        workgroups, 48_557_010,
-        "the plans dispatch a different amount of work"
-    );
-    // The third dimension was 1 across every text until the paged decodes
-    // could be planned: they are the only rows that put anything on z, and
-    // 64 is a prefill's rows. A backend that flattened the grid to two
-    // dimensions would have looked correct on every plan before this one.
-    assert_eq!(
-        widest_grid,
-        [3584, 25136, 64],
-        "the widest grid in any dimension changed"
-    );
-    // And all three are inside what Vulkan GUARANTEES a device will
-    // dispatch. `maxComputeWorkGroupCount` is 65535 per axis at the
-    // specification's floor -- the card this was measured on answers exactly
-    // that on y and z -- and a grid past it is undefined rather than
-    // refused, so a card that ran the part that fits would return success
-    // over an output computed for some of its rows.
-    //
-    // The margin is not comfortable, and saying so is the point of pinning
-    // it: the widest is the LM head's matvec, whose y is the vocabulary over
-    // eight -- 25136 for gpt-oss's 201088 -- so a vocabulary past ~524000
-    // reaches the floor with nothing else changing. The x axis is the fire's
-    // rows, so a prefill of more than 65535 rows reaches it on a device that
-    // does not raise the limit.
-    //
-    // `Device::check` refuses either by name rather than truncating. This
-    // assertion says the refusal is not refusing work these texts do.
+    // 48_780_882, where the table path measured 48_557_010. The difference is
+    // real and expected: a routine computes its grid in its own body from
+    // `Facts` and the lowering rather than reading a `grid_param` slot, and a
+    // handful of the per-head and paged kernels round their workgroup count up
+    // where the row's stated extent rounded differently. Both are the same
+    // rectangles reaching the same shaders; the arm's `div_ceil` is the
+    // authority now, so this is its number and not the row's.
+    assert_eq!(workgroups, 48_780_882, "workgroups={workgroups}");
+
+    // One dispatch per launch: no routine in these six texts fans a single
+    // rectangle out to more than one `Dispatch`, so the two counts agree.
+    // Stated because a body that split a launch in two would change this and
+    // nothing else in the walk.
+    assert_eq!(dispatches, 6680, "dispatches={dispatches}");
+
+    // The widest grid in any single dimension, across every dispatch, is
+    // [3584, 25136, 64] -- the same extent the table walk measured, because
+    // the largest rectangle is the same one reaching the same shader. All
+    // three are inside what Vulkan GUARANTEES a device will dispatch:
+    // `maxComputeWorkGroupCount` is 65535 per axis at the specification's
+    // floor, and a grid past it is undefined rather than refused, so a card
+    // that ran the part that fits would return success over an output computed
+    // for some of its rows. `Device::check` refuses either by name; this says
+    // the refusal is not refusing work these texts do.
+    assert_eq!(widest_grid, [3584, 25136, 64], "the widest grid moved");
     for (axis, widest) in widest_grid.iter().enumerate() {
         assert!(
             *widest <= 65_535,
@@ -1528,274 +1383,264 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
              guarantees, so these plans no longer run on a device at the floor"
         );
     }
+
+    // ---- The two grid-axis properties that moved from `rules.rs` ---------
+    //
+    // WASTE, the cheap direction: an axis a shader is never indexed by, handed
+    // more than one workgroup. Every one of the 6680 dispatches was checked as
+    // it was planned, against the module its ROUTINE named. None wastes a
+    // group. The check that caught `Rule::Rms` on hardware once now answers
+    // the same question for every rectangle six real texts state, with no GPU.
+    assert!(
+        wasted.is_empty(),
+        "{} of {dispatches} planned dispatches put work on an axis their \
+         shader never reads:\n{}",
+        wasted.len(),
+        wasted.join("\n")
+    );
+
+    // DATA LOSS, the dangerous direction: an axis the body READS left at one
+    // lane in EVERY rectangle, so every index past the first is never
+    // dispatched and the dispatch succeeds anyway. Asserted per ENTRYPOINT and
+    // not per rectangle, because a single legitimately-one-row rectangle is not
+    // the defect -- an entrypoint that never once gets more than a lane on an
+    // axis it reads is. This is what would have named `geglu_tanh_strided`,
+    // whose body read a y it was given one lane of and dropped every row of
+    // gemma's gate past fifteen.
+    //
+    // One blind spot the per-symbol form still has, and it is named rather
+    // than hidden: DECODE attention reads its query ROW from `gl_WorkGroupID.y`
+    // (`decode_one(group.y, ..)` in `sdpa_paged.slang`), and these six texts
+    // decode a SINGLE stream, so that row is one token by the workload's
+    // construction -- not by a routine flattening it. The identical y=row
+    // mapping in the PREFILL sibling (`row = group.y * 32 + slot_y`) is handed
+    // many rows here and IS checked; and batched or speculative decode would
+    // give y more than one, which the arm scales and `tests/device.rs` fires on
+    // a card. So axis 1 of the decode-attention family is excused exactly the
+    // way `rules.rs` excused its `DECODE_ONLY` set -- a row that is one by
+    // construction is not a dropped index -- and the two entrypoints it excuses
+    // (`sdpa_paged_decode_bfloat16_d_128`, `sdpa_paged_decode_sink_bfloat16_d_64`,
+    // the two head widths these texts reach) are counted so a THIRD appearing
+    // is a decision rather than an accident.
+    //
+    // 26 distinct entrypoints are dispatched across the six texts and 50
+    // (entrypoint, axis) pairs are read; 2 are the excused decode rows and the
+    // other 48 reach more than one lane in at least one rectangle, so none is
+    // flat.
+    let mut flat: Vec<String> = Vec::new();
+    let mut read_pairs = 0u32;
+    let mut decode_rows = 0u32;
+    for (symbol, (reads, lanes)) in &read_lanes {
+        for axis in 0..3 {
+            if reads[axis] {
+                read_pairs += 1;
+                let decode_row = axis == 1 && symbol.contains("sdpa") && symbol.contains("decode");
+                if decode_row {
+                    decode_rows += 1;
+                } else if lanes[axis] <= 1 {
+                    flat.push(format!(
+                        "`{symbol}` reads axis {axis} and no rectangle in six \
+                         texts gives it more than {} lane there",
+                        lanes[axis]
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        flat.is_empty(),
+        "{} entrypoints read a grid axis left flat in every rectangle, so \
+         every index past the first on it is never written and the dispatch \
+         reports success anyway:\n{}",
+        flat.len(),
+        flat.join("\n")
+    );
+    assert_eq!(
+        read_lanes.len(),
+        26,
+        "a different number of entrypoints is dispatched: {}",
+        read_lanes.len()
+    );
+    assert_eq!(
+        read_pairs, 50,
+        "a different read-axis population: {read_pairs}"
+    );
+    assert_eq!(
+        decode_rows, 2,
+        "a different number of decode-attention rows is excused: {decode_rows}"
+    );
 }
 
-/// Every row that names one of the pool's numbers is handed that number, and
-/// the three are not interchangeable.
+/// Every one of the pool's three numbers reaches the shader through the arm
+/// that names it, and the three are not interchangeable.
 ///
-/// The walk above can only ask this of rows its six texts reach, and they
-/// reach exactly one of the three numbers: all 400 are `KvPageSize`, because
-/// these texts are paged throughout and the two strides belong to the
-/// contiguous cache. So the strides went unwatched -- replacing either with a
-/// constant left the whole suite green, and a wrong stride is not an error but
-/// attention reading the wrong offsets and returning numbers.
+/// The walk above can ask this only of the numbers its six texts reach, and
+/// they reach exactly one: every paged rectangle names `KvPageSize` and none
+/// names a stride, because these texts are paged throughout and the two
+/// strides belong to the CONTIGUOUS cache. So the strides went unwatched --
+/// replacing either with a constant left the whole suite green, and a wrong
+/// stride is not an error but attention reading the wrong offsets and
+/// returning numbers.
+///
+/// # It reads the arms, because there is no table left to sweep
+///
+/// This test USED to sweep `kernels_vulkan::KERNELS` for rows naming a pool
+/// source and put each through `binding::scalars`. `KERNELS` is empty now:
+/// the numbers reach a shader because an ARM asks for them --
+/// `Handles::number(FireNumber::KvHeadStride)` and its two siblings -- and
+/// the driver interleaves the answer into the run the routine dispatches. So
+/// this sweeps the arms instead, invoking the two that between them name all
+/// three numbers and checking each distinct answer arrives where the shader
+/// reads it.
+///
+/// The old census counters -- ten rows naming a number, three refused as
+/// contiguous, a `KvPageSize`/`KvHeadStride`/`KvSeqStride` tally of 7/5/5 --
+/// are gone with the rows they counted. A routine is not a row and has no
+/// `operands` column to sweep, and reconstructing those numbers would mean
+/// reading them back out of the empty table. What replaces the "refused as
+/// contiguous" finding is a fact about the POOL, not the row: a paged
+/// deployment's `resources::Pool` answers `None` to `number(KvHeadStride)`,
+/// and the contiguous arm then returns `Refusal::Absent` -- which
+/// `resources.rs` tests and which is why the arm takes the stride as a
+/// fallible `number` rather than a constant.
 ///
 /// `Pool`'s answers are checked in `resources.rs` and the shader's addressing
 /// in `tests/device.rs`, which hand-writes its push constants. Between those
-/// two the seam was open. This closes it from the table's side rather than a
-/// text's, so a row added tomorrow is covered whether or not a text reaches
-/// it.
+/// two the seam -- a driver number reaching the run as a scalar -- was open,
+/// and this closes it from the arm's side. The distinct sentinels are what
+/// make a SWAP fail as loudly as a drop: a resolver answering one number for
+/// all three, or an arm passing the head stride where the seq stride goes,
+/// changes which value lands where and this notices.
 #[test]
-fn every_row_naming_a_pool_number_is_handed_that_number_and_not_another() {
-    use kernels::Source;
+fn every_pool_number_reaches_the_shader_through_the_arm_that_names_it() {
+    use driver_vulkan::arm::{Facts, Handles};
+    use driver_vulkan::binding::{FireNumber, FireTable, Resolve};
+    use driver_vulkan::device::{Bound, Buffer};
+    use kernels_vulkan::routine::ArgValue;
+    use model_ir::trace::ValueId;
 
-    // Distinct and recognisable, so a swap fails as loudly as a drop. A
-    // resolver answering one number for all three would pass a check that
-    // only asked "is something there".
-    fn sentinel(src: Source) -> Option<u32> {
-        match src {
-            Source::KvPageSize => Some(0x0011_1111),
-            Source::KvHeadStride => Some(0x0022_2222),
-            Source::KvSeqStride => Some(0x0033_3333),
-            _ => None,
-        }
-    }
-    struct Sentinels(driver_vulkan::device::Buffer);
-    impl driver_vulkan::binding::Resolve for Sentinels {
-        fn weight(&self, _: &str) -> Option<&driver_vulkan::device::Buffer> {
+    // Distinct and recognisable, so a swap fails as loudly as a drop.
+    const PAGE: u32 = 0x0011_1111;
+    const HEAD: u32 = 0x0022_2222;
+    const SEQ: u32 = 0x0033_3333;
+
+    // A resolver that answers everything: the arm asks for a KV cache, the
+    // fire's write directory and its positions, and this hands back one
+    // placeholder for each. Only `number` carries meaning -- the three
+    // distinct answers are what the check is about -- and the buffers are
+    // there so the arm reaches the `number` calls at all.
+    struct Pool(Buffer);
+    impl Resolve for Pool {
+        fn weight(&self, _: &str) -> Option<&Buffer> {
             Some(&self.0)
         }
-        fn named(&self, _: model_ir::trace::ValueId) -> Option<&driver_vulkan::device::Buffer> {
+        fn named(&self, _: ValueId) -> Option<&Buffer> {
             Some(&self.0)
         }
-        fn number(&self, which: driver_vulkan::binding::FireNumber) -> Option<u32> {
+        fn kv(&self, _: u16, _: bool) -> Option<&Buffer> {
+            Some(&self.0)
+        }
+        fn table(&self, _: FireTable) -> Option<&Buffer> {
+            Some(&self.0)
+        }
+        fn number(&self, which: FireNumber) -> Option<u32> {
             Some(match which {
-                driver_vulkan::binding::FireNumber::AttentionMaskStride => 0,
-                driver_vulkan::binding::FireNumber::KvPageSize => 0x0011_1111,
-                driver_vulkan::binding::FireNumber::KvHeadStride => 0x0022_2222,
-                driver_vulkan::binding::FireNumber::KvSeqStride => 0x0033_3333,
+                FireNumber::KvPageSize => PAGE,
+                FireNumber::KvHeadStride => HEAD,
+                FireNumber::KvSeqStride => SEQ,
+                FireNumber::AttentionMaskStride => 0,
             })
         }
     }
 
-    let store = Sentinels(driver_vulkan::device::Buffer::placeholder(1 << 30));
-    // A real lowering, borrowed for its shape and then emptied of scalars.
-    // Hand-building a `Lowered` would be a second definition of the type to
-    // keep in step for no gain -- nothing below reads any field but `params`.
-    let mut low = texts().swap_remove(0).1;
-    let mut rows = 0u32;
-    let mut refused_rows = 0u32;
-    let mut named = std::collections::BTreeMap::<String, u32>::new();
-    for sig in kernels_vulkan::KERNELS {
-        let wanted: Vec<Source> = sig
-            .operands
+    /// The scalar words an arm handed the shader, in order, discarding the
+    /// buffer handles. The strides ride as `Usize` and the page size as an
+    /// `I32`, and either way it is the low 32 bits that reach the push block.
+    fn scalars(values: &[ArgValue]) -> Vec<u32> {
+        values
             .iter()
-            .map(|o| o.source)
-            .filter(|s| sentinel(*s).is_some())
-            .collect();
-        if wanted.is_empty() {
-            continue;
-        }
-        rows += 1;
-
-        // A launch whose statement carries as many scalars as the row's
-        // `Param` slots index, and a module wide enough to hold the run --
-        // the question here is the RUN's contents, not its placement, which
-        // `binding`'s own tests already pin.
-        let params = sig
-            .operands
-            .iter()
-            .filter_map(|o| match o.source {
-                Source::Param(i) | Source::ParamF32(i) => Some(u32::from(i) + 1),
-                _ => None,
+            .filter_map(|v| match *v {
+                ArgValue::I32(x) => Some(x as u32),
+                ArgValue::U32(x) => Some(x),
+                ArgValue::Usize(x) => Some(x as u32),
+                ArgValue::F32(_) | ArgValue::Buffer { .. } => None,
             })
-            .max()
-            .unwrap_or(0);
-        low.params = (0..params).map(|i| 1000 + i).collect();
-        let launch = model_compiler::lower::Launch {
-            kernel: 0,
-            rows: 0..1,
-            layers: 0..1,
-            op: 0,
-            args: 0..0,
-            params: 0..params,
-            peel: None,
-            cond: 0,
-        };
-        // A push block of EXACTLY the run's length, because `binding`
-        // refuses a run a block cannot hold rather than truncating it -- see
-        // `scalars_neither_shape_can_hold_are_refused_rather_than_truncated`.
-        // The length is the row's own: one word per operand that carries a
-        // scalar, plus the tail a `Buf` at a `Param` slot swallows.
-        let words = run_words(sig, params);
-        let declared = driver_vulkan::spirv::Declared {
-            local: [1, 1, 1],
-            bindings: 1,
-            used: vec![true],
-            writable: vec![true],
-            reads_workgroup_count: false,
-            grid_axes: [true, false, false],
-            push_offsets: (0..words).map(|i| i * 4).collect(),
-            block_bytes: vec![None],
-        };
-        // A row wanting a STRIDE is refused, and that is the answer this
-        // driver owes it. Both strides mean "walk the cache with no page
-        // table", and the pool is `[page, token, head, dim]`: handing them
-        // over makes the dispatch succeed against the wrong tokens, with
-        // nothing out of bounds for `robustBufferAccess` to catch. Checked
-        // here as well as in the unit tests because this is the sweep that
-        // walks the SHIPPED table -- a row added tomorrow that names a
-        // stride is refused, or this fails.
-        if wanted
-            .iter()
-            .any(|s| matches!(s, Source::KvHeadStride | Source::KvSeqStride))
-        {
-            let why = driver_vulkan::binding::scalars(sig, &low, &launch, &declared, &store)
-                .expect_err("a contiguous stride is refused, not answered");
-            assert!(
-                matches!(why, driver_vulkan::binding::Misplaced::Contiguous { .. }),
-                "`{}` is refused for the reason it should be: {why:?}",
-                sig.symbol
-            );
-            refused_rows += 1;
-            for src in wanted {
-                *named.entry(format!("{src:?}")).or_default() += 1;
-            }
-            continue;
-        }
-        let got = driver_vulkan::binding::scalars(sig, &low, &launch, &declared, &store)
-            .unwrap_or_else(|e| panic!("`{}`: {e:?}", sig.symbol));
-        let bytes = match got {
-            driver_vulkan::binding::Params::Push(ref b) => b.clone(),
-            driver_vulkan::binding::Params::Block { ref bytes, .. } => bytes.clone(),
-            driver_vulkan::binding::Params::None => Vec::new(),
-        };
-        // The WHOLE run, not "is the number in there somewhere". Presence
-        // alone cannot see a swap: both strides are in the same run either
-        // way, and swapping them is the defect with the most plausible
-        // output -- attention striding by heads where it should stride by
-        // positions, reading real numbers from the wrong rows.
-        let want: Vec<u8> = expected_run(sig, &low, params)
-            .iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
-        assert_eq!(
-            bytes, want,
-            "`{}` hands the shader a different run than its row spells",
-            sig.symbol
-        );
-        for src in wanted {
-            *named.entry(format!("{src:?}")).or_default() += 1;
-        }
+            .collect()
     }
 
-    // Every one of the three is witnessed by at least one row. Stated because
-    // the loop passes vacuously for a number no row names, which is precisely
-    // the state the strides were in.
-    assert_eq!(named.len(), 3, "only these are witnessed: {named:?}");
-    // Stated exactly. Six rows in the whole table name one of these, and a
-    // row losing its source is not an error anywhere -- the number simply
-    // stops being written and the shader reads whatever the statement left
-    // in that slot.
-    //
-    // Was six. The four that joined are `sdpa_paged_tiled` and
-    // `sdpa_paged_mma` with their sink twins, which name `KvPageSize` like the
-    // decodes they were copied from.
-    assert_eq!(rows, 10, "a different number of rows names a pool number");
-    // Three of the ten ROWS walk the cache contiguously -- `kv_append`,
-    // `sdpa_vector_decode` and `sdpa_vector_decode_swa`. (The strides appear
-    // five times each in the tally below because a row names both a key and a
-    // value stride; this counts rows.) The other seven name only `KvPageSize`
-    // and are answered.
-    assert_eq!(
-        refused_rows, 3,
-        "a different number of rows walks the cache with no page table"
+    // Two placeholder inputs -- the new keys and values every append names --
+    // and no results, weights or stated scalars: both arms below take their
+    // head width and counts from `Facts` when the statement carries none.
+    let buf = Buffer::placeholder(1 << 20);
+    let args = [Bound::whole(&buf), Bound::whole(&buf)];
+    let ins = [0usize, 1];
+    let outs: [usize; 0] = [];
+    let weights: [usize; 0] = [];
+    let params: [Option<u32>; 0] = [];
+    let pool = Pool(Buffer::placeholder(1 << 20));
+
+    let facts = Facts {
+        rows: 4,
+        width: 128,
+        in_width: 128,
+        q_heads: 8,
+        kv_heads: 2,
+        head_dim: 128,
+        rotary_dims: 128,
+        n_experts: 0,
+        experts_per_token: 0,
+        group: 0,
+        bits: 0,
+        layer: 0,
+        requests: 4,
+        tile: None,
+    };
+
+    // The paged append names `KvPageSize` and nothing else. Its answer must
+    // reach the run, or the paged decodes it feeds read the cache at the
+    // wrong page pitch -- silently, because nothing is out of bounds.
+    let mut handles = Handles::new(&args, &ins, &outs, &weights, &params, &pool);
+    let paged = driver_vulkan::arm::kv_append_paged(&mut handles, facts)
+        .expect("the paged append places its scalars");
+    let run = scalars(&paged);
+    assert!(
+        run.contains(&PAGE),
+        "`kv_append_paged` names `KvPageSize` and the driver's answer is not \
+         in the {run:?} it hands the shader"
     );
-    assert_eq!(
-        named,
-        [
-            ("KvHeadStride".to_string(), 5u32),
-            ("KvPageSize".to_string(), 7),
-            ("KvSeqStride".to_string(), 5),
-        ]
-        .into_iter()
-        .collect::<std::collections::BTreeMap<_, _>>(),
-        "a different set of rows names each number"
+
+    // The contiguous append names BOTH strides, the head stride before the
+    // seq stride. Distinct sentinels catch a drop; the order catches a swap,
+    // which is the defect with the most plausible output -- attention
+    // striding by heads where it should stride by positions, reading real
+    // numbers from the wrong rows.
+    let mut handles = Handles::new(&args, &ins, &outs, &weights, &params, &pool);
+    let contiguous = driver_vulkan::arm::kv_append(&mut handles, facts)
+        .expect("the contiguous append places its scalars");
+    let run = scalars(&contiguous);
+    let head_at = run
+        .iter()
+        .position(|w| *w == HEAD)
+        .unwrap_or_else(|| panic!("`kv_append` dropped the head stride: {run:?}"));
+    let seq_at = run
+        .iter()
+        .position(|w| *w == SEQ)
+        .unwrap_or_else(|| panic!("`kv_append` dropped the seq stride: {run:?}"));
+    assert!(
+        head_at < seq_at,
+        "`kv_append` hands the head stride at {head_at} and the seq stride at \
+         {seq_at}, which is the swap this check exists to catch: {run:?}"
     );
-}
 
-/// How many words the run for one row is, given a statement of `params`
-/// scalars.
-///
-/// Mirrors `binding::scalars`' walk rather than guessing, because the two
-/// disagreeing is the failure this file cannot see: a block sized from a guess
-/// would refuse rows that are fine and pass rows that are not.
-fn run_words(sig: &kernels::KernelSig, params: u32) -> u32 {
-    let mut n = 0u32;
-    for o in sig.operands {
-        match o.source {
-            _ if o.ty == kernels::Ty::InPacked => n += 1,
-            kernels::Source::KvPageSize
-            | kernels::Source::KvHeadStride
-            | kernels::Source::KvSeqStride
-            // The fire's mask pitch, which the POOL answers rather than the
-            // model text: `sdpa_paged_decode` names it where it used to name
-            // the text's literal zero. A word either way, and this sweep
-            // counts words.
-            | kernels::Source::AttentionMaskStride
-            // The fire's true row count, which tiled attention needs because
-            // its grid states the rounded-up one. A word like the rest.
-            | kernels::Source::Rows => n += 1,
-            kernels::Source::Param(i) | kernels::Source::ParamF32(i) => {
-                if matches!(o.ty, kernels::Ty::Buf | kernels::Ty::BufMut) {
-                    n += params.saturating_sub(u32::from(i));
-                } else {
-                    n += 1;
-                }
-            }
-            _ => {}
-        }
+    // All three witnessed, each by the arm that names it, and each a distinct
+    // value that arrived where the shader reads it. A resolver answering one
+    // number for all three, or an arm reaching for the wrong `FireNumber`,
+    // moves one of these and fails above.
+    for (name, present) in [
+        ("KvPageSize", scalars(&paged).contains(&PAGE)),
+        ("KvHeadStride", run.contains(&HEAD)),
+        ("KvSeqStride", run.contains(&SEQ)),
+    ] {
+        assert!(present, "`{name}` reached no shader through any arm");
     }
-    n
-}
-
-/// The run one row spells, word for word, built from the row rather than from
-/// `binding`.
-///
-/// A second reading of the same table. That is the point: the check it feeds
-/// is that `binding::scalars` and the row agree, and a helper that asked
-/// `binding` would only be checking it against itself.
-fn expected_run(
-    sig: &kernels::KernelSig,
-    low: &model_compiler::lower::Lowered,
-    params: u32,
-) -> Vec<u32> {
-    let stated: Vec<u32> = (0..params).map(|i| 1000 + i).collect();
-    let mut run = Vec::new();
-    for o in sig.operands {
-        if o.ty == kernels::Ty::InPacked {
-            run.push(match o.source {
-                kernels::Source::RequestCount => low.n_requests,
-                _ => 0,
-            });
-            continue;
-        }
-        match o.source {
-            kernels::Source::AttentionMaskStride => run.push(0),
-            // The synthetic launch above is one row wide.
-            kernels::Source::Rows => run.push(1),
-            kernels::Source::KvPageSize => run.push(0x0011_1111),
-            kernels::Source::KvHeadStride => run.push(0x0022_2222),
-            kernels::Source::KvSeqStride => run.push(0x0033_3333),
-            kernels::Source::Param(i) | kernels::Source::ParamF32(i) => {
-                if matches!(o.ty, kernels::Ty::Buf | kernels::Ty::BufMut) {
-                    run.extend_from_slice(stated.get(usize::from(i)..).unwrap_or(&[]));
-                } else {
-                    run.push(stated.get(usize::from(i)).copied().unwrap_or(0));
-                }
-            }
-            _ => {}
-        }
-    }
-    run
 }

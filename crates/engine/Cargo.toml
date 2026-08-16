@@ -51,7 +51,6 @@ driver-wgpu = { path = "../driver-wgpu", optional = true }
 model-loader = { path = "../model-loader", default-features = false, optional = true }
 client = { path = "../client" }
 tokio = { version = "1.53", features = ["full"] }
-tokio-util = "0.7"
 parking_lot = "0.12"
 tarpc = { version = "0.37", features = ["serde1"] }
 anyhow = "1.0"
@@ -64,12 +63,47 @@ tracing-appender = "0.2"
 tracing-opentelemetry = "0.33"
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
-opentelemetry-semantic-conventions = "0.32"
+# default-features off: the default set drags in the HTTP transports
+# (`http-proto` → prost/opentelemetry-http → a second reqwest client) which
+# `telemetry.rs` never reaches — it only ever calls `.with_tonic()`.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "grpc-tonic",
+    "trace",
+    "metrics",
+] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
-wasmtime = { version = "47.0.1", features = ["pooling-allocator"] }
-wasmtime-wasi = { version = "47.0.1", features = ["p3"] }
-wasmtime-wasi-http = { version = "47.0.1", features = ["p3"] }
+# default-features off, because wasmtime's default set is the *tooling*
+# build, not the embedder one: `wat`/`wit-parser` (text and WIT parsing we
+# never do — inferlets arrive as binary components), `cache` (module cache on
+# disk), `coredump`, `profiling`, `debug-builtins`, the three GC collectors,
+# `stack-switching` and `threads` (no guest uses them). Everything the engine
+# actually reaches is listed here.
+wasmtime = { version = "47.0.1", default-features = false, features = [
+    "runtime",
+    "std",
+    "anyhow",
+    "async",
+    "backtrace",
+    "cranelift",
+    "parallel-compilation",
+    "component-model",
+    "component-model-async",
+    "pooling-allocator",
+    "addr2line",
+    "demangle",
+] }
+# p1 off (it is a default): nothing here links preview1 — the engine only ever
+# calls `p2::add_to_linker_async` and `p3::add_to_linker`, and p1 is what drags
+# in wiggle → witx → a second, ancient `wast`.
+wasmtime-wasi = { version = "47.0.1", default-features = false, features = ["p2", "p3"] }
+# `default-send-request` stays on (it is a default): it is what supplies the
+# blanket `WasiHttpHooks::send_request`, and its rustls is the ring build, not
+# aws-lc.
+wasmtime-wasi-http = { version = "47.0.1", default-features = false, features = [
+    "p2",
+    "p3",
+    "default-send-request",
+] }
 # Names `http::uri::Scheme` for the wasi:http@0.3 network-policy hook
 # (ProcessCtx::PieHttpHooks); shared with wasmtime-wasi-http's http 1.x.
 http = "1"
@@ -77,7 +111,6 @@ bytes = "1.12.1"
 uuid = { version = "1.24.0", features = ["serde", "v4"] }
 dashmap = "6.2.1"
 boxcar = "0.2.14"
-crossbeam-queue = "0.3"
 thiserror = "2.0.19"
 futures = "0.3.33"
 waker = { path = "../waker" }
@@ -86,40 +119,23 @@ grammar = { path = "../grammar" }
 # `forward` for the site table, which traces a real declaration to work out
 # where a fire's hook sites are.
 model = { path = "../model" }
-rmp-serde = "1.3.1"
 blake3 = "1.8.5"
-num-traits = "0.2.19"
-rmpv = { version = "1.3.1", features = ["with-serde"] }
 fancy-regex = "0.18.0"
-once_cell = "1.21"
 async-trait = "0.1.91"
 wasm-encoder = { version = "0.254.0", features = ["wasmparser"] }
 wasmparser = "0.254.0"
 wasm-metadata = "0.254.0"
-chrono = "0.4"
-ringbuffer = "0.16"
 libc = "0.2"
 # default-features off so reqwest's `default-tls` (native-tls → openssl) is
 # never pulled in: it dynamically links libssl.so.1.1, which doesn't exist on
 # OpenSSL-3 distros (Ubuntu 22.04+) and breaks the manylinux_2_28 release
 # binary. rustls is statically linked and distro-independent.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "charset"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "charset"] }
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
-bytemuck = { version = "1.25", features = ["derive"] }
-ipc-channel = "0.22"
 rustc-hash = "2.1"
-aho-corasick = "1"
-memchr = "2"
-unicode-normalization = "0.1"
 smallvec = "1"
 lru = "0.18.1"
-ahash = "0.8.12"
 ipnet = "2"
-# Host-side media decode for the model-agnostic multimodal API: the inferlet
-# hands raw encoded bytes (PNG/JPEG still, animated GIF) and the host decodes
-# them here, then resizes/patchifies per the bound model. Lean feature set —
-# WAV is parsed by hand in `multimodal::audio` (no extra crate).
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
 
 [features]
 default = []
@@ -220,6 +236,12 @@ profile-all = ["profile-fire"]       # everything
 
 [dev-dependencies]
 tempfile = "3"
+# The text-format parser, for tests only. The linker tests build their
+# fixtures as `(module ...)` source, which `Module::new` will only accept
+# with `wat` on; nothing in the engine itself ever compiles text, so the
+# parser has no business in a shipped binary. Dev-dependencies are not built
+# for `cargo build`, which is exactly the line we want here.
+wasmtime = { version = "47", default-features = false, features = ["wat"] }
 tensor-ir = { path = "../tensor-ir" }
 # The same `model`, with the one row that is not a model. The mock harness
 # has to name a row because `model::register` resolves one; see

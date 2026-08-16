@@ -29,6 +29,10 @@
 #[cfg(feature = "chat")]
 pub mod chat;
 
+/// This generation as llama.cpp spells it.
+#[cfg(feature = "contract")]
+pub mod import;
+
 // `Arc` reaches this module only through `Variant::chat`, so the
 // import carries that method's gate. It used to ride along with
 // `OnceLock`, which `rows()` needed unconditionally until

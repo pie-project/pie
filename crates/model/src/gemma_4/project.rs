@@ -565,9 +565,21 @@ pub fn metal_facts(
         // which is why `Deployment::v_norm` is where it is stated.
         v_norm: true,
         // gemma-4 runs the dense MLP and the bank off the SAME
-        // post-attention residual and adds them, which is the five norms
-        // round one block its forward states.
+        // post-attention residual, norms each leg's output, adds them, and
+        // norms the sum -- the SEVEN norms round one block its forward
+        // states.
         dense_beside_moe: mixture.is_some(),
+        // Both measured off `mlx-community/gemma-4-26b-a4b-it-4bit`, which
+        // publishes `layers.{n}.router.scale` `[2816]` and
+        // `layers.{n}.router.per_expert_scale` `[128]` in every mixture
+        // layer and neither in a dense one.
+        //
+        // Asked of the MIXTURE and not of the tensor list, for the reason
+        // `per_layer_scalar` just below is: a row states what it is, and a
+        // checkpoint that shipped the tensor without the block would then
+        // norm nothing twice rather than silently skip a scale.
+        router_input_norm: mixture.is_some(),
+        router_expert_scale: mixture.is_some(),
         // TRUE, and asked of the row rather than the tensors: gemma-4-31b
         // states `hidden_size_per_layer_input: 0` and has the scalar
         // anyway, which is the trap the deleted probe fell into from the

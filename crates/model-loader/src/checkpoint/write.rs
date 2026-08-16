@@ -94,9 +94,12 @@ fn profile_of(encoding: &Encoding) -> Result<(&'static str, Option<Value>), Erro
     if let Some((elems, bytes)) = spec.block_layout() {
         let name = match spec.scheme {
             QuantScheme::GgufQ4_0 => "gguf.q4_0/1",
+            QuantScheme::GgufQ4_1 => "gguf.q4_1/1",
             QuantScheme::GgufQ4K => "gguf.q4_k/1",
             QuantScheme::GgufQ5_0 => "gguf.q5_0/1",
+            QuantScheme::GgufQ5_1 => "gguf.q5_1/1",
             QuantScheme::GgufQ5K => "gguf.q5_k/1",
+            QuantScheme::GgufQ6K => "gguf.q6_k/1",
             QuantScheme::GgufQ8_0 => "gguf.q8_0/1",
             other => {
                 return Err(Error::Checkpoint(format!(
@@ -1063,5 +1066,42 @@ mod tests {
         };
         assert_eq!(write_to("a.zt"), write_to("b.zt"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The two GGUF tables are separate halves of one fact, and nothing but
+    /// this holds them level.
+    ///
+    /// A scheme that reports a `block_layout` is a scheme whose bytes this
+    /// writer will be asked to carry, so a missing profile is not a gap that
+    /// shows up in review -- it shows up as a refusal partway through writing
+    /// a 12 GB artifact, which is where `GgufQ6K` was found after its reader
+    /// half had already been added.
+    #[test]
+    fn every_blocked_scheme_can_be_written_back() {
+        for scheme in [
+            QuantScheme::GgufQ4_0,
+            QuantScheme::GgufQ4K,
+            QuantScheme::GgufQ5_0,
+            QuantScheme::GgufQ5K,
+            QuantScheme::GgufQ6K,
+            QuantScheme::GgufQ8_0,
+        ] {
+            let spec = QuantSpec {
+                scheme,
+                logical_dtype: DType::BF16,
+                bits_per_element: 0,
+                group_size: 0,
+                channel_axis: None,
+            };
+            assert!(
+                spec.block_layout().is_some(),
+                "{scheme:?} is a blocked scheme"
+            );
+            let (name, _) = profile_of(&Encoding::Quant(spec)).expect("a profile to write it under");
+            assert!(
+                name.starts_with("gguf."),
+                "{scheme:?} lands on {name}, which is not a gguf profile"
+            );
+        }
     }
 }

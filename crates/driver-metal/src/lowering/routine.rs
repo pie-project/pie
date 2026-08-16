@@ -927,11 +927,14 @@ pub fn stems() -> impl Iterator<Item = (&'static str, &'static Routine<Metal>)> 
 /// what stops an entry outliving its argument.
 pub const DARK: &[(&str, &str)] = &[(
     "silu_mul_strided",
-    "its entrypoint declares `row_pitch` at buffer(4) with buffer(3) left \
-     empty, and a routine's argument list is positional -- the index in the \
-     list IS the slot. Neither plane can express a hole, so crossing it would \
-     mean binding a null at 3 or renumbering the entrypoint. No text names \
-     it and no statement produces the row pitch it wants.",
+    "no text names it and no statement produces the `row_pitch` it wants, so \
+     a routine for it would be a call with no caller. This used to say the \
+     hole was the obstacle -- the entrypoint declares `row_pitch` at \
+     buffer(4) with buffer(3) left empty, and an argument list is positional \
+     -- and that stopped being true when `pad` became the idiom for exactly \
+     this: twenty-one routines now bind a valid address at an index their \
+     shader does not declare, because a slot nothing declares needs an \
+     address and not a meaning. What remains is the producer, not the shape.",
 )];
 
 #[cfg(test)]
@@ -1165,6 +1168,182 @@ mod tests {
         for name in ["rms_single_row", "sdpa_paged_decode", "qmm_t", "gdn_core"] {
             assert!(arm_for(name).is_some(), "{name}");
         }
+    }
+
+    /// **Every arm hands its routine the list its routine declares** — the
+    /// right number of values, each of the right kind.
+    ///
+    /// The two halves of a crossing are written in different crates. A
+    /// routine states its signature in `kernels-metal`; the arm that fills it
+    /// is in `arm::`; [`LIVE`] is the only place the two names meet. Nothing
+    /// compared them, because an arm returns `Vec<ArgValue>` and a `Vec` has
+    /// no arity: a list one short is [`Refusal::Arity`] and a value of the
+    /// wrong shape is [`Refusal::Kind`], both raised inside `KernelFn::invoke`
+    /// at DISPATCH — a device away and a whole fire late.
+    ///
+    /// The module doc above says an arm is a call and "an argument list one
+    /// short does not compile". That is true of the routine's own `pub fn`
+    /// and false of the arm, which builds a `Vec` and hands it over
+    /// positionally. This test is the missing half of that sentence.
+    ///
+    /// # It is not hypothetical
+    ///
+    /// Twelve quant routines gained a `pad` argument in one commit — their
+    /// shared argument table declares a slot at 7 and nothing was binding it —
+    /// and each of their arms had to grow a value in the same breath, while
+    /// `split_k` lost one. Fifteen argument lists were reconciled by COUNTING,
+    /// by hand, because a `vec![]` of the wrong length is a perfectly good
+    /// `vec![]` and the compiler had nothing to say about any of them.
+    ///
+    /// # Why a fixture, and why a generous one
+    ///
+    /// An arm's length is not a static fact. It is what the arm's body
+    /// builds, out of handles it asks for one at a time, so the only way to
+    /// ask how long it is, is to RUN it. The statement below is therefore
+    /// wider than any real one and its resolver answers every question: every
+    /// operand index is in range, every scalar is stated, every table and pool
+    /// and slab resolves. A refusal here is the arm's own and never the
+    /// fixture running out.
+    ///
+    /// That generosity is also why this cannot replace the conformance tests.
+    /// It compares the arm against the ROUTINE; `tests/text_conformance.rs`
+    /// compares the routine's dispatch list against the SHADER. Neither sees
+    /// the other's seam, and an argument can be the right kind in the right
+    /// slot of the wrong list.
+    #[test]
+    fn every_arm_fills_the_argument_list_its_routine_declares() {
+        use crate::lowering::arm::{Facts, Handles};
+        use crate::lowering::executor::{FireTable, Resolver};
+        use kernels_metal::routine::ArgValue;
+
+        /// One region, big enough that nothing an arm asks for falls off it.
+        const SOMEWHERE: Slice = Slice {
+            address: 0x1_0000,
+            bytes: 1 << 20,
+        };
+
+        /// A resolver that answers everything, including the three questions
+        /// whose real answers are optional — the KV pool, the GDN slabs, the
+        /// fire tables. A `None` from any of them is a refusal about the
+        /// DRIVER's state, and this test is not about the driver's state.
+        struct Everything;
+
+        impl Resolver for Everything {
+            fn weight(&mut self, _: &str) -> Option<Slice> {
+                Some(SOMEWHERE)
+            }
+            fn named(&mut self, _: model_ir::trace::ValueId) -> Option<Slice> {
+                Some(SOMEWHERE)
+            }
+            fn kv(&mut self, _: u16, _: bool) -> Option<Slice> {
+                Some(SOMEWHERE)
+            }
+            fn slab(&mut self, _: u16, _: &'static str) -> Option<Slice> {
+                Some(SOMEWHERE)
+            }
+            fn fire(&mut self, _: FireTable) -> Option<Slice> {
+                Some(SOMEWHERE)
+            }
+            fn pool(&mut self, _: FireTable) -> Option<u32> {
+                Some(16)
+            }
+        }
+
+        // What `Arg::unpack` will do to each value at dispatch, asked ahead of
+        // time. An unlisted kind panics rather than defaulting: a `Ty` this
+        // backend starts using should be classified deliberately, not swept
+        // into whichever arm a wildcard sat in.
+        let fits = |ty: Ty, v: ArgValue| match ty {
+            Ty::BufMut
+            | Ty::Buf
+            | Ty::I32s
+            | Ty::I32sMut
+            | Ty::U32s
+            | Ty::U32sMut
+            | Ty::U8s
+            | Ty::U8sMut
+            | Ty::F32s
+            | Ty::F32sMut => matches!(v, ArgValue::Buffer(_)),
+            Ty::I32 => matches!(v, ArgValue::I32(_)),
+            // `InPacked` carries a `u32`'s value and is not a `u32`: it is a
+            // FIELD of the preceding params struct, which is why it has a kind
+            // of its own and the same binding.
+            Ty::U32 | Ty::InPacked => matches!(v, ArgValue::U32(_)),
+            Ty::F32 => matches!(v, ArgValue::F32(_)),
+            Ty::Usize => matches!(v, ArgValue::Usize(_)),
+            other => panic!("no metal routine took `{other:?}` when this was written"),
+        };
+
+        let args: Vec<BoundArg> = (0..24)
+            .map(|i: u64| handle(0x1_0000 + i * 0x1000, 64))
+            .collect();
+        let ins: Vec<usize> = (0..8).collect();
+        let outs: Vec<usize> = (8..16).collect();
+        let weights: Vec<usize> = (16..24).collect();
+        // Non-zero, because arms divide by these: a group size of zero is
+        // `Refusal::Empty` and a zero axis makes a head count a division by it.
+        let params: Vec<Option<u32>> = (1..=16).map(Some).collect();
+        let facts = Facts {
+            rows: 4,
+            width: 64,
+            in_width: 64,
+            q_heads: 8,
+            kv_heads: 2,
+            head_dim: 64,
+            rotary_dims: 64,
+            n_experts: 8,
+            experts_per_token: 2,
+            group: 64,
+            bits: 4,
+            tile: Some((32, 32)),
+            layer: 0,
+            requests: 2,
+        };
+
+        let mut wrong: Vec<String> = Vec::new();
+        for (routines, arms) in LIVE {
+            for (name, stem, arm) in *arms {
+                let Some(routine) = routines.iter().find(|r| r.name == *name) else {
+                    wrong.push(format!("  {stem} -> `{name}`: no routine of that name"));
+                    continue;
+                };
+                let mut resolver = Everything;
+                let mut handles =
+                    Handles::new(&args, &ins, &outs, &weights, &params, &mut resolver);
+                let built = match arm(&mut handles, facts) {
+                    Ok(built) => built,
+                    Err(why) => {
+                        wrong.push(format!("  {stem} -> `{name}`: refused: {why}"));
+                        continue;
+                    }
+                };
+                if built.len() != routine.args.len() {
+                    wrong.push(format!(
+                        "  {stem} -> `{name}`: the arm hands {} value(s), the \
+                         routine takes {}",
+                        built.len(),
+                        routine.args.len()
+                    ));
+                    continue;
+                }
+                for (at, (value, (ty, _))) in built.iter().zip(routine.args).enumerate() {
+                    if !fits(*ty, *value) {
+                        wrong.push(format!(
+                            "  {stem} -> `{name}`: argument {at} is {ty:?} and \
+                             the arm bound {}",
+                            value.kind()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "an arm and its routine disagree about the call between them. \
+             Until this test existed the disagreement was a `Refusal` at \
+             dispatch, which names the arity but not the arm:\n{}",
+            wrong.join("\n")
+        );
     }
 
     /// The longest stem wins, and a stem may not end mid-word.

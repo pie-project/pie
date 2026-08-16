@@ -253,6 +253,26 @@ struct Walk<'a, 'p> {
 /// a reader because decoding is not reading: the runtime materialization is the
 /// driver's job, and this exists so the offline executor can check the driver's
 /// answer against an independent one.
+///
+/// Checked against a from-scratch reimplementation on
+/// `qwen2.5-0.5b-instruct-q4_0.gguf`: for `blk.0.attn_q.weight` both decoders
+/// land at cosine 0.89175 against the same model's HuggingFace weights, equal
+/// to five decimals. That number is *also* the trap, so it is recorded here.
+///
+/// Comparing a GGUF against its HuggingFace twin does not give ~0.996 (the
+/// error Q4_0 alone costs, which is what `o_proj` and `embed_tokens` show).
+/// Every matrix an RMSNorm feeds — q, k, v, gate, up — comes out between 0.80
+/// and 0.99, and the norm vectors themselves disagree despite being F32 on
+/// both sides. Nothing is wrong: the two published checkpoints simply split
+/// the norm scale differently between the norm vector and the columns it
+/// multiplies. Only the product is observable, and folding it back
+/// (`norm[i] × W[.., i]`) lifts those 120 matrices from a median of 0.977 to
+/// 0.995. Tensors no norm feeds are bit-identical — `output_norm.weight` and
+/// every attention bias compare exactly equal.
+///
+/// So a low cosine against an HF twin is evidence about the checkpoints, not
+/// about this function. Bit-equality on the unnormalized tensors is the signal
+/// worth watching for a regression here.
 fn decode_gguf_q4_0_block_into(block: &[u8; 18], values: &mut [f32; 32]) {
     let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
     for i in 0..16 {
@@ -261,6 +281,244 @@ fn decode_gguf_q4_0_block_into(block: &[u8; 18], values: &mut [f32; 32]) {
         let hi = ((packed >> 4) & 0x0f) as i32 - 8;
         values[i] = scale * lo as f32;
         values[i + 16] = scale * hi as f32;
+    }
+}
+
+/// Decode one GGUF `Q5_0` block: an F16 scale, a 32-bit plane of fifth bits,
+/// then sixteen packed bytes. Same halves as `Q4_0`, but each element's high
+/// bit comes from the plane, so the range is `(nibble | bit⁴) − 16`.
+///
+/// The plane is indexed by element, not by byte: bit `i` belongs to the low
+/// nibble of byte `i` and bit `i + 16` to its high nibble. Reading it as if it
+/// followed the packing order instead is the one way to get this wrong, and it
+/// produces plausible numbers rather than an error.
+fn decode_gguf_q5_0_block_into(block: &[u8; 22], values: &mut [f32; 32]) {
+    let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+    let plane = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+    for i in 0..16 {
+        let packed = block[6 + i];
+        let lo_bit = ((plane >> i) & 1) << 4;
+        let hi_bit = ((plane >> (i + 16)) & 1) << 4;
+        let lo = ((packed & 0x0f) as i32 | lo_bit as i32) - 16;
+        let hi = ((packed >> 4) as i32 | hi_bit as i32) - 16;
+        values[i] = scale * lo as f32;
+        values[i + 16] = scale * hi as f32;
+    }
+}
+
+/// Decode one GGUF `Q8_0` block: an F16 scale and thirty-two signed bytes,
+/// each element `byte × scale`. The only GGUF block with no packing at all.
+fn decode_gguf_q8_0_block_into(block: &[u8; 34], values: &mut [f32; 32]) {
+    let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+    for i in 0..32 {
+        values[i] = scale * f32::from(block[2 + i] as i8);
+    }
+}
+
+/// Decode one GGUF `Q4_1` block: an F16 scale, an F16 offset, then sixteen
+/// packed bytes. Affine rather than symmetric — `nibble × d + m`, with no
+/// bias subtracted from the nibble, because the offset already places the
+/// range wherever it belongs.
+///
+/// The offset is *added* here and *subtracted* in the K-quants. Sharing an
+/// arm between the two families would be a sign error that survives every
+/// shape and size check.
+fn decode_gguf_q4_1_block_into(block: &[u8; 20], values: &mut [f32; 32]) {
+    let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+    let m = half::f16::from_le_bytes([block[2], block[3]]).to_f32();
+    for i in 0..16 {
+        let packed = block[4 + i];
+        values[i] = f32::from(packed & 0x0f) * d + m;
+        values[i + 16] = f32::from(packed >> 4) * d + m;
+    }
+}
+
+/// Decode one GGUF `Q5_1` block: [`decode_gguf_q4_1_block_into`] plus the
+/// 32-bit fifth-bit plane [`decode_gguf_q5_0_block_into`] carries, indexed the
+/// same way — bit `i` for the low nibble of byte `i`, bit `i + 16` for its
+/// high one.
+fn decode_gguf_q5_1_block_into(block: &[u8; 24], values: &mut [f32; 32]) {
+    let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+    let m = half::f16::from_le_bytes([block[2], block[3]]).to_f32();
+    let plane = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+    for i in 0..16 {
+        let packed = block[8 + i];
+        let lo = (packed & 0x0f) as u32 | (((plane >> i) & 1) << 4);
+        let hi = (packed >> 4) as u32 | (((plane >> (i + 16)) & 1) << 4);
+        values[i] = lo as f32 * d + m;
+        values[i + 16] = hi as f32 * d + m;
+    }
+}
+
+/// The six-bit scale and six-bit minimum for one of the eight sub-blocks of a
+/// `Q4_K` or `Q5_K` block, unpacked from the twelve bytes they share.
+///
+/// `ggml`'s `get_scale_min_k4`. The first four sub-blocks read a whole byte
+/// each from the first two groups of four; the last four are spliced, taking
+/// their low four bits from the third group and their high two from the bits
+/// the first four sub-blocks left unused at the top of the first two groups.
+/// Twelve bytes for sixteen six-bit fields, with nothing wasted — which is
+/// also why it cannot be written as a shift and a mask.
+fn gguf_k_scale_min(index: usize, scales: &[u8; 12]) -> (u8, u8) {
+    if index < 4 {
+        (scales[index] & 63, scales[index + 4] & 63)
+    } else {
+        let scale = (scales[index + 4] & 0x0f) | ((scales[index - 4] >> 6) << 4);
+        let min = (scales[index + 4] >> 4) | ((scales[index] >> 6) << 4);
+        (scale, min)
+    }
+}
+
+/// Decode one GGUF `Q4_K` super-block: 256 elements as eight 32-element
+/// sub-blocks, each with its own six-bit scale and six-bit minimum, and the
+/// whole block sharing one F16 scale and one F16 minimum.
+///
+/// Unlike the `_0` family this is affine, not symmetric: an element is
+/// `d × scaleᵢ × nibble − dmin × minᵢ`, so the minimum is *subtracted* rather
+/// than folded into the quantized value. The 128 payload bytes are read in
+/// pairs of sub-blocks — low nibbles for the even one, high nibbles for the
+/// odd — which is why the loop steps by 64 elements and not 32.
+fn decode_gguf_q4_k_block_into(block: &[u8; 144], values: &mut [f32; 256]) {
+    let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+    let dmin = half::f16::from_le_bytes([block[2], block[3]]).to_f32();
+    let scales: &[u8; 12] = block[4..16].try_into().expect("twelve scale bytes");
+    let qs = &block[16..144];
+    for pair in 0..4 {
+        let (sc_lo, m_lo) = gguf_k_scale_min(pair * 2, scales);
+        let (sc_hi, m_hi) = gguf_k_scale_min(pair * 2 + 1, scales);
+        let (d_lo, min_lo) = (d * f32::from(sc_lo), dmin * f32::from(m_lo));
+        let (d_hi, min_hi) = (d * f32::from(sc_hi), dmin * f32::from(m_hi));
+        let packed = &qs[pair * 32..pair * 32 + 32];
+        let out = pair * 64;
+        for i in 0..32 {
+            values[out + i] = d_lo * f32::from(packed[i] & 0x0f) - min_lo;
+            values[out + 32 + i] = d_hi * f32::from(packed[i] >> 4) - min_hi;
+        }
+    }
+}
+
+/// Decode one GGUF `Q5_K` super-block: `Q4_K` plus a 32-byte plane carrying
+/// each element's fifth bit.
+///
+/// The plane is read by sub-block pair rather than by position: pair `p` uses
+/// bit `2p` of `plane[i]` for the low nibble and bit `2p + 1` for the high one.
+/// So one plane byte serves all eight sub-blocks at the same offset, and the
+/// fifth bit adds sixteen *before* the affine minimum is subtracted.
+fn decode_gguf_q5_k_block_into(block: &[u8; 176], values: &mut [f32; 256]) {
+    let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+    let dmin = half::f16::from_le_bytes([block[2], block[3]]).to_f32();
+    let scales: &[u8; 12] = block[4..16].try_into().expect("twelve scale bytes");
+    let plane = &block[16..48];
+    let qs = &block[48..176];
+    for pair in 0..4 {
+        let (sc_lo, m_lo) = gguf_k_scale_min(pair * 2, scales);
+        let (sc_hi, m_hi) = gguf_k_scale_min(pair * 2 + 1, scales);
+        let (d_lo, min_lo) = (d * f32::from(sc_lo), dmin * f32::from(m_lo));
+        let (d_hi, min_hi) = (d * f32::from(sc_hi), dmin * f32::from(m_hi));
+        let packed = &qs[pair * 32..pair * 32 + 32];
+        let (bit_lo, bit_hi) = (1u8 << (pair * 2), 1u8 << (pair * 2 + 1));
+        let out = pair * 64;
+        for i in 0..32 {
+            let fifth_lo = u8::from(plane[i] & bit_lo != 0) << 4;
+            let fifth_hi = u8::from(plane[i] & bit_hi != 0) << 4;
+            values[out + i] = d_lo * f32::from((packed[i] & 0x0f) + fifth_lo) - min_lo;
+            values[out + 32 + i] = d_hi * f32::from((packed[i] >> 4) + fifth_hi) - min_hi;
+        }
+    }
+}
+
+/// Decode one GGUF `Q6_K` super-block: 256 elements as sixteen 16-element
+/// sub-blocks, each with a signed eight-bit scale, over one F16 scale.
+///
+/// Symmetric like the `_0` family — `d × scaleᵢ × (six bits − 32)`, no
+/// minimum — but laid out in two halves of 128 elements, and within a half the
+/// four quarters are strided rather than contiguous: quarter `q` of the half
+/// takes its low four bits from `ql[l + 32·(q & 1)]` (low nibble for `q < 2`,
+/// high nibble above) and its top two from bits `2q..2q+2` of `qh[l]`. The
+/// sub-block scale index advances by two per quarter, so the sixteen scales
+/// are consumed eight per half.
+fn decode_gguf_q6_k_block_into(block: &[u8; 210], values: &mut [f32; 256]) {
+    let d = half::f16::from_le_bytes([block[208], block[209]]).to_f32();
+    for half_index in 0..2 {
+        let ql = &block[half_index * 64..half_index * 64 + 64];
+        let qh = &block[128 + half_index * 32..128 + half_index * 32 + 32];
+        let scales = &block[192 + half_index * 8..192 + half_index * 8 + 8];
+        let out = half_index * 128;
+        for i in 0..32 {
+            let sub = i / 16;
+            for quarter in 0..4 {
+                let nibble = if quarter < 2 {
+                    ql[i + 32 * quarter] & 0x0f
+                } else {
+                    ql[i + 32 * (quarter - 2)] >> 4
+                };
+                let top = (qh[i] >> (2 * quarter)) & 3;
+                let q = i32::from(nibble | (top << 4)) - 32;
+                let scale = f32::from(scales[sub + 2 * quarter] as i8);
+                values[out + quarter * 32 + i] = d * scale * q as f32;
+            }
+        }
+    }
+}
+
+/// Decode one block of any GGUF scheme the loader knows, into the `f32` values
+/// it stands for.
+///
+/// `block` and `values` are exactly the lengths `scheme.block_layout()` names;
+/// the conversions below are that promise restated, and a caller that breaks it
+/// panics here rather than reading a neighbouring block.
+fn decode_gguf_block_into(scheme: QuantScheme, block: &[u8], values: &mut [f32]) {
+    let bad = "block and value lengths must match the scheme's layout";
+    match scheme {
+        QuantScheme::GgufQ4_0 => {
+            decode_gguf_q4_0_block_into(
+                block.try_into().expect(bad),
+                values.try_into().expect(bad),
+            );
+        }
+        QuantScheme::GgufQ4_1 => {
+            decode_gguf_q4_1_block_into(
+                block.try_into().expect(bad),
+                values.try_into().expect(bad),
+            );
+        }
+        QuantScheme::GgufQ5_0 => {
+            decode_gguf_q5_0_block_into(
+                block.try_into().expect(bad),
+                values.try_into().expect(bad),
+            );
+        }
+        QuantScheme::GgufQ5_1 => {
+            decode_gguf_q5_1_block_into(
+                block.try_into().expect(bad),
+                values.try_into().expect(bad),
+            );
+        }
+        QuantScheme::GgufQ8_0 => {
+            decode_gguf_q8_0_block_into(
+                block.try_into().expect(bad),
+                values.try_into().expect(bad),
+            );
+        }
+        QuantScheme::GgufQ4K => {
+            decode_gguf_q4_k_block_into(
+                block.try_into().expect(bad),
+                values.try_into().expect(bad),
+            );
+        }
+        QuantScheme::GgufQ5K => {
+            decode_gguf_q5_k_block_into(
+                block.try_into().expect(bad),
+                values.try_into().expect(bad),
+            );
+        }
+        QuantScheme::GgufQ6K => {
+            decode_gguf_q6_k_block_into(
+                block.try_into().expect(bad),
+                values.try_into().expect(bad),
+            );
+        }
+        other => unreachable!("{other:?} reports no GGUF block layout"),
     }
 }
 
@@ -548,6 +806,7 @@ impl Walk<'_, '_> {
             TileMapKind::Scale => {
                 self.scale_bytes(source, inputs, outputs.first().copied(), &input, &transform)?
             }
+            TileMapKind::Bias => self.bias_bytes(source, inputs, &input, &transform)?,
             TileMapKind::Decode => {
                 self.decode_bytes(outputs.first().copied(), &input, &transform)?
             }
@@ -765,6 +1024,39 @@ impl Walk<'_, '_> {
             return None;
         };
         Some((u32::try_from(rows).ok()?, u32::try_from(cols).ok()?))
+    }
+
+    /// Add one constant to every element, in the operand's own dtype.
+    ///
+    /// The arithmetic is done in `f32` and written back at the source width,
+    /// which for a BF16 operand means the sum is rounded once -- the same
+    /// single rounding a scale takes, and the reason both are stated as one
+    /// kernel rather than as a host loop somebody writes twice.
+    ///
+    /// There is no per-block form and no quantized operand; `infer_bias`
+    /// refused both before a plan existed, so anything reaching here is a
+    /// plain float buffer and the only thing that can go wrong is the dtype
+    /// being absent, which is a plan bug rather than a contract's.
+    fn bias_bytes(
+        &self,
+        source: Option<&SourceExtent>,
+        inputs: &[BufferId],
+        bytes: &[u8],
+        transform: &TransformSpec,
+    ) -> Result<Vec<u8>, Error> {
+        let dtype = if let Some(source) = source {
+            self.source_dtype(source.tensor_id)?
+        } else if let Some(input) = inputs.first() {
+            self.buffer_dtype(*input)?
+        } else {
+            return Err(invalid("host Bias requires a source or input buffer"));
+        };
+        let by = f32::from_bits(transform.bias_bits);
+        let mut values = decode_values(bytes, dtype)?;
+        for value in &mut values {
+            *value = f64::from(*value as f32 + by);
+        }
+        encode_values(&values, dtype)
     }
 
     /// `Scale` multiplies, and what it multiplies by is the only thing that
@@ -1016,36 +1308,43 @@ impl Walk<'_, '_> {
     ///
     /// Only schemes whose scales live inside the block reach here — the
     /// validate pass admits exactly those — so the payload bytes are the whole
-    /// story and there is no factor operand to fetch. GGUF Q4_0 decodes through
-    /// [`decode_gguf_q4_0_block_into`] below, and the `f32` values it yields
-    /// narrow to the scheme's logical `BF16` by round to nearest even.
+    /// story and there is no factor operand to fetch. Which schemes those are
+    /// is not a list kept here: it is exactly the set that answers
+    /// `block_layout()`, so a scheme becomes decodable by declaring its layout
+    /// and gaining an arm in [`decode_gguf_block_into`], and cannot be half
+    /// admitted. The `f32` values it yields narrow to the scheme's logical
+    /// `BF16` by round to nearest even.
     fn decode_bytes(
         &self,
         output: Option<BufferId>,
         bytes: &[u8],
         transform: &TransformSpec,
     ) -> Result<Vec<u8>, Error> {
-        if transform.from != Some(QuantScheme::GgufQ4_0) {
+        let scheme = transform
+            .from
+            .ok_or_else(|| invalid("host Decode names no source scheme"))?;
+        let Some((elements, block_bytes)) = scheme.block_layout() else {
             return Err(invalid(format!(
-                "host Decode implements GGUF Q4_0 only, not {:?}",
-                transform.from
+                "host Decode implements the blocked GGUF schemes, not {scheme:?}"
             )));
-        }
+        };
+        let (elements, block_bytes) = (elements as usize, block_bytes as usize);
         let output = output.ok_or_else(|| invalid("host Decode requires an output buffer"))?;
         let dtype = self.buffer_dtype(output)?;
         if dtype != DType::BF16 {
             return Err(invalid(format!(
-                "GGUF Q4_0 decodes to its logical BF16, not {dtype:?}"
+                "GGUF {scheme:?} decodes to its logical BF16, not {dtype:?}"
             )));
         }
-        if !bytes.len().is_multiple_of(18) {
+        if !bytes.len().is_multiple_of(block_bytes) {
             return Err(invalid(format!(
-                "host Decode read {} bytes, not whole 18-byte Q4_0 blocks",
+                "host Decode read {} bytes, not whole {block_bytes}-byte {scheme:?} blocks",
                 bytes.len()
             )));
         }
-        let blocks = bytes.len() / 18;
-        let mut out = vec![0u8; blocks * 64];
+        let blocks = bytes.len() / block_bytes;
+        let out_bytes = elements * 2;
+        let mut out = vec![0u8; blocks * out_bytes];
         // Blocks are self-contained, so they decode in parallel the same way
         // encode rows do: disjoint output slices, any worker count, the same
         // bytes.
@@ -1062,16 +1361,16 @@ impl Walk<'_, '_> {
             let mut start = 0usize;
             while start < blocks {
                 let count = per_worker.min(blocks - start);
-                let (chunk, rest) = std::mem::take(&mut out_rest).split_at_mut(count * 64);
+                let (chunk, rest) = std::mem::take(&mut out_rest).split_at_mut(count * out_bytes);
                 out_rest = rest;
-                let source = &bytes[start * 18..(start + count) * 18];
+                let source = &bytes[start * block_bytes..(start + count) * block_bytes];
                 scope.spawn(move || {
-                    let mut values = [0.0f32; 32];
-                    for (block, out) in source.chunks_exact(18).zip(chunk.chunks_exact_mut(64)) {
-                        decode_gguf_q4_0_block_into(
-                            block.try_into().expect("chunks are 18 bytes"),
-                            &mut values,
-                        );
+                    let mut values = vec![0.0f32; elements];
+                    for (block, out) in source
+                        .chunks_exact(block_bytes)
+                        .zip(chunk.chunks_exact_mut(out_bytes))
+                    {
+                        decode_gguf_block_into(scheme, block, &mut values);
                         for (value, le) in values.iter().zip(out.chunks_exact_mut(2)) {
                             le.copy_from_slice(&bf16::from_f32(*value).to_bits().to_le_bytes());
                         }
@@ -3150,5 +3449,255 @@ mod tests {
             "{error}"
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+/// The GGUF block decoders, pinned by layout rather than by value.
+///
+/// Every one of these is a bit-gather, and a bit-gather's failure mode is not
+/// a wrong number but a right number in the wrong place — which no shape, size
+/// or sum check can see. So the payloads below are chosen so that each decoded
+/// element reports *where its bits came from*, and the assertions are about
+/// position.
+///
+/// The values themselves were checked separately and are not re-derived here:
+/// every decoder was run against a from-scratch reimplementation over the
+/// tensors of `qwen2.5-0.5b-instruct-q4_k_m.gguf` and `-q5_k_m.gguf`, and
+/// agreed bit for bit on 8.9M elements of Q4_K, Q5_K, Q6_K, Q5_0, Q5_1 and
+/// Q8_0. Q4_1 is the one scheme no file at hand uses, so it is held only by
+/// the layout tests here.
+#[cfg(test)]
+mod gguf_block_tests {
+    use super::*;
+
+    fn f16(value: f32) -> [u8; 2] {
+        half::f16::from_f32(value).to_le_bytes()
+    }
+
+    /// A 32-element block splits its sixteen payload bytes into low nibbles
+    /// first and high nibbles second — not byte order, not interleaved.
+    ///
+    /// The payload is a ramp, so byte `i` carries `i` in its low nibble and
+    /// zero in its high one. An implementation that emitted the two nibbles of
+    /// a byte adjacently would produce the same multiset of values and fail
+    /// only here.
+    #[test]
+    fn a_thirty_two_element_block_puts_every_low_nibble_before_any_high_one() {
+        let ramp: Vec<u8> = (0..16u8).collect();
+        let mut values = [0.0f32; 32];
+
+        let mut q4_0 = [0u8; 18];
+        q4_0[..2].copy_from_slice(&f16(1.0));
+        q4_0[2..].copy_from_slice(&ramp);
+        decode_gguf_q4_0_block_into(&q4_0, &mut values);
+        for i in 0..16 {
+            assert_eq!(values[i], i as f32 - 8.0, "q4_0 low nibble {i}");
+            assert_eq!(values[i + 16], -8.0, "q4_0 high nibble {i}");
+        }
+
+        // The `_1` schemes add their offset; a sign error here is invisible to
+        // every other check because the block still decodes to plausible
+        // weights, just mirrored about the offset.
+        let mut q4_1 = [0u8; 20];
+        q4_1[..2].copy_from_slice(&f16(1.0));
+        q4_1[2..4].copy_from_slice(&f16(2.0));
+        q4_1[4..].copy_from_slice(&ramp);
+        decode_gguf_q4_1_block_into(&q4_1, &mut values);
+        for i in 0..16 {
+            assert_eq!(values[i], i as f32 + 2.0, "q4_1 low nibble {i}");
+            assert_eq!(values[i + 16], 2.0, "q4_1 high nibble {i}");
+        }
+
+        // Q8_0 has no nibbles at all, so this is the control: if the ordering
+        // assertions above ever pass for the wrong reason, this one still
+        // holds and tells them apart. Its ramp straddles zero because Q8_0's
+        // codes are SIGNED, and a ramp of small positive bytes reads the same
+        // either way.
+        let mut q8_0 = [0u8; 34];
+        q8_0[..2].copy_from_slice(&f16(1.0));
+        for (i, byte) in q8_0[2..].iter_mut().enumerate() {
+            *byte = (i as i8 - 16) as u8;
+        }
+        decode_gguf_q8_0_block_into(&q8_0, &mut values);
+        for (i, value) in values.iter().enumerate() {
+            assert_eq!(*value, i as f32 - 16.0, "q8_0 element {i}");
+        }
+    }
+
+    /// The fifth-bit plane of a `_0`/`_1` block is indexed by ELEMENT — bit
+    /// `i` for the low nibble of byte `i`, bit `i + 16` for its high one.
+    ///
+    /// Two planes, each all-ones in one half. Reading the plane in packing
+    /// order instead (bits `2i` and `2i + 1`, which is what the K-quants do)
+    /// splits both halves down the middle rather than choosing one, so the
+    /// two conventions disagree on every element here.
+    #[test]
+    fn a_fifth_bit_plane_is_indexed_by_element_and_not_by_packing_order() {
+        let ramp: Vec<u8> = (0..16u8).collect();
+        let mut values = [0.0f32; 32];
+
+        for (plane, low_carries, high_carries) in
+            [(0x0000_ffffu32, true, false), (0xffff_0000u32, false, true)]
+        {
+            let mut q5_0 = [0u8; 22];
+            q5_0[..2].copy_from_slice(&f16(1.0));
+            q5_0[2..6].copy_from_slice(&plane.to_le_bytes());
+            q5_0[6..].copy_from_slice(&ramp);
+            decode_gguf_q5_0_block_into(&q5_0, &mut values);
+            for i in 0..16 {
+                let low = i as f32 + if low_carries { 16.0 } else { 0.0 } - 16.0;
+                let high = if high_carries { 16.0 } else { 0.0 } - 16.0;
+                assert_eq!(values[i], low, "q5_0 plane {plane:#x} low {i}");
+                assert_eq!(values[i + 16], high, "q5_0 plane {plane:#x} high {i}");
+            }
+
+            let mut q5_1 = [0u8; 24];
+            q5_1[..2].copy_from_slice(&f16(1.0));
+            q5_1[2..4].copy_from_slice(&f16(2.0));
+            q5_1[4..8].copy_from_slice(&plane.to_le_bytes());
+            q5_1[8..].copy_from_slice(&ramp);
+            decode_gguf_q5_1_block_into(&q5_1, &mut values);
+            for i in 0..16 {
+                let low = i as f32 + if low_carries { 16.0 } else { 0.0 } + 2.0;
+                let high = if high_carries { 16.0 } else { 0.0 } + 2.0;
+                assert_eq!(values[i], low, "q5_1 plane {plane:#x} low {i}");
+                assert_eq!(values[i + 16], high, "q5_1 plane {plane:#x} high {i}");
+            }
+        }
+    }
+
+    /// A K-quant's last four sub-blocks read their scale and minimum from the
+    /// spliced bytes, and the splice does not give the same answer as the
+    /// straight read.
+    ///
+    /// Twelve scale bytes of `0x01` are the cheapest payload that separates
+    /// the two branches of `gguf_k_scale_min`: sub-blocks 0..4 come out
+    /// `(scale 1, min 1)` and sub-blocks 4..8 come out `(scale 1, min 0)`,
+    /// because the spliced minimum takes its low four bits from the high
+    /// nibble of a byte that holds `0x01`. So the decoded block steps from
+    /// `nibble − 1` to `nibble` exactly at element 128, and an implementation
+    /// that ran the `j < 4` branch for all eight sub-blocks would hold `−1`
+    /// throughout.
+    #[test]
+    fn a_k_quant_splices_the_scales_of_its_last_four_sub_blocks() {
+        let mut values = [0.0f32; 256];
+
+        let mut q4_k = [0u8; 144];
+        q4_k[..2].copy_from_slice(&f16(1.0));
+        q4_k[2..4].copy_from_slice(&f16(1.0));
+        q4_k[4..16].copy_from_slice(&[0x01; 12]);
+        for (i, byte) in q4_k[16..].iter_mut().enumerate() {
+            *byte = (i & 0x0f) as u8;
+        }
+        decode_gguf_q4_k_block_into(&q4_k, &mut values);
+        for pair in 0..4 {
+            // Sub-block 2·pair carries the low nibbles, 2·pair + 1 the high
+            // ones, which the ramp leaves at zero.
+            let minimum = if pair < 2 { 1.0 } else { 0.0 };
+            for i in 0..32 {
+                assert_eq!(
+                    values[pair * 64 + i],
+                    (i & 0x0f) as f32 - minimum,
+                    "q4_k pair {pair} low {i}"
+                );
+                assert_eq!(
+                    values[pair * 64 + 32 + i],
+                    -minimum,
+                    "q4_k pair {pair} high {i}"
+                );
+            }
+        }
+
+        // Q5_K adds the plane, and reads it by PAIR rather than by element:
+        // bit 2·pair for the low nibbles, 2·pair + 1 for the high ones. A
+        // plane of `0b11` therefore lifts pair 0 alone.
+        let mut q5_k = [0u8; 176];
+        q5_k[..2].copy_from_slice(&f16(1.0));
+        q5_k[2..4].copy_from_slice(&f16(1.0));
+        q5_k[4..16].copy_from_slice(&[0x01; 12]);
+        q5_k[16..48].copy_from_slice(&[0b11; 32]);
+        for (i, byte) in q5_k[48..].iter_mut().enumerate() {
+            *byte = (i & 0x0f) as u8;
+        }
+        decode_gguf_q5_k_block_into(&q5_k, &mut values);
+        for pair in 0..4 {
+            let minimum = if pair < 2 { 1.0 } else { 0.0 };
+            let fifth = if pair == 0 { 16.0 } else { 0.0 };
+            for i in 0..32 {
+                assert_eq!(
+                    values[pair * 64 + i],
+                    (i & 0x0f) as f32 + fifth - minimum,
+                    "q5_k pair {pair} low {i}"
+                );
+                assert_eq!(
+                    values[pair * 64 + 32 + i],
+                    fifth - minimum,
+                    "q5_k pair {pair} high {i}"
+                );
+            }
+        }
+    }
+
+    /// Q6_K's four quarters are strided, not contiguous: quarters 0 and 1 take
+    /// the low nibbles of the two halves of `ql`, quarters 2 and 3 the high
+    /// ones, and each quarter's top two bits come from its own bit pair of
+    /// `qh`.
+    ///
+    /// The two halves of each `ql` run differ (`0x30` against `0x51`) so a
+    /// quarter reports which BYTE it read as well as which nibble, and
+    /// `qh = 0xE4` gives quarter `q` the value `q` in its bit pair. The four
+    /// quarters therefore decode to four distinct numbers, and any
+    /// transposition of them — the one mistake this layout invites — swaps
+    /// two. Filling `ql` uniformly instead would pin the nibble halves and
+    /// silently miss a swapped byte offset.
+    #[test]
+    fn q6_k_strides_its_quarters_across_the_nibble_halves_and_the_bit_pairs() {
+        let mut block = [0u8; 210];
+        for half in 0..2 {
+            block[half * 64..half * 64 + 32].fill(0x30);
+            block[half * 64 + 32..half * 64 + 64].fill(0x51);
+        }
+        block[128..192].fill(0b1110_0100);
+        block[192..208].fill(1);
+        block[208..210].copy_from_slice(&f16(1.0));
+
+        let mut values = [0.0f32; 256];
+        decode_gguf_q6_k_block_into(&block, &mut values);
+
+        // 0 | 0<<4, 1 | 1<<4, 3 | 2<<4, 5 | 3<<4 — each less the 32 bias.
+        let expected = [-32.0f32, -15.0, 3.0, 21.0];
+        for half in 0..2 {
+            for (quarter, want) in expected.iter().enumerate() {
+                for i in 0..32 {
+                    assert_eq!(
+                        values[half * 128 + quarter * 32 + i],
+                        *want,
+                        "q6_k half {half} quarter {quarter} element {i}"
+                    );
+                }
+            }
+        }
+
+        // With the codes held flat, the sub-block scales report which of the
+        // sixteen was used: `scales[8·half + i/16 + 2·quarter]`. Setting them
+        // to their own index makes every one of those readings distinct.
+        block[..128].fill(0);
+        block[128..192].fill(0);
+        for (i, byte) in block[192..208].iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        decode_gguf_q6_k_block_into(&block, &mut values);
+        for half in 0..2 {
+            for quarter in 0..4 {
+                for i in 0..32 {
+                    let scale = (half * 8 + i / 16 + 2 * quarter) as f32;
+                    assert_eq!(
+                        values[half * 128 + quarter * 32 + i],
+                        scale * -32.0,
+                        "q6_k scale index, half {half} quarter {quarter} element {i}"
+                    );
+                }
+            }
+        }
     }
 }

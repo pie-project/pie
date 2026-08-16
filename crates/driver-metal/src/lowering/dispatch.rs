@@ -80,6 +80,102 @@ pub struct Geometry {
     pub group: u32,
     /// See [`Geometry::group`].
     pub bits: u32,
+    /// The affine point the ROUTER GATES arrived at, when it differs from
+    /// [`Self::group`]/[`Self::bits`], or zero when one point serves.
+    ///
+    /// gpt-oss states two: `mlx-community/gpt-oss-20b-MXFP4-Q4` lists 98
+    /// tensors at group 64 / 4 bits and its 24 `mlp.router` gates at group
+    /// 64 / EIGHT, and its text names `affine_qmv_fast_bfloat16_gs_64_b_8`
+    /// for the gate beside `_b_4` for everything else. `model::binding`'s
+    /// `observed` already reads the gate's own point off the checkpoint --
+    /// `build_kernels_at` exists for no other row -- so the number reached
+    /// the binding and stopped there, and every gate projection composed the
+    /// dense spelling and refused `Misspelled`.
+    ///
+    /// Zero rather than "equal to the dense point" because `observed` states
+    /// it ONLY when it differs, and two spellings of one encoding is how a
+    /// text stops being comparable to itself across two checkpoints of one
+    /// row.
+    ///
+    /// The cost of reading the gate at the stack's width is not a crash:
+    /// `the_router_gate_is_read_at_its_own_width` measures it as "a fluent
+    /// model routing every token to almost the right experts, cosine 0.84
+    /// against the reference logits and not one NaN to notice it by".
+    pub router_group: u32,
+    /// See [`Geometry::router_group`].
+    pub router_bits: u32,
+    /// The per-head width the FULL-attention layers use, or zero for a stack
+    /// whose layers all share [`Self::head_dim`].
+    ///
+    /// gemma-4 states two, and both of them reach a symbol: its text names
+    /// `sdpa_paged_decode_bfloat16_d_<width>` for each, and `project`'s
+    /// `metal_kernel_refusal` checks BOTH against this backend's SDPA axis
+    /// before a load is accepted. So a fire-wide head width is not a
+    /// simplification here -- it is a number that is wrong for one of the two
+    /// layer kinds, and the routine composing a symbol from it spells one the
+    /// trace did not state.
+    ///
+    /// Rope has never had this problem, because a partial rotation is a
+    /// scalar the STATEMENT carries and [`arm::stated`] prefers it over the
+    /// fire's. SDPA's head width is an `Env` the routine composes, so it has
+    /// nowhere to ride but here.
+    ///
+    /// [`arm::stated`]: crate::lowering::arm
+    pub global_head_dim: u32,
+    /// The key/value head count the FULL-attention layers use, or zero for
+    /// one shape everywhere. See [`Self::global_head_dim`].
+    pub global_kv_heads: u32,
+    /// One full-attention layer every `full_attn_every`, or zero for a stack
+    /// that does not alternate.
+    ///
+    /// The same field, the same name and the same rule as
+    /// [`layout::kv::Shape::full_attn_every`], which sizes the POOL's pages
+    /// per layer off it. That the pool already alternated while the lowering
+    /// did not is how the two halves of one deployment disagreed: pages laid
+    /// out at 256 wide, read by a kernel instantiated at 128.
+    ///
+    /// [`layout::kv::Shape::full_attn_every`]: crate::layout::kv::Shape::full_attn_every
+    pub full_attn_every: u32,
+}
+
+impl Geometry {
+    /// Whether layer `l` attends the whole context.
+    ///
+    /// Character-for-character [`layout::kv::Shape::is_full_attention`], and
+    /// deliberately not a call to it: this module is the fire-invariant
+    /// lowering half, which holds no pool and must lower a text with no pool
+    /// allocated at all. Duplicating four tokens is cheaper than a dependency
+    /// that would make the host-only half need the pool's.
+    ///
+    /// [`layout::kv::Shape::is_full_attention`]: crate::layout::kv::Shape::is_full_attention
+    #[must_use]
+    pub const fn is_full_attention(&self, l: u32) -> bool {
+        self.full_attn_every > 1 && (l + 1).is_multiple_of(self.full_attn_every)
+    }
+
+    /// This layer's key/value head count and per-head width.
+    ///
+    /// The fire's own pair for every deployment but gemma-4, and for that one
+    /// the full layers' pair on the layers that are full.
+    #[must_use]
+    pub const fn heads_at(&self, l: u32) -> (u32, u32) {
+        if self.is_full_attention(l) {
+            (
+                if self.global_kv_heads > 0 {
+                    self.global_kv_heads
+                } else {
+                    self.kv_heads
+                },
+                if self.global_head_dim > 0 {
+                    self.global_head_dim
+                } else {
+                    self.head_dim
+                },
+            )
+        } else {
+            (self.kv_heads, self.head_dim)
+        }
+    }
 }
 
 /// One encodable dispatch: everything a command encoder needs, and nothing
@@ -367,6 +463,28 @@ pub fn facts_of(
     launch: &Launch,
     geometry: Geometry,
 ) -> crate::lowering::arm::Facts {
+    // THIS STATEMENT'S affine point, which is the fire's unless the statement
+    // is projecting a router gate and the gates arrived at their own.
+    //
+    // Read off the weight NAMES the statement carries, because that is the
+    // only thing that distinguishes the gate projection: it is an ordinary
+    // quantised matvec on an ordinary routine, and `affine_qmv_fast` has no
+    // way to tell whose matrix it was handed. `model::binding` already puts
+    // this name to a checkpoint to LEARN the point; this puts it to a
+    // statement to spend it.
+    let point = if geometry.router_bits > 0
+        && lowered.args[launch.args.start as usize..launch.args.end as usize]
+            .iter()
+            .any(|a| match a {
+                Arg::Weight(name) => {
+                    name.ends_with(crate::model::binding::ROUTER_GATE_AT_ANY_LAYER)
+                }
+                _ => false,
+            }) {
+        (geometry.router_group, geometry.router_bits)
+    } else {
+        (geometry.group, geometry.bits)
+    };
     crate::lowering::arm::facts(
         launch,
         geometry,
@@ -374,6 +492,7 @@ pub fn facts_of(
         sizing_width(lowered, launch),
         input_width(lowered, launch),
         named_tile(&lowered.kernels[launch.kernel as usize]),
+        point,
     )
 }
 
@@ -414,8 +533,9 @@ pub fn plan<'a, S: Resolver>(
 ///
 /// # Errors
 ///
-/// [`Undispatchable::Unclaimed`] for a symbol no row names or no routine has an
-/// arm for, and whatever [`plan_routine`] refuses.
+/// [`Undispatchable::Conditional`] for a guarded launch, [`Undispatchable::Unclaimed`]
+/// for a symbol no row names or no routine has an arm for, and whatever
+/// [`plan_routine`] refuses.
 pub fn plan_launch<'a, S: Resolver>(
     lowered: &'a Lowered,
     launch: &Launch,
@@ -429,6 +549,19 @@ pub fn plan_launch<'a, S: Resolver>(
     // -- it is a name nothing in this tree can dispatch, and saying so is the
     // whole of what the fallback used to hide.
     let symbol = &lowered.kernels[launch.kernel as usize];
+    // Before the lookup, because the guard is a fact about the LAUNCH and the
+    // lookup is a question about the symbol. This backend re-encodes every
+    // step and has no conditional graph node, so a guarded launch is
+    // undispatchable whatever kernel it names -- and asked in the other order
+    // an unclaimed symbol answered `Unclaimed`, which is true and is not the
+    // reason.
+    if launch.cond != Launch::NO_COND {
+        return Err(Undispatchable::Conditional {
+            symbol: symbol.clone(),
+            op: launch.op,
+            cond: launch.cond,
+        });
+    }
     // The trace names the fully INSTANTIATED entrypoint --
     // `silu_mul_bfloat16`, `affine_qmv_fast_bfloat16_gs_64_b_4` -- and a
     // routine is named after the row without the axis points. The registry
@@ -465,42 +598,59 @@ fn plan_routine<'a, S: Resolver>(
     resolver: &mut S,
 ) -> Result<Vec<Dispatch<'a>>, Undispatchable> {
     let symbol = &lowered.kernels[launch.kernel as usize];
-    if launch.cond != Launch::NO_COND {
-        return Err(Undispatchable::Conditional {
-            symbol: symbol.clone(),
-            op: launch.op,
-            cond: launch.cond,
-        });
-    }
     let bound = bind(lowered, launch, frame, resolver).map_err(|why| Undispatchable::Unbound {
         symbol: symbol.clone(),
         op: launch.op,
         why,
     })?;
-    // How many of the widthed operands are RESULTS: the ROUTINE says, by
-    // counting the `BufMut` in its own signature. The table path read this off
-    // a row's `Out` sources, which is the same fact stated in a place the
-    // compiler cannot check against the kernel.
-    let results = routine
-        .args
-        .iter()
-        .filter(|(ty, _)| *ty == kernels::Ty::BufMut)
-        .count();
     let args = &lowered.args[launch.args.start as usize..launch.args.end as usize];
-    let (ins, outs, weights) = crate::lowering::arm::split(args, results);
     let params: Vec<Option<u32>> = lowered.params
         [launch.params.start as usize..launch.params.end as usize]
         .iter()
         .map(|&p| Some(p))
         .collect();
     let facts = facts_of(lowered, launch, geometry);
-    let mut handles =
-        crate::lowering::arm::Handles::new(&bound.args, &ins, &outs, &weights, &params, resolver);
     let refused = |why| Undispatchable::Refused {
         symbol: symbol.clone(),
         op: launch.op,
         why,
     };
+    // HOW MANY OF THE WIDTHED OPERANDS ARE RESULTS -- measured, by asking the
+    // arm.
+    //
+    // It used to be counted off the signature, as the `BufMut` in it, which
+    // is the same fact the table path read off a row's `Out` sources. That
+    // count is wrong for every routine whose writable arguments include STATE:
+    // `attn::kv_append_paged` declares `k_pages` and `v_pages` as `BufMut`
+    // and both are the KV pool, which the driver holds and no traced value
+    // stands for. Counting them made a statement carrying two inputs and no
+    // result read as one carrying no input and two results, so the arm asked
+    // for `input(0)` and was told the statement does not carry one -- every
+    // fire, every layer, on every text in the suite.
+    //
+    // A type cannot tell the two apart, because they are the same type. The
+    // ARM can, and does: a result is what it asks `output(i)` for and the
+    // pool is what it asks `kv(..)` for. So the arm runs twice -- once over
+    // an undivided statement, purely to count the asks, and once over the
+    // split that count implies. It is two calls per LOWERING, which
+    // `lowering::cached` performs once and replays, and an arm is operand
+    // plumbing with nothing to repeat.
+    let (widthed, all_weights) = crate::lowering::arm::undivided(args);
+    let results = {
+        let mut probe = crate::lowering::arm::Handles::new(
+            &bound.args,
+            &widthed,
+            &widthed,
+            &all_weights,
+            &params,
+            resolver,
+        );
+        arm(&mut probe, facts).map_err(refused)?;
+        probe.asked_results()
+    };
+    let (ins, outs, weights) = crate::lowering::arm::split(args, results);
+    let mut handles =
+        crate::lowering::arm::Handles::new(&bound.args, &ins, &outs, &weights, &params, resolver);
     let values = arm(&mut handles, facts).map_err(refused)?;
     let staged = handles.staged();
     let planner = crate::lowering::routine::Planner::new(
@@ -755,6 +905,10 @@ mod tests {
         // step, so a union-lowered fire reaching this walk would encode every
         // arm of every guard unconditionally — a different answer, not a
         // slower one.
+        //
+        // `sized` is a symbol no stem claims, and that is the second half of
+        // what this pins: the guard is refused BEFORE the routine lookup, so
+        // the error names the guard rather than the name.
         let mut low = one(
             "sized",
             1,

@@ -71,7 +71,7 @@ use model_ir::trace::{FireClass, ForwardPlan};
 ///
 /// The 98 is a count that stops one entry short. The block carries 122
 /// overrides; the other 24 are the `mlp.router` gates at affine/64/**8**, and
-/// [`ROUTER_GATE`] is the name that asks after those. Theirs are the only
+/// [`ROUTER_GATES`] holds the name that asks after those. Theirs are the only
 /// entries in the block with no `mode` key, which is why every independent
 /// copy of this count stopped in the same place.
 ///
@@ -82,17 +82,71 @@ use model_ir::trace::{FireClass, ForwardPlan};
 /// them arrived in.
 pub const EXPERT_BANK: &str = "layers.0.mlp.experts.gate_proj.weight";
 
-/// The ROUTER GATE this load asks the affine point of.
+/// The ROUTER GATES this load asks the affine point of.
 ///
-/// The second and last name this driver puts to a checkpoint, and it asks
-/// the same KIND of question [`EXPERT_BANK`] does: what format did the bytes
-/// for this tensor arrive in. Whether the model HAS a router is the row's
-/// answer and is not asked here.
+/// The second and last question this driver puts to a checkpoint, and it asks
+/// the same KIND of thing [`EXPERT_BANK`] does: what format did the bytes for
+/// this tensor arrive in. Whether the model HAS a router is the row's answer
+/// and is not asked here.
 ///
-/// It is a constant for the reason that one is — so "which tensors does the
-/// load ask about" stays answerable by reading one file — and
-/// `no_probe_decides_a_fact` is the test that keeps it so.
-pub const ROUTER_GATE: &str = "layers.0.mlp.router.weight";
+/// TWO SPELLINGS, because a router is not always a member of the mlp:
+///
+/// - `layers.0.mlp.router.weight` — gpt-oss, whose routed block replaces the
+///   dense one, so the router hangs where the mlp was.
+/// - `layers.0.router.proj.weight` — gemma-4, whose routed block sits BESIDE
+///   a dense one that is still there, so the router is a sibling of both and
+///   is a module with a `proj` inside it rather than a bare weight.
+///
+/// A list rather than a suffix rule for the reason
+/// [`ROUTER_GATE_AT_ANY_LAYER`] gives at length: these names are not nested,
+/// `layers.0.router.proj.weight` does not end with `.router.weight`, and a
+/// constant that assumed it did would match nothing and refuse silently.
+/// That is exactly what happened — `gemma-4-26b-a4b` was refused as
+/// *"2 affine points beside its router gate's"* while one of the two WAS the
+/// router gate, under the spelling this list did not have.
+///
+/// It is a list of constants rather than names spelled at the call sites so
+/// that "which tensors does the load ask about" stays answerable by reading
+/// one file, and `no_probe_decides_a_fact` is the test that keeps it so.
+pub const ROUTER_GATES: &[&str] = &[
+    "layers.0.mlp.router.weight",
+    "layers.0.router.proj.weight",
+];
+
+/// The affine point of whichever router gate this checkpoint spells.
+///
+/// `None` when the checkpoint has no router at all, which is every dense row
+/// and is not an error: the callers both treat "no gate" and "a gate at the
+/// stack's own point" the same way, because they mean the same thing.
+pub fn router_point(
+    point_of: impl Fn(&str) -> Option<crate::batch::AffineFormat>,
+) -> Option<crate::batch::AffineFormat> {
+    ROUTER_GATES.iter().find_map(|n| point_of(n))
+}
+
+/// The router gate as a STATEMENT names it, at any layer.
+///
+/// Not a suffix of any [`ROUTER_GATES`] entry, and the difference is the
+/// point. This
+/// tensor has three spellings in this tree and they are not nested:
+///
+/// - `layers.0.mlp.router.weight` — the CHECKPOINT name, which is what
+///   [`ROUTER_GATES`] lists and what a load plan indexes tensors by.
+/// - `layer.{n}.mlp.router` — the tensor SPEC name, which `gpt_oss::project`
+///   declares the contract with.
+/// - `layer.{n}.router` — the name a lowered STATEMENT carries, which is the
+///   only one `lowering::dispatch` ever sees.
+///
+/// So a constant that assumed one contained another would match nothing and
+/// refuse silently, which is what the first two attempts at this did.
+///
+/// `lowering::dispatch` is what puts it to a statement: a checkpoint whose
+/// gates arrived at their own affine point projects them at that point, and
+/// the number reaches the routine through `Geometry::router_bits`. The
+/// statement also carries `layer.{n}.router.scales` and `.zeros`, which are
+/// the same tensor's companions and match too — harmless, because they answer
+/// the same question about the same weight.
+pub const ROUTER_GATE_AT_ANY_LAYER: &str = ".router";
 
 /// What this build's kernels can do, at any encoding.
 ///
@@ -204,7 +258,7 @@ pub fn observed(
     // `Some(repr)` on the text where `None` means the same thing -- two
     // spellings of one encoding, which is how a text stops being comparable
     // to itself across two checkpoints of the same row.
-    let router = point_of(ROUTER_GATE)
+    let router = router_point(&point_of)
         .filter(|p| *p != quant)
         .unwrap_or(crate::batch::AffineFormat { bits: 0, group: 0 });
     build_kernels_at(
@@ -318,6 +372,54 @@ pub fn serves(row: &dyn model::catalog::Variant) -> Result<(), model::deployment
 mod tests {
     use super::*;
     use crate::batch::AffineFormat;
+
+    /// Either router spelling reaches the binding, at its own point.
+    ///
+    /// gemma-4-26b-a4b was refused as *"2 affine points beside its router
+    /// gate's"* while one of those two points WAS its router gate's -- the
+    /// probe asked only for gpt-oss's `layers.0.mlp.router.weight` and
+    /// gemma-4 ships `layers.0.router.proj.weight`. The count that refuses
+    /// subtracts what this returns, so a spelling missing here is a
+    /// checkpoint refused for having the second point this driver was built
+    /// to carry.
+    #[test]
+    fn either_router_spelling_answers_the_probe() {
+        for name in ROUTER_GATES {
+            let asked = std::cell::RefCell::new(Vec::new());
+            let b = observed(
+                AffineFormat { bits: 4, group: 64 },
+                |t| {
+                    asked.borrow_mut().push(t.to_string());
+                    (t == *name).then_some(AffineFormat { bits: 8, group: 64 })
+                },
+                |_| false,
+            );
+            assert_eq!(
+                (b.router_quant_group, b.router_quant_bits),
+                (64, 8),
+                "the gate at `{name}` arrived at g64/b8 and the binding did \
+                 not carry it; the load asked {:?}",
+                asked.into_inner()
+            );
+        }
+    }
+
+    /// A gate at the stack's own point states nothing, under either spelling.
+    #[test]
+    fn a_router_that_shares_the_stacks_point_is_not_a_second_one() {
+        for name in ROUTER_GATES {
+            let b = observed(
+                AffineFormat { bits: 4, group: 64 },
+                |t| (t == *name).then_some(AffineFormat { bits: 4, group: 64 }),
+                |_| false,
+            );
+            assert_eq!(
+                (b.router_quant_group, b.router_quant_bits),
+                (0, 0),
+                "`{name}` at the stack's own point is the same point twice"
+            );
+        }
+    }
 
     /// The checkpoint's own affine point reaches the binding, both numbers.
     ///

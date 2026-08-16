@@ -158,7 +158,7 @@ impl Loaded {
         // nothing that matters: the empty arm hands that same point back,
         // which is the uniform checkpoint's answer and the reason this needs
         // no rule for what a router name looks like.
-        let router = self.affine_point_of(crate::model::binding::ROUTER_GATE);
+        let router = crate::model::binding::router_point(|n| self.affine_point_of(n));
         let unaccounted: Vec<(u32, u32)> = self
             .affine_points
             .iter()

@@ -12,9 +12,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use clap::Subcommand;
-use hf_hub::progress::{DownloadEvent, ProgressEvent, ProgressHandler};
 
 use crate::local::hf::runtime_snapshot_allow_patterns;
 use crate::ui::{Align, Answer, Mark, Palette, Row, Table};
@@ -74,7 +73,7 @@ pub fn run(cmd: ModelCmd) -> Result<Answer> {
 
 /// HF cache root for model snapshots: `<HF_HOME or ~/.cache/huggingface>/hub/`.
 fn hub_dir() -> std::path::PathBuf {
-    hf_hub::resolve_cache_dir()
+    crate::local::hf::resolve_cache_dir()
 }
 
 /// Convert `models--org--name` ↔ `org/name`.
@@ -398,31 +397,27 @@ impl crate::ui::Report for ModelInfo {
 /// -- and "get files from HuggingFace without converting them" is
 /// `huggingface-cli`'s job, not a mode of a pie command.
 pub(crate) fn fetch_snapshot(repo_id: &str) -> Result<std::path::PathBuf> {
-    let (owner, name) = parse_repo_id(repo_id)?;
+    // Checked here rather than at the hub: `owner/name` is the shape every
+    // downstream path assumes, and a 404 is a worse way to learn it.
+    parse_repo_id(repo_id)?;
     println!("Fetching {repo_id}");
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    // Multi-thread, because the downloader fans out across files: on a
+    // current-thread runtime the eight tasks would take turns on one core and
+    // the transfer would run at one connection's pace.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let label = repo_id.to_string();
     // Built out here so the result line can report what the transfer cost --
     // the bar erases itself when it finishes.
     let progress = ProgressBar::new();
-    let bar = progress.clone();
+    let sink = progress.sink();
     let snapshot_path = runtime.block_on(async move {
-        let client = hf_hub::HFClient::new().map_err(|e| anyhow!("init HF client: {e}"))?;
-        let repo = client.model(owner, name);
-        let progress = bar;
-        let result = repo
-            .snapshot_download()
-            .maybe_allow_patterns(Some(runtime_snapshot_allow_patterns()))
-            .progress(progress.clone())
-            .send()
-            .await
-            .map_err(|e| anyhow!("download {label}: {e}"));
-        progress.finish();
-        result
-    })?;
+        crate::local::hf::snapshot_download(&label, &runtime_snapshot_allow_patterns(), sink).await
+    });
+    progress.finish();
+    let snapshot_path = snapshot_path?;
     println!(
         "{} fetched to {}{}",
         crate::ui::Mark::Did.render(&crate::ui::Palette::for_stream(crate::ui::Stream::Stdout)),
@@ -442,11 +437,9 @@ fn parse_repo_id(s: &str) -> Result<(String, String)> {
     Ok((owner.to_string(), name.to_string()))
 }
 
-/// Inline ANSI progress bar driven by `hf_hub`'s [`ProgressHandler`]
-/// interface. Tracks the cumulative byte count emitted via
-/// `DownloadEvent::AggregateProgress` (xet batches) and per-file
-/// `DownloadEvent::Progress` (legacy LFS), and redraws at most every
-/// ~100 ms to keep the terminal readable.
+/// Inline ANSI progress bar for a snapshot fetch, driven by the downloader's
+/// [`crate::local::hf::Progress`] callbacks. Redraws at most every ~100 ms so
+/// a hundred-shard transfer does not spend its time writing escape codes.
 #[derive(Clone)]
 struct ProgressBar {
     inner: std::sync::Arc<ProgressBarInner>,
@@ -456,11 +449,6 @@ struct ProgressBarInner {
     total_files: AtomicU64,
     total_bytes: AtomicU64,
     bytes_done: AtomicU64,
-    /// Accumulator for legacy (non-xet) per-file progress, keyed by
-    /// filename. xet batches report aggregate bytes directly via
-    /// [`DownloadEvent::AggregateProgress`] so the legacy path only
-    /// fires for old LFS-pointer files.
-    per_file: Mutex<std::collections::HashMap<String, u64>>,
     started: Instant,
     last_draw: Mutex<Instant>,
     finished: AtomicBool,
@@ -470,66 +458,22 @@ struct ProgressBarInner {
     is_tty: bool,
 }
 
-impl ProgressBar {
-    fn new() -> Self {
-        Self {
-            inner: std::sync::Arc::new(ProgressBarInner {
-                total_files: AtomicU64::new(0),
-                total_bytes: AtomicU64::new(0),
-                bytes_done: AtomicU64::new(0),
-                per_file: Mutex::new(Default::default()),
-                started: Instant::now(),
-                last_draw: Mutex::new(Instant::now()),
-                finished: AtomicBool::new(false),
-                is_tty: std::io::stderr().is_terminal(),
-            }),
-        }
-    }
-
-    fn finish(&self) {
-        self.inner.finished.store(true, Ordering::Relaxed);
-        if self.inner.is_tty {
-            // Replace the bar line with a clean blank so the result line lands
-            // on a fresh row.
-            eprint!("\r\x1b[K");
-            let _ = std::io::stderr().flush();
-        }
-    }
-
-    /// What the transfer actually cost, for the result line.
-    ///
-    /// The bar erases itself when it finishes, so without this the only record
-    /// of a twenty-minute fetch was that it had ended.
-    fn summary(&self) -> String {
-        let moved = self.inner.bytes_done.load(Ordering::Relaxed);
-        if moved == 0 {
-            return String::new();
-        }
-        format!(
-            " ({} in {})",
-            crate::ui::bytes(moved),
-            crate::ui::duration(self.inner.started.elapsed())
-        )
-    }
-
+impl ProgressBarInner {
     fn draw(&self) {
-        if !self.inner.is_tty {
+        if !self.is_tty {
             return;
         }
         let now = Instant::now();
         {
-            let mut last = self.inner.last_draw.lock().unwrap();
+            let mut last = self.last_draw.lock().unwrap();
             if now.duration_since(*last).as_millis() < 100 {
                 return;
             }
             *last = now;
         }
-        let done = self.inner.bytes_done.load(Ordering::Relaxed);
-        let total = self.inner.total_bytes.load(Ordering::Relaxed);
-        let elapsed = now
-            .duration_since(self.inner.started)
-            .as_secs_f64()
-            .max(0.001);
+        let done = self.bytes_done.load(Ordering::Relaxed);
+        let total = self.total_bytes.load(Ordering::Relaxed);
+        let elapsed = now.duration_since(self.started).as_secs_f64().max(0.001);
         let rate = done as f64 / elapsed;
         let pct = if total > 0 {
             (done as f64 / total as f64).clamp(0.0, 1.0)
@@ -564,61 +508,64 @@ impl ProgressBar {
     }
 }
 
-impl ProgressHandler for ProgressBar {
-    fn on_progress(&self, event: &ProgressEvent) {
-        let ProgressEvent::Download(ev) = event else {
-            return;
-        };
-        match ev {
-            DownloadEvent::Start {
-                total_files,
-                total_bytes,
-            } => {
-                self.inner
-                    .total_files
-                    .store(*total_files as u64, Ordering::Relaxed);
-                self.inner
-                    .total_bytes
-                    .store(*total_bytes, Ordering::Relaxed);
-            }
-            DownloadEvent::Progress { files } => {
-                // Per-file deltas: keep a running max per filename and
-                // sum into `bytes_done`. xet downloads use
-                // `AggregateProgress` for the live byte counter, so
-                // legacy LFS files are the main consumers of this arm.
-                let mut map = self.inner.per_file.lock().unwrap();
-                for fp in files {
-                    let prev = map.get(&fp.filename).copied().unwrap_or(0);
-                    if fp.bytes_completed > prev {
-                        self.inner
-                            .bytes_done
-                            .fetch_add(fp.bytes_completed - prev, Ordering::Relaxed);
-                        map.insert(fp.filename.clone(), fp.bytes_completed);
-                    }
-                }
-                self.draw();
-            }
-            DownloadEvent::AggregateProgress {
-                bytes_completed,
-                total_bytes,
-                ..
-            } => {
-                // xet batch: bytes_completed is monotonic per batch.
-                // Treat it as authoritative — overwrite, don't accumulate.
-                self.inner
-                    .bytes_done
-                    .store(*bytes_completed, Ordering::Relaxed);
-                if *total_bytes > self.inner.total_bytes.load(Ordering::Relaxed) {
-                    self.inner
-                        .total_bytes
-                        .store(*total_bytes, Ordering::Relaxed);
-                }
-                self.draw();
-            }
-            DownloadEvent::Complete => {
-                self.draw();
-            }
+impl crate::local::hf::Progress for ProgressBarInner {
+    fn start(&self, files: u64, bytes: u64) {
+        self.total_files.store(files, Ordering::Relaxed);
+        self.total_bytes.store(bytes, Ordering::Relaxed);
+        self.draw();
+    }
+
+    fn advance(&self, bytes: u64) {
+        self.bytes_done.fetch_add(bytes, Ordering::Relaxed);
+        self.draw();
+    }
+}
+
+impl ProgressBar {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Arc::new(ProgressBarInner {
+                total_files: AtomicU64::new(0),
+                total_bytes: AtomicU64::new(0),
+                bytes_done: AtomicU64::new(0),
+                started: Instant::now(),
+                last_draw: Mutex::new(Instant::now()),
+                finished: AtomicBool::new(false),
+                is_tty: std::io::stderr().is_terminal(),
+            }),
         }
+    }
+
+    /// The handle the downloader reports into. Shares this bar's state, so the
+    /// result line can still read the byte count after the fetch returns.
+    fn sink(&self) -> std::sync::Arc<dyn crate::local::hf::Progress> {
+        self.inner.clone()
+    }
+
+    fn finish(&self) {
+        self.inner.finished.store(true, Ordering::Relaxed);
+        if self.inner.is_tty {
+            // Replace the bar line with a clean blank so the result line lands
+            // on a fresh row.
+            eprint!("\r\x1b[K");
+            let _ = std::io::stderr().flush();
+        }
+    }
+
+    /// What the transfer actually cost, for the result line.
+    ///
+    /// The bar erases itself when it finishes, so without this the only record
+    /// of a twenty-minute fetch was that it had ended.
+    fn summary(&self) -> String {
+        let moved = self.inner.bytes_done.load(Ordering::Relaxed);
+        if moved == 0 {
+            return String::new();
+        }
+        format!(
+            " ({} in {})",
+            crate::ui::bytes(moved),
+            crate::ui::duration(self.inner.started.elapsed())
+        )
     }
 }
 

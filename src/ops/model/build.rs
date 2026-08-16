@@ -303,7 +303,7 @@ pub fn run(args: BuildArgs) -> Result<crate::ui::Answer> {
     // Metadata first, weights streamed after — the same shape convert has.
     // The config was read above for its quantization; the artifact carries
     // those same bytes rather than a second reading of the same file.
-    let tokenizer = compile_tokenizer(&source)?;
+    let tokenizer = compile_tokenizer(&source, &metadata)?;
 
     let mut bar = ProgressLine::new();
     let mut spool = Spool::create(&out_file)?;
@@ -416,10 +416,10 @@ pub fn run(args: BuildArgs) -> Result<crate::ui::Answer> {
 /// rather than three policies that happened to be equal, which would be three
 /// things to keep equal.
 ///
-/// For wgpu the equality is not a resemblance: `driver-wgpu/src/names.rs` is
-/// byte-identical to `driver-vulkan/src/names.rs`, which is what the test
-/// below asserts by diffing the two files rather than by agreeing with this
-/// comment.
+/// For wgpu the equality is not a resemblance: the two shells read ONE name
+/// table, `driver/src/names.rs`, which each re-exports under its own path.
+/// It used to be two byte-identical copies, and the test below used to diff
+/// them; it now checks that neither shell has grown one back.
 fn bind_policy(backend: &str) -> Result<(Projections, Naming)> {
     match backend {
         "cuda" => Ok((Projections::Fused, Naming::Hf)),
@@ -497,7 +497,7 @@ mod tests {
 
     /// wgpu takes the same artifact as Vulkan, and the reason is checkable.
     ///
-    /// # Why this diffs two files instead of trusting the arm
+    /// # Why this reads two other crates instead of trusting the arm
     ///
     /// `bind_policy` puts `wgpu` in Metal's arm because `driver-wgpu` binds
     /// the tensors `driver-vulkan` binds. That is a claim about ANOTHER crate,
@@ -506,10 +506,17 @@ mod tests {
     /// build, it fails at `Shell::open` with a missing weight, one command
     /// later and in a different crate's words.
     ///
-    /// So the claim is checked where it lives: the two name tables are read
-    /// off disk and compared. `driver-wgpu/src/names.rs` was copied from the
-    /// sibling and is expected to stay a copy; the day it stops being one,
-    /// this test says so and this arm needs splitting.
+    /// This used to diff driver-wgpu/src/names.rs against
+    /// driver-vulkan/src/names.rs, which were byte-identical copies -- both
+    /// gone, so neither is backticked. They are now one file,
+    /// `driver/src/names.rs`, which both shells re-export -- so the equality
+    /// this arm rests on stopped being a thing to check and became a thing
+    /// that holds by construction.
+    ///
+    /// What is left to check is that it STAYS one file. A shell that grows a
+    /// name table of its own has silently reacquired the right to spell
+    /// weights differently, and the first symptom would again be a missing
+    /// weight at `Shell::open`.
     #[test]
     fn wgpu_is_authored_the_way_vulkan_is_because_it_binds_the_same_names() {
         assert_eq!(
@@ -521,21 +528,27 @@ mod tests {
         assert!(quant_fits("wgpu", RuntimeQuant::Fp8, Some("fp8")).is_err());
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let wgpu = std::fs::read_to_string(root.join("crates/driver-wgpu/src/names.rs"))
-            .expect("driver-wgpu carries a name table");
-        let vulkan = std::fs::read_to_string(root.join("crates/driver-vulkan/src/names.rs"))
-            .expect("driver-vulkan carries a name table");
-        assert_eq!(
-            wgpu, vulkan,
-            "the two drivers no longer spell weights the same way, so one \
-             `--backend` arm can no longer author for both"
-        );
-        // A control: the file is not empty, so the equality above is an
-        // equality of CONTENT rather than of two failed reads.
+        let shared = std::fs::read_to_string(root.join("crates/driver/src/names.rs"))
+            .expect("the one name table both shells read");
+        // A control: the equality below is about a real table rather than
+        // about two files that both failed to be there.
         assert!(
-            wgpu.contains("lm_head"),
+            shared.contains("lm_head"),
             "the table read is the real one, not an empty file"
         );
+        for shell in ["driver-wgpu", "driver-vulkan"] {
+            assert!(
+                !root.join(format!("crates/{shell}/src/names.rs")).exists(),
+                "{shell} grew a name table of its own, so one `--backend` arm \
+                 can no longer author for both"
+            );
+            let lib = std::fs::read_to_string(root.join(format!("crates/{shell}/src/lib.rs")))
+                .expect("a shell has a lib.rs");
+            assert!(
+                lib.contains("pub use driver::names;"),
+                "{shell} no longer re-exports the shared table"
+            );
+        }
     }
 
     /// The refusal names every spelling it would have taken.

@@ -14,58 +14,14 @@
 //! `quantized_qmv.wgsl` now, with the evidence for widening rather than
 //! refusing. `.wiki/kernel-metal-refactor.md` §9 records it.
 
-use kernels::{KernelSig, kernel};
-
-use crate::axes::*;
+use kernels::KernelSig;
 
 pub static KERNELS: &[KernelSig] = &[
-    kernel!(combine_sorted "combine_sorted", file = Some("moe/route.wgsl"),
-    launch = kernels::LaunchRule::RouteRows,
-    operands = kernels::operands![
-        y: Buf <- kernels::Source::In(0),
-        expert_weights: Buf <- kernels::Source::In(1),
-        out: BufMut <- kernels::Source::Out(0),
-        // `ExpertCombineParams` -- a POINTER where the scalars are, so the
-        // slot is packed rather than one buffer per number.
-        params: Buf <- kernels::Source::Param(0),
-        inv: Buf <- kernels::Source::In(2),
-    ]),
-    kernel!(route_gather "route_gather", file = Some("moe/route.wgsl"),
-    launch = kernels::LaunchRule::RouteRows,
-    // This statement's rows are the SORTED STACK, not the fire's tokens --
-    // `MoeRouteParams::padded`, the fifth word. It shares `RouteRows` with
-    // `combine_sorted`, whose rows ARE the fire's, which is why the extent is
-    // stated on the row and not decided by the rule. Given the fire's count
-    // the gather ran over a quarter of its own output at `top_k = 4` and left
-    // the rest whatever the arena held.
-    rows_param = Some(4),
-    operands = kernels::operands![
-        x: Buf <- kernels::Source::In(0),
-        out: BufMut <- kernels::Source::Out(0),
-        perm: Buf <- kernels::Source::In(1),
-        params: Buf <- kernels::Source::Param(0),
-    ]),
     // FIVE outputs, and that is the shape of the thing: a sort states the
     // permutation, the per-row expert, the per-tile expert, and the inverse
     // the combine reads back. A text that named fewer would leave the combine
     // reading whatever was in the buffer.
-    kernel!(route_sort "route_sort", file = Some("moe/route.wgsl"),
-    // ONE threadgroup, whatever the row count: the sort reduces across every
-    // (row, slot) pair through threadgroup atomics and stripes them over its
-    // own lanes. `RouterLane` -- which this shared until the row axis landed
-    // on it -- would launch one copy per row, each clearing and rewriting the
-    // permutation the others are reading.
-    launch = kernels::LaunchRule::RouterSort,
-    operands = kernels::operands![
-        expert_ids: Buf <- kernels::Source::In(0),
-        perm: BufMut <- kernels::Source::Out(0),
-        row_expert: BufMut <- kernels::Source::Out(1),
-        tile_expert: BufMut <- kernels::Source::Out(2),
-        params: Buf <- kernels::Source::Param(0),
-        inv: BufMut <- kernels::Source::Out(3),
-    ]),
     // 9 in quantized_qmm_t.wgsl
-    kernel!(mxfp4_qmm_t_routed_bias "mxfp4_qmm_t_routed_bias", axes = &[BF16, TILE_M, TILE_N]),
     // 1 in quantized_qmv.wgsl
     //
     // This row named no operands, which made it the one unstated row in the
@@ -92,42 +48,8 @@ pub static KERNELS: &[KernelSig] = &[
     // `biases` stays in the ABI and stays unread: the MXFP4 codec has no
     // separate bias plane, so the kernel takes the pointer and ignores it. A
     // row is positional, so dropping the slot would shift everything after it.
-    kernel!(mxfp4_qmv_routed_bias "mxfp4_qmv_routed_bias",
-    file = Some("moe/qmv_routed.wgsl"),
-    launch = kernels::LaunchRule::RoutedQmv,
-    // The matvec's row axis is `out_vec_size`, the second word, and not the
-    // output rectangle's width: a routed projection writes a whole token's
-    // `k` results end to end, so the value is `k` times as wide as one
-    // result. See `dsl::metal::routed_qmv`.
-    grid_param = Some(1),
-    operands = kernels::operands![
-        w: Buf <- kernels::Source::Weight(0),
-        scales: Buf <- kernels::Source::Weight(1),
-        // UNBOUND, and that is the row's statement rather than an omission:
-        // the MXFP4 codec has no separate bias plane, so nothing supplies this
-        // slot. It stays in the list because the SLOT exists -- this row is
-        // `affine_qmv_routed_bias`'s twelve parameters copied across, stamped
-        // from the same template at a different codec -- and a shader compiled
-        // for MXFP4 never binds it. A hole in a variant's binding set is legal;
-        // renumbering the operands to close it would put every weight after it
-        // one slot low, on every backend at once.
-        biases: Buf,
-        x: Buf <- kernels::Source::In(0),
-        y: BufMut <- kernels::Source::Out(0),
-        in_vec_size: I32 <- kernels::Source::Param(0),
-        out_vec_size: I32 <- kernels::Source::Param(1),
-        bias: Buf <- kernels::Source::Weight(2),
-        expert_ids: Buf <- kernels::Source::In(1),
-        x_slot_stride: I32 <- kernels::Source::Param(2),
-        x_row_stride: I32 <- kernels::Source::Param(3),
-        slots_per_row: I32 <- kernels::Source::Param(4),
-    ],
-    axes = &[BF16, GROUP_32, BITS_4]),
     // 54 in quantized_qmm_t.wgsl
-    kernel!(qmm_t_routed "affine_qmm_t_routed", axes = &[BF16, GROUP, BITS, TILE_M, TILE_N]),
     // 9 in quantized_qmm_t.wgsl
-    kernel!(qmm_t_routed_fp16 "affine_qmm_t_routed_fp16",
-        axes = &[BF16, GROUP_64, BITS_4, TILE_M, TILE_N]),
     // 1 in quantized_qmv.wgsl
     // ONE affine format, and that is the kernel's design rather than a gap:
     // `AffineQ::group_size` is a constant, so a second group point would name
@@ -135,101 +57,103 @@ pub static KERNELS: &[KernelSig] = &[
     // checkpoint at another group is meant to fail by name when its pipeline
     // is built -- which `entrypoint()` now does at the call instead of in the
     // shader compiler.
-    kernel!(qmv_routed "affine_qmv_routed", file = Some("moe/qmv_routed.wgsl"),
-    launch = kernels::LaunchRule::RoutedQmv,
-    // The matvec's row axis is `out_vec_size`, the second word, and not the
-    // output rectangle's width: a routed projection writes a whole token's
-    // `k` results end to end, so the value is `k` times as wide as one
-    // result. See `dsl::metal::routed_qmv`.
-    grid_param = Some(1),
-    operands = kernels::operands![
-        w: Buf <- kernels::Source::Weight(0),
-        scales: Buf <- kernels::Source::Weight(1),
-        biases: Buf <- kernels::Source::Weight(2),
-        x: Buf <- kernels::Source::In(0),
-        y: BufMut <- kernels::Source::Out(0),
-        in_vec_size: I32 <- kernels::Source::Param(0),
-        out_vec_size: I32 <- kernels::Source::Param(1),
-        // The unbiased variant; `affine_qmv_routed_bias` is the symbol that
-        // reads it.
-        bias: Buf,
-        // What makes it routed: the slot the row's expert lives in.
-        expert_ids: Buf <- kernels::Source::In(1),
-        x_slot_stride: I32 <- kernels::Source::Param(2),
-        x_row_stride: I32 <- kernels::Source::Param(3),
-        slots_per_row: I32 <- kernels::Source::Param(4),
-    ],
-    axes = &[BF16, GROUP_64, BITS_4]),
     // 1 in quantized_qmv.wgsl
-    kernel!(qmv_routed_bias "affine_qmv_routed_bias", file = Some("moe/qmv_routed.wgsl"),
-    launch = kernels::LaunchRule::RoutedQmv,
-    // The matvec's row axis is `out_vec_size`, the second word, and not the
-    // output rectangle's width: a routed projection writes a whole token's
-    // `k` results end to end, so the value is `k` times as wide as one
-    // result. See `dsl::metal::routed_qmv`.
-    grid_param = Some(1),
-    operands = kernels::operands![
-        w: Buf <- kernels::Source::Weight(0),
-        scales: Buf <- kernels::Source::Weight(1),
-        biases: Buf <- kernels::Source::Weight(2),
-        x: Buf <- kernels::Source::In(0),
-        y: BufMut <- kernels::Source::Out(0),
-        in_vec_size: I32 <- kernels::Source::Param(0),
-        out_vec_size: I32 <- kernels::Source::Param(1),
-        bias: Buf <- kernels::Source::Weight(3),
-        expert_ids: Buf <- kernels::Source::In(1),
-        x_slot_stride: I32 <- kernels::Source::Param(2),
-        x_row_stride: I32 <- kernels::Source::Param(3),
-        slots_per_row: I32 <- kernels::Source::Param(4),
-    ],
-    axes = &[BF16, GROUP_64, BITS_4]),
     // 1 in moe_route.wgsl
-    kernel!(router_topk "router_topk", file = Some("moe/route.wgsl"),
-    launch = kernels::LaunchRule::RouterLane,
-    operands = kernels::operands![
-        logits: Buf <- kernels::Source::In(0),
-        expert_ids: BufMut <- kernels::Source::Out(0),
-        expert_weights: BufMut <- kernels::Source::Out(1),
-        params: Buf <- kernels::Source::Param(0),
-        // The unscaled variant reads it and does nothing with it; the slot is
-        // positional so it is listed, and `router_topk_scaled` is the symbol
-        // that means it.
-        per_expert_scale: Buf,
-    ],
-    axes = &[BF16]),
     // 1 in moe_route.wgsl
-    kernel!(router_topk_scaled "router_topk_scaled", file = Some("moe/route.wgsl"),
-    launch = kernels::LaunchRule::RouterLane,
-    operands = kernels::operands![
-        logits: Buf <- kernels::Source::In(0),
-        expert_ids: BufMut <- kernels::Source::Out(0),
-        expert_weights: BufMut <- kernels::Source::Out(1),
-        params: Buf <- kernels::Source::Param(0),
-        per_expert_scale: Buf <- kernels::Source::In(1),
-    ],
-    axes = &[BF16]),
-    kernel!(shared_expert_combine "shared_expert_combine", file = Some("moe/route.wgsl"),
-    launch = kernels::LaunchRule::RouteRows,
-    operands = kernels::operands![
-        routed: Buf <- kernels::Source::In(0),
-        shared: Buf <- kernels::Source::In(1),
-        gate: Buf <- kernels::Source::In(2),
-        // May alias `routed`, which the driver does not need to know: an
-        // alias is two names for one address and the binding is by address.
-        out: BufMut <- kernels::Source::Out(0),
-        width: U32 <- kernels::Source::Param(0),
-    ]),
-    kernel!(shared_expert_combine_strided "shared_expert_combine_strided",
-    file = Some("moe/route.wgsl"),
-    launch = kernels::LaunchRule::RouteRows,
-    operands = kernels::operands![
-        routed: Buf <- kernels::Source::In(0),
-        shared: Buf <- kernels::Source::In(1),
-        gate: Buf <- kernels::Source::In(2),
-        out: BufMut <- kernels::Source::Out(0),
-        width: U32 <- kernels::Source::Param(0),
-        row_pitch: I32 <- kernels::Source::Param(1),
-    ]),
+];
+/// The entrypoints of this family's routines whose ROWS have been RETIRED.
+///
+/// `refactor-bigplan.md` §7 Stage 3. Not every kernel here has crossed its
+/// arm — this family still states rows for the ones that have not — so this
+/// is the retired SUBSET rather than the whole family, and
+/// `a_retired_familys_stated_entrypoints_are_what_its_bodies_fire` compares
+/// it against the bodies that fire them.
+///
+/// See [`crate::sample::ENTRYPOINTS`] for why a retired row's entrypoints
+/// have to be stated at all.
+pub static ENTRYPOINTS: &[&str] = &[
+    "affine_qmv_routed_bfloat16_gs_64_b_4",
+    "router_topk_bfloat16",
+    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_16_bn_16",
+    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_16_bn_32",
+    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_16_bn_64",
+    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_32_bn_16",
+    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_32_bn_32",
+    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_32_bn_64",
+    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_64_bn_16",
+    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_64_bn_32",
+    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_64_bn_64",
+    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_16_bn_16",
+    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_16_bn_32",
+    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_16_bn_64",
+    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_32_bn_16",
+    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_32_bn_32",
+    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_32_bn_64",
+    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_64_bn_16",
+    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_64_bn_32",
+    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_64_bn_64",
+    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_16_bn_16",
+    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_16_bn_32",
+    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_16_bn_64",
+    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_32_bn_16",
+    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_32_bn_32",
+    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_32_bn_64",
+    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_64_bn_16",
+    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_64_bn_32",
+    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_64_bn_64",
+    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_16_bn_16",
+    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_16_bn_32",
+    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_16_bn_64",
+    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_32_bn_16",
+    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_32_bn_32",
+    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_32_bn_64",
+    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_64_bn_16",
+    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_64_bn_32",
+    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_64_bn_64",
+    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_16_bn_16",
+    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_16_bn_32",
+    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_16_bn_64",
+    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_32_bn_16",
+    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_32_bn_32",
+    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_32_bn_64",
+    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_64_bn_16",
+    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_64_bn_32",
+    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_64_bn_64",
+    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_16_bn_16",
+    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_16_bn_32",
+    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_16_bn_64",
+    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_32_bn_16",
+    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_32_bn_32",
+    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_32_bn_64",
+    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_64_bn_16",
+    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_64_bn_32",
+    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_64_bn_64",
+    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_16_bn_16",
+    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_16_bn_32",
+    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_16_bn_64",
+    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_32_bn_16",
+    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_32_bn_32",
+    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_32_bn_64",
+    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_64_bn_16",
+    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_64_bn_32",
+    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_64_bn_64",
+    "affine_qmv_routed_bias_bfloat16_gs_64_b_4",
+    "combine_sorted",
+    "mxfp4_qmm_t_routed_bias_bfloat16_bm_16_bn_16",
+    "mxfp4_qmm_t_routed_bias_bfloat16_bm_16_bn_32",
+    "mxfp4_qmm_t_routed_bias_bfloat16_bm_16_bn_64",
+    "mxfp4_qmm_t_routed_bias_bfloat16_bm_32_bn_16",
+    "mxfp4_qmm_t_routed_bias_bfloat16_bm_32_bn_32",
+    "mxfp4_qmm_t_routed_bias_bfloat16_bm_32_bn_64",
+    "mxfp4_qmm_t_routed_bias_bfloat16_bm_64_bn_16",
+    "mxfp4_qmm_t_routed_bias_bfloat16_bm_64_bn_32",
+    "mxfp4_qmm_t_routed_bias_bfloat16_bm_64_bn_64",
+    "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4",
+    "route_gather",
+    "route_sort",
+    "router_topk_scaled_bfloat16",
+    "shared_expert_combine",
+    "shared_expert_combine_strided",
 ];
 
 use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, Routine};

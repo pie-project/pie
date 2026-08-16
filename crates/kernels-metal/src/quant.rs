@@ -1816,9 +1816,9 @@ pub fn qmm_t_bias(
             biases.v(),
             x.v(),
             y.v(),
-            bias.v(),
             k.v(),
             n.v(),
+            bias.v(),
         ],
     )
 }
@@ -1887,6 +1887,7 @@ pub fn qmm_t_fp16_precast(
     w: Buf,
     scales: Buf,
     biases: Buf,
+    pad: Buf,
     y: BufMut,
     half_in: Buf,
     k: i32,
@@ -1906,10 +1907,16 @@ pub fn qmm_t_fp16_precast(
             w.v(),
             scales.v(),
             biases.v(),
+            pad.v(),
             y.v(),
-            half_in.v(),
             k.v(),
             n.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
+            half_in.v(),
         ],
     )
 }
@@ -1925,6 +1932,7 @@ pub fn qmm_t_bias_fp16_precast(
     w: Buf,
     scales: Buf,
     biases: Buf,
+    pad: Buf,
     y: BufMut,
     bias: Buf,
     half_in: Buf,
@@ -1945,11 +1953,16 @@ pub fn qmm_t_bias_fp16_precast(
             w.v(),
             scales.v(),
             biases.v(),
+            pad.v(),
             y.v(),
-            bias.v(),
-            half_in.v(),
             k.v(),
             n.v(),
+            bias.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
+            half_in.v(),
         ],
     )
 }
@@ -1965,6 +1978,7 @@ pub fn qmm_t_residual_fp16_precast(
     w: Buf,
     scales: Buf,
     biases: Buf,
+    pad: Buf,
     y: BufMut,
     residual: Buf,
     half_in: Buf,
@@ -1985,11 +1999,16 @@ pub fn qmm_t_residual_fp16_precast(
             w.v(),
             scales.v(),
             biases.v(),
+            pad.v(),
             y.v(),
-            residual.v(),
-            half_in.v(),
             k.v(),
             n.v(),
+            residual.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
+            half_in.v(),
         ],
     )
 }
@@ -2014,11 +2033,11 @@ pub fn qmm_t_splitk(
     w: Buf,
     scales: Buf,
     biases: Buf,
+    pad: Buf,
     x: Buf,
     out: BufMut,
     k: i32,
     n: i32,
-    row_stride: i32,
     k_partition_size: i32,
     split_k_partition_stride: i32,
     split_k: i32,
@@ -2039,13 +2058,13 @@ pub fn qmm_t_splitk(
             scales.v(),
             biases.v(),
             x.v(),
-            out.v(),
+            pad.v(),
             k.v(),
             n.v(),
-            row_stride.v(),
+            pad.v(),
+            out.v(),
             k_partition_size.v(),
             split_k_partition_stride.v(),
-            split_k.v(),
         ],
     )
 }
@@ -2065,11 +2084,11 @@ pub fn qmm_t_splitk_f32(
     w: Buf,
     scales: Buf,
     biases: Buf,
+    pad: Buf,
     x: Buf,
     out: BufMut,
     k: i32,
     n: i32,
-    row_stride: i32,
     k_partition_size: i32,
     split_k_partition_stride: i32,
     split_k: i32,
@@ -2090,13 +2109,13 @@ pub fn qmm_t_splitk_f32(
             scales.v(),
             biases.v(),
             x.v(),
-            out.v(),
+            pad.v(),
             k.v(),
             n.v(),
-            row_stride.v(),
+            pad.v(),
+            out.v(),
             k_partition_size.v(),
             split_k_partition_stride.v(),
-            split_k.v(),
         ],
     )
 }
@@ -2112,11 +2131,11 @@ pub fn qmm_t_splitk_fp16_precast(
     w: Buf,
     scales: Buf,
     biases: Buf,
+    pad: Buf,
     out: BufMut,
     half_in: Buf,
     k: i32,
     n: i32,
-    row_stride: i32,
     k_partition_size: i32,
     split_k_partition_stride: i32,
     split_k: i32,
@@ -2134,14 +2153,16 @@ pub fn qmm_t_splitk_fp16_precast(
             w.v(),
             scales.v(),
             biases.v(),
-            out.v(),
-            half_in.v(),
+            pad.v(),
+            pad.v(),
             k.v(),
             n.v(),
-            row_stride.v(),
+            pad.v(),
+            out.v(),
             k_partition_size.v(),
             split_k_partition_stride.v(),
-            split_k.v(),
+            pad.v(),
+            half_in.v(),
         ],
     )
 }
@@ -2157,11 +2178,11 @@ pub fn qmm_t_splitk_fp16_precast_f32(
     w: Buf,
     scales: Buf,
     biases: Buf,
+    pad: Buf,
     out: BufMut,
     half_in: Buf,
     k: i32,
     n: i32,
-    row_stride: i32,
     k_partition_size: i32,
     split_k_partition_stride: i32,
     split_k: i32,
@@ -2179,14 +2200,16 @@ pub fn qmm_t_splitk_fp16_precast_f32(
             w.v(),
             scales.v(),
             biases.v(),
-            out.v(),
-            half_in.v(),
+            pad.v(),
+            pad.v(),
             k.v(),
             n.v(),
-            row_stride.v(),
+            pad.v(),
+            out.v(),
             k_partition_size.v(),
             split_k_partition_stride.v(),
-            split_k.v(),
+            pad.v(),
+            half_in.v(),
         ],
     )
 }
@@ -2206,6 +2229,7 @@ pub fn qmm_t_strided(
     w: Buf,
     scales: Buf,
     biases: Buf,
+    pad: Buf,
     x: Buf,
     y: BufMut,
     k: i32,
@@ -2231,6 +2255,7 @@ pub fn qmm_t_strided(
             y.v(),
             k.v(),
             n.v(),
+            pad.v(),
             row_stride.v(),
         ],
     )
@@ -2272,9 +2297,9 @@ pub fn qmm_t_strided_residual(
             biases.v(),
             x.v(),
             y.v(),
-            residual.v(),
             k.v(),
             n.v(),
+            residual.v(),
             row_stride.v(),
         ],
     )
@@ -2291,6 +2316,7 @@ pub fn qmm_t_strided_fp16_precast(
     w: Buf,
     scales: Buf,
     biases: Buf,
+    pad: Buf,
     y: BufMut,
     half_in: Buf,
     k: i32,
@@ -2310,11 +2336,16 @@ pub fn qmm_t_strided_fp16_precast(
             w.v(),
             scales.v(),
             biases.v(),
+            pad.v(),
             y.v(),
-            half_in.v(),
             k.v(),
             n.v(),
+            pad.v(),
             row_stride.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
+            half_in.v(),
         ],
     )
 }
@@ -2330,6 +2361,7 @@ pub fn qmm_t_strided_fp16_precast_residual(
     w: Buf,
     scales: Buf,
     biases: Buf,
+    pad: Buf,
     y: BufMut,
     residual: Buf,
     half_in: Buf,
@@ -2350,12 +2382,16 @@ pub fn qmm_t_strided_fp16_precast_residual(
             w.v(),
             scales.v(),
             biases.v(),
+            pad.v(),
             y.v(),
-            residual.v(),
-            half_in.v(),
             k.v(),
             n.v(),
+            residual.v(),
             row_stride.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
+            half_in.v(),
         ],
     )
 }
@@ -2373,9 +2409,8 @@ pub fn qmm_splitk_reduce(
     ctx: &Ctx<'_>,
     y: BufMut,
     partial: Buf,
-    k: i32,
+    pad: Buf,
     n: i32,
-    row_stride: i32,
     split_k_partition_stride: i32,
     split_k: i32,
     m: Env<i32>,
@@ -2388,11 +2423,16 @@ pub fn qmm_splitk_reduce(
             group: [GROUP_X, 1, 1],
         },
         &[
+            pad.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
             y.v(),
-            partial.v(),
-            k.v(),
+            pad.v(),
             n.v(),
-            row_stride.v(),
+            pad.v(),
+            partial.v(),
+            pad.v(),
             split_k_partition_stride.v(),
             split_k.v(),
         ],
@@ -2412,9 +2452,8 @@ pub fn qmm_splitk_reduce_f32(
     ctx: &Ctx<'_>,
     y: BufMut,
     partial: Buf,
-    k: i32,
+    pad: Buf,
     n: i32,
-    row_stride: i32,
     split_k_partition_stride: i32,
     split_k: i32,
     m: Env<i32>,
@@ -2427,11 +2466,16 @@ pub fn qmm_splitk_reduce_f32(
             group: [GROUP_X, 1, 1],
         },
         &[
+            pad.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
             y.v(),
-            partial.v(),
-            k.v(),
+            pad.v(),
             n.v(),
-            row_stride.v(),
+            pad.v(),
+            partial.v(),
+            pad.v(),
             split_k_partition_stride.v(),
             split_k.v(),
         ],
@@ -2440,20 +2484,36 @@ pub fn qmm_splitk_reduce_f32(
 
 /// The activation cast to half, ahead of a `_fp16_precast` tile.
 ///
-/// `k`, `n` and `row_stride` are bound and the body reads `count` -- the
-/// three are the tile's numbers, carried so this shares its argument list
-/// with the strided form below.
+/// # The ten pad slots
+///
+/// This kernel is encoded into `affine_qmm_t`'s argument table and numbers
+/// its three operands there rather than from zero: `x` at **3**, `y` at
+/// **12** and `count` at **13** (`quant/qmm_t.metal:379`). It shares the
+/// table so that a precast GEMM and the cast that feeds it can be encoded
+/// against one ordinal, which is the same reason [`crate::moe::qmm_t_routed`]
+/// numbers `tile_expert` at 12.
+///
+/// A routine's argument list is POSITIONAL -- the index in the list is the
+/// index in the table -- so reaching 13 means fourteen entries, and the ten
+/// the shader declares nothing at still have to hold an address. `pad` is
+/// taken once and bound at each.
+///
+/// It read `x` from slot 0 and wrote `y` to slot 1 before this, so the body
+/// took a scalar where the activation belongs and wrote through an index
+/// nothing bound -- which on this driver is whatever the previous step left
+/// at that address. `k`, `n` and `row_stride` went with the old list: the
+/// body reads none of them, and the doc that said they were "carried so this
+/// shares its argument list with the strided form" was describing a list that
+/// matched neither shader.
 ///
 /// # Errors
 ///
 /// Whatever [`crate::routine::elementwise`] refuses.
 pub fn cast_qmm_input_bfloat16_to_float16(
     ctx: &Ctx<'_>,
+    pad: Buf,
     cast_in: Buf,
     half_out: BufMut,
-    k: i32,
-    n: i32,
-    row_stride: i32,
     count: i32,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
@@ -2464,11 +2524,19 @@ pub fn cast_qmm_input_bfloat16_to_float16(
             group: [GROUP_X, 1, 1],
         },
         &[
+            pad.v(),
+            pad.v(),
+            pad.v(),
             cast_in.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
             half_out.v(),
-            k.v(),
-            n.v(),
-            row_stride.v(),
             count.v(),
         ],
     )
@@ -2476,17 +2544,23 @@ pub fn cast_qmm_input_bfloat16_to_float16(
 
 /// The same cast over rows that are not packed, `k` wide and `rows` deep.
 ///
+/// The same shared argument table as [`cast_qmm_input_bfloat16_to_float16`]
+/// and a different four slots of it: `x` at **3**, `K` at **5**,
+/// `row_stride` at **8** and `y` at **12** (`quant/qmm_t.metal:1004`). The
+/// two casts held one argument list between them and it was the ordinal
+/// numbering of NEITHER; they are the table's two shapes now, which is why
+/// this no longer builds its list by pushing onto the other's.
+///
 /// # Errors
 ///
 /// Whatever [`crate::routine::elementwise_rows`] refuses.
 pub fn cast_qmm_input_strided_bfloat16_to_float16(
     ctx: &Ctx<'_>,
+    pad: Buf,
     cast_in: Buf,
     half_out: BufMut,
     k: i32,
-    n: i32,
     row_stride: i32,
-    count: i32,
     rows: Env<i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
@@ -2497,12 +2571,19 @@ pub fn cast_qmm_input_strided_bfloat16_to_float16(
             group: [GROUP_X, 1, 1],
         },
         &[
+            pad.v(),
+            pad.v(),
+            pad.v(),
             cast_in.v(),
-            half_out.v(),
+            pad.v(),
             k.v(),
-            n.v(),
+            pad.v(),
+            pad.v(),
             row_stride.v(),
-            count.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
+            half_out.v(),
         ],
     )
 }
@@ -2606,6 +2687,7 @@ pub fn qmv_tail(
     w: Buf,
     scales: Buf,
     biases: Buf,
+    pad: Buf,
     x: Buf,
     y: BufMut,
     in_vec_size: i32,
@@ -2628,6 +2710,11 @@ pub fn qmv_tail(
             y.v(),
             in_vec_size.v(),
             out_vec_size.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
         ],
     )
 }
@@ -2643,6 +2730,7 @@ pub fn qmv_tail_bias(
     w: Buf,
     scales: Buf,
     biases: Buf,
+    pad: Buf,
     x: Buf,
     y: BufMut,
     bias: Buf,
@@ -2664,9 +2752,13 @@ pub fn qmv_tail_bias(
             biases.v(),
             x.v(),
             y.v(),
-            bias.v(),
             in_vec_size.v(),
             out_vec_size.v(),
+            bias.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
+            pad.v(),
         ],
     )
 }
@@ -2690,6 +2782,7 @@ pub fn qmv_wide_strided(
     w: Buf,
     scales: Buf,
     biases: Buf,
+    pad: Buf,
     x: Buf,
     y: BufMut,
     in_vec_size: i32,
@@ -2713,6 +2806,7 @@ pub fn qmv_wide_strided(
             y.v(),
             in_vec_size.v(),
             out_vec_size.v(),
+            pad.v(),
             row_stride.v(),
             m.v(),
         ],

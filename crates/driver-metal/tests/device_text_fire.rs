@@ -132,7 +132,34 @@ fn geometry() -> Geometry {
         rotary_dims: 128,
         n_experts: 0,
         experts_per_token: 0,
+        // The checkpoint's affine point. Zero is not "unquantised" -- the
+        // affine kernels refuse it as `Narrow { "affine group size", 0 }`,
+        // which is what these rigs took for years of not compiling.
+        group: 64,
+        bits: 4,
         ..Geometry::default()
+    }
+}
+
+/// The same, for a text whose layers do NOT all share one head width.
+///
+/// `LlamaLikeMetalFacts::gemma_like` states a second attention shape -- one
+/// full layer in six, 256 wide per head over 4 KV heads where the sliding
+/// ones are 128 over 8 -- and the text spells `sdpa_paged_decode_bfloat16_d_256`
+/// for those layers. A geometry that knows of only one width composes
+/// `_d_128` for the same statement and the fire is refused as
+/// [`Undispatchable::Misspelled`], which is the honest outcome: the driver
+/// cannot invent a width the deployment did not hand it.
+///
+/// Separate from [`geometry`] rather than folded into it, because a qwen
+/// text under these numbers would treat every sixth layer as full and read
+/// pages that are not there.
+fn gemma_geometry() -> Geometry {
+    Geometry {
+        global_head_dim: 256,
+        global_kv_heads: 4,
+        full_attn_every: 6,
+        ..geometry()
     }
 }
 
@@ -219,6 +246,8 @@ fn a_mixture_fires_on_the_device_through_the_same_executor() {
             rotary_dims: 128,
             n_experts: 128,
             experts_per_token: 8,
+            group: 64,
+            bits: 4,
             ..Geometry::default()
         },
         &mut store,
@@ -321,6 +350,14 @@ fn gpt_oss_fires_on_the_device_through_the_same_executor() {
             rotary_dims: 64,
             n_experts: 32,
             experts_per_token: 4,
+            group: 64,
+            bits: 4,
+            // gpt-oss's SECOND affine point. `mlx_lm` publishes its router
+            // gates at 8 bits inside a 4-bit stack, the text spells
+            // `affine_qmv_fast_bfloat16_gs_64_b_8` for them, and a geometry
+            // holding one point composes `_b_4` and is refused.
+            router_group: 64,
+            router_bits: 8,
             ..Geometry::default()
         },
         &mut store,
@@ -415,7 +452,7 @@ fn gemmas_side_network_fires_on_the_device() {
         &compiler,
         &mut pipelines,
         &lowered,
-        geometry(),
+        gemma_geometry(),
         &mut store,
     )
     .expect("the side network fires");
@@ -518,7 +555,7 @@ fn the_other_gemmas_per_layer_scalar_fires_on_the_device() {
         &compiler,
         &mut pipelines,
         &lowered,
-        geometry(),
+        gemma_geometry(),
         &mut store,
     )
     .expect("the scalar arm fires");

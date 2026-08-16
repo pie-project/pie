@@ -31,28 +31,34 @@
 //! know or ask what model this is.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 
-use model_loader::checkpoint::read::parse_checkpoint_metadata;
+use model_loader::checkpoint::read::{parse_checkpoint_attributes, parse_checkpoint_metadata};
 use model_loader::checkpoint::write::CheckpointWriter;
 use model_loader::checkpoint::{CheckpointMetadata, RawTensor};
+use model_loader::contract::Visibility as ContractVisibility;
 use model_loader::contract::materialize::{Materialization, materialize_contract};
+use model_loader::contract::{Expr, TensorContract, TensorType};
 use model_loader::executor::Progress;
 use model_loader::executor::sink::TensorSink;
 use model_loader::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
-use model_loader::types::{CheckpointFormat, TensorDecl, Visibility};
+use model_loader::types::{CheckpointFormat, Encoding, TensorDecl, Visibility};
 
 // The artifact's on-disk names come from whoever owns them: the loader owns
 // the metadata namespace and the provenance attributes, `model::encoding` owns
 // the object the checkpoint's own config lands in. A literal here would be a
 // second definition of something a reader elsewhere has to match exactly, and
 // a mismatch does not fail — the read just finds nothing.
+use model::catalog::Override;
 use model::encoding::CONFIG_OBJECT;
+use model::manifest::Observed;
+use model_loader::checkpoint::Attributes;
 use model_loader::checkpoint::meta::{SOURCE_KEY, VERSION_KEY, meta_name};
+use std::collections::HashMap;
 
 /// Parses a human-written byte size: `16GiB`, `5GB`, `512MiB`, `1000000`.
 ///
@@ -124,8 +130,42 @@ pub struct ImportArgs {
     /// snapshots an import downloaded is `pie cache clear snapshots`, which
     /// knows about all of them rather than the one just fetched, asks before
     /// deleting, and says how much it got back.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "consume_source")]
     pub delete_source: bool,
+    /// Release each source weight file's bytes as they are read, so the source
+    /// shrinks while the artifact grows and the import needs room for one copy
+    /// rather than two. The files are deleted when it ends.
+    ///
+    /// This is `--delete-source` without its safety property: the bytes go
+    /// before the artifact's digests verify, so an import that fails partway
+    /// leaves neither a usable source nor a usable artifact and the source has
+    /// to be fetched again. That is why it is already the default for a
+    /// snapshot this run downloaded — those are re-fetchable by definition —
+    /// and has to be asked for when the source was already on disk.
+    #[arg(long, conflicts_with = "keep_source")]
+    pub consume_source: bool,
+    /// Leave a freshly downloaded snapshot intact, which an import otherwise
+    /// consumes. For a HuggingFace cache shared with other tools.
+    #[arg(long)]
+    pub keep_source: bool,
+}
+
+/// Deletes the weight files a consuming import has been releasing as it read.
+///
+/// A guard rather than a call at the end, because the files have to go whether
+/// the import succeeded or gave up: a released file keeps its length and reads
+/// back as zeros where the holes are, and both pie's downloader and
+/// HuggingFace's take a full-length file for a complete one. Leaving one
+/// behind would be worse than leaving nothing — the next reader would get
+/// zeros instead of an error.
+struct Consumed<'a> {
+    metadata: &'a CheckpointMetadata,
+}
+
+impl Drop for Consumed<'_> {
+    fn drop(&mut self) {
+        let _ = remove_source_files(self.metadata);
+    }
 }
 
 pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
@@ -191,10 +231,78 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
 
     let mut materialization =
         materialize_contract(&metadata).map_err(|err| anyhow!("cannot convert: {err}"))?;
+    // The artifact's names, when the source speaks a vocabulary of its own.
+    // `None` covers both "already this vocabulary" (HuggingFace) and "a GGUF
+    // this build has no pass for" -- the second is reported rather than
+    // refused, because import is the family-blind half of the pair and
+    // converting a model pie cannot serve is still a conversion.
+    let attributes = gguf_attributes(&source, &metadata);
+    let ingest = gguf_ingest(attributes.as_ref(), &metadata);
+    let rename = ingest.as_ref().map(|map| {
+        map.iter()
+            .filter_map(|(src, what)| Some((src.clone(), what.name()?.to_string())))
+            .collect::<HashMap<String, String>>()
+    });
+    // The stacks, separately, because they have no single artifact name to
+    // rename to: one `[E, I, H]` expert stack is `E` tensors here. Left out
+    // of the projection they would be reported missing from every row that
+    // asks for a mixture, at exactly the moment the ingest had cut them out
+    // correctly -- which is what happened before this existed.
+    let unstack = ingest.as_ref().map(|map| {
+        map.iter()
+            .filter_map(|(src, what)| match what {
+                model::ingest::Ingest::Unstack { each } => Some((src.clone(), each.clone())),
+                _ => None,
+            })
+            .collect::<HashMap<String, String>>()
+    });
+    if let Some(map) = &ingest {
+        let applied = apply_gguf_ingest(&mut materialization, &metadata, map)?;
+        println!(
+            "convert: renaming {} tensor(s) out of llama.cpp's vocabulary",
+            map.len() - applied.dropped.len()
+        );
+        if applied.regrouped > 0 {
+            println!(
+                "convert: regrouping the rows of {} attention projection(s) — \
+                 llama.cpp stores a rope pair adjacent where pie stores the \
+                 two halves apart, and only the product of the two orders is \
+                 the same model",
+                applied.regrouped
+            );
+        }
+        if applied.unfolded > 0 {
+            println!(
+                "convert: taking a folded constant back out of {} norm(s) — \
+                 llama.cpp adds the one its kernel would otherwise apply and \
+                 pie's kernel applies its own, so the stored values describe \
+                 the same model only after one of them is undone",
+                applied.unfolded
+            );
+        }
+        if applied.unstacked > 0 {
+            println!(
+                "convert: cutting {} expert tensor(s) out of the stacks \
+                 llama.cpp joined them into — the safetensors release \
+                 publishes one tensor per expert, and the artifact holds \
+                 what a row can name",
+                applied.unstacked
+            );
+        }
+        for name in &applied.dropped {
+            println!(
+                "convert: dropping `{name}` — llama.cpp computed it at \
+                 conversion time and pie computes its own, so carrying it \
+                 would put a tensor in the artifact that no row can name"
+            );
+        }
+    }
     // Before the counts are printed, so a `--dry-run` reports what a real run
     // would write. See `declares_tied_head`.
+    let mut dropped = Vec::new();
+    let heads = tied_head_sources(&metadata, rename.as_ref());
     if declares_tied_head(&source) {
-        let dropped = drop_tied_head(&mut materialization);
+        dropped = drop_tied_head(&mut materialization, &heads);
         for name in &dropped {
             println!(
                 "convert: dropping `{name}` — this checkpoint declares \
@@ -203,17 +311,36 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
                  cannot identify an artifact that carries it"
             );
         }
+    } else if !heads.is_empty()
+        && head_is_a_materialized_tie(&will_publish(&metadata, rename.as_ref(), unstack.as_ref()))
+    {
+        dropped = drop_tied_head(&mut materialization, &heads);
+        for name in &dropped {
+            println!(
+                "convert: dropping `{name}` — this file states no tie, because \
+                 GGUF has no key for one, but it is the only tensor standing \
+                 between this checkpoint and exactly one catalog row, and that \
+                 row says the head IS the embedding"
+            );
+        }
     }
     println!(
         "convert: decode {} blocked tensor(s) to plain dtypes, copy {} through",
         materialization.decoded.len(),
         materialization.passthrough.len()
     );
+    report_servability(
+        &source,
+        &metadata,
+        &dropped,
+        rename.as_ref(),
+        unstack.as_ref(),
+    );
 
     // Metadata compiles here, before any bytes are written: an artifact whose
     // weights are perfect but whose tokenizer would not compile cannot serve,
     // and finding that out after copying 800 GB helps nobody.
-    let tokenizer = compile_tokenizer(&source)?;
+    let tokenizer = compile_tokenizer(&source, &metadata)?;
     match &tokenizer {
         Some(canonical) => println!(
             "convert: tokenizer compiled to {} ({} KiB)",
@@ -225,14 +352,34 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
              and serving it needs one from elsewhere"
         ),
     }
-    let config = carry_config(&source)?;
-    match &config {
-        Some(bytes) => println!(
-            "convert: carrying the checkpoint's config.json ({} bytes) as {CONFIG_OBJECT}",
-            bytes.len()
-        ),
-        None => println!("convert: no config.json beside the weights"),
-    }
+    let config = match carry_config(&source)? {
+        Some(bytes) => {
+            println!(
+                "convert: carrying the checkpoint's config.json ({} bytes) as {CONFIG_OBJECT}",
+                bytes.len()
+            );
+            Some(bytes)
+        }
+        // A GGUF has no config.json and does not need one: it states the same
+        // things in its own key-value block, so that is what gets carried.
+        // Not a fabricated HuggingFace document -- the keys stay `qwen2.*`
+        // and `general.*`, which is what the file actually said.
+        None => match attributes.as_ref().filter(|a| !a.is_empty()) {
+            Some(attributes) => {
+                let bytes = attributes.to_json().into_bytes();
+                println!(
+                    "convert: no config.json beside the weights; carrying the GGUF's own \
+                     key-value block ({} bytes) as {CONFIG_OBJECT} instead",
+                    bytes.len()
+                );
+                Some(bytes)
+            }
+            None => {
+                println!("convert: no config.json beside the weights");
+                None
+            }
+        },
+    };
 
     if let Some(max) = args.max_shard_size {
         println!(
@@ -242,9 +389,20 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
         );
     }
 
+    // Asking for `--delete-source` is asking for its order -- verify, then
+    // delete -- so it turns the default off rather than doubling up with it.
+    let consume =
+        !args.keep_source && !args.delete_source && (args.consume_source || source.fetched);
     if args.dry_run {
         if args.delete_source {
             report_would_delete(&metadata);
+        }
+        if consume {
+            println!(
+                "dry run: would then consume {} source weight file(s), freeing {}",
+                metadata.files.len(),
+                crate::ui::bytes(source_bytes(&metadata))
+            );
         }
         return Ok(crate::ui::Answer::noop(format!(
             "dry run: would write {}",
@@ -255,7 +413,7 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
     // The passthrough set, resolved to source addresses up front — the copy
     // total is part of the progress denominator from the first frame, and
     // resolving the file here leaves the copy loop nothing to look up.
-    let mut passthrough: Vec<(&RawTensor, &str)> =
+    let mut passthrough: Vec<(&RawTensor, &str, &str)> =
         Vec::with_capacity(materialization.passthrough.len());
     for name in &materialization.passthrough {
         let raw = metadata
@@ -266,9 +424,16 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
             .iter()
             .find(|file| file.id == raw.file_id)
             .ok_or_else(|| anyhow!("'{name}' points at a file the checkpoint lacks"))?;
-        passthrough.push((raw, file.path.as_str()));
+        // Borrowed from the map rather than owned here, so the merge's
+        // entry list still holds `&str` and the rename costs no copy per
+        // tensor.
+        let output = match &rename {
+            Some(map) => map.get(name).map_or(raw.name.as_str(), String::as_str),
+            None => raw.name.as_str(),
+        };
+        passthrough.push((raw, file.path.as_str(), output));
     }
-    let copy_bytes: u64 = passthrough.iter().map(|(raw, _)| raw.span_bytes).sum();
+    let copy_bytes: u64 = passthrough.iter().map(|(raw, _, _)| raw.span_bytes).sum();
 
     // pie's own objects, named into the reserved namespace so the write can
     // merge them with the weights in one ascending pass.
@@ -285,14 +450,12 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
     let started = std::time::Instant::now();
     let mut bar = ProgressLine::new();
 
-    // Decode phase: the blocked tensors stream through the plan executor
-    // into a disk spool, one at a time. Peak memory is one tensor's working
-    // set, not the decoded set — which for an F16 checkpoint is the whole
-    // model, the case that made the old collect-everything executor a
-    // 2x-model-size boot. The spool holds the decoded bytes so the ascending
-    // merge below can still interleave them with the passthrough copies.
-    let mut decode_read_bytes = 0u64;
-    let decoded = if materialization.contract.tensors.is_empty() {
+    // The decode, compiled but not yet run.
+    //
+    // Which of the two ways it runs is decided just below, and both end at the
+    // same place: `merge_entries` asks for a decoded tensor by name and gets
+    // its bytes. What differs is whether those bytes went to disk first.
+    let plan = if materialization.contract.tensors.is_empty() {
         None
     } else {
         let target = StorageTarget {
@@ -300,23 +463,61 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
             max_tile_bytes: 64 << 20,
             ..StorageTarget::default()
         };
-        let plan = model_loader::plan::compile(&metadata, &materialization.contract, target)
-            .map_err(|err| anyhow!("cannot compile the decode: {err}"))?;
-        let mut spool = Spool::create(&out_file)?;
-        model_loader::executor::Execution::new(&plan, &source.base())
-            .streaming()
-            .sink(&mut spool)
-            .progress(&mut |progress| {
-                decode_read_bytes = progress.total_read_bytes;
-                bar.render(&Progress {
-                    read_bytes: progress.read_bytes,
-                    total_read_bytes: progress.total_read_bytes + copy_bytes,
-                    finalized: progress.finalized,
-                });
-            })
-            .run()
-            .map_err(|err| anyhow!("decoding failed: {err}"))?;
-        Some((plan, spool))
+        Some(
+            model_loader::plan::compile(&metadata, &materialization.contract, target)
+                .map_err(|err| anyhow!("cannot compile the decode: {err}"))?,
+        )
+    };
+
+    // The decode's read total, taken from the checkpoint rather than from the
+    // executor, so the progress denominator is whole from the first frame
+    // instead of arriving with it.
+    let decode_bytes: u64 = materialization
+        .decoded
+        .iter()
+        .filter_map(|name| metadata.tensor_by_name(name))
+        .map(|raw| raw.span_bytes)
+        .sum();
+
+    // A schedule that already runs in the artifact's order needs no buffer
+    // between the two: its tensors are written as they are produced, and the
+    // decode overlaps the write instead of preceding it.
+    //
+    // Measured on this tree, the spool is what an F16 checkpoint pays most
+    // for. `huggyllama/llama-7b` reads 12.6 GiB and wrote 25.1 GiB to convert
+    // it -- the decoded set lands on disk once as the spool and once as the
+    // artifact -- and the decode ran to completion before the first artifact
+    // byte was written. Every checkpoint tried here (safetensors F16 and F32,
+    // a five-shard MLX 4-bit mix, GGUF Q4_0) schedules in ascending name
+    // order, so this is the path they take.
+    //
+    // The spool stays for the ones that do not. `weights()` is manifest order
+    // and nothing downstream promises to sort it, so a schedule that arrives
+    // out of order is a checkpoint pie has not seen rather than a bug, and it
+    // gets the buffer it needs.
+    let ordered = plan.as_ref().is_none_or(|plan| {
+        plan.tensors
+            .windows(2)
+            .all(|pair| pair[0].name <= pair[1].name)
+    });
+    let mut spool = match &plan {
+        Some(plan) if !ordered => {
+            let mut spool = Spool::create(&out_file)?;
+            model_loader::executor::Execution::new(plan, &source.base())
+                .streaming()
+                .sink(&mut spool)
+                .progress(&mut |progress| {
+                    bar.render(&Progress {
+                        read_bytes: progress.read_bytes,
+                        total_read_bytes: decode_bytes + copy_bytes,
+                        finalized: progress.finalized,
+                    });
+                })
+                .run()
+                .map_err(|err| anyhow!("decoding failed: {err}"))?;
+            Some(spool)
+        }
+        _ => None,
     };
 
     let provenance = BTreeMap::from([
@@ -328,21 +529,36 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
         None => CheckpointWriter::create(&out_file, &provenance),
     }
     .map_err(|err| anyhow!("cannot write the artifact: {err}"))?;
-    let mut decoded = decoded;
+    if consume {
+        println!(
+            "import: consuming the source as it is read; {} will not survive this run",
+            if source.fetched {
+                "the snapshot just downloaded"
+            } else {
+                "the source files"
+            }
+        );
+    }
+    let consumed = consume.then(|| Consumed {
+        metadata: &metadata,
+    });
     let written_bytes = write_artifact(
         &mut writer,
-        decoded.as_mut(),
+        plan.as_ref(),
+        &source.base(),
+        spool.as_mut(),
         &passthrough,
         &meta,
         &mut bar,
-        decode_read_bytes,
+        decode_bytes,
         copy_bytes,
+        consume,
     )?;
     // Closing belongs to whoever opened it: `finish` consumes the writer.
     writer
         .finish()
         .map_err(|err| anyhow!("cannot write the artifact: {err}"))?;
-    if let Some((_, spool)) = decoded {
+    if let Some(spool) = spool {
         spool.remove();
     }
 
@@ -359,11 +575,409 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
     if args.delete_source {
         delete_source(&source.name, &metadata, &out_file)?;
     }
+    if let Some(consumed) = consumed {
+        drop(consumed);
+        println!(
+            "{}: consumed {} source file(s), {}",
+            source.name,
+            metadata.files.len(),
+            crate::ui::bytes(source_bytes(&metadata))
+        );
+    }
     Ok(crate::ui::Answer::did(did))
 }
 
+/// Say whether the artifact this run is about to write is one this build can
+/// serve, and do no more than say it.
+///
+/// A report and not a refusal. Conversion is the family-blind half of the
+/// pair, and rewriting a checkpoint this build has no row for is a thing to
+/// want: the artifact is a container, and a row for it may land in a later
+/// build. What was not defensible was the SILENCE — `import` would finish,
+/// print a size and exit 0, and the first word about the model being unknown
+/// came from `build` after the bytes were on disk.
+///
+/// Held against the artifact this run will write, not the checkpoint it is
+/// reading, because the two disagree in exactly the way that matters here. A
+/// tie is spelled in a catalog row as the ABSENCE of `lm_head`, so a source
+/// that ships the materialized head fails a row its own conversion satisfies
+/// — see `declares_tied_head`. The projection is `dropped` removed and
+/// nothing else: materializing renames no tensor, and `Observed` already
+/// reports a packed tensor at its unpacked extents.
+///
+/// Costs no I/O. `Manifest::check` matches on names and extents, both of
+/// which are in the metadata that has already been parsed.
+/// What a GGUF source says about itself, or `None` for a source that is not
+/// one.
+///
+/// Read once and lent to both readers. Two of them want it — the rename wants
+/// the architecture, and the config wants the whole block — and the file is
+/// the same file. The cost is a header parse rather than a scan, but a second
+/// one still buys nothing.
+fn gguf_attributes(source: &Source, metadata: &CheckpointMetadata) -> Option<Attributes> {
+    if !metadata
+        .files
+        .iter()
+        .any(|file| file.format == CheckpointFormat::Gguf)
+    {
+        return None;
+    }
+    parse_checkpoint_attributes(&source.path).ok()
+}
+
+/// The artifact's names for a source that speaks a vocabulary of its own.
+///
+/// `None` three ways, and only one of them is a problem: the source is not a
+/// GGUF, or it is one whose architecture this build has no pass for, or it
+/// names no architecture at all. All three continue -- import is the
+/// family-blind half of the pair, and `report_servability` is what says which
+/// of the three happened and what it will cost.
+///
+/// Keyed on the SOURCE name, because that is what every caller here already
+/// holds: `materialize_contract` names its outputs after its inputs, and the
+/// passthrough set is source tensors by definition.
+fn gguf_ingest(
+    attributes: Option<&Attributes>,
+    metadata: &CheckpointMetadata,
+) -> Option<HashMap<String, model::ingest::Ingest>> {
+    let attributes = attributes?;
+    let architecture = attributes.architecture()?;
+    let names: Vec<&str> = metadata.tensors.iter().map(|t| t.name.as_str()).collect();
+    match model::ingest::gguf_ingest(attributes, &names) {
+        Ok(ingested) => Some(
+            names
+                .iter()
+                .map(|name| (*name).to_string())
+                .zip(ingested)
+                .collect(),
+        ),
+        // An architecture with no pass at all is `report_servability`'s to
+        // say, and it says it better -- with what the artifact will hold and
+        // what `pie model build` will do about it. Saying it twice, once
+        // here through a `contract:` prefix that means nothing at this point
+        // in the run, is two messages about one fact.
+        Err(_) if !model::ingest::can_ingest_gguf(architecture) => None,
+        Err(why) => {
+            // This one nothing else can say: the pass EXISTS and stopped on a
+            // tensor it had no name for. That is a map that predates the
+            // checkpoint, not a model pie does not support, and only one of
+            // the two is fixed by importing a different file.
+            println!("convert: WARNING - {why}");
+            None
+        }
+    }
+}
+
+/// What [`apply_gguf_ingest`] did, for the caller to report.
+struct Applied {
+    /// Tensors whose rows were put back in pie's order.
+    regrouped: usize,
+    /// Tensors a folded constant was taken back out of.
+    unfolded: usize,
+    /// Artifact tensors cut out of a stack the converter had joined.
+    unstacked: usize,
+    /// Source names that will not reach the artifact.
+    dropped: Vec<String>,
+}
+
+/// Applies one family's ingest pass to the materialization.
+///
+/// Three outcomes, and the awkward one is the middle. A rename is a field
+/// assignment and a drop is a `retain`, but a regrouping needs an expression,
+/// and the tensor that needs one may not have an expression yet: a BF16 GGUF
+/// stores Q and K at a width no cast improves, so `materialize_contract` puts
+/// them in `passthrough` and plans a byte copy. A byte copy cannot reorder
+/// rows, so such a tensor is PROMOTED here -- moved out of the passthrough set
+/// and given a contract entry of its own. A quantized GGUF needs no promotion
+/// because its Q and K are already decoded, but it takes the same expression;
+/// the regrouping moves whole rows, and a GGUF block lives inside a row.
+fn apply_gguf_ingest(
+    materialization: &mut Materialization,
+    metadata: &CheckpointMetadata,
+    map: &HashMap<String, model::ingest::Ingest>,
+) -> Result<Applied> {
+    use model::ingest::Ingest;
+
+    let mut dropped: Vec<String> = map
+        .iter()
+        .filter(|(_, what)| matches!(what, Ingest::Drop))
+        .map(|(name, _)| name.clone())
+        .collect();
+    dropped.sort();
+    materialization.decoded.retain(|n| !dropped.contains(n));
+    materialization.passthrough.retain(|n| !dropped.contains(n));
+    materialization
+        .contract
+        .tensors
+        .retain(|t| !dropped.contains(&t.name));
+
+    let mut regrouped = 0;
+    let mut unfolded = 0;
+    let mut unfold: Vec<(String, String, f32)> = Vec::new();
+    for tensor in &mut materialization.contract.tensors {
+        match map.get(&tensor.name) {
+            Some(Ingest::Debias { name, by }) => {
+                unfold.push((tensor.name.clone(), name.clone(), *by));
+                tensor.name.clone_from(name);
+                unfolded += 1;
+            }
+            Some(Ingest::Unpermute { name, heads }) => {
+                let shape = tensor
+                    .shape
+                    .clone()
+                    .ok_or_else(|| anyhow!("'{}' regroups but declares no shape", tensor.name))?;
+                tensor.expr = unpermute(&tensor.name, &shape, *heads)
+                    .map(|expr| expr.cast(tensor.encoding.clone()))?;
+                tensor.name.clone_from(name);
+                regrouped += 1;
+            }
+            Some(Ingest::Rename(name)) => tensor.name.clone_from(name),
+            // Not a rename of this entry but a replacement of it, and it
+            // needs the source's extents to know how many. Below.
+            Some(Ingest::Unstack { .. } | Ingest::Drop) | None => {}
+        }
+    }
+
+    // The unfold has to happen at the CHECKPOINT's width, before the
+    // narrowing this artifact does. llama.cpp writes Gemma's norms F32
+    // whatever else the file is quantized to, and pie stores them BF16: a
+    // `w + 1` rounded to BF16 and then decremented loses most of a small
+    // `w` -- 0.0123 comes back 0.0156 -- because the one dominates the
+    // mantissa. Subtracting first and rounding once is exact.
+    //
+    // Two kernels cannot nest (`operand_bytes` lowers its operand through the
+    // affine fragment), so the two steps are two contracts: an internal one
+    // that biases at the source width, and the public one that casts it.
+    // `__folded.` sorts below every artifact name, which is what the decode's
+    // ascending schedule needs of a tensor it is meant to skip.
+    let mut staging = Vec::new();
+    for (src, dst, by) in unfold {
+        let raw = metadata
+            .tensor_by_name(&src)
+            .ok_or_else(|| anyhow!("'{src}' is unfolded but is not in the checkpoint"))?;
+        let staged = format!("__folded.{dst}");
+        // At the front, because `Expr::Out` names a contract declared EARLIER
+        // and these are being added after everything they feed.
+        staging.push(TensorContract {
+            visibility: ContractVisibility::Internal,
+            ..TensorContract::new(
+                &staged,
+                Expr::src(&src).bias(by),
+                raw.shape.clone(),
+                raw.encoding.clone(),
+            )
+        });
+        let target = materialization
+            .contract
+            .tensors
+            .iter_mut()
+            .find(|t| t.name == dst)
+            .ok_or_else(|| anyhow!("'{dst}' was renamed away from under the unfold"))?;
+        target.expr = Expr::out(&staged).cast(target.encoding.clone());
+    }
+    materialization.contract.tensors.splice(0..0, staging);
+
+    // One stacked tensor, cut into the per-instance tensors the artifact
+    // holds. llama.cpp joins a mixture's experts -- `ffn_gate_exps` is one
+    // `[E, I, H]` tensor where the safetensors release publishes `E` separate
+    // `[I, H]` ones -- and taking it apart here is what makes the two imports
+    // the same artifact rather than two spellings of one.
+    //
+    // The count is the SOURCE's leading extent and not anything the family
+    // said. `qwen3moe.expert_count` is in the key-value block and agrees, but
+    // a slice is cut against the tensor and has to be measured against the
+    // tensor; a count from elsewhere that disagreed would read past the end
+    // or silently leave the tail behind.
+    //
+    // Each slice is one contiguous slab, so this is `E` runs and not `E`
+    // times anything -- unlike the MXFP4 experts of gpt-oss, whose GGUF form
+    // cannot be cut at all. See `crates/model/src/ingest.rs`.
+    let mut unstacked = 0;
+    let mut unstack: Vec<(String, String, Option<Encoding>)> = Vec::new();
+    for (src, what) in map {
+        let Ingest::Unstack { each } = what else {
+            continue;
+        };
+        // Present only if `materialize_contract` planned a decode for it. A
+        // BF16 stack in a BF16 artifact has none and the slice is the whole
+        // expression; a quantized one is cast, and the cast goes OUTSIDE the
+        // slice because a kernel cannot be an operand.
+        let cast_to = materialization
+            .contract
+            .tensors
+            .iter()
+            .find(|t| t.name == *src)
+            .map(|t| t.encoding.clone());
+        unstack.push((src.clone(), each.clone(), cast_to));
+    }
+    unstack.sort_by(|a, b| a.0.cmp(&b.0));
+    for (src, each, cast_to) in unstack {
+        let raw = metadata
+            .tensor_by_name(&src)
+            .ok_or_else(|| anyhow!("'{src}' unstacks but is not in the checkpoint"))?;
+        let Some((&count, rest)) = raw.shape.split_first() else {
+            return Err(anyhow!("'{src}' unstacks but declares no shape"));
+        };
+        if count <= 0 || rest.is_empty() {
+            return Err(anyhow!(
+                "'{src}' unstacks but is {:?}, which has no instances to cut",
+                raw.shape
+            ));
+        }
+        materialization.contract.tensors.retain(|t| t.name != src);
+        materialization.passthrough.retain(|n| n != &src);
+        if !materialization.decoded.iter().any(|n| n == &src) {
+            materialization.decoded.push(src.clone());
+        }
+        for index in 0..count {
+            let slab = Expr::src(&src)
+                .slice(0, index, 1)
+                .transmute(TensorType::new(rest.to_vec(), raw.encoding.clone()));
+            let (expr, encoding) = match &cast_to {
+                Some(to) => (slab.cast(to.clone()), to.clone()),
+                None => (slab, raw.encoding.clone()),
+            };
+            materialization.contract.tensors.push(TensorContract::new(
+                each.replace("{}", &index.to_string()),
+                expr,
+                rest.to_vec(),
+                encoding,
+            ));
+            unstacked += 1;
+        }
+    }
+
+    // A tensor that needs a transform but landed in `passthrough` has no
+    // contract to rewrite: `materialize_contract` planned a byte copy for it,
+    // because at BF16 or F32 there is no decode to do. A byte copy can neither
+    // reorder rows nor change a value, so such a tensor is PROMOTED here --
+    // moved out of the passthrough set and given a contract of its own. Gemma
+    // reaches this for every norm it publishes, since llama.cpp writes them
+    // F32 whatever the rest of the file is quantized to.
+    let promote: Vec<String> = materialization
+        .passthrough
+        .iter()
+        .filter(|name| {
+            matches!(
+                map.get(*name),
+                Some(Ingest::Unpermute { .. } | Ingest::Debias { .. })
+            )
+        })
+        .cloned()
+        .collect();
+    for src in promote {
+        let raw = metadata
+            .tensor_by_name(&src)
+            .ok_or_else(|| anyhow!("'{src}' is transformed but is not in the checkpoint"))?;
+        let (name, expr) = match map.get(&src) {
+            Some(Ingest::Unpermute { name, heads }) => {
+                regrouped += 1;
+                (name, unpermute(&src, &raw.shape, *heads)?)
+            }
+            Some(Ingest::Debias { name, by }) => {
+                unfolded += 1;
+                (name, Expr::src(&src).bias(*by))
+            }
+            _ => continue,
+        };
+        materialization.contract.tensors.push(TensorContract::new(
+            name,
+            expr,
+            raw.shape.clone(),
+            raw.encoding.clone(),
+        ));
+        materialization.passthrough.retain(|n| n != &src);
+        materialization.decoded.push(src.clone());
+    }
+
+    Ok(Applied {
+        regrouped,
+        unfolded,
+        unstacked,
+        dropped,
+    })
+}
+
+/// llama.cpp's rope row order, undone: `heads` groups, each de-interleaved.
+///
+/// Within one group of `hd` rows, llama.cpp holds the two halves of a rope
+/// pair next to each other and pie holds them `hd / 2` apart, so row `2k` of
+/// the group is row `k` and row `2k + 1` is row `hd / 2 + k`. That is two
+/// strided bands per group, concatenated -- and it is the cheapest form
+/// available, because consecutive rows are adjacent in exactly one of the two
+/// orders, so one row is the largest run any lowering could find.
+fn unpermute(src: &str, shape: &[i64], heads: u32) -> Result<Expr> {
+    let rows = *shape
+        .first()
+        .ok_or_else(|| anyhow!("'{src}' regroups but is a scalar"))?;
+    let heads = i64::from(heads);
+    if heads < 1 || rows % heads != 0 {
+        bail!("'{src}' has {rows} rows, which {heads} head(s) do not divide");
+    }
+    let group = rows / heads;
+    if group % 2 != 0 {
+        bail!("'{src}' has {group} rows per head, which is not a whole number of rope pairs");
+    }
+    let half = group / 2;
+    let mut legs = Vec::with_capacity(2 * heads as usize);
+    for head in 0..heads {
+        legs.push(Expr::src(src).stride(0, head * group, half, 2));
+        legs.push(Expr::src(src).stride(0, head * group + 1, half, 2));
+    }
+    Ok(Expr::concat(0, legs))
+}
+
+fn report_servability(
+    source: &Source,
+    metadata: &CheckpointMetadata,
+    dropped: &[String],
+    rename: Option<&HashMap<String, String>>,
+    unstack: Option<&HashMap<String, String>>,
+) {
+    // Held against the artifact that will be WRITTEN, which after a rename is
+    // not the checkpoint that was read. Observing the source here would
+    // report a `qwen2` GGUF as unidentifiable at exactly the moment the
+    // rename had made it identifiable.
+    // `dropped` is in the source's vocabulary, because that is the vocabulary
+    // the message that reported it was written in. The observation is in the
+    // artifact's, so the names cross over here.
+    let projected = will_publish(metadata, rename, unstack).without(match rename {
+        Some(map) => dropped.iter().filter_map(|name| map.get(name)).collect(),
+        None => dropped.iter().collect::<Vec<_>>(),
+    });
+    let why = match model::catalog::identify_observed(&projected, &Override::None) {
+        Ok(row) => {
+            println!("convert: the artifact will identify as `{}`", row.id());
+            return;
+        }
+        Err(why) => why,
+    };
+    // A GGUF with no ingest pass fails for a reason the row diff cannot
+    // state. Its tensors are called `blk.0.attn_q`, so EVERY row reports
+    // every tensor missing and the nearest-row list is three ways of saying
+    // the same nothing. The file names its own architecture, so say that.
+    if rename.is_none()
+        && let Some(architecture) = parse_checkpoint_attributes(&source.path)
+            .ok()
+            .as_ref()
+            .and_then(Attributes::architecture)
+    {
+        println!(
+            "convert: WARNING - this is a `{architecture}` GGUF, and its tensors keep \
+             llama.cpp's names\n  \
+             pie has no GGUF ingest pass, so the artifact will carry those names and \
+             `pie model build` will refuse it"
+        );
+        return;
+    }
+    println!(
+        "convert: WARNING - {why}\n  \
+         the artifact will still be written, and `pie model build` will refuse it"
+    );
+}
+
 fn report_would_delete(metadata: &CheckpointMetadata) {
-    let bytes: u64 = metadata.files.iter().map(|file| file.size_bytes).sum();
+    let bytes = source_bytes(metadata);
     println!(
         "dry run: would then delete {} source weight file(s), freeing {} MB",
         metadata.files.len(),
@@ -387,12 +1001,21 @@ fn delete_source(repo_id: &str, metadata: &CheckpointMetadata, artifact: &Path) 
         )
     })?;
 
-    let mut removed = 0usize;
-    let mut freed = 0u64;
+    remove_source_files(metadata)?;
+    println!(
+        "{repo_id}: artifact verified ({verified} tensors), deleted {} source file(s), freed {}",
+        metadata.files.len(),
+        crate::ui::bytes(source_bytes(metadata))
+    );
+    Ok(())
+}
+
+/// The checkpoint files the metadata names, each with the blob its cache
+/// symlink points at, plus the shard index that would otherwise keep naming
+/// files that no longer exist. Config and tokenizer files are untouched.
+fn remove_source_files(metadata: &CheckpointMetadata) -> Result<()> {
     for file in &metadata.files {
         remove_cache_file(Path::new(&file.path))?;
-        removed += 1;
-        freed += file.size_bytes;
     }
     if let Some(dir) = metadata
         .files
@@ -404,11 +1027,12 @@ fn delete_source(repo_id: &str, metadata: &CheckpointMetadata, artifact: &Path) 
             remove_cache_file(&index)?;
         }
     }
-    println!(
-        "{repo_id}: artifact verified ({verified} tensors), deleted {removed} source file(s), freed {}",
-        crate::ui::bytes(freed)
-    );
     Ok(())
+}
+
+/// What deleting the source weight files gives back.
+fn source_bytes(metadata: &CheckpointMetadata) -> u64 {
+    metadata.files.iter().map(|file| file.size_bytes).sum()
 }
 
 /// Removes one file from an HF cache: the snapshot entry is usually a symlink
@@ -428,6 +1052,46 @@ fn remove_cache_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Gives a range of a file back to the filesystem, without changing the file's
+/// length or the bytes outside the range.
+///
+/// Two callers, one situation: bytes that have just been read for the last
+/// time, in a file that is going to be deleted. Releasing as the read passes
+/// over them means the old copy shrinks while the new one grows, instead of
+/// both standing at full size until the end — which is the difference between
+/// needing room for two copies of a checkpoint and needing room for one.
+///
+/// Best-effort by design, and unchecked for that reason. A filesystem that
+/// cannot do this fails the call and the file stays whole, which costs space
+/// and nothing else: the bytes were read either way, and the caller deletes
+/// the file either way.
+fn release(file: &std::fs::File, offset: u64, len: u64) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `fallocate` only changes the allocation of the range it is
+        // given on a file descriptor the caller owns; it writes no memory.
+        // Within the range, whole blocks are deallocated and partial ones are
+        // zeroed, so no byte outside `offset..offset + len` is touched --
+        // which is what lets a caller release a range whose neighbours have
+        // not been read yet. `KEEP_SIZE` is redundant with `PUNCH_HOLE`, which
+        // never moves the end of the file, and is passed because the manual
+        // requires the pair.
+        unsafe {
+            libc::fallocate(
+                file.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                offset as libc::off_t,
+                len as libc::off_t,
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (file, offset, len);
+    }
+}
+
 /// The decoded tensors, spooled to disk beside the artifact.
 ///
 /// The executor streams tensors out in schedule order; the artifact writer
@@ -435,6 +1099,11 @@ fn remove_cache_file(path: &Path) -> Result<()> {
 /// copies. The spool is the buffer between the two orders, and it is a file
 /// rather than a map so the buffer costs disk instead of memory — the
 /// decoded set is the whole model for an F16 checkpoint.
+///
+/// Every checkpoint seen so far schedules in ascending name order already, so
+/// this is the fallback for the ones that will not, and the cost of taking it
+/// is measurable: spooling writes the decoded set twice, which is the
+/// difference between 13.0 s and 8.9 s on a 12.6 GiB F16 checkpoint.
 pub(crate) struct Spool {
     path: PathBuf,
     file: std::fs::File,
@@ -466,6 +1135,13 @@ impl Spool {
         })
     }
 
+    /// Reads `name` back, and frees it.
+    ///
+    /// Callers ask in ascending name order — that is what canonical form wants
+    /// and what both merges do — so this drops each name from the index as it
+    /// hands it over. A second ask for the same tensor, or an ask that goes
+    /// backwards, then fails to find it rather than reading bytes the
+    /// filesystem has already taken back.
     pub(crate) fn read(&mut self, name: &str) -> Result<Vec<u8>> {
         let (offset, len) = *self
             .index
@@ -477,6 +1153,19 @@ impl Spool {
             .seek(SeekFrom::Start(offset))
             .and_then(|_| self.file.read_exact(&mut bytes))
             .with_context(|| format!("cannot read '{name}' back from the spool"))?;
+
+        // The spool is written once, read once ascending, and deleted, so a
+        // tensor is dead the moment it is handed over. Releasing here is what
+        // makes the spool shrink as the artifact grows rather than both
+        // standing at full size when the merge ends. `pie model build` is
+        // where that matters most -- nothing passes through, so every tensor
+        // it writes is spooled first -- and peak filesystem use for
+        // `gpt-oss-20b` goes from 40.0 GiB to 27.7 GiB.
+        //
+        // Dropping the name is what keeps that safe: released bytes read back
+        // as zeros, so asking twice has to fail rather than quietly succeed.
+        self.index.remove(name);
+        release(&self.file, offset, len);
         Ok(bytes)
     }
 
@@ -554,6 +1243,13 @@ pub(crate) struct Source {
     pub(crate) name: String,
     /// Where the bytes came from, recorded in the artifact's provenance.
     pub(crate) origin: String,
+    /// Whether this run is what put the bytes on disk.
+    ///
+    /// The question `--consume-source` turns on: a snapshot this run just
+    /// downloaded is one the user never had before and can get again, so
+    /// spending it on the artifact takes nothing away. A path that was already
+    /// there is the user's, and is left alone unless they say otherwise.
+    pub(crate) fetched: bool,
 }
 
 impl Source {
@@ -605,25 +1301,33 @@ pub(crate) fn resolve_source(source: &str) -> Result<Source> {
             path: path.to_path_buf(),
             name: store_name(&name),
             origin,
+            fetched: false,
         });
     }
 
-    let snapshot = resolve_snapshot(source)?;
+    let (snapshot, fetched) = resolve_snapshot(source)?;
     Ok(Source {
         path: snapshot,
         name: store_name(source),
         origin: source.to_string(),
+        fetched,
     })
 }
 
 /// The snapshot directory of a downloaded repo: `models--org--name/snapshots/`
 /// holds one directory per revision; like the rest of `pie model`, the first
 /// one present is the one in use.
-fn resolve_snapshot(repo_id: &str) -> Result<PathBuf> {
-    let repo_dir =
-        hf_hub::resolve_cache_dir().join(format!("models--{}", repo_id.replace('/', "--")));
+///
+/// The flag says whether this call is what fetched it, which decides whether
+/// the import may consume the snapshot on its way through. Absence of the
+/// `snapshots` directory is the test, so a repo that was already in the cache
+/// -- however it got there -- counts as the user's.
+fn resolve_snapshot(repo_id: &str) -> Result<(PathBuf, bool)> {
+    let repo_dir = crate::local::hf::resolve_cache_dir()
+        .join(format!("models--{}", repo_id.replace('/', "--")));
     let snapshots = repo_dir.join("snapshots");
-    if !snapshots.exists() {
+    let fetched = !snapshots.exists();
+    if fetched {
         // Fetched here rather than by a separate `download` command. Whether a
         // source needs the network is a property of that source, not a
         // different operation -- and a `download` that stopped at the snapshot
@@ -639,7 +1343,7 @@ fn resolve_snapshot(repo_id: &str) -> Result<PathBuf> {
         .find(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .map(|entry| entry.path());
     match snapshot {
-        Some(path) => Ok(path),
+        Some(path) => Ok((path, fetched)),
         None => bail!("{repo_id} has no snapshot under {}", snapshots.display()),
     }
 }
@@ -761,11 +1465,11 @@ const TIED_HEAD_NAMES: [&str; 2] = ["lm_head.weight", "lm_head.bias"];
 /// with a `TensorContract` behind it, and one stored as BF16 lands in
 /// `passthrough`, so removing it from only the set this checkpoint happened to
 /// use would work until the next checkpoint chose the other width.
-fn drop_tied_head(materialization: &mut Materialization) -> Vec<String> {
+fn drop_tied_head(materialization: &mut Materialization, heads: &[String]) -> Vec<String> {
     let mut dropped = Vec::new();
     let mut take = |set: &mut Vec<String>| {
         set.retain(|name| {
-            let keep = !TIED_HEAD_NAMES.contains(&name.as_str());
+            let keep = !heads.contains(name);
             if !keep {
                 dropped.push(name.clone());
             }
@@ -774,11 +1478,93 @@ fn drop_tied_head(materialization: &mut Materialization) -> Vec<String> {
     };
     take(&mut materialization.decoded);
     take(&mut materialization.passthrough);
+    // By the ARTIFACT name, which is what a contract declares. Any rename
+    // has already been applied to these, so this list is `TIED_HEAD_NAMES`
+    // in both vocabularies at once -- and it is the same list as `heads` for
+    // every checkpoint that needed no rename.
     materialization
         .contract
         .tensors
         .retain(|t| !TIED_HEAD_NAMES.contains(&t.name.as_str()));
     dropped
+}
+
+/// The source's own names for the tensors that would be written as a head.
+///
+/// One list, two vocabularies. A HuggingFace checkpoint spells the head the
+/// way the artifact will, so this is `TIED_HEAD_NAMES` filtered by what the
+/// file holds; a GGUF calls it `output.weight`, and the only thing that knows
+/// that is the rename the ingest pass just produced. Deriving the list from
+/// the rename rather than tabulating GGUF's spelling here keeps the second
+/// vocabulary in the one module that speaks it.
+fn tied_head_sources(
+    metadata: &CheckpointMetadata,
+    rename: Option<&HashMap<String, String>>,
+) -> Vec<String> {
+    metadata
+        .tensors
+        .iter()
+        .map(|tensor| &tensor.name)
+        .filter(|name| {
+            let artifact = match rename {
+                Some(map) => map.get(*name).map_or(name.as_str(), String::as_str),
+                None => name.as_str(),
+            };
+            TIED_HEAD_NAMES.contains(&artifact)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Whether the catalog says this artifact's head is a tie, materialized.
+///
+/// The question `declares_tied_head` answers from `config.json`, asked of a
+/// file that has no config and no tie key either. GGUF LOSES the fact:
+/// llama.cpp's own reader takes a present `output.weight` to mean the model
+/// has a head, so the converter materializing a tie is indistinguishable, in
+/// the format, from a model that really has one.
+///
+/// What is left is pie's catalog, and it is a legitimate authority rather
+/// than a fallback -- a row stating `tied_embeddings` is a measured fact
+/// about the model, which is what the table is for. So the question is put to
+/// it directly: does dropping the head turn a checkpoint that matches NO row
+/// into one that matches exactly one? A yes is the catalog naming the model
+/// and saying it has no head. Anything else -- it already identified, it
+/// still does not, the drop made it ambiguous -- leaves the tensor alone.
+///
+/// Measured on `Qwen2.5-0.5B-Instruct-Q4_0.gguf`, whose `output.weight` is
+/// Q8_0 while the `token_embd.weight` it duplicates is Q4_0: dequantized,
+/// the two agree to cosine 0.9963, and their difference has rms 0.0013
+/// against a signal of rms 0.0157 -- which is Q4_0's own error and nothing
+/// else. The head is the embedding, stored more precisely because llama.cpp
+/// quantizes the output projection more precisely.
+fn head_is_a_materialized_tie(published: &Observed) -> bool {
+    // By the ARTIFACT name, because `published` has already been renamed and
+    // `without` lowers what it is given through the same rule the keys went
+    // through. Handing it the GGUF's `output.weight` would look right and
+    // remove nothing, which is a check that silently always answers no.
+    let headless = published.clone().without(TIED_HEAD_NAMES);
+    model::catalog::identify_observed(published, &Override::None).is_err()
+        && model::catalog::identify_observed(&headless, &Override::None).is_ok()
+}
+
+/// What the artifact will publish, which after a rename is not what was read.
+fn will_publish(
+    metadata: &CheckpointMetadata,
+    rename: Option<&HashMap<String, String>>,
+    unstack: Option<&HashMap<String, String>>,
+) -> Observed {
+    // Unstacked first: `renamed` would find nothing to move for these names
+    // either way, but the order says which of the two owns them, and only
+    // one of the two can.
+    let observed = match unstack {
+        Some(map) => Observed::of(metadata).unstacked(map),
+        None => Observed::of(metadata),
+    };
+    match rename {
+        Some(map) => observed.renamed(map),
+        None => observed,
+    }
 }
 
 pub(crate) fn carry_config(source: &Source) -> Result<Option<Vec<u8>>> {
@@ -799,10 +1585,9 @@ pub(crate) fn carry_config(source: &Source) -> Result<Option<Vec<u8>>> {
 ///
 /// Discovery follows the convention the worker already uses
 /// (`crates/worker/src/translate.rs`):
-/// `tokenizer.json`, else `tiktoken.model`, beside the weights. A source that
-/// is a single checkpoint file has no snapshot to look in and so has no
-/// tokenizer — that is `Ok(None)`, not an error, because converting a lone
-/// `.gguf` for its weights is a legitimate thing to do.
+/// `tokenizer.json`, else `tiktoken.model`, beside the weights — and failing
+/// both, the checkpoint's own tables, which is where a GGUF keeps its
+/// tokenizer. `Ok(None)` means every one of those was absent.
 ///
 /// A tokenizer that is *present but does not compile* is an error, and this is
 /// where the plan's "rejection moves to import" is actually paid for. pie's
@@ -813,9 +1598,10 @@ pub(crate) fn carry_config(source: &Source) -> Result<Option<Vec<u8>>> {
 /// the reason — and never produces an artifact that cannot serve.
 pub(crate) fn compile_tokenizer(
     source: &Source,
+    metadata: &CheckpointMetadata,
 ) -> Result<Option<tokenizer::canonical::CanonicalTokenizer>> {
     let Some(path) = tokenizer_path(source) else {
-        return Ok(None);
+        return gguf_tokenizer(source, metadata);
     };
 
     let tokenizer = tokenizer::Tokenizer::from_file(&path).map_err(|err| {
@@ -831,6 +1617,72 @@ pub(crate) fn compile_tokenizer(
         .to_canonical()
         .map(Some)
         .map_err(|err| anyhow!("cannot serialize {}: {err:#}", path.display()))
+}
+
+/// The tokenizer a GGUF carries inside itself, when there is no file beside
+/// the weights.
+///
+/// A GGUF is a whole snapshot in one file, tokenizer included, so "a lone
+/// `.gguf` has no tokenizer" was never true — it was true of the DIRECTORY.
+///
+/// # How faithful this is
+///
+/// Measured, on `Qwen2.5-0.5B-Instruct-Q4_0.gguf` against the same model's
+/// `tokenizer.json` compiled through the other path: `vocab_bytes`,
+/// `vocab_offsets`, `merge_table` and `byte_fallback` are equal BYTE FOR BYTE
+/// — 976,263, 606,664, 2,422,192 and 1,024 bytes — the pipelines are equal,
+/// and seven varied strings encode to the same ids.
+///
+/// One field differs, and it is llama.cpp's disagreement rather than this
+/// reader's: six tokens (`<|fim_prefix|>`, `<|fim_middle|>`, `<|fim_suffix|>`,
+/// `<|fim_pad|>`, `<|repo_name|>`, `<|file_sep|>`) are `special` here and not
+/// in the JSON, because llama.cpp's converter promotes anything spelled
+/// `<|…|>` to a control token over the model's own answer. `special` reaches
+/// only `decode(skip_special)`, so this changes what a decoder hides and
+/// nothing about what the model is fed. GGUF's answer is kept, because a
+/// GGUF's tokenizer is the one the file was built with.
+///
+/// # Errors
+///
+/// None from here. A GGUF whose tokenizer this build cannot read is reported
+/// and carries none, where a `tokenizer.json` that will not compile is
+/// refused — and the difference is not inconsistency but whose choice it was.
+/// A file beside the weights is one someone put there, so failing to use it
+/// is a surprise worth stopping for. A GGUF's tables are simply INSIDE it:
+/// refusing them would make `Llama-2-7B-GGUF` un-importable even for its
+/// weights, and pie can read that model's tokenizer perfectly well from its
+/// HuggingFace form — the gap is this reader's coverage, not pie's. Import is
+/// already the command that converts what it cannot serve and says so.
+fn gguf_tokenizer(
+    source: &Source,
+    metadata: &CheckpointMetadata,
+) -> Result<Option<tokenizer::canonical::CanonicalTokenizer>> {
+    if !metadata
+        .files
+        .iter()
+        .any(|file| file.format == CheckpointFormat::Gguf)
+    {
+        return Ok(None);
+    }
+    let tables = model_loader::checkpoint::read::parse_checkpoint_tokenizer(&source.path)?;
+    if tables.is_empty() {
+        return Ok(None);
+    }
+    let compiled = tokenizer::loader::gguf::from_tables(&tokenizer::loader::gguf::Tables {
+        model: &tables.model,
+        pre: tables.pre.as_deref(),
+        tokens: &tables.tokens,
+        token_types: &tables.token_types,
+        merges: &tables.merges,
+    })
+    .and_then(|tokenizer| tokenizer.to_canonical());
+    match compiled {
+        Ok(canonical) => Ok(Some(canonical)),
+        Err(why) => {
+            println!("convert: WARNING - this GGUF's own tokenizer does not compile: {why:#}");
+            Ok(None)
+        }
+    }
 }
 
 /// Why an existing artifact needs rebuilding, or `None` if it is current.
@@ -864,6 +1716,14 @@ fn staleness(artifact: &Path, version: &str, source: &str) -> Option<String> {
     }
 }
 
+/// Where one entry of the artifact's ascending merge gets its bytes.
+enum From<'a> {
+    Decoded(&'a TensorDecl),
+    /// The tensor and the file its bytes are in.
+    Copy(&'a RawTensor, &'a str),
+    Meta(&'a [u8]),
+}
+
 /// One pass over decoded tensors, passthrough tensors and metadata, in
 /// ascending name order. Returns the bytes written.
 ///
@@ -873,58 +1733,180 @@ fn staleness(artifact: &Path, version: &str, source: &str) -> Option<String> {
 /// after digits and capitals but before lowercase, so it lands in the middle
 /// of a typical weight namespace.
 ///
-/// Decoded tensors come from executor storage, passthrough is streamed from
-/// its source file through one bounded buffer, metadata comes from memory.
-/// The two byte counts are the progress denominator: what the decode already
-/// read, and what this pass is about to copy.
-fn write_artifact(
+/// Decoded tensors come from executor storage, passthrough is read by the
+/// lanes below, metadata comes from memory.
+/// The two byte counts are the progress denominator: what the decode reads,
+/// and what this pass copies.
+///
+/// `spool` present means the decode already ran into it; absent with a `plan`
+/// means it runs here, on a thread of its own, straight into the merge.
+#[allow(clippy::too_many_arguments)]
+fn write_artifact<'a>(
     writer: &mut CheckpointWriter,
-    decoded: Option<&mut (model_loader::plan::LoadPlan, Spool)>,
-    passthrough: &[(&RawTensor, &str)],
-    meta: &[(String, Vec<u8>)],
+    plan: Option<&'a model_loader::plan::LoadPlan>,
+    base: &Path,
+    spool: Option<&'a mut Spool>,
+    passthrough: &[(&'a RawTensor, &'a str, &'a str)],
+    meta: &'a [(String, Vec<u8>)],
     progress: &mut ProgressLine,
-    decode_read_bytes: u64,
+    decode_bytes: u64,
     copy_bytes: u64,
+    consume: bool,
 ) -> Result<u64> {
-    enum From<'a> {
-        Decoded(&'a TensorDecl),
-        /// The tensor and the file its bytes are in.
-        Copy(&'a RawTensor, &'a str),
-        Meta(&'a [u8]),
-    }
-    let mut entries: Vec<(&str, From<'_>)> = Vec::new();
-    let (decoded_plan, spool) = match decoded {
-        Some((plan, spool)) => (Some(&*plan), Some(spool)),
-        None => (None, None),
-    };
-    let mut spool = spool;
-    if let Some(plan) = decoded_plan {
-        for decl in &plan.tensors {
+    let mut entries: Vec<(&'a str, From<'a>)> = Vec::new();
+    if let Some(plan) = plan {
+        // The artifact holds what the contract made public. An internal
+        // tensor is scaffolding one public tensor is built out of -- the
+        // unfolded Gemma norm a cast then narrows -- and writing it would put
+        // a name in the artifact that no catalog row can account for.
+        for decl in plan
+            .tensors
+            .iter()
+            .filter(|decl| decl.visibility.is_public())
+        {
             entries.push((&decl.name, From::Decoded(decl)));
         }
     }
-    for (raw, path) in passthrough {
-        entries.push((&raw.name, From::Copy(raw, path)));
+    for (raw, path, output) in passthrough {
+        entries.push((output, From::Copy(raw, path)));
     }
     for (name, bytes) in meta {
         entries.push((name.as_str(), From::Meta(bytes)));
     }
     entries.sort_by(|a, b| a.0.cmp(b.0));
 
-    let mut sources: std::collections::HashMap<u32, std::fs::File> =
-        std::collections::HashMap::new();
-    let mut buffer = vec![0u8; 16 << 20];
+    // The copies, cut into reads and dealt round-robin to a few threads.
+    //
+    // The writer is and must stay sequential: `ztensor` appends, and a
+    // tensor's digest accumulates over its bytes in order. The READS have no
+    // such constraint, and they were where the wall clock went. A read and the
+    // write that follows it are never in flight at once in a single thread, so
+    // the device idles for whichever half is not running -- measured on this
+    // tree, an import moved ~2.4 GiB/s of combined traffic where the same
+    // files sustain ~6.6 GiB/s with several reads outstanding against one
+    // writer.
+    //
+    // Dealing chunk `k` to lane `k % lanes` is what keeps this cheap. Each
+    // lane produces its own chunks in order, so taking them back in that same
+    // order reassembles the global order for free: there is no reordering
+    // buffer here, only channels, and the writer still sees one ordered
+    // stream.
+    let chunks = plan_chunks(&entries);
+    let lane_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 8)
+        .min(chunks.len().max(1));
+    // When the decode streams it is simply another producer feeding this same
+    // merge, running here instead of before it: its reads overlap the
+    // artifact's writes, and its output goes to the artifact directly rather
+    // than to disk and back.
+    let decode_read = std::sync::atomic::AtomicU64::new(match spool {
+        // The spooled decode already ran, and already counted its reads.
+        Some(_) => decode_bytes,
+        None => 0,
+    });
+    std::thread::scope(|scope| {
+        let mut decoded = match (plan, spool) {
+            (Some(plan), None) => {
+                // One tensor in the channel and one being handed over bounds
+                // this at two tensors of memory, which is the promise the
+                // spool was keeping: peak is a working set, not the model.
+                let (to, from) = std::sync::mpsc::sync_channel(1);
+                let decode_read = &decode_read;
+                scope.spawn(move || {
+                    decode_into(plan, base, &to, &|read, _total| {
+                        decode_read.store(read, std::sync::atomic::Ordering::Relaxed);
+                    })
+                });
+                Decoded::Streamed(from)
+            }
+            (_, Some(spool)) => Decoded::Spooled(spool),
+            (None, None) => Decoded::Nothing,
+        };
+        let mut lanes = Vec::with_capacity(lane_count);
+        for lane in 0..lane_count {
+            // `DEPTH` full and `DEPTH` empty buffers per lane bounds the
+            // memory in flight at `lane_count * DEPTH * CHUNK`, ~512 MiB here.
+            let (filled, take_filled) = std::sync::mpsc::sync_channel(DEPTH);
+            let (recycle, take_recycled) = std::sync::mpsc::sync_channel(DEPTH);
+            for _ in 0..DEPTH {
+                let _ = recycle.send(vec![0u8; CHUNK as usize]);
+            }
+            let chunks = &chunks;
+            scope.spawn(move || {
+                read_lane(chunks, lane, lane_count, consume, &filled, &take_recycled)
+            });
+            lanes.push((take_filled, recycle));
+        }
+        let outcome = merge_entries(
+            writer,
+            &entries,
+            &chunks,
+            &mut decoded,
+            &lanes,
+            progress,
+            &decode_read,
+            decode_bytes,
+            copy_bytes,
+        );
+        // Dropping the producers is the shutdown protocol. Whatever happened
+        // above -- success, a short read, a failed write -- every reader is
+        // parked on one of these channels, and closing the end the merge holds
+        // wakes it with the error that tells it to return. Without this the
+        // scope never joins.
+        drop(lanes);
+        drop(decoded);
+        outcome
+    })
+}
+
+/// How much one read moves. Large enough that per-read overhead is noise
+/// against an NVMe transfer, small enough that the buffers in flight are
+/// bounded in the hundreds of MiB rather than by the largest expert bank.
+const CHUNK: u64 = 16 << 20;
+
+/// Reads each lane keeps outstanding ahead of the writer.
+const DEPTH: usize = 4;
+
+/// One lane's half of the pipe: where its bytes arrive, and where the writer
+/// hands the buffer back once it has been written.
+type Lane = (
+    std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    std::sync::mpsc::SyncSender<Vec<u8>>,
+);
+
+/// The ascending merge itself: one ordered pass over `entries`.
+#[allow(clippy::too_many_arguments)]
+fn merge_entries(
+    writer: &mut CheckpointWriter,
+    entries: &[(&str, From<'_>)],
+    chunks: &[Chunk<'_>],
+    decoded: &mut Decoded<'_>,
+    lanes: &[Lane],
+    progress: &mut ProgressLine,
+    decode_read: &std::sync::atomic::AtomicU64,
+    decode_bytes: u64,
+    copy_bytes: u64,
+) -> Result<u64> {
     let mut copied = 0u64;
     let mut written_bytes = 0u64;
-    for (name, entry) in &entries {
+    let mut next = 0usize;
+    for (name, entry) in entries {
         match entry {
             From::Decoded(decl) => {
-                let spool = spool.as_mut().expect("decoded entries imply a spool");
-                let bytes = spool.read(name)?;
+                let bytes = decoded.take(name)?;
                 writer
                     .add_tensor(decl, &bytes)
                     .map_err(|err| anyhow!("cannot write '{name}': {err}"))?;
                 written_bytes += bytes.len() as u64;
+                // A checkpoint that decodes end to end has no copies, so this
+                // is the only place its progress can come from.
+                progress.render(&Progress {
+                    read_bytes: decode_read.load(std::sync::atomic::Ordering::Relaxed) + copied,
+                    total_read_bytes: decode_bytes + copy_bytes,
+                    finalized: Some(name),
+                });
             }
             From::Meta(bytes) => {
                 let path = name
@@ -936,15 +1918,15 @@ fn write_artifact(
                 written_bytes += bytes.len() as u64;
             }
             From::Copy(raw, path) => {
-                let handle = match sources.entry(raw.file_id.0) {
-                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
-                        std::fs::File::open(path).with_context(|| format!("cannot open {path}"))?,
-                    ),
-                };
                 let decl = TensorDecl {
                     id: raw.id,
-                    name: raw.name.clone(),
+                    // The ENTRY's name, which is what this pass is ordered
+                    // by. `raw.name` is the source's, and an ingest pass
+                    // that renames makes the two differ -- with the sort
+                    // reading one and the write the other, which the
+                    // canonical writer catches as an out-of-order insert
+                    // only when the rename happens to cross a neighbour.
+                    name: (*name).to_string(),
                     shape: raw.shape.clone(),
                     encoding: raw.encoding.clone(),
                     alignment: 1,
@@ -953,23 +1935,26 @@ fn write_artifact(
                 writer
                     .begin_tensor(&decl, raw.span_bytes)
                     .map_err(|err| anyhow!("cannot write '{name}': {err}"))?;
-                handle
-                    .seek(SeekFrom::Start(raw.file_offset))
-                    .with_context(|| format!("cannot seek in {path}"))?;
+                // This tensor's chunks are the next ones in the global
+                // sequence, because `plan_chunks` cut them in `entries` order.
                 let mut remaining = raw.span_bytes;
                 while remaining > 0 {
-                    let take = remaining.min(buffer.len() as u64) as usize;
-                    handle
-                        .read_exact(&mut buffer[..take])
+                    let (filled, recycle) = &lanes[next % lanes.len()];
+                    let buffer = filled
+                        .recv()
+                        .map_err(|_| anyhow!("a reader stopped before '{name}'"))?
                         .with_context(|| format!("cannot read '{name}' from {path}"))?;
+                    let take = chunks[next].len;
+                    next += 1;
                     writer
                         .write(&buffer[..take])
                         .map_err(|err| anyhow!("cannot write '{name}': {err}"))?;
+                    let _ = recycle.send(buffer);
                     remaining -= take as u64;
                     copied += take as u64;
                     progress.render(&Progress {
-                        read_bytes: decode_read_bytes + copied,
-                        total_read_bytes: decode_read_bytes + copy_bytes,
+                        read_bytes: decode_read.load(std::sync::atomic::Ordering::Relaxed) + copied,
+                        total_read_bytes: decode_bytes + copy_bytes,
                         finalized: Some(name),
                     });
                 }
@@ -984,8 +1969,280 @@ fn write_artifact(
     Ok(written_bytes)
 }
 
+/// One contiguous read. A chunk never spans two tensors, so its position in
+/// the sequence is all the writer needs to know about it.
+struct Chunk<'a> {
+    path: &'a str,
+    offset: u64,
+    len: usize,
+}
+
+/// The passthrough copies as reads, in the order the writer will append them.
+fn plan_chunks<'a>(entries: &[(&str, From<'a>)]) -> Vec<Chunk<'a>> {
+    let mut chunks = Vec::new();
+    for (_, entry) in entries {
+        let From::Copy(raw, path) = entry else {
+            continue;
+        };
+        let mut offset = raw.file_offset;
+        let mut remaining = raw.span_bytes;
+        while remaining > 0 {
+            let len = remaining.min(CHUNK);
+            chunks.push(Chunk {
+                path,
+                offset,
+                len: len as usize,
+            });
+            offset += len;
+            remaining -= len;
+        }
+    }
+    chunks
+}
+
+/// Read every `lane_count`-th chunk starting at `lane`, recycling one bounded
+/// set of buffers with the writer.
+///
+/// Returning early is not an error path of its own: both channels are closed
+/// by the writer when it is done or has given up, and either `recv` failing or
+/// `send` failing means exactly that.
+fn read_lane(
+    chunks: &[Chunk<'_>],
+    lane: usize,
+    lane_count: usize,
+    consume: bool,
+    filled: &std::sync::mpsc::SyncSender<std::io::Result<Vec<u8>>>,
+    recycled: &std::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    let mut open: std::collections::HashMap<&str, std::fs::File> = std::collections::HashMap::new();
+    for chunk in chunks.iter().skip(lane).step_by(lane_count) {
+        let Ok(mut buffer) = recycled.recv() else {
+            return;
+        };
+        let read = read_chunk(&mut open, chunk, &mut buffer, consume);
+        if filled.send(read.map(|()| buffer)).is_err() {
+            return;
+        }
+    }
+}
+
+/// Fill `buffer` from the chunk's file, opening it on first use.
+///
+/// `read_exact_at` carries its own offset, so lanes sharing a file would not
+/// need separate handles for correctness -- they get them anyway because a
+/// handle per lane is one less thing to synchronise.
+///
+/// Under `consume`, the chunk's range is released as soon as it is in the
+/// buffer. Chunks partition the passthrough spans and each is read exactly
+/// once, by exactly one lane, so a chunk's bytes are dead the moment the read
+/// returns — and `release` leaves everything outside the range alone, so lanes
+/// working on neighbouring chunks of the same file do not interfere. The
+/// handle has to be writable for that, which is the only reason `consume`
+/// reaches this far down.
+///
+/// Only passthrough reads are released. What a decode reads it reads through
+/// the loader's own handles, so a conversion-heavy import gets less back while
+/// it runs — it gets the rest at the end, when the files are deleted. On the
+/// checkpoints where the peak actually hurts this costs little: above 100B
+/// parameters almost nothing decodes.
+fn read_chunk<'a>(
+    open: &mut std::collections::HashMap<&'a str, std::fs::File>,
+    chunk: &Chunk<'a>,
+    buffer: &mut [u8],
+    consume: bool,
+) -> std::io::Result<()> {
+    let file = match open.entry(chunk.path) {
+        std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
+        std::collections::hash_map::Entry::Vacant(slot) => slot.insert(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(consume)
+                .open(chunk.path)?,
+        ),
+    };
+    file.read_exact_at(&mut buffer[..chunk.len], chunk.offset)?;
+    if consume {
+        release(file, chunk.offset, chunk.len as u64);
+    }
+    Ok(())
+}
+
+/// Where the merge gets a decoded tensor's bytes.
+///
+/// The two ways differ only in whether the bytes went to disk on the way, and
+/// the merge is written not to know which it got.
+enum Decoded<'a> {
+    /// The executor is running right now, publishing tensors in the order the
+    /// merge asks for them.
+    Streamed(std::sync::mpsc::Receiver<std::result::Result<(String, Vec<u8>), String>>),
+    /// The executor already ran, into a file the merge seeks around in.
+    Spooled(&'a mut Spool),
+    /// Nothing decodes, so nothing asks.
+    Nothing,
+}
+
+impl Decoded<'_> {
+    /// The bytes for `name`, which the caller asks for in ascending order.
+    ///
+    /// A decode publishes more than the artifact keeps: `Visibility::Internal`
+    /// tensors are published so the arithmetic can name them and then left out
+    /// of the bind table, and a checkpoint can declare a tensor this build
+    /// drops. Both are names the merge will never ask for, so a stream that is
+    /// ascending is consumed by skipping past whatever sorts below the request
+    /// rather than by requiring the two sequences to match tensor for tensor.
+    ///
+    /// What that leaves is the check worth making: a name sorting *above* the
+    /// request cannot be skipped past, because the request would then never be
+    /// answered. That is the schedule not being ascending after all, and it is
+    /// reported rather than assembled.
+    fn take(&mut self, name: &str) -> Result<Vec<u8>> {
+        match self {
+            Self::Streamed(from) => loop {
+                let (produced, bytes) = from
+                    .recv()
+                    .map_err(|_| anyhow!("the decode stopped before '{name}'"))?
+                    .map_err(|err| anyhow!("decoding failed: {err}"))?;
+                match produced.as_str().cmp(name) {
+                    std::cmp::Ordering::Less => continue,
+                    std::cmp::Ordering::Equal => break Ok(bytes),
+                    std::cmp::Ordering::Greater => {
+                        break Err(anyhow!(
+                            "the decode produced '{produced}' where the artifact wants '{name}',                          so its schedule is not ascending"
+                        ));
+                    }
+                }
+            },
+            Self::Spooled(spool) => spool.read(name),
+            Self::Nothing => bail!("'{name}' decodes, but no decode ran"),
+        }
+    }
+}
+
+/// Run the decode, handing each tensor straight to the merge.
+///
+/// Errors travel down the channel rather than out of the return type: the
+/// merge is the only thing waiting, and a failure it can attribute to a tensor
+/// name is worth more than one this thread keeps to itself.
+/// `watch` is handed the executor's `(read_bytes, total_read_bytes)`, since
+/// this thread cannot touch the caller's progress line.
+fn decode_into(
+    plan: &model_loader::plan::LoadPlan,
+    base: &Path,
+    to: &std::sync::mpsc::SyncSender<std::result::Result<(String, Vec<u8>), String>>,
+    watch: &(dyn Fn(u64, u64) + Sync),
+) {
+    let mut sink = Handoff { to };
+    let outcome = model_loader::executor::Execution::new(plan, base)
+        .streaming()
+        .sink(&mut sink)
+        .progress(&mut |progress| watch(progress.read_bytes, progress.total_read_bytes))
+        .run();
+    if let Err(err) = outcome {
+        let _ = to.send(Err(err.to_string()));
+    }
+}
+
+/// The sink that makes the decode a producer instead of a phase.
+struct Handoff<'a> {
+    to: &'a std::sync::mpsc::SyncSender<std::result::Result<(String, Vec<u8>), String>>,
+}
+
+impl TensorSink for Handoff<'_> {
+    fn publish(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+    ) -> std::result::Result<(), model_loader::error::Error> {
+        self.to
+            .send(Ok((name.to_string(), bytes.to_vec())))
+            .map_err(|_| {
+                model_loader::error::Error::Checkpoint(format!(
+                    "the artifact writer stopped before '{name}'"
+                ))
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// A row's manifest as a checkpoint that satisfies it, optionally with a
+    /// head the row does not want.
+    fn published(id: &str, with_head: bool) -> model::manifest::Observed {
+        use model::manifest::Presence;
+        let row = model::catalog::find(id).expect("a row this build ships");
+        let manifest = row.manifest();
+        let mut pairs: Vec<(String, Vec<u64>)> = Vec::new();
+        for spec in &manifest.tensors {
+            if spec.presence == Presence::Absent {
+                continue;
+            }
+            for index in 0..manifest.layers.max(1) {
+                pairs.push((
+                    spec.name.replace("{}", &index.to_string()),
+                    spec.extents.clone(),
+                ));
+                if !spec.name.contains("{}") {
+                    break;
+                }
+            }
+        }
+        if with_head {
+            let embed = pairs
+                .iter()
+                .find(|(name, _)| name == "embed_tokens")
+                .map(|(_, extents)| extents.clone())
+                .expect("every row publishes an embedding");
+            pairs.push(("lm_head.weight".to_string(), embed));
+        }
+        model::manifest::Observed::from_pairs(pairs)
+    }
+
+    /// A tied row plus a head is a tie somebody materialized.
+    ///
+    /// The GGUF case with the GGUF taken out of it: `qwen2.5-0.5b` is
+    /// `tied_embeddings: true`, and llama.cpp ships `output.weight` anyway
+    /// because its own reader has no other way to store a head.
+    #[test]
+    fn a_head_a_tied_row_does_not_want_is_read_as_the_tie() {
+        assert!(head_is_a_materialized_tie(&published("qwen2.5-0.5b", true)));
+    }
+
+    /// A model that really has a head keeps it.
+    ///
+    /// The property that makes the check safe to run on every GGUF rather
+    /// than on the ones already believed tied. `qwen2.5-7b` is the same
+    /// generation with its own `lm_head` -- the vocabulary is padded to
+    /// 152_064 rather than 151_936, which is how the family splits -- and it
+    /// identifies WITH the head, so the first condition rejects it before
+    /// anything is dropped.
+    #[test]
+    fn a_head_the_row_asked_for_is_not_dropped() {
+        assert!(!head_is_a_materialized_tie(&published("qwen2.5-7b", true)));
+    }
+
+    /// A checkpoint with no head at all is not "improved" by removing one.
+    #[test]
+    fn a_checkpoint_that_already_identifies_is_left_alone() {
+        assert!(!head_is_a_materialized_tie(&published(
+            "qwen2.5-0.5b",
+            false
+        )));
+    }
+
+    /// Nothing is dropped from a checkpoint the catalog cannot place.
+    ///
+    /// Losing a tensor is the one outcome that cannot be undone by importing
+    /// again with a newer build, so a model this build does not know keeps
+    /// every byte it came with.
+    #[test]
+    fn an_unrecognized_checkpoint_keeps_its_head() {
+        let observed = model::manifest::Observed::from_pairs([
+            ("model.embed_tokens.weight", vec![7u64, 3]),
+            ("lm_head.weight", vec![7u64, 3]),
+        ]);
+        assert!(!head_is_a_materialized_tie(&observed));
+    }
     use super::*;
     use model_loader::checkpoint::write::{WriteTensor, write_zt};
     use model_loader::types::{DType, Encoding, TensorId};
@@ -1111,6 +2368,7 @@ mod tests {
                 path: dir.path().to_path_buf(),
                 name: "x".into(),
                 origin: "x".into(),
+                fetched: false,
             })
         };
         assert!(at(r#"{"tie_word_embeddings": true}"#));
@@ -1128,6 +2386,7 @@ mod tests {
             path: dir.path().join("model.safetensors"),
             name: "x".into(),
             origin: "x".into(),
+            fetched: false,
         }));
     }
 
@@ -1159,7 +2418,10 @@ mod tests {
             passthrough: vec!["lm_head.bias".into(), "model.embed_tokens.weight".into()],
             meta: vec!["pie.meta/x".into()],
         };
-        let mut dropped = drop_tied_head(&mut m);
+        // The source's names for the head. Equal to the artifact's here,
+        // which is every checkpoint that needs no rename.
+        let heads = ["lm_head.weight".to_string(), "lm_head.bias".to_string()];
+        let mut dropped = drop_tied_head(&mut m, &heads);
         dropped.sort();
         assert_eq!(dropped, ["lm_head.bias", "lm_head.weight"]);
         assert_eq!(m.decoded, ["model.norm.weight"]);
@@ -1182,6 +2444,6 @@ mod tests {
         assert_eq!(m.meta, ["pie.meta/x"], "metadata is not a weight");
         // Idempotent: a second sweep finds nothing, so a re-import of an
         // artifact this already cleaned reports no drops.
-        assert!(drop_tied_head(&mut m).is_empty());
+        assert!(drop_tied_head(&mut m, &heads).is_empty());
     }
 }

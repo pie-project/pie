@@ -2438,10 +2438,24 @@ pub mod facts;
 #[cfg(feature = "native")]
 pub mod frames;
 pub mod geometry;
-pub mod lowering;
+// `pub mod lowering` STOOD HERE -- 539 lines that read a `KernelSig`'s
+// operand kinds and answered which of a call's values was a descriptor and
+// which a push field, plus the `Call`, `Value` and `Mismatch` vocabulary for
+// saying so. Its production caller was `dispatch::plan_one`, which is gone,
+// and its last caller of any kind was one GPU test that now transcribes the
+// twenty-four bytes `attn/kv_write.slang` declares. What packs a routine's
+// scalars is `binding::params_from` feeding `encode::Encoder`.
+
 // Strings and a static table, so it is ungated: a caller that only wants to
 // know what a checkpoint calls `layer.3.down` should not have to link Vulkan.
-pub mod names;
+//
+// It LIVED here, and `driver-wgpu/src/names.rs` was a byte-for-byte copy of
+// the same 412 lines -- the second hand-written copy of one golden table,
+// which is the failure `driver`'s own module documentation opens by naming.
+// It is one table because it describes ONE thing, the names
+// `model::boot::compile_load_plan_for` publishes; two shells reading one
+// producer is not two conventions that happen to agree.
+pub use driver::names;
 // Pure Rust, and gated only because it speaks in `resources`' `Shape` and
 // `Request` -- which are pure data in a module that also holds device
 // handles. Splitting that module to ungate this one would buy nothing today.
@@ -2465,5 +2479,4 @@ pub mod turns;
 #[cfg(feature = "native")]
 pub use binding::{Arena, Resolve, Unbindable, bind, resolve};
 pub use geometry::{Dims, Local, Module, Rule, Tile, Ungeometric, groups, lanes};
-pub use lowering::{Call, Mismatch, Value, pack};
 pub use spirv::Declared;

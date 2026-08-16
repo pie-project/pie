@@ -133,6 +133,9 @@ pub struct Handles<'a> {
     block: Option<u32>,
     /// The words that block holds. See [`Handles::params_block`].
     words: Vec<u32>,
+    /// The highest result index an arm asked for, plus one. See
+    /// [`Handles::asked_results`].
+    asked: usize,
 }
 
 /// A launch's staged scalars, and which handle stands for them.
@@ -182,7 +185,24 @@ impl<'a> Handles<'a> {
             resolver,
             block: None,
             words: Vec::new(),
+            asked: 0,
         }
+    }
+
+    /// How many of the statement's widthed operands this arm treated as
+    /// RESULTS: the highest index it passed to [`Handles::output`] or
+    /// [`Handles::output_read`], plus one.
+    ///
+    /// The number `split` needs, and the only place it is known. A routine's
+    /// signature cannot answer it: `attn::kv_append_paged` declares two
+    /// `BufMut` and both are the KV POOL, which is state and not a traced
+    /// result, so counting writable arguments took this statement's two
+    /// inputs for results and left the arm nothing to read. The arm is what
+    /// decides -- `o.output(i)` for a result, `o.kv(..)` for the pool -- so
+    /// the arm is what is asked.
+    #[must_use]
+    pub fn asked_results(&self) -> usize {
+        self.asked
     }
 
     /// The staged scalars and the handle that points at them.
@@ -231,6 +251,7 @@ impl<'a> Handles<'a> {
     ///
     /// [`Refusal::Absent`] when the statement has fewer.
     pub fn output(&mut self, i: usize) -> Result<BufMut, Refusal> {
+        self.asked = self.asked.max(i + 1);
         let at = self.outs.get(i).copied();
         self.pick(at.as_ref(), "a result the statement does not carry")
             .map(BufMut)
@@ -246,6 +267,7 @@ impl<'a> Handles<'a> {
     ///
     /// [`Refusal::Absent`] when the statement has fewer.
     pub fn output_read(&mut self, i: usize) -> Result<Buf, Refusal> {
+        self.asked = self.asked.max(i + 1);
         let at = self.outs.get(i).copied();
         self.pick(at.as_ref(), "a result the statement does not carry")
             .map(Buf)
@@ -408,10 +430,27 @@ impl<'a> Handles<'a> {
 ///
 /// The trace concatenates inputs, then results, then weights, and the binder
 /// keeps that order. `results` is how many of the widthed ones are results,
-/// which the ROUTINE knows -- it is the count of `BufMut` in its signature --
-/// where the table path read it off the row's `Out` sources.
+/// which [`Handles::asked_results`] measures by running the arm — a fact the
+/// SIGNATURE cannot state, because a writable argument may be a traced result
+/// or may be state the driver holds and they are the same type.
 #[must_use]
 pub fn split(args: &[Arg], results: usize) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+    let (widthed, weights) = undivided(args);
+    let results = results.min(widthed.len());
+    let (ins, outs) = widthed.split_at(widthed.len() - results);
+    (ins.to_vec(), outs.to_vec(), weights)
+}
+
+/// The same two lists, with the cut between inputs and results NOT yet made.
+///
+/// What a probe run is given: every widthed operand answers as an input and
+/// as a result, so an arm reaches whatever it reaches and the only thing
+/// observed is HOW MANY results it asked for. Nothing the probe binds is
+/// used — `output(0)` under it is the first widthed operand rather than the
+/// first result — so its handles are discarded and the arm is run again over
+/// the real split.
+#[must_use]
+pub fn undivided(args: &[Arg]) -> (Vec<usize>, Vec<usize>) {
     let widthed: Vec<usize> = args
         .iter()
         .enumerate()
@@ -424,9 +463,7 @@ pub fn split(args: &[Arg], results: usize) -> (Vec<usize>, Vec<usize>, Vec<usize
         .filter(|(_, a)| matches!(a, Arg::Weight(_)))
         .map(|(i, _)| i)
         .collect();
-    let results = results.min(widthed.len());
-    let (ins, outs) = widthed.split_at(widthed.len() - results);
-    (ins.to_vec(), outs.to_vec(), weights)
+    (widthed, weights)
 }
 
 /// The environment a launch runs in, from the fire's geometry and the
@@ -444,7 +481,20 @@ pub fn facts(
     width: u32,
     in_width: u32,
     tile: Option<(u32, u32)>,
+    point: (u32, u32),
 ) -> Facts {
+    // THIS LAYER'S attention shape, not the fire's. gemma-4 is the one stack
+    // that states two, and its full-attention layers are twice as wide per
+    // head over a quarter the KV heads -- so a fire-wide pair is wrong for
+    // whichever kind of layer it is not, and a routine composing
+    // `sdpa_paged_decode_bfloat16_d_<width>` from it spells a symbol the trace
+    // did not state. Every other deployment leaves `full_attn_every` zero and
+    // gets its own pair back unchanged.
+    //
+    // `layers.start` because a rectangle is one layer's: `plan_launch` is
+    // reached per layer and the range is the peel's, not a span of differing
+    // shapes.
+    let (kv_heads, head_dim) = geometry.heads_at(u32::from(launch.layers.start));
     Facts {
         rows: launch.rows.end - launch.rows.start,
         tile,
@@ -453,13 +503,16 @@ pub fn facts(
         width,
         in_width,
         q_heads: geometry.q_heads,
-        kv_heads: geometry.kv_heads,
-        head_dim: geometry.head_dim,
+        kv_heads,
+        head_dim,
         rotary_dims: geometry.rotary_dims,
         n_experts: geometry.n_experts,
         experts_per_token: geometry.experts_per_token,
-        group: geometry.group,
-        bits: geometry.bits,
+        // THIS STATEMENT'S point, resolved by `facts_of` -- the fire's for
+        // every statement but a router gate projection on a checkpoint whose
+        // gates arrived at their own width.
+        group: point.0,
+        bits: point.1,
     }
 }
 
@@ -1299,6 +1352,12 @@ fn precast(o: &mut Handles<'_>) -> Result<Vec<ArgValue>, Refusal> {
     let half_in = o.input(0)?;
     let y = o.output(0)?;
     let mut v = c.to_vec();
+    // The hole at buffer 3. Every `_fp16_precast` shader keeps
+    // `affine_qmm_t`'s numbering, where 3 is `x` -- and a precast reads its
+    // activation from 12 instead, so 3 is declared by none of them. The
+    // weight rides it: a slot nothing declares needs an address and not a
+    // meaning.
+    v.push(c[0]);
     let tail: [ArgValue; 2] = [y.v(), half_in.v()];
     v.extend(tail);
     Ok(v)
@@ -1332,7 +1391,7 @@ pub fn qmm_t_bias_fp16_precast(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgV
     let bias = o.weight(3)?;
     let mut v = qmm_t_fp16_precast(o, f)?;
     // Between `y` and `half_in`: buffer 4.
-    v.insert(4, bias.v());
+    v.insert(5, bias.v());
     Ok(v)
 }
 
@@ -1348,7 +1407,7 @@ pub fn qmm_t_residual_fp16_precast(
 ) -> Result<Vec<ArgValue>, Refusal> {
     let residual = o.input(1)?;
     let mut v = qmm_t_fp16_precast(o, f)?;
-    v.insert(4, residual.v());
+    v.insert(5, residual.v());
     Ok(v)
 }
 
@@ -1359,13 +1418,8 @@ pub fn qmm_t_residual_fp16_precast(
 /// and how many there are. The driver that chooses to split states all four,
 /// and a statement that does not carry them is refused -- a zero split is a
 /// dispatch that reduces nothing.
-fn split_k(o: &Handles<'_>) -> Result<[ArgValue; 4], Refusal> {
-    Ok([
-        o.param(2)?.v(),
-        o.param(3)?.v(),
-        o.param(4)?.v(),
-        o.param(5)?.v(),
-    ])
+fn split_k(o: &Handles<'_>) -> Result<[ArgValue; 3], Refusal> {
+    Ok([o.param(3)?.v(), o.param(4)?.v(), o.param(5)?.v()])
 }
 
 /// `quant::qmm_t_splitk`: the GEMM with the contraction cut into partitions.
@@ -1382,6 +1436,8 @@ pub fn qmm_t_splitk(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refu
     let split = split_k(o)?;
     let (bm, _) = tile(f)?;
     let mut v = c.to_vec();
+    // The hole this shader leaves; see `precast`.
+    v.push(c[0]);
     let tail: [ArgValue; 4] = [x.v(), out.v(), k.v(), n.v()];
     v.extend(tail);
     v.extend(split);
@@ -1455,6 +1511,8 @@ pub fn qmm_t_strided(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Ref
     let (k, n) = kn(o)?;
     let (bm, _) = tile(f)?;
     let mut v = c.to_vec();
+    // The hole this shader leaves; see `precast`.
+    v.push(c[0]);
     let tail: [ArgValue; 9] = [
         x.v(),
         y.v(),
@@ -1473,18 +1531,37 @@ pub fn qmm_t_strided(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Ref
 /// `quant::qmm_t_strided_residual`: [`qmm_t_strided`] with the residual
 /// folded in.
 ///
-/// The residual is buffer 5, BEFORE `k` -- unlike [`qmm_t_residual`], whose
-/// is buffer 7. The two orders are the shaders' and there is no rule that
-/// derives one from the other, which is exactly the kind of fact a
-/// signature exists to state.
+/// The residual is buffer 7, where [`qmm_t_residual`] also puts it. This said
+/// buffer 5 for as long as it has existed, and bound it there, which is to
+/// say it bound the residual pointer over `K` and `N` over the residual. It
+/// does not delegate to [`qmm_t_strided`] because that shader leaves buffer 7
+/// undeclared and takes a pad for it, and this one declares it.
 ///
 /// # Errors
 ///
 /// See [`qmm_t_strided`].
 pub fn qmm_t_strided_residual(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
+    let c = codec(o)?;
+    let x = o.input(0)?;
     let residual = o.input(1)?;
-    let mut v = qmm_t_strided(o, f)?;
-    v.insert(5, residual.v());
+    let y = o.output(0)?;
+    let row_stride = o.param(2)?;
+    let (k, n) = kn(o)?;
+    let (bm, _) = tile(f)?;
+    let mut v = c.to_vec();
+    let tail: [ArgValue; 10] = [
+        x.v(),
+        y.v(),
+        residual.v(),
+        k.v(),
+        n.v(),
+        row_stride.v(),
+        f.group.cast_signed().v(),
+        f.bits.cast_signed().v(),
+        bm.v(),
+        f.rows.cast_signed().v(),
+    ];
+    v.extend(tail);
     Ok(v)
 }
 
@@ -1522,7 +1599,9 @@ pub fn qmm_t_strided_fp16_precast_residual(
 ) -> Result<Vec<ArgValue>, Refusal> {
     let residual = o.input(1)?;
     let mut v = qmm_t_strided_fp16_precast(o, f)?;
-    v.insert(4, residual.v());
+    // After the pad at 3 and `y` at 4; the shader declares `residual` at 7,
+    // which the routine's dispatch list is where it lands.
+    v.insert(5, residual.v());
     Ok(v)
 }
 
@@ -1539,13 +1618,14 @@ pub fn qmm_t_strided_fp16_precast_residual(
 pub fn qmm_splitk_reduce(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
     let partial = o.input(0)?;
     let y = o.output(0)?;
-    let (k, n) = kn(o)?;
+    let (_, n) = kn(o)?;
     Ok(vec![
         y.v(),
         partial.v(),
-        k.v(),
+        // Buffers 0..=3, 5, 7 and 9 belong to the GEMM this reduces and are
+        // declared by none of it; the partials ride them.
+        partial.v(),
         n.v(),
-        o.param(2)?.v(),
         o.param(3)?.v(),
         o.param(4)?.v(),
         f.rows.cast_signed().v(),
@@ -1569,40 +1649,57 @@ pub fn qmm_splitk_reduce_f32(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgVal
 /// than the fire's: a cast covers exactly the activation the multiply after
 /// it will read, which need not be the whole rectangle.
 ///
+/// # The pad
+///
+/// The routine takes one and binds it at the ten slots `affine_qmm_t`'s
+/// argument table has between this kernel's three -- see the routine for the
+/// numbering. `moe::qmm_t_routed` gets its pad from the trace, as a second
+/// input the statement carries; a cast has one input and no spare, so the
+/// SOURCE is bound at the holes. Nothing is declared at any of them, so what
+/// the address points at is never read; what matters is that it is a valid
+/// address rather than an index the encoder left holding whatever the last
+/// step wrote.
+///
 /// # Errors
 ///
-/// [`Refusal::Absent`] for the tensor, the result, or any of the four
-/// scalars.
+/// [`Refusal::Absent`] for the tensor, the result, or the count.
 pub fn cast_qmm_input_bfloat16_to_float16(
     o: &mut Handles<'_>,
     _f: Facts,
 ) -> Result<Vec<ArgValue>, Refusal> {
     let cast_in = o.input(0)?;
     let half_out = o.output(0)?;
-    let (k, n) = kn(o)?;
-    Ok(vec![
-        cast_in.v(),
-        half_out.v(),
-        k.v(),
-        n.v(),
-        o.param(2)?.v(),
-        o.param(3)?.v(),
-    ])
+    let count = o.param(3)?;
+    Ok(vec![cast_in.v(), cast_in.v(), half_out.v(), count.v()])
 }
 
 /// `quant::cast_qmm_input_strided_bfloat16_to_float16`:
 /// [`cast_qmm_input_bfloat16_to_float16`] over rows a pitch apart.
 ///
+/// It built its list by pushing onto that one, which held while the two
+/// routines shared an argument list. They do not: the shared table gives the
+/// strided form `K` at 5 and `row_stride` at 8, which the packed form has no
+/// slot for at all.
+///
 /// # Errors
 ///
-/// See [`cast_qmm_input_bfloat16_to_float16`].
+/// [`Refusal::Absent`] for the tensor, the result, or either scalar.
 pub fn cast_qmm_input_strided_bfloat16_to_float16(
     o: &mut Handles<'_>,
     f: Facts,
 ) -> Result<Vec<ArgValue>, Refusal> {
-    let mut v = cast_qmm_input_bfloat16_to_float16(o, f)?;
-    v.push(f.rows.cast_signed().v());
-    Ok(v)
+    let cast_in = o.input(0)?;
+    let half_out = o.output(0)?;
+    let (k, _) = kn(o)?;
+    let row_stride = o.param(2)?;
+    Ok(vec![
+        cast_in.v(),
+        cast_in.v(),
+        half_out.v(),
+        k.v(),
+        row_stride.v(),
+        f.rows.cast_signed().v(),
+    ])
 }
 
 /// `quant::qmv_fast`: the matvec, one row at a time.
@@ -1661,6 +1758,8 @@ pub fn qmv_tail(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal>
     let y = o.output(0)?;
     let (in_vec, out_vec) = kn(o)?;
     let mut v = c.to_vec();
+    // The hole this shader leaves; see `precast`.
+    v.push(c[0]);
     let tail: [ArgValue; 6] = [
         x.v(),
         y.v(),
@@ -1681,7 +1780,7 @@ pub fn qmv_tail(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal>
 pub fn qmv_tail_bias(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
     let bias = o.weight(3)?;
     let mut v = qmv_tail(o, f)?;
-    v.insert(5, bias.v());
+    v.insert(6, bias.v());
     Ok(v)
 }
 
@@ -1702,6 +1801,8 @@ pub fn qmv_wide_strided(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, 
     let y = o.output(0)?;
     let (in_vec, out_vec) = kn(o)?;
     let mut v = c.to_vec();
+    // The hole this shader leaves; see `precast`.
+    v.push(c[0]);
     let tail: [ArgValue; 7] = [
         x.v(),
         y.v(),
@@ -2394,13 +2495,32 @@ pub fn split_qkv_bf16(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Re
 /// and `gate` the sigmoid's argument, and the pitch is the statement's
 /// because a gated attention output is usually a window into a packed block.
 ///
+///
+/// # `input(1)`, not `input(0)`: the aliased operand is not the gate
+///
+/// `in_place = &[(0, 0)]` says output 0 and input 0 name the same address.
+/// The statement is `OpKind::SigmoidGateMul` with `inputs = [x, gate]` and one
+/// result (`model-ir/src/trace/builder.rs::sigmoid_gate_mul`), `lower::walk`
+/// pushes every input and then every output, and in-place changes where the
+/// OUTPUT is written and never the argument list -- so the launch carries
+/// three widthed args, `[x, gate, out]`, and the split with one result gives
+/// `ins = [x, gate]`.
+///
+/// So `input(0)` is the tensor `output(0)` already aliases. Asking for it
+/// binds ONE address at both slots and computes `attn *= sigmoid(attn)`:
+/// arithmetic that runs, reports success and never reads the gate, which no
+/// arity or shape check can see because the two operands share a shape by
+/// construction. This read `input(0)` until `driver-wgpu`'s crossing compared
+/// the three arms. It had never fired -- the row was bare on all three
+/// backends -- which is the only reason it cost nothing.
+///
 /// # Errors
 ///
 /// [`Refusal::Absent`] for either operand or the pitch.
 pub fn gate(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
     let row_stride = o.param(0)?;
     let attn = o.output(0)?;
-    let gate_in = o.input(0)?;
+    let gate_in = o.input(1)?;
     Ok(vec![
         attn.v(),
         gate_in.v(),
@@ -2496,14 +2616,17 @@ pub fn router_topk(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refus
 /// `moe::router_topk_scaled`: [`router_topk`] with a per-expert gain applied
 /// to the logits.
 ///
-/// The gain is a second INPUT rather than a weight: it is a traced value.
+/// The gain is a WEIGHT: `router.per_expert_scale` is a checkpoint tensor,
+/// `[n_experts]`, not a value the fire computes. It was declared an input
+/// here while no text stated the row at all, so nothing ever handed it
+/// either kind and the mismatch could not show.
 ///
 /// # Errors
 ///
 /// See [`router_topk`], plus [`Refusal::Absent`] for the gain.
 pub fn router_topk_scaled(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
     let logits = o.input(0)?;
-    let per_expert_scale = o.input(1)?;
+    let per_expert_scale = o.weight(0)?;
     let expert_ids = o.output(0)?;
     let expert_weights = o.output(1)?;
     let params = o.params_block();
@@ -2953,7 +3076,7 @@ pub fn gdn_prep(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal>
 ///
 /// See [`gdn_prep`].
 pub fn gdn_prep_slotted(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
-    let slot_ids = U32s(o.input(1)?.0);
+    let slot_ids = U32s(o.table(FireTable::RecurrentSlots));
     let mut v = gdn_prep(o, f)?;
     v.insert(13, slot_ids.v());
     Ok(v)
@@ -2973,7 +3096,7 @@ pub fn gdn_prep_slotted(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, 
 pub fn gdn_prep_prefill(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
     let row_pitch = o.param(0)?;
     let n_scan = o.param(1)?;
-    let slot_ids = U32s(o.input(1)?.0);
+    let slot_ids = U32s(o.table(FireTable::RecurrentSlots));
     let mixed = o.input(0)?;
     let conv_state = F32s(o.slab(f.layer, "conv_state")?);
     let conv_w = o.weight(0)?;
@@ -3039,13 +3162,23 @@ pub fn gdn_core(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal>
 /// `ssm::gdn_core_slotted`: [`gdn_core`] with the state index read from a
 /// slot table.
 ///
+/// # The index is twelve and its neighbours' is not
+///
+/// All three slotted arms put `slot_ids` immediately after `params`, and all
+/// three of those are at a different offset because the routines above them
+/// carry different operands: `gdn_prep` has the `pre_q`/`pre_k`/`pre_gate`
+/// triple and no `rstate`, so its `params` is twelfth and this one's is
+/// eleventh. This arm inserted at thirteen for a while, which put `slot_ids`
+/// after `rows` -- the table it means to index arriving where the row count
+/// belongs, and the row count arriving as a pointer.
+///
 /// # Errors
 ///
 /// See [`gdn_prep`].
 pub fn gdn_core_slotted(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
-    let slot_ids = U32s(o.input(1)?.0);
+    let slot_ids = U32s(o.table(FireTable::RecurrentSlots));
     let mut v = gdn_core(o, f)?;
-    v.insert(13, slot_ids.v());
+    v.insert(12, slot_ids.v());
     Ok(v)
 }
 
@@ -3091,7 +3224,7 @@ pub fn gdn_core_recurrent(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>
 ///
 /// See [`gdn_prep`].
 pub fn gdn_core_recurrent_slotted(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
-    let slot_ids = U32s(o.input(4)?.0);
+    let slot_ids = U32s(o.table(FireTable::RecurrentSlots));
     let mut v = gdn_core_recurrent(o, f)?;
     v.insert(11, slot_ids.v());
     Ok(v)
@@ -3120,7 +3253,7 @@ pub fn gdn_core_recurrent_prefill(o: &mut Handles<'_>, f: Facts) -> Result<Vec<A
     let pre_k = F32s(o.input(2)?.0);
     let pre_gate = F32s(o.input(3)?.0);
     let params = o.params_block();
-    let slot_ids = U32s(o.input(4)?.0);
+    let slot_ids = U32s(o.table(FireTable::RecurrentSlots));
     Ok(vec![
         pad.v(),
         rstate.v(),

@@ -11,128 +11,330 @@
 //! `host_name` lines typed out at `quantized_qmm_t.wgsl:2918-2966` rather
 //! than stamped, so they are five kernels and get five rows.
 
-use kernels::{Axis, KernelSig, kernel};
+use kernels::KernelSig;
 
-use crate::axes::*;
-
-pub static KERNELS: &[KernelSig] = &[
-    kernel!(cast_qmm_input_bfloat16_to_float16 "cast_qmm_input_bfloat16_to_float16"), // quantized_qmm_t.wgsl
-    kernel!(cast_qmm_input_strided_bfloat16_to_float16 "cast_qmm_input_strided_bfloat16_to_float16"), // quantized_qmm_t.wgsl
-    kernel!(encode_u4_bf16 "affine_encode_u4_bf16"), // transcode.wgsl
-    kernel!(encode_u4_f32 "affine_encode_u4_f32"),   // transcode.wgsl
-    kernel!(mxfp4_dequant_bf16 "mxfp4_dequant_bf16"), // transcode.wgsl
-    // 1 in quantized_qmm_t.wgsl
-    kernel!(qmm_splitk_reduce "qmm_splitk_reduce", axes = &[BF16]),
-    // 1 in quantized_qmm_t.wgsl
-    kernel!(qmm_splitk_reduce_f32 "qmm_splitk_reduce_f32", axes = &[BF16]),
-    // 54 in quantized_qmm_t.wgsl
-    // The batched projection, and its operand order is the GEMV's: weights,
-    // then the activation, then the result, then the two extents. The template
-    // is `affine_qmm_t_aligned`, so a reader diffing this against the shader
-    // looks for that name.
-    kernel!(qmm_t "affine_qmm_t", file = Some("quant/qmm_t.wgsl"), launch = kernels::LaunchRule::Qmm,
-        operands = kernels::operands![
-            w: Buf <- kernels::Source::Weight(0),
-            scales: Buf <- kernels::Source::Weight(1),
-            biases: Buf <- kernels::Source::Weight(2),
-            x: Buf <- kernels::Source::In(0),
-            y: BufMut <- kernels::Source::Out(0),
-            k: I32 <- kernels::Source::Param(0),
-            n: I32 <- kernels::Source::Param(1),
-        ],
-        axes = &[BF16, GROUP, BITS, TILE_M, TILE_N]),
-    // `affine_qmm_t_aligned` has no row: it is the TEMPLATE the two below are
-    // stamped from, and the census counted it as an entrypoint until the
-    // template guard learned that a parameter list wraps.
-    kernel!(qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4 "affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4"), // quantized_qmm_t.wgsl
-    kernel!(qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2 "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2"), // quantized_qmm_t.wgsl
-    kernel!(qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2 "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2"), // quantized_qmm_t.wgsl
-    kernel!(qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1 "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1"), // quantized_qmm_t.wgsl
-    kernel!(qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4 "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4"), // quantized_qmm_t.wgsl
-    // 54 in quantized_qmm_t.wgsl
-    kernel!(qmm_t_bias "affine_qmm_t_bias", axes = &[BF16, GROUP, BITS, TILE_M, TILE_N]),
-    // 9 in quantized_qmm_t.wgsl
-    kernel!(qmm_t_bias_fp16_precast "affine_qmm_t_bias_fp16_precast",
-        axes = &[BF16, GROUP_64, BITS_4, TILE_M, TILE_N]),
-    // 9 in quantized_qmm_t.wgsl
-    kernel!(qmm_t_fp16_precast "affine_qmm_t_fp16_precast",
-        axes = &[BF16, GROUP_64, BITS_4, TILE_M, TILE_N]),
-    // 54 in quantized_qmm_t.wgsl
-    kernel!(qmm_t_residual "affine_qmm_t_residual", file = Some("quant/qmm_t.wgsl"), launch = kernels::LaunchRule::Qmm,
-        operands = kernels::operands![
-            w: Buf <- kernels::Source::Weight(0),
-            scales: Buf <- kernels::Source::Weight(1),
-            biases: Buf <- kernels::Source::Weight(2),
-            x: Buf <- kernels::Source::In(0),
-            y: BufMut <- kernels::Source::Out(0),
-            k: I32 <- kernels::Source::Param(0),
-            n: I32 <- kernels::Source::Param(1),
-            residual: Buf <- kernels::Source::In(1),
-        ],
-        axes = &[BF16, GROUP, BITS, TILE_M, TILE_N]),
-    // 9 in quantized_qmm_t.wgsl
-    kernel!(qmm_t_residual_fp16_precast "affine_qmm_t_residual_fp16_precast",
-        axes = &[BF16, GROUP_64, BITS_4, TILE_M, TILE_N]),
-    // 18 in quantized_qmm_t.wgsl
-    kernel!(qmm_t_splitk "affine_qmm_t_splitk", axes = &[BF16, GROUP, BITS, TILE_M, TILE_N_32]),
-    // 18 in quantized_qmm_t.wgsl
-    kernel!(qmm_t_splitk_f32 "affine_qmm_t_splitk_f32",
-        axes = &[BF16, GROUP, BITS, TILE_M, TILE_N_32]),
-    // 3 in quantized_qmm_t.wgsl
-    kernel!(qmm_t_splitk_fp16_precast "affine_qmm_t_splitk_fp16_precast",
-        axes = &[BF16, GROUP_64, BITS_4, TILE_M, TILE_N_32]),
-    // 3 in quantized_qmm_t.wgsl
-    kernel!(qmm_t_splitk_fp16_precast_f32 "affine_qmm_t_splitk_fp16_precast_f32",
-        axes = &[BF16, GROUP_64, BITS_4, TILE_M, TILE_N_32]),
-    // 18 in quantized_qmm_t.wgsl
-    kernel!(qmm_t_strided "affine_qmm_t_strided", axes = &[BF16, GROUP, BITS, TILE_M, TILE_N_32]),
-    // 3 in quantized_qmm_t.wgsl
-    kernel!(qmm_t_strided_fp16_precast "affine_qmm_t_strided_fp16_precast",
-        axes = &[BF16, GROUP_64, BITS_4, TILE_M, TILE_N_32]),
-    // 3 in quantized_qmm_t.wgsl
-    kernel!(qmm_t_strided_fp16_precast_residual "affine_qmm_t_strided_fp16_precast_residual",
-        axes = &[BF16, GROUP_64, BITS_4, TILE_M, TILE_N_32]),
-    // 18 in quantized_qmm_t.wgsl
-    kernel!(qmm_t_strided_residual "affine_qmm_t_strided_residual",
-        axes = &[BF16, GROUP, BITS, TILE_M, TILE_N_32]),
-    // 6 in quantized_qmv.wgsl
-    // The loudest misbinding, and the reason the rows grew operands at all:
-    // this declares its WEIGHTS FIRST and the trace states them last, so
-    // positional binding put the activation where the packed weight belongs.
-    // Every projection of every layer.
-    kernel!(qmv_fast "affine_qmv_fast", file = Some("quant/qmv.wgsl"), launch = kernels::LaunchRule::Qmv,
-        operands = kernels::operands![
-            w: Buf <- kernels::Source::Weight(0),
-            scales: Buf <- kernels::Source::Weight(1),
-            biases: Buf <- kernels::Source::Weight(2),
-            x: Buf <- kernels::Source::In(0),
-            y: BufMut <- kernels::Source::Out(0),
-            in_vec_size: I32 <- kernels::Source::Param(0),
-            out_vec_size: I32 <- kernels::Source::Param(1),
-        ],
-        axes = &[BF16, GROUP, BITS]),
-    // 6 in quantized_qmv.wgsl
-    // The same, plus the block residual its epilogue folds — which the trace
-    // states as a second INPUT and the kernel takes at the very end.
-    kernel!(qmv_fast_residual "affine_qmv_fast_residual", file = Some("quant/qmv.wgsl"), launch = kernels::LaunchRule::Qmv,
-        operands = kernels::operands![
-            w: Buf <- kernels::Source::Weight(0),
-            scales: Buf <- kernels::Source::Weight(1),
-            biases: Buf <- kernels::Source::Weight(2),
-            x: Buf <- kernels::Source::In(0),
-            y: BufMut <- kernels::Source::Out(0),
-            in_vec_size: I32 <- kernels::Source::Param(0),
-            out_vec_size: I32 <- kernels::Source::Param(1),
-            residual: Buf <- kernels::Source::In(1),
-        ],
-        axes = &[BF16, GROUP, BITS]),
-    // 2 in quantized_qmv.wgsl
-    kernel!(qmv_tail "affine_qmv_tail", axes = &[BF16, GROUP_64, BITS]),
-    // 2 in quantized_qmv.wgsl
-    kernel!(qmv_tail_bias "affine_qmv_tail_bias", axes = &[BF16, GROUP_64, BITS]),
-    // 2 in quantized_qmm_t.wgsl
-    kernel!(qmv_wide_strided "affine_qmv_wide_strided",
-        axes = &[BF16, GROUP_64, BITS, Axis { what: "value dim", points: &["_v_4"] }, Axis { what: "k-loop unroll", points: &["_kl_8"] }]),
+/// EMPTY: this family's rows have been RETIRED.
+///
+/// `refactor-bigplan.md` §7 Stage 3. The three transcode encoders were the
+/// last to go and they could not go until their BODIES were fixed: each took a
+/// `_params: Buf` it had no way to use and forwarded no scalars at all, so the
+/// `@group(1)` block its shader reads would have arrived empty and the loop
+/// over groups would have run zero times and reported success.
+pub static KERNELS: &[KernelSig] = &[];
+/// The entrypoints of this family's routines whose ROWS have been RETIRED.
+///
+/// `refactor-bigplan.md` §7 Stage 3. Not every kernel here has crossed its
+/// arm — this family still states rows for the ones that have not — so this
+/// is the retired SUBSET rather than the whole family, and
+/// `a_retired_familys_stated_entrypoints_are_what_its_bodies_fire` compares
+/// it against the bodies that fire them.
+///
+/// See [`crate::sample::ENTRYPOINTS`] for why a retired row's entrypoints
+/// have to be stated at all.
+pub static ENTRYPOINTS: &[&str] = &[
+    "affine_encode_u4_bf16",
+    "affine_encode_u4_f32",
+    "affine_qmm_t_bfloat16_gs_128_b_4_bm_16_bn_16",
+    "affine_qmm_t_bfloat16_gs_128_b_4_bm_16_bn_32",
+    "affine_qmm_t_bfloat16_gs_128_b_4_bm_16_bn_64",
+    "affine_qmm_t_bfloat16_gs_128_b_4_bm_32_bn_16",
+    "affine_qmm_t_bfloat16_gs_128_b_4_bm_32_bn_32",
+    "affine_qmm_t_bfloat16_gs_128_b_4_bm_32_bn_64",
+    "affine_qmm_t_bfloat16_gs_128_b_4_bm_64_bn_16",
+    "affine_qmm_t_bfloat16_gs_128_b_4_bm_64_bn_32",
+    "affine_qmm_t_bfloat16_gs_128_b_4_bm_64_bn_64",
+    "affine_qmm_t_bfloat16_gs_128_b_8_bm_16_bn_16",
+    "affine_qmm_t_bfloat16_gs_128_b_8_bm_16_bn_32",
+    "affine_qmm_t_bfloat16_gs_128_b_8_bm_16_bn_64",
+    "affine_qmm_t_bfloat16_gs_128_b_8_bm_32_bn_16",
+    "affine_qmm_t_bfloat16_gs_128_b_8_bm_32_bn_32",
+    "affine_qmm_t_bfloat16_gs_128_b_8_bm_32_bn_64",
+    "affine_qmm_t_bfloat16_gs_128_b_8_bm_64_bn_16",
+    "affine_qmm_t_bfloat16_gs_128_b_8_bm_64_bn_32",
+    "affine_qmm_t_bfloat16_gs_128_b_8_bm_64_bn_64",
+    "affine_qmm_t_bfloat16_gs_32_b_4_bm_16_bn_16",
+    "affine_qmm_t_bfloat16_gs_32_b_4_bm_16_bn_32",
+    "affine_qmm_t_bfloat16_gs_32_b_4_bm_16_bn_64",
+    "affine_qmm_t_bfloat16_gs_32_b_4_bm_32_bn_16",
+    "affine_qmm_t_bfloat16_gs_32_b_4_bm_32_bn_32",
+    "affine_qmm_t_bfloat16_gs_32_b_4_bm_32_bn_64",
+    "affine_qmm_t_bfloat16_gs_32_b_4_bm_64_bn_16",
+    "affine_qmm_t_bfloat16_gs_32_b_4_bm_64_bn_32",
+    "affine_qmm_t_bfloat16_gs_32_b_4_bm_64_bn_64",
+    "affine_qmm_t_bfloat16_gs_32_b_8_bm_16_bn_16",
+    "affine_qmm_t_bfloat16_gs_32_b_8_bm_16_bn_32",
+    "affine_qmm_t_bfloat16_gs_32_b_8_bm_16_bn_64",
+    "affine_qmm_t_bfloat16_gs_32_b_8_bm_32_bn_16",
+    "affine_qmm_t_bfloat16_gs_32_b_8_bm_32_bn_32",
+    "affine_qmm_t_bfloat16_gs_32_b_8_bm_32_bn_64",
+    "affine_qmm_t_bfloat16_gs_32_b_8_bm_64_bn_16",
+    "affine_qmm_t_bfloat16_gs_32_b_8_bm_64_bn_32",
+    "affine_qmm_t_bfloat16_gs_32_b_8_bm_64_bn_64",
+    "affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
+    "affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_16",
+    "affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_32",
+    "affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_64",
+    "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_16",
+    "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32",
+    "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
+    "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_64",
+    "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_16",
+    "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32",
+    "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
+    "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
+    "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64",
+    "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
+    "affine_qmm_t_bfloat16_gs_64_b_8_bm_16_bn_16",
+    "affine_qmm_t_bfloat16_gs_64_b_8_bm_16_bn_32",
+    "affine_qmm_t_bfloat16_gs_64_b_8_bm_16_bn_64",
+    "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_16",
+    "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_32",
+    "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_64",
+    "affine_qmm_t_bfloat16_gs_64_b_8_bm_64_bn_16",
+    "affine_qmm_t_bfloat16_gs_64_b_8_bm_64_bn_32",
+    "affine_qmm_t_bfloat16_gs_64_b_8_bm_64_bn_64",
+    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_16_bn_16",
+    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_16_bn_32",
+    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_16_bn_64",
+    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_32_bn_16",
+    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_32_bn_32",
+    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_32_bn_64",
+    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_64_bn_16",
+    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_64_bn_32",
+    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_64_bn_64",
+    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_16_bn_16",
+    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_16_bn_32",
+    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_16_bn_64",
+    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_32_bn_16",
+    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_32_bn_32",
+    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_32_bn_64",
+    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_64_bn_16",
+    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_64_bn_32",
+    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_64_bn_64",
+    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_16_bn_16",
+    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_16_bn_32",
+    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_16_bn_64",
+    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_32_bn_16",
+    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_32_bn_32",
+    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_32_bn_64",
+    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_64_bn_16",
+    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_64_bn_32",
+    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_64_bn_64",
+    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_16_bn_16",
+    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_16_bn_32",
+    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_16_bn_64",
+    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_32_bn_16",
+    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_32_bn_32",
+    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_32_bn_64",
+    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_64_bn_16",
+    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_64_bn_32",
+    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_64_bn_64",
+    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_16_bn_16",
+    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_16_bn_32",
+    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_16_bn_64",
+    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_32_bn_16",
+    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_32_bn_32",
+    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_32_bn_64",
+    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_64_bn_16",
+    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_64_bn_32",
+    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_64_bn_64",
+    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_16_bn_16",
+    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_16_bn_32",
+    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_16_bn_64",
+    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_32_bn_16",
+    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_32_bn_32",
+    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_32_bn_64",
+    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_64_bn_16",
+    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_64_bn_32",
+    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_64_bn_64",
+    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_16",
+    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
+    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_64",
+    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_16",
+    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
+    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_64",
+    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_16",
+    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
+    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_64",
+    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_16",
+    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
+    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_64",
+    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_16",
+    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
+    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_64",
+    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_16",
+    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
+    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_64",
+    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_16_bn_16",
+    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_16_bn_32",
+    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_16_bn_64",
+    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_32_bn_16",
+    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_32_bn_32",
+    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_32_bn_64",
+    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_64_bn_16",
+    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_64_bn_32",
+    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_64_bn_64",
+    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_16_bn_16",
+    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_16_bn_32",
+    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_16_bn_64",
+    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_32_bn_16",
+    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_32_bn_32",
+    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_32_bn_64",
+    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_64_bn_16",
+    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_64_bn_32",
+    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_64_bn_64",
+    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_16_bn_16",
+    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_16_bn_32",
+    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_16_bn_64",
+    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_32_bn_16",
+    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_32_bn_32",
+    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_32_bn_64",
+    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_64_bn_16",
+    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_64_bn_32",
+    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_64_bn_64",
+    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_16_bn_16",
+    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_16_bn_32",
+    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_16_bn_64",
+    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_32_bn_16",
+    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_32_bn_32",
+    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_32_bn_64",
+    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_64_bn_16",
+    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_64_bn_32",
+    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_64_bn_64",
+    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_16_bn_16",
+    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_16_bn_32",
+    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_16_bn_64",
+    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_32_bn_16",
+    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
+    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_32_bn_64",
+    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_64_bn_16",
+    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_64_bn_32",
+    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_64_bn_64",
+    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_16_bn_16",
+    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_16_bn_32",
+    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_16_bn_64",
+    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_32_bn_16",
+    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_32_bn_32",
+    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_32_bn_64",
+    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_64_bn_16",
+    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_64_bn_32",
+    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_64_bn_64",
+    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_16",
+    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
+    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_64",
+    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_16",
+    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
+    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_64",
+    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_16",
+    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
+    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_64",
+    "affine_qmm_t_splitk_bfloat16_gs_128_b_4_bm_16_bn_32",
+    "affine_qmm_t_splitk_bfloat16_gs_128_b_4_bm_32_bn_32",
+    "affine_qmm_t_splitk_bfloat16_gs_128_b_4_bm_64_bn_32",
+    "affine_qmm_t_splitk_bfloat16_gs_128_b_8_bm_16_bn_32",
+    "affine_qmm_t_splitk_bfloat16_gs_128_b_8_bm_32_bn_32",
+    "affine_qmm_t_splitk_bfloat16_gs_128_b_8_bm_64_bn_32",
+    "affine_qmm_t_splitk_bfloat16_gs_32_b_4_bm_16_bn_32",
+    "affine_qmm_t_splitk_bfloat16_gs_32_b_4_bm_32_bn_32",
+    "affine_qmm_t_splitk_bfloat16_gs_32_b_4_bm_64_bn_32",
+    "affine_qmm_t_splitk_bfloat16_gs_32_b_8_bm_16_bn_32",
+    "affine_qmm_t_splitk_bfloat16_gs_32_b_8_bm_32_bn_32",
+    "affine_qmm_t_splitk_bfloat16_gs_32_b_8_bm_64_bn_32",
+    "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_16_bn_32",
+    "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_32_bn_32",
+    "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_64_bn_32",
+    "affine_qmm_t_splitk_bfloat16_gs_64_b_8_bm_16_bn_32",
+    "affine_qmm_t_splitk_bfloat16_gs_64_b_8_bm_32_bn_32",
+    "affine_qmm_t_splitk_bfloat16_gs_64_b_8_bm_64_bn_32",
+    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_4_bm_16_bn_32",
+    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_4_bm_32_bn_32",
+    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_4_bm_64_bn_32",
+    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_8_bm_16_bn_32",
+    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_8_bm_32_bn_32",
+    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_8_bm_64_bn_32",
+    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_4_bm_16_bn_32",
+    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_4_bm_32_bn_32",
+    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_4_bm_64_bn_32",
+    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_8_bm_16_bn_32",
+    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_8_bm_32_bn_32",
+    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_8_bm_64_bn_32",
+    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_16_bn_32",
+    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_32_bn_32",
+    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_64_bn_32",
+    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_8_bm_16_bn_32",
+    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_8_bm_32_bn_32",
+    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_8_bm_64_bn_32",
+    "affine_qmm_t_splitk_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
+    "affine_qmm_t_splitk_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
+    "affine_qmm_t_splitk_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
+    "affine_qmm_t_splitk_fp16_precast_f32_bfloat16_gs_64_b_4_bm_16_bn_32",
+    "affine_qmm_t_splitk_fp16_precast_f32_bfloat16_gs_64_b_4_bm_32_bn_32",
+    "affine_qmm_t_splitk_fp16_precast_f32_bfloat16_gs_64_b_4_bm_64_bn_32",
+    "affine_qmm_t_strided_bfloat16_gs_128_b_4_bm_16_bn_32",
+    "affine_qmm_t_strided_bfloat16_gs_128_b_4_bm_32_bn_32",
+    "affine_qmm_t_strided_bfloat16_gs_128_b_4_bm_64_bn_32",
+    "affine_qmm_t_strided_bfloat16_gs_128_b_8_bm_16_bn_32",
+    "affine_qmm_t_strided_bfloat16_gs_128_b_8_bm_32_bn_32",
+    "affine_qmm_t_strided_bfloat16_gs_128_b_8_bm_64_bn_32",
+    "affine_qmm_t_strided_bfloat16_gs_32_b_4_bm_16_bn_32",
+    "affine_qmm_t_strided_bfloat16_gs_32_b_4_bm_32_bn_32",
+    "affine_qmm_t_strided_bfloat16_gs_32_b_4_bm_64_bn_32",
+    "affine_qmm_t_strided_bfloat16_gs_32_b_8_bm_16_bn_32",
+    "affine_qmm_t_strided_bfloat16_gs_32_b_8_bm_32_bn_32",
+    "affine_qmm_t_strided_bfloat16_gs_32_b_8_bm_64_bn_32",
+    "affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_16_bn_32",
+    "affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_32_bn_32",
+    "affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_64_bn_32",
+    "affine_qmm_t_strided_bfloat16_gs_64_b_8_bm_16_bn_32",
+    "affine_qmm_t_strided_bfloat16_gs_64_b_8_bm_32_bn_32",
+    "affine_qmm_t_strided_bfloat16_gs_64_b_8_bm_64_bn_32",
+    "affine_qmm_t_strided_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
+    "affine_qmm_t_strided_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
+    "affine_qmm_t_strided_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
+    "affine_qmm_t_strided_fp16_precast_residual_bfloat16_gs_64_b_4_bm_16_bn_32",
+    "affine_qmm_t_strided_fp16_precast_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
+    "affine_qmm_t_strided_fp16_precast_residual_bfloat16_gs_64_b_4_bm_64_bn_32",
+    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_4_bm_16_bn_32",
+    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_4_bm_32_bn_32",
+    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_4_bm_64_bn_32",
+    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_8_bm_16_bn_32",
+    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_8_bm_32_bn_32",
+    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_8_bm_64_bn_32",
+    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_4_bm_16_bn_32",
+    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_4_bm_32_bn_32",
+    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_4_bm_64_bn_32",
+    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_8_bm_16_bn_32",
+    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_8_bm_32_bn_32",
+    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_8_bm_64_bn_32",
+    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_16_bn_32",
+    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
+    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_64_bn_32",
+    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_8_bm_16_bn_32",
+    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_8_bm_32_bn_32",
+    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_8_bm_64_bn_32",
+    "affine_qmv_fast_bfloat16_gs_128_b_4",
+    "affine_qmv_fast_bfloat16_gs_128_b_8",
+    "affine_qmv_fast_bfloat16_gs_32_b_4",
+    "affine_qmv_fast_bfloat16_gs_32_b_8",
+    "affine_qmv_fast_bfloat16_gs_64_b_4",
+    "affine_qmv_fast_bfloat16_gs_64_b_8",
+    "affine_qmv_fast_residual_bfloat16_gs_128_b_4",
+    "affine_qmv_fast_residual_bfloat16_gs_128_b_8",
+    "affine_qmv_fast_residual_bfloat16_gs_32_b_4",
+    "affine_qmv_fast_residual_bfloat16_gs_32_b_8",
+    "affine_qmv_fast_residual_bfloat16_gs_64_b_4",
+    "affine_qmv_fast_residual_bfloat16_gs_64_b_8",
+    "affine_qmv_tail_bfloat16_gs_64_b_4",
+    "affine_qmv_tail_bfloat16_gs_64_b_8",
+    "affine_qmv_tail_bias_bfloat16_gs_64_b_4",
+    "affine_qmv_tail_bias_bfloat16_gs_64_b_8",
+    "affine_qmv_wide_strided_bfloat16_gs_64_b_4_v_4_kl_8",
+    "affine_qmv_wide_strided_bfloat16_gs_64_b_8_v_4_kl_8",
+    "cast_qmm_input_bfloat16_to_float16",
+    "cast_qmm_input_strided_bfloat16_to_float16",
+    "qmm_splitk_reduce_bfloat16",
+    "qmm_splitk_reduce_f32_bfloat16",
+    "mxfp4_dequant_bf16",
 ];
 
 use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, Routine};
@@ -1889,25 +2091,40 @@ pub fn encode_u4_bf16(
     codes: BufMut,
     scales: BufMut,
     biases: BufMut,
-    // ACCEPTED AND NOT FORWARDED: the params block is a `@group(1)` UNIFORM
-    // in `quant/`'s shaders, not a `@group(0)` storage binding, so there is
-    // no buffer slot for it. The ROW states it because the trace supplies the
-    // scalar run and the table path packs it; a routine has no address to
-    // pass. `kernels-metal` met the same thing crossing its own `mlp` -- "the
-    // parameter block was a buffer with no address" -- and answered it with a
-    // handle that STANDS FOR the staged run, which is a driver-side seam this
-    // backend has not built yet. Until it does, the buffer count is what the
-    // module declares and this stays unread.
-    _params: Buf,
-    groups: Env<i32>,
+    // FORWARDED AS SCALARS, not as a buffer.
+    //
+    // `transcode.wgsl` puts this pair in a `@group(1) @binding(0)` UNIFORM —
+    // Metal spells it `constant DequantParams&` and Vulkan copied that into a
+    // storage binding, and neither shape is this one — so there is no
+    // `@group(0)` slot to forward and the block is built from the scalars a
+    // body passes. The signature took a `_params: Buf` it could not use and
+    // passed NOTHING, so the block arrived empty and the shader read zeros:
+    // zero groups is a loop that runs no iterations and reports success.
+    // A TRACE scalar and not an `Env`, though it also fixes the grid.
+    //
+    // `transcode.wgsl` bounds its own loop with it (`if (block >= params.groups)
+    // { return; }`), because `dispatch_workgroups` rounds up to a whole
+    // workgroup and the buffer's length is not the bound. An `Env` argument
+    // computes the grid and is NOT forwarded — that is what
+    // `a_body_passes_the_arguments_its_signature_takes_in_order` enforces — so
+    // a value the SHADER reads has to be stated.
+    groups: i32,
+    group_size: i32,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/transcode.wgsl",
             entrypoint: "affine_encode_u4_bf16",
-            lanes: kernels::shader::elementwise(*groups, 1)?,
+            lanes: kernels::shader::elementwise(groups, 1)?,
         },
-        &[input.v(), codes.v(), scales.v(), biases.v()],
+        &[
+            input.v(),
+            codes.v(),
+            scales.v(),
+            biases.v(),
+            groups.v(),
+            group_size.v(),
+        ],
     )
 }
 
@@ -1927,25 +2144,34 @@ pub fn encode_u4_f32(
     codes: BufMut,
     scales: BufMut,
     biases: BufMut,
-    // ACCEPTED AND NOT FORWARDED: the params block is a `@group(1)` UNIFORM
-    // in `quant/`'s shaders, not a `@group(0)` storage binding, so there is
-    // no buffer slot for it. The ROW states it because the trace supplies the
-    // scalar run and the table path packs it; a routine has no address to
-    // pass. `kernels-metal` met the same thing crossing its own `mlp` -- "the
-    // parameter block was a buffer with no address" -- and answered it with a
-    // handle that STANDS FOR the staged run, which is a driver-side seam this
-    // backend has not built yet. Until it does, the buffer count is what the
-    // module declares and this stays unread.
-    _params: Buf,
-    groups: Env<i32>,
+    // FORWARDED AS SCALARS, not as a buffer.
+    //
+    // `transcode.wgsl` puts this pair in a `@group(1) @binding(0)` UNIFORM —
+    // Metal spells it `constant DequantParams&` and Vulkan copied that into a
+    // storage binding, and neither shape is this one — so there is no
+    // `@group(0)` slot to forward and the block is built from the scalars a
+    // body passes. The signature took a `_params: Buf` it could not use and
+    // passed NOTHING, so the block arrived empty and the shader read zeros:
+    // zero groups is a loop that runs no iterations and reports success.
+    //
+    // A TRACE scalar, for the reason `encode_u4_bf16` states above.
+    groups: i32,
+    group_size: i32,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/transcode.wgsl",
             entrypoint: "affine_encode_u4_f32",
-            lanes: kernels::shader::elementwise(*groups, 1)?,
+            lanes: kernels::shader::elementwise(groups, 1)?,
         },
-        &[input.v(), codes.v(), scales.v(), biases.v()],
+        &[
+            input.v(),
+            codes.v(),
+            scales.v(),
+            biases.v(),
+            groups.v(),
+            group_size.v(),
+        ],
     )
 }
 
@@ -1964,25 +2190,39 @@ pub fn mxfp4_dequant_bf16(
     payload: Buf,
     exponents: Buf,
     out: BufMut,
-    // ACCEPTED AND NOT FORWARDED: the params block is a `@group(1)` UNIFORM
-    // in `quant/`'s shaders, not a `@group(0)` storage binding, so there is
-    // no buffer slot for it. The ROW states it because the trace supplies the
-    // scalar run and the table path packs it; a routine has no address to
-    // pass. `kernels-metal` met the same thing crossing its own `mlp` -- "the
-    // parameter block was a buffer with no address" -- and answered it with a
-    // handle that STANDS FOR the staged run, which is a driver-side seam this
-    // backend has not built yet. Until it does, the buffer count is what the
-    // module declares and this stays unread.
-    _params: Buf,
-    blocks: Env<i32>,
+    // FORWARDED AS SCALARS, not as a buffer.
+    //
+    // `transcode.wgsl` puts this pair in a `@group(1) @binding(0)` UNIFORM —
+    // Metal spells it `constant DequantParams&` and Vulkan copied that into a
+    // storage binding, and neither shape is this one — so there is no
+    // `@group(0)` slot to forward and the block is built from the scalars a
+    // body passes. The signature took a `_params: Buf` it could not use and
+    // passed NOTHING, so the block arrived empty and the shader read zeros:
+    // zero groups is a loop that runs no iterations and reports success.
+    // A TRACE scalar and not an `Env`, though it also fixes the grid.
+    //
+    // `transcode.wgsl` bounds its own loop with it (`if (block >= params.blocks)
+    // { return; }`), because `dispatch_workgroups` rounds up to a whole
+    // workgroup and the buffer's length is not the bound. An `Env` argument
+    // computes the grid and is NOT forwarded — that is what
+    // `a_body_passes_the_arguments_its_signature_takes_in_order` enforces — so
+    // a value the SHADER reads has to be stated.
+    blocks: i32,
+    block_size: i32,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/transcode.wgsl",
             entrypoint: "mxfp4_dequant_bf16",
-            lanes: kernels::shader::elementwise(*blocks, 1)?,
+            lanes: kernels::shader::elementwise(blocks, 1)?,
         },
-        &[payload.v(), exponents.v(), out.v()],
+        &[
+            payload.v(),
+            exponents.v(),
+            out.v(),
+            blocks.v(),
+            block_size.v(),
+        ],
     )
 }
 

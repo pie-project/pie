@@ -11,6 +11,156 @@ pub struct CheckpointMetadata {
     pub tensors: Vec<RawTensor>,
 }
 
+/// What a checkpoint says about ITSELF: a GGUF's key-value block.
+///
+/// Read with
+/// [`parse_checkpoint_attributes`](crate::checkpoint::read::parse_checkpoint_attributes)
+/// rather than carried on [`CheckpointMetadata`] — see that function for why.
+///
+/// Flat, because GGUF's keys already are: `general.architecture`, and then a
+/// block namespaced under whatever that says, `qwen2.attention.head_count`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Attributes {
+    by_key: std::collections::BTreeMap<String, Attribute>,
+}
+
+/// One key's value, as far as this type carries it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Attribute {
+    Uint(u64),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Text(String),
+    /// An array or a nested map, recorded as present and not as contents.
+    ///
+    /// GGUF puts its tokenizer here — `tokenizer.ggml.tokens` is every token
+    /// in the vocabulary — and no reader of this type wants a vocabulary. The
+    /// key is kept so that absence still means absent, which is the whole
+    /// value of an honest answer to `get`.
+    Aggregate,
+}
+
+impl Attributes {
+    #[must_use]
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (String, Attribute)>) -> Self {
+        Self {
+            by_key: pairs.into_iter().collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_key.is_empty()
+    }
+
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<&Attribute> {
+        self.by_key.get(key)
+    }
+
+    /// The value of `key`, when it is text.
+    #[must_use]
+    pub fn text(&self, key: &str) -> Option<&str> {
+        match self.by_key.get(key)? {
+            Attribute::Text(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Which architecture llama.cpp wrote this file for — `llama`, `qwen2`,
+    /// `gemma3`.
+    ///
+    /// The one key that is not namespaced, because it is the key that says
+    /// what the namespace IS. Everything the file states about its geometry
+    /// hangs off this answer, and a converter that had to guess an
+    /// architecture from tensor names would be guessing at exactly the point
+    /// where being wrong is silent.
+    #[must_use]
+    pub fn architecture(&self) -> Option<&str> {
+        self.text("general.architecture")
+    }
+
+    /// This key-value block as a flat JSON object.
+    ///
+    /// Flat, and with the dotted keys left dotted: `qwen2.block_count` stays
+    /// one key rather than becoming `{"qwen2": {"block_count": ...}}`. The
+    /// dots are part of the name in GGUF — `general.alignment` and
+    /// `qwen2.attention.head_count` are namespaced by convention and not by
+    /// structure — and inventing a nesting the format does not have would
+    /// make the round trip lossy for any key whose prefix is also a key.
+    ///
+    /// [`Attribute::Aggregate`] renders as `null`, which is the same claim
+    /// the variant makes: the key was there, the contents were not carried.
+    /// A non-finite float renders as `null` for the same reason — JSON has
+    /// no spelling for it, and a silent 0.0 would be a different number.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let map: serde_json::Map<String, serde_json::Value> = self
+            .by_key
+            .iter()
+            .map(|(key, value)| {
+                let value = match value {
+                    Attribute::Uint(n) => (*n).into(),
+                    Attribute::Int(n) => (*n).into(),
+                    Attribute::Float(n) => serde_json::Number::from_f64(*n)
+                        .map_or(serde_json::Value::Null, serde_json::Value::Number),
+                    Attribute::Bool(b) => (*b).into(),
+                    Attribute::Text(s) => s.clone().into(),
+                    Attribute::Aggregate => serde_json::Value::Null,
+                };
+                (key.clone(), value)
+            })
+            .collect();
+        serde_json::Value::Object(map).to_string()
+    }
+}
+
+/// GGUF's tokenizer tables, read whole.
+///
+/// The one thing [`Attributes`] deliberately does not carry. A vocabulary is
+/// 150,000 strings and no reader of a model's DESCRIPTION wants it, so the
+/// summary keeps `tokenizer.ggml.tokens` as an [`Attribute::Aggregate`] and
+/// the caller that actually wants the contents asks for them here, by name
+/// and on purpose.
+///
+/// Owned rather than borrowed because the source is a CBOR tree inside a
+/// memory map that the caller has no reason to keep open, and owned rather
+/// than compiled because compiling a tokenizer is the tokenizer crate's job
+/// — this crate reads files.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TokenizerTables {
+    /// `tokenizer.ggml.model` — `gpt2`, `llama`, `bert`, `rwkv`. Which
+    /// FAMILY of tokenizer, not which model.
+    pub model: String,
+    /// `tokenizer.ggml.pre` — llama.cpp's name for a pre-tokenizer it has
+    /// hard-coded, `qwen2` or `llama-bpe`. Absent in older files.
+    ///
+    /// A name and not a pattern, which is the whole difficulty: GGUF stores
+    /// the IDENTITY of a pre-tokenizer where `tokenizer.json` stores its
+    /// regexes, so a reader either knows the name or cannot proceed.
+    pub pre: Option<String>,
+    /// `tokenizer.ggml.tokens` — every token's text, in id order.
+    pub tokens: Vec<String>,
+    /// `tokenizer.ggml.token_type` — one per token, parallel to `tokens`.
+    ///
+    /// ggml's `llama_token_type`: 1 normal, 2 unknown, 3 control, 4 user
+    /// defined, 5 unused, 6 byte. This is how a GGUF says which tokens are
+    /// the added ones, a fact `tokenizer.json` keeps in a separate
+    /// `added_tokens` list.
+    pub token_types: Vec<i64>,
+    /// `tokenizer.ggml.merges` — `"left right"`, in rank order.
+    pub merges: Vec<String>,
+}
+
+impl TokenizerTables {
+    /// Whether the file carried a tokenizer at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointFile {
     pub id: FileId,
@@ -140,5 +290,80 @@ impl crate::contract::infer::CheckpointTypes for CheckpointMetadata {
                 shape: raw.shape.clone(),
                 encoding: crate::types::normalize_encoding(&raw.encoding),
             })
+    }
+}
+
+#[cfg(test)]
+mod attribute_tests {
+    use super::{Attribute, Attributes};
+
+    /// The rendering is what a GGUF import carries as `model/config`, so
+    /// every variant has to survive it -- and the two that JSON cannot spell
+    /// have to say so rather than pick a number.
+    #[test]
+    fn every_attribute_renders_and_the_unspellable_ones_say_null() {
+        let attributes = Attributes::from_pairs([
+            (
+                "general.architecture".into(),
+                Attribute::Text("qwen2".into()),
+            ),
+            ("qwen2.block_count".into(), Attribute::Uint(24)),
+            ("a.negative".into(), Attribute::Int(-3)),
+            ("a.float".into(), Attribute::Float(0.5)),
+            ("a.bool".into(), Attribute::Bool(true)),
+            ("a.nan".into(), Attribute::Float(f64::NAN)),
+            ("tokenizer.ggml.tokens".into(), Attribute::Aggregate),
+        ]);
+        let json: serde_json::Value = serde_json::from_str(&attributes.to_json()).unwrap();
+
+        assert_eq!(json["general.architecture"], "qwen2");
+        assert_eq!(json["qwen2.block_count"], 24);
+        assert_eq!(json["a.negative"], -3);
+        assert_eq!(json["a.float"], 0.5);
+        assert_eq!(json["a.bool"], true);
+        // Present, and honest about carrying no value: a 0.0 here would be a
+        // different number, and an omitted key would be a different fact.
+        assert!(json["a.nan"].is_null());
+        assert!(json["tokenizer.ggml.tokens"].is_null());
+        assert!(
+            json.as_object()
+                .unwrap()
+                .contains_key("tokenizer.ggml.tokens")
+        );
+    }
+
+    /// The dots are part of the key, not a path. `general` is not an object
+    /// here, and `qwen2.attention.head_count` is one key and not three.
+    #[test]
+    fn a_dotted_key_stays_one_key() {
+        let attributes =
+            Attributes::from_pairs([("qwen2.attention.head_count".into(), Attribute::Uint(14))]);
+        let json: serde_json::Value = serde_json::from_str(&attributes.to_json()).unwrap();
+
+        assert_eq!(json["qwen2.attention.head_count"], 14);
+        assert!(json.get("qwen2").is_none());
+    }
+
+    /// The whole point of carrying it: `Encoding::from_config_json` has to
+    /// read this document as an unquantized checkpoint. It IS one -- import
+    /// decodes every GGUF block on the way in, because no device capability
+    /// mask carries `DECODE` -- and a GGUF states its per-tensor scheme in
+    /// the tensor record rather than in a `quantization_config` block, so
+    /// there is nothing here for the reader to mistake for one.
+    #[test]
+    fn a_gguf_key_value_block_declares_no_quantization() {
+        let attributes = Attributes::from_pairs([
+            (
+                "general.architecture".into(),
+                Attribute::Text("qwen2".into()),
+            ),
+            ("general.file_type".into(), Attribute::Uint(2)),
+            ("qwen2.block_count".into(), Attribute::Uint(24)),
+        ]);
+        let json: serde_json::Value = serde_json::from_str(&attributes.to_json()).unwrap();
+
+        for key in ["quantization_config", "quantization", "text_config"] {
+            assert!(json.get(key).is_none(), "{key} would change the reading");
+        }
     }
 }

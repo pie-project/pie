@@ -535,6 +535,45 @@ pub fn split(args: &[Arg], results: usize) -> (Vec<usize>, Vec<usize>, Vec<usize
     (ins.to_vec(), outs.to_vec(), weights)
 }
 
+/// How many of a routine's `BufMut` operands the STATEMENT supplies.
+///
+/// [`split`]'s `results` is meant to be this number, and for ninety-eight
+/// routines it is exactly the count of [`kernels::Ty::BufMut`] in the
+/// signature. For two it is not, and the difference is not cosmetic: it
+/// silently swallowed every paged decode.
+///
+/// `attn::kv_append` and `attn::kv_append_paged` write the KV cache, and the
+/// cache is not an operand the trace carries -- the arm draws it from the POOL
+/// with [`Handles::kv`]. The rows that used to state these two said so, by
+/// naming `Source::KvKeys` and `Source::KvValues` where every other result
+/// named `Out(n)`, so the table path counted ZERO outputs for them. The
+/// routine signature cannot say it: `Provenance` distinguishes `Trace` from
+/// `Env` and a `BufMut` the driver supplies is neither.
+///
+/// So it is stated here, which is the same place the row's `Source` column
+/// lived -- driver-side, beside the arm that does the drawing.
+///
+/// The failure this fixes: both statements carry two INPUTS and no output, so
+/// counting two results made [`split`] hand both inputs to `outs` and leave
+/// `ins` empty. `o.input(0)` then refused `Absent`, every `kv_append_paged`
+/// rectangle was unplannable, and thirty-seven device tests went red at once.
+#[must_use]
+pub fn traced_results(routine: &kernels_vulkan::routine::Routine) -> usize {
+    let declared = routine
+        .args
+        .iter()
+        .filter(|(ty, _)| *ty == kernels::Ty::BufMut)
+        .count();
+    // Named by ROUTINE rather than by entrypoint, because the fact is about
+    // where the cache comes from and every instantiation of these two draws it
+    // the same way.
+    let from_the_pool = match routine.name {
+        "kv_append" | "kv_append_paged" => 2,
+        _ => 0,
+    };
+    declared - from_the_pool
+}
+
 /// One routine's operand plumbing: the values it takes, in its own order.
 ///
 /// `Env` arguments are appended by the arm from [`Facts`], because they are
@@ -678,6 +717,38 @@ pub fn silu_mul(o: &mut Handles<'_, '_>, f: Facts) -> Result<Vec<ArgValue>, Refu
         gate.v(),
         up.v(),
         out.v(),
+        f.width.cast_signed().v(),
+        f.rows.cast_signed().v(),
+    ])
+}
+
+/// `mlp::silu_mul_strided`: [`silu_mul`] over rows a pitch apart.
+///
+/// The row this arm serves was the LAST `kernel!` in this backend's table. It
+/// stayed there because `silu_mul` is a prefix of its stem, so the stem had to
+/// be RESERVED rather than served -- see [`Crossed::routine`], which no longer
+/// has a reservation to point at.
+///
+/// One pitch for all three tensors, because the body walks
+/// `tid.y * row_pitch + tid.x` for gate, up and out alike. It is the
+/// statement's first scalar or a refusal, for the reason `rope::neox_strided`
+/// gives: a pitch the fire could stand in for is a pitch that is silently
+/// wrong when the projection is packed.
+///
+/// # Errors
+///
+/// [`Refusal::Absent`] for an operand or the pitch the statement does not
+/// carry.
+pub fn silu_mul_strided(o: &mut Handles<'_, '_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
+    let row_pitch = o.param(0)?;
+    let gate = o.input(0)?;
+    let up = o.input(1)?;
+    let out = o.output(0)?;
+    Ok(vec![
+        gate.v(),
+        up.v(),
+        out.v(),
+        row_pitch.v(),
         f.width.cast_signed().v(),
         f.rows.cast_signed().v(),
     ])
@@ -1663,8 +1734,11 @@ pub fn route_sort(o: &mut Handles<'_, '_>, _f: Facts) -> Result<Vec<ArgValue>, R
 /// `padded` is the SORTED extent and not the token count: the sort rounds each
 /// expert's run up to a tile so the multiply's tiles never straddle two
 /// experts, which makes the gathered rectangle taller than the fire's. The
-/// statement states it -- the row said so with `rows_param = Some(4)` -- and
-/// the fire's count is the fallback for a trace that does not.
+/// statement states it as its fifth scalar -- which is what metal's row said
+/// with the column `kernels/tests/shader_backends_agree.rs` calls
+/// `DRIFTED["route_gather"]`, spelled here as the index `4` rather than as a
+/// column this driver reads -- and the fire's count is the fallback for a
+/// trace that does not.
 ///
 /// # Errors
 ///
@@ -2508,13 +2582,31 @@ pub fn split_qkv_bf16(o: &mut Handles<'_, '_>, f: Facts) -> Result<Vec<ArgValue>
 /// and `gate` the sigmoid's argument, and the pitch is the statement's because
 /// a gated attention output is usually a window into a packed block.
 ///
+/// # `input(1)`, not `input(0)`: the aliased operand is not the gate
+///
+/// `in_place = &[(0, 0)]` says output 0 and input 0 name the same address.
+/// The statement is `OpKind::SigmoidGateMul` with `inputs = [x, gate]` and one
+/// result (`model-ir/src/trace/builder.rs::sigmoid_gate_mul`), `lower::walk`
+/// pushes every input and then every output, and in-place changes where the
+/// OUTPUT is written and never the argument list -- so the launch carries
+/// three widthed args, `[x, gate, out]`, and the split with one result gives
+/// `ins = [x, gate]`.
+///
+/// So `input(0)` is the tensor `output(0)` already aliases. Asking for it
+/// binds ONE address at both slots and computes `attn *= sigmoid(attn)`:
+/// arithmetic that runs, reports success and never reads the gate, which no
+/// arity or shape check can see because the two operands share a shape by
+/// construction. This read `input(0)` until `driver-wgpu`'s crossing compared
+/// the three arms. It had never fired -- the row was bare on all three
+/// backends -- which is the only reason it cost nothing.
+///
 /// # Errors
 ///
 /// [`Refusal::Absent`] for either operand or the pitch.
 pub fn gate(o: &mut Handles<'_, '_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
     let row_stride = o.param(0)?;
     let attn = o.output(0)?;
-    let gate_in = o.input(0)?;
+    let gate_in = o.input(1)?;
     Ok(vec![
         attn.v(),
         gate_in.v(),
@@ -3406,12 +3498,10 @@ static LIVE: std::sync::LazyLock<Vec<Crossed>> = std::sync::LazyLock::new(|| {
             routine: Some(of(kernels_vulkan::layout::ROUTINES, "row_gather")),
             arm: Some(row_gather as Arm),
         },
-        // Reserved and not served: `silu_mul` would otherwise claim it, and
-        // `mlp` crosses four of its five. See [`Crossed::routine`].
         Crossed {
             stem: "silu_mul_strided",
-            routine: None,
-            arm: None,
+            routine: Some(of(kernels_vulkan::mlp::ROUTINES, "silu_mul_strided")),
+            arm: Some(silu_mul_strided as Arm),
         },
         // rope
         Crossed {
@@ -3597,12 +3687,12 @@ static LIVE: std::sync::LazyLock<Vec<Crossed>> = std::sync::LazyLock::new(|| {
             arm: Some(shared_expert_combine_strided as Arm),
         },
         Crossed {
-            stem: "qmv_routed",
+            stem: "affine_qmv_routed",
             routine: Some(of(kernels_vulkan::moe::ROUTINES, "qmv_routed")),
             arm: Some(qmv_routed as Arm),
         },
         Crossed {
-            stem: "qmv_routed_bias",
+            stem: "affine_qmv_routed_bias",
             routine: Some(of(kernels_vulkan::moe::ROUTINES, "qmv_routed_bias")),
             arm: Some(qmv_routed_bias as Arm),
         },
@@ -3612,12 +3702,12 @@ static LIVE: std::sync::LazyLock<Vec<Crossed>> = std::sync::LazyLock::new(|| {
             arm: Some(mxfp4_qmv_routed_bias as Arm),
         },
         Crossed {
-            stem: "qmm_t_routed",
+            stem: "affine_qmm_t_routed",
             routine: Some(of(kernels_vulkan::moe::ROUTINES, "qmm_t_routed")),
             arm: Some(qmm_t_routed as Arm),
         },
         Crossed {
-            stem: "qmm_t_routed_fp16",
+            stem: "affine_qmm_t_routed_fp16",
             routine: Some(of(kernels_vulkan::moe::ROUTINES, "qmm_t_routed_fp16")),
             arm: Some(qmm_t_routed_fp16 as Arm),
         },
@@ -3731,12 +3821,12 @@ static LIVE: std::sync::LazyLock<Vec<Crossed>> = std::sync::LazyLock::new(|| {
             arm: Some(cast_qmm_input_strided_bfloat16_to_float16 as Arm),
         },
         Crossed {
-            stem: "encode_u4_bf16",
+            stem: "affine_encode_u4_bf16",
             routine: Some(of(kernels_vulkan::quant::ROUTINES, "encode_u4_bf16")),
             arm: Some(encode_u4_bf16 as Arm),
         },
         Crossed {
-            stem: "encode_u4_f32",
+            stem: "affine_encode_u4_f32",
             routine: Some(of(kernels_vulkan::quant::ROUTINES, "encode_u4_f32")),
             arm: Some(encode_u4_f32 as Arm),
         },
@@ -3756,12 +3846,12 @@ static LIVE: std::sync::LazyLock<Vec<Crossed>> = std::sync::LazyLock::new(|| {
             arm: Some(qmm_splitk_reduce_f32 as Arm),
         },
         Crossed {
-            stem: "qmm_t",
+            stem: "affine_qmm_t",
             routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmm_t")),
             arm: Some(qmm_t as Arm),
         },
         Crossed {
-            stem: "qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
+            stem: "affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
             routine: Some(of(
                 kernels_vulkan::quant::ROUTINES,
                 "qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
@@ -3769,7 +3859,7 @@ static LIVE: std::sync::LazyLock<Vec<Crossed>> = std::sync::LazyLock::new(|| {
             arm: Some(qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4 as Arm),
         },
         Crossed {
-            stem: "qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
+            stem: "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
             routine: Some(of(
                 kernels_vulkan::quant::ROUTINES,
                 "qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
@@ -3777,7 +3867,7 @@ static LIVE: std::sync::LazyLock<Vec<Crossed>> = std::sync::LazyLock::new(|| {
             arm: Some(qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2 as Arm),
         },
         Crossed {
-            stem: "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
+            stem: "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
             routine: Some(of(
                 kernels_vulkan::quant::ROUTINES,
                 "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
@@ -3785,7 +3875,7 @@ static LIVE: std::sync::LazyLock<Vec<Crossed>> = std::sync::LazyLock::new(|| {
             arm: Some(qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2 as Arm),
         },
         Crossed {
-            stem: "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
+            stem: "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
             routine: Some(of(
                 kernels_vulkan::quant::ROUTINES,
                 "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
@@ -3793,7 +3883,7 @@ static LIVE: std::sync::LazyLock<Vec<Crossed>> = std::sync::LazyLock::new(|| {
             arm: Some(qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1 as Arm),
         },
         Crossed {
-            stem: "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
+            stem: "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
             routine: Some(of(
                 kernels_vulkan::quant::ROUTINES,
                 "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
@@ -3801,12 +3891,12 @@ static LIVE: std::sync::LazyLock<Vec<Crossed>> = std::sync::LazyLock::new(|| {
             arm: Some(qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4 as Arm),
         },
         Crossed {
-            stem: "qmm_t_bias",
+            stem: "affine_qmm_t_bias",
             routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmm_t_bias")),
             arm: Some(qmm_t_bias as Arm),
         },
         Crossed {
-            stem: "qmm_t_bias_fp16_precast",
+            stem: "affine_qmm_t_bias_fp16_precast",
             routine: Some(of(
                 kernels_vulkan::quant::ROUTINES,
                 "qmm_t_bias_fp16_precast",
@@ -3814,17 +3904,17 @@ static LIVE: std::sync::LazyLock<Vec<Crossed>> = std::sync::LazyLock::new(|| {
             arm: Some(qmm_t_bias_fp16_precast as Arm),
         },
         Crossed {
-            stem: "qmm_t_fp16_precast",
+            stem: "affine_qmm_t_fp16_precast",
             routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmm_t_fp16_precast")),
             arm: Some(qmm_t_fp16_precast as Arm),
         },
         Crossed {
-            stem: "qmm_t_residual",
+            stem: "affine_qmm_t_residual",
             routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmm_t_residual")),
             arm: Some(qmm_t_residual as Arm),
         },
         Crossed {
-            stem: "qmm_t_residual_fp16_precast",
+            stem: "affine_qmm_t_residual_fp16_precast",
             routine: Some(of(
                 kernels_vulkan::quant::ROUTINES,
                 "qmm_t_residual_fp16_precast",
@@ -3832,17 +3922,17 @@ static LIVE: std::sync::LazyLock<Vec<Crossed>> = std::sync::LazyLock::new(|| {
             arm: Some(qmm_t_residual_fp16_precast as Arm),
         },
         Crossed {
-            stem: "qmm_t_splitk",
+            stem: "affine_qmm_t_splitk",
             routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmm_t_splitk")),
             arm: Some(qmm_t_splitk as Arm),
         },
         Crossed {
-            stem: "qmm_t_splitk_f32",
+            stem: "affine_qmm_t_splitk_f32",
             routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmm_t_splitk_f32")),
             arm: Some(qmm_t_splitk_f32 as Arm),
         },
         Crossed {
-            stem: "qmm_t_splitk_fp16_precast",
+            stem: "affine_qmm_t_splitk_fp16_precast",
             routine: Some(of(
                 kernels_vulkan::quant::ROUTINES,
                 "qmm_t_splitk_fp16_precast",
@@ -3850,7 +3940,7 @@ static LIVE: std::sync::LazyLock<Vec<Crossed>> = std::sync::LazyLock::new(|| {
             arm: Some(qmm_t_splitk_fp16_precast as Arm),
         },
         Crossed {
-            stem: "qmm_t_splitk_fp16_precast_f32",
+            stem: "affine_qmm_t_splitk_fp16_precast_f32",
             routine: Some(of(
                 kernels_vulkan::quant::ROUTINES,
                 "qmm_t_splitk_fp16_precast_f32",
@@ -3858,12 +3948,12 @@ static LIVE: std::sync::LazyLock<Vec<Crossed>> = std::sync::LazyLock::new(|| {
             arm: Some(qmm_t_splitk_fp16_precast_f32 as Arm),
         },
         Crossed {
-            stem: "qmm_t_strided",
+            stem: "affine_qmm_t_strided",
             routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmm_t_strided")),
             arm: Some(qmm_t_strided as Arm),
         },
         Crossed {
-            stem: "qmm_t_strided_fp16_precast",
+            stem: "affine_qmm_t_strided_fp16_precast",
             routine: Some(of(
                 kernels_vulkan::quant::ROUTINES,
                 "qmm_t_strided_fp16_precast",
@@ -3871,7 +3961,7 @@ static LIVE: std::sync::LazyLock<Vec<Crossed>> = std::sync::LazyLock::new(|| {
             arm: Some(qmm_t_strided_fp16_precast as Arm),
         },
         Crossed {
-            stem: "qmm_t_strided_fp16_precast_residual",
+            stem: "affine_qmm_t_strided_fp16_precast_residual",
             routine: Some(of(
                 kernels_vulkan::quant::ROUTINES,
                 "qmm_t_strided_fp16_precast_residual",
@@ -3879,7 +3969,7 @@ static LIVE: std::sync::LazyLock<Vec<Crossed>> = std::sync::LazyLock::new(|| {
             arm: Some(qmm_t_strided_fp16_precast_residual as Arm),
         },
         Crossed {
-            stem: "qmm_t_strided_residual",
+            stem: "affine_qmm_t_strided_residual",
             routine: Some(of(
                 kernels_vulkan::quant::ROUTINES,
                 "qmm_t_strided_residual",
@@ -3887,27 +3977,27 @@ static LIVE: std::sync::LazyLock<Vec<Crossed>> = std::sync::LazyLock::new(|| {
             arm: Some(qmm_t_strided_residual as Arm),
         },
         Crossed {
-            stem: "qmv_fast",
+            stem: "affine_qmv_fast",
             routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmv_fast")),
             arm: Some(qmv_fast as Arm),
         },
         Crossed {
-            stem: "qmv_fast_residual",
+            stem: "affine_qmv_fast_residual",
             routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmv_fast_residual")),
             arm: Some(qmv_fast_residual as Arm),
         },
         Crossed {
-            stem: "qmv_tail",
+            stem: "affine_qmv_tail",
             routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmv_tail")),
             arm: Some(qmv_tail as Arm),
         },
         Crossed {
-            stem: "qmv_tail_bias",
+            stem: "affine_qmv_tail_bias",
             routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmv_tail_bias")),
             arm: Some(qmv_tail_bias as Arm),
         },
         Crossed {
-            stem: "qmv_wide_strided",
+            stem: "affine_qmv_wide_strided",
             routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmv_wide_strided")),
             arm: Some(qmv_wide_strided as Arm),
         },
@@ -3940,16 +4030,17 @@ mod tests {
 
     /// The lookup needs no `kernel!` row, which is the whole point of it.
     ///
-    /// Stated against the rows' ABSENCE rather than their presence: this is
-    /// the property that lets a family delete its rows in the same commit that
-    /// adds its arms, and a test that merely agreed with `sig_in` would keep
-    /// passing after the rows went and prove nothing about why.
+    /// This asserted `kernels::sig_in(KERNELS, "argmax_logits_bfloat16")
+    /// .is_none()` beside the line below -- the rows' ABSENCE rather than
+    /// their presence, so that a family could delete its rows in the same
+    /// commit that added its arms. Every family has, `KERNELS` is empty, and
+    /// this crate no longer names it: the `sig_in` half would now be a claim
+    /// about a table that has no rows for anything, which is not the claim.
+    ///
+    /// What is left is the half that still says something: the registry finds
+    /// an entrypoint by its own stems.
     #[test]
     fn the_lookup_reads_no_kernel_row() {
-        assert!(
-            kernels::sig_in(kernels_vulkan::KERNELS, "argmax_logits_bfloat16").is_none(),
-            "`sample`'s row is retired, and the routine path still finds it below"
-        );
         assert!(arm_for("argmax_logits_bfloat16").is_some());
     }
 
@@ -3997,25 +4088,33 @@ mod tests {
         );
     }
 
-    /// A crossed family with no arm is declared and DARK.
+    /// No family is dark any more.
     ///
-    /// The state every family not named in `LIVE` is in, and the
-    /// property that lets this land family by family: a routine whose arm is
-    /// unwritten must not be reachable, because reaching it would run a body
-    /// against operands nothing had worked out.
+    /// While the crossing ran, a family whose rows were gone but whose arms
+    /// were unwritten had to be UNREACHABLE -- reaching it would have run a
+    /// body against operands nothing had worked out -- and this test named
+    /// one such symbol and asserted `arm_for` refused it.
+    ///
+    /// There is no such symbol left to name, so the test says the thing the
+    /// naming was for instead: every routine this crate declares is filed in
+    /// `LIVE` with an arm. Written over the routine list rather than over a
+    /// symbol, because the failure it guards is a routine that crossed and
+    /// was never wired, and that is a hole in the list, not a bad stem.
     #[test]
-    fn a_family_whose_arms_are_unwritten_is_not_reachable() {
-        for dark in ["affine_qmv_fast_bfloat16_gs_64_b_4"] {
-            assert!(
-                arm_for(dark).is_none(),
-                "`{dark}` has no arm written and must not be callable"
-            );
-        }
+    fn no_routine_this_crate_declares_is_left_without_an_arm() {
+        let unwired: Vec<&str> = kernels_vulkan::routines()
+            .iter()
+            .map(|r| r.name)
+            .filter(|name| {
+                !LIVE
+                    .iter()
+                    .any(|c| c.routine.is_some_and(|r| r.name == *name) && c.arm.is_some())
+            })
+            .collect();
         assert!(
-            kernels_vulkan::routines()
-                .iter()
-                .any(|r| r.name == "qmv_fast"),
-            "the point is that it has CROSSED and is still dark, not that it is absent"
+            unwired.is_empty(),
+            "these routines crossed and reach no arm: {}",
+            unwired.join(", ")
         );
     }
 
@@ -4070,17 +4169,21 @@ mod tests {
         }
     }
 
-    /// A stem this driver reserves is a stem no other stem may claim.
+    /// The longest stem wins, so a stem that is another's prefix does not
+    /// steal it.
     ///
-    /// `silu_mul_strided` is the case: its row is still in the table because
-    /// its routine was never written, and `silu_mul` is a prefix of it
-    /// followed by a separator. Without the reservation the contiguous body
-    /// would be handed a strided rectangle, read its three operands at the
-    /// wrong pitches, and return success.
+    /// `silu_mul` is a prefix of `silu_mul_strided` followed by a separator.
+    /// While the strided routine was unwritten this was answered by RESERVING
+    /// the longer stem; now both are served, and the rule that has to hold is
+    /// the same one: `silu_mul_strided_bfloat16` reaches the strided body and
+    /// not the contiguous one, which would read three operands at the wrong
+    /// pitches and return success.
     #[test]
-    fn a_reserved_stem_falls_through_to_the_row_that_is_still_there() {
-        assert!(arm_for("silu_mul_strided_bfloat16").is_none());
-        assert!(arm_for("silu_mul_bfloat16").is_some());
+    fn the_longest_stem_wins_over_the_one_that_is_its_prefix() {
+        let strided = arm_for("silu_mul_strided_bfloat16").expect("a strided body");
+        assert_eq!(strided.0.name, "silu_mul_strided");
+        let flat = arm_for("silu_mul_bfloat16").expect("a contiguous body");
+        assert_eq!(flat.0.name, "silu_mul");
     }
 
     /// The affine axis is read off the entrypoint, which is where this backend
@@ -4134,5 +4237,89 @@ mod tests {
             vec![2],
             "a weight is not widthed and takes no place"
         );
+    }
+
+    /// Every entrypoint this crate can be asked for finds an arm.
+    ///
+    /// The stems here are ENTRYPOINT stems, not routine names, and the two
+    /// are not always the same word: `quant::qmm_t`'s entrypoints all begin
+    /// `affine_qmm_t`, because the row that used to state them named the
+    /// routine one way and the shader another. Thirty rows in `quant` and
+    /// `moe` are like that, and while the table still held them the bridge
+    /// was the row. It is this list now, so the list has to say the shader's
+    /// word.
+    ///
+    /// Stated as a sweep over `entrypoints()` rather than as a list of the
+    /// thirty, because the failure it catches is not "this stem is wrong" but
+    /// "a symbol a plan can name reaches nothing" -- which is silent: the
+    /// dispatch is dropped and the frame runs short.
+    #[test]
+    fn every_entrypoint_a_plan_can_name_finds_an_arm() {
+        let dark: Vec<String> = kernels_vulkan::entrypoints()
+            .into_iter()
+            .filter(|e| arm_for(e).is_none())
+            .collect();
+        assert!(
+            dark.is_empty(),
+            "{} entrypoints reach no arm, first few: {}",
+            dark.len(),
+            dark.iter().take(8).cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+
+    /// The two routines whose results the POOL supplies are counted as taking
+    /// none from the statement.
+    ///
+    /// The regression this pins: `traced_results` returning the raw `BufMut`
+    /// count made `split` hand `kv_append_paged`'s two INPUTS to `outs`, so
+    /// `o.input(0)` refused `Absent` and every paged decode was unplannable.
+    /// It is invisible in a signature -- both counts are two -- so it is
+    /// checked against the numbers rather than against the shape.
+    #[test]
+    fn a_result_the_pool_supplies_is_not_a_result_the_statement_carries() {
+        for name in ["kv_append", "kv_append_paged"] {
+            let r = kernels_vulkan::routines()
+                .iter()
+                .find(|r| r.name == name)
+                .copied()
+                .expect("the routine is declared");
+            assert_eq!(
+                r.args
+                    .iter()
+                    .filter(|(ty, _)| *ty == kernels::Ty::BufMut)
+                    .count(),
+                2,
+                "`{name}` states two mutable buffers"
+            );
+            assert_eq!(
+                traced_results(r),
+                0,
+                "`{name}` draws both from the pool, so the statement carries none"
+            );
+        }
+    }
+
+    /// Every OTHER routine takes its results from the statement.
+    ///
+    /// The exception list is a list, so it can grow silently wrong. This says
+    /// the exceptions are the only exceptions.
+    #[test]
+    fn every_other_routines_results_are_the_ones_it_declares() {
+        for r in kernels_vulkan::routines() {
+            if matches!(r.name, "kv_append" | "kv_append_paged") {
+                continue;
+            }
+            let declared = r
+                .args
+                .iter()
+                .filter(|(ty, _)| *ty == kernels::Ty::BufMut)
+                .count();
+            assert_eq!(
+                traced_results(r),
+                declared,
+                "`{}` is not on the exception list and must be counted whole",
+                r.name
+            );
+        }
     }
 }

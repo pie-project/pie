@@ -496,11 +496,14 @@ fn no_routine_invents_a_kernel() {
     // are deleted, and the retired list is the record of which hundred names
     // there ever were. Without it this test would forbid the deletion it was
     // written to survive.
-    let rows: std::collections::BTreeSet<&str> = kernels_vulkan::KERNELS
-        .iter()
-        .map(|r| r.name)
-        .chain(kernels_vulkan::retired_rows().iter().copied())
-        .collect();
+    // `KERNELS.iter().map(|r| r.name).chain(..)` STOOD HERE. `KERNELS` is
+    // empty -- every family crossed -- so the union is exactly the retired
+    // list, and the `.chain` was joining a hundred names to nothing. The
+    // retired list is the whole record of which hundred names there ever
+    // were, which is what this test needs and all it ever needed once the
+    // last family crossed.
+    let rows: std::collections::BTreeSet<&str> =
+        kernels_vulkan::retired_rows().iter().copied().collect();
     for r in kernels_vulkan::routines() {
         assert!(
             rows.contains(r.name),

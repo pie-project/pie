@@ -155,7 +155,6 @@
 mod capability;
 pub use crate::capability::Capability;
 
-use kernels::KernelSig;
 // Named only by the doc links above, which rustdoc still has to resolve.
 #[allow(unused_imports)]
 use kernels::Axis;
@@ -182,118 +181,59 @@ pub mod rope;
 pub mod sample;
 pub mod ssm;
 
-/// The family tables, concatenated.
+/// The family tables, concatenated. THERE ARE NO ROWS.
 ///
-/// A `const fn` fold rather than a `Vec`, so the whole table stays a `&'static`
-/// the compiler can read at load with no allocation — the same shape both
-/// sibling tables use for the same reason.
-pub static KERNELS: &[KernelSig] = &CONCAT;
-
-const FAMILIES: &[&[KernelSig]] = &[
-    attn::KERNELS,
-    layout::KERNELS,
-    mlp::KERNELS,
-    moe::KERNELS,
-    norm::KERNELS,
-    ptir::KERNELS,
-    quant::KERNELS,
-    rope::KERNELS,
-    sample::KERNELS,
-    ssm::KERNELS,
-];
-
-const fn total() -> usize {
-    let mut n = 0;
-    let mut i = 0;
-    while i < FAMILIES.len() {
-        n += FAMILIES[i].len();
-        i += 1;
-    }
-    n
-}
-
-const N: usize = total();
-
-const EMPTY: KernelSig = KernelSig {
-    name: "",
-    symbol: "",
-    file: None,
-    launch: kernels::LaunchRule::Unstated,
-    whole: false,
-    lacks: &[],
-    sink: None,
-    in_place: &[],
-    depth_prefix_plan: false,
-    // A standing fact about this table, no longer annotating a field: no
-    // kernel here is a mamba block, and `Prepare::Ssm` does not appear in
-    // this file. That is why the aux-slot field this crate used to carry
-    // was always empty. Step 9 measured that field CUDA-only and
-    // consolidated it onto `kernels_cuda::x::Contract`, so the reason
-    // outlived the field.
-    args: &[],
-    operands: &[],
-    axes: &[],
-    grid_param: None,
-    head_param: None,
-    heads_param: None,
-    rows_param: None,
-};
-
-const fn copy_sig(k: &KernelSig) -> KernelSig {
-    KernelSig {
-        name: k.name,
-        symbol: k.symbol,
-        file: k.file,
-        launch: k.launch,
-        whole: k.whole,
-        lacks: k.lacks,
-        sink: k.sink,
-        in_place: k.in_place,
-        depth_prefix_plan: k.depth_prefix_plan,
-        args: k.args,
-        operands: k.operands,
-        axes: k.axes,
-        grid_param: k.grid_param,
-        head_param: k.head_param,
-        heads_param: k.heads_param,
-        rows_param: k.rows_param,
-    }
-}
-
-/// The families laid end to end.
+/// This was `&CONCAT`: a `FAMILIES` list, a `total()`/`N` const fold, an
+/// `EMPTY` filler row, a field-by-field `copy_sig` because `KernelSig` is not
+/// `Copy` in a const context, and a const-evaluated loop that laid ten family
+/// tables end to end so the whole hundred stayed a `&'static` the compiler
+/// could read at load with no allocation. About a hundred and forty lines, and
+/// the last family crossing made all of it a machine for concatenating
+/// nothing.
 ///
-/// A `static` rather than a `const`: `KERNELS` borrows it, and borrowing a
-/// `const` promotes a fresh copy of the whole table rather than pointing at
-/// one. The initialiser is still a const-evaluated loop, because a `static`
-/// may be built by one.
-static CONCAT: [KernelSig; N] = {
-    let mut out = [EMPTY; N];
-    let mut at = 0;
-    let mut f = 0;
-    while f < FAMILIES.len() {
-        let family = FAMILIES[f];
-        let mut i = 0;
-        while i < family.len() {
-            out[at] = copy_sig(&family[i]);
-            at += 1;
-            i += 1;
-        }
-        f += 1;
-    }
-    out
-};
+/// The NAME stays, and stays deliberately, for exactly the reason
+/// `kernels-metal` gives at its own copy of this line:
+/// `kernels/tests/shader_backends_agree.rs` reads all three backends through
+/// it, and an empty table and an absent one are the same shape to that gate
+/// but not the same fact. This backend FINISHED. `refactor-bigplan.md` §7
+/// Stage 5 deletes `KernelSig` itself, once `kernels-wgpu` -- the last with
+/// rows -- can write this line too.
+///
+/// Nothing in this crate reads it, and nothing in `driver-vulkan` names
+/// `KernelSig` at all.
+pub static KERNELS: &[kernels::KernelSig] = &[];
+
+// The rest of what stood here, and where it went:
+//
+// `pub static KERNELS: &[KernelSig] = &CONCAT` was backed by the
+// `FAMILIES` list, the `total()`/`N` const fold, the `EMPTY` row, `copy_sig`,
+// and the const-evaluated `CONCAT` loop that laid ten family tables end to
+// end -- a hundred and forty lines whose only job was to make one `&'static
+// [KernelSig]` the compiler could read at load with no allocation.
+//
+// All ten families are `&[]`. Every one has crossed to a routine, so the fold
+// concatenated nothing into a zero-length array and `KERNELS` was an empty
+// slice that thirty-odd readers across three crates went on consulting -- each
+// of them, on the day its family crossed, quietly checking nothing.
+//
+// What names this crate's kernels now is `retired_rows()`, which is the whole
+// hundred, and `routines()`, which is what serves them. `entrypoints()` below
+// is unchanged in meaning and simpler in fact: it was the table's names plus
+// the retired ones, and it is the retired ones.
+//
+// `kernels-wgpu` is the last crate holding rows. When it finishes, the
+// `kernel!` macro and `KernelSig`'s sixteen fields go with it -- Stage 5 --
+// and nothing in this crate will have to move for that to happen.
 
 /// Every entrypoint the table names, sorted.
 ///
 /// The set `scripts/vulkan-kernel-audit.py` compares against the shader tree,
 /// and — one for one — the set of `.spv` module names a `native` build writes.
 pub fn entrypoints() -> Vec<String> {
-    let mut out: Vec<String> = KERNELS.iter().flat_map(KernelSig::entrypoints).collect();
-    out.extend(
-        RETIRED
-            .iter()
-            .flat_map(|family| family.iter().map(|n| (*n).to_owned())),
-    );
+    let mut out: Vec<String> = RETIRED
+        .iter()
+        .flat_map(|family| family.iter().map(|n| (*n).to_owned()))
+        .collect();
     out.sort();
     out
 }
@@ -436,6 +376,7 @@ pub fn retired_rows() -> &'static [&'static str] {
         "qmv_tail",
         "qmv_tail_bias",
         "qmv_wide_strided",
+        "silu_mul_strided",
     ]
 }
 
@@ -494,326 +435,33 @@ pub fn routines() -> Vec<&'static routine::Routine> {
     CROSSED.iter().copied().flatten().collect()
 }
 
-/// Where one operand rides. See [`bindings`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Binding {
-    /// `layout(std430, binding = N)`.
-    Buffer(u32),
-    /// The `N`-th field of the push-constant block.
-    Push(u32),
-    /// Nowhere of its own: a FIELD of the packed buffer ahead of it.
-    ///
-    /// [`kernels::Ty::InPacked`] is how a row says "the driver has to supply
-    /// this value, but it does not get a slot" — the value belongs to a struct
-    /// some earlier `Buf` operand already binds, so the driver writes it while
-    /// filling that buffer and the shader reads it as a struct member.
-    ///
-    /// Metal could fold this into the scalar run, because there a packed slot
-    /// IS the buffer and a trailing scalar lands in the same argument. Vulkan
-    /// splits the two runs, so folding it into the push block would push a word
-    /// no shader reads and leave the struct field unwritten — the defect this
-    /// variant exists to make unrepresentable.
-    Packed,
-}
-
-/// Which descriptor binding each operand of `sig` takes, and which
-/// push-constant field, under the two-pass rule this module's own docs state.
-///
-/// Both runs are indexed from zero and both follow the row's order, so the
-/// answer for operand `k` is a function of the row alone — which is the point:
-/// a shell binding a launch and a test checking a shader compute the same thing
-/// from the same place.
-///
-/// A row with no operands is UNSTATED (see [`KernelSig::operands`]), and this
-/// answers with an empty vector rather than inventing a nullary layout.
-#[must_use]
-pub fn bindings(sig: &KernelSig) -> Vec<Binding> {
-    let mut buffers = 0;
-    let mut pushes = 0;
-    sig.operands
-        .iter()
-        .map(|op| {
-            if matches!(op.ty, kernels::Ty::InPacked) {
-                // Consumes neither run: see `Binding::Packed`.
-                Binding::Packed
-            } else if is_buffer(op.ty) {
-                let at = buffers;
-                buffers += 1;
-                Binding::Buffer(at)
-            } else {
-                let at = pushes;
-                pushes += 1;
-                Binding::Push(at)
-            }
-        })
-        .collect()
-}
-
-/// How many descriptor bindings a row's pipeline layout declares.
-#[must_use]
-pub fn buffer_count(sig: &KernelSig) -> u32 {
-    sig.operands.iter().filter(|op| is_buffer(op.ty)).count() as u32
-}
-
-/// One scalar's place in the push-constant block, in BYTES.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PushField {
-    /// The operand's name, as the row spells it.
-    pub name: &'static str,
-    /// Byte offset from the start of the block.
-    pub offset: u32,
-    /// Width in bytes: four or eight.
-    pub size: u32,
-}
-
-/// The push-constant block's byte layout, which [`Binding::Push`] does NOT give.
-///
-/// `Binding::Push(n)` is a field INDEX, and a driver needs an offset. Turning
-/// one into the other is not multiplication, because a push block follows
-/// std430: a member is aligned to its own width, so an eight-byte scalar after
-/// a lone four-byte one starts at 8 and not at 4. `attn/kv_write.slang` is
-/// exactly that shape --
-///
-/// ```text
-/// int head_dim; uint64_t k_head_stride; uint64_t k_seq_stride;
-/// ```
-///
-/// -- so the naive sum of widths says 20 bytes and the real block is 24, with
-/// four bytes of padding after the first field. A driver that packs by
-/// concatenation writes both strides four bytes low and the shader reads two
-/// halves of two different numbers. Nothing reports it: Vulkan does not know
-/// what the bytes were supposed to mean.
-///
-/// That padding used to exist only as a hand-computed constant in a GPU test.
-/// It is derived here instead, so the test and any future driver get it from
-/// one place — which is the same reason [`bindings`] exists rather than each
-/// of them counting buffers by hand. Two other readers have since gone:
-/// `examples/dump_layout.rs` printed this layout and
-/// `scripts/vulkan-kernel-audit.py --bindings` compared it to what the shaders
-/// declare. Both are deleted, so this function is now the only statement of
-/// the push ABI and a shader that disagrees with it is caught on a device or
-/// not at all.
-#[must_use]
-pub fn push_layout(sig: &KernelSig) -> Vec<PushField> {
-    let mut at = 0u32;
-    sig.operands
-        .iter()
-        .filter(|op| !is_buffer(op.ty) && !matches!(op.ty, kernels::Ty::InPacked))
-        .map(|op| {
-            let size = push_width(op.ty);
-            at = at.next_multiple_of(size);
-            let field = PushField {
-                name: op.name,
-                offset: at,
-                size,
-            };
-            at += size;
-            field
-        })
-        .collect()
-}
-
-/// The push block's total size in bytes, padding included.
-///
-/// Rounded up to the block's own alignment — the widest member — because that
-/// is what a `VkPushConstantRange` covering the whole block has to be, and
-/// because `vkCmdPushConstants` takes a size that must be a multiple of four.
-#[must_use]
-pub fn push_size(sig: &KernelSig) -> u32 {
-    let fields = push_layout(sig);
-    let Some(last) = fields.last() else { return 0 };
-    let align = fields.iter().map(|f| f.size).max().unwrap_or(4);
-    (last.offset + last.size).next_multiple_of(align)
-}
-
-/// Every scalar kind a row can name is four or eight bytes wide.
-fn push_width(ty: kernels::Ty) -> u32 {
-    match ty {
-        kernels::Ty::Usize | kernels::Ty::I64 => 8,
-        _ => 4,
-    }
-}
-
-/// Whether a kind crosses as a device allocation rather than as a value.
-///
-/// Read off the KIND and not off a list of operand names, so a row that grows a
-/// buffer cannot land in the push block by omission. The struct-shaped and
-/// handle kinds of the CUDA vocabulary are not reachable from a Vulkan row —
-/// there is no stream and no cuBLAS handle here — so they answer `false`, and a
-/// row that used one would put a plan cache in a push constant: a failure at
-/// the row, where it can be read, rather than a silent binding.
-const fn is_buffer(ty: kernels::Ty) -> bool {
-    use kernels::Ty;
-    matches!(
-        ty,
-        Ty::BufMut
-            | Ty::Buf
-            | Ty::I32s
-            | Ty::I64s
-            | Ty::U32s
-            | Ty::U8s
-            | Ty::F32sMut
-            | Ty::F32s
-            | Ty::I32sMut
-            | Ty::U32sMut
-            | Ty::U8sMut
-            | Ty::U16s
-            | Ty::U16sMut
-            | Ty::I8s
-            | Ty::BufArray
-            | Ty::BufArrayMut
-            | Ty::BufArrayOut
-            | Ty::BufArrayOutMut
-            | Ty::U8Array
-            | Ty::I32Array
-            | Ty::StructuredMasks
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The two runs are independent and both start at zero — the property a
-    /// shell's binder and a shader's `layout` qualifiers have to agree on.
-    #[test]
-    fn buffers_and_push_constants_are_numbered_independently() {
-        let row = kernels::sig_in(KERNELS, "rms_single_row_bfloat16").expect("a stated row");
-        assert_eq!(
-            bindings(row),
-            vec![
-                Binding::Buffer(0), // x
-                Binding::Buffer(1), // w
-                Binding::Buffer(2), // out
-                Binding::Buffer(3), // params
-            ]
-        );
-
-        let row = kernels::sig_in(KERNELS, "affine_qmv_fast_bfloat16_gs_64_b_4").expect("a row");
-        assert_eq!(
-            bindings(row),
-            vec![
-                Binding::Buffer(0), // w
-                Binding::Buffer(1), // scales
-                Binding::Buffer(2), // biases
-                Binding::Buffer(3), // x
-                Binding::Buffer(4), // y
-                Binding::Push(0),   // in_vec_size
-                Binding::Push(1),   // out_vec_size
-            ]
-        );
-        assert_eq!(buffer_count(row), 5);
-    }
-
-    /// A packed field consumes NEITHER run.
-    ///
-    /// Found by comparing every shader's push block against the table field by
-    /// field: `row_gather.slang` declared no push constants at all, because the
-    /// count it needs is a member of the params struct it already binds. The
-    /// table was right and `bindings()` was wrong — it had inherited Metal's
-    /// "append to the scalars" reading, which would have had the driver push a
-    /// word the shader never reads while `p.count` stayed whatever the params
-    /// buffer happened to hold.
-    /// Asked of whatever packed row the table still holds rather than of a
-    /// named one: this used to name `row_gather_bfloat16`, and that row was
-    /// retired when `layout` crossed. What has to stay true is the RULE, and
-    /// the rule is about a kind of operand, not about one kernel.
-    #[test]
-    fn a_packed_field_takes_no_slot_of_its_own() {
-        let packed: Vec<&KernelSig> = KERNELS
-            .iter()
-            .filter(|r| bindings(r).contains(&Binding::Packed))
-            .collect();
-        for row in packed {
-            let bound = bindings(row);
-            let buffers = bound
-                .iter()
-                .filter(|b| matches!(b, Binding::Buffer(_)))
-                .count();
-            assert_eq!(
-                buffer_count(row),
-                u32::try_from(buffers).expect("a small count"),
-                "`{}`'s packed field took a descriptor slot",
-                row.name
-            );
-            assert!(
-                !bound.iter().any(|b| matches!(b, Binding::Push(_))),
-                "`{}` packs a field into a block it already binds, so it \
-                 pushes nothing -- a pushed word here is one the shader never \
-                 reads, while the struct member stays whatever the params \
-                 buffer happened to hold",
-                row.name
-            );
-        }
-    }
-
-    /// An unstated row gets no layout rather than a nullary one.
-    ///
-    /// Asked of whatever unstated row the table still holds rather than of a
-    /// named one: this used to name `argmax_logits_bfloat16`, and that row was
-    /// retired when `sample` crossed. A test that pins a row by name is a test
-    /// that fails when the refactor succeeds, which is the wrong way round.
-    #[test]
-    fn an_unstated_row_has_no_bindings() {
-        let unstated: Vec<&KernelSig> = KERNELS.iter().filter(|r| r.operands.is_empty()).collect();
-        assert!(
-            !unstated.is_empty(),
-            "no row states nothing, so this proves nothing -- delete it"
-        );
-        for row in unstated {
-            assert!(bindings(row).is_empty(), "`{}` got a layout", row.name);
-        }
-    }
-
-    /// `maxPushConstantsSize` is 128 bytes on the floor of the desktop Vulkan
-    /// implementations (and llama.cpp treats 128 as the number to respect), so
-    /// a row whose scalars overflow it is a row whose launch cannot be issued.
-    ///
-    /// This used to sum the widths, which is the wrong number: a push block is
-    /// std430, so an eight-byte scalar after a lone four-byte one is preceded
-    /// by four bytes of padding, and the sum UNDER-counts. Under-counting is
-    /// the dangerous direction for a ceiling — it lets a row that really does
-    /// overflow pass — so it asks [`push_size`] now.
-    #[test]
-    fn no_row_overflows_the_push_constant_floor() {
-        for row in KERNELS {
-            let bytes = push_size(row);
-            assert!(
-                bytes <= 128,
-                "`{}` wants {bytes} bytes of push constants; the floor is 128",
-                row.symbol
-            );
-        }
-    }
-
-    /// The padding is real, and this is the row that has it.
-    ///
-    /// `attn/kv_write.slang` declares `int head_dim; uint64_t k_head_stride;
-    /// uint64_t k_seq_stride;`, so the block is 4 + 4 pad + 8 + 8 = 24 and not
-    /// the 20 that adding the widths gives. A driver packing by concatenation
-    /// writes both strides four bytes low, and the shader reads two halves of
-    /// two different numbers with nothing to report it.
-    #[test]
-    fn an_eight_byte_scalar_after_a_four_byte_one_is_padded() {
-        let row = kernels::sig_in(KERNELS, "kv_append_bfloat16").expect("a row");
-        let fields = push_layout(row);
-        let places: Vec<(&str, u32)> = fields.iter().map(|f| (f.name, f.offset)).collect();
-        assert_eq!(
-            places,
-            vec![("head_dim", 0), ("k_head_stride", 8), ("k_seq_stride", 16)]
-        );
-        assert_eq!(push_size(row), 24);
-
-        // A block of one width needs no padding, and must not acquire any.
-        let plain =
-            kernels::sig_in(KERNELS, "affine_qmv_routed_bias_bfloat16_gs_64_b_4").expect("a row");
-        assert_eq!(
-            push_layout(plain)
-                .iter()
-                .map(|f| f.offset)
-                .collect::<Vec<_>>(),
-            vec![0, 4, 8, 12, 16]
-        );
-        assert_eq!(push_size(plain), 20);
-    }
-}
+// THE LAYOUT HALF STOOD HERE -- `Binding`, `bindings`, `buffer_count`,
+// `PushField`, `push_layout`, `push_size`, `push_width`, and the `#[cfg(test)]
+// mod tests` that held them to six transcribed rows. About four hundred lines
+// answering one question: given a `KernelSig`, which of its operands is a
+// storage binding, which is a field of the push block, and at what std430
+// offset does each land.
+//
+// Nothing asks it. `driver-vulkan` was the only caller and it names
+// `KernelSig` nowhere at all now: an arm states its own operands in ordinary
+// Rust, `binding::params_from` decides between a push block and a staged
+// buffer, and `encode::Encoder` writes the scalars at the offsets the MODULE
+// declares -- read out of the SPIR-V rather than derived from a row, which is
+// the same arithmetic with the second description taken out of the middle.
+//
+// The padding rule is the part worth not losing, so it is written down here
+// and checked on a device rather than described twice: `attn/kv_write.slang`
+// declares `int head_dim; PIE_STRIDE k_head_stride; PIE_STRIDE k_seq_stride;`
+// with `PIE_STRIDE` an eight-byte `uint2`, so the block is 4 + 4 pad + 8 + 8 =
+// 24 and NOT the 20 that adding the widths gives. A packer that concatenates
+// writes both strides four bytes low and the shader reads two halves of two
+// different numbers with nothing to report it. `driver-vulkan`'s
+// `the_scalars_this_crate_packs_are_the_ones_the_shader_addresses_with`
+// transcribes those twenty-four bytes and submits them to a real GPU, and
+// `driver-vulkan/tests/rules.rs` holds all 39 blocks of this tree to what an
+// independent SPIR-V walk measured.
+//
+// The 128-byte push ceiling that `no_row_overflows_the_push_constant_floor`
+// guarded is now the device's own `maxPushConstantsSize`, which
+// `Pipelines::get` takes and `driver-vulkan`'s
+// `the_tier_this_device_selects_is_one_it_can_actually_load` states outright.

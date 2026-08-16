@@ -260,6 +260,24 @@ fn prose(text: &str) -> (String, Vec<usize>) {
 /// not, which is the difference between "see that sibling's test" and "this
 /// module was ported from somewhere". Sixty characters is the whole allowance,
 /// and a NUL — a line of code — ends it.
+/// Is this citation inside a block that RETIRES the test it names?
+///
+/// A retirement has to name what it retired — "It was `x`, and it asserted
+/// ..." — and that name necessarily no longer resolves, because retiring it is
+/// what deleted it. Without this, the rule would forbid the one sentence a
+/// retirement exists to write, and the only way to satisfy it would be to
+/// describe the lost test WITHOUT naming it, which is exactly the vagueness
+/// this file is meant to prevent.
+///
+/// Scoped to the CURRENT comment block. `prose` separates blocks with `\0`,
+/// so a `RETIRED:` three comments earlier cannot excuse a live citation.
+fn retiring(before: &str) -> bool {
+    before
+        .rsplit('\0')
+        .next()
+        .is_some_and(|block| block.contains("RETIRED"))
+}
+
 fn whose(before: &str) -> bool {
     let from = before.len().saturating_sub(60);
     let tail = before[from..].trim_end();
@@ -413,7 +431,7 @@ fn every_proof_these_crates_cite_by_name_can_be_found() {
                 if !opens_like_a_test || !reads_like_a_test || names.contains(&cited) {
                     continue;
                 }
-                if whose(&stream[..open]) {
+                if whose(&stream[..open]) || retiring(&stream[..open]) {
                     continue;
                 }
                 let line = at.get(open).copied().unwrap_or(0);
@@ -689,7 +707,7 @@ fn every_refusal_this_crate_builds_is_one_a_test_names() {
     // less coverage than there is. Here the sentence fails.
     assert_eq!(
         (refusals.len(), refusals.len() - unnamed.len()),
-        (109, 83),
+        (112, 86),
         "this test's own doc says eighty-three of a hundred and nine refusal variants \
          are named by a test. Update the sentence with the number."
     );

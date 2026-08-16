@@ -700,7 +700,25 @@ mod identify {
         metadata: &CheckpointMetadata,
         chosen: &Override,
     ) -> Result<&'static dyn Variant, Unmatched> {
-        let observed = Observed::of(metadata);
+        identify_observed(&Observed::of(metadata), chosen)
+    }
+
+    /// [`identify`], for a caller already holding the names and extents.
+    ///
+    /// The same pass, split out because one caller does not have a
+    /// checkpoint to offer: `pie model import` wants to answer "will this
+    /// artifact serve" *before* it writes one, and the thing to hold against
+    /// the catalog is the artifact it is about to write rather than the
+    /// source it is reading. Those two disagree — see `import`'s
+    /// `declares_tied_head` — so the projection is the caller's to build.
+    ///
+    /// # Errors
+    ///
+    /// As [`identify`].
+    pub fn identify_observed(
+        observed: &Observed,
+        chosen: &Override,
+    ) -> Result<&'static dyn Variant, Unmatched> {
         if let Override::Id(id) = chosen {
             let row = find(id).ok_or_else(|| Unmatched::NoSuchId {
                 id: id.clone(),
@@ -708,7 +726,7 @@ mod identify {
             })?;
             return row
                 .manifest()
-                .check(&observed)
+                .check(observed)
                 .map(|()| row)
                 .map_err(|why| Unmatched::NoRow {
                     nearest: vec![(row.id(), why.to_string())],
@@ -718,7 +736,7 @@ mod identify {
         let mut matched: Vec<&'static dyn Variant> = Vec::new();
         let mut misses: Vec<(&'static str, usize, String)> = Vec::new();
         for row in catalog() {
-            match row.manifest().check(&observed) {
+            match row.manifest().check(observed) {
                 Ok(()) => matched.push(*row),
                 Err(why) => misses.push((row.id(), why.faults.len(), why.to_string())),
             }
@@ -740,7 +758,7 @@ mod identify {
 }
 
 #[cfg(feature = "contract")]
-pub use identify::identify;
+pub use identify::{identify, identify_observed};
 
 #[cfg(test)]
 mod tests {

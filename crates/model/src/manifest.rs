@@ -414,6 +414,12 @@ impl std::error::Error for Mismatch {}
 /// spell it differently again. Normalizing here means a spec is written
 /// once, in one vocabulary, and a new spelling is a rule in
 /// [`Self::logical`] rather than an alternative in every row.
+///
+/// That one vocabulary is also, by decision rather than by accident, the
+/// vocabulary a `.zt` ARTIFACT carries -- so an import pass with a foreign
+/// vocabulary of its own has a name to write. The decision and the two
+/// properties that make it usable are stated in
+/// `tests/a_row_identifies_from_its_own_names.rs`.
 #[derive(Clone, Debug, Default)]
 pub struct Observed {
     by_name: BTreeMap<String, Vec<u64>>,
@@ -441,6 +447,96 @@ impl Observed {
     #[must_use]
     pub fn extents(&self, logical: &str) -> Option<&[u64]> {
         self.by_name.get(logical).map(Vec::as_slice)
+    }
+
+    /// The same set, less the tensors named here.
+    ///
+    /// What a conversion is about to DROP, so a caller can hold the
+    /// catalog against the artifact it will write rather than the
+    /// checkpoint it is reading. The names are the checkpoint's, and
+    /// lowering them here means the caller passes what it dropped rather
+    /// than having to know this type's vocabulary.
+    ///
+    /// Removing rather than adding, because materializing renames
+    /// nothing: it undoes an encoding under each tensor's own name, and
+    /// [`logical_extents`](Self::of) already reports a packed tensor at
+    /// its unpacked size. A dropped name is the whole of the difference.
+    #[must_use]
+    pub fn without<N: AsRef<str>>(mut self, names: impl IntoIterator<Item = N>) -> Self {
+        for name in names {
+            self.by_name.remove(&Self::logical(name.as_ref()));
+        }
+        self
+    }
+
+    /// The same set, under the names an ingest pass will write.
+    ///
+    /// A GGUF import does not publish what it read: the artifact holds
+    /// `model.layers.0.self_attn.q_proj.weight` where the file held
+    /// `blk.0.attn_q.weight`. Held against the source, the catalog would
+    /// report every tensor missing from every row at exactly the moment the
+    /// rename had made the artifact identifiable.
+    ///
+    /// Applied AFTER the extents are read, which is why this is a method and
+    /// not a constructor argument: a rename changes no shape and no
+    /// encoding, so the one thing that must not be recomputed is the part
+    /// that was expensive to get right. Both sides go through
+    /// [`Self::logical`] for the same reason [`Self::without`]'s names do --
+    /// the caller passes the two spellings it is mapping between and needs to
+    /// know nothing about this type's own.
+    #[must_use]
+    pub fn renamed<K: AsRef<str>, V: AsRef<str>>(
+        mut self,
+        pairs: impl IntoIterator<Item = (K, V)>,
+    ) -> Self {
+        for (from, to) in pairs {
+            let from = Self::logical(from.as_ref());
+            let to = Self::logical(to.as_ref());
+            if from == to {
+                continue;
+            }
+            if let Some(extents) = self.by_name.remove(&from) {
+                self.by_name.insert(to, extents);
+            }
+        }
+        self
+    }
+
+    /// The same set, with one stacked name replaced by its instances.
+    ///
+    /// llama.cpp joins a mixture's experts: `blk.3.ffn_gate_exps.weight` is
+    /// one `[E, I, H]` tensor where the artifact holds `E` separate `[I, H]`
+    /// ones. [`Self::renamed`] cannot say that -- it moves extents from one
+    /// name to another and there is no one name to move them to -- so the
+    /// projection would report a mixture's experts missing at exactly the
+    /// moment the ingest had cut them out correctly.
+    ///
+    /// `template` carries a single `{}` for the instance index, and the
+    /// substitution happens BEFORE [`Self::logical`] runs. That order is the
+    /// whole of it: `logical` rewrites a layer index to its own `{}`, and a
+    /// name reaching it with two would be a name no row can match.
+    ///
+    /// The count is the leading extent, taken from the tensor rather than
+    /// from anything the caller knows. The instances are what is left of the
+    /// shape once it is gone.
+    #[must_use]
+    pub fn unstacked<K: AsRef<str>, V: AsRef<str>>(
+        mut self,
+        pairs: impl IntoIterator<Item = (K, V)>,
+    ) -> Self {
+        for (from, template) in pairs {
+            let Some(extents) = self.by_name.remove(&Self::logical(from.as_ref())) else {
+                continue;
+            };
+            let Some((&count, instance)) = extents.split_first() else {
+                continue;
+            };
+            for index in 0..count {
+                let name = template.as_ref().replace("{}", &index.to_string());
+                self.by_name.insert(Self::logical(&name), instance.to_vec());
+            }
+        }
+        self
     }
 
     /// Is this name published at all?
@@ -525,14 +621,36 @@ impl Observed {
         Self::global_spelling(out)
     }
 
-    /// The two model-level tensors pie's own lowering renames.
+    /// The two model-level tensors the MLX authoring path renames.
     ///
-    /// Layer-internal names survive the lowering unchanged, so the index
-    /// rewrite above is enough for all but two: the embedding table becomes
-    /// `shared_embedding` and the final norm becomes `final_norm`. Without
-    /// these an artifact `pie model build` wrote matches no row at all --
-    /// `qwen3-0.6b: missing embed_tokens; missing norm` -- which is the whole
-    /// catalog refusing the output of the tool that reads the catalog.
+    /// Not "pie's own lowering", which is what this said and is measurably
+    /// too broad. A `pie model build --backend cuda` artifact carries
+    /// HuggingFace names verbatim -- `model.embed_tokens.weight`,
+    /// `model.layers.0.self_attn.q_proj.weight`, `model.norm.weight` -- and
+    /// needs nothing here. The renames come from `--backend metal`,
+    /// `--backend vulkan` and `--backend wgpu`, which author under MLX names
+    /// because those drivers BIND MLX names; the same qwen3-0.6b built both
+    /// ways gives `model.embed_tokens.weight` one way and
+    /// `shared_embedding.weight` the other.
+    ///
+    /// Layer-internal names survive that authoring unchanged, which is why
+    /// two rows are enough: MLX and HuggingFace happen to agree on
+    /// `self_attn.q_proj.weight` and disagree only on the two globals and on
+    /// the `model.`/`layers.` framing the rewrite above already handles.
+    /// Without these an artifact `pie model build` wrote matches no row at
+    /// all -- `qwen3-0.6b: missing embed_tokens; missing norm` -- which is
+    /// the whole catalog refusing the output of the tool that reads the
+    /// catalog.
+    ///
+    /// That the list is TWO is therefore a fact about how close those two
+    /// vocabularies are, not a bound on how much a vocabulary may differ. A
+    /// zt artifact spelled in this crate's TRACE names would not be close:
+    /// `layer.0.qkv` is a fused bank with no checkpoint counterpart to be
+    /// spelled differently from, so nothing above would collapse it and this
+    /// list would have to become a reverse map per family. Which is the
+    /// measured argument against respelling zt -- it does not remove a
+    /// translation, it moves one from a place that needs two rows to a place
+    /// that needs a table, and invalidates every artifact on the way.
     ///
     /// `shared_embedding` is where a TIED model's `lm_head` went, and that
     /// needs no arm: the row that ties is the row whose manifest says the
@@ -718,10 +836,13 @@ mod from_checkpoint {
             let stored = [rows as i64, cols as i64];
             for (scheme, elems, bytes) in [
                 (QuantScheme::GgufQ4_0, 32u64, 18u64),
+                (QuantScheme::GgufQ4_1, 32, 20),
                 (QuantScheme::GgufQ5_0, 32, 22),
+                (QuantScheme::GgufQ5_1, 32, 24),
                 (QuantScheme::GgufQ8_0, 32, 34),
                 (QuantScheme::GgufQ4K, 256, 144),
                 (QuantScheme::GgufQ5K, 256, 176),
+                (QuantScheme::GgufQ6K, 256, 210),
             ] {
                 let span = rows * cols / elems * bytes;
                 assert_eq!(
@@ -813,8 +934,11 @@ mod from_checkpoint {
                 QuantScheme::GgufQ4K,
                 QuantScheme::GgufQ5_0,
                 QuantScheme::GgufQ5K,
+                QuantScheme::GgufQ6K,
                 QuantScheme::GgufQ8_0,
                 QuantScheme::Int4B8,
+                QuantScheme::GgufQ4_1,
+                QuantScheme::GgufQ5_1,
             ];
             // Exhaustiveness, checked by the compiler rather than by the
             // count: a new variant fails to match here.
@@ -833,8 +957,11 @@ mod from_checkpoint {
                     | QuantScheme::GgufQ4K
                     | QuantScheme::GgufQ5_0
                     | QuantScheme::GgufQ5K
+                    | QuantScheme::GgufQ6K
                     | QuantScheme::GgufQ8_0
-                    | QuantScheme::Int4B8 => true,
+                    | QuantScheme::Int4B8
+                    | QuantScheme::GgufQ4_1
+                    | QuantScheme::GgufQ5_1 => true,
                 }
             }
             for &scheme in EVERY {
@@ -859,7 +986,7 @@ mod from_checkpoint {
                     assert_ne!(elems, 0, "{scheme:?}'s block holds no elements");
                 }
             }
-            assert_eq!(EVERY.len(), 15, "a scheme was added; give it a case above");
+            assert_eq!(EVERY.len(), 18, "a scheme was added; give it a case above");
         }
 
         /// An explicit `bits_per_element` overrides the scheme's
@@ -1006,6 +1133,47 @@ mod tests {
         );
     }
 
+    /// Two rows are enough because two vocabularies are CLOSE, and a
+    /// third one would not be.
+    ///
+    /// `global_spelling` is a list of two, and it is tempting to read that
+    /// as a bound -- as though any authoring convention costs about two
+    /// rows and pie could therefore respell its artifacts in its own trace
+    /// names cheaply. It is not a bound. It is a measurement of how little
+    /// the MLX convention and the HuggingFace one disagree: they differ on
+    /// two globals and agree on every layer-internal name, so the index
+    /// rule above carries the rest.
+    ///
+    /// A trace name is not close in that way, and this pins why. The
+    /// forward asks for `layer.3.qkv`, which is a FUSED bank -- there is no
+    /// checkpoint tensor it is a different spelling of, so no rule here can
+    /// collapse it onto one. An artifact spelled that way would need a
+    /// reverse map per family before any row could match it, which is the
+    /// cost `global_spelling`'s two rows are sometimes mistaken for.
+    #[test]
+    fn a_fused_trace_name_is_nobodys_checkpoint_tensor() {
+        // The index rule fires, because that much is vocabulary-blind.
+        assert_eq!(Observed::logical("layer.3.qkv"), "layer.{}.qkv");
+        // And it lands on nothing a manifest states, where both authoring
+        // conventions land on the same row.
+        assert_eq!(
+            Observed::logical("layers.3.self_attn.q_proj.weight"),
+            Observed::logical("model.layers.3.self_attn.q_proj.weight")
+        );
+        assert_ne!(
+            Observed::logical("layer.3.qkv"),
+            Observed::logical("model.layers.3.self_attn.q_proj.weight")
+        );
+        // The halves it fuses are three separate rows, and no rule here
+        // knows they add up to it.
+        for part in ["q_proj", "k_proj", "v_proj"] {
+            assert_ne!(
+                Observed::logical("layer.3.qkv"),
+                Observed::logical(&format!("model.layers.3.self_attn.{part}.weight"))
+            );
+        }
+    }
+
     /// A packed weight matches the row that states its LOGICAL width,
     /// and only by a whole number of values per word.
     ///
@@ -1091,6 +1259,69 @@ mod tests {
                 Fault::Extent { want, got, .. } if want == &[4096, 4096] && got == &[4096, 2048]
             )),
             "{why:?}"
+        );
+    }
+
+    /// A rename is stated in the two vocabularies it maps between.
+    ///
+    /// Both sides lower through `logical`, so a caller passes the GGUF name
+    /// it read and the HuggingFace name it will write and needs to know
+    /// nothing about the normalized form in between -- which is the same
+    /// contract `without` offers, for the same reason.
+    #[test]
+    fn renaming_speaks_the_two_vocabularies_and_not_the_one_between() {
+        let observed = Observed::from_pairs([
+            ("blk.0.attn_q.weight", vec![896u64, 896]),
+            ("token_embd.weight", vec![151_936, 896]),
+        ]);
+        let renamed = observed.renamed([
+            (
+                "blk.0.attn_q.weight",
+                "model.layers.0.self_attn.q_proj.weight",
+            ),
+            ("token_embd.weight", "model.embed_tokens.weight"),
+        ]);
+        assert_eq!(
+            renamed.extents("layer.{}.self_attn.q_proj"),
+            Some(&[896, 896][..])
+        );
+        assert_eq!(renamed.extents("embed_tokens"), Some(&[151_936, 896][..]));
+        assert!(!renamed.has("blk.0.attn_q"), "the old name is gone");
+    }
+
+    /// A name the map does not mention is left where it is.
+    ///
+    /// So a partial rename is a partial rename and not a silent deletion:
+    /// the tensors that were not mapped still show up as themselves, which
+    /// is what makes the catalog's diff about the model rather than about
+    /// the map.
+    #[test]
+    fn renaming_leaves_an_unmentioned_name_alone() {
+        let observed = Observed::from_pairs([("output_norm.weight", vec![896u64])]);
+        let renamed = observed.renamed([("token_embd.weight", "model.embed_tokens.weight")]);
+        assert_eq!(renamed.extents("output_norm"), Some(&[896][..]));
+    }
+
+    /// A conversion that drops a tensor is asking about an artifact it has
+    /// not written, and it names what it dropped in the CHECKPOINT's
+    /// vocabulary — the only one it holds.
+    #[test]
+    fn dropping_a_tensor_answers_in_the_checkpoint_s_own_spelling() {
+        let observed = Observed::from_pairs([
+            ("model.embed_tokens.weight", &[8u64, 4][..]),
+            ("lm_head.weight", &[8, 4][..]),
+        ]);
+        assert!(observed.has("embed_tokens") && observed.has("lm_head"));
+
+        // The name a materialization reports, not the lowered one.
+        let projected = observed.without(["lm_head.weight"]);
+        assert!(
+            !projected.has("lm_head"),
+            "a tie's head is gone from what the artifact will publish"
+        );
+        assert!(
+            projected.has("embed_tokens"),
+            "and nothing else moved: materializing renames no tensor"
         );
     }
 

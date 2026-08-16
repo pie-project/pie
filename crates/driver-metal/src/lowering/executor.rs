@@ -171,6 +171,20 @@ pub enum FireTable {
     RopeFrequencies,
     /// Which rows the fire samples, one per request.
     SamplingIndices,
+    /// Per token: which recurrent-state slot its request occupies.
+    ///
+    /// A GDN stack's conv window and recurrent state are PER REQUEST and live
+    /// in a slab that requests take turns in, exactly as KV pages do -- so
+    /// which slab row a token addresses is the fire's answer and not the
+    /// model's, and the `_slotted` half of every GDN symbol exists to read it.
+    ///
+    /// It arrived here as `o.input(1)`, an OPERAND, because the GDN arms were
+    /// written against `device_gdn.rs`, which hands the kernel a slot buffer
+    /// it made itself. A text cannot make one: it has no way to name a fire's
+    /// slot assignment, and a trace that tried would be stating scheduling as
+    /// though it were architecture. Every other per-fire table on this
+    /// backend is a [`FireTable`] for that reason and this is the same fact.
+    RecurrentSlots,
 }
 
 /// Where an operand is: a device address and the bytes it may address.

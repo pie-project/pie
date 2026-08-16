@@ -22,8 +22,8 @@
 
 use crate::plan::index::PlanIndex;
 use crate::plan::{
-    FUSION_FP8_TO_MXFP4, LoadPlan, SourceExtent, StorageInstr, StorageTarget, TILE_MAP_CAST,
-    TILE_MAP_DECODE, TILE_MAP_ENCODE, TILE_MAP_REBLOCK, TILE_MAP_SCALE, TileMapKind,
+    FUSION_FP8_TO_MXFP4, LoadPlan, SourceExtent, StorageInstr, StorageTarget, TILE_MAP_BIAS,
+    TILE_MAP_CAST, TILE_MAP_DECODE, TILE_MAP_ENCODE, TILE_MAP_REBLOCK, TILE_MAP_SCALE, TileMapKind,
     TransformFusion,
 };
 use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme};
@@ -113,7 +113,8 @@ pub const VULKAN_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP
 
 /// The transforms `host_executor` implements. Not a device capability, so it is
 /// not part of the C surface.
-pub const HOST_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_REBLOCK | TILE_MAP_SCALE;
+pub const HOST_TILE_MAP_MASK: u32 =
+    TILE_MAP_CAST | TILE_MAP_REBLOCK | TILE_MAP_SCALE | TILE_MAP_BIAS;
 
 /// The mask offline conversion compiles against: everything `replay` runs plus
 /// `Encode` and `Decode`, which the host executor implements for exactly that
@@ -450,6 +451,12 @@ fn cuda_kernel(facts: &TileMapFacts) -> Option<&'static str> {
             && facts.dest_dtype == Some(DType::BF16)
             && facts.shape.is_some())
         .then_some(CUDA_SCALE_ROWS_BF16),
+        // No CUDA row, and the mask says so too. A bias is what an import
+        // needs to reconcile a checkpoint format's constant with pie's
+        // kernel, and an import runs on the host; a device plan that asks for
+        // one is a contract that wandered, and it should be refused by name
+        // rather than answered by a host fallback nobody asked for.
+        TileMapKind::Bias => None,
         // Runtime quantization. Both rows want a bf16 source and a 2-D shape;
         // the MXFP4 one additionally wants a width that is a whole number of
         // its 32-element block, and refuses to guess otherwise.

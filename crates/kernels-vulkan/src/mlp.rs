@@ -4,10 +4,9 @@
 //! name: it bakes gpt-oss's asymmetric clamp, its `alpha` and its `(up + 1)`
 //! term, and its own first line says so.
 
+use kernels::KernelSig;
 use kernels::routine::Refusal;
-use kernels::{KernelSig, kernel};
 
-use crate::axes::*;
 use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, Routine, elementwise};
 
 /// gemma's gated activation: `gelu_tanh(gate) * up`, the tanh approximation
@@ -141,12 +140,48 @@ pub fn silu_mul(
     )
 }
 
+/// [`silu_mul`] over rows that are not contiguous.
+///
+/// The three tensors share one pitch rather than three: `silu_mul_strided`'s
+/// body walks `tid.y * row_pitch + tid.x` for all of gate, up and out, which
+/// is the packed-projection case where the row a lane owns is the same
+/// distance apart in each. That is why this takes one `row_pitch` where
+/// [`geglu_tanh_strided`] takes a params block holding three.
+///
+/// The pitch is a PUSH CONSTANT, not a params buffer. `mlp/gated.slang`
+/// declares `Push { int row_pitch }` for this instantiation alone, and the
+/// grid is `ElementwiseRows` -- `x` over the row's width, `y` over the rows --
+/// because the body reads two axes rather than recovering them from a flat
+/// index.
+///
+/// # Errors
+///
+/// See [`crate::routine::elementwise_rows`].
+pub fn silu_mul_strided(
+    ctx: &Ctx<'_>,
+    gate: Buf,
+    up: Buf,
+    out: BufMut,
+    row_pitch: i32,
+    width: Env<i32>,
+    rows: Env<i32>,
+) -> Result<(), Refusal> {
+    ctx.dispatch(
+        Fire {
+            entrypoint: "silu_mul_strided_bfloat16",
+            lanes: crate::routine::elementwise_rows(*width, *rows)?,
+        },
+        &[gate.v(), up.v(), out.v(), row_pitch.v()],
+    )
+}
+
 /// This family's routines.
 pub static ROUTINES: &[Routine] = &[
     crate::routine!(geglu_tanh),
     crate::routine!(geglu_tanh_strided),
     crate::routine!(gptoss_swiglu),
     crate::routine!(silu_mul),
+    crate::routine!(silu_mul_strided),
 ];
 
 /// The entrypoints this family's crossed routines spell, now that their rows
@@ -156,17 +191,11 @@ pub static ENTRYPOINTS: &[&str] = &[
     "geglu_tanh_strided_bfloat16",
     "gptoss_swiglu_bfloat16",
     "silu_mul_bfloat16",
+    "silu_mul_strided_bfloat16",
 ];
 
-/// What is left of the table: the one kernel in `mlp/gated.slang` that has no
-/// routine. `silu_mul_strided` was never written, here or on Metal, and until
-/// it is the row is how it is dispatched -- which is why
-/// `driver-vulkan/src/arm.rs` RESERVES its stem rather than letting
-/// `silu_mul` claim it.
-pub static KERNELS: &[KernelSig] = &[
-    // 1 in mlp/gated.slang
-    kernel!(silu_mul_strided "silu_mul_strided", file = Some("mlp/gated.slang"), axes = &[BF16]),
-];
+/// This family states no rows. See [`crate::RETIRED`].
+pub static KERNELS: &[KernelSig] = &[];
 
 #[cfg(test)]
 mod tests {

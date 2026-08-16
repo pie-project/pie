@@ -301,6 +301,44 @@ mod tests {
         Store::new(Names::mlx(), tensors, named)
     }
 
+    /// The router has TWO module spellings and this map offers both.
+    ///
+    /// MEASURED on `mlx-community/gemma-4-26b-a4b-it-4bit`, where the whole
+    /// gap between the text and the load plan was this one role: ninety
+    /// unpublished names, which is thirty layers times the packed weight,
+    /// its scales and its zero point, and nothing else. `experts.switch_glu.*`
+    /// already resolved -- the refusal that stood in front of this row said
+    /// the contract published none of them, and the contract published all
+    /// of them.
+    ///
+    /// The two are not nested. gpt-oss replaces its dense MLP with the routed
+    /// block, so its router hangs under `mlp.`; gemma-4 keeps both blocks and
+    /// its router is a sibling of the pair with a `proj` inside it. A rule
+    /// that stripped or appended `mlp.` would get one of them wrong.
+    #[test]
+    fn the_router_answers_to_both_spellings_a_checkpoint_gives_it() {
+        let (t, n) = (HashMap::new(), HashMap::new());
+        let s = store(&t, &n);
+        for (traced, want) in [
+            ("layer.0.router", "layers.0.router.proj.weight"),
+            ("layer.0.router.scales", "layers.0.router.proj.scales"),
+            ("layer.0.router.zeros", "layers.0.router.proj.biases"),
+        ] {
+            assert!(
+                s.checkpoint_names(traced).iter().any(|c| c == want),
+                "`{traced}` offers {:?}, which does not include gemma-4's \
+                 `{want}`",
+                s.checkpoint_names(traced)
+            );
+        }
+        assert!(
+            s.checkpoint_names("layer.0.router")
+                .iter()
+                .any(|c| c == "layers.0.mlp.router.weight"),
+            "gpt-oss's spelling must survive gemma-4's being added"
+        );
+    }
+
     #[test]
     fn a_layer_scoped_name_becomes_the_checkpoints_path() {
         let (t, n) = (HashMap::new(), HashMap::new());

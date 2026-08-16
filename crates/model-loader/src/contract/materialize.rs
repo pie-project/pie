@@ -23,7 +23,7 @@
 use crate::checkpoint::CheckpointMetadata;
 use crate::contract::{Expr, ModelContract, TensorContract};
 use crate::error::Result;
-use crate::types::{DType, Encoding, QuantScheme};
+use crate::types::{DType, Encoding};
 
 /// What materializing one checkpoint means, stated before it is done — the
 /// shape a `--dry-run` reports.
@@ -62,9 +62,11 @@ pub fn materialize_contract(metadata: &CheckpointMetadata) -> Result<Materializa
         .collect();
     for tensor in metadata.weights() {
         match &tensor.encoding {
-            // The blocked schemes the host executor decodes today. More move
-            // up from the passthrough arm as their decoders land.
-            Encoding::Quant(spec) if spec.scheme == QuantScheme::GgufQ4_0 => {
+            // The blocked schemes the host executor decodes. The condition is
+            // the executor's own admission test rather than a list repeated
+            // here, so a scheme cannot be decodable in one file and opaque in
+            // the other.
+            Encoding::Quant(spec) if spec.scheme.block_layout().is_some() => {
                 decoded.push(tensor.name.clone());
                 tensors.push(TensorContract::new(
                     &tensor.name,
@@ -128,7 +130,7 @@ mod tests {
     use super::*;
     use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
     use crate::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
-    use crate::types::{Axis, CheckpointFormat, DType, FileId, QuantSpec, TensorId};
+    use crate::types::{Axis, CheckpointFormat, DType, FileId, QuantScheme, QuantSpec, TensorId};
 
     /// A mixed checkpoint — one Q4_0 tensor, one raw — splits into a decode
     /// plan for the first and a passthrough listing for the second, and the

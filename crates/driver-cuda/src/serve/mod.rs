@@ -105,6 +105,16 @@ use state::{ChannelState, InstanceEntry, ProgramEntry, channel_dtype};
 /// the OTHER requests in flight get to finish, and that the operator gets a
 /// message naming the entry point instead of a bare SIGABRT.
 pub(crate) fn guard<T>(what: &str, on_panic: T, body: impl FnOnce() -> T) -> T {
+    // The paragraph above is a promise, and `panic = "abort"` breaks it: with
+    // no unwinding there is nothing to catch, so every entry point below
+    // becomes the bare SIGABRT this exists to avoid. Fail the build instead of
+    // shipping a binary whose behaviour contradicts its own documentation.
+    #[cfg(panic = "abort")]
+    compile_error!(
+        "driver-cuda's C ABI seam converts a panic into a status code, which \
+         requires unwinding; `panic = \"abort\"` makes `guard` dead code and \
+         takes the process down with every other request it was serving"
+    );
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
         Ok(value) => value,
         Err(payload) => {

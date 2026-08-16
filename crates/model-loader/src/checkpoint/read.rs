@@ -17,8 +17,8 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use crate::checkpoint::CheckpointMetadata;
 use crate::checkpoint::zt;
+use crate::checkpoint::{Attributes, CheckpointMetadata, TokenizerTables};
 use crate::error::Error;
 
 /// Discover the safetensors shard files for a snapshot directory, matching the
@@ -72,22 +72,36 @@ pub fn discover_safetensors_files(snapshot_dir: &Path) -> Result<Vec<PathBuf>, E
     )))
 }
 
-/// The single GGUF checkpoint file for a snapshot directory, if present. GGUF
-/// checkpoints are a single-file format (`model.gguf` or a lone `*.gguf`).
-fn discover_gguf_file(snapshot_dir: &Path) -> Option<PathBuf> {
-    if snapshot_dir.is_file()
-        && snapshot_dir
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
-    {
-        return Some(snapshot_dir.to_path_buf());
-    }
+/// The GGUF checkpoint files for a snapshot directory, in shard order.
+///
+/// A snapshot holding GGUFs is not one checkpoint per directory. Qwen's
+/// `Qwen2.5-0.5B-Instruct-GGUF` ships `q4_0`, `q4_k_m` and `q5_k_m` side by
+/// side, all of the same model — reading them together would splice three
+/// different quantizations into one artifact. So the first file in sorted
+/// order is still what a bare directory means, exactly as before.
+///
+/// What is new is that llama.cpp also *splits* one checkpoint across files,
+/// and says so in the name: `<stem>-00001-of-00002.gguf`. Only the first
+/// shard carries the key-value block — the second holds `split.no`,
+/// `split.count`, `split.tensors.count` and nothing else, no architecture and
+/// no tokenizer — so a split is recognizable by its filename and by nothing
+/// inside it. That is why the pattern is the test here rather than a header
+/// key: a shard whose siblings are missing cannot introduce itself.
+///
+/// An incomplete set is refused rather than imported. Taking the first file
+/// of a split is not a smaller import, it is a model with holes: reading only
+/// shard one of `Qwen2.5-7B-Instruct-GGUF` yields 293 of its 339 tensors,
+/// which is every layer and no final norm — an artifact that gets written,
+/// fails to identify against any row, and reports it as `missing norm`.
+fn discover_gguf_files(snapshot_dir: &Path) -> Result<Option<Vec<PathBuf>>, Error> {
     let named = snapshot_dir.join("model.gguf");
     if named.is_file() {
-        return Some(named);
+        return Ok(Some(vec![named]));
     }
-    let mut ggufs: Vec<PathBuf> = std::fs::read_dir(snapshot_dir)
-        .ok()?
+    let Ok(entries) = std::fs::read_dir(snapshot_dir) else {
+        return Ok(None);
+    };
+    let mut ggufs: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
@@ -96,7 +110,59 @@ fn discover_gguf_file(snapshot_dir: &Path) -> Option<PathBuf> {
         })
         .collect();
     ggufs.sort();
-    ggufs.into_iter().next()
+    match ggufs.first() {
+        Some(first) => gguf_shard_set(first).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Every shard of the split `path` belongs to, or `path` alone when it is not
+/// a shard.
+///
+/// The set is read off the names beside it rather than off the directory
+/// listing, so an unrelated GGUF in the same directory — a second
+/// quantization of the same model — is never drawn in.
+fn gguf_shard_set(path: &Path) -> Result<Vec<PathBuf>, Error> {
+    let Some((prefix, own, count)) = split_shard_name(path) else {
+        return Ok(vec![path.to_path_buf()]);
+    };
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut shards = Vec::with_capacity(count as usize);
+    for index in 1..=count {
+        let shard = dir.join(format!("{prefix}-{index:05}-of-{count:05}.gguf"));
+        if !shard.is_file() {
+            return Err(Error::Checkpoint(format!(
+                "{} is shard {own} of {count}, and shard {index} is not beside \
+                 it ({} is missing); a split GGUF is one checkpoint, and \
+                 importing the shards that happen to be present would write a \
+                 model with holes",
+                path.display(),
+                shard.display()
+            )));
+        }
+        shards.push(shard);
+    }
+    Ok(shards)
+}
+
+/// The `(prefix, index, count)` of a llama.cpp split shard name, or `None` for
+/// a name that is not one.
+///
+/// llama.cpp writes `SPLIT_PATH_FORMAT` as `%s-%05d-of-%05d.gguf` and finds
+/// the siblings by the same spelling, so matching it is not a heuristic — it
+/// is the convention both sides agree on. The width is not enforced, because
+/// a five-digit format is a floor rather than a ceiling: a hundred-thousandth
+/// shard would spell six.
+fn split_shard_name(path: &Path) -> Option<(String, u32, u32)> {
+    let stem = path.file_stem()?.to_str()?;
+    let (head, count) = stem.rsplit_once("-of-")?;
+    let (prefix, index) = head.rsplit_once('-')?;
+    let count: u32 = count.parse().ok()?;
+    let index: u32 = index.parse().ok()?;
+    if count == 0 || index == 0 || index > count {
+        return None;
+    }
+    Some((prefix.to_string(), index, count))
 }
 
 /// The single `.zt` checkpoint for a snapshot directory, if present.
@@ -168,24 +234,107 @@ pub fn read_meta(metadata: &CheckpointMetadata, path: &str) -> Result<Option<Vec
     Ok(Some(bytes))
 }
 
-pub fn parse_checkpoint_metadata(snapshot_dir: &Path) -> Result<CheckpointMetadata, Error> {
+/// Which files hold this checkpoint, and whether the format names them as a
+/// set.
+///
+/// Extracted so the two questions asked of a snapshot — where are the tensors,
+/// and what does the file say about itself — find the files by one rule
+/// instead of two that can drift apart. The distinction is kept rather than
+/// flattened to a list because a lone safetensors file is still a member of a
+/// set, and `index_all` refuses a name in two files where `index` has no
+/// second file to refuse against.
+enum Discovered {
+    One(PathBuf),
+    Set(Vec<PathBuf>),
+}
+
+fn discover(snapshot_dir: &Path) -> Result<Discovered, Error> {
     if let Some(zt) = discover_zt_file(snapshot_dir) {
-        return zt::parse_checkpoint(&zt);
+        return Ok(Discovered::One(zt));
     }
     if snapshot_dir.is_file() {
         // A file names itself; detection is the projections' job, not a
-        // suffix's.
-        return zt::parse_checkpoint(snapshot_dir);
+        // suffix's. The exception is a split GGUF, where the suffix is the
+        // only thing that knows: naming shard one names the whole checkpoint,
+        // and the shards after it carry no header to say so.
+        return Ok(one_or_set(gguf_shard_set(snapshot_dir)?));
     }
     // Safetensors takes precedence — it is the canonical HF snapshot format and
     // the C++ loader opens it first.
     match discover_safetensors_files(snapshot_dir) {
-        Ok(files) => zt::parse_checkpoint_files(&files),
-        Err(safetensors_err) => match discover_gguf_file(snapshot_dir) {
-            Some(gguf) => zt::parse_checkpoint(&gguf),
+        Ok(files) => Ok(Discovered::Set(files)),
+        Err(safetensors_err) => match discover_gguf_files(snapshot_dir)? {
+            Some(files) => Ok(one_or_set(files)),
             None => Err(safetensors_err),
         },
     }
+}
+
+/// A lone file stays `One`; more than one is a `Set`.
+///
+/// Not a cosmetic distinction: `One` reads through `index`, `Set` through
+/// `index_all`, which refuses a tensor name that appears in two files.
+fn one_or_set(mut files: Vec<PathBuf>) -> Discovered {
+    if files.len() == 1 {
+        Discovered::One(files.remove(0))
+    } else {
+        Discovered::Set(files)
+    }
+}
+
+pub fn parse_checkpoint_metadata(snapshot_dir: &Path) -> Result<CheckpointMetadata, Error> {
+    match discover(snapshot_dir)? {
+        Discovered::One(path) => zt::parse_checkpoint(&path),
+        Discovered::Set(paths) => zt::parse_checkpoint_files(&paths),
+    }
+}
+
+/// What this checkpoint says about ITSELF, as opposed to about its tensors.
+///
+/// A separate call and not a field on [`CheckpointMetadata`], because it
+/// answers a separate question and almost nobody asks it. `CheckpointMetadata`
+/// is the addressing information a plan is compiled from — which bytes live
+/// where — and every caller needs all of it. A GGUF's key-values are a
+/// description of the model that only conversion reads, and threading them
+/// through would have put an unused field in the hundred-odd literals that
+/// build this type in tests.
+///
+/// Reads a header, not a payload. For safetensors that header is a JSON
+/// preamble and this comes back empty; for GGUF it is where the whole
+/// key-value block lives.
+///
+/// # Errors
+///
+/// The snapshot holds no checkpoint this loader can open.
+pub fn parse_checkpoint_attributes(snapshot_dir: &Path) -> Result<Attributes, Error> {
+    match discover(snapshot_dir)? {
+        Discovered::One(path) => zt::parse_attributes(&path),
+        Discovered::Set(paths) => zt::parse_attributes_files(&paths),
+    }
+}
+
+/// The `tokenizer.ggml.*` tables a GGUF snapshot carries, whole.
+///
+/// One file only, where [`parse_checkpoint_attributes`] takes a set — and the
+/// first, not any. Only shard one of a split GGUF carries a key-value block;
+/// every shard after it holds `split.no`, `split.count` and
+/// `split.tensors.count`, so there is nothing to merge and asking a later
+/// shard would find no vocabulary at all. Measured on
+/// `qwen2.5-7b-instruct-q4_0-00002-of-00002.gguf`: three keys, against 26 in
+/// shard one.
+///
+/// # Errors
+///
+/// The snapshot holds no checkpoint this loader can open.
+pub fn parse_checkpoint_tokenizer(snapshot_dir: &Path) -> Result<TokenizerTables, Error> {
+    let path = match discover(snapshot_dir)? {
+        Discovered::One(path) => path,
+        Discovered::Set(mut paths) => {
+            paths.sort();
+            paths.remove(0)
+        }
+    };
+    zt::parse_tokenizer_tables(&path)
 }
 
 /// Check that the files a compiled plan declares are on disk, at the size the
@@ -280,7 +429,82 @@ mod tests {
         let dir = tmpdir("direct_gguf");
         let path = dir.join("model.gguf");
         std::fs::write(&path, b"GGUF").unwrap();
-        assert_eq!(discover_gguf_file(&path), Some(path.clone()));
+        assert_eq!(gguf_shard_set(&path).unwrap(), vec![path.clone()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Only llama.cpp's own spelling counts, because only llama.cpp's own
+    /// writer produces a split. The near-misses matter more than the hit: a
+    /// model whose name merely contains `-of-` must not be mistaken for a
+    /// shard, or discovery would start looking for siblings that were never
+    /// written.
+    #[test]
+    fn a_split_is_recognized_only_by_llama_cpps_own_spelling() {
+        let split = Path::new("/m/qwen2.5-7b-instruct-q4_0-00001-of-00002.gguf");
+        assert_eq!(
+            split_shard_name(split),
+            Some(("qwen2.5-7b-instruct-q4_0".to_string(), 1, 2))
+        );
+        for lookalike in [
+            "/m/model.gguf",
+            "/m/best-of-breed.gguf",
+            "/m/model-1-of-.gguf",
+            "/m/model--of-2.gguf",
+            "/m/model-00003-of-00002.gguf",
+            "/m/model-00000-of-00002.gguf",
+        ] {
+            assert_eq!(
+                split_shard_name(Path::new(lookalike)),
+                None,
+                "{lookalike} is not a shard name"
+            );
+        }
+    }
+
+    /// The regression this whole path exists for. Reading shard one alone
+    /// yielded 293 of a 7B model's 339 tensors — every layer and no final
+    /// norm — and wrote a 12.7 GiB artifact that matched no catalog row.
+    /// Silence is the failure mode, so the gap has to be an error.
+    #[test]
+    fn a_split_gguf_is_gathered_whole_or_refused() {
+        let dir = tmpdir("gguf_split");
+        let first = dir.join("m-00001-of-00002.gguf");
+        let second = dir.join("m-00002-of-00002.gguf");
+        std::fs::write(&first, b"GGUF").unwrap();
+
+        let refusal = gguf_shard_set(&first).unwrap_err().to_string();
+        assert!(refusal.contains("m-00002-of-00002.gguf"), "{refusal}");
+
+        std::fs::write(&second, b"GGUF").unwrap();
+        // Named by either member, the checkpoint is the same set, in order.
+        for named in [&first, &second] {
+            assert_eq!(
+                gguf_shard_set(named).unwrap(),
+                vec![first.clone(), second.clone()]
+            );
+        }
+        assert_eq!(
+            discover_gguf_files(&dir).unwrap(),
+            Some(vec![first.clone(), second.clone()])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A HF GGUF snapshot holds several *independent* quantizations of one
+    /// model — `Qwen2.5-0.5B-Instruct-GGUF` ships q4_0, q4_k_m and q5_k_m
+    /// side by side. Gathering every `.gguf` in the directory would splice
+    /// three different models together, so a directory still means one file
+    /// unless the names say otherwise.
+    #[test]
+    fn independent_quantizations_in_one_directory_are_not_a_split() {
+        let dir = tmpdir("gguf_quants");
+        for quant in ["q4_0", "q4_k_m", "q5_k_m"] {
+            std::fs::write(dir.join(format!("qwen2.5-0.5b-{quant}.gguf")), b"GGUF").unwrap();
+        }
+        assert_eq!(
+            discover_gguf_files(&dir).unwrap(),
+            Some(vec![dir.join("qwen2.5-0.5b-q4_0.gguf")])
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

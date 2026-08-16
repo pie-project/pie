@@ -343,11 +343,76 @@ pub fn pack(sig: &KernelSig, values: &[Value]) -> Result<Call, Mismatch> {
 mod tests {
     use super::*;
 
-    /// The one row in the table that needs a value with no slot of its own.
-    fn packed_row() -> Option<&'static KernelSig> {
-        kernels_wgpu::KERNELS
-            .iter()
-            .find(|s| s.operands.iter().any(|o| matches!(o.ty, Ty::InPacked)))
+    // The rows these tests are about, stated HERE rather than looked up.
+    //
+    // `kernels_wgpu::KERNELS` IS EMPTY: every family has crossed to routines,
+    // so `kernels::sig_in(KERNELS, "kv_append")` answers `None` and a lookup
+    // would be a lookup of nothing. What is under test is `pack` -- a
+    // `KernelSig` and a run of values into the two runs a dispatch needs, and
+    // this crate's exported answer for any caller that still holds a row --
+    // and a `KernelSig` is a value a test can write down. Each of these is
+    // transcribed from the row that held it, so every property below is still
+    // checked against the case it was found against rather than against a
+    // shape invented to make an assertion true. `driver-vulkan::lowering`'s
+    // tests state theirs the same way, from the same rows.
+
+    /// `attn::kv_append`, as its row stated it: an `i32` and then two 64-bit
+    /// strides, which is the block WGSL's alignment pads.
+    ///
+    /// The shape is not incidental to anything below. `attn/kv_write.wgsl`
+    /// declares `struct Params { head_dim: i32, k_head_stride: vec2<u32>,
+    /// k_seq_stride: vec2<u32> }`, and its own comment states why the strides
+    /// are at 8 and 16 rather than at 4 and 12 -- so a narrow scalar in front
+    /// of a wide one is the case every offset assertion here is about.
+    fn kv_append() -> KernelSig {
+        kernels::kernel!(kv_append "kv_append", file = Some("attn/kv_write.wgsl"),
+            launch = kernels::LaunchRule::PerHead,
+            operands = kernels::operands![
+                k_new: Buf <- kernels::Source::In(0),
+                v_new: Buf <- kernels::Source::In(1),
+                k_cache: BufMut <- kernels::Source::KvKeys,
+                v_cache: BufMut <- kernels::Source::KvValues,
+                pos: I32s <- kernels::Source::Positions,
+                head_dim: I32 <- kernels::Source::Param(0),
+                k_head_stride: Usize <- kernels::Source::KvHeadStride,
+                k_seq_stride: Usize <- kernels::Source::KvSeqStride,
+            ],
+            head_param = Some(0),
+            axes = &[kernels_wgpu::axes::BF16])
+    }
+
+    /// `layout::row_gather`, as its row stated it: the one row in this table
+    /// that ever needed a value with no slot of its own.
+    ///
+    /// `count` is the second FIELD of the `RowGatherParams` struct that buffer
+    /// 3 already binds, which is the whole of what `Ty::InPacked` says.
+    fn packed_row() -> KernelSig {
+        kernels::kernel!(row_gather "row_gather", file = Some("layout/row_gather.wgsl"),
+            launch = kernels::LaunchRule::ElementwiseRows,
+            operands = kernels::operands![
+                input: Buf <- kernels::Source::In(0),
+                out: BufMut <- kernels::Source::Out(0),
+                rows: U32s <- kernels::Source::SamplingIndices,
+                params: Buf <- kernels::Source::Param(0),
+                count: InPacked <- kernels::Source::RequestCount,
+            ],
+            axes = &[kernels_wgpu::axes::BF16])
+    }
+
+    /// A row that states no operands at all: `mlp::silu_mul_strided`, the last
+    /// one this table held.
+    ///
+    /// UNSTATED and not nullary. 56 rows over 292 entrypoints were in that
+    /// state, and this is the one that outlived all of them, because every
+    /// backend had inherited metal's finding that its entrypoint leaves a
+    /// buffer slot empty and so cannot take a positional argument list. That
+    /// is true of MSL's flat argument table and not of `mlp/gated.wgsl`, so
+    /// the kernel has since crossed like the rest; the ROW is transcribed as
+    /// it stood, because an empty operand list is the shape `pack` has to
+    /// refuse and that shape does not depend on which kernel wore it.
+    fn unstated() -> KernelSig {
+        kernels::kernel!(silu_mul_strided "silu_mul_strided",
+            axes = &[kernels_wgpu::axes::BF16])
     }
 
     /// A value for whatever kind an operand wants, so a test can build a call
@@ -369,7 +434,7 @@ mod tests {
 
     #[test]
     fn a_row_splits_into_the_two_runs_a_dispatch_needs() {
-        let sig = kernels::sig_in(kernels_wgpu::KERNELS, "kv_append").expect("the row is stated");
+        let sig = &kv_append();
         let call = call_for(sig).expect("every operand is the kind the row wants");
         assert_eq!(
             call.buffers.len() as u32,
@@ -393,7 +458,7 @@ mod tests {
     /// stride.
     #[test]
     fn padding_is_left_where_the_layout_leaves_it() {
-        let sig = kernels::sig_in(kernels_wgpu::KERNELS, "kv_append").expect("stated");
+        let sig = &kv_append();
         let call = call_for(sig).expect("packs");
         let fields = kernels_wgpu::uniform_layout(sig);
         let sum: u32 = fields.iter().map(|f| f.size).sum();
@@ -416,7 +481,7 @@ mod tests {
     /// A scalar lands at its own offset and nowhere else.
     #[test]
     fn each_scalar_is_written_where_its_field_says() {
-        let sig = kernels::sig_in(kernels_wgpu::KERNELS, "kv_append").expect("stated");
+        let sig = &kv_append();
         let values: Vec<Value> = sig
             .operands
             .iter()
@@ -451,7 +516,7 @@ mod tests {
     /// this backend returns zero.
     #[test]
     fn a_sixty_four_bit_value_is_two_words_low_first() {
-        let sig = kernels::sig_in(kernels_wgpu::KERNELS, "kv_append").expect("stated");
+        let sig = &kv_append();
         let at = sig
             .operands
             .iter()
@@ -474,18 +539,22 @@ mod tests {
     }
 
     /// An unstated row refuses rather than answering with an empty call.
+    ///
+    /// The refusal is live code and the row is not: [`pack`] still guards its
+    /// own entry, and a caller holding a row with an empty operand list still
+    /// has to be told that the row cannot say what a call looks like. Answering
+    /// with an empty [`Call`] would be a dispatch that binds nothing and
+    /// reports success, which is the one outcome an empty list must not
+    /// produce.
     #[test]
     fn an_unstated_row_will_not_pretend_to_be_nullary() {
-        let sig = kernels_wgpu::KERNELS
-            .iter()
-            .find(|s| s.operands.is_empty())
-            .expect("56 of them are");
-        assert_eq!(pack(sig, &[]), Err(Mismatch::Unstated));
+        let sig = unstated();
+        assert_eq!(pack(&sig, &[]), Err(Mismatch::Unstated));
     }
 
     #[test]
     fn a_call_with_the_wrong_number_of_values_is_refused() {
-        let sig = kernels::sig_in(kernels_wgpu::KERNELS, "kv_append").expect("stated");
+        let sig = &kv_append();
         assert_eq!(
             pack(sig, &[Value::Buffer(0)]),
             Err(Mismatch::Arity {
@@ -503,7 +572,7 @@ mod tests {
     /// says "storage buffer" at both slots.
     #[test]
     fn a_scalar_standing_in_for_a_buffer_is_refused() {
-        let sig = kernels::sig_in(kernels_wgpu::KERNELS, "kv_append").expect("stated");
+        let sig = &kv_append();
         let mut values: Vec<Value> = sig.operands.iter().map(|o| value_for(o.ty)).collect();
         values[0] = Value::I32(1);
         assert!(matches!(
@@ -520,7 +589,7 @@ mod tests {
     /// on a row where the next field started at 4, its value.
     #[test]
     fn a_wide_scalar_in_a_narrow_slot_is_refused() {
-        let sig = kernels::sig_in(kernels_wgpu::KERNELS, "kv_append").expect("stated");
+        let sig = &kv_append();
         let mut values: Vec<Value> = sig.operands.iter().map(|o| value_for(o.ty)).collect();
         let at = sig
             .operands
@@ -542,9 +611,7 @@ mod tests {
     /// struct a storage buffer already binds.
     #[test]
     fn a_packed_operand_takes_no_slot_and_is_not_lost() {
-        let Some(sig) = packed_row() else {
-            return;
-        };
+        let sig = &packed_row();
         let call = call_for(sig).expect("packs");
         assert_eq!(call.packed.len(), 1, "the row has exactly one");
         assert_eq!(
@@ -559,40 +626,59 @@ mod tests {
         );
     }
 
-    /// Every stated row in the table packs, with no arm written for any of it.
-    ///
-    /// The claim the module is for. 43 stated rows, ten operand kinds, and a
-    /// `match` on kind rather than on name -- so a row the table already has
-    /// needs no code here to receive it.
-    #[test]
-    fn every_stated_row_packs_from_its_own_description() {
-        let mut packed = 0;
-        for sig in kernels_wgpu::KERNELS {
-            if sig.operands.is_empty() {
-                continue;
-            }
-            let call = call_for(sig).unwrap_or_else(|e| panic!("`{}`: {e}", sig.name));
-            assert_eq!(call.buffers.len() as u32, kernels_wgpu::storage_count(sig));
-            assert_eq!(call.uniform.len() as u32, kernels_wgpu::uniform_size(sig));
-            packed += 1;
-        }
-        assert!(packed >= 40, "only {packed} rows were packed");
-    }
+    // RETIRED: THE TABLE IS EMPTY, so the walk has nothing to walk.
+    //
+    // It asserted the claim this module exists for, over the whole table at
+    // once: every row that stated its operands packed from its OWN
+    // description, with no arm written for any of it -- 43 stated rows, ten
+    // operand kinds, and a `pack` that matches on the operand's KIND and
+    // never on the kernel's name, so a row the table already had needed no
+    // code here to receive it. Each row's call had to come out with
+    // `kernels_wgpu::storage_count(sig)` buffers and a
+    // `kernels_wgpu::uniform_size(sig)` block, and the floor of ten was there
+    // so the sweep could not quietly shrink.
+    //
+    // It did NOT go blind, and the floor is why: `for sig in KERNELS` over an
+    // empty table runs its body zero times, so `packed` stayed at zero and
+    // `assert!(packed >= 10)` failed rather than an empty loop passing in
+    // silence. Retiring it converts a loud failure into a recorded absence,
+    // which is the honest trade and not a repair -- the sweep is gone because
+    // its subject is gone, not because it started agreeing.
+    //
+    // The same claim is made per kernel on the routine plane, and by the same
+    // means: `crate::lowering::routine::bind` splits a body's arguments into
+    // buffers (from its handles) and a scalar run (from its `ArgValue`s) with
+    // no match on any kernel's name either, refusing by name through
+    // `Unplanned::{Handle,Scalars,Operand,Silent,Blocks,Absent,NoCache}` where
+    // this refused through `Mismatch::{Unstated,Arity,Kind}`. What is walked
+    // instead of a table is `crate::lowering::arm`'s `CROSSED` registry -- one
+    // stem per crossed kernel -- and `driver-wgpu/tests/arena.rs`'s
+    // `the_routine_path_plans_what_the_table_path_planned` is what derived
+    // every field of a rectangle twice, by the row and by the arm, for as long
+    // as there were rows to derive it from.
 
-    /// No stated row's block is one a WebGPU implementation must refuse.
+    /// No block this packs is one a WebGPU implementation must refuse.
     ///
     /// Two ceilings at once, and neither is decorative. `wgpu` rejects a
     /// uniform binding whose size is not a multiple of 16, and it rejects one
     /// past `max_uniform_buffer_binding_size`, whose floor is 16 KiB. The
     /// first is the one a hand-packed block fails; `kernels-wgpu` rounds for
     /// it, and this is where a driver finds out if it stopped.
+    ///
+    /// Over the rows this module states rather than over the table, which is
+    /// empty -- so this is two blocks and not 43, and it says so. The two are
+    /// the two shapes there are: a padded block rounded up from 24 to 32, and
+    /// a row whose only scalar is packed into somebody else's struct, which
+    /// declares no `@group(1)` at all and must therefore pack to nothing
+    /// rather than to a 16-byte block a shell would then create a bind group
+    /// for. The run-time half of the second ceiling lives in `crate::device`,
+    /// as `Ceiling::UniformBinding` -- behind the `native` feature, since it
+    /// needs an adapter -- and it measures against that adapter's real limit
+    /// rather than against the guaranteed floor.
     #[test]
     fn every_block_this_packs_is_one_webgpu_will_bind() {
-        for sig in kernels_wgpu::KERNELS {
-            if sig.operands.is_empty() {
-                continue;
-            }
-            let call = call_for(sig).expect("packs");
+        for sig in [kv_append(), packed_row()] {
+            let call = call_for(&sig).expect("packs");
             assert!(
                 call.uniform.len().is_multiple_of(16),
                 "`{}` packs a {}-byte block, which is not a multiple of the 16 \

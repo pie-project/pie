@@ -235,7 +235,11 @@ pub mod dispatch;
 pub mod facts;
 pub mod geometry;
 pub mod lowering;
-pub mod names;
+// Not a module of this crate: `driver::names` is the one table, and the copy
+// that stood here was byte-for-byte identical to `driver-vulkan`'s 412 lines.
+// Re-exported rather than referred to directly so `driver_wgpu::names` keeps
+// answering, which is what this crate's own `tests/checkpoint.rs` asks.
+pub use driver::names;
 pub mod programs;
 pub mod reflect;
 pub mod rope;

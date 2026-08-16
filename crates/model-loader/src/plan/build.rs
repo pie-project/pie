@@ -328,6 +328,18 @@ impl Builder<'_> {
                 let value = self.transform_with(payload, &decl, TileMapKind::Scale, extra, spec)?;
                 (value, decl)
             }
+            // A bias is the scale's shape with one operand: a constant the
+            // spec carries and an operand lowered like any other expression.
+            Expr::Bias { src, by } => {
+                let (payload, _) = self.operand_bytes(src, &decl)?;
+                let spec = TransformSpec {
+                    bias_bits: *by,
+                    ..TransformSpec::default()
+                };
+                let value =
+                    self.transform_with(payload, &decl, TileMapKind::Bias, Vec::new(), spec)?;
+                (value, decl)
+            }
             // A cast needs a kernel for the same reason a scale does, and its
             // operand is lowered the same way: the conversion is the only part
             // that costs anything.

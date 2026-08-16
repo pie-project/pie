@@ -299,24 +299,21 @@ impl Gemma4 {
     /// and Metal deploys these rows. The routed bank is unwritten on
     /// both, and that is what this still says.
     /// MEASURED against `mlx-community/gemma-4-26b-a4b-it-4bit`, and the
-    /// first sentence this refusal carried was wrong about its own reason.
+    /// mixture rows serve now. The refusal that stood here is gone, and
+    /// every sentence it carried was wrong about something.
     ///
-    /// It said "no routed-expert TEXT", and the text is written.
-    /// `metal_shape` carries all three mixture facts, `metal_facts` sets
-    /// `dense_beside_moe: mixture.is_some()`, and
-    /// `llama_like_metal` has the branch -- a second `gated()` off the
-    /// same post-attention residual, added back -- plus `Activation::Geglu`
-    /// in the routed path. Lifting this refusal and running
-    /// `device_checkpoint_names` reaches the text and gets a different
-    /// answer: **90 names the text states are not tensors the load plan
-    /// publishes**, the routed bank and the dense MLP alike. The
-    /// checkpoint has them under exactly the spellings asked for. So the
-    /// missing half is the gemma-4 CONTRACT, not the forward.
+    /// It said "no routed-expert TEXT", and the text was written.
+    /// It said the contract publishes none of `experts.switch_glu.*`, read
+    /// off a run reporting **90 unpublished names** -- thirty layers times
+    /// `router`, `router.scales`, `router.zeros`, which is ONE role whose
+    /// module gemma-4 spells `router.proj` where gpt-oss spells
+    /// `mlp.router`. Every `experts.switch_glu.*` name resolved. A count of
+    /// one spelling repeated per layer was read as a census of what was
+    /// missing.
     ///
-    /// And the forward is not finished either, which the same measurement
-    /// shows and `mlx_lm/models/gemma4_text.py::DecoderLayer.__call__`
-    /// settles. Layer 0 of the A4B ships seven norms where the dense 31b
-    /// ships four, and the reference says what each is for:
+    /// What was really missing was the SHAPE of the block, which
+    /// `mlx_lm/models/gemma4_text.py::DecoderLayer.__call__` settles. Layer
+    /// 0 of the A4B ships seven norms where the dense 31b ships four:
     ///
     /// ```text
     /// h1 = post_ffn_norm_1(mlp(pre_ffn_norm(h)))     // dense leg
@@ -324,32 +321,25 @@ impl Gemma4 {
     /// h  = post_ffn_norm(h1 + h2) + residual         // join, THEN norm
     /// ```
     ///
-    /// Both legs read the same `h`. Each has its own pre-norm and its own
-    /// post-norm. The shared `post_feedforward_layernorm` lands on the
-    /// SUM, and in a mixture layer the dense leg's post-norm is
-    /// `post_feedforward_layernorm_1`, which a dense layer does not have
-    /// at all -- so the mixture changes the dense leg too. The Metal
-    /// branch has none of this: it chains off the post-dense residual,
-    /// reuses `mlp_norm` for the routed pre-norm, states no post-norm, and
-    /// adds instead of joining.
+    /// Both legs read the same `h`, each has its own pair of norms, and the
+    /// shared `post_feedforward_layernorm` lands on the SUM. The branch that
+    /// stood here chained off the post-dense residual, reused `mlp_norm` for
+    /// the routed pre-norm, stated no leg post-norm, and added where the
+    /// reference joins. Firing it measured finite everywhere and **19456 at
+    /// its widest against a 1000 ceiling** -- exactly the missing norms, and
+    /// exactly why "it runs and produces no NaN" is not the question.
     ///
-    /// The router is a sixth statement rather than a projection.
-    /// `Router.__call__` is `rms_norm(x, scale * hidden^-0.5)` -> project
-    /// -> top-k -> softmax -> `* per_expert_scale[indices]`. Both of those
-    /// weights are in the checkpoint, and nothing here states either.
+    /// The router is its own statement and not a projection:
+    /// `Router.__call__` is `rms_norm(x, scale * hidden^-0.5)` -> project ->
+    /// top-k -> softmax -> `* per_expert_scale[indices]`. Both weights are in
+    /// the checkpoint; `router_input_norm` and `router_expert_scale` state
+    /// them, and `moe/route.metal::router_topk_scaled` already had the
+    /// buffer.
     ///
-    /// That is what makes this a refusal rather than a gap to walk past:
-    /// every one of those five tensors is small, so a build that ignored
-    /// them would run at full speed and be quietly wrong.
+    /// Nothing refuses here now. What is NOT yet true is a numeric reference:
+    /// no `REFERENCES` row holds this checkpoint, so the claim this doc can
+    /// make is "shaped like the reference", not "agrees with it".
     fn untraced(&self) -> Option<Refusal> {
-        if self.mixture.is_some() {
-            return Some(Refusal::Unsupported(
-                "gemma-4 26B-A4B: the routed block is traced but not loadable here \
-                 (`gemma4_enable_moe`, 128 experts top-8) -- the contract publishes none \
-                 of `experts.switch_glu.*`, and the branch's own three norms and the \
-                 router's two scales are unstated; the dense rows serve",
-            ));
-        }
         None
     }
 }
@@ -704,8 +694,8 @@ mod tests {
             .collect();
         assert_eq!(
             deployed.len(),
-            3,
-            "the A4B refuses, so three rows advertise"
+            4,
+            "every gemma-4 row advertises now, the A4B included"
         );
         let labels: std::collections::BTreeSet<&str> =
             deployed.iter().map(|(_, d)| d.advertised.arch).collect();
@@ -815,63 +805,42 @@ mod tests {
         );
     }
 
-    /// A row that LOADS and does not SERVE. The manifest identifies it,
-    /// the load shape is complete, the author would write its contract —
-    /// and the deployment refuses, which is the whole reason the trait's
-    /// signature carries a `Result`.
+    /// The row that used to LOAD and not SERVE.
+    ///
+    /// This test asserted a refusal and asserted its WORDING, and the
+    /// wording is why it is worth keeping in inverted form: the sentence
+    /// went through three phrasings and each of the first two guarded a
+    /// claim that had already stopped being true. It blamed the routed
+    /// text, which was written; then the `switch_glu` contract, which
+    /// published every name; and finally the three join norms, which is
+    /// what was actually missing and is now stated.
+    ///
+    /// So what it holds now is the row SERVING, and serving with the
+    /// mixture's own shape rather than as a dense row that happens to
+    /// deploy.
     #[test]
-    fn the_mixture_row_loads_and_refuses_to_serve_in_this_build() {
+    fn the_mixture_row_serves_with_the_mixtures_own_shape() {
         let a4b = row("gemma-4-26b-a4b");
         assert!(!a4b.manifest().tensors.is_empty());
         assert_eq!(a4b.load_shape().n_experts, 128);
-        let refusal = a4b
+        assert!(a4b.untraced().is_none(), "nothing refuses the mixture now");
+        let d = a4b
             .deployment(Deployed::single())
-            .expect_err("the A4B cannot be served");
-        assert!(matches!(refusal, Refusal::Unsupported(_)));
-        let text = refusal.to_string();
-        // The payload is a SENTENCE, not a label: it names the model,
-        // both missing legs, and the config keys a reader would grep
-        // for. `Unsupported` used to be a unit variant and every one of
-        // its nine sites reached an operator as "no deployment
-        // derivation for this model type".
-        assert!(
-            text.contains("gemma-4"),
-            "the refusal must name the model: {text}"
-        );
-        // This USED to ask for the token "routed-expert", which was the
-        // old sentence's own phrasing rather than anything a reader
-        // needs, and it was guarding a sentence that named the wrong
-        // missing leg: it said the routed TEXT was unwritten, and the
-        // text is written. What a reader must be able to grep is the
-        // tensor family the contract does not publish, so that is what
-        // this asks for now.
-        assert!(
-            text.contains("switch_glu"),
-            "the refusal must name the tensors it cannot load: {text}"
-        );
-        assert!(
-            text.contains("gemma4_enable_moe"),
-            "and the config key it is about: {text}"
-        );
-        // `attention_k_eq_v` USED to be named here as a second missing
-        // leg. It is not missing, and a refusal listing a reason that
-        // has been implemented sends a reader to fix what already works.
-        assert!(
-            !text.contains("attention_k_eq_v"),
-            "the k/v mode is served now, so the refusal must not still blame it: {text}"
-        );
-        assert!(
-            text.contains("dense rows serve"),
-            "a refusal that says what DOES work is the difference between a dead end and a \
-             next step: {text}"
-        );
+            .expect("the A4B serves");
+        assert_eq!(d.shape.experts_per_token, 8);
+        assert_eq!(d.shape.moe_intermediate, 704);
+        // The DENSE leg is still there, at its own width, because the
+        // mixture sits beside it rather than replacing it. A row whose
+        // `intermediate` had collapsed to the routed one would deploy and
+        // run the wrong FFN.
+        assert_eq!(d.shape.intermediate, 2112);
     }
 
     /// The three dense rows deploy, so the refusal above is about the
     /// A4B and not about the generation.
     #[test]
     fn the_dense_rows_serve() {
-        for id in ["gemma-4-e2b", "gemma-4-e4b", "gemma-4-31b"] {
+        for id in ["gemma-4-e2b", "gemma-4-e4b", "gemma-4-31b", "gemma-4-26b-a4b"] {
             let d = row(id).deployment(Deployed::single());
             assert!(d.is_ok(), "{id} refused, and its legs are all traced");
         }
@@ -886,9 +855,22 @@ mod tests {
     /// it reproduces MLX's logits on real weights. The hypothetical is
     /// kept, inverted, because the pairing is the thing worth holding:
     /// whatever `untraced` answers, `deployment` must agree.
+    ///
+    /// `untraced` answers `None` for EVERY row now — the mixture was the
+    /// last refusal and its text is written. The pairing is asserted
+    /// across the whole list rather than on one row, because a predicate
+    /// that refuses nothing can be paired with anything by accident.
     #[test]
     fn a_row_that_cannot_deploy_cannot_trace_either() {
-        assert!(row("gemma-4-26b-a4b").untraced().is_some());
+        for v in VARIANTS {
+            assert_eq!(
+                v.untraced().is_none(),
+                v.deployment(Deployed::single()).is_ok(),
+                "'{}' answers `untraced` and `deployment` differently",
+                v.id
+            );
+        }
+        assert!(row("gemma-4-26b-a4b").untraced().is_none());
         assert!(row("gemma-4-e4b").untraced().is_none());
 
         let k_eq_v_only = Gemma4 {
@@ -906,10 +888,6 @@ mod tests {
         );
         assert!(k_eq_v_only.deployment(Deployed::single()).is_ok());
 
-        // The pairing, on the row that DOES refuse.
-        let a4b = row("gemma-4-26b-a4b");
-        assert!(a4b.untraced().is_some());
-        assert!(a4b.deployment(Deployed::single()).is_err());
     }
 
     /// A METAL load traces the llama-like Metal text, at THIS row's

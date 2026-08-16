@@ -285,6 +285,10 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
             let ty = infer(src, scope)?;
             infer_cast(&ty, to)
         }
+        Expr::Bias { src, by } => {
+            let ty = infer(src, scope)?;
+            infer_bias(ty, *by)
+        }
         Expr::Scale { src, factor } => {
             let ty = infer(src, scope)?;
             match factor {
@@ -688,6 +692,43 @@ fn blocked_suffix(ty: &TensorType) -> Option<&[i64]> {
     ty.shape.get(channel..)
 }
 
+/// How many elements of `encoding` a run of `bytes` holds.
+///
+/// A blocked scheme is not a bit width and cannot be priced as one. A GGUF
+/// Q4_K block spends 144 bytes on 256 elements, of which only 128 are the
+/// 4-bit codes -- the rest are the scales and minima that read them. Dividing
+/// by the code width prices the codes and forgets everything else, so the
+/// count comes back a fourteenth too high.
+///
+/// Measured, on the first real tensor to ask: cutting one expert out of a
+/// Q4_K_M `Qwen3-30B-A3B` stack, the operand's 1 572 864 elements were
+/// counted as 1 720 320 and the transmute was refused for not matching a
+/// shape that was correct. This is the same distinction
+/// [`ByteScale`](crate::contract::compile) draws for offsets, on the other
+/// side of the same conversion.
+fn elements_in(bytes: u64, encoding: &Encoding) -> Result<i64, Error> {
+    if let Encoding::Quant(spec) = encoding
+        && let Some((elems, block)) = spec.block_layout()
+    {
+        if block == 0 || !bytes.is_multiple_of(block) {
+            return Err(Error::Contract(format!(
+                "Transmute of {bytes} bytes is not a whole number of {block}-byte blocks"
+            )));
+        }
+        return i64::try_from(bytes / block * elems).or_overflow("Transmute element count");
+    }
+    let bits = element_bits(encoding).ok_or_else(|| {
+        Error::Contract(format!("Transmute to {encoding:?} has no element width"))
+    })?;
+    let total_bits = bytes.checked_mul(8).or_overflow("Transmute byte size")?;
+    if !total_bits.is_multiple_of(bits) {
+        return Err(Error::Contract(format!(
+            "Transmute of {bytes} bytes does not divide into {bits}-bit elements"
+        )));
+    }
+    i64::try_from(total_bits / bits).or_overflow("Transmute element count")
+}
+
 /// [`Expr::Transmute`]: the same bytes named differently.
 ///
 /// `src` is passed for its *form* alone — whether it is a whole tensor — which
@@ -695,21 +736,7 @@ fn blocked_suffix(ty: &TensorType) -> Option<&[i64]> {
 /// width needs to know.
 fn infer_transmute(ty: &TensorType, to: &TensorType, src: &Expr) -> Result<TensorType, Error> {
     let from_bytes = ty.byte_size()?;
-    let bits = element_bits(&to.encoding).ok_or_else(|| {
-        Error::Contract(format!(
-            "Transmute to {:?} has no element width",
-            to.encoding
-        ))
-    })?;
-    let total_bits = from_bytes
-        .checked_mul(8)
-        .or_overflow("Transmute byte size")?;
-    if !total_bits.is_multiple_of(bits) {
-        return Err(Error::Contract(format!(
-            "Transmute of {from_bytes} bytes does not divide into {bits}-bit elements"
-        )));
-    }
-    let total = i64::try_from(total_bits / bits).or_overflow("Transmute element count")?;
+    let total = elements_in(from_bytes, &to.encoding)?;
     let resolved = TensorType {
         shape: resolve_extents(&to.shape, total)?,
         encoding: to.encoding.clone(),
@@ -730,7 +757,9 @@ fn infer_transmute(ty: &TensorType, to: &TensorType, src: &Expr) -> Result<Tenso
             "renames its operand to the type it already has",
         ));
     }
-    if element_bits(&ty.encoding) != Some(bits) && !matches!(src, Expr::Src(_) | Expr::Out(_)) {
+    if element_bits(&ty.encoding) != element_bits(&to.encoding)
+        && !matches!(src, Expr::Src(_) | Expr::Out(_))
+    {
         return Err(Error::Contract(
             "Transmute changes the element width, so it may only rename a whole \
              tensor; publish the expression first and transmute that name"
@@ -1018,6 +1047,47 @@ fn infer_scale(ty: TensorType, factor_bits: u32) -> Result<TensorType, Error> {
     }
     if factor == 1.0 {
         return Err(denotes_its_operand("Scale", "multiplies by one"));
+    }
+    Ok(ty)
+}
+
+/// A `Bias` yields its operand's type, and admits the same operands a uniform
+/// `Scale` does for the same reasons: a quantized payload has no elements to
+/// add to until its scales are named, and an integer one has no rounding rule
+/// anybody stated.
+///
+/// The two rejected constants differ from `Scale`'s by exactly the identity.
+/// Zero is refused because it is both a no-op and what an all-zero FFI node
+/// carries, so a `Bias` that forgot to set its constant reads as one that
+/// meant nothing -- the same trap, arriving through the same door. One is
+/// *accepted* here and rejected there, because adding one is a real operation
+/// and multiplying by one is not; the constant this node exists for is
+/// literally `-1.0`.
+fn infer_bias(ty: TensorType, by_bits: u32) -> Result<TensorType, Error> {
+    let dtype = match ty.encoding {
+        Encoding::Raw(dtype) => dtype,
+        Encoding::Quant(_) => {
+            return Err(Error::Contract(format!(
+                "Bias of a quantized tensor ({:?}) is not supported; a code                  word means nothing to add to until its scales are named",
+                ty.encoding
+            )));
+        }
+    };
+    if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
+        return Err(Error::Contract(format!(
+            "Bias requires F32, F16 or BF16 elements, got {dtype:?}"
+        )));
+    }
+    let by = f32::from_bits(by_bits);
+    if !by.is_finite() {
+        return Err(Error::Contract(format!("Bias must be finite, got {by}")));
+    }
+    if by == 0.0 {
+        return Err(Error::Contract(
+            "Bias is zero, which is also what an unset constant field reads \
+             as; state the constant the contract meant"
+                .to_string(),
+        ));
     }
     Ok(ty)
 }

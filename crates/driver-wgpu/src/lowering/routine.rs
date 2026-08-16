@@ -73,6 +73,37 @@ pub enum Unplanned {
     /// nothing, so a caller that treated it as done would run a launch that
     /// writes nothing and reports success.
     Silent,
+    /// The body bound the parameter block TWICE in one dispatch.
+    ///
+    /// A block is one buffer and one bind-group position, so a second is not
+    /// a shape this crate can stage. Unreachable today — an arm mints one
+    /// handle for it — and refused by name rather than by `buffers` silently
+    /// coming out one entry short.
+    Blocks,
+    /// The body asked for a KV LAYER this fire does not hold.
+    ///
+    /// The table path refuses the same thing as `Unbindable::NoKvCache`; this
+    /// is that refusal with the body's own argument position in hand.
+    NoCache {
+        /// The body's argument position.
+        at: usize,
+        /// Which layer.
+        layer: u16,
+        /// Values rather than keys.
+        values: bool,
+    },
+    /// The body asked for a fire TABLE this fire does not hold.
+    ///
+    /// A rope frequency run or a sampling index list the resolver has no
+    /// buffer for. The table path refuses the same thing as
+    /// `Unbindable::NoDriverResource`, and this is that refusal with the
+    /// body's own argument position in hand.
+    Absent {
+        /// The body's argument position.
+        at: usize,
+        /// Which table it wanted.
+        what: crate::binding::FireTable,
+    },
 }
 
 impl std::fmt::Display for Unplanned {
@@ -92,6 +123,18 @@ impl std::fmt::Display for Unplanned {
                 write!(f, "the body's operand {at} is not in the fire: {why}")
             }
             Self::Silent => write!(f, "the body stated no dispatch"),
+            Self::Blocks => write!(f, "the body bound two parameter blocks"),
+            Self::NoCache { at, layer, values } => write!(
+                f,
+                "the body's operand {at} wants layer {layer}'s {}, which this \
+                 fire does not hold",
+                if *values { "values" } else { "keys" }
+            ),
+            Self::Absent { at, what } => write!(
+                f,
+                "the body's operand {at} wants the fire's {what:?}, which this \
+                 fire does not hold"
+            ),
         }
     }
 }
@@ -189,6 +232,21 @@ pub fn state(routine: &'static Routine<Wgpu>, args: &[ArgValue]) -> Result<Vec<S
     Ok(out)
 }
 
+/// What one of the body's handles resolved to.
+///
+/// Three answers where an `Option` gave two. The parameter BLOCK and an
+/// UNBOUND binding both bind no buffer and mean opposite things: the first
+/// takes a bind-group position and the second takes none.
+#[derive(Clone, Copy)]
+pub enum Placed<'a, B> {
+    /// A real buffer.
+    Buffer(Bound<'a, B>),
+    /// The packed scalar run.
+    Params,
+    /// A binding the module declares and this statement does not fill.
+    Nothing,
+}
+
 /// Turn one stated dispatch into the [`Dispatch`] the shell submits.
 ///
 /// `bounds` is what the arm resolved, indexed by the handles it minted.
@@ -199,19 +257,39 @@ pub fn state(routine: &'static Routine<Wgpu>, args: &[ArgValue]) -> Result<Vec<S
 /// when the packed scalars do not fit the module's uniform block.
 pub fn bind<'a, B>(
     stated: &Stated,
-    bounds: &[Bound<'a, B>],
+    bounds: &[Placed<'a, B>],
+    scalars: &[u32],
     declared: &Declared,
     symbol: &'a str,
     launch: &Launch,
 ) -> Result<Dispatch<'a, B>, Unplanned> {
+    // The PARAMETER BLOCK's place in the body's buffer list, if it asked for
+    // one. Its handle resolves to no `Bound` — it is the packed scalar run and
+    // the driver stages it — so it takes a position and no entry, which is
+    // exactly what `Dispatch::block_at` means.
+    let mut storage_block = None;
     let mut buffers = Vec::with_capacity(stated.handles.len());
-    for &h in &stated.handles {
+    for (n, &h) in stated.handles.iter().enumerate() {
         let at = h as usize;
         let bound = bounds.get(at).ok_or(Unplanned::Handle {
             handle: h,
             minted: bounds.len(),
         })?;
-        buffers.push(*bound);
+        match bound {
+            Placed::Buffer(bound) => buffers.push(*bound),
+            // A binding the module declares and nothing fills: it takes a
+            // position and no entry, exactly as `reorder`'s `Slot::Nothing`
+            // does. NOT the params block — telling the two apart is why this
+            // is an enum and not an `Option`, and conflating them made
+            // `router_topk` refuse itself as two blocks.
+            Placed::Nothing => {}
+            Placed::Params => {
+                if storage_block.is_some() {
+                    return Err(Unplanned::Blocks);
+                }
+                storage_block = Some(n);
+            }
+        }
     }
 
     // The scalars, packed in the order the body passed them and aligned the
@@ -244,6 +322,47 @@ pub fn bind<'a, B>(
             bytes.push(0);
         }
         bytes.extend_from_slice(&run[..width]);
+    }
+
+    // A STORAGE block, when the body asked for one.
+    //
+    // Two different things are called "the parameter block" on this backend
+    // and the module decides which. A `@group(1)` uniform is built from the
+    // scalars the BODY passed and is a bind group of its own; a `@group(0)`
+    // storage entry is the statement's own scalar run, staged as a buffer, and
+    // it takes a place in the numbering. `mlp`'s three gated activations are
+    // the second kind — `gated.wgsl` declares `@group(0) @binding(3)
+    // var<storage> params` — and the table path resolves them the same way,
+    // through a row that states `Param(0): Buf`.
+    if let Some(at) = storage_block {
+        // The statement's run FIRST, then whatever the body passed beside the
+        // block. That order is the table path's: `scalars` builds one run by
+        // walking the row, taking the whole tail at a `Param(_): Buf` and
+        // appending each derived number after it — `row_gather`'s request
+        // count is exactly such a number, and its shader reads it as the last
+        // field of the struct.
+        //
+        // Most bodies append nothing: an `Env` argument computes the grid and
+        // never reaches `ctx.dispatch`, so `mlp`'s three gated activations
+        // pass no scalars at all and the run is the statement's alone.
+        let mut run: Vec<u8> = scalars.iter().flat_map(|w| w.to_le_bytes()).collect();
+        run.extend_from_slice(&bytes);
+        let local = declared.local;
+        return Ok(Dispatch {
+            symbol,
+            buffers,
+            params: Params::Block {
+                bytes: run,
+                at: ParamSlot::Storage(u32::try_from(at).expect("a small binding number")),
+            },
+            block_at: Some(at),
+            groups: [
+                stated.lanes[0].div_ceil(local[0].max(1)),
+                stated.lanes[1].div_ceil(local[1].max(1)),
+                stated.lanes[2].div_ceil(local[2].max(1)),
+            ],
+            op: launch.op,
+        });
     }
 
     let params = if bytes.is_empty() {
@@ -316,24 +435,65 @@ pub fn plan<'a, R: crate::binding::Resolve>(
         min_offset,
     } = sources;
     let args = &lowered.args[launch.args.start as usize..launch.args.end as usize];
-    let mut handles = super::arm::Handles::over(args, results(routine));
+    let scalars = &lowered.params[launch.params.start as usize..launch.params.end as usize];
+    // The fire's own numbers, asked for once and handed to the arm as a map.
+    // A `Resolve` answers each independently and an arm that took the resolver
+    // could ask for anything; this keeps the ask to the four an arm may want.
+    let mut numbers = std::collections::BTreeMap::new();
+    for which in [
+        crate::binding::FireNumber::KvPageSize,
+        crate::binding::FireNumber::KvHeadStride,
+        crate::binding::FireNumber::KvSeqStride,
+        crate::binding::FireNumber::AttentionMaskStride,
+    ] {
+        if let Some(n) = resolver.number(which) {
+            numbers.insert(which, n);
+        }
+    }
+    let mut handles = super::arm::Handles::with_numbers(args, results(routine), scalars, &numbers);
     let taken_args = arm(&mut handles, facts).map_err(Unplanned::Refused)?;
     let stated = state(routine, &taken_args)?;
 
     // The operands the BODY asked for, resolved in the order it asked. Not
     // the statement's order: `Handles` minted a handle per ask, and this
-    // walks the same list.
-    let mut bounds = Vec::with_capacity(handles.taken().len());
-    for (at, arg) in handles.taken().iter().enumerate() {
-        let bound = crate::binding::resolve(arg, launch, arena, resolver, min_offset)
-            .map_err(|why| Unplanned::Operand { at, why })?;
-        bounds.push(bound);
+    // walks the same list. `None` is the parameter block, which has no `Arg`
+    // to resolve — it holds its handle's place so the ones after it are right.
+    let mut bounds = Vec::with_capacity(handles.asked().len());
+    for (at, arg) in handles.asked().iter().enumerate() {
+        match arg {
+            super::arm::Asked::Operand(arg) => {
+                let bound = crate::binding::resolve(arg, launch, arena, resolver, min_offset)
+                    .map_err(|why| Unplanned::Operand { at, why })?;
+                bounds.push(Placed::Buffer(bound));
+            }
+            super::arm::Asked::Params => bounds.push(Placed::Params),
+            super::arm::Asked::Unbound => bounds.push(Placed::Nothing),
+            super::arm::Asked::Kv { values } => {
+                // The layer is the RECTANGLE's, read here rather than carried
+                // by the arm: `reorder` takes `launch.layers.start` for
+                // `Source::KvKeys` and an arm holding its own number could
+                // disagree with the launch it is planning.
+                let layer = launch.layers.start;
+                let held = resolver.kv(layer, *values).ok_or(Unplanned::NoCache {
+                    at,
+                    layer,
+                    values: *values,
+                })?;
+                bounds.push(Placed::Buffer(crate::binding::Bound::whole(held)));
+            }
+            super::arm::Asked::Table(which) => {
+                let held = resolver
+                    .table(*which)
+                    .ok_or(Unplanned::Absent { at, what: *which })?;
+                bounds.push(Placed::Buffer(crate::binding::Bound::whole(held)));
+            }
+        }
     }
 
     let symbol = lowered.kernels[launch.kernel as usize].as_str();
     stated
         .iter()
-        .map(|one| bind(one, &bounds, declared, symbol, launch))
+        .map(|one| bind(one, &bounds, scalars, declared, symbol, launch))
         .collect()
 }
 
@@ -341,9 +501,11 @@ pub fn plan<'a, R: crate::binding::Resolve>(
 /// armed it.
 ///
 /// Both halves or neither: a body with no arm cannot be given its operands,
-/// and an arm with no body has nothing to hand them to. 99 routines have
-/// crossed and one is armed, so this answers `None` for almost everything —
-/// which is what keeps the table path serving every real fire today.
+/// and an arm with no body has nothing to hand them to. The table is empty and
+/// every family has crossed, so `None` is no longer a fallback to the table
+/// path — it is a symbol nothing can plan, and
+/// `an_armed_symbol_is_reached_through_the_spelling_a_plan_uses` is what says
+/// the census holds none.
 #[must_use]
 pub fn armed(symbol: &str) -> Option<(&'static Routine<Wgpu>, super::arm::Arm)> {
     // By STEM, not by name. A plan spells `silu_mul_bfloat16` and the routine
@@ -500,7 +662,8 @@ mod tests {
             op: 0,
             ..sample_launch()
         };
-        let d: Dispatch<'_, ()> = bind(&stated, &[], &declared, "e", &launch).expect("it packs");
+        let d: Dispatch<'_, ()> =
+            bind(&stated, &[], &[], &declared, "e", &launch).expect("it packs");
         let Params::Block { bytes, .. } = d.params else {
             panic!("scalars should make a block");
         };
@@ -524,7 +687,7 @@ mod tests {
         };
         let declared = declared(0, [1, 1, 1]);
         let launch = sample_launch();
-        let out: Result<Dispatch<'_, ()>, _> = bind(&stated, &[], &declared, "e", &launch);
+        let out: Result<Dispatch<'_, ()>, _> = bind(&stated, &[], &[], &declared, "e", &launch);
         assert_eq!(
             out.unwrap_err(),
             Unplanned::Handle {
@@ -559,6 +722,139 @@ mod tests {
     /// A body that dispatches nothing is `Unplanned::Silent`, not success.
     ///
     /// Distinct from a refusal on purpose: the body returned `Ok` having
+    /// A body that wants a KV LAYER this fire lacks is `Unplanned::NoCache`.
+    ///
+    /// The pool is per-LAYER state and the layer is the rectangle's, not the
+    /// arm's: `plan` reads `launch.layers.start` when it resolves the ask, the
+    /// same number `reorder` takes for `kernels::Source::KvKeys`. An arm
+    /// carrying its own layer could disagree with the launch it is planning,
+    /// and a paged decode reading the wrong layer's keys is a model that runs
+    /// and answers from the wrong context.
+    #[test]
+    fn a_kv_layer_this_fire_does_not_hold_is_refused_by_name() {
+        let args = [model_compiler::lower::Arg::Arena {
+            at: 0,
+            width: 64,
+            bytes: 2,
+        }];
+        let mut o = super::super::arm::Handles::over(&args, 1);
+        let _ = o.output(0).expect("the one operand");
+        let keys = o.kv(false);
+        let values = o.kv(true);
+        assert!(
+            matches!(keys, ArgValue::Buffer(1)) && matches!(values, ArgValue::Buffer(2)),
+            "keys and values take their own handles: {keys:?}, {values:?}"
+        );
+        assert!(
+            matches!(
+                o.asked().get(2),
+                Some(super::super::arm::Asked::Kv { values: true })
+            ),
+            "and the second is recorded as the VALUES half"
+        );
+
+        let why = Unplanned::NoCache {
+            at: 1,
+            layer: 7,
+            values: false,
+        };
+        let said = why.to_string();
+        assert!(
+            said.contains("operand 1") && said.contains("layer 7") && said.contains("keys"),
+            "the refusal names the position, the layer AND which half: {said}"
+        );
+    }
+
+    /// A body that wants a fire TABLE this fire lacks is `Unplanned::Absent`.
+    ///
+    /// The rope frequencies, the sampling indices and the token ids belong to
+    /// the FIRE, not to the statement, so an arm asks for them by name and the
+    /// resolver may simply not hold one. The table path refuses the same thing
+    /// as `Unbindable::NoDriverResource`; this is that refusal with the body's
+    /// own argument position in hand, which is what a reader needs in order to
+    /// know WHICH ask went unanswered.
+    #[test]
+    fn a_fire_table_this_fire_does_not_hold_is_refused_by_name() {
+        let args = [model_compiler::lower::Arg::Arena {
+            at: 0,
+            width: 64,
+            bytes: 2,
+        }];
+        let mut o = super::super::arm::Handles::over(&args, 1);
+        let _ = o.output(0).expect("the one operand");
+        let table = o.table(crate::binding::FireTable::RopeFrequencies);
+        assert!(
+            matches!(table, ArgValue::Buffer(1)),
+            "the table takes the handle after the operand, got {table:?}"
+        );
+        assert!(
+            matches!(
+                o.asked().get(1),
+                Some(super::super::arm::Asked::Table(
+                    crate::binding::FireTable::RopeFrequencies
+                ))
+            ),
+            "and it is recorded as a TABLE, which is what `plan` resolves \
+             through the resolver rather than through the arena"
+        );
+
+        // The refusal `plan` raises when the resolver holds no such buffer.
+        // Built here rather than driven through a fire, because a `Resolve`
+        // that answers `None` for one table and real buffers for the rest is
+        // more scaffolding than the claim is worth.
+        let why = Unplanned::Absent {
+            at: 1,
+            what: crate::binding::FireTable::RopeFrequencies,
+        };
+        let said = why.to_string();
+        assert!(
+            said.contains("operand 1") && said.contains("RopeFrequencies"),
+            "the refusal names the position AND the table: {said}"
+        );
+    }
+
+    /// A body that binds two parameter blocks is `Unplanned::Blocks`.
+    ///
+    /// One block is one buffer and one bind-group position. A second would
+    /// leave `buffers` an entry short of what the body meant, and the shader
+    /// would read some other operand's bytes as its scalars — a dispatch that
+    /// runs and answers wrongly. Unreachable through `Handles`, which mints
+    /// one handle for the block, so this drives `bind` directly.
+    #[test]
+    fn two_parameter_blocks_in_one_dispatch_are_refused_by_name() {
+        let stated = Stated {
+            module: "m".to_owned(),
+            entrypoint: "e".to_owned(),
+            lanes: [1, 1, 1],
+            handles: vec![0, 1],
+            scalars: Vec::new(),
+        };
+        let out: Result<Dispatch<'_, ()>, _> = bind(
+            &stated,
+            &[Placed::Params, Placed::Params],
+            &[7],
+            &declared(0, [1, 1, 1]),
+            "e",
+            &sample_launch(),
+        );
+        assert!(
+            matches!(out, Err(Unplanned::Blocks)),
+            "expected two blocks to be refused, got {out:?}"
+        );
+    }
+
+    /// RETIRED with `Unplanned::Both`, which turned out to be the wrong rule.
+    ///
+    /// It asserted that a body binding a storage block AND passing scalars is
+    /// refused, on the reasoning that the block IS the statement's run.
+    /// `layout::row_gather` does exactly that on purpose — its request count
+    /// is a FIELD of the struct, and the table path appends the same number to
+    /// the same run — so the refusal was rejecting a correct body. `bind` now
+    /// appends the body's scalars to the statement's run, and the 24
+    /// `row_gather` rectangles of
+    /// `the_routine_path_plans_what_the_table_path_planned` agree with the row
+    /// on every byte.
+
     /// asked for nothing, and a caller that took that for done would run a
     /// launch that writes nothing and reports success — which is the same
     /// failure a zero grid is, arrived at from the other side.
@@ -625,7 +921,7 @@ mod tests {
         };
         let launch = sample_launch();
         let out: Result<Dispatch<'_, ()>, _> =
-            bind(&stated, &[], &declared(8, [1, 1, 1]), "e", &launch);
+            bind(&stated, &[], &[], &declared(8, [1, 1, 1]), "e", &launch);
         assert_eq!(
             out.unwrap_err(),
             Unplanned::Scalars {
@@ -753,7 +1049,7 @@ mod tests {
                 resolver: &Empty,
                 min_offset: 256,
             },
-            super::super::arm::facts(7, crate::dispatch::Geometry::default(), 1, 1024, 1024),
+            super::super::arm::facts("x", 7, crate::dispatch::Geometry::default(), 1, 1024, 1024),
         );
         assert!(
             matches!(out, Err(Unplanned::Operand { at: 0, .. })),
@@ -763,28 +1059,127 @@ mod tests {
 
     /// The armed symbols are crossed, and reached through the spelling a
     /// plan actually uses.
+    ///
+    /// [`armed`] is [`super::super::arm::crossed`] plus one lookup: the
+    /// registry answers a ROUTINE NAME, and this finds the routine carrying
+    /// it. `arm.rs`'s `the_armed_stems_are_the_ones_registered_and_nothing_
+    /// else` owns the first half over the whole census. What is only
+    /// checkable here is the JOIN, and it fails quietly: a stem whose
+    /// `routine:` override names a body `kernels_wgpu::routines()` does not
+    /// carry answers `None` with no error anywhere, and now that the table is
+    /// empty a symbol that answers `None` is a symbol NO path can plan.
+    ///
+    /// Both traps below are live, and a lookup that falls into either still
+    /// returns `Some` and still plans a real dispatch:
+    ///
+    /// * `affine_qmv_routed_bfloat16_gs_64_b_4` is spelled with a
+    ///   QUANTIZATION SCHEME its routine's name never carries -- the body is
+    ///   `qmv_routed` -- so a lookup that matched on the routine's own name
+    ///   would find nothing here. That is `kernels-metal::kernel_of`'s defect,
+    ///   which cost 363 of 479 entrypoints, and this crate reproduced it
+    ///   twice.
+    ///
+    /// * `silu_mul` is a strict prefix of `silu_mul_strided` and both are
+    ///   armed, so a first-match lookup hands a STRIDED rectangle to the
+    ///   contiguous body: a flat grid where the shader wants rows, and every
+    ///   row past the first read from the wrong offset. Both operands are
+    ///   storage buffers of the same length, so nothing downstream sees it.
+    ///
+    /// This test used to assert `armed("silu_mul_strided_bfloat16").is_none()`
+    /// and to count the routines whose own NAME is claimable. The first was a
+    /// fact about the roster -- `silu_mul_strided` was the fleet's last
+    /// unarmed kernel -- and stopped being true the day it was armed; the
+    /// second is the trap itself wearing a number, and is kept below only as
+    /// the inequality it always was.
     #[test]
     fn an_armed_symbol_is_reached_through_the_spelling_a_plan_uses() {
-        assert!(armed("argmax_logits").is_some());
-        assert!(armed("copy_logits_bf16").is_some());
-        // The stem lookup: the routine is `silu_mul` and the plan says this.
-        assert!(armed("silu_mul_bfloat16").is_some());
-        assert_eq!(
-            armed("silu_mul_bfloat16").expect("armed").0.name,
-            "silu_mul",
-            "the symbol resolves to the routine its STEM names"
+        // The symbol a plan spells, and the routine whose body must run.
+        for (symbol, body) in [
+            ("argmax_logits", "argmax_logits"),
+            ("argmax_logits_bfloat16", "argmax_logits"),
+            ("copy_logits_bf16", "copy_logits_bf16"),
+            // The nesting trap, in both directions: the shorter stem must not
+            // claim the longer symbol, and the longer must not shadow the
+            // shorter.
+            ("silu_mul_bfloat16", "silu_mul"),
+            ("silu_mul_strided_bfloat16", "silu_mul_strided"),
+            // The scheme prefix, which the routine's name never carries.
+            ("affine_qmv_routed_bfloat16_gs_64_b_4", "qmv_routed"),
+            (
+                "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4",
+                "mxfp4_qmv_routed_bias",
+            ),
+            ("sdpa_paged_decode_bfloat16_d_128", "sdpa_paged_decode"),
+        ] {
+            let (routine, _) = armed(symbol)
+                .unwrap_or_else(|| panic!("`{symbol}` is a symbol this backend plans"));
+            assert_eq!(
+                routine.name, body,
+                "`{symbol}` reached `{}`, and its body is `{body}`: a lookup \
+                 that lands on the wrong routine binds real buffers, \
+                 dispatches, and answers from the wrong shape",
+                routine.name
+            );
+        }
+
+        // A ROUTINE'S OWN NAME IS NOT A SPELLING ANY PLAN USES. `qmv_routed`
+        // is what the body is called and `affine_qmv_routed_...` is what
+        // `lowered.kernels` holds; nothing states the former, so answering it
+        // would mean the lookup had started matching on names instead of on
+        // symbols -- and the same change would silently unclaim all 30
+        // routines whose spelling carries a prefix.
+        assert!(
+            armed("qmv_routed").is_none(),
+            "a routine's own name is not a symbol, and answering it means the \
+             lookup is matching on the body rather than on the plan"
         );
-        // Claimed by a longer stem with no arm.
-        assert!(armed("silu_mul_strided_bfloat16").is_none());
-        // Crossed, not armed: its body exists and the driver still plans it
-        // from its row.
-        assert!(armed("rms_single_row_bfloat16").is_none());
+        assert!(
+            armed("qmv_routed_bfloat16_gs_64_b_4").is_none(),
+            "the scheme is part of the spelling: `affine_` and `mxfp4_` name \
+             different weight layouts through one body"
+        );
+        // A stem may not end mid-word.
+        assert!(armed("silu_multiply").is_none());
+        // And a name no backend has.
         assert!(armed("not_a_kernel").is_none());
-        let both = kernels_wgpu::routines()
-            .into_iter()
-            .filter(|r| armed(r.name).is_some())
-            .count();
-        assert_eq!(both, 3);
+
+        // THE JOIN, over the census. Every symbol the registry claims has to
+        // arrive at a routine that EXISTS: `find(|r| r.name == stem)` is an
+        // `Option` and its `None` is indistinguishable, from the outside, from
+        // a symbol nobody armed. A `routine:` override with a typo in it, or a
+        // body renamed in `kernels-wgpu` without its registration, lands here
+        // and nowhere else.
+        let points = kernels_wgpu::entrypoints();
+        let lost: Vec<&String> = points
+            .iter()
+            .filter(|p| super::super::arm::crossed(p).is_some() && armed(p).is_none())
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "{} entrypoints are claimed by an armed stem whose routine this \
+             crate cannot find, starting with {:?}. The registry names a body \
+             `kernels_wgpu::routines()` does not carry, and the symbol is \
+             unplannable by any path.",
+            lost.len(),
+            &lost[..lost.len().min(4)],
+        );
+
+        // COUNTING BY ROUTINE NAME IS THE TRAP ITSELF, so it is asserted as
+        // the inequality and not as a number: a routine spelled with a scheme
+        // prefix cannot answer to its own name, and a suite that measured
+        // coverage this way would read the fleet as a third short while every
+        // kernel was in fact reachable. The count that means something is the
+        // one over SYMBOLS, and it is the sweep above.
+        let routines = kernels_wgpu::routines();
+        let by_name = routines.iter().filter(|r| armed(r.name).is_some()).count();
+        assert!(
+            by_name < routines.len(),
+            "{by_name} of {} routines answer to their own name. If that ever \
+             becomes all of them, either every scheme prefix has left the \
+             spellings or the lookup has started matching on names -- and the \
+             second is the defect this test is named for",
+            routines.len()
+        );
     }
 
     fn sample_launch() -> Launch {

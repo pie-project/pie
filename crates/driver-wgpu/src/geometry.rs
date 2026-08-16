@@ -871,6 +871,8 @@ fn rope_heads(dims: Dims) -> Result<u32, Ungeometric> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lowering::arm::Facts;
+    use crate::lowering::routine::Stated;
 
     /// A plausible fire, at a width that does not divide a workgroup.
     ///
@@ -910,6 +912,198 @@ mod tests {
         [64, 1, 1],
         [32, 8, 1],
     ];
+
+    /// One statement, wide enough that no arm in the tree runs out of operands.
+    ///
+    /// The three sweeps below drive the ROUTINE path, because that is where a
+    /// grid comes from now: `kernels_wgpu::KERNELS` is empty, no symbol
+    /// carries a `LaunchRule` any more, and the extent a launch actually gets
+    /// is the one a body computed and handed to `ctx.dispatch`. To read that
+    /// extent something has to feed the arm, and this is the feed.
+    ///
+    /// Nothing here is measured. No sweep below looks at an operand's address,
+    /// its width or its bytes -- what is measured is the extent a body
+    /// computes and the module it names -- so the statement only has to be
+    /// long enough and generous enough that an arm refuses for a reason that
+    /// belongs to the BODY: twelve arena operands where the widest arm binds
+    /// five, six weights where the widest names four.
+    ///
+    /// That is what lets a sweep skip a refusal and still mean something. A
+    /// refusal here is "this body is not compiled for that head width" or
+    /// "that scalar was not stated", never "the fixture was too short".
+    fn statement() -> Vec<model_compiler::lower::Arg> {
+        let mut args: Vec<model_compiler::lower::Arg> = (0..12usize)
+            .map(|n| model_compiler::lower::Arg::Arena {
+                at: n * 256,
+                width: 128,
+                bytes: 2,
+            })
+            .collect();
+        args.extend((0..6).map(|n| model_compiler::lower::Arg::Weight(format!("w.{n}"))));
+        args
+    }
+
+    /// The fire a sweep states, as the `Env` values a body reads.
+    fn firing(symbol: &str, rows: u32, width: u32, fire: crate::dispatch::Geometry) -> Facts {
+        crate::lowering::arm::facts(symbol, rows, fire, 3, width, width)
+    }
+
+    /// What one body asks for, run through the arm that feeds it.
+    ///
+    /// [`crate::lowering::routine::plan`] minus the binding: the arm finds the
+    /// operands a symbol's routine wants, the body states its module, its
+    /// entrypoint and its LANES. Only the last is geometry, and it is the half
+    /// a row's `LaunchRule` used to state -- so this is the seam a claim about
+    /// a grid has to be made at now, and every rule this file names is checked
+    /// against a body that reached the same shape by its own arithmetic.
+    ///
+    /// A body may state MORE than one dispatch, so this answers all of them.
+    fn fired(symbol: &str, facts: Facts, scalars: &[u32]) -> Result<Vec<Stated>, String> {
+        let (routine, arm) = crate::lowering::routine::armed(symbol)
+            .ok_or_else(|| format!("`{symbol}` is claimed by no armed stem"))?;
+        let args = statement();
+        let mut handles = crate::lowering::arm::Handles::with_scalars(
+            &args,
+            crate::lowering::routine::results(routine),
+            scalars,
+        );
+        let taken = arm(&mut handles, facts).map_err(|why| format!("its arm refused: {why:?}"))?;
+        crate::lowering::routine::state(routine, &taken).map_err(|why| why.to_string())
+    }
+
+    /// The widest extent any fire asks of each module, and how many census
+    /// symbols answered no fire at all.
+    ///
+    /// THREE fires, because "flat" has to be a fact about a body's ARITHMETIC
+    /// and not about one fixture's numbers: an axis is left flat only when
+    /// every fire that reached the module left it at a single lane, so a body
+    /// that flattens an axis because this run happens to make it one is not a
+    /// finding. The scalar runs differ per WORD as well as per fire, since a
+    /// body that divides one stated number by another would otherwise be free
+    /// to answer one twice.
+    ///
+    /// Two of them were not enough, and the way they failed is the argument
+    /// for the third. Both stated a word 1 larger than half their width, and
+    /// `rms_strided_head_row` reads `width / stated(1)` as its head count and
+    /// puts it on y -- so both answered ONE head, agreed with each other, and
+    /// made a rule that flattens nothing look flat. Two fires that share an
+    /// accident are one fire. The numbers here are chosen so the quotients are
+    /// wide, and the merge keeps the WIDEST per axis, so adding a fire can
+    /// only ever REMOVE a finding and never introduce one.
+    ///
+    /// Keyed by the entrypoint the BODY named, which is not always the symbol
+    /// that was fired: several bodies pick their module by head width, so two
+    /// symbols reach one module and a symbol can reach a module its own name
+    /// does not spell. The symbol kept beside the extent is the first that
+    /// reached it, for the failure message.
+    ///
+    /// A body that refuses a fire -- a head width it is not compiled for, a
+    /// tiling it does not carry -- is skipped, and the count of the symbols
+    /// that refused EVERY fire is returned rather than asserted: it measures
+    /// the generosity of the fixture, which is not the caller's subject.
+    fn widest() -> (
+        std::collections::BTreeMap<String, ([u32; 3], String)>,
+        usize,
+    ) {
+        let fires = [
+            (
+                7u32,
+                128u32,
+                crate::dispatch::Geometry {
+                    q_heads: 4,
+                    kv_heads: 2,
+                    head_dim: 64,
+                    rotary_dims: 64,
+                    n_experts: 8,
+                    experts_per_token: 2,
+                },
+                [128u32, 96, 64, 48, 32, 16, 8, 4, 2, 3, 5, 7],
+            ),
+            (
+                13,
+                256,
+                crate::dispatch::Geometry {
+                    q_heads: 6,
+                    kv_heads: 3,
+                    head_dim: 128,
+                    rotary_dims: 64,
+                    n_experts: 16,
+                    experts_per_token: 4,
+                },
+                [256u32, 160, 96, 64, 4, 48, 24, 12, 6, 9, 15, 21],
+            ),
+            // THE WIDE FIRE, and its first two words are the whole point of
+            // it. Several arms read a count as a QUOTIENT of two stated
+            // numbers -- `rms_strided_head_row` takes `heads = width /
+            // stated(1)`, and `norm::per_head_row` puts that head count on y
+            // and nothing else -- so a run whose word 1 is more than half its
+            // width answers ONE head by integer division, on a rule that
+            // flattens nothing. Both fires above do exactly that (128/96 and
+            // 256/160), which read as a flat y axis and was a fact about the
+            // fixture.
+            //
+            // 512 over 32 is sixteen heads, and the axis states its true
+            // extent. The merge below keeps the WIDEST answer per axis, so
+            // adding a fire can only ever remove a finding: this cannot mask
+            // an axis that is flat under the other two and is why the accident
+            // is repaired by adding a fire rather than by editing one.
+            (
+                5,
+                512,
+                crate::dispatch::Geometry {
+                    q_heads: 8,
+                    kv_heads: 4,
+                    head_dim: 128,
+                    rotary_dims: 128,
+                    n_experts: 32,
+                    experts_per_token: 8,
+                },
+                [512u32, 32, 128, 96, 8, 64, 48, 24, 12, 10, 18, 30],
+            ),
+        ];
+
+        // The accident above is a property of these numbers, so it is pinned
+        // here rather than left to a reader to rediscover. Word 1 is read as a
+        // divisor of the width by the whole norm family, and an axis derived
+        // from a quotient that truncates to one is indistinguishable from an
+        // axis a rule genuinely flattens. At least one fire must divide its
+        // width more than once, or this sweep is blind to every per-head extent
+        // in the fleet.
+        assert!(
+            fires
+                .iter()
+                .any(|(_, width, _, run)| run[1] > 0 && *width / run[1] > 1),
+            "no fire states a word 1 that divides its width more than once, \
+             so every per-head axis reads as flat by accident"
+        );
+
+        let mut seen: std::collections::BTreeMap<String, ([u32; 3], String)> =
+            std::collections::BTreeMap::new();
+        let mut unreached = 0usize;
+        for symbol in kernels_wgpu::entrypoints() {
+            let mut answered = false;
+            for (rows, width, fire, scalars) in &fires {
+                let Ok(stated) = fired(&symbol, firing(&symbol, *rows, *width, *fire), scalars)
+                else {
+                    continue;
+                };
+                answered = true;
+                for one in stated {
+                    let extent = one.lanes;
+                    let at = seen
+                        .entry(one.entrypoint)
+                        .or_insert_with(|| ([0; 3], symbol.clone()));
+                    for (widest, lane) in at.0.iter_mut().zip(extent) {
+                        *widest = (*widest).max(lane);
+                    }
+                }
+            }
+            if !answered {
+                unreached += 1;
+            }
+        }
+        (seen, unreached)
+    }
 
     /// Every workgroup count, times its workgroup, covers the thread extent.
     ///
@@ -1126,23 +1320,46 @@ mod tests {
         );
     }
 
-    /// And no row in the table names a rule this file refuses.
-    ///
-    /// The other direction, and the one that would catch `kernels-wgpu` growing
-    /// a mamba row before this crate grew a grid for it. The table's 99 rows
-    /// use `SERVED` plus `Unstated`; a row naming anything else would plan and
-    /// then refuse at every fire, which is a worse failure than not compiling.
-    #[test]
-    fn no_row_in_the_table_names_a_rule_this_backend_refuses() {
-        for sig in kernels_wgpu::KERNELS {
-            assert!(
-                sig.launch == Rule::Unstated || SERVED.contains(&sig.launch),
-                "`{}` states {:?}, which this backend has no grid for",
-                sig.symbol,
-                sig.launch
-            );
-        }
-    }
+    // RETIRED: THE TABLE IS EMPTY, so the walk has no row whose rule to read.
+    //
+    // It was `no_row_in_the_table_names_a_rule_this_backend_refuses`, and it
+    // asserted the direction `the_rules_this_backend_serves_are_exactly_the_
+    // ones_with_shaders` above cannot: that walk starts from the VOCABULARY
+    // and proves every `kernels::LaunchRule` variant is either served with a
+    // grid or refused by name, which says nothing about which of them anybody
+    // actually states. This one started from the FLEET -- every row of
+    // `kernels_wgpu::KERNELS`, all 99 of them -- and required each row's
+    // `launch` to be `Rule::Unstated` or a member of `SERVED`. A row naming
+    // any of the twenty-four unruled variants would compile, would plan, and
+    // would then answer `Ungeometric::Unruled` at every fire it ever reached,
+    // which is a worse failure than a build that stops: it arrives per launch,
+    // at runtime, on a machine that already loaded the weights. What it was
+    // written to catch was `kernels-wgpu` growing a mamba row -- `PerRow`,
+    // `RecurrentScan`, `Slab` -- before this crate grew a grid for it.
+    //
+    // It BECAME BLIND, and it went blind QUIETLY, which is the part worth
+    // recording. `for sig in KERNELS` over an empty table runs its body zero
+    // times and the test passes; there was no floor here, no `assert!(checked
+    // >= n)` of the kind `binding.rs`'s two retired walks carried, so nothing
+    // in this file's output changed on the day its subject was deleted. It
+    // did not start agreeing that no row names an unruled rule. There are no
+    // rows to name one. A green run reported that and a reader would have
+    // believed it, which is why it is written down here rather than left to
+    // pass.
+    //
+    // Nothing inherits the claim WHOLE, because nothing states a rule any
+    // more: a routine computes its own lanes and hands them to `ctx.dispatch`,
+    // so there is no field left for a body to fill in wrongly and no
+    // `Ungeometric::Unruled` on the path a plan takes. The half that survives
+    // is the one about grids that cannot run, and it is now measured on real
+    // launches instead of declarations -- `kernels-wgpu`'s
+    // `tests/routines.rs::no_routine_dispatches_an_empty_grid` fires every
+    // body and refuses a zero on any axis, and this file's
+    // `no_module_reads_a_grid_axis_its_rule_leaves_flat` drives the census
+    // through its arms and checks the extent each body computes against the
+    // axes its module reads. Both catch a body that cannot be launched
+    // correctly; neither can catch, or needs to, a body that names a rule
+    // nobody serves.
 
     /// Which rules answer a grid with a zero in it, stated exactly.
     ///
@@ -1301,83 +1518,186 @@ mod tests {
     /// Every decode-attention module in the tree is half the head it serves.
     ///
     /// The one arithmetic divergence from `driver-vulkan`, measured against
-    /// the shaders rather than argued from them. `suffix_value` reads the
-    /// `_d_N` out of the entrypoint -- which is what SELECTED the module, so
-    /// it is the head width the driver believes it asked for -- and `naga`
-    /// reads the `@workgroup_size` out of the source the same name expands to.
-    /// The two are computed from different places and have to agree at a
-    /// factor of two.
+    /// the shaders rather than argued from them. Three numbers computed in
+    /// three different places have to agree at a factor of two: the head width
+    /// the fire states, the `_d_N` in the entrypoint the BODY named -- which
+    /// is what SELECTS the module, so it is the head width the driver believes
+    /// it asked for -- and the `@workgroup_size` `naga` reads out of the
+    /// source that name expands to.
+    ///
+    /// This used to walk the rows whose `launch` was `Rule::SdpaVector`.
+    /// `kernels_wgpu::KERNELS` is empty, so the population is now the five
+    /// crossed bodies that dispatch through `attn`'s `vector_grid`, fired at
+    /// every head width the tree compiles. A body picks its entrypoint by
+    /// indexing a literal spelling table with the fire's head width and
+    /// REFUSES a width it was not compiled for, so the eleven entrypoints
+    /// pinned at the bottom are the whole decode fleet as the bodies can reach
+    /// it -- and a body that stops naming one fails that list rather than
+    /// quietly shrinking the sweep.
     ///
     /// This is the check that would catch the divergence being undone. A
     /// shader author who "fixed" `PIE_PAIRS` to `PIE_HEAD_DIM` would make
-    /// every decode dispatch here refuse; one who did it while somebody else
-    /// removed the doubling below would make every decode launch twice the
-    /// workgroups and read twice the head count off `num_workgroups.x`, which
-    /// is a wrong answer and not a refusal.
+    /// every decode dispatch here fail on the workgroup; one who did it while
+    /// somebody else removed the halving in `vector_grid` would make every
+    /// decode launch twice the workgroups and read twice the head count off
+    /// `num_workgroups.x`, which is a wrong answer and not a refusal.
     ///
-    /// Entrypoints the tree cannot yet compile are skipped for the reason
-    /// `crate::reflect`'s own sweep gives -- that is `kernels-wgpu`'s claim,
-    /// not this one's -- and the count is asserted so the skip cannot empty
-    /// the test.
+    /// The extent is compared BOTH ways for that reason. `Rule::SdpaVector`
+    /// and `vector_grid` compute the same three-axis shape from the same three
+    /// facts in two crates that never call each other, so the day they stop
+    /// agreeing one of them is a grid nothing else in this tree can tell from
+    /// a right one.
     #[test]
     fn a_decode_attention_module_is_half_the_head_it_serves() {
-        let mut checked = 0;
-        for sig in kernels_wgpu::KERNELS {
-            if sig.launch != Rule::SdpaVector {
-                continue;
-            }
-            for name in sig.entrypoints() {
-                let Ok(declared) =
-                    crate::reflect::entrypoint(&name, kernels_wgpu::Capability::Baseline)
-                else {
+        /// The bodies that dispatch a decode attention through `vector_grid`.
+        const DECODE: [&str; 5] = [
+            "sdpa_paged_decode",
+            "sdpa_paged_decode_sink",
+            "sdpa_vector_decode",
+            "sdpa_vector_decode_swa",
+            "sdpa_vector_decode_sink",
+        ];
+        /// Every head width any of them is compiled for, offered to all five.
+        const WIDTHS: [u32; 4] = [64, 128, 256, 512];
+
+        let (rows, q_heads) = (7u32, 4u32);
+        let mut reached: Vec<String> = Vec::new();
+        for stem in DECODE {
+            for head_dim in WIDTHS {
+                let symbol = format!("{stem}_bfloat16_d_{head_dim}");
+                let fire = crate::dispatch::Geometry {
+                    q_heads,
+                    kv_heads: 2,
+                    head_dim,
+                    rotary_dims: head_dim,
+                    n_experts: 0,
+                    experts_per_token: 0,
+                };
+                // A width this body is not compiled for is a refusal and not a
+                // gap: the pinned list below is what says which pairs were
+                // supposed to answer.
+                let Ok(stated) = fired(&symbol, firing(&symbol, rows, 128, fire), &[128; 8]) else {
                     continue;
                 };
-                let head_dim = suffix_value(&name, "_d_")
-                    .unwrap_or_else(|| panic!("`{name}` states no head width in its name"));
+                assert_eq!(
+                    stated.len(),
+                    1,
+                    "`{symbol}` is one decode dispatch, and it stated {}",
+                    stated.len()
+                );
+                let name = stated[0].entrypoint.clone();
+                let declared =
+                    crate::reflect::entrypoint(&name, kernels_wgpu::Capability::Baseline)
+                        .unwrap_or_else(|e| panic!("`{name}`, which `{symbol}`'s body named: {e}"));
                 let module = Module::loaded(&name, &declared);
+                assert_eq!(
+                    suffix_value(&name, "_d_"),
+                    Some(head_dim),
+                    "`{symbol}` fired at a {head_dim}-wide head and its body \
+                     named `{name}`, which selects another module"
+                );
                 assert_eq!(
                     module.local.at(0) * 2,
                     head_dim,
                     "`{name}` declares a workgroup of {:?} for a {head_dim}-wide head",
                     declared.local
                 );
-                // And the rule accepts it, which is the same claim from the
-                // other side: one workgroup per (head, row), exactly.
-                let d = Dims { head_dim, ..dims() };
+
+                // And the rule says the same thing from the other side: the
+                // body's own extent, and `Rule::SdpaVector`'s, computed apart.
+                let d = Dims {
+                    rows,
+                    q_heads,
+                    head_dim,
+                    ..dims()
+                };
+                assert_eq!(
+                    stated[0].lanes,
+                    lanes(Rule::SdpaVector, d, module).unwrap_or_else(|e| panic!("`{name}`: {e}")),
+                    "`{name}`: the body's extent and `Rule::SdpaVector`'s are \
+                     the same shape reached twice, and they have parted"
+                );
                 assert_eq!(
                     groups(Rule::SdpaVector, d, module).unwrap_or_else(|e| panic!("`{name}`: {e}")),
-                    [d.q_heads, d.rows, 1]
+                    [q_heads, rows, 1],
+                    "`{name}`: one workgroup per (head, row), exactly"
                 );
-                checked += 1;
+                reached.push(name);
             }
         }
+
+        reached.sort();
         assert_eq!(
-            checked, 13,
-            "the table states four decode-attention rows over 13 entrypoints, \
-             and every one is measured against its own module -- a floor here \
-             would let the sweep shrink without saying so"
+            reached,
+            [
+                "sdpa_paged_decode_bfloat16_d_128",
+                "sdpa_paged_decode_bfloat16_d_256",
+                "sdpa_paged_decode_bfloat16_d_512",
+                "sdpa_paged_decode_bfloat16_d_64",
+                "sdpa_paged_decode_sink_bfloat16_d_64",
+                "sdpa_vector_decode_bfloat16_d_128",
+                "sdpa_vector_decode_bfloat16_d_256",
+                "sdpa_vector_decode_bfloat16_d_64",
+                "sdpa_vector_decode_sink_bfloat16_d_64",
+                "sdpa_vector_decode_swa_bfloat16_d_256",
+                "sdpa_vector_decode_swa_bfloat16_d_512",
+            ],
+            "the decode fleet as its bodies can name it -- a width that stops \
+             answering is a module that stopped being reachable, and a width \
+             that starts is one nothing has measured"
         );
     }
 
-    /// No module reads a grid axis its rule leaves flat.
+    /// No module reads a grid axis its body leaves flat.
     ///
     /// The third member of the family `a_decode_attention_module_is_half_the_
     /// head_it_serves` and `a_routed_matvec_covers_every_output_row_its_module_
     /// owns` belong to, and the one that generalises: instead of naming a rule
-    /// and checking its arithmetic, it asks every row whether the SHAPE its
-    /// rule produces can carry the axes its module actually reads.
+    /// and checking its arithmetic, it asks every SYMBOL in the census whether
+    /// the shape its launch actually gets can carry the axes its module really
+    /// reads.
     ///
-    /// A rule that answers `[n, 1, 1]` promises the body indexes on x alone. If
-    /// that body reads `global_invocation_id.y` as a row, every row but the
+    /// A launch that answers `[n, 1, 1]` promises the body indexes on x alone.
+    /// If that body reads `global_invocation_id.y` as a row, every row but the
     /// first is never written — and an undershot grid writes nothing, the gap
     /// reads back as whatever the buffer held, and the dispatch returns
     /// success. There is no symptom until somebody compares numbers.
+    ///
+    /// That is the claim; the units it is made in are the subtle part, and the
+    /// body below spells them out. A lane is a THREAD, `dispatch_workgroups`
+    /// takes workgroups, and one lane on an axis whose workgroup is two wide
+    /// is a global extent of two rather than of one. Reading `lanes[a] == 1`
+    /// as "the shader sees index 0 there" is a statement about a one-wide
+    /// workgroup and about nothing else.
+    ///
+    /// ## Where the shape comes from now
+    ///
+    /// It used to come from the row: `lanes(sig.launch, ..)` for every row in
+    /// `kernels_wgpu::KERNELS`. The table is empty, so the extent is taken
+    /// where a real launch takes it — the arm feeds the routine, the BODY
+    /// computes its own lanes and names its own entrypoint, and this compares
+    /// those two answers against each other. That is a stronger reading than
+    /// the row was: the row said what the driver would ask for, the body says
+    /// what it asks for, and the entrypoint keyed below is the module that
+    /// will actually run rather than the one the symbol suggests.
+    ///
+    /// It is also a NARROWER population, and the narrowing is the honest part.
+    /// A module no body names at any of [`widest`]'s three fires has no grid
+    /// to be wrong about, so it is not measured here; that an entrypoint is
+    /// reachable at all is `arm.rs`'s
+    /// `every_entrypoint_is_claimed_by_the_stem_that_owns_it` and `reflect`'s
+    /// own census sweep, not this one's.
     ///
     /// `crate::reflect` already computes which axes a module reads, and it has
     /// been computed and never asked. It is safe to ask because it errs in the
     /// right direction: where the call walk cannot follow a builtin into a
     /// helper it answers "every axis" rather than "no axis", so a module this
     /// check cannot read makes the check STRICTER rather than vacuous.
+    ///
+    /// `kernels-wgpu`'s `a_flat_rows_shader_does_not_read_its_row_off_the_y_
+    /// axis` is the same claim from the shader side, on the bodies that call
+    /// `elementwise` and on the y axis only. This one is over every body, on
+    /// all three axes, and against the module the body chose.
     ///
     /// ## The defect it caught, and how it was closed
     ///
@@ -1399,99 +1719,192 @@ mod tests {
     /// `gid.x` is a flat element index. `kernels-vulkan`'s copy is still
     /// `local_size_y = 16` over the same rule and still has this.
     ///
+    /// That defect is also the reason the exemption below is written with two
+    /// conjuncts rather than one. `@workgroup_size(16, 16)` makes the global y
+    /// extent SIXTEEN, so an exemption phrased as "the axis is not really
+    /// flat" would have passed `geglu_tanh_strided` — the axis was never flat,
+    /// and sixteen rows out of twenty-one is still a silent loss. Only a body
+    /// that reads `@builtin(num_workgroups)`, and so builds its index out of
+    /// the grid it was actually given, is excused.
+    ///
+    /// ## The defect the routine path caught, which the row path could not
+    ///
+    /// Re-anchored on real launches, this sweep reaches every entrypoint a
+    /// body can name rather than the rows that stated a rule, and it named
+    /// three: `gdn_prep_bfloat16`, `gdn_prep_prefill_bfloat16` and
+    /// `gdn_prep_slotted_bfloat16`, all reading y against a grid stating one
+    /// lane there. None of them reads `gid` at all — they index off `wid.z`
+    /// and `lid` — and the report was still correct, because
+    /// `ssm/gdn_prep.wgsl` declared `@builtin(global_invocation_id)` for every
+    /// variant while only the recurrent arm read it. naga materialises an
+    /// `Expression::FunctionArgument` for a declared argument whether or not
+    /// anything uses it, so `reflect::axes_read` found a grid position it
+    /// could not account for and returned its `[true; 3]` fallback: the
+    /// entrypoints CLAIMED to read all three axes. The declaration was the
+    /// lie, and the repair was to declare the builtin only where it is read.
+    /// An unread builtin costs nothing at run time and is therefore invisible
+    /// there; it is not invisible to reflection, which reads the signature and
+    /// not the body.
+    ///
+    /// Recorded because the temptation was to exempt it here. An
+    /// entrypoint whose `grid_axes` is `[true; 3]` is exactly the shape of
+    /// `reflect`'s fallback, and skipping those would have made this quiet
+    /// again — and would have blinded it to a real class: a module that reads
+    /// three axes against a grid that fills one. The check was right to ask.
+    ///
+    /// ## And the accident it reported, which was the fixture's
+    ///
+    /// `rms_strided_head_row_bfloat16` came back on the same run and was not a
+    /// defect of any kind. Its y extent is `norm::per_head_row`'s head count,
+    /// which the arm reads as `width / stated(1)`, and both fires then in use
+    /// stated a word 1 past half their width — so integer division answered
+    /// one head twice and a rule that flattens nothing looked flat. That is
+    /// the structural weakness of reading a real launch instead of a rule: a
+    /// rule literals a `1` on the axes it flattens and cannot be talked out of
+    /// it, while a launch's `1` may be arithmetic or may be an accident, and
+    /// the two are not distinguishable from one sample. [`widest`]'s third
+    /// fire is the repair, and its doc says why adding one is sound where
+    /// editing one would not have been.
+    ///
     /// The list below is consequently EMPTY, and the emptiness is asserted
     /// from both ends: an entry that stops being defective fails just as
-    /// loudly as a row that starts being one. That is what said the fix had
+    /// loudly as a module that starts being one. That is what said the fix had
     /// landed -- `these are listed as known-defective and are not` -- in the
     /// same run that proved it.
     #[test]
     fn no_module_reads_a_grid_axis_its_rule_leaves_flat() {
-        // Rows whose module reads an axis the rule flattens. Each would be a
-        // defect, each would be named, and the list is pinned so it cannot
-        // grow in silence.
+        // ENTRYPOINTS whose module reads an axis its body flattens -- the
+        // entrypoint and not the symbol, because the entrypoint is what the
+        // body named and what `naga` was read for. Each would be a defect,
+        // each would be named, and the list is pinned so it cannot grow in
+        // silence.
         const KNOWN: [(&str, &str); 0] = [];
 
-        let d = Dims {
-            rows: 7,
-            width: 96,
-            in_width: 96,
-            q_heads: 4,
-            kv_heads: 2,
-            head_dim: 64,
-            axis: 96,
-            rotary_dims: 64,
-            n_experts: 8,
-            experts_per_token: 2,
-        };
+        let (seen, unreached) = widest();
 
         let mut found: Vec<String> = Vec::new();
         let mut wasted: Vec<String> = Vec::new();
         let mut checked = 0usize;
 
-        for sig in kernels_wgpu::KERNELS {
-            if sig.launch == Rule::Unstated {
-                continue;
+        for (name, (extent, symbol)) in &seen {
+            let declared = crate::reflect::entrypoint(name, kernels_wgpu::Capability::Baseline)
+                .unwrap_or_else(|e| panic!("`{name}`, which `{symbol}`'s body named: {e}"));
+            checked += 1;
+
+            for (axis, lanes) in extent.iter().enumerate() {
+                if *lanes > 1 || !declared.grid_axes[axis] {
+                    continue;
+                }
+                // LANES ARE THREADS, and one lane is not one index. The global
+                // extent on an axis is `lanes.div_ceil(local) * local` -- what
+                // `routine::bind` computes and hands to `dispatch_workgroups`
+                // -- so a single lane against a workgroup of two is an extent
+                // of TWO, and a body reading `global_invocation_id.y` there
+                // sees both values. Reading `lanes == 1` as "the shader only
+                // ever sees index 0" is true of a one-wide workgroup and false
+                // of every other.
+                //
+                // But a wider workgroup is not a defence either, and that
+                // distinction is the whole of `geglu_tanh_strided` below:
+                // `@workgroup_size(16, 16)` over `[width * rows, 1, 1]` is an
+                // extent of SIXTEEN on y, never flat, and rows 16 and up were
+                // still never written -- because the body read `gid.y` as a
+                // row of a rectangle nothing had sized. Exempting on workgroup
+                // width alone retires the defect this test exists for.
+                //
+                // What separates the two is whether the body reconstructs its
+                // index from THE GRID IT WAS GIVEN.
+                // `cast_qmm_input_bfloat16_to_float16` is `@workgroup_size(32,
+                // 2, 2)` over `elementwise`'s `[count, 1, 1]`, reads `gid.y`,
+                // and is correct: `idx = gid.x + gid.y * groups.x * 32u` makes
+                // y the high digit of a flat index whose span is the
+                // launcher's own, and `quant/qmm_t.wgsl` says why in as many
+                // words -- *"the alternative is a flat index that disagrees
+                // with the launcher's grid, which is a wrong answer"*. It
+                // takes `@builtin(num_workgroups)` in order to agree.
+                // `geglu_tanh_strided` did not, and could not have.
+                //
+                // So the exemption takes BOTH, and neither alone: a module
+                // whose workgroup is one wide on the axis sees index 0 there
+                // whatever arithmetic it does, and a module that never asks
+                // how big the grid is cannot be folding it into an index.
+                //
+                // `reads_workgroup_count` is DECLARATION-shaped -- `reflect`
+                // sets it from the entry point's `@builtin` arguments, not
+                // from a use -- so a body that declares the builtin and
+                // ignores it takes an exemption it has not earned. A real
+                // hole, and the narrow direction to err in: the alternative is
+                // failing the one body in this tree that does this correctly.
+                //
+                // The waste half below already recorded this units confusion
+                // from the other side -- *"`lanes` is a THREAD extent and a
+                // body that indexes by lane consumes it correctly"* -- and
+                // that note was written while the data-loss half above still
+                // read a lane as an index. The same category error, found
+                // twice, fixed once.
+                let local = declared.local[axis].max(1);
+                if local > 1 && declared.reads_workgroup_count {
+                    continue;
+                }
+                found.push(format!(
+                    "{name} reads axis {axis}, given {lanes} lane over a \
+                     workgroup of {local}, fired as `{symbol}`"
+                ));
             }
-            for name in sig.entrypoints() {
-                let Ok(declared) =
-                    crate::reflect::entrypoint(&name, kernels_wgpu::Capability::Baseline)
-                else {
-                    continue;
-                };
-                let module = Module::loaded(&name, &declared);
-                let Ok(extent) = lanes(sig.launch, d, module) else {
-                    // A rule this backend refuses is `Unruled`'s business, and
-                    // a geometry that cannot be built cannot be compared.
-                    continue;
-                };
-                checked += 1;
 
-                for (axis, lanes) in extent.iter().enumerate() {
-                    // The rule leaves an axis FLAT when it puts exactly one
-                    // lane on it: the body may then only ever see index 0
-                    // there.
-                    if *lanes > 1 || !declared.grid_axes[axis] {
-                        continue;
-                    }
-                    // A module whose own workgroup is wider than one on this
-                    // axis is reading a LOCAL index, which is legitimate:
-                    // `local_invocation_id.y` is a lane within the group and
-                    // has nothing to do with the grid. Only a global read of a
-                    // flattened axis is the defect, and `grid_axes` is about
-                    // the global builtins.
-                    found.push(format!("{} ({name}) reads axis {axis}", sig.symbol));
+            // The MIRROR, which is harmless and is checked anyway.
+            //
+            // `driver-vulkan/tests/rules.rs` has exactly this and only this —
+            // `if !read && given > 1` — and it is why that crate did not catch
+            // `geglu_tanh_strided`: work given to an axis nothing reads is
+            // WASTE, and an axis the body reads that the launch leaves at one
+            // is DATA LOSS. They are different predicates and only the first
+            // was written.
+            //
+            // Kept because waste is still a disagreement between a grid and a
+            // body, and a grid that hands out a dimension nobody uses is
+            // usually a grid that meant to hand out a different one. It is
+            // reported separately so the two never get confused for each other
+            // again.
+            //
+            // LANES here too, and this arm has the units problem the loss arm
+            // above just had -- but in the harmless direction, which is why it
+            // is left as it is and not quietly changed. In WORKGROUP units the
+            // predicate would be `lanes.div_ceil(local) > 1`, and that is the
+            // form that would be assertable: `route_sort` and the two
+            // `router_topk`s are `256` lanes over a `256`-wide workgroup, so
+            // they are ONE workgroup and would stop being reported, while
+            // `residual_add`'s two-dimensional grid against a `gid.x`-only
+            // body is 64 workgroups on an axis nothing reads and would
+            // survive. That is the whole of the note below, arithmetic rather
+            // than an allow-list. It is not made here because promoting this
+            // half from reported to asserted is a decision to take with a run
+            // in hand, and nothing has run it in these units.
+            for (axis, lanes) in extent.iter().enumerate() {
+                if *lanes <= 1 || declared.grid_axes[axis] {
+                    continue;
                 }
-
-                // The MIRROR, which is harmless and is checked anyway.
-                //
-                // `driver-vulkan/tests/rules.rs` has exactly this and only
-                // this — `if !read && given > 1` — and it is why that crate
-                // did not catch `geglu_tanh_strided`: work given to an axis
-                // nothing reads is WASTE, and an axis the body reads that the
-                // rule leaves at one is DATA LOSS. They are different
-                // predicates and only the first was written.
-                //
-                // Kept because waste is still a disagreement between a rule
-                // and a body, and a rule that hands out a dimension nobody
-                // uses is usually a rule that meant to hand out a different
-                // one. It is reported separately so the two never get
-                // confused for each other again.
-                for (axis, lanes) in extent.iter().enumerate() {
-                    if *lanes <= 1 || declared.grid_axes[axis] {
-                        continue;
-                    }
-                    wasted.push(format!(
-                        "{} ({name}) is given {lanes} on axis {axis}, which it never reads",
-                        sig.symbol
-                    ));
-                }
+                wasted.push(format!(
+                    "{name} is given {lanes} on axis {axis}, which it never \
+                     reads, fired as `{symbol}`"
+                ));
             }
         }
 
         assert!(
-            checked > 60,
+            // A FLOOR and not a count. What it can be is bounded by the
+            // fixture rather than by the tree: a body that refuses every one
+            // of [`widest`]'s fires is not measured here, and tightening this
+            // into a census would make it a test of how plausible those fires
+            // are. The coverage is printed instead, so a sweep that quietly
+            // stops reaching half the fleet is visible in the output.
+            checked > 10,
             "only {checked} entrypoints were geometry-checked; a sweep that \
              read almost nothing passes as loudly as one that read everything"
+        );
+        eprintln!(
+            "{checked} modules measured through their bodies; {unreached} \
+             census symbols refused every fire"
         );
 
         let mut symbols: Vec<&str> = found
@@ -1505,8 +1918,8 @@ mod tests {
         let fresh: Vec<&&str> = symbols.iter().filter(|s| !known.contains(**s)).collect();
         assert!(
             fresh.is_empty(),
-            "these rows read a grid axis their rule flattens, which means every \
-             index past the first on that axis is never written and the \
+            "these modules read a grid axis their body flattens, which means \
+             every index past the first on that axis is never written and the \
              dispatch succeeds anyway:\n  {}\n\nfull list:\n  {}",
             fresh.iter().map(|s| **s).collect::<Vec<_>>().join("\n  "),
             found.join("\n  "),
@@ -1525,10 +1938,10 @@ mod tests {
         //
         // * `route_sort` and the two `router_topk`s read no global builtin at
         //   all — they take `local_invocation_id` and stride over the
-        //   workgroup width, which is exactly what their rules intend. `Given
-        //   256 lanes on x` is one workgroup, not 256 of them, and the rule is
+        //   workgroup width, which is exactly what their grids intend. `Given
+        //   256 lanes on x` is one workgroup, not 256 of them, and the grid is
         //   right. This half of the report is a category error in the check
-        //   rather than in the row: `lanes()` is a THREAD extent and a body
+        //   rather than in the body: `lanes` is a THREAD extent and a body
         //   that indexes by lane consumes it correctly.
         //
         // * `kv_append` reads only `gid.x` and `gid.y`, and `grid_axes` says
@@ -1548,16 +1961,16 @@ mod tests {
         // above keeps trusting `grid_axes` to say an axis IS read -- a trust
         // that is now measured on the one pair in the tree built to test it.
         //
-        // It is printed and not asserted because the rows it names are RIGHT:
-        // asserting emptiness would fail on three rows that consume their
+        // It is printed and not asserted because the modules it names are
+        // RIGHT: asserting emptiness would fail on three that consume their
         // lanes correctly, and asserting an exception list would be a list of
-        // three correct rows. What the print buys is that a FOURTH row joining
+        // three correct modules. What the print buys is that a FOURTH joining
         // them is visible in the output rather than silent.
         if !wasted.is_empty() {
             eprintln!(
-                "rows given work on an axis `grid_axes` says they never read \
-                 ({} of them). Expected for a body that indexes by lane over a \
-                 workgroup -- see the note above this print:\n  {}",
+                "modules given work on an axis `grid_axes` says they never \
+                 read ({} of them). Expected for a body that indexes by lane \
+                 over a workgroup -- see the note above this print:\n  {}",
                 wasted.len(),
                 wasted.join("\n  "),
             );
@@ -1571,7 +1984,7 @@ mod tests {
         assert!(
             stale.is_empty(),
             "these are listed as known-defective and are not: {stale:?}. If the \
-             shared table was fixed, delete the entry in the same diff.",
+             body or the shader was fixed, delete the entry in the same diff.",
         );
     }
 
@@ -1595,73 +2008,122 @@ mod tests {
     /// the reason is worth stating because it is a general blindness:
     /// `lanes()` is both the claim and the reference there, so a rule that
     /// lies agrees with itself. What catches it is comparing the rule against
-    /// something computed somewhere else — here, the `@workgroup_size` `naga`
-    /// reads out of the module the driver actually selected.
+    /// something computed somewhere else -- here, the `@workgroup_size` `naga`
+    /// reads out of the module the driver actually selected, and the extent
+    /// `moe`'s `routed_qmv_grid` computes for the same fire.
+    ///
+    /// The three rows this used to walk are gone with the rest of
+    /// `kernels_wgpu::KERNELS`, and the three symbols below are what replaced
+    /// them: the same three entrypoints, reached the way a plan reaches them.
+    /// The row's `grid_param = Some(1)` -- "the y extent is the second scalar,
+    /// which is `out_vec_size`, not the rectangle's width" -- is now the
+    /// BODY's `routed_qmv_grid(rows, out_vec_size, slots)`, and it is read
+    /// here off the same scalar run the shader's uniform block gets.
     ///
     /// The claim is exact rather than a bound: `groups()`'s y must be
-    /// `ceil(width / local_y)`, so that every output row belongs to some
-    /// invocation and no row belongs to two. An UNDERSHOOT writes nothing and
-    /// returns success; an overshoot is harmless only because the body guards
-    /// `out_row < out_vec_size`, and that guard is not this file's to assume.
+    /// `ceil(out_vec_size / local_y)`, so that every output row belongs to
+    /// some invocation and no row belongs to two. An UNDERSHOOT writes nothing
+    /// and returns success; an overshoot is harmless only because the body
+    /// guards `out_row < out_vec_size`, and that guard is not this file's to
+    /// assume.
     #[test]
     fn a_routed_matvec_covers_every_output_row_its_module_owns() {
+        /// Every symbol whose body dispatches through `moe::routed_qmv_grid`.
+        const ROUTED: [&str; 3] = [
+            "affine_qmv_routed_bfloat16_gs_64_b_4",
+            "affine_qmv_routed_bias_bfloat16_gs_64_b_4",
+            "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4",
+        ];
+
+        let (rows, slots) = (7u32, 2u32);
         let mut checked = 0;
-        for sig in kernels_wgpu::KERNELS {
-            if sig.launch != Rule::RoutedQmv {
-                continue;
-            }
-            for name in sig.entrypoints() {
-                let Ok(declared) =
-                    crate::reflect::entrypoint(&name, kernels_wgpu::Capability::Baseline)
-                else {
-                    continue;
+        for symbol in ROUTED {
+            // Output widths that are NOT multiples of the module's y, so the
+            // round-up is a different expression from the division. At a
+            // multiple the two agree and this check proves nothing -- which is
+            // how the defect survived a suite that used them.
+            for out_vec in [13u32, 47, 1] {
+                // Word 1 is `out_vec_size` and word 4 is the slot count: the
+                // same run the shader's uniform block gets, read by the arm
+                // and handed to the body, which is the only path a y extent
+                // takes now.
+                let scalars = [128, out_vec, 128, 128, slots, 0, 0, 0];
+                let fire = crate::dispatch::Geometry {
+                    q_heads: 4,
+                    kv_heads: 2,
+                    head_dim: 64,
+                    rotary_dims: 64,
+                    n_experts: 8,
+                    experts_per_token: slots,
                 };
+                let stated = fired(symbol, firing(symbol, rows, 128, fire), &scalars)
+                    .unwrap_or_else(|e| panic!("`{symbol}` is a matvec this tree plans: {e}"));
+                assert_eq!(stated.len(), 1, "`{symbol}` is one dispatch");
+                let name = stated[0].entrypoint.clone();
+                let declared =
+                    crate::reflect::entrypoint(&name, kernels_wgpu::Capability::Baseline)
+                        .unwrap_or_else(|e| panic!("`{name}`, which `{symbol}`'s body named: {e}"));
                 let module = Module::loaded(&name, &declared);
                 let lanes_y = module.local.at(1);
                 assert!(
-                    lanes_y >= 1,
-                    "`{name}` declares a workgroup of {:?}, which owns no output row",
+                    // Not a formality: `Local::at` clamps to one, so a module
+                    // that stopped tiling on y would make the round-up below
+                    // the identity and this whole sweep would prove nothing
+                    // while still passing. The premise is asserted so it
+                    // cannot rot into an assumption.
+                    lanes_y > 1,
+                    "`{name}` declares a workgroup of {:?}, which owns ONE \
+                     output row -- the round-up below is then an identity and \
+                     measures nothing",
                     declared.local
                 );
 
-                // An extent that is NOT a multiple of the module's y, so the
-                // round-up is a different expression from the division. At a
-                // multiple the two agree and this check proves nothing --
-                // which is how the defect survived a suite that used them.
-                //
-                // The extent is `axis`, which is what `grid_param = Some(1)`
-                // on these three rows names: `out_vec_size`, one result's
-                // width. `width` is set to FOUR TIMES it here, modelling a
-                // routed projection at `top_k = 4` writing a whole token's
-                // results end to end -- so a grid that read the rectangle
-                // instead of the row's own statement launches four times over
-                // and fails this by number.
-                for axis in [13u32, 47, 1] {
-                    let d = Dims {
-                        axis,
-                        width: axis * 4,
-                        ..dims()
-                    };
-                    let got = groups(Rule::RoutedQmv, d, module)
-                        .unwrap_or_else(|e| panic!("`{name}` at axis {axis}: {e}"));
-                    assert_eq!(
-                        got[1],
-                        axis.div_ceil(lanes_y),
-                        "`{name}` at axis {axis}: {} workgroups on y for a \
-                         module owning {lanes_y} output rows each. Every row \
-                         past {} is never written, and the dispatch succeeds.",
-                        got[1],
-                        got[1] * lanes_y,
-                    );
-                }
+                // The ROW's own statement rather than the rectangle's width: a
+                // routed projection writes a whole token's `k` results end to
+                // end, so `width` is `k * out_vec_size` and a grid that read
+                // the rectangle would launch `k` times over. `axis` is what
+                // `grid_param = Some(1)` used to name and what the body reads
+                // out of word 1.
+                let d = Dims {
+                    rows,
+                    axis: out_vec,
+                    width: out_vec * 4,
+                    experts_per_token: slots,
+                    ..dims()
+                };
+                assert_eq!(
+                    stated[0].lanes,
+                    lanes(Rule::RoutedQmv, d, module).unwrap_or_else(|e| panic!("`{name}`: {e}")),
+                    "`{name}` at an output of {out_vec}: the body's extent and \
+                     `Rule::RoutedQmv`'s are the same shape reached twice"
+                );
+                assert_eq!(
+                    stated[0].lanes[1],
+                    out_vec,
+                    "`{name}`: the y extent is the OUTPUT WIDTH, and a grid \
+                     that read the rectangle instead launches {} times over",
+                    stated[0].lanes[1] / out_vec.max(1)
+                );
+
+                let got = groups(Rule::RoutedQmv, d, module)
+                    .unwrap_or_else(|e| panic!("`{name}` at an output of {out_vec}: {e}"));
+                assert_eq!(
+                    got[1],
+                    out_vec.div_ceil(lanes_y),
+                    "`{name}` at an output of {out_vec}: {} workgroups on y for \
+                     a module owning {lanes_y} output rows each. Every row past \
+                     {} is never written, and the dispatch succeeds.",
+                    got[1],
+                    got[1] * lanes_y,
+                );
                 checked += 1;
             }
         }
         assert_eq!(
-            checked, 3,
-            "the table states three routed-matvec rows, one entrypoint each, \
-             and every one is measured against its own module -- a floor here \
-             would let the sweep shrink without saying so"
+            checked, 9,
+            "three routed matvecs at three output widths each, every one \
+             measured against its own module -- a floor here would let the \
+             sweep shrink without saying so"
         );
     }
 

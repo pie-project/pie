@@ -25,7 +25,20 @@ path = "src/lib.rs"
 tensor-ir = { path = "../tensor-ir" }
 # The shared host<->driver contract: the launch package is built out of the
 # same declarations the drivers read it with, rather than a second copy.
-driver-api = { path = "../driver-api" }
+#
+# `default-features = false` for the reason `driver-vulkan` and `driver-wgpu`
+# both write out at their own edges: the default `rpc` feature reaches `tarpc`
+# and through it tokio, `opentelemetry` and `rand`, and `getrandom` REFUSES to
+# build for `wasm32-unknown-unknown` without a cfg flag nothing here can set.
+# This crate names no `tarpc` anywhere; it wants the declarations.
+#
+# Cargo unifies features across the graph, so one dependent taking the default
+# hands `rpc` to everyone. `driver` now depends on this crate, `driver-wgpu`
+# depends on `driver`, and that path -- one edge that did not say
+# `default-features = false` -- is what broke `driver-wgpu`'s three browser
+# tests. Both of that crate's own edges had said it, with comments explaining
+# why, and neither could help.
+driver-api = { path = "../driver-api", default-features = false }
 
 # Shared ratchet from the root manifest. The toolchain's three crates are gated
 # with `-D warnings` in CI; see `[workspace.lints]` in the workspace `Cargo.toml`.

@@ -398,6 +398,34 @@ pub struct Layer {
     /// The norm on the FFN's output, before the residual add. gemma's
     /// `post_feedforward_layernorm`; see [`Layer::post_attn_norm`].
     pub post_mlp_norm: NormW,
+    /// The MIXTURE layer's per-LEG norms, which only gemma-4's MoE rows name.
+    ///
+    /// A gemma-4 mixture layer runs a dense FFN and a routed one SIDE BY
+    /// SIDE off the same post-attention stream, norms each leg's output on
+    /// its own, adds the two, and only then applies [`Layer::post_mlp_norm`]
+    /// to the sum. So the layer ships seven norms where a dense gemma ships
+    /// four: `_1` is the dense leg's output norm, `mlp_norm_2` the routed
+    /// leg's INPUT norm, `post_mlp_norm_2` its output norm.
+    ///
+    /// `mlp_norm_2` and [`Layer::mlp_norm`] are the same width and different
+    /// tensors. Reusing one for both is a substitution no shape check can
+    /// see, which is why the routed leg names its own.
+    pub post_mlp_norm_1: NormW,
+    pub mlp_norm_2: NormW,
+    pub post_mlp_norm_2: NormW,
+    /// The router's own RMS-norm weight, `[hidden]`.
+    ///
+    /// gemma-4 norms the router's input at a scale that is neither leg's,
+    /// then projects. Distinct from the router's quantisation scales, which
+    /// ride [`Layer::router`]'s own affine point.
+    pub router_scale: NormW,
+    /// The router's learned per-expert gain, `[n_experts]`.
+    ///
+    /// Multiplies the weights AFTER the top-k softmax, which is why
+    /// `moe/route.metal` carries it as `router_topk_scaled`'s fifth buffer
+    /// rather than folding it into the logits: applied before the softmax it
+    /// would move the ranking.
+    pub router_expert_scale: MatW,
     pub q_norm: NormW,
     pub k_norm: NormW,
     pub kv: Kv,
@@ -576,6 +604,11 @@ impl M {
             mlp_norm: row_norm("mlp_norm"),
             post_attn_norm: row_norm("post_attn_norm"),
             post_mlp_norm: row_norm("post_mlp_norm"),
+            post_mlp_norm_1: row_norm("post_mlp_norm_1"),
+            mlp_norm_2: row_norm("mlp_norm_2"),
+            post_mlp_norm_2: row_norm("post_mlp_norm_2"),
+            router_scale: row_norm("router_scale"),
+            router_expert_scale: mat("router_expert_scale", f.n_experts),
             q_norm: qk_norm("q_norm"),
             k_norm: qk_norm("k_norm"),
             kv: Kv {

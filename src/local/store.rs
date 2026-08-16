@@ -140,7 +140,8 @@ pub fn remove(entry: &Entry) -> Result<()> {
 /// The cache demotes to a staging area once artifacts exist: it is what
 /// `convert` reads, not what serving reads.
 pub fn staging_dir(repo_id: &str) -> Option<PathBuf> {
-    let dir = hf_hub::resolve_cache_dir().join(format!("models--{}", repo_id.replace('/', "--")));
+    let dir = crate::local::hf::resolve_cache_dir()
+        .join(format!("models--{}", repo_id.replace('/', "--")));
     dir.is_dir().then_some(dir)
 }
 

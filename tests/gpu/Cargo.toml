@@ -48,7 +48,14 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3"
 # `cuda_boot_smoke` scrapes `/metrics` off a booted engine over HTTP.
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+#
+# `rustls-no-provider` rather than `rustls` for the same reason the rest of the
+# tree uses it: reqwest's `rustls` feature hard-selects the aws-lc backend, and
+# because features unify across a workspace build, this one dev-dependency was
+# enough to put `aws-lc-sys` back into every `cargo build --workspace`. These
+# probes only ever talk to loopback over plain HTTP, so they need no provider
+# at all.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 # Diagnostic trace subscriber for the inproc forward-path probes (RUST_LOG).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `cuda_declared_family_parity` captures fd 2 to assert on what the driver

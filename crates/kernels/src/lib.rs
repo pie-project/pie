@@ -1257,9 +1257,7 @@ impl Ty {
             Ty::MlaPlanCache => "const ::pie::attn::MlaPlanCache&",
             Ty::HopperPrefillPlan => "const ::pie::attn::HopperPrefillPlan&",
             Ty::YarnOriginalParams => "const ::pie::attn::YarnOriginalParams*",
-            Ty::StructuredMasks => {
-                "const ::pie::attn::StructuredMaskParams*"
-            }
+            Ty::StructuredMasks => "const ::pie::attn::StructuredMaskParams*",
         }
     }
 

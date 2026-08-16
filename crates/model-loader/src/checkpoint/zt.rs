@@ -32,7 +32,9 @@ use std::path::{Path, PathBuf};
 use ztensor::format::cbor::Value;
 use ztensor::{DType as ZDType, Source};
 
-use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
+use crate::checkpoint::{
+    Attribute, Attributes, CheckpointFile, CheckpointMetadata, RawTensor, TokenizerTables,
+};
 use crate::error::Error;
 use crate::types::{
     Axis, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec, TensorId,
@@ -55,6 +57,108 @@ pub fn parse_checkpoint(path: &Path) -> Result<CheckpointMetadata, Error> {
 /// files is refused rather than resolved by precedence.
 pub fn parse_checkpoint_files(paths: &[PathBuf]) -> Result<CheckpointMetadata, Error> {
     describe(&ztensor_compat::index_all(paths).map_err(Error::from)?)
+}
+
+/// The file-level key-values, for a caller asking what the checkpoint says
+/// about itself. See `read::parse_checkpoint_attributes`.
+pub fn parse_attributes(path: &Path) -> Result<Attributes, Error> {
+    Ok(attributes_of(&ztensor_compat::index(path).map_err(Error::from)?))
+}
+
+/// [`parse_attributes`], for a checkpoint the caller claims is one set.
+pub fn parse_attributes_files(paths: &[PathBuf]) -> Result<Attributes, Error> {
+    Ok(attributes_of(
+        &ztensor_compat::index_all(paths).map_err(Error::from)?,
+    ))
+}
+
+/// The `tokenizer.ggml.*` tables, whole.
+///
+/// Separate from [`parse_attributes`] because the cost is: this reads a
+/// 150,000-entry vocabulary and its merge list, which the description of a
+/// model has no use for. A caller pays for it by asking.
+///
+/// Empty tables rather than an error for a file that carries none — a
+/// safetensors checkpoint has no `tokenizer.ggml.*` keys and is not wrong for
+/// it, and a GGUF converted for its weights alone is a legitimate thing.
+pub fn parse_tokenizer_tables(path: &Path) -> Result<TokenizerTables, Error> {
+    Ok(tokenizer_tables_of(
+        &ztensor_compat::index(path).map_err(Error::from)?,
+    ))
+}
+
+fn tokenizer_tables_of(source: &Source) -> TokenizerTables {
+    let Some(Value::Map(entries)) = source.attributes() else {
+        return TokenizerTables::default();
+    };
+    let find = |name: &str| {
+        entries
+            .iter()
+            .find(|(key, _)| matches!(key, Value::Text(text) if text == name))
+            .map(|(_, value)| value)
+    };
+    let text = |name: &str| match find(name) {
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => None,
+    };
+    // A non-text entry inside a table is dropped rather than defaulted. An
+    // empty string at token 40,000 would shift nothing and read as a real
+    // token; a short table trips the length check the loader already makes.
+    let texts = |name: &str| match find(name) {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                Value::Text(value) => Some(value.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let ints = |name: &str| match find(name) {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                Value::Uint(value) => i64::try_from(*value).ok(),
+                Value::Nint(value) => Some(-1 - i64::try_from(*value).unwrap_or(i64::MAX)),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    TokenizerTables {
+        model: text("tokenizer.ggml.model").unwrap_or_default(),
+        pre: text("tokenizer.ggml.pre"),
+        tokens: texts("tokenizer.ggml.tokens"),
+        token_types: ints("tokenizer.ggml.token_type"),
+        merges: texts("tokenizer.ggml.merges"),
+    }
+}
+
+/// zTensor's CBOR attribute map, projected onto the loader's flat one.
+///
+/// Arrays and nested maps land on [`Attribute::Aggregate`]: the only ones any
+/// real file carries are GGUF's tokenizer tables, and copying a 150,000-entry
+/// vocabulary into a description of the model would cost every reader for a
+/// reader that does not exist. A key that is present stays present, so
+/// `get` returning `None` still means the file did not say.
+fn attributes_of(source: &Source) -> Attributes {
+    let Some(Value::Map(entries)) = source.attributes() else {
+        return Attributes::default();
+    };
+    Attributes::from_pairs(entries.iter().filter_map(|(key, value)| {
+        let Value::Text(key) = key else { return None };
+        let value = match value {
+            Value::Uint(v) => Attribute::Uint(*v),
+            // CBOR spells a negative as `-1 - n`, which is the one shape a
+            // cast cannot round-trip on its own.
+            Value::Nint(v) => Attribute::Int(-1 - i64::try_from(*v).unwrap_or(i64::MAX)),
+            Value::Float(v) => Attribute::Float(*v),
+            Value::Bool(v) => Attribute::Bool(*v),
+            Value::Text(v) => Attribute::Text(v.clone()),
+            _ => Attribute::Aggregate,
+        };
+        Some((key.clone(), value))
+    }))
 }
 
 /// Verifies every tensor digest of a `.zt` artifact; returns the tensor count.
@@ -377,9 +481,12 @@ fn scheme_of(layout: &str, attrs: Option<&Value>) -> Result<QuantScheme, Error> 
     Ok(match layout {
         "zt.mx/1" => QuantScheme::Mxfp4E2M1E8M0,
         "gguf.q4_0/1" => QuantScheme::GgufQ4_0,
+        "gguf.q4_1/1" => QuantScheme::GgufQ4_1,
         "gguf.q4_k/1" => QuantScheme::GgufQ4K,
         "gguf.q5_0/1" => QuantScheme::GgufQ5_0,
+        "gguf.q5_1/1" => QuantScheme::GgufQ5_1,
         "gguf.q5_k/1" => QuantScheme::GgufQ5K,
+        "gguf.q6_k/1" => QuantScheme::GgufQ6K,
         "gguf.q8_0/1" => QuantScheme::GgufQ8_0,
         "gguf.mxfp4/1" => QuantScheme::Mxfp4E2M1E8M0,
         other => {
@@ -452,6 +559,14 @@ mod tests {
     /// Writes a file and describes it, which is the whole path this module is:
     /// zTensor's object model in, the loader's flat tensor space out.
     fn lower(name: &str, write: impl FnOnce(&mut Writer)) -> Result<Vec<RawTensor>, Error> {
+        let path = lower_file(name, write);
+        let described = parse_checkpoint(&path);
+        let _ = std::fs::remove_file(&path);
+        described.map(|m| m.tensors)
+    }
+
+    /// [`lower`], stopping at the file, for a test that reads it another way.
+    fn lower_file(name: &str, write: impl FnOnce(&mut Writer)) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "pie-zt-{}-{name}-{}.zt",
             std::process::id(),
@@ -464,9 +579,7 @@ mod tests {
             .unwrap();
         write(&mut writer);
         writer.finish().unwrap();
-        let described = parse_checkpoint(&path);
-        let _ = std::fs::remove_file(&path);
-        described.map(|m| m.tensors)
+        path
     }
 
     #[test]
@@ -482,6 +595,61 @@ mod tests {
         assert_eq!(tensor.span_bytes, 32);
         assert_eq!(tensor.file_offset % 65536, 0);
         assert_eq!(tensor.encoding, Encoding::Raw(DType::BF16));
+    }
+
+    /// A checkpoint's key-values survive the trip, and silence stays silent.
+    ///
+    /// The projection is lossy on purpose — an array becomes `Aggregate` —
+    /// so the property worth pinning is that a key which is present stays
+    /// present. A caller reads `get(...).is_none()` as "the file did not
+    /// say", and that reading is only true if nothing is dropped on the way.
+    #[test]
+    fn attributes_round_trip_and_an_array_keeps_only_its_key() {
+        let path = std::env::temp_dir().join(format!("pie-zt-attrs-{}.zt", std::process::id()));
+        let mut writer = Writer::options().create(&path).unwrap();
+        writer.set_attributes(cbor::Value::Map(vec![
+            (
+                cbor::Value::Text("general.architecture".into()),
+                cbor::Value::Text("qwen2".into()),
+            ),
+            (
+                cbor::Value::Text("qwen2.block_count".into()),
+                cbor::Value::Uint(24),
+            ),
+            (
+                cbor::Value::Text("rope.scale".into()),
+                cbor::Value::Nint(2),
+            ),
+            (
+                cbor::Value::Text("tokenizer.ggml.tokens".into()),
+                cbor::Value::Array(vec![cbor::Value::Text("a".into())]),
+            ),
+        ]));
+        writer.add("w", [2u64, 2], ZDType::BF16, &[0u8; 8]).unwrap();
+        writer.finish().unwrap();
+        let attributes = parse_attributes(&path).unwrap();
+
+        assert_eq!(attributes.architecture(), Some("qwen2"));
+        assert_eq!(
+            attributes.get("qwen2.block_count"),
+            Some(&Attribute::Uint(24))
+        );
+        // CBOR spells -3 as Nint(2).
+        assert_eq!(attributes.get("rope.scale"), Some(&Attribute::Int(-3)));
+        assert_eq!(
+            attributes.get("tokenizer.ggml.tokens"),
+            Some(&Attribute::Aggregate),
+            "the vocabulary is not carried, but the file did say it has one"
+        );
+        assert_eq!(attributes.get("absent"), None);
+
+        // A checkpoint that says nothing about itself is not an error.
+        let bare = lower_file("bare-attrs", |w| {
+            w.add("w", [2u64, 2], ZDType::BF16, &[0u8; 8]).unwrap();
+        });
+        assert!(parse_attributes(&bare).unwrap().is_empty());
+        let _ = std::fs::remove_file(&bare);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Every format zTensor can report has a name here.

@@ -231,6 +231,24 @@ impl Ctx {
 fn init_observability(log_level: &str) {
     observe::init_tracing(log_level);
     lifecycle::install_panic_hook();
+    install_crypto_provider();
+}
+
+/// Choose the process-wide TLS backend.
+///
+/// Every HTTPS client in a pie process is built on reqwest's
+/// `rustls-no-provider`: rustls then refuses to guess a crypto backend, and the
+/// first `Client::builder().build()` fails at runtime unless someone has said
+/// which one to use. That someone is process boot, once, before any role can
+/// reach the network -- the alternative is each of four bins plus the embedded
+/// Python engine remembering to do it, and only finding out they forgot when a
+/// model download fails on a user's machine.
+///
+/// Idempotent by construction: `install_default` returns `Err` when a provider
+/// is already installed, which is a fact rather than a failure (the Python
+/// wheel boots the engine in a host process that may have installed its own).
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 /// **CLI invocation** init for one-shot ops subcommands (`pie model list`,

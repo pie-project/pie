@@ -1012,50 +1012,145 @@ fn main(@builtin(workgroup_id) w: vec3<u32>) { out_[w.x] = 1u; }
         );
     }
 
-    /// And the module's own uniform block agrees with the row's.
+    /// And the module's own uniform block agrees with the layout a row-shaped
+    /// description derives.
     ///
-    /// The disagreement this is for is silent: the row says where the driver
-    /// will write each scalar and the shader says where it will read them, the
-    /// two are computed from different places, and a mismatch is a plausible
-    /// number rather than an error. Checked over whatever the tree has today,
-    /// for the stated rows only -- an unstated row has no layout to compare.
+    /// The disagreement this is for is silent: one side says where a driver
+    /// will write each scalar and the other says where the shader will read
+    /// them, the two are computed from different places, and a mismatch is a
+    /// plausible number rather than an error. `attn/kv_write.wgsl`'s own
+    /// comment states the case -- "`head_dim` at 0, then two 64-bit strides at
+    /// 8 and 16 -- NOT at 4 and 12" -- and ends it with *nothing at runtime
+    /// would report the mismatch, because a uniform buffer is just bytes*.
+    ///
+    /// # The rows are STATED here, and the sweep is gone with the table
+    ///
+    /// This walked `kernels_wgpu::KERNELS` and compared 24 entrypoints. The
+    /// table is empty, so there is no row left to walk and the `compared == 24`
+    /// floor is what said so -- it failed rather than passing over an empty
+    /// iterator, which is the only reason this is being rewritten instead of
+    /// having quietly stopped looking.
+    ///
+    /// What is stated here is ONE side of each comparison and the cheap one:
+    /// an operand list, transcribed from the row `attn` retired, which is
+    /// itself a transcription of the shader's `struct Params`. Both sides of
+    /// the answer are still computed by live code --
+    /// `kernels_wgpu::uniform_layout` derives the offsets from those kinds
+    /// alone, and this module's own walk reads them off the module `naga`
+    /// parsed -- so an alignment rule that stopped agreeing with WGSL still
+    /// fails here. The `want` run is pinned as well, because two computations
+    /// agreeing is worth less than two computations agreeing on the number the
+    /// specification names.
+    ///
+    /// The two entrypoints are the two shapes the arithmetic has, one file
+    /// apart: a narrow scalar in front of two 64-bit strides, which pads, and
+    /// three `i32`s, which do not. The paged row is also the one whose scalars
+    /// are INTERLEAVED with buffers -- six of which it does not even read --
+    /// so it is what says a storage operand cannot shift a uniform field.
+    ///
+    /// The routine plane packs the same block from the body's `ArgValue`s in
+    /// `crate::lowering::routine::bind`, under the same rule, and holds it
+    /// against `Declared::uniform_bytes` -- but only for SIZE, as
+    /// `routine::Unplanned::Scalars`. It never consults
+    /// `Declared::uniform_offsets`, so nothing on that plane compares a field's
+    /// PLACE against the struct a shader declares. The one other comparison
+    /// that did, `driver-wgpu/tests/arena.rs`'s
+    /// `every_launchs_scalars_land_where_its_module_reads_them`, asks
+    /// `kernels_wgpu::sig` for a row first and now counts every launch as
+    /// retired instead. That is why this was worth restating rather than
+    /// retiring with its table: a block of the right LENGTH with its fields in
+    /// the wrong places is a shader reading a stride where a head count
+    /// belongs, and a uniform buffer is bytes, so nothing reports it.
+    ///
+    /// And with no row to place from, `crate::binding::params_from` writes
+    /// each word AT `Declared::uniform_offsets` -- the reflection's answer is
+    /// the only statement left of where a scalar goes, which makes this the
+    /// check that it is where WGSL's rule puts it.
     #[test]
     fn a_stated_rows_uniform_layout_is_the_one_its_shader_declares() {
+        // `attn::kv_append`, as its row stated it. Only the operand KINDS and
+        // their order matter here: they are the whole of what a uniform layout
+        // is derived from.
+        let contiguous = kernels::kernel!(kv_append "kv_append",
+            file = Some("attn/kv_write.wgsl"),
+            launch = kernels::LaunchRule::PerHead,
+            operands = kernels::operands![
+                k_new: Buf <- kernels::Source::In(0),
+                v_new: Buf <- kernels::Source::In(1),
+                k_cache: BufMut <- kernels::Source::KvKeys,
+                v_cache: BufMut <- kernels::Source::KvValues,
+                pos: I32s <- kernels::Source::Positions,
+                head_dim: I32 <- kernels::Source::Param(0),
+                k_head_stride: Usize <- kernels::Source::KvHeadStride,
+                k_seq_stride: Usize <- kernels::Source::KvSeqStride,
+            ],
+            head_param = Some(0));
+        // And `attn::kv_append_paged`, whose `ring_*` operands belong to a
+        // shared ring ABI it never reads. They are buffers, so they take
+        // `@group(0)` entries and no uniform field, and the three scalars
+        // between them are still fields 0, 1 and 2.
+        let paged = kernels::kernel!(kv_append_paged "kv_append_paged",
+            file = Some("attn/kv_write.wgsl"),
+            launch = kernels::LaunchRule::PerHead,
+            operands = kernels::operands![
+                k_new: Buf <- kernels::Source::In(0),
+                v_new: Buf <- kernels::Source::In(1),
+                k_pages: BufMut <- kernels::Source::KvKeys,
+                v_pages: BufMut <- kernels::Source::KvValues,
+                ring_4: Buf,
+                head_dim: I32 <- kernels::Source::Param(0),
+                ring_6: Buf,
+                ring_7: Buf,
+                ring_8: Buf,
+                ring_9: Buf,
+                page_size: I32 <- kernels::Source::KvPageSize,
+                ring_11: Buf,
+                n_kv_heads: I32 <- kernels::Source::Param(1),
+                w_page: U32s <- kernels::Source::KvWritePage,
+                w_off: U32s <- kernels::Source::KvWriteOffset,
+                ring_15: Buf,
+            ],
+            head_param = Some(0),
+            heads_param = Some(1));
+
         let mut compared = 0;
-        for sig in kernels_wgpu::KERNELS {
-            if sig.operands.is_empty() {
-                continue;
-            }
-            let want: Vec<u32> = kernels_wgpu::uniform_layout(sig)
+        for (name, sig, want) in [
+            ("kv_append_bfloat16", &contiguous, [0u32, 8, 16]),
+            ("kv_append_paged_bfloat16", &paged, [0u32, 4, 8]),
+        ] {
+            let derived: Vec<u32> = kernels_wgpu::uniform_layout(sig)
                 .iter()
                 .map(|f| f.offset)
                 .collect();
-            for name in sig.entrypoints() {
-                let d = entrypoint(&name, Capability::Baseline)
-                    .unwrap_or_else(|e| panic!("`{name}` has no readable module: {e}"));
-                assert_eq!(
-                    d.uniform_offsets, want,
-                    "`{name}`: the row writes its scalars at {want:?} and the \
-                     shader reads them at {:?}",
-                    d.uniform_offsets
-                );
-                // And the block the shell will send is big enough, which is
-                // the WebGPU direction of the check -- over is fine, under is
-                // a binding `wgpu` refuses.
-                assert!(
-                    kernels_wgpu::uniform_size(sig) >= d.uniform_bytes,
-                    "`{name}`: the row's block is {} bytes and the shader's \
-                     struct needs {}",
-                    kernels_wgpu::uniform_size(sig),
-                    d.uniform_bytes
-                );
-                compared += 1;
-            }
+            assert_eq!(
+                derived, want,
+                "`{name}`'s operand kinds must derive the offsets WGSL's \
+                 alignment rule gives them"
+            );
+            let d = entrypoint(name, Capability::Baseline)
+                .unwrap_or_else(|e| panic!("`{name}` has no readable module: {e}"));
+            assert_eq!(
+                d.uniform_offsets, want,
+                "`{name}`: a driver writes its scalars at {want:?} and the \
+                 shader reads them at {:?}",
+                d.uniform_offsets
+            );
+            // And the block a shell will send is big enough, which is the
+            // WebGPU direction of the check -- over is fine, under is a
+            // binding `wgpu` refuses.
+            assert!(
+                kernels_wgpu::uniform_size(sig) >= d.uniform_bytes,
+                "`{name}`: the derived block is {} bytes and the shader's \
+                 struct needs {}",
+                kernels_wgpu::uniform_size(sig),
+                d.uniform_bytes
+            );
+            compared += 1;
         }
         assert_eq!(
-            compared, 196,
-            "48 rows state operands, over 196 entrypoints, and every one of \
-             them is compared -- a floor here would let the sweep shrink"
+            compared, 2,
+            "both entrypoints of `attn/kv_write.wgsl` are compared, and a \
+             loop that compared neither would otherwise pass"
         );
     }
 

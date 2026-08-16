@@ -97,41 +97,48 @@
 //! checkpoint tests take. Run against
 //! `mlx-community/Llama-3.2-1B-Instruct-4bit`.
 //!
-//! # gpt-oss-20b: it loads now, and it NaNs
+//! # gpt-oss-20b: it agrees with MLX
 //!
-//! Measured 2026-08-10 against `mlx-community/gpt-oss-20b-MXFP4-Q4`, which
+//! Measured 2026-08-16 against `mlx-community/gpt-oss-20b-MXFP4-Q4`, which
 //! became runnable here the day `stage_plan_weights` stopped holding the
 //! model twice (12.1 GB peak; the old path wanted about twice that and this
 //! machine has 32 GB).
 //!
-//! `a_real_checkpoints_weights_produce_finite_varied_activations` **fails**
-//! on it: 909,207 NaNs. That is the first numeric result gpt-oss has ever
-//! produced here -- every prior gate was structural (names resolve, the fire
-//! encodes, the launches are legal grids), and all of those still pass.
+//! `a_real_checkpoints_weights_produce_finite_varied_activations` passes:
+//! **0 NaN and 0 inf** over 2,004,992 arena bytes in thirty regions, and
+//! `one_token_at_position_zero_agrees_with_mlx` passes against the
+//! `REFERENCES` row below -- argmax 11, span `[-8.25, 10.1875]`, where MLX
+//! says token 11 at 10.173439 over `(-8.259116, 10.173439)`.
 //!
-//! What the bisection says, which is where anyone picking this up should
-//! start: **layer 0 is entirely finite and plausible.** Twelve statements,
-//! every one writing both rows, magnitudes from 2.5 to 36, the KV pool
-//! holding real keys and values --
+//! This paragraph read "it loads now, and it NaNs" for six days and named
+//! 909,207 NaNs downstream of the router, with the SwiGLU's `limit`/`alpha`
+//! and the expert bank's padded row count as the two candidates to check
+//! first. Neither was ever investigated under that heading. What closed it
+//! was a sweep of the quantized kernels that found seventeen of them reading
+//! whatever the previous dispatch had left in a slot the encoder never
+//! wrote -- `0fc54bedb`, which was not looking for this and did not know it
+//! had fixed it, because nobody had run this gate since.
 //!
-//! ```text
-//! [ 8] sdpa_paged_decode_sink_bfloat16_d_64   max|v| 10.25
-//! [ 9] affine_qmv_fast_residual_...           max|v| 31.25
-//! [10] rms_single_row_bfloat16                max|v|  2.51
-//! [11] affine_qmv_fast_...  (the router)      max|v|  3.90
-//! ```
+//! **That is the lesson worth keeping, and it is about the rig and not the
+//! arithmetic:** a failure recorded in prose and not in a suite that runs is
+//! a failure nobody learns has been fixed. The six days are not the cost of
+//! the bug; they are the cost of the only record of it being a comment.
 //!
-//! So the attention half is right, the sink kernel runs, and the router is
-//! handed a sane activation. The NaN is downstream of statement 11 -- in the
-//! six-statement routed FFN (`route_sort`, `route_gather`, two
-//! `routed_qmv`, the clamped `swiglu`, `combine_sorted`) or in what a later
-//! layer does with its output.
+//! # What is still open on gpt-oss: the routed prefill has no GEMM
 //!
-//! Two candidates worth checking first, in order: the SwiGLU's `limit` and
-//! `alpha` (gpt-oss clamps the gate above, clamps the linear branch both ways
-//! and adds one to it -- a wrong bound there is an overflow, not a rounding
-//! error), and the expert bank's row count after the sort pads each group up
-//! to a tile.
+//! `attention_is_a_minority_of_a_long_prefill` **fails** on it, and the
+//! profile beneath it says why in one line: at n=2048,
+//! `mxfp4_qmv_routed_bias` takes **11,469 ms of 12,277 -- 93.4%** of the
+//! fire. Every other statement in the model has a batched form and takes
+//! its rows in one dispatch; the dense projections run
+//! `affine_qmm_t_...bm_32_bn_32` at 290 ms for the same rows. The routed
+//! leg has only the matvec, so a 2048-row prefill dispatches it 2048 times.
+//!
+//! So this is not an attention problem and the test's name is now the
+//! misleading part: attention IS a minority (256 ms, 2.1%). The assertion it
+//! makes still holds -- the failure is real and the number is the routed
+//! GEMM's absence, which is a kernel that does not exist rather than a
+//! parameter that is wrong.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -283,6 +290,40 @@ struct Reference {
     /// implementations there measures `tanh`'s asymptote and not the fire, so
     /// the value is not compared and the TOKEN still is.
     cap: f32,
+    /// The fraction of a PRE-CAP logit that this row's own ROUTING moves,
+    /// and zero for a row that does not route.
+    ///
+    /// A top-k router is a DISCRETE function of a continuous score. gemma-4's
+    /// picks 8 of 128, and the eighth and ninth scores are routinely closer
+    /// together than bf16 can separate, so two implementations that agree on
+    /// every score to within a rounding still send some token through a
+    /// different expert -- once per layer is enough, and there are thirty.
+    ///
+    /// This is not a bound guessed to make a gate pass. It was MEASURED, by
+    /// perturbing MLX'S OWN router logits by 0.2% and rerunning its own
+    /// forward, which is a change far smaller than the difference between two
+    /// correct kernels:
+    ///
+    /// ```text
+    ///   token            3643    31836  236958    6367   77902   40308
+    ///   MLX + 0.2%     0.9749   0.9694  0.9587  0.9612  0.9273  0.9398
+    ///   this driver    0.9628   0.9633  0.9455  0.9538  0.9234  0.9326
+    /// ```
+    ///
+    /// -- pre-cap, against MLX's unperturbed self. The driver sits INSIDE the
+    /// band MLX reaches by disagreeing with itself, and 1% of noise lands in
+    /// the same place as 0.2%: the routing has already flipped everything a
+    /// near-tie can flip, so the displacement saturates rather than growing.
+    ///
+    /// What does NOT move is the ORDER. Across seeds the argmax stays 3643
+    /// and the separated top three stay `{3643, 1082, 31836}`; only ranks
+    /// four and five trade with a sixth token that was already inside a bf16
+    /// ulp of them. So this row is gated exactly there -- the set and the
+    /// argmax held to the letter, the VALUES held to what routing leaves.
+    ///
+    /// A dense row carries zero here and is unaffected. gemma-4-31b's top
+    /// five still have to land within a bf16 ulp of MLX, and do.
+    routing: f32,
 }
 
 /// Taken by hand with `mlx_lm.utils.load`, one forward over `[[bos]]`, the
@@ -308,6 +349,8 @@ const REFERENCES: &[Reference] = &[
         mid: [(111_912, 3.595_703), (34917, 2.455_078), (22631, 1.400_391)],
         widest: Some(410.5),
         cap: 0.0,
+        // Dense. Nothing here routes.
+        routing: 0.0,
     },
     // gpt-oss-20b, and the first routed checkpoint in the table: every
     // number above was measured on a DENSE mlp, so nothing here had ever
@@ -336,6 +379,12 @@ const REFERENCES: &[Reference] = &[
         mid: [(39985, 6.580_502), (43065, 4.287_484), (10303, 1.586_527)],
         widest: Some(42_752.0),
         cap: 0.0,
+        // gpt-oss ROUTES -- 4 of 32 -- and still lands within a bf16 ulp of
+        // MLX at every rank this gate reads. So a mixture does not get the
+        // band for being a mixture: it gets it for having near-ties, and
+        // thirty-two experts chosen four at a time do not produce them the
+        // way a hundred and twenty-eight chosen eight do. Zero, and it holds.
+        routing: 0.0,
     },
     Reference {
         model: "gemma-4-31b-it-4bit",
@@ -354,6 +403,36 @@ const REFERENCES: &[Reference] = &[
         // which says only that it is under a thousand.
         widest: None,
         cap: 30.0,
+        // Dense gemma. Held to the ulp.
+        routing: 0.0,
+    },
+    // The first MIXTURE gemma in the table, and the row this driver refused
+    // to serve until the join was written. Its logits sit well under the cap
+    // -- top 21.625 against 30 -- so unlike the dense 31b nothing here is
+    // erased by `tanh` and the values are compared directly.
+    //
+    // Ranks five and six TIE at 20.5, which the depth scan above resolves by
+    // claiming only the top four. A table that asserted all five would be
+    // asking this driver to break a tie MLX did not.
+    Reference {
+        model: "gemma-4-26b-a4b-it-4bit",
+        bos: 2,
+        top: [
+            (3643, 21.625),
+            (1082, 21.0),
+            (236_958, 20.75),
+            (31836, 20.75),
+            (197, 20.5),
+        ],
+        next: Some(20.5),
+        span: (-11.125, 21.625),
+        mid: [(142_507, 10.25), (165_767, 8.375), (196_731, 5.812_5)],
+        widest: None,
+        cap: 30.0,
+        // 8 of 128, and the near-ties that come with it. See the field.
+        // Measured displacement is 7.7% at its worst; this is that, rounded
+        // up to a tenth, and NOT the smallest number that passes.
+        routing: 0.10,
     },
 ];
 
@@ -755,6 +834,16 @@ fn dispatch_geometry(dg: &driver_metal::batch::DecodeGeometry, binding: &MetalBi
         // same place.
         group: binding.quant_group,
         bits: binding.quant_bits,
+        // The five below are the axes a row states TWICE, and they are read
+        // from the same two documents `serve/launch.rs` reads them from. A
+        // literal here would be a third answer: this file points a real GPU
+        // at the driver, so a geometry it assembles differently is a
+        // comparison against a program `serve` never runs.
+        global_head_dim: dg.global_head_dim,
+        global_kv_heads: dg.global_kv_heads,
+        full_attn_every: dg.full_attn_every,
+        router_group: binding.router_quant_group,
+        router_bits: binding.router_quant_bits,
     }
 }
 
@@ -2524,10 +2613,20 @@ fn one_token_at_position_zero_agrees_with_mlx() {
                 pre(mine)
             );
         }
+        // Plus what ROUTING moves, for a row that routes. Stated pre-cap --
+        // that is where it was measured and where it means anything -- and
+        // carried back through the same slope the bf16 term crosses.
+        let allowed = if reference.routing > 0.0 && reference.cap > 0.0 {
+            let pre = reference.cap * (logit / reference.cap).atanh();
+            let slope = 1.0 - (logit / reference.cap).powi(2);
+            slack + reference.routing * pre.abs() * slope
+        } else {
+            slack
+        };
         assert!(
-            (mine - logit).abs() <= slack,
+            (mine - logit).abs() <= allowed,
             "token {want}: MLX logit {logit}, this {mine} — further apart than \
-             bf16 and the cap's slope explain ({slack})."
+             bf16, the cap's slope and this row's routing explain ({allowed})."
         );
     }
 
@@ -2570,6 +2669,9 @@ fn one_token_at_position_zero_agrees_with_mlx() {
     let scale = bf16_slack(want_lo.abs().max(want_hi.abs()));
     for (token, want) in &reference.mid {
         let mine = logits[*token];
+        // Down here the cap does not reach, so the routing band is the plain
+        // fraction of the value with no slope to cross.
+        let scale = scale + reference.routing * want.abs();
         assert!(
             (mine - want).abs() <= scale,
             "token {token}, well down the distribution: MLX says {want} and \

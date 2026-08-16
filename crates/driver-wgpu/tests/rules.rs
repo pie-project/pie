@@ -213,35 +213,33 @@ fn the_two_ports_of_metals_table_decline_the_same_blocks() {
     );
 }
 
-/// No row of this backend's table names a rule this backend refuses.
-///
-/// The `Unruled` list is only correct if the table agrees with it. This asks
-/// the TABLE rather than the file: a row that stated `RecurrentScan` would
-/// compile, plan, and then refuse at every fire, which is a worse failure than
-/// not compiling — and a worse one to diagnose, because the row looks fine.
-///
-/// It lives here beside the cross-check rather than in `geometry.rs` because
-/// it is the same question asked of the other side of the same seam.
-#[test]
-fn no_row_of_the_wgpu_table_names_a_rule_this_backend_refuses() {
-    let refused = unruled(&own());
-    let mut named = BTreeSet::new();
-    for sig in kernels_wgpu::KERNELS {
-        let rule = format!("{:?}", sig.launch);
-        assert!(
-            !refused.contains(&rule),
-            "`{}` states {rule}, which `geometry.rs` refuses as unruled",
-            sig.symbol
-        );
-        named.insert(rule);
-    }
-    // The table is 99 rows and states a handful of distinct rules; a run that
-    // saw one would mean the iteration is wrong rather than the table narrow.
-    assert!(
-        named.len() > 5,
-        "the table's rows name only {named:?}, so this checked almost nothing"
-    );
-}
+// RETIRED: THE TABLE IS EMPTY, and no routine names a `LaunchRule` at all.
+//
+// It asked the TABLE what the `Unruled` list above asks the file: a row that
+// stated `RecurrentScan` would compile, plan, and then refuse at every fire —
+// a worse failure than not compiling, and a worse one to diagnose, because the
+// row looks fine. It lived here beside the cross-check because it was the same
+// question asked of the other side of the same seam.
+//
+// It BECAME BLIND, not true: zero rows name zero rules, so nothing was
+// established about any of them. Its own floor (`named.len() > 5`) is what
+// said so out loud rather than letting an empty iteration pass.
+//
+// There is no routine-plane counterpart to write, and that is the point rather
+// than a gap. A `LaunchRule` was a ROW's way of describing a grid to a driver
+// that had to build one on its behalf. A routine states its grid directly —
+// `kernels::shader::{elementwise, elementwise_rows, ...}` or a helper of its
+// own — so there is no name to disagree with `geometry.rs` about, and the
+// class of failure this guarded against cannot be spelled any more.
+//
+// What replaces it is stronger and is already running: `driver-wgpu`'s
+// `no_module_reads_a_grid_axis_its_rule_leaves_flat` compares the grid a body
+// actually asks for against the axes its MODULE actually reads, over every
+// entrypoint a corpus of real fires reaches. That is a claim about the shader
+// rather than about a rule's name, and it caught two things this never could:
+// `residual_add` asking a 2-D grid of a `gid.x`-only shader, and
+// `gdn_prep`'s unread `global_invocation_id` making reflection report three
+// axes it never touches.
 
 /// The gates the sibling runs and this port does not, named.
 ///
@@ -419,13 +417,15 @@ fn the_first_ported_routine_asks_for_the_grid_its_row_asked_for() {
     let declared = driver_wgpu::reflect::declared(&source).expect("it reflects");
     let module = Module::new(declared.local);
 
-    let row = kernels::sig_in(kernels_wgpu::KERNELS, "ple_combine")
-        .expect("the row this routine is being compared against");
-    assert_eq!(
-        row.launch,
-        Rule::Elementwise,
-        "if the row's rule changed, this comparison is against the wrong thing"
-    );
+    // The RULE, stated rather than read off a row: `layout` has retired and
+    // `ple_combine` has none. It is `Elementwise` — `[width * rows, 1, 1]` —
+    // which is what `the_routine_path_plans_what_the_table_path_planned`
+    // compared this body against, on every rectangle of every text, in the
+    // commit that armed it. What this test still adds is the DRIVER's
+    // `groups`: the body states lanes and this is the function that turns
+    // them into workgroups, so a `div_ceil` that disagreed with the body's
+    // extent would show here and nowhere else.
+    let rule = Rule::Elementwise;
 
     for (rows, width) in [(1_u32, 64_u32), (7, 64), (3, 4096), (1, 1)] {
         let dims = Dims {
@@ -434,7 +434,7 @@ fn the_first_ported_routine_asks_for_the_grid_its_row_asked_for() {
             in_width: width,
             ..Dims::default()
         };
-        let want = groups(row.launch, dims, module).expect("the rule answers");
+        let want = groups(rule, dims, module).expect("the rule answers");
 
         let to = Lanes::default();
         kernels_wgpu::layout::ple_combine(

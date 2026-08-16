@@ -833,6 +833,10 @@ pub fn metal_facts(
         // both. gemma-4 runs both branches off the post-attention
         // residual and adds them, which is five norms round one block.
         dense_beside_moe: false,
+        // Every routed family but gemma-4 projects its router off the same
+        // value its experts read and publishes no per-expert gain.
+        router_input_norm: false,
+        router_expert_scale: false,
         // The ROW's, and the one field of the routed arm that no bank, no
         // manifest and no load can be asked for: the weights are identical
         // either way and only their denominator differs.

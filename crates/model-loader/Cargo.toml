@@ -106,7 +106,16 @@ cudarc = { version = "0.19.8", optional = true, default-features = false, featur
 ] }
 # The checkpoint readers; the requirement itself lives in the workspace
 # manifest, because releasing them is a two-repo dance.
-ztensor = { workspace = true, features = ["zstd"] }
+#
+# No `zstd` here, deliberately. The loader addresses checkpoint bytes where
+# they lie so a device can be pointed at them, and an encoded part has no
+# address at all -- `zt.zstd-seekable/1` payloads are refused by
+# `checkpoint::zt` whether or not the codec is linked. Registering the
+# encoding would only change the wording of the refusal, in exchange for
+# zstd-sys, whose build script is the single most expensive C compile in the
+# tree. It stays on under `[dev-dependencies]`, where a test needs to *write*
+# a compressed part to prove the refusal.
+ztensor = { workspace = true }
 ztensor-compat = { workspace = true, features = [
     "safetensors",
     "gguf",
@@ -120,7 +129,11 @@ serde_json = "1.0"
 thiserror = "2.0"
 
 [dev-dependencies]
-ztensor = { workspace = true }
+# `zstd` is a test-only need: `a_part_with_no_address_is_refused` has to
+# produce a genuinely compressed part, and the writer will not record an
+# encoding it cannot perform. Dev-dependencies are not built for `cargo
+# build`, so this keeps zstd-sys out of every shipped binary.
+ztensor = { workspace = true, features = ["zstd"] }
 # A dev-only cycle, which cargo permits: the golden and verifier tests check
 # the *marshalled* view of a plan, and the marshalling lives in the ABI crate
 # above this one. The lib itself must never depend on it — that is the whole

@@ -10,6 +10,7 @@ use anyhow::Result;
 
 use crate::Tokenizer;
 
+pub mod gguf;
 pub mod huggingface;
 pub mod tiktoken;
 

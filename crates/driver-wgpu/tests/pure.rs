@@ -118,24 +118,30 @@ const COMPILES_C: &[&str] = &["cc", "cmake", "bindgen", "pkg-config", "autotools
 /// twice over. That is a stronger arrangement than the alternative of dropping
 /// the suffix check, which would silently admit every real `-sys` crate as
 /// well.
-const SYS_IN_NAME_ONLY: &[&str] = &["renderdoc-sys", "js-sys", "windows-sys"];
+const SYS_IN_NAME_ONLY: &[&str] = &["renderdoc-sys"];
 
 /// Crates that declare `links` without owning a native library to link.
 ///
-/// `wasm-bindgen-shared` declares `links = "wasm_bindgen"`, which reads like
-/// the strongest signal this file has. It is not one: the key is how
-/// `wasm-bindgen` refuses to let two incompatible versions of itself into one
-/// build — cargo enforces `links` uniqueness, and the crate borrows that for a
-/// version check. There is no library, and its build script has no build
-/// dependencies, so there is nothing for it to compile with.
+/// EMPTY, and the entry that stood here was deleted by the test below rather
+/// than by anyone deciding it was settled — which is the arrangement working.
 ///
-/// Re-checked structurally by [`links_is_only_a_version_lock`], the same way
-/// the suffix exceptions are. Both it and `js-sys` are in the closure only
-/// through `wgpu`'s wasm target, and `windows-sys` only through its Windows
-/// one; this crate exists to run in a browser and on every desktop, so
-/// filtering the graph down to the host triple would be answering an easier
-/// question than the one this file asks.
-const LINKS_WITHOUT_A_LIBRARY: &[&str] = &["wasm-bindgen-shared"];
+/// `js-sys`, `windows-sys` and `wasm-bindgen-shared` all appeared in this
+/// closure at once when `driver` gained a `tensor-compiler` edge that took
+/// `driver-api`'s DEFAULT features: `rpc` reaches `tarpc`, and tokio's
+/// platform closure reaches all three. They were allow-listed here first,
+/// with structural re-checks, on the reasoning that a browser-targeting crate
+/// cannot filter its graph to the host triple.
+///
+/// That reasoning was sound and the premise was wrong. The three browser
+/// tests were RED at the same moment — `getrandom` refuses to build for
+/// `wasm32-unknown-unknown` — and the one-line `default-features = false` that
+/// fixed those took the three crates out of the closure entirely. The
+/// exceptions then failed as stale, by name, which is how they came out.
+///
+/// Worth keeping the shape for the next time: an allow-list whose staleness
+/// check fires is an allow-list that told you the workaround was hiding
+/// something.
+const LINKS_WITHOUT_A_LIBRARY: &[&str] = &[];
 
 /// Every allow-listed `-sys` crate is in the closure and owns nothing.
 ///

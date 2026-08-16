@@ -96,6 +96,17 @@ mod status;
 mod step;
 mod value;
 
+// The one PUBLIC module here, where every other is private behind a flat
+// re-export. It stays a module because it is the only thing in this crate a
+// caller navigates by path rather than by symbol: two driver test suites
+// already say `names::Naming::mlx()`, and both keep saying it after the move
+// because each shell re-exports this module under its own name.
+//
+// Strings and a static table, so it is ungated on every shell that takes it:
+// a caller that only wants to know what a checkpoint calls `layer.3.down`
+// should not have to link a graphics API to ask.
+pub mod names;
+
 pub use error::{Error, Result};
 
 /// The launch ABI, re-exported.

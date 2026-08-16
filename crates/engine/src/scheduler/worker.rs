@@ -1209,6 +1209,15 @@ impl DriverLane {
             // `driver 0 stalled for 7030.132606596s (no progress, work queued
             // or in flight)` until the process was killed by hand.
             let owed = Owed::of(&request);
+            // Answering the owed frame is only possible if the panic unwinds
+            // to here. Under `panic = "abort"` the stall this replaced is
+            // traded for killing every other lane and session too, silently.
+            #[cfg(panic = "abort")]
+            compile_error!(
+                "the driver lane answers its owed frame from the panic path, \
+                 which requires unwinding; under `panic = \"abort\"` a panic \
+                 in one lane takes down every session the engine is serving"
+            );
             let handled =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     match request {

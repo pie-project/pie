@@ -170,6 +170,11 @@ pub mod encoding;
 pub mod boot;
 #[cfg(feature = "contract")]
 pub mod contract;
+/// The ingest aspect: a foreign checkpoint vocabulary in, this crate's out.
+/// Sits with `contract` because it is the layer below it -- the same
+/// question, one step earlier.
+#[cfg(feature = "contract")]
+pub mod ingest;
 #[cfg(feature = "chat")]
 pub mod multimodal;
 

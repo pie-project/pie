@@ -1,6 +1,17 @@
 //! FFI — the only surface the other side of the boundary sees (B10): opaque
 //! `u64` slot ids in, `0/1` out, callable from any thread, never unwinds.
 
+// "Never unwinds" is enforced by catching, and catching needs something to
+// catch. Under `panic = "abort"` a panic in the table takes the caller's
+// process down instead of returning `0`, which is not what this module's
+// contract says and not what its callers -- a driver's completion thread,
+// often not Rust -- can cope with.
+#[cfg(panic = "abort")]
+compile_error!(
+    "the waker's C ABI contract is `never unwinds, returns 0/1`, which is \
+     implemented with `catch_unwind` and so requires `panic = \"unwind\"`"
+);
+
 #[cfg(not(loom))]
 use crate::table::{WakeOutcome, WakerTable};
 

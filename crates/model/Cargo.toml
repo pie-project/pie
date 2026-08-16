@@ -34,6 +34,10 @@ path = "src/lib.rs"
 # each against each aspect rather than by reading its imports.
 
 [[test]]
+name = "a_row_identifies_from_its_own_names"
+required-features = ["contract"]
+
+[[test]]
 name = "family_contracts"
 required-features = ["contract"]
 
@@ -57,7 +61,7 @@ required-features = ["contract"]
 # editing this line twice and the row that dispatches to it. One crate, and a
 # feature gates modules directly.
 default = ["chat"]
-chat = ["dep:tokenizer", "dep:anyhow", "dep:serde_json", "dep:image"]
+chat = ["dep:tokenizer", "dep:serde_json", "dep:image"]
 # THE `config` FEATURE IS GONE, and so are the 3,595 lines behind it: a
 # `pie.model/1` descriptor normalized out of a 136-field schema by 845
 # lines, a reader that parsed it back, a `ModelFacts` projection of the
@@ -69,7 +73,7 @@ chat = ["dep:tokenizer", "dep:anyhow", "dep:serde_json", "dep:image"]
 # a const needs no dependency to be read. `encoding` is the only part
 # that still opens a file, and it rides with `contract` because the only
 # thing that asks it is an authoring pass deciding how to store a weight.
-contract = ["dep:model-loader", "dep:serde_json", "dep:anyhow"]
+contract = ["dep:model-loader", "dep:serde_json"]
 # THE `forward` FEATURE IS GONE. It gated a generation's forward text on the
 # argument that `pie model convert` "must not drag the tracer in behind"
 # a chat template and a load contract. Nothing in this tree did that: all six
@@ -132,7 +136,6 @@ model-loader = { path = "../model-loader", default-features = false, optional = 
 # declaration lowers the way it says it does.
 model-dsl = { path = "../model-dsl" }
 model-ir = { path = "../model-ir" }
-anyhow = { version = "1.0", optional = true }
 serde_json = { version = "1.0", features = ["preserve_order"], optional = true }
 # Host-side media decode for the model-agnostic multimodal API.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"], optional = true }

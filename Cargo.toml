@@ -369,13 +369,18 @@ tokio = { version = "1.53", features = ["full"] }
 tracing = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # R3 weight/runtime provisioning downloaders — these live ONLY here (the worker
 # lib links zero provisioning machinery). `reqwest` carries `blocking` because
-# the CLI `model pull` / `runtime install` downloads are synchronous.
-hf-hub = "1.0.0"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "stream"] }
+# the CLI `runtime install` download is synchronous; the HF snapshot fetch in
+# `local::hf::download` is async and streams.
+#
+# `rustls-no-provider`, not `rustls`: reqwest's `rustls` feature hard-selects
+# the aws-lc backend (`rustls = ["__rustls-aws-lc-rs", ...]`), whose build
+# script was the single most expensive unit in a cold build and a second crypto
+# backend beside the `ring` the client crate and wasmtime-wasi-http already
+# link. `bootstrap::install_crypto_provider` picks ring at process boot.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "blocking", "stream"] }
 tar = "0.4"
 xz2 = "0.1"
 toml_edit = "0.25.13"
@@ -495,8 +500,23 @@ print_stderr = "deny"
 # (CUDA kernel compile + Rust+C++ link grew from ~1h to many hours)
 # without measurably better artifacts. Thin LTO parallelizes across
 # codegen units, so we leave codegen-units at the default (16) too.
+#
+# NO `panic = "abort"`. It was here, and it was quietly deleting behaviour
+# this tree goes to some length to provide: three `catch_unwind` barriers
+# turn a panic into an answer rather than a dead process -- the driver lane
+# in `engine::scheduler::worker` (which drains and fails the requests behind
+# a poisoned lane instead of leaving a frame in flight, after one was
+# measured stalled for 7030s), and the two C ABI seams in
+# `driver_cuda::serve::guard` and `pie_wake`, whose whole documented purpose
+# is that an operator gets a message naming the entry point "instead of a
+# bare SIGABRT". Under `abort` every one of them is dead code and the
+# shipped binary does exactly what those comments say it must not.
+#
+# Each of the three now fails the build under `cfg(panic = "abort")`, so
+# this is not a line anyone can put back by accident. It cost ~8 MiB of
+# binary, which is not a currency this project trades in.
 [profile.release-min]
 inherits = "release"
 lto = "thin"
-panic = "abort"
 strip = "symbols"
+

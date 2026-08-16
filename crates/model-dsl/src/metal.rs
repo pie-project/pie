@@ -228,6 +228,24 @@ pub fn embed_gather(
 /// every norm this family states (attn_norm, mlp_norm, q_norm,
 /// k_norm, final_norm; the driver fans five `Kernel` kinds onto it).
 pub fn rms_norm(x: &Val, w: &NormW, row: u32, eps: f32) -> Val {
+    rms_norm_gain(x, w, row, eps, 1.0)
+}
+
+/// The same, with a CONSTANT folded into the gain vector.
+///
+/// `rms.metal` already multiplies every channel by `p.gain`, and every caller
+/// but one wants it at unity. gemma-4's ROUTER is the one: `Router.__call__`
+/// is `rms_norm(x, self.scale * hidden**-0.5, eps)`, where the scalar is not
+/// in the checkpoint and not in the weight -- the reference builds the
+/// product at call time.
+///
+/// It is a GAIN and not a separate multiply because the shader has the slot,
+/// and because 2816**-0.5 is 0.0188: dropping it scales the router's logits
+/// by fifty-three, which leaves the top-k RANKING untouched and turns the
+/// softmax over the chosen eight into very nearly one-hot. A model that
+/// routes to the right experts and weights them wrong is fluent, which is
+/// how it read as "close but the argmax moved".
+pub fn rms_norm_gain(x: &Val, w: &NormW, row: u32, eps: f32, gain: f32) -> Val {
     let out = same_shape(x);
     with_params(
         &x.t,
@@ -258,7 +276,7 @@ pub fn rms_norm(x: &Val, w: &NormW, row: u32, eps: f32) -> Val {
             row,
             1,
             u32::from(w.variant == model_ir::trace::NormVariant::Gemma),
-            1.0f32.to_bits(),
+            gain.to_bits(),
         ],
         vec![x.id],
         Some(out),
@@ -1150,10 +1168,18 @@ pub fn router_topk(
     logits: &Val,
     n_experts: u32,
     experts_per_token: u32,
-    scaled: bool,
+    per_expert_scale: Option<&MatW>,
     norm_topk_prob: bool,
 ) -> (Val, Val) {
-    let sym = if scaled {
+    // The SCALED form takes a fifth buffer, and it used to be selected by a
+    // `bool` that bound nothing: the text named `router_topk_scaled_bfloat16`
+    // and handed it four operands, leaving the shader to read its per-expert
+    // gain out of whatever the slot held. Nothing reached it -- every caller
+    // passed `false` -- so the gap was a symbol away from firing rather than
+    // a live defect. Naming the tensor instead of a flag makes the two
+    // inseparable: there is no way to ask for the scaled kernel without
+    // saying which weight it scales by.
+    let sym = if per_expert_scale.is_some() {
         "router_topk_scaled_bfloat16"
     } else {
         "router_topk_bfloat16"
@@ -1162,7 +1188,9 @@ pub fn router_topk(
     let ids = logits.t.with(logits.layer, |b| {
         b.launch_with_params(
             sym,
-            vec![],
+            per_expert_scale
+                .map(|w| vec![w.name.clone()])
+                .unwrap_or_default(),
             None,
             // `RouterParams`, packed: the shader takes a struct pointer,
             // so this run IS the struct and every word of it has to be
@@ -1492,4 +1520,191 @@ pub fn shared_expert_combine(routed: &Val, shared: &Val, gate: &Val, width: u32)
         Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
     )
     .expect("the shared landing produces its rows")
+}
+
+// ------------------------------------------------------------------ gdn ---
+
+/// The shape a gated-DeltaNet block runs at, as `GdnCoreParams` orders it.
+///
+/// One struct rather than eleven arguments because the shader reads it as one
+/// struct: `ssm/gdn_params.h` declares `{Dk, Dv, Hk, Hv, conv_dim, Kc, q_off,
+/// k_off, v_off, eps, inv_sqrt_dk}` and `Handles::params_block` packs the
+/// statement's scalars in the order they were stated. A text that stated ten
+/// of them would not fail -- it would leave `inv_sqrt_dk` reading whatever
+/// word followed, which is a prescale and so a wrong answer rather than a
+/// fault.
+#[derive(Debug, Clone, Copy)]
+pub struct GdnShape {
+    /// Key head width.
+    pub k_dim: u32,
+    /// Value head width.
+    pub v_dim: u32,
+    /// Key heads.
+    pub k_heads: u32,
+    /// Value heads.
+    pub v_heads: u32,
+    /// Channels the causal convolution carries: `2*Hk*Dk + Hv*Dv`.
+    pub conv_dim: u32,
+    /// Convolution kernel width.
+    pub conv_k: u32,
+    /// Where q, k and v start in the fused in-projection's row.
+    pub q_off: u32,
+    /// See [`Self::q_off`].
+    pub k_off: u32,
+    /// See [`Self::q_off`].
+    pub v_off: u32,
+    /// The l2 norm's epsilon.
+    pub eps: f32,
+}
+
+impl GdnShape {
+    /// The eleven scalars, in `GdnCoreParams` order.
+    ///
+    /// `inv_sqrt_dk` is COMPUTED here rather than stated: it is `Dk**-0.5`
+    /// and nothing else, and a text free to state it separately is a text
+    /// that can state it inconsistently with the `Dk` beside it.
+    fn params(self) -> Vec<u32> {
+        vec![
+            self.k_dim,
+            self.v_dim,
+            self.k_heads,
+            self.v_heads,
+            self.conv_dim,
+            self.conv_k,
+            self.q_off,
+            self.k_off,
+            self.v_off,
+            self.eps.to_bits(),
+            (self.k_dim as f32).powf(-0.5).to_bits(),
+        ]
+    }
+}
+
+/// The six weights every GDN statement reads, in the order the arms ask.
+///
+/// `arm::gates` reads weights two through five and the conv pair is zero and
+/// one, so the order here is the signature and not a convenience.
+#[derive(Debug, Clone)]
+pub struct GdnW {
+    /// The causal convolution's kernel and bias.
+    pub conv_w: String,
+    /// See [`Self::conv_w`].
+    pub conv_b: String,
+    /// The decay's log-space rate, `f32`.
+    pub a_log: String,
+    /// The decay's bias.
+    pub dt_bias: String,
+    /// The `a` and `b` gate projections' outputs.
+    pub a_gate: String,
+    /// See [`Self::a_gate`].
+    pub b_gate: String,
+}
+
+impl GdnW {
+    fn names(&self) -> Vec<String> {
+        vec![
+            self.conv_w.clone(),
+            self.conv_b.clone(),
+            self.a_log.clone(),
+            self.dt_bias.clone(),
+            self.a_gate.clone(),
+            self.b_gate.clone(),
+        ]
+    }
+}
+
+fn recurrent_state(layer: u32) -> Option<StateRef> {
+    Some(StateRef {
+        store: StateStore::RecurrentState,
+        layer,
+    })
+}
+
+/// `ssm/gdn_core.metal::gdn_core_slotted_bfloat16` — the fused
+/// convolution, norm, gating and recurrent step, one token per request.
+///
+/// SLOTTED unconditionally, and the sealed `gdn_core_bfloat16` is not stated
+/// by any text here. The two symbols take the same twelve buffers; the
+/// difference is whether the conv and recurrent slabs are indexed by the row
+/// or by the fire's slot table, and a served fire always has requests taking
+/// turns in a slab. The sealed form is what `device_gdn.rs` compares the
+/// split pair against, which is a claim about the arithmetic and not a
+/// serving path.
+pub fn gdn_core(mixed: &Val, shape: GdnShape, w: &GdnW, layer: u32) -> Val {
+    with_params(
+        &mixed.t,
+        Some(layer),
+        "gdn_core_slotted",
+        w.names(),
+        recurrent_state(layer),
+        shape.params(),
+        vec![mixed.id],
+        Some((
+            Shape(vec![Dim::Tokens, Dim::Const(shape.v_heads * shape.v_dim)]),
+            DType::BF16,
+        )),
+    )
+    .expect("the gdn core produces its rows")
+}
+
+/// `ssm/gdn_prep.metal::gdn_prep_slotted_bfloat16` — the q/k path, computed
+/// once per head instead of once per value dimension.
+///
+/// Three results, all `f32`: the normalized and prescaled q, the normalized
+/// k, and `{decay, beta}` per value head. They are the bridge to
+/// [`gdn_core_recurrent`], which recomputes none of them.
+pub fn gdn_prep(mixed: &Val, shape: GdnShape, w: &GdnW, layer: u32) -> (Val, Val, Val) {
+    let per_head = Shape(vec![Dim::Tokens, Dim::Const(shape.v_heads * shape.k_dim)]);
+    let gate = Shape(vec![Dim::Tokens, Dim::Const(2 * shape.v_heads)]);
+    let ids = mixed.t.with(Some(layer), |b| {
+        b.launch_with_params(
+            "gdn_prep_slotted",
+            w.names(),
+            recurrent_state(layer),
+            shape.params(),
+            vec![mixed.id],
+            vec![
+                (per_head.clone(), DType::F32),
+                (per_head, DType::F32),
+                (gate, DType::F32),
+            ],
+        )
+    });
+    let mk = |id| Val {
+        t: mixed.t.clone(),
+        id,
+        layer: Some(layer),
+    };
+    (mk(ids[0]), mk(ids[1]), mk(ids[2]))
+}
+
+/// `ssm/gdn_prep.metal::gdn_core_recurrent_slotted_bfloat16` — the scan over
+/// what [`gdn_prep`] wrote.
+///
+/// It still takes `mixed`, and that is not a redundancy: the v channel is
+/// unique per value dimension, so there is no q/k-style sharing to hoist and
+/// the scan does its own convolution over v.
+pub fn gdn_core_recurrent(
+    mixed: &Val,
+    pre_q: &Val,
+    pre_k: &Val,
+    pre_gate: &Val,
+    shape: GdnShape,
+    w: &GdnW,
+    layer: u32,
+) -> Val {
+    with_params(
+        &mixed.t,
+        Some(layer),
+        "gdn_core_recurrent_slotted",
+        w.names(),
+        recurrent_state(layer),
+        shape.params(),
+        vec![mixed.id, pre_q.id, pre_k.id, pre_gate.id],
+        Some((
+            Shape(vec![Dim::Tokens, Dim::Const(shape.v_heads * shape.v_dim)]),
+            DType::BF16,
+        )),
+    )
+    .expect("the gdn scan produces its rows")
 }

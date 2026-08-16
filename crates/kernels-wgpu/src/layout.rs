@@ -9,114 +9,46 @@
 // reason, at a ceiling of 24.
 #![allow(clippy::too_many_arguments)]
 
-use kernels::{KernelSig, kernel};
+use kernels::KernelSig;
 
-use crate::axes::*;
+/// EMPTY: this family's rows have been RETIRED.
+///
+/// `refactor-bigplan.md` §7 Stage 3. Six kernels over 26 entrypoints — the
+/// four quantized embedding gathers carry a two-axis product (`gs` x `b`) and
+/// are the reason this backend's affine point had to be readable from the
+/// SYMBOL rather than from a launch fact.
+pub static KERNELS: &[KernelSig] = &[];
 
-pub static KERNELS: &[KernelSig] = &[
-    // 6 in embed_gather.wgsl
-    kernel!(embed_gather_4bit "embed_gather_4bit", file = Some("layout/embed_gather.wgsl"), launch = kernels::LaunchRule::Elementwise,
-        operands = kernels::operands![
-            w: Buf <- kernels::Source::Weight(0),
-            scales: Buf <- kernels::Source::Weight(1),
-            biases: Buf <- kernels::Source::Weight(2),
-            // The token IDS: the FIRE's, not the statement's. A text cannot
-            // state them — they are this fire's data, not this model's
-            // structure — so the row names which table and the driver's
-            // resolver answers, the same way `Positions` has always worked.
-            id: I32s <- kernels::Source::TokenIds,
-            out: BufMut <- kernels::Source::Out(0),
-            hidden: I32 <- kernels::Source::Param(0),
-        ],
-        axes = &[BF16, GROUP, BITS]),
-    // 6 in embed_gather.wgsl
-    kernel!(embed_gather_mb_4bit "embed_gather_mb_4bit", file = Some("layout/embed_gather.wgsl"), launch = kernels::LaunchRule::ElementwiseRows,
-        operands = kernels::operands![
-            w: Buf <- kernels::Source::Weight(0),
-            scales: Buf <- kernels::Source::Weight(1),
-            biases: Buf <- kernels::Source::Weight(2),
-            // The token IDS: a fire value the text does not state and
-            // `Source` has no name for. Stated as a gap rather than omitted —
-            // a row is positional, so closing it would shift `out`.
-            id: I32s <- kernels::Source::TokenIds,
-            out: BufMut <- kernels::Source::Out(0),
-            hidden: I32 <- kernels::Source::Param(0),
-        ],
-        axes = &[BF16, GROUP, BITS]),
-    // 6 in embed_gather.wgsl
-    // `embed_gather_4bit` with the embedding SCALE folded in -- gemma
-    // multiplies its embeddings by `sqrt(hidden)`, which is a number the
-    // statement carries rather than a kernel that knows the model.
-    //
-    // Single-row like its unscaled twin: `embed_gather_scaled_mb_4bit` is the
-    // M>1 form and the one a text should name.
-    kernel!(embed_gather_scaled_4bit "embed_gather_scaled_4bit",
-        file = Some("layout/embed_gather.wgsl"),
-        launch = kernels::LaunchRule::Elementwise,
-        operands = kernels::operands![
-            w: Buf <- kernels::Source::Weight(0),
-            scales: Buf <- kernels::Source::Weight(1),
-            biases: Buf <- kernels::Source::Weight(2),
-            id: I32s <- kernels::Source::TokenIds,
-            out: BufMut <- kernels::Source::Out(0),
-            hidden: I32 <- kernels::Source::Param(0),
-            embed_scale: F32 <- kernels::Source::ParamF32(1),
-        ],
-        axes = &[BF16, GROUP, BITS]),
-    // 6 in embed_gather.wgsl
-    // The M>1 form, and the one a text should name: it reduces to the
-    // single-row one at N=1, where that one reads `id[0]` whatever grid it is
-    // handed.
-    kernel!(embed_gather_scaled_mb_4bit "embed_gather_scaled_mb_4bit",
-        file = Some("layout/embed_gather.wgsl"),
-        launch = kernels::LaunchRule::ElementwiseRows,
-        operands = kernels::operands![
-            w: Buf <- kernels::Source::Weight(0),
-            scales: Buf <- kernels::Source::Weight(1),
-            biases: Buf <- kernels::Source::Weight(2),
-            id: I32s <- kernels::Source::TokenIds,
-            out: BufMut <- kernels::Source::Out(0),
-            hidden: I32 <- kernels::Source::Param(0),
-            embed_scale: F32 <- kernels::Source::ParamF32(1),
-        ],
-        axes = &[BF16, GROUP, BITS]),
-    // 1 in ple_combine.wgsl
-    // gemma's PLE join: `(proj + token) * inv_sqrt2`, over the whole
-    // `[n_layers, ple_dim]` block at once. The scale is `1/sqrt(2)` and it is
-    // the JOIN's, not a deployment's -- two streams averaged in the
-    // root-mean-square sense.
-    kernel!(ple_combine "ple_combine", file = Some("layout/ple_combine.wgsl"),
-        launch = kernels::LaunchRule::Elementwise,
-        operands = kernels::operands![
-            proj: Buf <- kernels::Source::In(0),
-            token: Buf <- kernels::Source::In(1),
-            out: BufMut <- kernels::Source::Out(0),
-            // `PleCombineParams`: inv_sqrt2 then n, packed.
-            params: Buf <- kernels::Source::Param(0),
-        ],
-        axes = &[BF16]),
-    // 1 in row_gather.wgsl
-    // The readout's gather. A prefill's stream is one row per TOKEN and its
-    // readout is one distribution per REQUEST, so the sampled rows have to be
-    // picked out before the lm head runs. `Kernel::G4RowGather` is what the
-    // retiring driver called it.
-    kernel!(row_gather "row_gather", file = Some("layout/row_gather.wgsl"),
-        launch = kernels::LaunchRule::ElementwiseRows,
-        operands = kernels::operands![
-            input: Buf <- kernels::Source::In(0),
-            out: BufMut <- kernels::Source::Out(0),
-            rows: U32s <- kernels::Source::SamplingIndices,
-            // `RowGatherParams` — width then count, PACKED into buffer 3.
-            // There is no buffer 4, so the count is not an operand: it is the
-            // struct's second FIELD, which `Ty::InPacked` is how a row says.
-            //
-            // The statement states `[width]` and the driver appends the count,
-            // giving `[width, count]` — exactly the struct — because a packed
-            // slot's run already covers every scalar after it.
-            params: Buf <- kernels::Source::Param(0),
-            count: InPacked <- kernels::Source::RequestCount,
-        ],
-        axes = &[BF16]),
+/// The entrypoints this family's routines spell, now that its rows are gone.
+///
+/// See [`crate::sample::ENTRYPOINTS`].
+pub static ENTRYPOINTS: &[&str] = &[
+    "embed_gather_4bit_bfloat16_gs_128_b_4",
+    "embed_gather_4bit_bfloat16_gs_128_b_8",
+    "embed_gather_4bit_bfloat16_gs_32_b_4",
+    "embed_gather_4bit_bfloat16_gs_32_b_8",
+    "embed_gather_4bit_bfloat16_gs_64_b_4",
+    "embed_gather_4bit_bfloat16_gs_64_b_8",
+    "embed_gather_mb_4bit_bfloat16_gs_128_b_4",
+    "embed_gather_mb_4bit_bfloat16_gs_128_b_8",
+    "embed_gather_mb_4bit_bfloat16_gs_32_b_4",
+    "embed_gather_mb_4bit_bfloat16_gs_32_b_8",
+    "embed_gather_mb_4bit_bfloat16_gs_64_b_4",
+    "embed_gather_mb_4bit_bfloat16_gs_64_b_8",
+    "embed_gather_scaled_4bit_bfloat16_gs_128_b_4",
+    "embed_gather_scaled_4bit_bfloat16_gs_128_b_8",
+    "embed_gather_scaled_4bit_bfloat16_gs_32_b_4",
+    "embed_gather_scaled_4bit_bfloat16_gs_32_b_8",
+    "embed_gather_scaled_4bit_bfloat16_gs_64_b_4",
+    "embed_gather_scaled_4bit_bfloat16_gs_64_b_8",
+    "embed_gather_scaled_mb_4bit_bfloat16_gs_128_b_4",
+    "embed_gather_scaled_mb_4bit_bfloat16_gs_128_b_8",
+    "embed_gather_scaled_mb_4bit_bfloat16_gs_32_b_4",
+    "embed_gather_scaled_mb_4bit_bfloat16_gs_32_b_8",
+    "embed_gather_scaled_mb_4bit_bfloat16_gs_64_b_4",
+    "embed_gather_scaled_mb_4bit_bfloat16_gs_64_b_8",
+    "ple_combine_bfloat16",
+    "row_gather_bfloat16",
 ];
 
 // ── The routine shape ────────────────────────────────────────────────
@@ -666,22 +598,36 @@ mod ported {
         // construction -- the body passes rows = 1 -- so their `Elementwise`
         // grid is `[W * 1, 1, 1]`. The rest carry the fire's rows.
         for ((name, (_, _, lanes, _)), _) in order.iter().zip(seen.iter()).zip(0..) {
-            let row = kernels::sig_in(KERNELS, name)
-                .unwrap_or_else(|| panic!("`{name}` still has a row to compare against"));
+            // The RULE each body's grid must match. It was read off the row
+            // until Stage 3 retired them; stated here because the claim is
+            // about the BODY and a deleted row is not a reason to stop making
+            // it. `driver-wgpu`'s
+            // `the_routine_path_plans_what_the_table_path_planned` compared
+            // all six against their rows before those rows went.
+            let rule = match *name {
+                // The single-row gathers pass `rows = 1` themselves, so their
+                // grid is flat; the `_mb_` pair carries the fire's rows on y.
+                "ple_combine" | "embed_gather_4bit" | "embed_gather_scaled_4bit" => {
+                    kernels::LaunchRule::Elementwise
+                }
+                "embed_gather_mb_4bit" | "embed_gather_scaled_mb_4bit" | "row_gather" => {
+                    kernels::LaunchRule::ElementwiseRows
+                }
+                other => panic!("`{other}` has no stated rule here"),
+            };
             let rows = if name.starts_with("embed_gather") && !name.contains("_mb_") {
                 1
             } else {
                 R
             };
-            let want = match row.launch {
+            let want = match rule {
                 kernels::LaunchRule::Elementwise => [W.unsigned_abs() * rows.unsigned_abs(), 1, 1],
                 kernels::LaunchRule::ElementwiseRows => [W.unsigned_abs(), rows.unsigned_abs(), 1],
-                other => panic!("`{name}`'s row states {other:?}, which this test does not model"),
+                other => panic!("`{name}` states {other:?}, which this test does not model"),
             };
             assert_eq!(
                 *lanes, want,
-                "`{name}`'s body asks for {lanes:?} where its row's {:?} wants {want:?}",
-                row.launch
+                "`{name}`'s body asks for {lanes:?} where {rule:?} wants {want:?}"
             );
         }
     }

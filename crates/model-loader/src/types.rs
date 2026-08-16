@@ -130,6 +130,35 @@ pub enum QuantScheme {
     /// order and the C++ side reads them as integers, so inserting one in the
     /// middle renumbers every scheme after it.
     Int4B8,
+    /// llama.cpp's `block_q6_K`: a 256-element super-block of 6-bit codes,
+    /// scaled in sixteens.
+    ///
+    /// 210 bytes -- 128 of low nibbles, 64 of high pairs, 16 signed sub-block
+    /// scales and one half-precision super-block scale -- measured off
+    /// `llama-2-7b.Q4_0.gguf` rather than read off a struct definition.
+    ///
+    /// Carried because a "Q4_0" release is not uniformly Q4_0: that file
+    /// holds 225 Q4_0 tensors and exactly one Q6_K, `output.weight`, and
+    /// without this row the missing scheme refused the whole 3.8 GB file at
+    /// parse. Naming a scheme is what lets its bytes be COPIED; decoding them
+    /// is a separate claim this does not make.
+    GgufQ6K,
+    /// llama.cpp's `block_q4_1`: 20 bytes per 32 elements — an F16 scale, an
+    /// F16 offset and sixteen packed bytes, each element `nibble × d + m`.
+    ///
+    /// The affine sibling of [`Self::GgufQ4_0`]. Its offset is *added*, where
+    /// a K-quant's minimum is subtracted, so the two cannot share a decoder
+    /// arm however similar they look.
+    GgufQ4_1,
+    /// llama.cpp's `block_q5_1`: 24 bytes per 32 elements — [`Self::GgufQ4_1`]
+    /// plus a 32-bit plane of fifth bits.
+    ///
+    /// Carried because a K-quant release is not uniformly K-quant, the same
+    /// way `GgufQ6K` is: `qwen2.5-0.5b-instruct-q5_k_m.gguf` holds 12 Q5_K
+    /// tensors, 12 Q6_K and **133 Q5_1**, so without this row the file is
+    /// refused at parse and the most common Q5 release in the wild cannot be
+    /// read at all.
+    GgufQ5_1,
 }
 
 impl QuantScheme {
@@ -140,9 +169,11 @@ impl QuantScheme {
             | Self::Mxfp4E2M1E8M0
             | Self::MlxAffineU4
             | Self::GgufQ4_0
+            | Self::GgufQ4_1
             | Self::GgufQ4K
             | Self::Int4B8 => 4,
-            Self::GgufQ5_0 | Self::GgufQ5K => 5,
+            Self::GgufQ5_0 | Self::GgufQ5_1 | Self::GgufQ5K => 5,
+            Self::GgufQ6K => 6,
             Self::Fp8E4M3
             | Self::Fp8E5M2
             | Self::Int8Symmetric
@@ -152,11 +183,49 @@ impl QuantScheme {
         }
     }
 
+    /// The block a GGUF-family scheme stores, as `(elements, bytes)`, or
+    /// `None` for a scheme whose payload is a plain bit-packing.
+    ///
+    /// GGUF blocks carry their scales *inside* the payload — Q4_0 is one F16
+    /// scale and sixteen packed bytes per 32 elements — so their size is not
+    /// `elements × bits / 8` and a span computed that way reads short. These
+    /// are the GGML reference layouts, and this table is the only place in
+    /// the crate that states them — `checkpoint/zt.rs` and
+    /// `checkpoint/write.rs` carry the `gguf.q4_0/1` encoding *name* and ask
+    /// here for its size.
+    ///
+    /// Answering here is also what makes a scheme decodable: the host `Decode`
+    /// sizes its blocks from this and dispatches on the same set, so a scheme
+    /// listed here without a decoder is a compile error rather than a run that
+    /// reads the wrong number of bytes.
+    pub fn block_layout(self) -> Option<(u64, u64)> {
+        match self {
+            Self::GgufQ4_0 => Some((32, 18)),
+            Self::GgufQ4_1 => Some((32, 20)),
+            Self::GgufQ5_0 => Some((32, 22)),
+            Self::GgufQ5_1 => Some((32, 24)),
+            Self::GgufQ8_0 => Some((32, 34)),
+            Self::GgufQ4K => Some((256, 144)),
+            Self::GgufQ5K => Some((256, 176)),
+            Self::GgufQ6K => Some((256, 210)),
+            _ => None,
+        }
+    }
+
     pub fn default_group_size(self) -> u32 {
         match self {
             Self::AwqInt4 | Self::GptqInt4 | Self::Mxfp4E2M1E8M0 | Self::Int4B8 => 32,
             Self::MlxAffineU4 => 64,
-            Self::GgufQ4_0 | Self::GgufQ4K | Self::GgufQ5_0 | Self::GgufQ5K => 32,
+            Self::GgufQ4_0
+            | Self::GgufQ4_1
+            | Self::GgufQ4K
+            | Self::GgufQ5_0
+            | Self::GgufQ5_1
+            | Self::GgufQ5K => 32,
+            // Sixteen, not the 32 its neighbours use: Q6_K carries one scale
+            // per sixteen elements. Inert for extents either way, since a
+            // scheme with a `block_layout` answers through that.
+            Self::GgufQ6K => 16,
             Self::Fp8E4M3
             | Self::Fp8E5M2
             | Self::Int8Symmetric
@@ -229,7 +298,20 @@ impl QuantSpec {
         self
     }
 
+    /// The width of one element when the payload is a plain array, or `None`
+    /// when it is not addressable that way.
+    ///
+    /// A blocked scheme answers `None` whatever its bit width. Q8_0 is the
+    /// reason this is stated rather than implied: it is the one GGUF scheme
+    /// whose bits divide by eight, so a width derived from bits alone comes
+    /// back as `Some(1)` and every caller then sizes its span as
+    /// `elements × 1`, which is short by the F16 scale in each block. The
+    /// others fall out only because four, five and six bits do not divide.
+    /// Having a block is the property that matters, so it is asked first.
     pub fn dense_element_bytes(&self) -> Option<u64> {
+        if self.block_layout().is_some() {
+            return None;
+        }
         let bits = self.normalized_bits();
         if bits.is_multiple_of(8) {
             Some(u64::from(bits / 8))
@@ -249,14 +331,7 @@ impl QuantSpec {
     /// `checkpoint/write.rs` carry the `gguf.q4_0/1` encoding *name* and ask
     /// here for its size.
     pub fn block_layout(&self) -> Option<(u64, u64)> {
-        match self.scheme {
-            QuantScheme::GgufQ4_0 => Some((32, 18)),
-            QuantScheme::GgufQ5_0 => Some((32, 22)),
-            QuantScheme::GgufQ8_0 => Some((32, 34)),
-            QuantScheme::GgufQ4K => Some((256, 144)),
-            QuantScheme::GgufQ5K => Some((256, 176)),
-            _ => None,
-        }
+        self.scheme.block_layout()
     }
 
     pub fn normalized_bits(&self) -> u8 {

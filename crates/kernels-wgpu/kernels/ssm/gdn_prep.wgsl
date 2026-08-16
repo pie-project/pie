@@ -407,8 +407,19 @@ fn write_conv_prefill(slot: i32, t: i32, c: i32) {
 //#else
 @compute @workgroup_size(32)
 //#endif
+// `gid` is DECLARED ONLY WHERE IT IS READ, which is the recurrent arm's
+// `dv_idx`. Declaring it unconditionally cost nothing at run time -- naga keeps
+// an unread builtin and the driver binds nothing for it -- but it cost a
+// reflection fact: `Declared::grid_axes` reports a wholly unused
+// `global_invocation_id` as reading ALL THREE axes, so the non-recurrent
+// variants claimed to read `gid.y` while their grid states `1` there, and
+// `driver-wgpu::geometry`'s flat-axis sweep read that as three kernels whose
+// every index past the first is never written. The sweep was right to ask; the
+// declaration was what lied.
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+//#if defined(PIE_RECURRENT)
         @builtin(global_invocation_id) gid: vec3<u32>,
+//#endif
         @builtin(workgroup_id) wid: vec3<u32>) {
 //#if defined(PIE_RECURRENT)
     let n = i32(wid.z);

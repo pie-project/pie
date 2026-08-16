@@ -105,6 +105,11 @@ fn init_tracing() {
 #[pyo3(text_signature = "(toml_str)")]
 fn bootstrap(py: Python<'_>, toml_str: &str) -> PyResult<PyEngineHandle> {
     init_tracing();
+    // The CLI does this in `bootstrap::install_crypto_provider`; the wheel does
+    // not link that crate, and every HTTPS client in the engine (inferlet
+    // registry fetches, blob loads) is built on `rustls-no-provider` and would
+    // fail to build a client without a backend chosen first. Idempotent.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cfg: ServeConfig = toml::from_str(toml_str)
         .map_err(|e| PyValueError::new_err(format!("parse config TOML: {e}")))?;
     cfg.validate()

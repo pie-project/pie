@@ -23,3 +23,7 @@
 
 #[cfg(feature = "chat")]
 pub mod chat;
+
+/// This architecture as llama.cpp spells it.
+#[cfg(feature = "contract")]
+pub mod import;

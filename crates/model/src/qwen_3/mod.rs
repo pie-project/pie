@@ -18,6 +18,16 @@
 // import carries that method's gate. It used to ride along with
 // `OnceLock`, which `rows()` needed unconditionally until
 // `rows_of!` absorbed it.
+/// This generation as llama.cpp spells it.
+#[cfg(feature = "contract")]
+pub mod import;
+
+/// This generation's MIXTURE as llama.cpp spells it. A second module and
+/// not a second table in the first: the GGUF architecture string is
+/// `qwen3moe` and not `qwen3`, and a pass is per input vocabulary.
+#[cfg(feature = "contract")]
+pub mod import_moe;
+
 #[cfg(feature = "chat")]
 use std::sync::Arc;
 
