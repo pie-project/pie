@@ -413,16 +413,31 @@ private:
         }
         // MXFP4 pairs E2M1 elements with E8M0 exponents; Int4B8 pairs
         // biased nibbles with plain BF16 factors; FP8 pairs a byte per element
-        // with F32 reciprocal scales. No kernel reads another's factor format.
+        // with reciprocal scales the kernel reads as F32 — shipped either F32
+        // or BF16 (Qwen3.6-FP8 stores `weight_scale_inv` BF16), and a BF16
+        // slab is widened here with the cast kernel rather than in the plan,
+        // where the cast's staged operand would be untyped bytes. No kernel
+        // reads another's factor format.
+        const bool fp8_bf16_factors = fp8 && factors.dtype() == DType::BF16;
         const DType want_factors =
             mxfp4 ? DType::E8M0 : (int4b8 ? DType::BF16 : DType::FP32);
-        if (factors.dtype() != want_factors) {
+        if (factors.dtype() != want_factors && !fp8_bf16_factors) {
             throw std::runtime_error(
                 "rust storage executor: this scheme's block scales are " +
                 std::string(dtype_name(want_factors)) +
                 ", but the factor operand declares " +
                 std::string(dtype_name(factors.dtype())));
         }
+        DeviceTensor widened_factors;
+        const void* factor_data = factors.data();
+#if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
+        if (fp8_bf16_factors) {
+            widened_factors = DeviceTensor::allocate(DType::FP32, factors.shape());
+            // Stream 0, like the dequant launch below that reads it.
+            cast_tensor_to_ptr(factors, widened_factors.data(), DType::FP32);
+            factor_data = widened_factors.data();
+        }
+#endif
 
         DeviceTensor scratch = acquire_scale_source(
             instr, source, fp8 ? rows * cols : rows * cols / 2);
@@ -439,7 +454,7 @@ private:
             kernels::launch_dequant_fp8_e4m3_to_bf16_blocked(
                 static_cast<const std::uint8_t*>(scratch.data()),
                 dst,
-                static_cast<const float*>(factors.data()),
+                static_cast<const float*>(factor_data),
                 static_cast<int>(rows),
                 static_cast<int>(cols),
                 static_cast<int>(row_block),
@@ -469,6 +484,7 @@ private:
         (void)scratch;
         (void)dst;
         (void)row_block;
+        (void)factor_data;
         throw std::runtime_error(
             "rust storage executor: CUDA TileMap Scale compiled without CUDA "
             "headers");

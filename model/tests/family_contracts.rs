@@ -554,11 +554,15 @@ fn gdn_scale(j: usize) -> f32 {
 /// An FP8-GDN checkpoint with *real bytes*: every `linear_attn` projection
 /// ships E4M3 beside a bf16 `weight_scale_inv` in 4x4 blocks, and the file
 /// holds the values `gdn_value`/`gdn_scale` state so the host executor can be
-/// checked against arithmetic done here. K = V = 8 with 4-row blocks keeps
-/// every tp=2 band on a block boundary; everything else is zero-filled bf16.
+/// checked against arithmetic done here. K = 8 and V = 16 with 4-row blocks
+/// keep every tp=2 band on a block boundary while making the three bands
+/// *unequal* — the real checkpoint's geometry (K/128=16, V/128=48), whose
+/// per-rank scale rows are runs of unequal length that no single strided
+/// walk covers, so the gathered factors go through a staging buffer exactly
+/// as they do on the pod. Everything else is zero-filled bf16.
 fn qwen3_5_fp8_gdn_checkpoint() -> CheckpointMetadata {
     let hidden = 8i64;
-    let (k_dim, v_dim) = (8i64, 8i64);
+    let (k_dim, v_dim) = (8i64, 16i64);
     let conv_dim = 2 * k_dim + v_dim;
     let block = 4i64;
     let fp8 = Encoding::Raw(DType::F8E4M3);
@@ -679,6 +683,15 @@ fn qwen3_5_fp8_gdn_dequantizes_to_expected_bf16() {
                 Visibility::Internal,
                 "{leaf}: factors are load-time only, not a bind name"
             );
+            // At the checkpoint's own dtype: a cast to F32 in the plan hands
+            // the CUDA executor an operand it cannot type — a staged gather
+            // is untyped bytes to it — so the widening belongs to the Scale
+            // kernel, not the contract.
+            assert_eq!(
+                scales.encoding,
+                Encoding::Raw(DType::BF16),
+                "{leaf}: factors ship as the checkpoint stores them"
+            );
         }
         let plan = compile_load_plan(&checkpoint, &contract, target.clone())
             .expect("compiling failed");
@@ -710,6 +723,44 @@ fn qwen3_5_fp8_gdn_dequantizes_to_expected_bf16() {
             assert_eq!(transform.scale_blocks, vec![4, 4]);
             assert_eq!(transform.from, Some(QuantScheme::Fp8E4M3));
         }
+        // Every Cast must be one the CUDA engine can actually run: a *dense*
+        // file source (its cast path refuses non-compact sources), or an
+        // input buffer backed by a declared tensor (an anonymous buffer is
+        // typed u8 there, and u8 -> fp32 is — correctly — unsupported).
+        // This is the regression the real checkpoint caught at tp 2: the
+        // factors' cast read a staged, untyped gather of unequal bands.
+        for instr in &plan.instrs {
+            let StorageInstr::TileMap {
+                kind: TileMapKind::Cast,
+                source,
+                inputs,
+                ..
+            } = instr
+            else {
+                continue;
+            };
+            match source {
+                Some(source) => assert!(
+                    source.stride.is_dense(),
+                    "tp{tp_size} rank {tp_rank}: a Cast source the CUDA engine \
+                     refuses as non-compact: {source:?}"
+                ),
+                None => {
+                    let input = inputs.first().expect("Cast with no source has an input");
+                    let typed = plan
+                        .buffers
+                        .iter()
+                        .find(|decl| decl.id == *input)
+                        .is_some_and(|decl| decl.tensor.is_some());
+                    assert!(
+                        typed,
+                        "tp{tp_size} rank {tp_rank}: a Cast reads buffer \
+                         {input:?}, which no tensor declaration types — the \
+                         CUDA engine would run it as u8"
+                    );
+                }
+            }
+        }
 
         // The CUDA plan above pins what the driver will run; the host replay
         // executes the same contract compiled against the host's own mask.
@@ -723,24 +774,29 @@ fn qwen3_5_fp8_gdn_dequantizes_to_expected_bf16() {
         )
         .expect("host execution failed");
         // This rank's global rows/cols per projection: at tp=2 the qkv rows
-        // are the rank's half of each of the [K|K|V] bands, z splits rows,
-        // out_proj splits columns.
-        let half = |base: i64| -> Vec<i64> {
-            (base + i64::from(tp_rank) * 4..base + i64::from(tp_rank) * 4 + 4).collect()
+        // are the rank's half of each of the [K=8 | K=8 | V=16] bands, z
+        // splits rows, out_proj splits columns.
+        let half = |base: i64, len: i64| -> Vec<i64> {
+            let start = base + i64::from(tp_rank) * len / 2;
+            (start..start + len / 2).collect()
         };
         let (qkv_rows, z_rows, out_cols) = if tp_size == 1 {
-            ((0..24).collect::<Vec<i64>>(), all8.clone(), all8.clone())
+            (
+                (0..32).collect::<Vec<i64>>(),
+                (0..16).collect::<Vec<i64>>(),
+                (0..16).collect::<Vec<i64>>(),
+            )
         } else {
             (
-                [half(0), half(8), half(16)].concat(),
-                half(0),
-                half(0),
+                [half(0, 8), half(8, 8), half(16, 16)].concat(),
+                half(0, 16),
+                half(0, 16),
             )
         };
         for (leaf, rows, cols, full_cols) in [
             ("in_proj_qkv", &qkv_rows, &all8, 8),
             ("in_proj_z", &z_rows, &all8, 8),
-            ("out_proj", &all8, &out_cols, 8),
+            ("out_proj", &all8, &out_cols, 16),
         ] {
             let name = format!("{la}{leaf}.weight");
             let bytes = storage
@@ -757,8 +813,8 @@ fn qwen3_5_fp8_gdn_dequantizes_to_expected_bf16() {
 }
 
 /// A tp that splits inside a scale block has no representable scale slice —
-/// K = V = 8 in 4-row blocks cannot split 4 ways — and must be refused
-/// rather than approximated.
+/// K = 8 in 4-row blocks cannot split 4 ways — and must be refused rather
+/// than approximated.
 #[test]
 fn qwen3_5_fp8_gdn_refuses_misaligned_tp() {
     let mut facts = facts("qwen3_5", 2);
