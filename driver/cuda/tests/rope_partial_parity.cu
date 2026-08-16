@@ -12,6 +12,21 @@
 //     does it reproduce vLLM's `cos_sin_cache` exactly. Checked against that
 //     table itself, with NO tolerance and NO transcendental evaluated here.
 //
+// REPRODUCING THIS WITHOUT BUILDING THE WHOLE DRIVER. `driver/cuda/CMakeLists.txt`
+// sets no global CUDA flags and no numeric ones anywhere: no `-use_fast_math`,
+// no `--fmad` override, no `-prec-div`/`-prec-sqrt`/`-ftz`. The only per-target
+// CUDA options are `--extended-lambda --expt-relaxed-constexpr` plus warning
+// flags, none of which affect arithmetic. So compiling just `kernels/rope.cu`
+// and this file directly --
+//
+//   nvcc -std=c++17 -O2 -I<src> -I<tests> -gencode arch=compute_89,code=sm_89 \
+//        -c kernels/rope.cu tests/rope_partial_parity.cu
+//
+// -- is numerically identical to the real target, and avoids building 77
+// sources to check a rounding question. It also means `sincosf` is the accurate
+// library routine and not silently mapped onto the `__sincosf` intrinsic, which
+// a fast-math flag would do and which would make this whole file inert.
+//
 // The fp64 reference below is legitimate for the first and ILLEGITIMATE for
 // the second. vLLM's table is a deliberately rounded bf16 value, so a kernel
 // that is more accurate than it is further from parity, not closer. Do not
@@ -481,10 +496,41 @@ void run_default_path_differs() {
 // The read-back probe above pins the TABLE but not the ROTATE: with a=1, b=0
 // an fp32 rotate and a bf16 rotate agree trivially. This drives random bf16
 // operands and reproduces the rotate exactly -- three separately-rounded
-// operations per output, in Triton's operand order -- with cos/sin taken FROM
-// THE GOLDEN TABLE rather than recomputed, so no transcendental is evaluated
-// here either and there is nothing to be tolerant about.
-void run_vllm_rotate_structure(int head_dim) {
+// operations per output, in Triton's operand order. No transcendental is
+// evaluated here, so there is nothing to be tolerant about.
+//
+// THE REFERENCE COS/SIN COME FROM PIE'S OWN TABLE, read back off the device,
+// NOT from the golden. That is deliberate and it is the difference between one
+// defect reporting once and reporting three times.
+//
+// An earlier version sourced them from `g::kCosSinCache`. Because Pie's table
+// differs from the reference at 19 entries, every one of those entries poisoned
+// this check too -- amplified by 6 heads x 2 lanes per affected pair, it turned
+// 19 table entries into 130 and 132 "rotate" failures, on rows that had nothing
+// wrong with their rotation. A reader then had to run a separate probe to
+// discover that the rotate check was failing for a table reason.
+//
+// Sourcing from Pie's own table makes this check answer exactly one question:
+// given whatever cos/sin the kernel actually has, does it combine them with q/k
+// correctly? Table-vs-reference parity is owned solely by
+// `run_vllm_golden_table`, which is red at 19 and is where that fact belongs.
+//
+// This does NOT make the check circular, and that was verified rather than
+// asserted -- three candidate kernels simulated against each other:
+//
+//   variant                 read-back table    random-operand rotate
+//   correct bf16 rotate     identical          identical
+//   fp32 rotate             IDENTICAL          differs, 2181/4000
+//   swapped operand order   differs            differs, 4000/4000
+//
+// The middle row is the whole point. An fp32 rotate is INVISIBLE to the
+// read-back -- with a = 1.0, b = 0.0 the products are exact and every variant
+// agrees -- so if the extraction could launder a rotate defect, that is the one
+// it would launder. It does not: under random operands the check catches it on
+// more than half the pairs. A wrong pair offset or operand order is caught by
+// both probes.
+void run_vllm_rotate_structure(int head_dim,
+                               const std::vector<std::uint16_t>& pie_table) {
     namespace g = pie_rope_golden;
     constexpr int q_heads = 4, kv_heads = 2;
     const int tokens = g::kRows;
@@ -508,9 +554,9 @@ void run_vllm_rotate_structure(int head_dim) {
             for (int h = 0; h < heads; ++h) {
                 const int base = (n * heads + h) * head_dim;
                 for (int j = 0; j < angles; ++j) {
-                    const float c = bf16_to_float(g::kCosSinCache[n].entry[j]);
-                    const float s =
-                        bf16_to_float(g::kCosSinCache[n].entry[angles + j]);
+                    const int row = n * g::kRotaryDim;
+                    const float c = bf16_to_float(pie_table[row + j]);
+                    const float s = bf16_to_float(pie_table[row + angles + j]);
                     const float a = bf16_to_float(buf[base + j]);
                     const float b = bf16_to_float(buf[base + j + angles]);
                     const float ac = bf16_to_float(float_to_bf16(a * c));
@@ -586,6 +632,11 @@ int main() {
         return 77;  // ctest's conventional "skipped"
     }
 
+    // Fixture sanity first, genuinely before any GPU work: every input it reads
+    // is `constexpr`, so it cannot depend on device state, and a fixture that
+    // cannot fail should be reported before spending a single kernel launch.
+    run_golden_slice_is_not_blind();
+
     const Case cases[] = {
         // The shape that was broken in production.
         {"qwen3.6-27b", 256, 64, 8, 2, 4, 1e7f},
@@ -601,11 +652,14 @@ int main() {
 
     // Parity against vLLM's own cos_sin_cache. Zero tolerance, both directions:
     // knob-on must reproduce it, knob-off must not.
-    run_golden_slice_is_not_blind();
     run_vllm_golden_table();
     run_default_path_differs();
-    run_vllm_rotate_structure(256);   // production shape
-    run_vllm_rotate_structure(128);   // head_dim != 4 * rotary_dim
+    // Reference cos/sin for the rotate checks are Pie's OWN table, so a table
+    // residual cannot masquerade as a rotate failure. See the note above
+    // `run_vllm_rotate_structure`.
+    const std::vector<std::uint16_t> pie_table = read_back_table(Path::VllmTable);
+    run_vllm_rotate_structure(256, pie_table);   // production shape
+    run_vllm_rotate_structure(128, pie_table);   // head_dim != 4 * rotary_dim
 
     if (g_failures != 0) {
         std::printf("\n%d check(s) FAILED\n", g_failures);
