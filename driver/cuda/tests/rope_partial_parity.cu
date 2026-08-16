@@ -8,7 +8,7 @@
 //     question is "does it rotate the right dims by the right angle" and the
 //     historical bugs were whole-number-sized.
 //
-//   * `launch_rope_partial_vllm_table_bf16` (PIE_ROPE_VLLM_TABLE=1) -- BITS:
+//   * `launch_rope_partial_vllm_table_bf16` (PIE_DEBUG_ROPE_VLLM_TABLE=1) -- BITS:
 //     does it reproduce vLLM's `cos_sin_cache` exactly. Checked against that
 //     table itself, with NO tolerance and NO transcendental evaluated here.
 //

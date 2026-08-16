@@ -63,7 +63,7 @@ __device__ __forceinline__ void rope_cos_sin(
     __sincosf(ang, &sin_v, &cos_v);
 }
 
-// ── vLLM cos/sin-table primitives (opt-in, PIE_ROPE_VLLM_TABLE=1) ──────────
+// ── vLLM cos/sin-table primitives (opt-in, PIE_DEBUG_ROPE_VLLM_TABLE=1) ──────────
 //
 // vLLM never evaluates trig on a GPU. `RotaryEmbedding.__init__` builds
 // `cos_sin_cache` once on the host in fp32 -- inv_freq from a weak-scalar

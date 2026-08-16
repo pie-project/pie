@@ -198,7 +198,7 @@ void launch_rope_partial_bf16_position_delta(
 // and casts q/k down to match, so a Pie that computed accurate fp32 trig on the
 // fly would be MORE accurate than the reference and still mismatch it.
 //
-// Reached in production only via `PIE_ROPE_VLLM_TABLE=1`, which redirects both
+// Reached in production only via `PIE_DEBUG_ROPE_VLLM_TABLE=1`, which redirects both
 // `launch_rope_partial_bf16` and `..._position_delta`. Exposed directly so a
 // test can drive both pipelines in one process without touching the
 // environment. Default OFF: this moves every partial-rotary model, Gemma-4
@@ -216,7 +216,7 @@ void launch_rope_partial_vllm_table_bf16(
 
 // Blocks that ran past the end of the host-built table and fell back to device
 // trig, which is NOT bit-parity with the reference. Non-zero means the table is
-// too small for the context in use -- raise PIE_ROPE_VLLM_TABLE_MAX_POS. This
+// too small for the context in use -- raise PIE_DEBUG_ROPE_VLLM_TABLE_MAX_POS. This
 // synchronises; call it from tests and diagnostics, not from a hot path.
 unsigned int rope_vllm_table_oob_blocks(float theta, int rotary_dim);
 
@@ -225,7 +225,7 @@ int rope_vllm_table_capacity_for(float theta, int rotary_dim);
 
 // Which host trig built the table: "exact" (correctly rounded; the default,
 // and deterministic across C libraries) or "libm" (`cosf`/`sinf`, selected by
-// PIE_ROPE_VLLM_TABLE_TRIG=libm, which correlates slightly better with the
+// PIE_DEBUG_ROPE_VLLM_TABLE_TRIG=libm, which correlates slightly better with the
 // reference's MKL but is a property of the build host). This changes the
 // table's bits, so a parity result is uninterpretable without it.
 const char* rope_vllm_table_trig_name();

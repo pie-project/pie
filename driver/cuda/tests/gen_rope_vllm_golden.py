@@ -55,7 +55,7 @@ one. Measured against the real MKL reference, it does not:
 
 The driver therefore DEFAULTS to the correctly rounded build, which is both the
 closer of the two and deterministic across C libraries;
-PIE_ROPE_VLLM_TABLE_TRIG=libm selects the other.
+PIE_DEBUG_ROPE_VLLM_TABLE_TRIG=libm selects the other.
 
 A claim that cosf/sinf scores 0 mismatches in the campaign window and 1 overall
 is NOT true and should not be re-derived. It came from misreading an artifact

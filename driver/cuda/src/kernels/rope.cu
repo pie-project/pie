@@ -841,7 +841,7 @@ __global__ void rope_partial_vllm_table_bf16_kernel(
 //
 // CAPACITY. Indexed by absolute position, so the table must span the context.
 // Default 262144 positions (33.5 MB at rotary_dim=64), overridable with
-// PIE_ROPE_VLLM_TABLE_MAX_POS. Beyond it the kernel degrades to device trig --
+// PIE_DEBUG_ROPE_VLLM_TABLE_MAX_POS. Beyond it the kernel degrades to device trig --
 // i.e. to the 4-in-1.9M behaviour above -- and bumps `oob` so that degradation
 // cannot be silent. The right fix is to size this from
 // `cfg.max_position_embeddings`, which is in scope at all eight call sites;
@@ -925,7 +925,7 @@ std::uint16_t bf16_rne_bits(float f) {
 // PIE_CUDA_RUNTIME_IMAGE=nvidia/cuda:12.9.1-cudnn-runtime-ubuntu22.04, so the
 // decoder runs on Ubuntu 22.04.
 //
-// `PIE_ROPE_VLLM_TABLE_TRIG=libm` selects the `cosf`/`sinf` build, so the
+// `PIE_DEBUG_ROPE_VLLM_TABLE_TRIG=libm` selects the `cosf`/`sinf` build, so the
 // comparison stays reproducible and the choice revisitable rather than
 // entombed. Do not chase the remaining 19: the reference's exact bits require
 // vendoring closed-source, x86-only oneMKL into a CUDA driver's host-side table
@@ -935,7 +935,7 @@ enum class TableTrig { Libm, Exact };
 
 TableTrig vllm_table_trig() {
     static const TableTrig mode = [] {
-        const char* v = std::getenv("PIE_ROPE_VLLM_TABLE_TRIG");
+        const char* v = std::getenv("PIE_DEBUG_ROPE_VLLM_TABLE_TRIG");
         if (v != nullptr && std::strcmp(v, "libm") == 0) return TableTrig::Libm;
         return TableTrig::Exact;
     }();
@@ -944,7 +944,7 @@ TableTrig vllm_table_trig() {
 
 int vllm_table_capacity() {
     static const int cap = [] {
-        if (const char* v = std::getenv("PIE_ROPE_VLLM_TABLE_MAX_POS")) {
+        if (const char* v = std::getenv("PIE_DEBUG_ROPE_VLLM_TABLE_MAX_POS")) {
             const int n = std::atoi(v);
             if (n > 0) return n;
         }
@@ -1052,7 +1052,7 @@ const VllmCosSinTable* vllm_table_for(float theta, int rotary_dim) {
 // the default flips.
 bool rope_vllm_table_enabled() {
     static const bool enabled = [] {
-        const char* v = std::getenv("PIE_ROPE_VLLM_TABLE");
+        const char* v = std::getenv("PIE_DEBUG_ROPE_VLLM_TABLE");
         return v != nullptr && v[0] != '\0' && v[0] != '0';
     }();
     return enabled;
