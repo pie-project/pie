@@ -740,7 +740,6 @@ std::string dense_cache_signature() {
 struct DenseGemmTuner {
     std::mutex mu;
     std::unordered_map<std::uint64_t, DenseTactic> chosen;
-    std::unordered_map<std::uint64_t, int> seen;
     TuningCache disk{"dense_gemm.txt", dense_cache_signature()};
 
     static DenseGemmTuner& instance() {
@@ -846,17 +845,17 @@ bool dense_tactic_for(cublasHandle_t caller, const void* W, int M, int N,
     }
     if (tuner.chosen.size() >= kMaxTunedShapes) return false;
 
-    // Measuring a shape costs ~10 kernel launches per candidate plus a stall,
-    // which is only worth paying for a shape that will come back. Decode
-    // shapes are seen exactly once here -- during graph capture -- and then
-    // replayed forever from the graph, so those must be tuned on sight or
-    // never. Everything else is prefill, whose M is the token count and so is
-    // effectively arbitrary; make it prove it recurs before spending anything
-    // on it.
-    if (capturing == cudaStreamCaptureStatusNone && ++tuner.seen[key] < 2) {
-        return false;
-    }
-
+    // The tactic must be fixed BEFORE a shape's first result can be observed.
+    // This used to defer tuning until a prefill shape "proved it recurs"
+    // (second sighting), which made the very first call of a shape run the
+    // default kernel and every later identical call run the tuned one — two
+    // numerically different accumulation orders for the same request, i.e. an
+    // engine whose prefill bits depend on whether a same-length request ran
+    // earlier in its lifetime. Tuning on sight closes that: one shape, one
+    // kernel, chosen before first use. The sweep (~10 launches per candidate
+    // plus a stall) is paid once per shape per machine — the on-disk memo
+    // answers for free on every later boot — and kMaxTunedShapes bounds the
+    // total spend for workloads with an unbounded spread of prompt lengths.
     DenseTactic tactic{};
     if (!tuner.disk.lookup(key, &tactic.kind, &tactic.algo) ||
         tactic.kind < 0 || tactic.kind > static_cast<int>(GemmKind::Gemv)) {
@@ -882,9 +881,9 @@ bool dense_tactic_for(cublasHandle_t caller, const void* W, int M, int N,
 }
 
 // Side-effect-free peek at the tuner's verdict for this shape. Deliberately
-// does *not* call `dense_tactic_for`: that bumps the `seen` counter and can
-// trigger a tune, and asking "would you have picked the GEMV?" must not
-// change the answer to "what will you pick?".
+// does *not* call `dense_tactic_for`: that can trigger a tune, and asking
+// "would you have picked the GEMV?" must not change the answer to "what
+// will you pick?".
 bool dense_tactic_already_gemv(int M, int N, int K, float beta) {
     auto& tuner = DenseGemmTuner::instance();
     std::lock_guard<std::mutex> lock(tuner.mu);

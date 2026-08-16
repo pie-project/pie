@@ -2252,8 +2252,20 @@ int Context::Impl::launch_body(
     if (needs_growth) {
         recalibrate_elastic_budget(/*reset_hard_ceiling=*/false);
     }
-    const auto commit = pie_cuda_driver::commit_cuda_arena_targets_atomically(
+    auto commit = pie_cuda_driver::commit_cuda_arena_targets_atomically(
         elastic_pool_, targets);
+    if (commit.outcome != pie_cuda_driver::CudaCommitOutcome::Committed) {
+        // The budget is a cached view of free device memory, captured the
+        // last time a growing frame recalibrated. A transient external
+        // allocation (a large prefill's workspace peak) can depress that
+        // snapshot, and frames that fit inside committed arenas never
+        // refresh it — leaving every later frame rejected against a stale
+        // number while the device memory is actually free. Refresh from the
+        // device and retry once before declaring the frame unservable.
+        recalibrate_elastic_budget(/*reset_hard_ceiling=*/false);
+        commit = pie_cuda_driver::commit_cuda_arena_targets_atomically(
+            elastic_pool_, targets);
+    }
     if (commit.outcome == pie_cuda_driver::CudaCommitOutcome::Exhausted) {
         return PIE_STATUS_EXHAUSTED;
     }
