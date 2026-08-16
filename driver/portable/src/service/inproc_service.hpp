@@ -37,6 +37,12 @@ private:
     bool verbose_;
     std::uint64_t handled_ = 0;
     pie_driver::ResponseBuilder response_builder_;
+
+    // True when the KV backend does not support ggml_backend_tensor_get
+    // at non-zero offsets (ggml-Vulkan silently returns zeros for such
+    // reads). Set once in the constructor; guards CopyD2D and CopyD2H.
+    // See: https://github.com/pie-project/pie/issues/418
+    bool needs_full_tensor_staging_ = false;
 };
 
 }  // namespace service
