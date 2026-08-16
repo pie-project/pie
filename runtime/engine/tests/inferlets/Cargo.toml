@@ -7,6 +7,7 @@ members = [
     "direct-channel-e2e",
     "direct-mixed-e2e",
     "generate",
+    "declared-budget",
     "generate-gdn",
     "generate-gdn-n1",
     "rs-buffer-bench",

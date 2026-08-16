@@ -27,8 +27,20 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 has_thinking: true,
                 has_tools: true,
                 tool_call_format: ToolCallFormat::Json,
+                // Qwen3's template opens the model's turn bare and, when the
+                // caller turns thinking off, closes an empty reasoning block
+                // after the header. An empty suffix here made
+                // `cue_without_thinking()` equal to `cue()`, so the flag could
+                // not change the prompt at all and the model was free to open a
+                // `<think>` block the caller had just declined.
                 generation_suffix: "",
-                thinking_off_suffix: "",
+                thinking_off_suffix: "<think>\n\n</think>\n\n",
+                // Qwen3's template renders the block for a post-query turn only
+                // when that turn is last or carries reasoning; Qwen3.5's renders
+                // one either way.
+                empty_reasoning_header: false,
+                system_before_tools: true,
+                content_call_separator: "\n",
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -47,6 +59,9 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 // was never trained to generate at.
                 generation_suffix: "<think>\n",
                 thinking_off_suffix: "<think>\n\n</think>\n\n",
+                empty_reasoning_header: true,
+                system_before_tools: false,
+                content_call_separator: "\n\n",
                 trim_content: true,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -59,6 +74,9 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 tool_call_format: ToolCallFormat::Json,
                 generation_suffix: "<think>\n",
                 thinking_off_suffix: "<think>\n",
+                empty_reasoning_header: true,
+                system_before_tools: false,
+                content_call_separator: "\n\n",
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -80,6 +98,9 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 tool_call_format: ToolCallFormat::Json,
                 generation_suffix: "",
                 thinking_off_suffix: "",
+                empty_reasoning_header: true,
+                system_before_tools: false,
+                content_call_separator: "\n\n",
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>"],
             },
@@ -124,6 +145,9 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 tool_call_format: ToolCallFormat::Json,
                 generation_suffix: "",
                 thinking_off_suffix: "",
+                empty_reasoning_header: true,
+                system_before_tools: false,
+                content_call_separator: "\n\n",
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },

@@ -79,6 +79,57 @@ pub struct ChatMLConfig {
     /// carry both. A template with no thinking-off form repeats
     /// `generation_suffix` here.
     pub thinking_off_suffix: &'static str,
+    /// Whether a replayed assistant turn past the last user query opens a
+    /// reasoning block even when it carried no reasoning.
+    ///
+    /// Qwen3's template renders one only when the turn is the last message or
+    /// carries `reasoning_content`:
+    ///
+    /// ```jinja
+    /// {%- if loop.index0 > ns.last_query_index %}
+    ///     {%- if loop.last or (not loop.last and reasoning_content) %}
+    /// ```
+    ///
+    /// Qwen3.5 and later dropped the inner condition and open one on every
+    /// post-query turn, so this cannot be one behaviour for both.
+    ///
+    /// The `loop.last` half is a fact about the message LIST and does not reach
+    /// this crate: `assistant_call` is told which side of the last user query
+    /// its turn sits on and nothing else. A conversation whose final message is
+    /// an assistant turn therefore renders no block where Qwen3's template
+    /// renders an empty one -- the rarer of the two cases, and the one that
+    /// cannot be fixed without widening the trait every generation implements.
+    pub empty_reasoning_header: bool,
+    /// Where the caller's system text sits in the turn that declares tools.
+    ///
+    /// Qwen3 and Qwen2.5 open the turn with it and put the declaration after:
+    ///
+    /// ```jinja
+    /// {{- '<|im_start|>system\n' }}
+    /// {%- if messages[0].role == 'system' %}
+    ///     {{- messages[0].content + '\n\n' }}
+    /// {%- endif %}
+    /// {{- "# Tools\n\n..." }}
+    /// ```
+    ///
+    /// Qwen3.5 and later lead with the declaration and nest the system text
+    /// after it. Same two pieces, opposite order, and the order is the prompt.
+    pub system_before_tools: bool,
+    /// What separates non-empty assistant content from the FIRST replayed call.
+    ///
+    /// Qwen3 and Qwen2.5 write a single newline, and the same one before every
+    /// later call:
+    ///
+    /// ```jinja
+    /// {%- if (loop.first and content) or (not loop.first) %}
+    ///     {{- '\n' }}
+    /// {%- endif %}
+    /// ```
+    ///
+    /// Qwen3.5 and later open the first call after a blank line instead. Later
+    /// calls are one newline apart in every generation, so only this one
+    /// separator varies.
+    pub content_call_separator: &'static str,
     /// Whether the checkpoint's template applies `|trim` to message content.
     ///
     /// Qwen3.5 and later do; Qwen3 and Qwen2 emit `message.content` verbatim.
@@ -226,14 +277,15 @@ impl QwenInstruct {
     /// the constraint wins silently -- so the model spends the turn being
     /// steered away from what it was just told to do.
     fn build_tool_system_prompt(tools: &[String], format: ToolCallFormat) -> String {
-        // The opening differs per template generation. Qwen3.5+ is transcribed
-        // from the checkpoint's own `chat_template`; the Json opening is the
-        // pre-existing Qwen3 text, including its leading space, because no
-        // reference for those checkpoints was read here and rewording a prompt
-        // on a hunch is the failure this file exists to stop.
+        // The opening differs per template generation, and both are transcribed
+        // from a checkpoint's own `chat_template`. The Json one used to carry a
+        // leading space that no template has: Qwen3 and Qwen2.5 both write
+        // `# Tools` at the very start of the block, whether or not a system
+        // message precedes it. One character, one token, on every prompt that
+        // declares a tool.
         let mut prompt = String::from(match format {
             ToolCallFormat::Json => {
-                " # Tools\n\n\
+                "# Tools\n\n\
                  You may call one or more functions to assist with the user query.\n\n\
                  You are provided with function signatures within <tools></tools> XML tags:\n\
                  <tools>"
@@ -262,27 +314,23 @@ impl QwenInstruct {
 
     /// The system turn a tool-declaring conversation opens with.
     ///
-    /// The Qwen3.5+ template does not render the caller's system message as its
-    /// own turn when tools are present: it emits ONE system turn that leads
-    /// with the declaration and nests the system content after it. Two turns
-    /// are a different prompt, not a formatting variant.
+    /// No Qwen template renders the caller's system message as its own turn
+    /// when tools are present: they emit ONE system turn holding both pieces.
+    /// Two turns are a different prompt, not a formatting variant. Which piece
+    /// leads is the template's to say -- see `system_before_tools`.
     fn tool_system_body(&self, system: &str, tools: &[String]) -> String {
-        let mut body = Self::build_tool_system_prompt(tools, self.config.tool_call_format);
+        let declaration = Self::build_tool_system_prompt(tools, self.config.tool_call_format);
         let system = system.trim();
-        if !system.is_empty() {
-            body.push_str("\n\n");
-            body.push_str(system);
+        if system.is_empty() {
+            return declaration;
         }
-        body
+        if self.config.system_before_tools {
+            format!("{system}\n\n{declaration}")
+        } else {
+            format!("{declaration}\n\n{system}")
+        }
     }
 
-    /// The `<tool_call>` surface for one replayed call, without its separator.
-    ///
-    /// Arguments arrive as a JSON object — the same string the decoder reports
-    /// in [`ToolEvent::Call`]. String values are written raw and everything
-    /// else as JSON, which is the template's `args_value | string if ... else
-    /// args_value | tojson`; a value that is a bare string would otherwise come
-    /// back quoted and no longer be the value the tool was called with.
     /// A replayed assistant turn's body: reasoning header, content, calls.
     fn assistant_turn_body(
         &self,
@@ -298,28 +346,56 @@ impl QwenInstruct {
         };
 
         let mut body = String::new();
-        if reasoning_header && self.config.has_thinking {
+        let renders_header = self.config.empty_reasoning_header || !reasoning.is_empty();
+        if reasoning_header && self.config.has_thinking && renders_header {
             body.push_str("<think>\n");
             body.push_str(reasoning);
             body.push_str("\n</think>\n\n");
         }
         body.push_str(content);
         for (index, call) in calls.iter().enumerate() {
-            // The template separates the first call from non-empty content by a
-            // blank line and every later call by a single newline.
+            // The template separates the first call from non-empty content by
+            // `content_call_separator` and every later call by a newline.
             if index == 0 {
                 if !content.trim().is_empty() {
-                    body.push_str("\n\n");
+                    body.push_str(self.config.content_call_separator);
                 }
             } else {
                 body.push('\n');
             }
-            body.push_str(&Self::tool_call_surface(call));
+            body.push_str(&self.tool_call_surface(call));
         }
         body
     }
 
-    fn tool_call_surface(call: &ToolCall) -> String {
+    /// The `<tool_call>` surface for one replayed call, without its separator.
+    ///
+    /// In the surface the checkpoint's own template teaches -- the same
+    /// `ToolCallFormat` the declaration demonstrates, the grammar admits and
+    /// the decoder parses. This was the one of those five sites that ignored
+    /// the field, so a Qwen3 or Qwen2.5 conversation was replayed to the model
+    /// in a syntax its template never shows and its own next call will not use.
+    ///
+    /// Arguments arrive as a JSON object — the same string the decoder reports
+    /// in [`ToolEvent::Call`]. `Json` writes it through, which is the
+    /// template's `tool_call.arguments` verbatim when it is a string. `Qwen35Xml`
+    /// writes string values raw and everything else as JSON, which is that
+    /// template's `args_value | string if ... else args_value | tojson`; a value
+    /// that is a bare string would otherwise come back quoted and no longer be
+    /// the value the tool was called with.
+    fn tool_call_surface(&self, call: &ToolCall) -> String {
+        if self.config.tool_call_format == ToolCallFormat::Json {
+            // `{"name": "NAME", "arguments": {...}}`, the Hermes-style body
+            // Qwen3's and Qwen2.5's templates write between the tags.
+            let arguments = match call.arguments_json.trim() {
+                "" => "{}",
+                arguments => arguments,
+            };
+            return format!(
+                "<tool_call>\n{{\"name\": \"{}\", \"arguments\": {arguments}}}\n</tool_call>",
+                call.name
+            );
+        }
         let mut surface = format!("<tool_call>\n<function={}>\n", call.name);
         if let Ok(serde_json::Value::Object(arguments)) =
             serde_json::from_str::<serde_json::Value>(&call.arguments_json)
@@ -1056,6 +1132,9 @@ mod tests {
                 has_tools: true,
                 generation_suffix: "",
                 thinking_off_suffix: "",
+                empty_reasoning_header: true,
+                system_before_tools: false,
+                content_call_separator: "\n\n",
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -1071,6 +1150,9 @@ mod tests {
                 has_tools: true,
                 generation_suffix: "",
                 thinking_off_suffix: "",
+                empty_reasoning_header: true,
+                system_before_tools: false,
+                content_call_separator: "\n\n",
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -1086,6 +1168,9 @@ mod tests {
                 has_tools: false,
                 generation_suffix: "",
                 thinking_off_suffix: "",
+                empty_reasoning_header: true,
+                system_before_tools: false,
+                content_call_separator: "\n\n",
                 trim_content: false,
                 stop_tokens: &["<|im_end|>"],
             },
@@ -1165,10 +1250,62 @@ mod tests {
                 has_tools: true,
                 generation_suffix: "<think>\n",
                 thinking_off_suffix: "<think>\n\n</think>\n\n",
+                empty_reasoning_header: true,
+                system_before_tools: false,
+                content_call_separator: "\n\n",
                 trim_content: true,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )
+    }
+
+    /// The `qwen3` arm `pie_model::instruct::create` selects, field for field.
+    ///
+    /// A separate helper from `qwen3()` above, which is a generic ChatML
+    /// fixture and does not claim to be any checkpoint: the four fields this
+    /// one restates are the ones Qwen3's template answers differently from
+    /// Qwen3.5's, so a test that means "the Qwen3 checkpoint" has to say them.
+    fn qwen3_arm() -> QwenInstruct {
+        QwenInstruct::new(
+            make_tok(),
+            ChatMLConfig {
+                tool_call_format: ToolCallFormat::Json,
+                has_thinking: true,
+                has_tools: true,
+                generation_suffix: "",
+                thinking_off_suffix: "<think>\n\n</think>\n\n",
+                empty_reasoning_header: false,
+                system_before_tools: true,
+                content_call_separator: "\n",
+                trim_content: false,
+                stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+            },
+        )
+    }
+
+    /// Qwen3's template renders the reasoning block on a post-query turn only
+    /// when the turn is last or carries reasoning; Qwen3.5's renders one either
+    /// way. Pie emitted an empty block for both, which is 19 characters the
+    /// Qwen3 checkpoint never sees in that position.
+    #[test]
+    fn an_empty_reasoning_header_is_rendered_only_where_the_template_renders_one() {
+        let call = ToolCall { name: "f".into(), arguments_json: "{}".into() };
+        let qwen3 = qwen3_arm();
+        let bare = qwen3.assistant_turn_body("", &[call.clone()], true);
+        assert!(!bare.starts_with("<think>"), "{bare}");
+        // Reasoning present: the block is the template's in both generations.
+        assert!(
+            qwen3
+                .assistant_turn_body("<think>\nwhy\n</think>\n\nok", &[], true)
+                .starts_with("<think>\nwhy\n</think>\n\n")
+        );
+        // And the Qwen3.5+ arm is unmoved: still an empty block on a turn that
+        // carried no reasoning.
+        assert!(
+            qwen3_6()
+                .assistant_turn_body("", &[call], true)
+                .starts_with("<think>\n\n</think>\n\n")
+        );
     }
 
     /// The template opens the model's turn INSIDE a reasoning block, and closes
@@ -1235,8 +1372,14 @@ mod tests {
         );
         // Content and a call are separated by a blank line, later calls by one.
         assert_eq!(
-            inst.assistant_turn_body("<think>\nwhy\n</think>\n\nok", &[call.clone(), call], true),
+            inst.assistant_turn_body("<think>\nwhy\n</think>\n\nok", &[call.clone(), call.clone()], true),
             "<think>\nwhy\n</think>\n\nok\n\n<tool_call>\n<function=f>\n</function>\n</tool_call>\n<tool_call>\n<function=f>\n</function>\n</tool_call>"
+        );
+        // Qwen3's template writes ONE newline there, and the same one before
+        // every later call.
+        assert_eq!(
+            qwen3_arm().assistant_turn_body("<think>\nwhy\n</think>\n\nok", &[call.clone(), call], true),
+            "<think>\nwhy\n</think>\n\nok\n<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call>\n<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call>"
         );
         // Before the boundary the header is dropped, which is what `assistant`
         // has always rendered.
@@ -1244,19 +1387,27 @@ mod tests {
     }
 
     /// The surface the checkpoint's template demonstrates, byte for byte --
-    /// `encoded_turns` used to render a replayed call as an EMPTY turn.
+    /// `encoded_turns` used to render a replayed call as an EMPTY turn, and
+    /// then to render every arm's in the Qwen3.5 XML one.
     #[test]
     fn a_replayed_call_renders_the_surface_the_template_teaches() {
         let call = ToolCall {
             name: "get_weather".into(),
-            arguments_json: r#"{"city":"Paris","days":3}"#.into(),
+            arguments_json: r#"{"city": "Paris", "days": 3}"#.into(),
         };
         assert_eq!(
-            QwenInstruct::tool_call_surface(&call),
+            qwen3_6().tool_call_surface(&call),
             "<tool_call>\n<function=get_weather>\n\
              <parameter=city>\nParis\n</parameter>\n\
              <parameter=days>\n3\n</parameter>\n\
              </function>\n</tool_call>"
+        );
+        // The Json arms get the body their own template writes, arguments
+        // through as they arrived.
+        assert_eq!(
+            qwen3_arm().tool_call_surface(&call),
+            "<tool_call>\n{\"name\": \"get_weather\", \
+             \"arguments\": {\"city\": \"Paris\", \"days\": 3}}\n</tool_call>"
         );
     }
 
@@ -1280,11 +1431,33 @@ mod tests {
         assert!(body.contains("<IMPORTANT>"));
         // No system content, no separator and no empty tail.
         assert!(inst.tool_system_body("  ", &["{}".to_string()]).ends_with("</IMPORTANT>"));
-        // The Json-format templates keep the declaration they had; nothing here
-        // was measured against those checkpoints.
+    }
+
+    /// Qwen3 and Qwen2.5 write the caller's system text FIRST and the
+    /// declaration after it; Qwen3.5+ do the reverse. Same two pieces, and the
+    /// order is the prompt.
+    #[test]
+    fn the_declaration_and_the_system_text_are_ordered_as_the_template_writes_them() {
+        let tools = ["{}".to_string()];
+        let qwen3 = qwen3_arm();
+        let body = qwen3.tool_system_body("You are a helpful assistant.", &tools);
+        assert!(body.starts_with("You are a helpful assistant.\n\n# Tools\n\n"), "{body}");
+        // The declaration opens with `# Tools` and no leading space -- no
+        // template has one, and it cost a token on every tool-declaring prompt.
         assert!(
-            QwenInstruct::build_tool_system_prompt(&["{}".to_string()], ToolCallFormat::Json)
-                .starts_with(" # Tools")
+            QwenInstruct::build_tool_system_prompt(&tools, ToolCallFormat::Json)
+                .starts_with("# Tools")
+        );
+        // With no system text the turn is the declaration alone, either way up.
+        assert_eq!(
+            qwen3.tool_system_body("  ", &tools),
+            QwenInstruct::build_tool_system_prompt(&tools, ToolCallFormat::Json)
+        );
+        // And the Qwen3.5+ arm still leads with the declaration.
+        assert!(
+            qwen3_6()
+                .tool_system_body("You are a helpful assistant.", &tools)
+                .starts_with("# Tools")
         );
     }
 
@@ -1377,6 +1550,9 @@ mod tests {
                 has_tools: true,
                 generation_suffix: "",
                 thinking_off_suffix: "",
+                empty_reasoning_header: true,
+                system_before_tools: false,
+                content_call_separator: "\n\n",
                 trim_content: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },

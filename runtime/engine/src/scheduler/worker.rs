@@ -2528,6 +2528,12 @@ impl BatchScheduler {
                 &mut instances,
                 &stats,
                 &mut frame_policy,
+                &lane,
+                &mut lane_inflight,
+                &mut lane_token,
+                &pending,
+                page_size,
+                limits,
             );
             progress |= Self::retire_ready_control(&mut in_flight_control);
             let (dispatched, wait_hint) = Self::dispatch_ready_items(
@@ -4087,11 +4093,50 @@ impl BatchScheduler {
         (true, true)
     }
 
+    /// Whether `request` may be re-posted as its own frame after its
+    /// co-batched frame was rejected, without reordering its pipeline: repost
+    /// appends to the FIFO lane, so it is only safe when no LATER fire of the
+    /// same pipeline is already in flight or queued. Untracked/prebuilt
+    /// riders (`pipeline_id == None`) have no order key and keep the
+    /// rejection path.
+    fn can_repost_solo(
+        request: &PendingRequest,
+        in_flight_launches: &VecDeque<PendingLaunchBatch>,
+        pending: &PendingQueue,
+    ) -> bool {
+        let Some(pipeline_id) = request.pipeline_id else {
+            return false;
+        };
+        if request.completion.is_settled() || request.completion.cancel_requested() {
+            return false;
+        }
+        let in_flight = in_flight_launches.iter().any(|batch| {
+            batch
+                .requests
+                .iter()
+                .any(|other| other.pipeline_id == Some(pipeline_id))
+        });
+        if in_flight {
+            return false;
+        }
+        !pending.items.iter().any(|item| match item {
+            QueuedItem::Launch(launch) => launch.request.pipeline_id == Some(pipeline_id),
+            _ => false,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn retire_ready_launches(
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         instances: &mut HashMap<u64, TrackedInstance>,
         stats: &Arc<SchedulerStats>,
         frame_policy: &mut FramePolicy,
+        driver_lane: &DriverLane,
+        lane_inflight: &mut u64,
+        lane_token: &mut u64,
+        pending: &PendingQueue,
+        page_size: u32,
+        limits: SchedulerLimits,
     ) -> bool {
         let mut progress = false;
         while let Some(front) = in_flight_launches.front() {
@@ -4124,9 +4169,88 @@ impl BatchScheduler {
                 }
             }
             if let Some(message) = launch_failure {
-                let message = format!("direct launch rejected: {message}");
-                for request in &retired.requests {
-                    request.completion.reject_unsubmitted(message.clone());
+                // CONTAINMENT: a rejected frame's admission figure is a MAX
+                // over its members (`required_kv_pages` is the frame-union
+                // high-water), so the rejection is attributable to its
+                // largest member(s) — a co-batched neighbor that fits alone
+                // must not die for it. Rejection has no side effects
+                // (folded admission posts nothing on failure), so every
+                // member whose pipeline order allows it is re-posted as its
+                // OWN sealed frame; the driver re-answers per member, and
+                // only a member the driver rejects ALONE carries the typed
+                // failure to its process. A solo frame is that terminal
+                // case already.
+                let requests = std::mem::take(&mut retired.requests);
+                let solo = requests.len() == 1;
+                // Repost decisions are PER PIPELINE and taken before any
+                // repost is posted: a frame may carry several fires of one
+                // pipeline (one per wave), and judging them one at a time
+                // would see the first repost in flight and wrongly reject
+                // its own sibling.
+                let repostable: std::collections::HashSet<ProcessId> = if solo {
+                    std::collections::HashSet::new()
+                } else {
+                    requests
+                        .iter()
+                        .filter(|request| {
+                            Self::can_repost_solo(request, in_flight_launches, pending)
+                        })
+                        .filter_map(|request| request.pipeline_id)
+                        .collect()
+                };
+                // One repost frame PER PIPELINE, its fires as consecutive
+                // waves in original order: the pipeline's fires stay atomic
+                // (all admitted or all rejected together — a later fire must
+                // never execute after its predecessor was refused), and the
+                // FIFO lane preserves fire order.
+                let mut reposts: Vec<(ProcessId, Vec<Vec<Box<PendingRequest>>>)> = Vec::new();
+                for request in requests {
+                    let repost = request
+                        .pipeline_id
+                        .is_some_and(|pipeline| repostable.contains(&pipeline))
+                        && !request.completion.is_settled()
+                        && !request.completion.cancel_requested();
+                    if !repost {
+                        request
+                            .completion
+                            .reject_unsubmitted(format!("direct launch rejected: {message}"));
+                        continue;
+                    }
+                    let pipeline = request
+                        .pipeline_id
+                        .expect("repostable membership requires a pipeline id");
+                    match reposts.iter_mut().find(|(id, _)| *id == pipeline) {
+                        Some((_, waves)) => waves.push(vec![request]),
+                        None => reposts.push((pipeline, vec![vec![request]])),
+                    }
+                }
+                for (_, waves) in reposts {
+                    let (submission, requests) =
+                        batch::build_frame_submission(waves, limits, page_size, stats);
+                    for request in &requests {
+                        if let Some(instance) = instances.get_mut(&request.instance_id) {
+                            instance.in_flight += 1;
+                        }
+                    }
+                    let batch_size = requests.len() as u64;
+                    let total_tokens = requests
+                        .iter()
+                        .map(|req| req.request.token_ids.len())
+                        .sum::<usize>();
+                    *lane_token += 1;
+                    let token = *lane_token;
+                    in_flight_launches.push_back(PendingLaunchBatch {
+                        state: LaunchState::Posted { token },
+                        requests,
+                        started: Instant::now(),
+                        batch_size,
+                        total_tokens,
+                    });
+                    *lane_inflight += 1;
+                    driver_lane.post(LaneRequest::Launch {
+                        token,
+                        submission: LaneLaunch(submission),
+                    });
                 }
                 progress = true;
                 continue;

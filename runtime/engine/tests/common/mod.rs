@@ -10,4 +10,4 @@ pub mod sampler_assert;
 
 // Compiled once per test binary; not every binary uses every re-export.
 #[allow(unused_imports)]
-pub use env::{MockEnv, create_mock_env};
+pub use env::{MockEnv, create_mock_env, create_mock_env_with_admission_ceiling};
