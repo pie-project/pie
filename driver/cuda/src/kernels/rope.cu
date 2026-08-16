@@ -2,6 +2,13 @@
 
 #include <cuda_bf16.h>
 
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <vector>
+
 #include "kernels/rope_device.cuh"
 
 namespace pie_cuda_driver::kernels {
@@ -720,6 +727,376 @@ __global__ void rope_partial_bf16_kernel(
     }
 }
 
+// vLLM-shaped partial rotary. Same channel semantics as the kernel above --
+// rotate [0, rotary_dim) with pair offset rotary_dim/2, leave
+// [rotary_dim, head_dim) untouched -- and a different numeric pipeline:
+// vLLM's inv_freq exponent form, accurate fp32 trig, cos/sin ROUNDED TO BF16
+// before use, and a bf16 rotate. See the block comment in rope_device.cuh.
+//
+// Kept as a separate kernel rather than a branch inside
+// `rope_partial_bf16_kernel` so the default path stays byte-for-byte the code
+// that shipped; the knob is meant to be a measurable A/B, and a shared kernel
+// body would make "unset is bit-unchanged" an argument instead of a fact.
+//
+// The per-token cos/sin row is built once in shared memory and indexed by
+// every head, which is literally the "index the table" step: `rope_angles` is
+// 32 for Qwen3.5-9B while `total_heads` is 10, so the naive form would
+// evaluate the same 32 transcendentals ten times.
+__global__ void rope_partial_vllm_table_bf16_kernel(
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    const std::int32_t* __restrict__ positions,
+    int position_delta,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim,
+    float theta,
+    const __nv_bfloat16* __restrict__ table,
+    int table_capacity,
+    unsigned int* __restrict__ oob)
+{
+    extern __shared__ __nv_bfloat16 rope_tab[];
+    const int n = blockIdx.x;
+    const int total_heads = num_q_heads + num_kv_heads;
+    const int rope_angles = rotary_dim / 2;
+    const int pos = positions[n] + position_delta;
+
+    // Uniform across the block: `pos` does not depend on threadIdx.
+    const bool in_table =
+        table != nullptr && pos >= 0 && pos < table_capacity;
+
+    for (int j = threadIdx.x; j < rope_angles; j += blockDim.x) {
+        if (in_table) {
+            const long long row = static_cast<long long>(pos) * rotary_dim;
+            rope_tab[j] = table[row + j];
+            rope_tab[rope_angles + j] = table[row + rope_angles + j];
+        } else {
+            // Past the table. Degrades to device trig -- i.e. to what this
+            // path did before the table existed -- which is NOT bit-parity
+            // with the reference. Counted so it cannot be silent.
+            __nv_bfloat16 cos_b, sin_b;
+            rope_cos_sin_vllm_table(theta, j, rotary_dim, pos, cos_b, sin_b);
+            rope_tab[j] = cos_b;
+            rope_tab[rope_angles + j] = sin_b;
+        }
+    }
+    if (!in_table && threadIdx.x == 0 && oob != nullptr) atomicAdd(oob, 1u);
+    __syncthreads();
+
+    for (int t = threadIdx.x; t < total_heads * rope_angles; t += blockDim.x) {
+        const int head_idx = t / rope_angles;
+        const int dim_pair = t % rope_angles;
+        const __nv_bfloat16 cos_b = rope_tab[dim_pair];
+        const __nv_bfloat16 sin_b = rope_tab[rope_angles + dim_pair];
+
+        __nv_bfloat16* base;
+        if (head_idx < num_q_heads) {
+            base = q +
+                (static_cast<long long>(n) * num_q_heads + head_idx) * head_dim;
+        } else {
+            const int kv_h = head_idx - num_q_heads;
+            base = k +
+                (static_cast<long long>(n) * num_kv_heads + kv_h) * head_dim;
+        }
+        rotate_pair_bf16(base, dim_pair, dim_pair + rope_angles, cos_b, sin_b);
+    }
+}
+
+// ── The cos/sin table, built on the HOST ───────────────────────────────────
+//
+// This is the part that makes the path faithful rather than merely similar.
+// vLLM evaluates cos/sin once at init, on the host, and indexes the result
+// thereafter; no GPU kernel of its own ever computes trig. Pie evaluating the
+// same formula on the device is NOT equivalent, and the difference was
+// measured rather than argued: over 30001 positions x 64 lanes, a device-trig
+// implementation of this path matched the reference on 1,920,060 of 1,920,064
+// entries and differed on 4 --
+//
+//   pos=4498   cos[ 8]  +1 ulp    0.3451 fp32 ulp from a bf16 midpoint
+//   pos=7460   sin[16]  +1 ulp    0.1156
+//   pos=13848  cos[ 7]  +1 ulp    0.7032
+//   pos=21467  cos[ 6]  -1 ulp    0.5967
+//
+// -- every one exactly one bf16 ulp, every one within 0.71 fp32 ulp of a
+// rounding midpoint. That is the signature of two independent ~1-ulp trig
+// implementations disagreeing about which side of a boundary a value falls on:
+// 52 entries in that population lie within 1 fp32 ulp of a midpoint and 4 of
+// them flipped, ~8%. It is NOT a rounding-rule difference -- CUDA's
+// `__float2bfloat16` and torch's `.to(bfloat16)` are both round-to-nearest-
+// even, so a tie breaks identically on both sides no matter how many ties
+// there are.
+//
+// There is no device-side fix for that. Correct rounding would not help,
+// because the reference is not correctly rounded either; the only way to get
+// the reference's bits is to run the reference's evaluation. So the table is
+// built here with the host libm, exactly as the fixture in
+// tests/rope_vllm_cos_sin_golden.hpp is built: fp32 inv_freq in vLLM's form,
+// fp32 angle, trig in double, rounded to fp32, then rounded once to bf16 (RNE,
+// which is what `.to(torch.bfloat16)` does).
+//
+// Whether this host's libm agrees with the reference host's on every entry is
+// an EMPIRICAL question, not something the construction guarantees. It is the
+// right structure and the best available shot; it is not a proof of parity.
+//
+// CAPACITY. Indexed by absolute position, so the table must span the context.
+// Default 262144 positions (33.5 MB at rotary_dim=64), overridable with
+// PIE_ROPE_VLLM_TABLE_MAX_POS. Beyond it the kernel degrades to device trig --
+// i.e. to the 4-in-1.9M behaviour above -- and bumps `oob` so that degradation
+// cannot be silent. The right fix is to size this from
+// `cfg.max_position_embeddings`, which is in scope at all eight call sites;
+// that is deferred to the change that flips the default, because it means
+// touching those call sites and re-measuring.
+
+std::uint16_t bf16_rne_bits(float f) {
+    std::uint32_t b;
+    std::memcpy(&b, &f, sizeof(b));
+    return static_cast<std::uint16_t>((b + 0x7fffu + ((b >> 16) & 1u)) >> 16);
+}
+
+// Which host trig builds the table. The reasoning took three wrong turns before
+// it settled, so it is written out rather than summarised.
+//
+// The reference's trig is Intel MKL VML, not SLEEF and not glibc. Measured:
+// `vmsCos`/`vmsSin` with torch's exact mode word
+// `VML_HA|VML_FTZDAZ_OFF|VML_ERRMODE_IGNORE` (0x140102) reproduce torch
+// bit-for-bit, 0 diffs over 960,032 angles. `ATen/cpu/vml.h` specialises
+// vcos/vsin onto MKL whenever `AT_MKL_ENABLED() && !__APPLE__`, so
+// `Vectorized<float>::cos()` is never reached on an x86 torch build -- which is
+// what the reference runs.
+//
+// We cannot call MKL from here, so the question is which available
+// implementation lands closest to it. In PRINCIPLE error-correlation could beat
+// accuracy: MKL VML HA is itself ~0.60 ulp and not correctly rounded, so an
+// implementation wrong in a similar way could agree with it more often than a
+// perfect one would. Measured, it does not.
+//
+// Fraction of angles whose fp32 value differs from the reference:
+//
+//   double -> round to fp32 (correctly rounded) : 5.205%
+//   plain cosf/sinf                             : 5.297%
+//
+// So `exact` is the CLOSER of the two, not merely the more deterministic. At
+// bf16 they are near-indistinguishable -- over positions 0..262143 (16,777,216
+// angles) `exact` misses 19 entries and `libm` 18, differing only at
+// pos=70308 cos[5] -- but that one entry is noise, and it runs opposite to the
+// fp32 figures above. `cosf`/`sinf` are almost correctly rounded here anyway:
+// they differ from the double-rounded value on 1.18% of those angles, always by
+// exactly 1 fp32 ulp, and bf16 absorbs all but one. The two backends are very
+// nearly the same function.
+//
+// `exact` is therefore the default on two independent legs:
+//
+//   1. DETERMINISM. Correct rounding has exactly one answer, so the table
+//      depends on nothing -- not the C library, its version, the compiler, or
+//      the CPU. `libm` is by definition whatever the linked libm does, which
+//      would make Pie's table a property of the machine it was built on. True
+//      in principle; NOT demonstrated by the two glibcs tested below, which
+//      agree exactly. The liability is structural, not observed.
+//   2. PROXIMITY. 5.205% versus 5.297%, above. Measured, not argued.
+//
+// A REFUTED CLAIM AND ITS RESOLUTION, recorded because the underlying artifact
+// row is easy to misread the same way twice.
+//
+//   The claim was that plain `cosf`/`sinf` scores 0 mismatches in the campaign
+//   window and 1 overall against the reference, making it a free improvement.
+//   It does not: on the deployment base it misses 18, including pos=13852, the
+//   single in-window entry.
+//
+//   The 0/1 was a real number measuring something else. The artifact row reads
+//   "PIE vs libm cosf/sinf -- fp32 differs 197877/16777216 (1.179%), bf16
+//   differs 1". That is PIE'S CONSTRUCTION AGAINST GLIBC -- the distance
+//   between our own two candidate backends -- not glibc against the reference.
+//   Read as a reference comparison it invents a free win that does not exist.
+//   The figures reproduce exactly, which is precisely why the misreading
+//   survived: the numbers were never wrong, only their subject. The
+//   libm-vs-reference figure lives in a different row of the same artifact and
+//   is the 5.297% above.
+//
+//   A second explanation offered for the same figure -- that the correlation
+//   tracks the glibc version, 2.35 versus 2.41 -- is independently false. Both
+//   were run rather than reasoned about, in ubuntu:22.04 (glibc 2.35) and
+//   debian:13 (glibc 2.41), same source and same fixture: the per-entry output
+//   is BYTE-IDENTICAL. 18/19 either way, same 1.1794% divergence. glibc's
+//   `cosf`/`sinf` are bit-identical between those versions for this input set.
+//
+// The deployment target is glibc 2.35 regardless:
+// `backend/docker/eval-worker-base.Dockerfile` pins
+// PIE_CUDA_RUNTIME_IMAGE=nvidia/cuda:12.9.1-cudnn-runtime-ubuntu22.04, so the
+// decoder runs on Ubuntu 22.04.
+//
+// `PIE_ROPE_VLLM_TABLE_TRIG=libm` selects the `cosf`/`sinf` build, so the
+// comparison stays reproducible and the choice revisitable rather than
+// entombed. Do not chase the remaining 19: the reference's exact bits require
+// vendoring closed-source, x86-only oneMKL into a CUDA driver's host-side table
+// builder. The open question is whether any of this flips a token, which needs
+// an end-to-end run, not more numerics.
+enum class TableTrig { Libm, Exact };
+
+TableTrig vllm_table_trig() {
+    static const TableTrig mode = [] {
+        const char* v = std::getenv("PIE_ROPE_VLLM_TABLE_TRIG");
+        if (v != nullptr && std::strcmp(v, "libm") == 0) return TableTrig::Libm;
+        return TableTrig::Exact;
+    }();
+    return mode;
+}
+
+int vllm_table_capacity() {
+    static const int cap = [] {
+        if (const char* v = std::getenv("PIE_ROPE_VLLM_TABLE_MAX_POS")) {
+            const int n = std::atoi(v);
+            if (n > 0) return n;
+        }
+        return 262144;
+    }();
+    return cap;
+}
+
+struct VllmCosSinTable {
+    int device = -1;
+    float theta = 0.f;
+    int rotary_dim = 0;
+    int capacity = 0;
+    __nv_bfloat16* dev = nullptr;
+    unsigned int* oob = nullptr;
+};
+
+// Keyed by device as well as by shape: tensor parallelism runs every rank in
+// this one process, each bound to its own device, so a process-global table
+// would hand rank 1 an allocation belonging to rank 0.
+const VllmCosSinTable* vllm_table_for(float theta, int rotary_dim) {
+    if (rotary_dim <= 0 || (rotary_dim % 2) != 0) return nullptr;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return nullptr;
+
+    static std::mutex mu;
+    static std::vector<std::unique_ptr<VllmCosSinTable>> cache;
+    std::lock_guard<std::mutex> lock(mu);
+    for (const auto& t : cache) {
+        if (t->device == device && t->theta == theta &&
+            t->rotary_dim == rotary_dim) {
+            return t.get();
+        }
+    }
+
+    const int angles = rotary_dim / 2;
+    const int cap = vllm_table_capacity();
+
+    // inv_freq in vLLM's form: exponent 2j/rotary_dim formed in fp32, the
+    // power taken first and the reciprocal AFTER it.
+    std::vector<float> inv(angles);
+    for (int j = 0; j < angles; ++j) {
+        const float expo = (2.f * static_cast<float>(j)) /
+                           static_cast<float>(rotary_dim);
+        const float p = static_cast<float>(
+            std::pow(static_cast<double>(theta), static_cast<double>(expo)));
+        inv[j] = 1.f / p;
+    }
+
+    const bool exact = vllm_table_trig() == TableTrig::Exact;
+    std::vector<std::uint16_t> host(
+        static_cast<std::size_t>(cap) * static_cast<std::size_t>(rotary_dim));
+    for (int p = 0; p < cap; ++p) {
+        std::uint16_t* row =
+            host.data() + static_cast<std::size_t>(p) * rotary_dim;
+        for (int j = 0; j < angles; ++j) {
+            const float ang = static_cast<float>(p) * inv[j];  // fp32 product
+            // `std::cos(float)` is the float overload, i.e. `cosf`. The double
+            // form is the correctly-rounded one and is the WORSE match; see
+            // `vllm_table_trig`.
+            const float c = exact
+                ? static_cast<float>(std::cos(static_cast<double>(ang)))
+                : std::cos(ang);
+            const float s = exact
+                ? static_cast<float>(std::sin(static_cast<double>(ang)))
+                : std::sin(ang);
+            row[j] = bf16_rne_bits(c);
+            row[angles + j] = bf16_rne_bits(s);
+        }
+    }
+
+    auto entry = std::make_unique<VllmCosSinTable>();
+    entry->device = device;
+    entry->theta = theta;
+    entry->rotary_dim = rotary_dim;
+    entry->capacity = cap;
+
+    const std::size_t bytes = host.size() * sizeof(std::uint16_t);
+    if (cudaMalloc(&entry->dev, bytes) != cudaSuccess) return nullptr;
+    if (cudaMalloc(&entry->oob, sizeof(unsigned int)) != cudaSuccess) {
+        cudaFree(entry->dev);
+        return nullptr;
+    }
+    cudaMemset(entry->oob, 0, sizeof(unsigned int));
+
+    // Uploaded on a private stream. The caller's stream may be under CUDA-graph
+    // capture, where a copy is RECORDED rather than performed -- the table
+    // would then be filled on replay instead of now, or not at all.
+    cudaStream_t build = nullptr;
+    if (cudaStreamCreateWithFlags(&build, cudaStreamNonBlocking) != cudaSuccess) {
+        cudaFree(entry->dev);
+        cudaFree(entry->oob);
+        return nullptr;
+    }
+    cudaMemcpyAsync(entry->dev, host.data(), bytes, cudaMemcpyHostToDevice, build);
+    cudaStreamSynchronize(build);
+    cudaStreamDestroy(build);
+
+    cache.push_back(std::move(entry));
+    return cache.back().get();
+}
+
+// Opt-in, default OFF. A global numerics change would move every partial-rotary
+// model -- Gemma-4 reaches this launcher too -- so the A/B gets measured before
+// the default flips.
+bool rope_vllm_table_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_ROPE_VLLM_TABLE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+void dispatch_rope_partial(
+    void* q, void* k,
+    const std::int32_t* positions,
+    int position_delta,
+    int num_tokens,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim,
+    float theta,
+    cudaStream_t stream,
+    bool vllm_table)
+{
+    constexpr int BLOCK = 256;
+    dim3 grid(num_tokens);
+    dim3 block(BLOCK);
+    if (vllm_table) {
+        const std::size_t smem = static_cast<std::size_t>(rotary_dim / 2) * 2 *
+                                 sizeof(__nv_bfloat16);
+        const VllmCosSinTable* t = vllm_table_for(theta, rotary_dim);
+        rope_partial_vllm_table_bf16_kernel<<<grid, block, smem, stream>>>(
+            static_cast<__nv_bfloat16*>(q),
+            static_cast<__nv_bfloat16*>(k),
+            positions,
+            position_delta,
+            num_q_heads, num_kv_heads, head_dim, rotary_dim, theta,
+            t != nullptr ? t->dev : nullptr,
+            t != nullptr ? t->capacity : 0,
+            t != nullptr ? t->oob : nullptr);
+        return;
+    }
+    rope_partial_bf16_kernel<<<grid, block, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(q),
+        static_cast<__nv_bfloat16*>(k),
+        positions,
+        position_delta,
+        num_q_heads, num_kv_heads, head_dim, rotary_dim, theta);
+}
+
 }  // namespace
 
 void launch_rope_partial_bf16(
@@ -733,15 +1110,9 @@ void launch_rope_partial_bf16(
     float theta,
     cudaStream_t stream)
 {
-    constexpr int BLOCK = 256;
-    dim3 grid(num_tokens);
-    dim3 block(BLOCK);
-    rope_partial_bf16_kernel<<<grid, block, 0, stream>>>(
-        static_cast<__nv_bfloat16*>(q),
-        static_cast<__nv_bfloat16*>(k),
-        positions,
-        0,
-        num_q_heads, num_kv_heads, head_dim, rotary_dim, theta);
+    dispatch_rope_partial(q, k, positions, 0, num_tokens, num_q_heads,
+                          num_kv_heads, head_dim, rotary_dim, theta, stream,
+                          rope_vllm_table_enabled());
 }
 
 void launch_rope_partial_bf16_position_delta(
@@ -756,15 +1127,45 @@ void launch_rope_partial_bf16_position_delta(
     float theta,
     cudaStream_t stream)
 {
-    constexpr int BLOCK = 256;
-    dim3 grid(num_tokens);
-    dim3 block(BLOCK);
-    rope_partial_bf16_kernel<<<grid, block, 0, stream>>>(
-        static_cast<__nv_bfloat16*>(q),
-        static_cast<__nv_bfloat16*>(k),
-        positions,
-        position_delta,
-        num_q_heads, num_kv_heads, head_dim, rotary_dim, theta);
+    dispatch_rope_partial(q, k, positions, position_delta, num_tokens,
+                          num_q_heads, num_kv_heads, head_dim, rotary_dim,
+                          theta, stream, rope_vllm_table_enabled());
+}
+
+void launch_rope_partial_vllm_table_bf16(
+    void* q, void* k,
+    const std::int32_t* positions,
+    int num_tokens,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim,
+    float theta,
+    cudaStream_t stream)
+{
+    dispatch_rope_partial(q, k, positions, 0, num_tokens, num_q_heads,
+                          num_kv_heads, head_dim, rotary_dim, theta, stream,
+                          /*vllm_table=*/true);
+}
+
+unsigned int rope_vllm_table_oob_blocks(float theta, int rotary_dim)
+{
+    const VllmCosSinTable* t = vllm_table_for(theta, rotary_dim);
+    if (t == nullptr || t->oob == nullptr) return 0u;
+    unsigned int n = 0u;
+    cudaMemcpy(&n, t->oob, sizeof(n), cudaMemcpyDeviceToHost);
+    return n;
+}
+
+int rope_vllm_table_capacity_for(float theta, int rotary_dim)
+{
+    const VllmCosSinTable* t = vllm_table_for(theta, rotary_dim);
+    return t != nullptr ? t->capacity : 0;
+}
+
+const char* rope_vllm_table_trig_name()
+{
+    return vllm_table_trig() == TableTrig::Exact ? "exact" : "libm";
 }
 
 namespace {

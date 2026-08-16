@@ -190,6 +190,46 @@ void launch_rope_partial_bf16_position_delta(
     float theta,
     cudaStream_t stream);
 
+// Same channel semantics as `launch_rope_partial_bf16`, with vLLM's numeric
+// pipeline instead of Pie's: inv_freq as `1 / theta^(2j/rotary_dim)`, accurate
+// fp32 trig, cos/sin rounded to bf16 before use, and a bf16 rotate. vLLM
+// evaluates its cos/sin cache once on the host in fp32 and then stores it as
+// bf16; the `triton_mrope` path our reference leg runs indexes that bf16 table
+// and casts q/k down to match, so a Pie that computed accurate fp32 trig on the
+// fly would be MORE accurate than the reference and still mismatch it.
+//
+// Reached in production only via `PIE_ROPE_VLLM_TABLE=1`, which redirects both
+// `launch_rope_partial_bf16` and `..._position_delta`. Exposed directly so a
+// test can drive both pipelines in one process without touching the
+// environment. Default OFF: this moves every partial-rotary model, Gemma-4
+// included, so the A/B is measured before the default flips.
+void launch_rope_partial_vllm_table_bf16(
+    void* q, void* k,
+    const std::int32_t* positions,
+    int num_tokens,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim,
+    float theta,
+    cudaStream_t stream);
+
+// Blocks that ran past the end of the host-built table and fell back to device
+// trig, which is NOT bit-parity with the reference. Non-zero means the table is
+// too small for the context in use -- raise PIE_ROPE_VLLM_TABLE_MAX_POS. This
+// synchronises; call it from tests and diagnostics, not from a hot path.
+unsigned int rope_vllm_table_oob_blocks(float theta, int rotary_dim);
+
+// Positions the host-built table spans, or 0 if it could not be built.
+int rope_vllm_table_capacity_for(float theta, int rotary_dim);
+
+// Which host trig built the table: "exact" (correctly rounded; the default,
+// and deterministic across C libraries) or "libm" (`cosf`/`sinf`, selected by
+// PIE_ROPE_VLLM_TABLE_TRIG=libm, which correlates slightly better with the
+// reference's MKL but is a property of the build host). This changes the
+// table's bits, so a parity result is uninterpretable without it.
+const char* rope_vllm_table_trig_name();
+
 // Partial rotary embedding on the LAST `rotary_dim` dimensions of each head.
 // Used by DeepSeek V4 where RoPE is applied to the trailing 64 dims of
 // head_dim=512. Pair convention: NeoX (offset+i, offset+i+rotary_dim/2) by
