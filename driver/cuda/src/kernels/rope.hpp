@@ -214,6 +214,15 @@ void launch_rope_partial_vllm_table_bf16(
     float theta,
     cudaStream_t stream);
 
+// Blocks that ran past the end of the host-built table and fell back to device
+// trig, which is NOT bit-parity with the reference. Non-zero means the table is
+// too small for the context in use -- raise PIE_ROPE_VLLM_TABLE_MAX_POS. This
+// synchronises; call it from tests and diagnostics, not from a hot path.
+unsigned int rope_vllm_table_oob_blocks(float theta, int rotary_dim);
+
+// Positions the host-built table spans, or 0 if it could not be built.
+int rope_vllm_table_capacity_for(float theta, int rotary_dim);
+
 // Partial rotary embedding on the LAST `rotary_dim` dimensions of each head.
 // Used by DeepSeek V4 where RoPE is applied to the trailing 64 dims of
 // head_dim=512. Pair convention: NeoX (offset+i, offset+i+rotary_dim/2) by

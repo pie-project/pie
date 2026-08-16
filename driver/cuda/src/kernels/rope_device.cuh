@@ -106,8 +106,16 @@ __device__ __forceinline__ float rope_inv_freq_vllm(
     return 1.f / p;
 }
 
-// One stored table entry: fp32 trig, then rounded to bf16 (RNE, which is what
-// `.to(torch.bfloat16)` does).
+// One table entry computed ON THE DEVICE: fp32 trig, then rounded to bf16
+// (RNE, which is what `.to(torch.bfloat16)` does).
+//
+// THIS IS THE FALLBACK, NOT THE PATH. The table is built on the host (see
+// `vllm_table_for` in rope.cu) because device trig does not reproduce the
+// reference's bits: measured over 30001 positions x 64 lanes, this function
+// differs from the reference on 4 entries, each exactly one bf16 ulp, each
+// within 0.71 fp32 ulp of a rounding midpoint. This is reached only past the
+// end of the host table, where parity is explicitly not claimed and the
+// occurrence is counted.
 //
 // `sincosf` rather than `__sincosf`, but NOT because the intrinsic falls apart.
 // Measured on sm89 at lane 0 -- where inv_freq[0] is exactly 1.0, so the angle

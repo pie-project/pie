@@ -330,17 +330,50 @@ void run_case(const Case& c) {
                 passthrough_violations);
 }
 
+// ── Is the fixture capable of catching anything? ───────────────────────────
+//
+// A bf16 table can only disagree where the fp32 value it was rounded from sits
+// near a rounding midpoint. The first version of this slice contained no such
+// entry at all, so it passed 832/832 with zero tolerance while being blind to
+// the only defect that can occur. This asserts the sample has teeth, before
+// any GPU work, so a future regeneration cannot quietly reintroduce a
+// decorative green.
+void run_golden_slice_is_not_blind() {
+    namespace g = pie_rope_golden;
+    constexpr int kFloor = 8;
+    const bool ok = g::kEntriesWithinOneUlp >= kFloor;
+    if (!ok) ++g_failures;
+    std::printf("[%s] %-28s rows=%d entries=%d  boundary_adjacent<=1ulp=%d "
+                "(required: >=%d, else the sample cannot fail)\n",
+                ok ? "ok" : "FAIL", "golden slice has teeth", g::kRows,
+                g::kRows * g::kRotaryDim, g::kEntriesWithinOneUlp, kFloor);
+}
+
 // ── The parity assertion: knob-on must reproduce vLLM's table exactly ──────
 void run_vllm_golden_table() {
     namespace g = pie_rope_golden;
     const std::vector<std::uint16_t> got = read_back_table(Path::VllmTable);
     const int bad = count_table_mismatches(got, /*report=*/true);
-    const bool ok = bad == 0;
+
+    // The host-built table must actually have covered every position used. If
+    // it ran short the kernel silently degrades to device trig, which is the
+    // behaviour this path exists to replace -- so a green above would mean
+    // nothing.
+    const int capacity =
+        kernels::rope_vllm_table_capacity_for(g::kTheta, g::kRotaryDim);
+    const unsigned int oob =
+        kernels::rope_vllm_table_oob_blocks(g::kTheta, g::kRotaryDim);
+    int max_pos = 0;
+    for (int n = 0; n < g::kRows; ++n)
+        max_pos = std::max(max_pos, g::kCosSinCache[n].pos);
+
+    const bool ok = bad == 0 && oob == 0u && capacity > max_pos;
     if (!ok) ++g_failures;
-    std::printf("[%s] %-28s rotary_dim=%d  entries=%d  mismatches_vs_vllm=%d "
-                "(required: 0)\n",
+    std::printf("[%s] %-28s entries=%d  mismatches_vs_vllm=%d (required: 0)  "
+                "table_capacity=%d (max_pos=%d)  device_trig_fallback_blocks=%u"
+                " (required: 0)\n",
                 ok ? "ok" : "FAIL", "vllm-table matches cache",
-                g::kRotaryDim, g::kRows * g::kRotaryDim, bad);
+                g::kRows * g::kRotaryDim, bad, capacity, max_pos, oob);
 }
 
 // ── The knob-off assertion: it must NOT reproduce vLLM's table ─────────────
@@ -491,6 +524,7 @@ int main() {
 
     // Parity against vLLM's own cos_sin_cache. Zero tolerance, both directions:
     // knob-on must reproduce it, knob-off must not.
+    run_golden_slice_is_not_blind();
     run_vllm_golden_table();
     run_default_path_differs();
     run_vllm_rotate_structure(256);   // production shape
