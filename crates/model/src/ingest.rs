@@ -67,18 +67,98 @@
 //!   by construction: see `ByteScale::Blocked` in
 //!   `model_loader::contract::compile`, where only whole blocks have
 //!   addresses because half a block is codes with no scale to read them by.
-//!   It is not a budget problem -- though it is also that, at 16.6 M runs per
-//!   tensor against a `MAX_RUNS` of 1 M.
 //! * GGUF keeps `ffn_gate_exps` and `ffn_up_exps` apart where the checkpoint
 //!   fuses them into one `gate_up_proj` with gate on even rows and up on odd.
-//!   Interleaving is expressible; splitting the block is not, so this one
-//!   never gets its turn.
+//!   That half IS within reach -- a destination row is 90 blocks of 16 bytes
+//!   laid end to end, so the interleave is 32 x 5760 runs and stays under
+//!   `MAX_RUNS`. It never gets its turn, because the split above comes first.
 //! * That file also requantizes attention and the embeddings to Q8_0, so it
 //!   is not a lossless carrier of the checkpoint pie can already import.
 //!
-//! Which is why there is no `gpt-oss` arm: it would need a fifth `Ingest`
-//! shape whose transform the loader cannot perform. `qwen3moe` needed one
-//! too, and got it, because a slab of a BF16 stack is a contiguous run.
+//! ## What it would actually take, since "refused by the algebra" misleads
+//!
+//! The first bullet is about the AFFINE fragment, and reads as though the
+//! algebra were short a node. It is not, and someone who sets out to add one
+//! will find the node already written.
+//!
+//! `Expr::Repack` is precisely this case -- the table in
+//! `model_loader::contract` files it as **placement priced as a kernel**, may
+//! pad, and may not reinterpret an element, which a block split does not. The
+//! cost ladder is therefore behaving correctly rather than obstructing:
+//! `Transmute` to bytes and `Slice` the 17 apart WOULD denote the right
+//! tensors, and `infer` is right to push it off the free row, because as a
+//! placement it is 16.6 M runs against a `MAX_RUNS` of 1 M. That number is
+//! not a budget to raise. The innermost axis is 17 bytes and the cut is
+//! inside it, so contiguity breaks at every block and the run list is the
+//! size of the data. A transform whose run list is O(data) is not a
+//! placement; run lists are how the executor says "memcpy".
+//!
+//! So the missing piece is not algebra but an IMPLEMENTATION of the node.
+//! `TILE_MAP_REPACK` is set in no mask in `model_loader::plan::passes::tile`
+//! -- not `HOST_TILE_MAP_MASK`, not `CONVERT_TILE_MAP_MASK`, and not CUDA's,
+//! whose doc records dropping the claim because advertising a transform with
+//! no implementation made plans compile and then die at execution naming only
+//! a kind. `RepackLayout::MarlinMxfp4Weight` and its scale twin exist as
+//! types with no executor behind them; the kernels were the deleted C++
+//! `transcode_engine.hpp`'s and were never ported. `walk.rs` says it plainly:
+//! `Repack` is the host executor's standing refusal, and an import runs on
+//! the host.
+//!
+//! That is the honest size of it: a host Repack kernel and a wider mask, in
+//! the loader, for a node the tree deliberately does not implement.
+//!
+//! ## And the carrier is why it would not pay
+//!
+//! Four gpt-oss GGUFs were checked by reading their headers over range
+//! requests, against pie's own `openai--gpt-oss-20b.zt`, which holds every
+//! attention projection, `embed_tokens` and `lm_head` at BF16:
+//!
+//! | file | the 98 non-expert weights |
+//! |------|---------------------------|
+//! | `ggml-org/gpt-oss-20b-GGUF` MXFP4 | Q8_0 |
+//! | `bartowski/...-MXFP4-Experimental` | Q8_0 |
+//! | `lmstudio-community/gpt-oss-20b-GGUF` | Q8_0 |
+//! | `unsloth/gpt-oss-20b-GGUF` F16 | F16 |
+//!
+//! Every one of them carries the experts as MXFP4 and downgrades everything
+//! else -- `token_embd.weight` and `output.weight` included. There is no
+//! lossless carrier to import, so the kernel above would be built to produce
+//! a WORSE artifact than `pie model import openai/gpt-oss-20b` already
+//! produces. That, and not the algebra, is the reason to leave this alone.
+//!
+//! ## The way around the kernel, and why it is worse still
+//!
+//! There is a second route, and it is much cheaper than a host Repack: do
+//! not split the block, DECODE it. `walk.rs` already decodes eight GGUF
+//! schemes, and a 17-byte MXFP4 block -- one E8M0 exponent, then 32 E2M1
+//! nibbles -- is structurally the smallest of them. The nibble table and the
+//! exponent are already in `model_loader::codec`, and MXFP4 to BF16 is
+//! exact, so it would be a decoder and no arithmetic risk.
+//!
+//! It is closed today by one line rather than by a policy:
+//! `QuantScheme::Mxfp4E2M1E8M0` answers `None` to `block_layout`, because
+//! inside pie MXFP4 is not an opaque block at all -- it is the split
+//! `_blocks`/`_scales` pair, which is why the safetensors release is CARRIED
+//! rather than decoded. Opening it means a distinct scheme, not a layout on
+//! that one.
+//!
+//! The reason not to is a size. Measured on `openai--gpt-oss-20b.zt`:
+//!
+//! | | packed | decoded to BF16 |
+//! |---|--------|-----------------|
+//! | expert `_blocks` + `_scales` | 9.46 GiB | 35.60 GiB |
+//! | everything else | 3.37 GiB | 3.37 GiB |
+//! | artifact | **12.82 GiB** | **38.97 GiB** |
+//!
+//! Three times the artifact, to hold the same numbers, with the 98 weights
+//! around them at Q8_0 instead of BF16. So the cheap route loses on BOTH
+//! counts the expensive one only lost on one of -- and pie already writes
+//! the 12.82 GiB column from the HuggingFace release. A GGUF gpt-oss saves
+//! about 26 GiB of download and spends it back on disk three times over.
+//!
+//! Which is why there is no `gpt-oss` arm. `qwen3moe` needed a new `Ingest`
+//! shape too, and got it, because a slab of a BF16 stack is a contiguous run
+//! -- it stayed on the free row, where this cannot.
 //!
 //! # An architecture refused for the opposite reason: `gemma4`
 //!
@@ -399,9 +479,82 @@ mod tests {
         assert!(why.contains("`gpt-oss`"), "{why}");
     }
 
-    /// gemma4 is refused too, and for a reason nothing about its weights
-    /// would suggest.
+    /// The refusal above rests on a loader fact, so the loader is asked.
     ///
+    /// The module doc says the missing piece for gpt-oss is not a node in the
+    /// algebra -- `Expr::Repack` already denotes "placement priced as a
+    /// kernel" -- but an implementation of that node, which nothing in this
+    /// tree has. That is a claim about `model_loader`, written in `model`,
+    /// and the two crates are free to move apart.
+    ///
+    /// So it is checked rather than asserted in prose. The day a host Repack
+    /// lands, this fails, and the paragraph explaining why gpt-oss cannot be
+    /// ingested is the thing that needs rereading -- the carrier measurement
+    /// beneath it would then be the whole of the answer.
+    ///
+    /// `TILE_MAP_REBLOCK` rides along as the negative control: the host does
+    /// implement that one, so a mask of zero, or a constant that stopped
+    /// naming anything, cannot pass this by accident.
+    #[test]
+    fn no_target_advertises_the_repack_this_refusal_rests_on() {
+        use model_loader::plan::{
+            CONVERT_TILE_MAP_MASK, HOST_TILE_MAP_MASK, TILE_MAP_REBLOCK, TILE_MAP_REPACK,
+        };
+
+        assert_eq!(
+            HOST_TILE_MAP_MASK & TILE_MAP_REPACK,
+            0,
+            "the host executor implements Repack now; re-read the gpt-oss section"
+        );
+        assert_eq!(
+            CONVERT_TILE_MAP_MASK & TILE_MAP_REPACK,
+            0,
+            "an import may carry a Repack now; re-read the gpt-oss section"
+        );
+        assert_ne!(
+            CONVERT_TILE_MAP_MASK & TILE_MAP_REBLOCK,
+            0,
+            "the control: a convert does carry Reblock, so these masks do name transforms"
+        );
+    }
+
+    /// And the cheap way around it is shut too, by a `None`.
+    ///
+    /// The other half of the same paragraph. Decoding an MXFP4 block instead
+    /// of splitting it needs no Repack at all -- only a block layout and a
+    /// decoder, next to the eight `walk.rs` already has. What stops it is
+    /// that `Mxfp4E2M1E8M0` reports no block layout, because in pie MXFP4 is
+    /// the split `_blocks`/`_scales` pair rather than an opaque block.
+    ///
+    /// That is a `None` and not a refusal, so nothing would complain if it
+    /// became a `Some`. This is the complaint. If it fires, the thing to
+    /// re-read is the size table: decoding trades 12.82 GiB of artifact for
+    /// 38.97 GiB holding the same numbers.
+    ///
+    /// `GgufQ8_0` is the negative control -- the scheme this file's own
+    /// measurement found gpt-oss GGUFs demoting everything else to, and one
+    /// the loader does decode, so a `block_layout` that had stopped
+    /// answering at all cannot pass this by accident.
+    #[test]
+    fn mxfp4_is_not_a_block_the_loader_can_decode_either() {
+        use model_loader::types::QuantScheme;
+
+        assert_eq!(
+            QuantScheme::Mxfp4E2M1E8M0.block_layout(),
+            None,
+            "MXFP4 decodes as a GGUF block now; re-read the gpt-oss section, \
+             which prices that route at 3x the artifact"
+        );
+        assert_eq!(
+            QuantScheme::GgufQ8_0.block_layout(),
+            Some((32, 34)),
+            "the control: the loader does describe blocks, so this is MXFP4's \
+             own answer and not an empty table"
+        );
+    }
+
+    /// gemma4 is refused too, and for a reason nothing about its weights
+    /// would suggest.    ///
     /// Its text tower is the shortest map any file measured here would need:
     /// a pure rename, experts already fused as `[E, 2I, H]`, and -- unlike
     /// `gemma3` -- no constant folded into any norm. What refuses it is that

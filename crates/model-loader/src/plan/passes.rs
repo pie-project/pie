@@ -88,6 +88,11 @@ pub fn all() -> &'static [Pass] {
             run: validate::validate_target_support,
         },
         Pass {
+            name: "validate-bound-encodings",
+            stage: Stage::Check,
+            run: validate::validate_bound_encodings,
+        },
+        Pass {
             name: "validate-scale-factors",
             stage: Stage::Check,
             run: validate::validate_scale_factors,

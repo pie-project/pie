@@ -62,13 +62,44 @@ pub fn parse_checkpoint_files(paths: &[PathBuf]) -> Result<CheckpointMetadata, E
 /// The file-level key-values, for a caller asking what the checkpoint says
 /// about itself. See `read::parse_checkpoint_attributes`.
 pub fn parse_attributes(path: &Path) -> Result<Attributes, Error> {
-    Ok(attributes_of(&ztensor_compat::index(path).map_err(Error::from)?))
+    Ok(attributes_of(
+        &ztensor_compat::index(path).map_err(Error::from)?,
+    ))
 }
 
 /// [`parse_attributes`], for a checkpoint the caller claims is one set.
+///
+/// Sorts before reading, and the sort is load-bearing. `Source::merge` does
+/// NOT merge the file-level key-values: it keeps the first source that has
+/// any and drops the rest. That is the right rule for the case this exists to
+/// serve -- only shard one of a split GGUF carries a key-value block -- but it
+/// makes the answer a function of the order the caller passed.
+///
+/// Measured on `qwen2.5-7b-instruct-q4_0-*-of-00002`, before the sort:
+///
+/// | given | tensors | attribute keys |
+/// |-------|---------|----------------|
+/// | `[1, 2]` | 339 | 29, with `general.architecture` and the vocabulary |
+/// | `[2, 1]` | 339 | 3: `split.no`, `split.count`, `split.tensors.count` |
+///
+/// Note the tensor count. Reversed, nothing is missing and nothing errors --
+/// the caller gets a whole checkpoint that does not say what architecture it
+/// is or carry a tokenizer, which downstream reads as a file that declined to
+/// answer. A later shard has three keys rather than none, so it is not empty
+/// and `merge` keeps it.
+///
+/// Every discovery path in this module already produces shard order --
+/// `discover_gguf_files` sorts and `gguf_shard_set` builds `1..=count`,
+/// safetensors comes out of a `BTreeSet` -- so today this sort changes
+/// nothing. It is here so that the property lives where it is DEPENDED on
+/// rather than only where it happens to be produced; a shard name's index is
+/// fixed-width within one set, so lexicographic order is index order.
+/// [`parse_tokenizer_tables`]'s caller already reads the set this way.
 pub fn parse_attributes_files(paths: &[PathBuf]) -> Result<Attributes, Error> {
+    let mut paths = paths.to_vec();
+    paths.sort();
     Ok(attributes_of(
-        &ztensor_compat::index_all(paths).map_err(Error::from)?,
+        &ztensor_compat::index_all(&paths).map_err(Error::from)?,
     ))
 }
 
@@ -482,13 +513,22 @@ fn scheme_of(layout: &str, attrs: Option<&Value>) -> Result<QuantScheme, Error> 
         "zt.mx/1" => QuantScheme::Mxfp4E2M1E8M0,
         "gguf.q4_0/1" => QuantScheme::GgufQ4_0,
         "gguf.q4_1/1" => QuantScheme::GgufQ4_1,
+        "gguf.q2_k/1" => QuantScheme::GgufQ2K,
+        "gguf.q3_k/1" => QuantScheme::GgufQ3K,
         "gguf.q4_k/1" => QuantScheme::GgufQ4K,
         "gguf.q5_0/1" => QuantScheme::GgufQ5_0,
         "gguf.q5_1/1" => QuantScheme::GgufQ5_1,
         "gguf.q5_k/1" => QuantScheme::GgufQ5K,
         "gguf.q6_k/1" => QuantScheme::GgufQ6K,
+        "gguf.iq4_nl/1" => QuantScheme::GgufIq4Nl,
+        "gguf.iq4_xs/1" => QuantScheme::GgufIq4Xs,
         "gguf.q8_0/1" => QuantScheme::GgufQ8_0,
-        "gguf.mxfp4/1" => QuantScheme::Mxfp4E2M1E8M0,
+        "gguf.mxfp4/1" => QuantScheme::GgufMxfp4,
+        "gguf.iq2_xxs/1" => QuantScheme::GgufIq2Xxs,
+        "gguf.iq2_xs/1" => QuantScheme::GgufIq2Xs,
+        "gguf.iq2_s/1" => QuantScheme::GgufIq2S,
+        "gguf.iq3_xxs/1" => QuantScheme::GgufIq3Xxs,
+        "gguf.iq3_s/1" => QuantScheme::GgufIq3S,
         other => {
             return Err(Error::Checkpoint(format!(
                 "layout {other:?} has no loader quantization scheme; a plan cannot \
@@ -616,10 +656,7 @@ mod tests {
                 cbor::Value::Text("qwen2.block_count".into()),
                 cbor::Value::Uint(24),
             ),
-            (
-                cbor::Value::Text("rope.scale".into()),
-                cbor::Value::Nint(2),
-            ),
+            (cbor::Value::Text("rope.scale".into()), cbor::Value::Nint(2)),
             (
                 cbor::Value::Text("tokenizer.ggml.tokens".into()),
                 cbor::Value::Array(vec![cbor::Value::Text("a".into())]),
@@ -650,6 +687,66 @@ mod tests {
         assert!(parse_attributes(&bare).unwrap().is_empty());
         let _ = std::fs::remove_file(&bare);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A set is read in shard order, whatever order it was handed in.
+    ///
+    /// `Source::merge` keeps the first source that HAS file-level key-values
+    /// and drops every later one, so which file answers is decided by the
+    /// caller's order. This reproduces the split-GGUF shape that makes that
+    /// matter: one member carrying the real block, another carrying only the
+    /// three `split.*` keys llama.cpp writes into shards two and up.
+    ///
+    /// Written with `.zt` files because the rule under test is `merge`'s and
+    /// is format-blind; the names carry the fixed-width index a split GGUF
+    /// uses, since that is what makes sorting the same thing as ordering.
+    ///
+    /// The tensor assertion is the point. Reversed and unsorted, this used to
+    /// come back with BOTH tensors and three keys -- a complete checkpoint
+    /// that cannot say what it is. Nothing is missing and nothing errors, so
+    /// only asking for the architecture catches it.
+    #[test]
+    fn a_shard_set_is_read_in_shard_order_however_it_is_handed_over() {
+        let first = lower_file("m-00001-of-00002", |w| {
+            w.set_attributes(cbor::Value::Map(vec![
+                (
+                    cbor::Value::Text("general.architecture".into()),
+                    cbor::Value::Text("llama".into()),
+                ),
+                (cbor::Value::Text("split.no".into()), cbor::Value::Uint(0)),
+            ]));
+            w.add("one", [2u64, 2], ZDType::BF16, &[0u8; 8]).unwrap();
+        });
+        let second = lower_file("m-00002-of-00002", |w| {
+            w.set_attributes(cbor::Value::Map(vec![
+                (cbor::Value::Text("split.no".into()), cbor::Value::Uint(1)),
+                (
+                    cbor::Value::Text("split.tensors.count".into()),
+                    cbor::Value::Uint(1),
+                ),
+            ]));
+            w.add("two", [2u64, 2], ZDType::BF16, &[0u8; 8]).unwrap();
+        });
+
+        for order in [
+            vec![first.clone(), second.clone()],
+            vec![second.clone(), first.clone()],
+        ] {
+            let whole = parse_checkpoint_files(&order).unwrap();
+            assert_eq!(
+                whole.tensors.len(),
+                2,
+                "both members are present either way, which is why this is silent"
+            );
+            let attributes = parse_attributes_files(&order).unwrap();
+            assert_eq!(
+                attributes.architecture(),
+                Some("llama"),
+                "the member carrying the key-value block has to be the one that answers"
+            );
+        }
+        let _ = std::fs::remove_file(&first);
+        let _ = std::fs::remove_file(&second);
     }
 
     /// Every format zTensor can report has a name here.

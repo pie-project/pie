@@ -113,6 +113,22 @@ pub enum QuantScheme {
     Mxfp4E2M1E8M0,
     MlxAffineU4,
     GgufQ4_0,
+    /// Two bits per weight, affine, in sixteen sub-blocks of sixteen.
+    ///
+    /// The lowest-precision block ggml stores self-contained, and the reason
+    /// the K family stops here rather than at Q4_K: an IQ scheme of the same
+    /// width indexes a lattice compiled into llama.cpp, so its block does not
+    /// carry its own values. This one does.
+    ///
+    /// Unlike [`Self::GgufQ4K`] the super-block scales sit at the END of the
+    /// payload, after the sub-block scales and the quants.
+    GgufQ2K,
+    /// Three bits per weight, symmetric, in sixteen sub-blocks of sixteen.
+    ///
+    /// The third bit lives in a separate 32-byte mask, and it reads
+    /// INVERTED: a set bit means the element keeps its two-bit value, and a
+    /// clear one means four is subtracted from it.
+    GgufQ3K,
     GgufQ4K,
     GgufQ5_0,
     GgufQ5K,
@@ -159,6 +175,98 @@ pub enum QuantScheme {
     /// refused at parse and the most common Q5 release in the wild cannot be
     /// read at all.
     GgufQ5_1,
+    /// llama.cpp's `block_iq4_nl`: 18 bytes per 32 elements — an F16 scale
+    /// and sixteen packed bytes of 4-bit indices.
+    ///
+    /// The same size as [`Self::GgufQ4_0`] and a different thing entirely.
+    /// Q4_0's nibble is a *number*, offset by eight; this one is an INDEX
+    /// into a sixteen-entry table of non-uniform levels. "NL" is non-linear:
+    /// the levels crowd near zero, where weights are dense, and spread out
+    /// toward the tails. Reading these codes as Q4_0's would decode every
+    /// element to the wrong magnitude while looking entirely plausible.
+    ///
+    /// The table is llama.cpp's `kvalues_iq4nl` and is compiled in rather
+    /// than shipped, which is what makes this decodable where the IQ2/IQ3
+    /// lattice schemes are not: sixteen values fit in a line, a lattice does
+    /// not.
+    GgufIq4Nl,
+    /// llama.cpp's `block_iq4_xs`: 136 bytes per 256 elements — eight
+    /// sub-blocks of 32 over [`Self::GgufIq4Nl`]'s table.
+    ///
+    /// The sub-block scale is six bits split across two planes: four low bits
+    /// in `scales_l`, packed two per byte, and two high bits in `scales_h`,
+    /// packed eight per `u16`. It is read as `ls - 32`, so it is signed and
+    /// the super-block scale multiplies it.
+    ///
+    /// Measured on `Llama-3.2-1B-Instruct-UD-Q2_K_XL.gguf`, which holds five
+    /// of these beside IQ2_S, IQ2_XS, IQ3_S and IQ3_XXS. Naming this one does
+    /// not name those: they index a lattice, and the lattice is not in the
+    /// file.
+    GgufIq4Xs,
+    /// llama.cpp's `block_mxfp4`: 17 bytes per 32 elements — one E8M0 scale
+    /// byte followed by sixteen bytes of packed E2M1 nibbles.
+    ///
+    /// The same *numeric* format as [`Self::Mxfp4E2M1E8M0`] and a different
+    /// *byte* layout, which is the only thing a loader addresses bytes with.
+    /// OCP Microscaling stores the codes and the scales as two planes, so a
+    /// tensor of N elements is N/2 bytes of data beside a separate scale
+    /// tensor; ggml interleaves the scale into each block, so the same tensor
+    /// is N × 17/32 bytes with no companion at all.
+    ///
+    /// The two shared one variant until this was measured. `gguf.mxfp4/1` was
+    /// read as `Mxfp4E2M1E8M0`, which reports no block layout, so the tensor
+    /// passed through byte for byte and was written back out under the OCP
+    /// profile `zt.mx/1`. On `gpt-oss-20b-MXFP4.gguf` that produced 72 objects
+    /// whose declared extent was 132,710,400 bytes over a stored span of
+    /// 141,004,800 — a ratio of exactly 17/16 — so **597 MB of payload sat
+    /// outside what the manifest described**, and every block after the first
+    /// was at the wrong offset for any consumer computing addresses from the
+    /// profile. Naming the layout separately is what makes the two spans agree.
+    GgufMxfp4,
+    /// llama.cpp's `block_iq2_xxs`: 66 bytes per 256 elements.
+    ///
+    /// The first of the schemes that quantize a *direction* rather than a
+    /// magnitude. A byte does not hold a weight here — it holds an address
+    /// into a 256-entry table of eight-element points, chosen offline against
+    /// real weight distributions, and the block's scale and a seven-bit sign
+    /// index place that point. Two bits a weight buys nothing unless the
+    /// points are good, and the points are what "IQ" names.
+    ///
+    /// The table is not in the file. It is compiled in, from `gguf-py`'s
+    /// `iq2xxs_grid`, which is why these landed after the IQ4 schemes rather
+    /// than beside them — see `crates/model-loader/src/executor/iq_grid.rs`.
+    GgufIq2Xxs,
+    /// llama.cpp's `block_iq2_xs`: 74 bytes per 256 elements over a 512-entry
+    /// grid.
+    ///
+    /// Twice [`Self::GgufIq2Xxs`]'s grid, so the point index takes nine bits
+    /// and the sign index moves up to the top seven of the same `u16`. The
+    /// eight extra bytes over `IQ2_XXS` are per-16 scales instead of per-32.
+    GgufIq2Xs,
+    /// llama.cpp's `block_iq2_s`: 82 bytes per 256 elements over a 1024-entry
+    /// grid.
+    ///
+    /// The widest IQ2 grid, addressed by ten bits — eight in `qs` and two more
+    /// in a `qh` plane. It also stops packing signs through a parity index and
+    /// stores all eight outright, which is what the extra bytes over
+    /// [`Self::GgufIq2Xs`] buy.
+    GgufIq2S,
+    /// llama.cpp's `block_iq3_xxs`: 98 bytes per 256 elements.
+    ///
+    /// The IQ3 grids hold **four** components per point, not eight, so a point
+    /// index covers four weights and 64 of them cover the block. Everything
+    /// else is shaped like [`Self::GgufIq2Xxs`] — four seven-bit sign indices
+    /// and a four-bit scale to a `u32` — with the scale factor doubled to
+    /// match a grid whose components run to 62.
+    GgufIq3Xxs,
+    /// llama.cpp's `block_iq3_s`: 110 bytes per 256 elements over a 512-entry
+    /// four-component grid.
+    ///
+    /// The one scheme here whose scale is an odd integer, `1 + 2s`, over a grid
+    /// of the odd numbers 1 through 15. Its `qh` plane contributes a single bit
+    /// per point where [`Self::GgufIq2S`]'s contributes two, and its signs are
+    /// stored outright.
+    GgufIq3S,
 }
 
 impl QuantScheme {
@@ -171,7 +279,12 @@ impl QuantScheme {
             | Self::GgufQ4_0
             | Self::GgufQ4_1
             | Self::GgufQ4K
+            | Self::GgufIq4Nl
+            | Self::GgufIq4Xs
+            | Self::GgufMxfp4
             | Self::Int4B8 => 4,
+            Self::GgufQ2K | Self::GgufIq2Xxs | Self::GgufIq2Xs | Self::GgufIq2S => 2,
+            Self::GgufQ3K | Self::GgufIq3Xxs | Self::GgufIq3S => 3,
             Self::GgufQ5_0 | Self::GgufQ5_1 | Self::GgufQ5K => 5,
             Self::GgufQ6K => 6,
             Self::Fp8E4M3
@@ -205,11 +318,46 @@ impl QuantScheme {
             Self::GgufQ5_0 => Some((32, 22)),
             Self::GgufQ5_1 => Some((32, 24)),
             Self::GgufQ8_0 => Some((32, 34)),
+            Self::GgufQ2K => Some((256, 84)),
+            Self::GgufQ3K => Some((256, 110)),
             Self::GgufQ4K => Some((256, 144)),
             Self::GgufQ5K => Some((256, 176)),
             Self::GgufQ6K => Some((256, 210)),
+            Self::GgufIq4Nl => Some((32, 18)),
+            Self::GgufIq4Xs => Some((256, 136)),
+            Self::GgufMxfp4 => Some((32, 17)),
+            Self::GgufIq2Xxs => Some((256, 66)),
+            Self::GgufIq2Xs => Some((256, 74)),
+            Self::GgufIq2S => Some((256, 82)),
+            Self::GgufIq3Xxs => Some((256, 98)),
+            Self::GgufIq3S => Some((256, 110)),
             _ => None,
         }
+    }
+
+    /// Whether this scheme keeps its scales *inside* its payload.
+    ///
+    /// The same question [`block_layout`](Self::block_layout) answers with
+    /// sizes, asked by the callers that only want the yes or no. It is worth a
+    /// name because three separate policies turn on it, and reading
+    /// `block_layout().is_some()` at each one states the mechanism where the
+    /// decision belongs:
+    ///
+    /// - `pie model import` **keeps** such a tensor as the source wrote it,
+    ///   rather than unpacking it to BF16 (`contract::materialize`).
+    /// - A family author **decodes** one before publishing it, because it is
+    ///   about to be bound (`model::shared::builder`).
+    /// - The loader **refuses** to hand one to a device that has no kernel
+    ///   able to read it (`plan::passes::validate`).
+    ///
+    /// All three follow from the one fact, so all three should ask for it by
+    /// name. Note the two MXFP4 spellings are not the same answer:
+    /// `GgufMxfp4` interleaves its scale with its codes and is self-contained,
+    /// while `Mxfp4E2M1E8M0` is the OCP form with a separate scale plane and
+    /// is not.
+    #[must_use]
+    pub fn is_self_contained(self) -> bool {
+        self.block_layout().is_some()
     }
 
     pub fn default_group_size(self) -> u32 {
@@ -221,11 +369,25 @@ impl QuantScheme {
             | Self::GgufQ4K
             | Self::GgufQ5_0
             | Self::GgufQ5_1
-            | Self::GgufQ5K => 32,
+            | Self::GgufQ5K
+            | Self::GgufIq4Nl
+            | Self::GgufIq4Xs
+            | Self::GgufMxfp4 => 32,
             // Sixteen, not the 32 its neighbours use: Q6_K carries one scale
-            // per sixteen elements. Inert for extents either way, since a
-            // scheme with a `block_layout` answers through that.
-            Self::GgufQ6K => 16,
+            // per sixteen elements, and Q2_K and Q3_K cut their super-block
+            // into sixteen sub-blocks of sixteen the same way. Inert for
+            // extents either way, since a scheme with a `block_layout`
+            // answers through that.
+            Self::GgufQ2K | Self::GgufQ3K | Self::GgufQ6K => 16,
+            // The IQ lattice schemes have no group size in the sense the
+            // affine ones do: a grid point covers eight elements (IQ2) or four
+            // (IQ3), and scales run per 16 or 32. Inert either way, since a
+            // scheme with a `block_layout` answers extents through that.
+            Self::GgufIq2Xxs
+            | Self::GgufIq2Xs
+            | Self::GgufIq2S
+            | Self::GgufIq3Xxs
+            | Self::GgufIq3S => 32,
             Self::Fp8E4M3
             | Self::Fp8E5M2
             | Self::Int8Symmetric
@@ -309,7 +471,7 @@ impl QuantSpec {
     /// others fall out only because four, five and six bits do not divide.
     /// Having a block is the property that matters, so it is asked first.
     pub fn dense_element_bytes(&self) -> Option<u64> {
-        if self.block_layout().is_some() {
+        if self.scheme.is_self_contained() {
             return None;
         }
         let bits = self.normalized_bits();

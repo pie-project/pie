@@ -569,6 +569,18 @@ fn load_model_drivers(
         apply_embedded_calibration(&mut embedded_base_opts, user_cfg.server.calibrate_planner);
         let resolved_model = weights::resolve(&m.model)
             .with_context(|| format!("resolving the model for {:?}", m.name))?;
+        // WHICH LAY-OUT OF IT, if the store holds one already built for this
+        // boot. A miss is not an error: an archive is servable as it stands,
+        // and all a miss costs is the family transforms `pie model build`
+        // exists to move offline. See `weights::prefer_runtime`.
+        let resolved_model = weights::prefer_runtime(
+            resolved_model,
+            &weights::Request {
+                backend: flavor.as_str().to_string(),
+                component: format!("{component:?}").to_lowercase(),
+                tp_size: tp_degree,
+            },
+        );
         // Lifted once, here, in one open. The drivers get the compiled model
         // config beside their bootstrap TOML; the runtime gets the whole of it.
         // Nobody downstream re-opens the artifact or re-decides what it is —

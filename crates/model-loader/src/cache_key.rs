@@ -33,6 +33,20 @@ pub struct ArtifactInputs<'a> {
     pub component: u32,
 }
 
+impl ArtifactInputs<'_> {
+    /// The component of a build that materializes the model entire.
+    ///
+    /// `driver_api::ModelComponent::Full as u32`, restated rather than
+    /// imported: the key belongs to `model-loader`, which has no business
+    /// depending on a driver interface, and `pie model build` has no business
+    /// depending on one either. It is the *first* discriminant of that enum
+    /// (`crates/driver-api/src/remote.rs`), which is the property that has to
+    /// hold — a component appended later cannot collide with it, and one
+    /// inserted before it would be a change to every existing key, which is a
+    /// cache miss and not a wrong answer.
+    pub const WHOLE_MODEL: u32 = 0;
+}
+
 /// Name the artifact this plan will materialize.
 ///
 /// Three independent inputs decide the bytes that land on the device:
@@ -60,15 +74,38 @@ pub fn artifact_cache_key(plan: &LoadPlan, inputs: &ArtifactInputs<'_>) -> Strin
     format!("{:016x}", hash.0)
 }
 
+/// Name the archive a runtime artifact was derived from, as it stood then.
+///
+/// The same size-and-mtime reading [`artifact_cache_key`] mixes, on its own and
+/// spelled out, because a runtime artifact has to *state* which archive it is a
+/// cache of. The key already covers this — but the key is a name a builder
+/// chose, and a reader that wants to know whether a file went stale needs the
+/// fact rather than the name.
+///
+/// Same over-approximation, same failure handling: an unreadable directory and
+/// an unreadable file both mix a sentinel rather than being skipped, so "cannot
+/// tell" never reads as "unchanged".
+pub fn snapshot_stat(dir: &Path) -> String {
+    let mut hash = Fnv1a::new();
+    hash.mix_snapshot_stat(dir);
+    format!("{:016x}", hash.0)
+}
+
 /// Whether a file in the snapshot directory can change what a recompile produces.
 ///
 /// Broader than the plan's file table on purpose: the table names what the plan
 /// *reads*, while the key must cover anything that could change what a recompile
 /// would decide — including `config.json` and an index file the plan itself never
 /// opens. Over-approximating only costs a cache miss.
+///
+/// `.zt` is here because the key names files in the store: `pie model build`
+/// reads an archive, not a snapshot, so leaving it out would make the stat leg
+/// contribute nothing at all on that path — and the stat leg is the only one
+/// that notices a checkpoint rewritten in place under an unchanged header.
 fn affects_compilation(name: &str) -> bool {
     name.ends_with(".safetensors")
         || name.ends_with(".gguf")
+        || name.ends_with(".zt")
         || name == "config.json"
         || name == "model.safetensors.index.json"
 }

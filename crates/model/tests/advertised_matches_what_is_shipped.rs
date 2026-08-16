@@ -47,15 +47,19 @@ use std::collections::BTreeMap;
 /// that broke DeepSeek's advertised facts stayed green because DeepSeek
 /// was never in the walk.
 const THIS_BUILD_CANNOT_DEPLOY: &[(&str, &str)] = &[
-    (
-        "gemma-4-26b-a4b",
-        // The text IS written; what is missing is the contract that
-        // publishes `experts.switch_glu.*`, and the branch's own norms
-        // and the router's two scales. `Gemma4::untraced` carries the
-        // measurement -- this column used to say "no routed-expert
-        // text", which named the wrong half.
-        "no loadable routed bank for a gemma-4 block",
-    ),
+    // `gemma-4-26b-a4b` STOOD HERE, for "no loadable routed bank for a
+    // gemma-4 block". It deploys now, at every rank -- the contract that
+    // publishes `experts.switch_glu.*`, the branch's own norms and the
+    // router's two scales all landed, and `Gemma4::untraced` returns
+    // `None` with the measurement written out above it.
+    //
+    // Note what that does and does not mean, because the row is still not
+    // servable everywhere: `Gemma4::trace` refuses it on CUDA, along with
+    // `gemma-4-31b`, for reading V out of the K projection where the
+    // hand-written CUDA text projects one. This list is about
+    // `deployment()` alone, and a row refused later by a backend belongs
+    // to that backend's arm rather than here -- which is exactly why
+    // `gemma-4-31b` was never in this list either.
     ("glm-5-106b-a12b", "no MLA latent store"),
     ("kimi-k2", "no MLA latent store"),
     ("kimi-k3", "no MLA latent store"),

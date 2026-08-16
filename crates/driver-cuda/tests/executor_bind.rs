@@ -46,7 +46,11 @@ impl Resolver for Sentinels {
 }
 
 fn plan_of(class: FireClass) -> model_ir::trace::ForwardPlan {
-    llama_like_cuda(&LlamaLikeFacts::qwen3_0_6b(), &LlamaLikeCudaFacts::qwen3_0_6b_l40s(), class)
+    llama_like_cuda(
+        &LlamaLikeFacts::qwen3_0_6b(),
+        &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
+        class,
+    )
 }
 
 fn lowered(class: FireClass, rows: usize) -> Lowered {
@@ -55,8 +59,21 @@ fn lowered(class: FireClass, rows: usize) -> Lowered {
         &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
         class,
     );
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
-    lower(&plan, &rows, Fire { captures_across_splits: false }).expect("the live form lowers")
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        rows
+    ];
+    lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("the live form lowers")
 }
 
 /// The qwen3_5 hybrid (E-gate family #1): `Qwen3.5-0.8B-Base`'s facts
@@ -85,9 +102,26 @@ fn qwen35_live_cuda() -> Qwen35CudaFacts {
 }
 
 fn qwen35_lowered(class: FireClass, rows: usize) -> Lowered {
-    let plan = qwen3_5_hybrid_cuda(&Qwen35HybridFacts::qwen3_5_0_8b(), &qwen35_live_cuda(), class);
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
-    lower(&plan, &rows, Fire { captures_across_splits: false }).expect("the hybrid lowers")
+    let plan = qwen3_5_hybrid_cuda(
+        &Qwen35HybridFacts::qwen3_5_0_8b(),
+        &qwen35_live_cuda(),
+        class,
+    );
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        rows
+    ];
+    lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("the hybrid lowers")
 }
 
 /// gemma-2 (E-gate family #2): the 9b facts, DECODE class — the only
@@ -97,20 +131,39 @@ fn gemma2_lowered(rows: usize) -> Lowered {
         &model::gemma_2::forward::facts::Gemma2Facts::gemma_2_9b(),
         FireClass::Decode,
     );
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
-    lower(&plan, &rows, Fire { captures_across_splits: false }).expect("gemma2 lowers")
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        rows
+    ];
+    lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("gemma2 lowers")
 }
 
 #[test]
 fn every_launch_of_the_gemma2_deployment_binds() {
     let l = gemma2_lowered(4);
     assert!(!l.launches.is_empty());
-    let frame = Frame { arena: 0x10000 as *mut c_void, arena_bytes: l.arena_bytes };
+    let frame = Frame {
+        arena: 0x10000 as *mut c_void,
+        arena_bytes: l.arena_bytes,
+    };
     let mut resolver = Sentinels::default();
     for launch in &l.launches {
         let bound = bind(&l, launch, frame, &mut resolver)
             .unwrap_or_else(|r| panic!("gemma2: launch refused: {r:?}"));
-        assert_eq!(bound.args.len(), (launch.args.end - launch.args.start) as usize);
+        assert_eq!(
+            bound.args.len(),
+            (launch.args.end - launch.args.start) as usize
+        );
     }
     // gemma2's ARG-level weights are all `scale.*` constants (which bind
     // without the resolver); the tensor weights ride the op join.
@@ -120,8 +173,12 @@ fn every_launch_of_the_gemma2_deployment_binds() {
     );
     let dp = driver_cuda::bind::DispatchPlan::new(&plan, &l);
     assert!(
-        (0..l.launches.len())
-            .any(|i| { dp.spec(i).weight.as_deref().is_some_and(|w| !w.starts_with("scale.")) }),
+        (0..l.launches.len()).any(|i| {
+            dp.spec(i)
+                .weight
+                .as_deref()
+                .is_some_and(|w| !w.starts_with("scale."))
+        }),
         "a forward that names no tensor weights did not lower the model"
     );
 }
@@ -135,21 +192,31 @@ fn every_lowered_gemma2_kernel_has_a_bridge_row() {
             unreachable.insert(symbol.clone());
         }
     }
-    assert!(unreachable.is_empty(), "gemma2 kernels with no stated bridge row: {unreachable:?}");
+    assert!(
+        unreachable.is_empty(),
+        "gemma2 kernels with no stated bridge row: {unreachable:?}"
+    );
 }
 
 #[test]
 #[ignore = "enumeration aid, not a claim"]
 fn print_the_gemma2_vocabulary() {
     let l = gemma2_lowered(4);
-    eprintln!("=== gemma2 decode: {} launches, arena {}", l.launches.len(), l.arena_bytes);
+    eprintln!(
+        "=== gemma2 decode: {} launches, arena {}",
+        l.launches.len(),
+        l.arena_bytes
+    );
     for (i, k) in l.kernels.iter().enumerate() {
         let n = l.launches.iter().filter(|x| x.kernel as usize == i).count();
         eprintln!("  {k}  x{n}");
     }
     for launch in l.launches.iter().take(30) {
         let args = &l.args[launch.args.start as usize..launch.args.end as usize];
-        eprintln!("  L {} rows={:?} args={args:?}", l.kernels[launch.kernel as usize], launch.rows);
+        eprintln!(
+            "  L {} rows={:?} args={args:?}",
+            l.kernels[launch.kernel as usize], launch.rows
+        );
     }
 }
 
@@ -161,8 +228,21 @@ fn gemma4_lowered(class: FireClass, rows: usize) -> Lowered {
         &model::gemma_4::forward::facts::Gemma4CudaFacts::gemma_4_e4b_synthetic(),
         class,
     );
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
-    lower(&plan, &rows, Fire { captures_across_splits: false }).expect("gemma4 lowers")
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        rows
+    ];
+    lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("gemma4 lowers")
 }
 
 #[test]
@@ -170,12 +250,18 @@ fn every_launch_of_the_gemma4_deployment_binds() {
     for (class, rows) in [(FireClass::Decode, 4), (FireClass::Prefill, 7)] {
         let l = gemma4_lowered(class, rows);
         assert!(!l.launches.is_empty());
-        let frame = Frame { arena: 0x10000 as *mut c_void, arena_bytes: l.arena_bytes };
+        let frame = Frame {
+            arena: 0x10000 as *mut c_void,
+            arena_bytes: l.arena_bytes,
+        };
         let mut resolver = Sentinels::default();
         for launch in &l.launches {
             let bound = bind(&l, launch, frame, &mut resolver)
                 .unwrap_or_else(|r| panic!("gemma4 {class:?}: launch refused: {r:?}"));
-            assert_eq!(bound.args.len(), (launch.args.end - launch.args.start) as usize);
+            assert_eq!(
+                bound.args.len(),
+                (launch.args.end - launch.args.start) as usize
+            );
         }
     }
 }
@@ -189,20 +275,39 @@ fn nemotron_lowered(rows: usize) -> Lowered {
         &model::nemotron_h::forward::facts::NemotronHFacts::nemotron_h_synthetic(),
         FireClass::Decode,
     );
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
-    lower(&plan, &rows, Fire { captures_across_splits: false }).expect("nemotron_h lowers")
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        rows
+    ];
+    lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("nemotron_h lowers")
 }
 
 #[test]
 fn every_launch_of_the_nemotron_deployment_binds() {
     let l = nemotron_lowered(4);
     assert!(!l.launches.is_empty());
-    let frame = Frame { arena: 0x10000 as *mut c_void, arena_bytes: l.arena_bytes };
+    let frame = Frame {
+        arena: 0x10000 as *mut c_void,
+        arena_bytes: l.arena_bytes,
+    };
     let mut resolver = Sentinels::default();
     for launch in &l.launches {
         let bound = bind(&l, launch, frame, &mut resolver)
             .unwrap_or_else(|r| panic!("nemotron_h: launch refused: {r:?}"));
-        assert_eq!(bound.args.len(), (launch.args.end - launch.args.start) as usize);
+        assert_eq!(
+            bound.args.len(),
+            (launch.args.end - launch.args.start) as usize
+        );
     }
 }
 
@@ -225,7 +330,11 @@ fn every_lowered_nemotron_kernel_has_a_bridge_row() {
 #[ignore = "enumeration aid, not a claim"]
 fn print_the_nemotron_vocabulary() {
     let l = nemotron_lowered(4);
-    eprintln!("=== nemotron_h Decode: {} launches, arena {}", l.launches.len(), l.arena_bytes);
+    eprintln!(
+        "=== nemotron_h Decode: {} launches, arena {}",
+        l.launches.len(),
+        l.arena_bytes
+    );
     for (i, k) in l.kernels.iter().enumerate() {
         let n = l.launches.iter().filter(|x| x.kernel as usize == i).count();
         eprintln!("  {k}  x{n}");
@@ -241,7 +350,10 @@ fn print_the_nemotron_vocabulary() {
             || k.contains("conv")
         {
             let args = &l.args[launch.args.start as usize..launch.args.end as usize];
-            eprintln!("  L {k} rows={:?} layers={:?} args={args:?}", launch.rows, launch.layers);
+            eprintln!(
+                "  L {k} rows={:?} layers={:?} args={args:?}",
+                launch.rows, launch.layers
+            );
         }
     }
 }
@@ -257,7 +369,10 @@ fn every_lowered_gemma4_kernel_has_a_bridge_row() {
             }
         }
     }
-    assert!(unreachable.is_empty(), "gemma4 kernels with no stated bridge row: {unreachable:?}");
+    assert!(
+        unreachable.is_empty(),
+        "gemma4 kernels with no stated bridge row: {unreachable:?}"
+    );
 }
 
 #[test]
@@ -265,7 +380,11 @@ fn every_lowered_gemma4_kernel_has_a_bridge_row() {
 fn print_the_gemma4_vocabulary() {
     for (class, rows) in [(FireClass::Decode, 4), (FireClass::Prefill, 7)] {
         let l = gemma4_lowered(class, rows);
-        eprintln!("=== gemma4 {class:?}: {} launches, arena {}", l.launches.len(), l.arena_bytes);
+        eprintln!(
+            "=== gemma4 {class:?}: {} launches, arena {}",
+            l.launches.len(),
+            l.arena_bytes
+        );
         for (i, k) in l.kernels.iter().enumerate() {
             let n = l.launches.iter().filter(|x| x.kernel as usize == i).count();
             eprintln!("  {k}  x{n}");
@@ -423,15 +542,17 @@ fn bridged_symbols() -> BTreeSet<&'static str> {
     // forward to `norm` routines that were already declared, so nothing in
     // that module is a row waiting to be filtered back out. The set below IS
     // the dispatchable set, by construction rather than by predicate.
-    let rows: BTreeSet<&'static str> =
-        kernels_cuda::sigs().iter().map(|k| k.symbol).collect();
+    let rows: BTreeSet<&'static str> = kernels_cuda::sigs().iter().map(|k| k.symbol).collect();
     let mut reachable = rows.clone();
     reachable.extend(AWAITING_THE_VERIFY_STASH_POOL);
     reachable.extend(LOWERED_WITH_A_HOST_PROGRAM_AND_NO_ARM);
     for (lowered, row) in RENAMED_AT_THE_ABI {
         // The exception buys nothing if its TARGET is imaginary: a
         // rename is only reachable when the row it renames to is.
-        assert!(rows.contains(row), "`{lowered}` is bound to `{row}`, which has no bridge row");
+        assert!(
+            rows.contains(row),
+            "`{lowered}` is bound to `{row}`, which has no bridge row"
+        );
         reachable.insert(lowered);
     }
     reachable
@@ -445,7 +566,10 @@ fn every_launch_of_the_anchor_deployment_binds() {
 
         // The arena the frame would allocate — the binder only addresses
         // it, so a dangling sentinel base is fine off-device.
-        let frame = Frame { arena: 0x10000 as *mut c_void, arena_bytes: l.arena_bytes };
+        let frame = Frame {
+            arena: 0x10000 as *mut c_void,
+            arena_bytes: l.arena_bytes,
+        };
         let mut resolver = Sentinels::default();
 
         for launch in &l.launches {
@@ -475,7 +599,10 @@ fn every_launch_of_the_hybrid_deployment_binds() {
     for &(class, rows) in HYBRID_CORPUS {
         let l = qwen35_lowered(class, rows);
         assert!(!l.launches.is_empty(), "{class:?} lowered to nothing");
-        let frame = Frame { arena: 0x10000 as *mut c_void, arena_bytes: l.arena_bytes };
+        let frame = Frame {
+            arena: 0x10000 as *mut c_void,
+            arena_bytes: l.arena_bytes,
+        };
         let mut resolver = Sentinels::default();
         for launch in &l.launches {
             let bound = bind(&l, launch, frame, &mut resolver)
@@ -519,7 +646,10 @@ fn every_lowered_hybrid_kernel_has_a_bridge_row() {
             }
         }
     }
-    assert!(unreachable.is_empty(), "hybrid kernels with no stated bridge row: {unreachable:?}");
+    assert!(
+        unreachable.is_empty(),
+        "hybrid kernels with no stated bridge row: {unreachable:?}"
+    );
 }
 
 /// The dispatchability claim: nothing lowers to a kernel the bridge
@@ -537,7 +667,10 @@ fn every_lowered_kernel_has_a_bridge_row() {
             }
         }
     }
-    assert!(unreachable.is_empty(), "lowered kernels with no stated bridge row: {unreachable:?}");
+    assert!(
+        unreachable.is_empty(),
+        "lowered kernels with no stated bridge row: {unreachable:?}"
+    );
 }
 
 /// The refusals refuse: an arena smaller than the lowering sized is
@@ -546,12 +679,20 @@ fn every_lowered_kernel_has_a_bridge_row() {
 fn the_binder_diagnoses_drift_rather_than_addressing_through_it() {
     let l = lowered(FireClass::Decode, 4);
 
-    let starved = Frame { arena: 0x10000 as *mut c_void, arena_bytes: 1 };
+    let starved = Frame {
+        arena: 0x10000 as *mut c_void,
+        arena_bytes: 1,
+    };
     let mut resolver = Sentinels::default();
-    let refusal =
-        l.launches.iter().find_map(|launch| bind(&l, launch, starved, &mut resolver).err());
+    let refusal = l
+        .launches
+        .iter()
+        .find_map(|launch| bind(&l, launch, starved, &mut resolver).err());
     assert!(
-        matches!(refusal, Some(BindRefusal::ArenaOutOfBounds { arena_bytes: 1, .. })),
+        matches!(
+            refusal,
+            Some(BindRefusal::ArenaOutOfBounds { arena_bytes: 1, .. })
+        ),
         "a one-byte arena must refuse: {refusal:?}"
     );
 
@@ -564,9 +705,14 @@ fn the_binder_diagnoses_drift_rather_than_addressing_through_it() {
             Some(0x2000 as *mut c_void)
         }
     }
-    let frame = Frame { arena: 0x10000 as *mut c_void, arena_bytes: l.arena_bytes };
-    let refusal =
-        l.launches.iter().find_map(|launch| bind(&l, launch, frame, &mut NoWeights).err());
+    let frame = Frame {
+        arena: 0x10000 as *mut c_void,
+        arena_bytes: l.arena_bytes,
+    };
+    let refusal = l
+        .launches
+        .iter()
+        .find_map(|launch| bind(&l, launch, frame, &mut NoWeights).err());
     assert!(
         matches!(refusal, Some(BindRefusal::UnknownWeight(_))),
         "a weightless store must be diagnosed by NAME: {refusal:?}"
@@ -598,33 +744,65 @@ fn print_all_deployment_vocabularies() {
         (
             "olmo2_1b",
             LlamaLikeFacts::olmo2_1b(),
-            LlamaLikeCudaFacts { decode_fused_post: true, ..tail.clone() },
+            LlamaLikeCudaFacts {
+                decode_fused_post: true,
+                ..tail.clone()
+            },
         ),
         (
             "qwen2_5_1_5b",
             LlamaLikeFacts::qwen2_5_1_5b(),
-            LlamaLikeCudaFacts { force_prefill_path: true, ..tail.clone() },
+            LlamaLikeCudaFacts {
+                force_prefill_path: true,
+                ..tail.clone()
+            },
         ),
         (
             "mistral_7b_v03",
             LlamaLikeFacts::mistral_7b_v03(),
-            LlamaLikeCudaFacts { decode_fused_post: true, ..tail.clone() },
+            LlamaLikeCudaFacts {
+                decode_fused_post: true,
+                ..tail.clone()
+            },
         ),
         (
             "phi3_mini",
             LlamaLikeFacts::phi3_mini(),
-            LlamaLikeCudaFacts { head_dim_padded: true, head_dim_kernel: 128, ..tail.clone() },
+            LlamaLikeCudaFacts {
+                head_dim_padded: true,
+                head_dim_kernel: 128,
+                ..tail.clone()
+            },
         ),
     ];
     let bridged = bridged_symbols();
     for (name, facts, cuda) in &deployments {
         for class in [FireClass::Decode, FireClass::Prefill] {
             let plan = llama_like_cuda(facts, cuda, class);
-            let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; 4];
-            let l = lower(&plan, &rows, Fire { captures_across_splits: false }).expect("lowers");
-            let missing: Vec<&String> =
-                l.kernels.iter().filter(|k| !bridged.contains(k.as_str())).collect();
-            let frame = Frame { arena: 0x10000 as *mut c_void, arena_bytes: l.arena_bytes };
+            let rows: Vec<Row> = vec![
+                Row {
+                    samples: true,
+                    ..Row::default()
+                };
+                4
+            ];
+            let l = lower(
+                &plan,
+                &rows,
+                Fire {
+                    captures_across_splits: false,
+                },
+            )
+            .expect("lowers");
+            let missing: Vec<&String> = l
+                .kernels
+                .iter()
+                .filter(|k| !bridged.contains(k.as_str()))
+                .collect();
+            let frame = Frame {
+                arena: 0x10000 as *mut c_void,
+                arena_bytes: l.arena_bytes,
+            };
             let mut r = Sentinels::default();
             for launch in &l.launches {
                 let _ = bind(&l, launch, frame, &mut r);
@@ -688,13 +866,20 @@ fn print_the_hybrid_vocabulary() {
 fn print_the_anchor_vocabulary() {
     for (class, rows) in [(FireClass::Decode, 4), (FireClass::Prefill, 7)] {
         let l = lowered(class, rows);
-        eprintln!("=== {class:?}: {} launches, arena {} bytes", l.launches.len(), l.arena_bytes);
+        eprintln!(
+            "=== {class:?}: {} launches, arena {} bytes",
+            l.launches.len(),
+            l.arena_bytes
+        );
         for (i, k) in l.kernels.iter().enumerate() {
             let n = l.launches.iter().filter(|x| x.kernel as usize == i).count();
             eprintln!("  {k}  x{n}");
         }
         {
-            let frame = Frame { arena: 0x10000 as *mut c_void, arena_bytes: l.arena_bytes };
+            let frame = Frame {
+                arena: 0x10000 as *mut c_void,
+                arena_bytes: l.arena_bytes,
+            };
             let mut r = Sentinels::default();
             for (i, launch) in l.launches.iter().enumerate() {
                 let _ = bind(&l, launch, frame, &mut r);
@@ -734,14 +919,31 @@ fn print_the_lora_vocabulary() {
         &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
         FireClass::Decode,
     );
-    let rows: Vec<Row> = vec![Row { samples: true, lora: true, ..Row::default() }; 2];
-    let l = lower(&plan, &rows, Fire { captures_across_splits: false }).expect("lowers");
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            lora: true,
+            ..Row::default()
+        };
+        2
+    ];
+    let l = lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("lowers");
     eprintln!("=== lora decode: {} launches", l.launches.len());
     for launch in &l.launches {
         let k = &l.kernels[launch.kernel as usize];
         if k.contains("lora") {
             let args = &l.args[launch.args.start as usize..launch.args.end as usize];
-            eprintln!("  L {k} rows={:?} layers={:?} args={args:?}", launch.rows, launch.layers);
+            eprintln!(
+                "  L {k} rows={:?} layers={:?} args={args:?}",
+                launch.rows, launch.layers
+            );
         }
     }
 }
@@ -756,20 +958,39 @@ fn gemma3n_lowered(rows: usize) -> Lowered {
         &model::gemma_3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(),
         FireClass::Decode,
     );
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
-    lower(&plan, &rows, Fire { captures_across_splits: false }).expect("gemma3n lowers")
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        rows
+    ];
+    lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("gemma3n lowers")
 }
 
 #[test]
 fn every_launch_of_the_gemma3n_deployment_binds() {
     let l = gemma3n_lowered(4);
     assert!(!l.launches.is_empty());
-    let frame = Frame { arena: 0x10000 as *mut c_void, arena_bytes: l.arena_bytes };
+    let frame = Frame {
+        arena: 0x10000 as *mut c_void,
+        arena_bytes: l.arena_bytes,
+    };
     let mut resolver = Sentinels::default();
     for launch in &l.launches {
         let bound = bind(&l, launch, frame, &mut resolver)
             .unwrap_or_else(|r| panic!("gemma3n: launch refused: {r:?}"));
-        assert_eq!(bound.args.len(), (launch.args.end - launch.args.start) as usize);
+        assert_eq!(
+            bound.args.len(),
+            (launch.args.end - launch.args.start) as usize
+        );
     }
 }
 
@@ -782,14 +1003,21 @@ fn every_lowered_gemma3n_kernel_has_a_bridge_row() {
             unreachable.insert(symbol.clone());
         }
     }
-    assert!(unreachable.is_empty(), "gemma3n kernels with no stated bridge row: {unreachable:?}");
+    assert!(
+        unreachable.is_empty(),
+        "gemma3n kernels with no stated bridge row: {unreachable:?}"
+    );
 }
 
 #[test]
 #[ignore = "enumeration aid, not a claim"]
 fn print_the_gemma3n_vocabulary() {
     let l = gemma3n_lowered(4);
-    eprintln!("=== gemma3n Decode: {} launches, arena {}", l.launches.len(), l.arena_bytes);
+    eprintln!(
+        "=== gemma3n Decode: {} launches, arena {}",
+        l.launches.len(),
+        l.arena_bytes
+    );
     for (i, k) in l.kernels.iter().enumerate() {
         let n = l.launches.iter().filter(|x| x.kernel as usize == i).count();
         eprintln!("  {k}  x{n}");
@@ -807,7 +1035,10 @@ fn print_the_gemma3n_vocabulary() {
             && seen.insert(k.clone())
         {
             let args = &l.args[launch.args.start as usize..launch.args.end as usize];
-            eprintln!("  L {k} rows={:?} layers={:?} args={args:?}", launch.rows, launch.layers);
+            eprintln!(
+                "  L {k} rows={:?} layers={:?} args={args:?}",
+                launch.rows, launch.layers
+            );
         }
     }
 }
@@ -821,20 +1052,39 @@ fn gpt_oss_lowered(class: FireClass, rows: usize) -> Lowered {
         &model::gpt_oss::forward::facts::GptOssCudaFacts::gpt_oss_20b_synthetic(),
         class,
     );
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
-    lower(&plan, &rows, Fire { captures_across_splits: false }).expect("gpt_oss lowers")
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        rows
+    ];
+    lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("gpt_oss lowers")
 }
 
 #[test]
 fn every_launch_of_the_gpt_oss_deployment_binds() {
     let l = gpt_oss_lowered(FireClass::Decode, 4);
     assert!(!l.launches.is_empty());
-    let frame = Frame { arena: 0x10000 as *mut c_void, arena_bytes: l.arena_bytes };
+    let frame = Frame {
+        arena: 0x10000 as *mut c_void,
+        arena_bytes: l.arena_bytes,
+    };
     let mut resolver = Sentinels::default();
     for launch in &l.launches {
         let bound = bind(&l, launch, frame, &mut resolver)
             .unwrap_or_else(|r| panic!("gpt_oss: launch refused: {r:?}"));
-        assert_eq!(bound.args.len(), (launch.args.end - launch.args.start) as usize);
+        assert_eq!(
+            bound.args.len(),
+            (launch.args.end - launch.args.start) as usize
+        );
     }
 }
 
@@ -847,14 +1097,21 @@ fn every_lowered_gpt_oss_kernel_has_a_bridge_row() {
             unreachable.insert(symbol.clone());
         }
     }
-    assert!(unreachable.is_empty(), "gpt_oss kernels with no stated bridge row: {unreachable:?}");
+    assert!(
+        unreachable.is_empty(),
+        "gpt_oss kernels with no stated bridge row: {unreachable:?}"
+    );
 }
 
 #[test]
 #[ignore = "enumeration aid, not a claim"]
 fn print_the_gpt_oss_vocabulary() {
     let l = gpt_oss_lowered(FireClass::Decode, 4);
-    eprintln!("=== gpt_oss Decode: {} launches, arena {}", l.launches.len(), l.arena_bytes);
+    eprintln!(
+        "=== gpt_oss Decode: {} launches, arena {}",
+        l.launches.len(),
+        l.arena_bytes
+    );
     for (i, k) in l.kernels.iter().enumerate() {
         let n = l.launches.iter().filter(|x| x.kernel as usize == i).count();
         eprintln!("  {k}  x{n}");
@@ -864,7 +1121,10 @@ fn print_the_gpt_oss_vocabulary() {
         let k = &l.kernels[launch.kernel as usize];
         if seen.insert(k.clone()) {
             let args = &l.args[launch.args.start as usize..launch.args.end as usize];
-            eprintln!("  L {k} rows={:?} layers={:?} args={args:?}", launch.rows, launch.layers);
+            eprintln!(
+                "  L {k} rows={:?} layers={:?} args={args:?}",
+                launch.rows, launch.layers
+            );
         }
     }
 }
@@ -880,8 +1140,21 @@ fn glm5_lowered(rows: usize) -> Lowered {
         &model::glm_5::forward::facts::Glm5Facts::glm5_106b_a12b(),
         FireClass::Decode,
     );
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
-    lower(&plan, &rows, Fire { captures_across_splits: false }).expect("glm5 lowers")
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        rows
+    ];
+    lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("glm5 lowers")
 }
 
 fn kimi_k2_lowered(rows: usize) -> Lowered {
@@ -890,8 +1163,21 @@ fn kimi_k2_lowered(rows: usize) -> Lowered {
         &model::kimi_k2::forward::facts::KimiCudaFacts::kimi_k2_synthetic(),
         FireClass::Decode,
     );
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
-    lower(&plan, &rows, Fire { captures_across_splits: false }).expect("kimi_k2 lowers")
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        rows
+    ];
+    lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("kimi_k2 lowers")
 }
 
 fn kimi_k3_lowered(rows: usize) -> Lowered {
@@ -899,8 +1185,21 @@ fn kimi_k3_lowered(rows: usize) -> Lowered {
         &model::kimi_k3::forward::facts::KimiK3Facts::kimi_k3_synthetic(),
         FireClass::Decode,
     );
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
-    lower(&plan, &rows, Fire { captures_across_splits: false }).expect("kimi_k3 lowers")
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        rows
+    ];
+    lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("kimi_k3 lowers")
 }
 
 fn dsv4_lowered(rows: usize) -> Lowered {
@@ -908,8 +1207,21 @@ fn dsv4_lowered(rows: usize) -> Lowered {
         &model::deepseek_v4::forward::facts::Dsv4Facts::dsv4_synthetic(),
         FireClass::Decode,
     );
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
-    lower(&plan, &rows, Fire { captures_across_splits: false }).expect("dsv4 lowers")
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        rows
+    ];
+    lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("dsv4 lowers")
 }
 
 #[test]
@@ -921,12 +1233,18 @@ fn every_launch_of_the_remaining_families_binds() {
         ("deepseek_v4", dsv4_lowered(4)),
     ] {
         assert!(!l.launches.is_empty(), "{name} lowered to nothing");
-        let frame = Frame { arena: 0x10000 as *mut c_void, arena_bytes: l.arena_bytes };
+        let frame = Frame {
+            arena: 0x10000 as *mut c_void,
+            arena_bytes: l.arena_bytes,
+        };
         let mut resolver = Sentinels::default();
         for launch in &l.launches {
             let bound = bind(&l, launch, frame, &mut resolver)
                 .unwrap_or_else(|r| panic!("{name}: launch refused: {r:?}"));
-            assert_eq!(bound.args.len(), (launch.args.end - launch.args.start) as usize);
+            assert_eq!(
+                bound.args.len(),
+                (launch.args.end - launch.args.start) as usize
+            );
         }
     }
 }
@@ -935,14 +1253,22 @@ fn every_launch_of_the_remaining_families_binds() {
 fn every_lowered_kernel_of_the_remaining_families_has_a_bridge_row() {
     let bridged = bridged_symbols();
     let mut unreachable = BTreeSet::new();
-    for l in [glm5_lowered(4), kimi_k2_lowered(4), kimi_k3_lowered(4), dsv4_lowered(4)] {
+    for l in [
+        glm5_lowered(4),
+        kimi_k2_lowered(4),
+        kimi_k3_lowered(4),
+        dsv4_lowered(4),
+    ] {
         for symbol in &l.kernels {
             if !bridged.contains(symbol.as_str()) {
                 unreachable.insert(symbol.clone());
             }
         }
     }
-    assert!(unreachable.is_empty(), "kernels with no stated bridge row: {unreachable:?}");
+    assert!(
+        unreachable.is_empty(),
+        "kernels with no stated bridge row: {unreachable:?}"
+    );
 }
 
 // The four builders below fed `every_lowered_symbol_has_an_arm`, deleted at
@@ -991,11 +1317,24 @@ fn every_lowered_kernel_of_the_remaining_families_has_a_bridge_row() {
 /// refuses anything else.
 fn masked_lowered(rows: usize) -> Lowered {
     let plan = plan_of(FireClass::Decode);
-    let mut r: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
+    let mut r: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        rows
+    ];
     for row in r.iter_mut().skip(rows.saturating_sub(2)) {
         row.custom_mask = true;
     }
-    lower(&plan, &r, Fire { captures_across_splits: false }).expect("a masked fire lowers")
+    lower(
+        &plan,
+        &r,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("a masked fire lowers")
 }
 
 /// The same, on the hook axis: the suffix rows carry attached programs,
@@ -1003,11 +1342,24 @@ fn masked_lowered(rows: usize) -> Lowered {
 /// being interchangeable.
 fn hooked_lowered(rows: usize) -> Lowered {
     let plan = plan_of(FireClass::Decode);
-    let mut r: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
+    let mut r: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        rows
+    ];
     for row in r.iter_mut().skip(rows.saturating_sub(2)) {
         row.hooked = true;
     }
-    lower(&plan, &r, Fire { captures_across_splits: false }).expect("a hooked fire lowers")
+    lower(
+        &plan,
+        &r,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("a hooked fire lowers")
 }
 
 /// The UNION lowering: every guard arm present, nothing decided.
@@ -1019,11 +1371,19 @@ fn hooked_lowered(rows: usize) -> Lowered {
 /// it before the kernel list is built.
 fn union_lowered(rows: usize) -> Lowered {
     let plan = plan_of(FireClass::Decode);
-    let r: Vec<Row> = vec![Row { samples: true, ..Row::default() }; rows];
+    let r: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        rows
+    ];
     model_compiler::lower::lower_with(
         &plan,
         &r,
-        Fire { captures_across_splits: false },
+        Fire {
+            captures_across_splits: false,
+        },
         model_compiler::lower::GuardMode::Union,
     )
     .expect("the union lowers")
@@ -1051,8 +1411,14 @@ fn every_mark_lowered(rows: usize) -> Lowered {
         };
         rows
     ];
-    lower(&plan, &r, Fire { captures_across_splits: false })
-        .expect("a fire carrying every mark lowers")
+    lower(
+        &plan,
+        &r,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("a fire carrying every mark lowers")
 }
 
 /// The same bridge-row claim, over the four lowerings whose rows are MARKED.
@@ -1084,7 +1450,10 @@ fn every_kernel_a_marked_fire_lowers_to_has_a_bridge_row() {
     // stopped producing kernels at all would satisfy the assertion below
     // perfectly, which is the way this shape of test dies quietly.
     for (what, l) in &corpus {
-        assert!(!l.kernels.is_empty(), "the {what} lowering produced no kernels at all");
+        assert!(
+            !l.kernels.is_empty(),
+            "the {what} lowering produced no kernels at all"
+        );
     }
     for (_, l) in &corpus {
         for symbol in &l.kernels {
@@ -1157,7 +1526,10 @@ fn every_lowered_symbol_runs_or_says_why_not() {
         ("union", union_lowered(4)),
     ];
     for (what, l) in &corpus {
-        assert!(!l.kernels.is_empty(), "the {what} lowering produced no kernels at all");
+        assert!(
+            !l.kernels.is_empty(),
+            "the {what} lowering produced no kernels at all"
+        );
         for symbol in &l.kernels {
             match driver_cuda::bind::arms::bound(symbol) {
                 Some(b) if b.arm.is_some() => armed += 1,
@@ -1172,7 +1544,10 @@ fn every_lowered_symbol_runs_or_says_why_not() {
     // registry lookup that started answering `None` for everything would
     // report every symbol at once, and one that started answering `Some`
     // for everything would report nothing and look like success.
-    assert!(armed > 50, "only {armed} armed symbols — the registry lookup broke");
+    assert!(
+        armed > 50,
+        "only {armed} armed symbols — the registry lookup broke"
+    );
     assert!(
         absent.is_empty(),
         "symbols a live deployment lowers to that the arm registries do not mention. \
@@ -1245,19 +1620,39 @@ fn a_named_operand_names_its_alias_owner() {
         (
             "mistral_7b_v03",
             LlamaLikeFacts::mistral_7b_v03(),
-            LlamaLikeCudaFacts { decode_fused_post: true, ..tail.clone() },
+            LlamaLikeCudaFacts {
+                decode_fused_post: true,
+                ..tail.clone()
+            },
         ),
         (
             "phi3_mini",
             LlamaLikeFacts::phi3_mini(),
-            LlamaLikeCudaFacts { head_dim_padded: true, head_dim_kernel: 128, ..tail.clone() },
+            LlamaLikeCudaFacts {
+                head_dim_padded: true,
+                head_dim_kernel: 128,
+                ..tail.clone()
+            },
         ),
     ];
     for (name, facts, cuda) in &corpus {
         for class in [FireClass::Decode, FireClass::Prefill] {
             let plan = llama_like_cuda(facts, cuda, class);
-            let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; 4];
-            let l = lower(&plan, &rows, Fire { captures_across_splits: false }).expect("lowers");
+            let rows: Vec<Row> = vec![
+                Row {
+                    samples: true,
+                    ..Row::default()
+                };
+                4
+            ];
+            let l = lower(
+                &plan,
+                &rows,
+                Fire {
+                    captures_across_splits: false,
+                },
+            )
+            .expect("lowers");
             let dp = driver_cuda::bind::DispatchPlan::new(&plan, &l);
 
             let owner = |v: ValueId| l.value_owner.get(v as usize).copied().unwrap_or(v);
@@ -1316,15 +1711,18 @@ fn a_named_operand_names_its_alias_owner() {
                 };
                 let args = &l.args[lu.args.start as usize..lu.args.end as usize];
                 for &(o, in_i) in pairs {
-                    let (Some(a_in), Some(a_out)) =
-                        (args.get(in_i as usize), args.get(op.inputs.len() + o as usize))
-                    else {
+                    let (Some(a_in), Some(a_out)) = (
+                        args.get(in_i as usize),
+                        args.get(op.inputs.len() + o as usize),
+                    ) else {
                         continue;
                     };
                     assert_eq!(
-                        a_in,
-                        a_out,
-                        "{name} {class:?} launch {i} ({}): in_place ({o}, {in_i}) says output {o}                          IS input {in_i}, but the lowering placed them apart — input {a_in:?} vs                          output {a_out:?}. The arm writes through ONE pointer, so it will                          accumulate into whatever the output slot last held",
+                        a_in, a_out,
+                        "{name} {class:?} launch {i} ({}): in_place ({o}, {in_i}) says output {o} \
+                         IS input {in_i}, but the lowering placed them apart — input {a_in:?} vs \
+                         output {a_out:?}. The arm writes through ONE pointer, so it will \
+                         accumulate into whatever the output slot last held",
                         l.kernels[lu.kernel as usize],
                     );
                     checked += 1;
@@ -1332,6 +1730,9 @@ fn a_named_operand_names_its_alias_owner() {
             }
         }
     }
-    assert!(checked > 0, "no NAMED operand was reached, so nothing was checked");
+    assert!(
+        checked > 0,
+        "no NAMED operand was reached, so nothing was checked"
+    );
     eprintln!("a_named_operand_names_its_alias_owner: {checked} named operands");
 }

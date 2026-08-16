@@ -176,12 +176,18 @@ fn not_served() -> BTreeMap<&'static str, &'static str> {
 /// Being a named list rather than a `matches!` on the error is
 /// deliberate: a row that starts refusing without anyone deciding it
 /// should is exactly the regression this file is for.
+///
+/// EMPTY today, and the empty list is doing work. Its one entry was
+/// `google--gemma-4-26B-A4B-it`, excused for `attention_k_eq_v` and a
+/// 128-expert block; both legs are traced now, so the differential
+/// compares its deployment like any other row's. Kept rather than
+/// deleted because the category is real -- `deployment` returns a
+/// `Result` and a build that cannot provision a store still has to turn
+/// a load away at the door -- and because `every_unfired_row_actually_refuses`
+/// is what noticed the excuse had gone stale rather than letting it
+/// silently skip half a comparison.
 fn identified_but_unfired() -> BTreeMap<&'static str, &'static str> {
-    BTreeMap::from([(
-        "google--gemma-4-26B-A4B-it",
-        "`attention_k_eq_v` reads V from the K projection and the block is \
-         routed over 128 experts; this build traces neither leg",
-    )])
+    BTreeMap::new()
 }
 
 /// The object a checkpoint's own numbers live in.

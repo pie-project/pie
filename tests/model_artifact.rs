@@ -166,6 +166,8 @@ fn import_streams_a_fully_decoded_model_through_the_spool() {
         force: false,
         max_shard_size: None,
         delete_source: false,
+        consume_source: false,
+        keep_source: false,
     })
     .expect("import failed");
 

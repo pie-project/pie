@@ -62,6 +62,12 @@
       "rewrites": 0
     },
     {
+      "pass": "validate-bound-encodings",
+      "instrs_before": 63,
+      "instrs_after": 63,
+      "rewrites": 0
+    },
+    {
       "pass": "validate-scale-factors",
       "instrs_before": 63,
       "instrs_after": 63,

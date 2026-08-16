@@ -477,6 +477,12 @@ mod tests {
 
         std::fs::write(&second, b"GGUF").unwrap();
         // Named by either member, the checkpoint is the same set, in order.
+        //
+        // In order is not cosmetic. Only shard one carries a key-value block,
+        // and `zt::parse_attributes_files` reads the set's first member that
+        // has one -- it sorts for itself now, so this is no longer the only
+        // thing standing between a reordering here and a checkpoint that
+        // cannot say what architecture it is.
         for named in [&first, &second] {
             assert_eq!(
                 gguf_shard_set(named).unwrap(),

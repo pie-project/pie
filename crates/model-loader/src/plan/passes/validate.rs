@@ -18,7 +18,9 @@ use crate::error::{Error, OrOverflow, Result};
 use crate::plan::geometry::extent_storage_bytes;
 use crate::plan::index::instr_by_id;
 use crate::plan::{LoadPlan, StorageInstr, TileMapKind};
-use crate::types::{BufferId, QuantScheme, RepackLayout, TensorId};
+use crate::types::{
+    BackendKind, BufferId, Encoding, QuantScheme, RepackLayout, TensorId, Visibility,
+};
 
 /// Every `Fill` runs before every write to the buffer it zeroes.
 ///
@@ -162,7 +164,7 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
                 || (*kind == TileMapKind::Decode
                     && transform
                         .from
-                        .is_some_and(|scheme| scheme.block_layout().is_some()))
+                        .is_some_and(|scheme| scheme.is_self_contained()))
                 || (*kind == TileMapKind::Repack
                     && program.target.native_mxfp4_moe
                     && transform.repack.is_some_and(|repack| {
@@ -175,6 +177,64 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
             return Err(Error::Unsupported(format!(
                 "{:?} target does not support {:?} TileMap ({:?}->{:?})",
                 program.target.backend, kind, transform.from, transform.to
+            )));
+        }
+    }
+    Ok(0)
+}
+
+/// A tensor the driver BINDS is stored in something the driver can read.
+///
+/// Narrowly: no device may be handed a self-contained block. A GGUF block
+/// carries its scales inside the payload, and `CONVERT_TILE_MAP_MASK`'s own
+/// doc states the consequence — *"the schemes it covers carry their scales
+/// inside the payload (GGUF blocks), which no device kernel reads"*. That
+/// sentence was true and unenforced.
+///
+/// **Why this pass exists although it cannot fire.** `validate_target_support`
+/// looks like the guard for this and is not: it refuses a `Decode` a backend
+/// has no bit for, so it only sees a plan that TRIES to decode. A plan that
+/// passes a blocked tensor straight through to the device emits no `TileMap`
+/// at all, so there is nothing for it to refuse. The only thing standing
+/// between a Q4_K checkpoint and a CUDA arena today is that
+/// `contract::materialize` decodes every blocked scheme on the way into a
+/// `.zt`, one crate away, for reasons that are about disk rather than about
+/// device kernels.
+///
+/// Measured, by flipping exactly that policy: `pie model import` of
+/// `qwen2.5-0.5b-instruct-q4_0.gguf` with blocked schemes preserved is
+/// **269 MiB in 153 ms** instead of 946 MiB in 1 s, and `pie model build
+/// --backend cuda` over the result **succeeded**, writing a runtime artifact
+/// holding 169 `GgufQ4_0` tensors for a device with no kernel that reads one.
+/// It compiled, it validated, and it was wrong. That is the hole, and the
+/// prize on the other side of it — 3.5x on disk — is large enough that the
+/// policy will be revisited, so the invariant is stated here where the plan
+/// can see it rather than left resting on a decision made for other reasons.
+///
+/// Only `Visibility::Public` tensors are checked. An `Internal` tensor is an
+/// intermediate the plan itself consumes and the driver never sees, and a
+/// blocked one is exactly what a `Decode` reads from — refusing it would
+/// refuse the repair.
+pub(super) fn validate_bound_encodings(program: &mut LoadPlan) -> Result<usize> {
+    // A host target legitimately publishes blocked tensors: `pie model
+    // import`'s passthrough is this, and the whole point of an offline
+    // conversion is to write bytes no device has read yet.
+    if program.target.backend == BackendKind::Unknown {
+        return Ok(0);
+    }
+    for tensor in &program.tensors {
+        if tensor.visibility != Visibility::Public {
+            continue;
+        }
+        let Encoding::Quant(spec) = &tensor.encoding else {
+            continue;
+        };
+        if spec.scheme.is_self_contained() {
+            return Err(Error::Unsupported(format!(
+                "{}: a {:?} target would bind `{}` as {:?}, whose scales live \
+                 inside the payload — no device kernel reads one. It has to be \
+                 decoded, and this plan does not decode it",
+                tensor.name, program.target.backend, tensor.name, spec.scheme
             )));
         }
     }

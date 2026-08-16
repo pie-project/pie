@@ -4572,7 +4572,8 @@ fn every_module_this_device_claims_it_can_load_builds_a_pipeline() {
         // routine states.
         assert!(
             kernels_vulkan::retired().contains(&name.as_str()),
-            "`{name}` is not a retired entrypoint and there is no table left              for it to come from, which entrypoints.rs covers"
+            "`{name}` is not a retired entrypoint and there is no table left \
+             for it to come from, which entrypoints.rs covers"
         );
         let (buffers, push) = (0u32, 0usize);
 

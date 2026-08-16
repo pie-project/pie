@@ -186,6 +186,18 @@ struct Artifact {
     tensors: usize,
     written_by: Option<String>,
     source: Option<String>,
+    /// Per-target builds derived from this archive. Reported so that the store
+    /// size a listing shows is the store size on disk: a runtime artifact is
+    /// as large as the archive it came from, and a model with three of them
+    /// occupies four times what the archive line alone would suggest.
+    runtimes: Vec<RuntimeBuild>,
+}
+
+#[derive(serde::Serialize)]
+struct RuntimeBuild {
+    key: String,
+    bytes: u64,
+    runtime_quant: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -243,6 +255,25 @@ impl crate::ui::Report for ModelList {
                     format!("{from}{by}"),
                 ],
             ));
+            // Indented under the archive they came from, because that is the
+            // relationship: a build is derived and deleting it costs a
+            // rebuild, where deleting the archive costs a re-import.
+            for runtime in &artifact.runtimes {
+                let quant = runtime
+                    .runtime_quant
+                    .as_deref()
+                    .map(|q| format!(", {q}"))
+                    .unwrap_or_default();
+                table.push(Row::new(
+                    Mark::Plain,
+                    [
+                        format!("  runtime/{}", runtime.key),
+                        crate::ui::bytes(runtime.bytes),
+                        String::new(),
+                        format!("built{quant}"),
+                    ],
+                ));
+            }
         }
         table.print(palette);
 
@@ -306,6 +337,15 @@ fn list() -> Result<Answer> {
             .into_iter()
             .map(|e| Artifact {
                 shards: e.shards(),
+                runtimes: e
+                    .runtimes
+                    .iter()
+                    .map(|r| RuntimeBuild {
+                        key: r.key.clone(),
+                        bytes: r.bytes,
+                        runtime_quant: r.runtime_quant.clone(),
+                    })
+                    .collect(),
                 name: e.name,
                 root: e.root,
                 bytes: e.bytes,
@@ -333,6 +373,15 @@ fn info(name: String) -> Result<Answer> {
     };
     Ok(Answer::report(ModelInfo {
         shards: entry.shards(),
+        runtimes: entry
+            .runtimes
+            .iter()
+            .map(|r| RuntimeBuild {
+                key: r.key.clone(),
+                bytes: r.bytes,
+                runtime_quant: r.runtime_quant.clone(),
+            })
+            .collect(),
         name: entry.name,
         root: entry.root,
         files: entry.files,
@@ -354,6 +403,7 @@ pub struct ModelInfo {
     tensors: usize,
     written_by: Option<String>,
     source: Option<String>,
+    runtimes: Vec<RuntimeBuild>,
 }
 
 impl crate::ui::Report for ModelInfo {
@@ -377,6 +427,24 @@ impl crate::ui::Report for ModelInfo {
             row("written by", format!("pie {written_by}"));
         }
         row("path", crate::ui::short_path(&self.root));
+        // What has been built from it, and for what. `pie model build` is the
+        // only thing that writes these, and `pie model rm` takes them with the
+        // archive because they are derived from it.
+        for runtime in &self.runtimes {
+            let quant = runtime
+                .runtime_quant
+                .as_deref()
+                .map(|q| format!(" ({q})"))
+                .unwrap_or_default();
+            row(
+                "runtime",
+                format!(
+                    "{} — {}{quant}",
+                    runtime.key,
+                    crate::ui::bytes(runtime.bytes)
+                ),
+            );
+        }
         table.print(palette);
         println!(
             "\n{}",
@@ -588,11 +656,18 @@ fn remove(name: String, skip_confirm: bool) -> Result<Answer> {
         );
     };
 
-    let bytes = entry.bytes;
+    // The archive AND the builds derived from it, because that is what the
+    // removal takes. Reporting the archive alone understated a three-artifact
+    // model as one file, in a confirmation prompt whose whole job is to say
+    // what is about to be lost.
+    let files = entry.files.len() + entry.runtimes.iter().map(|r| r.files.len()).sum::<usize>();
+    let derived = match entry.runtimes.len() {
+        0 => String::new(),
+        n => format!(", {n} build(s)"),
+    };
     let what = format!(
-        "artifact {name} ({}, {} file(s))",
-        crate::ui::bytes(bytes),
-        entry.files.len()
+        "artifact {name} ({}, {files} file(s){derived})",
+        crate::ui::bytes(entry.total_bytes()),
     );
 
     if !skip_confirm

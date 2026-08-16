@@ -31,6 +31,7 @@ use half::bf16;
 
 use std::collections::HashSet;
 
+use super::iq_grid;
 use super::{Progress, Residency};
 use crate::codec::cast::{cast_elements, decode_values, encode_values};
 use crate::codec::fp8::{decode_fp8_e4m3_elements, f32_to_fp8_e4m3};
@@ -350,6 +351,139 @@ fn decode_gguf_q5_1_block_into(block: &[u8; 24], values: &mut [f32; 32]) {
     }
 }
 
+/// Decode one GGUF `Q2_K` super-block: 256 elements as sixteen sub-blocks of
+/// sixteen, each with a four-bit scale and a four-bit minimum, the whole
+/// block sharing one F16 scale and one F16 minimum.
+///
+/// Affine like `Q4_K` -- an element is `d × scaleᵢ × q − dmin × minᵢ` -- but
+/// laid out the other way round. `Q4_K` opens with its two F16s; here they
+/// close the block, at bytes 80 and 82, after the sixteen sub-block bytes and
+/// the sixty-four quant bytes. Reading this one like its neighbour finds the
+/// scales where the payload is.
+///
+/// The payload is read in two 32-byte windows, each visited four times at
+/// shifts 0, 2, 4 and 6, and each visit taking sixteen elements from the low
+/// half of the window and sixteen from the high half. So a sub-block is
+/// sixteen elements that share one byte offset and one shift -- not sixteen
+/// consecutive bytes -- and a decoder that walked the quants linearly would
+/// produce the right count of plausible numbers in the wrong places.
+///
+/// Checked against llama.cpp's own dequantizer rather than only against the
+/// unit tests below. `Llama-3.2-1B-Instruct-Q2_K.gguf`, tensor
+/// `blk.0.ffn_gate.weight`: all 16,777,216 elements are BIT-IDENTICAL to the
+/// `gguf` package's `dequantize`, once the reference is rounded to the BF16
+/// this writes. Against the model's own BF16 release the same artifact holds
+/// a mean cosine of 0.992 over 47 tensors, which is Q2_K's error and not
+/// this function's.
+fn decode_gguf_q2_k_block_into(block: &[u8; 84], values: &mut [f32; 256]) {
+    let scales = &block[0..16];
+    let qs = &block[16..80];
+    let d = half::f16::from_le_bytes([block[80], block[81]]).to_f32();
+    let dmin = half::f16::from_le_bytes([block[82], block[83]]).to_f32();
+    let mut out = 0;
+    let mut sub = 0;
+    for window in 0..2 {
+        let q = &qs[window * 32..window * 32 + 32];
+        for step in 0..4 {
+            let shift = 2 * step;
+            for half in 0..2 {
+                let packed = scales[sub];
+                sub += 1;
+                let dl = d * f32::from(packed & 0x0f);
+                let ml = dmin * f32::from(packed >> 4);
+                for l in 0..16 {
+                    values[out] = dl * f32::from((q[half * 16 + l] >> shift) & 3) - ml;
+                    out += 1;
+                }
+            }
+        }
+    }
+}
+
+/// The sixteen six-bit scales of a `Q3_K` block, unpacked from twelve bytes.
+///
+/// A different splice from [`gguf_k_scale_min`], which serves `Q4_K` and
+/// `Q5_K`: there the twelve bytes hold eight scales AND eight minimums, here
+/// they hold sixteen scales and no minimums, because `Q3_K` is symmetric.
+///
+/// `ggml` writes it as four `u32` words -- the low four bits of each scale
+/// come from the first eight bytes, and the top two bits from the last four,
+/// two bits at a time. Kept in that form deliberately: the byte-at-a-time
+/// spelling is four nested index expressions that look like an off-by-one in
+/// every one of them, and this is the shape the reference can be read against.
+///
+/// The result is biased by 32, which the caller subtracts. Returning the raw
+/// six bits would make every scale positive and the whole block wrong by a
+/// factor that varies per sub-block.
+fn gguf_q3_k_scales(raw: &[u8; 12]) -> [i8; 16] {
+    const LOW_NIBBLES: u32 = 0x0f0f_0f0f;
+    const BIT_PAIRS: u32 = 0x0303_0303;
+    let word =
+        |i: usize| u32::from_le_bytes([raw[4 * i], raw[4 * i + 1], raw[4 * i + 2], raw[4 * i + 3]]);
+    let (a, b, top) = (word(0), word(1), word(2));
+    let aux = [
+        (a & LOW_NIBBLES) | ((top & BIT_PAIRS) << 4),
+        (b & LOW_NIBBLES) | (((top >> 2) & BIT_PAIRS) << 4),
+        ((a >> 4) & LOW_NIBBLES) | (((top >> 4) & BIT_PAIRS) << 4),
+        ((b >> 4) & LOW_NIBBLES) | (((top >> 6) & BIT_PAIRS) << 4),
+    ];
+    let mut scales = [0i8; 16];
+    for (i, slot) in scales.iter_mut().enumerate() {
+        *slot = aux[i / 4].to_le_bytes()[i % 4] as i8;
+    }
+    scales
+}
+
+/// Decode one GGUF `Q3_K` super-block: 256 elements as sixteen sub-blocks of
+/// sixteen, symmetric, with each element's third bit in a separate mask.
+///
+/// The mask reads INVERTED, and that is the whole difficulty of this block.
+/// `ggml` stores the two low bits of `q + 4` and sets the mask bit when the
+/// value needed no borrow, so a SET bit subtracts nothing and a CLEAR bit
+/// subtracts four. Reading it the intuitive way -- set means add -- shifts
+/// every element by four and still decodes, which is why it is stated here
+/// rather than left to the shape of the expression.
+///
+/// The mask is not advanced with the quants, either. Its 32 bytes are read
+/// eight times, once per `(window, shift)` pair, taking one bit each time, so
+/// the bit selector runs 1, 2, 4 … 128 ACROSS both windows while the quant
+/// pointer moves. Restarting it at the second window is the mistake this
+/// layout invites, and it corrupts only the upper half of the block.
+///
+/// Checked the same way as [`decode_gguf_q2_k_block_into`]:
+/// `Llama-3.2-1B-Instruct-Q3_K_M.gguf`, `blk.0.ffn_gate.weight`, all
+/// 16,777,216 elements bit-identical to the `gguf` package's `dequantize`
+/// after BF16 rounding. Mean cosine 0.998 against the BF16 release -- above
+/// Q2_K's 0.992, which is the ordering the two widths should produce and a
+/// second reason to believe both.
+fn decode_gguf_q3_k_block_into(block: &[u8; 110], values: &mut [f32; 256]) {
+    let hmask = &block[0..32];
+    let qs = &block[32..96];
+    let raw: &[u8; 12] = block[96..108].try_into().expect("twelve scale bytes");
+    let d = half::f16::from_le_bytes([block[108], block[109]]).to_f32();
+    let scales = gguf_q3_k_scales(raw);
+    let mut out = 0;
+    let mut sub = 0;
+    let mut selector = 1u8;
+    for window in 0..2 {
+        let q = &qs[window * 32..window * 32 + 32];
+        for step in 0..4 {
+            let shift = 2 * step;
+            for half in 0..2 {
+                let dl = d * f32::from(scales[sub] - 32);
+                sub += 1;
+                for l in 0..16 {
+                    let at = half * 16 + l;
+                    let borrow = if hmask[at] & selector == 0 { 4 } else { 0 };
+                    values[out] = dl * f32::from(i16::from((q[at] >> shift) & 3) - borrow);
+                    out += 1;
+                }
+            }
+            selector <<= 1;
+        }
+    }
+}
+
 /// The six-bit scale and six-bit minimum for one of the eight sub-blocks of a
 /// `Q4_K` or `Q5_K` block, unpacked from the twelve bytes they share.
 ///
@@ -461,6 +595,293 @@ fn decode_gguf_q6_k_block_into(block: &[u8; 210], values: &mut [f32; 256]) {
     }
 }
 
+/// The sixteen levels an `IQ4_NL` or `IQ4_XS` code indexes, from llama.cpp's
+/// `kvalues_iq4nl`.
+///
+/// Non-uniform on purpose, and the reason these schemes cost four bits and
+/// beat four-bit uniform quantization: weights cluster near zero, so the
+/// levels do too — 1, 13, 25 on the way out, then 38, 53, 69, 89, 113 as the
+/// gaps widen. A uniform grid spends half its codes on a range almost nothing
+/// occupies.
+///
+/// Compiled in rather than read from the file, exactly as llama.cpp does.
+/// That is what separates IQ4 from IQ2/IQ3: those index a lattice too large
+/// to write down here, and a GGUF does not ship it either, so naming them
+/// would not make them decodable.
+const IQ4_LEVELS: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
+
+/// Decode one GGUF `IQ4_NL` block: 32 elements as sixteen bytes of paired
+/// 4-bit indices over one F16 scale.
+///
+/// The pairing is by half, not by neighbour: byte `j` holds element `j` in its
+/// low nibble and element `j + 16` in its high one. Reading it as adjacent
+/// pairs would interleave the two halves of every block.
+fn decode_gguf_iq4_nl_block_into(block: &[u8; 18], values: &mut [f32; 32]) {
+    let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+    let qs = &block[2..18];
+    for j in 0..16 {
+        values[j] = d * f32::from(IQ4_LEVELS[usize::from(qs[j] & 0x0f)]);
+        values[j + 16] = d * f32::from(IQ4_LEVELS[usize::from(qs[j] >> 4)]);
+    }
+}
+
+/// Decode one GGUF `IQ4_XS` super-block: 256 elements as eight 32-element
+/// sub-blocks over [`decode_gguf_iq4_nl_block_into`]'s levels.
+///
+/// Each sub-block's scale is six bits assembled from two planes — four low
+/// bits from `scales_l`, two sub-blocks to a byte, and two high bits from the
+/// `scales_h` u16, eight sub-blocks to it — then read as `ls - 32`, so it is
+/// signed and a scale of exactly 32 means zero. The quants are laid out as
+/// eight independent `IQ4_NL` payloads of sixteen bytes each, halves and all.
+fn decode_gguf_iq4_xs_block_into(block: &[u8; 136], values: &mut [f32; 256]) {
+    let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+    let scales_h = u16::from_le_bytes([block[2], block[3]]);
+    let scales_l = &block[4..8];
+    let qs = &block[8..136];
+    for sub in 0..8 {
+        let low = (scales_l[sub / 2] >> (4 * (sub % 2))) & 0x0f;
+        let high = ((scales_h >> (2 * sub)) & 3) as u8;
+        let ls = i32::from(low | (high << 4)) - 32;
+        let dl = d * ls as f32;
+        let packed = &qs[sub * 16..sub * 16 + 16];
+        let out = sub * 32;
+        for j in 0..16 {
+            values[out + j] = dl * f32::from(IQ4_LEVELS[usize::from(packed[j] & 0x0f)]);
+            values[out + j + 16] = dl * f32::from(IQ4_LEVELS[usize::from(packed[j] >> 4)]);
+        }
+    }
+}
+
+/// The sixteen values an E2M1 nibble stands for, doubled, from llama.cpp's
+/// `kvalues_mxfp4`.
+///
+/// E2M1 itself codes 0, 0.5, 1, 1.5, 2, 3, 4, 6 and their negatives — every
+/// one a half-integer. llama.cpp stores them as the integers `0, 1, 2, 3, 4,
+/// 6, 8, 12` and halves the scale instead, which keeps the table exact in
+/// `i8`. [`decode_gguf_mxfp4_block_into`] applies the matching half, so the
+/// product is the value E2M1 names and not twice it.
+///
+/// The sign is the top bit of the nibble, so the negative half repeats the
+/// positive one in order rather than mirroring it.
+const MXFP4_LEVELS: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// Decode one GGUF `MXFP4` block: 32 elements as one E8M0 scale byte followed
+/// by sixteen bytes of paired E2M1 nibbles.
+///
+/// **This is not the OCP Microscaling byte layout**, which is why it has a
+/// scheme of its own. OCP splits a tensor into a plane of codes and a separate
+/// scale tensor; ggml interleaves one scale byte into each 32-element block,
+/// making the block 17 bytes rather than 16. The numbers the two describe are
+/// the same; the addresses are not.
+///
+/// The scale is E8M0 — a bare exponent, biased by 127 — and it is applied
+/// halved, at `2^(e - 128)`, to cancel the doubling in [`MXFP4_LEVELS`]. That
+/// is exact for every `e`, including the two llama.cpp writes as subnormal
+/// bit patterns: `e = 0` gives `2^-128` and `e = 1` gives `2^-127`, which is
+/// what `ggml_e8m0_to_fp32_half`'s `0x00200000 << x` branch computes.
+///
+/// The nibbles pair by half, as in [`decode_gguf_iq4_nl_block_into`]: byte `j`
+/// carries element `j` low and element `j + 16` high.
+fn decode_gguf_mxfp4_block_into(block: &[u8; 17], values: &mut [f32; 32]) {
+    let d = mxfp4_scale(block[0]);
+    let qs = &block[1..17];
+    for j in 0..16 {
+        values[j] = d * f32::from(MXFP4_LEVELS[usize::from(qs[j] & 0x0f)]);
+        values[j + 16] = d * f32::from(MXFP4_LEVELS[usize::from(qs[j] >> 4)]);
+    }
+}
+
+/// `2^(e - 128)` for an E8M0 exponent byte, formed exactly.///
+/// `e - 128` reaches -128, one below the smallest normal float's exponent, so
+/// two of the 256 inputs are subnormal and cannot be written as an exponent
+/// field. llama.cpp spells them as the literal bit patterns `0x00200000 << e`;
+/// this says the same thing as a shift of the subnormal unit, which is what
+/// those patterns are.
+fn mxfp4_scale(e: u8) -> f32 {
+    if e < 2 {
+        // 0x00200000 and 0x00400000 as floats: 2^-128 and 2^-127.
+        f32::from_bits(0x0020_0000 << e)
+    } else {
+        f32::from_bits(u32::from(e - 1) << 23)
+    }
+}
+
+/// The sign byte an IQ2/IQ3 seven-bit sign index stands for.
+///
+/// llama.cpp ships this as a 128-byte table, `ksigns_iq2xs`, but it is a rule
+/// rather than data: the low seven bits are the index itself and the eighth is
+/// whatever makes the byte's population count even. The formats spend seven
+/// bits to say eight signs and recover the last one from that parity, which is
+/// where a good part of IQ2's advantage over a plain two-bit quantization
+/// comes from.
+///
+/// Stated rather than transcribed because a rule can be read, and 128 magic
+/// bytes cannot.
+fn iq_sign_byte(index: u8) -> u8 {
+    let index = index & 0x7f;
+    index | (((index.count_ones() & 1) as u8) << 7)
+}
+
+/// Applies sign bit `bit` of `signs` to `value`: set means negate.
+fn iq_signed(value: f32, signs: u8, bit: usize) -> f32 {
+    if (signs >> bit) & 1 == 1 {
+        -value
+    } else {
+        value
+    }
+}
+
+/// Decode one GGUF `IQ2_XXS` block: 256 elements in 66 bytes.
+///
+/// `d: f16` then sixteen `u32`, read in pairs. Each pair covers 32 elements:
+/// the first holds four bytes, each a point in the 256-entry
+/// [`IQ2XXS_GRID`](iq_grid::IQ2XXS_GRID), and the second packs four seven-bit
+/// sign indices at bit offsets 0, 7, 14 and 21 with a four-bit scale in its top
+/// nibble.
+///
+/// The scale is `(0.5 + s) * 0.25`, so it is never zero — a sub-block cannot
+/// be switched off, only made small. That half-step is why the four bits reach
+/// 3.875 rather than 3.75, and dropping it decodes every weight about 12% too
+/// small at the low end.
+fn decode_gguf_iq2_xxs_block_into(block: &[u8; 66], values: &mut [f32; 256]) {
+    let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+    for group in 0..8 {
+        let at = 2 + group * 8;
+        let points = u32::from_le_bytes([block[at], block[at + 1], block[at + 2], block[at + 3]]);
+        let aux = u32::from_le_bytes([block[at + 4], block[at + 5], block[at + 6], block[at + 7]]);
+        let db = d * (0.5 + (aux >> 28) as f32) * 0.25;
+        for sub in 0..4 {
+            let point = ((points >> (8 * sub)) & 0xff) as usize;
+            let signs = iq_sign_byte(((aux >> (7 * sub)) & 0x7f) as u8);
+            let out = group * 32 + sub * 8;
+            for bit in 0..8 {
+                let g = f32::from(iq_grid::IQ2XXS_GRID[point * 8 + bit]);
+                values[out + bit] = iq_signed(db * g, signs, bit);
+            }
+        }
+    }
+}
+
+/// Decode one GGUF `IQ2_XS` block: 256 elements in 74 bytes.
+///
+/// `d: f16`, then 32 `u16`, then eight scale bytes. Each `u16` is one grid
+/// point of eight elements: its low **nine** bits address the 512-entry
+/// [`IQ2XS_GRID`](iq_grid::IQ2XS_GRID) and its top seven are the sign index.
+/// The scale bytes hold two four-bit scales each, one per 16 elements, applied
+/// as `(0.5 + s) * 0.25`.
+///
+/// The nine-bit split is the difference from `IQ2_XXS`, whose grid is 256
+/// points and whose sign index therefore starts a bit earlier. Masking with
+/// 0xFF here would address the right grid a quarter of the time.
+fn decode_gguf_iq2_xs_block_into(block: &[u8; 74], values: &mut [f32; 256]) {
+    let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+    let scales = &block[66..74];
+    for k in 0..32 {
+        let q = u16::from_le_bytes([block[2 + k * 2], block[3 + k * 2]]);
+        let sub = k / 2;
+        let s = (scales[sub / 2] >> (4 * (sub % 2))) & 0x0f;
+        let db = d * (0.5 + f32::from(s)) * 0.25;
+        let point = usize::from(q & 511);
+        let signs = iq_sign_byte((q >> 9) as u8);
+        for bit in 0..8 {
+            let g = f32::from(iq_grid::IQ2XS_GRID[point * 8 + bit]);
+            values[k * 8 + bit] = iq_signed(db * g, signs, bit);
+        }
+    }
+}
+
+/// Decode one GGUF `IQ2_S` block: 256 elements in 82 bytes.
+///
+/// `d: f16`, 32 quant bytes, 32 sign bytes, eight high-bit bytes, eight scale
+/// bytes. The grid is 1024 points, so a point needs ten bits: eight from `qs`
+/// and two more from `qh`, four points to a `qh` byte.
+///
+/// Unlike `IQ2_XXS` and `IQ2_XS` the signs are **stored outright**, one byte of
+/// eight bits per grid point, not as a seven-bit index through
+/// [`iq_sign_byte`]. That is what the extra eight bytes over `IQ2_XS` buy,
+/// along with the wider grid: the parity trick is dropped once there is room
+/// for the eighth bit.
+fn decode_gguf_iq2_s_block_into(block: &[u8; 82], values: &mut [f32; 256]) {
+    let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+    let qs = &block[2..34];
+    let signs = &block[34..66];
+    let qh = &block[66..74];
+    let scales = &block[74..82];
+    for k in 0..32 {
+        let high = (qh[k / 4] >> (2 * (k % 4))) & 3;
+        let point = usize::from(qs[k]) | (usize::from(high) << 8);
+        let sub = k / 2;
+        let s = (scales[sub / 2] >> (4 * (sub % 2))) & 0x0f;
+        let db = d * (0.5 + f32::from(s)) * 0.25;
+        for bit in 0..8 {
+            let g = f32::from(iq_grid::IQ2S_GRID[point * 8 + bit]);
+            values[k * 8 + bit] = iq_signed(db * g, signs[k], bit);
+        }
+    }
+}
+
+/// Decode one GGUF `IQ3_XXS` block: 256 elements in 98 bytes.
+///
+/// `d: f16`, 64 quant bytes, then eight `u32`. The grid points are **four**
+/// components, not eight, so a byte of `qs` covers four elements and the
+/// 64 bytes cover all 256.
+///
+/// The eight trailing `u32` are shaped exactly like `IQ2_XXS`'s odd words —
+/// four seven-bit sign indices and a four-bit scale on top — and each covers 32
+/// elements. The scale is `(0.5 + s) * 0.5`, twice `IQ2_XXS`'s factor, because
+/// the grid values are larger: `IQ3_XXS`'s components run to 62 where
+/// `IQ2_XXS`'s stop at 43.
+fn decode_gguf_iq3_xxs_block_into(block: &[u8; 98], values: &mut [f32; 256]) {
+    let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+    let qs = &block[2..66];
+    for group in 0..8 {
+        let at = 66 + group * 4;
+        let aux = u32::from_le_bytes([block[at], block[at + 1], block[at + 2], block[at + 3]]);
+        let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
+        for sub in 0..4 {
+            let signs = iq_sign_byte(((aux >> (7 * sub)) & 0x7f) as u8);
+            let out = group * 32 + sub * 8;
+            // Eight elements is two grid points here, where the IQ2 schemes
+            // get eight from one.
+            for bit in 0..8 {
+                let point = usize::from(qs[(out + bit) / 4]);
+                let g = f32::from(iq_grid::IQ3XXS_GRID[point * 4 + (out + bit) % 4]);
+                values[out + bit] = iq_signed(db * g, signs, bit);
+            }
+        }
+    }
+}
+
+/// Decode one GGUF `IQ3_S` block: 256 elements in 110 bytes.
+///
+/// `d: f16`, 64 quant bytes, eight high-bit bytes, 32 sign bytes, four scale
+/// bytes. The grid is 512 four-component points, so a point takes nine bits:
+/// eight from `qs` and one from `qh`, **eight points to a `qh` byte** — one bit
+/// each, not the two-bit fields `IQ2_S` uses.
+///
+/// The scale is `1 + 2s`, not `(0.5 + s) * k`: it is an odd integer, and the
+/// grid components are the odd numbers 1 through 15. `IQ3_S` is the one scheme
+/// here whose scale has no fractional part, which is why sharing a scale
+/// helper with the others would be wrong rather than merely awkward.
+fn decode_gguf_iq3_s_block_into(block: &[u8; 110], values: &mut [f32; 256]) {
+    let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+    let qs = &block[2..66];
+    let qh = &block[66..74];
+    let signs = &block[74..106];
+    let scales = &block[106..110];
+    for i in 0..256 {
+        let sub = i / 32;
+        let s = (scales[sub / 2] >> (4 * (sub % 2))) & 0x0f;
+        let db = d * (1.0 + 2.0 * f32::from(s));
+        let p = i / 4;
+        let point = usize::from(qs[p]) | (usize::from((qh[p / 8] >> (p % 8)) & 1) << 8);
+        let g = f32::from(iq_grid::IQ3S_GRID[point * 4 + i % 4]);
+        values[i] = iq_signed(db * g, signs[i / 8], i % 8);
+    }
+}
+
 /// Decode one block of any GGUF scheme the loader knows, into the `f32` values
 /// it stands for.
 ///
@@ -500,6 +921,18 @@ fn decode_gguf_block_into(scheme: QuantScheme, block: &[u8], values: &mut [f32])
                 values.try_into().expect(bad),
             );
         }
+        QuantScheme::GgufQ2K => {
+            decode_gguf_q2_k_block_into(
+                block.try_into().expect(bad),
+                values.try_into().expect(bad),
+            );
+        }
+        QuantScheme::GgufQ3K => {
+            decode_gguf_q3_k_block_into(
+                block.try_into().expect(bad),
+                values.try_into().expect(bad),
+            );
+        }
         QuantScheme::GgufQ4K => {
             decode_gguf_q4_k_block_into(
                 block.try_into().expect(bad),
@@ -514,6 +947,54 @@ fn decode_gguf_block_into(scheme: QuantScheme, block: &[u8], values: &mut [f32])
         }
         QuantScheme::GgufQ6K => {
             decode_gguf_q6_k_block_into(
+                block.try_into().expect(bad),
+                values.try_into().expect(bad),
+            );
+        }
+        QuantScheme::GgufIq4Nl => {
+            decode_gguf_iq4_nl_block_into(
+                block.try_into().expect(bad),
+                values.try_into().expect(bad),
+            );
+        }
+        QuantScheme::GgufIq4Xs => {
+            decode_gguf_iq4_xs_block_into(
+                block.try_into().expect(bad),
+                values.try_into().expect(bad),
+            );
+        }
+        QuantScheme::GgufMxfp4 => {
+            decode_gguf_mxfp4_block_into(
+                block.try_into().expect(bad),
+                values.try_into().expect(bad),
+            );
+        }
+        QuantScheme::GgufIq2Xxs => {
+            decode_gguf_iq2_xxs_block_into(
+                block.try_into().expect(bad),
+                values.try_into().expect(bad),
+            );
+        }
+        QuantScheme::GgufIq2Xs => {
+            decode_gguf_iq2_xs_block_into(
+                block.try_into().expect(bad),
+                values.try_into().expect(bad),
+            );
+        }
+        QuantScheme::GgufIq2S => {
+            decode_gguf_iq2_s_block_into(
+                block.try_into().expect(bad),
+                values.try_into().expect(bad),
+            );
+        }
+        QuantScheme::GgufIq3Xxs => {
+            decode_gguf_iq3_xxs_block_into(
+                block.try_into().expect(bad),
+                values.try_into().expect(bad),
+            );
+        }
+        QuantScheme::GgufIq3S => {
+            decode_gguf_iq3_s_block_into(
                 block.try_into().expect(bad),
                 values.try_into().expect(bad),
             );
@@ -3638,6 +4119,120 @@ mod gguf_block_tests {
         }
     }
 
+    /// `Q2_K` keeps its super-block scales at the END of the payload.
+    ///
+    /// The one thing about this block that is not like `Q4_K`, which opens
+    /// with the same two F16s. A decoder that read them at offset zero would
+    /// take two sub-block scale bytes for a scale, which is a number rather
+    /// than a crash.
+    ///
+    /// So the two F16s are given values no scale byte can spell -- `d` is 1.0
+    /// and `dmin` is 0.0 -- and the sub-block bytes are filled with a pattern
+    /// that would read as an absurd scale if it were mistaken for one. With
+    /// `dmin` at zero the minimum drops out and each element is just its
+    /// sub-block scale times its two-bit quant, which is what makes the
+    /// striding visible on its own.
+    ///
+    /// The quants are `0b11_10_01_00` everywhere, so shift `s` yields quant
+    /// `s` for every element: the four shifts of a window separate cleanly,
+    /// and sub-block `n` reports `scale(n) * (n / 2 % 4)`.
+    #[test]
+    fn q2_k_reads_its_super_block_scales_after_the_payload() {
+        let mut block = [0u8; 84];
+        // Sub-block n has scale 1 + n mod 15 and minimum 0. Modulo fifteen
+        // and not n + 1: the scale is a NIBBLE, so a sixteenth sub-block
+        // numbered straight through would store 16 and read back as 0 -- and
+        // as a scale of zero it would agree with an undecoded block.
+        for n in 0..16 {
+            block[n] = 1 + (n as u8) % 15;
+        }
+        block[16..80].fill(0b11_10_01_00);
+        block[80..82].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+        block[82..84].copy_from_slice(&half::f16::from_f32(0.0).to_le_bytes());
+
+        let mut values = [0f32; 256];
+        decode_gguf_q2_k_block_into(&block, &mut values);
+
+        for n in 0..16 {
+            let scale = (1 + n % 15) as f32;
+            // Shift 2·step of `0b11_10_01_00`, and step is the pair index
+            // within a window.
+            let quant = (n % 8 / 2) as f32;
+            for l in 0..16 {
+                assert_eq!(
+                    values[n * 16 + l],
+                    scale * quant,
+                    "sub-block {n}, element {l}"
+                );
+            }
+        }
+        // Sub-block 0 is quant 0, so it is the one place a misread scale
+        // would hide. Pinned from the other side: give it a non-zero quant.
+        block[16] = 0b11_11_11_01;
+        decode_gguf_q2_k_block_into(&block, &mut values);
+        assert_eq!(values[0], 1.0, "d is 1.0 and sub-block 0's scale is 1");
+    }
+
+    /// `Q3_K`'s third bit reads inverted, and its selector spans both windows.
+    ///
+    /// Two mistakes this layout invites, and neither produces a wrong shape
+    /// or an out-of-range value -- only wrong numbers. `ggml` sets the mask
+    /// bit when an element needed no borrow, so a SET bit subtracts nothing
+    /// and a CLEAR one subtracts four; and the bit selector advances across
+    /// the two 32-byte quant windows rather than restarting at the second, so
+    /// eight `(window, shift)` pairs consume the eight bits of each mask byte.
+    ///
+    /// Both are pinned at once with an all-zero mask against an all-ones one,
+    /// on a block whose quants are zero and whose scale is one. Every element
+    /// is then `-4` or `0`, and any half-block the selector got wrong reports
+    /// the other value.
+    #[test]
+    fn q3_k_borrows_where_its_mask_is_clear_and_carries_the_selector_across() {
+        let mut block = [0u8; 110];
+        // Twelve scale bytes that decode to 33 everywhere: the low nibble is
+        // 1 in the first eight bytes and the top two bits are 0b10, giving
+        // 0b100001 = 33, which is 1 after the bias of 32.
+        for i in 0..8 {
+            block[96 + i] = 0x11;
+        }
+        for i in 8..12 {
+            block[96 + i] = 0xAA;
+        }
+        block[108..110].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+        assert_eq!(
+            gguf_q3_k_scales(block[96..108].try_into().unwrap()),
+            [33i8; 16],
+            "the splice, before it is used"
+        );
+
+        let mut values = [0f32; 256];
+        decode_gguf_q3_k_block_into(&block, &mut values);
+        assert!(
+            values.iter().all(|v| *v == -4.0),
+            "a clear mask borrows four everywhere"
+        );
+
+        block[0..32].fill(0xFF);
+        decode_gguf_q3_k_block_into(&block, &mut values);
+        assert!(
+            values.iter().all(|v| *v == 0.0),
+            "a set mask borrows nothing -- the bit is not an addend"
+        );
+
+        // The selector, isolated: only bit 4 set means only the FIFTH of the
+        // eight (window, shift) pairs keeps its value. That pair is in the
+        // second window, so a selector restarted at the window boundary would
+        // light the first pair instead.
+        block[0..32].fill(1 << 4);
+        decode_gguf_q3_k_block_into(&block, &mut values);
+        let lit: Vec<usize> = (0..256).filter(|i| values[*i] == 0.0).collect();
+        assert_eq!(lit.len(), 32, "one (window, shift) pair is 32 elements");
+        assert_eq!(
+            lit[0], 128,
+            "and it is the first pair of the SECOND window, not of the first"
+        );
+    }
+
     /// Q6_K's four quarters are strided, not contiguous: quarters 0 and 1 take
     /// the low nibbles of the two halves of `ql`, quarters 2 and 3 the high
     /// ones, and each quarter's top two bits come from its own bit pair of
@@ -3699,5 +4294,621 @@ mod gguf_block_tests {
                 }
             }
         }
+    }
+
+    /// `IQ4_NL` pairs its nibbles by HALF, not by neighbour, and its codes
+    /// are indices rather than numbers.
+    ///
+    /// Two mistakes this layout invites, and each survives every size check.
+    /// Reading byte `j` as elements `2j` and `2j+1` interleaves the two
+    /// halves of the block — the values are all still present, in the wrong
+    /// places. Reading the nibble as a magnitude instead of an index into
+    /// `IQ4_LEVELS` gives numbers of the right sign and roughly the right
+    /// spread. So the codes here are laid out to separate the halves (`0x10`
+    /// for the first sixteen bytes, `0x32` for nothing, since there are only
+    /// sixteen) and the expectation is the table, not arithmetic on the code.
+    #[test]
+    fn iq4_nl_pairs_its_nibbles_by_half_not_by_neighbour() {
+        let mut block = [0u8; 18];
+        block[0..2].copy_from_slice(&f16(1.0));
+        // Low nibble counts up, high nibble counts down, so no element of the
+        // first half can be confused with one of the second.
+        for (j, byte) in block[2..18].iter_mut().enumerate() {
+            *byte = (j as u8) | (((15 - j) as u8) << 4);
+        }
+        let mut values = [0.0f32; 32];
+        decode_gguf_iq4_nl_block_into(&block, &mut values);
+        for j in 0..16 {
+            assert_eq!(
+                values[j],
+                f32::from(IQ4_LEVELS[j]),
+                "iq4_nl first half element {j} reads the low nibble"
+            );
+            assert_eq!(
+                values[j + 16],
+                f32::from(IQ4_LEVELS[15 - j]),
+                "iq4_nl second half element {j} reads the high nibble"
+            );
+        }
+        // The levels are not a line. If they were, this scheme would be Q4_0
+        // with extra steps and the table would not be worth carrying.
+        let first_gap = f32::from(IQ4_LEVELS[8]) - f32::from(IQ4_LEVELS[7]);
+        let last_gap = f32::from(IQ4_LEVELS[15]) - f32::from(IQ4_LEVELS[14]);
+        assert!(
+            last_gap > first_gap * 2.0,
+            "the levels must crowd near zero: {first_gap} against {last_gap}"
+        );
+    }
+
+    /// `IQ4_XS` builds each sub-block scale from six bits split across two
+    /// planes, and reads the result SIGNED.
+    ///
+    /// Four low bits come from `scales_l`, two sub-blocks to a byte; two high
+    /// bits come from the `scales_h` u16, eight sub-blocks to it; and the
+    /// assembled value is biased by 32. Dropping the high plane caps every
+    /// scale at 15 — which still decodes, to weights uniformly too small.
+    /// Dropping the bias flips the sign of every sub-block whose scale is
+    /// under 32. Both are pinned here by giving each of the eight sub-blocks
+    /// a different scale and holding the codes flat.
+    #[test]
+    fn iq4_xs_assembles_a_six_bit_scale_from_two_planes() {
+        let mut block = [0u8; 136];
+        block[0..2].copy_from_slice(&f16(1.0));
+        // Six bits biased by 32, so the scale runs `-32..=31` and both signs
+        // have to appear. Each is chosen so its low nibble and its high pair
+        // both carry information: no sub-block is decodable from one plane.
+        let want: [i32; 8] = [-32, -20, -8, -1, 0, 12, 20, 31];
+        let mut scales_h = 0u16;
+        for (sub, ls) in want.iter().enumerate() {
+            let raw = (ls + 32) as u8;
+            block[4 + sub / 2] |= (raw & 0x0f) << (4 * (sub % 2));
+            scales_h |= u16::from((raw >> 4) & 3) << (2 * sub);
+        }
+        block[2..4].copy_from_slice(&scales_h.to_le_bytes());
+        // Every code index 8, whose level is 1, so each element reports its
+        // sub-block's scale and nothing else.
+        block[8..136].fill(0x88);
+
+        let mut values = [0.0f32; 256];
+        decode_gguf_iq4_xs_block_into(&block, &mut values);
+        for (sub, ls) in want.iter().enumerate() {
+            let expected = *ls as f32 * f32::from(IQ4_LEVELS[8]);
+            for i in 0..32 {
+                assert_eq!(
+                    values[sub * 32 + i],
+                    expected,
+                    "iq4_xs sub-block {sub} element {i}"
+                );
+            }
+        }
+    }
+
+    /// One real `IQ4_XS` block, decoded to values a second quantization of
+    /// the same weights agrees with.
+    ///
+    /// Structure tests cannot catch a wrong level table: any monotone table
+    /// decodes to plausible weights. So the table was checked against data.
+    /// `Llama-3.2-1B-Instruct-UD-Q2_K_XL.gguf` stores five `ffn_down`
+    /// tensors as IQ4_XS, and `Llama-3.2-1B-Instruct-Q3_K_M.gguf` stores four
+    /// of the same five as Q4_K — the same weights, quantized twice,
+    /// independently. Decoded both ways they agree at r = 0.994 with a
+    /// magnitude ratio of 0.998, and the residual is what discriminates:
+    /// NRMSE against the Q4_K decode is 0.106 for this table, 0.147 with two
+    /// adjacent levels transposed, and 0.207 for any linear table. The
+    /// correct one is the minimum.
+    ///
+    /// This block is the first of `blk.13.ffn_down.weight` in that file. It
+    /// is here so the agreement survives without the 700 MB it was measured
+    /// on.
+    #[test]
+    fn iq4_xs_decodes_a_real_block_the_way_a_second_quantization_reads_it() {
+        const BLOCK: [u8; 136] = [
+            0xd1, 0x00, 0x0c, 0xcf, 0x62, 0x90, 0x28, 0x9b, 0xcb, 0x72, 0x1a, 0xc5, 0xb7, 0x96,
+            0x49, 0x3d, 0xf0, 0x54, 0x18, 0x6d, 0xba, 0xdb, 0x8a, 0xc5, 0xbe, 0x70, 0x03, 0x8f,
+            0xb3, 0x9a, 0x94, 0x48, 0xbc, 0xec, 0x55, 0x99, 0x34, 0x7b, 0xc7, 0x13, 0xd8, 0x59,
+            0x98, 0x86, 0x61, 0xa9, 0xe7, 0x95, 0xa8, 0x4c, 0x0d, 0x84, 0x6c, 0xa7, 0xa4, 0x96,
+            0x52, 0xb7, 0x49, 0x5a, 0x31, 0x4a, 0x79, 0x92, 0x6e, 0x1d, 0x08, 0xc3, 0x5d, 0x9a,
+            0xcf, 0x96, 0xbc, 0xa1, 0xa9, 0x7e, 0x48, 0x55, 0xa3, 0x2d, 0x01, 0xb2, 0xb8, 0x8e,
+            0x88, 0x76, 0x7f, 0x86, 0x7c, 0xdd, 0xf7, 0xae, 0x2e, 0xb6, 0xd5, 0xd0, 0x40, 0x81,
+            0x29, 0xd6, 0xdb, 0xd2, 0x7a, 0xfd, 0x64, 0xf2, 0x12, 0xb3, 0xbb, 0x17, 0x39, 0xf1,
+            0xda, 0x0c, 0x8f, 0xaa, 0xf6, 0xdd, 0x78, 0xd9, 0x43, 0xdb, 0x63, 0x45, 0xd3, 0xd2,
+            0x89, 0xb7, 0xa0, 0x88, 0x55, 0x2b, 0x58, 0x9c, 0x9a, 0x34,
+        ];
+        let mut values = [0.0f32; 256];
+        decode_gguf_iq4_xs_block_into(&BLOCK, &mut values);
+
+        let first: [f32; 8] = [
+            -1.420_140_3e-2,
+            3.101_885_3e-2,
+            -9.343_028e-3,
+            1.308_023_9e-2,
+            3.737_211_2e-3,
+            8.221_864_7e-3,
+            -4.858_374_6e-3,
+            -2.578_675_7e-2,
+        ];
+        for (i, want) in first.iter().enumerate() {
+            assert!(
+                (values[i] - want).abs() < 1e-9,
+                "element {i}: {} against {want}",
+                values[i]
+            );
+        }
+        // The whole block, so a fault past element eight is not missed. Sums
+        // rather than 256 literals, and both signs of one: the plain sum
+        // would survive a sign flip that the absolute sum catches, and the
+        // absolute sum would survive a permutation that neither catches but
+        // the structure tests above do.
+        let sum: f32 = values.iter().sum();
+        let abs: f32 = values.iter().map(|v| v.abs()).sum();
+        assert!((sum - -6.562_542_9e-2).abs() < 1e-6, "block sum {sum}");
+        assert!((abs - 3.578_529_1).abs() < 1e-5, "block absolute sum {abs}");
+    }
+
+    /// The E8M0 scale is exactly `2^(e - 128)` for every one of its 256 codes.
+    ///
+    /// The halving is the whole reason this is `- 128` and not `- 127`:
+    /// [`MXFP4_LEVELS`] stores E2M1's half-integers doubled so the table can be
+    /// `i8`, and the scale carries the matching half. Two codes then land below
+    /// the smallest normal float, which is why llama.cpp writes them as
+    /// subnormal bit patterns and why this cannot be `2f32.powi(e - 128)`
+    /// naively formed from an exponent field.
+    ///
+    /// Checked against `f64` arithmetic, which represents every one of the 256
+    /// powers exactly, and compared for equality rather than tolerance: these
+    /// are powers of two, so a correct implementation is exact and a tolerance
+    /// would hide an off-by-one in the bias.
+    #[test]
+    fn the_mxfp4_scale_is_a_power_of_two_at_every_code() {
+        for e in 0u16..=255 {
+            let want = 2f64.powi(i32::from(e) - 128);
+            let got = f64::from(mxfp4_scale(e as u8));
+            assert_eq!(got, want, "e={e}");
+        }
+    }
+
+    /// A real `MXFP4` block, decoded to what the same weights say in OpenAI's
+    /// own planar MXFP4.
+    ///
+    /// The first block of `blk.0.ffn_down_exps.weight` from
+    /// `ggml-org/gpt-oss-20b-GGUF`. Its reference is not another
+    /// implementation of this decoder but the *other layout* of the same
+    /// tensor: `openai/gpt-oss-20b`'s
+    /// `model.layers.0.mlp.experts.down_proj_blocks`/`_scales`, which is OCP
+    /// planar MXFP4 and pairs its nibbles by neighbour where ggml pairs them
+    /// by half. Decoding both and comparing gave **exact equality over 4000
+    /// blocks**, with the scale bytes byte-identical between the two files and
+    /// the quant bytes not — llama.cpp repacks the nibbles and copies the
+    /// scales.
+    ///
+    /// That is what makes this a test of the pairing rather than of a
+    /// transcription: reading these codes as adjacent pairs correlates with
+    /// the truth at **0.066**, so the mistake is not subtle once it is
+    /// measured, and is invisible until it is.
+    #[test]
+    fn mxfp4_decodes_a_real_block_the_way_the_planar_layout_reads_it() {
+        const BLOCK: [u8; 17] = [
+            0x79, 0x1b, 0x07, 0xac, 0x4d, 0xa2, 0xe2, 0x2a, 0x25, 0x41, 0x43, 0x9a, 0xeb, 0x12,
+            0x2c, 0x28, 0x81,
+        ];
+        let mut values = [0.0f32; 32];
+        decode_gguf_mxfp4_block_into(&BLOCK, &mut values);
+
+        // e = 121, so the scale is 2^-7 and every value is a small multiple of
+        // it. Exact comparisons: each is a half-integer times a power of two.
+        assert_eq!(mxfp4_scale(BLOCK[0]), 0.0078125);
+        let want: [f32; 32] = [
+            -0.0234375, 0.09375, -0.03125, -0.046875, 0.015625, 0.015625, -0.015625, 0.046875,
+            0.0078125, 0.0234375, -0.015625, -0.0234375, 0.015625, -0.03125, 0.0, 0.0078125,
+            0.0078125, 0.0, -0.015625, 0.03125, -0.015625, -0.0625, 0.015625, 0.015625, 0.03125,
+            0.03125, -0.0078125, -0.0625, 0.0078125, 0.015625, 0.015625, 0.0,
+        ];
+        assert_eq!(values, want);
+    }
+
+    /// The nibbles pair by half, and the levels are E2M1's.
+    ///
+    /// Byte `j` carries element `j` and element `j + 16`, so a synthetic block
+    /// whose bytes are `j | ((15 - j) << 4)` gives the levels in order down
+    /// the first half and in reverse down the second. Adjacent pairing would
+    /// interleave them, which no sum or magnitude check would notice.
+    ///
+    /// The scale is `e = 127`, which the halving makes `2^-1`, so the decoded
+    /// values are the E2M1 value set itself: 0, 0.5, 1, 1.5, 2, 3, 4, 6 and
+    /// their negatives. That anchors [`MXFP4_LEVELS`] absolutely rather than
+    /// only relative to itself — the table is those values doubled, and this
+    /// is the code at which the halving gives them back. `e = 128` would give
+    /// the doubled table, which is what makes the bias worth pinning.
+    #[test]
+    fn mxfp4_pairs_its_nibbles_by_half_over_the_e2m1_value_set() {
+        let mut block = [0u8; 17];
+        block[0] = 127;
+        for j in 0..16u8 {
+            block[1 + usize::from(j)] = j | ((15 - j) << 4);
+        }
+        let mut values = [0.0f32; 32];
+        decode_gguf_mxfp4_block_into(&block, &mut values);
+
+        let e2m1: [f32; 16] = [
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        ];
+        for j in 0..16 {
+            assert_eq!(values[j], e2m1[j], "first half element {j}");
+            assert_eq!(values[j + 16], e2m1[15 - j], "second half element {j}");
+        }
+    }
+
+    /// The affine blocks place their range with an offset, not with a bias.
+    ///
+    /// Q4_1 and Q5_1 had no test at all. They are the two arms whose doc
+    /// warns about a sign -- the offset is ADDED here and SUBTRACTED in the
+    /// K-quants -- and a sign error there survives every shape and size
+    /// check, because the block is still the right length and the numbers are
+    /// still plausible.
+    ///
+    /// So each is pinned against its symmetric twin through an identity
+    /// rather than against a table of expected floats. `Q4_0` spells its
+    /// range as `(n - 8) * d`; `Q4_1` has no bias, so the same mapping is
+    /// exactly `m = -8d`. If the two agree for all 32 elements then the
+    /// offset is added with the right sign AND no bias is hiding underneath
+    /// it -- one wrong sign moves every element by `16d`, and a stray bias by
+    /// `8d`. `Q5_1` against `Q5_0` at `m = -16d` says the same, and says it
+    /// about the fifth-bit plane too, since both read the same plane bytes.
+    ///
+    /// The identity alone would pass if BOTH decoders were wrong the same
+    /// way, so absolute values are anchored beside it. The nibbles are laid
+    /// out so that the low nibble of byte `i` is `i` and its high nibble is
+    /// `15 - i`: every element differs from its neighbour, and the two halves
+    /// run in opposite directions, so a decoder that swapped them reports the
+    /// mirror rather than something that still looks sorted.
+    #[test]
+    fn the_affine_blocks_offset_their_range_where_the_symmetric_ones_bias_it() {
+        let d = 0.5f32;
+        let le = |v: f32| half::f16::from_f32(v).to_le_bytes();
+        let nibbles: [u8; 16] = std::array::from_fn(|i| ((15 - i as u8) << 4) | i as u8);
+
+        let mut q4_0 = [0u8; 18];
+        q4_0[..2].copy_from_slice(&le(d));
+        q4_0[2..].copy_from_slice(&nibbles);
+        let mut symmetric = [0f32; 32];
+        decode_gguf_q4_0_block_into(&q4_0, &mut symmetric);
+
+        let mut q4_1 = [0u8; 20];
+        q4_1[..2].copy_from_slice(&le(d));
+        q4_1[2..4].copy_from_slice(&le(-8.0 * d));
+        q4_1[4..].copy_from_slice(&nibbles);
+        let mut affine = [0f32; 32];
+        decode_gguf_q4_1_block_into(&q4_1, &mut affine);
+
+        assert_eq!(symmetric, affine, "Q4_1 at m = -8d is Q4_0");
+        assert_eq!(affine[0], -4.0, "element 0 is the LOW nibble of byte 0");
+        assert_eq!(affine[15], 3.5);
+        assert_eq!(affine[16], 3.5, "element 16 is the HIGH nibble of byte 0");
+        assert_eq!(affine[31], -4.0);
+
+        // Bit 3 lifts the low nibble of byte 3; bit 20 lifts the HIGH nibble
+        // of byte 4. Two bits far apart in the word and adjacent in the
+        // block, so a plane read in packing order lands on neither.
+        let plane = ((1u32 << 3) | (1 << 20)).to_le_bytes();
+
+        let mut q5_0 = [0u8; 22];
+        q5_0[..2].copy_from_slice(&le(d));
+        q5_0[2..6].copy_from_slice(&plane);
+        q5_0[6..].copy_from_slice(&nibbles);
+        let mut symmetric = [0f32; 32];
+        decode_gguf_q5_0_block_into(&q5_0, &mut symmetric);
+
+        let mut q5_1 = [0u8; 24];
+        q5_1[..2].copy_from_slice(&le(d));
+        q5_1[2..4].copy_from_slice(&le(-16.0 * d));
+        q5_1[4..8].copy_from_slice(&plane);
+        q5_1[8..].copy_from_slice(&nibbles);
+        let mut affine = [0f32; 32];
+        decode_gguf_q5_1_block_into(&q5_1, &mut affine);
+
+        assert_eq!(symmetric, affine, "Q5_1 at m = -16d is Q5_0");
+        // 3 | 16 = 19, against the 3 its neighbours read.
+        assert_eq!(affine[3], 19.0 * d - 8.0);
+        assert_eq!(affine[4], 4.0 * d - 8.0, "the bit did not leak sideways");
+        // High nibble of byte 4 is 11, lifted to 27.
+        assert_eq!(affine[20], 27.0 * d - 8.0);
+        assert_eq!(affine[21], 10.0 * d - 8.0);
+    }
+
+    /// `ksigns_iq2xs` is a parity rule, so state the rule and check it holds.
+    ///
+    /// llama.cpp ships 128 bytes; [`iq_sign_byte`] ships one line. The two are
+    /// the same thing only if every result has even population count and the
+    /// low seven bits come back unchanged, which is what makes seven bits
+    /// enough to say eight signs. If the rule were ever wrong the failure
+    /// would be a sign flip on one element in eight — visible in a perplexity
+    /// number and in nothing else — so it is checked here over the whole
+    /// domain rather than sampled.
+    #[test]
+    fn the_iq_sign_byte_is_the_index_completed_to_even_parity() {
+        for index in 0u16..=255 {
+            let index = index as u8;
+            let got = iq_sign_byte(index);
+            assert_eq!(got & 0x7f, index & 0x7f, "index {index} was not preserved");
+            assert_eq!(got.count_ones() % 2, 0, "index {index} gave odd parity");
+        }
+        // The eighth bit is genuinely used: half the domain sets it.
+        let set = (0u16..128)
+            .filter(|i| iq_sign_byte(*i as u8) & 0x80 != 0)
+            .count();
+        assert_eq!(set, 64, "the parity bit is not carrying information");
+    }
+
+    /// `IQ2_XS` splits its `u16` at bit **nine**, not bit eight.
+    ///
+    /// The grid is 512 points, so the point index does not fit in a byte. A
+    /// decoder that masked with 0xFF — the obvious thing, and what `IQ2_XXS`
+    /// correctly does over its 256-point grid — would read the right point for
+    /// the half of the domain below 256 and the wrong one above, and would
+    /// also shift the sign index by one bit. This block puts the point at 511
+    /// so both halves of a wrong split are wrong.
+    #[test]
+    fn iq2_xs_takes_nine_bits_of_point_and_seven_of_sign() {
+        let mut block = [0u8; 74];
+        block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+        block[2..4].copy_from_slice(&511u16.to_le_bytes());
+        let mut values = [0.0f32; 256];
+        decode_gguf_iq2_xs_block_into(&block, &mut values);
+
+        // Scale nibble zero is still (0.5 + 0) * 0.25, never zero.
+        let db = 0.125f32;
+        for bit in 0..8 {
+            let want = db * f32::from(iq_grid::IQ2XS_GRID[511 * 8 + bit]);
+            assert_eq!(values[bit], want, "element {bit} of point 511");
+        }
+        // And the test discriminates: an eight-bit mask would land on 255.
+        let truncated = &iq_grid::IQ2XS_GRID[255 * 8..255 * 8 + 8];
+        let correct = &iq_grid::IQ2XS_GRID[511 * 8..511 * 8 + 8];
+        assert_ne!(
+            truncated, correct,
+            "point 255 and 511 must differ to test this"
+        );
+    }
+
+    /// `IQ2_S` packs four points per `qh` byte; `IQ3_S` packs eight.
+    ///
+    /// Both extend an eight-bit `qs` with bits from `qh`, and the two schemes
+    /// sit next to each other in this file, so the field widths are easy to
+    /// cross. They are not interchangeable: `IQ2_S` takes **two** bits per
+    /// point to reach a 1024-point grid, `IQ3_S` takes **one** to reach 512.
+    /// Using the wrong one addresses the right grid for the first few points
+    /// and drifts after, which is exactly the kind of fault a whole-block sum
+    /// would hide behind plausible numbers.
+    #[test]
+    fn the_high_bits_of_iq2_s_and_iq3_s_are_different_widths() {
+        // IQ2_S: qh byte 0 = 0b11 in field k=0 lifts point 0 to point 768.
+        let mut block = [0u8; 82];
+        block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+        block[66] = 0b11;
+        let mut values = [0.0f32; 256];
+        decode_gguf_iq2_s_block_into(&block, &mut values);
+        for bit in 0..8 {
+            let want = 0.125 * f32::from(iq_grid::IQ2S_GRID[768 * 8 + bit]);
+            assert_eq!(values[bit], want, "IQ2_S element {bit} of point 768");
+        }
+        // Field k=1 is the *next two bits*, so it is untouched and reads point 0.
+        for bit in 0..8 {
+            let want = 0.125 * f32::from(iq_grid::IQ2S_GRID[bit]);
+            assert_eq!(values[8 + bit], want, "IQ2_S point 1 was disturbed");
+        }
+
+        // IQ3_S: qh byte 0 bit 0 lifts point 0 to point 256, and bit 1 is the
+        // *next point*, not the second bit of this one.
+        let mut block = [0u8; 110];
+        block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+        block[66] = 0b11;
+        let mut values = [0.0f32; 256];
+        decode_gguf_iq3_s_block_into(&block, &mut values);
+        for i in 0..8 {
+            let want = f32::from(iq_grid::IQ3S_GRID[256 * 4 + i % 4]);
+            assert_eq!(values[i], want, "IQ3_S element {i} of point 256");
+        }
+    }
+
+    /// `IQ3_S`'s scale is `1 + 2s` — an odd integer, with no half-step.
+    ///
+    /// Every other IQ scheme here scales by `(0.5 + s) * k`. `IQ3_S` does not,
+    /// because its grid components are the odd numbers 1..15 and the odd
+    /// multiplier is what keeps the product on the intended lattice. Sharing a
+    /// scale helper across the schemes would therefore be wrong rather than
+    /// merely awkward, and this pins that down: with `d = 1` and scale nibble
+    /// `s`, element zero is exactly `(1 + 2s)` times a grid entry.
+    #[test]
+    fn the_iq3_s_scale_is_an_odd_integer() {
+        for s in 0u8..16 {
+            let mut block = [0u8; 110];
+            block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+            block[106] = s;
+            let mut values = [0.0f32; 256];
+            decode_gguf_iq3_s_block_into(&block, &mut values);
+            let want = f32::from(1 + 2 * u16::from(s)) * f32::from(iq_grid::IQ3S_GRID[0]);
+            assert_eq!(values[0], want, "IQ3_S scale nibble {s}");
+        }
+    }
+
+    /// The five lattice schemes, each on a real block, against `gguf-py`.
+    ///
+    /// These grids are not in the file: llama.cpp compiles them in, and
+    /// [`iq_grid`] compiles in the same ones. So the only correctness argument
+    /// available is agreement with the reference implementation, and it was
+    /// taken over whole tensors — 110M elements across
+    /// `Llama-3.2-1B-Instruct-UD-Q2_K_XL.gguf` and
+    /// `Llama-3.2-1B-Instruct-UD-IQ2_XXS.gguf`, decoded by `gguf-py`, rounded
+    /// to BF16 and compared to the imported artifact. Every element matched
+    /// exactly; `IQ4_XS`, already known good, rode along as the control.
+    ///
+    /// The blocks below are the first block of one tensor per scheme from
+    /// those files, kept here so the agreement survives without the 3 GB it
+    /// was measured on. Values come from `gguf-py`, not from this decoder.
+    ///
+    /// Each block is checked at its first eight elements and then by two sums
+    /// over all 256: the plain sum would survive a sign flip that the absolute
+    /// sum catches, and the absolute sum would survive a permutation that
+    /// neither catches but the structure tests above do.
+    #[test]
+    fn the_iq_lattice_schemes_decode_real_blocks_the_way_gguf_py_does() {
+        fn check(name: &str, values: &[f32; 256], first: [f32; 8], sum: f32, abs: f32) {
+            for (i, want) in first.iter().enumerate() {
+                assert!(
+                    (values[i] - want).abs() < 1e-9,
+                    "{name} element {i}: {} against {want}",
+                    values[i]
+                );
+            }
+            let got_sum: f32 = values.iter().sum();
+            let got_abs: f32 = values.iter().map(|v| v.abs()).sum();
+            assert!((got_sum - sum).abs() < 1e-5, "{name} block sum {got_sum}");
+            assert!(
+                (got_abs - abs).abs() < 1e-4,
+                "{name} absolute sum {got_abs}"
+            );
+        }
+
+        // blk.0.attn_k.weight of Llama-3.2-1B-Instruct-UD-IQ2_XXS.gguf
+        const IQ2_XXS: [u8; 66] = [
+            0xf9, 0x19, 0x00, 0x00, 0x00, 0x00, 0x70, 0xc7, 0x96, 0xf0, 0x85, 0x4b, 0x52, 0x04,
+            0x2f, 0x34, 0x68, 0x47, 0x12, 0x07, 0x01, 0x0d, 0x85, 0x5f, 0x5e, 0x78, 0x35, 0xfb,
+            0xc4, 0xe2, 0x5b, 0x93, 0xf8, 0x38, 0x36, 0x21, 0x15, 0xc9, 0x12, 0xdc, 0x4b, 0x47,
+            0x45, 0xdb, 0x7b, 0x47, 0xb7, 0xd4, 0x95, 0x36, 0xb5, 0x70, 0x59, 0x0d, 0x9e, 0x1b,
+            0xe1, 0x5a, 0xae, 0x54, 0x2d, 0x2f, 0x07, 0x38, 0x9f, 0x51,
+        ];
+        let mut values = [0.0f32; 256];
+        decode_gguf_iq2_xxs_block_into(&IQ2_XXS, &mut values);
+        check(
+            "IQ2_XXS",
+            &values,
+            [
+                9.040_641_8e-2,
+                9.040_641_8e-2,
+                9.040_641_8e-2,
+                9.040_641_8e-2,
+                -9.040_641_8e-2,
+                -9.040_641_8e-2,
+                -9.040_641_8e-2,
+                -9.040_641_8e-2,
+            ],
+            -1.180_022_5,
+            1.587_908_5e1,
+        );
+
+        // blk.2.attn_k.weight of Llama-3.2-1B-Instruct-UD-Q2_K_XL.gguf
+        const IQ2_XS: [u8; 74] = [
+            0x4e, 0x11, 0x7d, 0xa1, 0x9d, 0x56, 0xcc, 0x1b, 0x2c, 0x50, 0x57, 0xa0, 0x6a, 0x7a,
+            0x7e, 0x93, 0xdb, 0xe4, 0xbb, 0x19, 0xee, 0x42, 0x90, 0x43, 0x9c, 0x5c, 0xd5, 0xaa,
+            0x06, 0x87, 0x34, 0x22, 0x8c, 0xd4, 0x90, 0xfb, 0x4c, 0x53, 0xa3, 0xd1, 0x50, 0x94,
+            0x4b, 0xd9, 0x4f, 0x81, 0x79, 0x19, 0x37, 0xef, 0x4b, 0xbd, 0xb9, 0x4b, 0x25, 0xfa,
+            0xe9, 0x34, 0x49, 0xb6, 0xa7, 0x0c, 0xa8, 0x1b, 0x7a, 0xeb, 0xa7, 0x5e, 0xb4, 0x9c,
+            0x99, 0x8f, 0x9a, 0x79,
+        ];
+        let mut values = [0.0f32; 256];
+        decode_gguf_iq2_xs_block_into(&IQ2_XS, &mut values);
+        check(
+            "IQ2_XS",
+            &values,
+            [
+                5.220_830_4e-2,
+                9.713_172_9e-3,
+                5.220_830_4e-2,
+                3.035_366_5e-2,
+                -9.713_172_9e-3,
+                9.713_172_9e-3,
+                -5.220_830_4e-2,
+                3.035_366_5e-2,
+            ],
+            1.295_089_7e-3,
+            6.650_609_5,
+        );
+
+        // blk.2.ffn_gate.weight of the same file.
+        const IQ2_S: [u8; 82] = [
+            0x03, 0x0d, 0x76, 0x19, 0xaf, 0x0e, 0x6c, 0xa5, 0x86, 0xad, 0x8b, 0xdb, 0xf2, 0x1d,
+            0x54, 0x00, 0x57, 0x01, 0x10, 0x43, 0x6c, 0x52, 0x21, 0xc7, 0xd1, 0xec, 0x5f, 0x87,
+            0x53, 0x7b, 0x14, 0x64, 0xce, 0x45, 0x14, 0x58, 0x2d, 0x69, 0x55, 0xc9, 0x1b, 0x91,
+            0xa8, 0x1c, 0xdc, 0x2d, 0x29, 0xa9, 0x70, 0xbd, 0xa3, 0xe7, 0x0e, 0xc2, 0x1f, 0xce,
+            0x54, 0x57, 0x2d, 0x5e, 0x0f, 0x15, 0xdd, 0x5e, 0xbf, 0x4d, 0xf4, 0x35, 0xc5, 0xc1,
+            0x28, 0xa9, 0x4a, 0x86, 0xb8, 0x88, 0xba, 0x8f, 0x6f, 0x8f, 0x79, 0xa9,
+        ];
+        let mut values = [0.0f32; 256];
+        decode_gguf_iq2_s_block_into(&IQ2_S, &mut values);
+        check(
+            "IQ2_S",
+            &values,
+            [
+                2.795_079_4e-2,
+                2.795_079_4e-2,
+                -5.200_147_6e-3,
+                5.200_147_6e-3,
+                -1.625_046_1e-2,
+                1.625_046_1e-2,
+                5.200_147_6e-3,
+                5.200_147_6e-3,
+            ],
+            -2.665_075_7e-2,
+            3.598_693_3,
+        );
+
+        // blk.0.attn_k.weight of the same file.
+        const IQ3_XXS: [u8; 98] = [
+            0x4e, 0x10, 0x20, 0x9e, 0x3e, 0x6d, 0x88, 0x50, 0x7e, 0x1d, 0x7b, 0x95, 0xa6, 0xa0,
+            0x93, 0x58, 0x21, 0x46, 0xcb, 0x1a, 0x2f, 0x47, 0x05, 0x75, 0x8d, 0x00, 0x42, 0x27,
+            0x01, 0xda, 0x70, 0xa7, 0x77, 0xc7, 0x79, 0x67, 0x08, 0x49, 0x3b, 0x3f, 0xbc, 0x84,
+            0x9a, 0x98, 0x1c, 0xce, 0xb6, 0x5b, 0x54, 0x22, 0x06, 0x79, 0x29, 0x2f, 0x45, 0x4c,
+            0x7e, 0x0c, 0x63, 0x26, 0xa0, 0x19, 0x1a, 0x13, 0x73, 0xa1, 0x70, 0xc7, 0x96, 0x90,
+            0x2f, 0x34, 0x68, 0x87, 0x85, 0x5f, 0x5e, 0xe8, 0x5b, 0x93, 0xf8, 0x78, 0x12, 0xdc,
+            0x4b, 0x97, 0xb7, 0xd4, 0x95, 0x76, 0x9e, 0x1b, 0xe1, 0xfa, 0x07, 0x38, 0x9f, 0xb1,
+        ];
+        let mut values = [0.0f32; 256];
+        decode_gguf_iq3_xxs_block_into(&IQ3_XXS, &mut values);
+        check(
+            "IQ3_XXS",
+            &values,
+            [
+                2.995_204_9e-2,
+                1.098_241_8e-1,
+                4.992_008_2e-2,
+                9.984_016_4e-3,
+                -4.992_008_2e-2,
+                -1.098_241_8e-1,
+                -4.992_008_2e-2,
+                -6.988_811_5e-2,
+            ],
+            -8.318_262e-1,
+            1.324_616_2e1,
+        );
+
+        // blk.0.ffn_gate.weight of the same file.
+        const IQ3_S: [u8; 110] = [
+            0x2c, 0x08, 0x31, 0x1f, 0x91, 0xa6, 0xe2, 0x67, 0xa3, 0xbf, 0x44, 0xeb, 0xcf, 0xe5,
+            0x1b, 0x2c, 0x16, 0x51, 0x23, 0xd8, 0x20, 0xc5, 0x3f, 0xc2, 0x32, 0x7a, 0x81, 0xf9,
+            0x01, 0x9c, 0x71, 0xfb, 0x9a, 0x52, 0x7e, 0x12, 0x8f, 0x3e, 0xd5, 0x3a, 0x0b, 0x6a,
+            0xe1, 0x77, 0x05, 0xf2, 0x33, 0x95, 0x9d, 0xff, 0xdc, 0x5f, 0x91, 0x8a, 0xe1, 0x3c,
+            0x28, 0xca, 0x1c, 0x69, 0x9d, 0x1a, 0x5d, 0xc9, 0x3e, 0xe6, 0xee, 0x68, 0x74, 0xa8,
+            0x89, 0x58, 0x50, 0x4a, 0x16, 0xa3, 0x26, 0x3d, 0xe4, 0xbf, 0x38, 0x0f, 0x06, 0xdc,
+            0x73, 0x30, 0x33, 0x61, 0x87, 0x98, 0x78, 0xa7, 0x78, 0x73, 0x69, 0x35, 0x46, 0xd8,
+            0xe7, 0xa4, 0x29, 0x84, 0xb2, 0x66, 0x4b, 0x96, 0x8b, 0xa8, 0xcb, 0xaf,
+        ];
+        let mut values = [0.0f32; 256];
+        decode_gguf_iq3_s_block_into(&IQ3_S, &mut values);
+        check(
+            "IQ3_S",
+            &values,
+            [
+                3.221_082_7e-2,
+                -1.464_128_5e-2,
+                -1.464_128_5e-2,
+                2.928_257e-3,
+                -8.784_771e-3,
+                2.049_779_9e-2,
+                2.928_257e-3,
+                2.049_779_9e-2,
+            ],
+            -1.858_806_6e-1,
+            3.636_131_3,
+        );
     }
 }

@@ -90,6 +90,8 @@ fn fixture_artifact() -> String {
             dry_run: false,
             force: true,
             delete_source: false,
+            consume_source: false,
+            keep_source: false,
             max_shard_size: None,
         })
         .expect("convert the smoke snapshot");

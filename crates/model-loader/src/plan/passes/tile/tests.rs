@@ -207,9 +207,13 @@ fn backends_without_transform_kernels_decide_nothing() {
     // to bind, so it advertises the kinds it executes but asks for none of the
     // tiling or fusion the lowering can offer: there is no staging buffer to
     // size and no kernel to fuse into.
+    //
+    // `TILE_MAP_DECODE` is in the mask and makes no difference to that, which
+    // is the point being restated: a device mask says which transforms a plan
+    // may CARRY. Metal runs every one of them on the host either way.
     assert_eq!(
         METAL_TILE_MAP_MASK,
-        TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE
+        TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE | TILE_MAP_DECODE
     );
     let target = StorageTarget {
         backend: BackendKind::Metal,

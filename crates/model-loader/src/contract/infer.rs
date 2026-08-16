@@ -415,21 +415,61 @@ fn axis_index(axis: Axis, rank: usize, what: &str) -> Result<usize, Error> {
     Ok(index)
 }
 
-/// The group size along `axis`, when the encoding blocks that axis.
+/// Which axis a quantized encoding groups along, and how many elements share
+/// one set of factors there.
 ///
-/// Quantized encodings pack `group_size` consecutive elements along
-/// `channel_axis` under one scale, so any structural operation on that axis must
-/// respect the block boundary or the scales stop lining up with the data.
-fn block_granularity(encoding: &Encoding, axis: usize) -> Option<i64> {
-    let Encoding::Quant(spec) = encoding else {
+/// Two encodings answer this two different ways, and only one of them says so
+/// out loud.
+///
+/// A **planar** scheme -- AWQ, GPTQ, an MLX affine bank -- keeps its scales in
+/// a tensor of their own, laid out against a stated `channel_axis`. It has to
+/// state one, because nothing about the code plane implies it.
+///
+/// A **self-contained** scheme -- every `Gguf*`, MXFP4 -- interleaves its
+/// scales with its codes inside each block, so there is no separate plane to
+/// align and nothing to state. Every such tensor reaches us with
+/// `channel_axis: None`. But it is grouped all the same: the block runs along
+/// the FASTEST axis, which in this crate's fastest-last convention is the last
+/// one. `ffn_gate_exps` declares GGUF dims `[2048, 768, 128]` and is held here
+/// as `[128, 768, 2048]` = `[E, I, H]`, and the Q4_K blocks run along `H`.
+///
+/// Reading `channel_axis` alone therefore returned `None` for exactly the
+/// schemes whose blocks are hardest to cut safely, and every alignment rule
+/// keyed on it -- [`infer_slice`]'s boundary check, [`infer_stride`]'s refusal,
+/// [`infer_gather`]'s, and [`blocked_suffix`]'s regroup check -- silently did
+/// not apply to them. That was unreachable while every blocked tensor was
+/// decoded to BF16 on the way into an archive: nothing downstream ever saw one.
+/// An archive that keeps its source packing hands them straight to the family
+/// contracts, and the hole becomes reachable -- a `Stride` over `H` would have
+/// been accepted, taking every other 4-bit code out of a block and leaving a
+/// block no scale describes, with the byte arithmetic still balancing.
+///
+/// Leading axes stay free, which is what keeps the expert unstack legal: the
+/// slab cut is on axis 0 and never touches the blocked axis.
+fn blocked_axis(ty: &TensorType) -> Option<(usize, i64)> {
+    let Encoding::Quant(spec) = &ty.encoding else {
         return None;
     };
-    let channel = spec.channel_axis?;
-    if usize::from(channel.0) != axis {
-        return None;
+    if let Some((elems, _)) = spec.block_layout() {
+        let last = ty.rank().checked_sub(1)?;
+        let group = i64::try_from(elems).ok()?;
+        return (group > 1).then_some((last, group));
     }
+    let channel = usize::from(spec.channel_axis?.0);
     let group = i64::from(spec.normalized_group_size());
-    (group > 1).then_some(group)
+    (group > 1).then_some((channel, group))
+}
+
+/// The group size along `axis`, when the encoding blocks that axis.
+///
+/// Quantized encodings pack a group of consecutive elements along one axis
+/// under one set of factors, so any structural operation on that axis must
+/// respect the block boundary or the factors stop lining up with the data.
+/// [`blocked_axis`] says which axis that is.
+fn block_granularity(ty: &TensorType, axis: usize) -> Option<i64> {
+    blocked_axis(ty)
+        .filter(|&(index, _)| index == axis)
+        .map(|(_, group)| group)
 }
 
 /// Shared by [`Expr::Slice`] and [`Expr::Stride`]: both name `len` positions
@@ -511,7 +551,7 @@ fn infer_slice(ty: &TensorType, axis: Axis, start: i64, len: i64) -> Result<Tens
             &format!("covers the whole of axis {index}"),
         ));
     }
-    if let Some(group) = block_granularity(&ty.encoding, index)
+    if let Some(group) = block_granularity(ty, index)
         && (start % group != 0 || len % group != 0)
     {
         return Err(Error::Contract(format!(
@@ -546,7 +586,7 @@ fn infer_stride(
     // A band may land on a quantized axis if it lands on group boundaries. A
     // stride may not land on one at all: taking every other element of a block
     // leaves a block that no scale describes.
-    if let Some(group) = block_granularity(&ty.encoding, index) {
+    if let Some(group) = block_granularity(ty, index) {
         return Err(Error::Contract(format!(
             "Stride with step {step} on quantized axis {index} would split its {group}-element groups"
         )));
@@ -583,7 +623,7 @@ fn infer_gather(ty: &TensorType, axis: Axis, indices: &[i64]) -> Result<TensorTy
     // Same reason a stride may not: a permutation of the elements inside a
     // block leaves a block no scale describes. Permuting whole blocks is a
     // `Concat` of `Slice`s, which keeps every group intact and is checked as such.
-    if let Some(group) = block_granularity(&ty.encoding, index) {
+    if let Some(group) = block_granularity(ty, index) {
         return Err(Error::Contract(format!(
             "Gather on quantized axis {index} would split its {group}-element groups"
         )));
@@ -652,7 +692,7 @@ fn infer_concat(axis: Axis, parts: &[TensorType]) -> Result<TensorType, Error> {
             .checked_add(part.shape[index])
             .or_overflow("Concat extent overflows i64")?;
     }
-    if let Some(group) = block_granularity(&head.encoding, index) {
+    if let Some(group) = block_granularity(head, index) {
         for (offset, part) in parts.iter().enumerate() {
             if part.shape[index] % group != 0 {
                 return Err(Error::Contract(format!(
@@ -685,10 +725,7 @@ fn element_bits(encoding: &Encoding) -> Option<u64> {
 /// against these extents, so regrouping them moves data out from under its
 /// factors while the byte count still balances.
 fn blocked_suffix(ty: &TensorType) -> Option<&[i64]> {
-    let Encoding::Quant(spec) = &ty.encoding else {
-        return None;
-    };
-    let channel = usize::from(spec.channel_axis?.0);
+    let (channel, _) = blocked_axis(ty)?;
     ty.shape.get(channel..)
 }
 
@@ -1068,7 +1105,8 @@ fn infer_bias(ty: TensorType, by_bits: u32) -> Result<TensorType, Error> {
         Encoding::Raw(dtype) => dtype,
         Encoding::Quant(_) => {
             return Err(Error::Contract(format!(
-                "Bias of a quantized tensor ({:?}) is not supported; a code                  word means nothing to add to until its scales are named",
+                "Bias of a quantized tensor ({:?}) is not supported; a code \
+                 word means nothing to add to until its scales are named",
                 ty.encoding
             )));
         }
@@ -1291,6 +1329,122 @@ mod tests {
 
     /// A checkpoint whose only tensor is blocked along axis 1, so the two
     /// selection nodes can be asked the same question about the same axis.
+    /// A GGUF expert stack, as `import_moe` hands one over: self-contained
+    /// blocks, so `channel_axis` is `None`, held fastest-last as `[E, I, H]`.
+    fn gguf_stack() -> FakeCheckpoint {
+        FakeCheckpoint(HashMap::from([(
+            "w".to_string(),
+            TensorType {
+                shape: vec![128, 768, 2048],
+                encoding: Encoding::Quant(QuantSpec {
+                    scheme: QuantScheme::GgufQ4K,
+                    logical_dtype: DType::BF16,
+                    bits_per_element: 0,
+                    group_size: 0,
+                    channel_axis: None,
+                }),
+            },
+        )]))
+    }
+
+    /// A self-contained block states no `channel_axis`, and every alignment
+    /// rule used to be keyed on one.
+    ///
+    /// So for exactly the schemes whose blocks interleave their scales with
+    /// their codes -- the ones that cannot survive being cut mid-block -- the
+    /// rules did not apply. This was unreachable while import decoded every
+    /// blocked tensor to BF16; an archive that keeps its source packing hands
+    /// them to the family contracts directly, and a `Stride` over the packed
+    /// axis would have been ACCEPTED, taking every other code out of a block
+    /// and leaving a block no scale describes, byte arithmetic still balancing.
+    ///
+    /// The expert cut has to stay legal on the same tensor, which is the whole
+    /// reason the rule names one axis rather than refusing quantized tensors
+    /// wholesale.
+    #[test]
+    fn a_self_contained_block_is_grouped_along_its_fastest_axis() {
+        let ck = gguf_stack();
+
+        // Axis 0 is the expert axis: `import_moe` cuts one slab per expert,
+        // and every slab is whole blocks however the blocks run.
+        let ty = check_one(Expr::src("w").slice(0, 3, 1), &ck).expect("an expert slab cuts");
+        assert_eq!(ty.shape, vec![1, 768, 2048]);
+
+        // The last axis is where the blocks are. Q4_K holds 256 elements per
+        // block, so a cut has to land on one.
+        let err = check_one(Expr::src("w").slice(2, 100, 256), &ck)
+            .expect_err("a cut that starts mid-block is refused");
+        assert!(
+            format!("{err}").contains("not aligned to its 256-element groups"),
+            "{err}"
+        );
+        check_one(Expr::src("w").slice(2, 256, 512), &ck).expect("an aligned cut is allowed");
+
+        // A stride cannot land on it at all, at any alignment.
+        let err = check_one(Expr::src("w").stride(2, 0, 4, 256), &ck)
+            .expect_err("a stride over the packed axis is refused");
+        assert!(
+            format!("{err}").contains("would split its 256-element groups"),
+            "{err}"
+        );
+
+        // ... but a stride over a leading axis is untouched.
+        check_one(Expr::src("w").stride(0, 0, 4, 2), &ck).expect("a stride over experts is fine");
+    }
+
+    /// The rename that follows the expert cut, which is the reason the rule
+    /// names one axis instead of refusing quantized tensors outright.
+    ///
+    /// `import_moe` cuts a slab and immediately drops the leading `1`:
+    /// `[1, I, H] -> [I, H]`. That has to keep working, because it is the
+    /// whole GGUF MoE ingest — and no GGUF MoE reaches plan compilation in
+    /// this environment (gpt-oss refuses at identification and no
+    /// `Qwen3-30B-A3B` blob is present), so this is the only place the path is
+    /// exercised at all.
+    ///
+    /// The regroup refusal on the other side is what `blocked_suffix` is for,
+    /// and it began applying to these schemes at the same moment: a rename may
+    /// rearrange the axes ABOVE the blocks freely and must leave the blocked
+    /// axis and everything below it alone. `[E, I, H] -> [E * I, H]` is a
+    /// leading regroup and legal; anything that changes `H` moves data out
+    /// from under scales it cannot see, while the byte count still balances.
+    #[test]
+    fn a_rename_may_regroup_above_the_blocks_and_not_at_them() {
+        let ck = gguf_stack();
+
+        // The unstack, exactly as `import_moe` spells it.
+        let slab = Expr::src("w")
+            .slice(0, 3, 1)
+            .transmute(TensorType::new(vec![768, 2048], ck.0["w"].encoding.clone()));
+        let ty = check_one(slab, &ck).expect("a slab drops its leading 1");
+        assert_eq!(ty.shape, vec![768, 2048]);
+
+        // Folding two leading axes together touches no block.
+        check_one(
+            Expr::src("w").transmute(TensorType::new(
+                vec![128 * 768, 2048],
+                ck.0["w"].encoding.clone(),
+            )),
+            &ck,
+        )
+        .expect("leading axes may regroup");
+
+        // Reshaping ACROSS the blocked axis is the one that must not pass. The
+        // byte count is identical, so only the blocked-suffix rule refuses it.
+        let err = check_one(
+            Expr::src("w").transmute(TensorType::new(
+                vec![128, 768 * 2, 1024],
+                ck.0["w"].encoding.clone(),
+            )),
+            &ck,
+        )
+        .expect_err("halving the blocked axis is refused");
+        assert!(
+            format!("{err}").contains("only leading axes may regroup"),
+            "{err}"
+        );
+    }
+
     fn blocked() -> FakeCheckpoint {
         FakeCheckpoint(HashMap::from([(
             "w".to_string(),

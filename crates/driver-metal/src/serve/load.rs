@@ -92,7 +92,7 @@ impl Shell {
             }
         };
 
-        // WHICH MODEL THIS IS, asked of the TENSORS.
+        // WHICH MODEL THIS IS, asked of the TENSORS — unless pie wrote them.
         //
         // The config above no longer DECIDES anything. What this driver did
         // instead was read `architectures[0]` out of a descriptor, lowercase
@@ -106,15 +106,25 @@ impl Shell {
         // is the point: a config that lies about its geometry used to be
         // believed by the derivation and contradicted by an assertion several
         // frames later, if at all. A checkpoint is a known model or it is not.
+        //
+        // The exception is an artifact `pie model build` produced, whose
+        // tensors are post-transform and match no manifest by construction; it
+        // carries the row this same identification settled at build time. See
+        // `catalog::identify_artifact`.
         let chosen = self
             .boot_model_id
             .as_ref()
             .map_or(model::catalog::Override::None, |id| {
                 model::catalog::Override::Id(id.clone())
             });
-        let row = model::catalog::identify(&meta, &chosen).map_err(|e| Error::Unserved {
-            what: "load_model",
-            message: e.to_string(),
+        let attributes =
+            model_loader::checkpoint::read::parse_checkpoint_attributes(&desc.snapshot_dir)
+                .unwrap_or_default();
+        let row = model::catalog::identify_artifact(&attributes, &meta, &chosen).map_err(|e| {
+            Error::Unserved {
+                what: "load_model",
+                message: e.to_string(),
+            }
         })?;
         let encoding = model::encoding::Encoding::from_config_json(&config_json).map_err(|e| {
             Error::Unserved {

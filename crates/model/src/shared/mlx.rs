@@ -509,7 +509,9 @@ pub type RenameRule<'r> = &'r dyn Fn(&Builder<'_>, &str) -> Result<Option<String
 /// header states.
 ///
 /// `RuntimeQuant::Int4` adds one arm: a rank-2 `.weight` the checkpoint left
-/// in a float type is encoded to affine-U4 instead of declared as values. It
+/// in a float type -- or in a self-contained block this path can unpack, see
+/// [`unpacks_to_bf16`] -- is encoded to affine-U4 instead of declared as
+/// values. It
 /// is the same rule gpt-oss applies unconditionally — its published checkpoint
 /// mixes MXFP4 experts with BF16 attention, and the matvecs are quantized — and
 /// the same `Encode` op, so what runs at load without a request and offline
@@ -523,6 +525,39 @@ pub type RenameRule<'r> = &'r dyn Fn(&Builder<'_>, &str) -> Result<Option<String
 /// quantized correctly offline and from misread bits at load. `Cast` is in
 /// both tile-map masks and is what `push_direct` already does with these two
 /// widths, so the chain costs nothing and removes the disagreement.
+/// A block this path can unpack on the way to the encoder.
+///
+/// **Why this exists at all, which is recent.** Until an archive began
+/// keeping the packing its source shipped, `pie model import` decoded every
+/// block to BF16, so a GGUF-derived checkpoint arrived here with every
+/// projection already a float and the encode arm below covered it. Once the
+/// blocks survived import, those same projections stopped being floats and
+/// fell out of the arm into `push_direct` -- published as values, given a
+/// `Cast` to BF16 by `decode_bound_blocks`, and shipped with no `.scales`
+/// beside them.
+///
+/// Nothing failed. `pie model build --backend vulkan --quant int4` against a
+/// q4_0 archive printed `quant=Int4` and wrote 942 MiB of BF16 where 320 MiB
+/// of affine-U4 was asked for -- and the artifact could not have bound, since
+/// Metal's loader asks for `.weight`/`.scales`/`.biases` unconditionally,
+/// which is the very failure the refusal above exists to prevent. It just
+/// arrived by a route the refusal does not watch: that gate asks whether
+/// anything WILL supply the scales, and under `--quant int4` the honest answer
+/// was "the encoder will", right up until the encoder quietly declined.
+///
+/// So a self-contained block is widened exactly as F16 and F32 are, through
+/// the same named intermediate, and reaches the same encoder. `BF16` is
+/// required of the logical dtype rather than assumed: the driver's
+/// `encode_mlx_affine_u4` reads every 2-byte element as BF16, so a block that
+/// unpacks to anything else must not silently take this path either.
+fn unpacks_to_bf16(encoding: &Encoding) -> bool {
+    matches!(
+        encoding,
+        Encoding::Quant(spec)
+            if spec.scheme.is_self_contained() && spec.logical_dtype == DType::BF16
+    )
+}
+
 pub fn author_mlx_file(
     b: &mut Builder<'_>,
     schema: &str,
@@ -573,7 +608,10 @@ pub fn author_mlx_file(
         } else if encode_floats && raw.name.ends_with(".weight") && raw.shape.len() == 2 {
             let value = if is_raw(&raw.encoding, DType::BF16) {
                 Expr::src(&raw.name)
-            } else if is_raw(&raw.encoding, DType::F16) || is_raw(&raw.encoding, DType::F32) {
+            } else if is_raw(&raw.encoding, DType::F16)
+                || is_raw(&raw.encoding, DType::F32)
+                || unpacks_to_bf16(&raw.encoding)
+            {
                 // Two tile maps, not one expression: `Cast` needs a kernel, so
                 // a cast feeding an encode has to leave a buffer behind for the
                 // encode to read rather than nest inside it.
@@ -617,6 +655,7 @@ mod tests {
     use model_loader::contract::ModelContract;
     use model_loader::plan::StorageTarget;
     use model_loader::types::{BackendKind, FileId, TensorId};
+    use model_loader::types::{QuantScheme, QuantSpec};
 
     const HIDDEN: i64 = 64;
     const ROWS: i64 = 32;
@@ -869,6 +908,90 @@ mod tests {
             "layers.0.mlp.down_proj.weight",
             vec![ROWS, HIDDEN],
             Encoding::Raw(DType::U8),
+        );
+        let c =
+            run(t, RuntimeQuant::Int4, &passthrough).expect("an unencodable weight is not fatal");
+        assert_eq!(names(&c), vec!["layers.0.mlp.down_proj.weight"]);
+    }
+
+    /// A GGUF block under `--quant int4` is UNPACKED and then encoded, the
+    /// same two-step an F32 weight takes.
+    ///
+    /// This is a regression test with a live failure behind it. Once import
+    /// stopped decoding blocks, a q4_0 projection stopped being a float, fell
+    /// past the encode arm into `push_direct` and was published as values --
+    /// so `--backend vulkan --quant int4` reported `quant=Int4` and wrote
+    /// 942 MiB of BF16 where 320 MiB of affine-U4 was asked for, with no
+    /// `.scales` beside any of it. Metal's loader asks for those
+    /// unconditionally, so the artifact built and could not have bound.
+    #[test]
+    fn a_block_is_unpacked_on_the_way_to_the_encoder() {
+        let mut t = Vec::new();
+        tensor(
+            &mut t,
+            "layers.0.mlp.down_proj.weight",
+            vec![ROWS, HIDDEN],
+            Encoding::Quant(QuantSpec {
+                scheme: QuantScheme::GgufQ4_0,
+                logical_dtype: DType::BF16,
+                bits_per_element: 4,
+                group_size: 32,
+                channel_axis: None,
+            }),
+        );
+        let c = run(t, RuntimeQuant::Int4, &passthrough).expect("int4 unpacks and encodes");
+        let widened = c
+            .tensors
+            .iter()
+            .find(|x| x.name == "layers.0.mlp.down_proj.weight.bf16")
+            .expect("the block is unpacked into a buffer the encoder can read");
+        assert!(
+            matches!(&widened.expr, model_loader::contract::Expr::Cast { .. }),
+            "the intermediate unpacks rather than relabels: {:?}",
+            widened.expr
+        );
+        // What actually went wrong, asserted directly: the published weight
+        // must be affine-U4 with scales beside it, not the block passed
+        // through. Without this the test passes for a contract that unpacks
+        // to BF16 and stops there -- which is exactly the bug.
+        let published = c
+            .tensors
+            .iter()
+            .find(|x| x.name == "layers.0.mlp.down_proj.weight")
+            .expect("the projection is published");
+        assert!(
+            matches!(&published.encoding, Encoding::Quant(spec)
+                if spec.scheme == QuantScheme::MlxAffineU4),
+            "the projection is encoded, not passed through: {:?}",
+            published.encoding
+        );
+        // The `.scales`/`.biases` Metal binds are written by the plan off
+        // this declaration, so the declaration is what this layer can
+        // assert -- and it is the thing that was missing.
+        assert_eq!(
+            widened.visibility,
+            model_loader::contract::Visibility::Internal
+        );
+    }
+
+    /// The negative control for the case above: a block that unpacks to
+    /// something other than BF16 must NOT take that path, because the
+    /// driver's encoder reads every 2-byte element as BF16 and would
+    /// quantize correct numbers from misread bits.
+    #[test]
+    fn a_block_that_does_not_unpack_to_bf16_is_left_alone() {
+        let mut t = Vec::new();
+        tensor(
+            &mut t,
+            "layers.0.mlp.down_proj.weight",
+            vec![ROWS, HIDDEN],
+            Encoding::Quant(QuantSpec {
+                scheme: QuantScheme::GgufQ4_0,
+                logical_dtype: DType::F32,
+                bits_per_element: 4,
+                group_size: 32,
+                channel_axis: None,
+            }),
         );
         let c =
             run(t, RuntimeQuant::Int4, &passthrough).expect("an unencodable weight is not fatal");

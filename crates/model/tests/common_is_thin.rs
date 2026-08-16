@@ -162,6 +162,17 @@ const NOT_SHARED: &[(&str, &str)] = &[
         "family-aware by design -- it dispatches on a VisionArch",
     ),
     (
+        "ingest.rs",
+        "THE GGUF DISPATCH. `pass_for` answers a `general.architecture` \
+         string -- `qwen2`, `qwen3`, `qwen3moe`, `gemma3`, `llama` -- with \
+         the family's own ingest pass, and its doc names two more \
+         (`gpt-oss`, `gemma4`) to record why they are REFUSED. Naming \
+         families is what the module IS, and the string it switches on is \
+         llama.cpp's rather than pie's: nothing but a table can bridge a \
+         foreign vocabulary to this crate's modules. It sits outside the \
+         perimeter -- no driver reaches it, only `pie model import` does",
+    ),
+    (
         "shared/weight_names.rs",
         "a MAP between two of this crate's own vocabularies: the trace names \
          the DSL invents and the published names a contract author invents. \

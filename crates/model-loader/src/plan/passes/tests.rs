@@ -6,8 +6,8 @@
 
 use super::rewrite::try_merge_bulk_extent_write;
 use super::validate::{
-    validate_fill_order, validate_kernel_operands, validate_persistent_layout,
-    validate_target_support,
+    validate_bound_encodings, validate_fill_order, validate_kernel_operands,
+    validate_persistent_layout, validate_target_support,
 };
 use crate::extent::Extent;
 use crate::plan::pass::{Pass, Stage, run_passes};
@@ -15,7 +15,10 @@ use crate::plan::{
     BufferDecl, DestExtent, LoadPlan, SourceExtent, StorageInstr, StorageTarget, TileMapKind,
     TileSpec, TransformSpec,
 };
-use crate::types::{BackendKind, BufferId, DType, FileId, InstrId, TensorId};
+use crate::types::{
+    BackendKind, BufferId, DType, Encoding, FileId, InstrId, QuantScheme, QuantSpec, TensorDecl,
+    TensorId, Visibility,
+};
 
 fn operand(id: u32, bytes: u64, alignment: u32, offset: Option<u64>) -> BufferDecl {
     BufferDecl {
@@ -386,6 +389,87 @@ fn target_transform_matrix_matches_host_and_metal_executors() {
     assert!(validate_target_support(&mut metal).is_err());
     metal.instrs[0] = tile(TileMapKind::Repack);
     assert!(validate_target_support(&mut metal).is_err());
+}
+
+/// A device is never handed a block whose scales are inside it.
+///
+/// The four cases are the whole rule, and the last two are the ones that make
+/// it narrow enough to be safe to add:
+///
+/// * a device binding a GGUF block is refused — the case that compiled, and
+///   produced a CUDA artifact holding 169 `GgufQ4_0` tensors;
+/// * the same plan on a HOST target passes, because `pie model import`'s
+///   passthrough is exactly this and writing bytes no device has read is what
+///   an offline conversion is for;
+/// * an INTERNAL blocked tensor passes on a device, because that is what a
+///   `Decode` reads FROM — refusing it would refuse the repair;
+/// * an MXFP4 tensor passes on a device, because inside pie MXFP4 is the split
+///   `_blocks`/`_scales` pair rather than a self-contained block, which is why
+///   it answers `None` to `block_layout` — and gpt-oss is served that way.
+#[test]
+fn a_device_is_not_handed_a_block_whose_scales_are_inside_it() {
+    fn decl(scheme: QuantScheme, visibility: Visibility) -> TensorDecl {
+        TensorDecl {
+            id: TensorId(0),
+            name: "layer.0.q_proj".to_string(),
+            shape: vec![256, 256],
+            encoding: Encoding::Quant(
+                QuantSpec {
+                    scheme,
+                    logical_dtype: DType::BF16,
+                    bits_per_element: 0,
+                    group_size: 0,
+                    channel_axis: None,
+                }
+                .normalized(),
+            ),
+            alignment: 1,
+            visibility,
+        }
+    }
+    fn plan(backend: BackendKind, tensor: TensorDecl) -> LoadPlan {
+        let mut plan = LoadPlan::empty(StorageTarget {
+            backend,
+            ..StorageTarget::default()
+        });
+        plan.tensors.push(tensor);
+        plan
+    }
+
+    let mut cuda = plan(
+        BackendKind::Cuda,
+        decl(QuantScheme::GgufQ4_0, Visibility::Public),
+    );
+    let Err(err) = validate_bound_encodings(&mut cuda) else {
+        panic!("a CUDA target bound a GGUF block");
+    };
+    let said = format!("{err:?}");
+    assert!(
+        said.contains("layer.0.q_proj") && said.contains("GgufQ4_0"),
+        "the refusal has to name the tensor and the scheme, not just the kind: {said}"
+    );
+
+    // The control, and the reason this pass asks the backend at all.
+    let mut host = plan(
+        BackendKind::Unknown,
+        decl(QuantScheme::GgufQ4_0, Visibility::Public),
+    );
+    assert!(validate_bound_encodings(&mut host).is_ok());
+
+    let mut internal = plan(
+        BackendKind::Cuda,
+        decl(QuantScheme::GgufQ4_0, Visibility::Internal),
+    );
+    assert!(validate_bound_encodings(&mut internal).is_ok());
+
+    let mut mxfp4 = plan(
+        BackendKind::Cuda,
+        decl(QuantScheme::Mxfp4E2M1E8M0, Visibility::Public),
+    );
+    assert!(
+        validate_bound_encodings(&mut mxfp4).is_ok(),
+        "gpt-oss binds MXFP4 on CUDA, and it is not a self-contained block"
+    );
 }
 
 /// Two persistent buffers, so that an arena-relative write has to be matched to

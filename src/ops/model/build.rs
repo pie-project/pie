@@ -46,7 +46,11 @@ use clap::Args;
 use model::catalog::{Override, Unmatched};
 use model::encoding::{CONFIG_OBJECT, Encoding};
 use model::shared::policy::{Mxfp4MoeRequest, Naming, Policy, Projections, RuntimeQuant};
-use model_loader::checkpoint::meta::{SOURCE_KEY, VERSION_KEY, meta_name};
+use model_loader::checkpoint::meta::{
+    BACKEND_KEY, CACHE_KEY_KEY, COMPONENT_KEY, CONTRACT_KEY, CONTRACT_REVISION, MODEL_ID_KEY,
+    MOE_KEY, RUNTIME_QUANT_KEY, SOURCE_ENCODING_KEY, SOURCE_KEY, SOURCE_STAT_KEY, TP_SIZE_KEY,
+    VERSION_KEY, meta_name,
+};
 use model_loader::checkpoint::read::parse_checkpoint_metadata;
 use model_loader::checkpoint::write::CheckpointWriter;
 use model_loader::executor::Progress;
@@ -54,8 +58,8 @@ use model_loader::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 use model_loader::types::Visibility;
 
 use super::import::{
-    ProgressLine, Spool, artifact_path, carry_config, compile_tokenizer, pie_version,
-    resolve_source, store_path,
+    ProgressLine, Source, Spool, artifact_path, carry_config, compile_tokenizer, pie_version,
+    resolve_source,
 };
 
 #[derive(Args, Debug)]
@@ -123,9 +127,18 @@ pub struct BuildArgs {
 struct CarriedObjects {
     config_bytes: Vec<u8>,
     tokenizer: Vec<(String, Vec<u8>)>,
+    /// What `--quant` the source artifact was already built with, if any.
+    baked_quant: Option<String>,
+    /// How the checkpoint the archive was imported from stored its numbers.
+    ///
+    /// See `SOURCE_ENCODING_KEY`. Carried forward so a built artifact can say
+    /// what its weights have been through, and read here so a requantization
+    /// can say so out loud.
+    source_encoding: Option<String>,
 }
 
 fn read_carried_objects(path: &Path) -> Result<CarriedObjects> {
+    let attributes = model_loader::checkpoint::zt::parse_attributes(path).ok();
     let checkpoint = parse_checkpoint_metadata(path)
         .map_err(|err| anyhow!("cannot read {}: {err}", path.display()))?;
     let config_bytes = model_loader::checkpoint::read::read_meta(&checkpoint, CONFIG_OBJECT)?
@@ -152,12 +165,41 @@ fn read_carried_objects(path: &Path) -> Result<CarriedObjects> {
     Ok(CarriedObjects {
         config_bytes,
         tokenizer,
+        baked_quant: attributes
+            .as_ref()
+            .and_then(|attrs| attrs.text(RUNTIME_QUANT_KEY).map(str::to_string)),
+        source_encoding: attributes
+            .as_ref()
+            .and_then(|attrs| attrs.text(SOURCE_ENCODING_KEY).map(str::to_string)),
     })
 }
 
+/// What `pie model build` reads, preferring the store archive.
+///
+/// [`resolve_source`] answers `import`'s question — where do fresh weights
+/// come from — and for a bare name that is the HuggingFace snapshot. `build`'s
+/// question is different: it re-lays a model pie already holds, and pie holds
+/// it as the archive. Falling through to the snapshot meant `pie model build
+/// <name>` re-derived from HuggingFace everything the import had already
+/// decided, and could fail identification on a snapshot whose archive builds
+/// perfectly well.
+///
+/// A path is still taken as given. This only changes what a bare name means,
+/// and only when the store has one.
+fn resolve_build_source(spelled: &str) -> Result<Source> {
+    if !Path::new(spelled).exists() {
+        for name in [spelled.to_string(), spelled.replace('/', "--")] {
+            let archive = crate::local::store::archive_path(&name);
+            if archive.is_file() {
+                return resolve_source(&archive.to_string_lossy());
+            }
+        }
+    }
+    resolve_source(spelled)
+}
+
 pub fn run(args: BuildArgs) -> Result<crate::ui::Answer> {
-    let source = resolve_source(&args.source)?;
-    // Two kinds of source, and the difference is only where the config comes
+    let source = resolve_build_source(&args.source)?; // Two kinds of source, and the difference is only where the config comes
     // from: an artifact carries the checkpoint's own, and a snapshot has it
     // on disk. Both reach the author the same way from here.
     let carried = if source.path.is_file() {
@@ -186,11 +228,19 @@ pub fn run(args: BuildArgs) -> Result<crate::ui::Answer> {
     let encoding = Encoding::from_config_json(&config)
         .map_err(|err| anyhow!("cannot read the model config's quantization: {err}"))?;
 
-    let runtime_quant = RuntimeQuant::resolve(args.quant.as_deref().unwrap_or(""), args.fp8_native)
-        .map_err(|err| anyhow!("--quant: {err}"))?;
-    if args.quant.as_deref() == Some("fp8") && runtime_quant == RuntimeQuant::None {
-        println!("optimize: --quant fp8 without --fp8-native is dropped, as serve would drop it");
+    let requested = QuantRequest {
+        spelled: args.quant.as_deref(),
+        fp8_native: args.fp8_native,
+        backend: &args.backend,
+        baked_quant: carried.as_ref().and_then(|c| c.baked_quant.as_deref()),
+        source_label: &source.path.display().to_string(),
+        source_encoding: carried.as_ref().and_then(|c| c.source_encoding.as_deref()),
+    };
+    let resolved = resolve_quant(&requested)?;
+    for notice in &resolved.notices {
+        println!("optimize: {notice}");
     }
+    let runtime_quant = resolved.quant;
     let moe_request = match args.moe.as_deref() {
         None => Mxfp4MoeRequest::Auto,
         Some("routed") => Mxfp4MoeRequest::RoutedDecode,
@@ -202,23 +252,7 @@ pub fn run(args: BuildArgs) -> Result<crate::ui::Answer> {
         ),
         Some(other) => bail!("--moe {other:?} is not `routed` or `bf16`"),
     };
-    // Which driver serves this decides which tensors exist, so it is resolved
-    // before anything is authored. The pair moves together -- there is no
-    // driver that wants MLX names over fused banks -- so one flag sets both
-    // and no combination can be spelled that no bind path reads.
-    let (projections, naming) = bind_policy(&args.backend)?;
-    // A requantization is only real if the serving driver's kernels read what
-    // it produces, so the two flags are checked against each other rather than
-    // each alone. Refusing here is the difference between an artifact that
-    // cannot be bound and one that is quietly the wrong numbers.
-    quant_fits(&args.backend, runtime_quant, args.quant.as_deref())?;
-    let policy = Policy {
-        projections,
-        naming,
-        runtime_quant,
-        moe_request,
-        ..Policy::default()
-    };
+    let policy = build_policy(&args.backend, runtime_quant, moe_request)?;
     // The host is the executing device, so the target states exactly what
     // the host executor implements — and tp stays whole: a sharded
     // materialization is one artifact per rank, which the store cannot say
@@ -279,16 +313,59 @@ pub fn run(args: BuildArgs) -> Result<crate::ui::Answer> {
         policy.moe_request,
     );
 
-    // `-optimized` on both branches. It was on the store branch only, so
-    // `--out <a directory>` wrote `<name>.zt` -- which is exactly the name
-    // `pie model import` gives the plain converted artifact. Pointed at the
-    // store, `--out` therefore replaced a portable checkpoint with one whose
-    // tensors are this build's runtime layout, under a name that still said
-    // otherwise.
-    let optimized = format!("{}-optimized", source.name);
+    // The plan before the path, because the path is derived from it. Compiling
+    // is metadata work — no weight byte is read — so a dry run pays for it and
+    // gets to report the key it would have written under.
+    let plan = model_loader::plan::compile(&metadata, &contract, target)
+        .map_err(|err| anyhow!("cannot compile: {err}"))?;
+
+    // WHAT THIS BUILD IS FOR, AS ITS NAME.
+    //
+    // The output used to be `<name>-optimized.zt` beside the archive. That
+    // spelled the relationship between the two as a name suffix, allowed only
+    // one build to exist at a time, and — because `--backend`, `--quant` and
+    // the MoE lowering all land in the tensors and none of them in the name —
+    // let a CUDA build be served to Metal with nothing on disk to contradict
+    // it. The cache key is over the whole compiled plan, so every one of those
+    // facts moves the file.
+    let key = model_loader::cache_key::artifact_cache_key(
+        &plan,
+        &model_loader::cache_key::ArtifactInputs {
+            snapshot_dir: &source.base(),
+            runtime_quant: &format!("{runtime_quant:?}").to_lowercase(),
+            // `pie model build` materializes the whole model; a component is a
+            // slice of one, which only the serving path asks for.
+            component: model_loader::cache_key::ArtifactInputs::WHOLE_MODEL,
+        },
+    );
     let out_file = match &args.out {
-        Some(out) => artifact_path(out, &optimized),
-        None => store_path(&optimized),
+        Some(out) => artifact_path(out, &format!("{}-{key}", source.name)),
+        None => {
+            // A RUNTIME IS DERIVED FROM AN ARCHIVE, SO THERE HAS TO BE ONE.
+            //
+            // The store is `<name>/archive.zt` plus `<name>/runtime/<key>.zt`,
+            // and everything that reads it enters through the archive: a model
+            // directory holding only builds is invisible to `pie model list`,
+            // `info` and `remove`, which makes a multi-gigabyte artifact
+            // unreclaimable through the CLI and unaccounted for in the store
+            // size. Building straight from a snapshot used to be fine because
+            // the output was a flat sibling; now it would create exactly that
+            // state. Refused rather than tolerated, because "a runtime hangs
+            // off an archive" is the layout, and a reader that must handle its
+            // violation is a reader that cannot rely on it.
+            let archive = crate::local::store::archive_path(&source.name);
+            if !archive.is_file() {
+                bail!(
+                    "nothing to derive from: the store has no {}. \
+                     `pie model import {}` writes one — that artifact is servable \
+                     on its own, and this command lays it out for one backend. \
+                     To build somewhere else, pass `--out <path>`.",
+                    crate::ui::short_path(&archive),
+                    args.source,
+                );
+            }
+            crate::local::store::runtime_path(&source.name, &key)
+        }
     };
     if args.dry_run {
         return Ok(crate::ui::Answer::noop(format!(
@@ -296,9 +373,6 @@ pub fn run(args: BuildArgs) -> Result<crate::ui::Answer> {
             crate::ui::short_path(&out_file)
         )));
     }
-
-    let plan = model_loader::plan::compile(&metadata, &contract, target)
-        .map_err(|err| anyhow!("cannot compile: {err}"))?;
 
     // Metadata first, weights streamed after — the same shape convert has.
     // The config was read above for its quantization; the artifact carries
@@ -320,13 +394,73 @@ pub fn run(args: BuildArgs) -> Result<crate::ui::Answer> {
         .run()
         .map_err(|err| anyhow!("materializing failed: {err}"))?;
 
-    let provenance = BTreeMap::from([
+    let mut provenance = BTreeMap::from([
         (VERSION_KEY.to_string(), pie_version().to_string()),
         (
             SOURCE_KEY.to_string(),
             format!("optimize:{}", source.origin),
         ),
+        // What this build is for, said out loud. The path says it too, and the
+        // path is what the store matches on; these are what survive the file
+        // being copied somewhere the store cannot see.
+        //
+        // They are also what the SERVE path matches on, which is the reason
+        // there are six of them and not two. A serve cannot reproduce the key
+        // above: it names the plan *this* command compiled, against the host
+        // converter's `StorageTarget`, and a serve compiles for its device.
+        // Worse, the plan a serve would compile over the archive may not
+        // compile at all — a transform outside the backend's tile-map mask is
+        // exactly the work `build` exists to move offline. So a runtime is
+        // chosen by matching the request it states against the request being
+        // made, and every fact that decides the bytes has to be said here or
+        // the match is unsound.
+        (BACKEND_KEY.to_string(), args.backend.clone()),
+        (CACHE_KEY_KEY.to_string(), key.clone()),
+        (
+            MOE_KEY.to_string(),
+            format!("{moe_request:?}").to_lowercase(),
+        ),
+        // `pie model build` materializes the model entire; a component is a
+        // slice, which only the serving path asks for.
+        (COMPONENT_KEY.to_string(), "full".to_string()),
+        // One artifact, unsharded. See `target` above.
+        (TP_SIZE_KEY.to_string(), "1".to_string()),
+        (
+            SOURCE_STAT_KEY.to_string(),
+            model_loader::cache_key::snapshot_stat(&source.base()),
+        ),
+        (CONTRACT_KEY.to_string(), CONTRACT_REVISION.to_string()),
+        // WHICH MODEL THIS IS, DECIDED ONCE, HERE.
+        //
+        // `identify` above answered it against the *archive*, whose tensors
+        // are spelled the way the manifests are. What this command writes is
+        // spelled the way the bind path reads, which is a different vocabulary
+        // and not one any manifest describes — so a boot that re-derived the
+        // row from these tensors would be asking a settled question of
+        // evidence that can no longer answer it, and would get "no such model"
+        // for a model pie itself just identified.
+        //
+        // See `MODEL_ID_KEY`: this is believed rather than re-checked, and it
+        // is only sound beside `CONTRACT_KEY`, which says the tensors were
+        // laid out by the contract that goes with this row.
+        (MODEL_ID_KEY.to_string(), row.id().to_string()),
     ]);
+    // Carried, not re-derived: this command reads an archive whose weights are
+    // already normalized, so the only party that ever knew what the original
+    // checkpoint stored is the import that read it. Dropping it here would
+    // make a built artifact the one place the chain goes dark.
+    if let Some(was) = carried.as_ref().and_then(|c| c.source_encoding.clone()) {
+        provenance.insert(SOURCE_ENCODING_KEY.to_string(), was);
+    }
+    // Only when one was baked in. Absent means "no runtime quantization",
+    // which is what every imported artifact and every unquantized build is,
+    // so there is nothing to write for them and nothing to read back.
+    if runtime_quant != RuntimeQuant::None {
+        provenance.insert(
+            RUNTIME_QUANT_KEY.to_string(),
+            format!("{runtime_quant:?}").to_lowercase(),
+        );
+    }
     let mut writer = CheckpointWriter::create(&out_file, &provenance)
         .map_err(|err| anyhow!("cannot write the artifact: {err}"))?;
 
@@ -428,6 +562,237 @@ fn bind_policy(backend: &str) -> Result<(Projections, Naming)> {
     }
 }
 
+/// The policy a build authors with, which is the bind path's — except for one
+/// flag, deliberately.
+///
+/// # What is persisted is not what is bound
+///
+/// [`bind_policy`] says CUDA binds [`Projections::Fused`], and it is right:
+/// the CUDA bind path reads a fused q/k/v bank. But fusion is not a fact about
+/// which tensors EXIST. `Builder::publish_fused` defines the bank and then
+/// re-publishes each projection as `Expr::out(bank).slice(..)` — a non-owning
+/// view — precisely so that a bind path reading q/k/v individually still finds
+/// them under their own names. On a device those views are pointers into the
+/// bank, which is why that function's own doc can say "this is not a
+/// persistent duplicate-memory budget".
+///
+/// A file has no pointers. Every `Public` tensor this command writes gets its
+/// own bytes, and a view is `Public` because the bind path reads it by name —
+/// so persisting a fusion persists the bank AND the projections it aliases.
+/// Measured on Qwen3-0.6B: 366 tensors against the archive's 310, and the 56
+/// extra banks total 587,202,560 bytes — exactly the file-size delta, and
+/// exactly the delta in resident VRAM (560 MiB), because the boot then uploads
+/// both. The artifact was 1.79 GB where the archive was 1.19 GB, and loaded no
+/// faster.
+///
+/// So a build authors the fusion away and lets the load path make it, from the
+/// projections, the way it does over the archive. What is given up is a
+/// concatenation, which is memory-bandwidth trivial and measured at no
+/// difference (457/433 ms archive against 431/444 ms prebuilt); what is bought
+/// is that `build` stops making the model bigger. Verified after: 310 tensors,
+/// 1.19 GB, 1392 MiB resident — the archive's numbers exactly.
+///
+/// **The rule this is an instance of: a build must not materialize a tensor
+/// that another materialized tensor is a view of.** The transforms `build`
+/// exists for — dequantization, expert stacking, requantization — are not
+/// views and are unaffected, which is measurable: gpt-oss-20b builds to the
+/// same 459 tensors and 12.8 GiB either way.
+fn build_policy(
+    backend: &str,
+    runtime_quant: RuntimeQuant,
+    moe_request: Mxfp4MoeRequest,
+) -> Result<Policy> {
+    let (_bound_projections, naming) = bind_policy(backend)?;
+    Ok(Policy {
+        projections: Projections::InPlace,
+        naming,
+        runtime_quant,
+        moe_request,
+        ..Policy::default()
+    })
+}
+
+/// The quantized part of a source encoding summary, when there is one.
+///
+/// [`SOURCE_ENCODING_KEY`] is the sorted distinct set, each member tagged with
+/// the kind the importer knew it to be — `raw:bf16`, `quant:q4_0`,
+/// `quant:q4_k,quant:q6_k`. So "was any of it quantized" is answered by
+/// reading, and this function needs no table and holds no opinion.
+///
+/// It used to have both: it carried the raw dtype spellings and treated
+/// anything else as quantized. That inverted the risk rather than removing it
+/// — closed against a new *scheme*, wide open against a new or renamed
+/// `DType`, which would have read as quantized and advised the operator
+/// against a second rounding of a checkpoint that was never rounded once.
+/// Nothing would have failed. The classification belongs where the `Encoding`
+/// is in hand, so it moved to `import::source_encoding`, and this reads what
+/// that decided.
+///
+/// An untagged summary is one an older pie wrote. It yields `None` — no notice
+/// — rather than a guess: the notice is advice, and advice inferred from a
+/// format that did not carry the fact is worse than silence. Re-import and it
+/// is tagged.
+fn quantized_source(summary: &str) -> Option<String> {
+    let quantized: Vec<&str> = summary
+        .split(',')
+        .filter_map(|part| part.trim().strip_prefix("quant:"))
+        .filter(|name| !name.is_empty())
+        .collect();
+    (!quantized.is_empty()).then(|| quantized.join("/"))
+}
+
+/// Everything `pie model build` is told about a requantization.
+///
+/// Grouped into one value because they are one question. See
+/// [`resolve_quant`].
+pub struct QuantRequest<'a> {
+    /// `--quant` as the operator spelled it, for the message that quotes it.
+    pub spelled: Option<&'a str>,
+    pub fp8_native: bool,
+    pub backend: &'a str,
+    /// `--quant` a previous build already baked into this source, if any.
+    pub baked_quant: Option<&'a str>,
+    /// How to name the source in a message. The operator may have several
+    /// artifacts of one model, so the refusal has to say WHICH one is baked.
+    pub source_label: &'a str,
+    /// [`SOURCE_ENCODING_KEY`] off the source artifact: how the checkpoint it
+    /// was imported from stored its numbers.
+    pub source_encoding: Option<&'a str>,
+}
+
+/// What a build should do about `--quant`, decided once.
+#[derive(Debug)]
+pub struct ResolvedQuant {
+    /// The scheme authoring will actually apply. `None` when the request was
+    /// dropped, which is a decision and not a failure.
+    pub quant: RuntimeQuant,
+    /// Lines to print, without the `optimize: ` prefix.
+    pub notices: Vec<String>,
+}
+
+/// Decides what `--quant` means for this source, on this backend, once.
+///
+/// # Why this is one function and was four
+///
+/// "May these weights be requantized into this scheme?" used to be answered
+/// in four places, each from a different source of truth and at a different
+/// time, which is why the answers did not agree:
+///
+/// - `quant_fits` — backend x scheme, a table, before authoring. Correct.
+/// - the second-rounding notice — `pie_source_encoding`, before authoring,
+///   advisory only.
+/// - `Builder::runtime_quant_scheme` — the model's `config.json`, DURING
+///   authoring. Structurally unable to fire for an imported archive, which
+///   never carries a `quantization_config`; its own comment said so.
+/// - `Builder::push_runtime_quant` — a per-tensor dtype whitelist, during
+///   authoring, one tensor at a time. It is what actually stopped
+///   `--quant fp8 --fp8-native` against a q4_0 archive, and it said
+///   "must be BF16/FP16/FP32/F8E4M3" — a true sentence about dtypes that
+///   names neither the cause nor the fix.
+///
+/// The three facts needed to answer properly — what was asked, what the
+/// backend reads, how the source stored its numbers — are all in hand HERE,
+/// at the CLI boundary, and only two of them are ever in hand inside the
+/// builder. So the decision belongs here, and the builder should receive a
+/// policy that is already true and merely execute it.
+///
+/// That the source's encoding is available at all is recent: until an archive
+/// kept the packing its source shipped, `pie model import` decoded every block
+/// to BF16 and the fact was destroyed on the way in.
+fn resolve_quant(req: &QuantRequest<'_>) -> Result<ResolvedQuant> {
+    let quant = RuntimeQuant::resolve(req.spelled.unwrap_or(""), req.fp8_native)
+        .map_err(|err| anyhow!("--quant: {err}"))?;
+    let mut notices = Vec::new();
+    // Quantizing weights that are already quantized rounds them twice, and
+    // nothing about the weights themselves says which is which -- an FP8
+    // tensor a checkpoint shipped and one this command wrote look identical.
+    // The source artifact is asked instead, because it is the only party that
+    // knows. Re-laying without `--quant` stays available: it is the layout
+    // work alone, and it touches no numbers.
+    if let Some(baked) = req.baked_quant
+        && quant != RuntimeQuant::None
+    {
+        bail!(
+            "{} was already built with --quant {baked}; quantizing it again \
+             would round the same weights a second time. Build from the \
+             imported artifact or the snapshot instead, or drop --quant to \
+             re-lay this one unchanged",
+            req.source_label
+        );
+    }
+    // THE SAME ROUNDING, ONE LAYER FURTHER BACK.
+    //
+    // The refusal above catches a build of a build. This catches the case it
+    // cannot see: a build of an IMPORT of an already-quantized checkpoint.
+    // `q4_0 -> bf16 -> fp8` rounds the same weights twice, and the second
+    // rounding is not recoverable.
+    //
+    // **Whether that is refused depends on whether the operator has another
+    // move, and only this function knows.** On CUDA they do: the blocks decode
+    // to BF16 at build and every kernel binds them, so dropping `--quant`
+    // serves the model at the precision it was shipped at. Refusing there
+    // costs nothing and prevents a silent quality loss.
+    //
+    // On Metal, Vulkan and wgpu they do not. Measured: `--backend vulkan`
+    // without `--quant int4` refuses at authoring -- "the Metal driver binds
+    // every projection through its affine-U4 path" -- so int4 is not one way
+    // to serve a GGUF there, it is the only way. Refusing would not protect
+    // the numbers; it would take the model away. So it is said, not refused,
+    // and the operator's real choice -- a different source repo -- is named.
+    if quant != RuntimeQuant::None
+        && let Some(was) = req.source_encoding
+        && let Some(quantized) = quantized_source(was)
+    {
+        let spelling = format!("{quant:?}").to_lowercase();
+        if requantization_is_the_only_way_to_serve(req.backend) {
+            notices.push(format!(
+                "note -- these weights were {quantized} in the checkpoint they \
+                 were imported from, so --quant {spelling} rounds them a second \
+                 time. This backend binds every projection through its affine-U4 \
+                 path, so there is no build without it; a BF16 or already-4-bit \
+                 source would round once"
+            ));
+        } else {
+            bail!(
+                "these weights were {quantized} in the checkpoint they were \
+                 imported from, so --quant {spelling} would round them a second \
+                 time. {} binds them as they are -- drop --quant to serve them \
+                 at the precision they were shipped at, or build from a BF16 \
+                 source to round once",
+                req.backend
+            );
+        }
+    }
+    if req.spelled == Some("fp8") && quant == RuntimeQuant::None {
+        notices.push("--quant fp8 without --fp8-native is dropped, as serve would drop it".into());
+    }
+    // Which driver serves this decides which tensors exist, so it is resolved
+    // before anything is authored. A requantization is only real if that
+    // driver's kernels read what it produces, so the two flags are checked
+    // against each other rather than each alone: refusing here is the
+    // difference between an artifact that cannot be bound and one that is
+    // quietly the wrong numbers.
+    quant_fits(req.backend, quant, req.spelled)?;
+    Ok(ResolvedQuant { quant, notices })
+}
+
+/// Whether this backend can only serve through a requantization.
+///
+/// Metal, Vulkan and wgpu bind every projection through the MLX affine-U4
+/// path, so `--quant int4` is not one way to serve a model there but the only
+/// one -- measured: `--backend vulkan` without it refuses at authoring, naming
+/// the missing `.scales`. CUDA binds BF16 directly, so `--quant` is optional
+/// there and dropping it is a real answer an operator can be given.
+///
+/// This is the same fact [`quant_fits`] holds, asked the other way round, and
+/// it stays two functions on purpose: one refuses a scheme the backend cannot
+/// read, the other decides whether an operator has an alternative. Folding
+/// them together would put "what can this bind" and "what should we tell them"
+/// in one table.
+fn requantization_is_the_only_way_to_serve(backend: &str) -> bool {
+    matches!(backend, "metal" | "vulkan" | "wgpu")
+}
+
 /// Refuses a requantization the serving backend's kernels do not read.
 fn quant_fits(backend: &str, quant: RuntimeQuant, spelled: Option<&str>) -> Result<()> {
     match (backend, quant) {
@@ -454,6 +819,152 @@ fn quant_fits(backend: &str, quant: RuntimeQuant, spelled: Option<&str>) -> Resu
 mod tests {
     use super::*;
 
+    fn req<'a>(spelled: Option<&'a str>, backend: &'a str) -> QuantRequest<'a> {
+        QuantRequest {
+            spelled,
+            fp8_native: false,
+            backend,
+            baked_quant: None,
+            source_encoding: None,
+            source_label: "artifact.zt",
+        }
+    }
+
+    /// What `--quant` means is one decision, so it has one place and these
+    /// tests are that place's whole surface. They run without a GPU, without
+    /// a checkpoint and without authoring anything, which is the point: the
+    /// answers used to be discoverable only by building a model on a machine
+    /// with the right driver, and two of the four answers disagreed.
+    #[test]
+    fn a_quant_request_is_resolved_from_the_three_facts_that_decide_it() {
+        // Backend x scheme, which was always right.
+        assert!(resolve_quant(&req(Some("int4"), "cuda")).is_err());
+        assert!(resolve_quant(&req(Some("int4"), "vulkan")).is_ok());
+        assert!(resolve_quant(&req(Some("int8"), "vulkan")).is_err());
+
+        // A spelling nothing reads is a refusal, not a silent drop.
+        assert!(resolve_quant(&req(Some("int2"), "cuda")).is_err());
+
+        // fp8 without --fp8-native resolves to None and SAYS so. Serve would
+        // drop it anyway, so building it in would be a lie about the file.
+        let dropped = resolve_quant(&req(Some("fp8"), "cuda")).unwrap();
+        assert_eq!(dropped.quant, RuntimeQuant::None);
+        assert!(dropped.notices.iter().any(|n| n.contains("is dropped")));
+
+        // The same flag with the flag it needs keeps the scheme and says
+        // nothing, there being nothing to say.
+        let native = QuantRequest {
+            fp8_native: true,
+            ..req(Some("fp8"), "cuda")
+        };
+        let kept = resolve_quant(&native).unwrap();
+        assert_eq!(kept.quant, RuntimeQuant::Fp8);
+        assert!(kept.notices.is_empty());
+    }
+
+    /// The source's own encoding is the third fact, and the newest: before an
+    /// archive kept the packing it was shipped with, import decoded every
+    /// block to BF16 and there was nothing here to read.
+    ///
+    /// What it decides is not "is this allowed" but "does the operator have
+    /// another move", which is why the same source gets two answers.
+    #[test]
+    fn a_source_that_was_already_quantized_is_told_about_and_not_refused() {
+        let from_gguf = QuantRequest {
+            source_encoding: Some("quant:q4_0,quant:q8_0"),
+            ..req(Some("int4"), "vulkan")
+        };
+        let resolved = resolve_quant(&from_gguf).unwrap();
+        // NOT refused, and that is deliberate: Vulkan, Metal and wgpu bind
+        // every projection through the affine-U4 path, so refusing here does
+        // not protect the numbers -- it takes GGUF models away from those
+        // backends entirely.
+        assert_eq!(resolved.quant, RuntimeQuant::Int4);
+        let notice = resolved.notices.join(" ");
+        assert!(notice.contains("q4_0/q8_0"), "{notice}");
+        assert!(notice.contains("second time"), "{notice}");
+
+        // A source that was never quantized draws no notice. This is the
+        // negative control: without it the assertion above passes for a
+        // function that warns unconditionally.
+        let from_bf16 = QuantRequest {
+            source_encoding: Some("raw:bf16"),
+            ..req(Some("int4"), "vulkan")
+        };
+        assert!(resolve_quant(&from_bf16).unwrap().notices.is_empty());
+
+        // An untagged summary is one an older pie wrote, and it yields
+        // silence rather than a guess.
+        let legacy = QuantRequest {
+            source_encoding: Some("q4_0"),
+            ..req(Some("int4"), "vulkan")
+        };
+        assert!(resolve_quant(&legacy).unwrap().notices.is_empty());
+
+        // And without `--quant` there is no second rounding to warn about,
+        // however the source was stored.
+        let relay = QuantRequest {
+            source_encoding: Some("quant:q4_0"),
+            ..req(None, "vulkan")
+        };
+        assert!(resolve_quant(&relay).unwrap().notices.is_empty());
+    }
+
+    /// The same source and the same second rounding, on a backend that can
+    /// serve without it -- and there it is refused.
+    ///
+    /// This is the case that sent the user asking. It was already refused
+    /// before this, but by `Builder::push_runtime_quant`'s dtype whitelist,
+    /// one tensor at a time, after the model was open, saying only
+    /// "runtime_quant source '...down_proj.weight' must be
+    /// BF16/FP16/FP32/F8E4M3" -- which names a dtype, not the fact that the
+    /// weights were already 4-bit, and offers no way forward.
+    #[test]
+    fn requantizing_a_quantized_source_is_refused_where_the_model_serves_without_it() {
+        let to_fp8 = QuantRequest {
+            fp8_native: true,
+            source_encoding: Some("quant:q4_0,quant:q8_0"),
+            ..req(Some("fp8"), "cuda")
+        };
+        let err = resolve_quant(&to_fp8).unwrap_err().to_string();
+        assert!(err.contains("q4_0/q8_0"), "{err}");
+        assert!(err.contains("drop --quant"), "{err}");
+
+        // The negative control the refusal above needs: a source that was
+        // never quantized requantizes on the same backend without complaint.
+        // Without this the assertion passes for a function that refuses every
+        // cuda requantization.
+        let from_bf16 = QuantRequest {
+            fp8_native: true,
+            source_encoding: Some("raw:bf16"),
+            ..req(Some("fp8"), "cuda")
+        };
+        let ok = resolve_quant(&from_bf16).unwrap();
+        assert_eq!(ok.quant, RuntimeQuant::Fp8);
+        assert!(ok.notices.is_empty());
+    }
+
+    /// A build of a build is refused; the message names the artifact because
+    /// an operator may hold several of one model.
+    #[test]
+    fn requantizing_an_artifact_that_was_already_quantized_is_refused() {
+        let again = QuantRequest {
+            baked_quant: Some("int4"),
+            ..req(Some("int4"), "vulkan")
+        };
+        let err = resolve_quant(&again).unwrap_err().to_string();
+        assert!(err.contains("artifact.zt"), "{err}");
+        assert!(err.contains("already built with --quant int4"), "{err}");
+
+        // Re-laying the same artifact without `--quant` stays available: it
+        // is layout work and touches no numbers.
+        let relay = QuantRequest {
+            baked_quant: Some("int4"),
+            ..req(None, "vulkan")
+        };
+        assert_eq!(resolve_quant(&relay).unwrap().quant, RuntimeQuant::None);
+    }
+
     /// The flag decides which tensors exist, so every accepted spelling has
     /// to name a bind path that reads them -- and Vulkan's is Metal's.
     #[test]
@@ -472,6 +983,72 @@ mod tests {
         );
         let refused = bind_policy("rocm").unwrap_err().to_string();
         assert!(refused.contains("vulkan"), "got: {refused}");
+    }
+
+    /// A BUILD DOES NOT PERSIST A FUSION, ON ANY BACKEND.
+    ///
+    /// The one place the artifact deliberately disagrees with the bind path,
+    /// so it is pinned with its own control: `bind_policy` must still say CUDA
+    /// binds fused, because that is true and is what the load path does. What
+    /// must not come back is writing that fusion down — it duplicates every
+    /// projection it aliases, 587,202,560 bytes on Qwen3-0.6B, on disk and
+    /// again in VRAM. See [`build_policy`].
+    #[test]
+    fn a_build_does_not_persist_a_fusion() {
+        for backend in ["cuda", "metal", "vulkan", "wgpu"] {
+            let policy = build_policy(backend, RuntimeQuant::None, Mxfp4MoeRequest::Auto).unwrap();
+            assert_eq!(
+                policy.projections,
+                Projections::InPlace,
+                "a {backend} build would persist a fused bank beside the \
+                 projections it is a view of",
+            );
+            assert_eq!(
+                policy.naming,
+                bind_policy(backend).unwrap().1,
+                "naming IS a fact about which tensors exist, so a build must \
+                 keep honouring the bind path for it",
+            );
+        }
+        assert_eq!(
+            bind_policy("cuda").unwrap().0,
+            Projections::Fused,
+            "the control: CUDA still BINDS a fused bank, and a build that \
+             stopped saying so would be describing a different load path",
+        );
+    }
+
+    /// WHAT COUNTS AS "ALREADY QUANTIZED", AND WHY IT IS SPELLED IN REVERSE.
+    ///
+    /// The predicate behind the double-rounding notice. Listing the RAW dtypes
+    /// and treating everything else as quantized is what keeps it closed: the
+    /// set of quantization schemes grows (five IQ lattice decoders landed in
+    /// one commit), the set of raw dtypes does not, so a scheme added tomorrow
+    /// is caught without anyone remembering to come back here.
+    #[test]
+    fn a_source_that_was_quantized_is_recognised_however_it_was_spelled() {
+        assert_eq!(quantized_source("raw:bf16"), None);
+        assert_eq!(quantized_source("raw:bf16,raw:f32"), None);
+        assert_eq!(quantized_source(""), None);
+        assert_eq!(quantized_source("quant:q4_0"), Some("q4_0".to_string()));
+        // The normal GGUF case: llama.cpp keeps some tensors at a wider
+        // scheme, and which ones were coarse is what a second rounding
+        // compounds — so the whole set is reported, not a dominant one.
+        assert_eq!(
+            quantized_source("raw:bf16,quant:q4_k,quant:q6_k"),
+            Some("q4_k/q6_k".to_string()),
+        );
+        // A scheme this test has never heard of still counts.
+        assert_eq!(
+            quantized_source("quant:iq2_xxs"),
+            Some("iq2_xxs".to_string())
+        );
+        // And so does a DTYPE it has never heard of, in the other direction.
+        // This is the case the list this replaced got wrong: it knew thirteen
+        // raw spellings and called the fourteenth a quantization.
+        assert_eq!(quantized_source("raw:some_future_float"), None);
+        // An archive an older pie wrote carries no tags. Silence, not a guess.
+        assert_eq!(quantized_source("bf16,q4_k"), None);
     }
 
     /// A requantization the serving kernels cannot read is refused, and the

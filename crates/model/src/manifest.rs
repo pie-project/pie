@@ -931,6 +931,16 @@ mod from_checkpoint {
                 QuantScheme::Mxfp4E2M1E8M0,
                 QuantScheme::MlxAffineU4,
                 QuantScheme::GgufQ4_0,
+                QuantScheme::GgufIq4Nl,
+                QuantScheme::GgufIq4Xs,
+                QuantScheme::GgufMxfp4,
+                QuantScheme::GgufIq2Xxs,
+                QuantScheme::GgufIq2Xs,
+                QuantScheme::GgufIq2S,
+                QuantScheme::GgufIq3Xxs,
+                QuantScheme::GgufIq3S,
+                QuantScheme::GgufQ2K,
+                QuantScheme::GgufQ3K,
                 QuantScheme::GgufQ4K,
                 QuantScheme::GgufQ5_0,
                 QuantScheme::GgufQ5K,
@@ -954,6 +964,16 @@ mod from_checkpoint {
                     | QuantScheme::Mxfp4E2M1E8M0
                     | QuantScheme::MlxAffineU4
                     | QuantScheme::GgufQ4_0
+                    | QuantScheme::GgufIq4Nl
+                    | QuantScheme::GgufIq4Xs
+                    | QuantScheme::GgufMxfp4
+                    | QuantScheme::GgufIq2Xxs
+                    | QuantScheme::GgufIq2Xs
+                    | QuantScheme::GgufIq2S
+                    | QuantScheme::GgufIq3Xxs
+                    | QuantScheme::GgufIq3S
+                    | QuantScheme::GgufQ2K
+                    | QuantScheme::GgufQ3K
                     | QuantScheme::GgufQ4K
                     | QuantScheme::GgufQ5_0
                     | QuantScheme::GgufQ5K
@@ -986,7 +1006,7 @@ mod from_checkpoint {
                     assert_ne!(elems, 0, "{scheme:?}'s block holds no elements");
                 }
             }
-            assert_eq!(EVERY.len(), 18, "a scheme was added; give it a case above");
+            assert_eq!(EVERY.len(), 28, "a scheme was added; give it a case above");
         }
 
         /// An explicit `bits_per_element` overrides the scheme's

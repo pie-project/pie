@@ -377,7 +377,11 @@ pub(crate) fn build_tp_plane(
         .map(|w| i32::from_ne_bytes([w[0], w[1], w[2], w[3]]))
         .collect();
 
-    let ag = HostAllgather { rank, world_size: world, gather };
+    let ag = HostAllgather {
+        rank,
+        world_size: world,
+        gather,
+    };
     let cfg = Config {
         same_process: true,
         group_devices,
@@ -480,7 +484,7 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
         }
     };
 
-    // WHICH MODEL THIS IS, asked of the TENSORS.
+    // WHICH MODEL THIS IS, asked of the TENSORS — unless pie wrote them.
     //
     // The config above no longer DECIDES anything: the row that authors
     // the contract, projects the deployment and speaks the chat template
@@ -491,13 +495,20 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
     // point. A config that lies about its geometry used to be believed
     // by the derivation and contradicted by an assertion several frames
     // later, if at all. A checkpoint is now a known model or it is not.
+    //
+    // The exception is an artifact `pie model build` produced, whose
+    // tensors are post-transform and match no manifest by construction.
+    // It carries the row this same identification settled at build time.
+    // See `catalog::identify_artifact`.
     let chosen = state
         .boot_model_id
         .as_ref()
         .map_or(model::catalog::Override::None, |id| {
             model::catalog::Override::Id(id.clone())
         });
-    let row = model::catalog::identify(&meta, &chosen)
+    let attributes =
+        model_loader::checkpoint::read::parse_checkpoint_attributes(snapshot).unwrap_or_default();
+    let row = model::catalog::identify_artifact(&attributes, &meta, &chosen)
         .map_err(|e| crate::Error::unsupported("load_model: identify", e.to_string()))?;
 
     // What the FILES say about how the numbers are stored, which is not
@@ -1464,8 +1475,14 @@ mod tests {
 
     #[test]
     fn a_single_rank_needs_no_collective_and_is_never_refused() {
-        assert!(tp_serving_refusal(1, "").is_ok(), "one rank reduces nothing");
-        assert!(tp_serving_refusal(0, "").is_ok(), "and neither does a mis-stated zero");
+        assert!(
+            tp_serving_refusal(1, "").is_ok(),
+            "one rank reduces nothing"
+        );
+        assert!(
+            tp_serving_refusal(0, "").is_ok(),
+            "and neither does a mis-stated zero"
+        );
     }
 
     /// The refusal has to NAME what it is waiting on, because the sentence it
@@ -1484,7 +1501,10 @@ mod tests {
         // A key is what a two-rank group is missing now, and the refusal says
         // so rather than reaching for something further down.
         let why = tp_serving_refusal(2, "").expect_err("a group with no key cannot rendezvous");
-        assert!(why.contains("tp_group_id"), "names the value it read: {why}");
+        assert!(
+            why.contains("tp_group_id"),
+            "names the value it read: {why}"
+        );
         assert!(
             !why.contains("CAN_LAUNCH"),
             "there IS device text, so that is not what blocks it: {why}"

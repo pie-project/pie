@@ -70,7 +70,16 @@ pub const CUDA_QUANTIZE_BF16_TO_FP8: &str = "quant::quantize_bf16_to_fp8_e4m3_pe
 ///
 /// What a CUDA arena actually launches is narrower still and is not a mask:
 /// the plan names a kernel per instruction, and the backing looks it up.
-pub const CUDA_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE;
+///
+/// `TILE_MAP_DECODE` is here because an archive may hold a self-contained
+/// block. It is not a device kernel and does not claim to be: none of these
+/// three drivers implements `run_tile_map`, so a decode in one of their plans
+/// runs on the HOST, streaming into the arena — slower than a load whose bytes
+/// are already plain, and the price of an archive that kept its source
+/// packing. `pie model build` is how that price is paid once instead of every
+/// boot.
+pub const CUDA_TILE_MAP_MASK: u32 =
+    TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE | TILE_MAP_DECODE;
 
 /// The transforms a plan for a Metal target may CARRY.
 ///
@@ -91,7 +100,16 @@ pub const CUDA_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_S
 /// the name of the second.
 ///
 /// [`ArenaBacking::runs_named_kernels`]: crate::executor::arena::ArenaBacking::runs_named_kernels
-pub const METAL_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE;
+///
+/// `TILE_MAP_DECODE` is here because an archive may hold a self-contained
+/// block. It is not a device kernel and does not claim to be: none of these
+/// three drivers implements `run_tile_map`, so a decode in one of their plans
+/// runs on the HOST, streaming into the arena — slower than a load whose bytes
+/// are already plain, and the price of an archive that kept its source
+/// packing. `pie model build` is how that price is paid once instead of every
+/// boot.
+pub const METAL_TILE_MAP_MASK: u32 =
+    TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE | TILE_MAP_DECODE;
 
 /// The transforms `host_executor` implements. Not a device capability, so it is
 /// not part of the C surface.
@@ -109,7 +127,16 @@ pub const METAL_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_
 /// the other.
 ///
 /// [`ArenaBacking::runs_named_kernels`]: crate::executor::arena::ArenaBacking::runs_named_kernels
-pub const VULKAN_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE;
+///
+/// `TILE_MAP_DECODE` is here because an archive may hold a self-contained
+/// block. It is not a device kernel and does not claim to be: none of these
+/// three drivers implements `run_tile_map`, so a decode in one of their plans
+/// runs on the HOST, streaming into the arena — slower than a load whose bytes
+/// are already plain, and the price of an archive that kept its source
+/// packing. `pie model build` is how that price is paid once instead of every
+/// boot.
+pub const VULKAN_TILE_MAP_MASK: u32 =
+    TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE | TILE_MAP_DECODE;
 
 /// The transforms `host_executor` implements. Not a device capability, so it is
 /// not part of the C surface.
@@ -128,10 +155,16 @@ pub const HOST_TILE_MAP_MASK: u32 =
 /// host and its output written back to a checkpoint, not compared against a
 /// device.
 ///
-/// `Decode` is here and in no device mask: the schemes it covers carry their
-/// scales inside the payload (GGUF blocks), which no device kernel reads —
-/// decoding them offline into a checkpoint the device *can* read is the whole
-/// point of conversion.
+/// `Decode` was here and in no device mask, on the grounds that the schemes it
+/// covers carry their scales inside the payload (GGUF blocks), which no device
+/// kernel reads. The first half is still true and the conclusion was not: a
+/// device mask says which transforms a plan for that backend may CARRY, not
+/// which its kernels run, and a decode in a Cuda/Metal/Vulkan plan runs on the
+/// host like every other transform those drivers do not implement. Refusing it
+/// here refused an archive that kept its source packing, which is a much
+/// larger thing than it was meant to protect — so the three device masks
+/// admit it now, and `validate_bound_encodings` enforces the fact that
+/// actually matters: a device is never HANDED a block.
 pub const CONVERT_TILE_MAP_MASK: u32 = HOST_TILE_MAP_MASK | TILE_MAP_ENCODE | TILE_MAP_DECODE;
 
 /// Which transforms a plan compiled for `backend` may CARRY.

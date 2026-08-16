@@ -4870,7 +4870,8 @@ mod tests {
             let (found, _) = crossed(symbol).expect("armed");
             assert_eq!(
                 found, stem,
-                "`{symbol}` resolved to `{found}`, not `{stem}`: the lookup                  stopped at a prefix instead of taking the longest stem"
+                "`{symbol}` resolved to `{found}`, not `{stem}`: the lookup \
+                 stopped at a prefix instead of taking the longest stem"
             );
         }
         // A stem may not end mid-word.

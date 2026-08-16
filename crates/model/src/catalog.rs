@@ -675,7 +675,93 @@ pub fn are_declared_twins(ids: &[&str]) -> bool {
 mod identify {
     use super::{Override, Unmatched, Variant, catalog, find, nearest_ids};
     use crate::manifest::Observed;
+    use model_loader::checkpoint::Attributes;
     use model_loader::checkpoint::CheckpointMetadata;
+    use model_loader::checkpoint::meta;
+
+    /// Which variant this artifact is, letting a pie-built one say so.
+    ///
+    /// **The entry point a serve boot wants**, and the difference from
+    /// [`identify`] is which question it is willing to ask.
+    ///
+    /// [`identify`] asks the tensors. That is the right question for a
+    /// checkpoint, where "does this satisfy the manifest" and "is this the
+    /// model" are the same sentence — which is the property the whole
+    /// arrangement is built on. It is the wrong question for the output of
+    /// `pie model build`, because that output is not a checkpoint: the load
+    /// transforms have already run, so a fused bank stands where three
+    /// projections were and every family's post-transform spelling stands
+    /// where the checkpoint's was. No manifest describes those tensors, and
+    /// none should — they are pie's own form.
+    ///
+    /// The row was nonetheless already decided for that artifact, by this same
+    /// identification, at build time, against the archive. So a built artifact
+    /// states it and this reads it back.
+    ///
+    /// **What keeps that from being a hole.** Three things, and all three are
+    /// load-bearing:
+    ///
+    /// - Only `pie model build` writes [`meta::MODEL_ID_KEY`]. An imported
+    ///   archive does not, so the ordinary path is unchanged for every
+    ///   artifact whose tensors *can* answer the question.
+    /// - The statement is believed only beside a matching
+    ///   [`meta::CONTRACT_REVISION`]. A row implies a set of tensors only
+    ///   through the contract that laid them out; an artifact from a pie that
+    ///   laid them out differently is believed about nothing.
+    /// - A statement naming a row this build does not have is an error, not a
+    ///   fallthrough. Falling through would hold tensors nobody can describe
+    ///   against every manifest in the table, and the danger is not that it
+    ///   fails — it is that it might match.
+    ///
+    /// [`Override`] still wins where it disagrees with nothing, and is refused
+    /// where it disagrees with the record: an operator saying `--as X` of an
+    /// artifact pie wrote as `Y` is asserting something pie's own note
+    /// contradicts, and the two are not reconcilable by looking harder.
+    ///
+    /// # Errors
+    ///
+    /// As [`identify`], plus a stated row this build does not serve and a
+    /// stated row an override contradicts.
+    pub fn identify_artifact(
+        attributes: &Attributes,
+        metadata: &CheckpointMetadata,
+        chosen: &Override,
+    ) -> Result<&'static dyn Variant, Unmatched> {
+        let Some(stated) = stated_row(attributes) else {
+            return identify(metadata, chosen);
+        };
+        let row = find(stated).ok_or_else(|| Unmatched::NoSuchId {
+            id: stated.to_string(),
+            nearest: nearest_ids(stated, 3),
+        })?;
+        if let Override::Id(id) = chosen
+            && id != row.id()
+        {
+            return Err(Unmatched::NoRow {
+                nearest: vec![(
+                    row.id(),
+                    format!(
+                        "`pie model build` wrote this artifact as this row; `{id}` asks for another, and a built artifact is not evidence either way"
+                    ),
+                )],
+            });
+        }
+        Ok(row)
+    }
+
+    /// The row a pie-built artifact states, when it is one and says so.
+    ///
+    /// `None` covers every artifact that is not a build of this pie's
+    /// contract: a checkpoint, an imported archive, and a build from a pie
+    /// whose contract revision has since moved. All three are identified from
+    /// their tensors, which is what they are written to support.
+    fn stated_row(attributes: &Attributes) -> Option<&str> {
+        let contract = attributes.text(meta::CONTRACT_KEY)?;
+        if contract != meta::CONTRACT_REVISION.to_string() {
+            return None;
+        }
+        attributes.text(meta::MODEL_ID_KEY)
+    }
 
     /// Which variant this checkpoint is.
     ///
@@ -758,7 +844,7 @@ mod identify {
 }
 
 #[cfg(feature = "contract")]
-pub use identify::{identify, identify_observed};
+pub use identify::{identify, identify_artifact, identify_observed};
 
 #[cfg(test)]
 mod tests {
@@ -1187,7 +1273,8 @@ mod tests {
 pub(crate) mod identify_tests {
     use super::*;
     use crate::manifest::Presence;
-    use model_loader::checkpoint::{CheckpointMetadata, RawTensor};
+    use model_loader::checkpoint::meta;
+    use model_loader::checkpoint::{Attribute, Attributes, CheckpointMetadata, RawTensor};
     use model_loader::types::{DType, Encoding, FileId, TensorId};
 
     /// The checkpoint a row DESCRIBES, as a real `CheckpointMetadata`.
@@ -1311,6 +1398,160 @@ pub(crate) mod identify_tests {
                     .unwrap_or_else(|e| panic!("{id} named explicitly and still refused: {e}"));
                 assert_eq!(found.id(), *id);
             }
+        }
+    }
+
+    /// An artifact `pie model build` wrote is taken at its word.
+    ///
+    /// The tensors here describe nothing — which is the point, and is what a
+    /// built artifact genuinely looks like to a manifest: the load transforms
+    /// have run, so a fused bank stands where three projections were. The
+    /// negative control is the same metadata without the statement, which must
+    /// still be refused; otherwise this test would pass on a bug that accepted
+    /// everything.
+    #[test]
+    fn a_built_artifact_is_taken_at_its_word() {
+        let row = catalog()[0];
+        let metadata = post_transform_metadata();
+        assert!(
+            identify(&metadata, &Override::None).is_err(),
+            "the control is broken: these tensors were supposed to match no row, \
+             so accepting them proves nothing",
+        );
+        let found = identify_artifact(&built_as(row.id()), &metadata, &Override::None)
+            .expect("a build states its row and the row is in this catalog");
+        assert_eq!(found.id(), row.id());
+    }
+
+    /// A build laid out by another contract revision is not believed.
+    ///
+    /// A row implies a set of tensors only through the contract that laid them
+    /// out. Once that moves, the statement is about a layout this build does
+    /// not read, so it stops being evidence and the artifact falls back to
+    /// being identified from its tensors — which, for a built artifact, means
+    /// refused. Refusing is the right outcome: it is one `pie model build`
+    /// away from working, where binding it is silently wrong.
+    #[test]
+    fn a_build_from_another_contract_revision_is_not_believed() {
+        let row = catalog()[0];
+        let stale = Attributes::from_pairs(vec![
+            (
+                meta::CONTRACT_KEY.to_string(),
+                Attribute::Text((meta::CONTRACT_REVISION + 1).to_string()),
+            ),
+            (
+                meta::MODEL_ID_KEY.to_string(),
+                Attribute::Text(row.id().to_string()),
+            ),
+        ]);
+        assert!(
+            identify_artifact(&stale, &post_transform_metadata(), &Override::None).is_err(),
+            "a statement about a layout this build does not read was believed",
+        );
+    }
+
+    /// A stated row this build does not have is refused, not fallen through.
+    ///
+    /// Falling through would hold tensors no manifest describes against every
+    /// manifest in the table. The danger is not that it fails — it is that it
+    /// might match.
+    #[test]
+    fn a_stated_row_this_build_does_not_have_is_refused_rather_than_guessed() {
+        let Err(err) = identify_artifact(
+            &built_as("qwen3-0.6b-but-not-really"),
+            &post_transform_metadata(),
+            &Override::None,
+        ) else {
+            panic!("an unknown row was resolved to something");
+        };
+        assert!(
+            matches!(err, Unmatched::NoSuchId { .. }),
+            "the refusal should name the id that is missing, not diff the \
+             tensors against rows that were never in question: {err}",
+        );
+    }
+
+    /// `--as` may confirm the record; it may not contradict it.
+    ///
+    /// [`Override`] exists for a checkpoint that is genuinely a known model
+    /// under an unknown name. A built artifact is not under an unknown name:
+    /// pie wrote its name on it. An operator asserting otherwise is asserting
+    /// something pie's own note contradicts, and no amount of inspecting the
+    /// tensors resolves it, so it is refused rather than picked between.
+    #[test]
+    fn an_override_may_confirm_the_record_but_not_contradict_it() {
+        let row = catalog()[0];
+        let other = catalog()
+            .iter()
+            .find(|candidate| candidate.id() != row.id())
+            .expect("the catalog has more than one row");
+        let stated = built_as(row.id());
+        let confirmed = identify_artifact(
+            &stated,
+            &post_transform_metadata(),
+            &Override::Id(row.id().to_string()),
+        )
+        .expect("an override naming the row the artifact states is not a disagreement");
+        assert_eq!(confirmed.id(), row.id());
+        assert!(
+            identify_artifact(
+                &stated,
+                &post_transform_metadata(),
+                &Override::Id(other.id().to_string()),
+            )
+            .is_err(),
+            "an override contradicting the artifact's own record was allowed",
+        );
+    }
+
+    /// Everything that is not a build is identified exactly as before.
+    ///
+    /// The blast radius, pinned: only `pie model build` writes
+    /// [`meta::MODEL_ID_KEY`], so an imported archive and a bare checkpoint
+    /// still answer the question with their tensors, and still must.
+    #[test]
+    fn an_artifact_that_states_nothing_is_identified_from_its_tensors() {
+        for row in catalog() {
+            let metadata = checkpoint_of(*row);
+            let bare = identify(&metadata, &Override::None);
+            let through = identify_artifact(&Attributes::default(), &metadata, &Override::None);
+            assert_eq!(
+                bare.map(Variant::id).map_err(|e| e.to_string()),
+                through.map(Variant::id).map_err(|e| e.to_string()),
+                "{} identifies differently through the artifact path",
+                row.id(),
+            );
+        }
+    }
+
+    /// A build's provenance, as `pie model build` writes it.
+    fn built_as(id: &str) -> Attributes {
+        Attributes::from_pairs(vec![
+            (
+                meta::CONTRACT_KEY.to_string(),
+                Attribute::Text(meta::CONTRACT_REVISION.to_string()),
+            ),
+            (
+                meta::MODEL_ID_KEY.to_string(),
+                Attribute::Text(id.to_string()),
+            ),
+        ])
+    }
+
+    /// Tensors shaped like a built artifact's: named for the bind path, and
+    /// therefore describing no row in the table.
+    fn post_transform_metadata() -> CheckpointMetadata {
+        CheckpointMetadata {
+            files: Vec::new(),
+            tensors: vec![RawTensor {
+                id: TensorId(0),
+                name: "model.layers.0.self_attn.qkv_proj.fused.weight".to_string(),
+                file_id: FileId(0),
+                file_offset: 0,
+                span_bytes: 8,
+                shape: vec![2, 2],
+                encoding: Encoding::Raw(DType::BF16),
+            }],
         }
     }
 

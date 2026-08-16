@@ -231,13 +231,16 @@ pub const VARIANTS: &[Gemma4] = &[
             vision: Some(A4B_VISION),
         },
     },
-    // google/gemma-4-26B-A4B-it — the row that LOADS and does not SERVE.
-    // Its contract authors, its manifest identifies it, and its
-    // deployment refuses: `attention_k_eq_v` and a 128-expert routed
-    // bank are two legs this build has no traced text for. Stating the
-    // row anyway is the point — a checkpoint this build can identify and
-    // cannot fire says so at the door, where the old arrangement loaded
-    // it happily and died at its first fire.
+    // google/gemma-4-26B-A4B-it — the mixture row, and it SERVES now.
+    // It used to be the row that loaded and did not serve: its
+    // deployment refused at the door because this build had no loadable
+    // routed bank for a gemma-4 block. `Gemma4::untraced` carries the
+    // measurement that ended that, and returns `None`.
+    //
+    // What is still true is narrower and belongs to one backend:
+    // `Gemma4::trace` refuses this row and `gemma-4-31b` alike on CUDA,
+    // because both read V out of the K projection and the hand-written
+    // CUDA text projects one. The Metal text reads it and serves them.
     Gemma4 {
         id: "gemma-4-26b-a4b",
         shape: Gemma4Facts::gemma_4_26b_a4b(),
@@ -378,9 +381,11 @@ impl Variant for Gemma4 {
 
     /// # Errors
     ///
-    /// [`Refusal::Unsupported`] for the A4B: this build has no text for
-    /// `attention_k_eq_v` or for a routed gemma-4 block, and the row
-    /// says so at the door rather than at its first fire.
+    /// None today. [`Self::untraced`] returns `None` for every row this
+    /// generation ships, and its doc records the measurement that ended
+    /// the A4B's refusal. The signature stays fallible because the door
+    /// is where a store this build does not provision has to say so, and
+    /// a row that grows one is a `Some` here rather than a new call site.
     fn deployment(&self, load: Deployed<'_>) -> Result<Deployment, Refusal> {
         if let Some(refusal) = self.untraced() {
             return Err(refusal);
@@ -421,9 +426,12 @@ impl Variant for Gemma4 {
 
     /// # Errors
     ///
-    /// [`Refusal::Unsupported`] for the A4B, by the same predicate
-    /// [`Self::deployment`] refuses on — a row that cannot be deployed
-    /// cannot be traced.
+    /// [`Refusal::Unsupported`] on CUDA for the rows that read V out of
+    /// the K projection — `gemma-4-31b` and the A4B — because the
+    /// hand-written CUDA text projects a `v_proj` their checkpoints do
+    /// not ship. Not the same predicate [`Self::deployment`] answers:
+    /// that one refuses nothing today, and this is a fact about ONE
+    /// backend's text rather than about a store the build lacks.
     fn trace(
         &self,
         class: model_ir::trace::FireClass,
@@ -444,11 +452,12 @@ impl Variant for Gemma4 {
             // The kernel set's three refusals, not this row's. This arm
             // asked only the shard question. Neither of the other two
             // fires for a row published today -- every gemma runs at
-            // head width 256 and 26B-A4B is refused earlier for having
-            // no routed text -- so this is the door being able to SAY
-            // what it cannot run, rather than a mis-serving repaired.
-            // Without it an off-axis width aborts in `model-compiler`
-            // rather than arriving as a sentence.
+            // head width 256, and the A4B reaches here now rather than
+            // being refused earlier for having no routed text -- so this
+            // is the door being able to SAY what it cannot run, rather
+            // than a mis-serving repaired. Without it an off-axis width
+            // aborts in `model-compiler` rather than arriving as a
+            // sentence.
             crate::shared::llama_like::project::metal_kernel_refusal(&shape, &facts, load, bind)?;
             return Ok(crate::shared::llama_like::forward::llama_like_metal(
                 &shape, &facts, class,
@@ -824,9 +833,7 @@ mod tests {
         assert!(!a4b.manifest().tensors.is_empty());
         assert_eq!(a4b.load_shape().n_experts, 128);
         assert!(a4b.untraced().is_none(), "nothing refuses the mixture now");
-        let d = a4b
-            .deployment(Deployed::single())
-            .expect("the A4B serves");
+        let d = a4b.deployment(Deployed::single()).expect("the A4B serves");
         assert_eq!(d.shape.experts_per_token, 8);
         assert_eq!(d.shape.moe_intermediate, 704);
         // The DENSE leg is still there, at its own width, because the
@@ -840,7 +847,12 @@ mod tests {
     /// A4B and not about the generation.
     #[test]
     fn the_dense_rows_serve() {
-        for id in ["gemma-4-e2b", "gemma-4-e4b", "gemma-4-31b", "gemma-4-26b-a4b"] {
+        for id in [
+            "gemma-4-e2b",
+            "gemma-4-e4b",
+            "gemma-4-31b",
+            "gemma-4-26b-a4b",
+        ] {
             let d = row(id).deployment(Deployed::single());
             assert!(d.is_ok(), "{id} refused, and its legs are all traced");
         }
@@ -887,7 +899,50 @@ mod tests {
             "V read from K is a different attention and this build has it"
         );
         assert!(k_eq_v_only.deployment(Deployed::single()).is_ok());
+    }
 
+    /// Deploying is not tracing, and CUDA is where the two part.
+    ///
+    /// The pairing above holds for `untraced`, which answers about STORES
+    /// this build provisions and is backend-blind. `trace` answers about
+    /// TEXT, and one of the two texts is short: `project::trace` declares
+    /// a `v_proj` and matmuls it unconditionally, so the rows that read V
+    /// out of the K projection have no CUDA text at all.
+    ///
+    /// Nothing asserted that until now, which is how its documentation
+    /// came to say the refusal was `deployment`'s predicate long after
+    /// `deployment` had stopped refusing anything. Both shipped rows that
+    /// carry `k_eq_v` are checked, and a row that does not carry it is the
+    /// control -- without it a `trace` that refused every gemma on CUDA
+    /// would pass.
+    #[test]
+    fn the_rows_that_read_v_out_of_k_have_no_cuda_text_and_say_so() {
+        let class = model_ir::trace::FireClass::Decode;
+        for id in ["gemma-4-31b", "gemma-4-26b-a4b"] {
+            let row = row(id);
+            assert!(row.k_eq_v, "'{id}' is one of the rows this is about");
+            assert!(
+                row.deployment(Deployed::single()).is_ok(),
+                "'{id}' deploys -- the refusal below is the text's, not the door's"
+            );
+            let refusal = row
+                .trace(class, Deployed::single())
+                .expect_err("no CUDA text for a row that reads V out of K");
+            let Refusal::Unsupported(why) = refusal else {
+                panic!("'{id}' refused for a reason this test does not name: {refusal:?}");
+            };
+            assert!(
+                why.contains("attention_k_eq_v"),
+                "the refusal names the fact it turns on: {why}"
+            );
+        }
+        // The control: a dense gemma-4 with an ordinary V projection
+        // traces on CUDA, so the arm above is reading `k_eq_v` and not
+        // refusing the generation.
+        assert!(
+            row("gemma-4-e4b").trace(class, Deployed::single()).is_ok(),
+            "a row with its own `v_proj` has a CUDA text"
+        );
     }
 
     /// A METAL load traces the llama-like Metal text, at THIS row's

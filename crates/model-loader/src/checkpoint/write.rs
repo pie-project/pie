@@ -42,15 +42,43 @@ pub struct WriteTensor<'a> {
 /// layout on the object says which scheme. The one exception is MXFP4's
 /// payload, whose elements are half a byte — `f4_e2m1` says so, and the size
 /// equation the reader checks follows from it.
+///
+/// FP8 is not an exception so much as not a group code at all, and it is the
+/// one case where this function has to agree with [`profile_of`] rather than
+/// decide on its own: that function writes FP8 under `dense` because "FP8
+/// weights are not group-quantized codes: they are plain f8 elements … `dense`
+/// plus the logical type says that exactly". Answering `U8` with no logical
+/// type here writes only the first half of that sentence, and the reader —
+/// which takes `dense` to mean the parts are plain values — hands the weight
+/// back as `Raw(U8)` with its type gone.
+///
+/// Measured on `pie model build --backend cuda --quant fp8 --fp8-native` from
+/// `Qwen--Qwen3-0.6B.zt`, before and after: **196 tensors** carried no logical
+/// type, the artifacts differ by 2,940 bytes of metadata and **not one byte of
+/// payload**, and the erasure *propagates* — re-authoring a type-erased
+/// artifact writes another one, because the reader answers `U8` and the writer
+/// stores what it was told.
+///
+/// Serving was never affected: both artifacts re-author to the same 506
+/// tensors. What broke is using a built FP8 artifact as a quantization source,
+/// which refused with "runtime_quant source 'model.layers.0.mlp.down_proj.weight'
+/// must be BF16/FP16/FP32/F8E4M3" — the weight *was* F8E4M3, and the file no
+/// longer said so.
+/// `every_scheme_the_writer_accepts_is_one_the_reader_gives_back` is what found
+/// this and is what keeps the two functions agreeing.
 fn storage_of(
     decl_dtype: DType,
     encoding: &Encoding,
 ) -> Result<(ZDType, Option<&'static str>), Error> {
     if let Encoding::Quant(spec) = encoding {
-        return Ok(match spec.scheme {
-            QuantScheme::Mxfp4E2M1E8M0 => (ZDType::U8, Some("f4_e2m1")),
-            _ => (ZDType::U8, None),
-        });
+        match spec.scheme {
+            // Stored as plain elements under `dense`, so the dtype table
+            // below is the right answer — `decl_dtype` is already the spec's
+            // logical type, which for these schemes is the F8 width itself.
+            QuantScheme::Fp8E4M3 | QuantScheme::Fp8E5M2 => {}
+            QuantScheme::Mxfp4E2M1E8M0 => return Ok((ZDType::U8, Some("f4_e2m1"))),
+            _ => return Ok((ZDType::U8, None)),
+        }
     }
     Ok(match decl_dtype {
         DType::F32 => (ZDType::F32, None),
@@ -93,12 +121,22 @@ fn profile_of(encoding: &Encoding) -> Result<(&'static str, Option<Value>), Erro
     // reader needs to check sizes.
     if let Some((elems, bytes)) = spec.block_layout() {
         let name = match spec.scheme {
+            QuantScheme::GgufQ2K => "gguf.q2_k/1",
+            QuantScheme::GgufQ3K => "gguf.q3_k/1",
             QuantScheme::GgufQ4_0 => "gguf.q4_0/1",
             QuantScheme::GgufQ4_1 => "gguf.q4_1/1",
             QuantScheme::GgufQ4K => "gguf.q4_k/1",
             QuantScheme::GgufQ5_0 => "gguf.q5_0/1",
             QuantScheme::GgufQ5_1 => "gguf.q5_1/1",
             QuantScheme::GgufQ5K => "gguf.q5_k/1",
+            QuantScheme::GgufIq4Nl => "gguf.iq4_nl/1",
+            QuantScheme::GgufIq4Xs => "gguf.iq4_xs/1",
+            QuantScheme::GgufMxfp4 => "gguf.mxfp4/1",
+            QuantScheme::GgufIq2Xxs => "gguf.iq2_xxs/1",
+            QuantScheme::GgufIq2Xs => "gguf.iq2_xs/1",
+            QuantScheme::GgufIq2S => "gguf.iq2_s/1",
+            QuantScheme::GgufIq3Xxs => "gguf.iq3_xxs/1",
+            QuantScheme::GgufIq3S => "gguf.iq3_s/1",
             QuantScheme::GgufQ6K => "gguf.q6_k/1",
             QuantScheme::GgufQ8_0 => "gguf.q8_0/1",
             other => {
@@ -1093,15 +1131,203 @@ mod tests {
                 group_size: 0,
                 channel_axis: None,
             };
-            assert!(
-                spec.block_layout().is_some(),
-                "{scheme:?} is a blocked scheme"
-            );
-            let (name, _) = profile_of(&Encoding::Quant(spec)).expect("a profile to write it under");
+            assert!(spec.scheme.is_self_contained(), "{scheme:?} is a blocked scheme");
+            let (name, _) =
+                profile_of(&Encoding::Quant(spec)).expect("a profile to write it under");
             assert!(
                 name.starts_with("gguf."),
                 "{scheme:?} lands on {name}, which is not a gguf profile"
             );
         }
+    }
+
+    /// What the reader gives back for a scheme the writer was handed.
+    ///
+    /// Not every scheme comes back as itself, and the ones that do not are a
+    /// decision rather than a gap: FP8 weights are plain elements, not group
+    /// codes, so they are stored under `dense` and the reader answers with a
+    /// dtype and no scheme.
+    #[derive(Debug, PartialEq, Eq)]
+    enum RoundTrip {
+        /// Written under a quantization profile; read back as the same scheme.
+        Survives,
+        /// Written as `dense`; read back as a plain dtype, scheme discarded.
+        Collapses(DType),
+        /// Not a spelling the rest of the loader builds. `Encoding::Raw` is
+        /// how an unquantized tensor is written, so `Quant { scheme: None }`
+        /// has no round trip to check.
+        NotAnEncoding,
+    }
+
+    /// The round trip each scheme must make, stated once.
+    ///
+    /// **Exhaustive on purpose, and it is the only completeness check either
+    /// half of the round trip has.** `profile_of` ends in `other => Err(...)`
+    /// and `scheme_of` matches strings, so neither is checked by the
+    /// compiler: a new `QuantScheme` compiles clean and fails at runtime, on
+    /// the first artifact somebody writes with it. `rustc` refuses this match
+    /// until a new variant is given an answer, which is what makes forgetting
+    /// the list below expensive rather than silent.
+    fn round_trip_of(scheme: QuantScheme) -> RoundTrip {
+        match scheme {
+            QuantScheme::None => RoundTrip::NotAnEncoding,
+            QuantScheme::Fp8E4M3 => RoundTrip::Collapses(DType::F8E4M3),
+            QuantScheme::Fp8E5M2 => RoundTrip::Collapses(DType::F8E5M2),
+            QuantScheme::Int8Symmetric
+            | QuantScheme::Int8Asymmetric
+            | QuantScheme::AwqInt4
+            | QuantScheme::GptqInt4
+            | QuantScheme::Mxfp4E2M1E8M0
+            | QuantScheme::MlxAffineU4
+            | QuantScheme::Int4B8
+            | QuantScheme::GgufQ4_0
+            | QuantScheme::GgufQ4_1
+            | QuantScheme::GgufQ2K
+            | QuantScheme::GgufQ3K
+            | QuantScheme::GgufQ4K
+            | QuantScheme::GgufQ5_0
+            | QuantScheme::GgufQ5_1
+            | QuantScheme::GgufQ5K
+            | QuantScheme::GgufQ6K
+            | QuantScheme::GgufQ8_0
+            | QuantScheme::GgufIq4Nl
+            | QuantScheme::GgufIq4Xs
+            | QuantScheme::GgufMxfp4
+            | QuantScheme::GgufIq2Xxs
+            | QuantScheme::GgufIq2Xs
+            | QuantScheme::GgufIq2S
+            | QuantScheme::GgufIq3Xxs
+            | QuantScheme::GgufIq3S => RoundTrip::Survives,
+        }
+    }
+
+    /// Every variant, in declaration order.
+    ///
+    /// Hand-maintained, and kept honest the way
+    /// `manifest::from_checkpoint::tests::no_scheme_has_a_zero_width_so_no_division_can_fault`
+    /// keeps its own copy honest: [`round_trip_of`] is exhaustive so a new
+    /// variant cannot compile without an answer, and the length assertion in
+    /// the test below fails if the answer was written without adding the
+    /// variant here.
+    const EVERY_SCHEME: &[QuantScheme] = &[
+        QuantScheme::None,
+        QuantScheme::Fp8E4M3,
+        QuantScheme::Fp8E5M2,
+        QuantScheme::Int8Symmetric,
+        QuantScheme::Int8Asymmetric,
+        QuantScheme::AwqInt4,
+        QuantScheme::GptqInt4,
+        QuantScheme::Mxfp4E2M1E8M0,
+        QuantScheme::MlxAffineU4,
+        QuantScheme::GgufQ4_0,
+        QuantScheme::GgufQ2K,
+        QuantScheme::GgufQ3K,
+        QuantScheme::GgufQ4K,
+        QuantScheme::GgufQ5_0,
+        QuantScheme::GgufQ5K,
+        QuantScheme::GgufQ8_0,
+        QuantScheme::Int4B8,
+        QuantScheme::GgufQ6K,
+        QuantScheme::GgufQ4_1,
+        QuantScheme::GgufQ5_1,
+        QuantScheme::GgufIq4Nl,
+        QuantScheme::GgufIq4Xs,
+        QuantScheme::GgufMxfp4,
+        QuantScheme::GgufIq2Xxs,
+        QuantScheme::GgufIq2Xs,
+        QuantScheme::GgufIq2S,
+        QuantScheme::GgufIq3Xxs,
+        QuantScheme::GgufIq3S,
+    ];
+
+    /// The writer's profile is readable by the reader that has to read it,
+    /// for every scheme, through a real file.
+    ///
+    /// `profile_of` writes twelve layout profiles and
+    /// [`scheme_of`](crate::checkpoint::zt) reads twelve back, in two
+    /// modules, with no shared table and nothing checking they agree. They
+    /// have to: an artifact whose layout the reader cannot resolve is refused
+    /// at parse, so a scheme that writes under a profile nobody reads
+    /// produces a file that pie itself cannot open.
+    ///
+    /// End to end rather than `scheme_of(profile_of(s))` because the seam is
+    /// wider than those two functions: the attributes go out as CBOR and come
+    /// back parsed, and `zt.quant_group/1` does not carry a scheme name at
+    /// all — the reader *derives* it from `bits`, `packing`, `scale_form` and
+    /// `zero_point`, so six schemes share one profile and are told apart only
+    /// by values that survive a serialization round trip.
+    #[test]
+    fn every_scheme_the_writer_accepts_is_one_the_reader_gives_back() {
+        use crate::types::Axis;
+
+        let dir = tmpdir("roundtrip");
+        for &scheme in EVERY_SCHEME {
+            let expected = round_trip_of(scheme);
+            if expected == RoundTrip::NotAnEncoding {
+                continue;
+            }
+            let spec = QuantSpec {
+                scheme,
+                logical_dtype: match scheme {
+                    QuantScheme::Fp8E4M3 => DType::F8E4M3,
+                    QuantScheme::Fp8E5M2 => DType::F8E5M2,
+                    _ => DType::BF16,
+                },
+                bits_per_element: 0,
+                group_size: 0,
+                channel_axis: Some(Axis(0)),
+            }
+            .normalized();
+
+            // One block for a blocked scheme, one group for the rest. The
+            // sizes come from the scheme rather than from a literal so that a
+            // scheme whose geometry changes is exercised at its new geometry.
+            let (elems, nbytes) = match spec.block_layout() {
+                Some((elems, bytes)) => (elems as i64, bytes as usize),
+                None => {
+                    let group = u64::from(spec.normalized_group_size()).max(1);
+                    let bits = u64::from(spec.normalized_bits());
+                    (
+                        group as i64,
+                        usize::try_from((group * bits).div_ceil(8)).unwrap(),
+                    )
+                }
+            };
+
+            let path = dir.join(format!("{scheme:?}.zt"));
+            let d = decl("w", vec![1, elems], Encoding::Quant(spec));
+            write_zt(
+                &path,
+                &BTreeMap::new(),
+                &[WriteTensor {
+                    decl: &d,
+                    bytes: &vec![0x5au8; nbytes],
+                }],
+            )
+            .unwrap_or_else(|err| panic!("{scheme:?} could not be written: {err}"));
+
+            let read = parse_checkpoint(&path)
+                .unwrap_or_else(|err| panic!("{scheme:?} wrote a file pie cannot open: {err}"));
+            let got = &read.tensor_by_name("w").unwrap().encoding;
+
+            match (&expected, got) {
+                (RoundTrip::Survives, Encoding::Quant(got)) => assert_eq!(
+                    got.scheme, scheme,
+                    "{scheme:?} was written and read back as {:?}",
+                    got.scheme
+                ),
+                (RoundTrip::Collapses(dtype), Encoding::Raw(got)) => assert_eq!(
+                    got, dtype,
+                    "{scheme:?} collapses to a plain dtype, but not to {dtype:?}"
+                ),
+                _ => panic!("{scheme:?}: expected {expected:?}, read back {got:?}"),
+            }
+        }
+        assert_eq!(
+            EVERY_SCHEME.len(),
+            28,
+            "a scheme was added; give it a case above"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
