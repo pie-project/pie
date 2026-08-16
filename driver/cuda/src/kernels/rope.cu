@@ -2,6 +2,8 @@
 
 #include <cuda_bf16.h>
 
+#include <cstdlib>
+
 #include "kernels/rope_device.cuh"
 
 namespace pie_cuda_driver::kernels {
@@ -720,6 +722,111 @@ __global__ void rope_partial_bf16_kernel(
     }
 }
 
+// vLLM-shaped partial rotary. Same channel semantics as the kernel above --
+// rotate [0, rotary_dim) with pair offset rotary_dim/2, leave
+// [rotary_dim, head_dim) untouched -- and a different numeric pipeline:
+// vLLM's inv_freq exponent form, accurate fp32 trig, cos/sin ROUNDED TO BF16
+// before use, and a bf16 rotate. See the block comment in rope_device.cuh.
+//
+// Kept as a separate kernel rather than a branch inside
+// `rope_partial_bf16_kernel` so the default path stays byte-for-byte the code
+// that shipped; the knob is meant to be a measurable A/B, and a shared kernel
+// body would make "unset is bit-unchanged" an argument instead of a fact.
+//
+// The per-token cos/sin row is built once in shared memory and indexed by
+// every head, which is literally the "index the table" step: `rope_angles` is
+// 32 for Qwen3.5-9B while `total_heads` is 10, so the naive form would
+// evaluate the same 32 transcendentals ten times.
+__global__ void rope_partial_vllm_table_bf16_kernel(
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    const std::int32_t* __restrict__ positions,
+    int position_delta,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim,
+    float theta)
+{
+    extern __shared__ __nv_bfloat16 rope_tab[];
+    const int n = blockIdx.x;
+    const int total_heads = num_q_heads + num_kv_heads;
+    const int rope_angles = rotary_dim / 2;
+    const int pos = positions[n] + position_delta;
+
+    for (int j = threadIdx.x; j < rope_angles; j += blockDim.x) {
+        __nv_bfloat16 cos_b, sin_b;
+        rope_cos_sin_vllm_table(theta, j, rotary_dim, pos, cos_b, sin_b);
+        rope_tab[j] = cos_b;
+        rope_tab[rope_angles + j] = sin_b;
+    }
+    __syncthreads();
+
+    for (int t = threadIdx.x; t < total_heads * rope_angles; t += blockDim.x) {
+        const int head_idx = t / rope_angles;
+        const int dim_pair = t % rope_angles;
+        const __nv_bfloat16 cos_b = rope_tab[dim_pair];
+        const __nv_bfloat16 sin_b = rope_tab[rope_angles + dim_pair];
+
+        __nv_bfloat16* base;
+        if (head_idx < num_q_heads) {
+            base = q +
+                (static_cast<long long>(n) * num_q_heads + head_idx) * head_dim;
+        } else {
+            const int kv_h = head_idx - num_q_heads;
+            base = k +
+                (static_cast<long long>(n) * num_kv_heads + kv_h) * head_dim;
+        }
+        rotate_pair_bf16(base, dim_pair, dim_pair + rope_angles, cos_b, sin_b);
+    }
+}
+
+// Opt-in, default OFF. A global numerics change would move every partial-rotary
+// model -- Gemma-4 reaches this launcher too -- so the A/B gets measured before
+// the default flips.
+bool rope_vllm_table_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_ROPE_VLLM_TABLE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+void dispatch_rope_partial(
+    void* q, void* k,
+    const std::int32_t* positions,
+    int position_delta,
+    int num_tokens,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim,
+    float theta,
+    cudaStream_t stream,
+    bool vllm_table)
+{
+    constexpr int BLOCK = 256;
+    dim3 grid(num_tokens);
+    dim3 block(BLOCK);
+    if (vllm_table) {
+        const std::size_t smem = static_cast<std::size_t>(rotary_dim / 2) * 2 *
+                                 sizeof(__nv_bfloat16);
+        rope_partial_vllm_table_bf16_kernel<<<grid, block, smem, stream>>>(
+            static_cast<__nv_bfloat16*>(q),
+            static_cast<__nv_bfloat16*>(k),
+            positions,
+            position_delta,
+            num_q_heads, num_kv_heads, head_dim, rotary_dim, theta);
+        return;
+    }
+    rope_partial_bf16_kernel<<<grid, block, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(q),
+        static_cast<__nv_bfloat16*>(k),
+        positions,
+        position_delta,
+        num_q_heads, num_kv_heads, head_dim, rotary_dim, theta);
+}
+
 }  // namespace
 
 void launch_rope_partial_bf16(
@@ -733,15 +840,9 @@ void launch_rope_partial_bf16(
     float theta,
     cudaStream_t stream)
 {
-    constexpr int BLOCK = 256;
-    dim3 grid(num_tokens);
-    dim3 block(BLOCK);
-    rope_partial_bf16_kernel<<<grid, block, 0, stream>>>(
-        static_cast<__nv_bfloat16*>(q),
-        static_cast<__nv_bfloat16*>(k),
-        positions,
-        0,
-        num_q_heads, num_kv_heads, head_dim, rotary_dim, theta);
+    dispatch_rope_partial(q, k, positions, 0, num_tokens, num_q_heads,
+                          num_kv_heads, head_dim, rotary_dim, theta, stream,
+                          rope_vllm_table_enabled());
 }
 
 void launch_rope_partial_bf16_position_delta(
@@ -756,15 +857,25 @@ void launch_rope_partial_bf16_position_delta(
     float theta,
     cudaStream_t stream)
 {
-    constexpr int BLOCK = 256;
-    dim3 grid(num_tokens);
-    dim3 block(BLOCK);
-    rope_partial_bf16_kernel<<<grid, block, 0, stream>>>(
-        static_cast<__nv_bfloat16*>(q),
-        static_cast<__nv_bfloat16*>(k),
-        positions,
-        position_delta,
-        num_q_heads, num_kv_heads, head_dim, rotary_dim, theta);
+    dispatch_rope_partial(q, k, positions, position_delta, num_tokens,
+                          num_q_heads, num_kv_heads, head_dim, rotary_dim,
+                          theta, stream, rope_vllm_table_enabled());
+}
+
+void launch_rope_partial_vllm_table_bf16(
+    void* q, void* k,
+    const std::int32_t* positions,
+    int num_tokens,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim,
+    float theta,
+    cudaStream_t stream)
+{
+    dispatch_rope_partial(q, k, positions, 0, num_tokens, num_q_heads,
+                          num_kv_heads, head_dim, rotary_dim, theta, stream,
+                          /*vllm_table=*/true);
 }
 
 namespace {

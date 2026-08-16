@@ -1115,7 +1115,10 @@ pie_add_cuda_target(gdn_recurrent_step_parity
   LIBS pie_driver_cuda_lib CUDA::cudart)
 # Partial rotary must rotate [0, rotary_dim) with pair offset rotary_dim/2 and
 # leave [rotary_dim, head_dim) bit-identical. Both halves were wrong and shipped,
-# because nothing built a test for this launcher.
+# because nothing built a test for this launcher. Also pins the opt-in
+# vLLM cos/sin-table path bit-for-bit (inv_freq form, bf16-rounded trig, bf16
+# rotate) and probes that it is materially more accurate than the default
+# `__sincosf` path at long positions.
 pie_add_cuda_target(rope_partial_parity
   SOURCES tests/rope_partial_parity.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests

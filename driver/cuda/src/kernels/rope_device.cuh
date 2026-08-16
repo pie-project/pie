@@ -63,6 +63,105 @@ __device__ __forceinline__ void rope_cos_sin(
     __sincosf(ang, &sin_v, &cos_v);
 }
 
+// ── vLLM cos/sin-table primitives (opt-in, PIE_ROPE_VLLM_TABLE=1) ──────────
+//
+// vLLM never evaluates trig on a GPU. `RotaryEmbedding.__init__` builds
+// `cos_sin_cache` once on the host in fp32 -- inv_freq from a weak-scalar
+// base, angle = fp32(pos) * inv_freq, eager `cos()`/`sin()` -- and then does
+// `cache.to(dtype)`, which ROUNDS THE WHOLE TABLE TO BF16 AND STORES IT. The
+// path our reference leg actually runs (`triton_mrope`, i.e. no
+// `--language-model-only`) loads that bf16 row with no fp32 cast and casts q/k
+// DOWN via `.to(sin_row.dtype)`, so the rotate is bf16 end to end.
+//
+// So three things have to change together, and "call accurate trig" is only
+// one of them:
+//   1. the exponent form -- `1 / theta^(2j/rotary_dim)`, not `theta^(-2j/d)`
+//   2. cos/sin rounded to bf16 BEFORE they are used at all
+//   3. the rotate done in bf16, not fp32
+// Swapping `__sincosf` for `sincosf` alone would leave Pie strictly MORE
+// accurate than the reference and still mismatch it.
+//
+// The table itself is a memoization, not a numerical device: entry (pos, j) is
+// a pure function of (pos, j) with no accumulated state, so evaluating it per
+// token here is bit-identical to indexing vLLM's preallocated array. What is
+// reproduced is the arithmetic, not the allocation.
+
+// inv_freq[j], vLLM form: `1.0 / (base ** (arange(0, rotary_dim, 2) / rotary_dim))`.
+//
+// Two details that are not interchangeable with `powf(theta, -2j/rotary_dim)`:
+// the reciprocal is taken AFTER the power (a separate fp32 rounding), and the
+// exponent is the positive `2j/rotary_dim`. The power itself is evaluated in
+// double and rounded once because device `powf` carries up to 8 ulp, and at
+// j=1 the angle reaches ~1.2e4 rad at position 20000 where 8 ulp is ~6e-3 rad
+// -- a full bf16 step in cos. vLLM's host-side power is correctly rounded, so
+// the double evaluation is the FAITHFUL one here, not the over-accurate one.
+__device__ __forceinline__ float rope_inv_freq_vllm(
+    float theta, int dim_pair, int rotary_dim)
+{
+    // Exponent formed in fp32, as vLLM's fp32 arange/divide does.
+    const float exponent = (2.f * static_cast<float>(dim_pair)) /
+                           static_cast<float>(rotary_dim);
+    const float p = static_cast<float>(
+        pow(static_cast<double>(theta), static_cast<double>(exponent)));
+    return 1.f / p;
+}
+
+// One stored table entry: accurate fp32 trig, then rounded to bf16 (RNE, which
+// is what `.to(torch.bfloat16)` does). `sincosf` -- not `__sincosf` -- because
+// the SFU intrinsic's range reduction collapses above ~100 rad, and inv_freq[0]
+// is exactly 1.0 for rotary_dim=64/theta=1e7, so lane 0's angle in radians IS
+// the token position.
+__device__ __forceinline__ void rope_cos_sin_vllm_table(
+    float theta, int dim_pair, int rotary_dim, int pos,
+    __nv_bfloat16& cos_b, __nv_bfloat16& sin_b)
+{
+    const float ang = static_cast<float>(pos) *
+                      rope_inv_freq_vllm(theta, dim_pair, rotary_dim);
+    float sin_v, cos_v;
+    sincosf(ang, &sin_v, &cos_v);
+    cos_b = __float2bfloat16(cos_v);
+    sin_b = __float2bfloat16(sin_v);
+}
+
+// bf16 arithmetic, one rounding per operation.
+//
+// The exact product of two bf16 values needs 16 significand bits and the exact
+// sum needs at most 24 for any exponent gap a rotation produces, so fp32 holds
+// both EXACTLY and the single `__float2bfloat16` is the only rounding. That
+// makes these bit-identical to native `mul.rn.bf16` / `add.rn.bf16` without an
+// `__CUDA_ARCH__ >= 800` guard. This is emphatically NOT `rotate_pair`'s fp32
+// rotate, which rounds once at the end of the whole expression.
+__device__ __forceinline__ __nv_bfloat16 bf16_mul(
+    __nv_bfloat16 a, __nv_bfloat16 b)
+{
+    return __float2bfloat16(__bfloat162float(a) * __bfloat162float(b));
+}
+
+__device__ __forceinline__ __nv_bfloat16 bf16_add(
+    __nv_bfloat16 a, __nv_bfloat16 b)
+{
+    return __float2bfloat16(__bfloat162float(a) + __bfloat162float(b));
+}
+
+__device__ __forceinline__ __nv_bfloat16 bf16_sub(
+    __nv_bfloat16 a, __nv_bfloat16 b)
+{
+    return __float2bfloat16(__bfloat162float(a) - __bfloat162float(b));
+}
+
+// `x1*cos - x2*sin` / `x2*cos + x1*sin` with every intermediate rounded to
+// bf16 -- what an all-bf16 tensor expression evaluates to. Dims `i` and `j` are
+// passed explicitly so the caller owns the pairing rule.
+__device__ __forceinline__ void rotate_pair_bf16(
+    __nv_bfloat16* base, int i, int j,
+    __nv_bfloat16 cos_b, __nv_bfloat16 sin_b)
+{
+    const __nv_bfloat16 a = base[i];
+    const __nv_bfloat16 b = base[j];
+    base[i] = bf16_sub(bf16_mul(a, cos_b), bf16_mul(b, sin_b));
+    base[j] = bf16_add(bf16_mul(b, cos_b), bf16_mul(a, sin_b));
+}
+
 // Linear ramp over dim index: 0 below low_dim, 1 above high_dim. Blends
 // between unscaled (high freq) and `1/factor`-scaled (low freq) inv_freq, in
 // the dim-index domain rather than the wavelen domain Llama-3 YaRN uses.
