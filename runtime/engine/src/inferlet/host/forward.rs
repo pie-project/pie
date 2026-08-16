@@ -185,6 +185,10 @@ fn poll_channel(
                 return Ok(ChannelPoll::Pending { cell, fires });
             }
             Err(ChannelError::Empty) => {}
+            // A peek surfaces poison without consuming it; fall through to
+            // the real `take` below so the error is delivered exactly once
+            // and the session channel recovers.
+            Err(ChannelError::Poisoned(_)) => {}
             Err(error) => return Ok(ChannelPoll::Ready(Err(error.to_string()))),
         }
     }
