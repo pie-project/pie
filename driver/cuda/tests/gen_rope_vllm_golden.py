@@ -44,15 +44,27 @@ you measured with --reference-isa; the test prints it on every run.
 AND NOTE WHY THIS CANNOT BE "FIXED" IN THE HOST ARITHMETIC
 ==========================================================
 
-Correct rounding is not the goal, and chasing it makes things worse. Measured
-on x86 against the real MKL reference:
+Correct rounding is not the goal in principle: MKL VML HA is itself ~0.60 ulp
+and not correctly rounded, so an implementation that is similarly imperfect
+lands on the same side of a bf16 midpoint slightly more often than a perfect
+one does. Measured over 0..262143 against the real MKL reference:
 
-    double -> round to fp32   (correctly rounded, 0.5000 ulp):   1 / 19
-    plain glibc cosf/sinf     (NOT correctly rounded, 0.5599):   0 /  1
+    double -> round to fp32  (correctly rounded) : 19 mismatches
+    plain cosf/sinf                              : 18 mismatches
 
-MKL VML HA is itself 0.6012 ulp and not correctly rounded, so being
-similarly-imperfect lands on the same side of a bf16 midpoint more often than
-being perfect does. Do not "fix" the arithmetic toward correctness.
+One entry, in 16,777,216. The driver nevertheless DEFAULTS to the correctly
+rounded build, because it is deterministic across C libraries and one entry is
+not worth trading that for; PIE_ROPE_VLLM_TABLE_TRIG=libm selects the other.
+
+Two claims about this are NOT true and should not be re-derived: that cosf/sinf
+scores 0 in the campaign window (it is 18, and misses 13852, the one in-window
+entry), and that the difference tracks the glibc version. The latter was tested
+directly in ubuntu:22.04 (glibc 2.35) and debian:13 (glibc 2.41): per-entry
+output is BYTE-IDENTICAL, 18/19 either way.
+
+None of this changes the fixture. The base construction below is the
+correctly-rounded one and the overrides are measured against IT, so the fixture
+equals the reference regardless of which backend the driver happens to use.
 
 NOTE THE BASE CONSTRUCTION HERE IS DELIBERATELY THE CORRECTLY-ROUNDED ONE, and
 is NOT required to match the driver. What matters is that base + overrides

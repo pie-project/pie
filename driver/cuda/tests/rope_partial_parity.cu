@@ -441,6 +441,13 @@ void run_vllm_golden_table() {
                 ok ? "ok" : "FAIL", "vllm-table matches cache",
                 g::kRows * g::kRotaryDim, d.total, d.at_override, d.elsewhere,
                 d.guards_broken, capacity, max_pos, oob);
+    // The trig backend changes the table's bits, so a mismatch count means
+    // nothing without it. Expected on the deployment base (glibc 2.35):
+    // exact -> 19, libm -> 18, of which only pos=13852 is inside the campaign
+    // window. Neither is zero; closing the rest would mean vendoring oneMKL.
+    std::printf("      host trig backend: %s   (exact is deterministic across "
+                "C libraries; libm is not)\n",
+                kernels::rope_vllm_table_trig_name());
     if (d.guards_broken > 0)
         std::printf("      REGRESSION: an entry the host-side table build "
                     "already fixed has come undone\n");

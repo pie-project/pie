@@ -876,36 +876,55 @@ std::uint16_t bf16_rne_bits(float f) {
 // would notice except the parity test, which is why that test pins measured
 // reference bits rather than a formula.
 //
-// THE SIZE OF THE WIN IS SMALL AND ENVIRONMENT-DEPENDENT. Measured here on
-// glibc 2.35 (Ubuntu 22.04, x86_64), over positions 0..262143:
+// BUT THE DEFAULT IS THE CORRECTLY-ROUNDED BUILD ANYWAY, because the win is
+// one entry and the cost is determinism.
 //
-//   double -> round to fp32 (correctly rounded) vs reference : 19 mismatches
-//   plain cosf/sinf                             vs reference : 18 mismatches
+// Measured over positions 0..262143 (16,777,216 angles) against the reference:
 //
-// One entry, pos=70308 cos[5]. The reason is that this glibc's `cosf`/`sinf`
-// are ALMOST correctly rounded: they differ from the double-rounded value on
-// 1.18% of the 16,777,216 angles in that range, always by exactly 1 fp32 ulp,
-// and bf16 absorbs all but ONE of those. The two backends are very nearly the
-// same function.
+//   double -> round to fp32 (correctly rounded) : 19 mismatches
+//   plain cosf/sinf                             : 18 mismatches
 //
-// A campaign measurement reported 0/1 for this backend rather than 18/19. That
-// is arithmetically incompatible with what is measured here -- if the two
-// backends differ on a single bf16 entry, they cannot differ by 18 in their
-// mismatch counts -- so one of the two environments is not glibc 2.35 scalar
-// `cosf`. Until that is resolved, do not quote 0/1: the defensible claim is
-// that `libm` is never worse and is better by one entry here.
+// The single entry is pos=70308 cos[5]. `cosf`/`sinf` are ALMOST correctly
+// rounded here: they differ from the double-rounded value on 1.18% of those
+// angles, always by exactly 1 fp32 ulp, and bf16 absorbs all but ONE. The two
+// backends are very nearly the same function.
 //
-// `PIE_ROPE_VLLM_TABLE_TRIG=exact` selects the correctly-rounded build, so the
+// `exact` wins on determinism. Correct rounding has exactly one answer, so the
+// table it produces depends on nothing -- not the C library, its version, the
+// compiler, or the CPU. `libm` is by definition whatever the linked libm does,
+// which would make Pie's table a property of the machine it was built on. For
+// a parity campaign that is a real liability, and it is not worth trading for
+// one entry in 16.7 million.
+//
+// TWO CLAIMS ABOUT THIS THAT ARE NOT TRUE, recorded so they are not re-derived:
+//
+//   * "plain cosf/sinf scores 0 in the campaign window and 1 overall." Not
+//     reproduced. On the deployment base it is 18, and 13852 -- the one
+//     in-window entry -- is among the 18 it misses.
+//   * "the error correlation moves with the glibc version, 2.35 vs 2.41."
+//     It does not. Both were measured directly, in ubuntu:22.04 (glibc 2.35)
+//     and debian:13 (glibc 2.41), and the per-entry output is BYTE-IDENTICAL:
+//     18/19 either way, and the same 1.1794% fp32 divergence. Whatever produced
+//     0/1 elsewhere, it was not the glibc version.
+//
+// The deployment target is glibc 2.35 regardless:
+// `backend/docker/eval-worker-base.Dockerfile` pins
+// PIE_CUDA_RUNTIME_IMAGE=nvidia/cuda:12.9.1-cudnn-runtime-ubuntu22.04, so the
+// decoder runs on Ubuntu 22.04.
+//
+// `PIE_ROPE_VLLM_TABLE_TRIG=libm` selects the error-correlated build, so the
 // comparison stays reproducible and the choice revisitable rather than
-// entombed. Do not "improve" the default toward correct rounding; that is the
-// direction measured to be worse, however slightly.
+// entombed. Do not chase the remaining 19: the reference's exact bits require
+// vendoring closed-source, x86-only oneMKL into a CUDA driver's host-side table
+// builder. The open question is whether any of this flips a token, which needs
+// an end-to-end run, not more numerics.
 enum class TableTrig { Libm, Exact };
 
 TableTrig vllm_table_trig() {
     static const TableTrig mode = [] {
         const char* v = std::getenv("PIE_ROPE_VLLM_TABLE_TRIG");
-        if (v != nullptr && std::strcmp(v, "exact") == 0) return TableTrig::Exact;
-        return TableTrig::Libm;
+        if (v != nullptr && std::strcmp(v, "libm") == 0) return TableTrig::Libm;
+        return TableTrig::Exact;
     }();
     return mode;
 }
@@ -1129,6 +1148,11 @@ int rope_vllm_table_capacity_for(float theta, int rotary_dim)
 {
     const VllmCosSinTable* t = vllm_table_for(theta, rotary_dim);
     return t != nullptr ? t->capacity : 0;
+}
+
+const char* rope_vllm_table_trig_name()
+{
+    return vllm_table_trig() == TableTrig::Exact ? "exact" : "libm";
 }
 
 namespace {
