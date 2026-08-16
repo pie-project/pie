@@ -106,11 +106,20 @@ __device__ __forceinline__ float rope_inv_freq_vllm(
     return 1.f / p;
 }
 
-// One stored table entry: accurate fp32 trig, then rounded to bf16 (RNE, which
-// is what `.to(torch.bfloat16)` does). `sincosf` -- not `__sincosf` -- because
-// the SFU intrinsic's range reduction collapses above ~100 rad, and inv_freq[0]
-// is exactly 1.0 for rotary_dim=64/theta=1e7, so lane 0's angle in radians IS
-// the token position.
+// One stored table entry: fp32 trig, then rounded to bf16 (RNE, which is what
+// `.to(torch.bfloat16)` does).
+//
+// `sincosf` rather than `__sincosf`, but NOT because the intrinsic falls apart.
+// Measured on sm89 at lane 0 -- where inv_freq[0] is exactly 1.0, so the angle
+// in radians IS the token position -- `__sincosf`'s absolute error is 1.78e-05
+// at positions 0-200, 5.39e-04 at 1000-4000, 2.31e-03 at 13000-20000 and
+// 4.24e-03 past 20000, against a bf16 step of 7.8e-03. It degrades
+// monotonically; it does not collapse.
+//
+// The reason the swap is needed is not accuracy. vLLM's values are a specific
+// bf16-rounded table, and only reproducing that table reproduces its bits: an
+// error of half a bf16 step is exactly the size that flips table entries, and
+// a flipped entry is a parity miss no matter how small it is.
 __device__ __forceinline__ void rope_cos_sin_vllm_table(
     float theta, int dim_pair, int rotary_dim, int pos,
     __nv_bfloat16& cos_b, __nv_bfloat16& sin_b)

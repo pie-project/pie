@@ -1,4 +1,24 @@
-// Parity guard for `launch_rope_partial_bf16` against a CPU reference.
+// Guards for the two partial-rotary launchers. They test DIFFERENT PROPERTIES
+// against DIFFERENT REFERENCES, and confusing the two is how this file went
+// wrong once already:
+//
+//   * `launch_rope_partial_bf16` (default)  -- STRUCTURE: which channels
+//     rotate, which pass through, what the frequency denominator is. Checked
+//     against the HF definition in fp64, with a tolerance, because the
+//     question is "does it rotate the right dims by the right angle" and the
+//     historical bugs were whole-number-sized.
+//
+//   * `launch_rope_partial_vllm_table_bf16` (PIE_ROPE_VLLM_TABLE=1) -- BITS:
+//     does it reproduce vLLM's `cos_sin_cache` exactly. Checked against that
+//     table itself, with NO tolerance and NO transcendental evaluated here.
+//
+// The fp64 reference below is legitimate for the first and ILLEGITIMATE for
+// the second. vLLM's table is a deliberately rounded bf16 value, so a kernel
+// that is more accurate than it is further from parity, not closer. Do not
+// carry the fp64 reference across into the vLLM checks; see the long note
+// above them for what happened when an earlier draft did.
+//
+// ── The default path: structure ────────────────────────────────────────────
 //
 // WHY THIS EXISTS. Partial rotary rotates only the first `rotary_dim`
 // channels of each head and leaves `[rotary_dim, head_dim)` untouched. The
@@ -50,6 +70,7 @@
 #include <cuda_runtime.h>
 
 #include "kernels/rope.hpp"
+#include "rope_vllm_cos_sin_golden.hpp"
 
 namespace kernels = pie_cuda_driver::kernels;
 
@@ -91,80 +112,120 @@ void reference_rope_partial(
     // [rotary_dim, head_dim) deliberately untouched.
 }
 
-// ── vLLM cos/sin-table emulation (PIE_ROPE_VLLM_TABLE / the explicit
-//    `launch_rope_partial_vllm_table_bf16` launcher) ─────────────────────────
+// ── vLLM cos/sin-table parity (the `..._vllm_table` launcher) ──────────────
 //
-// This reference is deliberately NOT the accurate one above. vLLM computes its
-// cos/sin cache once on the host in fp32 and then rounds the whole table to
-// bf16 before storing it; the `triton_mrope` path indexes that bf16 table with
-// no fp32 cast and casts q/k down to match, so the rotate is bf16 too. A Pie
-// that computed accurate fp32 trig per token would be MORE accurate than the
-// reference and still mismatch it, so what is pinned here is the ROUNDING
-// STRUCTURE, not the accuracy:
+// WHAT THE REFERENCE IS. vLLM's `cos_sin_cache`, embedded verbatim in
+// rope_vllm_cos_sin_golden.hpp. Not a formula evaluated here, not a
+// recomputation, and deliberately NOT fp64 truth.
 //
-//   4. inv_freq = 1 / theta^(2j/rotary_dim)  -- reciprocal AFTER the power,
-//      positive exponent; not the `theta^(-2j/d)` the default path uses
-//   5. cos/sin rounded to bf16 (RNE) BEFORE they are used at all
-//   6. the rotate itself in bf16: three separately-rounded operations per
-//      output, not one fp32 expression rounded at the end
+// WHY fp64 TRUTH IS THE WRONG REFERENCE, and must not be reintroduced. vLLM
+// builds that cache once at init in fp32 and then does `cache.to(dtype)`,
+// which rounds the whole table to bf16 and stores it; the `triton_mrope` path
+// indexes those bf16 values with no fp32 cast and casts q/k down to match. The
+// reference value is a rounded, lossy number BY CONSTRUCTION. An
+// implementation that computed cos/sin more accurately would move AWAY from
+// it. On this path a more accurate kernel is a WORSE kernel. Any assertion
+// phrased as "how close is this to the true cosine" measures the wrong thing
+// and will point the next reader in the wrong direction -- an earlier draft of
+// this file asserted exactly that (it demanded the table path beat the default
+// path against an fp64 reference) and had to be withdrawn, because the change
+// this file guards cannot satisfy it and should not.
 //
-// Numbering continues the three assertions listed at the top of this file;
-// 1-3 (which channels rotate, which pass through, the denominator) apply to
-// this path unchanged and are checked for it as well.
+// The property under test is reproduction of the reference's BITS. Nothing in
+// the vLLM checks below evaluates a transcendental at all.
+//
+// HOW THE TABLE IS READ BACK. The kernel exposes no table, so feed it a head
+// whose rotated slice is a = 1.0, b = 0.0:
+//
+//   out[j]          = (1*cos) - (0*sin) = cos[j]
+//   out[j+angles]   = (0*cos) + (1*sin) = sin[j]
+//
+// Every operand is already bf16 and every product is exact, so the output IS
+// the table row, bit for bit, with no tolerance anywhere. It reads out the
+// fp32-rotate path just as exactly as the bf16 one, so the same probe compares
+// both against the same golden.
+//
+// TOLERANCE: NONE. Zero mismatches, no allowance for rounding-boundary ties.
+// One bf16 ulp in cos can flip a token whose logits sit near a decision
+// boundary, so an allowance would quietly bless a token flip. If this
+// assertion goes red, the parity defect is real and small: report it with the
+// positions and lanes below. Do not widen the bar to reach green.
+constexpr int kGoldenHeadDim = 256;
 
-float vllm_inv_freq(float theta, int j, int rotary_dim) {
-    const float exponent = (2.f * static_cast<float>(j)) /
-                           static_cast<float>(rotary_dim);
-    const float p = static_cast<float>(
-        std::pow(static_cast<double>(theta), static_cast<double>(exponent)));
-    return 1.f / p;
-}
-
-// A lane whose accurate fp32 trig value sits within `kTieMargin` fp32 ulp of a
-// bf16 rounding boundary can round either way depending on which correctly-
-// rounded-to-2-ulp implementation evaluated it (device `sincosf` vs host
-// `std::cos`). Those lanes are excluded from the bit-exact comparison and
-// counted instead. The exclusion is deterministic -- fixed seed, fixed
-// positions -- so this cannot make the test flaky; it is reported so that a
-// change which silently pushes many lanes into the excluded set is visible.
-constexpr std::uint32_t kTieMargin = 16;
-
-bool near_bf16_boundary(float v) {
-    std::uint32_t bits;
-    std::memcpy(&bits, &v, sizeof(bits));
-    const std::uint32_t r = bits & 0xffffu;
-    return r + kTieMargin >= 0x8000u && r <= 0x8000u + kTieMargin;
-}
-
-// Rotates in place over bf16 bit patterns, so every rounding the kernel does is
-// reproduced here rather than approximated.
-void reference_rope_partial_vllm(
-    std::vector<std::uint16_t>& head, int rotary_dim, int pos, float theta,
-    std::vector<char>& lane_excluded) {
+// One head laid out so the rotated slice reads back as the cos/sin row.
+void fill_table_probe_head(std::uint16_t* head, int head_dim, int rotary_dim) {
     const int angles = rotary_dim / 2;
-    const std::vector<std::uint16_t> in = head;
-    for (int j = 0; j < angles; ++j) {
-        const float ang = static_cast<float>(pos) *
-                          vllm_inv_freq(theta, j, rotary_dim);
-        const float c32 = static_cast<float>(std::cos(static_cast<double>(ang)));
-        const float s32 = static_cast<float>(std::sin(static_cast<double>(ang)));
-        lane_excluded[j] =
-            near_bf16_boundary(c32) || near_bf16_boundary(s32) ? 1 : 0;
+    for (int d = 0; d < head_dim; ++d) head[d] = 0x0000;  // +0.0f
+    for (int j = 0; j < angles; ++j) head[j] = 0x3f80;    // 1.0f
+}
 
-        const float c = bf16_to_float(float_to_bf16(c32));
-        const float s = bf16_to_float(float_to_bf16(s32));
-        const float a = bf16_to_float(in[j]);
-        const float b = bf16_to_float(in[j + angles]);
+enum class Path { Default, VllmTable };
 
-        // Three roundings per output, in Triton's operand order.
-        const float ac = bf16_to_float(float_to_bf16(a * c));
-        const float bs = bf16_to_float(float_to_bf16(b * s));
-        const float bc = bf16_to_float(float_to_bf16(b * c));
-        const float as = bf16_to_float(float_to_bf16(a * s));
-        head[j] = float_to_bf16(ac - bs);
-        head[j + angles] = float_to_bf16(bc + as);
+// Recovers [kRows][kRotaryDim] of whichever path is asked for.
+std::vector<std::uint16_t> read_back_table(Path path) {
+    namespace g = pie_rope_golden;
+    const int tokens = g::kRows;
+    const int total = tokens * kGoldenHeadDim;
+
+    std::vector<std::uint16_t> buf(total);
+    std::vector<std::int32_t> positions(tokens);
+    for (int n = 0; n < tokens; ++n) {
+        positions[n] = g::kCosSinCache[n].pos;
+        fill_table_probe_head(buf.data() + n * kGoldenHeadDim, kGoldenHeadDim,
+                              g::kRotaryDim);
     }
-    // [rotary_dim, head_dim) deliberately untouched.
+
+    void *dq = nullptr, *dk = nullptr;  // distinct: both are `__restrict__`
+    std::int32_t* dpos = nullptr;
+    cudaMalloc(&dq, total * sizeof(std::uint16_t));
+    cudaMalloc(&dk, sizeof(std::uint16_t));
+    cudaMalloc(&dpos, tokens * sizeof(std::int32_t));
+    cudaMemcpy(dq, buf.data(), total * sizeof(std::uint16_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dpos, positions.data(), tokens * sizeof(std::int32_t),
+               cudaMemcpyHostToDevice);
+
+    if (path == Path::VllmTable) {
+        kernels::launch_rope_partial_vllm_table_bf16(
+            dq, dk, dpos, tokens, /*num_q_heads=*/1, /*num_kv_heads=*/0,
+            kGoldenHeadDim, g::kRotaryDim, g::kTheta, /*stream=*/nullptr);
+    } else {
+        kernels::launch_rope_partial_bf16(
+            dq, dk, dpos, tokens, /*num_q_heads=*/1, /*num_kv_heads=*/0,
+            kGoldenHeadDim, g::kRotaryDim, g::kTheta, /*stream=*/nullptr);
+    }
+    cudaDeviceSynchronize();
+    cudaMemcpy(buf.data(), dq, total * sizeof(std::uint16_t), cudaMemcpyDeviceToHost);
+    cudaFree(dq); cudaFree(dk); cudaFree(dpos);
+
+    std::vector<std::uint16_t> table(tokens * g::kRotaryDim);
+    for (int n = 0; n < tokens; ++n)
+        for (int e = 0; e < g::kRotaryDim; ++e)
+            table[n * g::kRotaryDim + e] = buf[n * kGoldenHeadDim + e];
+    return table;
+}
+
+int count_table_mismatches(const std::vector<std::uint16_t>& got, bool report) {
+    namespace g = pie_rope_golden;
+    int bad = 0, printed = 0;
+    for (int n = 0; n < g::kRows; ++n) {
+        for (int e = 0; e < g::kRotaryDim; ++e) {
+            const std::uint16_t want = g::kCosSinCache[n].entry[e];
+            const std::uint16_t have = got[n * g::kRotaryDim + e];
+            if (have == want) continue;
+            ++bad;
+            if (!report || printed >= 10) continue;
+            ++printed;
+            const int ulp = static_cast<int>(have) - static_cast<int>(want);
+            std::printf("      pos=%-6d %s[%2d]  got=0x%04x want=0x%04x  "
+                        "delta=%+d bf16 ulp\n",
+                        g::kCosSinCache[n].pos,
+                        e < g::kAngles ? "cos" : "sin",
+                        e < g::kAngles ? e : e - g::kAngles, have, want, ulp);
+        }
+    }
+    if (report && bad > printed)
+        std::printf("      ... and %d more\n", bad - printed);
+    return bad;
 }
 
 struct Case {
@@ -269,171 +330,136 @@ void run_case(const Case& c) {
                 passthrough_violations);
 }
 
-// Bit-exact guard for the vLLM-table path. Positions are LONG on purpose:
-// `inv_freq[0]` is exactly 1.0 at rotary_dim=64/theta=1e7, so lane 0's angle in
-// radians is the token position itself, and everything this path exists to fix
-// only becomes visible past a few hundred.
-void run_vllm_case(const Case& c) {
+// ── The parity assertion: knob-on must reproduce vLLM's table exactly ──────
+void run_vllm_golden_table() {
+    namespace g = pie_rope_golden;
+    const std::vector<std::uint16_t> got = read_back_table(Path::VllmTable);
+    const int bad = count_table_mismatches(got, /*report=*/true);
+    const bool ok = bad == 0;
+    if (!ok) ++g_failures;
+    std::printf("[%s] %-28s rotary_dim=%d  entries=%d  mismatches_vs_vllm=%d "
+                "(required: 0)\n",
+                ok ? "ok" : "FAIL", "vllm-table matches cache",
+                g::kRotaryDim, g::kRows * g::kRotaryDim, bad);
+}
+
+// ── The knob-off assertion: it must NOT reproduce vLLM's table ─────────────
+//
+// Without this, a silent regression that routed the knob back to the default
+// kernel -- or a knob that never took effect -- would leave the check above
+// passing for the wrong reason. The default path uses the `__sincosf` SFU
+// intrinsic and a `theta^(-2j/d)` exponent form, so it disagrees with the
+// reference table on a few percent of entries. The floor is set well below the
+// campaign's measured disagreement rate (~3.8% of entries at corpus lengths,
+// ~4.9% past position 20000) so this states a real property rather than a
+// tuned threshold.
+void run_default_path_differs() {
+    namespace g = pie_rope_golden;
+    const int entries = g::kRows * g::kRotaryDim;
+    const std::vector<std::uint16_t> got = read_back_table(Path::Default);
+    const int bad = count_table_mismatches(got, /*report=*/false);
+    const int floor = entries / 100;  // 1%, vs ~4% measured
+    const bool ok = bad >= floor;
+    if (!ok) ++g_failures;
+    std::printf("[%s] %-28s entries=%d  mismatches_vs_vllm=%d (required: >=%d, "
+                "the knob must actually change something)\n",
+                ok ? "ok" : "FAIL", "default path differs", entries, bad, floor);
+}
+
+// ── The bf16 rotate structure, on real data ────────────────────────────────
+//
+// The read-back probe above pins the TABLE but not the ROTATE: with a=1, b=0
+// an fp32 rotate and a bf16 rotate agree trivially. This drives random bf16
+// operands and reproduces the rotate exactly -- three separately-rounded
+// operations per output, in Triton's operand order -- with cos/sin taken FROM
+// THE GOLDEN TABLE rather than recomputed, so no transcendental is evaluated
+// here either and there is nothing to be tolerant about.
+void run_vllm_rotate_structure(int head_dim) {
+    namespace g = pie_rope_golden;
+    constexpr int q_heads = 4, kv_heads = 2;
+    const int tokens = g::kRows;
+    const int angles = g::kAngles;
+    const int total_q = tokens * q_heads * head_dim;
+    const int total_k = tokens * kv_heads * head_dim;
+
     std::mt19937 rng(4321);
     std::uniform_real_distribution<float> dist(-1.f, 1.f);
-
-    const int total_q = c.num_tokens * c.num_q_heads * c.head_dim;
-    const int total_k = c.num_tokens * c.num_kv_heads * c.head_dim;
     std::vector<std::uint16_t> q(total_q), k(total_k);
     for (int i = 0; i < total_q; ++i) q[i] = float_to_bf16(dist(rng));
     for (int i = 0; i < total_k; ++i) k[i] = float_to_bf16(dist(rng));
     const std::vector<std::uint16_t> q_in = q, k_in = k;
     std::vector<std::uint16_t> q_ref = q, k_ref = k;
 
-    std::vector<std::int32_t> positions(c.num_tokens);
-    for (int n = 0; n < c.num_tokens; ++n) positions[n] = 13000 + 1777 * n;
+    std::vector<std::int32_t> positions(tokens);
+    for (int n = 0; n < tokens; ++n) positions[n] = g::kCosSinCache[n].pos;
 
-    const int angles = c.rotary_dim / 2;
-    // excluded[token][j]: set by the reference when lane j of that token's row
-    // sits on a bf16 rounding boundary.
-    std::vector<std::vector<char>> excluded(
-        c.num_tokens, std::vector<char>(angles, 0));
-
-    auto ref_heads = [&](std::vector<std::uint16_t>& buf, int heads) {
-        for (int n = 0; n < c.num_tokens; ++n) {
+    auto rotate_ref = [&](std::vector<std::uint16_t>& buf, int heads) {
+        for (int n = 0; n < tokens; ++n) {
             for (int h = 0; h < heads; ++h) {
-                const int base = (n * heads + h) * c.head_dim;
-                std::vector<std::uint16_t> head(buf.begin() + base,
-                                                buf.begin() + base + c.head_dim);
-                reference_rope_partial_vllm(head, c.rotary_dim, positions[n],
-                                            c.theta, excluded[n]);
-                std::copy(head.begin(), head.end(), buf.begin() + base);
+                const int base = (n * heads + h) * head_dim;
+                for (int j = 0; j < angles; ++j) {
+                    const float c = bf16_to_float(g::kCosSinCache[n].entry[j]);
+                    const float s =
+                        bf16_to_float(g::kCosSinCache[n].entry[angles + j]);
+                    const float a = bf16_to_float(buf[base + j]);
+                    const float b = bf16_to_float(buf[base + j + angles]);
+                    const float ac = bf16_to_float(float_to_bf16(a * c));
+                    const float bs = bf16_to_float(float_to_bf16(b * s));
+                    const float bc = bf16_to_float(float_to_bf16(b * c));
+                    const float as = bf16_to_float(float_to_bf16(a * s));
+                    buf[base + j] = float_to_bf16(ac - bs);
+                    buf[base + j + angles] = float_to_bf16(bc + as);
+                }
             }
         }
     };
-    ref_heads(q_ref, c.num_q_heads);
-    ref_heads(k_ref, c.num_kv_heads);
+    rotate_ref(q_ref, q_heads);
+    rotate_ref(k_ref, kv_heads);
 
     void *dq = nullptr, *dk = nullptr;
     std::int32_t* dpos = nullptr;
     cudaMalloc(&dq, total_q * sizeof(std::uint16_t));
     cudaMalloc(&dk, total_k * sizeof(std::uint16_t));
-    cudaMalloc(&dpos, c.num_tokens * sizeof(std::int32_t));
+    cudaMalloc(&dpos, tokens * sizeof(std::int32_t));
     cudaMemcpy(dq, q.data(), total_q * sizeof(std::uint16_t), cudaMemcpyHostToDevice);
     cudaMemcpy(dk, k.data(), total_k * sizeof(std::uint16_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(dpos, positions.data(), c.num_tokens * sizeof(std::int32_t),
+    cudaMemcpy(dpos, positions.data(), tokens * sizeof(std::int32_t),
                cudaMemcpyHostToDevice);
-
     kernels::launch_rope_partial_vllm_table_bf16(
-        dq, dk, dpos, c.num_tokens, c.num_q_heads, c.num_kv_heads, c.head_dim,
-        c.rotary_dim, c.theta, /*stream=*/nullptr);
+        dq, dk, dpos, tokens, q_heads, kv_heads, head_dim, g::kRotaryDim,
+        g::kTheta, /*stream=*/nullptr);
     cudaDeviceSynchronize();
     cudaMemcpy(q.data(), dq, total_q * sizeof(std::uint16_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(k.data(), dk, total_k * sizeof(std::uint16_t), cudaMemcpyDeviceToHost);
     cudaFree(dq); cudaFree(dk); cudaFree(dpos);
 
-    int bit_mismatches = 0, passthrough_violations = 0, skipped = 0;
+    int bit_mismatches = 0, passthrough_violations = 0;
     auto check = [&](const std::vector<std::uint16_t>& got,
                      const std::vector<std::uint16_t>& in,
                      const std::vector<std::uint16_t>& ref, int heads) {
-        for (int n = 0; n < c.num_tokens; ++n) {
+        for (int n = 0; n < tokens; ++n)
             for (int h = 0; h < heads; ++h) {
-                const int base = (n * heads + h) * c.head_dim;
-                for (int d = 0; d < c.head_dim; ++d) {
-                    if (d >= c.rotary_dim) {
-                        // Assertion 2: pass-through stays bit-identical here too.
+                const int base = (n * heads + h) * head_dim;
+                for (int d = 0; d < head_dim; ++d) {
+                    if (d >= g::kRotaryDim) {
+                        // Assertion 2 holds on this path too.
                         if (got[base + d] != in[base + d]) ++passthrough_violations;
-                        continue;
+                    } else if (got[base + d] != ref[base + d]) {
+                        ++bit_mismatches;
                     }
-                    if (excluded[n][d % angles]) { ++skipped; continue; }
-                    // Assertions 1, 3, 4, 5, 6: every rounding reproduced.
-                    if (got[base + d] != ref[base + d]) ++bit_mismatches;
                 }
             }
-        }
     };
-    check(q, q_in, q_ref, c.num_q_heads);
-    check(k, k_in, k_ref, c.num_kv_heads);
+    check(q, q_in, q_ref, q_heads);
+    check(k, k_in, k_ref, kv_heads);
 
     const bool ok = bit_mismatches == 0 && passthrough_violations == 0;
     if (!ok) ++g_failures;
     std::printf("[%s] %-28s head_dim=%d rotary_dim=%d  bit_mismatches=%d  "
-                "passthrough_violations=%d  tie_lanes_skipped=%d\n",
-                ok ? "ok" : "FAIL", c.label, c.head_dim, c.rotary_dim,
-                bit_mismatches, passthrough_violations, skipped);
+                "passthrough_violations=%d (required: 0/0)\n",
+                ok ? "ok" : "FAIL", "vllm-table rotate", head_dim,
+                g::kRotaryDim, bit_mismatches, passthrough_violations);
 }
-
-// Non-vacuity, and the sign of the fix. At position 20000 the default path's
-// `__sincosf` has lost its range reduction -- lane 0's angle is 20000 rad --
-// while the vLLM-table path should land within a couple of bf16 steps of true
-// math. If this ever reports the two paths as comparable, either the knob is
-// not routing or `sincosf` has been mapped onto the intrinsic by a fast-math
-// flag, and the whole change is inert.
-void run_long_position_probe() {
-    constexpr int head_dim = 256, rotary_dim = 64, heads = 4;
-    constexpr float theta = 1e7f;
-    // Several long positions, not one: `__sincosf`'s error at a single position
-    // could land small by luck, and a probe that can pass by luck is not a probe.
-    const std::vector<std::int32_t> positions = {13000, 16384, 20000, 24000};
-    const int tokens = static_cast<int>(positions.size());
-    const int total = tokens * heads * head_dim;
-
-    std::mt19937 rng(99);
-    std::uniform_real_distribution<float> dist(-1.f, 1.f);
-    std::vector<std::uint16_t> src(total);
-    for (int i = 0; i < total; ++i) src[i] = float_to_bf16(dist(rng));
-
-    std::vector<float> ref(total);
-    for (int i = 0; i < total; ++i) ref[i] = bf16_to_float(src[i]);
-    for (int n = 0; n < tokens; ++n) {
-        for (int h = 0; h < heads; ++h) {
-            const int base = (n * heads + h) * head_dim;
-            std::vector<float> head(ref.begin() + base,
-                                    ref.begin() + base + head_dim);
-            reference_rope_partial(head, head_dim, rotary_dim, positions[n], theta);
-            std::copy(head.begin(), head.end(), ref.begin() + base);
-        }
-    }
-
-    auto max_err = [&](bool vllm_table) {
-        std::vector<std::uint16_t> buf = src;
-        void *d = nullptr, *dk = nullptr;   // q and k stay distinct: both are
-        std::int32_t* dpos = nullptr;       // `__restrict__` on the kernel.
-        cudaMalloc(&d, total * sizeof(std::uint16_t));
-        cudaMalloc(&dk, sizeof(std::uint16_t));
-        cudaMalloc(&dpos, tokens * sizeof(std::int32_t));
-        cudaMemcpy(d, buf.data(), total * sizeof(std::uint16_t), cudaMemcpyHostToDevice);
-        cudaMemcpy(dpos, positions.data(), tokens * sizeof(std::int32_t),
-                   cudaMemcpyHostToDevice);
-        if (vllm_table) {
-            kernels::launch_rope_partial_vllm_table_bf16(
-                d, dk, dpos, tokens, heads, 0, head_dim, rotary_dim, theta, nullptr);
-        } else {
-            kernels::launch_rope_partial_bf16(
-                d, dk, dpos, tokens, heads, 0, head_dim, rotary_dim, theta, nullptr);
-        }
-        cudaDeviceSynchronize();
-        cudaMemcpy(buf.data(), d, total * sizeof(std::uint16_t), cudaMemcpyDeviceToHost);
-        cudaFree(d); cudaFree(dk); cudaFree(dpos);
-        double m = 0.0;
-        for (int n = 0; n < tokens; ++n)
-            for (int h = 0; h < heads; ++h)
-                for (int j = 0; j < rotary_dim; ++j) {
-                    const int i = (n * heads + h) * head_dim + j;
-                    m = std::fmax(m, std::fabs(bf16_to_float(buf[i]) - ref[i]));
-                }
-        return m;
-    };
-
-    const double err_default = max_err(false);
-    const double err_table = max_err(true);
-    // One bf16 step at unit scale is ~7.8e-3 and a bf16 rotate rounds three
-    // times, so 4e-2 is a loose ceiling on a correct table path. Measured on
-    // the host, bf16(cos(fp32 angle)) is within 1.8e-3 of true math across
-    // every lane at position 20000.
-    const bool ok = err_table <= 4e-2 && err_default > 10.0 * err_table;
-    if (!ok) ++g_failures;
-    std::printf("[%s] %-28s positions=13000..24000  err_default=%.3e  "
-                "err_vllm_table=%.3e\n",
-                ok ? "ok" : "FAIL", "long-position-probe",
-                err_default, err_table);
-}
-
 }  // namespace
 
 int main() {
@@ -463,14 +489,12 @@ int main() {
     };
     for (const auto& c : cases) run_case(c);
 
-    // Same channel contract, vLLM's rounding structure.
-    const Case vllm_cases[] = {
-        {"vllm-table qwen3.5-9b", 256, 64, 8, 2, 4, 1e7f},
-        {"vllm-table partial-half", 128, 64, 4, 2, 3, 1e6f},
-        {"vllm-table full-rotary", 128, 128, 4, 2, 3, 1e6f},
-    };
-    for (const auto& c : vllm_cases) run_vllm_case(c);
-    run_long_position_probe();
+    // Parity against vLLM's own cos_sin_cache. Zero tolerance, both directions:
+    // knob-on must reproduce it, knob-off must not.
+    run_vllm_golden_table();
+    run_default_path_differs();
+    run_vllm_rotate_structure(256);   // production shape
+    run_vllm_rotate_structure(128);   // head_dim != 4 * rotary_dim
 
     if (g_failures != 0) {
         std::printf("\n%d check(s) FAILED\n", g_failures);
