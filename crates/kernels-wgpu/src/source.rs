@@ -89,9 +89,8 @@ pub fn source(path: &str) -> Option<&'static str> {
 
 /// Every variant the tree declares, with the file each was declared in.
 ///
-/// The census `entrypoints.generated.txt` is written from, and what
-/// `tests/entrypoints.rs` compares against the table's own product. A tree and
-/// a table that disagree is a test failure here rather than a "no such
+/// What `tests/entrypoints.rs` compares against the table's own product. A
+/// tree and a table that disagree is a test failure here rather than a "no such
 /// pipeline" at the first fire.
 ///
 /// # Panics

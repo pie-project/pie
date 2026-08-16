@@ -28,20 +28,20 @@
 // is the Vulkan table's, operand for operand, and not a translation of Metal's
 // buffer indices (that translation is what cost the Vulkan port sixty misbound
 // entrypoints).
-@group(0) @binding(0) var<storage, read> w: array<u32>;
+@group(0) @binding(0) var<storage, read_write> w: array<u32>;
 //#if defined(PIE_MXFP4)
 // E8M0, one BYTE per 32-element block: four to a `u32` word, lowest first.
-@group(0) @binding(1) var<storage, read> exponents: array<u32>;
-@group(0) @binding(2) var<storage, read> x: array<u32>;
+@group(0) @binding(1) var<storage, read_write> exponents: array<u32>;
+@group(0) @binding(2) var<storage, read_write> x: array<u32>;
 @group(0) @binding(3) var<storage, read_write> y: array<atomic<u32>>;
-@group(0) @binding(4) var<storage, read> bias: array<u32>;
-@group(0) @binding(5) var<storage, read> tile_expert: array<i32>;
+@group(0) @binding(4) var<storage, read_write> bias: array<u32>;
+@group(0) @binding(5) var<storage, read_write> tile_expert: array<i32>;
 //#else
-@group(0) @binding(1) var<storage, read> scales: array<u32>;
-@group(0) @binding(2) var<storage, read> biases: array<u32>;
-@group(0) @binding(3) var<storage, read> x: array<u32>;
+@group(0) @binding(1) var<storage, read_write> scales: array<u32>;
+@group(0) @binding(2) var<storage, read_write> biases: array<u32>;
+@group(0) @binding(3) var<storage, read_write> x: array<u32>;
 @group(0) @binding(4) var<storage, read_write> y: array<atomic<u32>>;
-@group(0) @binding(5) var<storage, read> tile_expert: array<i32>;
+@group(0) @binding(5) var<storage, read_write> tile_expert: array<i32>;
 //#endif
 
 // The reduction length and the output width. Both are the SORTED tensor's, so

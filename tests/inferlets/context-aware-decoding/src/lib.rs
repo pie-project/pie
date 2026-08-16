@@ -369,6 +369,18 @@ fn report(
     } else {
         kl_total / scored as f64
     };
+    // KL is non-negative by Jensen, so a negative one is float error in the
+    // sum rather than a measurement: at alpha = 0 every term is the rounding
+    // between two log-softmaxes of the same logits, and the total lands
+    // either side of zero at around 1e-9. Printing that as `mean_kl=-0.0000`
+    // makes the sign bit of a value indistinguishable from zero look like a
+    // failed identity. Clamped only inside the noise -- a mean KL genuinely
+    // below -1e-6 is a defect, and stays visible.
+    let mean_kl = if (-1e-6..0.0).contains(&mean_kl) {
+        0.0
+    } else {
+        mean_kl
+    };
     let identity = if alpha.abs() < 1e-6 && (shifts > 0 || mean_kl > 1e-3) {
         " IDENTITY-VIOLATION"
     } else {

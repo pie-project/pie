@@ -1,6 +1,6 @@
 //! What happens when a trace states one of `moe`'s symbols.
 //!
-//! These were `bind!` arms inside `kernels-cuda-new`. They read the driver's
+//! These were `bind!` arms inside `kernels-cuda`. They read the driver's
 //! own vocabulary through [`Cx`], so they belong on this side of the seam:
 //! the kernels crate exposes routines, and joining a statement to one is the
 //! driver's job.
@@ -8,9 +8,9 @@
 use core::ffi::c_void;
 
 use kernels::Refusal;
-use kernels_cuda_new::jit::Ctx;
-use kernels_cuda_new::x::abi::bf16;
-use kernels_cuda_new::x::moe::*;
+use kernels_cuda::jit::Ctx;
+use kernels_cuda::jit::abi::bf16;
+use kernels_cuda::moe::*;
 
 use super::super::cx::Cx;
 use super::Bound;
@@ -20,7 +20,7 @@ fn apply_per_expert_scale_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Re
     let top_k = cx.in_width(1)?;
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    apply_per_expert_scale_bf16(
+    apply_per_expert_scale::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<i32>(),
         cx.arg_in(1)?.cast::<f32>(),
@@ -34,7 +34,7 @@ fn topk_sqrtsoftplus_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal
     let correction_bias = cx.weight(0).map_or(core::ptr::null(), |w| w.cast_const().cast::<f32>());
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    topk_sqrtsoftplus_bf16(
+    topk_sqrtsoftplus::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.arg_out(0)?.cast::<i32>(),
@@ -111,7 +111,7 @@ fn gather_moe_aligned_inputs_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(),
     let top_k = i32::try_from(cx.param(0)?).unwrap_or(0);
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    gather_moe_aligned_inputs_bf16(
+    gather_moe_aligned_inputs::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.arg_in(1)?.cast_const().cast::<i32>(),
@@ -130,7 +130,7 @@ fn reorder_moe_aligned_output_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<()
     let top_k = i32::try_from(cx.param(0)?).unwrap_or(0);
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    reorder_moe_aligned_output_bf16(
+    reorder_moe_aligned_output::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.arg_in(1)?.cast_const().cast::<i32>(),
@@ -149,7 +149,7 @@ fn topk_sigmoid_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     let correction_bias = cx.weight(0).map_or(core::ptr::null(), |w| w.cast_const().cast::<f32>());
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    topk_sigmoid_bf16(
+    topk_sigmoid::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.arg_out(0)?.cast::<i32>(),
@@ -167,7 +167,7 @@ fn topk_sigmoid_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
 fn topk_softmax_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    topk_softmax_bf16(
+    topk_softmax::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.arg_out(0)?.cast::<i32>(),
@@ -186,7 +186,7 @@ fn moe_gate_up_gemv_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal>
     }
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    moe_gate_up_decode_gemv_bf16(
+    moe_gate_up_decode_gemv::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<i32>(),
         cx.arg_in(1)?.cast_const().cast::<bf16>(),
@@ -207,7 +207,7 @@ fn moe_down_gemv_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     }
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    moe_down_decode_gemv_bf16(
+    moe_down_decode_gemv::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<i32>(),
         cx.arg_in(1)?.cast_const().cast::<bf16>(),
@@ -224,7 +224,7 @@ fn moe_down_gemv_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
 fn moe_weighted_sum_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    token_batched_weighted_sum_bf16(
+    token_batched_weighted_sum::<bf16>(
         &ctx,
         cx.arg_out(0)?.cast::<bf16>(),
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
@@ -239,7 +239,7 @@ fn moe_weighted_sum_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal>
 fn moe_weighted_sum_add_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    token_batched_weighted_sum_add_bf16(
+    token_batched_weighted_sum_add::<bf16>(
         &ctx,
         cx.arg_out(0)?.cast::<bf16>(),
         cx.arg_in(0)?.cast_const().cast::<bf16>(),

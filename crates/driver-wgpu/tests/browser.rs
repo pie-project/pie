@@ -155,9 +155,37 @@ fn build(package: &str, features: &[&str]) -> Result<(), String> {
     })
 }
 
+/// Whether a skip is allowed at all.
+///
+/// The skip below is right for a local checkout and wrong for CI, and nothing
+/// distinguished the two. `dtolnay/rust-toolchain@stable` installs no extra
+/// targets, so on the runner every test in this file took the skip path and
+/// PASSED — and `cargo test` hides a passing test's stdout, so the message
+/// explaining that was never printed either. The claim this whole backend
+/// exists to make was unmeasured, by six green tests.
+///
+/// Installing the target in the workflow fixes it once. This makes it stay
+/// fixed: with `PIE_WGPU_REQUIRE_BROWSER=1` set, a missing target is a
+/// FAILURE naming what to do, so the day someone drops the `targets:` line
+/// the job goes red instead of quiet.
+fn skipping_is_allowed() -> bool {
+    std::env::var("PIE_WGPU_REQUIRE_BROWSER")
+        .ok()
+        .filter(|v| !v.is_empty() && v != "0")
+        .is_none()
+}
+
 macro_rules! skip_unless_target {
     () => {
         if !target_installed() {
+            assert!(
+                skipping_is_allowed(),
+                "`{TARGET}` is not installed and PIE_WGPU_REQUIRE_BROWSER is \
+                 set, so this cannot be skipped: `rustup target add {TARGET}`, \
+                 or add it to the job's `targets:` if this is CI. Whether this \
+                 backend reaches a browser is the one claim it has that its \
+                 siblings do not."
+            );
             println!(
                 "SKIP: `{TARGET}` is not installed for this toolchain, so \
                  whether this backend reaches a browser is unmeasured. \

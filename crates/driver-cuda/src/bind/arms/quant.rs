@@ -1,6 +1,6 @@
 //! What happens when a trace states one of `quant`'s symbols.
 //!
-//! These were `bind!` arms inside `kernels-cuda-new`. They read the driver's
+//! These were `bind!` arms inside `kernels-cuda`. They read the driver's
 //! own vocabulary through [`Cx`], so they belong on this side of the seam:
 //! the kernels crate exposes routines, and joining a statement to one is the
 //! driver's job.
@@ -8,9 +8,9 @@
 use core::ffi::c_void;
 
 use kernels::Refusal;
-use kernels_cuda_new::jit::Ctx;
-use kernels_cuda_new::x::abi::{bf16, f16};
-use kernels_cuda_new::x::quant::*;
+use kernels_cuda::jit::Ctx;
+use kernels_cuda::jit::abi::{bf16, f16};
+use kernels_cuda::quant::*;
 
 use super::super::cx::Cx;
 use super::Bound;
@@ -20,7 +20,7 @@ fn dequant_wna16_int4b8_to_bf16_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<
     let group_size = i32::try_from(cx.param(0)?).unwrap_or(0);
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    dequant_wna16_int4b8_to_bf16(
+    dequant_wna16_int4b8_to::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<i32>(),
         cx.arg_in(1)?.cast_const().cast::<bf16>(),
@@ -41,7 +41,7 @@ fn cast_fp32_to_bf16_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal
     let n = rows.unsigned_abs() as usize * width.unsigned_abs() as usize;
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    cast_fp32_to_bf16(
+    cast_fp32_to::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<f32>(),
         cx.arg_out(0)?.cast::<bf16>(),
@@ -80,7 +80,7 @@ fn dequant_fp8_e4m3_to_bf16_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), 
     let n = rows.unsigned_abs() as usize * width.unsigned_abs() as usize;
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    dequant_fp8_e4m3_to_bf16(
+    dequant_fp8_e4m3_to::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<u8>(),
         cx.arg_out(0)?.cast::<bf16>(),
@@ -126,7 +126,7 @@ fn dequant_fp8_e4m3_to_bf16_per_group_arm(cx: &Cx<'_>, stream: *mut c_void) -> R
 fn dequant_mxfp4_to_bf16_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    dequant_mxfp4_to_bf16(
+    dequant_mxfp4_to::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<u8>(),
         cx.arg_in(1)?.cast_const().cast::<u8>(),
@@ -153,7 +153,7 @@ fn bf16_to_fp16_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
 fn scale_rows_bf16_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    scale_rows_bf16(
+    scale_rows::<bf16>(
         &ctx,
         cx.arg_out(0)?.cast::<bf16>(),
         cx.arg_in(1)?.cast_const().cast::<bf16>(),

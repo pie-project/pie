@@ -1,5 +1,6 @@
 #pragma once
-// Stub for kernels-cuda/csrc/src/layout/slot_ops.hpp.
+// Stub for layout/slot_ops.hpp in the archive crate's csrc/src -- the host
+// header, deleted with that crate at 85c6c674b.
 //
 // `zero_slots_if_fresh` is a device-predicated scatter: the slot ids live in
 // device memory, so which rows it touches is not knowable on the host. What IS

@@ -45,8 +45,8 @@ use crate::manifest::Manifest;
 use crate::shared::llama_like::project;
 use crate::shared::llama_like::spec::LlamaLikeFacts;
 
-use model_compiler::facts::{NormPlacement, QkNorm};
-use model_compiler::trace::{NormVariant, RopeKind};
+use model_ir::facts::{NormPlacement, QkNorm};
+use model_ir::trace::{NormVariant, RopeKind};
 
 /// One OLMo 3 checkpoint.
 pub struct Olmo3 {
@@ -284,9 +284,9 @@ impl Variant for Olmo3 {
     /// rather than something a family assumes — see [`crate::olmo_2`].
     fn trace(
         &self,
-        class: model_compiler::trace::FireClass,
+        class: model_ir::trace::FireClass,
         load: Deployed<'_>,
-    ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
+    ) -> Result<model_ir::trace::ForwardPlan, crate::deployment::Refusal> {
         project::trace(&self.shape, self.row(), class, load)
     }
 
@@ -668,7 +668,7 @@ mod tests {
 
     #[test]
     fn every_row_traces_both_fire_classes() {
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
 
         for v in VARIANTS {
             for class in [FireClass::Decode, FireClass::Prefill] {
@@ -685,10 +685,10 @@ mod tests {
             }
         }
         let seven = row("olmo-3-7b")
-            .trace(model_compiler::trace::FireClass::Decode, Deployed::single())
+            .trace(model_ir::trace::FireClass::Decode, Deployed::single())
             .expect("traces");
         let thirty_two = row("olmo-3-32b")
-            .trace(model_compiler::trace::FireClass::Decode, Deployed::single())
+            .trace(model_ir::trace::FireClass::Decode, Deployed::single())
             .expect("traces");
         assert!(
             thirty_two.ops.len() > seven.ops.len(),

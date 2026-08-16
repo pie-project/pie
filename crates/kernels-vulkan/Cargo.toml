@@ -3,13 +3,13 @@ name = "kernels-vulkan"
 version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
-description = "Vulkan kernel implementations (GLSL compute shaders + SPIR-V variant instantiation) and the signature table that declares them."
+description = "Vulkan kernel implementations (Slang compute shaders + SPIR-V variant instantiation) and the signature table that declares them."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 publish = false
 
 # The shader directory. A Vulkan shell reads DEP_PIE_KERNELS_VULKAN_KERNELS_DIR
-# for the `.comp` tree, DEP_..._INCLUDE for the param headers a shader and its
+# for the `.slang` tree, DEP_..._INCLUDE for the param headers a shader and its
 # host caller must agree on, and — under `native` — DEP_..._SPV_DIR for the
 # compiled SPIR-V modules, one per entrypoint.
 links = "pie_kernels_vulkan"
@@ -20,10 +20,10 @@ name = "kernels_vulkan"
 path = "src/lib.rs"
 
 [features]
-# `native` is what costs `glslc`. Unlike Metal, Vulkan has no runtime shader
+# `native` is what costs `slangc`. Unlike Metal, Vulkan has no runtime shader
 # compiler in the driver: a pipeline is built from a SPIR-V module, so the
-# GLSL -> SPIR-V hop has to happen at BUILD time, and `native` is the hop.
-# Off by default for the reason it is off on both siblings — `model-compiler`
+# Slang -> SPIR-V hop has to happen at BUILD time, and `native` is the hop.
+# Off by default for the reason it is off on both siblings — `model-ir`
 # takes the signature table and should reach nothing else, least of all a
 # shader toolchain.
 default = []
@@ -34,14 +34,22 @@ kernels = { path = "../kernels" }
 
 [dev-dependencies]
 # The table test resolves through `sig_in`, which is the shared crate's, to
-# check the lookup `model-compiler` actually calls rather than a copy of it.
+# check the lookup `model-ir` actually calls rather than a copy of it.
 kernels = { path = "../kernels" }
 
-# Vulkan itself, for the GPU harness in `tests/gpu.rs` and `examples/probe.rs`
-# ONLY. It is a dev-dependency on purpose: this crate ships a table and a
-# shader tree, and a driver is what owns a device. If Vulkan ever appears under
+# Vulkan itself, for the GPU harness in `tests/gpu.rs` ONLY. It is a
+# dev-dependency on purpose: this crate ships a table and a shader tree, and
+# a driver is what owns a device. If Vulkan ever appears under
 # `[dependencies]` here, the layering has gone wrong.
 #
 # `loaded` and not `linked`: the loader is opened with `dlopen` at run time, so
 # a machine with no Vulkan at all still builds and still runs every other test.
 ash = { version = "0.38", default-features = false, features = ["loaded", "std"] }
+
+# NO `[[example]]` sections, and the absence is load-bearing for the reason
+# `kernels-cuda/Cargo.toml` states at length: a `[[example]]` whose file is
+# gone does not make a skipped target, it makes a manifest cargo cannot PARSE,
+# and this crate is a workspace member, so every command in the workspace fails
+# with it. `examples/` is deleted here -- `dump_layout.rs` printed the launch
+# ABI and `dump_rules.rs` printed each row's launch rule -- so there is no file
+# for such a section to name.

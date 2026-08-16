@@ -16,7 +16,7 @@
 //! { ... }
 //! ```
 //!
-//! [`routine!`] then produces its table row *from the signature* — the row
+//! [`macro@crate::routine`] then produces its table row *from the signature* — the row
 //! cannot drift from the code, because there is only one statement of it.
 //!
 //! ## Why [`Backend`]
@@ -38,7 +38,15 @@ pub trait Backend: Copy + 'static {
     /// A value bound to one argument — the backend's `ArgValue`.
     type Value: Copy;
     /// What a routine body launches through.
-    type Ctx;
+    ///
+    /// `?Sized`, because it is only ever named behind a reference and a
+    /// backend may not be able to own its device. CUDA's is a struct holding
+    /// the JIT cache and the cuBLAS handles; wgpu's is `dyn Encode`, because
+    /// `kernels-wgpu` depends on `kernels` and nothing else — it embeds WGSL
+    /// and cannot name an adapter, so the thing a body dispatches through has
+    /// to be supplied by the driver. A `Sized` bound here would have forced
+    /// that crate to take a `wgpu` dependency it exists not to have.
+    type Ctx<'a>: ?Sized;
 }
 
 /// Who supplies an argument.
@@ -143,7 +151,10 @@ impl core::fmt::Display for Refusal {
                 write!(f, "{what} is {at}, below the smallest unit of work")
             }
             Self::Wide { what, at, max } => {
-                write!(f, "{what} is {at}, above the {max} this kernel was compiled for")
+                write!(
+                    f,
+                    "{what} is {at}, above the {max} this kernel was compiled for"
+                )
             }
             Self::Null { what } => write!(f, "{what} is null"),
             Self::Misaligned { what } => write!(f, "{what} is not aligned as the kernel reads it"),
@@ -238,7 +249,7 @@ pub trait KernelFn<B: Backend, M>: Copy {
     ///
     /// Whatever the body refuses, or [`Refusal::Arity`] / [`Refusal::Kind`]
     /// if the list does not fit the signature.
-    fn invoke(self, ctx: &B::Ctx, args: &[B::Value]) -> Result<(), Refusal>;
+    fn invoke<'x>(self, ctx: &'x B::Ctx<'x>, args: &[B::Value]) -> Result<(), Refusal>;
 }
 
 /// Stamp [`KernelFn`] for one arity.
@@ -246,12 +257,12 @@ macro_rules! impl_kernel_fn {
     ($(($arg:ident, $at:tt)),* $(,)?) => {
         impl<B: Backend, F, $($arg: Arg<B>),*> KernelFn<B, ($($arg,)*)> for F
         where
-            F: Fn(&B::Ctx, $($arg),*) -> Result<(), Refusal> + Copy,
+            F: for<'x> Fn(&'x B::Ctx<'x>, $($arg),*) -> Result<(), Refusal> + Copy,
         {
             const ARGS: &'static [(Ty, Provenance)] = &[$(($arg::TY, $arg::PROV)),*];
             const SPELLING: &'static [&'static str] = &[$($arg::SPELLING),*];
 
-            fn invoke(self, ctx: &B::Ctx, args: &[B::Value]) -> Result<(), Refusal> {
+            fn invoke<'x>(self, ctx: &'x B::Ctx<'x>, args: &[B::Value]) -> Result<(), Refusal> {
                 // Fully qualified because one `F` may be a routine for more
                 // than one backend, which leaves `Self::ARGS` ambiguous.
                 let want = <Self as KernelFn<B, ($($arg,)*)>>::ARGS.len();
@@ -275,9 +286,36 @@ impl_kernel_fn!((A0, 0), (A1, 1), (A2, 2));
 impl_kernel_fn!((A0, 0), (A1, 1), (A2, 2), (A3, 3));
 impl_kernel_fn!((A0, 0), (A1, 1), (A2, 2), (A3, 3), (A4, 4));
 impl_kernel_fn!((A0, 0), (A1, 1), (A2, 2), (A3, 3), (A4, 4), (A5, 5));
-impl_kernel_fn!((A0, 0), (A1, 1), (A2, 2), (A3, 3), (A4, 4), (A5, 5), (A6, 6));
-impl_kernel_fn!((A0, 0), (A1, 1), (A2, 2), (A3, 3), (A4, 4), (A5, 5), (A6, 6), (A7, 7));
-impl_kernel_fn!((A0, 0), (A1, 1), (A2, 2), (A3, 3), (A4, 4), (A5, 5), (A6, 6), (A7, 7), (A8, 8));
+impl_kernel_fn!(
+    (A0, 0),
+    (A1, 1),
+    (A2, 2),
+    (A3, 3),
+    (A4, 4),
+    (A5, 5),
+    (A6, 6)
+);
+impl_kernel_fn!(
+    (A0, 0),
+    (A1, 1),
+    (A2, 2),
+    (A3, 3),
+    (A4, 4),
+    (A5, 5),
+    (A6, 6),
+    (A7, 7)
+);
+impl_kernel_fn!(
+    (A0, 0),
+    (A1, 1),
+    (A2, 2),
+    (A3, 3),
+    (A4, 4),
+    (A5, 5),
+    (A6, 6),
+    (A7, 7),
+    (A8, 8)
+);
 impl_kernel_fn!(
     (A0, 0),
     (A1, 1),
@@ -566,7 +604,8 @@ impl_kernel_fn!(
 
 /// A routine body with its types erased — what [`call`](Routine::body) goes
 /// through.
-pub type Body<B> = fn(&<B as Backend>::Ctx, &[<B as Backend>::Value]) -> Result<(), Refusal>;
+pub type Body<B> =
+    for<'x> fn(&'x <B as Backend>::Ctx<'x>, &[<B as Backend>::Value]) -> Result<(), Refusal>;
 
 /// One routine's table row, and the body behind it.
 ///
@@ -618,6 +657,43 @@ impl<B: Backend> Routine<B> {
     }
 }
 
+/// One routine's row with its backend forgotten.
+///
+/// The machinery is generic over [`Backend`], so three backends' `ROUTINES`
+/// are three unrelated types and cannot be put in one list. This is the view
+/// that can: the derived argument list and the three stated facts, which are
+/// exactly the columns `.wiki/kernel-x/refactor-bigplan.md` §3's cross-backend
+/// agreement gate compares. The body and everything device-shaped is left
+/// behind on purpose — grids, tiers and entrypoint spellings are properly
+/// per-backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Declared {
+    /// The routine's name, which is the `fn`'s name.
+    pub name: &'static str,
+    /// Its arguments, derived from the signature.
+    pub args: &'static [(Ty, Provenance)],
+    /// This statement consumes its whole operand, not a row range.
+    pub whole: bool,
+    /// This statement participates in the depth-prefix plan.
+    pub depth_prefix_plan: bool,
+    /// `(input, output)` pairs that must be given the same address.
+    pub in_place: &'static [(u32, u32)],
+}
+
+impl<B: Backend> Routine<B> {
+    /// This row, with the backend forgotten, for a cross-backend comparison.
+    #[must_use]
+    pub const fn declared(&self) -> Declared {
+        Declared {
+            name: self.name,
+            args: self.args,
+            whole: self.whole,
+            depth_prefix_plan: self.depth_prefix_plan,
+            in_place: self.in_place,
+        }
+    }
+}
+
 impl<B: Backend> core::fmt::Debug for Routine<B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Routine")
@@ -645,6 +721,91 @@ pub const fn spell<B: Backend, M, F: KernelFn<B, M>>(_body: F) -> &'static [&'st
     F::SPELLING
 }
 
+/// A symbol the DRIVER fires by path, declared without a statement's
+/// argument list.
+///
+/// # The distinction, and why it is not a weaker [`routine!`](crate::routine!)
+///
+/// A `routine!` says: *a trace statement binds this*. That is what forces
+/// every parameter to be [`Arg`] — [`KernelFn::invoke`] recovers them from a
+/// `&[Value]` the statement produced, so a parameter no statement can supply
+/// is a parameter the extractor cannot describe.
+///
+/// (It said `call` until `4d2753b4d`'s CI run denied the ambiguity beside it.
+/// There is no `call` in this crate and there never was on this branch; the
+/// link resolved to the MODULE, so the name had been wrong in silence.)
+///
+/// Some kernels are not like that, and no amount of porting makes them so.
+/// A paged-KV write takes the layer's page geometry; an all-reduce takes a
+/// communicator; a quantised GEMM takes a weight REPRESENTATION. Each is a
+/// property of the fire or of the deployment, assembled by the driver, and a
+/// statement mentions none of them. **They are still symbols a lowered model
+/// text may name**, so the compiler must be able to look them up, and
+/// `check_plan` refuses a model at load whose launched symbol is undeclared.
+///
+/// Both halves of that were true before this macro existed, and the cost was
+/// a hand-written table — `not_yet_crossed.rs` in the CUDA backend, 21 rows,
+/// each transcribing columns that a `fn` was sitting right beside. Every row
+/// in it was a symbol whose BODY existed and whose ARGUMENTS were not a
+/// statement's. This macro is that observation:
+///
+/// > A symbol is declared by the `fn` that runs it. Whether a STATEMENT can
+/// > call it is a different question, and answering "no" is not a reason to
+/// > write the declaration out by hand.
+///
+/// # What it produces
+///
+/// A [`Routine`] like `routine!`'s, with three differences, each of which is
+/// a fact rather than a compromise:
+///
+/// * `args` is empty, because no statement supplies them. `KernelSig::args`'
+///   own doc calls an empty list UNSTATED, which is exactly right here.
+/// * `spelling` likewise.
+/// * `body` REFUSES. Reaching it means something dispatched this symbol by
+///   string, and the driver that owns it calls it by path — typed, and
+///   checked by the compiler rather than by [`Refusal::Kind`] at first fire.
+///   The refusal names that, so a wrong call site is a sentence and not a
+///   mystery.
+///
+/// The `fn` is NAMED and not merely stringified, so a declaration cannot
+/// outlive its body: deleting the `fn` fails this macro's expansion rather
+/// than leaving a symbol nothing runs.
+///
+/// Trailing facts are [`Routine`]'s `const` builders, as `routine!`'s are.
+#[macro_export]
+macro_rules! driver_bound {
+    ($backend:ty, $body:ident $(, $fact:ident $(= $value:expr)?)* $(,)?) => {{
+        // The point of naming `$body` rather than only stringifying it. A
+        // declaration whose `fn` has been deleted is the defect this whole
+        // table was rebuilt to make impossible, and a `stringify!` alone
+        // would reintroduce it one macro later.
+        #[allow(dead_code)]
+        fn names_a_real_fn() {
+            let _ = $body;
+        }
+        fn by_path<'x>(
+            _ctx: &'x <$backend as $crate::routine::Backend>::Ctx<'x>,
+            _args: &[<$backend as $crate::routine::Backend>::Value],
+        ) -> ::core::result::Result<(), $crate::routine::Refusal> {
+            ::core::result::Result::Err($crate::routine::Refusal::Absent {
+                what: "a statement-bound body: this symbol is declared so a model \
+                       text may name it, and fired by the driver through a typed \
+                       call rather than by string",
+            })
+        }
+        $crate::routine::Routine::<$backend> {
+            name: ::core::stringify!($body),
+            args: &[],
+            spelling: &[],
+            body: by_path,
+            whole: false,
+            depth_prefix_plan: false,
+            in_place: &[],
+        }
+        $(.$fact($($value)?))*
+    }};
+}
+
 /// One routine's row, from its `fn` and nothing else.
 ///
 /// Backends wrap this with their own [`Backend`] type filled in, so that a
@@ -660,16 +821,51 @@ pub const fn spell<B: Backend, M, F: KernelFn<B, M>>(_body: F) -> &'static [&'st
 ///
 /// Trailing facts are the `const` builders of [`Routine`], named:
 /// `routine!(B, rope_bf16, whole, in_place = &[(0, 0)])`.
+///
+/// # A generic body, and why the name is stated then
+///
+/// A routine may be generic — over its element type, over a block width — and
+/// then one `fn` answers several trace symbols:
+///
+/// ```ignore
+/// routine!(B, rope_bf16 = rope::<bf16, 256>)
+/// routine!(B, rope_f16  = rope::<f16, 256>)
+/// ```
+///
+/// The name is written out in that form because `stringify!` of the body would
+/// answer `rope::<bf16, 256>`, which is not a symbol any trace can state. This
+/// is the ONE place a routine's name is typed by hand, and it is the place the
+/// instantiation is chosen — so the two cannot drift apart without the line
+/// itself being wrong. The plain form derives the name and is what a routine
+/// with nothing to vary still uses.
 #[macro_export]
 macro_rules! routine {
+    ($backend:ty, $name:ident = $body:expr $(, $fact:ident $(= $value:expr)?)* $(,)?) => {{
+        fn shim<'x>(
+            ctx: &'x <$backend as $crate::routine::Backend>::Ctx<'x>,
+            args: &[<$backend as $crate::routine::Backend>::Value],
+        ) -> ::core::result::Result<(), $crate::routine::Refusal> {
+            <_ as $crate::routine::KernelFn<$backend, _>>::invoke($body, ctx, args)
+        }
+        $crate::routine::Routine::<$backend> {
+            name: ::core::stringify!($name),
+            args: $crate::routine::describe::<$backend, _, _>($body),
+            spelling: $crate::routine::spell::<$backend, _, _>($body),
+            body: shim,
+            whole: false,
+            depth_prefix_plan: false,
+            in_place: &[],
+        }
+        $(.$fact($($value)?))*
+    }};
     ($backend:ty, $body:ident $(, $fact:ident $(= $value:expr)?)* $(,)?) => {{
         // A `fn` item is zero-sized, so this names `$body` without capturing
         // it -- which is what lets the shim be a plain `fn` pointer.
-        fn shim(
-            ctx: &<$backend as $crate::routine::Backend>::Ctx,
+        fn shim<'x>(
+            ctx: &'x <$backend as $crate::routine::Backend>::Ctx<'x>,
             args: &[<$backend as $crate::routine::Backend>::Value],
         ) -> ::core::result::Result<(), $crate::routine::Refusal> {
-            $crate::routine::KernelFn::invoke($body, ctx, args)
+            <_ as $crate::routine::KernelFn<$backend, _>>::invoke($body, ctx, args)
         }
         $crate::routine::Routine::<$backend> {
             name: ::core::stringify!($body),

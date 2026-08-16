@@ -308,13 +308,13 @@ impl StepSubmission {
             requests,
             true,
         )?;
-        if let Some(&last) = self.channel_ticket_indptr.last() {
-            if last as usize != self.channel_expected_head.len() {
-                return bad(format!(
-                    "channel_ticket_indptr ends at {last}, not the {} tickets",
-                    self.channel_expected_head.len()
-                ));
-            }
+        if let Some(&last) = self.channel_ticket_indptr.last()
+            && last as usize != self.channel_expected_head.len()
+        {
+            return bad(format!(
+                "channel_ticket_indptr ends at {last}, not the {} tickets",
+                self.channel_expected_head.len()
+            ));
         }
 
         rows(

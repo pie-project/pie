@@ -60,10 +60,39 @@ pub struct Geometry {
 /// that needs a command buffer to compute.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Dispatch<'a> {
-    /// The entrypoint to run, borrowed from [`Lowered::kernels`].
-    pub symbol: &'a str,
+    /// The entrypoint to run.
+    ///
+    /// Borrowed from [`Lowered::kernels`] on the plan-ordered path, which
+    /// costs nothing and is what it has always been. Owned when a ROUTINE
+    /// composed it: a body that varies over an instantiation axis builds the
+    /// whole spelling itself — `affine_qmm_t_bf16_gs_128_b_4` — and the
+    /// `String` it built lives in the body's frame, which ends before the
+    /// dispatch is recorded. `Cow` is the smaller of the two prices; the
+    /// other was making every body's entrypoint `&'static str`, which forbids
+    /// exactly the axis instantiation half this table needs.
+    pub symbol: std::borrow::Cow<'a, str>,
     /// The operands, in binding order over the module's non-hole slots.
     pub buffers: Vec<Bound<'a>>,
+    /// Which of [`Self::buffers`] the shader may WRITE through, in the same
+    /// order and of the same length.
+    ///
+    /// Read off the kernel row's operand types -- [`kernels::Ty::BufMut`] is
+    /// "the launcher may write through this" and everything else is a read --
+    /// which is the only place the distinction exists. SPIR-V does not carry
+    /// it usefully: `slangc` decorates a buffer `NonWritable` only when the
+    /// shader said `readonly`, and this tree's shaders mostly do not.
+    ///
+    /// What it is FOR is the barrier between two dispatches. A fire is a few
+    /// hundred rectangles over one arena and the recording used to put a
+    /// full pipeline barrier between every pair of them, which on this card
+    /// is 8 microseconds each -- measured, 3.8 milliseconds of a 7.2
+    /// millisecond decode. Most neighbouring pairs do not touch the same
+    /// bytes, and this is what lets the recorder tell which ones do.
+    ///
+    /// A row that states no operands has no answer here, so every slot is
+    /// marked written: the coarse reading is the safe one, and it is what
+    /// this driver did for every slot of every launch before this existed.
+    pub writes: Vec<bool>,
     /// Where this launch's scalars go, and the bytes to put there.
     ///
     /// Not a `Vec<u8>`, because "the bytes to push" is only half the answer:
@@ -179,12 +208,31 @@ pub enum Undispatchable {
         /// The grid that would have been dispatched.
         groups: [u32; 3],
     },
+    /// A crossed ROUTINE would not launch this statement.
+    ///
+    /// The routine path's single refusal, carrying whatever the arm, the body
+    /// or the encoder said. Distinct from every variant above because those
+    /// are the TABLE path's vocabulary -- a row that named an operand it does
+    /// not have, a rule with no grid -- and a routine has none of those parts
+    /// to get wrong. What it can refuse instead is an extent that came out
+    /// empty, an entrypoint this build did not produce, and an argument list
+    /// the module's bindings do not fit.
+    Refused {
+        /// The symbol the plan named, which is not necessarily the entrypoint
+        /// the body asked for.
+        symbol: String,
+        /// What the routine said.
+        why: kernels::routine::Refusal,
+    },
 }
 
 impl std::fmt::Display for Undispatchable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unknown { symbol } => write!(f, "no kernel row states `{symbol}`"),
+            Self::Refused { symbol, why } => {
+                write!(f, "the routine for `{symbol}` refused: {why:?}")
+            }
             Self::Layout(why) => write!(f, "{why}"),
             Self::Operand { at, why } => write!(f, "operand {at}: {why}"),
             Self::Scalars { stated, room } => {
@@ -323,12 +371,28 @@ pub fn dims_of(sig: &KernelSig, lowered: &Lowered, launch: &Launch, fire: Geomet
 /// bindings and holes decide the ARITY. Separating them at the call site
 /// would let a caller pass a module's geometry with another module's layout,
 /// which is a mistake nothing downstream could detect.
-#[derive(Clone, Copy, Debug)]
+// No `Debug`: `KernelSig` has none, and printing a whole kernel row beside a
+// workgroup size would say nothing a reader of a refusal wants.
+#[derive(Clone, Copy)]
 pub struct Built<'a> {
     /// Workgroup size and tile, from the entrypoint name and the module.
     pub module: Module,
     /// What the module binds.
     pub declared: &'a crate::spirv::Declared,
+    /// The kernel table's row for this symbol, when the caller already has it.
+    ///
+    /// `None` means "look it up", which is what a test wants and what this
+    /// did for everyone before the field existed. A fire passes `Some`
+    /// because the lookup is a LINEAR scan of the whole table -- see
+    /// [`kernels::sig_in`], which compares every symbol and then, for a
+    /// specialised name like `affine_qmm_t_bf16_gs_128_b_4`, walks the axis
+    /// points of every row again -- and a decode of 452 rectangles over nine
+    /// distinct symbols was doing it 452 times. Measured on this card: 0.23
+    /// ms a fire, against a plan phase of 0.85 and a whole step of 6.7.
+    ///
+    /// The same argument, and the same cache, as the SPIR-V reflection beside
+    /// it in `serve::fire`: once per SYMBOL, not once per launch.
+    pub sig: Option<&'static KernelSig>,
 }
 
 /// Where a launch's operands are to be found.
@@ -387,7 +451,11 @@ pub fn plan_one<'a, R: Resolve>(
     sources: Sources<'a, R>,
     fire: Geometry,
 ) -> Result<Dispatch<'a>, Undispatchable> {
-    let Built { module, declared } = built;
+    let Built {
+        module,
+        declared,
+        sig,
+    } = built;
     let Sources {
         arena,
         resolver,
@@ -403,19 +471,45 @@ pub fn plan_one<'a, R: Resolve>(
             cond: launch.cond,
         });
     }
-    let sig = row(table, symbol).ok_or_else(|| Undispatchable::Unknown {
-        symbol: symbol.to_owned(),
-    })?;
+    let sig = match sig {
+        Some(s) => s,
+        None => row(table, symbol).ok_or_else(|| Undispatchable::Unknown {
+            symbol: symbol.to_owned(),
+        })?,
+    };
 
     // Not `bind`, which hands the descriptors over in the order the TRACE
     // states -- inputs, outputs, weights. The shader binds them in the order
     // its kernel row states, and for 2898 of this tree's 3992 rectangles
-    // those differ. `rms_single_row` is the plainest: `norm/rms.comp` is
+    // those differ. `rms_single_row` is the plainest: `norm/rms.slang` is
     // `0=x, 1=w, 2=out`, its row is `In(0), Weight(0), Out(0)`, and the trace
     // hands over `In(0), Out(0), Weight(0)` -- so positionally the norm reads
     // its own output as the weight and writes over the weight.
     let slots = reorder(sig, lowered, launch, arena, resolver, min_offset)
         .map_err(|(at, why)| Undispatchable::Operand { at, why })?;
+
+    // Which slot the shader may write, read here rather than after
+    // `descriptors` because this is the only point where a slot's index is
+    // still the index of the OPERAND that produced it.
+    //
+    // Sound because `descriptors` never drops a `Slot::Buffer`: it drops
+    // repeated `Slot::Params` and pops trailing `Slot::Nothing`, and refuses
+    // outright rather than pop anything else. So the buffers below are
+    // `slots`' buffers, in `slots`' order.
+    let writes: Vec<bool> = if sig.operands.is_empty() {
+        slots
+            .iter()
+            .filter(|s| matches!(s, Slot::Buffer(_)))
+            .map(|_| true)
+            .collect()
+    } else {
+        slots
+            .iter()
+            .zip(sig.operands)
+            .filter(|(s, _)| matches!(s, Slot::Buffer(_)))
+            .map(|(_, o)| o.ty == kernels::Ty::BufMut)
+            .collect()
+    };
 
     // Where the scalars go is the MODULE's decision, not the plan's, and
     // `binding::params` is what reads it off the SPIR-V. Passed through
@@ -487,6 +581,18 @@ pub fn plan_one<'a, R: Resolve>(
             module: real,
         });
     }
+    // The claim `writes` rests on: that laying the slots out neither drops,
+    // adds nor moves a buffer. Checked rather than trusted, because a
+    // disagreement here is not a crash -- it is a barrier decided from some
+    // other operand's writability, which is a race, which is a plausible
+    // number.
+    if writes.len() != buffers.len() {
+        return Err(Undispatchable::Arity {
+            symbol: symbol.to_owned(),
+            stated: writes.len(),
+            module: buffers.len(),
+        });
+    }
 
     let dims = dims_of(sig, lowered, launch, fire);
     let groups =
@@ -496,8 +602,9 @@ pub fn plan_one<'a, R: Resolve>(
     }
 
     Ok(Dispatch {
-        symbol,
+        symbol: symbol.into(),
         buffers,
+        writes,
         params: placed,
         block_at,
         groups,

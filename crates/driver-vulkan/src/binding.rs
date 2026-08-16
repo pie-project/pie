@@ -42,7 +42,7 @@
 //! later layer will act on.
 
 use model_compiler::lower::{Arg, Launch, Lowered};
-use model_compiler::trace::ValueId;
+use model_ir::trace::ValueId;
 
 use crate::device::{Bound, Buffer};
 
@@ -120,6 +120,12 @@ pub enum FireNumber {
     KvHeadStride,
     /// The stride between positions in the cache.
     KvSeqStride,
+    /// The pitch of this fire's mask rectangle, in keys.
+    ///
+    /// Zero when the fire states no mask, and the shader reads that as "apply
+    /// the causal rule alone". Not a fact about the cache, which is why
+    /// [`crate::resources::Pool`] answers it and `Shape` does not.
+    AttentionMaskStride,
 }
 
 /// The fire-wide tables a kernel row may name.
@@ -357,7 +363,7 @@ pub fn bind<'a, R: Resolve>(
 /// operands in TRACE order -- inputs, then outputs, then weights -- and a
 /// shader binds them in the order its kernel row states, and those are not
 /// the same order. `rms_single_row`'s row is `In(0), Weight(0), Out(0),
-/// params`, and `norm/rms.comp` decorates exactly that; the trace hands over
+/// params`, and `norm/rms.slang` decorates exactly that; the trace hands over
 /// `In(0), Out(0), Weight(0)`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Slot<'a> {
@@ -522,6 +528,11 @@ pub fn reorder<'a, R: Resolve>(
             | kernels::Source::KvHeadStride
             | kernels::Source::KvSeqStride
             | kernels::Source::KvPageSize
+            // A scalar like the rest of this group, and now one the rows
+            // actually name: `kernels-vulkan`'s paged-attention rows take
+            // their mask pitch from here rather than from the model's
+            // `Param(3)`, which the shared lowering spells as a literal zero.
+            | kernels::Source::AttentionMaskStride
             | kernels::Source::KvLayerView
             | kernels::Source::KvLayerField(_)
             | kernels::Source::RequestCount
@@ -864,6 +875,11 @@ pub fn scalars<R: Resolve>(
         }
         let number = match operand.source {
             kernels::Source::KvPageSize => Some(FireNumber::KvPageSize),
+            // The fire's mask pitch, answered by `Pool` rather than by
+            // `Shape`. A row that names it and gets a constant would index
+            // one row's mask at another row's offset, which is the same
+            // family of defect as the two strides above.
+            kernels::Source::AttentionMaskStride => Some(FireNumber::AttentionMaskStride),
             _ => None,
         };
         if let Some(want) = number {
@@ -929,6 +945,14 @@ pub fn scalars<R: Resolve>(
                         .unwrap_or(0),
                 );
             }
+            // The fire's TRUE row count, which the grid cannot say. Tiled
+            // attention rounds the rows up to whole 32-row tiles, so a fire of
+            // 40 rows dispatches two tiles and the 24 lanes of the second that
+            // are past the end reach every barrier and must contribute
+            // nothing. `gl_NumWorkGroups.y * 32` is the rounded number; this
+            // is the real one, and the difference is the whole reason the row
+            // carries an eighteenth operand.
+            kernels::Source::Rows => run.push(launch.rows.end - launch.rows.start),
             // Split on the operand's KIND rather than on a list of source
             // names, which is what makes this closed. A BUFFER contributes no
             // scalar because binding it is `reorder`'s job, so a new buffer
@@ -949,7 +973,10 @@ pub fn scalars<R: Resolve>(
     params_from(&run, declared)
 }
 
-fn params_from(stated: &[u32], declared: &crate::spirv::Declared) -> Result<Params, Misplaced> {
+pub(crate) fn params_from(
+    stated: &[u32],
+    declared: &crate::spirv::Declared,
+) -> Result<Params, Misplaced> {
     // Asked in this order because push is the stronger claim: it accounts for
     // every descriptor as well as every scalar, and a module that declares a
     // push block of the right size is not also hiding a parameter buffer.
@@ -980,6 +1007,15 @@ fn params_from(stated: &[u32], declared: &crate::spirv::Declared) -> Result<Para
     // six: `combine_sorted` binds its 12-byte block at 3 of 5 and `route_sort`
     // its 28-byte block at 4 of 6, each with an operand after it. Where a
     // parameter block sits is the kernel's own ABI.
+    //
+    // Searching by size is also what CONSTRAINS how a shader may spell the
+    // block, which is not obvious from here and bites anyone editing the
+    // kernel tree. A block has to declare a fixed extent, so it cannot be a
+    // Slang `StructuredBuffer<T>` -- that is a runtime array, reflection
+    // reports no size for it (correctly), and every launch would be refused
+    // with "n scalars stated, room for 0". The tree therefore keeps one
+    // GLSL-syntax construct, `PIE_PARAMS` in `kernels/common/bf16.slang`,
+    // which is why `build.rs` passes `-allow-glsl`.
     let want = stated.len() as u32 * 4;
     if want > 0
         && let Some(at) = declared.block_bytes.iter().position(|b| *b == Some(want))
@@ -1317,6 +1353,7 @@ mod tests {
             local: [1, 1, 1],
             bindings: blocks.len() as u32,
             used: vec![true; blocks.len()],
+            writable: vec![true; blocks.len()],
             reads_workgroup_count: false,
             grid_axes: [true, false, false],
             push_offsets: push.to_vec(),
@@ -1484,9 +1521,28 @@ mod tests {
     /// output 128, which no real `AddBias` would be -- the op is in place --
     /// and that is the point: an implementation reading the first widthed
     /// operand passes with 64, and the row said the last.
+    /// The `add_bias` row, written out rather than scraped.
+    ///
+    /// `norm` has crossed and the row is gone, but what these two tests are
+    /// about is `binding`'s arm for `Source::OutWidth` -- which is still
+    /// reachable, because a row anywhere in the fleet may name it and the
+    /// catch-all this file used to have would answer zero. Scraping a live row
+    /// only ever stood in for stating one; this states it.
+    fn add_bias_sig() -> kernels::KernelSig {
+        kernels::kernel!(add_bias "add_bias", file = Some("norm/add_bias.slang"),
+            launch = kernels::LaunchRule::RouteRows,
+            in_place = &[(0, 0)],
+            operands = kernels::operands![
+                out: BufMut <- kernels::Source::Out(0),
+                bias: Buf <- kernels::Source::Weight(0),
+                width: I32 <- kernels::Source::OutWidth(0),
+            ],
+            axes = &[kernels_vulkan::axes::BF16])
+    }
+
     #[test]
     fn a_row_that_names_its_outputs_width_is_handed_that_width() {
-        let sig = kernels::sig_in(kernels_vulkan::KERNELS, "add_bias").expect("the row is stated");
+        let sig = &add_bias_sig();
         assert!(
             sig.operands
                 .iter()
@@ -1533,7 +1589,7 @@ mod tests {
     /// number where a padded block-major count belongs.
     #[test]
     fn a_source_this_driver_cannot_work_out_is_refused_rather_than_zeroed() {
-        let base = kernels::sig_in(kernels_vulkan::KERNELS, "add_bias").expect("stated");
+        let base = add_bias_sig();
         let operands: Vec<kernels::Operand> = base
             .operands
             .iter()
@@ -1547,7 +1603,7 @@ mod tests {
             .collect();
         let sig = kernels::KernelSig {
             operands: Box::leak(operands.into_boxed_slice()),
-            ..*base
+            ..base
         };
         let low = lowered(vec![
             Arg::Arena {

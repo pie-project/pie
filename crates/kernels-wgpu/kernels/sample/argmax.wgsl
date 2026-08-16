@@ -41,12 +41,12 @@
 
 //#include "common/bf16.inc.wgsl"
 
-@group(0) @binding(0) var<storage, read> logits: array<u32>;
+@group(0) @binding(0) var<storage, read_write> logits: array<u32>;
 @group(0) @binding(1) var<storage, read_write> next_token: array<u32>;
 // `vocab` and `n_eos` are fields, not uniform-block scalars: the row states no
 // operands, and both siblings pack them here with the stop-token list.
 struct ArgmaxParams { vocab: u32, n_eos: u32, eos_ids: array<u32, 8> }
-@group(0) @binding(2) var<storage, read> params: ArgmaxParams;
+@group(0) @binding(2) var<storage, read_write> params: ArgmaxParams;
 @group(0) @binding(3) var<storage, read_write> eos_flag: array<u32>;
 
 const LANES = 256u;

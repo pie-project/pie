@@ -228,7 +228,7 @@ fn the_live_workspace_pins_stages_and_fences_on_the_device() {
         let pin = ws.view().page_locked_int;
         assert!(!pin.is_null(), "begin pinned the active slot");
         unsafe { pin.cast::<u8>().write_bytes(0x5a, 16) };
-        ws.end_plan_update(&mut ops, raw);
+        ws.end_plan_update(&mut ops, raw).expect("end");
     }
 
     ws.release(&mut ops);

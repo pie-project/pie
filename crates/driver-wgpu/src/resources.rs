@@ -57,7 +57,7 @@ use crate::binding::{FireTable, Resolve};
 #[cfg(feature = "native")]
 use crate::device::{Buffer, Device, Failed, Move};
 #[cfg(feature = "native")]
-use model_compiler::trace::ValueId;
+use model_ir::trace::ValueId;
 
 /// What a deployment decided about its cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +132,12 @@ impl Shape {
             FireNumber::KvPageSize => Some(self.page_size),
             FireNumber::KvHeadStride => Some(self.head_dim),
             FireNumber::KvSeqStride => u32::try_from(self.row()).ok(),
+            // NOT the pool's to answer. A mask rectangle is as wide as the
+            // widest row of the FIRE that supplied it, and a `Shape` outlives
+            // every fire it serves. `Pool::number` answers this one from what
+            // it staged; answering a stale width here would index a row's mask
+            // at the previous fire's pitch.
+            FireNumber::AttentionMaskStride | FireNumber::Rows => None,
         }
     }
 
@@ -204,6 +210,33 @@ pub struct Request {
     /// something wants its answer — and a third meaning for a vector that
     /// already has two would be worse than the gap.
     pub samples: Vec<u32>,
+    /// Where each of this request's rows writes its KV, when the PROGRAM said
+    /// so: `(physical page, offset within it)`, one per row.
+    ///
+    /// Empty is the ordinary case and means "derive": a row appends at
+    /// `pages[position / page_size]`, offset `position % page_size`, which is
+    /// what every host and envelope fire wants and what this driver did for
+    /// everything until a beam asked for something else. A device-geometry
+    /// program binds `W_SLOT`/`W_OFF` and traces its own placement -- forked
+    /// lanes take different copies of a page at the SAME position -- and
+    /// `envelope::fill` translates those into this.
+    pub writes: Vec<Option<(u32, u32)>>,
+    /// One row of allow-bytes per query row, or empty for no mask.
+    ///
+    /// Decoded HERE rather than carried as runs, because this half of the
+    /// crate is the portable one and `driver_api::plan::EncodedMask` is a wire
+    /// type. `frames::requests_of` does the decoding; this holds the
+    /// rectangle.
+    ///
+    /// Each inner vector is `1` where the key is visible to that row and `0`
+    /// where it is not, indexed from key ZERO of the request's history. Rows
+    /// may be ragged -- a later row sees more keys -- and [`Frame::of`] pads
+    /// to the widest.
+    ///
+    /// Empty means the request states no mask, which is not the same as a mask
+    /// of all zeros: the first leaves `attention_mask_enabled` clear and the
+    /// causal rule alone applies, the second forbids everything.
+    pub mask: Vec<Vec<u8>>,
 }
 
 impl Request {
@@ -214,15 +247,24 @@ impl Request {
             positions,
             pages,
             samples: Vec::new(),
+            mask: Vec::new(),
+            writes: Vec::new(),
         }
     }
 
-    /// Which of this request's rows are read out, with the default resolved.
+    /// Which of this request's OWN rows are read out, with the default
+    /// resolved.
     ///
-    /// The empty case is the last row and not "no rows", so this is where the
-    /// two meanings of an empty vector are separated — a caller that means no
-    /// rows says so by putting a row index out of range, which [`Frame::of`]
-    /// refuses.
+    /// Numbered from the request: index 0 is its first row. That is what the
+    /// scheduler writes -- measured twice, most recently on the merged tree
+    /// (`qo=[0, 92, 93] sidx=[91, 0]`: request 1 spans rows 92..93 and names
+    /// `0`, its own) -- and `driver::resolve` pushes `span - 1` from the
+    /// request's own row count when no read-out port is bound.
+    ///
+    /// The empty case is this request's last row and not "no rows", so this is
+    /// where the two meanings of an empty vector are separated — a caller that
+    /// means no rows says so by putting a row index out of range, which
+    /// [`Frame::of`] refuses.
     fn read(&self) -> Vec<u32> {
         if self.samples.is_empty() {
             self.positions
@@ -234,6 +276,22 @@ impl Request {
             self.samples.clone()
         }
     }
+}
+
+/// Little-endian bytes into the `u32` words a storage buffer is written in.
+///
+/// The shader reads one byte out of a word with `(word >> ((at & 3) * 8)) &
+/// 0xff`, which is little-endian, and `from_le_bytes` is the same statement
+/// said once here instead of open-coded at each caller.
+fn pack_bytes(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks(4)
+        .map(|c| {
+            let mut w = [0u8; 4];
+            w[..c.len()].copy_from_slice(c);
+            u32::from_le_bytes(w)
+        })
+        .collect()
 }
 
 /// What a fire's tables cannot be built from.
@@ -279,10 +337,28 @@ pub enum Unstageable {
         /// How many rows it contributes.
         rows: usize,
     },
-    /// Two requests in one fire own the same page.
+    /// A request states a write descriptor that does not cover its rows.
+    ///
+    /// One slot per row or none at all: a table one short would give a row
+    /// another row's slot, which is the single failure the descriptor exists
+    /// to prevent.
+    WriteRows {
+        /// Which request.
+        request: usize,
+        /// How many slots it states.
+        writes: usize,
+        /// How many rows it has.
+        rows: usize,
+    },
+    /// Two requests in one fire WRITE the same page.
     ///
     /// Not an error the shaders could survive: both would append to it and each
     /// would read the other's rows as its own history.
+    ///
+    /// Sharing a page to READ is allowed and load-bearing: a beam's lanes are
+    /// separate requests of one conversation and they share every page of the
+    /// prefix they forked from. Refusing that refused beam search before it
+    /// could state what it wanted, which is how the narrower rule was found.
     SharedPage {
         /// The page both named.
         page: u32,
@@ -311,11 +387,36 @@ pub enum Unstageable {
     /// answer, so the emptiness is refused where it can still be named instead
     /// of at the first table that trips over it.
     NoRows,
+    /// A request states a mask for some of its rows but not all of them.
+    ///
+    /// The rectangle is indexed by the FIRE's row number, so a short mask list
+    /// would leave later rows enabled against entries belonging to earlier
+    /// ones. The shader's own stride bound cannot see that -- every index is
+    /// inside the rectangle -- so it is refused here.
+    MaskRows {
+        /// How many mask rows the request states.
+        stated: usize,
+        /// How many rows it contributes.
+        rows: usize,
+    },
+    /// A mask row longer than a `u32` can address.
+    MaskTooWide {
+        /// The widest row's length.
+        widest: usize,
+    },
 }
 
 impl std::fmt::Display for Unstageable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::WriteRows {
+                request,
+                writes,
+                rows,
+            } => write!(
+                f,
+                "request {request} states {writes} write slot(s) for its {rows} row(s)"
+            ),
             Self::PastItsPages {
                 request,
                 position,
@@ -343,6 +444,13 @@ impl std::fmt::Display for Unstageable {
             ),
             Self::NoSlots => write!(f, "the shape says a page holds no slots"),
             Self::NoRows => write!(f, "the fire has no rows"),
+            Self::MaskRows { stated, rows } => write!(
+                f,
+                "a request states {stated} mask rows and contributes {rows}"
+            ),
+            Self::MaskTooWide { widest } => {
+                write!(f, "a mask row of {widest} keys does not fit a u32 stride")
+            }
         }
     }
 }
@@ -378,6 +486,33 @@ pub struct Frame {
     /// this is the only table whose length is not the fire's row count, and the
     /// count is what the row calls `RequestCount`.
     pub sampling_indices: Vec<u32>,
+    /// Row offsets splitting [`Self::sampling_indices`] per request; one
+    /// longer than the request count.
+    ///
+    /// Recorded rather than re-derived because a request may name SEVERAL
+    /// readout rows -- a speculative verifier names one per drafted token --
+    /// and without the boundaries there is no telling whose rows are whose.
+    /// `sampling_indices` alone was enough only while every request named
+    /// exactly one.
+    pub sampling_indptr: Vec<u32>,
+    /// The custom mask, one BYTE per `(row, key)`, packed four to a word.
+    ///
+    /// `attn/sdpa_paged.wgsl` reads `attention_mask[row * stride + kp]` as a
+    /// byte and treats non-zero as "allowed". Empty when no request in the
+    /// fire states a mask.
+    pub attention_mask: Vec<u32>,
+    /// One BYTE per row: non-zero where that row's mask applies.
+    ///
+    /// Always staged, even with no mask anywhere, because the shader reads it
+    /// unconditionally and a slot nobody filled is a slot bound to something
+    /// else.
+    pub attention_mask_enabled: Vec<u32>,
+    /// Bytes between one row's mask entry and the next.
+    ///
+    /// Zero when the fire carries no mask, which is also what makes the
+    /// shader's own bound (`kp >= stride` forbids) refuse every key for an
+    /// enabled row with no rectangle behind it -- the safe direction.
+    pub attention_mask_stride: u32,
 }
 
 impl Frame {
@@ -413,7 +548,41 @@ impl Frame {
                         pages: shape.pages,
                     });
                 }
-                if let Some(&first) = owner.get(&page) {
+                frame.kv_page_indices.push(page);
+            }
+            // The pages this request WRITES: one per row, the page its
+            // position lands in. Two requests may READ one page -- a beam's
+            // lanes share the prefix they forked from, and that sharing is
+            // the whole economy of a beam -- but two that write it would each
+            // append over the other, which is what this refusal is for and
+            // all it is for.
+            for (i, &position) in request.positions.iter().enumerate() {
+                // A STATED slot is not this rule's business.
+                //
+                // The rule catches a DERIVED collision: this driver's own
+                // arithmetic putting two requests in one page, where "both
+                // would append to it" is a thing neither asked for. A program
+                // that traces its own placement has asked -- a beam's lanes
+                // name the same cell before they fork, on purpose, because
+                // they are the same conversation writing the same token --
+                // and the driver refusing it was refusing a plan, not a bug.
+                //
+                // What still holds them apart is the descriptor itself: after
+                // the fork the lanes state DIFFERENT slots, and `Frame::of`
+                // writes where each one said.
+                if request.writes.get(i).copied().flatten().is_some() {
+                    continue;
+                }
+                let page = {
+                    let virt = (position / page_size) as usize;
+                    let Some(&page) = request.pages.get(virt) else {
+                        continue;
+                    };
+                    page
+                };
+                if let Some(&first) = owner.get(&page)
+                    && first != r
+                {
                     return Err(Unstageable::SharedPage {
                         page,
                         first,
@@ -421,11 +590,13 @@ impl Frame {
                     });
                 }
                 owner.insert(page, r);
-                frame.kv_page_indices.push(page);
             }
             // Before the rows are pushed, so `base` is where this request's
             // rows start in the fire.
             let base = u32::try_from(frame.positions.len()).unwrap_or(u32::MAX);
+            if frame.sampling_indptr.is_empty() {
+                frame.sampling_indptr.push(0);
+            }
             for row in request.read() {
                 if row as usize >= request.positions.len() {
                     return Err(Unstageable::NotItsRow {
@@ -436,26 +607,98 @@ impl Frame {
                 }
                 frame.sampling_indices.push(base + row);
             }
-            for &position in &request.positions {
-                let virt = (position / page_size) as usize;
-                let Some(&page) = request.pages.get(virt) else {
-                    return Err(Unstageable::PastItsPages {
-                        request: r,
-                        position,
-                        pages: request.pages.len(),
-                    });
+            frame
+                .sampling_indptr
+                .push(u32::try_from(frame.sampling_indices.len()).unwrap_or(u32::MAX));
+            if !request.writes.is_empty() && request.writes.len() != request.positions.len() {
+                return Err(Unstageable::WriteRows {
+                    request: r,
+                    writes: request.writes.len(),
+                    rows: request.positions.len(),
+                });
+            }
+            for (i, &position) in request.positions.iter().enumerate() {
+                // STATED first. A program that traces its own placement is
+                // answered with it; everything else derives, which is the
+                // same arithmetic this driver has always used.
+                let (page, offset) = match request.writes.get(i).copied().flatten() {
+                    Some((page, offset)) => (page, offset),
+                    None => {
+                        let virt = (position / page_size) as usize;
+                        let Some(&page) = request.pages.get(virt) else {
+                            return Err(Unstageable::PastItsPages {
+                                request: r,
+                                position,
+                                pages: request.pages.len(),
+                            });
+                        };
+                        (page, position % page_size)
+                    }
                 };
+                if page >= shape.pages {
+                    return Err(Unstageable::NoSuchPage {
+                        request: r,
+                        page,
+                        pages: shape.pages,
+                    });
+                }
                 frame.positions.push(position);
                 frame
                     .request_of_token
                     .push(u32::try_from(r).unwrap_or(u32::MAX));
                 frame.kv_write_page.push(page);
-                frame.kv_write_offset.push(position % page_size);
+                frame.kv_write_offset.push(offset);
             }
         }
         frame
             .kv_page_indptr
             .push(u32::try_from(frame.kv_page_indices.len()).unwrap_or(u32::MAX));
+
+        // The mask rectangle, after every row is placed, because its pitch is
+        // the widest row of the WHOLE fire and its row index is the fire's.
+        //
+        // A request that states a mask must state one per row it contributes:
+        // a partial rectangle would leave some rows enabled against entries
+        // that belong to another row, which is the failure the shader's own
+        // stride bound cannot see.
+        let mut widest = 0usize;
+        for request in requests {
+            if request.mask.is_empty() {
+                continue;
+            }
+            if request.mask.len() != request.positions.len() {
+                return Err(Unstageable::MaskRows {
+                    stated: request.mask.len(),
+                    rows: request.positions.len(),
+                });
+            }
+            widest = widest.max(request.mask.iter().map(Vec::len).max().unwrap_or(0));
+        }
+        if widest > 0 {
+            let stride = u32::try_from(widest).map_err(|_| Unstageable::MaskTooWide { widest })?;
+            let rows = frame.positions.len();
+            let mut bytes = vec![0u8; rows * widest];
+            let mut enabled = vec![0u8; rows];
+            let mut at = 0usize;
+            for request in requests {
+                for (j, _) in request.positions.iter().enumerate() {
+                    if let Some(row) = request.mask.get(j) {
+                        enabled[at + j] = 1;
+                        let into = (at + j) * widest;
+                        // Shorter than the pitch is the ragged case and the
+                        // zeros are correct: a key this row's mask does not
+                        // mention is a key it does not see, and the shader
+                        // forbids it either way (`kp >= stride` for the tail
+                        // past the rectangle, a zero byte within it).
+                        bytes[into..into + row.len()].copy_from_slice(row);
+                    }
+                }
+                at += request.positions.len();
+            }
+            frame.attention_mask = pack_bytes(&bytes);
+            frame.attention_mask_enabled = pack_bytes(&enabled);
+            frame.attention_mask_stride = stride;
+        }
         Ok(frame)
     }
 
@@ -535,6 +778,19 @@ impl Frame {
 #[cfg(feature = "native")]
 pub struct Pool {
     shape: Shape,
+    /// How many rows the fire this pool last staged has.
+    ///
+    /// Beside `mask_stride` and for its reasons: a per-FIRE number living on
+    /// the pool because the pool is what stages a fire's tables, and zero
+    /// until one has been.
+    rows: u32,
+    /// The mask pitch of the fire this pool last staged, in bytes.
+    ///
+    /// A per-FIRE number living on the pool because the pool is what stages a
+    /// fire's tables and what a row's `Source::AttentionMaskStride` is
+    /// resolved against. Zero until a fire with a mask is staged, and back to
+    /// zero for one without -- see `Pool::stage`.
+    mask_stride: u32,
     keys: Vec<Buffer>,
     values: Vec<Buffer>,
     tables: BTreeMap<FireTable, Buffer>,
@@ -572,6 +828,8 @@ impl Pool {
             values.push(device.zeroed(bytes)?);
         }
         Ok(Self {
+            rows: 0,
+            mask_stride: 0,
             shape,
             keys,
             values,
@@ -762,13 +1020,35 @@ impl Pool {
         ] {
             self.state(device, which, words)?;
         }
+        // The mask, when the fire carries one, and zeros when it does not.
+        //
+        // `attn/sdpa_paged.wgsl` reads `attention_mask_enabled[row]`
+        // unconditionally, so the enable table is always staged: a slot nobody
+        // filled is a slot bound to something else. Zero there is the true
+        // answer for causal attention, which is what a fire with no mask is.
+        //
         // One byte per row, and a `u32` of zeros is four zero bytes -- the
         // narrowing is the shader's. Rounded up so a fire of one row still gets
         // a word. No `.max(1)`: `Frame::of` refuses a rowless fire by name
         // (`Unstageable::NoRows`), so the round-up cannot reach zero.
-        let bytes = frame.rows().div_ceil(4);
-        self.state(device, FireTable::AttentionMask, &vec![0; bytes])?;
-        self.state(device, FireTable::AttentionMaskEnabled, &vec![0; bytes])?;
+        let words = frame.rows().div_ceil(4);
+        if frame.attention_mask_stride > 0 {
+            self.state(device, FireTable::AttentionMask, &frame.attention_mask)?;
+            self.state(
+                device,
+                FireTable::AttentionMaskEnabled,
+                &frame.attention_mask_enabled,
+            )?;
+        } else {
+            self.state(device, FireTable::AttentionMask, &vec![0; words])?;
+            self.state(device, FireTable::AttentionMaskEnabled, &vec![0; words])?;
+        }
+        // Recorded because the SCALAR is the fire's, not the pool's: the row
+        // names `Source::AttentionMaskStride` and `Pool::number` answers it
+        // from here. Set on every stage, including to zero, so a fire with no
+        // mask cannot read the previous fire's pitch.
+        self.mask_stride = frame.attention_mask_stride;
+        self.rows = u32::try_from(frame.rows()).unwrap_or(u32::MAX);
         Ok(())
     }
 
@@ -1043,7 +1323,13 @@ impl Resolve for Pool {
     }
 
     fn number(&self, which: FireNumber) -> Option<u32> {
-        self.shape.number(which)
+        match which {
+            // The fire's, from what this pool last staged. `Shape` answers
+            // `None` for it and says why.
+            FireNumber::AttentionMaskStride => Some(self.mask_stride),
+            FireNumber::Rows => Some(self.rows),
+            other => self.shape.number(other),
+        }
     }
 }
 
@@ -1371,6 +1657,81 @@ mod tests {
         assert_eq!(frame.readouts(), 2);
     }
 
+    /// A ragged mask is staged at the FIRE's pitch, and a row nobody masked
+    /// is left disabled beside it.
+    ///
+    /// The one control on the rectangle this driver actually ships. It is the
+    /// counterpart of `driver-vulkan`'s
+    /// `a_windowed_row_is_staged_as_that_window_and_padded_to_the_fires_pitch`,
+    /// whose GPU gate names it as the reason an end-to-end run is not the
+    /// control: a driver that accepted masks and dropped them would answer the
+    /// same words. Only the bytes say whether the mask arrived.
+    ///
+    /// Three claims, and each is a way to be wrong:
+    ///
+    /// * the pitch is the widest row of the WHOLE fire, not of a request. Two
+    ///   requests staged at their own pitches would put row 2 of the second
+    ///   where the shader looks for row 1, since `row * stride + kp` is one
+    ///   arithmetic over one buffer;
+    /// * a short row is padded with zeros, because a key its mask does not
+    ///   mention is a key it does not see -- the same answer the shader's
+    ///   `kp >= stride` bound gives past the rectangle;
+    /// * a request that states no mask leaves its rows DISABLED, and a step
+    ///   mixes. `attention_mask_enabled[row]` is read per row for exactly
+    ///   that, and a fire-wide flag would make one request's window into
+    ///   everybody's.
+    #[test]
+    fn a_ragged_mask_is_staged_at_the_fires_pitch_and_an_unmasked_row_is_disabled() {
+        let masked = Request {
+            mask: vec![vec![1, 0, 1], vec![1, 1, 0, 0, 1]],
+            ..Request::of(vec![0, 1], vec![7])
+        };
+        let plain = Request::of(vec![0], vec![2]);
+        let frame = Frame::of(shape(), &[masked, plain]).expect("a stageable fire");
+
+        assert_eq!(
+            frame.attention_mask_stride, 5,
+            "the widest row of the fire is five keys, and it is five for every row"
+        );
+        // Three rows at a pitch of five is fifteen bytes, packed four to a
+        // word little-endian, the last word short and zero-filled.
+        assert_eq!(
+            frame.attention_mask,
+            vec![
+                u32::from_le_bytes([1, 0, 1, 0]),
+                u32::from_le_bytes([0, 1, 1, 0]),
+                u32::from_le_bytes([0, 1, 0, 0]),
+                u32::from_le_bytes([0, 0, 0, 0]),
+            ],
+            "row 0 is its three keys then two zeros, row 1 is its five, and \
+             row 2 is the unmasked request's"
+        );
+        assert_eq!(
+            frame.attention_mask_enabled,
+            vec![u32::from_le_bytes([1, 1, 0, 0])],
+            "the two rows that stated a mask are enabled and the third is not"
+        );
+    }
+
+    /// A request that masks some of its rows and not others is refused.
+    ///
+    /// A partial rectangle is the one shape that cannot be padded into
+    /// correctness. The missing rows would be staged as all-zero AND enabled
+    /// -- a row that attends nothing -- or disabled, which is a row that
+    /// attends everything; neither is what a guest that skipped them meant,
+    /// and the shader cannot tell either from a mask that was meant.
+    #[test]
+    fn a_request_that_masks_some_of_its_rows_is_refused() {
+        let partial = Request {
+            mask: vec![vec![1, 1]],
+            ..Request::of(vec![0, 1], vec![7])
+        };
+        assert_eq!(
+            Frame::of(shape(), &[partial]).err(),
+            Some(Unstageable::MaskRows { stated: 1, rows: 2 })
+        );
+    }
+
     /// A row that would reach into the next request's pages is refused.
     #[test]
     fn a_row_that_would_reach_into_the_next_requests_pages_is_refused() {
@@ -1413,6 +1774,102 @@ mod tests {
         );
     }
 
+    /// A STATED write slot is where the row is written, and the derivation is
+    /// not consulted.
+    ///
+    /// The whole point of `W_SLOT`/`W_OFF`: a beam's lanes fork and take
+    /// different copies of a page at the SAME position, so a target worked
+    /// out from the position can only ever name one cell for both.
+    #[test]
+    fn a_stated_write_slot_is_the_one_written() {
+        let shape = shape();
+        let mut lane = Request::of(vec![20], vec![4, 5]);
+        // Position 20 derives page 5 (virtual 1) offset 4. The program says
+        // page 9, offset 11, and that is where it goes.
+        lane.writes = vec![Some((9, 11))];
+        let frame = Frame::of(shape, &[lane]).expect("stageable");
+        assert_eq!(frame.kv_write_page, vec![9]);
+        assert_eq!(frame.kv_write_offset, vec![11]);
+    }
+
+    /// And a stated slot outside the pool is refused, exactly like a derived
+    /// one: the program states LOGICAL pages and `envelope::fill` translates
+    /// them, so a number past the pool means the translation went wrong.
+    #[test]
+    fn a_stated_write_page_past_the_pool_is_refused() {
+        let shape = shape();
+        let mut lane = Request::of(vec![0], vec![4]);
+        lane.writes = vec![Some((shape.pages, 0))];
+        assert_eq!(
+            Frame::of(shape, &[lane]).err(),
+            Some(Unstageable::NoSuchPage {
+                request: 0,
+                page: shape.pages,
+                pages: shape.pages,
+            })
+        );
+    }
+
+    /// A write descriptor that does not cover the request's rows is refused,
+    /// because a table one short gives a row another row's slot.
+    #[test]
+    fn a_write_descriptor_short_of_its_rows_is_refused() {
+        let shape = shape();
+        let mut lane = Request::of(vec![0, 1, 2], vec![4]);
+        lane.writes = vec![Some((4, 0)), Some((4, 1))];
+        assert_eq!(
+            Frame::of(shape, &[lane]).err(),
+            Some(Unstageable::WriteRows {
+                request: 0,
+                writes: 2,
+                rows: 3,
+            })
+        );
+    }
+
+    /// Two requests may STATE the same slot, which the ownership rule leaves
+    /// alone: a beam's lanes name the same cell before they fork, on purpose.
+    #[test]
+    fn two_requests_may_state_the_same_slot() {
+        let shape = shape();
+        let lane = || {
+            let mut r = Request::of(vec![0], vec![7]);
+            r.writes = vec![Some((7, 0))];
+            r
+        };
+        let frame = Frame::of(shape, &[lane(), lane()]).expect("the program said so");
+        assert_eq!(frame.kv_write_page, vec![7, 7]);
+        assert_eq!(frame.kv_write_offset, vec![0, 0]);
+    }
+
+    /// Two requests may share a page they only READ, and not one they write.
+    ///
+    /// A beam's lanes are separate requests of one conversation: they share
+    /// every page of the prefix they forked from, and each writes only the
+    /// page its own position lands in. Refusing the shared prefix refused beam
+    /// search itself.
+    #[test]
+    fn two_requests_share_a_page_they_read_and_not_one_they_write() {
+        let shape = shape();
+        // Page size is 16, so position 20 lands in virtual page 1 and page 0
+        // is read-only for both lanes.
+        let lane = |last: u32| Request::of(vec![last], vec![4, 5]);
+        Frame::of(shape, &[lane(20), lane(20)])
+            .expect_err("both lanes write virtual page 1, which is physical page 5");
+
+        let shared_prefix_only = [
+            Request::of(vec![20], vec![4, 5]),
+            Request::of(vec![20], vec![4, 6]),
+        ];
+        let frame = Frame::of(shape, &shared_prefix_only)
+            .expect("physical page 4 is read by both and written by neither");
+        assert_eq!(
+            frame.kv_page_indices,
+            vec![4, 5, 4, 6],
+            "the shared prefix page appears once per lane"
+        );
+    }
+
     /// A request cannot read out a row that is not its own.
     #[test]
     fn a_request_cannot_read_out_a_row_that_is_not_its_own() {
@@ -1432,7 +1889,8 @@ mod tests {
     /// A request's own row becomes the fire's row.
     ///
     /// The offset that makes a second request's `samples: [0]` mean ITS first
-    /// row and not the fire's.
+    /// row and not the fire's -- the numbering the scheduler writes, measured
+    /// on its own output.
     #[test]
     fn a_requests_own_row_becomes_the_fires_row() {
         let shape = shape();
@@ -1442,6 +1900,26 @@ mod tests {
         second.samples = vec![0];
         let frame = Frame::of(shape, &[first, second]).expect("stageable");
         assert_eq!(frame.sampling_indices, vec![0, 2, 3]);
+    }
+
+    /// An unstated read-out is still this request's own last row, resolved
+    /// against where its rows begin.
+    #[test]
+    fn an_unstated_readout_is_this_requests_last_row() {
+        let shape = shape();
+        let frame = Frame::of(
+            shape,
+            &[
+                Request::of(vec![0, 1, 2], vec![1]),
+                Request::of(vec![0, 1], vec![9]),
+            ],
+        )
+        .expect("stageable");
+        assert_eq!(
+            frame.sampling_indices,
+            vec![2, 4],
+            "the last row of each, in the fire's numbering"
+        );
     }
 
     /// The seriation says the same thing the sampling table does.

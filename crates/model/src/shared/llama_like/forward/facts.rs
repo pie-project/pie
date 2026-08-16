@@ -8,8 +8,8 @@
 use serde::{Deserialize, Serialize};
 // The shared vocabulary stayed with the toolchain -- more than one family
 // is written in these words.
-use model_compiler::dsl::WeightRepr;
-pub use model_compiler::facts::{NormPlacement, QkNorm};
+use model_dsl::WeightRepr;
+pub use model_ir::facts::{NormPlacement, QkNorm};
 
 /// The shape, re-exported so a declaration reaches its facts and the
 /// words they are stated in from one place.
@@ -43,14 +43,14 @@ pub struct LlamaLikeCudaFacts {
     /// the declaration checks both.
     pub decode_fused_post: bool,
     /// The workspace carries a rope table (`ws.rope_table` non-empty), so
-    /// the fused arm's first layer states [`model_compiler::trace::OpKind::RopeTableBuild`];
+    /// the fused arm's first layer states [`model_ir::trace::OpKind::RopeTableBuild`];
     /// without it the fused kernel derives cos/sin from theta in-kernel
     /// and no table launch exists.
     pub rope_table: bool,
     /// FlashInfer's decode kernel set lacks this model's GQA ratio
     /// (`!flashinfer_decode_supports_gqa`, context.cpp:1413-1414): decode
     /// fires fall back to dequant + the prefill kernel
-    /// ([`model_compiler::trace::AttnKernel::PrefillDequantDecode`]). XQA, when
+    /// ([`model_ir::trace::AttnKernel::PrefillDequantDecode`]). XQA, when
     /// eligible, overrides this (context.cpp:1427).
     pub force_prefill_path: bool,
     /// The attention kernels run at a padded `head_dim_kernel` wider than
@@ -99,7 +99,7 @@ pub struct LlamaLikeCudaFacts {
     #[serde(default)]
     pub gate_up_fused: bool,
     /// How this deployment STORES its linear projections — the weight
-    /// representation axis ([`model_compiler::dsl::WeightRepr`]).
+    /// representation axis ([`model_dsl::WeightRepr`]).
     ///
     /// A pure binding fact, like [`Self::gate_up_fused`], and the last
     /// one the driver was answering for itself: `make_weight_view` built
@@ -240,7 +240,7 @@ pub struct LlamaLikeMetalFacts {
     ///
     /// Serde-defaulted, so a fixture written before this field reads as it did.
     #[serde(default)]
-    pub proj_repr: model_compiler::dsl::WeightRepr,
+    pub proj_repr: model_dsl::WeightRepr,
     /// Bits per packed weight element — 4 or 8.
     ///
     /// The affine entrypoints are instantiated over `(group size × bit
@@ -278,7 +278,7 @@ pub struct LlamaLikeMetalFacts {
     ///
     /// `None` is "the same as `proj_repr`", which is every other checkpoint.
     #[serde(default)]
-    pub moe_repr: Option<model_compiler::dsl::WeightRepr>,
+    pub moe_repr: Option<model_dsl::WeightRepr>,
     /// [`Self::affine_bits`] for the expert banks; see [`Self::moe_repr`].
     #[serde(default)]
     pub moe_bits: u32,
@@ -301,7 +301,7 @@ pub struct LlamaLikeMetalFacts {
     /// `None` is "the same as `proj_repr`", which is every other checkpoint,
     /// including every non-MoE one.
     #[serde(default)]
-    pub router_repr: Option<model_compiler::dsl::WeightRepr>,
+    pub router_repr: Option<model_dsl::WeightRepr>,
     /// [`Self::affine_bits`] for the router gate; see [`Self::router_repr`].
     #[serde(default)]
     pub router_bits: u32,
@@ -611,6 +611,22 @@ impl LlamaLikeMetalFacts {
     pub fn gpt_oss_20b() -> Self {
         Self {
             // Every layer carries one learned logit per head.
+            // YaRN's OTHER number, which the rope table cannot carry:
+            // `1.3466^2 / 8`, against the `0.125` a derived
+            // `1/sqrt(64)` gives. This was 0.0 -- the "derive it"
+            // sentinel -- so this fixture, and the four backends' text
+            // tests that read it, attended at the plain temperature.
+            // `yarn_softmax_scale`'s own doc says what that costs: a
+            // 1.81x error in the softmax temperature does not fault, it
+            // sharpens every distribution in the stack and reads as a
+            // model that has become oddly confident.
+            //
+            // Held equal to the derivation by
+            // `gpt_oss::project`'s total comparison, which is where the
+            // number belongs -- a fixture in `shared` that CALLED into
+            // `gpt_oss` would be the layering inversion this crate is
+            // arranged to avoid.
+            attn_scale: 0.226_657_55,
             attn_sinks: true,
             // `swiglu_limit: 7.0`, and alpha is the activation's own constant.
             activation: Activation::SwiGlu {
@@ -652,8 +668,32 @@ impl LlamaLikeMetalFacts {
             // facts, and it stated `moe_repr: None` by inheritance — an
             // affine reading of an MXFP4 bank, which is the exact defect
             // `routed_qmv`'s doc records as 909,207 NaNs.
-            moe_repr: Some(model_compiler::dsl::WeightRepr::Mxfp4Marlin),
+            moe_repr: Some(model_dsl::WeightRepr::Mxfp4Marlin),
             moe_bits: 4,
+            // The SECOND affine point, and it was inherited too. Measured
+            // on this row's own `config.json`: 98 dense tensors at
+            // group 64 / 4 bits and 24 `mlp.router` gates at group 64 /
+            // EIGHT. `model::binding::observed` reads that gate's point
+            // off the checkpoint and states it whenever it differs, so a
+            // real load of this row binds `router_quant_bits: 8` and this
+            // fixture bound none.
+            //
+            // The cost is written a few hundred lines away in
+            // `the_router_gate_is_read_at_its_own_width`: the gate is a
+            // `[2880, 32]` matrix whose error the whole mixture inherits,
+            // which is why `mlx_lm` spends the bits there, and reading it
+            // at the stack's 4 is "a fluent model routing every token to
+            // almost the right experts, cosine 0.84 against the reference
+            // logits and not one NaN to notice it by". That test proves
+            // the SYMBOL follows the binding; this makes the fixture the
+            // binding a real load produces.
+            router_repr: Some(model_dsl::WeightRepr::Scaled {
+                layout: model_dsl::ScaleLayout::PerGroup,
+                group: 64,
+                axis: 0,
+                zero_point: true,
+            }),
+            router_bits: 8,
             ..Self::synthetic()
         }
     }
@@ -673,6 +713,10 @@ impl LlamaLikeMetalFacts {
             per_layer_emb_dim: 256,
             kv_shared_layers: 4,
             dense_beside_moe: true,
+            // Every shipped gemma-4 norms its V, and no other family here
+            // does -- so a fixture that left this false made the one text
+            // that could exercise the branch fire the branch beside it.
+            v_norm: true,
             // `sqrt(1024)`, and 1024 is the `hidden` of
             // `LlamaLikeFacts::qwen3_0_6b()`, which is what both call sites
             // pair this with.
@@ -690,6 +734,26 @@ impl LlamaLikeMetalFacts {
             // gemma-4-31b.
             embed_scale: 32.0,
             window_left: (0..24).map(|l| if l % 6 == 5 { -1 } else { 512 }).collect(),
+            // gemma-4 states TWO attention geometries and every shipped row
+            // moves all three of these off the default. A fixture that left
+            // them there described one shape for the whole stack, which is
+            // every family here EXCEPT the one it is named for -- so the
+            // gemma texts never emitted the second geometry and never
+            // rotated a fraction.
+            //
+            // Doubling and halving what the paired `LlamaLikeFacts` states
+            // (`qwen3_0_6b`: `head_dim` 128, `kv_heads` 8), because this
+            // fixture is not a measurement; what has to be true is that the
+            // two geometries DIFFER, the way 31b's 256/16 differs from its
+            // 512/4.
+            global_head_dim: 256,
+            global_kv_heads: 4,
+            // A quarter, which is what all three shipped rows publish.
+            // Zero is not a smaller fraction, it is "rotate every channel":
+            // the neighbouring test records that a full gemma-4 layer would
+            // rotate 512 where the checkpoint rotates 128 and the model
+            // would produce fluent nonsense at long range.
+            full_partial_rotary: 0.25,
             rope_theta: 1_000_000.0,
             // The SLIDING layers' base. gemma states both, and this fixture
             // slides twenty of its twenty-four layers.
@@ -700,7 +764,7 @@ impl LlamaLikeMetalFacts {
 
     /// This layer's window, `-1` for all of it. See [`Self::window_left`].
     pub fn window_left_at(&self, l: u32) -> i32 {
-        model_compiler::facts::window_left_at(&self.window_left, l)
+        model_ir::facts::window_left_at(&self.window_left, l)
     }
 
     /// This layer's rotary base. See [`Self::rope_theta_sliding`].
@@ -792,8 +856,8 @@ impl LlamaLikeMetalFacts {
             // they describe is a quantized checkpoint. MLX stores the pair
             // beside the packed weight as `.scales` and `.biases`, which is
             // a zero-point layout.
-            proj_repr: model_compiler::dsl::WeightRepr::Scaled {
-                layout: model_compiler::dsl::ScaleLayout::PerGroup,
+            proj_repr: model_dsl::WeightRepr::Scaled {
+                layout: model_dsl::ScaleLayout::PerGroup,
                 group: 64,
                 axis: 0,
                 zero_point: true,
@@ -807,10 +871,14 @@ impl LlamaLikeMetalFacts {
             // point states a checkpoint fact, and this file holds none.
             router_repr: None,
             router_bits: 0,
-            // The narrowest rung `qmm_bm` can pick, so it is the one a short
-            // window fires; `bn = 32` is the only column tile the residual
-            // variant is instantiated at.
-            qmm_tile: (16, 32),
+            // What `project::QMM_TILE` states, which is the rung every kernel
+            // tree hand-tunes a build at; `bn = 32` is the only column tile
+            // the residual variant is instantiated at. Written out rather
+            // than read from the constant so that a fixture and a projection
+            // can be compared -- `gemma_4`'s
+            // `the_shared_gemma_fixture_moves_wherever_every_gemma_row_moves`
+            // does exactly that, and caught this the day the tile widened.
+            qmm_tile: (32, 32),
             // `Projections::InPlace` is what `compile_load_plan` authors with,
             // and the join declines under it.
             gate_up_fused: false,
@@ -860,7 +928,7 @@ impl LlamaLikeCudaFacts {
     /// reads it, which is what the drivers' `per_layer_window_left`
     /// fallback meant.
     pub fn window_left_at(&self, l: u32) -> i32 {
-        model_compiler::facts::window_left_at(&self.window_left, l)
+        model_ir::facts::window_left_at(&self.window_left, l)
     }
 
     /// Qwen3-0.6B on L40S, default env — MEASURED 2026-08-02 against the
@@ -911,6 +979,149 @@ impl LlamaLikeCudaFacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every branch this text takes, taken BOTH WAYS by some fixture --
+    /// or named here with the reason it cannot be.
+    ///
+    /// A predicate only one fixture polarity reaches is a branch that
+    /// compiles and is never emitted, and this crate has now shipped four
+    /// defects of exactly that shape: `embed_scale` and `v_norm` left at
+    /// the llama value under a gemma name, `o_bias` and `router_bias`
+    /// left false under gpt-oss's. Each was found by an ad-hoc census run
+    /// by hand, and an ad-hoc census is a thing you stop running.
+    ///
+    /// Read through `serde` so the field list is the struct's rather than
+    /// a copy of it, the same reason the comparisons in `gpt_oss` and
+    /// `gemma_4` are total. A boolean added tomorrow is asked about the
+    /// day it is added.
+    ///
+    /// `EXCUSED` is held EXACTLY, so an entry that stops being needed
+    /// fails as loudly as a branch that goes dark. That is the property
+    /// the hand census lacked: it reported `shared_intermediate` as
+    /// unexercised because it counted FIXTURES, and the coverage was in a
+    /// test that builds its facts inline.
+    #[test]
+    fn every_metal_predicate_is_stated_more_than_one_way_or_excused() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        // `(field, why)`, and the why has to be a fact about the crate
+        // rather than an intention.
+        const EXCUSED: &[(&str, &str)] = &[
+            // Refused at trace time by `llama_like_metal` itself, with the
+            // reason written there: `silu_mul` takes gate and up as two
+            // buffers, no Metal kernel splits a packed bank into them, and
+            // `compile_load_plan` authors with `Projections::InPlace` so
+            // the join declines. A fixture stating `true` would assert,
+            // not branch.
+            ("gate_up_fused", "asserted false in the text"),
+            // Stated inline by `driver-metal`'s texts rather than by a
+            // constructor here: `text_conformance`'s "gemma facts, scalar
+            // instead of PLE" row and `device_text_fire::the_other_gemmas_
+            // per_layer_scalar_fires_on_the_device`, the second of which
+            // encodes `layer_scalar` on a device. gemma-4-31b is the
+            // shipped row behind it -- it serves, and only its seventeen
+            // gigabytes keep it out of the real-weights rig here.
+            ("per_layer_scalar", "stated inline by driver-metal's texts"),
+            // Both ways in `gemma_4::project`'s own mapping test, which
+            // loops `k_eq_v` over `[false, true]` and reads the fact back
+            // off `metal_facts`. The two rows that state it, the 31b and
+            // the 26b-a4b, ship no `v_proj` at all.
+            ("v_from_k", "both ways in gemma_4::project's mapping test"),
+            // Both ways in this module's own `the_metal_facts_resolve_at_
+            // trace_time`, which traces one fixture with the fold and one
+            // without and counts the residual symbols. No shipped Metal
+            // binding turns it off -- the arm is for a deployment whose
+            // loader states an explicit residual landing per block -- so a
+            // fixture stating `false` would describe a deployment that
+            // does not exist.
+            (
+                "fuse_residual_gemv",
+                "both ways in this module's own trace test",
+            ),
+            // NOT A BRANCH. `llama_like_metal` reads it as `let _ =` and
+            // sets `paged = true` unconditionally, with the reason written
+            // there: it is a fact about the DRIVER's allocation and not
+            // about the fire. A fixture stating `false` would change
+            // nothing that is emitted.
+            ("paged_multi_batch", "read and discarded, with a reason"),
+            // Not a branch either: it is an ARGUMENT to `router_topk`, so
+            // the false side is the same symbol computing something else.
+            // Every routed row in this catalog publishes `true`, which is
+            // the opposite of `Qwen3MoeConfig`'s class default -- see
+            // `RowScalars::norm_topk_prob`.
+            ("norm_topk_prob", "an argument, not a branch"),
+            // ANDed with the FIRE CLASS: `multi_batch = class !=
+            // FireClass::Decode`, so one fixture takes both arms across the
+            // classes a conformance run fires. A decode emits `qmv`, a
+            // prefill the guarded `qmm`.
+            (
+                "qmm_multi_batch",
+                "the conjunct beside it is the fire class",
+            ),
+            // ANDed with a SHAPE fact -- `f.qkv_bias`, `f.o_bias`,
+            // `f.router_bias` -- and the seven `LlamaLikeFacts` fixtures
+            // state those both ways, so both arms are emitted. The shipped
+            // bindings differ too: gpt-oss binds `add_bias: true` and
+            // gemma-4 binds it false.
+            ("add_bias", "the conjunct beside it is a shape fact"),
+            // A NUMBER rather than a bool, and the census only saw it once
+            // it stopped asking about polarity. Four in all three fixtures;
+            // `kernels-metal` instantiates `affine_qmv_fast_bfloat16_gs_
+            // {32,64,128}_b_8` as well and `mlx-community` publishes 8-bit
+            // snapshots of these same rows, so the other width is a point
+            // production reaches. Stated by `driver-metal`'s
+            // `text_conformance`: the "8-bit affine" row, and
+            // `the_two_affine_widths_are_an_exchange_not_a_default` which
+            // asserts each text names ONE width and that they differ --
+            // presence would pass while a projection read its width from
+            // somewhere other than these facts.
+            ("affine_bits", "stated inline by driver-metal's texts"),
+        ];
+
+        let scalars = |m: &LlamaLikeMetalFacts| match serde_json::to_value(m) {
+            Ok(serde_json::Value::Object(o)) => o
+                .into_iter()
+                .filter(|(_, v)| v.is_boolean() || v.is_number())
+                .map(|(k, v)| (k, v.to_string()))
+                .collect::<BTreeMap<_, _>>(),
+            other => panic!("these facts serialise as a struct, not {other:?}"),
+        };
+        let every = [
+            scalars(&LlamaLikeMetalFacts::synthetic()),
+            scalars(&LlamaLikeMetalFacts::gpt_oss_20b()),
+            scalars(&LlamaLikeMetalFacts::gemma_like()),
+        ];
+        // Non-vacuity. `serde_json` handing back an empty map -- a rename, a
+        // `skip_serializing_if`, a struct that stopped deriving -- would
+        // make every assertion below pass over nothing.
+        assert!(
+            every[0].len() >= 20,
+            "these facts carry more scalars than this: {:?}",
+            every[0].keys().collect::<Vec<_>>()
+        );
+
+        let dark: BTreeSet<&str> = every[0]
+            .keys()
+            .filter(|name| every.iter().all(|f| f[*name] == every[0][*name]))
+            .map(String::as_str)
+            .collect();
+        let excused: BTreeSet<&str> = EXCUSED.iter().map(|(f, _)| *f).collect();
+
+        let opened: Vec<&&str> = dark.difference(&excused).collect();
+        assert!(
+            opened.is_empty(),
+            "branch(es) every fixture states IDENTICALLY, and none is \
+             excused. A predicate one value reaches compiles and is never \
+             emitted the other way: {opened:?}"
+        );
+        let closed: Vec<&&str> = excused.difference(&dark).collect();
+        assert!(
+            closed.is_empty(),
+            "excuse(s) that stopped being needed -- a fixture now states \
+             more than one value, so the entry says something false about \
+             this crate: {closed:?}"
+        );
+    }
 
     /// gpt-oss alternates: even layers see a window, odd layers see all.
     ///

@@ -87,6 +87,16 @@ pub trait Modules {
     /// module for an entrypoint that was never compiled with the extension --
     /// which is most of them, and is what "tiers are additive" means.
     fn code(&self, symbol: &str, tier: Capability) -> Option<&[u8]>;
+
+    /// WHICH capability supplied [`Self::code`]'s answer.
+    ///
+    /// The same walk, reporting the tier it stopped at instead of the bytes.
+    /// It exists because "the tier is on" was previously inferred rather than
+    /// observed: the device test compared a tiered run against a scalar one
+    /// and took a bitwise DIFFERENCE as proof the module had loaded. That is
+    /// a proxy, and when it failed it said only that the two agreed, which is
+    /// the one thing that is never useful to know.
+    fn resolved(&self, symbol: &str, tier: Capability) -> Option<Capability>;
 }
 
 impl Modules for BTreeMap<String, Vec<u8>> {
@@ -99,6 +109,17 @@ impl Modules for BTreeMap<String, Vec<u8>> {
                 other => self.get(&format!("{symbol}.{}", other.tag())),
             })
             .map(Vec::as_slice)
+    }
+
+    fn resolved(&self, symbol: &str, tier: Capability) -> Option<Capability> {
+        Capability::PREFERENCE
+            .iter()
+            .skip_while(|&&c| c != tier)
+            .find(|&&c| match c {
+                Capability::Baseline => self.contains_key(symbol),
+                other => self.contains_key(&format!("{symbol}.{}", other.tag())),
+            })
+            .copied()
     }
 }
 
@@ -178,6 +199,15 @@ pub struct Fired {
     /// them spent 22 milliseconds a fire doing it, so this number is the only
     /// thing that tells them apart.
     pub parsed: usize,
+    /// How many of those symbols resolved ABOVE `Capability::Baseline`.
+    ///
+    /// The direct answer to "did this fire actually run the tier it was built
+    /// at", which nothing reported before. A fire at `Coopmat` on a store
+    /// with no cooperative-matrix module is not an error -- tiers are
+    /// additive and most entrypoints have only a baseline build -- so the
+    /// only way to tell a tier that is ON from one that is merely SELECTED is
+    /// to count what it reached.
+    pub tiered: usize,
 }
 
 /// Why a fire did not run.
@@ -311,14 +341,21 @@ pub fn fire<R: Resolve, M: Modules>(
     // device addresses a storage buffer from, so 3624 bytes of scalars take
     // rather more room than that. Room is not what was scarce.
     let mut planned = Vec::with_capacity(lowered.launches.len());
-    let mut read: std::collections::BTreeMap<&str, crate::spirv::Declared> =
-        std::collections::BTreeMap::new();
+    // Per SYMBOL: the reflection, and the kernel table's row. Both are walks
+    // over something whose size is the tree's and not the fire's -- a few
+    // thousand SPIR-V words, and a hundred kernel rows with axis points --
+    // and both used to happen once per LAUNCH.
+    let mut read: std::collections::BTreeMap<
+        &str,
+        (crate::spirv::Declared, &'static kernels::KernelSig),
+    > = std::collections::BTreeMap::new();
     // Counted where the parse happens rather than taken from `read.len()` at
     // the end. The map's size is the number of distinct symbols whether the
     // cache is consulted or not -- measured: a mutation that dropped every
     // entry before looking it up reported the same number and passed the test
     // that exists to catch it. This counts the walk.
     let mut parsed = 0usize;
+    let mut tiered = 0usize;
     let mut spans: Vec<Option<(u64, u64)>> = Vec::with_capacity(planned.capacity());
     let mut scalars: Vec<u8> = Vec::new();
     let give_back = |device: &Device, block: Option<crate::device::Buffer>| {
@@ -326,8 +363,81 @@ pub fn fire<R: Resolve, M: Modules>(
             device.free(b);
         }
     };
+    // The reflection every path shares. On the table path `read` below keys
+    // it by the PLAN's symbol; a routine names its own entrypoint, which the
+    // plan need not carry at all, so the routine path needs a cache that can
+    // still miss. Both walk the same SPIR-V exactly once per name.
+    let reflection = Reflection {
+        modules,
+        tier,
+        seen: core::cell::RefCell::new(BTreeMap::new()),
+    };
     for (at, launch) in lowered.launches.iter().enumerate() {
         let symbol = lowered.kernels[launch.kernel as usize].as_str();
+        // The ROUTINE path, when the symbol's family has arms.
+        //
+        // The registry does its OWN lookup, against the entrypoint stems it
+        // states, rather than resolving the symbol through
+        // `kernels::sig_in(KERNELS, ..)`. That is what lets a family's rows be
+        // deleted the moment its arms are written: a fork that read the table
+        // would make a crossed family unreachable the instant its rows went,
+        // which is the circularity `.wiki/kernel-x/refactor-bigplan.md` §7
+        // leaves between Stage 3 ("that family's `kernel!` rows deleted") and
+        // Stage 5 ("the arm registry becomes the lookup").
+        if let Some((routine, arm)) = crate::arm::arm_for(symbol) {
+            // The two refusals a MISSING module gets, said here so that
+            // crossing a family does not change the shape of the answer.
+            //
+            // `Reflect::of` collapses "the store holds nothing under this
+            // name" and "it holds something that is not SPIR-V" into `None`,
+            // and a body meeting that `None` refuses with `Undeclared` -- a
+            // refusal that reads as "the shader does not bind what the body
+            // states", which is a different fault with a different fix. The
+            // table path has always distinguished them and a caller acts on
+            // the distinction: `NoModule` means build the module, `Unreadable`
+            // means the bytes under it are damaged.
+            //
+            // Asked of the PLAN's symbol, which is the name the store is keyed
+            // by and the name the refusal must carry. A body that composes a
+            // different entrypoint still meets `Undeclared`, correctly: that
+            // is a body naming a module this build did not produce, which is
+            // the body's fault and not the store's.
+            let Some(code) = modules.code(symbol, tier) else {
+                return Err(Unfired::NoModule {
+                    at,
+                    symbol: symbol.to_owned(),
+                });
+            };
+            if let Err(why) = crate::spirv::words(code).and_then(|w| crate::spirv::declared(&w)) {
+                return Err(Unfired::Unreadable {
+                    at,
+                    symbol: symbol.to_owned(),
+                    why,
+                });
+            }
+            let made = plan_routine(
+                lowered,
+                launch,
+                symbol,
+                routine,
+                arm,
+                arena,
+                resolver,
+                geometry,
+                &reflection,
+                device,
+            )
+            .map_err(|why| Unfired::Unplannable {
+                at,
+                symbol: symbol.to_owned(),
+                why,
+            })?;
+            for d in made {
+                push_scalars(device, &d, &mut spans, &mut scalars);
+                planned.push(d);
+            }
+            continue;
+        }
         let Some(code) = modules.code(symbol, tier) else {
             return Err(Unfired::NoModule {
                 at,
@@ -349,12 +459,27 @@ pub fn fire<R: Resolve, M: Modules>(
         // The map is keyed by a borrow of the plan's own symbol, which is why
         // it costs no lifetime the signature did not already have: `Declared`
         // is owned, and `plan_one` borrows it only for the call.
-        let declared = match read.entry(symbol) {
+        let (declared, sig) = match read.entry(symbol) {
             std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::btree_map::Entry::Vacant(e) => {
                 parsed += 1;
+                if modules
+                    .resolved(symbol, tier)
+                    .is_some_and(|c| c != Capability::Baseline)
+                {
+                    tiered += 1;
+                }
+                let Some(sig) = kernels::sig_in(kernels_vulkan::KERNELS, symbol) else {
+                    return Err(Unfired::Unplannable {
+                        at,
+                        symbol: symbol.to_owned(),
+                        why: crate::dispatch::Undispatchable::Unknown {
+                            symbol: symbol.to_owned(),
+                        },
+                    });
+                };
                 match crate::spirv::words(code).and_then(|w| crate::spirv::declared(&w)) {
-                    Ok(d) => e.insert(d),
+                    Ok(d) => e.insert((d, sig)),
                     Err(why) => {
                         return Err(Unfired::Unreadable {
                             at,
@@ -375,6 +500,7 @@ pub fn fire<R: Resolve, M: Modules>(
                     [declared.local[0], declared.local[1], declared.local[2]],
                 ),
                 declared,
+                sig: Some(sig),
             },
             Sources {
                 arena,
@@ -393,23 +519,12 @@ pub fn fire<R: Resolve, M: Modules>(
                 });
             }
         };
-        match &d.params {
-            Params::Block { bytes, .. } => {
-                // Aligned to what the device will address a storage buffer
-                // from, because these are bound as sub-ranges and
-                // `Bound::at` refuses any other offset -- rightly, since an
-                // unaligned descriptor is invalid rather than slow.
-                let align = device.min_storage_offset();
-                let pad = scalars.len() as u64 % align;
-                if pad != 0 {
-                    scalars.resize(scalars.len() + (align - pad) as usize, 0);
-                }
-                spans.push(Some((scalars.len() as u64, bytes.len() as u64)));
-                scalars.extend_from_slice(bytes);
-            }
-            _ => spans.push(None),
-        }
-        planned.push((symbol.to_owned(), d));
+        push_scalars(device, &d, &mut spans, &mut scalars);
+        // The `Dispatch` already borrows the plan's symbol -- see
+        // `Dispatch::symbol` -- so the owned copy this used to push beside it
+        // was a `String` allocation per rectangle, 452 of them in a decode,
+        // for a name the tuple's other half was already holding.
+        planned.push(d);
     }
 
     // One allocation, or none when no rectangle in this fire states a block.
@@ -444,7 +559,16 @@ pub fn fire<R: Resolve, M: Modules>(
         one_at_a_time,
     )
     // Filled in here because `record` never sees pass one. See `Fired`.
-    .map(|f| Fired { parsed, ..f });
+    .map(|f| Fired {
+        // Plus the routine path's own reads. Its cache is keyed by
+        // ENTRYPOINT rather than by plan symbol -- a body spells its own, and
+        // a two-pass reduction names two for one statement -- but a miss is a
+        // miss, and the invariant this number exists for is "one walk of the
+        // SPIR-V per module, not one per rectangle".
+        parsed: parsed + reflection.seen.borrow().len(),
+        tiered,
+        ..f
+    });
     // After the fence and not before: `run_all` waits, so by here the queue
     // is done with every block in it. This is the whole reason the buffer is
     // owned by this function rather than returned.
@@ -470,7 +594,7 @@ fn record<M: Modules>(
     device: &Device,
     pipelines: &mut Pipelines,
     modules: &M,
-    planned: &[(String, crate::dispatch::Dispatch<'_>)],
+    planned: &[crate::dispatch::Dispatch<'_>],
     scalars: Blocks<'_>,
     tier: Capability,
     one_at_a_time: bool,
@@ -478,22 +602,28 @@ fn record<M: Modules>(
     // Pass two: every distinct module gets a pipeline, so that pass three can
     // hold a reference to all of them at once.
     let mut buffers = Vec::with_capacity(planned.len());
+    // The write masks, kept beside the buffers because pass two can INSERT a
+    // slot into a launch's bindings -- the scalar block -- and a mask that
+    // still described the plan's list would be off by one from there on.
+    let mut writes: Vec<Vec<bool>> = Vec::with_capacity(planned.len());
     let Blocks { block, spans } = scalars;
     let blocks = spans.iter().filter(|s| s.is_some()).count();
-    for (at, ((symbol, d), span)) in planned.iter().zip(spans).enumerate() {
+    for (at, (d, span)) in planned.iter().zip(spans).enumerate() {
+        let symbol = d.symbol.as_ref();
         let mut b = d.buffers.clone();
+        let mut w = d.writes.clone();
         if let Some((offset, len)) = *span {
             let Some(slot) = d.block_at else {
                 return Err(Unfired::Impossible {
                     at,
-                    symbol: symbol.clone(),
+                    symbol: symbol.to_owned(),
                     what: "its scalars are a block and the planner named no slot for it",
                 });
             };
             let Some(buf) = block else {
                 return Err(Unfired::Impossible {
                     at,
-                    symbol: symbol.clone(),
+                    symbol: symbol.to_owned(),
                     what: "its scalars name a span of a block buffer that was not allocated",
                 });
             };
@@ -504,6 +634,10 @@ fn record<M: Modules>(
             let bound =
                 Bound::at(device, buf, offset, len).map_err(|why| Unfired::Refused { at, why })?;
             b.insert(slot, bound);
+            // Read-only: the shader reads its parameters out of it and this
+            // driver is the only thing that ever writes it, on the host,
+            // before the fire is submitted.
+            w.insert(slot, false);
         }
         let push = match &d.params {
             Params::Push(p) => p.len() as u32,
@@ -516,21 +650,25 @@ fn record<M: Modules>(
             .get(device, symbol, code, push, b.len() as u32, tier)
             .map_err(|why| Unfired::Refused { at, why })?;
         buffers.push(b);
+        writes.push(w);
     }
 
     // Pass three.
     let mut run = Vec::with_capacity(planned.len());
-    for ((symbol, d), b) in planned.iter().zip(&buffers) {
+    for ((d, b), w) in planned.iter().zip(&buffers).zip(&writes) {
+        let symbol = d.symbol.as_ref();
         let Some(pipeline) = pipelines.peek(symbol, tier) else {
             return Err(Unfired::Impossible {
                 at: run.len(),
-                symbol: symbol.clone(),
+                symbol: symbol.to_owned(),
                 what: "no pipeline, one pass after every pipeline was built",
             });
         };
         run.push(Recorded {
+            symbol,
             pipeline,
             buffers: b,
+            writes: w,
             push: match &d.params {
                 Params::Push(p) => p,
                 _ => &[],
@@ -552,6 +690,7 @@ fn record<M: Modules>(
             // Pass one's, and this function is passes two and three. The
             // caller fills it.
             parsed: 0,
+            tiered: 0,
         });
     }
     device
@@ -562,6 +701,7 @@ fn record<M: Modules>(
         submissions: 1,
         blocks,
         parsed: 0,
+        tiered: 0,
     })
 }
 
@@ -575,15 +715,37 @@ pub struct Logits {
     pub rows: usize,
     /// Elements in one distribution, which is the vocabulary.
     pub vocab: usize,
-    /// `rows * vocab` values, row major.
+    /// `read.len() * vocab` values, row major, in `read`'s order.
     pub values: Vec<f32>,
+    /// Which of the fire's rows `values` holds, ascending.
+    ///
+    /// # Why this is not always `0..rows`
+    ///
+    /// It used to be, and that is what a 1024-token prefill costs when it is:
+    /// the text computes a distribution for EVERY row -- see the "every row
+    /// samples" note in `turns.rs`, which is a workaround for how the epilogue
+    /// is spelled and not a choice this crate makes -- so the arena holds 155
+    /// million logits and a caller wants one of them. Copying and widening the
+    /// other 151,935 rows was half the step.
+    ///
+    /// So [`logits_of`] reads a stated set instead, and this says which. A row
+    /// nobody asked for is not zero and not stale: [`Logits::row`] answers
+    /// `None` for it, which is the difference between a caller getting a wrong
+    /// distribution and a caller getting an error.
+    pub read: Vec<usize>,
 }
 
 impl Logits {
-    /// One distribution.
+    /// One distribution, by the row number the FIRE gave it.
+    ///
+    /// `None` both for a row past the fire and for a row that was not read
+    /// back. The two are not distinguished because a caller can do nothing
+    /// different about them: both mean "this driver does not have that
+    /// distribution".
     #[must_use]
     pub fn row(&self, at: usize) -> Option<&[f32]> {
-        self.values.get(at * self.vocab..(at + 1) * self.vocab)
+        let held = self.read.binary_search(&at).ok()?;
+        self.values.get(held * self.vocab..(held + 1) * self.vocab)
     }
 }
 
@@ -641,10 +803,9 @@ impl std::error::Error for Unread {}
 /// own doc, which is where this got it from, and it is checked here rather
 /// than assumed.
 ///
-/// This reads the WHOLE arena and slices it. `Device::read` has no offset, and
-/// an arena is tens of megabytes against a vocabulary of a few hundred
-/// kilobytes, so this is wasteful and is not on any path that matters: a fire
-/// is read once.
+/// Every row of the readout. [`logits_of`] is the one a server should call:
+/// this is for callers -- tests, mostly -- that want the whole rectangle and
+/// know it is small.
 ///
 /// # Errors
 ///
@@ -654,6 +815,36 @@ pub fn logits(
     device: &Device,
     arena: &crate::device::Buffer,
     lowered: &Lowered,
+) -> Result<Logits, Unread> {
+    let rows = lowered.readout.ok_or(Unread::NoExit)?.rows as usize;
+    logits_of(device, arena, lowered, &(0..rows).collect::<Vec<_>>())
+}
+
+/// The rows `want` of a fire's distributions, off the arena and widened.
+///
+/// `want` is taken as fire row numbers, and rows outside the readout are
+/// ignored rather than refused: a caller states the rows it will ask about,
+/// and a row the fire did not produce is a question [`Logits::row`] already
+/// answers with `None`.
+///
+/// # What it reads
+///
+/// ONE contiguous span, from the first wanted row to the last, and then only
+/// the wanted rows are widened out of it. A span rather than a row each
+/// because a read is a DMA with a fence -- about 300 us of fixed cost -- so
+/// eight scattered rows would be eight submissions, and a decode's rows are
+/// every row anyway. A prefill's single readout is its last row, which makes
+/// the span one row of a rectangle with a thousand.
+///
+/// # Errors
+///
+/// [`Unread`], and [`Failed`] is folded into it only through
+/// [`Unread::PastArena`] -- the read itself is checked before it is asked for.
+pub fn logits_of(
+    device: &Device,
+    arena: &crate::device::Buffer,
+    lowered: &Lowered,
+    want: &[usize],
 ) -> Result<Logits, Unread> {
     let exit = lowered.readout.ok_or(Unread::NoExit)?;
     let rows = exit.rows as usize;
@@ -672,36 +863,266 @@ pub fn logits(
     if !matches!(exit.bytes, 2 | 4) {
         return Err(Unread::Width(exit.bytes));
     }
-    let whole = device.read(arena).map_err(|_| Unread::PastArena {
-        at: exit.at,
-        extent,
-        arena: lowered.arena_bytes,
-    })?;
-    let bytes = whole
-        .get(exit.at..exit.at + extent)
-        .ok_or(Unread::PastArena {
+    // The rows a caller stated, and one span of them.
+    //
+    // `read` is what came back and `values` is in its order, so a row nobody
+    // asked for is absent rather than wrong -- see `Logits::read`.
+    let mut read: Vec<usize> = want.iter().copied().filter(|&r| r < rows).collect();
+    read.sort_unstable();
+    read.dedup();
+    let (Some(&first), Some(&last)) = (read.first(), read.last()) else {
+        return Ok(Logits {
+            rows,
+            vocab,
+            values: Vec::new(),
+            read,
+        });
+    };
+    let width = vocab * exit.bytes as usize;
+    let span = (last + 1 - first) * width;
+    // The READOUT and not the arena.
+    //
+    // Reading the whole buffer and slicing it was 334 megabytes for a
+    // 1024-token prefill where the logits are 311 of them -- and of THOSE, a
+    // caller wants one row. `Device::read_at` is also where the staged copy
+    // is, so this line is what puts a fire's answer on the copy engine
+    // instead of on an uncached PCIe read.
+    let bytes = device
+        .read_at(arena, (exit.at + first * width) as u64, span as u64)
+        .map_err(|_| Unread::PastArena {
             at: exit.at,
             extent,
-            arena: whole.len(),
+            arena: lowered.arena_bytes,
         })?;
-    let values = match exit.bytes {
-        // bf16 is the TOP half of an f32, so widening is a shift and not a
-        // conversion. Written as bits rather than through a cast because
-        // `u16 as f32` is a numeric conversion and this is a reinterpretation.
-        2 => bytes
-            .chunks_exact(2)
-            .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
-            .collect(),
-        _ => bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-    };
+    let mut values = Vec::with_capacity(read.len() * vocab);
+    for &row in &read {
+        let at = (row - first) * width;
+        let one = bytes.get(at..at + width).ok_or(Unread::PastArena {
+            at: exit.at,
+            extent,
+            arena: lowered.arena_bytes,
+        })?;
+        match exit.bytes {
+            // bf16 is the TOP half of an f32, so widening is a shift and not
+            // a conversion. Written as bits rather than through a cast
+            // because `u16 as f32` is a numeric conversion and this is a
+            // reinterpretation.
+            2 => values.extend(
+                one.chunks_exact(2)
+                    .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16)),
+            ),
+            _ => values.extend(
+                one.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+            ),
+        }
+    }
     Ok(Logits {
         rows,
         vocab,
         values,
+        read,
     })
+}
+
+/// Gather one dispatch's scalar block into the fire's single staging run.
+///
+/// Factored out because both planning paths need it and neither may skip it:
+/// `spans` is indexed by DISPATCH, so a path that pushed a `Dispatch` without
+/// pushing a span would shift every block after it onto the wrong offsets --
+/// which binds a real buffer of a plausible size and computes a number.
+///
+/// The alignment is what the device will address a storage buffer from,
+/// because these are bound as sub-ranges and `Bound::at` refuses any other
+/// offset -- rightly, since an unaligned descriptor is invalid rather than
+/// slow.
+fn push_scalars(
+    device: &Device,
+    d: &crate::dispatch::Dispatch<'_>,
+    spans: &mut Vec<Option<(u64, u64)>>,
+    scalars: &mut Vec<u8>,
+) {
+    match &d.params {
+        Params::Block { bytes, .. } => {
+            let align = device.min_storage_offset();
+            let pad = scalars.len() as u64 % align;
+            if pad != 0 {
+                scalars.resize(scalars.len() + (align - pad) as usize, 0);
+            }
+            spans.push(Some((scalars.len() as u64, bytes.len() as u64)));
+            scalars.extend_from_slice(bytes);
+        }
+        Params::Push(_) | Params::None => spans.push(None),
+    }
+}
+
+/// The module cache the routine path reflects through.
+///
+/// One walk of the SPIR-V per ENTRYPOINT, which is the same guarantee the
+/// table path's `read` map gives and for the same measured reason: reading a
+/// module is a few thousand words, and doing it once per launch cost 22
+/// milliseconds of a 24-millisecond pass.
+///
+/// Keyed by entrypoint rather than by plan symbol because a routine spells its
+/// own -- a body that instantiates an axis builds `affine_qmm_t_bf16_gs_128_b_4`
+/// itself, and a two-pass reduction names two entrypoints for one statement.
+/// A miss is cached as a miss, so a routine naming a module this build did not
+/// produce costs one lookup rather than one parse per launch.
+type Reflected = (crate::geometry::Module, std::rc::Rc<crate::spirv::Declared>);
+
+struct Reflection<'m, M: Modules> {
+    modules: &'m M,
+    tier: Capability,
+    seen: core::cell::RefCell<BTreeMap<String, Option<Reflected>>>,
+}
+
+impl<M: Modules> crate::encode::Reflect for Reflection<'_, M> {
+    fn of(&self, entrypoint: &str) -> Option<Reflected> {
+        if let Some(held) = self.seen.borrow().get(entrypoint) {
+            return held.clone();
+        }
+        let made = self
+            .modules
+            .code(entrypoint, self.tier)
+            .and_then(|code| {
+                crate::spirv::words(code)
+                    .and_then(|w| crate::spirv::declared(&w))
+                    .ok()
+            })
+            .map(|d| {
+                (
+                    crate::geometry::Module::named(
+                        entrypoint,
+                        [d.local[0], d.local[1], d.local[2]],
+                    ),
+                    std::rc::Rc::new(d),
+                )
+            });
+        self.seen
+            .borrow_mut()
+            .insert(entrypoint.to_owned(), made.clone());
+        made
+    }
+}
+
+/// One launch of a crossed routine, as the dispatches its body asked for.
+///
+/// The ARM resolves the statement's operands into handles and states the
+/// routine's argument list; the BODY states the rectangle and the entrypoint.
+/// Neither half can state the other's, which is the point: an arm that
+/// computed a grid would put back the second opinion the refactor removes, and
+/// a body that reached for an operand would need to know a trace.
+///
+/// # Errors
+///
+/// [`Undispatchable::Operand`] for an operand the statement does not carry,
+/// and [`Undispatchable::Refused`] for anything the routine or the encoder
+/// would not launch -- an empty extent, an entrypoint this build did not
+/// produce, an argument list the module's bindings do not fit.
+#[allow(clippy::too_many_arguments)]
+fn plan_routine<'a, R: Resolve, M: Modules>(
+    lowered: &Lowered,
+    launch: &model_compiler::lower::Launch,
+    symbol: &str,
+    routine: &'static kernels_vulkan::routine::Routine,
+    arm: crate::arm::Arm,
+    arena: Arena<'a>,
+    resolver: &'a R,
+    geometry: Geometry,
+    reflection: &Reflection<'_, M>,
+    device: &Device,
+) -> Result<Vec<crate::dispatch::Dispatch<'a>>, Undispatchable> {
+    // A conditional rectangle's guard was NOT answered by the lowering, and
+    // this walk has no way to answer it -- recording every arm would run
+    // every arm. The table path refuses here for the same reason.
+    if launch.cond != model_compiler::lower::Launch::NO_COND {
+        return Err(Undispatchable::Conditional {
+            symbol: symbol.to_owned(),
+            cond: launch.cond,
+        });
+    }
+    let bound = crate::binding::bind(
+        lowered,
+        launch,
+        arena,
+        resolver,
+        device.min_storage_offset(),
+    )
+    .map_err(|(at, why)| Undispatchable::Operand { at, why })?;
+
+    // How many of the widthed operands are RESULTS: the ROUTINE says, by
+    // counting the `BufMut` in its own signature. The table path read this off
+    // a row's `Out` sources, which is the same fact stated in a place the
+    // compiler cannot check against the kernel.
+    let results = routine
+        .args
+        .iter()
+        .filter(|(ty, _)| *ty == kernels::Ty::BufMut)
+        .count();
+    let args = &lowered.args[launch.args.start as usize..launch.args.end as usize];
+    let (ins, outs, weights) = crate::arm::split(args, results);
+    let params: Vec<Option<u32>> = (launch.params.start as usize..launch.params.end as usize)
+        .map(|at| lowered.params.get(at).copied())
+        .collect();
+
+    let widths: Vec<u32> = args
+        .iter()
+        .filter_map(|a| match a {
+            model_compiler::lower::Arg::Arena { width, .. }
+            | model_compiler::lower::Arg::Named { width, .. } => Some(*width),
+            model_compiler::lower::Arg::Weight(_) => None,
+        })
+        .collect();
+    let (group, bits) = crate::arm::affine_of(symbol).unwrap_or((0, 0));
+    let facts = crate::arm::Facts {
+        rows: launch.rows.end - launch.rows.start,
+        // The last widthed operand is the launch's last OUTPUT, which is what
+        // sizes the rectangle; the first is its first input. The same two
+        // numbers `dispatch::dims_of` reads, off the same list.
+        width: widths.last().copied().unwrap_or(0),
+        in_width: widths.first().copied().unwrap_or(0),
+        q_heads: geometry.q_heads,
+        kv_heads: geometry.kv_heads,
+        head_dim: geometry.head_dim,
+        rotary_dims: geometry.rotary_dims,
+        n_experts: geometry.n_experts,
+        experts_per_token: geometry.experts_per_token,
+        group,
+        bits,
+        tile: crate::arm::tile_of(symbol),
+        layer: launch.layers.start,
+        // The readouts this fire serves, which is the PLAN's number and not
+        // the sampling table's length.
+        //
+        // Reading it off the table instead was tried and is wrong: that
+        // buffer is a fire-wide resource sized once, so its length answers
+        // how many indices it can HOLD, not how many this fire gathers. On a
+        // 32-row readout it answered 1, and `row_gather` wrote one row and
+        // reported success -- caught only because the two matmul kernels then
+        // disagreed about 3 of 32 tokens.
+        //
+        // `.wiki/kernel-x/vulkan-refactor.md` §10 -- that `binding::extent`
+        // sizes every arena operand by `launch.rows`, which is false for a
+        // gather whose OUTPUT is in request space and whose INPUT is in token
+        // space -- is a real defect and is NOT this number's to fix. It is
+        // fixed where the extent is computed, and until then this stays
+        // exactly what `kernels::Source::RequestCount` resolved to.
+        requests: lowered.n_requests,
+    };
+
+    let mut handles = crate::arm::Handles::new(&bound, &ins, &outs, &weights, &params, resolver);
+    let values = arm(&mut handles, facts).map_err(|why| Undispatchable::Refused {
+        symbol: symbol.to_owned(),
+        why,
+    })?;
+    let taken = handles.bound().to_vec();
+    let staged = handles.staged();
+    let encoder = crate::encode::Encoder::new(reflection, &taken, &staged, launch.op);
+    (routine.body)(&encoder, &values).map_err(|why| Undispatchable::Refused {
+        symbol: symbol.to_owned(),
+        why,
+    })?;
+    Ok(encoder.finish())
 }
 
 #[cfg(test)]
@@ -717,6 +1138,52 @@ mod tests {
         m.insert("qmm.fp16".to_owned(), vec![3]);
         m.insert("rope".to_owned(), vec![4]);
         m
+    }
+
+    /// `resolved` names the tier `code` actually answered from.
+    ///
+    /// The pair has to agree or the count built on it is decoration: one says
+    /// which bytes, the other says where they came from, and a test that
+    /// asserted only the second could pass while the first fell back.
+    #[test]
+    fn the_tier_reported_is_the_tier_the_bytes_came_from() {
+        let m = store();
+        assert_eq!(
+            m.resolved("qmm", Capability::Coopmat),
+            Some(Capability::Coopmat)
+        );
+        assert_eq!(
+            m.resolved("rope", Capability::Coopmat),
+            Some(Capability::Baseline),
+            "no coopmat build, so the tier that answered is the baseline"
+        );
+        assert_eq!(m.resolved("nothing", Capability::Coopmat), None);
+        for symbol in ["qmm", "rope"] {
+            for tier in Capability::PREFERENCE {
+                assert_eq!(
+                    m.resolved(symbol, tier).is_some(),
+                    m.code(symbol, tier).is_some(),
+                    "{symbol} at {tier:?}: the two walks disagree about whether \
+                     there is an answer at all"
+                );
+            }
+        }
+    }
+
+    /// A lower tier never REPORTS a higher one, for the same reason it never
+    /// reads its module.
+    #[test]
+    fn a_lower_tier_never_reports_a_higher_ones_module() {
+        let m = store();
+        assert_eq!(
+            m.resolved("qmm", Capability::Baseline),
+            Some(Capability::Baseline)
+        );
+        assert_eq!(
+            m.resolved("qmm", Capability::Fp16),
+            Some(Capability::Fp16),
+            "the walk starts AT the tier, so fp16 stops at its own build"
+        );
     }
 
     /// A tiered module is reachable, which for a long time it was not.

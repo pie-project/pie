@@ -9,6 +9,27 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Long-lived rewrite branches are neither. `rewrite` has carried months
+  # of work -- a whole Metal driver, a kernel table, a catalog refactor --
+  # without one commit on it ever being built by this file, and the branch
+  # found out what CI thought only at merge time. That is how four cargo
+  # commands here ended up naming a `--features forward` the same branch
+  # had deleted: the step was a hard error, and no machine ever reached it.
+  #
+  # This does not put every push to those branches on the runners, which
+  # would make someone else's in-flight work red for reasons that are not
+  # theirs. It asks for the branch to be RUNNABLE on demand, by whoever
+  # wants the answer before the merge rather than after it.
+  #
+  # Whether that works from here is NOT established. GitHub's own docs say
+  # a `workflow_dispatch` workflow must be present on the DEFAULT branch to
+  # be dispatchable, and `main`'s copy of this file does not have this
+  # trigger; reports differ on whether selecting a non-default branch works
+  # anyway. So this line is either already live or arrives the moment the
+  # file reaches `main`, and nobody here can tell which without a token.
+  # It is written down rather than tested because the untested half is
+  # harmless: worst case it is inert, and it is inert TODAY.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -76,13 +97,22 @@ jobs:
       # `--all-targets` because a test is where the gates come apart first:
       # a `chat`-only vision table named from an ungated test is the same
       # defect one layer down, and was also present.
+      #
+      # `forward` is GONE -- the aspect that "will need the DSL" was
+      # deleted along with the code behind it -- and the two lines naming
+      # it stayed here afterwards, so this step began with
+      # `the package 'model' does not contain this feature` and checked
+      # NOTHING. It went unseen for the same reason as everything above:
+      # this workflow fires on `main` and on pull requests, and the branch
+      # the deletion happened on is neither. The aspects are now `chat` and
+      # `contract`, and the last line is the pair, which is what
+      # `contract,forward` was there to be.
       - name: cargo check (model, one aspect at a time)
         run: |
           cargo check -p model --no-default-features --all-targets
           cargo check -p model --no-default-features --all-targets --features chat
           cargo check -p model --no-default-features --all-targets --features contract
-          cargo check -p model --no-default-features --all-targets --features forward
-          cargo check -p model --no-default-features --all-targets --features contract,forward
+          cargo check -p model --no-default-features --all-targets --features chat,contract
 
       # The compiler crates are at zero clippy warnings, so they are the only
       # part of the workspace that can be gated. The rest still carries ~240
@@ -107,6 +137,29 @@ jobs:
       # RUSTC_WORKSPACE_WRAPPER, which lints every *path* dependency that gets
       # built, not just the selected packages. Without it this step fails on
       # the driver crate's 13 warnings, which are not the compiler's to fix.
+      # `kernels-metal` and `kernels-vulkan` joined for a reason worth writing
+      # down: `b45970b5e` gave `kernels-metal`'s signatures typed handles and
+      # updated the bodies but not `ssm.rs`'s own `#[cfg(test)]` module, so
+      # `cargo test -p kernels-metal` did not BUILD for a day -- sixteen
+      # `arguments to this function are incorrect` -- and nothing in this file
+      # said so. A test that does not compile is a check that is not running,
+      # and it is the quietest kind of gap there is.
+      #
+      # `--all-targets` is what closes it: it compiles the `#[cfg(test)]`
+      # modules, which `cargo check` and a bare `cargo clippy` do not. Both
+      # crates are Rust plus a shader tree and both compile and lint clean on
+      # a Linux host with no device -- checked before adding them, because a
+      # gate that cannot run is worse than none.
+      #
+      # The rustfmt step below has listed both for a while, which is why the
+      # gap was easy to miss: they WERE gated, by the check that reads the
+      # source without compiling it.
+      #
+      # Their two drivers cannot join, and the reasons are worth having:
+      # `driver-vulkan` makes `kernels-vulkan`'s build script emit SPIR-V,
+      # which needs `slangc` on the runner; `driver-metal` has a real
+      # `type_complexity` error in its lib and a macOS-only device half. Both
+      # remain uncovered here.
       - name: cargo clippy (deny warnings)
         run: |
           cargo clippy --no-deps --all-targets \
@@ -117,6 +170,19 @@ jobs:
             -p bootstrap -p client -p controller -p driver -p driver-api \
             -p engine -p gateway -p grammar -p inferlet \
             -p inferlet-macros -p kernels -p pie -p tokenizer -p worker \
+            -p driver-wgpu -p kernels-wgpu \
+            -p kernels-metal -p kernels-vulkan \
+            -- -D warnings
+
+      # The WebGPU pair's second half. Both halves of `driver-wgpu` compile on
+      # any host -- `naga` is Rust and `wgpu`'s device calls are behind
+      # `native` -- so unlike `driver-metal` this needs no second RUNNER, only
+      # a second invocation. The step above lints the portable half; without
+      # this one, `envelope`, `frames`, `serve`, `shell` and `turns` are gated
+      # out of the build that lints and nothing covers them.
+      - name: cargo clippy (driver-wgpu, device half)
+        run: |
+          cargo clippy --no-deps --all-targets -p driver-wgpu --features native \
             -- -D warnings
 
       # `model` runs as its own command because it needs `--all-features`.
@@ -157,6 +223,17 @@ jobs:
       # -- it carries 76 warnings, and a gate is worth nothing until the
       # crate is at zero -- but fmt is at zero now, and the cheap half of a
       # gate is still worth having when the alternative is neither half.
+      #
+      # `driver-vulkan` joins on exactly the `driver-metal` argument above.
+      # Its exclusion read "being rewritten wholesale ... the only thing
+      # adding it buys today is a merge conflict", which was true of the crate
+      # while it was being written and stopped being true when it landed. Its
+      # CLIPPY used to stay out because `kernels-vulkan`'s build script shells
+      # out to a shader compiler and panics without it, so linting the crate
+      # needs one on the runner. That turned out to be one download, and the
+      # `driver-vulkan` job below now installs `slangc` and runs clippy over
+      # both Vulkan crates with `-D warnings`. This line stays for `cargo
+      # fmt`, which needs neither a compiler nor a GPU.
       - name: cargo fmt (compiler crates)
         run: |
           cargo fmt --check \
@@ -168,7 +245,8 @@ jobs:
             -p bootstrap -p client -p controller -p driver -p driver-api \
             -p gateway -p grammar -p inferlet \
             -p inferlet-macros -p kernels -p kernels-metal -p kernels-vulkan \
-            -p pie -p pie-gpu-tests -p pie-server-py -p tokenizer
+            -p pie -p pie-gpu-tests -p pie-server-py -p tokenizer \
+            -p driver-wgpu -p kernels-wgpu -p driver-vulkan
 
   # Full-workspace verification — the guardrail + anti-bitrot net. Closes the
   # gap that let the runtime benches rot unseen: the dedicated jobs only build a
@@ -289,7 +367,7 @@ jobs:
         run: python3 scripts/coverage-audit.py
 
       - name: kernel table (every symbol carries its family)
-        run: cargo test -p model --features forward --test kernels_table
+        run: cargo test -p model --test kernels_table
 
       # The SEAM between the two vocabularies that name the same tensors:
       # the trace names a forward pass invents, and the published names a
@@ -300,10 +378,10 @@ jobs:
       # at FIRE time as `UnknownWeight`. Detecting drift one request too
       # late is what this moves to CI.
       #
-      # It needs `contract` as well as `forward` because it reaches the
+      # It needs `contract` because it reaches the
       # descriptor schema `HfConfig` lives in.
       - name: weight-name seam (a trace name a checkpoint can never answer)
-        run: cargo test -p model --features forward,contract --test seam_names
+        run: cargo test -p model --features contract --test seam_names
 
       # driver-cuda is excluded from the two sweeps above because it has no
       # default feature and refuses to build until one of `cuda-12` / `cuda-13`
@@ -322,9 +400,11 @@ jobs:
       #
       # `launch_abi` is the exception to "pure Rust" and NOT an exception to the
       # line above: it shells out to g++ (present on every ubuntu runner) to
-      # compile a shim generated from `kernels-cuda`'s table against the real
-      # `rope.hpp`, which is how a wrong operand row becomes a build error
-      # rather than a golden nobody can regenerate. It takes `cudaStream_t`
+      # compile a shim generated from the kernel table against the real
+      # `rope.hpp` -- a header of the ahead-of-time ARCHIVE crate, which held
+      # the name `kernels-cuda` until `85c6c674b` and is not the JIT crate
+      # that holds it now. That is how a wrong operand row becomes a build
+      # error rather than a golden nobody can regenerate. It takes `cudaStream_t`
       # from `tests/oracle/launch_abi/stub/`, so it still asks for no toolkit --
       # deliberately, since a proof whose answer depends on which CUDA is
       # installed is not one.
@@ -360,40 +440,72 @@ jobs:
       - name: cargo test (the PTIR program path, through the ABI)
         run: cargo test -p engine --features driver-cuda --test ptir_shell
 
-  metal-kernel-table:
-    name: metal kernel table (shaders vs entrypoints.generated.txt)
+  metal-kernel-boundary:
+    name: metal kernel boundary (kernels-metal reaches nothing above it)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
-      - name: Check the committed entrypoint set against the shaders
-        run: python3 scripts/metal-kernel-audit.py --check
+      # This job was `metal-kernel-table` and ran two steps. The first is gone
+      # and the rename is deliberate: a job called "shaders vs the Rust table"
+      # that no longer compares them is the green check the `--cpp` paragraph
+      # below warns about. If a branch protection rule names the old check, it
+      # needs updating -- loudly, which is the point.
+      #
+      # What went was invariant (1): every entrypoint in `kernels/` resolves to
+      # exactly one (row, axis point), and every (row, axis point) to exactly
+      # one entrypoint. It ran as `scripts/metal-kernel-audit.py --table`,
+      # which expanded the `instantiate_*` macros with the C preprocessor for
+      # the shader half and ran `cargo run -p kernels-metal --example
+      # entrypoints` for the table half. That example is deleted with the rest
+      # of `examples/`, so the mode is retired and the step with it -- and no
+      # `#[test]` picked it up, because the shader half needs a preprocessor.
+      # `kernels-vulkan` and `kernels-wgpu` still hold their copy of the
+      # invariant inside `cargo test`, since a Slang or WGSL variant is
+      # DECLARED on a `// pie:instantiate` line and reading the set is a parse.
+      #
+      # The Rust toolchain install went with it. `--one-way` is a directory
+      # walk and needs no cargo; the toolchain was there for the example.
 
-      - name: Check entrypoint.h accepts every real name and refuses the rest
-        run: python3 scripts/metal-kernel-audit.py --cpp
+      # Four flags used to run here and all four served the C++ Metal driver,
+      # which the Rust port removed. `--no-concat` (invariant (2) -- the driver
+      # NAMES a kernel, it does not spell one), `--paths` and
+      # `--dead-paths-unused` (invariant (4) -- every `.metal` literal
+      # resolves) all walked `crates/driver-metal/csrc`, so all three reported
+      # success over an empty set.
+      #
+      # `--cpp` was the last to go and the one worth naming, because it never
+      # reported a false success: it compiled `csrc/tests/entrypoint_test.cpp`
+      # against `include/pie/kernels/entrypoint.h` and both were real, so it
+      # passed honestly right up until they were deleted. A green check does
+      # not say the thing it checks still has callers. The launch shapes those
+      # headers carried are Rust now, in `driver-metal/src/lowering/grid.rs`.
+      #
+      # The script FAILS on all four rather than passing, so none can come
+      # back quietly -- and `--table`, `--check` and `--write` now fail the
+      # same way for the same reason. No invariant went unheld when the C++
+      # left:
+      #
+      #   * `model-compiler`'s `kernels::check_plan` runs from `trace::finish`
+      #     on every plan and refuses any launched symbol no row declares --
+      #     which checks the RESULT, so it catches a name built by any means.
+      #   * `driver-metal`'s `every_file_a_kernel_row_states_is_a_file_
+      #     that_exists` holds every `KernelSig::file` against the shader tree.
+      #   * `kernels-metal`'s `tests/entrypoints.rs` holds the name grammar
+      #     against the same 481 entrypoints `--cpp` read, in the language the
+      #     driver is written in.
 
-      # Invariant (2): the driver NAMES a kernel, it does not spell one. Before
-      # this, ~40 sites built entrypoint strings with `+` and nothing checked
-      # the result -- `affine_qmv_routed` is compiled for one of six affine
-      # formats, so a mixture at any other reached the Metal compiler as a
-      # string and failed there, at model load, on a Mac.
-      - name: Check no driver source assembles an entrypoint name
-        run: python3 scripts/metal-kernel-audit.py --no-concat
-
-      # Invariant (3): kernels-metal depends on nothing above it. The headers
-      # there are host C++ now -- launch shapes, params, the name grammar -- so
-      # the boundary is no longer enforced by the file extension, and a
-      # `#include` of a driver header would be the arrow turning around. That
-      # is how `runahead.hpp` ended up in kernels-cuda.
+      # Invariant (3): kernels-metal depends on nothing above it, and now also
+      # that nothing in its shader tree is host C++. Both halves are one walk:
+      # a `#include` of a driver header, or a mention of a driver TYPE, is the
+      # arrow turning around -- that is how `runahead.hpp` ended up in the
+      # ahead-of-time archive crate, which held the name kernels-cuda until it
+      # was deleted at `85c6c674b`. And a header no shader includes is host C++
+      # sitting in the runtime search path, which is what `affine_format.hpp`
+      # was until it was deleted with the library that included it.
       - name: Check kernels-metal reaches nothing above it
         run: python3 scripts/metal-kernel-audit.py --one-way
 
-      # Tests and tools open shaders by PATH, and both the family move and the
-      # rename swept only `csrc/src` -- leaving five stale paths and one dead
-      # entrypoint name behind. A guard that looks where the edit looked cannot
-      # catch the edit's blind spot, so this one walks all of `csrc`.
-      - name: Check every shader path the driver names resolves
-        run: python3 scripts/metal-kernel-audit.py --paths
 
   # WIT drift — the canonical inferlet interface (crates/inferlet/wit) is
   # vendored into ONE remaining copy, bakery's
@@ -511,6 +623,321 @@ jobs:
         run: |
           cargo build -p pie --no-default-features
 
+  # The WebGPU driver and the seams that join it to the engine and the worker.
+  #
+  # `driver-wgpu` is an OPTIONAL feature of `engine`, `worker` and `pie`, so
+  # every plain `cargo test -p engine` builds its seam OUT -- the same hole
+  # `driver-metal` below was written for, and this backend had no job at all
+  # until now. `crates/engine/src/driver/backend/wgpu.rs` is 1,600 lines that
+  # nothing in CI compiled.
+  #
+  # No GPU is asked for. The device suites (`device`, `serving`) take
+  # `required-features = ["native"]` and each opens an adapter through an
+  # `Option`, so on a runner without one they SKIP rather than fail -- but the
+  # steps below deliberately do not run them. What they cover is what a
+  # compiler can settle: the portable half's 163 tests, both feature halves of
+  # the crate, and every seam that names the driver.
+  driver-wgpu:
+    name: driver-wgpu (portable half + seams)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # `tests/browser.rs` builds this crate and `kernels-wgpu` for a
+          # browser, which is the one claim this backend has that its
+          # siblings do not. Without the target installed, every one of its
+          # six tests takes the skip path and PASSES -- and `cargo test`
+          # hides a passing test's stdout, so the message saying so was never
+          # printed either. `PIE_WGPU_REQUIRE_BROWSER` on the step below
+          # turns that skip into a failure, so dropping this line goes red
+          # rather than quiet.
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-driver-wgpu-${{ hashFiles('**/Cargo.lock') }}
+
+      # The half that needs no adapter, and the one `default = []` exists to
+      # keep reachable. It stopped compiling its own test targets once; a
+      # `cargo build` would not have said so, because the break was in
+      # `#[cfg(test)]` code.
+      - name: cargo test (driver-wgpu, portable half)
+        run: cargo test -p driver-wgpu
+        env:
+          PIE_WGPU_REQUIRE_BROWSER: "1"
+
+      # The device half, compiled and not run: `--no-run` builds every test
+      # target behind `native` without asking the runner for a GPU.
+      - name: cargo test --no-run (driver-wgpu, device half)
+        run: cargo test -p driver-wgpu --features native --no-run
+
+      - name: cargo test (kernels-wgpu, table + WGSL front end)
+        run: cargo test -p kernels-wgpu
+
+      # The three shader tables, compared -- `.wiki/kernel-x/refactor-bigplan.md`
+      # §1.1. They are one table written down three times (100/100 identical
+      # `launch`, 100/100 `axes`, 94/100 `operands`) and NOTHING in this
+      # workspace compared them, which is why seven statements had drifted and
+      # nobody could say which side was right. It also carries §8's countdown:
+      # 300 rows to 0, a constant that only falls.
+      #
+      # It lives in `kernels` because it is above all three backends, and it
+      # runs in this job because this job is the one that already builds them.
+      - name: cargo test (the three shader tables agree)
+        run: cargo test -p kernels --test shader_backends_agree
+
+      # Mesa's CPU rasteriser, which is what makes the numeric proofs below
+      # RUNNABLE on a runner with no GPU. This whole backend has only ever
+      # been measured on llvmpipe; it is a strict implementation with no
+      # vendor shortcuts, so a shader that agrees with a reference here agrees
+      # because it is right.
+      - name: Install a software adapter (llvmpipe)
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+
+      # Most tests in both files open an adapter through an `Option` and print
+      # `SKIP` when there is none, and `cargo test` eats that line without
+      # `--nocapture`. So until the two switches below, both steps read the
+      # SAME GREEN whether every proof ran against llvmpipe or the install
+      # above silently did nothing -- and nothing checked which. The install
+      # exists for the express purpose of making these runnable;
+      # `PIE_WGPU_REQUIRE_ADAPTER` and `PIE_WGPU_REQUIRE_DEVICE` are how the
+      # purpose gets checked rather than assumed.
+      #
+      # How many that is, each suite counts and prints for itself -- in
+      # `the_runner_states_whether_it_has_an_adapter` and
+      # `..._whether_it_has_a_device`. This comment used to say "51 kernel
+      # proofs and 13 device tests"; they are 55 and 18, which is what a
+      # hand-kept number is worth after a few months.
+      #
+      # If either switch goes red, that IS the measurement: it means the
+      # guarantee this job has been printing all along was never held.
+      - name: cargo test (kernels-wgpu, on-device numeric proofs)
+        env:
+          PIE_WGPU_REQUIRE_ADAPTER: "1"
+        run: cargo test -p kernels-wgpu --test gpu
+
+      - name: cargo test (driver-wgpu, device tests)
+        env:
+          PIE_WGPU_REQUIRE_DEVICE: "1"
+        run: cargo test -p driver-wgpu --features native --test device
+
+      # This backend's three end-to-end gates, COMPILED. They cannot run here
+      # -- each is `#[ignore]` and wants a built model in `PIE_HOME` -- but
+      # every file under `tests/gpu/tests` is `#![cfg(feature = "...")]`, so
+      # without a step that turns a driver feature on, no compiler in CI has
+      # ever read one. Forty-odd files across four backends, in the same shape
+      # the seams below are here for, and found by asking which job builds
+      # them rather than by one going red.
+      - name: cargo test --no-run (wgpu end-to-end gates)
+        run: cargo test -p pie-gpu-tests --features driver-wgpu --no-run
+
+      # The three seams. Each is a file that exists only when the feature is
+      # on, which is exactly the shape that rots unread.
+      #
+      # CLIPPY rather than `check`, for the reason the `driver-wgpu, device
+      # half` step above gives about `envelope`/`frames`/`serve`/`shell`: the
+      # workspace clippy step lints `-p engine` with DEFAULT features, so
+      # `driver/backend/wgpu.rs` is gated out of the build that lints and
+      # nothing covered it. A `check` would not have covered it either.
+      - name: cargo clippy (engine, driver-wgpu seam)
+        run: |
+          cargo clippy --no-deps --all-targets -p engine --features driver-wgpu \
+            -- -D warnings
+
+      # And a `check` does not reach their DOC comments. The wgpu seam is the
+      # most heavily commented file in `engine`, and rustdoc compiles an
+      # indented block as Rust -- so a pasted watchdog line,
+      # `in_flight_control: KV copy pipeline Some(..) settled=false`, was a
+      # doctest that had never compiled and nothing above would ever say so.
+      # Cheap: the crate is already built by the step before this one.
+      - name: cargo test --doc (engine, driver-wgpu seam)
+        run: cargo test -p engine --features driver-wgpu --doc
+
+      # The same gap on this side. The device half's step above is `--no-run`,
+      # which does not merely skip RUNNING the doctests -- it never builds
+      # them -- and `--test device` reaches one target. So a doctest written
+      # anywhere under `native` would execute in no job at all.
+      #
+      # It measures nothing today on purpose: the crate's only two doctests are
+      # ```ignore signature sketches, and what checks THOSE is
+      # `the_seam_these_crates_sketch_is_the_seam_they_declare`, not rustdoc.
+      # This step is here for the next one somebody writes.
+      - name: cargo test --doc (driver-wgpu, device half)
+        run: cargo test -p driver-wgpu --features native --doc
+
+      # `cargo test --doc` and `cargo doc` are DIFFERENT checks and the step
+      # above is only the first. `--doc` compiles the code blocks in a doc
+      # comment; it never resolves an intra-doc LINK, so `[`WAIT`]` kept
+      # pointing at a constant for hours after that constant was renamed to
+      # `WAIT_DEFAULT`, with every suite, both clippy scopes and the doctests
+      # green. Seven links in this crate had rotted that way, two of them from
+      # that one rename.
+      #
+      # `--features native`, because the whole crate is the documented surface:
+      # the portable half's docs cross-reference the device half by name --
+      # `resources.rs` says in so many words which three types are behind the
+      # gate -- and in a build where those items do not exist, an accurate
+      # cross-reference cannot resolve. Rewriting them into dead text to please
+      # the smaller configuration would trade a working link for a worse one.
+      - name: cargo doc (driver-wgpu + kernels-wgpu, deny broken links)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --no-deps -p driver-wgpu --features native
+          cargo doc --no-deps -p kernels-wgpu
+          # `kernels` too, and it is not a wgpu crate: the routine machinery
+          # and the shared operand vocabulary live there, this job is the one
+          # that already builds it, and it had two unresolved links -- a macro
+          # shadowed by the module of the same name, and a `driver-cuda` type
+          # named as if it were local.
+          cargo doc --no-deps -p kernels
+
+      - name: cargo clippy (worker, driver-wgpu seam)
+        run: |
+          cargo clippy --no-deps --all-targets -p worker --features driver-wgpu \
+            -- -D warnings
+
+      - name: cargo build (pie binary, driver-wgpu)
+        run: cargo build -p pie --features driver-wgpu
+
+      # `pie config init` writes a `[driver]` block per compiled flavor, and
+      # `it_names_the_driver_this_binary_actually_has` checks that the block is
+      # the flavor the binary HAS. With default features that test resolves to
+      # the no-driver fallback, so the wgpu block -- and whether the config it
+      # writes parses at all -- is asserted by nothing. A missing arm does not
+      # fail to compile: it falls into the catch-all, which is exactly how
+      # Metal's went unnoticed, and the test's own comment says so.
+      - name: cargo test (pie, driver-wgpu template + seam)
+        run: cargo test -p pie --lib --features driver-wgpu
+
+      # The TWO-driver binary, which is the configuration neither driver's own
+      # job builds. `driver-wgpu` and `driver-vulkan` landed within a day of
+      # each other into the same files, the same functions and the same match
+      # arms -- eleven conflicts -- and a duplicated arm or a colliding name
+      # shows up only where both are on. The commit that wired this backend
+      # claimed the pair builds and put nothing behind the claim.
+      #
+      # It needs no shader toolchain: `kernels-vulkan`'s `native` is what costs
+      # `slangc` and nothing on this path turns it on.
+      - name: cargo build (pie binary, both portable drivers)
+        run: cargo build -p pie --features driver-wgpu,driver-vulkan
+
+  # The Vulkan backend, which had no job of its own until the question that
+  # kept it out was actually asked.
+  #
+  # The reason given for excluding it was that `kernels-vulkan`'s build script
+  # shells out to a shader compiler, so anything behind `native` needs one on
+  # the runner -- and it was never established that a runner could get one.
+  #
+  # It can. The tree is written in Slang and compiled by `slangc`, which is
+  # not in any distribution but IS a published release tarball, so the step
+  # below fetches the exact version this tree is developed and measured
+  # against (2026.14.1) rather than whatever a package manager happens to
+  # have. Pinning is the point: `slangc` chooses the SPIR-V dialect a storage
+  # buffer is emitted in, and a different choice loads silently and is
+  # visible only by disassembling. So this job takes the whole backend, not
+  # the portable slice.
+  driver-vulkan:
+    name: driver-vulkan (+ kernels, shaders, seams)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-driver-vulkan-${{ hashFiles('**/Cargo.lock') }}
+
+      # `slangc` is what `native` costs. Nothing else: this job deliberately
+      # does NOT install `mesa-vulkan-drivers`, which the sibling wgpu job
+      # does and which would otherwise be the obvious way to make the
+      # on-device proofs below RUN rather than skip.
+      #
+      # It was tried and measured. Mesa 26.0's `lavapipe` presents a device,
+      # claims the tier, and then SIGSEGVs inside the ICD partway through
+      # `affine_qmm_t_is_right_at_every_tile_shape_and_quantization_point` --
+      # reproducibly, in isolation, on a shader that is right on real
+      # hardware. So a software device here does not buy coverage; it buys a
+      # red job that says nothing about this repository.
+      #
+      # With no device at all, every on-device test in both crates skips by
+      # design and says why, so the steps below stay meaningful: they prove
+      # the shaders COMPILE and the Rust around them builds and passes its
+      # host-side tests. Actually running them wants the hardware gates.
+      - name: Install the Slang shader compiler
+        run: |
+          ver=2026.14.1
+          url="https://github.com/shader-slang/slang/releases/download/v$ver/slang-$ver-linux-x86_64-glibc-2.27.tar.gz"
+          mkdir -p "$HOME/slang"
+          curl -fsSL "$url" | tar -xz -C "$HOME/slang"
+          echo "PIE_SLANGC=$HOME/slang/bin/slangc" >> "$GITHUB_ENV"
+          "$HOME/slang/bin/slangc" -v
+
+      # The half that needs neither a device nor `slangc`, and the one
+      # `default = []` exists to keep reachable: 82 tests across the lib and
+      # four test targets.
+      - name: cargo test (driver-vulkan, portable half)
+        run: cargo test -p driver-vulkan
+
+      # Every shader, compiled. This is the step the exclusion was about, and
+      # it is the one that would have caught a `.slang` that only a newer
+      # `slangc` accepts -- which is why the version above is pinned rather
+      # than taken from whatever is latest at the time the job runs.
+      - name: cargo test (kernels-vulkan, table + every SPIR-V module)
+        run: cargo test -p kernels-vulkan --features native
+
+      # The device half of the driver, compiled and not run.
+      - name: cargo test --no-run (driver-vulkan, device half)
+        run: cargo test -p driver-vulkan --features native --no-run
+
+      # This backend's end-to-end gates, COMPILED. Each is `#[ignore]` and
+      # wants a built model, so they cannot run here -- but every file under
+      # `tests/gpu/tests` is `#![cfg(feature = "...")]`, so without a step
+      # that turns this driver's feature on, no compiler reads one.
+      - name: cargo test --no-run (vulkan end-to-end gates)
+        run: cargo test -p pie-gpu-tests --features driver-vulkan --no-run
+
+      # CLIPPY, which the `cargo fmt` list above says is out of reach for this
+      # crate for want of a shader compiler. It is installed two steps up.
+      # Both crates are at zero warnings today, which is the whole bar.
+      #
+      # `--no-deps` because `-D warnings` otherwise reaches the dependency
+      # graph, where `kernels-cuda` has 29 warnings this job has no
+      # business failing on. Verified to still bite: re-indenting one doc line
+      # in `driver-vulkan`'s device tests turns this step red.
+      - name: cargo clippy (vulkan crates)
+        run: |
+          cargo clippy --no-deps -p kernels-vulkan -p driver-vulkan \
+            --features kernels-vulkan/native,driver-vulkan/native \
+            --all-targets -- -D warnings
+
+      # The seams. Each is a file that exists only when the feature is on.
+      - name: cargo check (engine, driver-vulkan seam)
+        run: cargo check -p engine --features driver-vulkan
+
+      - name: cargo check (worker, driver-vulkan)
+        run: cargo check -p worker --features driver-vulkan
+
+      - name: cargo build (pie binary, driver-vulkan)
+        run: cargo build -p pie --features driver-vulkan
+
   # The Metal driver and the seam that joins it to the engine.
   #
   # `driver-metal` is an OPTIONAL feature of `engine`, so a plain
@@ -557,6 +984,47 @@ jobs:
 
       - name: cargo test (driver-metal, metal-4)
         run: cargo test -p driver-metal --features metal-4
+
+      # Does this runner have a GPU, and did anything above use it?
+      #
+      # Every device test in the crate opens with `let Ok(context) =
+      # Context::new() else { return; }`, which is the right shape -- a test
+      # that cannot run should not fail -- and has one bad property: a test
+      # that skipped and a test that measured a thousand numbers both print
+      # `ok`. That is the same failure this job's own comment names three
+      # steps up, "a job that tested nothing and a job that tested the
+      # portable half look identical", and the device tests had it worse:
+      # they were `#[ignore]`d, so no step here ran them at all. Several
+      # thousand assertions against real hardware -- every paged attention
+      # entrypoint and every GDN entrypoint -- were compiled by CI and
+      # executed by nobody but a laptop.
+      #
+      # `device_presence` states the answer in the log either way, so a build
+      # that measured nothing says so. The step after it runs the device tests
+      # wherever there is a device to run them on. Named separately because
+      # their green ticks mean different things.
+      #
+      # The open question this settles is whether a hosted runner vends a
+      # Metal 4 device at all. `macos-latest` now maps to macOS 26, which is
+      # the OS Metal 4 needs; whether the virtualised Apple GPU behind it
+      # exposes one has never been checked by anything in this tree. When the
+      # log says PRESENT, set `PIE_METAL_REQUIRE_DEVICE=1` below and the
+      # silence can never come back.
+      - name: Does this runner have a Metal 4 device?
+        run: |
+          cargo test -p driver-metal --features metal-4 \
+            --test device_presence -- --nocapture
+
+      # The three device tests that need a GPU and nothing else. The other
+      # `#[ignore]`d tests in this crate are excluded on purpose and by name:
+      # `device_real_weights` and `device_checkpoint_names` want a checkpoint
+      # this runner has no way to fetch, and `device_icb` allocates 5 GiB.
+      - name: cargo test (driver-metal, device tests — needs real hardware)
+        run: |
+          cargo test -p driver-metal --features metal-4 \
+            --test device_attention --test device_gdn --test device_kernels \
+            --test device_saturation \
+            -- --include-ignored --test-threads=1
 
       # Type-check AND test: the seam's tests run everything that needs no
       # checkpoint, and the checkpoint-gated ones state that they skipped.
@@ -608,7 +1076,20 @@ jobs:
       # which is exactly the failure that hides — a configuration nobody
       # builds is a configuration nobody checks, which is §7's own argument
       # for `metal-4` being a feature rather than a `target_vendor`.
-      - name: cargo build (every feature spelling)
+      #
+      # AND A TEST TARGET IS A CONFIGURATION NOBODY BUILT. `--all-targets` is
+      # this step's second half and was added after the sentence above proved
+      # true one level down: `cargo check` does not build test targets, so a
+      # `tests/*.rs` that stopped compiling stayed green everywhere. Five such
+      # targets accumulated before anyone looked, and the sixth —
+      # `tests/serve.rs`, 4,083 lines — had been dead since `50fa127a3`
+      # deleted the C descriptor structs it imports, which is longer than any
+      # of them. It is only built under `cuda-13,abi`, and this line was the
+      # only place that spelling was built at all.
+      #
+      # `cargo test --no-run` rather than `cargo build --all-targets`: they
+      # compile the same set, and the first says what the compile is FOR.
+      - name: cargo build (every feature spelling, every target)
         run: |
           # `cuda-13,bridge` STOOD HERE. `bridge` is retired (north star §6)
           # and naming a feature that does not exist is a hard cargo error,
@@ -618,7 +1099,17 @@ jobs:
           # and `["_cuda", …]` after, so the configuration this step actually
           # built under both spellings is the one below. The spelling that
           # went was a strict subset, not a distinct configuration.
-          cargo build -p driver-cuda --features cuda-13,abi
+          cargo test -p driver-cuda --features cuda-13,abi --no-run --all-targets
+
+          # `model-loader`'s CUDA half is the same hole from the other side.
+          # Its `executor::cuda` is `feature = "cuda"`, and its lib TEST is
+          # where the four tile-map symbols are resolved against
+          # `kernels_cuda::routine` — the check that a plan cannot name a
+          # kernel this build has no host program for. Nothing built it: the
+          # workspace sweeps take the crate without the feature, and the
+          # feature was only ever reached transitively through `driver-cuda`,
+          # which does not compile a dependency's tests.
+          cargo test -p model-loader --features cuda-13 --no-run --all-targets
 
       - name: cargo build (driver-cuda)
         run: |

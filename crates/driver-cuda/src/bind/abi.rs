@@ -254,11 +254,11 @@ pub struct YarnOriginalParams {
 /// does [`Default`] here.
 ///
 /// **RE-EXPORTED, no longer defined here.** The one definition is
-/// `kernels_cuda_new::x::attn::params::StructuredMaskParams`, in the crate
+/// `kernels_cuda::attn::params::StructuredMaskParams`, in the crate
 /// that owns `attn`'s device text, for the reason `x/xqa.rs` gives for
 /// `KvCacheList`: `unit!` has to NAME the type to declare
-/// `attn::device::pack_structured_mask`, and `driver-cuda` depends on
-/// `kernels-cuda-new` rather than the other way round. A mirror in two
+/// `pie::attn::pack_structured_mask`, and `driver-cuda` depends on
+/// `kernels-cuda` rather than the other way round. A mirror in two
 /// crates is a layout assertion that can drift.
 ///
 /// It nearly did. `pack_dense_mask.cuh:29-50` argues that two definitions of
@@ -267,12 +267,12 @@ pub struct YarnOriginalParams {
 /// its `.hpp` are deleted, so from that day the two agreed by luck. They did
 /// agree: `kind@0 window@4 sink@8`, `sizeof=12 alignof=4`, MEASURED out of
 /// NVRTC's PTX by `nvrtc-probes/attn_structured_mask.py` against the surviving
-/// `attn::device::StructuredMaskParams`. Kept as a re-export and not deleted
+/// `pie::attn::StructuredMaskParams`. Kept as a re-export and not deleted
 /// because [`kernels::Ty::needs_mirror`] answers true for
 /// `Ty::StructuredMasks` — `Ty::rust()` spells it as the unqualified `*const
 /// StructuredMaskParams`, so a generated binding only compiles in a module
 /// that has this name in scope, and [`ffi`] below is that module.
-pub use kernels_cuda_new::x::attn::params::StructuredMaskParams;
+pub use kernels_cuda::attn::params::StructuredMaskParams;
 
 /// The activation the fused CUTLASS MoE runs between its two grouped GEMMs.
 ///
@@ -355,7 +355,7 @@ pub enum Mxfp4RowSelect {
 /// a shim entry `abi::emit_c_shim` generated from
 /// `table::driver_internal`'s `envelope_seed` row. **Both are gone**: the
 /// `.cu` is deleted, the row is deleted, and the launch is
-/// [`kernels_cuda_new::x::layout::envelope_seed_empty`] — a driver-owned
+/// [`kernels_cuda::layout::envelope_seed_empty`] — a driver-owned
 /// `kernels::Launch` over a `LaunchRule::Unstated` JIT row. The signature
 /// here does not change, so no caller of this function does.
 ///
@@ -385,8 +385,8 @@ pub fn seed_envelopes_empty(
 ) {
     // SAFETY: `stream` outlives the launch, and the two envelope planes are
     // the cache's own allocation for `num_pages * num_kv_heads * head_dim`.
-    let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(stream.as_raw().cast()) };
-    let _ = kernels_cuda_new::x::layout::envelope_seed_empty(
+    let ctx = unsafe { kernels_cuda::jit::Ctx::on(stream.as_raw().cast()) };
+    let _ = kernels_cuda::layout::envelope_seed_empty(
         &ctx,
         env_min.cast(),
         env_max.cast(),

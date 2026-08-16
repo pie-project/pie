@@ -5115,7 +5115,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -5636,7 +5636,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -6157,7 +6157,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -6678,7 +6678,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -7199,7 +7199,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -7720,7 +7720,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -8241,7 +8241,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -8762,7 +8762,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -9283,7 +9283,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -9804,7 +9804,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -10325,7 +10325,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -10846,7 +10846,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -11367,7 +11367,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -11888,7 +11888,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -12409,7 +12409,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -12930,7 +12930,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -13451,7 +13451,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -13972,7 +13972,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -14493,7 +14493,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -15014,7 +15014,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -15535,7 +15535,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -16056,7 +16056,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -16577,7 +16577,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -17098,7 +17098,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -17619,7 +17619,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -18140,7 +18140,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -18661,7 +18661,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -19182,7 +19182,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -19703,7 +19703,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -20224,7 +20224,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -20745,7 +20745,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [
@@ -21266,7 +21266,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "pie_lora_qkv_correction"
+          "kernel": "gemm::lora_qkv_correction"
         }
       },
       "inputs": [

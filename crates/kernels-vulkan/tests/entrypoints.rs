@@ -5,35 +5,51 @@
 //! > every entrypoint in `kernels/` resolves to exactly one (row, axis point),
 //! > and every (row, axis point) to exactly one entrypoint
 //!
-//! The comparison runs in two hops, and the split is the same one the Metal
-//! tree draws for a different reason. There it is a C preprocessor a `cargo
-//! test` should not shell out to; here it is `glslc` — the census is cheap
-//! (the variants are DECLARED, not expanded), but proving a declared variant
-//! COMPILES is not, and a test that shells out to a Vulkan toolchain is a test
-//! that fails on every box without one. So `scripts/vulkan-kernel-audit.py`
-//! owns the toolchain half and writes `entrypoints.generated.txt`, and this
-//! test does the half that must be hermetic and fast.
+//! Both halves are read here, in one hermetic test binary. The shader half used
+//! to arrive as a committed `entrypoints.generated.txt` written by
+//! `scripts/vulkan-kernel-audit.py`, on the reasoning that the census was the
+//! toolchain's to produce — but it never was. A variant is DECLARED on a
+//! `// pie:instantiate` line, so reading the set is a parse, which is what
+//! `build.rs` already does and what [`from_the_shaders`] does below. Only
+//! proving a declared variant COMPILES needs `slangc`, and that half stays in
+//! the audit script where a box without a Vulkan toolchain never runs it.
 //!
-//! When a shader changes, both hops fail and they fail in a useful order:
-//! `--check` names the entrypoint that appeared or vanished, and this test then
-//! says whether the table has a row for it.
+//! What the file bought, and what its removal costs, is the cross-backend
+//! comparison: `kernels-metal` cannot expand its own census without a C
+//! preprocessor, so parity with it was a diff of two committed artifacts and
+//! there is no hermetic replacement for it here.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-fn artifact() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("entrypoints.generated.txt")
-}
-
+/// Every entrypoint the shader tree instantiates, from the directives.
+///
+/// A `@tier` variant is another compile of an entrypoint that already exists at
+/// baseline — same name, different defines — so only the baseline lines name
+/// the set. `every_tier_has_a_baseline_beneath_it` is what holds that claim up.
 fn from_the_shaders() -> BTreeSet<String> {
-    std::fs::read_to_string(artifact())
-        .expect(
-            "entrypoints.generated.txt exists; regenerate it with \
-             scripts/vulkan-kernel-audit.py --write",
-        )
-        .lines()
-        .map(str::to_string)
-        .collect()
+    let mut out = BTreeSet::new();
+    for (_, text) in shader_sources() {
+        for line in text.lines() {
+            let Some(rest) = line
+                .trim_start()
+                .strip_prefix("//")
+                .map(str::trim_start)
+                .and_then(|r| r.strip_prefix("pie:instantiate"))
+            else {
+                continue;
+            };
+            let mut words = rest.split_whitespace();
+            let Some(name) = words.next() else { continue };
+            match words.next().and_then(|w| w.strip_prefix('@')) {
+                Some(tier) if tier != "baseline" => continue,
+                _ => {
+                    out.insert(name.to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 #[test]
@@ -97,51 +113,40 @@ fn no_two_rows_claim_the_same_entrypoint() {
 /// precisely how the next real divergence gets waved through.
 #[test]
 fn the_table_is_one_hundred_kernels_over_four_hundred_and_eighty_one_entrypoints() {
-    assert_eq!(kernels_vulkan::KERNELS.len(), 100);
+    // Rows PLUS retired rows: `.wiki/kernel-x/refactor-bigplan.md` §7 empties
+    // the table family by family, and coverage is what the two together name.
+    // The hundred is the invariant; which side of the crossing a kernel sits
+    // on is not.
+    assert_eq!(
+        kernels_vulkan::KERNELS.len() + kernels_vulkan::retired_rows().len(),
+        100
+    );
     assert_eq!(kernels_vulkan::entrypoints().len(), 481);
 }
 
-/// The parity with `kernels-metal` above, actually compared rather than
-/// asserted as a number.
+/// The parity with `kernels-metal` above was checked here, entrypoint for
+/// entrypoint, by diffing this crate's committed census against that crate's.
 ///
-/// A matching count is much weaker than it looks — two tables can agree on 480
-/// while disagreeing about which 480, and that is the drift the claim exists to
-/// catch. Both crates commit a generated entrypoint list, so the sets can be
-/// diffed directly, and a dev-dependency is not needed (`kernels-metal` does
-/// not build off macOS, which is precisely why the comparison has to go through
-/// the file rather than the crate).
-#[test]
-fn every_entrypoint_is_one_kernels_metal_also_has() {
-    let sibling = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../kernels-metal/entrypoints.generated.txt");
-    let text = std::fs::read_to_string(&sibling)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", sibling.display()));
-
-    let metal: std::collections::BTreeSet<&str> = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    let ours: std::collections::BTreeSet<String> =
-        kernels_vulkan::entrypoints().into_iter().collect();
-
-    let extra: Vec<&String> = ours
-        .iter()
-        .filter(|n| !metal.contains(n.as_str()))
-        .collect();
-    let missing: Vec<&&str> = metal.iter().filter(|n| !ours.contains(**n)).collect();
-    assert!(
-        extra.is_empty() && missing.is_empty(),
-        "the two tables have drifted apart\n  only in vulkan: {extra:?}\n  only in metal:  {missing:?}"
-    );
-}
-
-/// Every entrypoint resolves through the public lookup `model-compiler` uses,
+/// Both artifacts are gone, and this comparison went with them. It cannot be
+/// rebuilt in-process: `kernels-metal` does not build off macOS, so a
+/// dev-dependency is not available, and its census cannot be parsed the way
+/// this crate's now is — the Metal axis product is written as `instantiate_*`
+/// macros that only a C preprocessor expands. The count above is what remains,
+/// and it is strictly weaker: two tables can agree on 481 while disagreeing
+/// about which 481.
+/// Every entrypoint resolves through the public lookup `model-ir` uses,
 /// at every point of every axis. `sig_in` tries exact matches first and axis
 /// matches second, so a base that shadows a sibling's point surfaces here.
 #[test]
 fn every_entrypoint_resolves_through_sig_in() {
+    let retired = kernels_vulkan::retired();
     for name in from_the_shaders() {
+        // A crossed family resolves through `driver-vulkan/src/arm.rs`'s stem
+        // lookup instead. What must hold is that the entrypoint has SOME
+        // owner, not that the owner is a row.
+        if retired.contains(&name.as_str()) {
+            continue;
+        }
         assert!(
             kernels::sig_in(kernels_vulkan::KERNELS, &name).is_some(),
             "`{name}` does not resolve"
@@ -149,25 +154,77 @@ fn every_entrypoint_resolves_through_sig_in() {
     }
 }
 
-/// A row that names a FILE names one that exists.
+/// Every row names a file, it exists, and the shader in it defines the row.
 ///
-/// Metal can leave this to the runtime shader compiler, which fails at model
-/// load with the path in hand. Vulkan cannot: the file is read at BUILD time
-/// by `build.rs`, so a row pointing at a shader nobody wrote would be a
-/// pipeline the shell asks for and cannot create, one layer away from the
+/// Metal can leave the first part to the runtime shader compiler, which fails
+/// at model load with the path in hand. Vulkan cannot: the file is read at
+/// BUILD time by `build.rs`, so a row pointing at a shader nobody wrote would
+/// be a pipeline the shell asks for and cannot create, one layer away from the
 /// row that named it.
+///
+/// The other two parts are why this is not just an existence check. Which
+/// shader defines a row used to be recorded in a `//` comment beside it, on
+/// 57 of the 100 rows, and a comment is not checked -- two of them were wrong
+/// by the time anyone looked. `qmv_wide_strided` said `quant/qmm_t.slang` and
+/// its instantiations are in `quant/qmv.slang`; `copy_logits_bf16` said
+/// `ptir/ptir/logits_copy.slang`, a directory deep in a tree that has one.
+/// Neither could fail anything, which is exactly the problem: a reader
+/// following either lands in the wrong shader and the build says nothing.
+///
+/// So the comments became the `file` field on every row, and this test makes
+/// the field load-bearing by reading the `pie:instantiate` directives out of
+/// the stated shader and requiring the row's own host name among them. A row
+/// that moves to another file now fails here rather than misleading whoever
+/// reads it next. `lowering::dispatch` on the Metal side opens this same
+/// field, which is the other reason a row without one is a row that cannot be
+/// found.
 #[test]
-fn every_stated_file_exists() {
+fn every_row_names_the_shader_that_defines_it() {
     let kernels = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernels");
     for row in kernels_vulkan::KERNELS {
-        let Some(file) = row.file else { continue };
+        let file = row.file.unwrap_or_else(|| {
+            panic!(
+                "`{}` states no file; every row names the shader it is \
+                 stamped from",
+                row.name
+            )
+        });
         let path = kernels.join(file);
         assert!(
             path.exists(),
             "`{}` states `{file}`, which does not exist",
-            row.symbol
+            row.name
+        );
+        let text = std::fs::read_to_string(&path).expect("the shader reads");
+        // The row's host name is a STEM: the axes stamp suffixes onto it, so
+        // `affine_qmv_wide_strided` is declared as
+        // `affine_qmv_wide_strided_bfloat16_gs_64_...`. An exact match is
+        // right for an unaxised row and a prefix for the rest, and the
+        // underscore keeps `gdn_core` from matching `gdn_core_recurrent`,
+        // which is a different row in a different shader.
+        let host = row.symbol;
+        let found = text.lines().filter_map(directive).any(|name| {
+            name == host || name.strip_prefix(host).is_some_and(|r| r.starts_with('_'))
+        });
+        assert!(
+            found,
+            "`{}` states `{file}`, which instantiates no `{host}`",
+            row.name
         );
     }
+}
+
+/// The name a `// pie:instantiate` line declares, if this line is one.
+///
+/// The same anchoring `build.rs` uses, so a `pie:instantiate` mentioned in
+/// prose is not read as a declaration here either.
+fn directive(line: &str) -> Option<&str> {
+    line.trim_start()
+        .strip_prefix("//")?
+        .trim_start()
+        .strip_prefix("pie:instantiate")?
+        .split_whitespace()
+        .next()
 }
 
 /// Every `@tier` directive names an entrypoint that also has a baseline.
@@ -178,7 +235,7 @@ fn every_stated_file_exists() {
 /// an entrypoint that resolves on the author's GPU and on no other.
 ///
 /// `build.rs` asserts the same thing, but only under `--features native` — that
-/// is, only on a machine with glslc. This runs everywhere.
+/// is, only on a machine with slangc. This runs everywhere.
 #[test]
 fn every_tier_has_a_baseline_beneath_it() {
     let mut baseline = BTreeSet::new();
@@ -222,21 +279,12 @@ fn every_tier_has_a_baseline_beneath_it() {
              every entrypoint must resolve on a device with no optional features",
         );
     }
-
-    // The artifact counts entrypoints, so a tier that leaked into it would mean
-    // the tier had become an entrypoint -- the exact confusion the mechanism
-    // exists to prevent.
-    assert_eq!(
-        baseline,
-        from_the_shaders(),
-        "the baseline instantiations and entrypoints.generated.txt disagree",
-    );
 }
 
 /// A tier never invents an entrypoint the table does not name.
 #[test]
 fn no_tier_names_an_unknown_entrypoint() {
-    let known = from_the_shaders();
+    let known: BTreeSet<String> = kernels_vulkan::entrypoints().into_iter().collect();
     for (file, text) in shader_sources() {
         for line in text.lines() {
             let Some(rest) = line
@@ -278,7 +326,7 @@ fn baseline_modules_are_unsuffixed() {
     assert!(Capability::Baseline.requires().is_empty());
 }
 
-/// Every `.comp` under `kernels/`, as `(display path, contents)`.
+/// Every `.slang` under `kernels/`, as `(display path, contents)`.
 fn shader_sources() -> Vec<(String, String)> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernels");
     let mut out = Vec::new();
@@ -288,7 +336,10 @@ fn shader_sources() -> Vec<(String, String)> {
             let path = entry.expect("a readable entry").path();
             if path.is_dir() {
                 stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "comp") {
+            } else if path
+                .extension()
+                .is_some_and(|e| e == "comp" || e == "slang")
+            {
                 let rel = path
                     .strip_prefix(&root)
                     .expect("under kernels/")
@@ -387,6 +438,11 @@ fn every_row_states_the_same_facts_kernels_metal_does() {
                         row = Some(name);
                     }
                 }
+                // The table ends here; see `row_calls`, which had the same
+                // gap and was reading a crossed family's tests as operands.
+                if t == "];" {
+                    row = None;
+                }
                 let Some(row) = &row else { continue };
                 // A field can open the line or sit inline in the `kernel!`
                 // call, and both spellings appear in both crates. What is NOT
@@ -441,7 +497,10 @@ fn every_row_states_the_same_facts_kernels_metal_does() {
 
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let ours = grid_fields(&src);
-    let theirs = grid_fields(&src.join("../../kernels-metal/src"));
+    let mut theirs = grid_fields(&src.join("../../kernels-metal/src"));
+    for gone in kernels_vulkan::retired_rows() {
+        theirs.remove(*gone);
+    }
 
     // The scrape has to find the whole table, and enough facts within it, or
     // this passes by reading nothing -- the exact failure a text-based check
@@ -516,7 +575,7 @@ fn every_row_states_the_same_facts_kernels_metal_does() {
 /// It passes with no exceptions, which is worth saying because it did not at
 /// first: `mxfp4_qmv_routed_bias` was stated here and not on the Metal side.
 /// That was a live gap in `kernels-metal` rather than a divergence to
-/// tolerate -- `model-compiler` names the symbol -- so it was closed there
+/// tolerate -- `model-ir` names the symbol -- so it was closed there
 /// instead of allow-listed here. An exception list on a test like this is how
 /// the next real divergence gets waved through.
 #[test]
@@ -556,6 +615,18 @@ fn every_row_asks_for_the_same_operands_kernels_metal_does() {
                         row = Some(name);
                     }
                 }
+                // The table ENDS here, and everything after it is ordinary
+                // Rust. Without this the last row of a file goes on claiming
+                // every `name: value,` line beneath it, and once a family
+                // crosses to a routine the file below the table is full of
+                // them -- `sample.rs`'s tests state `handle: 10,` and this
+                // read 10, 11, 12 and 13 as `argmax_logits`'s four operands.
+                // A text scrape that cannot tell where it stopped reading is
+                // the failure a text scrape invites, and it fails LOUDLY here
+                // only because the whole point of this test is a comparison.
+                if t == "];" {
+                    row = None;
+                }
                 let Some(row) = &row else { continue };
                 if let Some(rest) = t.strip_prefix("launch = kernels::") {
                     out.entry(row.clone()).or_default().0 =
@@ -592,7 +663,10 @@ fn every_row_asks_for_the_same_operands_kernels_metal_does() {
 
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let ours = row_calls(&src);
-    let theirs = row_calls(&src.join("../../kernels-metal/src"));
+    let mut theirs = row_calls(&src.join("../../kernels-metal/src"));
+    for gone in kernels_vulkan::retired_rows() {
+        theirs.remove(*gone);
+    }
 
     // The scrape has to find the whole table on both sides, or this passes by
     // comparing almost nothing -- the failure a text-based check invites.
@@ -616,14 +690,22 @@ fn every_row_asks_for_the_same_operands_kernels_metal_does() {
     // there is to compare and a threshold below it would let the scrape rot
     // silently. Asserting the exact number would just be a second copy of the
     // count `the_table_is_one_hundred_kernels...` already owns.
+    //
+    // Less one per row this crate has RETIRED, since those are dropped from
+    // `theirs` above. That is the loosest the floor may be and still mean
+    // something: it falls by exactly what the crossing removes and by nothing
+    // else, so a scrape that stops reading the macro is still caught.
+    let floor = 44 - kernels_vulkan::retired_rows().len();
     let stated = theirs.values().filter(|(_, ops)| !ops.is_empty()).count();
     assert!(
-        stated >= 44,
+        stated >= floor,
         "only {stated} kernels-metal rows scraped with any operands at all; \
-         44 rows state operands, so the scrape has stopped reading some"
+         {floor} rows state operands and are not retired here, so the scrape \
+         has stopped reading some"
     );
 
     let mut wrong: Vec<String> = Vec::new();
+    let mut allowed_seen: Vec<(String, usize)> = Vec::new();
     for (row, (metal_launch, metal_ops)) in &theirs {
         let Some((our_launch, our_ops)) = ours.get(row) else {
             wrong.push(format!("  {row}: kernels-metal has this row and we do not"));
@@ -647,6 +729,10 @@ fn every_row_asks_for_the_same_operands_kernels_metal_does() {
         for i in 0..our_ops.len().max(metal_ops.len()) {
             let (a, b) = (our_ops.get(i), metal_ops.get(i));
             if a != b {
+                if DELIBERATE.contains(&(row.as_str(), i)) {
+                    allowed_seen.push((row.clone(), i));
+                    continue;
+                }
                 wrong.push(format!(
                     "  {row}[{i}]: {} here, {} in kernels-metal",
                     a.map(String::as_str).unwrap_or("<nothing>"),
@@ -664,4 +750,54 @@ fn every_row_asks_for_the_same_operands_kernels_metal_does() {
         wrong.len(),
         wrong.join("\n")
     );
+
+    // A stale exception is the failure mode an exception list has, so it is
+    // checked in BOTH directions: an entry that no longer names a difference
+    // is one the tables have since agreed on, and keeping it would hide the
+    // next divergence at the same slot.
+    let mut stale: Vec<String> = DELIBERATE
+        .iter()
+        .filter(|(row, at)| {
+            !allowed_seen
+                .iter()
+                .any(|(seen, sat)| seen == row && sat == at)
+        })
+        .map(|(row, at)| format!("`{row}` operand {at}"))
+        .collect();
+    stale.sort();
+    assert!(
+        stale.is_empty(),
+        "these rows agree with kernels-metal now, so the exception is stale:\n  {}",
+        stale.join("\n  "),
+    );
 }
+
+/// The operands this table deliberately asks for differently, and why.
+///
+/// Not a skip list: the test above asserts each entry still names a REAL
+/// difference, so an exception that outlives its reason fails rather than
+/// accumulates.
+///
+/// `sdpa_paged_decode{,_sink}` operand 13 is the mask PITCH. `kernels-metal`
+/// takes it from `Source::Param(3)` -- a launch parameter, which means from
+/// the model TEXT -- and no text can know it: the pitch is a property of the
+/// fire the driver is assembling, not of the program being lowered, and every
+/// text in the corpus states `0` there. Zero is what the shader reads as
+/// "forbid every key of an enabled row", so a mask bound through that slot
+/// answers nothing rather than answering wrongly -- the safe direction, and
+/// still not the mask the guest asked for.
+///
+/// This table asks for `Source::AttentionMaskStride`, which the driver
+/// answers from the fire it is assembling. `kernels-wgpu` states the same
+/// exception for the same two rows.
+/// `sdpa_paged_tiled{,_sink}` carry the same exception at the same slot for
+/// the same reason, because they are the same operand list with `n_rows`
+/// added to the end.
+const DELIBERATE: &[(&str, usize)] = &[
+    ("sdpa_paged_decode", 13),
+    ("sdpa_paged_decode_sink", 13),
+    ("sdpa_paged_tiled", 13),
+    ("sdpa_paged_tiled_sink", 13),
+    ("sdpa_paged_mma", 13),
+    ("sdpa_paged_mma_sink", 13),
+];

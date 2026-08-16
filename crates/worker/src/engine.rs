@@ -1158,7 +1158,7 @@ fn group_driver(m: &config::ModelConfig, group_idx: usize, driver_idx: usize) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{StartupBanner, model_artifact_digest, model_identity};
+    use super::{StartupBanner, model_artifact_digest};
 
     #[test]
     fn startup_banner_render_includes_public_startup_fields_only() {

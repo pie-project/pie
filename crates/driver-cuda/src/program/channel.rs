@@ -108,101 +108,182 @@ impl ChannelShape {
     }
 }
 
-/// Every channel of one instance: the cells and the four cursor arrays.
+/// Every channel THE DRIVER HOLDS: the cells and the four cursor arrays,
+/// indexed by a global channel SLOT.
 ///
-/// One allocation per array rather than per channel. The C++ does the same,
-/// and the reason is not tidiness: the four cursor arrays are passed to the
-/// control kernels as four pointers, so they have to be contiguous per
-/// channel index whatever a channel's own size is.
+/// # Why this is one registry and not one per instance
+///
+/// It used to be per instance, sized from that instance's own `channel_ids`,
+/// and [`ChannelState::is_extern`](crate::serve::state::ChannelState::is_extern)
+/// recorded what that cost: two instances naming one channel got two rings, so
+/// the exporter filled its own and the importer read a zeroed cell and called
+/// it a value. That is exactly the shape of the bench's decode loop — the
+/// prefill's epilogue puts the sampled token on a channel the DECODE instance
+/// binds to `EmbedTokens` — so a chained frame could not be served at all.
+///
+/// So a channel has ONE ring, wherever it is named from, and an instance is a
+/// MAP from its dense channel index to the slot that ring lives at
+/// ([`Session`](super::session::Session)). The four cursor arrays stay flat and
+/// contiguous, because the control kernels take them as four pointers and index
+/// them by the channel numbers they are handed — which are now global slots.
+///
+/// # The cells are per slot, and that is what makes growth cheap
+///
+/// Channels are registered one at a time over a serving day, so the registry
+/// grows. One allocation per slot's cells means growth adds an allocation and
+/// touches nothing that already exists; a single block with offsets would have
+/// to move every live cell to make room. The four cursor arrays DO have to be
+/// contiguous, so those are reallocated and copied — they are
+/// `MAX_RING + 12` bytes per slot, which is why that is affordable and the
+/// cells are not.
 #[derive(Debug)]
 pub struct Rings {
-    cells: DeviceBuffer,
+    cells: Vec<DeviceBuffer>,
     full: DeviceBuffer,
     head: DeviceBuffer,
     tail: DeviceBuffer,
     cap1: DeviceBuffer,
-    /// Byte offset of each channel's ring within `cells`.
-    offsets: Vec<usize>,
     shapes: Vec<ChannelShape>,
+    /// Slots the four cursor arrays have room for. Never below
+    /// `shapes.len()`.
+    reserved: usize,
 }
 
 impl Rings {
-    /// Allocate and zero the rings for `shapes`, in channel order.
+    /// Allocate and zero a registry holding `shapes`, at slots `0..shapes.len()`.
     ///
     /// # Errors
     ///
     /// If a ring is longer than [`MAX_RING`], if a cell is empty, or if the
     /// device refuses the allocation.
     pub fn new(alloc: &Allocator, shapes: &[ChannelShape], stream: StreamRef<'_>) -> Result<Self> {
-        let count = shapes.len();
-        if count == 0 {
-            return Err(Error::invalid(
-                "program::channel",
-                "an instance with no channels",
-            ));
-        }
-
-        let mut offsets = Vec::with_capacity(count);
-        let mut total = 0usize;
-        for shape in shapes {
-            let ring = shape.ring()?;
-            let cell = shape.cell_bytes();
-            if cell == 0 {
-                return Err(Error::invalid(
-                    "program::channel",
-                    "a channel whose cell is zero bytes holds nothing and can \
-                     never be ready",
-                ));
-            }
-            offsets.push(total);
-            total = total.checked_add(cell * ring as usize).ok_or_else(|| {
-                Error::invalid("program::channel", "the rings do not fit in memory")
-            })?;
-        }
-
-        // Zeroed, all five. A fresh allocation is not promised zero, and a
+        // Zeroed, all four. A fresh allocation is not promised zero, and a
         // garbage cursor is a ring that is already full, already mid-sequence,
         // or already holding a value nothing wrote.
         let zero = |bytes: usize| -> Result<DeviceBuffer> {
-            let mut buffer = alloc.alloc(bytes)?;
+            let mut buffer = alloc.alloc(bytes.max(1))?;
             buffer.memset(0, stream)?;
             Ok(buffer)
         };
-        let cells = zero(total)?;
-        let full = zero(count * MAX_RING as usize)?;
-        let head = zero(count * size_of::<u32>())?;
-        let tail = zero(count * size_of::<u32>())?;
-        let mut cap1 = zero(count * size_of::<u32>())?;
+        let mut rings = Self {
+            cells: Vec::new(),
+            full: zero(0)?,
+            head: zero(0)?,
+            tail: zero(0)?,
+            cap1: zero(0)?,
+            shapes: Vec::new(),
+            reserved: 0,
+        };
+        for shape in shapes {
+            rings.register(alloc, *shape, stream)?;
+        }
+        Ok(rings)
+    }
 
+    /// Give a channel a ring of its own, and answer the slot it landed at.
+    ///
+    /// Slots are handed out in registration order and NEVER REUSED, because a
+    /// slot is the identity a `Session`'s dense map points at and a reused one
+    /// would hand a new channel the old channel's cursors while some session
+    /// still named it.
+    ///
+    /// # What that costs, and it is not yet paid
+    ///
+    /// A closed channel's slot is not reclaimed, so a serving day of N
+    /// requests leaves N × (its channels) rings allocated — the cells, plus
+    /// `MAX_RING + 12` bytes of cursor array each. Nothing frees them.
+    /// Reclaiming needs a free list AND a way to know no live session still
+    /// holds the slot, which is the same liveness question `close_instance`
+    /// answers for sessions and nothing answers for channels. Measured on the
+    /// bench: 18 channels per request, so 16 requests reach slot 288 — small,
+    /// and linear in requests served, which is the shape that eventually is
+    /// not.
+    ///
+    /// # Errors
+    ///
+    /// If the ring is longer than [`MAX_RING`], if the cell is empty, or if the
+    /// device refuses the allocation.
+    pub fn register(
+        &mut self,
+        alloc: &Allocator,
+        shape: ChannelShape,
+        stream: StreamRef<'_>,
+    ) -> Result<u32> {
+        let ring = shape.ring()?;
+        let cell = shape.cell_bytes();
+        if cell == 0 {
+            return Err(Error::invalid(
+                "program::channel",
+                "a channel whose cell is zero bytes holds nothing and can \
+                 never be ready",
+            ));
+        }
+        let slot = self.shapes.len();
+        self.reserve(alloc, slot + 1, stream)?;
+        let mut cells = alloc.alloc(cell * ring as usize)?;
+        cells.memset(0, stream)?;
+        self.cells.push(cells);
+        self.shapes.push(shape);
         // `cap1` is the one array with contents rather than zeros: it is the
         // modulus every cursor advance divides by, and a zero there is a
         // division by zero inside the commit kernel.
-        let cap1_bytes: Vec<u8> = shapes
-            .iter()
-            .map(|shape| shape.ring().expect("checked above"))
-            .flat_map(u32::to_le_bytes)
-            .collect();
-        cap1.copy_from_host(&cap1_bytes, stream)?;
-
-        Ok(Self {
-            cells,
-            full,
-            head,
-            tail,
-            cap1,
-            offsets,
-            shapes: shapes.to_vec(),
-        })
+        self.cap1
+            .write_at(slot * size_of::<u32>(), &ring.to_le_bytes(), stream)?;
+        u32::try_from(slot)
+            .map_err(|_| Error::invalid("program::channel", "more channels than a u32 counts"))
     }
 
-    /// How many channels this instance carries.
+    /// Make the four cursor arrays hold at least `want` slots, preserving what
+    /// the live ones already say.
+    ///
+    /// Doubling rather than exact, because every registration would otherwise
+    /// reallocate and copy all four.
+    fn reserve(&mut self, alloc: &Allocator, want: usize, stream: StreamRef<'_>) -> Result<()> {
+        if want <= self.reserved {
+            return Ok(());
+        }
+        let grown = want.max(self.reserved * 2).max(8);
+        // Read the live prefix back before the swap. The cursors live on the
+        // DEVICE — the control kernels advance them — so a host-side copy kept
+        // alongside would be a guess that is right until the first fire that
+        // commits.
+        let live = self.shapes.len();
+        let mut old_full = vec![0u8; live * MAX_RING as usize];
+        let mut old_head = vec![0u8; live * size_of::<u32>()];
+        let mut old_tail = vec![0u8; live * size_of::<u32>()];
+        let mut old_cap1 = vec![0u8; live * size_of::<u32>()];
+        if live != 0 {
+            self.full.copy_to_host(&mut old_full, stream)?;
+            self.head.copy_to_host(&mut old_head, stream)?;
+            self.tail.copy_to_host(&mut old_tail, stream)?;
+            self.cap1.copy_to_host(&mut old_cap1, stream)?;
+            stream.synchronize()?;
+        }
+        let fresh = |bytes: usize, seed: &[u8]| -> Result<DeviceBuffer> {
+            let mut buffer = alloc.alloc(bytes)?;
+            buffer.memset(0, stream)?;
+            if !seed.is_empty() {
+                buffer.write_at(0, seed, stream)?;
+            }
+            Ok(buffer)
+        };
+        self.full = fresh(grown * MAX_RING as usize, &old_full)?;
+        self.head = fresh(grown * size_of::<u32>(), &old_head)?;
+        self.tail = fresh(grown * size_of::<u32>(), &old_tail)?;
+        self.cap1 = fresh(grown * size_of::<u32>(), &old_cap1)?;
+        stream.synchronize()?;
+        self.reserved = grown;
+        Ok(())
+    }
+
+    /// How many channels this registry holds.
     #[must_use]
     pub fn len(&self) -> usize {
         self.shapes.len()
     }
 
-    /// Whether there are no channels. There never are none — [`Rings::new`]
-    /// refuses that — but clippy asks and the answer is honest.
+    /// Whether the registry holds nothing yet, which is its state before the
+    /// first channel is registered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.shapes.is_empty()
@@ -232,8 +313,8 @@ impl Rings {
             .get(c)
             .ok_or_else(|| Error::invalid("program::channel", format!("no channel {c}")))?;
         let ring = shape.ring()?;
-        let at = self.offsets[c] + (slot % ring) as usize * shape.cell_bytes();
-        Ok(self.cells.as_ptr() as u64 + at as u64)
+        let at = (slot % ring) as usize * shape.cell_bytes();
+        Ok(self.cells[c].as_ptr() as u64 + at as u64)
     }
 
     /// The `full` flag array, for the control kernels.
@@ -288,8 +369,8 @@ impl Rings {
             ));
         }
         let ring = shape.ring()?;
-        let at = self.offsets[c] + (slot % ring) as usize * shape.cell_bytes();
-        self.cells.write_at(at, bytes, stream)?;
+        let at = (slot % ring) as usize * shape.cell_bytes();
+        self.cells[c].write_at(at, bytes, stream)?;
 
         // The flag, then the cursor. A cell that is full but whose tail has
         // not advanced is merely not yet published; a tail that has advanced
@@ -318,10 +399,54 @@ impl Rings {
             .copied()
             .ok_or_else(|| Error::invalid("program::channel", format!("no channel {c}")))?;
         let ring = shape.ring()?;
-        let at = self.offsets[c] + (slot % ring) as usize * shape.cell_bytes();
+        let at = (slot % ring) as usize * shape.cell_bytes();
         let mut out = vec![0u8; shape.cell_bytes()];
-        self.cells.read_at(at, &mut out, stream)?;
+        self.cells[c].read_at(at, &mut out, stream)?;
         Ok(out)
+    }
+
+    /// Consume channel `c`'s committed cell: clear its full bit and advance
+    /// `head`, exactly as the commit kernel's `taken` loop does.
+    ///
+    /// # Why the host does this and not the commit kernel
+    ///
+    /// A DESCRIPTOR port is not a stage op. `Port::consumes` names the four
+    /// that take — `EmbedTokens`, `Positions`, `WSlot`, `WOff` — and no
+    /// `LaunchOp` in any stage mentions them, so `stage_channels` cannot see
+    /// them and the commit kernel is never handed them. Left unconsumed their
+    /// heads never move while their tails do, and after `capacity` fires the
+    /// ring is full: the epilogue's own `chan_put` then fails readiness and the
+    /// decode loop stops producing, silently, some tens of tokens in.
+    ///
+    /// It is a host write because the driver has already synchronized by the
+    /// time it resolves a step's descriptors — the previous step's
+    /// `Session::fire` ends on `stream.synchronize()` — so there is no kernel
+    /// ordering left to respect, and a launch would buy nothing.
+    ///
+    /// # Errors
+    ///
+    /// If the channel does not exist, or a copy fails.
+    pub fn consume_front(&mut self, c: usize, stream: StreamRef<'_>) -> Result<()> {
+        let shape = self
+            .shapes
+            .get(c)
+            .copied()
+            .ok_or_else(|| Error::invalid("program::channel", format!("no channel {c}")))?;
+        let ring = shape.ring()?;
+        let mut head = [0u8; 4];
+        self.head.read_at(c * size_of::<u32>(), &mut head, stream)?;
+        stream.synchronize()?;
+        let head = u32::from_le_bytes(head) % ring;
+        // The flag, THEN the cursor — the same order the commit kernel writes
+        // them in, so a reader that catches the pair mid-update sees a cell
+        // that is not yet consumed rather than one that is consumed twice.
+        self.full
+            .write_at(c * MAX_RING as usize + head as usize, &[0u8], stream)?;
+        let next = (head + 1) % ring;
+        self.head
+            .write_at(c * size_of::<u32>(), &next.to_le_bytes(), stream)?;
+        stream.synchronize()?;
+        Ok(())
     }
 
     /// The four cursors of every channel, as the host sees them.
@@ -595,6 +720,20 @@ pub struct HostChannel {
     pub cell_bytes: usize,
     /// `capacity + 1`.
     pub ring: u32,
+    /// `PIE_CHANNEL_HOST_ROLE_*`: which side of this mirror the ENGINE is on.
+    ///
+    /// The bridge is DIRECTIONAL and the mirror is not: one head/tail pair
+    /// serves both, so a driver that both publishes into a plane and takes
+    /// from it reads back its own writes. On a loop-carried channel — the
+    /// epilogue puts the next token, `push` mirrors it, `pull` takes it — that
+    /// is one extra cell in the device ring per fire, which fills the ring and
+    /// then reads the fire-after-next's value as this fire's.
+    ///
+    /// So the role decides: the driver TAKES only from a plane the engine
+    /// writes, and PUBLISHES only into one the engine reads. A device-only
+    /// channel (`NONE`) is bridged in neither direction, which is exactly what
+    /// it means — both ends of it are programs.
+    pub role: u8,
 }
 
 impl HostChannel {
@@ -611,13 +750,29 @@ impl HostChannel {
         words: *mut std::ffi::c_void,
         cell_bytes: usize,
         ring: u32,
+        role: u8,
     ) -> Self {
         Self {
             mirror: mirror.cast(),
             words: words.cast(),
             cell_bytes,
             ring,
+            role,
         }
+    }
+
+    /// Does the ENGINE write this plane? Only then may the driver take from it.
+    /// See [`HostChannel::role`].
+    #[must_use]
+    pub const fn engine_writes(&self) -> bool {
+        self.role == driver::driver_api::local::PIE_CHANNEL_HOST_ROLE_WRITER
+    }
+
+    /// Does the ENGINE read this plane? Only then may the driver publish into
+    /// it. See [`HostChannel::role`].
+    #[must_use]
+    pub const fn engine_reads(&self) -> bool {
+        self.role == driver::driver_api::local::PIE_CHANNEL_HOST_ROLE_READER
     }
 
     fn word(&self, i: usize) -> u64 {
@@ -715,6 +870,27 @@ impl HostChannel {
 /// from a reader that never asked to consume — which is a value dropped
 /// on the floor, one per fire, and looks like a slow leak rather than a
 /// bug.
+///
+/// # Readiness is FIRST TOUCH, and the loop-carried channel is why
+///
+/// `need_full` and `need_empty` are the readiness question, and a channel
+/// answers ONE of them however many times the stage touches it. The rule is
+/// `driver::channel_effects`'s, said there in as many words: *"First touch,
+/// as shipped: not `take || read` against `put`. An in-place channel is in
+/// both sets, and gating on both would ask for a ring that is at once
+/// non-empty and non-full."*
+///
+/// A loop-carried counter is exactly that channel — `let n = kv_len.take();
+/// kv_len.put(&(n + 1))`, which is the shape every decode epilogue in the
+/// tree has — and this used to list it in both. On a capacity-1 ring the two
+/// demands are unsatisfiable at once: holding the one value it was given
+/// makes it non-empty, which is the take's requirement and the put's
+/// refusal. So EVERY decode epilogue answered `NotReady`, forever, and the
+/// fire fell through to raw logits with nothing to say it had.
+///
+/// `taken` and `put` are unaffected: those are what the commit advances, and
+/// a channel both taken and put advances BOTH — which is why the commit
+/// kernel publishes before it consumes.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct StageChannels {
     /// Channels that must hold a value: everything read or taken.
@@ -745,6 +921,9 @@ pub fn stage_channels(
             v.push(c);
         }
     };
+    // Which channels have already answered the readiness question. See the
+    // FIRST TOUCH paragraph above: a channel answers it once.
+    let mut gated: Vec<u32> = Vec::new();
     for op in &plan.ops {
         let local = op.channel;
         if local == u32::MAX {
@@ -761,18 +940,30 @@ pub fn stage_channels(
         // plan's field is sized for the whole opcode space and a tag is a
         // byte of it. Widening here rather than narrowing `code` keeps the
         // comparison total.
+        let first_touch = !gated.contains(&global);
         match op.code {
             c if c == u16::from(tags::CHAN_TAKE) => {
-                push(&mut out.need_full, global);
+                if first_touch {
+                    push(&mut out.need_full, global);
+                }
                 push(&mut out.taken, global);
             }
-            c if c == u16::from(tags::CHAN_READ) => push(&mut out.need_full, global),
+            c if c == u16::from(tags::CHAN_READ) => {
+                if first_touch {
+                    push(&mut out.need_full, global);
+                }
+            }
             c if c == u16::from(tags::CHAN_PUT) => {
-                push(&mut out.need_empty, global);
+                if first_touch {
+                    push(&mut out.need_empty, global);
+                }
                 push(&mut out.put, global);
             }
-            _ => {}
+            // An op that is not a channel op touches no channel, whatever it
+            // names, so it must not claim the first touch either.
+            _ => continue,
         }
+        gated.push(global);
     }
     Ok(out)
 }
@@ -843,6 +1034,47 @@ mod tests_2 {
         assert_eq!(got.put, vec![2]);
     }
 
+    /// A channel a stage BOTH takes and puts answers ONE readiness question:
+    /// the direction of its first touch.
+    ///
+    /// `let n = kv_len.take(); kv_len.put(&(n + 1))` is every decode
+    /// epilogue in the tree, and listing it in both sets asks for a ring that
+    /// is at once non-empty and non-full. On the capacity-1 ring the engine
+    /// declares for it, no state satisfies both — so the fire answered
+    /// `NotReady` forever and the decode loop produced nothing, with the
+    /// driver reporting only that it had waited.
+    ///
+    /// `taken` and `put` are unaffected: the commit advances BOTH, which is
+    /// why the commit kernel publishes before it consumes.
+    #[test]
+    fn a_channel_taken_and_put_gates_on_its_first_touch_only() {
+        let plan = LaunchStagePlan {
+            ops: vec![op(tags::CHAN_TAKE, 0), op(tags::CHAN_PUT, 0)],
+            channel_bindings: vec![4],
+            ..LaunchStagePlan::default()
+        };
+        let got = stage_channels(&plan).expect("bindings cover the ops");
+        assert_eq!(got.need_full, vec![4], "the take is the first touch");
+        assert_eq!(
+            got.need_empty,
+            Vec::<u32>::new(),
+            "and the put does not also demand room: no ring is both"
+        );
+        assert_eq!(got.taken, vec![4], "the commit still consumes");
+        assert_eq!(got.put, vec![4], "and still publishes");
+
+        // The other order is the other answer, which is what makes this a
+        // rule about the ops rather than a preference for takes.
+        let plan = LaunchStagePlan {
+            ops: vec![op(tags::CHAN_PUT, 0), op(tags::CHAN_TAKE, 0)],
+            channel_bindings: vec![4],
+            ..LaunchStagePlan::default()
+        };
+        let got = stage_channels(&plan).expect("bindings cover the ops");
+        assert_eq!(got.need_empty, vec![4], "the put is the first touch");
+        assert_eq!(got.need_full, Vec::<u32>::new());
+    }
+
     /// One channel named twice appears once.
     ///
     /// The control kernels take a set; a repeated index would advance a
@@ -909,6 +1141,11 @@ mod tests_2 {
                 ring,
             }
         }
+        /// The plane as a channel the engine both writes and reads.
+        ///
+        /// Not a role any real registration carries — a channel is one or the
+        /// other — but these cases are about the RING, and a stand-in that
+        /// refused half its own operations could not exercise it.
         fn chan(&mut self) -> HostChannel {
             unsafe {
                 HostChannel::new(
@@ -916,6 +1153,7 @@ mod tests_2 {
                     self.words.as_mut_ptr().cast(),
                     self.cell_bytes,
                     self.ring,
+                    driver::driver_api::local::PIE_CHANNEL_HOST_ROLE_WRITER,
                 )
             }
         }

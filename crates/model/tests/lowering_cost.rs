@@ -32,8 +32,8 @@ use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
 use model::qwen_3_5::forward::qwen3_5_hybrid_cuda;
 use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
 use model::shared::llama_like::forward::llama_like_cuda;
-use model_compiler::FireClass;
 use model_compiler::lower::{Fire, Row, lower};
+use model_ir::FireClass;
 
 fn rows(n: usize) -> Vec<Row> {
     (0..n)
@@ -46,7 +46,7 @@ fn rows(n: usize) -> Vec<Row> {
 
 /// Median of `reps` timed calls, in microseconds. Median rather than mean
 /// because one preempted call should not set the number.
-fn median_us(plan: &model_compiler::ForwardPlan, rows: &[Row], reps: usize) -> f64 {
+fn median_us(plan: &model_ir::ForwardPlan, rows: &[Row], reps: usize) -> f64 {
     // Warm the allocator and any lazily built tables first; the first call
     // is not the one being asked about.
     for _ in 0..8 {
@@ -70,7 +70,7 @@ fn median_us(plan: &model_compiler::ForwardPlan, rows: &[Row], reps: usize) -> f
 #[ignore = "a measurement, not an assertion"]
 fn what_lowering_costs_per_fire() {
     const REPS: usize = 200;
-    let cases: Vec<(&str, model_compiler::ForwardPlan)> = vec![
+    let cases: Vec<(&str, model_ir::ForwardPlan)> = vec![
         (
             "llama_like qwen3-0.6B decode",
             llama_like_cuda(

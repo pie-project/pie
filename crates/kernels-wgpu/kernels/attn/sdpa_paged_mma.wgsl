@@ -33,23 +33,26 @@
 //#include "common/bf16.inc.wgsl"
 //#include "attn/sdpa_online.inc.wgsl"
 
-@group(0) @binding(0) var<storage, read> queries: array<u32>;
-@group(0) @binding(1) var<storage, read> k_pages: array<u32>;
-@group(0) @binding(2) var<storage, read> v_pages: array<u32>;
+@group(0) @binding(0) var<storage, read_write> queries: array<u32>;
+@group(0) @binding(1) var<storage, read_write> k_pages: array<u32>;
+@group(0) @binding(2) var<storage, read_write> v_pages: array<u32>;
 @group(0) @binding(3) var<storage, read_write> out_: array<u32>;
-@group(0) @binding(4) var<storage, read> position_ids: array<i32>;
-@group(0) @binding(5) var<storage, read> req_of_token: array<i32>;
-@group(0) @binding(6) var<storage, read> kv_page_indices: array<u32>;
-@group(0) @binding(7) var<storage, read> kv_page_indptr: array<u32>;
+@group(0) @binding(4) var<storage, read_write> position_ids: array<i32>;
+@group(0) @binding(5) var<storage, read_write> req_of_token: array<i32>;
+@group(0) @binding(6) var<storage, read_write> kv_page_indices: array<u32>;
+@group(0) @binding(7) var<storage, read_write> kv_page_indptr: array<u32>;
 // `U8s` in the row: WGSL's smallest storage element is four bytes, so both mask
 // buffers cross as `array<u32>` and a byte is a shift.
-@group(0) @binding(8) var<storage, read> attention_mask: array<u32>;
-@group(0) @binding(9) var<storage, read> attention_mask_enabled: array<u32>;
-@group(0) @binding(10) var<storage, read> sinks: array<u32>;
+@group(0) @binding(8) var<storage, read_write> attention_mask: array<u32>;
+@group(0) @binding(9) var<storage, read_write> attention_mask_enabled: array<u32>;
+@group(0) @binding(10) var<storage, read_write> sinks: array<u32>;
 
-// Both rows here are UNSTATED, so no `bindings()` answer covers them; this is
-// the order `kernels-vulkan/kernels/attn/sdpa_paged_mma.comp` states, which is
-// the lowered plan's own order a driver falls back to.
+// Both rows STATE these eighteen operands now -- `kernels-metal` stated them
+// and the three tables are compared row for row -- so `bindings()` answers for
+// this file and a driver binds from the row rather than from a fallback. The
+// order is unchanged: it is the one
+// `kernels-vulkan/kernels/attn/sdpa_paged_mma.comp` states, which was the
+// lowered plan's own order back when nothing could be derived.
 struct Params {
     gqa_factor: i32,
     page_size: i32,

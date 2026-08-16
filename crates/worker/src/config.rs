@@ -678,6 +678,31 @@ pub struct ModelConfig {
     /// declines a write it has no room for rather than filling the disk.
     #[serde(default)]
     pub weight_cache_dir: String,
+    /// How many KV pages the driver opens its pool with. `None` is the
+    /// backend's own default.
+    ///
+    /// # Why it is declared here and read somewhere else
+    ///
+    /// It is not used by this struct at all. `driver-vulkan`'s and
+    /// `driver-wgpu`'s backends both parse `[model] kv_pages` out of the RAW
+    /// config bytes -- neither has this type in scope -- and both document it
+    /// in those words: "a number the boot config can override".
+    ///
+    /// It could not be overridden. This struct is `deny_unknown_fields`, so
+    /// the key those two backends read was rejected by the deserializer
+    /// before either of them saw the bytes:
+    ///
+    /// ```text
+    ///   unknown field `kv_pages`, expected one of `name`, `hf_repo`,
+    ///   `model`, `driver`, `scheduler`, `weight_cache_dir`
+    /// ```
+    ///
+    /// So this field exists to be ACCEPTED. That is a real job under
+    /// `deny_unknown_fields`, and the alternative -- dropping the denial --
+    /// would silently swallow every typo in the table. Declaring the key that
+    /// somebody else reads is the narrow version of the same permission.
+    #[serde(default)]
+    pub kv_pages: Option<u32>,
 }
 
 impl ModelConfig {
@@ -1863,6 +1888,44 @@ device = ["cpu"]
         let cfg: Config = toml::from_str(&blank).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("model.model"), "{err}");
+    }
+
+    /// The key two drivers document as an override actually parses.
+    ///
+    /// `driver-vulkan` and `driver-wgpu` both read `[model] kv_pages` out of
+    /// the raw config bytes and both call it "a number the boot config can
+    /// override". It was not one: this struct is `deny_unknown_fields`, so
+    /// the deserializer refused the key before either backend saw the bytes,
+    /// and the only way to set it was to not use this type. Nothing noticed
+    /// because nothing here reads it -- the field is declared to be
+    /// ACCEPTED, and a test is the only thing that can say so.
+    #[test]
+    fn the_kv_pages_override_two_drivers_read_is_one_this_config_accepts() {
+        let cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.model.kv_pages, None,
+            "absent must stay absent, or every boot overrides a default it \
+             never meant to"
+        );
+
+        let with = MINIMAL_METAL.replace(
+            "hf_repo = \"Qwen/Qwen3-0.6B\"",
+            "hf_repo = \"Qwen/Qwen3-0.6B\"\nkv_pages = 8",
+        );
+        assert_ne!(with, MINIMAL_METAL, "the fixture should carry the key");
+        let cfg: Config = toml::from_str(&with)
+            .expect("`[model] kv_pages` is the key driver-vulkan and driver-wgpu read");
+        cfg.validate().unwrap();
+        assert_eq!(cfg.model.kv_pages, Some(8));
+
+        // ...and the denial is still doing its job for everything else.
+        let typo = MINIMAL_METAL.replace(
+            "hf_repo = \"Qwen/Qwen3-0.6B\"",
+            "hf_repo = \"Qwen/Qwen3-0.6B\"\nkv_page = 8",
+        );
+        toml::from_str::<Config>(&typo)
+            .expect_err("a near-miss of the key must still be refused by name");
     }
 
     #[test]

@@ -7,15 +7,16 @@
 //! image, a group index computed from a patch position, a pooling divisor.
 //! `new-horizon.md` §42 measured the only fact that matters about the
 //! gemma-4 towers: *"a tower's `.cu` includes nine `.cuh` device headers and
-//! every one of them was already in `kernels-cuda-new/csrc/src`. The archive
+//! every one of them was already in `kernels-cuda/csrc/src`. The archive
 //! was never holding tower device code; it was compiling a host walk over
 //! device code that had already left."*
 //!
-//! §42 then moved that host walk from `kernels-cuda/csrc` to
-//! `driver-cuda/csrc`, which changed the archive it was compiled into and not
-//! the language it was written in. This module is the other half: **every
-//! line that runs on the CPU is Rust, and the only C++ left is device text
-//! NVRTC compiles at run time.** A `<<<grid, block, smem, stream>>>` becomes a
+//! §42 then moved that host walk from the archive crate's `csrc` — the one
+//! the quotation calls "the archive" — to `driver-cuda/csrc`, which changed
+//! the `.a` it was compiled into and not the language it was written in.
+//! This module is the other half: **every line that runs on the CPU is Rust,
+//! and the only C++ left is device text NVRTC compiles at run time.** A
+//! `<<<grid, block, smem, stream>>>` becomes a
 //! [`call`] of the routine that already states that geometry; the arena
 //! becomes a [`Scratch`]; the per-image loop becomes a `for`.
 //!
@@ -30,7 +31,7 @@
 //! # The geometry is not invented here
 //!
 //! Every tower kernel's grid now lives beside the instantiation it launches,
-//! in `kernels_cuda_new::x::vision`, where it was transcribed from the C++
+//! in `kernels_cuda::vision`, where it was transcribed from the C++
 //! launcher it replaces. What is left at a call site is the walk's own
 //! vocabulary — which buffer, which extent, which weight — and the `<<<>>>`
 //! citation is on the routine.
@@ -58,9 +59,8 @@
 
 use std::ffi::c_void;
 
-use kernels_cuda_new::ArgValue;
-use kernels_cuda_new::jit::Ctx;
-use kernels_cuda_new::x::Refusal;
+use kernels_cuda::jit::Ctx;
+use kernels_cuda::Refusal;
 
 use crate::device::{Allocator, DeviceBuffer, StreamRef};
 use crate::{Error, Result};

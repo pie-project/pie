@@ -9,6 +9,11 @@
 #
 # `default_attn_score_window` caches its env read in a static, so that axis
 # is swept across PROCESSES.
+#
+# `KSRC` below points into the ARCHIVE crate `kernels-cuda` — CMake+nvcc, a
+# `csrc/` of host `.hpp` and `.cpp` — deleted whole at `85c6c674b`. The line
+# is left unchanged because it records the command that took the golden, not
+# a path anyone can follow.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

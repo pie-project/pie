@@ -287,8 +287,8 @@ pub fn cuda_facts(f: &GptOssFacts, load: Deployed<'_>) -> super::forward::facts:
 #[must_use]
 pub fn metal_shape(f: &GptOssFacts) -> crate::shared::llama_like::spec::LlamaLikeFacts {
     use crate::shared::llama_like::spec::LlamaLikeFacts;
-    use model_compiler::facts::{NormPlacement, QkNorm};
-    use model_compiler::trace::{NormVariant, RopeKind};
+    use model_ir::facts::{NormPlacement, QkNorm};
+    use model_ir::trace::{NormVariant, RopeKind};
 
     LlamaLikeFacts {
         hidden: f.hidden,
@@ -351,7 +351,7 @@ pub fn metal_facts(
     bind: &crate::catalog::MetalBinding,
 ) -> crate::shared::llama_like::forward::facts::LlamaLikeMetalFacts {
     use crate::shared::llama_like::forward::facts::{Activation, LlamaLikeMetalFacts};
-    use model_compiler::dsl::{ScaleLayout, WeightRepr};
+    use model_dsl::{ScaleLayout, WeightRepr};
 
     LlamaLikeMetalFacts {
         // Every gpt-oss layer carries a per-head sink; the row stopped
@@ -419,7 +419,7 @@ pub fn metal_facts(
         // getting it wrong is the QUIET failure: a bank read at the wrong
         // format is 909,207 NaNs, and a gate read at the wrong width is a
         // fluent model routing every token to almost the right experts.
-        router_repr: (bind.router_quant_group != 0).then(|| WeightRepr::Scaled {
+        router_repr: (bind.router_quant_group != 0).then_some(WeightRepr::Scaled {
             layout: ScaleLayout::PerGroup,
             group: bind.router_quant_group,
             axis: 0,
@@ -492,9 +492,9 @@ fn yarn_softmax_scale(head_dim: u32) -> f32 {
 #[must_use]
 pub fn trace(
     f: &GptOssFacts,
-    class: model_compiler::trace::FireClass,
+    class: model_ir::trace::FireClass,
     load: Deployed<'_>,
-) -> model_compiler::trace::ForwardPlan {
+) -> model_ir::trace::ForwardPlan {
     super::forward::gpt_oss_cuda(f, &cuda_facts(f, load), class)
 }
 
@@ -563,6 +563,59 @@ mod tests {
         );
     }
 
+    /// The synthetic Metal fixture IS this projection, field for field.
+    ///
+    /// `LlamaLikeMetalFacts::gpt_oss_20b()` is what four backends' text
+    /// tests fire, and `metal_facts` is what a real load reads. Two
+    /// readings of one row, so the only honest relation is equality --
+    /// and stated as a whole struct rather than a list of fields,
+    /// because the two drifts this pair has had were both in fields no
+    /// list contained.
+    ///
+    /// `rope_freq_table` was the first: the fixture said `false` and
+    /// called 150000 "a plain geometric ladder", which was true of
+    /// nothing. `attn_scale` was the second, and it was 0.0 -- the
+    /// "derive `1/sqrt(head_dim)`" sentinel -- where this row rescales
+    /// by YaRN. See `yarn_softmax_scale`: a 1.81x error in the softmax
+    /// temperature does not fault, it sharpens every distribution in the
+    /// stack. Both were found by comparing everything at once, after
+    /// the enumerations that were supposed to hold this pair together
+    /// had passed.
+    ///
+    /// The binding half is pinned to the deployment the sibling test
+    /// builds, because those five fields are a load's observation and
+    /// not the row's claim.
+    #[test]
+    fn the_synthetic_metal_fixture_is_this_projection() {
+        use crate::shared::llama_like::forward::facts::LlamaLikeMetalFacts;
+        // The binding a real load OBSERVES, not the sibling test's.
+        //
+        // This mattered, and it is the reason this test missed a field on
+        // its first pass. `model::binding::observed` reads the router
+        // gate's affine point off the checkpoint and states it whenever it
+        // differs from the stack's, and this row's `config.json` puts 98
+        // dense tensors at group 64 / 4 bits and 24 `mlp.router` gates at
+        // group 64 / EIGHT. Written against `(0, 0)` this comparison
+        // agreed with a fixture that bound no second point -- two readings
+        // of a deployment nobody loads.
+        let bind = crate::catalog::MetalBinding {
+            quant_group: 64,
+            quant_bits: 4,
+            router_quant_group: 64,
+            router_quant_bits: 8,
+            moe_mxfp4: true,
+            fuse_residual_gemv: true,
+            paged_multi_batch: true,
+            qmm_multi_batch: true,
+            add_bias: true,
+        };
+        assert_eq!(
+            LlamaLikeMetalFacts::gpt_oss_20b(),
+            metal_facts(&f20b(), &bind),
+            "the fixture and the projection are one row"
+        );
+    }
+
     /// FOUR attention biases, not three: q, k, v and the LANDING.
     ///
     /// The shared Metal text adds the landing's bias behind `o_bias &&
@@ -585,7 +638,7 @@ mod tests {
     #[test]
     fn the_attention_landing_takes_its_own_bias_beside_the_three_projections() {
         use crate::shared::llama_like::forward::llama_like_metal;
-        use model_compiler::trace::{FireClass, OpKind};
+        use model_ir::trace::{FireClass, OpKind};
         let f = f20b();
         let bind = crate::catalog::MetalBinding {
             quant_group: 64,
@@ -958,7 +1011,7 @@ mod tests {
     /// decode.
     #[test]
     fn every_fire_class_traces() {
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
         for class in [FireClass::Decode, FireClass::Prefill] {
             let plan = trace(&f20b(), class, Deployed::single());
             assert!(!plan.ops.is_empty(), "{class:?} traced nothing");

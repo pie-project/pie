@@ -275,7 +275,7 @@ fn the_backend_lowering_reads_its_numbers_off_the_target() {
         //   the plan depend on something no caller stated. A symbol cannot be
         //   one of those, and it is checked from the other end —
         //   `executor::cuda`'s tests resolve each against
-        //   `kernels_cuda_new::runtime::hosts` when the feature is on.
+        //   `kernels_cuda::runtime::hosts` when the feature is on.
         if trimmed.starts_with("const ") || trimmed.starts_with("pub const ") {
             if trimmed.contains("TILE_MAP_MASK") || trimmed.contains(": &str = \"") {
                 continue;

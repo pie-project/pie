@@ -25,9 +25,9 @@ pub struct Gemma3nAltUpFacts {
 }
 
 /// This family's attention IS a plain GQA block — see
-/// [`model_compiler::facts::GqaFacts`], which both families carried
+/// [`model_ir::facts::GqaFacts`], which both families carried
 /// field-identically.
-pub type Gemma3nAttnFacts = model_compiler::facts::GqaFacts;
+pub type Gemma3nAttnFacts = model_ir::facts::GqaFacts;
 
 /// The window schedule, as a rule evaluated at compile time.
 ///
@@ -37,7 +37,7 @@ pub type Gemma3nAttnFacts = model_compiler::facts::GqaFacts;
 /// `const fn` expands it, so the array in the binary and the rule that
 /// generated it cannot come apart.
 ///
-/// The predicate is [`model_compiler::facts::full_attn_at`]'s —
+/// The predicate is [`model_ir::facts::full_attn_at`]'s —
 /// `(l + 1) % interval == 0` — written out because that function is not
 /// `const` and a `const` row cannot call it.
 #[must_use]
@@ -90,7 +90,7 @@ pub struct Gemma3nFacts {
     pub altup: Gemma3nAltUpFacts,
     pub attn: Gemma3nAttnFacts,
     /// The SLIDING WINDOW each layer attends over, `-1` for none —
-    /// read through [`model_compiler::facts::window_left_at`], which is
+    /// read through [`model_ir::facts::window_left_at`], which is
     /// where the shape of this list is documented.
     ///
     /// The dispatch statements carry it, so no executor reaches into
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn an_empty_schedule_reads_as_no_window() {
         let f = Gemma3nFacts::gemma3n_synthetic();
-        assert_eq!(model_compiler::facts::window_left_at(f.window_left, 0), -1);
-        assert_eq!(model_compiler::facts::window_left_at(f.window_left, 5), -1);
+        assert_eq!(model_ir::facts::window_left_at(f.window_left, 0), -1);
+        assert_eq!(model_ir::facts::window_left_at(f.window_left, 5), -1);
     }
 }

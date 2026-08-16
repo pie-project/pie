@@ -12,7 +12,7 @@
 //! * every weight and named value the trace states reaches the resolver — the
 //!   map is the only per-family piece left, as designed;
 //! * every kernel symbol the lowering emits has a **stated row** in
-//!   `kernels_metal::KERNELS`, so an entry point exists for the dispatch half
+//!   the routine registry's stems, so an entry point exists for the dispatch half
 //!   to compile by name. That is the claim the whole approach rests on: on
 //!   this backend a symbol is a name, so a lowering that states one the table
 //!   knows needs no arm written to receive it.
@@ -28,7 +28,7 @@ use driver_metal::lowering::executor::{BindRefusal, Frame, Resolver, Slice, bind
 use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
 use model::shared::llama_like::forward::llama_like_metal;
 use model_compiler::lower::{Fire, Lowered, Row, lower};
-use model_compiler::trace::{FireClass, ValueId};
+use model_ir::trace::{FireClass, ValueId};
 
 /// Answers every name with a distinct region and records what was asked.
 ///
@@ -139,19 +139,20 @@ fn no_arena_operand_addresses_past_the_arena_the_lowering_sized() {
 }
 
 #[test]
-fn every_symbol_the_lowering_names_has_a_row_in_the_metal_table() {
+fn every_symbol_the_lowering_names_is_one_a_routine_claims() {
     // The claim the approach rests on. A symbol is a NAME on this backend, so
     // the dispatch half compiles the entry point the lowering states — but
-    // only if the table knows the contract, because the row is where the
-    // contract lives.
-    // `sig_in` is the crate's own answer: an exact symbol match, or the row
-    // whose axes cover an instantiated point (`silu_mul` covers
-    // `silu_mul_bfloat16`). Comparing against `KernelSig::name` instead would
-    // be comparing a dsl-side name to a recorded symbol.
+    // only if something knows the contract.
+    //
+    // The row was where the contract lived and `sig_in` was how it was found.
+    // Every Metal family has retired its rows, so the answer is the routine
+    // registry's stem: `crossed` is the same resolution `plan_launch`
+    // performs, which makes a fault here a launch that would refuse `Unclaimed`
+    // at run time, named at its source instead of at the dispatch.
     let mut missing: BTreeSet<String> = BTreeSet::new();
     for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 16)] {
         for symbol in &lowered(class, rows).kernels {
-            if kernels::sig_in(kernels_metal::KERNELS, symbol).is_none() {
+            if driver_metal::lowering::routine::crossed(symbol).is_none() {
                 missing.insert(symbol.clone());
             }
         }
@@ -169,8 +170,9 @@ fn every_symbol_the_lowering_names_has_a_row_in_the_metal_table() {
     // is why it needs none.
     assert!(
         missing.is_empty(),
-        "the metal text names {} symbol(s) with no `kernel!` row: {missing:?}\n\
-         A row is where the contract lives; add it in the module beside the .metal.",
+        "the metal text names {} symbol(s) no routine stem claims: {missing:?}\n\
+         Nothing can dispatch it. Add a routine in the module beside the \
+         .metal, and give it a stem in `LIVE`.",
         missing.len()
     );
 }
@@ -178,28 +180,29 @@ fn every_symbol_the_lowering_names_has_a_row_in_the_metal_table() {
 #[test]
 fn every_symbol_the_lowering_names_states_the_file_that_defines_it() {
     // Metal compiles at run time from `(path, entry name)`, so a symbol whose
-    // row does not say which file defines it cannot be dispatched — and the
-    // only things that knew the file were the per-family plans that retire.
-    // Demand-driven: a row gets its `file` when a text names it, and this is
-    // what asks.
+    // file nothing states cannot be dispatched.
+    //
+    // The row's `file` column was that statement and it is retired with the
+    // rows. `kernels_metal::shaders()` is where the pair lives now, one per
+    // instantiated name — so this asks the census directly, and a symbol
+    // missing from it is a symbol no pipeline can be built for.
+    let census: BTreeSet<&str> = kernels_metal::shaders()
+        .into_iter()
+        .map(|(_, entry)| entry)
+        .collect();
     let mut unstated: BTreeSet<String> = BTreeSet::new();
     for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 16)] {
         for symbol in &lowered(class, rows).kernels {
-            match kernels::sig_in(kernels_metal::KERNELS, symbol) {
-                Some(sig) if sig.file.is_some() => {}
-                // The known gap has no row at all; `every_symbol_..._row`
-                // owns it.
-                None => {}
-                Some(_) => {
-                    unstated.insert(symbol.clone());
-                }
+            if !census.contains(symbol.as_str()) {
+                unstated.insert(symbol.clone());
             }
         }
     }
     assert!(
         unstated.is_empty(),
-        "{} symbol(s) the metal text names have a row that states no file: {unstated:?}\n\
-         Add `file = Some(\"dir/file.metal\")` to the row.",
+        "{} symbol(s) the metal text names are in no family's `ENTRYPOINTS`, \
+         so nothing states the shader `dispatch` has to open for them: \
+         {unstated:?}",
         unstated.len()
     );
 }

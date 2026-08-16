@@ -1,6 +1,6 @@
 //! What happens when a trace states one of `rope`'s symbols.
 //!
-//! These were `bind!` arms inside `kernels-cuda-new`. They read the driver's
+//! These were `bind!` arms inside `kernels-cuda`. They read the driver's
 //! own vocabulary through [`Cx`], so they belong on this side of the seam:
 //! the kernels crate exposes routines, and joining a statement to one is the
 //! driver's job.
@@ -8,9 +8,9 @@
 use core::ffi::c_void;
 
 use kernels::Refusal;
-use kernels_cuda_new::jit::Ctx;
-use kernels_cuda_new::x::abi::bf16;
-use kernels_cuda_new::x::rope::*;
+use kernels_cuda::jit::Ctx;
+use kernels_cuda::jit::abi::bf16;
+use kernels_cuda::rope::*;
 
 use super::super::cx::Cx;
 use super::Bound;
@@ -105,7 +105,7 @@ fn rope_partial_last_bf16_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Re
     }
     let q = cx.arg_out(0)?.cast::<bf16>();
     let kv_heads = cx.out_width(1).map_or(0, |w| w / kv.head_dim);
-    let yarn = cx.yarn().unwrap_or(kernels_cuda_new::x::Yarn::NONE);
+    let yarn = cx.yarn().unwrap_or(kernels_cuda::rope::Yarn::NONE);
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
     rope_partial_last_bf16(

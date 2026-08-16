@@ -1,6 +1,6 @@
 //! What happens when a trace states one of `sample`'s symbols.
 //!
-//! These were `bind!` arms inside `kernels-cuda-new`. They read the driver's
+//! These were `bind!` arms inside `kernels-cuda`. They read the driver's
 //! own vocabulary through [`Cx`], so they belong on this side of the seam:
 //! the kernels crate exposes routines, and joining a statement to one is the
 //! driver's job.

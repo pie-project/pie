@@ -155,6 +155,27 @@ pub enum Undispatchable {
         /// The operand's name, as the row spells it.
         name: &'static str,
     },
+    /// A crossed routine could not be planned.
+    ///
+    /// Carries the reason as a STRING rather than the `Unplanned` itself,
+    /// because `Unplanned` holds an `Unbindable` and this enum is compared
+    /// for equality across the suite.
+    Routine {
+        /// The entrypoint.
+        symbol: String,
+        /// What the routine plane said.
+        why: String,
+    },
+    /// A body stated a number of dispatches this path cannot carry.
+    ///
+    /// One launch, one `Dispatch`. A two-pass reduction is two entrypoints
+    /// over one statement and would need the launch path to widen first.
+    Multiple {
+        /// The entrypoint.
+        symbol: String,
+        /// How many the body asked for.
+        stated: usize,
+    },
     /// The rule and dims do not describe a grid.
     Ungeometric {
         /// Why.
@@ -234,6 +255,14 @@ impl std::fmt::Display for Undispatchable {
             } => write!(
                 f,
                 "`{symbol}` states {stated} operands and its module binds {module}"
+            ),
+            Self::Routine { symbol, why } => {
+                write!(f, "`{symbol}` could not be planned as a routine: {why}")
+            }
+            Self::Multiple { symbol, stated } => write!(
+                f,
+                "`{symbol}`'s body stated {stated} dispatches and one launch \
+                 carries one"
             ),
             Self::Ungeometric { why } => write!(f, "no grid: {why}"),
             Self::Empty { groups } => {
@@ -335,12 +364,37 @@ pub fn dims_of(sig: &KernelSig, lowered: &Lowered, launch: &Launch, fire: Geomet
 /// and unread slots decide the ARITY. Separating them at the call site would
 /// let a caller pass a module's geometry with another module's layout, which is
 /// a mistake nothing downstream could detect.
-#[derive(Clone, Copy, Debug)]
+// `KernelSig` has no `Debug`, so this cannot derive one either.
+#[derive(Clone, Copy)]
 pub struct Built<'a> {
     /// Workgroup size and tile, from the entrypoint name and the module.
     pub module: Module,
     /// What the module binds.
     pub declared: &'a crate::reflect::Declared,
+    /// The table row this symbol resolves to, if the caller has it.
+    ///
+    /// `None` means "look it up", which is what a test does and what any
+    /// caller that has one symbol in hand should do. A caller with a LOOP over
+    /// launches should pass it: `row` is `sig_in`, which walks the table for
+    /// an exact match and then walks it AGAIN matching axis points, and a
+    /// decode fires 452 launches over ten distinct symbols.
+    ///
+    /// `driver-vulkan` carries the same field for the same reason and states
+    /// it in the same words -- "once per SYMBOL, not once per launch" -- which
+    /// is where this was found: its `serve::fire` caches the reflection and the
+    /// row together, and this backend had ported only the first half.
+    ///
+    /// # What it is worth here, which is not much
+    ///
+    /// The plan phase of a real decode: **2.0 ms to 1.3 ms**, interleaved, over
+    /// 452 launches. That is 0.7 ms of a ~28 ms step -- about 2.5%, and well
+    /// under this machine's run-to-run spread, which the same binary shows as
+    /// 33 to 45 ms. It is kept because it is free and strictly less work, and
+    /// because the alternative was to leave a `sig_in` walk in a loop after
+    /// discovering the sibling had removed exactly that; it is NOT kept on a
+    /// measured end-to-end win, and this says so rather than letting the next
+    /// reader assume one.
+    pub sig: Option<&'static KernelSig>,
 }
 
 /// Where a launch's operands are to be found.
@@ -384,6 +438,13 @@ fn row(table: &'static [KernelSig], symbol: &str) -> Option<&'static KernelSig> 
     kernels::sig_in(table, symbol)
 }
 
+/// `row`, for a caller that wants to resolve a symbol ONCE and hand the
+/// answer to every launch that names it. See [`Built::sig`].
+#[must_use]
+pub fn row_of(table: &'static [KernelSig], symbol: &str) -> Option<&'static KernelSig> {
+    row(table, symbol)
+}
+
 /// Turn one launch into a dispatch.
 ///
 /// `table` is `kernels_wgpu::KERNELS` in every caller; it is a parameter so
@@ -408,7 +469,7 @@ pub fn plan_one<'a, R: Resolve>(
     sources: Sources<'a, R>,
     fire: Geometry,
 ) -> Result<Dispatch<'a, R::Buffer>, Undispatchable> {
-    let Built { module, declared } = built;
+    let Built { declared, .. } = built;
     let Sources {
         arena,
         resolver,
@@ -424,9 +485,96 @@ pub fn plan_one<'a, R: Resolve>(
             cond: launch.cond,
         });
     }
-    let sig = row(table, symbol).ok_or_else(|| Undispatchable::Unknown {
-        symbol: symbol.to_owned(),
-    })?;
+    // THE FORK. A symbol this backend has both crossed and ARMED is planned
+    // by its routine: the arm finds the operands, the body states the module,
+    // the entrypoint and the lanes, and neither reads the row's `operands` or
+    // `launch` columns. One symbol qualifies today.
+    //
+    // ABOVE THE ROW LOOKUP, which is the point. An armed symbol needs no
+    // `KernelSig` at all: the arm finds the operands, the body states the
+    // grid, and the two widths a body's `Facts` want come off the LOWERING --
+    // the last widthed operand is what the launch writes and the first is
+    // what it reads. So a family whose arms are all in can have its rows
+    // DELETED, which is Stage 3 and is what the countdown counts.
+    if let Some((routine, arm)) = crate::lowering::routine::armed(symbol) {
+        let facts = crate::lowering::arm::facts(
+            launch.rows.end - launch.rows.start,
+            fire,
+            lowered.n_requests,
+            widths(lowered, launch).next_back().unwrap_or(0),
+            widths(lowered, launch).next().unwrap_or(0),
+        );
+        let mut planned = crate::lowering::routine::plan(
+            routine,
+            arm,
+            lowered,
+            launch,
+            declared,
+            Sources {
+                arena,
+                resolver,
+                min_offset,
+            },
+            facts,
+        )
+        .map_err(|why| Undispatchable::Routine {
+            symbol: symbol.to_owned(),
+            why: why.to_string(),
+        })?;
+        // A body MAY state more than one dispatch -- a two-pass reduction is
+        // two entrypoints over one statement -- and this function returns
+        // one. Nothing in this tree does it, so the shape stays narrow and
+        // the day something does, it is a named refusal rather than a
+        // silently dropped pass.
+        if planned.len() != 1 {
+            return Err(Undispatchable::Multiple {
+                symbol: symbol.to_owned(),
+                stated: planned.len(),
+            });
+        }
+        return Ok(planned.remove(0));
+    }
+
+    plan_by_row(lowered, launch, table, built, sources, fire)
+}
+
+/// One rectangle planned from its ROW, with the fork behind it.
+///
+/// The table path, split out of [`plan_one`] so it can be CALLED — by
+/// `the_routine_path_plans_what_the_table_path_planned`, which derives every
+/// field of a live kernel's dispatch twice and compares. There is no other way
+/// to reach this once a symbol is armed, because the fork above answers first
+/// and by design.
+///
+/// # Errors
+///
+/// Every variant of [`Undispatchable`] except `Routine` and `Multiple`, which
+/// only the routine plane raises.
+pub fn plan_by_row<'a, R: Resolve>(
+    lowered: &'a Lowered,
+    launch: &Launch,
+    table: &'static [KernelSig],
+    built: Built<'_>,
+    sources: Sources<'a, R>,
+    fire: Geometry,
+) -> Result<Dispatch<'a, R::Buffer>, Undispatchable> {
+    let symbol = lowered.kernels[launch.kernel as usize].as_str();
+    let Built {
+        module,
+        declared,
+        sig: stated,
+    } = built;
+    let Sources {
+        arena,
+        resolver,
+        min_offset,
+    } = sources;
+    let sig = match stated {
+        Some(sig) => sig,
+        None => row(table, symbol).ok_or_else(|| Undispatchable::Unknown {
+            symbol: symbol.to_owned(),
+        })?,
+    };
 
     // Not `bind`, which hands the operands over in the order the TRACE states
     // -- inputs, outputs, weights. The shader binds them in the order its
@@ -551,6 +699,7 @@ pub fn plan_one<'a, R: Resolve>(
     }
 
     let dims = dims_of(sig, lowered, launch, fire);
+
     let groups =
         groups(sig.launch, dims, module).map_err(|why| Undispatchable::Ungeometric { why })?;
     if groups.contains(&0) {
@@ -604,7 +753,7 @@ mod tests {
     use super::*;
     use crate::binding::Placeholder;
     use crate::geometry::Local;
-    use model_compiler::trace::ValueId;
+    use model_ir::trace::ValueId;
 
     #[derive(Default)]
     struct Store {
@@ -634,7 +783,6 @@ mod tests {
         file: None,
         launch: Rule::Elementwise,
         whole: false,
-        needs: kernels::Prepare::None,
         lacks: &[],
         sink: None,
         in_place: &[],
@@ -691,6 +839,271 @@ mod tests {
     }
 
     /// A plan of one rectangle over `symbol`, with `args` operands.
+    /// An ARMED symbol is planned by its routine, and the row's columns are
+    /// not what decided the answer.
+    ///
+    /// The fork's whole claim, and it is now as strong as it can get:
+    /// `argmax_logits` HAS NO ROW. `sample`'s `kernel!` rows came off when its
+    /// arm landed, so `kernels_wgpu::sig` returns `None` and there is nothing
+    /// for the table path to read — not a row without a rule, no row. A grid
+    /// coming back is therefore proof the routine path ran, because the other
+    /// path cannot even begin.
+    ///
+    /// Its ENTRYPOINT is still stated, by `kernels_wgpu::RETIRED`, so every
+    /// sweep still compiles and covers the shader. Losing the row is not
+    /// losing the kernel.
+    ///
+    /// The first assertion below pins that, so if a row is ever restored this
+    /// test says the reasoning changed rather than passing on the old one.
+    ///
+    /// The grid is `256` lanes over one workgroup of 256, which is
+    /// `sample/argmax.wgsl`'s `@workgroup_size(256)` and the body's own
+    /// `rows` extent.
+    #[test]
+    fn an_armed_symbol_is_planned_by_its_routine_and_not_by_its_row() {
+        let lowered = plan(
+            "argmax_logits",
+            vec![
+                arena_arg(0),
+                arena_arg(1024),
+                arena_arg(2048),
+                arena_arg(4096),
+            ],
+            Vec::new(),
+        );
+        let buf = Placeholder(1 << 20);
+        let store = Store::default();
+        let d = declared(0, &[]);
+
+        // The table path cannot do this: there is no row to read.
+        assert!(
+            kernels_wgpu::sig("argmax_logits").is_none(),
+            "a row for `argmax_logits` is back, so a grid no longer proves \
+             which path answered"
+        );
+
+        let got = plan_one(
+            &lowered,
+            &lowered.launches[0],
+            kernels_wgpu::KERNELS,
+            Built {
+                module: Module {
+                    local: Local([256, 1, 1]),
+                    tile: None,
+                },
+                declared: &d,
+                sig: None,
+            },
+            Sources {
+                arena: Arena {
+                    buffer: &buf,
+                    bytes: 1 << 20,
+                },
+                resolver: &store,
+                min_offset: 256,
+            },
+            Geometry::default(),
+        )
+        .expect("the routine path planned it");
+
+        assert_eq!(got.symbol, "argmax_logits");
+        // The body states `[GROUP_X, rows, 1]` lanes -- one workgroup of 256
+        // reduces ONE ROW over the vocabulary -- so four rows is four
+        // workgroups on y and one on x. I guessed `[1, 1, 1]` writing this
+        // and the fork answered `[1, 4, 1]`; the body was right and the guess
+        // was a grid that would have reduced row zero four times.
+        assert_eq!(got.groups, [1, 4, 1]);
+        // Four operands, in the order the BODY asked -- logits, next_token,
+        // params, eos_flag -- which is in, out, in, out against a statement
+        // that states its reads first.
+        assert_eq!(got.buffers.len(), 4);
+        assert_eq!(got.op, 11);
+    }
+
+    /// The second armed symbol halves its width, and the fork carries it.
+    ///
+    /// `ptir::copy_logits_bf16` is the only place on this backend where the
+    /// grid is not a function of the operand width the way every row states
+    /// it: `logits_copy.wgsl` packs two bf16 into a `u32`, so one lane owns
+    /// one WORD and the x extent is half the vocabulary. `kernels-metal`'s row
+    /// for the same kernel states the unhalved `[vocab, rows, 1]` and is right
+    /// about ITS shader, which has a 16-bit type.
+    ///
+    /// So this is the fact worth a test of its own: a width arriving whole and
+    /// a grid coming back halved. Nothing else would notice if the body
+    /// dropped the `/ 2` — the dispatch would simply write the top half of
+    /// every row and leave the rest, which is a wrong answer that still runs.
+    #[test]
+    fn the_logits_copy_grid_is_half_the_width_it_was_given() {
+        // NOT `arena_arg`, whose width is 64: 64 lanes and 32 both fit one
+        // workgroup of 256, so the halved and unhalved grids are the SAME
+        // `[1, rows, 1]` and the first version of this test passed either
+        // way. 1024 is the smallest round width where they differ -- 4
+        // workgroups against 2 -- which is the whole point of it.
+        let wide = |at: usize| Arg::Arena {
+            at,
+            width: 1024,
+            bytes: 2,
+        };
+        let lowered = plan(
+            "copy_logits_bf16",
+            vec![wide(0), wide(4096), wide(8192)],
+            Vec::new(),
+        );
+        let buf = Placeholder(1 << 20);
+        let store = Store::default();
+        let d = declared(0, &[]);
+
+        assert!(
+            kernels_wgpu::sig("copy_logits_bf16").is_none(),
+            "a row for `copy_logits_bf16` is back, so a grid no longer proves \
+             which path answered"
+        );
+
+        let got = plan_one(
+            &lowered,
+            &lowered.launches[0],
+            kernels_wgpu::KERNELS,
+            Built {
+                module: Module {
+                    local: Local([256, 1, 1]),
+                    tile: None,
+                },
+                declared: &d,
+                sig: None,
+            },
+            Sources {
+                arena: Arena {
+                    buffer: &buf,
+                    bytes: 1 << 20,
+                },
+                resolver: &store,
+                min_offset: 256,
+            },
+            Geometry::default(),
+        )
+        .expect("the routine path planned it");
+
+        assert_eq!(got.symbol, "copy_logits_bf16");
+        // 1024 / 2 = 512 words over a workgroup of 256, so TWO on x. Four on
+        // y is the launch's rows. Unhalved it would be four on x, and the
+        // shader would read past the row it was given.
+        assert_eq!(got.groups, [2, 4, 1]);
+        // source, destination, params -- in, out, in, against a statement
+        // that states its reads first. The two U32 arguments the arm appends
+        // are widths, not buffers, and do not bind.
+        assert_eq!(got.buffers.len(), 3);
+    }
+
+    /// An odd vocabulary is refused by the BODY, through the fork.
+    ///
+    /// The body's own header requires `vocab` to be even, because an odd pitch
+    /// starts the next row inside the previous row's last word. That refusal
+    /// is a fact about the shader that no row had a column for, and this is
+    /// the first time this backend can state one: the table path would have
+    /// dispatched an odd width and written the rows into each other.
+    #[test]
+    fn an_odd_vocabulary_is_refused_where_the_row_had_no_column_for_it() {
+        let lowered = plan(
+            "copy_logits_bf16",
+            vec![
+                Arg::Arena {
+                    at: 0,
+                    width: 63,
+                    bytes: 2,
+                },
+                Arg::Arena {
+                    at: 1024,
+                    width: 63,
+                    bytes: 2,
+                },
+                Arg::Arena {
+                    at: 2048,
+                    width: 63,
+                    bytes: 2,
+                },
+            ],
+            Vec::new(),
+        );
+        let buf = Placeholder(1 << 20);
+        let store = Store::default();
+        let d = declared(0, &[]);
+        let got = plan_one(
+            &lowered,
+            &lowered.launches[0],
+            kernels_wgpu::KERNELS,
+            Built {
+                module: Module {
+                    local: Local([256, 1, 1]),
+                    tile: None,
+                },
+                declared: &d,
+                sig: None,
+            },
+            Sources {
+                arena: Arena {
+                    buffer: &buf,
+                    bytes: 1 << 20,
+                },
+                resolver: &store,
+                min_offset: 256,
+            },
+            Geometry::default(),
+        );
+        let Err(Undispatchable::Routine { symbol, why }) = got else {
+            panic!("expected the body to refuse an odd width, got {got:?}");
+        };
+        assert_eq!(symbol, "copy_logits_bf16");
+        assert!(
+            why.contains("vocab"),
+            "the refusal should name the width it refused: {why}"
+        );
+    }
+
+    /// A routine that cannot be planned is `Undispatchable::Routine`, and it
+    /// carries what the routine plane said.
+    ///
+    /// The armed symbol against a statement of no operands: the arm asks for
+    /// its first input and the statement has none, so the refusal comes back
+    /// from the arm rather than from anything the table path would have said.
+    #[test]
+    fn a_routine_that_cannot_be_planned_is_refused_by_name() {
+        let lowered = plan("argmax_logits", Vec::new(), Vec::new());
+        let buf = Placeholder(1 << 20);
+        let store = Store::default();
+        let d = declared(0, &[]);
+        let got = plan_one(
+            &lowered,
+            &lowered.launches[0],
+            kernels_wgpu::KERNELS,
+            Built {
+                module: Module {
+                    local: Local([256, 1, 1]),
+                    tile: None,
+                },
+                declared: &d,
+                sig: None,
+            },
+            Sources {
+                arena: Arena {
+                    buffer: &buf,
+                    bytes: 1 << 20,
+                },
+                resolver: &store,
+                min_offset: 256,
+            },
+            Geometry::default(),
+        );
+        let Err(Undispatchable::Routine { symbol, why }) = got else {
+            panic!("expected a routine refusal, got {got:?}");
+        };
+        assert_eq!(symbol, "argmax_logits");
+        assert!(
+            why.contains("an input"),
+            "the refusal should carry what the arm said, got `{why}`"
+        );
+    }
+
     fn plan(symbol: &str, args: Vec<Arg>, params: Vec<u32>) -> Lowered {
         Lowered {
             launches: vec![Launch {
@@ -718,6 +1131,87 @@ mod tests {
             conds: Vec::new(),
             readout: None,
         }
+    }
+
+    /// A row whose scalars the module has no room for is refused by name.
+    ///
+    /// From the census in `tests/citations.rs`: `Undispatchable::Scalars` is
+    /// one of the refusals this crate builds and no test named. It is the
+    /// translation of `binding::Misplaced::Count`, which IS tested one layer
+    /// down -- so what this adds is the three-arm `match` between them, where a
+    /// swapped arm compiles and hands back a refusal describing a different
+    /// fault entirely.
+    ///
+    /// `Misplaced::Count`'s own doc says why the underlying defect has no
+    /// symptom: WGSL requires every access to be bounds-checked, so a block
+    /// short of what the shader reads returns ZEROS rather than faulting, and
+    /// a missing pitch is "a plausible number that no layer and no assertion
+    /// will object to". The refusal is the only thing that ever says so, which
+    /// is the argument for asserting it by name rather than by `is_err`.
+    ///
+    /// `shared_expert_combine_strided` is the row because it is the smallest
+    /// stated one whose buffers a default resolver can satisfy -- four arena
+    /// operands, `In` and `Out` only, no weights, no fire tables, no cache --
+    /// and it states two scalars. A module declaring room for one is the
+    /// mismatch.
+    #[test]
+    fn a_module_with_no_room_for_the_rows_scalars_says_how_many_of_each() {
+        let symbol = kernels_wgpu::sig("shared_expert_combine_strided")
+            .expect("the table ships the strided shared-expert combine")
+            .entrypoints()
+            .into_iter()
+            .next()
+            .expect("the row has entrypoints");
+        let lowered = plan(
+            &symbol,
+            vec![
+                arena_arg(0),
+                arena_arg(1024),
+                arena_arg(2048),
+                arena_arg(4096),
+            ],
+            vec![3, 5],
+        );
+        let buf = Placeholder(1 << 20);
+        let store = Store::default();
+
+        let plan_against = |uniform: &[u32]| {
+            let d = declared(4, uniform);
+            plan_one(
+                &lowered,
+                &lowered.launches[0],
+                kernels_wgpu::KERNELS,
+                Built {
+                    module: Module {
+                        local: Local([256, 1, 1]),
+                        tile: None,
+                    },
+                    declared: &d,
+                    sig: None,
+                },
+                Sources {
+                    arena: Arena {
+                        buffer: &buf,
+                        bytes: 1 << 20,
+                    },
+                    resolver: &store,
+                    min_offset: 256,
+                },
+                fire(),
+            )
+            .map(|_| ())
+        };
+
+        // The premise: with room for both, this rectangle plans. Without it
+        // the refusal below could be about anything.
+        plan_against(&[0, 4]).expect("a module with room for both scalars");
+
+        let why = plan_against(&[0]).expect_err("a module with room for one");
+        assert!(
+            matches!(why, Undispatchable::Scalars { stated: 2, room: 1 }),
+            "a row of two scalars against a block of one came back as `{why}`, \
+             which does not say that the shader would have read a zero"
+        );
     }
 
     fn arena_arg(at: usize) -> Arg {
@@ -773,6 +1267,7 @@ mod tests {
                     tile: None,
                 },
                 declared: &d,
+                sig: None,
             },
             Sources {
                 arena: Arena {
@@ -821,6 +1316,7 @@ mod tests {
             Built {
                 module: Module::new([256, 1, 1]),
                 declared: &d,
+                sig: None,
             },
             Sources {
                 arena: Arena {
@@ -909,6 +1405,7 @@ mod tests {
                     Built {
                         module: Module::loaded(&name, &declared),
                         declared: &declared,
+                        sig: None,
                     },
                     Sources {
                         arena,
@@ -933,8 +1430,8 @@ mod tests {
             wrong.join("\n  ")
         );
         assert_eq!(
-            bound, 292,
-            "56 rows over 292 entrypoints state no operands; if that number \
+            bound, 283,
+            "50 rows over 283 entrypoints state no operands; if that number \
              moved, a row was filled in or added and this test should say so"
         );
     }
@@ -991,6 +1488,7 @@ mod tests {
                 Built {
                     module: Module::new([256, 1, 1]),
                     declared: &d,
+                    sig: None,
                 },
                 Sources {
                     arena,
@@ -1122,6 +1620,7 @@ mod tests {
                     Built {
                         module: Module::loaded(&name, &declared),
                         declared: &declared,
+                        sig: None,
                     },
                     Sources {
                         arena,
@@ -1201,8 +1700,8 @@ mod tests {
             refused.join("\n  ")
         );
         assert_eq!(
-            planned, 183,
-            "44 rows over 189 entrypoints state operands; 183 plan and the six \
+            planned, 190,
+            "48 rows over 196 entrypoints state operands; 190 plan and the six \
              contiguous-cache ones are refused above"
         );
     }
@@ -1223,6 +1722,7 @@ mod tests {
                 Built {
                     module: Module::new([256, 1, 1]),
                     declared: &d,
+                    sig: None,
                 },
                 Sources {
                     arena: Arena {
@@ -1257,6 +1757,7 @@ mod tests {
                 Built {
                     module: Module::new([256, 1, 1]),
                     declared: &d,
+                    sig: None,
                 },
                 Sources {
                     arena: Arena {
@@ -1366,6 +1867,7 @@ mod tests {
             Built {
                 module: Module::new([256, 1, 1]),
                 declared: &d,
+                sig: None,
             },
             Sources {
                 arena: Arena {
@@ -1407,6 +1909,7 @@ mod tests {
             Built {
                 module: Module::new([256, 1, 1]),
                 declared: &d,
+                sig: None,
             },
             Sources {
                 arena: Arena {
@@ -1456,6 +1959,7 @@ mod tests {
             Built {
                 module: Module::new([256, 1, 1]),
                 declared: &d,
+                sig: None,
             },
             Sources {
                 arena: Arena {

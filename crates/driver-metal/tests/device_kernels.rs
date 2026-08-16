@@ -8,6 +8,12 @@
 //! plausible text, and the assertion that no quoted include survived would
 //! still hold -- it is the compiler that notices the definitions are gone.
 //!
+//! And then a second test goes one step further than a library, because a
+//! library is not a launch: it builds a compute PIPELINE for every entrypoint
+//! the kernel table declares, which is where Metal enforces the threadgroup
+//! memory budget and the thread count. A shader can compile at a width the
+//! device will not run.
+//!
 //! Requires a Metal 4 GPU, so it skips rather than fails when there is none.
 //! The rest of the workspace is developed on Linux and this file has to be a
 //! no-op there.
@@ -17,8 +23,12 @@
 use std::path::PathBuf;
 
 use driver_metal::Error;
+// The pipeline's own ceiling, which is the one fact about a built pipeline
+// that no `driver-metal` type re-exports: `Encoder` reads it to refuse an
+// over-wide dispatch and keeps it private.
 use driver_metal::device::Context;
 use driver_metal::program::Compiler;
+use objc2_metal::MTLComputePipelineState;
 
 /// An entry point no kernel defines.
 ///
@@ -90,5 +100,130 @@ fn every_shipped_kernel_compiles_on_this_device() {
         rejected.len(),
         files.len(),
         rejected.join("\n")
+    );
+}
+
+/// **Compiling is not launching, and only this test knows the difference.**
+///
+/// The test above drives every shader to a LIBRARY and stops, because it asks
+/// one question of all of them at once and a library is where that question is
+/// answered. This one goes the rest of the way: for every entrypoint the
+/// kernel table declares, it builds a COMPUTE PIPELINE STATE, which is where
+/// Metal enforces what a library never checks -- the 32 KB of threadgroup
+/// memory a threadgroup may declare, and the thread count an entrypoint's
+/// `max_total_threads_per_threadgroup` will accept.
+///
+/// The gap is not hypothetical. `sdpa_paged_mma.metal` carried, for as long as
+/// it existed, an argument that a 128-wide head "would be 40 KB, over the 32
+/// KB a threadgroup gets" and therefore could not be instantiated. The
+/// arithmetic was right for `KT=64` and the file instantiates `KT=16`, where
+/// the same three tiles are 16 KB. Nothing contradicted it because nothing
+/// asked the device: the shader compiled at every width, and no width but 64
+/// was ever built into a pipeline. It is a pipeline now, and so is every other
+/// entrypoint the families name.
+///
+/// It also holds the other direction. A pair that states a file it does not
+/// own -- a symbol the shader does not define -- fails here with "exports no
+/// such" and passes everywhere else, because the path in `ENTRYPOINTS` is a
+/// string nothing else dereferences until a load reaches it.
+///
+/// And it reads the ceiling back off each pipeline. Building is permission to
+/// dispatch at SOME width, not at the width the row's rule will ask for, and
+/// Metal does not refuse an over-wide threadgroup -- it skips the dispatch,
+/// leaves the output holding whatever it held, and reports success.
+/// `device::encoder::dispatch` catches that at serve time; this catches it at
+/// build time, for the three rules that fix a width from the row alone.
+///
+/// 180 of the 481 pipelines admit fewer than 1024 threads on this Mac, down to
+/// 576 for the quantised GEMMs, so the ceiling is not a formality. None of
+/// them is below what its own rule dispatches -- `qmv_mb` asks for 64 and
+/// `qmm_t` for 128 -- which is why the assertion is against the rule and not
+/// against a pinned census that would say more about this device than about
+/// this tree.
+#[test]
+#[ignore = "needs a Metal 4 device"]
+fn every_declared_entrypoint_builds_a_pipeline_on_this_device() {
+    let context = match Context::new() {
+        Ok(c) => c,
+        Err(Error::NoDevice) => return,
+        Err(e) => panic!("context: {e}"),
+    };
+    let compiler = Compiler::new(&context).expect("compiler");
+    let root = kernels_dir();
+
+    let mut sources: std::collections::HashMap<&'static str, String> = Default::default();
+    let mut refused = Vec::new();
+    let mut narrow: Vec<String> = Vec::new();
+    let mut built = 0usize;
+
+    // The census, not the table. Every family has retired its `kernel!` rows,
+    // so `KERNELS` is empty and a sweep keyed on it would build NOTHING and
+    // say so with a passing test. `kernels_metal::shaders()` is the same set
+    // of `(file, entrypoint)` pairs the rows used to generate, stated by the
+    // families instead -- and there is no `fileless` case left to collect,
+    // because a pair without a file cannot be written down.
+    for (file, entry) in kernels_metal::shaders() {
+        let source = sources.entry(file).or_insert_with(|| {
+            driver_metal::layout::shader::read_source(root.join(file))
+                .unwrap_or_else(|e| panic!("{}: {e}", root.join(file).display()))
+        });
+        built += 1;
+        match compiler.compile(&context, source, entry) {
+            Err(e) => refused.push(format!("  {entry} [{file}]: {e}")),
+            Ok(pso) => {
+                // What the BODY will ask for. Most routines derive a
+                // threadgroup from facts this test has none of; the
+                // attention families fix theirs outright, as two
+                // constants, and those are what a shader alone can be
+                // checked against.
+                //
+                // The numbers are imported rather than mirrored. A
+                // literal here would go stale the day the body retunes,
+                // and it would go stale silently in the safe direction --
+                // a test that admits 1024 while the body launches 1088.
+                let Some((routine, _)) = driver_metal::lowering::routine::crossed(entry) else {
+                    continue;
+                };
+                let wants = match routine.name {
+                    "sdpa_paged_mma" | "sdpa_paged_mma_sink" => kernels_metal::attn::MMA_GROUP[0],
+                    "sdpa_paged_decode"
+                    | "sdpa_paged_decode_sink"
+                    | "sdpa_paged_tiled"
+                    | "sdpa_paged_tiled_sink"
+                    | "sdpa_vector_decode"
+                    | "sdpa_vector_decode_swa" => kernels_metal::attn::BIG_GROUP[0],
+                    _ => continue,
+                };
+                let admits = pso.maxTotalThreadsPerThreadgroup() as u32;
+                if admits < wants {
+                    narrow.push(format!(
+                        "  {entry} [{file}]: admits {admits}, `{}` dispatches {wants}",
+                        routine.name
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        built > 400,
+        "only {built} entrypoints were built, so the census shrank and this \
+         test compared almost nothing"
+    );
+    assert!(
+        refused.is_empty(),
+        "{} of {built} declared entrypoints compile but the device refuses \
+         to make a pipeline for them:\n{}",
+        refused.len(),
+        refused.join("\n")
+    );
+
+    narrow.sort();
+    assert!(
+        narrow.is_empty(),
+        "{} entrypoint(s) build a pipeline the device will not let their own launch rule \
+         dispatch:\n{}",
+        narrow.len(),
+        narrow.join("\n")
     );
 }

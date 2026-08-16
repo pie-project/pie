@@ -11,8 +11,8 @@
 //! goldens can only say that for families that already migrated; this
 //! says it for the construct.
 
-use model_compiler::dsl::*;
-use model_compiler::trace::{DType, Dim, GuardPred, OpKind, Shape};
+use model_dsl::*;
+use model_ir::trace::{DType, Dim, GuardPred, OpKind, Shape};
 
 /// A statement the registry knows, so `trace_finish` accepts it, and
 /// one with no operands so the two chains differ in nothing but the

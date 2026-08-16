@@ -33,8 +33,8 @@
 //! * **`kM3RegionThreads` transcription.** The width the region kernels
 //!   reduce over is the compiler's `METAL_M3_REGION_THREADS`, whose own doc
 //!   says a hand-kept copy with a "must equal" comment has nothing comparing
-//!   the two. The mirror here is compared: a dev-dependency test holds it
-//!   against the compiler's constant.
+//!   the two. It is imported here rather than transcribed, so there is no
+//!   second copy for a comment to be wrong about.
 
 use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
@@ -71,10 +71,13 @@ pub const MAX_LANES: usize = 64;
 /// The threadgroup width a generated grouped region is dispatched at,
 /// bounded below by a simd and above by the pipeline's own maximum.
 ///
-/// Mirror of `tensor_compiler::codegen::metal::fused::METAL_M3_REGION_THREADS`
-/// — the emitted kernels size their threadgroup memory against it and fault
-/// `0xB3` on a wider launch — drift-checked by a dev-dependency test.
-pub const REGION_THREADS: u32 = 512;
+/// From the emitter that chose it: the emitted kernels size their threadgroup
+/// memory against this and fault `0xB3` on a wider launch. It was a `= 512`
+/// copy here with a drift test holding the two together, which is what the
+/// emitter's own doc asked for when it said a hand-kept copy carrying a "must
+/// equal" comment has nothing comparing the two. An import has nothing to
+/// compare.
+pub use tensor_compiler::codegen::metal::fused::METAL_M3_REGION_THREADS as REGION_THREADS;
 
 /// One lane of a group: a prepared fire and its runtime numbers.
 ///
@@ -963,20 +966,4 @@ fn program_error(message: String) -> Error {
 /// A lane-table offset that is `Some` by construction.
 fn lane_offset(value: Option<u64>) -> Result<u64> {
     value.ok_or_else(|| program_error("Metal M3 lane-table offset left the table".to_owned()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The emitter's own doc on `METAL_M3_REGION_THREADS` says a hand-kept
-    /// copy with a "must equal" comment has nothing comparing the two. This
-    /// is the something.
-    #[test]
-    fn the_region_thread_mirror_still_matches_the_emitter() {
-        assert_eq!(
-            REGION_THREADS,
-            tensor_compiler::codegen::metal::fused::METAL_M3_REGION_THREADS
-        );
-    }
 }

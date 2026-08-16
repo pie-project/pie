@@ -288,9 +288,9 @@ impl Variant for GptOss {
 
     fn trace(
         &self,
-        class: model_compiler::trace::FireClass,
+        class: model_ir::trace::FireClass,
         load: Deployed<'_>,
-    ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
+    ) -> Result<model_ir::trace::ForwardPlan, crate::deployment::Refusal> {
         // METAL, through the SHARED text. This arm returned
         // `project::NO_METAL` for as long as the projection below did not
         // exist, and that refusal's own doc had narrowed the gap to one
@@ -606,10 +606,30 @@ mod tests {
     /// fixture exists, other tests read it, and a number that drifted
     /// between the two would be exactly the two-readings-of-one-document
     /// defect this catalog was built to remove.
+    ///
+    /// Three had drifted, and this test could not see them because it
+    /// compared thirteen named fields instead of the struct. `rope` said
+    /// `Standard` where gpt-oss is the table's only YaRN row, and
+    /// `o_bias` and `router_bias` said false where the checkpoint ships
+    /// `self_attn.o_proj.bias [2880]` and `mlp.router.bias [32]`. The
+    /// conformance text named for gpt-oss was reading all three.
+    ///
+    /// So the first assertion is now TOTAL, and it is the one that
+    /// matters: an enumeration can only catch drift in a field somebody
+    /// thought to list, and the fields nobody lists are exactly where
+    /// drift survives. The named ones below are kept because they say
+    /// something the total cannot — they anchor to the ROW, so a
+    /// `metal_shape` that agreed with the fixture and disagreed with the
+    /// checkpoint would still be caught.
     #[test]
     fn the_llama_like_fixture_measures_the_same_checkpoint() {
         let f = &row("gpt-oss-20b").shape;
         let l = crate::shared::llama_like::spec::LlamaLikeFacts::gpt_oss_20b();
+        assert_eq!(
+            l,
+            super::project::metal_shape(f),
+            "the fixture and the projection are one checkpoint"
+        );
         assert_eq!(l.hidden, f.hidden);
         assert_eq!(l.layers, f.layers);
         assert_eq!(l.q_heads, f.q_heads);
@@ -660,8 +680,8 @@ mod tests {
             assert_ne!(v.load_shape().layers, 0, "{}", v.id());
             assert!(v.deployment(Deployed::single()).is_ok(), "{}", v.id());
             for class in [
-                model_compiler::trace::FireClass::Decode,
-                model_compiler::trace::FireClass::Prefill,
+                model_ir::trace::FireClass::Decode,
+                model_ir::trace::FireClass::Prefill,
             ] {
                 let plan = v.trace(class, Deployed::single()).expect("traceable");
                 assert!(!plan.ops.is_empty(), "{}: {class:?}", v.id());
@@ -722,7 +742,7 @@ mod tests {
     #[test]
     fn a_metal_load_is_traced_as_this_row_and_not_as_a_llama() {
         use crate::catalog::{Backend, Deployed, MetalBinding};
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
 
         // `moe_mxfp4` TRUE, which is what `binding::observed` answers for
         // every gpt-oss published: the checkpoint lists its dense tensors as
@@ -808,7 +828,7 @@ mod tests {
     #[test]
     fn the_router_gate_is_read_at_its_own_width() {
         use crate::catalog::{Deployed, MetalBinding};
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
 
         let at = |router_group: u32, router_bits: u32| {
             let bind = MetalBinding {

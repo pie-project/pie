@@ -3,7 +3,7 @@
 //! The port of `driver-cuda/csrc/vision/gemma4_vision.cu` (322 lines) and of
 //! `gemma4_towers_c.cpp`'s vision half (52 lines). Both were host C++ over
 //! device text that had already moved to
-//! `kernels-cuda-new/csrc/src/vision/gemma4_vision.cuh`; what is here is that
+//! `kernels-cuda/kernels/vision/gemma4_vision.cuh`; what is here is that
 //! same walk with the `<<<>>>` written by [`super::fire`] instead of by nvcc.
 //!
 //! # Every launch, and the launcher it reproduces
@@ -39,7 +39,8 @@
 
 use std::ffi::c_void;
 
-use kernels_cuda_new::x::{norm, vision};
+use kernels_cuda::jit::abi::bf16;
+use kernels_cuda::{norm, vision};
 use model::shared::tower_names::VISION_SLOTS_PER_LAYER;
 
 use super::{Scratch, call};
@@ -83,7 +84,13 @@ pub struct Clip {
 impl Clip {
     /// Five consecutive slots — `gemma4_towers_c.cpp`'s `clip_of`.
     fn of(t: &[*const c_void]) -> Self {
-        Self { w: t[0], imin: t[1], imax: t[2], omin: t[3], omax: t[4] }
+        Self {
+            w: t[0],
+            imin: t[1],
+            imax: t[2],
+            omin: t[3],
+            omax: t[4],
+        }
     }
 }
 
@@ -350,7 +357,9 @@ fn run(
     let scr = scratch.f32s(nz * nz)?;
 
     // `gemma4_vision.cu:193` — the patch pixels rescaled into `hn`.
-    call("vision::k_scale_bf16", stream, |ctx| vision::k_scale_bf16(ctx, pixel, hn, hidden_elems))?;
+    call("vision::k_scale_bf16", stream, |ctx| {
+        vision::k_scale_bf16(ctx, pixel, hn, hidden_elems)
+    })?;
     // `:194` — cuBLAS, no `<<<>>>`. See the module header.
     gemm(cublas, hn.cast_const(), w.patch_w, h, n, hd, hd);
     // `:195` — the two axial position-table rows, added in place on `h`.
@@ -365,17 +374,34 @@ fn run(
         clin(cublas, hn.cast_const(), v, xc, &layer.v, n, hd, hd, stream)?;
         // `:200` — the per-head norms are `rows = N * NH` of 64, which is the
         // `hidden, hidden, hidden` strides at a head's width.
-        let head_rows =
-            n.checked_mul(nh).ok_or_else(|| Error::invalid(WHO, "N * NH overflowed"))?;
+        let head_rows = n
+            .checked_mul(nh)
+            .ok_or_else(|| Error::invalid(WHO, "N * NH overflowed"))?;
         let head_dim = hd / nh;
-        rms(q.cast_const(), layer.q_norm, q, head_rows, head_dim, eps, stream)?;
-        rms(k.cast_const(), layer.k_norm, k, head_rows, head_dim, eps, stream)?;
+        rms(
+            q.cast_const(),
+            layer.q_norm,
+            q,
+            head_rows,
+            head_dim,
+            eps,
+            stream,
+        )?;
+        rms(
+            k.cast_const(),
+            layer.k_norm,
+            k,
+            head_rows,
+            head_dim,
+            eps,
+            stream,
+        )?;
         // `:200` — `nd::rmsnorm_no_scale<bfd,256><<<dim3(N*NH),dim3(256),0,S>>>(D(v),D(v),64,EPS);`
         // `LaunchRule::RowsPerHead` with an ABSENT `stated_head_dim` is
         // `grid[rows,1,1] block[256,1,1]`, and the head width is the operand
         // the C++ passed as `64` rather than an extent the rule recovers.
         call("norm::rmsnorm_no_scale_bf16", stream, |ctx| {
-            norm::rmsnorm_no_scale_bf16(
+            norm::rmsnorm_no_scale::<bf16>(
                 ctx,
                 v.cast_const().cast(),
                 v.cast(),
@@ -399,17 +425,57 @@ fn run(
             call("vision::k_qk_bf16", stream, |ctx| {
                 vision::k_qk_bf16(ctx, q.cast_const(), k.cast_const(), scr, n, nh, head, 1.0)
             })?;
-            call("vision::k_softmax_bf16", stream, |ctx| vision::k_softmax_bf16(ctx, scr, n))?;
+            call("vision::k_softmax_bf16", stream, |ctx| {
+                vision::k_softmax_bf16(ctx, scr, n)
+            })?;
             call("vision::k_av_bf16", stream, |ctx| {
                 vision::k_av_bf16(ctx, scr.cast_const(), v.cast_const(), attn, n, nh, head)
             })?;
         }
-        clin(cublas, attn.cast_const(), tmp, xc, &layer.o, n, hd, hd, stream)?;
-        rms(tmp.cast_const(), layer.post_attn_ln, tmp, n, hd, eps, stream)?;
+        clin(
+            cublas,
+            attn.cast_const(),
+            tmp,
+            xc,
+            &layer.o,
+            n,
+            hd,
+            hd,
+            stream,
+        )?;
+        rms(
+            tmp.cast_const(),
+            layer.post_attn_ln,
+            tmp,
+            n,
+            hd,
+            eps,
+            stream,
+        )?;
         residual_add(h, tmp.cast_const(), hidden_elems, n_u, hd_u, stream)?;
         rms(h.cast_const(), layer.pre_ff_ln, hn, n, hd, eps, stream)?;
-        clin(cublas, hn.cast_const(), gate, xc, &layer.gate, n, hd, im, stream)?;
-        clin(cublas, hn.cast_const(), up, xc, &layer.up, n, hd, im, stream)?;
+        clin(
+            cublas,
+            hn.cast_const(),
+            gate,
+            xc,
+            &layer.gate,
+            n,
+            hd,
+            im,
+            stream,
+        )?;
+        clin(
+            cublas,
+            hn.cast_const(),
+            up,
+            xc,
+            &layer.up,
+            n,
+            hd,
+            im,
+            stream,
+        )?;
         // `:208` — `geglu_tanh<<<(ge+255)/256, 256, 0, S>>>` with
         // `ge = (int)((long)N*IM)`. That grid was `LaunchRule::Elementwise`
         // evaluated from the `N` by `IM` rectangle; §5 step 5 took `mlp` into
@@ -426,8 +492,8 @@ fn run(
         //
         // SAFETY: `stream` outlives the launch, and the three pointers address
         // this tower's own arena for `inter_elems` bf16 elements.
-        let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(stream.as_raw().cast()) };
-        kernels_cuda_new::x::mlp::geglu_tanh_bf16(
+        let ctx = unsafe { kernels_cuda::jit::Ctx::on(stream.as_raw().cast()) };
+        kernels_cuda::mlp::geglu_tanh::<bf16>(
             &ctx,
             gate.cast_const().cast(),
             up.cast_const().cast(),
@@ -436,7 +502,17 @@ fn run(
                 .map_err(|_| Error::invalid(WHO, "N * IM does not fit the kernel's int"))?,
         )
         .map_err(|why| Error::invalid("mlp::geglu_tanh_bf16", format!("{why:?}")))?;
-        clin(cublas, act.cast_const(), tmp, xc, &layer.down, n, im, hd, stream)?;
+        clin(
+            cublas,
+            act.cast_const(),
+            tmp,
+            xc,
+            &layer.down,
+            n,
+            im,
+            hd,
+            stream,
+        )?;
         rms(tmp.cast_const(), layer.post_ff_ln, tmp, n, hd, eps, stream)?;
         residual_add(h, tmp.cast_const(), hidden_elems, n_u, hd_u, stream)?;
     }
@@ -461,10 +537,26 @@ fn run(
     let pn = scratch.bf16(pooled_elems)?;
     // `:219` — `rmsnorm_no_scale<bfd,256><<<dim3(OUTL), dim3(256), 0, S>>>`.
     call("norm::rmsnorm_no_scale_bf16", stream, |ctx| {
-        norm::rmsnorm_no_scale_bf16(ctx, pooled.cast_const().cast(), pn.cast(), out_len, hd, 0, eps)
+        norm::rmsnorm_no_scale::<bf16>(
+            ctx,
+            pooled.cast_const().cast(),
+            pn.cast(),
+            out_len,
+            hd,
+            0,
+            eps,
+        )
     })?;
     // `:220` — the third and last cuBLAS call.
-    gemm(cublas, pn.cast_const(), w.embed_proj, out_proj, out_len, txt, hd);
+    gemm(
+        cublas,
+        pn.cast_const(),
+        w.embed_proj,
+        out_proj,
+        out_len,
+        txt,
+        hd,
+    );
     // `:221`. The arena is dropped after this, which is the order the C++
     // destructor ran in: synchronise, then free.
     stream.synchronize()?;
@@ -553,7 +645,7 @@ fn residual_add(
     }
     let _ = (rows, width);
     call("norm::residual_add_bf16", stream, |ctx| {
-        norm::residual_add_bf16(ctx, y.cast(), x.cast(), elems)
+        norm::residual_add::<bf16>(ctx, y.cast(), x.cast(), elems)
     })
 }
 

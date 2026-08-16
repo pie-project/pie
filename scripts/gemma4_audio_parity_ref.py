@@ -47,6 +47,24 @@ Usage
          crates/driver-cuda/csrc/src/model/gemma4/gemma4_audio_forward.cu \\
          -o /tmp/gap
     /tmp/gap /tmp/gemma4_audio_parity
+
+That nvcc line no longer runs
+-----------------------------
+It is kept as the record of what the harness was compiled against, not as an
+instruction. Both translation units it names and both include roots are gone:
+`crates/driver-cuda/csrc` was deleted at `b58db6c16`, which took
+`gemma4_audio_full_parity.cu` and `gemma4_audio_forward.cu` together, and
+`crates/kernels-cuda/csrc/src` was the ARCHIVE crate's host header tree --
+the `.hpp` that declared the `.cu` launchers -- deleted with the crate itself
+at `85c6c674b`.
+
+Flag the second `-I` in particular, because the name has been reused since.
+`crates/kernels-cuda/csrc/src` EXISTS again and holds the JIT crate's device
+text: `.cuh` that NVRTC compiles at run time, no host headers at all. nvcc
+would take the flag happily and find nothing behind it that this command
+wanted, which reads as a source error rather than a stale path.
+
+The dump below is unaffected. It reads a checkpoint and writes `.npy`.
 """
 
 from __future__ import annotations

@@ -74,7 +74,7 @@ pub struct Naming {
     /// not the same role. `mlx-community/gpt-oss-20b-MXFP4-Q4` publishes an
     /// expert `bias` of `[32, 2880]`, one per output row, and no `biases` at
     /// all; the zero point beside `scales` would be `[32, 2880, 90]`, one per
-    /// group. `qmv_routed.comp` reads them at two different bindings, and
+    /// group. `qmv_routed` reads them at two different bindings, and
     /// under `PIE_MXFP4` it does not declare the zero point's at all.
     pub zero_point_suffix: &'static [&'static str],
     /// What the additive bias the text spells `.bias` is called.
@@ -101,6 +101,21 @@ const ROLES: &[(&str, &[&str])] = &[
     ("q_bias", &["self_attn.q_proj.bias"]),
     ("k_bias", &["self_attn.k_proj.bias"]),
     ("v_bias", &["self_attn.v_proj.bias"]),
+    // The OUTPUT projection's bias and the router's, which this table could
+    // not spell until gpt-oss's text started binding them.
+    //
+    // The three above were added for qwen-2 and stopped there, because
+    // qwen-2's `o_proj` carries none. gpt-oss's does, and so does its router,
+    // and a name this table cannot spell is not a refusal anywhere: `spellings`
+    // answers with nothing, the loader allocates for the weights it could name,
+    // and the rest stay bound to whatever the arena held. 48 of gpt-oss-20b's
+    // 775 weights, in the layer loop, silently.
+    //
+    // Found by `tests/checkpoint.rs` after an upstream fixture change, which is
+    // the only reason it was found: `driver-vulkan` carries the identical table
+    // and its own checkpoint test does not sweep this text.
+    ("o_bias", &["self_attn.o_proj.bias"]),
+    ("router_bias", &["mlp.gate.bias", "mlp.router.bias"]),
     ("q_norm", &["self_attn.q_norm"]),
     ("k_norm", &["self_attn.k_norm"]),
     // One learned logit per head, and the one role whose tensor hangs under

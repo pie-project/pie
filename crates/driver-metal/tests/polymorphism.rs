@@ -35,9 +35,9 @@ use std::collections::BTreeSet;
 use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
 use model::shared::llama_like::forward::llama_like_metal;
 use model_compiler::lower::{Fire, Lowered, Row, Uncovered, lower};
-use model_compiler::trace::FireClass;
+use model_ir::trace::FireClass;
 
-fn plan(class: FireClass) -> model_compiler::trace::ForwardPlan {
+fn plan(class: FireClass) -> model_ir::trace::ForwardPlan {
     llama_like_metal(
         &LlamaLikeFacts::qwen3_0_6b(),
         &LlamaLikeMetalFacts::synthetic(),

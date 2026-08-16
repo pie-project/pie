@@ -30,17 +30,22 @@ use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme};
 
 /// The kernel rows a load may run on the device, by table symbol.
 ///
-/// Named here rather than reached for out of `kernels-cuda-new`, because the
+/// Named here rather than reached for out of `kernels-cuda`, because the
 /// plan for a CUDA target is compiled on machines that have no CUDA at all —
 /// the import path does it, and so does every test. A plan is a claim about
 /// what a device will do, and making that claim must not require the device's
 /// toolchain.
 ///
 /// What keeps them honest is the other side: with `feature = "cuda"` on,
-/// `executor::cuda` calls exactly these through the generated typed entry
-/// points and a test resolves each against `kernels_cuda_new::runtime::hosts`.
-/// A symbol that stopped existing fails that build rather than becoming a
-/// plan nothing can run.
+/// `executor::cuda` calls exactly these as the typed `x::quant` host programs
+/// they are, and a test resolves each against `kernels_cuda::routine`. A
+/// symbol that stopped existing fails that build rather than becoming a plan
+/// nothing can run.
+///
+/// The typed call and the string are two halves of one claim, and only
+/// together: the call is checked by the compiler and does not know what this
+/// constant says; the constant is what a plan carries and the compiler cannot
+/// read it. The test is where the two meet.
 pub const CUDA_CAST_FP32_TO_BF16: &str = "quant::cast_fp32_to_bf16";
 pub const CUDA_SCALE_ROWS_BF16: &str = "quant::scale_rows_bf16";
 pub const CUDA_QUANTIZE_BF16_TO_MXFP4: &str = "quant::quantize_bf16_to_mxfp4_e2m1_per_block";
@@ -643,9 +648,7 @@ fn tile_map_facts(
             .first()
             .and_then(|buffer| logical_shape(plan, *buffer)),
         max_tile_bytes: tile.max_tile_bytes,
-        dest_dtype: outputs
-            .first()
-            .and_then(|buffer| raw_dtype(plan, *buffer)),
+        dest_dtype: outputs.first().and_then(|buffer| raw_dtype(plan, *buffer)),
         in_place: rewrites_in_place(plan, source.as_ref(), inputs, outputs, dest.as_ref()),
         blocked_scale: !transform.scale_blocks.is_empty(),
         operands_in_arena: inputs

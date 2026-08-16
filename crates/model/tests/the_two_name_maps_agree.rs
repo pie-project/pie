@@ -36,7 +36,7 @@
 
 use model::catalog::{self, Deployed, MetalBinding};
 use model::shared::weight_names::Names;
-use model_compiler::trace::FireClass;
+use model_ir::trace::FireClass;
 use std::collections::BTreeSet;
 
 /// The binding `tests/catalog_backends.rs` traces every row against.

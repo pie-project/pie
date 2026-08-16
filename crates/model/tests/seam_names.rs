@@ -58,7 +58,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use model::catalog::LoadShape;
 use model_compiler::lower::{Arg, Fire, Row, lower};
-use model_compiler::trace::{FireClass, ForwardPlan};
+use model_ir::trace::{FireClass, ForwardPlan};
 
 /// Which naming scheme a family's checkpoint follows.
 ///

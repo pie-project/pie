@@ -37,7 +37,7 @@
 //!
 //! # The fallback did not need writing. It needed a CALLER.
 //!
-//! [`kernels_cuda_new::x::gemm::dense::batched_act_x_wt_bf16`] is this
+//! [`kernels_cuda::gemm::dense::batched_act_x_wt_bf16`] is this
 //! module's second leg, and it was already in the tree, already ported,
 //! already carrying the capture latch that makes the grouped form safe under
 //! stream capture. Its own doc says what it was waiting for: *"**This symbol
@@ -69,8 +69,8 @@
 
 use core::ffi::c_void;
 
-use kernels_cuda_new::x::Refusal;
-use kernels_cuda_new::x::abi::bf16;
+use kernels_cuda::Refusal;
+use kernels_cuda::jit::abi::bf16;
 
 use crate::fire::moe_ptrs::Arrays;
 
@@ -122,13 +122,13 @@ pub unsafe fn grouped_gemm_bf16(
         return Err(Refusal::Empty { what: "the padded block count" });
     }
 
-    if kernels_cuda_new::x::moe::supported(m, n, k).is_ok() {
+    if kernels_cuda::moe::supported(m, n, k).is_ok() {
         // SAFETY: the caller's obligation. The host program repeats the
         // predicate and would decline on its own; it is asked here first
         // because the answer selects the implementation rather than reporting
         // one.
-        let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(stream) };
-        return match kernels_cuda_new::x::moe::moe_grouped_gemm_bf16(
+        let ctx = unsafe { kernels_cuda::jit::Ctx::on(stream) };
+        return match kernels_cuda::moe::moe_grouped_gemm::<bf16>(
             &ctx,
             a.cast::<bf16>(),
             bank.cast::<bf16>(),
@@ -172,7 +172,7 @@ pub unsafe fn grouped_gemm_bf16(
     // `max_blocks` device addresses, which is what this entry point's own
     // safety note requires.
     unsafe {
-        kernels_cuda_new::x::gemm::dense::batched_act_x_wt_bf16(
+        kernels_cuda::gemm::dense::batched_act_x_wt_bf16(
             handle, a_ptrs, b_ptrs, c_ptrs, m, n, k, max_blocks, 0.0,
         );
     }

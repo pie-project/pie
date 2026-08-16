@@ -10,6 +10,8 @@ identity control: at the parameter value where the algorithm reduces to plain
 sampling, the reported divergence must be exactly zero.
 """
 
+import asyncio
+import re
 import json
 import os
 
@@ -360,12 +362,38 @@ async def test_classifier_free_guidance(client, args):
     assert "[cfg]" in output and "mean_kl=" in output, output
 
 
+def _assert_kl_identity(output: str) -> None:
+    """The report's mean KL is zero to the tolerance the inferlet itself uses.
+
+    Asserting the STRING `mean_kl=0.0000` looked equivalent and was not. KL is
+    non-negative by Jensen, so at an exact identity every term is float error
+    and the total lands either side of zero at about 1e-9. Printed to four
+    places that is `0.0000` or `-0.0000`, and the string form accepts one and
+    rejects the other -- so the sign bit of a value indistinguishable from
+    zero decided the result. It passed on Qwen3-0.6B and failed on the second
+    model for no reason but which way the last rounding went.
+
+    The tolerance is 5e-5 and not the 1e-3 the inferlets use for their own
+    `IDENTITY-VIOLATION` marker, because 5e-5 is what the string check
+    actually enforced -- four decimal places round to `0.0000` below exactly
+    that -- and a rewrite of a check should not quietly loosen it by twenty
+    times. The float error being corrected for is around 1e-9, so this still
+    has four orders of margin. The marker is asserted too, since it is the
+    inferlet's own statement about its own arithmetic.
+    """
+    found = re.search(r"mean_kl=(-?\d+\.\d+)", output)
+    assert found, f"no mean_kl in the report: {output}"
+    mean_kl = float(found.group(1))
+    assert abs(mean_kl) < 5e-5, f"mean_kl={mean_kl} is not an identity: {output}"
+    assert "IDENTITY-VIOLATION" not in output, output
+
+
 async def test_classifier_free_guidance_identity(client, args):
     """guidance=1.0 is plain conditional sampling, so the KL must be exactly 0."""
     output = await _nonempty(
         client, args, "classifier-free-guidance", {"max_tokens": 4, "guidance": 1.0}
     )
-    assert "mean_kl=0.0000" in output, output
+    _assert_kl_identity(output)
 
 
 async def test_context_aware_decoding(client, args):
@@ -388,7 +416,7 @@ async def test_context_aware_decoding_identity(client, args):
         {"max_tokens": 4, "alpha": 0.0, "context": "The sky is green.",
          "query": "What colour is the sky?"},
     )
-    assert "mean_kl=0.0000" in output, output
+    _assert_kl_identity(output)
 
 
 async def test_asap_grammar_aligned_decoding(client, args):
@@ -695,6 +723,38 @@ async def test_sliding_window_attention_attends_prompt(client, args):
     )
 
 
+async def test_greedy_decoding_is_the_same_alone_and_in_a_crowd(client, args):
+    """A greedy program answers the same whether or not it has neighbours.
+
+    Everything else in this file runs one program at a time against a server
+    that batches, pages, and grows a KV pool for many at once -- so the whole
+    sweep can be green while the interesting half of the driver has never been
+    asked a question. This asks it: the same prompt at temperature 0, run alone
+    and then run 2, 4 and 8 ways at once, must give back the same tokens every
+    time. Anything a request can see of another -- a page, a row of scores, a
+    slot in a batch -- shows up here as a lane that diverged.
+
+    It also covers the thing that made this test hard to write. Two of these
+    launching together install the same program twice at once, which the
+    server used to key by the program's hash and therefore treat as one
+    upload.
+    """
+    ask = {"prompt": "Explain why the sky appears blue.", "max_tokens": 24, "temperature": 0.0}
+
+    async def once():
+        return await run_inferlet(client, "chat-completion", ask, timeout=300)
+
+    solo = await once()
+    assert solo.strip(), "the greedy run said nothing"
+    for width in (2, 4, 8):
+        lanes = await asyncio.gather(*[once() for _ in range(width)])
+        for i, lane in enumerate(lanes):
+            assert lane == solo, (
+                f"at width {width}, lane {i} diverged from the same prompt run alone:\n"
+                f"  alone = {solo!r}\n  crowd = {lane!r}"
+            )
+
+
 def tests():
     return [
         test_chat_completion,
@@ -732,6 +792,7 @@ def tests():
         test_asap_grammar_aligned_decoding,
         test_token_healing,
         test_naive_baseline,
+        test_greedy_decoding_is_the_same_alone_and_in_a_crowd,
         test_quest_attention,
         test_tova_attention,
         test_h2o_attention,

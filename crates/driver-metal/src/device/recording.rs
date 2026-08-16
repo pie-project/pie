@@ -91,6 +91,16 @@ pub struct Command<'a> {
     /// an index. Not hashed: two fires that differ only in a symbol string
     /// differ in a pipeline pointer too.
     pub symbol: &'a str,
+    /// Whether this command must wait for the ones before it.
+    ///
+    /// The same statement `bind::encode::encode` makes, made once and read by
+    /// both paths, because a recording that orders its commands differently
+    /// from the encode it stands in for is the drift `device_icb.rs` exists to
+    /// catch. `bind::encode::commands` computes it from the same [`Hazards`]
+    /// walk.
+    ///
+    /// [`Hazards`]: crate::bind::encode
+    pub barrier: bool,
 }
 
 /// A fire's dispatches, recorded.
@@ -132,10 +142,13 @@ const FOUR_GIB: u64 = 1 << 32;
 ///
 /// # Barriers
 ///
-/// Every command carries one, which is what `encode` does between dispatches
-/// and for the same measured reason: Metal does not order two dispatches in
-/// one encoder, and three runs of one fire without a barrier gave widest
-/// activations of 11.7, 23.1 and 4.5e12. Two of the three looked plausible.
+/// A command carries one when `bind::encode::commands` said it does, which is
+/// the same rule `encode` applies between dispatches and for the same measured
+/// reason: Metal does not order two dispatches in one encoder, and three runs
+/// of one fire without any barrier gave widest activations of 11.7, 23.1 and
+/// 4.5e12. Two of the three looked plausible. It is not every command, because
+/// the operand directions say which ones can overlap; it was every command
+/// until they did.
 ///
 /// # Errors
 ///
@@ -273,8 +286,12 @@ pub fn record(context: &Context, regions: &Regions, commands: &[Command<'_>]) ->
             },
         );
         // See the doc: a statement reading what the previous one wrote reads
-        // whatever was there without this, and the failure is a number.
-        recorded.setBarrier();
+        // whatever was there without this, and the failure is a number. Only
+        // where the operands say one is needed -- `bind::encode` decided, and
+        // a recording repeats its decision rather than making its own.
+        if command.barrier {
+            recorded.setBarrier();
+        }
     }
 
     Ok(Recording {

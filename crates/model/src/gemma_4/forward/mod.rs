@@ -3,8 +3,8 @@
 pub mod facts;
 
 use self::facts::{Gemma4CudaFacts, Gemma4Facts};
-use model_compiler::dsl::{self, MatW, NormW, WeightRepr, matmul};
-use model_compiler::trace::{FireClass, ForwardPlan, NormVariant, RopeKind};
+use model_dsl::{self as dsl, MatW, NormW, WeightRepr, matmul};
+use model_ir::trace::{FireClass, ForwardPlan, NormVariant, RopeKind};
 
 // ── gemma-4 ──────────────────────────────────────────────────────────
 
@@ -181,7 +181,7 @@ pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass
             // THIS LAYER's sliding window, `-1` for none — a
             // load-time fact the dispatch statements carry, where four
             // executors used to re-derive it per launch.
-            let window_left = model_compiler::facts::window_left_at(&cuda.window_left, l);
+            let window_left = model_ir::facts::window_left_at(&cuda.window_left, l);
             let w = Gemma4LayerW::new(l, facts);
             let full = facts.is_full_attn(l);
             let d = facts.head_dim_of(l);

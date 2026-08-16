@@ -8,9 +8,11 @@ license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 publish = false
 
-# The shader directory. `driver-metal` reads DEP_PIE_KERNELS_METAL_KERNELS_DIR
-# and bakes it in as the runtime shader path, and DEP_..._INCLUDE for the
-# param headers a shader and its host caller must agree on.
+# The shader directory, published as DEP_PIE_KERNELS_METAL_KERNELS_DIR and
+# baked in as the runtime shader path. There was a second key, DEP_..._INCLUDE,
+# for a host C++ header library; it went with the C++ driver that was its only
+# reader. The `*_params.h` it also covered are inside the shader tree, where
+# the `.metal` files that `#include` them can reach them.
 links = "pie_kernels_metal"
 build = "build.rs"
 
@@ -22,7 +24,7 @@ path = "src/lib.rs"
 # `native` means something quieter here than on the CUDA side, because Metal
 # compiles its shaders at RUN time: there is no build to gate, only the
 # staging of `ptir_rng.generated.metal` out of `tensor-compiler`. Off by
-# default for the same reason regardless -- `model-compiler` takes the
+# default for the same reason regardless -- `model-ir` takes the
 # signature table and should reach nothing else.
 default = []
 native = []
@@ -32,5 +34,13 @@ kernels = { path = "../kernels" }
 
 [dev-dependencies]
 # The table test resolves through `sig_in`, which is the shared crate's, to
-# check the lookup `model-compiler` actually calls rather than a copy of it.
+# check the lookup `model-ir` actually calls rather than a copy of it.
 kernels = { path = "../kernels" }
+
+# NO `[[example]]` sections, and the absence is load-bearing for the reason
+# `kernels-cuda/Cargo.toml` states at length: a `[[example]]` whose file is
+# gone does not make a skipped target, it makes a manifest cargo cannot PARSE,
+# and this crate is a workspace member, so every command in the workspace fails
+# with it. `examples/` is deleted here -- `entrypoints.rs` printed the table's
+# entrypoint product for `scripts/metal-kernel-audit.py --table`, and that mode
+# is retired with it -- so there is no file for such a section to name.

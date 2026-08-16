@@ -1,7 +1,8 @@
 //! The driver's cuBLAS handle — gate-cublas.
 //!
-//! Ports `kernels-cuda`'s `CublasHandle` (`gemm/gemm.hpp`), which by the
-//! campaign's own rule is driver C++ living in the kernels crate — the
+//! Ports the `CublasHandle` of `kernels-cuda` — the archive crate, deleted
+//! at `85c6c674b` — out of its `gemm/gemm.hpp`, which by the campaign's own
+//! rule is driver C++ that was living in the kernels crate: the
 //! launchers take a raw `cublasHandle_t`, only the driver ever constructs
 //! the wrapper. The generated bodies call `.handle()` 3,590 times and
 //! pass it into the gemm launchers; construction is once per engine.
@@ -203,9 +204,32 @@ impl<H> CublasHandle<H> {
 }
 
 impl<H> Drop for CublasHandle<H> {
+    /// The leak check — **except while the thread is already panicking.**
+    ///
+    /// `release` needs the `CublasOps` a destructor cannot reach, so the
+    /// only thing left here is to notice when a caller forgot. That is
+    /// worth a `debug_assert!` on the ordinary path and is actively
+    /// harmful on the unwinding one: a panic raised inside a `Drop` that
+    /// is running BECAUSE of another panic aborts the process, and the
+    /// message that reaches the terminal is *"panic in a destructor during
+    /// cleanup"* — this one — while the assertion that actually failed is
+    /// never printed at all.
+    ///
+    /// It cost a whole debugging session. A logit A/B failed, the process
+    /// died on SIGABRT with this text on top, and the real message
+    /// underneath it — *"argmax drifted (ours 11.875 at 14582)"* — was
+    /// simply gone. Every GPU test in the crate that holds a handle
+    /// across an assertion had the same hole.
+    ///
+    /// A handle leaked on the way out of a panic is also the case where
+    /// the check is worth least: the fire is being torn down, the process
+    /// is going down with it, and the leak is a consequence of the
+    /// failure rather than the failure. So the check keeps the path where
+    /// it can still be true and yields the one where it can only shout
+    /// over the answer.
     fn drop(&mut self) {
         debug_assert!(
-            self.handle.is_none(),
+            self.handle.is_none() || std::thread::panicking(),
             "CublasHandle dropped without release()"
         );
     }

@@ -35,7 +35,7 @@ pub struct Gemma4CudaFacts {
     /// fire class are class/guard vocabulary).
     pub kv_native_bf16: bool,
     /// The SLIDING WINDOW each layer attends over, `-1` for none —
-    /// read through [`model_compiler::facts::window_left_at`], which is
+    /// read through [`model_ir::facts::window_left_at`], which is
     /// where the shape of this list is documented.
     ///
     /// The dispatch statements carry it, so no executor reaches into

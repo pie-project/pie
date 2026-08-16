@@ -32,6 +32,8 @@ use crate::layout::shader::Request;
 use crate::program::Compiler;
 
 use crate::lowering::dispatch::{Dispatch, pipelines_needed};
+use crate::lowering::dispatch::merge;
+use crate::lowering::executor::Slice;
 
 /// The scalars a fire's statements state, in one device buffer.
 ///
@@ -334,9 +336,23 @@ pub fn encode_one(
     )
 }
 
+/// What a barrier here makes visible.
+///
+/// [`Visibility::ExecutionOnly`] is the cheaper statement and its doc records
+/// that both landed within noise of each other on a sweep. Re-measured with
+/// the hazard rule in place, on a decode where a barrier is 30 % of the GPU
+/// time and so the difference would show if there were one: 237 tok/s at 128
+/// of context against 243, which is the same answer again. So the cost of a
+/// barrier here is the ORDERING, not the flush, and this stays on the
+/// conservative one.
+///
+/// [`Visibility::ExecutionOnly`]: crate::device::Visibility::ExecutionOnly
+const VISIBILITY: crate::device::Visibility = crate::device::Visibility::Device;
+
 /// Encode a whole fire, in the order the lowering stated.
 ///
-/// **This is the executor.** One loop, a barrier, no branch on anything.
+/// **This is the executor.** One loop, a barrier where the operands say one is
+/// needed, no branch on anything.
 ///
 /// # The barrier
 ///
@@ -345,18 +361,37 @@ pub fn encode_one(
 /// wrote reads whatever was there — and the failure is not a crash but a
 /// *number*, sometimes right.
 ///
-/// Measured before this line existed: three runs of one fire over one
+/// Measured before any barrier existed: three runs of one fire over one
 /// checkpoint's weights gave widest activations of 11.7, 23.1 and 4.5e12.
-/// Two of the three looked entirely plausible. That is the whole argument for
-/// the barrier being unconditional here — a hazard that produces a believable
-/// answer two times in three is one no amount of eyeballing finds.
+/// Two of the three looked entirely plausible. That is why the rule below is
+/// conservative in every direction it is unsure — a hazard that produces a
+/// believable answer two times in three is one no amount of eyeballing finds.
 ///
-/// After EVERY dispatch, not between the ones that alias. `lowering::executor::bind` asks
-/// `barrier_after` because its DAG states which launches run concurrently;
-/// this walk has no such statement and inventing one would be the driver
-/// deciding something about a text. A text that wants concurrency can say so
-/// when there is something to say it with; until then the correct order is the
-/// stated one.
+/// # Why it is no longer after EVERY dispatch
+///
+/// It was, and the doc here used to defend that: *"`lowering::executor::bind`
+/// asks `barrier_after` because its DAG states which launches run
+/// concurrently; this walk has no such statement."* The walk does have one
+/// now. [`Dispatch::writes`] is the statement, read off the row's
+/// [`kernels::Source`], and it is not the driver deciding something about a
+/// text — it is the text's own operand directions, arriving late.
+///
+/// Measured on Llama-3.2-1B-Instruct-4bit / M1 Max, a barrier after every one
+/// of a decode's 228 dispatches cost **36 % of the decode**: 218 tok/s at 128
+/// of context against 341 with none at all, and 194 against 296 at 1024. A
+/// prefill barely notices (901 ms against 886) because its dispatches are long
+/// enough to hide the drain. So this is a decode fix, and it is the largest
+/// single one left.
+///
+/// # The rule
+///
+/// A barrier goes BEFORE a dispatch that would race anything since the last
+/// one — write-after-write, write-after-read, or read-after-write against the
+/// ranges tracked in [`Hazards`]. Everything else runs concurrently, which for
+/// a decode layer is `q`/`k`/`v` against each other and `gate` against `up`.
+///
+/// A trailing barrier closes the fire, because what the encoder leaves is read
+/// by whatever comes after it.
 ///
 /// # Errors
 ///
@@ -370,11 +405,91 @@ pub fn encode(
     params: &Params,
     dispatches: &[Dispatch<'_>],
 ) -> Result<()> {
+    let mut hazards = Hazards::default();
+    let mut n = 0;
     for (index, dispatch) in dispatches.iter().enumerate() {
+        if hazards.races(dispatch) {
+            encoder.barrier(VISIBILITY);
+            hazards.clear();
+            n += 1;
+        }
         encode_one(encoder, table, pipelines, params, index, dispatch)?;
-        encoder.barrier(crate::device::Visibility::Device);
+        hazards.note(dispatch);
+    }
+    if !dispatches.is_empty() {
+        encoder.barrier(VISIBILITY);
+        n += 1;
+    }
+    if std::env::var_os("PIE_METAL_BARRIER_COUNT").is_some() {
+        eprintln!("barriers {n} of {} dispatches", dispatches.len());
     }
     Ok(())
+}
+
+/// The byte ranges read and written since the last barrier.
+///
+/// Small on purpose: a decode's layer barriers every few dispatches, so these
+/// hold a dozen entries and the scan is a dozen comparisons. [`Self::CAP`]
+/// bounds the pathological case — a long run of genuinely independent
+/// dispatches would otherwise turn the scan quadratic, and paying a barrier is
+/// cheaper than paying for the proof that one is unnecessary.
+#[derive(Default)]
+struct Hazards {
+    reads: Vec<Slice>,
+    writes: Vec<Slice>,
+}
+
+impl Hazards {
+    /// Ranges tracked before a barrier is emitted on size alone.
+    const CAP: usize = 64;
+
+    /// Whether this dispatch must wait for everything since the last barrier.
+    ///
+    /// Three hazards, and all three are real here. **RAW** is the one the
+    /// 4.5e12 activation came from. **WAW** is two statements landing on the
+    /// same arena slot, which happens constantly because the arena reuses
+    /// offsets. **WAR** is a statement overwriting a slot the previous one is
+    /// still reading, which the arena's reuse makes just as reachable.
+    fn races(&self, dispatch: &Dispatch<'_>) -> bool {
+        if self.reads.len() + self.writes.len() >= Self::CAP {
+            return true;
+        }
+        dispatch
+            .touches
+            .writes
+            .iter()
+            .any(|w| hits(w, &self.writes) || hits(w, &self.reads))
+            || dispatch
+                .touches
+                .reads
+                .iter()
+                .any(|r| hits(r, &self.writes))
+    }
+
+    fn clear(&mut self) {
+        self.reads.clear();
+        self.writes.clear();
+    }
+
+    fn note(&mut self, dispatch: &Dispatch<'_>) {
+        for slice in &dispatch.touches.reads {
+            merge(&mut self.reads, *slice);
+        }
+        for slice in &dispatch.touches.writes {
+            merge(&mut self.writes, *slice);
+        }
+    }
+}
+
+/// Whether `slice` overlaps any range in `set`, as half-open byte intervals.
+fn hits(slice: &Slice, set: &[Slice]) -> bool {
+    if slice.address == 0 || slice.bytes == 0 {
+        return false;
+    }
+    let end = slice.address.saturating_add(slice.bytes);
+    set.iter().any(|s| {
+        slice.address < s.address.saturating_add(s.bytes) && s.address < end
+    })
 }
 
 /// Lower a fire's dispatches into the commands a recording is made of.
@@ -405,10 +520,16 @@ pub fn commands<'a>(
     params: &Params,
     dispatches: &'a [Dispatch<'a>],
 ) -> Result<Vec<Command<'a>>> {
+    let mut hazards = Hazards::default();
     dispatches
         .iter()
         .enumerate()
         .map(|(index, dispatch)| {
+            let barrier = hazards.races(dispatch);
+            if barrier {
+                hazards.clear();
+            }
+            hazards.note(dispatch);
             let pipeline = pipelines
                 .get(dispatch.symbol)
                 .ok_or_else(|| Error::Create {
@@ -440,6 +561,7 @@ pub fn commands<'a>(
                 grid: dispatch.grid,
                 threadgroup: dispatch.threadgroup,
                 symbol: dispatch.symbol,
+                barrier,
             })
         })
         .collect()

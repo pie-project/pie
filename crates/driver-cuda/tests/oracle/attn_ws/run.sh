@@ -6,6 +6,12 @@
 # `DeviceTensor::allocate` (the shared tensor_recorder) and the six CUDA
 # entry points the TU calls (stub/cuda_recorder.cpp), which record pins and
 # events symbolically — the call sequence IS the behaviour under test.
+#
+# `kernels-cuda` above and in `KSRC` below is the ARCHIVE crate — CMake+nvcc,
+# a `csrc/` of host `.hpp` and `.cpp` — deleted whole at `85c6c674b`, and the
+# view/tensor headers this copies out of `$KSRC` went with it. The lines are
+# left unchanged because they record the command that took the golden, not a
+# path anyone can follow.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

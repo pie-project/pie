@@ -1783,6 +1783,9 @@ mod tests {
 
     fn test_caps() -> DriverCapabilities {
         DriverCapabilities {
+            // These fixtures fire host-geometry steps, so the per-step
+            // interleave this names is not what they exercise.
+            resolves_geometry_per_step: false,
             has_lora: false,
             model_site_summary: Default::default(),
             abi_version: ::driver_api::PIE_DRIVER_ABI_VERSION,
@@ -1888,6 +1891,7 @@ mod tests {
         );
         let remote_driver_id = crate::driver::register_driver_backend(
             crate::driver::DriverSpec {
+                resolves_geometry_per_step: false,
                 // Overwritten by `register_driver_backend` from the
                 // backend itself; see `DriverSpec::device_domain`.
                 device_domain: ::driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED,
@@ -2024,6 +2028,7 @@ mod tests {
         );
         let remote_driver_id = crate::driver::register_driver_backend(
             crate::driver::DriverSpec {
+                resolves_geometry_per_step: false,
                 // Overwritten by `register_driver_backend` from the
                 // backend itself; see `DriverSpec::device_domain`.
                 device_domain: ::driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED,

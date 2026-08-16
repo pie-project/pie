@@ -2,19 +2,20 @@
 //
 // The row states five buffers and no scalars: `params` is a `Buf`, so the two
 // widths are a STRUCT the driver fills rather than fields of a uniform block,
-// and this file declares no `@group(1)` at all. Ask
-// `cargo run -p kernels-wgpu --example dump_layout -- split_qkv_bf16` rather
-// than counting: the numbers below are the row's, not Metal's.
+// and this file declares no `@group(1)` at all. Read the row through
+// `kernels_wgpu::bindings` and `kernels_wgpu::uniform_size` rather than
+// counting: the numbers below are the row's, not Metal's. The deleted
+// `dump_layout` example only printed that answer.
 
 //#include "common/bf16.inc.wgsl"
 
-@group(0) @binding(0) var<storage, read> packed: array<u32>;
+@group(0) @binding(0) var<storage, read_write> packed: array<u32>;
 @group(0) @binding(1) var<storage, read_write> q: array<u32>;
 @group(0) @binding(2) var<storage, read_write> k: array<u32>;
 @group(0) @binding(3) var<storage, read_write> v: array<u32>;
 
 struct SplitQkvParams { q_width: u32, kv_width: u32 }
-@group(0) @binding(4) var<storage, read> params: SplitQkvParams;
+@group(0) @binding(4) var<storage, read_write> params: SplitQkvParams;
 
 // The bf16 half-index unpack. `pie_load_bf16(&packed, i)` is the shared answer
 // and cannot be CALLED: its `ptr<storage, array<u32>, read>` parameter is

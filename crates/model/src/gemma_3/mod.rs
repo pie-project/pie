@@ -33,8 +33,8 @@ use crate::shared::llama_like::spec::LlamaLikeFacts;
 
 use self::project::Schedule;
 
-use model_compiler::facts::{NormPlacement, QkNorm};
-use model_compiler::trace::{NormVariant, RopeKind};
+use model_ir::facts::{NormPlacement, QkNorm};
+use model_ir::trace::{NormVariant, RopeKind};
 
 /// RMSNorm epsilon, shared by the whole generation.
 ///
@@ -280,9 +280,9 @@ impl Variant for Gemma3 {
 
     fn trace(
         &self,
-        class: model_compiler::trace::FireClass,
+        class: model_ir::trace::FireClass,
         load: Deployed<'_>,
-    ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
+    ) -> Result<model_ir::trace::ForwardPlan, crate::deployment::Refusal> {
         project::trace(&self.shape, &self.schedule, NORM_EPS, class, load)
     }
 

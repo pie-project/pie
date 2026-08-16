@@ -1,6 +1,6 @@
 //! The rotary frequency table, for the deployments that cannot state one.
 //!
-//! A plain rope is a geometric ladder and `rope/neox.comp` raises it itself:
+//! A plain rope is a geometric ladder and `rope/neox.slang` raises it itself:
 //! `theta = scale * position * exp2(-(i / pair_half) * base)`, where the
 //! statement carries `base`. Measured against three real texts, that `base` is
 //! `log2(rope_theta)` -- `2^19.931568` is 1_000_000 for qwen3 and `2^17.194603`

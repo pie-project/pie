@@ -25,10 +25,10 @@
 use serde::{Deserialize, Serialize};
 
 /// This family's MLA geometry IS the shared one — see
-/// [`model_compiler::facts::MlaFacts`]. Three families carried
+/// [`model_ir::facts::MlaFacts`]. Three families carried
 /// field-identical copies of it; the alias keeps every existing spelling
 /// working while there is only one definition to disagree with.
-pub type Glm5MlaFacts = model_compiler::facts::MlaFacts;
+pub type Glm5MlaFacts = model_ir::facts::MlaFacts;
 
 /// The DSA lightning indexer. A separate small attention whose only
 /// output is a top-k page mask for the real one.
@@ -69,7 +69,7 @@ pub struct Glm5MoeFacts {
 impl Glm5MoeFacts {
     /// Whether a shared expert rides beside the routed ones. A predicate
     /// rather than a second field, for the reason every derived width in
-    /// [`model_compiler::facts`] is a method: a stored answer is a
+    /// [`model_ir::facts`] is a method: a stored answer is a
     /// second thing to keep in step.
     #[must_use]
     pub const fn has_shared_expert(&self) -> bool {
@@ -103,7 +103,7 @@ impl Glm5Facts {
     ///
     /// The shared predicate, named locally. Four families spell this
     /// call and the LOGIC is already shared -- `after_dense_prefix`
-    /// lives in `model_compiler::facts` for exactly that reason, and its
+    /// lives in `model_ir::facts` for exactly that reason, and its
     /// own doc explains why it is named for the PREFIX rather than for
     /// the mixture. What is left here is a one-line projection onto this
     /// family's own field, which is cheaper than the trait that would
@@ -111,7 +111,7 @@ impl Glm5Facts {
     /// machinery than the line it replaces.
     #[must_use]
     pub fn is_moe_layer(&self, l: u32) -> bool {
-        model_compiler::facts::after_dense_prefix(self.dense_layers, l)
+        model_ir::facts::after_dense_prefix(self.dense_layers, l)
     }
 }
 

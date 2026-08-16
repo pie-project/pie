@@ -13,6 +13,12 @@
 # nothing else, and reaches neither — every tensor here is a non-owning view —
 # so a stub <cuda_runtime.h> plus five one-line definitions is the whole
 # replacement.
+#
+# `kernels-cuda` above and in `KSRC` below is the ARCHIVE crate — CMake+nvcc,
+# a `csrc/` of host `.hpp` and `.cpp` — deleted whole at `85c6c674b`, and
+# `tensor.cpp` went before it. That is the positional input the compile dies
+# on; see tests/oracle_census.rs. The lines are left unchanged because they
+# record the command that took the golden, not a path anyone can follow.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -26,7 +26,7 @@ use driver_api::local::{
 };
 use driver_api::{ChannelRegistrationPlan, InstanceBindingPlan};
 
-use driver_api::completion::{CompletionBroker, CompletionTarget};
+use driver_api::completion::CompletionBroker;
 use driver_api::{FrameSubmission, LaunchPlan, StepSubmission};
 use driver_cuda::serve::Shell;
 
@@ -108,8 +108,12 @@ use common::gpu_guard;
 // caller learns the fire is done. The engine waits for it. A test that reads
 // the ring or a terminal cell on the next line has to wait for it too.
 //
-// The counter is per DRIVER, carried in the runtime callbacks' `ctx`, so
-// tests running in parallel cannot see each other's fires.
+// The completion is per FIRE, minted from the test's own broker, so tests
+// running in parallel cannot see each other's fires and no fire can be
+// mistaken for the one before it. It was a counter per DRIVER, carried in
+// the runtime callbacks' `ctx` — the `ctx` was the C boundary's way of
+// handing a driver something it could not name, and what it was carrying is
+// a `Clone` handle a driver simply holds.
 
 /// The runtime callbacks a driver is created with in the real world.
 ///
@@ -144,7 +148,14 @@ fn qwen3_snapshot() -> Option<std::path::PathBuf> {
     })
 }
 
-/// The generated descriptor beside it.
+/// The generated model config beside it.
+///
+/// The BOOT KEY that names it is `[model] config`. It was `[model]
+/// descriptor` until `7c6998f39` renamed it — *"the name claimed it was a
+/// descriptor; it is a config path, read once"* — and every boot string in
+/// this file still said the old spelling, because a boot key nothing reads
+/// is a silent default and this file has not compiled since. The FIXTURE
+/// files on disk keep their generated names, which is why the helper does.
 fn qwen3_descriptor() -> Option<std::path::PathBuf> {
     let p = std::path::PathBuf::from(
         "/tmp/claude-0/-root--patissier-work-tart-alpha/7460e4c3-f305-45df-9603-2298b0c0c60e/scratchpad",
@@ -157,12 +168,17 @@ fn qwen3_descriptor() -> Option<std::path::PathBuf> {
 ///
 /// The wait was a spin on a counter an `extern "C"` notify bumped. It is the
 /// completion the broker minted now — the same object the scheduler awaits.
-fn fire_and_wait(
-    shell: &mut Shell,
-    frame: &FrameSubmission,
-    target: CompletionTarget,
-    completion: &driver_api::SubmissionCompletion,
-) -> i32 {
+///
+/// The completion is minted HERE, one per fire, and the broker is what the
+/// caller passes. That is not a shortening of the argument list: a completion
+/// settles at its epoch and STAYS settled, so one minted by the caller and
+/// handed to a chain of fires is a fence for the first of them and a no-op
+/// for every one after — which is precisely the reading a test that inspects
+/// the ring on the next line cannot survive. The counter this replaced was
+/// re-armed by construction, because each fire bumped it and the helper
+/// remembered the value it started from.
+fn fire_and_wait(shell: &mut Shell, frame: &FrameSubmission, broker: &CompletionBroker) -> i32 {
+    let (target, completion) = broker.launch_completion(1);
     let status = code(shell.launch(frame, target));
     if status != PIE_STATUS_OK {
         return status;
@@ -291,7 +307,7 @@ fn load_model_answers_capabilities_an_engine_can_parse() {
         eprintln!("skipped: no cached Qwen3-0.6B or descriptor");
         return;
     };
-    let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
+    let boot = format!("[model]\nconfig = \"{}\"\n", descriptor.display());
     let broker = engine_runtime();
     let opened = Shell::open(boot.as_bytes(), broker.clone());
     let d = opened;
@@ -457,7 +473,7 @@ fn load_model_loads_a_real_snapshot_through_the_abi() {
         return;
     }
 
-    let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
+    let boot = format!("[model]\nconfig = \"{}\"\n", descriptor.display());
     let broker = engine_runtime();
     let opened = Shell::open(boot.as_bytes(), broker.clone());
     let d = opened;
@@ -564,11 +580,6 @@ fn the_registries_run_the_id_lifecycle() {
 /// carrying its own copy of the frame hides the thing worth reading,
 /// which is WHICH deployments the shell can open.
 fn load_and_fire(repo: &str, descriptor_name: &str, what: &str) -> bool {
-    use driver_api::local::{
-        InstanceBinding, PIE_TERMINAL_OUTCOME_SUCCESS, PieBytes, PieCompletion, PieInstanceDesc,
-        PieModelLoadDesc, PieRuntimeCallbacks, TerminalCell,
-    };
-
     let home = std::env::var("HOME").expect("HOME");
     let snaps = std::path::PathBuf::from(&home)
         .join(".cache/huggingface/hub")
@@ -602,7 +613,7 @@ fn load_and_fire(repo: &str, descriptor_name: &str, what: &str) -> bool {
     // callback when the work retires. Reading the cell straight after the
     // launch call used to be correct and is now a race that happens to
     // win, which is the worst kind.
-    let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
+    let boot = format!("[model]\nconfig = \"{}\"\n", descriptor.display());
     let broker = CompletionBroker::new();
     let opened = Shell::open(boot.as_bytes(), broker.clone());
     let d = opened;
@@ -810,7 +821,7 @@ fn an_unserveable_gqa_ratio_is_refused_at_load() {
         eprintln!("skipped: no generated Qwen2.5 descriptor");
         return;
     }
-    let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
+    let boot = format!("[model]\nconfig = \"{}\"\n", descriptor.display());
     let broker = CompletionBroker::new();
     let opened = Shell::open(boot.as_bytes(), broker.clone());
     let d = opened;
@@ -836,13 +847,6 @@ fn an_unserveable_gqa_ratio_is_refused_at_load() {
 #[test]
 fn a_real_decode_frame_launches_through_the_abi() {
     let _gpu = gpu_guard();
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    use driver_api::local::{
-        InstanceBinding, PIE_TERMINAL_OUTCOME_SUCCESS, PieBytes, PieCompletion, PieInstanceDesc,
-        PieModelLoadDesc, PieRuntimeCallbacks, TerminalCell,
-    };
-
     let home = std::env::var("HOME").expect("HOME");
     let snaps = std::path::PathBuf::from(&home)
         .join(".cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots");
@@ -864,12 +868,7 @@ fn a_real_decode_frame_launches_through_the_abi() {
         return;
     }
 
-    static NOTIFIED: AtomicU64 = AtomicU64::new(0);
-    unsafe extern "C" fn notify(_ctx: *mut std::ffi::c_void, wait_id: u64, _epoch: u64) {
-        NOTIFIED.store(wait_id, Ordering::SeqCst);
-    }
-
-    let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
+    let boot = format!("[model]\nconfig = \"{}\"\n", descriptor.display());
     let broker = CompletionBroker::new();
     let opened = Shell::open(boot.as_bytes(), broker.clone());
     let d = opened;
@@ -937,22 +936,21 @@ fn a_real_decode_frame_launches_through_the_abi() {
         steps: vec![step.clone()],
         ..Default::default()
     };
-    let (completion, completion_handle) = broker.launch_completion(1);
-    let _ = &completion_handle;
-    let status = code(d.launch(&frame, completion));
-    assert_eq!(status, PIE_STATUS_OK, "the frame launches");
-    // THE NOTIFY IS THE FENCE. `Shell::launch` returns with the fire still
-    // on the stream, so the terminal cell below has not been written yet —
-    // waiting for the notify is what the engine does and what makes the
-    // assertions after it about the fire rather than about the call.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while NOTIFIED.load(Ordering::SeqCst) != 0xBEEF {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the runtime was never notified"
-        );
-        std::thread::yield_now();
-    }
+    // THE COMPLETION IS THE FENCE. `Shell::launch` returns with the fire
+    // still on the stream, so the terminal cell below has not been written
+    // yet — waiting for the completion is what the engine does and what
+    // makes the assertions after it about the fire rather than about the
+    // call.
+    //
+    // It was a spin on a static that an `extern "C"` notify wrote the
+    // wait id into, compared against the `0xBEEF` the test had chosen for
+    // itself. Neither half survives: a wait id is the broker's to assign,
+    // and the notify is a method on the broker the driver holds.
+    assert_eq!(
+        fire_and_wait(&mut d, &frame, &broker),
+        PIE_STATUS_OK,
+        "the frame launches"
+    );
     assert_eq!(
         cell.load(),
         PIE_TERMINAL_OUTCOME_SUCCESS,
@@ -968,7 +966,6 @@ fn a_real_decode_frame_launches_through_the_abi() {
 #[test]
 fn channels_bind_the_ring_contract() {
     let _gpu = gpu_guard();
-    use driver_api::local::{ChannelBinding, PIE_CHANNEL_DTYPE_BOOL, PieChannelDesc, PieU32Slice};
 
     let mut d = Shell::open(b"", engine_runtime()).expect("the driver creates");
 
@@ -1082,12 +1079,6 @@ fn channels_bind_the_ring_contract() {
 #[test]
 fn logits_come_back_through_the_ring() {
     let _gpu = gpu_guard();
-    // The fire retires asynchronously; this is how the test learns it did.
-    let fires = fire_counter();
-    use driver_api::local::{
-        ChannelBinding, InstanceBinding, PIE_CHANNEL_HOST_ROLE_READER, PieBytes, PieChannelDesc,
-        PieCompletion, PieInstanceDesc, PieModelLoadDesc, PieU32Slice, PieU64Slice,
-    };
 
     let home = std::env::var("HOME").expect("HOME");
     let snaps = std::path::PathBuf::from(&home)
@@ -1112,7 +1103,7 @@ fn logits_come_back_through_the_ring() {
     let reference: serde_json::Value =
         serde_json::from_str(include_str!("oracle/real_decode/reference.json")).expect("reference");
 
-    let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
+    let boot = format!("[model]\nconfig = \"{}\"\n", descriptor.display());
     let broker = CompletionBroker::new();
     let opened = Shell::open(boot.as_bytes(), broker.clone());
     let d = opened;
@@ -1219,12 +1210,7 @@ fn logits_come_back_through_the_ring() {
         steps: vec![step.clone()],
         ..Default::default()
     };
-    let (completion, completion_handle) = broker.launch_completion(1);
-    let _ = &completion_handle;
-    assert_eq!(
-        fire_and_wait(&mut d, &frame, completion, &completion_handle),
-        PIE_STATUS_OK
-    );
+    assert_eq!(fire_and_wait(&mut d, &frame, &broker), PIE_STATUS_OK);
 
     // The ring advanced once, and cell 0 holds the last row's logits.
     let words = unsafe { std::slice::from_raw_parts(chb.word_base as *const u64, 4) };
@@ -1261,12 +1247,6 @@ fn logits_come_back_through_the_ring() {
 #[test]
 fn multi_step_resize_and_copy_preserve_the_kv() {
     let _gpu = gpu_guard();
-    // The fire retires asynchronously; this is how the test learns it did.
-    let fires = fire_counter();
-    use driver_api::local::{
-        ChannelBinding, InstanceBinding, PIE_CHANNEL_HOST_ROLE_READER, PieBytes, PieChannelDesc,
-        PieCompletion, PieInstanceDesc, PieModelLoadDesc, PieU32Slice, PieU64Slice,
-    };
 
     let home = std::env::var("HOME").expect("HOME");
     let snaps = std::path::PathBuf::from(&home)
@@ -1291,7 +1271,7 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
     let reference: serde_json::Value =
         serde_json::from_str(include_str!("oracle/real_decode/reference.json")).expect("reference");
 
-    let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
+    let boot = format!("[model]\nconfig = \"{}\"\n", descriptor.display());
     let broker = CompletionBroker::new();
     let opened = Shell::open(boot.as_bytes(), broker.clone());
     let d = opened;
@@ -1419,10 +1399,8 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
         steps: steps.to_vec(),
         ..Default::default()
     };
-    let (completion, completion_handle) = broker.launch_completion(1);
-    let _ = &completion_handle;
     assert_eq!(
-        fire_and_wait(&mut d, &frame, completion, &completion_handle),
+        fire_and_wait(&mut d, &frame, &broker),
         PIE_STATUS_OK,
         "the two-step frame launches"
     );
@@ -1437,6 +1415,15 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
         .max_by(|a, b| a.1.total_cmp(b.1))
         .map(|(t, _)| t)
         .unwrap();
+
+    // ONE completion for the control verbs below, and it is not the
+    // per-fire kind. `resize_pool` and `copy_kv` synchronize before they
+    // notify, so their answer IS their `i32` and nothing here waits on the
+    // completion at all — it is the address they notify, and one address
+    // serves all four. A fire is the opposite case, which is why
+    // `fire_and_wait` mints its own.
+    let (completion, completion_handle) = broker.launch_completion(1);
+    let _ = &completion_handle;
 
     // Resize larger (migrates page 0), copy page 0 → page 2, then decode
     // AGAINST PAGE 2: same context bytes, so the same logits cell.
@@ -1467,10 +1454,7 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
         required_kv_pages: 4,
         ..Default::default()
     };
-    assert_eq!(
-        fire_and_wait(&mut d, &frame3, completion, &completion_handle),
-        PIE_STATUS_OK
-    );
+    assert_eq!(fire_and_wait(&mut d, &frame3, &broker), PIE_STATUS_OK);
     assert_eq!(words[1], 3, "the third fire delivered");
     let cell2 = unsafe {
         std::slice::from_raw_parts((chb.mirror_base as *const f32).add(2 * VOCAB), VOCAB)
@@ -1547,10 +1531,7 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
         required_kv_pages: 4,
         ..Default::default()
     };
-    assert_eq!(
-        fire_and_wait(&mut d, &frame4, completion, &completion_handle),
-        PIE_STATUS_OK
-    );
+    assert_eq!(fire_and_wait(&mut d, &frame4, &broker), PIE_STATUS_OK);
     assert_eq!(words[1], 4, "the fourth fire delivered");
     let cell3 = unsafe {
         std::slice::from_raw_parts((chb.mirror_base as *const f32).add(3 * VOCAB), VOCAB)
@@ -1586,12 +1567,6 @@ fn multi_step_resize_and_copy_preserve_the_kv() {
 #[test]
 fn a_fifty_step_greedy_chain_is_deterministic_and_leak_free() {
     let _gpu = gpu_guard();
-    // The fire retires asynchronously; this is how the test learns it did.
-    let fires = fire_counter();
-    use driver_api::local::{
-        ChannelBinding, InstanceBinding, PIE_CHANNEL_HOST_ROLE_READER, PieBytes, PieChannelDesc,
-        PieCompletion, PieInstanceDesc, PieModelLoadDesc, PieU32Slice, PieU64Slice,
-    };
 
     let home = std::env::var("HOME").expect("HOME");
     let snaps = std::path::PathBuf::from(&home)
@@ -1628,7 +1603,7 @@ fn a_fifty_step_greedy_chain_is_deterministic_and_leak_free() {
     const PAGE: u32 = 16;
 
     let chain = |run_tag: u64| -> (Vec<u32>, usize, usize) {
-        let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
+        let boot = format!("[model]\nconfig = \"{}\"\n", descriptor.display());
         let broker = CompletionBroker::new();
         let opened = Shell::open(boot.as_bytes(), broker.clone());
         let d = opened;
@@ -1675,8 +1650,6 @@ fn a_fifty_step_greedy_chain_is_deterministic_and_leak_free() {
         let mut binding = InstanceBinding::default();
         bind(&mut d, &inst, &mut binding);
         let instance_ids: [u64; 1] = [binding.instance_id];
-        let (completion, completion_handle) = broker.launch_completion(1);
-        let _ = &completion_handle;
 
         let total_pages = ((prompt.len() + STEPS) as u32).div_ceil(PAGE);
         let all_pages: Vec<u32> = (0..total_pages).collect();
@@ -1730,10 +1703,7 @@ fn a_fifty_step_greedy_chain_is_deterministic_and_leak_free() {
                 steps: steps_arr.to_vec(),
                 ..Default::default()
             };
-            assert_eq!(
-                fire_and_wait(d, &frame, completion, &completion_handle),
-                PIE_STATUS_OK
-            );
+            assert_eq!(fire_and_wait(d, &frame, &broker), PIE_STATUS_OK);
         };
 
         // Prefill, then the greedy chain. The engine's half of the ring:
@@ -1837,10 +1807,6 @@ fn a_fifty_step_greedy_chain_is_deterministic_and_leak_free() {
 #[ignore = "the scaled soak: ~1 minute of GPU; run explicitly"]
 fn the_711_fire_soak_holds_steady() {
     let _gpu = gpu_guard();
-    use driver_api::local::{
-        ChannelBinding, InstanceBinding, PIE_CHANNEL_HOST_ROLE_READER, PieBytes, PieChannelDesc,
-        PieCompletion, PieInstanceDesc, PieModelLoadDesc, PieU32Slice, PieU64Slice,
-    };
 
     let home = std::env::var("HOME").expect("HOME");
     let snaps = std::path::PathBuf::from(&home)
@@ -1876,7 +1842,7 @@ fn the_711_fire_soak_holds_steady() {
     const DECODES: usize = 50;
     const PAGE: u32 = 16;
 
-    let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
+    let boot = format!("[model]\nconfig = \"{}\"\n", descriptor.display());
     let broker = engine_runtime();
     let opened = Shell::open(boot.as_bytes(), broker.clone());
     let d = opened;
@@ -1923,8 +1889,6 @@ fn the_711_fire_soak_holds_steady() {
     let mut binding = InstanceBinding::default();
     bind(&mut d, &inst, &mut binding);
     let instance_ids: [u64; 1] = [binding.instance_id];
-    let (completion, completion_handle) = broker.launch_completion(1);
-    let _ = &completion_handle;
     let words = chb.word_base as *mut u64;
 
     let total_pages = ((prompt.len() + DECODES) as u32).div_ceil(PAGE);
@@ -1971,7 +1935,7 @@ fn the_711_fire_soak_holds_steady() {
                 steps: steps_arr.to_vec(),
                 ..Default::default()
             };
-            assert_eq!(code(d.launch(&frame, completion)), PIE_STATUS_OK);
+            assert_eq!(fire_and_wait(d, &frame, &broker), PIE_STATUS_OK);
         };
         let read_argmax = |i: u64| -> u32 {
             let cell = unsafe {
@@ -2058,13 +2022,6 @@ fn the_711_fire_soak_holds_steady() {
 #[test]
 fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
     let _gpu = gpu_guard();
-    // The fire retires asynchronously; this is how the test learns it did.
-    let fires = fire_counter();
-    use driver_api::local::{
-        ChannelBinding, InstanceBinding, PIE_CHANNEL_HOST_ROLE_READER, PIE_RS_FLAG_RESET, PieBytes,
-        PieChannelDesc, PieCompletion, PieInstanceDesc, PieModelLoadDesc, PieU32Slice, PieU64Slice,
-        StateCopyRange,
-    };
 
     let home = std::env::var("HOME").expect("HOME");
     let snaps = std::path::PathBuf::from(&home)
@@ -2092,7 +2049,7 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
         serde_json::from_str(include_str!("oracle/real_decode/qwen3_5_0_8b.json"))
             .expect("reference");
 
-    let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
+    let boot = format!("[model]\nconfig = \"{}\"\n", descriptor.display());
     let broker = CompletionBroker::new();
     let opened = Shell::open(boot.as_bytes(), broker.clone());
     let d = opened;
@@ -2153,9 +2110,7 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
             steps: vec![step.clone()],
             ..Default::default()
         };
-        let (completion, completion_handle) = broker.launch_completion(1);
-        let _ = &completion_handle;
-        fire_and_wait(d, &frame, completion, &completion_handle)
+        fire_and_wait(d, &frame, &broker)
     };
 
     // ── Prefill on slot 0 (RESET — a fresh sequence). ──
@@ -2355,12 +2310,6 @@ fn the_hybrid_loads_fires_and_copies_state_through_the_abi() {
 #[test]
 fn gemma4_loads_and_fires_both_classes_through_the_abi() {
     let _gpu = gpu_guard();
-    // The fire retires asynchronously; this is how the test learns it did.
-    let fires = fire_counter();
-    use driver_api::local::{
-        ChannelBinding, InstanceBinding, PIE_CHANNEL_HOST_ROLE_READER, PieBytes, PieChannelDesc,
-        PieCompletion, PieInstanceDesc, PieModelLoadDesc, PieU32Slice, PieU64Slice,
-    };
 
     let home = std::env::var("HOME").expect("HOME");
     let snaps = std::path::PathBuf::from(&home)
@@ -2388,7 +2337,7 @@ fn gemma4_loads_and_fires_both_classes_through_the_abi() {
         serde_json::from_str(include_str!("oracle/real_decode/gemma4_e2b.json"))
             .expect("reference");
 
-    let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
+    let boot = format!("[model]\nconfig = \"{}\"\n", descriptor.display());
     let broker = CompletionBroker::new();
     let opened = Shell::open(boot.as_bytes(), broker.clone());
     let d = opened;
@@ -2449,9 +2398,7 @@ fn gemma4_loads_and_fires_both_classes_through_the_abi() {
             steps: vec![step.clone()],
             ..Default::default()
         };
-        let (completion, completion_handle) = broker.launch_completion(1);
-        let _ = &completion_handle;
-        fire_and_wait(d, &frame, completion, &completion_handle)
+        fire_and_wait(d, &frame, &broker)
     };
 
     // ── Prefill: the A/B's prompt, the A/B's exact argmax. ──
@@ -2604,7 +2551,7 @@ fn gemma4_vision_encodes_real_weights_through_the_abi() {
         return;
     }
 
-    let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
+    let boot = format!("[model]\nconfig = \"{}\"\n", descriptor.display());
     let broker = engine_runtime();
     let opened = Shell::open(boot.as_bytes(), broker.clone());
     let d = opened;
@@ -2721,7 +2668,7 @@ fn gemma4_audio_encodes_real_weights_through_the_abi() {
         eprintln!("skipped: no generated gemma4 descriptor");
         return;
     }
-    let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
+    let boot = format!("[model]\nconfig = \"{}\"\n", descriptor.display());
     let broker = engine_runtime();
     let opened = Shell::open(boot.as_bytes(), broker.clone());
     let d = opened;
@@ -2826,7 +2773,7 @@ fn gemma4_mixed_media_encodes_through_one_call() {
         eprintln!("skipped: no generated gemma4 descriptor");
         return;
     }
-    let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
+    let boot = format!("[model]\nconfig = \"{}\"\n", descriptor.display());
     let broker = engine_runtime();
     let opened = Shell::open(boot.as_bytes(), broker.clone());
     let d = opened;
@@ -2967,7 +2914,7 @@ fn gemma4_vision_encode_matches_hf_cosine() {
     assert_eq!(pshape[1], 768);
     let positions: Vec<u32> = pos_f.iter().map(|&v| v as u32).collect();
 
-    let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
+    let boot = format!("[model]\nconfig = \"{}\"\n", descriptor.display());
     let broker = engine_runtime();
     let opened = Shell::open(boot.as_bytes(), broker.clone());
     let d = opened;
@@ -3090,7 +3037,7 @@ fn gemma4_audio_encode_matches_hf_cosine() {
     let text_hidden = rshape[1];
     assert_eq!(fshape[1], 128);
 
-    let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
+    let boot = format!("[model]\nconfig = \"{}\"\n", descriptor.display());
     let broker = engine_runtime();
     let opened = Shell::open(boot.as_bytes(), broker.clone());
     let d = opened;
@@ -3222,7 +3169,7 @@ fn a_quantized_checkpoint_loads_through_the_abi() {
     let raw = std::fs::read_to_string(&config).expect("config.json");
     let dpath = std::env::temp_dir().join("pie_gpt_oss_config.json");
     std::fs::write(&dpath, &raw).expect("write config");
-    let boot = format!("[model]\ndescriptor = \"{}\"\n", dpath.display());
+    let boot = format!("[model]\nconfig = \"{}\"\n", dpath.display());
     let broker = CompletionBroker::new();
     let opened = Shell::open(boot.as_bytes(), broker.clone());
     let d = opened;
@@ -3269,12 +3216,10 @@ fn a_quantized_checkpoint_loads_through_the_abi() {
 /// it cannot run its completion somewhere else.
 #[test]
 fn a_launch_returns_before_its_fire_retires() {
+    use std::future::Future;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-    use driver_api::local::{
-        InstanceBinding, PieBytes, PieCompletion, PieInstanceDesc, PieModelLoadDesc,
-        PieRuntimeCallbacks,
-    };
+    use std::task::{Context, Poll, Wake, Waker};
 
     let _gpu = gpu_guard();
     let home = std::env::var("HOME").expect("HOME");
@@ -3300,23 +3245,65 @@ fn a_launch_returns_before_its_fire_retires() {
 
     static DONE: AtomicBool = AtomicBool::new(false);
     static WHERE: AtomicU64 = AtomicU64::new(0);
-    unsafe extern "C" fn notify(_ctx: *mut std::ffi::c_void, _wait_id: u64, _epoch: u64) {
-        // The thread the completion ran on, as a number we can compare.
-        let id = format!("{:?}", std::thread::current().id());
-        let n = id
-            .bytes()
-            .fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(b)));
-        WHERE.store(n, Ordering::Release);
-        DONE.store(true, Ordering::Release);
+
+    /// Records WHERE a fire was retired, from inside the retirement.
+    ///
+    /// This was an `extern "C"` notify the driver was handed in its runtime
+    /// callbacks, and it is a waker parked on the fire's completion now.
+    /// The observation is the same one: `CompletionBroker::notify` publishes
+    /// the epoch and wakes the parked waker INLINE, on the notifying thread
+    /// — so this runs wherever the driver retired the fire, which is a
+    /// CUDA callback thread if the retirement is stream-ordered and the
+    /// calling thread if `launch` synchronized and notified itself.
+    struct Recorder;
+    impl Wake for Recorder {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            // The thread the completion ran on, as a number we can compare.
+            let id = format!("{:?}", std::thread::current().id());
+            let n = id
+                .bytes()
+                .fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(b)));
+            WHERE.store(n, Ordering::Release);
+            DONE.store(true, Ordering::Release);
+        }
     }
-    DONE.store(false, Ordering::Release);
+
+    // A completion for ONE fire, with the recorder already parked on it.
+    //
+    // Fresh per fire rather than one for the test: a completion settles at
+    // its epoch and stays settled, so polling a spent one is ready on the
+    // spot and parks nothing — the second fire would then be measured
+    // against the first fire's recording.
+    //
+    // The returned future must outlive the fire. Dropping it frees the wait
+    // slot, and a driver notifying a freed slot wakes nobody.
+    let arm = |broker: &CompletionBroker| {
+        DONE.store(false, Ordering::Release);
+        let (target, handle) = broker.launch_completion(1);
+        let waker = Waker::from(Arc::new(Recorder));
+        let mut parked = Box::pin(handle);
+        let polled = parked.as_mut().poll(&mut Context::from_waker(&waker));
+        assert!(
+            matches!(polled, Poll::Pending),
+            "the completion settled before its fire was launched"
+        );
+        assert!(
+            !DONE.load(Ordering::Acquire),
+            "the waker fired at registration rather than at retirement, so \
+             it recorded the calling thread and proves nothing"
+        );
+        (target, parked)
+    };
 
     // THIS DRIVER RUNS AHEAD, and it asks for that itself rather than
     // through the environment — every other test in this file shares the
     // process and expects `launch` to have finished the fire when it
     // returns.
     let boot = format!(
-        "[model]\ndescriptor = \"{}\"\n[driver]\nrunahead = true\n",
+        "[model]\nconfig = \"{}\"\n[driver]\nrunahead = true\n",
         descriptor.display()
     );
     let broker = CompletionBroker::new();
@@ -3386,9 +3373,6 @@ fn a_launch_returns_before_its_fire_retires() {
         steps: vec![step.clone()],
         ..Default::default()
     };
-    let (completion, completion_handle) = broker.launch_completion(1);
-    let _ = &completion_handle;
-
     let caller = format!("{:?}", std::thread::current().id());
     let caller_n = caller
         .bytes()
@@ -3400,6 +3384,7 @@ fn a_launch_returns_before_its_fire_retires() {
     // which the few milliseconds of GPU work it eventually enqueues
     // retire easily. Measuring that fire cannot tell "the call waited"
     // from "the work was done before the call could return".
+    let (completion, _warm_parked) = arm(&broker);
     assert_eq!(
         code(d.launch(&frame, completion)),
         PIE_STATUS_OK,
@@ -3413,8 +3398,8 @@ fn a_launch_returns_before_its_fire_retires() {
         );
         std::thread::yield_now();
     }
-    DONE.store(false, Ordering::Release);
 
+    let (completion, _parked) = arm(&broker);
     let t0 = std::time::Instant::now();
     let status = code(d.launch(&frame, completion));
     let returned_after = t0.elapsed();
@@ -3472,7 +3457,7 @@ fn a_launch_returns_before_its_fire_retires() {
         ..Default::default()
     };
     for round in 0..3 {
-        DONE.store(false, Ordering::Release);
+        let (completion, _parked) = arm(&broker);
         let t = std::time::Instant::now();
         let st = code(d.launch(&dec_frame, completion));
         let issued = t.elapsed();
@@ -3615,11 +3600,6 @@ fn a_kv_cache_dtype_is_read_and_an_unreadable_one_is_refused() {
 #[test]
 fn every_request_in_a_frame_gets_its_own_logits() {
     let _gpu = gpu_guard();
-    let fires = fire_counter();
-    use driver_api::local::{
-        ChannelBinding, InstanceBinding, PIE_CHANNEL_HOST_ROLE_READER, PieBytes, PieChannelDesc,
-        PieCompletion, PieInstanceDesc, PieModelLoadDesc, PieU32Slice, PieU64Slice,
-    };
 
     let Some(snap) = qwen3_snapshot() else {
         eprintln!("skipped: no cached Qwen3-0.6B");
@@ -3632,7 +3612,7 @@ fn every_request_in_a_frame_gets_its_own_logits() {
     let reference: serde_json::Value =
         serde_json::from_str(include_str!("oracle/real_decode/reference.json")).expect("reference");
 
-    let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
+    let boot = format!("[model]\nconfig = \"{}\"\n", descriptor.display());
     let broker = CompletionBroker::new();
     let opened = Shell::open(boot.as_bytes(), broker.clone());
     let d = opened;
@@ -3742,12 +3722,7 @@ fn every_request_in_a_frame_gets_its_own_logits() {
         steps: vec![step.clone()],
         ..Default::default()
     };
-    let (completion, completion_handle) = broker.launch_completion(1);
-    let _ = &completion_handle;
-    assert_eq!(
-        fire_and_wait(&mut d, &frame, completion, &completion_handle),
-        PIE_STATUS_OK
-    );
+    assert_eq!(fire_and_wait(&mut d, &frame, &broker), PIE_STATUS_OK);
 
     // BOTH rings advanced. The one that used to stay at zero is request 1's.
     for (r, chb) in rings.iter().enumerate() {
@@ -3812,17 +3787,12 @@ fn every_request_in_a_frame_gets_its_own_logits() {
 #[test]
 fn a_region_table_that_does_not_describe_its_rows_is_refused() {
     let _gpu = gpu_guard();
-    let fires = fire_counter();
-    use driver_api::local::{
-        ChannelBinding, InstanceBinding, PIE_CHANNEL_HOST_ROLE_READER, PieBytes, PieChannelDesc,
-        PieCompletion, PieInstanceDesc, PieModelLoadDesc, PieU32Slice, PieU64Slice,
-    };
 
     let (Some(snap), Some(descriptor)) = (qwen3_snapshot(), qwen3_descriptor()) else {
         eprintln!("skipped: no cached Qwen3-0.6B or descriptor");
         return;
     };
-    let boot = format!("[model]\ndescriptor = \"{}\"\n", descriptor.display());
+    let boot = format!("[model]\nconfig = \"{}\"\n", descriptor.display());
     let broker = CompletionBroker::new();
     let opened = Shell::open(boot.as_bytes(), broker.clone());
     let d = opened;
@@ -3928,7 +3898,7 @@ fn a_region_table_that_does_not_describe_its_rows_is_refused() {
 
     // A tiling table whose region carries an ADAPTER is refused too, and
     // for a different reason: the bit reaches the `HasLora` guard now, so
-    // the trace states `pie_lora_qkv_correction` — and the executor's arm
+    // the trace states `gemm::lora_qkv_correction` — and the executor's arm
     // for it is a NO-OP while nothing stages the table, which it must be
     // for union captures to record it. Running the fire would apply no
     // correction and return tokens that look like a slightly worse model.
@@ -3975,7 +3945,7 @@ fn a_region_table_that_does_not_describe_its_rows_is_refused() {
         ..Default::default()
     };
     assert_eq!(
-        fire_and_wait(&mut d, &frame, completion, &completion_handle),
+        fire_and_wait(&mut d, &frame, &broker),
         PIE_STATUS_OK,
         "a table that tiles its rows is the served case"
     );
@@ -3994,10 +3964,6 @@ fn a_region_table_that_does_not_describe_its_rows_is_refused() {
 #[test]
 fn an_extern_channel_registers_and_refuses_to_attach() {
     let _gpu = gpu_guard();
-    use driver_api::local::{
-        ChannelBinding, InstanceBinding, PIE_CHANNEL_EXTERN_IMPORT, PieBytes, PieChannelDesc,
-        PieInstanceDesc, PieU32Slice, PieU64Slice,
-    };
 
     let mut d = Shell::open(b"", engine_runtime()).expect("the driver creates");
 

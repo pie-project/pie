@@ -436,9 +436,9 @@ impl Variant for Gemma4 {
     /// cannot be traced.
     fn trace(
         &self,
-        class: model_compiler::trace::FireClass,
+        class: model_ir::trace::FireClass,
         load: Deployed<'_>,
-    ) -> Result<model_compiler::trace::ForwardPlan, Refusal> {
+    ) -> Result<model_ir::trace::ForwardPlan, Refusal> {
         if let Some(refusal) = self.untraced() {
             return Err(refusal);
         }
@@ -934,7 +934,7 @@ mod tests {
     #[test]
     fn a_metal_load_traces_this_rows_two_attention_shapes_and_not_a_llamas() {
         use crate::catalog::{Backend, Deployed, MetalBinding};
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
 
         let bind = MetalBinding {
             quant_group: 64,

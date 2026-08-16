@@ -185,7 +185,7 @@
 //! impl driver_wgpu::binding::Resolve for Store {
 //!     type Buffer = device::Buffer;
 //!     fn weight(&self, name: &str) -> Option<&device::Buffer>;
-//!     fn named(&self, value: model_compiler::trace::ValueId) -> Option<&device::Buffer>;
+//!     fn named(&self, value: model_ir::trace::ValueId) -> Option<&device::Buffer>;
 //!     // Defaulted to `None`; state them only where the text needs them.
 //!     fn kv(&self, layer: u16, values: bool) -> Option<&device::Buffer>;
 //!     fn number(&self, which: binding::FireNumber) -> Option<u32>;
@@ -260,6 +260,11 @@ pub mod envelope;
 pub mod frames;
 #[cfg(feature = "native")]
 pub mod serve;
+// `Encode` over a real adapter -- what a `kernels-wgpu` routine body
+// dispatches through. Gated with the rest of the device half because it names
+// a `Pipeline`.
+#[cfg(feature = "native")]
+pub mod encode;
 #[cfg(feature = "native")]
 pub mod shell;
 #[cfg(feature = "native")]

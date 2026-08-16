@@ -28,12 +28,12 @@
 //!   caller needs `causal_mask = false` and the old wrapper hard-coded
 //!   `true`; the five booleans are now [`crate::bind::PrefillPlanFlags`],
 //!   named, so the ViT's bidirectionality is a field and not a position.
-//! * The fire is [`crate::fire::flashinfer_fa2_dispatch::prefill`] followed
-//!   by [`crate::fire::flashinfer_fa2::fire_prefill`] — the same two steps
+//! * The fire is [`kernels_cuda::attn::fa2::dispatch::prefill`] followed
+//!   by [`kernels_cuda::attn::fa2::plan::fire_prefill`] — the same two steps
 //!   `bind::service::attn_dispatch_attention_flashinfer_prefill_bf16` takes.
 //!   This tower cannot go through the service because it holds no
 //!   `DispatchCtx`: it is not a lowered model, it is a hand-written walk.
-//! * The kernel is NVRTC's, from `kernels-cuda-new`'s `families::fa2`. No
+//! * The kernel is NVRTC's, from `kernels-cuda`'s `families::fa2`. No
 //!   `<<<>>>` and no C++ is reached from this file at all.
 //!
 //! `execution.rs` wrote the old state down before the port: *"`ffi::pie_k_attn_
@@ -59,9 +59,9 @@ use crate::bind::PrefillPlan;
 use crate::bind::abi::AttentionWorkspaceView;
 use crate::device::{Allocator, DeviceBuffer, StreamRef};
 use crate::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps, StagingOps};
-use crate::fire::flashinfer_fa2 as fa2;
-use crate::fire::flashinfer_fa2_dispatch as fa2d;
-use crate::fire::merge_states;
+use kernels_cuda::attn::fa2::plan as fa2;
+use kernels_cuda::attn::fa2::dispatch as fa2d;
+use kernels_cuda::cascade::merge_states;
 use crate::{Error, Result};
 
 /// This module's name in a refusal — `super::WHO`'s reason, one file down.
@@ -343,7 +343,7 @@ pub(super) fn attend(
     // synchronises; the four index buffers are this module's own and were
     // uploaded on this stream; the view is the workspace's; `lse` is null,
     // which the launcher reads as "do not write log-sum-exp".
-    let bufs = fa2d::Buffers {
+    let bufs = kernels_cuda::attn::fa2::params::Buffers {
         q: q as u64,
         k_pages: k as u64,
         v_pages: v as u64,
@@ -357,7 +357,7 @@ pub(super) fn attend(
         float_buffer: view.float_buffer as u64,
     };
     let plan = st.plan.cache();
-    let arm = fa2d::prefill_arm(plan.full_attention_variant, plan.causal_mask, 0.0);
+    let arm = kernels_cuda::attn::fa2::prefill_arm(plan.full_attention_variant, plan.causal_mask, 0.0);
     let fired = fa2d::prefill(plan, &bufs, fa2::fa_device(), arm, 0.0, sm_scale);
     let (mut dispatch, partials) = match fired {
         fa2d::Fired::Whole(d) => (d, None),
@@ -384,7 +384,11 @@ pub(super) fn attend(
             },
             stream.as_raw().cast(),
         )
-    }?;
+    }
+    // The routine answers a `kernels::Refusal` since §6.3 -- one crate down
+    // there is no driver `Error` to flatten it into. The conversion belongs
+    // here, at the edge of the crate whose error vocabulary this is.
+    .map_err(|why| Error::invalid("flashinfer fa2 prefill", why.to_string()))?;
     if let Some(split) = partials {
         // SAFETY: as above. `prefill.cuh:4350-4352` fires exactly this, in
         // exactly this position.
@@ -393,7 +397,7 @@ pub(super) fn attend(
         // the difference is that this caller HAS an error to return. Both
         // refuse; neither substitutes a different kernel.
         let merged =
-            unsafe { merge_states::variable_length(split.merge(), stream.as_raw().cast()) };
+            unsafe { merge_states::variable_length(split.merge_job(), stream.as_raw().cast()) };
         if let merge_states::Merged::Declined(why) = merged {
             return Err(Error::invalid(
                 WHO,

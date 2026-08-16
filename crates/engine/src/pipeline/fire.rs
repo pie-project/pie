@@ -1282,6 +1282,20 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let readout_defaulted = geometry.readout_defaulted;
         geometry.apply_to(&mut req);
         req.device_resolved_geometry = decode_envelope.is_some();
+        // The same fact as the line above, said as a CLASS rather than a bool,
+        // because there are three ways to read a fire's geometry and a bool
+        // holds two. This path serves the two the bool could carry; the third
+        // is stamped in `fire_device_geometry`, which a device-geometry pass
+        // takes instead of this one.
+        //
+        // The bool is deliberately left alone. Every existing consumer
+        // (`worker::has_device_geometry`, `wire.rs`'s `deferred_geometry`, the
+        // co-batching rules) keeps the behaviour it was measured with.
+        req.geometry_class = if decode_envelope.is_some() {
+            ::driver_api::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE
+        } else {
+            ::driver_api::PIE_GEOMETRY_CLASS_HOST
+        };
         // Carried to the batcher, which keeps such a fire out of shared
         // waves — see `scheduler::worker::has_dense_device_mask`. The
         // stamp is the program's binding, but it is NOT final: a fire
@@ -1764,7 +1778,21 @@ fn validate_frame<C: FireContext>(
     let mut host_resolved: Vec<bool> = Vec::with_capacity(fired.len());
     for (index, &(_, rep)) in fired.iter().enumerate() {
         let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
-        let devgeo = ctx.resources().get(&fwd)?.devgeo.is_some();
+        let pass = ctx.resources().get(&fwd)?;
+        // ... unless the driver resolves a step's ports when the step RUNS.
+        // The paragraph above describes `FramePrepare`, which is one driver's
+        // shape and not the contract: `driver-vulkan`'s `launch` converts one
+        // step, fires it, lets its program run, and only then converts the
+        // next -- so a chained slot's cell is filled by the time it is read,
+        // and refusing the frame refuses work that backend performs. The
+        // capability is asked rather than assumed, so a driver that does the
+        // frame-entry thing keeps the refusal.
+        let per_step = pass
+            .bound()
+            .ok()
+            .and_then(|bound| crate::driver::get_spec(bound.bound_instance.driver_id).ok())
+            .is_some_and(|spec| spec.resolves_geometry_per_step);
+        let devgeo = pass.devgeo.is_some() && !per_step;
         host_resolved.push(devgeo || rs_host_resolved[index]);
     }
     for (slot, &(_, rep)) in fired.iter().enumerate() {
@@ -2813,6 +2841,33 @@ async fn fire_device_geometry<C: FireContext>(
     // rejects (`dense device mask in a multi-program batch`) — the failing
     // prepare then poisoned descriptor channel 0 and lost every stream.
     req.dense_device_mask = ctx.resources().get(&fwd)?.dense_mask;
+    // The CLASS this fire is, said on the wire.
+    //
+    // A POOLED device-geometry fire states its pages in a channel and picks a
+    // subset of them in-graph, so there is nothing for the driver to read in
+    // the wire plan -- and until this line there was nothing in the wire
+    // TABLES either: `scheduler::batch` stamps from the request, this path
+    // never set anything, and the fire went out as class 0 (`Host`). Every
+    // portable driver then looked for geometry in the plan, found none, and
+    // refused with `no page span in a CSR of 0 entries` -- a true statement
+    // about a plan that was never the place to look. The engine's own log
+    // ("executes as a pool-owned device-geometry pass") had already named the
+    // class; it just never travelled.
+    //
+    // The NON-pooled device-geometry fire (the Track B page lease) keeps
+    // class 0 deliberately. It is what CUDA runs today, its driver resolves
+    // geometry from the device-composed template whatever the wire says, and
+    // its scheduling was measured with the stamp it has. Nothing here is an
+    // argument for moving it.
+    if ctx
+        .resources()
+        .get(&fwd)?
+        .devgeo
+        .as_ref()
+        .is_some_and(|devgeo| devgeo.pooled)
+    {
+        req.geometry_class = ::driver_api::PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY;
+    }
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
     ticket_reservation.apply_to(&mut req);
     let last_page_len = if pages.is_empty() { 0 } else { page_size };

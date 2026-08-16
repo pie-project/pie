@@ -310,3 +310,299 @@ fn f() {}
          line, and skips prose"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The same question, asked of the workflow instead of the source.
+// ---------------------------------------------------------------------------
+
+/// A package's own name, as its manifest gives it.
+fn package_name(manifest: &str) -> Option<String> {
+    let mut section = String::new();
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            section = line.trim_matches(['[', ']']).to_string();
+            continue;
+        }
+        if section == "package"
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim() == "name"
+        {
+            return Some(value.trim().trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+/// Every `.yml`/`.yaml` under `.github/workflows`.
+fn workflows(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root.join(".github/workflows")) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "yml" || e == "yaml") {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Logical shell commands: `\`-continued lines joined, comments dropped.
+///
+/// A workflow's `run:` block is shell, and its cargo invocations wrap. A
+/// scan that read physical lines would see `cargo test -p model \` and
+/// `--features forward --test kernels_table` as two unrelated things and
+/// attribute the feature to no package at all.
+fn shell_commands(yaml: &str) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut pending: Option<(usize, String)> = None;
+    for (n, raw) in yaml.lines().enumerate() {
+        let line = raw.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let (text, continues) = match line.strip_suffix('\\') {
+            Some(head) => (head.trim_end(), true),
+            None => (line, false),
+        };
+        match &mut pending {
+            Some((_, acc)) => {
+                acc.push(' ');
+                acc.push_str(text);
+            }
+            None => pending = Some((n + 1, text.to_string())),
+        }
+        if !continues && let Some(done) = pending.take() {
+            out.push(done);
+        }
+    }
+    if let Some(done) = pending.take() {
+        out.push(done);
+    }
+    out
+}
+
+/// The `-p`/`--package` names and the `--features` names in one command.
+fn packages_and_features(command: &str) -> (Vec<String>, Vec<String>) {
+    let mut packages = Vec::new();
+    let mut features = Vec::new();
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let mut i = 0;
+    while i < words.len() {
+        let (flag, inline) = match words[i].split_once('=') {
+            Some((f, v)) => (f, Some(v)),
+            None => (words[i], None),
+        };
+        let value = match inline {
+            Some(v) => Some(v.to_string()),
+            None => words.get(i + 1).map(|w| (*w).to_string()),
+        };
+        match flag {
+            "-p" | "--package" | "--exclude" => {
+                if let Some(v) = value
+                    && !v.starts_with('-')
+                {
+                    packages.push(v);
+                }
+            }
+            "-F" | "--features" => {
+                if let Some(v) = value
+                    && !v.starts_with('-')
+                {
+                    features.extend(v.split(',').map(str::to_string));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (packages, features)
+}
+
+/// Every `features: x` value a matrix supplies, with its line number.
+///
+/// A build command reads `--features ${{ matrix.target.features }}`, and
+/// no amount of shell parsing turns that into a feature name. The values
+/// are in the same file, one `features:` key per matrix row, so a command
+/// that asks for an expression is checked against all of them instead.
+/// That is looser than checking the row that will actually run -- but a
+/// renamed feature breaks EVERY row, and this is what stands between a
+/// release build and finding out at tag time.
+fn matrix_features(yaml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in yaml.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some(value) = line.strip_prefix("features:") else {
+            continue;
+        };
+        let value = value.trim().trim_matches(['"', '\'']);
+        if value.is_empty() || value.contains("${{") {
+            continue;
+        }
+        out.extend(value.split(',').map(|f| f.trim().to_string()));
+    }
+    out
+}
+
+/// No cargo command in a workflow asks for a feature nobody declares.
+///
+/// # Why this is not the sibling above
+///
+/// That one reads `cfg(feature = "...")` in Rust, where naming a deleted
+/// feature compiles to nothing and says nothing. This reads the CI
+/// workflow, where naming a deleted feature is a HARD error --
+/// `the package 'model' does not contain this feature` -- and cargo
+/// stops before it builds anything.
+///
+/// A hard error sounds like the safer of the two, and it is exactly as
+/// invisible when nothing runs the workflow. `ci.yml` fires on pushes to
+/// `main` and on pull requests; the branch this crate is being rewritten
+/// on is neither, so a rewrite that deletes a feature leaves four cargo
+/// commands naming it and every one of them looks fine until the merge.
+///
+/// That is not hypothetical either. The same refactor whose deleted
+/// `forward` feature the sibling test above was written for left
+/// `--features forward` in four places in `ci.yml`, and it sat there
+/// because the only machine that would have objected never got a turn.
+#[test]
+fn every_workflow_feature_names_a_feature_its_package_declares() {
+    let root = workspace_root();
+    let mut manifest_paths = Vec::new();
+    manifests(&root, &mut manifest_paths);
+
+    let mut declared: std::collections::BTreeMap<String, BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for path in &manifest_paths {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if let Some(name) = package_name(&text) {
+            declared.insert(name, declared_features(&text));
+        }
+    }
+    assert!(
+        declared.contains_key("model") && declared.len() >= 10,
+        "read {} packages, which is not this workspace",
+        declared.len()
+    );
+
+    let files = workflows(&root);
+    assert!(
+        !files.is_empty(),
+        "no workflow found under {}/.github/workflows -- this test would \
+         pass over nothing",
+        root.display()
+    );
+
+    let mut ghosts = Vec::new();
+    let mut checked = 0usize;
+    for file in &files {
+        let Ok(yaml) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        for (line, command) in shell_commands(&yaml) {
+            if !command.contains("cargo ") {
+                continue;
+            }
+            let (packages, features) = packages_and_features(&command);
+            if features.is_empty() {
+                continue;
+            }
+            // Attributed to a package or not checkable: `--workspace
+            // --features x` unifies across everything and this cannot
+            // say whose feature it is.
+            let known: Vec<&BTreeSet<String>> =
+                packages.iter().filter_map(|p| declared.get(p)).collect();
+            if known.is_empty() {
+                continue;
+            }
+            let matrix = matrix_features(&yaml);
+            for feature in features {
+                // `dep/feat` names a DEPENDENCY's feature, which this
+                // package need not declare.
+                if feature.contains('/') || feature.is_empty() {
+                    continue;
+                }
+                // `--features ${{ matrix.target.features }}`: the name is
+                // not here, so every value the matrix can supply is
+                // checked in its place.
+                let names: Vec<String> = if feature.contains("${{") {
+                    matrix.clone()
+                } else {
+                    vec![feature]
+                };
+                for feature in names {
+                    checked += 1;
+                    if !known.iter().any(|d| d.contains(&feature)) {
+                        let name = file
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        ghosts.push(format!(
+                            "{name}:{line} asks {packages:?} for `--features \
+                         {feature}`, which none of them declares"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        checked >= 10,
+        "only {checked} feature names were checked across {} workflow \
+         files, so this scan is not reading the cargo commands it thinks \
+         it is",
+        files.len()
+    );
+    assert!(
+        ghosts.is_empty(),
+        "CI names features that do not exist, and cargo stops with `the \
+         package '...' does not contain this feature` before it builds \
+         anything:\n  {}",
+        ghosts.join("\n  ")
+    );
+}
+
+/// The workflow scan reads continuations, flags, and prose the way it claims.
+#[test]
+fn the_workflow_scan_reads_a_wrapped_cargo_line() {
+    let sample = "\
+      # cargo test -p model --features ghost
+      - name: something
+        run: |
+          cargo test -p model --features forward \\
+            --test kernels_table
+          cargo clippy -p driver-metal --features=metal-4 --all-targets
+";
+    let commands = shell_commands(sample);
+    let joined: Vec<&str> = commands.iter().map(|(_, c)| c.as_str()).collect();
+    assert!(
+        joined.contains(&"cargo test -p model --features forward --test kernels_table"),
+        "the wrapped command was not rejoined: {joined:?}"
+    );
+    assert!(
+        !joined.iter().any(|c| c.contains("ghost")),
+        "a commented-out cargo line was read as a command: {joined:?}"
+    );
+
+    let (packages, features) =
+        packages_and_features("cargo test -p model -p kernels --features contract,dep/x");
+    assert_eq!(packages, vec!["model", "kernels"]);
+    assert_eq!(features, vec!["contract", "dep/x"]);
+
+    let (_, equals) = packages_and_features("cargo clippy -p driver-metal --features=metal-4");
+    assert_eq!(equals, vec!["metal-4"], "`--features=x` was not read");
+
+    let (_, none) = packages_and_features("cargo test -p model --features --test x");
+    assert!(
+        none.is_empty(),
+        "a flag was read as a feature name: {none:?}"
+    );
+}

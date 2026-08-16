@@ -146,7 +146,7 @@ fn raw_names_agree(dir: &str) {
     use model::shared::llama_like::forward::facts::LlamaLikeMetalFacts;
     use model::shared::llama_like::forward::llama_like_metal;
     use model_compiler::lower::{Arg, Fire, Row, lower};
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     // Skipping on an unreadable checkpoint rather than failing, because the
     // reason is a fact about the artifact and not about this crate -- see the
@@ -347,7 +347,7 @@ fn names_the_text_binds(fixture: &Fixture) -> std::collections::BTreeSet<String>
     use model::shared::llama_like::forward::facts::LlamaLikeMetalFacts;
     use model::shared::llama_like::forward::llama_like_metal;
     use model_compiler::lower::{Arg, Fire, Row, lower};
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     let text = llama_like_metal(
         &(fixture.facts)(),

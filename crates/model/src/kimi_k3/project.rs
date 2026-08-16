@@ -95,7 +95,7 @@ pub fn manifest(f: &KimiK3Facts, tied_embeddings: bool) -> Manifest {
     let all_dense = f.dense_layers >= f.layers;
     // A stack with no periodic full layer ships no MLA tensors at all —
     // which is what an interval of zero says, and the reading
-    // `model_compiler::facts::full_attn_at` settled.
+    // `model_ir::facts::full_attn_at` settled.
     let has_mla = (0..f.layers).any(|l| f.is_full_attn(l));
     let has_kda = (0..f.layers).any(|l| !f.is_full_attn(l));
     // The three names BOTH halves publish. See [`shared_width`]: one
@@ -525,8 +525,8 @@ pub const NO_METAL: &str = "kimi-k3 has no Metal text in this build: its forward
 /// which this build has no text for.
 pub fn trace(
     f: &KimiK3Facts,
-    class: model_compiler::trace::FireClass,
-) -> Result<model_compiler::trace::ForwardPlan, Refusal> {
+    class: model_ir::trace::FireClass,
+) -> Result<model_ir::trace::ForwardPlan, Refusal> {
     if f.attn.output_gate {
         return Err(Refusal::Unsupported(
             "kimi_k3: the MLA output gate is not stated by this build's text — \
@@ -1196,7 +1196,7 @@ mod tests {
     /// a rename here is a rename of every recorded plan.
     #[test]
     fn the_text_traces_for_both_fire_classes() {
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
         let f = k3();
         for (class, suffix) in [
             (FireClass::Decode, "decode"),
@@ -1213,7 +1213,7 @@ mod tests {
     /// refusal is the whole reason `trace` returns a `Result`.
     #[test]
     fn a_gated_mla_output_is_refused_and_not_traced() {
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
         let mut gated = k3();
         gated.attn.output_gate = true;
         for class in [FireClass::Decode, FireClass::Prefill] {

@@ -1,156 +1,106 @@
-//! `comm/custom_all_reduce.cu`'s HOST PROGRAM, in Rust — 664 lines with
-//! **zero** `__global__` and **zero** `<<<>>>`, which is what made it a host
-//! program that happened to carry a `.cu` extension.
+//! `comm/custom_all_reduce.cu`'s LIFECYCLE, in Rust: peer access, the IPC
+//! handle exchange, the workspace slabs, and the destructor that closes what
+//! they opened.
 //!
-//! The file was named for linkage, not for content. Its whole body is peer
-//! access, an IPC handle exchange, two slabs of workspace with a geometry
-//! computed on the host, two predicates, and a template dispatch. Exactly
-//! **two lines** of it reached device text — `impl_->allreduce<__nv_bfloat16>`
-//! at `custom_all_reduce.cu:614-620` and `allreduce_fusion_kernel_launcher`
-//! at `:157-162` — and both live in headers this repository does not carry.
+//! The `.cu` was 664 lines with **zero** `__global__` and **zero** `<<<>>>` —
+//! named for linkage, not for content. Exactly **two lines** of it reached
+//! device text, `impl_->allreduce<__nv_bfloat16>` at `:614-620` and
+//! `allreduce_fusion_kernel_launcher` at `:157-162`, and both live in headers
+//! this repository does not carry.
 //!
-//! # The four terms
+//! # The split, and which half this is
 //!
-//! **What it fires.** Nothing, today, and that is a statement about the
-//! headers rather than about this module. The two launch points name
-//! `flashinfer/comm/vllm_custom_all_reduce.cuh` and
-//! `flashinfer/comm/trtllm_allreduce_fusion.cuh`, which are CPM-*fetched*
-//! at configure time and are **not** vendored:
-//! `crates/kernels-cuda-new/csrc/src/attn/flashinfer/` holds `attention/` and
-//! has no `comm/` directory at all, so NVRTC has nothing to compile. Both
-//! points therefore answer [`Decline::NoDeviceText`], and each answer carries
-//! the resolved [`Instantiation`] and the exact header that would supply it —
-//! the refusal IS the specification for the vendoring step.
+//! The whole host program came here first. `.wiki/kernel-x/refactor-plan.md`
+//! §6.3 then divided it, and the dividing question was **what owns
+//! something**:
 //!
-//! **What sits between.** Four device allocations whose sizes are host
-//! arithmetic and appear in no row's operand list: the `Signal` + staging
-//! slab ([`SIGNAL_BYTES`] + `max_bytes`), the `RankData` slab (8 MiB of
-//! 64-byte slots), the three fusion buffers (`buffer`, `flag`, `lamport`,
-//! each 2 MiB-aligned), and the `3 * world_size + 1` pointer workspace that
-//! is copied to the device once at construction. Every one of those is
-//! computed by [`CustomAllReduce::new`] from the constructor block at
-//! `custom_all_reduce.cu:222-401`.
+//! * **[`kernels_cuda::comm`]** took the half a LAUNCH reads — the
+//!   240-point template cross product as data, the two `switch`es that pick a
+//!   point out of it, the `AllReduceFusionParams` mirror, both refusals and
+//!   both bodies. None of it touches a device; the tests that came with it
+//!   said so in as many words. `comm::all_reduce_bf16` and
+//!   `comm::all_reduce_residual_rmsnorm_bf16` are `driver_bound!` rows
+//!   derived from `fn`s there. **Its header carries the `kernels.def`
+//!   measurement, the 240/24/1 arithmetic and the JIT argument** — this file
+//!   no longer restates any of it.
+//! * **This file** kept everything with a lifetime: peer-access enablement,
+//!   the IPC handle memo, the `Signal` + staging slab, the `RankData` slab,
+//!   the fusion plane's four allocations and its Lamport initialisation,
+//!   [`CustomAllReduce::register_buffer`],
+//!   [`CustomAllReduce::register_graph_buffers`] and [`Drop`]. Three other
+//!   processes hold the far end of those handles.
 //!
-//! **What it decides on the host.** Whether peer access exists in both
-//! directions between every pair in the group; whether the group is fully
-//! connected; whether a message is worth the NVLink kernel at all
-//! ([`CustomAllReduce::can_handle`], a four-term test ending in a world-size
-//! crossover table); whether the fused landing is available
-//! ([`CustomAllReduce::can_fuse_residual_rmsnorm`]); and which of upstream's
-//! 240 compile-time instantiations a call selects ([`resolve`]).
+//! The line is not a preference. Every function here reports through
+//! [`crate::error::Error`], which carries a `cudaError` and a `String`;
+//! `kernels-cuda` can name neither, and `kernels::Refusal` deliberately
+//! carries no driver code. Moving the lifecycle would have meant deciding
+//! what a failed IPC exchange IS, which is a design question and not a port.
 //!
-//! **What vocabulary is missing.** Only the device text. There is no
-//! `LaunchRule` here and no `Launch`: this module never builds a grid,
-//! because the kernels it would fire are launched by upstream's own host
-//! launcher templates, which take an `AllReduceFusionParams` and compute
-//! their own geometry. [`FusionParams`] mirrors that struct field for field
-//! so the thing a vendored path needs is written down rather than inferred.
+//! [`CustomAllReduce::plane`] is the seam: the five facts a launch reads off
+//! this side, `Copy`, filled per call.
 //!
-//! # The 240-kernel cross product, and what 111s means under a JIT
+//! # What was missing has landed
 //!
-//! `kernels.def`'s `PIE_AR_FUSION_PATTERN` block made the argument, and the
-//! measurement in it must not be consumed by this port, so it is restated
-//! here with its arithmetic intact. flashinfer's `allreduce_fusion_op()`
-//! turns four runtime values into one compile-time cross product:
+//! The two launch points named `flashinfer/comm/vllm_custom_all_reduce.cuh`
+//! and `flashinfer/comm/trtllm_allreduce_fusion.cuh`, which were CPM-*fetched*
+//! at configure time and not vendored, so both bodies answered a
+//! `Decline::NoDeviceText`. Both headers are internalised now at
+//! `csrc/src/attn/flashinfer/comm/`, `kernels/comm/all_reduce.cuh` is the
+//! root over them, and `kernels_cuda::comm::CAN_LAUNCH` is `true`. That
+//! variant is gone with the absence it described.
 //!
-//! ```text
-//!   nranks {2,4,8,16}  x  pattern {10}  x  fp32_acc {2}
-//!       x  (oneshot x trigger_completion_at_end {2}, or twoshot {1})
-//!     = 4 x 10 x 2 x 3
-//!     = 240 kernels
-//! ```
+//! What that changed on THIS side is one field and one method.
+//! [`CustomAllReduce::plane`] used to carry the group size, the rank and the
+//! fusion workspace, which is all the FUSED launcher reads. The PLAIN one
+//! reads three more things — the peer `Signal*` array by value, this rank's
+//! own `Signal*`, and a `RankData*` naming the input's eight peer addresses —
+//! so [`PeerPlane`] is the widening and [`CustomAllReduce::plane_for`] is
+//! where the per-call one is resolved.
 //!
-//! — **96% of every kernel in `custom_all_reduce.cu`, and the reason that
-//! translation unit cost 111s (40s cicc + 44s ptxas)**. pie reaches exactly
-//! one pattern, `kARResidualRMSNorm`; the other nine are FP8/FP4 quant
-//! epilogues no pie call site can select.
+//! # What got BETTER in the crossing, and it stayed here
 //!
-//! Three of those four axes are template parameters of
-//! `allreduce_fusion_kernel_launcher<Pattern, T, NRanks, Fp32Acc>` and the
-//! fourth is not: `use_oneshot` and `trigger_completion_at_end` are RUNTIME
-//! fields of `AllReduceFusionParams` that the launcher itself branches on to
-//! pick among three `__global__`s. So the 240 is `80 host instantiations x 3
-//! device leaves`, and [`Leaf`] is that third factor named. Getting this
-//! decomposition wrong is how a pruning argument turns into a wrong count.
-//!
-//! **The measurement was about an AHEAD-OF-TIME translation unit, and under
-//! a JIT it says something different.** Written out:
-//!
-//! ```text
-//!   upstream, unpruned          4 x 10 x 2 x 3  = 240 kernels   ~111 s
-//!   pie's AOT build, pruned     4 x  1 x 2 x 3  =  24 kernels   ~11 s
-//!   under NVRTC, on demand              reached =   1 kernel    ~0.46 s, once
-//! ```
-//!
-//! 111s / 240 is **~0.46s per instantiation**, and that figure is the whole
-//! translation. Ahead of time it was a cost paid on the build's critical
-//! path on every build, whether or not a single one of the 240 ever ran; the
-//! `PIE_AR_FUSION_PATTERN` list bought back 216 of them, or ~99s. Under a
-//! JIT that compiles on demand the cross product stops being a *build* cost
-//! at all and becomes a **cache-key space**: a point nobody reaches is never
-//! compiled, so there is nothing left for a list to prune, and the remaining
-//! ~11s of pie's own pruned build goes with it. What survives is ~0.46s of
-//! FIRST-CALL latency for the one point pie reaches, paid once per process
-//! and off everyone else's critical path.
-//!
-//! So the list's job changes rather than ends. It no longer states which
-//! points were BUILT; it states which points are **reachable**, and that is
-//! checkable before a fire instead of during one. [`INSTANTIATED`] is that
-//! list, in Rust, and [`resolve`] is the check.
-//!
-//! # The runtime throw became a refusal
-//!
-//! `kernels.def` said it plainly: *"a missing entry surfaces as a runtime
-//! throw, not a link error"*. Both throws are here, and neither is spelled
-//! like a failure of the launch:
-//!
-//! ```text
-//!   custom_all_reduce.cu:171-176  "pattern N is not instantiated"
-//!                                   -> Decline::PatternNotInstantiated
-//!   custom_all_reduce.cu:206-209  "does not support TP world size N"
-//!                                   -> Decline::WorldSizeUnsupported
-//! ```
-//!
-//! [`fire::gemv`] is the established shape and this module follows it:
-//! [`AllReduce`] is `#[must_use]`, *"it declined"* cannot be spelled like
-//! *"it ran"*, and a decline enqueues **nothing** — the caller's `output` is
-//! exactly as it found it, and `dist::all_reduce_bf16` (NCCL) is the other
-//! arm. A refusal is never a fallback: a null `car` is
-//! [`Decline::NoInstance`], matching `custom_all_reduce.hpp:170-174` and
-//! `:193-197`, which threw rather than quietly reducing nothing.
-//!
-//! [`fire::gemv`]: crate::fire::gemv
-//!
-//! # What is NOT here, and why the lifecycle is
-//!
-//! `.wiki/driver/new-horizon.md` §43.4 records that the reachability audit
-//! reports the `CustomAllReduce` lifecycle dead **and is wrong**. It is kept
-//! whole. The half of `vllm::CustomAllreduce` this module absorbs —
-//! `open_ipc_handle`, `get_graph_buffer_ipc_meta`, `check_rank_data_capacity`,
-//! `register_buffer(void**)` and `register_graph_buffers` — is pure host code
-//! in upstream too; only `allreduce<T>()` launches. So the Rust owns the
-//! entire lifecycle natively and declines at exactly the two points where
-//! device text is required, which is a smaller surface than the C++ had.
-//!
-//! One thing got *better* in the crossing rather than merely equal.
-//! `custom_all_reduce.cu:340-342` initialised the Lamport buffer by calling
+//! `custom_all_reduce.cu:340-342` initialised the Lamport buffer by launching
 //! `flashinfer::trtllm_allreduce::lamportInitialize<__nv_bfloat16>`, which
-//! launches a kernel to write negative-zero into every slot. Negative zero
-//! in bf16 is `0x8000`, a 16-bit pattern and not a byte pattern, so
-//! `cudaMemset` cannot express it — but `cuMemsetD16_v2` can, exactly, and
-//! it is a driver-API call with no device text behind it. See
-//! [`CustomAllReduce::new`]. That is one launch point removed rather than
-//! deferred.
+//! writes negative zero into every slot. Negative zero in bf16 is `0x8000`, a
+//! 16-bit pattern and not a byte pattern, so `cudaMemset` cannot express it —
+//! but `cuMemsetD16_v2` can, exactly, and it is a driver-API call with no
+//! device text behind it. See [`CustomAllReduce::new`]. That is one launch
+//! point removed rather than deferred, and it is why the count above is two
+//! and not three.
+//!
+//! # Two leaks the C++ had, closed by the crossing
+//!
+//! `custom_all_reduce.cu:520-538` and `:355-375` opened peer handles with
+//! bare `cudaIpcOpenMemHandle` calls and recorded them nowhere, so the
+//! destructor (`:403-427`, which walks only `signal_peers_`) could not close
+//! them. Every open here goes through `CustomAllReduce::open_ipc_handle`,
+//! which memoises by handle bytes, and [`Drop`] closes the memo. A throwing
+//! C++ constructor also freed nothing; [`CustomAllReduce::new`] builds the
+//! value first and lets [`Drop`] run on the error path.
 //!
 //! # Reachability today
 //!
-//! `serve/load.rs:120-147` refuses `tp_size > 1` outright — *"there is no
-//! NCCL in this tree and no `CustomAllReduce` handle to pass"* — so nothing
-//! in this module runs in any configuration this driver currently accepts.
-//! It is written whole anyway, because the alternative to writing it is
-//! leaving 664 lines of C++ in an archive that is being deleted, and because
-//! the thing that is missing (a vendored `comm/`) is named precisely enough
-//! here that closing it is a vendoring step and not a re-derivation.
+//! **The missing arm is written.** `bind/arms/comm.rs` binds both symbols and
+//! reaches this file's [`CustomAllReduce`] through [`ResidentPlane`], the
+//! thread-local the shell publishes its plane into;
+//! `serve::load::build_tp_plane` is what constructs one, out of
+//! `layout::rendezvous::tp_host_allgather`. So every line below is now
+//! reachable BY CONSTRUCTION, and so is a fire that gets past it:
+//! `kernels_cuda::comm::CAN_LAUNCH` is `true`, so
+//! `serve::load::tp_serving_refusal` no longer turns `tp_size > 1` away at
+//! `create` — it refuses a world size no plane can be built for, and a group
+//! with no key, and nothing else.
+//!
+//! **Nothing in this module has been run against a second GPU, and that is
+//! now the only thing standing between this and a working collective.** The
+//! box this was written on has one, so `enable_peer_access`, the IPC
+//! exchange, `build_fusion`'s Lamport initialisation, [`Drop`],
+//! [`CustomAllReduce::plane_for`]'s slot arithmetic and every launch
+//! `kernels_cuda::comm` makes out of them are correct by reading and by their
+//! C++ ancestry, and by nothing else. A two-rank fire is the first thing that
+//! would test any of it, and this repository has never run one.
+//!
+//! [`kernels_cuda::comm`]: kernels_cuda::comm
 
 // `initialise` prints ONE line to stderr at construction, which the archive
 // did at `custom_all_reduce.cu:398-404` and which is the only trace a
@@ -196,26 +146,16 @@ use crate::error::{Error, check_cu, check_rt, ignore_in_drop};
 /// quoted here with the derivation rather than referenced.
 pub const SIGNAL_BYTES: usize = 1152 + 2304;
 
-/// `vllm::kMaxBlocks` — `vllm_custom_all_reduce.cuh:46`.
-///
-/// The same 36 that `custom_all_reduce.cu:613` passes as `block_limit`. The
-/// two agreeing is not a coincidence to be preserved by hand: the launcher
-/// clamps its grid to this, so a `block_limit` above it would silently do
-/// nothing and one below it would leave bandwidth on the floor.
-pub const MAX_BLOCKS: i32 = 36;
+// `MAX_BLOCKS` AND `ALL_REDUCE_THREADS` STOOD HERE and are `comm`'s, because
+// they are the launch RECTANGLE and the launch descended. They are re-exported
+// below with the rest of it. The constants that remain in this file are the
+// ones the CONSTRUCTOR spends -- the signal slab, the rank-data slot width,
+// the Lamport cap and the 2 MiB fusion alignment -- which is the same line the
+// whole split is drawn on.
 
 /// `sizeof(vllm::RankData)` — `vllm_custom_all_reduce.cuh:62-64`,
 /// `struct __align__(16) RankData { void* ptrs[8]; }`.
 pub const RANK_DATA_BYTES: usize = 8 * 8;
-
-/// The 512 threads `custom_all_reduce.cu:614` pins on every plain P2P
-/// all-reduce, and the 36 blocks beside it (`:613`).
-///
-/// Not a tuning knob and not derived from a shape: the vllm kernel's
-/// one-shot and two-shot bodies both assume a fixed cooperative rectangle,
-/// and the launcher takes the pair as arguments only so a caller can shrink
-/// it. Nothing in pie ever did.
-pub const ALL_REDUCE_THREADS: i32 = 512;
 
 /// `custom_all_reduce.hpp:69` — the default `max_bytes`, 8 MiB.
 pub const DEFAULT_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -254,582 +194,32 @@ pub const LAMPORT_COMM_CAP: usize = 2_145_386_496;
 /// 16-bit fill, so `cuMemsetD16_v2` writes it with no kernel at all.
 const LAMPORT_EMPTY_BF16: u16 = 0x8000;
 
-// ── the cross product, as data ───────────────────────────────────────────
+// ── THE LAUNCH HALF STOOD HERE ──────────────────────────────────────────
+//
+// `FusionPattern`, `INSTANTIATED`, `NRANKS`, `Leaf`, `Instantiation`,
+// `REACHED`, `resolve`, `Decline`, `AllReduce` and the
+// `AllReduceFusionParams` mirror. All of it is `kernels_cuda::comm`; the
+// module header above is the argument for the line the split was drawn on,
+// and `comm`'s own header carries the 240-point measurement that used to be
+// stated here.
+//
+// One thing is worth repeating at the point of removal rather than only at
+// the top, because it is the test a reader will want to apply to the next
+// split: **not one line of what left touched a device.** The module's own
+// tests said so -- *"host arithmetic over an upstream struct layout, and none
+// of it touches a device"* -- and four of the six went with the cross product
+// while two stayed with the constants the constructor spends.
 
-/// `flashinfer::trtllm_allreduce_fusion::AllReduceFusionPattern`, with
-/// upstream's discriminants.
-///
-/// **The discriminants are not contiguous** — 6 and 7 are absent upstream —
-/// so this enum states each one explicitly rather than relying on
-/// declaration order. A `from_code` that assumed density would map
-/// `kARResidualRMSNormPerTokenGroupFP8PackedQuant` (8) onto a pattern two
-/// places away, silently, on a path whose whole job is to refuse the
-/// patterns pie cannot serve.
-///
-/// # A drift worth recording
-///
-/// `kernels.def`'s block says `pattern {10}` and derives `4 x 10 x 2 x 3 =
-/// 240` from it. Today's upstream header
-/// (`trtllm_allreduce_fusion.cuh:720-733`) declares **eight** enumerators
-/// spanning 0..=9. The 240 is preserved above exactly as measured — it was
-/// measured against the header the archive compiled, and a measurement is
-/// not amended by a later reading — but a re-measurement on today's upstream
-/// would find `4 x 8 x 2 x 3 = 192`. Recorded rather than reconciled: the
-/// only number this module ACTS on is the size of [`INSTANTIATED`], which is
-/// 1 either way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(i32)]
-pub enum FusionPattern {
-    /// `kAllReduce` — the reduction with no epilogue.
-    AllReduce = 0,
-    /// `kARResidualRMSNorm` — **the one pattern pie reaches.**
-    ARResidualRMSNorm = 1,
-    /// `kARResidualRMSNormFp8Quant`.
-    ARResidualRMSNormFp8Quant = 2,
-    /// `kARResidualRMSNormFP4Quant`.
-    ARResidualRMSNormFp4Quant = 3,
-    /// `kARResidualRMSNormOutFP8Quant`.
-    ARResidualRMSNormOutFp8Quant = 4,
-    /// `kARResidualRMSNormOutFP4Quant`.
-    ARResidualRMSNormOutFp4Quant = 5,
-    /// `kARResidualRMSNormPerTokenGroupFP8PackedQuant`. Note the gap: 6 and
-    /// 7 are not enumerators upstream.
-    ARResidualRMSNormPerTokenGroupFp8PackedQuant = 8,
-    /// `kARResidualRMSNormOutPerTokenGroupFP8PackedQuant`.
-    ARResidualRMSNormOutPerTokenGroupFp8PackedQuant = 9,
-}
-
-impl FusionPattern {
-    /// Every pattern upstream declares, in discriminant order.
-    pub const ALL: &'static [Self] = &[
-        Self::AllReduce,
-        Self::ARResidualRMSNorm,
-        Self::ARResidualRMSNormFp8Quant,
-        Self::ARResidualRMSNormFp4Quant,
-        Self::ARResidualRMSNormOutFp8Quant,
-        Self::ARResidualRMSNormOutFp4Quant,
-        Self::ARResidualRMSNormPerTokenGroupFp8PackedQuant,
-        Self::ARResidualRMSNormOutPerTokenGroupFp8PackedQuant,
-    ];
-
-    /// The `int` upstream's `enum class ... : int` carries.
-    #[must_use]
-    pub const fn code(self) -> i32 {
-        self as i32
-    }
-
-    /// The C++ spelling, for a message a reader can grep upstream for.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::AllReduce => "kAllReduce",
-            Self::ARResidualRMSNorm => "kARResidualRMSNorm",
-            Self::ARResidualRMSNormFp8Quant => "kARResidualRMSNormFp8Quant",
-            Self::ARResidualRMSNormFp4Quant => "kARResidualRMSNormFP4Quant",
-            Self::ARResidualRMSNormOutFp8Quant => "kARResidualRMSNormOutFP8Quant",
-            Self::ARResidualRMSNormOutFp4Quant => "kARResidualRMSNormOutFP4Quant",
-            Self::ARResidualRMSNormPerTokenGroupFp8PackedQuant => {
-                "kARResidualRMSNormPerTokenGroupFP8PackedQuant"
-            }
-            Self::ARResidualRMSNormOutPerTokenGroupFp8PackedQuant => {
-                "kARResidualRMSNormOutPerTokenGroupFP8PackedQuant"
-            }
-        }
-    }
-
-    /// The pattern with this discriminant, or `None`.
-    ///
-    /// Explicit rather than a transmute, for the gap the type's doc names.
-    #[must_use]
-    pub fn from_code(code: i32) -> Option<Self> {
-        Self::ALL.iter().copied().find(|p| p.code() == code)
-    }
-}
-
-/// `kernels.def`'s `PIE_AR_FUSION_PATTERN` list, in Rust — **one entry.**
-///
-/// This is the whole of what the `#include "kernels.def"` inside
-/// `dispatch_ar_fusion_pattern` (`custom_all_reduce.cu:163-169`) expanded to.
-/// The C++ expanded it into `case` labels of a `switch` on
-/// `params.pattern`; [`resolve`] is that switch, and the `default:` that
-/// threw is [`Decline::PatternNotInstantiated`].
-///
-/// **Adding a pattern to a call site requires adding it here**, exactly as
-/// `kernels.def` said — but the consequence has changed and is now better:
-/// a missing entry used to surface as a runtime throw deep inside a fire,
-/// and now surfaces as a `Decline` a caller must handle by type.
-pub static INSTANTIATED: &[FusionPattern] = &[FusionPattern::ARResidualRMSNorm];
-
-/// upstream flashinfer's supported TP world sizes —
-/// `custom_all_reduce.cu:181-200`'s `switch (params.nranks)`.
-///
-/// **Deliberately unpruned, and the archive said why** (`:177-179`): *"nranks
-/// is upstream flashinfer's supported set rather than a pie-owned axis, so it
-/// stays fully instantiated: TP world size is a deployment choice and pruning
-/// it would turn a valid launch into a runtime throw."* Under a JIT the
-/// argument gets stronger, not weaker — an unreached world size now costs
-/// nothing at all, not even a compile.
-pub static NRANKS: &[i32] = &[2, 4, 8, 16];
-
-/// Which of the three device leaves a set of runtime flags selects.
-///
-/// The axis that is NOT a template parameter. `AllReduceFusionParams` carries
-/// `use_oneshot` and `trigger_completion_at_end` as fields; the launcher
-/// branches on them and picks one of three `__global__`s. `kernels.def`
-/// wrote it `(oneshot x trigger_completion_at_end {2}, or twoshot {1})`,
-/// which is 3 and not 4 — the two-shot path ignores
-/// `trigger_completion_at_end` entirely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Leaf {
-    /// `use_oneshot = true`, `trigger_completion_at_end = false`. **The one
-    /// pie sets** — `custom_all_reduce.cu:653`, `:658`.
-    OneShot,
-    /// `use_oneshot = true`, `trigger_completion_at_end = true`.
-    OneShotTriggerAtEnd,
-    /// `use_oneshot = false`. `trigger_completion_at_end` is not read.
-    TwoShot,
-}
-
-impl Leaf {
-    /// The leaf a pair of `AllReduceFusionParams` flags selects.
-    #[must_use]
-    pub const fn of(use_oneshot: bool, trigger_completion_at_end: bool) -> Self {
-        if !use_oneshot {
-            Self::TwoShot
-        } else if trigger_completion_at_end {
-            Self::OneShotTriggerAtEnd
-        } else {
-            Self::OneShot
-        }
-    }
-}
-
-/// How many device leaves a single host instantiation carries — 3.
-pub const LEAVES: usize = 3;
-
-/// `fp32_acc {2}` — the `Fp32Acc` template parameter's two values.
-pub const FP32_ACC_VALUES: usize = 2;
-
-/// The cross product `kernels.def` measured: **240 kernels**.
-///
-/// Stated as a constant rather than recomputed, because it is a
-/// MEASUREMENT's denominator and recomputing it from today's
-/// [`FusionPattern::ALL`] would silently restate it as 192 — see that type's
-/// drift note.
-pub const UPSTREAM_POINTS: usize = 240;
-
-/// The translation unit's cost, in seconds — `kernels.def:114-115`.
-pub const AOT_TU_SECONDS: usize = 111;
-
-/// Of which cicc — `kernels.def:115`.
-pub const AOT_CICC_SECONDS: usize = 40;
-
-/// Of which ptxas — `kernels.def:115`.
-pub const AOT_PTXAS_SECONDS: usize = 44;
-
-/// What pie's own AOT build compiled after `PIE_AR_FUSION_PATTERN` pruned
-/// the pattern axis: `4 nranks x 1 pattern x 2 fp32_acc x 3 leaves` = **24**.
-///
-/// Derived rather than written, so that adding a pattern to [`INSTANTIATED`]
-/// moves the figure the module's header quotes.
-pub const AOT_POINTS_AFTER_PRUNING: usize =
-    NRANKS.len() * INSTANTIATED.len() * FP32_ACC_VALUES * LEAVES;
-
-/// One point of the cross product: everything a launch has to fix before
-/// any device text exists for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Instantiation {
-    /// `NRanks` — a template parameter.
-    pub nranks: i32,
-    /// `Pattern` — a template parameter.
-    pub pattern: FusionPattern,
-    /// `Fp32Acc` — a template parameter. `custom_all_reduce.cu:660` pins
-    /// `constexpr bool use_fp32_acc = true`: **fp32 accumulation of bf16
-    /// multiplies**, the arithmetic every parity check in this tree is
-    /// written against.
-    pub fp32_acc: bool,
-    /// The runtime leaf. NOT a template parameter — see [`Leaf`].
-    pub leaf: Leaf,
-}
-
-impl Instantiation {
-    /// The name expression a vendored `comm/` would hand NVRTC.
-    ///
-    /// The **host launcher** specialisation, which is what the archive named
-    /// (`custom_all_reduce.cu:157-162`) and what `T = __nv_bfloat16` is fixed
-    /// in. The `__global__` NVRTC would actually compile is one of the three
-    /// [`Leaf`] bodies this specialisation dispatches to, and its own
-    /// template parameter list is NOT transcribed here because this tree
-    /// cannot see it: `csrc/src/attn/flashinfer/` has no `comm/`. Inventing it
-    /// would be inventing an ABI.
-    #[must_use]
-    pub fn name_expression(&self) -> String {
-        format!(
-            "flashinfer::trtllm_allreduce_fusion::allreduce_fusion_kernel_launcher<\
-             (flashinfer::trtllm_allreduce_fusion::AllReduceFusionPattern){}, \
-             __nv_bfloat16, {}, {}>",
-            self.pattern.code(),
-            self.nranks,
-            self.fp32_acc
-        )
-    }
-}
-
-/// The one point pie reaches — 1 of [`UPSTREAM_POINTS`].
-///
-/// Every field is what `custom_all_reduce.cu:637-660` set, and the world size
-/// is 2 because `can_fuse_residual_rmsnorm` (`:493-501`) admits nothing else.
-pub const REACHED: Instantiation = Instantiation {
-    nranks: 2,
-    pattern: FusionPattern::ARResidualRMSNorm,
-    fp32_acc: true,
-    leaf: Leaf::OneShot,
-};
-
-/// The two `switch` statements of `custom_all_reduce.cu:143-215`, as one
-/// function — **and both of their `throw`s, as `Err`.**
-///
-/// Order matters and is upstream's: `pie_allreduce_fusion_op` switched on
-/// `nranks` first (`:181`) and reached `dispatch_ar_fusion_pattern`'s switch
-/// on `pattern` (`:165`) only inside a supported arm. A caller with both
-/// wrong therefore hears about the world size, which is the one it can
-/// actually change.
-///
-/// # Errors
-///
-/// [`Decline::WorldSizeUnsupported`] for an `nranks` outside [`NRANKS`], and
-/// [`Decline::PatternNotInstantiated`] for a pattern outside
-/// [`INSTANTIATED`].
-pub fn resolve(
-    nranks: i32,
-    pattern: FusionPattern,
-    fp32_acc: bool,
-    use_oneshot: bool,
-    trigger_completion_at_end: bool,
-) -> std::result::Result<Instantiation, Decline> {
-    if !NRANKS.contains(&nranks) {
-        return Err(Decline::WorldSizeUnsupported { nranks });
-    }
-    if !INSTANTIATED.contains(&pattern) {
-        return Err(Decline::PatternNotInstantiated { code: pattern.code() });
-    }
-    Ok(Instantiation {
-        nranks,
-        pattern,
-        fp32_acc,
-        leaf: Leaf::of(use_oneshot, trigger_completion_at_end),
-    })
-}
-
-// ── the refusals ─────────────────────────────────────────────────────────
-
-/// Why a call did not reduce anything.
-///
-/// Every arm enqueues NOTHING, which is the whole contract: on a decline the
-/// caller's `output` is exactly as it found it and `dist::all_reduce_bf16`
-/// (NCCL) is the arm to take instead. `custom_all_reduce.hpp:160-163` is the
-/// sentence this type exists to keep true — *"WHICH is a guard in the text
-/// rather than an `if` inside a driver method"*.
-///
-/// Not `Copy`: [`Decline::NoDeviceText`] carries the resolved instantiation's
-/// name expression, and that string is the specification for the vendoring
-/// step. Losing it to keep the type two words wide would be losing the only
-/// thing that makes the refusal actionable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Decline {
-    /// `car` was null — `custom_all_reduce.hpp:170-174`, `:193-197`.
-    ///
-    /// **A refusal, not a fallback.** The header threw here, and its comment
-    /// says why: *"a null one is a deployment that configured no custom
-    /// all-reduce, which is a refusal rather than a fallback: the fused
-    /// landing IS this kernel, and there is no other way to spell it."*
-    NoInstance,
-    /// The instance exists but construction never completed —
-    /// `custom_all_reduce.cu:606-608`, `:503`, `:544`.
-    ///
-    /// In the C++ this was `!impl_`, the moved-from and default-constructed
-    /// state. Rust has no default-constructed `CustomAllReduce`, so this is
-    /// reachable only through the raw-pointer ABI forms.
-    NotInitialised,
-    /// `input` was null — `custom_all_reduce.cu:466`.
-    NullInput,
-    /// `bytes == 0`, `bytes > max_bytes` or `bytes % 16 != 0` —
-    /// `custom_all_reduce.cu:467`.
-    ///
-    /// The 16-byte rule is the kernel's vector width, not a preference.
-    Bytes {
-        /// The message size asked for.
-        bytes: usize,
-        /// The configured ceiling.
-        max_bytes: usize,
-    },
-    /// `world_size > 2` and some ordered pair in the group has no peer
-    /// access — `custom_all_reduce.cu:468`.
-    NotFullyConnected {
-        /// The group size that would have needed it.
-        world_size: i32,
-    },
-    /// `cudaStreamIsCapturing` itself failed — `custom_all_reduce.cu:470`.
-    ///
-    /// The C++ folded this into its `false`. It is separated here because a
-    /// failing query is a broken stream and not a message that is too large,
-    /// and the two want different things from a caller.
-    CaptureUnknown,
-    /// The input's base allocation was never `register_buffer`'d —
-    /// `custom_all_reduce.cu:477`.
-    ///
-    /// Also covers the `cuPointerGetAttribute` failure the C++ caught and
-    /// turned into `false` at `:471-476`: a pointer with no queryable base
-    /// cannot have been registered.
-    Unregistered,
-    /// Above the world-size crossover where NCCL wins on bandwidth —
-    /// `custom_all_reduce.cu:483-485`.
-    AboveCrossover {
-        /// The message size asked for.
-        bytes: usize,
-        /// The threshold that applied.
-        crossover: usize,
-        /// The world size that selected it.
-        world_size: i32,
-    },
-    /// No fusion workspace was built — `custom_all_reduce.cu:495`.
-    ///
-    /// The constructor builds one only for `world_size == 2` with both
-    /// `fusion_max_tokens > 0` and `fusion_hidden > 0` (`:308`).
-    NoFusionWorkspace,
-    /// `tokens <= 0` or `tokens > fusion_max_tokens` —
-    /// `custom_all_reduce.cu:496`.
-    FusionTokens {
-        /// What was asked for.
-        tokens: i32,
-        /// What the workspace was sized for.
-        max_tokens: i32,
-    },
-    /// `hidden != fusion_hidden` — `custom_all_reduce.cu:497`.
-    ///
-    /// Equality, not a bound: the Lamport buffer's stride is baked into the
-    /// workspace at construction.
-    FusionHidden {
-        /// What was asked for.
-        hidden: i32,
-        /// What the workspace was sized for.
-        want: i32,
-    },
-    /// `world_size != 2` — `custom_all_reduce.cu:498`.
-    FusionWorldSize {
-        /// The group size.
-        world_size: i32,
-    },
-    /// `hidden % 8 != 0` — `custom_all_reduce.cu:499`.
-    FusionHiddenNotOctet {
-        /// The hidden size that failed it.
-        hidden: i32,
-    },
-    /// The pattern is not in [`INSTANTIATED`] —
-    /// `custom_all_reduce.cu:171-176`, which threw.
-    PatternNotInstantiated {
-        /// The `AllReduceFusionPattern` discriminant asked for.
-        code: i32,
-    },
-    /// The world size is not in [`NRANKS`] — `custom_all_reduce.cu:206-209`,
-    /// which threw.
-    WorldSizeUnsupported {
-        /// The world size asked for.
-        nranks: i32,
-    },
-    /// The instantiation resolved and **there is no device text for it in
-    /// this tree.**
-    ///
-    /// The only arm that is not a port of a C++ branch, and the only one that
-    /// is a statement about the repository rather than about the call. It
-    /// carries the name expression so that vendoring the header is a
-    /// mechanical step: the point is already resolved.
-    NoDeviceText {
-        /// What would have launched.
-        what: &'static str,
-        /// The header that defines it, as an `#include` path.
-        header: &'static str,
-        /// [`Instantiation::name_expression`] for the resolved point.
-        name_expression: String,
-    },
-}
-
-impl fmt::Display for Decline {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NoInstance => write!(
-                f,
-                "this deployment configured no custom all-reduce, and the P2P \
-                 reduction is stated; there is no other way to spell it"
-            ),
-            Self::NotInitialised => write!(f, "the custom all-reduce is not initialised"),
-            Self::NullInput => write!(f, "`input` is null"),
-            Self::Bytes { bytes, max_bytes } => write!(
-                f,
-                "{bytes} bytes is zero, above the {max_bytes}-byte ceiling, or not a multiple of 16"
-            ),
-            Self::NotFullyConnected { world_size } => write!(
-                f,
-                "world size {world_size} needs peer access between every ordered pair and does not \
-                 have it"
-            ),
-            Self::CaptureUnknown => write!(f, "`cudaStreamIsCapturing` failed on this stream"),
-            Self::Unregistered => {
-                write!(f, "the input's base allocation was never passed to `register_buffer`")
-            }
-            Self::AboveCrossover { bytes, crossover, world_size } => write!(
-                f,
-                "{bytes} bytes is at or above the {crossover}-byte crossover for world size \
-                 {world_size}; NCCL wins on bandwidth here"
-            ),
-            Self::NoFusionWorkspace => write!(
-                f,
-                "no fusion workspace was built (world size 2 with a positive `fusion_max_tokens` \
-                 and `fusion_hidden` is what builds one)"
-            ),
-            Self::FusionTokens { tokens, max_tokens } => {
-                write!(f, "{tokens} tokens against a workspace sized for {max_tokens}")
-            }
-            Self::FusionHidden { hidden, want } => {
-                write!(f, "hidden {hidden} against a workspace sized for exactly {want}")
-            }
-            Self::FusionWorldSize { world_size } => {
-                write!(f, "the fused landing is world size 2 only; this group is {world_size}")
-            }
-            Self::FusionHiddenNotOctet { hidden } => {
-                write!(f, "hidden {hidden} is not a multiple of 8")
-            }
-            Self::PatternNotInstantiated { code } => write!(
-                f,
-                "`AllReduceFusionPattern` {code} is not in `fire::all_reduce::INSTANTIATED`; \
-                 adding a pattern to a call site requires adding it there"
-            ),
-            Self::WorldSizeUnsupported { nranks } => write!(
-                f,
-                "the fused all-reduce does not support TP world size {nranks} (flashinfer supports \
-                 2, 4, 8, 16)"
-            ),
-            Self::NoDeviceText { what, header, name_expression } => write!(
-                f,
-                "{what} has no device text in this tree: `{header}` is CPM-fetched, not vendored, \
-                 and `crates/kernels-cuda-new/csrc/src/attn/flashinfer/` has no `comm/`. The point \
-                 is resolved -- NVRTC would need `{name_expression}`"
-            ),
-        }
-    }
-}
-
-/// What a reduction did.
-///
-/// The C++'s `void`-or-throw, with the ambiguity removed. `#[must_use]`
-/// because ignoring this answer is the one way to get a wrong result out of
-/// these functions: a declined call leaves the destination untouched, and a
-/// caller that reads it anyway reads whatever was there — which for an
-/// all-reduce is this rank's unreduced partial, a plausible-looking tensor
-/// that is silently wrong on every rank but one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[must_use]
-pub enum AllReduce {
-    /// The launch is on the stream.
-    Launched,
-    /// Nothing was enqueued. **Use `dist::all_reduce_bf16` for this one.**
-    Declined(Decline),
-}
-
-// ── the parameter block a vendored path would fill ───────────────────────
-
-/// `flashinfer::trtllm_allreduce_fusion::AllReduceFusionParams<T>`, mirrored.
-///
-/// Every field is one `custom_all_reduce.cu:637-659` set, in that order, and
-/// nothing is added. It is here because it is **the specification of what a
-/// vendored or NVRTC path needs**: the launcher takes this struct and derives
-/// its own grid from it, so a future `comm/` port has to fill exactly these
-/// and no reader should have to reconstruct the list from a deleted file.
-///
-/// **It is deliberately NOT `#[repr(C)]`**, and that is also a claim this
-/// tree cannot check: the upstream struct's field ORDER is not transcribed
-/// here (the header is not vendored), so this is a checklist, not an ABI. A
-/// path that actually passes it across must re-derive the layout from the
-/// vendored header, and a `#[repr(C)]` here would look like it already had.
-#[derive(Debug, Clone, Copy)]
-pub struct FusionParams {
-    /// `params.nranks` — `:638`.
-    pub nranks: i32,
-    /// `params.rank` — `:639`.
-    pub rank: i32,
-    /// `params.size = tokens * hidden` — `:640`. Element count, not bytes.
-    pub size: i32,
-    /// `params.hidden_dim` — `:641`.
-    pub hidden_dim: i32,
-    /// `params.workspace` — `:642`, the device array of `3 * world + 1`
-    /// pointers.
-    pub workspace: *mut c_void,
-    /// `params.allreduce_in` — `:643`.
-    pub allreduce_in: *const c_void,
-    /// `params.allreduce_out = nullptr` — `:644`. The unfused output is not
-    /// wanted; only the normed one is.
-    pub allreduce_out: *mut c_void,
-    /// `params.residual_in` — `:645`.
-    pub residual_in: *const c_void,
-    /// `params.residual_out` — `:646`. **The same pointer as
-    /// `residual_in`**, which is the `in_place = &[(0, 1)]` the row states.
-    pub residual_out: *mut c_void,
-    /// `params.norm_out` — `:647`.
-    pub norm_out: *mut c_void,
-    /// `params.quant_out = nullptr` — `:648`. Set only by the nine FP8/FP4
-    /// patterns pie does not reach.
-    pub quant_out: *mut c_void,
-    /// `params.scale_out = nullptr` — `:649`.
-    pub scale_out: *mut c_void,
-    /// `params.rms_gamma` — `:650`.
-    pub rms_gamma: *const c_void,
-    /// `params.rms_eps` — `:651`.
-    pub rms_eps: f32,
-    /// `params.scale_factor = nullptr` — `:652`.
-    pub scale_factor: *const c_void,
-    /// `params.use_oneshot = true` — `:653`. One half of [`Leaf`].
-    pub use_oneshot: bool,
-    /// `params.layout = QuantizationSFLayout::SWIZZLED_128x4` — `:654`.
-    ///
-    /// Carried as the enumerator NAME rather than a number: it is read only
-    /// by the quant epilogues, so pie's value is never load-bearing, and a
-    /// discriminant transcribed from an unvendored header would be an
-    /// invention with no consumer to catch it.
-    pub layout: &'static str,
-    /// `params.stream` — `:655`.
-    pub stream: *mut c_void,
-    /// `params.pattern` — `:656`.
-    pub pattern: FusionPattern,
-    /// `params.trigger_completion_at_end = false` — `:657`. The other half
-    /// of [`Leaf`].
-    pub trigger_completion_at_end: bool,
-    /// `launch_with_pdl = false` — `:661`. Not a field of the struct
-    /// upstream; the launcher's second argument. Kept beside the fields it
-    /// travels with.
-    pub launch_with_pdl: bool,
-    /// `use_fp32_acc = true` — `:660`. The `Fp32Acc` template parameter,
-    /// which is why it is not a struct field upstream either.
-    pub use_fp32_acc: bool,
-}
-
-impl FusionParams {
-    /// The [`Instantiation`] this parameter block selects.
-    ///
-    /// # Errors
-    ///
-    /// Whatever [`resolve`] refuses.
-    pub fn instantiation(&self) -> std::result::Result<Instantiation, Decline> {
-        resolve(
-            self.nranks,
-            self.pattern,
-            self.use_fp32_acc,
-            self.use_oneshot,
-            self.trigger_completion_at_end,
-        )
-    }
-}
-
-// ── host helpers, one per anonymous-namespace function ───────────────────
+// FOUR NAMES AND NOT SIXTEEN. The first draft of this line re-exported the
+// whole of `comm` -- the cross product, the constants, `resolve`, every
+// instantiation type -- on the reasoning that a reader arriving here should
+// not have to go looking. Measured: eleven of the sixteen had no use in
+// `driver-cuda` outside this file's own prose, so re-exporting them would
+// have been publishing a second address for a module that has one, and the
+// second address is the one that goes stale. These four are the ones this
+// file's own code speaks: the outcome, the refusal, and the two halves of the
+// descriptor `CustomAllReduce::plane` fills.
+pub use kernels_cuda::comm::{AllReduce, Decline, FusionPlane, PeerPlane, Plane};
 
 /// `custom_all_reduce.cu:84-86` — `align_up(n, a)`.
 fn align_up(n: usize, a: usize) -> usize {
@@ -972,7 +362,9 @@ pub type Allgather = Arc<dyn Fn(&[u8], &mut [u8]) + Send + Sync>;
 
 /// What this needs from the collective, and nothing more —
 /// `custom_all_reduce.hpp:39-57`, kept whole because the reasoning is the
-/// reason the type exists.
+/// reason the type exists. It is quoted verbatim, so the `kernels-cuda` it
+/// names is the ARCHIVE crate it was written against, deleted at
+/// `85c6c674b`.
 ///
 /// > The wrapper used to take an `NcclComm&`. It reads exactly two things off
 /// > it — the world size, and one bootstrap-time all-gather of IPC handles —
@@ -1051,8 +443,12 @@ struct Fusion {
     max_tokens: i32,
     /// `fusion_hidden_`.
     hidden: i32,
-    /// `fusion_lamport_comm_bytes_`, `:329-333`.
-    lamport_comm_bytes: usize,
+    // `lamport_comm_bytes` STOOD HERE, mirroring the archive's
+    // `fusion_lamport_comm_bytes_` (`:329-333`). The port keeps it as a LOCAL
+    // in `ensure_fusion`, where it sizes the Lamport span and goes into the
+    // flag block's fourth word; storing a second copy on the state gave it a
+    // reader-free lifetime, and a mirrored field is only worth its risk when
+    // something later asks it.
 }
 
 // ── the lifecycle ────────────────────────────────────────────────────────
@@ -1347,7 +743,6 @@ impl CustomAllReduce {
             flag_dev,
             max_tokens,
             hidden,
-            lamport_comm_bytes,
         });
 
         // `:339-342`, and the one place this port does LESS device work than
@@ -1573,6 +968,34 @@ impl CustomAllReduce {
     /// half of the graph path that has no device text in it, and porting it
     /// later would mean reconstructing this collective from a deleted file.
     ///
+    /// # The capture path WILL need this, and here is where the call goes
+    ///
+    /// Checked rather than assumed, because "does a bind arm ever see a
+    /// capturing stream?" decides it and the answer is **yes**.
+    /// `bind::run_captured` is not a separate dispatch surface — it walks the
+    /// same launches and calls the same `bind`/`dispatch` as `run` — and it
+    /// overwrites `ctx.stream` with the graph builder's stream per region, so
+    /// `bind/arms/comm.rs` issues onto a capturing stream during a capture.
+    /// [`CustomAllReduce::can_handle`] answers `Ok` immediately for a
+    /// capturing stream WITHOUT the registration check (the address will be
+    /// replayed, not dereferenced now), which is exactly the case this
+    /// function settles afterwards.
+    ///
+    /// The capture is `fire::launch::capture_or_replay`'s, per fire rather
+    /// than one-time: it opens whenever an `(R, N, class, model, lora)`
+    /// bucket is cold or its epoch went stale. The call belongs between
+    /// `scope.end()` and `graph.instantiate()` — after the capture closes,
+    /// because the collective is not capturable, and before instantiate,
+    /// because this writes the `RankData` slots the replayed addresses
+    /// resolve through.
+    ///
+    /// Two things a future caller must not miss. `CaptureScope` also closes
+    /// on `Drop` (the abandoned-capture path), and the two error arms after
+    /// `scope.end()` take it — a capture abandoned with buffers queued would
+    /// leave them queued into the next capture's registration. And that file
+    /// is not this one's to edit here, which is why this is a note and not a
+    /// call.
+    ///
     /// # Errors
     ///
     /// A failing IPC exchange or an exhausted `RankData` slab.
@@ -1713,153 +1136,218 @@ impl CustomAllReduce {
         }
     }
 
-    /// `custom_all_reduce.cu:488-495` — `can_fuse_residual_rmsnorm`.
+    /// The five facts a LAUNCH reads off this instance.
     ///
-    /// The C++ took a `cudaStream_t /*stream*/` it never read; the parameter
-    /// is gone rather than kept as `_stream`, because unlike `buf_bytes` it
-    /// answers no question that could later be asked of it.
+    /// `can_fuse_residual_rmsnorm` and the two reduction bodies stood here and
+    /// are `kernels_cuda::comm`'s. This is what replaces the `&mut self`
+    /// they took: a `Copy` descriptor, filled per call, carrying the group
+    /// size, this rank and — when the constructor built one — the fusion
+    /// workspace's address and the two extents it was sized for.
+    ///
+    /// **Three of `Fusion`'s five fields are deliberately not in it.**
+    /// `buffers` and `flag_dev` are what `build_fusion` allocated and
+    /// initialised, and no launch reads either; carrying them would make this
+    /// a mirror of the private struct instead of a statement of what a launch
+    /// needs, and a mirror is a thing that can start disagreeing.
+    ///
+    /// [`CustomAllReduce::can_handle`] is NOT expressible through this and
+    /// stayed a method, which is the second half of the same argument: it
+    /// walks `self.buffers` for the registration check and queries the
+    /// stream's capture state, so it is a function of the instance rather than
+    /// of the plane.
+    #[must_use]
+    pub fn plane(&self) -> Plane {
+        Plane {
+            world_size: self.world_size,
+            rank: self.rank,
+            fusion: self.fusion.as_ref().map(|f| FusionPlane {
+                workspace: f.workspace_dev,
+                max_tokens: f.max_tokens,
+                hidden: f.hidden,
+            }),
+            peers: PeerPlane {
+                signals: self.signal_array(),
+                self_signal: usize::try_from(self.rank)
+                    .ok()
+                    .and_then(|at| self.signal_peers.get(at).copied())
+                    .unwrap_or(std::ptr::null_mut()),
+                // Per CALL, and this is the accessor that has no call to
+                // answer for. [`CustomAllReduce::plane_for`] is the one the
+                // plain reduction goes through.
+                rank_data: std::ptr::null_mut(),
+                fully_connected: self.fully_connected,
+            },
+        }
+    }
+
+    /// `vllm::RankSignals` — `Signal* signals[8]`, self included.
+    ///
+    /// Eight and not `world_size`, because upstream's struct is eight
+    /// pointers wide at every world size and the kernel is written against
+    /// that: `sg.signals[threadIdx.x]` under `if (threadIdx.x < ngpus)`.
+    /// Entries at or past `world_size` are never read and are zeroed here, so
+    /// a kernel that read one anyway faults instead of following a stale
+    /// address.
+    fn signal_array(&self) -> [*mut c_void; 8] {
+        let mut out = [std::ptr::null_mut(); 8];
+        for (slot, peer) in out.iter_mut().zip(self.signal_peers.iter()) {
+            *slot = *peer;
+        }
+        out
+    }
+
+    /// The plane a PLAIN reduction of `input` reduces through.
+    ///
+    /// [`CustomAllReduce::plane`] plus the one fact that is per call: the
+    /// `RankData*` slot `register_buffer` wrote for this input's base
+    /// allocation. `vllm::CustomAllreduce::allreduce` looked this up itself
+    /// (`vllm_custom_all_reduce.cuh:454-467`), and it is here because the
+    /// launcher descended and the map did not.
+    ///
+    /// Null `rank_data` is `Decline::Unregistered`, which is what upstream
+    /// threw. Two ways to get one, and they are upstream's two:
+    ///
+    /// * the input's base address is not in `buffers` — never registered;
+    /// * `cuPointerGetAttribute` will not name a base — not a device
+    ///   allocation this process made.
+    ///
+    /// # Capture is the third way, and it does NOT mutate here
+    ///
+    /// On a capturing stream upstream takes `d_rank_data_base_ +
+    /// graph_unreg_buffers_.size()` and pushes `input` onto
+    /// `graph_unreg_buffers_` in the same expression, so the slot is claimed
+    /// whether or not a kernel is enqueued. This computes the same address
+    /// and pushes NOTHING; [`CustomAllReduce::note_graph_buffer`] is the
+    /// push, and the caller makes it only after the launch actually happened.
+    /// A deferred registration for a launch that declined would bind the next
+    /// real one to the wrong slot, which is silent and rank-dependent.
     ///
     /// # Errors
     ///
-    /// The [`Decline`] that the corresponding `return false` stood for.
-    pub fn can_fuse_residual_rmsnorm(
-        &self,
-        tokens: i32,
-        hidden: i32,
-    ) -> std::result::Result<(), Decline> {
-        // `:490`.
-        let Some(fusion) = self.fusion.as_ref() else {
-            return Err(Decline::NoFusionWorkspace);
+    /// Never — an unresolvable input is a null `rank_data`, not an error,
+    /// because the launch half has a [`Decline`] for it and a caller that
+    /// gets an `Err` here cannot tell it from a broken stream.
+    #[must_use]
+    pub fn plane_for(&self, input: *const c_void, capturing: bool) -> Plane {
+        let mut plane = self.plane();
+        plane.peers.rank_data = if capturing {
+            // `register_graph_buffers` drains `graph_unreg_buffers` into
+            // `write_rank_data`, which starts at `rank_data_next` and lays the
+            // rows down in order -- so the slot this launch replays out of is
+            // that base plus however many captures are already queued.
+            let slot = self.rank_data_next + self.graph_unreg_buffers.len();
+            if self.rank_data.is_null() || slot >= self.rank_data_slots {
+                std::ptr::null_mut()
+            } else {
+                (self.rank_data as usize + slot * RANK_DATA_BYTES) as *mut c_void
+            }
+        } else {
+            base_ptr(input)
+                .ok()
+                .and_then(|base| self.buffers.get(&(base as usize)).copied())
+                .unwrap_or(std::ptr::null_mut())
         };
-        // `:491`.
-        if tokens <= 0 || tokens > fusion.max_tokens {
-            return Err(Decline::FusionTokens { tokens, max_tokens: fusion.max_tokens });
-        }
-        // `:492`.
-        if hidden != fusion.hidden {
-            return Err(Decline::FusionHidden { hidden, want: fusion.hidden });
-        }
-        // `:493`. The fusion plane is built for TP=2 only (`:308`), so this
-        // is unreachable from a constructed `Fusion` -- kept because the C++
-        // kept it and because it is the invariant, not a consequence.
-        if self.world_size != 2 {
-            return Err(Decline::FusionWorldSize { world_size: self.world_size });
-        }
-        // `:494`. The kernel's vector width in bf16 elements.
-        if hidden % 8 != 0 {
-            return Err(Decline::FusionHiddenNotOctet { hidden });
-        }
-        Ok(())
+        plane
     }
 
-    /// `custom_all_reduce.cu:603-621` — the plain bf16 in-place all-reduce.
+    /// Record that a CAPTURED launch claimed the next `RankData` slot for
+    /// `input` — upstream's `graph_unreg_buffers_.push_back(input)`.
     ///
-    /// `count` is an ELEMENT count, not bytes (`custom_all_reduce.hpp:100`).
-    ///
-    /// # The one line that has not crossed
-    ///
-    /// ```text
-    /// impl_->allreduce<__nv_bfloat16>(stream, in, out, (int)count, 36, 512);
-    /// ```
-    ///
-    /// `block_limit = 36` (`:612`) and `threads = 512` (`:613`) are the
-    /// tuning constants, carried as [`MAX_BLOCKS`] and [`ALL_REDUCE_THREADS`]
-    /// so they survive the file. `36` is not a choice here: it is
-    /// `vllm_custom_all_reduce.cuh:46`'s `kMaxBlocks`, and it is the first
-    /// dimension of the `Signal` counters, so a larger grid would index off
-    /// the end of a 3456-byte struct.
-    ///
-    /// `(int)count` at `:618` is a silent narrowing. It cannot bite today —
-    /// `can_handle` refuses above `max_bytes`, which defaults to 8 MiB —
-    /// but `all_reduce_bf16` never called `can_handle`, so nothing enforced
-    /// it. **When the launcher crosses, that narrowing becomes a refusal.**
-    ///
-    /// Nothing is appended to `graph_unreg_buffers` on the capture path, and
-    /// that is deliberate: see the field's note.
+    /// Split out of [`CustomAllReduce::plane_for`] so that the slot is
+    /// claimed only when a kernel was actually enqueued. `register_graph_buffers`
+    /// drains this list and fills the slots in order, so a push with no
+    /// launch behind it shifts every later replay onto the wrong peer
+    /// addresses.
+    pub fn note_graph_buffer(&mut self, input: *mut c_void) {
+        self.graph_unreg_buffers.push(input);
+    }
+}
+
+// ── how an ARM reaches it ────────────────────────────────────────────────
+
+thread_local! {
+    /// The plane this thread's fires reduce through — see [`ResidentPlane`].
+    static CURRENT: std::cell::Cell<*mut CustomAllReduce> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// One rank's plane, owned by the shell and published to the thread that
+/// fires.
+///
+/// # Why a thread-local and not a `DispatchCtx` field
+///
+/// A bind arm is a `fn(&Cx, *mut c_void)`, and [`Cx`](crate::bind::cx::Cx) is
+/// query-only by `northstar.md` §3.3: it answers facts about a STATEMENT, and
+/// a communicator is not one. `DispatchCtx` is where the driver's other
+/// per-fire handle lives — `ctx.cublas` — and that is the precedent this
+/// would otherwise follow.
+///
+/// It does not follow it, for a reason about ownership rather than taste. A
+/// `cublasHandle_t` is a `*mut c_void` that any thread may hold;
+/// `CustomAllReduce` is neither `Send` nor `Sync`, because every one of its
+/// methods assumes the calling thread holds the device context the
+/// constructor ran on, and because three other ranks hold the far end of its
+/// IPC handles. **A TP group's ranks are threads of one process** — the whole
+/// of `layout::rendezvous` is built on that — so "this thread's plane" is not
+/// an approximation of "this rank's plane", it is the same statement.
+///
+/// # What the type guarantees
+///
+/// Construction publishes and [`Drop`] retracts, so the raw pointer in
+/// `CURRENT` is live for exactly as long as the value behind it. The address
+/// is a `Box`'s, so it survives the shell being moved; and the shell holding
+/// a `!Send` field is what stops it being moved to a thread the publication
+/// would not follow.
+#[derive(Debug)]
+pub struct ResidentPlane(Box<CustomAllReduce>);
+
+impl ResidentPlane {
+    /// Publish `car` as the calling thread's plane.
     #[must_use]
-    pub fn all_reduce_bf16(
-        &mut self,
-        _input: *const c_void,
-        _output: *mut c_void,
-        count: usize,
-        _stream: *mut c_void,
-    ) -> AllReduce {
-        AllReduce::Declined(Decline::NoDeviceText {
-            what: "vllm::CustomAllreduce::allreduce<__nv_bfloat16>",
-            header: "flashinfer/comm/vllm_custom_all_reduce.cuh",
-            name_expression: format!(
-                "vllm::CustomAllreduce::allreduce<__nv_bfloat16>(stream, in, out, \
-                 {count}, {MAX_BLOCKS}, {ALL_REDUCE_THREADS})"
-            ),
-        })
+    pub fn publish(car: CustomAllReduce) -> Self {
+        let mut boxed = Box::new(car);
+        let at: *mut CustomAllReduce = &raw mut *boxed;
+        CURRENT.with(|slot| slot.set(at));
+        Self(boxed)
     }
 
-    /// `custom_all_reduce.cu:623-662` — the fused all-reduce + residual add
-    /// + RMSNorm.
-    ///
-    /// The C++ threw when `can_fuse_residual_rmsnorm` said no (`:633-635`);
-    /// that throw is the [`Decline`] the query returned, unchanged, which is
-    /// the whole point of the query returning one.
-    ///
-    /// # What has not crossed
-    ///
-    /// The launcher call at `:658-659`. Everything up to it — every field of
-    /// [`FusionParams`], and the four runtime values that select the
-    /// instantiation — is computed here, so the refusal names the exact
-    /// template point rather than the family.
+    /// The plane, for a caller that already has the shell.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn all_reduce_residual_rmsnorm_bf16(
-        &mut self,
-        input: *const c_void,
-        residual_inout: *mut c_void,
-        rms_gamma: *const c_void,
-        norm_out: *mut c_void,
-        tokens: i32,
-        hidden: i32,
-        eps: f32,
-        stream: *mut c_void,
-    ) -> AllReduce {
-        if let Err(decline) = self.can_fuse_residual_rmsnorm(tokens, hidden) {
-            return AllReduce::Declined(decline);
-        }
-        let Some(fusion) = self.fusion.as_ref() else {
-            return AllReduce::Declined(Decline::NoFusionWorkspace);
-        };
-        // `:637-661`, field for field and in the file's order.
-        let params = FusionParams {
-            nranks: self.world_size,
-            rank: self.rank,
-            size: tokens * hidden,
-            hidden_dim: hidden,
-            workspace: fusion.workspace_dev,
-            allreduce_in: input,
-            allreduce_out: std::ptr::null_mut(),
-            residual_in: residual_inout.cast_const(),
-            residual_out: residual_inout,
-            norm_out,
-            quant_out: std::ptr::null_mut(),
-            scale_out: std::ptr::null_mut(),
-            rms_gamma,
-            rms_eps: eps,
-            scale_factor: std::ptr::null(),
-            use_oneshot: true,
-            layout: "SWIZZLED_128x4",
-            stream,
-            pattern: FusionPattern::ARResidualRMSNorm,
-            trigger_completion_at_end: false,
-            launch_with_pdl: false,
-            use_fp32_acc: true,
-        };
-        match params.instantiation() {
-            Err(decline) => AllReduce::Declined(decline),
-            Ok(point) => AllReduce::Declined(Decline::NoDeviceText {
-                what: "flashinfer::trtllm_allreduce_fusion::allreduce_fusion_kernel_launcher",
-                header: "flashinfer/comm/trtllm_allreduce_fusion.cuh",
-                name_expression: point.name_expression(),
-            }),
-        }
+    pub fn plane(&self) -> Plane {
+        self.0.plane()
     }
+}
+
+impl Drop for ResidentPlane {
+    fn drop(&mut self) {
+        CURRENT.with(|slot| slot.set(std::ptr::null_mut()));
+    }
+}
+
+/// Run `f` against this thread's plane, or answer `None` when it has none.
+///
+/// **Re-entrant calls see `None`.** The pointer is taken out of the slot for
+/// the duration and restored after, so two overlapping `&mut` borrows of one
+/// `CustomAllReduce` cannot be produced even if an arm somehow re-entered the
+/// dispatch. Nothing does today; the property is what makes the `&mut` sound
+/// without a `RefCell`'s runtime cost on every fire.
+///
+/// `&mut` and not `&` because [`CustomAllReduce::register_buffer`] takes one,
+/// and an arm firing on a buffer the plane has never seen has to be able to
+/// register it — that is the call `can_handle`'s [`Decline::Unregistered`]
+/// exists to send a caller to.
+pub fn with_current<R>(f: impl FnOnce(&mut CustomAllReduce) -> R) -> Option<R> {
+    let at = CURRENT.with(|slot| slot.replace(std::ptr::null_mut()));
+    if at.is_null() {
+        return None;
+    }
+    // SAFETY: `ResidentPlane` publishes the address of its own `Box` and
+    // retracts it in `Drop`, so a non-null slot names a live value; the slot
+    // is nulled for the duration above, so no second `&mut` can be minted
+    // while this one is alive.
+    let out = f(unsafe { &mut *at });
+    CURRENT.with(|slot| slot.set(at));
+    Some(out)
 }
 
 /// `custom_all_reduce.cu:403-427` — the destructor.
@@ -1919,13 +1407,31 @@ unsafe fn reborrow<'a>(car: *mut c_void) -> Option<&'a mut CustomAllReduce> {
     Some(unsafe { &mut *car.cast::<CustomAllReduce>() })
 }
 
-/// `custom_all_reduce.hpp:164-180` — the free form of
-/// [`CustomAllReduce::all_reduce_bf16`].
+// THESE TWO ARE NOW THE WHOLE OF THE DRIVER'S SIDE, and that is what the
+// descent bought. Each used to be one of THREE layers -- `bind/service.rs`'s
+// `comm_all_reduce_bf16` called this, which called
+// `CustomAllReduce::all_reduce_bf16`, which built the refusal -- and the
+// middle layer's entire content was `reborrow` plus a forward. `bind/
+// service.rs` is deleted and the innermost layer is `kernels_cuda::comm`,
+// so what is left here is the one thing neither of the others could do:
+// **turn an opaque handle back into a Rust value.** `car` is a `*mut c_void`
+// because a row's operand is spelled `KernelParam::CustomAllReduce` and the
+// model compiler must not be able to tell whether a symbol is cuBLAS, a JIT'd
+// kernel or a Rust struct.
+//
+// Neither has a caller today, and neither did before: `bind/service.rs`'s
+// wrappers were called by a generated dispatch that no longer exists, so
+// `bind::route` answers `Route::Rows` for both symbols and the hand match has
+// no arm. That is a real gap and it is `bind/arms/comm.rs`-shaped, not this
+// file's; recording it here is the most a descent can do about it.
+
+/// `custom_all_reduce.hpp:164-180` — the plain P2P reduction, by handle.
 ///
 /// # Safety
 ///
 /// `car` is an opaque [`CustomAllReduce`] handle; `input` and `output`
-/// address at least `count` bf16 elements on the device.
+/// address at least `count` bf16 elements on the device, and `stream` names a
+/// live CUDA stream for the duration of the call.
 #[must_use]
 pub unsafe fn all_reduce_bf16(
     car: *mut c_void,
@@ -1938,17 +1444,50 @@ pub unsafe fn all_reduce_bf16(
     let Some(car) = (unsafe { reborrow(car) }) else {
         return AllReduce::Declined(Decline::NoInstance);
     };
-    car.all_reduce_bf16(input, output, count, stream)
+    // The capture query is the driver's because the plane is: it decides
+    // WHICH `RankData` slot the launch addresses, and under capture that slot
+    // is one nothing has filled yet -- `register_graph_buffers` fills it once
+    // the peers have exchanged handles for the replayed addresses.
+    let Some(capturing) = capturing(stream) else {
+        return AllReduce::Declined(Decline::CaptureUnknown);
+    };
+    let plane = car.plane_for(input, capturing);
+    // SAFETY: `stream` is the caller's, live across the call.
+    let ctx = unsafe { kernels_cuda::jit::Ctx::on(stream) };
+    let fired = kernels_cuda::comm::all_reduce_bf16(&ctx, plane, input, output, count);
+    // Upstream pushed BEFORE the launch and could not tell the two apart; the
+    // push is here, after, so a decline claims no slot. `plane_for`'s doc has
+    // the argument.
+    if capturing && fired == AllReduce::Launched {
+        car.note_graph_buffer(input.cast_mut());
+    }
+    fired
 }
 
-/// `custom_all_reduce.hpp:186-201` — the free form of
-/// [`CustomAllReduce::all_reduce_residual_rmsnorm_bf16`].
+/// Whether `stream` is capturing, or `None` if the driver would not say.
+///
+/// `custom_all_reduce.cu:470`'s query, hoisted out of `can_handle` so the
+/// launch path can ask it too: both readers want the same fact and the C++
+/// asked it twice.
+fn capturing(stream: *mut c_void) -> Option<bool> {
+    let mut status = cudaStreamCaptureStatus::cudaStreamCaptureStatusNone;
+    // SAFETY: `stream` is a `cudaStream_t` from the caller (null is the legal
+    // default stream) and the out-parameter is live.
+    if unsafe { cudaStreamIsCapturing(stream as cudaStream_t, &mut status) }
+        != cudaError::cudaSuccess
+    {
+        return None;
+    }
+    Some(status == cudaStreamCaptureStatus::cudaStreamCaptureStatusActive)
+}
+
+/// `custom_all_reduce.hpp:186-201` — the fused landing, by handle.
 ///
 /// # Safety
 ///
 /// `car` is an opaque [`CustomAllReduce`] handle; `input`, `residual_inout`
-/// and `norm_out` address at least `tokens * hidden` bf16 elements, and
-/// `rms_gamma` at least `hidden`.
+/// and `norm_out` address at least `tokens * hidden` bf16 elements,
+/// `rms_gamma` at least `hidden`, and `stream` names a live CUDA stream.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn all_reduce_residual_rmsnorm_bf16(
@@ -1966,7 +1505,11 @@ pub unsafe fn all_reduce_residual_rmsnorm_bf16(
     let Some(car) = (unsafe { reborrow(car) }) else {
         return AllReduce::Declined(Decline::NoInstance);
     };
-    car.all_reduce_residual_rmsnorm_bf16(
+    // SAFETY: as above.
+    let ctx = unsafe { kernels_cuda::jit::Ctx::on(stream) };
+    kernels_cuda::comm::all_reduce_residual_rmsnorm_bf16(
+        &ctx,
+        car.plane(),
         input,
         residual_inout,
         rms_gamma,
@@ -1974,7 +1517,6 @@ pub unsafe fn all_reduce_residual_rmsnorm_bf16(
         tokens,
         hidden,
         eps,
-        stream,
     )
 }
 
@@ -2019,10 +1561,7 @@ pub unsafe fn register_graph_buffers(car: *mut c_void) -> crate::error::Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AOT_POINTS_AFTER_PRUNING, Decline, FusionPattern, INSTANTIATED, LAMPORT_COMM_CAP,
-        RANK_DATA_BYTES, REACHED, SIGNAL_BYTES, UPSTREAM_POINTS, align_up, resolve,
-    };
+    use super::{LAMPORT_COMM_CAP, RANK_DATA_BYTES, SIGNAL_BYTES, align_up};
 
     /// Every constant this file carries is host arithmetic over an upstream
     /// struct layout, and none of it touches a device. That is the whole
@@ -2044,42 +1583,17 @@ mod tests {
         assert_eq!(align_up(LAMPORT_COMM_CAP, 1 << 21), LAMPORT_COMM_CAP);
     }
 
-    #[test]
-    fn the_cross_product_is_the_number_kernels_def_measured() {
-        assert_eq!(UPSTREAM_POINTS, 240);
-        // `4 nranks x 1 pattern x 2 fp32_acc x 3 leaves`.
-        assert_eq!(AOT_POINTS_AFTER_PRUNING, 24);
-        assert_eq!(INSTANTIATED.len(), 1);
-        assert_eq!(INSTANTIATED[0], FusionPattern::ARResidualRMSNorm);
-    }
-
-    #[test]
-    fn the_one_reached_point_resolves() {
-        let got = resolve(REACHED.nranks, REACHED.pattern, REACHED.fp32_acc, true, false)
-            .expect("the one point pie reaches must resolve");
-        assert_eq!(got, REACHED);
-    }
-
-    #[test]
-    fn an_uninstantiated_pattern_declines_with_its_code() {
-        // The nine patterns pie never selects were the 96%.
-        let err = resolve(2, FusionPattern::ARResidualRMSNormFp8Quant, true, true, false)
-            .expect_err("an unpruned pattern must decline");
-        assert_eq!(
-            err,
-            Decline::PatternNotInstantiated {
-                code: FusionPattern::ARResidualRMSNormFp8Quant.code()
-            }
-        );
-    }
-
-    #[test]
-    fn an_unsupported_world_size_declines_before_the_pattern_is_read() {
-        // Upstream's switch is on `nranks` first (`trtllm_allreduce_fusion.
-        // cuh`'s launcher dispatch), so a world size of 3 refuses even for a
-        // pattern that is instantiated.
-        let err = resolve(3, FusionPattern::ARResidualRMSNorm, true, true, false)
-            .expect_err("world_size 3 must decline");
-        assert_eq!(err, Decline::WorldSizeUnsupported { nranks: 3 });
-    }
+    // FOUR MORE TESTS STOOD HERE AND ARE `kernels_cuda::comm`'s, with the
+    // cross product they assert on: `the_cross_product_is_the_number_kernels_\
+    // def_measured`, `the_one_reached_point_resolves`,
+    // `an_uninstantiated_pattern_declines_with_its_code` and
+    // `an_unsupported_world_size_declines_before_the_pattern_is_read`. They
+    // did not stay behind the re-export, and that is the point: a test that
+    // reaches its subject through a `pub use` is testing the re-export.
+    //
+    // The two above stayed because their subjects did. `SIGNAL_BYTES`,
+    // `RANK_DATA_BYTES`, `LAMPORT_COMM_CAP` and `align_up` size the PLANE and
+    // are spent by the constructor in this file; the cross product sizes a
+    // LAUNCH. That is the same line the whole split is drawn on, and these
+    // six tests are where it is easiest to see.
 }

@@ -16,7 +16,7 @@
 //!   [`crate::spirv::Declared::bindings`] for exactly this reason.
 //! * A push range may not be wider than the block the module declares, and it
 //!   may not be narrower than what the shader reads.
-//! * `robustBufferAccess` must be on. `quant/qmm_t.comp` accumulates over its
+//! * `robustBufferAccess` must be on. `quant/qmm_t.slang` accumulates over its
 //!   whole tile and guards only the store, so at a ragged shape it deliberately
 //!   fetches outside the matrix and needs those reads defined as zero.
 //! * A descriptor's offset must be a multiple of
@@ -280,6 +280,47 @@ impl From<spirv::Malformed> for Failed {
 
 /// End the process on a validation error, printing what the layer said.
 ///
+/// # Running with the layer at all
+///
+/// Every command in this repository's history disables it -- `VK_LAYER_PATH=`
+/// is set empty in the gate invocations and in the sweep -- so this callback
+/// went a long time without ever firing. Ubuntu has no validation package
+/// installed by default either. To actually use it:
+///
+/// ```sh
+/// cd /tmp && apt-get download vulkan-validationlayers
+/// dpkg-deb -x vulkan-validationlayers_*.deb /tmp/vvl
+/// VK_LAYER_PATH=/tmp/vvl/usr/share/vulkan/explicit_layer.d \
+/// LD_LIBRARY_PATH=/tmp/vvl/usr/lib/x86_64-linux-gnu \
+/// VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
+///   cargo test -p driver-vulkan --features native --test device -- --nocapture
+/// ```
+///
+/// `--nocapture` matters: without it the abort below takes the process down
+/// before the harness prints what this callback wrote, and the failure looks
+/// like an unexplained SIGABRT. That is exactly how the first real find --
+/// two tests passing one `VkDevice`'s buffers to another's commands --
+/// presented itself.
+///
+/// Measured clean this way, with GPU-assisted validation on: the 40 kernel
+/// proofs, the 71 device tests (329 s under the layer), all twelve end-to-end
+/// gates, and the full 40-program inferlet sweep, which is the broadest thing
+/// there is to point it at -- 36/40, the four being the model-gated attention
+/// intrinsics that refuse on every backend. The layer was confirmed loaded in
+/// the server process rather than assumed, since a clean run under a layer
+/// that never loaded says nothing at all.
+///
+/// Re-measured after the shader tree moved from GLSL to Slang, and that is
+/// the reason to re-measure rather than to trust the paragraph above. The
+/// bodies did not change what they do, but the COMPILER changed what they
+/// declare: `slangc` spells 8-bit storage access with the wider
+/// `UniformAndStorageBuffer8BitAccess` capability, and a module may not
+/// declare a capability whose feature is off. Two devices had to ask for it
+/// -- this one, and the separate one `kernels-vulkan`'s harness builds -- and
+/// neither omission was visible without the layer: this NVIDIA driver loads
+/// the module regardless, so all 250 driver tests, all 40 proofs and 36/40 of
+/// the sweep passed while both were wrong.
+///
 /// # Safety
 ///
 /// Called by the Vulkan loader with a `p_callback_data` valid for the duration
@@ -305,6 +346,69 @@ unsafe extern "system" fn fail_on_validation_error(
     // Abort and not panic: this is called across an `extern \"system\"`
     // boundary, where an unwind is undefined.
     std::process::abort();
+}
+
+/// Where a fire's time actually goes, per kernel, measured on the device.
+///
+/// Every performance claim in this crate before this existed was wall-clock
+/// around a `queue_submit`/`wait_for_fences` pair. That answers "how long did
+/// the step take" and nothing else: a decode is four hundred and fifty
+/// dispatches, and which of them the milliseconds belong to has never been
+/// askable here. Deciding what to optimise from a single number is deciding
+/// from a guess, and the guesses this crate has had to throw away -- the model
+/// was in system RAM, the coopmat modules were unreachable, the logits
+/// readback was uncached -- were all found by measuring a level down.
+///
+/// Off unless `PIE_VULKAN_TIMING` is set in the environment, because it is not
+/// free: two `vkCmdWriteTimestamp`s per dispatch, and a `vkGetQueryPoolResults`
+/// that blocks on the same fence the fire already waited for.
+///
+/// ## What it costs, which is more than it looks
+///
+/// Measured, release, the 4-bit qwen3-0.6b at twenty-four tokens: the
+/// submit-and-wait around one decode fire is **3.47 ms with this off and 5.78
+/// ms with it on**. Two thirds added to the very thing being measured. The
+/// pool reset is 453 queries of it, but most of it is the timestamps
+/// themselves: a `BOTTOM_OF_PIPE` write after every dispatch is a point the
+/// card cannot finish early, so neighbouring dispatches that had been
+/// overlapping stop.
+///
+/// So the absolute milliseconds this reports are an upper bound and not a
+/// benchmark, and a claim of the form "this kernel takes N ms" must not be
+/// built on them. What survives the perturbation is the SHARES, and only
+/// because the differences that matter here are far larger than it: attention
+/// goes from a fifth of device time to three quarters between short and long
+/// context, which two thirds of added overhead cannot manufacture.
+///
+/// It also means the honest way to measure the driver's own overhead is with
+/// this off, timing the submit against the wall.
+///
+/// ## What the numbers mean, and what they do not
+///
+/// One timestamp is written at `TOP_OF_PIPE` before the first dispatch and one
+/// at `BOTTOM_OF_PIPE` after each, so slot `i + 1` minus slot `i` is the time
+/// from "everything before this dispatch had finished" to "this dispatch had
+/// finished" -- which includes any barrier recorded in front of it. That is
+/// the honest unit: a barrier exists because of the dispatch after it, and
+/// charging it there is what makes the per-symbol totals add up to the fire.
+///
+/// The attribution is only exact where the dispatches cannot overlap. Two
+/// neighbours with no barrier between them may run at once on this card, and
+/// then the first one's slice absorbs work the second one did. So a symbol's
+/// total is an upper bound on its own time and the SUM over a fire is right;
+/// treat a single row as "this much time had passed by here", not as an
+/// isolated kernel benchmark.
+struct Timing {
+    pool: vk::QueryPool,
+    /// Nanoseconds per tick, from `VkPhysicalDeviceLimits::timestampPeriod`.
+    period: f32,
+    /// How many queries the pool holds. A fire needing more is skipped whole
+    /// rather than reported in part, and counted in `skipped`.
+    slots: u32,
+    /// Symbol to (total ticks, times dispatched).
+    per_symbol: Mutex<HashMap<String, (u64, u32)>>,
+    /// Fires that had more dispatches than the pool has slots.
+    skipped: std::sync::atomic::AtomicU32,
 }
 
 /// An open Vulkan device with a compute queue.
@@ -346,6 +450,16 @@ pub struct Device {
     /// BAR -- and a driver that concluded "unified" from finding one would be
     /// wrong about every allocation that did not fit in it.
     unified: bool,
+
+    /// Whether the device reports itself as a CPU implementation.
+    ///
+    /// Narrower than [`Self::unified`] on purpose: that one is about where
+    /// memory lives and is true of an integrated GPU as well, which is a real
+    /// device with a real clock. This is about whether there is a GPU at all.
+    /// It exists because a wall-clock BUDGET is meaningful on hardware and
+    /// meaningless on `llvmpipe`, and a suite run there should say which it is
+    /// rather than fail a regression guard that was calibrated elsewhere.
+    software: bool,
     validated: bool,
     /// The tiers this device can actually load, best first.
     ///
@@ -369,6 +483,35 @@ pub struct Device {
     /// difference between one allocation per fire and one per scalar block,
     /// since both answer correctly.
     allocations: std::sync::atomic::AtomicU32,
+    /// How many pipeline barriers the fires on this device have recorded.
+    ///
+    /// A number, not a duration, for the reason every counter here is one: a
+    /// `hazards` that answered `true` for everything would record the same
+    /// right answers this driver recorded before it existed, only slowly, and
+    /// on a shared machine a duration measures the neighbours. What a test
+    /// can hold is that a fire of `n` dispatches records FEWER than `n - 1`
+    /// of these and more than none.
+    barriers: std::sync::atomic::AtomicU32,
+    /// The staging buffer [`Device::read_at`] DMAs into, kept between reads.
+    ///
+    /// Grown to the largest read asked for and never shrunk, which is the
+    /// rule `Scratch`'s descriptor pool follows for the same reason: a
+    /// server's reads are the same two or three sizes forever, so a cache
+    /// reaches the largest of them and then stops being an allocation at all.
+    /// Measured, and the reason it exists: a create-plus-allocate-plus-free
+    /// costs about 260 us on this card, which is a twentieth of a decode.
+    ///
+    /// `None` until the first staged read, so a device that never reads back
+    /// -- and every device on a machine with no checkpoint -- allocates
+    /// nothing.
+    staging: Mutex<Option<Buffer>>,
+    /// Reads that went through the copy engine rather than through a mapping.
+    ///
+    /// Counted because the difference between the two is thirty seconds on a
+    /// prefill and nothing at all in the answer, so a change that quietly
+    /// stopped staging would show up only as a slow server. See
+    /// [`Device::read_at`].
+    staged: std::sync::atomic::AtomicU32,
     /// How many buffers this device has freed, ever.
     ///
     /// The other half of [`Device::live_buffers`]. A path that returns early
@@ -376,6 +519,21 @@ pub struct Device {
     /// twenty-four gigabytes and a scalar block is tens of bytes, so nothing
     /// downstream ever fails -- and this is what makes that countable.
     frees: std::sync::atomic::AtomicU32,
+    /// How many BYTES this device has uploaded through [`Device::write`].
+    ///
+    /// Bytes rather than calls, because the question this answers is about
+    /// bus traffic and the calls differ by five orders of magnitude: a fire
+    /// table is tens of bytes and a prefill's arena was 233 megabytes.
+    ///
+    /// It exists because "the device made these bytes itself" is a claim
+    /// about a route, and this crate has now had the same route mistake three
+    /// times without a single test going red -- the contents were always
+    /// correct. Counting the bus makes the claim checkable without timing
+    /// anything, which on a shared box is the difference between a tripwire
+    /// and a flaky test. See `turns::arena_for`.
+    uploaded: std::sync::atomic::AtomicU64,
+    /// Per-kernel device time, when `PIE_VULKAN_TIMING` asked for it.
+    timing: Option<Timing>,
 }
 
 /// What one fire allocates, kept between fires.
@@ -535,6 +693,242 @@ impl Scratch {
     }
 }
 
+/// One physical device the loader offered, and everything needed to
+/// decide whether to run on it.
+///
+/// This exists because the previous line of code was `devices.first()`,
+/// and the Vulkan specification says nothing whatsoever about the order
+/// `vkEnumeratePhysicalDevices` returns. On the machine this crate was
+/// developed on that call returns the discrete card at index 0 and a
+/// `llvmpipe` software rasteriser at index 1 -- so every number ever
+/// measured here was measured on the card, and none of it was because the
+/// code asked. Reorder the ICD manifests, run on a laptop whose iGPU
+/// enumerates first, or use a loader build without the device-select
+/// sort, and the whole suite would have moved onto a CPU implementation,
+/// passed every correctness test it has, and got slower by two orders of
+/// magnitude while saying nothing.
+///
+/// So the choice is made here, from the device's own reported type, and
+/// the software adapter is chosen only when it is the only thing that can
+/// compute at all.
+struct Candidate {
+    handle: vk::PhysicalDevice,
+    props: vk::PhysicalDeviceProperties,
+    name: String,
+    /// `None` means this device cannot run a compute shader, which is why
+    /// picking one is not simply a matter of ranking types. A device with
+    /// no compute queue is not a worse choice, it is not a choice.
+    compute_family: Option<u32>,
+}
+
+impl Candidate {
+    fn read(instance: &ash::Instance, handle: vk::PhysicalDevice) -> Self {
+        let props = unsafe { instance.get_physical_device_properties(handle) };
+        let name = props
+            .device_name_as_c_str()
+            .map_or_else(|_| "<unnamed>".to_string(), |s| s.to_string_lossy().into());
+        let compute_family =
+            unsafe { instance.get_physical_device_queue_family_properties(handle) }
+                .iter()
+                .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
+                .map(|i| i as u32);
+        Self {
+            handle,
+            props,
+            name,
+            compute_family,
+        }
+    }
+
+    /// Lower is better. The order is the one an inference runtime wants and
+    /// not the one the enum happens to declare: a real card, then a shared
+    /// one, then a virtualised one, then whatever `OTHER` is, and a CPU
+    /// implementation last of all because it is a correctness tool rather
+    /// than a device.
+    /// The reported type as a word. `PhysicalDeviceType` is a newtype over an
+    /// integer with no `Debug`, and a bare number in the one message a user
+    /// with no working device ever sees would tell them nothing.
+    fn kind(&self) -> &'static str {
+        match self.props.device_type {
+            vk::PhysicalDeviceType::DISCRETE_GPU => "discrete",
+            vk::PhysicalDeviceType::INTEGRATED_GPU => "integrated",
+            vk::PhysicalDeviceType::VIRTUAL_GPU => "virtual",
+            vk::PhysicalDeviceType::CPU => "software",
+            _ => "other",
+        }
+    }
+
+    fn rank(&self) -> u8 {
+        match self.props.device_type {
+            vk::PhysicalDeviceType::DISCRETE_GPU => 0,
+            vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
+            vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
+            vk::PhysicalDeviceType::CPU => 4,
+            _ => 3,
+        }
+    }
+
+    /// The best device that can compute, or `None` if none can.
+    ///
+    /// `PIE_VULKAN_DEVICE` overrides the ranking with a case-insensitive
+    /// substring of the device name -- which is how the software adapter
+    /// gets deliberately selected, and the only reason this crate can
+    /// prove the ranking works rather than assert it. An override that
+    /// matches nothing that can compute is a refusal, not a fallback: a
+    /// run that was asked for a named device and silently got another one
+    /// would be a worse failure than not starting.
+    fn choose(seen: &[Self]) -> Option<&Self> {
+        Self::choose_from(seen, std::env::var("PIE_VULKAN_DEVICE").ok().as_deref())
+    }
+
+    /// The decision itself, with the override passed in rather than read.
+    ///
+    /// Split out so that it is a pure function of its arguments, which is the
+    /// only way the ranking can be tested against device shapes this machine
+    /// does not have -- and, less obviously, the only way those tests can run
+    /// in PARALLEL. A `choose` that reads the environment can only be tested
+    /// by a test that writes it, and two such tests in one process race each
+    /// other rather than the code. This one was written the other way first
+    /// and the ranking test failed intermittently for exactly that reason.
+    fn choose_from<'a>(seen: &'a [Self], want: Option<&str>) -> Option<&'a Self> {
+        let usable = || seen.iter().filter(|c| c.compute_family.is_some());
+        match want.map(str::trim).filter(|w| !w.is_empty()) {
+            Some(want) => {
+                let want = want.to_ascii_lowercase();
+                usable().find(|c| c.name.to_ascii_lowercase().contains(&want))
+            }
+            None => usable().min_by_key(|c| c.rank()),
+        }
+    }
+
+    /// Every device seen and why it was or was not eligible, for the one
+    /// message a user gets when nothing here can run.
+    fn roster(seen: &[Self]) -> String {
+        if seen.is_empty() {
+            return "nothing at all".to_string();
+        }
+        seen.iter()
+            .map(|c| {
+                let q = if c.compute_family.is_some() {
+                    "compute"
+                } else {
+                    "NO compute queue"
+                };
+                format!("{} ({}, {q})", c.name, c.kind())
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// The one `(M, N, K, types, scope)` every `@coopmat` module in this tree uses.
+///
+/// `quant/qmm_t.slang` declares `CoopMat<half, Subgroup, 16, 16, MatrixA>`,
+/// the same for B, and `CoopMat<float, Subgroup, 16, 16, MatrixAccumulator>`.
+/// Every other coopmat module here matches it. One shape, so one query.
+const OUR_MATRIX: (u32, u32, u32) = (16, 16, 16);
+
+/// Whether the device advertises the configuration the coopmat tier needs.
+///
+/// The point of this function is that the FEATURE BIT DOES NOT IMPLY IT.
+/// `VK_KHR_cooperative_matrix` guarantees no configuration whatsoever; the
+/// device publishes a list and anything off it is undefined behaviour. On the
+/// machine this was written on, the discrete card publishes fifteen entries
+/// including this one, and Mesa's `lavapipe` -- which advertises the
+/// extension, the feature, `shaderFloat16` and the memory model, and passes
+/// every other admission test this crate had -- publishes four, all 8x8x8.
+/// Handing it a 16x16x16 matrix segfaulted inside `vkCreateComputePipelines`
+/// while the validation layer reported nothing, which is the correct
+/// behaviour of a validation layer: undefined is not invalid.
+fn advertises_the_matrix_this_tree_uses(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+) -> bool {
+    let ext = ash::khr::cooperative_matrix::Instance::new(entry, instance);
+    let props = unsafe { ext.get_physical_device_cooperative_matrix_properties(physical) }
+        .unwrap_or_default();
+    let (m, n, k) = OUR_MATRIX;
+    props.iter().any(|c| {
+        c.m_size == m
+            && c.n_size == n
+            && c.k_size == k
+            // A and B are `half`, the accumulator and the result `float`. All
+            // four are checked because a device may publish the shape with
+            // other component types and that is a different matrix.
+            && c.a_type == vk::ComponentTypeKHR::FLOAT16
+            && c.b_type == vk::ComponentTypeKHR::FLOAT16
+            && c.c_type == vk::ComponentTypeKHR::FLOAT32
+            && c.result_type == vk::ComponentTypeKHR::FLOAT32
+            // Subgroup scope, because that is what the typealias says. A
+            // workgroup-scoped entry of the same shape is not this matrix.
+            && c.scope == vk::ScopeKHR::SUBGROUP
+    })
+}
+
+/// How long a fence wait may take before the driver calls it a failure.
+///
+/// This was `fence_timeout_ns()` written out three times, with nothing saying what
+/// the number was for or what it cost. It is a deadlock guard: a `vkQueueSubmit`
+/// whose fence never signals would otherwise wedge the calling thread forever,
+/// and a scheduler blocked in an un-timed wait cannot even report that it is
+/// stuck. Ten seconds is enormous next to the ~5 ms a decode step takes on the
+/// card this was written against.
+///
+/// The cost is that a device merely SLOW is indistinguishable from a device
+/// that is gone. That is not hypothetical and it is not new -- `fire`'s
+/// recovery path already documents a prefill tile missing this wait in a debug
+/// build under two validation layers, and how the timeout was then buried
+/// under the fault it caused. Measured again, and much harder, on Mesa's
+/// `llvmpipe`: with the coopmat tier correctly declined, 59 of this crate's 72
+/// device tests pass there and 13 fail, none of them on an answer. They fail
+/// on this number. A CPU implementation running a real model's prefill does
+/// not finish a tile in ten seconds and never will.
+///
+/// So the deadline is now named, stated once, and can be raised for a device
+/// that deserves more time. `PIE_VULKAN_FENCE_TIMEOUT_SECS` takes whole
+/// seconds; a value that does not parse, or is zero, is ignored in favour of
+/// the default, because a submit with no deadline at all is the hang this
+/// exists to prevent and a typo should not buy one.
+fn fence_timeout_ns() -> u64 {
+    const DEFAULT_SECS: u64 = 10;
+    let secs = std::env::var("PIE_VULKAN_FENCE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(DEFAULT_SECS);
+    // Saturating, because `u64::MAX` nanoseconds is how Vulkan spells "wait
+    // forever" and nobody should reach it by writing a large number of
+    // seconds. Clamped an hour below it so the multiplication cannot land
+    // there by accident.
+    secs.saturating_mul(1_000_000_000).min(u64::MAX - 1)
+}
+
+/// What a device that ran out of time is told, and it is not `TIMEOUT`.
+///
+/// The deadline above is raisable, which is worth nothing to the person who
+/// hits it, because the three wait sites reported `wait: ERROR_TIMEOUT` and
+/// stopped there. That names neither how long the driver actually waited nor
+/// the one environment variable that would have let it wait longer. The
+/// knob existed and was reachable only by reading this file.
+///
+/// It is the timeout arm specifically that gets the longer message.
+/// `ERROR_DEVICE_LOST` is a different event with a different remedy, and
+/// telling someone whose GPU fell off the bus to raise a deadline would send
+/// them the wrong way.
+fn waited_too_long(during: &str, e: vk::Result, ns: u64) -> Failed {
+    if e == vk::Result::TIMEOUT {
+        let secs = ns / 1_000_000_000;
+        return Failed::Vulkan(format!(
+            "{during}: wait: the device did not signal within {secs}s. That is a \
+             deadlock guard, not a device limit -- a slow device (a software \
+             adapter running a real model's prefill, say) needs more than the \
+             default. Raise it with PIE_VULKAN_FENCE_TIMEOUT_SECS=<whole seconds>."
+        ));
+    }
+    Failed::Vulkan(format!("{during}: wait: {e}"))
+}
+
 impl Device {
     /// Open the first device with a compute queue.
     ///
@@ -654,22 +1048,23 @@ impl Device {
             Ok(d) => d,
             Err(e) => bail!("cannot enumerate devices: {e}"),
         };
-        let Some(&physical) = devices.first() else {
+        if devices.is_empty() {
             bail!("the loader found no physical device")
-        };
-
-        let props = unsafe { instance.get_physical_device_properties(physical) };
-        let name = props
-            .device_name_as_c_str()
-            .map_or_else(|_| "<unnamed>".to_string(), |s| s.to_string_lossy().into());
-
-        let family = unsafe { instance.get_physical_device_queue_family_properties(physical) }
+        }
+        let seen: Vec<Candidate> = devices
             .iter()
-            .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE));
-        let Some(family) = family else {
-            bail!("{name} has no compute queue")
+            .map(|&d| Candidate::read(&instance, d))
+            .collect();
+        let Some(chosen) = Candidate::choose(&seen) else {
+            bail!(
+                "no device here can compute. The loader offered {}",
+                Candidate::roster(&seen)
+            )
         };
-        let family = family as u32;
+        let physical = chosen.handle;
+        let name = chosen.name.clone();
+        let family = chosen.compute_family.expect("choose() only returns those");
+        let props = chosen.props;
 
         // Ask what the device has, then enable the subset the shader tree
         // needs. Naming them one by one rather than handing back everything
@@ -707,7 +1102,7 @@ impl Device {
         let core = unsafe { instance.get_physical_device_features(physical) };
 
         if core.robust_buffer_access != vk::TRUE {
-            // Refusing rather than continuing. `quant/qmm_t.comp` fetches
+            // Refusing rather than continuing. `quant/qmm_t.slang` fetches
             // outside its matrix on purpose and needs those reads defined as
             // zero; without this the spec allows neighbouring memory, which is
             // a wrong answer and not a crash.
@@ -723,6 +1118,18 @@ impl Device {
             .shader_float16(f12.shader_float16 == vk::TRUE)
             .shader_int8(f12.shader_int8 == vk::TRUE)
             .storage_buffer8_bit_access(f12.storage_buffer8_bit_access == vk::TRUE)
+            // The UNIFORM half is asked for as well, and it is not redundant.
+            // The shaders only ever put `uint8_t` in a storage buffer, and
+            // `glslc` used to emit exactly `StorageBuffer8BitAccess` for that.
+            // `slangc` emits the wider `UniformAndStorageBuffer8BitAccess`
+            // instead -- the same access, spelled with the capability that
+            // also covers UBOs -- and a module may not DECLARE a capability
+            // whose feature is off, whatever it goes on to do with it
+            // (`VUID-VkShaderModuleCreateInfo-pCode-08740`, which the
+            // validation layer reported on the first module the device loads).
+            .uniform_and_storage_buffer8_bit_access(
+                f12.uniform_and_storage_buffer8_bit_access == vk::TRUE,
+            )
             .vulkan_memory_model(f12.vulkan_memory_model == vk::TRUE)
             .vulkan_memory_model_device_scope(f12.vulkan_memory_model_device_scope == vk::TRUE);
         let mut ecm = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default()
@@ -746,15 +1153,30 @@ impl Device {
         //
         // `vulkanMemoryModelDeviceScope` is the subtle one and it is not
         // optional: turning the memory model on changes the rules for EVERY
-        // module the device loads, and `moe/route.comp` -- a BASELINE module
+        // module the device loads, and `moe/route.slang` -- a BASELINE module
         // that has nothing to do with matrices -- counts token histograms with
         // a device-scoped `atomicAdd`. Enabling the model without the scope
         // breaks it.
+        //
+        // And the CONFIGURATION, which the feature bit does not imply.
+        // `VK_KHR_cooperative_matrix` promises no shape at all: a device
+        // advertises a list of `(M, N, K, types, scope)` tuples and a
+        // `coopmat` outside that list is undefined behaviour, not a slow path.
+        // Asking only the feature was measured wrong rather than argued:
+        // Mesa's `lavapipe` advertises the extension, the feature, `float16`
+        // and the memory model, and advertises exactly four configurations,
+        // all of them 8x8x8. This tree's matrices are 16x16x16 -- see
+        // `quant/qmm_t.slang`, whose `MatA`/`MatB`/`MatAcc` fix that shape --
+        // so admitting the tier there handed the driver a matrix it had never
+        // claimed, and `vkCreateComputePipelines` segfaulted with the
+        // validation layer reporting nothing at all. It reports nothing
+        // because nothing illegal happened: undefined is not invalid.
         let coopmat = has_coopmat
             && fcm.cooperative_matrix == vk::TRUE
             && f12.shader_float16 == vk::TRUE
             && f12.vulkan_memory_model == vk::TRUE
-            && f12.vulkan_memory_model_device_scope == vk::TRUE;
+            && f12.vulkan_memory_model_device_scope == vk::TRUE
+            && advertises_the_matrix_this_tree_uses(&entry, &instance, physical);
 
         let mut tiers = vec![Capability::Baseline];
         if f12.shader_float16 == vk::TRUE {
@@ -817,6 +1239,34 @@ impl Device {
         };
 
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
+        // Timestamps, if asked for and if the device can answer.
+        //
+        // `timestampComputeAndGraphics` is the one check worth making: the
+        // specification says that when it is true, every queue family that
+        // supports graphics or compute reports 64 valid timestamp bits. A
+        // device that says false may still support them on some family, and
+        // this driver does not go looking -- a measurement tool that reports
+        // on some cards and silently mis-reports on others is worse than one
+        // that says it is unavailable.
+        let timing = (std::env::var_os("PIE_VULKAN_TIMING").is_some()
+            && props.limits.timestamp_compute_and_graphics == vk::TRUE
+            && props.limits.timestamp_period > 0.0)
+            .then(|| {
+                let slots = 4096u32;
+                let info = vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(slots);
+                unsafe { device.create_query_pool(&info, None) }
+                    .ok()
+                    .map(|pool| Timing {
+                        pool,
+                        period: props.limits.timestamp_period,
+                        slots,
+                        per_symbol: Mutex::new(HashMap::new()),
+                        skipped: std::sync::atomic::AtomicU32::new(0),
+                    })
+            })
+            .flatten();
         Ok(Self {
             entry,
             messenger,
@@ -833,12 +1283,53 @@ impl Device {
                 props.device_type,
                 vk::PhysicalDeviceType::INTEGRATED_GPU | vk::PhysicalDeviceType::CPU
             ),
+            software: props.device_type == vk::PhysicalDeviceType::CPU,
             validated,
             tiers,
             scratch: Mutex::new(scratch),
             allocations: std::sync::atomic::AtomicU32::new(0),
+            barriers: std::sync::atomic::AtomicU32::new(0),
+            staging: Mutex::new(None),
+            staged: std::sync::atomic::AtomicU32::new(0),
             frees: std::sync::atomic::AtomicU32::new(0),
+            uploaded: std::sync::atomic::AtomicU64::new(0),
+            timing,
         })
+    }
+
+    /// Where the device time went, per kernel, since this device was opened.
+    ///
+    /// Empty unless `PIE_VULKAN_TIMING` was set in the environment when the
+    /// device was opened -- see [`Timing`], which also states what the numbers
+    /// do and do not mean. Sorted longest first, as milliseconds and the
+    /// number of dispatches that made them up.
+    #[must_use]
+    pub fn timings(&self) -> Vec<(String, f64, u32)> {
+        let Some(t) = self.timing.as_ref() else {
+            return Vec::new();
+        };
+        let per = t
+            .per_symbol
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut rows: Vec<(String, f64, u32)> = per
+            .iter()
+            .map(|(k, (ticks, n))| (k.clone(), *ticks as f64 * f64::from(t.period) / 1.0e6, *n))
+            .collect();
+        rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+        rows
+    }
+
+    /// How many fires were too big to time, and so are missing from
+    /// [`Device::timings`].
+    ///
+    /// Public because a total that silently omits the largest fire is the one
+    /// way this tool could mislead, and a reader has to be able to rule it out.
+    #[must_use]
+    pub fn timings_skipped(&self) -> u32 {
+        self.timing
+            .as_ref()
+            .map_or(0, |t| t.skipped.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// How many descriptor pools the fires on this device have needed.
@@ -861,6 +1352,34 @@ impl Device {
     #[must_use]
     pub fn allocations(&self) -> u32 {
         self.allocations.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many bytes this device has uploaded through [`Device::write`].
+    ///
+    /// Cumulative over the device's life. See the field for why bytes and not
+    /// calls.
+    #[must_use]
+    pub fn uploaded(&self) -> u64 {
+        self.uploaded.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many pipeline barriers this device's fires have recorded.
+    ///
+    /// Cumulative over the device's life. See the field, and [`hazards`] for
+    /// what decides them.
+    #[must_use]
+    pub fn barriers(&self) -> u32 {
+        self.barriers.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many reads went through the copy engine.
+    ///
+    /// See [`Device::read_at`]: a read that does NOT is a read of uncached
+    /// write-combined memory, which on this card runs at ten megabytes a
+    /// second.
+    #[must_use]
+    pub fn staged(&self) -> u32 {
+        self.staged.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// How many buffers this device holds that nothing has freed.
@@ -959,6 +1478,19 @@ impl Device {
         self.unified
     }
 
+    /// Whether this device is a CPU implementation of Vulkan.
+    ///
+    /// Public so that a test asserting a TIME can say what it is timing. Every
+    /// correctness check in this crate applies unchanged to a software
+    /// adapter -- and 59 of the 72 device tests already passed on `llvmpipe`
+    /// the first time it was tried -- but a ceiling in milliseconds is a
+    /// statement about a particular piece of hardware, and enforcing it
+    /// against an LLVM JIT measures the host's cores.
+    #[must_use]
+    pub fn software(&self) -> bool {
+        self.software
+    }
+
     /// Does the device expose memory the host cannot see?
     ///
     /// The second signal for [`Self::unified`], and independent of it: that one
@@ -1021,10 +1553,54 @@ impl Device {
     pub fn buffer(&self, bytes: &[u8]) -> Result<Buffer, Failed> {
         // At least four bytes: a zero-sized buffer cannot be created, and an
         // operand a variant never reads still needs a descriptor to point at.
-        let size = bytes.len().max(4) as u64;
+        let buffer = self.allocate(bytes.len().max(4) as u64)?;
+        if !bytes.is_empty() {
+            self.write(&buffer, bytes)?;
+        }
+        Ok(buffer)
+    }
+
+    /// A buffer of `size` bytes whose contents are UNDEFINED.
+    ///
+    /// The allocation half of [`Device::buffer`] without the write half, for
+    /// a caller that is about to fill the whole thing on the device. Filling
+    /// it from the host instead would mean holding `size` bytes of host
+    /// memory to do it, which for a KV pool is the pool's own size again.
+    ///
+    /// Undefined, not zero: Vulkan does not clear a fresh allocation, and
+    /// pretending otherwise is the kind of assumption that reads correctly
+    /// for a year. A caller that needs zeros asks for [`Device::zero`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Device::buffer`].
+    pub fn empty(&self, size: u64) -> Result<Buffer, Failed> {
+        self.allocate(size.max(4))
+    }
+
+    /// The allocation both of the above share.
+    fn allocate(&self, size: u64) -> Result<Buffer, Failed> {
         let info = vk::BufferCreateInfo::default()
             .size(size)
-            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            // TRANSFER_SRC as well as STORAGE_BUFFER, because a buffer in
+            // mappable VRAM is write-combined and reading one back through
+            // its mapping is uncached: measured on this card, 334 megabytes
+            // of a prefill's arena took 33 SECONDS to copy out, which is ten
+            // megabytes a second on a bus that does twelve gigabytes. The
+            // copy engine reads the same memory at bus speed, so `read_at`
+            // DMAs into a host-cached staging buffer instead -- and it can
+            // only do that if the buffer it reads was created as a transfer
+            // source.
+            // TRANSFER_DST as well, so a buffer can be the DESTINATION of a
+            // device-side copy. That is what lets a pool resize move the
+            // pages it keeps without either side touching host memory: see
+            // [`Device::copy_between`], and the measurement beside
+            // `Pool::resize`.
+            .usage(
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_SRC
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+            )
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let handle = unsafe { self.device.create_buffer(&info, None) }
             .map_err(|e| Failed::of_vulkan(e, "create buffer", size))?;
@@ -1124,16 +1700,42 @@ impl Device {
             memory,
             size,
             mapped: need.size,
+            local: self.memory.memory_types[index as usize]
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL),
         };
         self.allocations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if !bytes.is_empty() {
-            self.write(&buffer, bytes)?;
-        }
         Ok(buffer)
     }
 
     /// Overwrite a buffer's first `bytes.len()` bytes.
+    ///
+    /// # Why this one stays on the host when the copies did not
+    ///
+    /// Because the write-combined penalty is one-directional, and that is
+    /// worth stating where somebody auditing the mappings will read it.
+    /// Write-combining exists to make streaming stores fast; it is the LOAD
+    /// side that runs uncached. Measured on this card, through the same
+    /// mapping [`Device::copy_within`] was abandoning:
+    ///
+    /// ```text
+    ///    64 KiB    10.1 GB/s
+    ///     1 MiB    10.3 GB/s
+    ///    16 MiB    10.2 GB/s
+    /// ```
+    ///
+    /// Against about thirty megabytes a second for a host READ of the same
+    /// memory -- a factor of three hundred and forty between the directions.
+    /// So an upload has nothing to gain from a staging buffer and would pay
+    /// an extra copy for it, while a download stages ([`Device::read_at`])
+    /// and an in-buffer move goes to the copy engine. Three different answers
+    /// from one measurement, which is why the number lives here rather than
+    /// in a commit message.
+    ///
+    /// This is the per-step path as well as the load path:
+    /// [`crate::resources::Pool::state`] rewrites a fire's tables in place
+    /// through it whenever the size is unchanged.
     ///
     /// # Errors
     ///
@@ -1158,6 +1760,8 @@ impl Device {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
             self.device.unmap_memory(buffer.memory);
         }
+        self.uploaded
+            .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -1170,26 +1774,58 @@ impl Device {
     /// A general two-buffer copy would be a second thing to test for the one
     /// caller that does not exist.
     ///
-    /// # Why on the host
+    /// # Which route, and why it is not always the same one
     ///
     /// Every buffer this driver allocates is host-visible and coherent -- see
     /// [`Device::buffer`] -- so a `memmove` through a mapping is a copy with
     /// no command buffer, no barrier and nothing in flight when it returns.
-    /// `driver-metal`'s `copy_kv` says the same thing for the same reason: a
-    /// completion the caller waits on would be waiting for nothing. A device
-    /// with a device-local cache would want `vkCmdCopyBuffer` instead, which
-    /// is why [`crate::facts`] reports whether the memory is unified.
+    /// That was the whole implementation, and being CORRECT is the only thing
+    /// it was: host-visible is not the same as fast to read. This card's
+    /// mappable VRAM is write-combined, so the load side of that `memmove`
+    /// runs uncached, and the copy never needed to leave the card at all.
+    /// Measured here, one range onto another of the same size:
+    ///
+    /// ```text
+    ///     1 KiB   mapping 17.8 us    copy engine 41.0 us
+    ///     2 KiB   mapping 35.1 us    copy engine 15.9 us
+    ///    32 KiB   mapping 1.04 ms    copy engine 22.9 us
+    ///   256 KiB   mapping 8.33 ms    copy engine 27.0 us
+    ///     1 MiB   mapping 33.37 ms   copy engine 27.4 us
+    /// ```
+    ///
+    /// The mapping route is LINEAR in the bytes -- about thirty megabytes a
+    /// second -- and the copy engine's cost is the submission, flat at some
+    /// twenty microseconds. They cross at about a kilobyte and a half. At a
+    /// megabyte it is a thousand times, and this is the path a prefix share
+    /// and a fork take: [`crate::resources::Pool::copy_plan`] calls it once
+    /// per layer per half for every page the engine asks to move. It is the
+    /// same defect [`crate::resources::Pool::resize`] had and for the same
+    /// reason, found by measuring the route rather than by any test going red.
+    ///
+    /// There is no size threshold, and the table is why one would be false
+    /// economy: below the crossover the mapping saves twenty-three
+    /// microseconds, and above it the copy engine saves thirty-three
+    /// milliseconds. A branch that has to be right about a page's size in
+    /// order to pay for itself is worth less than the line it costs.
+    ///
+    /// So the copy engine takes it whenever the two ranges are DISJOINT,
+    /// which is every move a pool actually makes: a whole-page move names two
+    /// different pages, and a cell move is one row. The mapping stays for the
+    /// overlapping case, because a `vkCmdCopyBuffer` whose source and
+    /// destination regions overlap within one buffer is undefined -- and the
+    /// promise below is worth keeping rather than quietly narrowing.
     ///
     /// Overlapping ranges are allowed and move correctly: this is a `memmove`,
     /// not a `memcpy`. Stated rather than left to the reader because a page
-    /// compaction moves pages DOWN, and every such move within one page-size
+    /// compaction moves pages DOWN, and a move by less than one page-size
     /// stride overlaps.
     ///
     /// # Errors
     ///
     /// [`Failed::Vulkan`] if either range leaves the buffer, or if the
-    /// mapping fails. A range that left the buffer would otherwise be a write
-    /// past an allocation, which this card does not report.
+    /// mapping or the submission fails. A range that left the buffer would
+    /// otherwise be a write past an allocation, which this card does not
+    /// report.
     pub fn copy_within(
         &self,
         buffer: &Buffer,
@@ -1207,6 +1843,18 @@ impl Device {
         if bytes == 0 || from == to {
             return Ok(());
         }
+        // Disjoint, so the copy engine can have it. `from + bytes` and
+        // `to + bytes` are both known not to overflow by the bounds check
+        // above.
+        if from + bytes <= to || to + bytes <= from {
+            return self.submit_once("copy within a buffer", |device, cmd| {
+                let region = [vk::BufferCopy::default()
+                    .src_offset(from)
+                    .dst_offset(to)
+                    .size(bytes)];
+                unsafe { device.cmd_copy_buffer(cmd, buffer.handle, buffer.handle, &region) };
+            });
+        }
         unsafe {
             let ptr = self
                 .device
@@ -1220,23 +1868,339 @@ impl Device {
         Ok(())
     }
 
+    /// Copy `len` bytes from one buffer into another, ON THE DEVICE.
+    ///
+    /// One `vkCmdCopyBuffer` on the transfer path, one fence, and nothing
+    /// through a mapping. That matters for the same reason [`Device::read_at`]
+    /// stages: mappable VRAM is write-combined, so a host-side move of a
+    /// device buffer pays an uncached read for every byte -- ten megabytes a
+    /// second, measured on this card. The copy engine reads the same memory
+    /// at the bus's rate and, for a device-to-device move, never leaves the
+    /// card at all.
+    ///
+    /// Unlike [`Device::copy_within`], the two buffers must be DIFFERENT
+    /// allocations; a `vkCmdCopyBuffer` whose regions overlap within one
+    /// buffer is undefined, and the in-buffer move that a page compaction
+    /// needs is what `copy_within` is for.
+    ///
+    /// # Errors
+    ///
+    /// [`Failed::Vulkan`] if either range leaves its buffer, or if the
+    /// submission fails. Not a silent fallback like [`Device::stage`]: a
+    /// caller moving a pool's contents cannot carry on without the bytes.
+    pub fn copy_between(
+        &self,
+        src: &Buffer,
+        src_at: u64,
+        dst: &Buffer,
+        dst_at: u64,
+        len: u64,
+    ) -> Result<(), Failed> {
+        if src_at.checked_add(len).is_none_or(|e| e > src.size) {
+            return Err(Failed::Vulkan(format!(
+                "copy of {len} bytes from {src_at} in a {}-byte source",
+                src.size
+            )));
+        }
+        if dst_at.checked_add(len).is_none_or(|e| e > dst.size) {
+            return Err(Failed::Vulkan(format!(
+                "copy of {len} bytes to {dst_at} in a {}-byte destination",
+                dst.size
+            )));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        self.submit_once("copy between buffers", |device, cmd| {
+            let region = [vk::BufferCopy::default()
+                .src_offset(src_at)
+                .dst_offset(dst_at)
+                .size(len)];
+            unsafe { device.cmd_copy_buffer(cmd, src.handle, dst.handle, &region) };
+        })
+    }
+
+    /// Fill `len` bytes of a buffer from `at` with zeros, on the device.
+    ///
+    /// The tail of a grown pool, without holding the tail in host memory to
+    /// write it. `vkCmdFillBuffer` needs both the offset and the length to be
+    /// multiples of four, which every pool extent here is -- a page holds
+    /// whole elements of at least two bytes and at least two of them -- so a
+    /// range that is not is a caller's arithmetic slip and says so.
+    ///
+    /// # Errors
+    ///
+    /// [`Failed::Vulkan`] if the range leaves the buffer, is not
+    /// four-byte-aligned in both offset and length, or if the submission
+    /// fails.
+    pub fn zero(&self, buffer: &Buffer, at: u64, len: u64) -> Result<(), Failed> {
+        if at.checked_add(len).is_none_or(|e| e > buffer.size) {
+            return Err(Failed::Vulkan(format!(
+                "zero of {len} bytes from {at} in a {}-byte buffer",
+                buffer.size
+            )));
+        }
+        if !at.is_multiple_of(4) || !len.is_multiple_of(4) {
+            return Err(Failed::Vulkan(format!(
+                "zero of {len} bytes from {at} is not four-byte aligned"
+            )));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        self.submit_once("zero a buffer", |device, cmd| unsafe {
+            device.cmd_fill_buffer(cmd, buffer.handle, at, len, 0);
+        })
+    }
+
+    /// Record one transfer command, submit it, and wait for it.
+    ///
+    /// The scratch command buffer and fence are the same pair
+    /// [`Device::stage`] uses, and the lock is what keeps the two off each
+    /// other. Waited on rather than left in flight because every caller here
+    /// reads or frees what it just moved.
+    fn submit_once(
+        &self,
+        during: &'static str,
+        record: impl FnOnce(&ash::Device, vk::CommandBuffer),
+    ) -> Result<(), Failed> {
+        let scratch = self
+            .scratch
+            .lock()
+            .map_err(|_| Failed::Vulkan(format!("{during}: the scratch lock is poisoned")))?;
+        let (cmd, fence) = (scratch.cmd, scratch.fence);
+        unsafe {
+            self.device
+                .begin_command_buffer(
+                    cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .map_err(|e| Failed::Vulkan(format!("{during}: begin: {e}")))?;
+            record(&self.device, cmd);
+            self.device
+                .end_command_buffer(cmd)
+                .map_err(|e| Failed::Vulkan(format!("{during}: end: {e}")))?;
+            self.device
+                .reset_fences(&[fence])
+                .map_err(|e| Failed::Vulkan(format!("{during}: reset: {e}")))?;
+            let bufs = [cmd];
+            let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
+            self.device
+                .queue_submit(self.queue, &submits, fence)
+                .map_err(|e| Failed::Vulkan(format!("{during}: submit: {e}")))?;
+            let ns = fence_timeout_ns();
+            self.device
+                .wait_for_fences(&[fence], true, ns)
+                .map_err(|e| waited_too_long(during, e, ns))?;
+        }
+        Ok(())
+    }
+
     /// Read a buffer's contents back.
     ///
     /// # Errors
     ///
     /// [`Failed::Vulkan`] if the mapping fails.
     pub fn read(&self, buffer: &Buffer) -> Result<Vec<u8>, Failed> {
-        let mut out = vec![0u8; buffer.size as usize];
+        self.read_at(buffer, 0, buffer.size)
+    }
+
+    /// Read `len` bytes of a buffer from `at`.
+    ///
+    /// # Why this is not a mapped copy
+    ///
+    /// Every buffer this driver allocates prefers the memory type that is
+    /// both `DEVICE_LOCAL` and `HOST_VISIBLE` -- see [`Device::buffer`],
+    /// where that one line was worth five times the decode rate. Mappable
+    /// VRAM is WRITE-COMBINED: writes through the mapping are fast because
+    /// they coalesce, and reads through it are uncached, unprefetched, and
+    /// one PCIe round trip deep.
+    ///
+    /// Measured on this card, on a 1024-token prefill of qwen3-0.6B:
+    ///
+    /// | phase | mapped | staged |
+    /// |---|---|---|
+    /// | allocate and zero the 334 MB arena | 82 ms | 82 ms |
+    /// | every dispatch of every layer | 588 ms | 588 ms |
+    /// | **read the answer back** | **32 967 ms** | **220 ms** |
+    /// | widen 155 M bf16 logits to f32 | 278 ms | 278 ms |
+    /// | the whole step | 33 847 ms | 1 107 ms |
+    ///
+    /// Ten megabytes a second, and ninety-eight per cent of the step. The
+    /// dispatches -- the part a driver is for -- were under a sixtieth of it.
+    ///
+    /// So the read goes through the copy engine: a staging buffer in
+    /// host-cached system memory, one `vkCmdCopyBuffer`, one fence, and then
+    /// a cached `memcpy` out of it. The DMA reads VRAM at the bus's own rate
+    /// and the host reads system RAM at the cache's.
+    ///
+    /// Two fallbacks, both to the mapping this used to be: a buffer whose
+    /// memory is NOT device-local is already in system memory and staging it
+    /// would be a copy for nothing, and a staging path that cannot allocate
+    /// or cannot submit should be slow rather than a failure.
+    ///
+    /// # Errors
+    ///
+    /// [`Failed::Vulkan`] if the range leaves the buffer, or if the mapping
+    /// fails.
+    pub fn read_at(&self, buffer: &Buffer, at: u64, len: u64) -> Result<Vec<u8>, Failed> {
+        if at.checked_add(len).is_none_or(|e| e > buffer.size) {
+            return Err(Failed::Vulkan(format!(
+                "{len} bytes from {at} in a {}-byte buffer",
+                buffer.size
+            )));
+        }
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        if buffer.local
+            && let Some(out) = self.stage(buffer, at, len)
+        {
+            self.staged
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(out);
+        }
+        let mut out = vec![0u8; len as usize];
         unsafe {
             let ptr = self
                 .device
                 .map_memory(buffer.memory, 0, buffer.mapped, vk::MemoryMapFlags::empty())
                 .map_err(|e| Failed::Vulkan(format!("map: {e}")))?
                 .cast::<u8>();
-            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), out.len());
+            std::ptr::copy_nonoverlapping(ptr.add(at as usize), out.as_mut_ptr(), out.len());
             self.device.unmap_memory(buffer.memory);
         }
         Ok(out)
+    }
+
+    /// `len` bytes from `at`, through the copy engine, or `None` to fall back.
+    ///
+    /// Every failure answers `None` rather than an error, because every one of
+    /// them means "this could not be done the fast way" and the slow way is
+    /// still there. The only thing that would make a failure here fatal is a
+    /// partial copy, and there is no partial copy: the fence is waited on
+    /// before anything is read out of the staging buffer.
+    fn stage(&self, buffer: &Buffer, at: u64, len: u64) -> Option<Vec<u8>> {
+        let mut held = self.staging.lock().ok()?;
+        if held.as_ref().is_none_or(|b| b.size < len) {
+            if let Some(old) = held.take() {
+                // Waited on, because the buffer being replaced was the
+                // destination of a copy this device submitted. Every such copy
+                // was waited on below before its bytes were read, so nothing
+                // is in flight -- but a free that depends on that reasoning
+                // rather than on a wait is a use-after-free the day the wait
+                // moves.
+                unsafe { self.device.destroy_buffer(old.handle, None) };
+                unsafe { self.device.free_memory(old.memory, None) };
+            }
+            *held = Some(self.staging_of(len)?);
+        }
+        let staging = held.as_ref()?;
+
+        let copied = {
+            let Ok(scratch) = self.scratch.lock() else {
+                return None;
+            };
+            let (cmd, fence) = (scratch.cmd, scratch.fence);
+            unsafe {
+                self.device
+                    .begin_command_buffer(
+                        cmd,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )
+                    .and_then(|()| {
+                        let region = [vk::BufferCopy::default()
+                            .src_offset(at)
+                            .dst_offset(0)
+                            .size(len)];
+                        self.device
+                            .cmd_copy_buffer(cmd, buffer.handle, staging.handle, &region);
+                        self.device.end_command_buffer(cmd)
+                    })
+                    .and_then(|()| self.device.reset_fences(&[fence]))
+                    .and_then(|()| {
+                        let bufs = [cmd];
+                        let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
+                        self.device.queue_submit(self.queue, &submits, fence)
+                    })
+                    .and_then(|()| {
+                        self.device
+                            .wait_for_fences(&[fence], true, fence_timeout_ns())
+                    })
+            }
+        };
+        copied.ok()?;
+
+        let mut out = vec![0u8; len as usize];
+        let ptr = unsafe {
+            self.device.map_memory(
+                staging.memory,
+                0,
+                staging.mapped,
+                vk::MemoryMapFlags::empty(),
+            )
+        }
+        .ok()?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr.cast::<u8>(), out.as_mut_ptr(), out.len());
+            self.device.unmap_memory(staging.memory);
+        }
+        Some(out)
+    }
+
+    /// A host-cached buffer of at least `len` bytes to DMA into.
+    ///
+    /// Not [`Device::buffer`], which prefers the memory this exists to avoid:
+    /// that one asks for `DEVICE_LOCAL` first because the shaders read it, and
+    /// an uncached staging buffer would move the uncached read from one side
+    /// of the copy to the other.
+    fn staging_of(&self, len: u64) -> Option<Buffer> {
+        let info = vk::BufferCreateInfo::default()
+            .size(len)
+            .usage(vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let handle = unsafe { self.device.create_buffer(&info, None) }.ok()?;
+        let need = unsafe { self.device.get_buffer_memory_requirements(handle) };
+        let prefers = |flags: vk::MemoryPropertyFlags| {
+            (0..self.memory.memory_type_count).find(|i| {
+                need.memory_type_bits & (1 << i) != 0
+                    && self.memory.memory_types[*i as usize]
+                        .property_flags
+                        .contains(flags)
+            })
+        };
+        let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        // HOST_CACHED first, and it is the whole point.
+        let index = prefers(want | vk::MemoryPropertyFlags::HOST_CACHED).or_else(|| prefers(want));
+        let Some(index) = index else {
+            unsafe { self.device.destroy_buffer(handle, None) };
+            return None;
+        };
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(need.size)
+            .memory_type_index(index);
+        let Ok(memory) = (unsafe { self.device.allocate_memory(&alloc, None) }) else {
+            unsafe { self.device.destroy_buffer(handle, None) };
+            return None;
+        };
+        if unsafe { self.device.bind_buffer_memory(handle, memory, 0) }.is_err() {
+            unsafe {
+                self.device.destroy_buffer(handle, None);
+                self.device.free_memory(memory, None);
+            }
+            return None;
+        }
+        Some(Buffer {
+            handle,
+            memory,
+            size: len,
+            mapped: need.size,
+            // Host memory by construction, and the flag is what stops a read
+            // OF this buffer from trying to stage it into another one.
+            local: false,
+        })
     }
 
     /// Destroy a buffer.
@@ -1277,8 +2241,10 @@ impl Device {
         // so every improvement to a fire had to be made twice or silently
         // was not.
         self.run_all(&[Recorded {
+            symbol: "run_one",
             pipeline,
             buffers,
+            writes: &[],
             push,
             groups,
         }])
@@ -1380,7 +2346,7 @@ impl Device {
         // Two different things make a layout wider than the bindings a module
         // decorates, and they pull opposite ways:
         //
-        // * a hole, where `glslc` dropped a binding in the MIDDLE of the set.
+        // * a hole, where `slangc` dropped a binding in the MIDDLE of the set.
         //   `affine_qmv_routed` has seven slots and one hole, and a real
         //   lowering states exactly six operands for it. Demanding seven
         //   would mean demanding a buffer for a binding no shader reads and
@@ -1494,7 +2460,7 @@ impl Device {
             // Only the bindings the module actually decorates.
             //
             // 165 of this tree's 665 modules leave a hole -- 358 of them in
-            // all -- because `glslc` drops the declaration of a buffer a
+            // all -- because `slangc` drops the declaration of a buffer a
             // variant never reads, and `kv_append_paged` holes 10 and 11 on
             // purpose to keep Metal's ring-ABI slots. A hole is free on
             // Metal, where an argument index nothing is set at is one the
@@ -1547,14 +2513,38 @@ impl Device {
                             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                     )
                     .map_err(|e| Failed::Vulkan(format!("begin: {e}")))?;
+                // The ranges written, and the ranges touched at all, since
+                // the last barrier. See `hazards`.
+                let mut pending_writes: Vec<Span> = Vec::new();
+                let mut pending_reads: Vec<Span> = Vec::new();
+                // Timestamps only when the pool can hold one per dispatch plus
+                // the opening one. A partial answer would be read as a whole
+                // one, so a fire that does not fit is left out of the totals
+                // and counted instead.
+                let clock = self.timing.as_ref().filter(|t| {
+                    let fits = run.len() < t.slots as usize;
+                    if !fits {
+                        t.skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    fits
+                });
+                if let Some(t) = clock {
+                    device.cmd_reset_query_pool(cmd, t.pool, 0, run.len() as u32 + 1);
+                    device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, t.pool, 0);
+                }
                 for (at, one) in run.iter().enumerate() {
-                    if at > 0 {
+                    if at > 0 && hazards(one, &pending_writes, &pending_reads) {
+                        pending_writes.clear();
+                        pending_reads.clear();
+                        self.barriers
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         // One global barrier rather than a buffer barrier per
-                        // operand. A plan chains through ONE arena, so every
-                        // buffer barrier this could state would name the same
-                        // buffer, and a driver coalesces them into the same
-                        // stall. Correct and coarse; the finer version is a
-                        // measurement this crate has not made.
+                        // operand. Every buffer barrier this could state would
+                        // name one of two or three buffers -- the arena, a KV
+                        // page, a fire table -- and a driver coalesces them
+                        // into the same stall, so the finer barrier would buy
+                        // the finer PLACEMENT and nothing else. The placement
+                        // is what `hazards` decides, above.
                         let barrier = [vk::MemoryBarrier::default()
                             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                             .dst_access_mask(
@@ -1569,6 +2559,18 @@ impl Device {
                             &[],
                             &[],
                         );
+                    }
+                    // A mask that is not exactly as long as the bindings is
+                    // one this code cannot index, so every slot counts as a
+                    // write -- which is what the driver did for every slot
+                    // before any mask existed.
+                    let blind = one.writes.len() != one.buffers.len();
+                    for (i, b) in one.buffers.iter().enumerate() {
+                        let span = Span::of(b);
+                        if blind || one.writes[i] {
+                            pending_writes.push(span);
+                        }
+                        pending_reads.push(span);
                     }
                     device.cmd_bind_pipeline(
                         cmd,
@@ -1593,6 +2595,14 @@ impl Device {
                         );
                     }
                     device.cmd_dispatch(cmd, one.groups[0], one.groups[1], one.groups[2]);
+                    if let Some(t) = clock {
+                        device.cmd_write_timestamp(
+                            cmd,
+                            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                            t.pool,
+                            at as u32 + 1,
+                        );
+                    }
                 }
                 device
                     .end_command_buffer(cmd)
@@ -1612,15 +2622,160 @@ impl Device {
                     .queue_submit(self.queue, &submits, fence)
                     .map_err(|e| Failed::Vulkan(format!("submit: {e}")));
                 submitted.and_then(|()| {
+                    let ns = fence_timeout_ns();
                     device
-                        .wait_for_fences(&[fence], true, 10_000_000_000)
-                        .map_err(|e| Failed::Vulkan(format!("wait: {e}")))
-                })
+                        .wait_for_fences(&[fence], true, ns)
+                        .map_err(|e| waited_too_long("fire", e, ns))
+                })?;
+
+                // The fence has been waited on, so every query is available
+                // and `WAIT` costs nothing; it is asked for anyway because
+                // "available" is a property of the query and not of the fence,
+                // and a read that assumed otherwise would return stale ticks
+                // with no way to tell.
+                if let Some(t) = clock {
+                    let mut ticks = vec![0u64; run.len() + 1];
+                    if device
+                        .get_query_pool_results(
+                            t.pool,
+                            0,
+                            &mut ticks,
+                            vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                        )
+                        .is_ok()
+                    {
+                        let mut per = t
+                            .per_symbol
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        for (at, one) in run.iter().enumerate() {
+                            let slice = ticks[at + 1].saturating_sub(ticks[at]);
+                            let e = per.entry(one.symbol.to_string()).or_insert((0, 0));
+                            e.0 += slice;
+                            e.1 += 1;
+                        }
+                    }
+                }
+                Ok(())
             }
         })();
 
         result.map_err(|e| (0, e))
     }
+}
+
+/// A range of one buffer, in the terms a hazard is decided in.
+///
+/// The buffer HANDLE and not the `&Buffer`, for the reason [`Bound`]'s
+/// `PartialEq` states: two borrows of one buffer are the same memory, and a
+/// comparison that said otherwise would miss the hazard between them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Span {
+    buffer: vk::Buffer,
+    from: u64,
+    to: u64,
+}
+
+impl Span {
+    fn of(b: &Bound<'_>) -> Self {
+        Self {
+            buffer: b.buffer.handle,
+            from: b.offset,
+            to: b.offset + b.len,
+        }
+    }
+
+    fn meets(self, other: Self) -> bool {
+        self.buffer == other.buffer && self.from < other.to && other.from < self.to
+    }
+}
+
+/// Does this dispatch have to wait for the ones recorded since the last
+/// barrier?
+///
+/// # Why a fire is not one long chain
+///
+/// It looks like one -- a plan threads a hidden state through a few hundred
+/// rectangles -- and for a long time this driver recorded it as one, with a
+/// full pipeline barrier between every pair. That is not free: measured on
+/// this card, a qwen3-0.6b decode of 452 rectangles spends 4.6 milliseconds
+/// inside the submit, and 3.8 of those go away when the barriers do. Eight
+/// microseconds each, which is what a compute-to-compute flush costs when the
+/// dispatch it separates is a single row of a small model and takes two.
+///
+/// Most neighbouring pairs do not touch the same bytes. A layer's Q, K and V
+/// projections all read the same normed rows and write three different
+/// places; the per-head rotary writes are disjoint; a norm's scratch is not
+/// the next norm's. What makes those visible is that this driver binds RANGES
+/// and not whole buffers -- see [`Bound`], and the note there on why
+/// `WHOLE_SIZE` is never used -- so two rectangles of one arena are two spans
+/// that can be compared.
+///
+/// # The three hazards, and why reads are tracked too
+///
+/// A barrier goes in when this dispatch would otherwise race one already
+/// recorded:
+///
+///   - **read-after-write**: it reads a range something pending wrote;
+///   - **write-after-write**: it writes a range something pending wrote;
+///   - **write-after-read**: it writes a range something pending READ, which
+///     is the one it would be easy to leave out. Without a barrier the two
+///     dispatches may overlap, so the earlier one's reads can land after the
+///     later one's write and see the new bytes.
+///
+/// An operand the kernel row marks [`kernels::Ty::BufMut`] counts as both,
+/// since "may write through" does not say it does not also read.
+///
+/// The write-after-read case is the one this crate cannot demonstrate, and
+/// that is recorded rather than hidden. Dropping it entirely leaves the
+/// byte-for-byte comparison against the one-submission-per-dispatch reference
+/// passing on three runs of all six texts, and changes the count on exactly
+/// one of them -- olmo2-1b, 227 barriers to 211. So it is here because the
+/// specification requires it and not because a measurement caught it.
+///
+/// # Which of the three a decode actually spends
+///
+/// All three were counted on a warm qwen3-0.6b decode, classifying every
+/// barrier by the first case that fired for it. The 311 barriers of a step
+/// are **283 read-after-write, 28 write-after-write, and 0 write-after-read**
+/// -- the three sum to the count exactly, which is the check that the
+/// classification and the decision are reading the same thing.
+///
+/// This was measured to answer a specific suspicion, and refuted it. Barriers
+/// are about 72% of a decode, and the cheap explanation would have been false
+/// serialization: an arena that hands two independent operations overlapping
+/// ranges makes them look dependent, and a transformer decode has plenty of
+/// independent pairs -- the three projections, the gate and the up. If that
+/// were happening it would show up as write-after-read and write-after-write,
+/// because a false dependency is precisely one where no value flows.
+///
+/// It is not happening. 91% of the barriers are read-after-write: one
+/// dispatch reads what the one before it wrote, which is what a forward pass
+/// IS. There is no bookkeeping left to fix here, and the way to fewer
+/// barriers is fewer kernels.
+///
+/// # What this trusts
+///
+/// The kernel table's operand types. A row that calls an output `Buf` would
+/// have this omit a barrier the fire needs, and the result is not a fault --
+/// it is a race, so it is a number that is right most of the time. That is
+/// why the claim is checked against the coarse recording rather than
+/// reasoned about: see the test that fires a real decode both ways and
+/// compares the arenas byte for byte.
+fn hazards(one: &Recorded<'_, '_>, wrote: &[Span], read: &[Span]) -> bool {
+    // A pending list that has grown this long is one where the scan costs
+    // more than the barrier it might save. Nothing in this tree reaches it --
+    // a decode's longest barrier-free run is a few dozen rectangles -- and it
+    // is here so that a fire which does cannot become quadratic.
+    if read.len() > 512 {
+        return true;
+    }
+    let blind = one.writes.len() != one.buffers.len();
+    one.buffers.iter().enumerate().any(|(i, b)| {
+        let span = Span::of(b);
+        let writes = blind || one.writes[i];
+        wrote.iter().any(|w| span.meets(*w)) || (writes && read.iter().any(|r| span.meets(*r)))
+    })
 }
 
 /// One dispatch in a recorded run.
@@ -1630,10 +2785,22 @@ impl Device {
 /// list of hundreds is not something a reader would catch.
 #[derive(Clone, Copy)]
 pub struct Recorded<'a, 'b> {
+    /// The entrypoint's name, for [`Device::timings`] only.
+    ///
+    /// Nothing in the recording reads it -- the pipeline below is what runs --
+    /// and it is here because a per-dispatch duration with no name attached is
+    /// a list of numbers. `serve` already has the symbol borrowed at the point
+    /// it builds this, so carrying it costs a pointer and no allocation.
+    pub symbol: &'a str,
     /// The compiled module and its layout.
     pub pipeline: &'a Pipeline,
     /// One range per binding the module reads, less its holes.
     pub buffers: &'a [Bound<'b>],
+    /// Which of [`Self::buffers`] the shader may write through.
+    ///
+    /// Parallel to `buffers`. An empty slice means "no idea", which is read
+    /// as "all of them" -- see [`Device::run_all`]'s barriers.
+    pub writes: &'a [bool],
     /// The push block, empty if the module has none.
     pub push: &'a [u8],
     /// Workgroups in each dimension, none of them zero.
@@ -1648,10 +2815,22 @@ impl Drop for Device {
             // undefined, and the layer reports it as a use-after-free with no
             // obvious connection to the test that caused it.
             let _ = self.device.device_wait_idle();
+            if let Some(t) = self.timing.as_ref() {
+                self.device.destroy_query_pool(t.pool, None);
+            }
             self.scratch
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .destroy(&self.device, self.pool);
+            if let Some(b) = self
+                .staging
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                self.device.destroy_buffer(b.handle, None);
+                self.device.free_memory(b.memory, None);
+            }
             self.device.destroy_command_pool(self.pool, None);
             self.device.destroy_device(None);
             if let Some((debug, m)) = self.messenger.take() {
@@ -1678,6 +2857,13 @@ pub struct Buffer {
     /// rounds up, and mapping past this is invalid while mapping only `size`
     /// is not always allowed for a coherent range.
     mapped: u64,
+    /// Whether the memory it was given is device-local as well as mappable.
+    ///
+    /// Which is the same question as "is reading this back through its
+    /// mapping uncached", and [`Device::read_at`] asks it to decide whether a
+    /// staged copy is worth making. A buffer in plain system memory is read
+    /// fastest by reading it.
+    local: bool,
 }
 
 impl Buffer {
@@ -1707,6 +2893,7 @@ impl Buffer {
             memory: vk::DeviceMemory::null(),
             size,
             mapped: size,
+            local: false,
         }
     }
 }
@@ -1972,7 +3159,7 @@ impl Pipelines {
     /// under what the module declares rather than an alternative to it. Both
     /// numbers are needed because they disagree, and measurement says which
     /// way: over the 188 stated entrypoints 177 agree and 11 have a module
-    /// declaring exactly one binding FEWER than the row does, because glslc
+    /// declaring exactly one binding FEWER than the row does, because slangc
     /// drops the `OpDecorate Binding` of a buffer the shader never reads.
     /// `layer_scalar_mul_bfloat16` is one -- the row lists four buffers and
     /// the compiled module decorates three.
@@ -2155,7 +3342,7 @@ fn slots(pipeline: &Pipeline) -> impl Iterator<Item = usize> + '_ {
 
 #[cfg(test)]
 mod tests {
-    use super::Failed;
+    use super::{Candidate, Failed};
     use ash::vk;
 
     /// The classification, which is the whole of the retry decision.
@@ -2207,4 +3394,270 @@ mod tests {
             "a fault's text must name the call that failed: {e}"
         );
     }
+
+    /// A synthetic candidate, so the ranking can be tested on machines and
+    /// shapes this box does not have.
+    fn candidate(name: &str, ty: vk::PhysicalDeviceType, compute: bool) -> Candidate {
+        Candidate {
+            handle: vk::PhysicalDevice::null(),
+            props: vk::PhysicalDeviceProperties {
+                device_type: ty,
+                ..Default::default()
+            },
+            name: name.to_string(),
+            compute_family: compute.then_some(0),
+        }
+    }
+
+    /// The device is chosen by what it IS, not by where the loader put it.
+    ///
+    /// This is the test for the bug that was here: `devices.first()`. The
+    /// Vulkan specification does not order `vkEnumeratePhysicalDevices`, and
+    /// this very machine offers a discrete card and a `llvmpipe` software
+    /// rasteriser -- so the entire suite ran on the card by the loader's grace
+    /// and would have run on a CPU implementation, silently and correctly and
+    /// a hundred times slower, had that order ever changed.
+    ///
+    /// Every case puts the wanted device LAST, because a ranking that is
+    /// really still `first()` passes any test that puts it first.
+    #[test]
+    fn the_device_chosen_is_the_best_one_and_not_the_first_one() {
+        let software = || candidate("llvmpipe", vk::PhysicalDeviceType::CPU, true);
+        let cases: [(&str, Vec<Candidate>, &str); 4] = [
+            (
+                "a software adapter must not beat a card",
+                vec![
+                    software(),
+                    candidate("card", vk::PhysicalDeviceType::DISCRETE_GPU, true),
+                ],
+                "card",
+            ),
+            (
+                "an integrated part must not beat a card",
+                vec![
+                    candidate("igpu", vk::PhysicalDeviceType::INTEGRATED_GPU, true),
+                    candidate("card", vk::PhysicalDeviceType::DISCRETE_GPU, true),
+                ],
+                "card",
+            ),
+            (
+                "a card that cannot compute is not a choice, it is not eligible",
+                vec![
+                    candidate("blind card", vk::PhysicalDeviceType::DISCRETE_GPU, false),
+                    software(),
+                ],
+                "llvmpipe",
+            ),
+            (
+                "software is right when it is the only thing there",
+                vec![software()],
+                "llvmpipe",
+            ),
+        ];
+        for (why, seen, want) in cases {
+            let got = Candidate::choose_from(&seen, None).map(|c| c.name.clone());
+            assert_eq!(
+                got.as_deref(),
+                Some(want),
+                "{why}. Saw {}",
+                Candidate::roster(&seen)
+            );
+        }
+
+        let none = vec![candidate(
+            "display only",
+            vk::PhysicalDeviceType::DISCRETE_GPU,
+            false,
+        )];
+        assert!(
+            Candidate::choose_from(&none, None).is_none(),
+            "a device with no compute queue was chosen, and the queue index \
+             that follows would be invented"
+        );
+        assert!(
+            Candidate::roster(&none).contains("NO compute queue"),
+            "the one message a user with no usable device gets must say WHY \
+             each device was passed over: {}",
+            Candidate::roster(&none)
+        );
+    }
+
+    /// `PIE_VULKAN_DEVICE` overrides the ranking, and refuses rather than
+    /// falls back.
+    ///
+    /// The override is what makes the ranking testable on a real machine --
+    /// it is how the software adapter sitting next to this box's card gets
+    /// opened deliberately -- so it has to be exact. A name that matches
+    /// nothing usable must not quietly hand back the device the ranking would
+    /// have picked: a run that asked for one device and got another is a
+    /// worse outcome than a run that did not start, because it looks like a
+    /// measurement.
+    #[test]
+    fn a_named_device_is_taken_at_its_word_or_refused() {
+        let card = "NVIDIA GeForce RTX 4090";
+        let pipe = "llvmpipe (LLVM 21.1.8, 256 bits)";
+        let seen = vec![
+            candidate(card, vk::PhysicalDeviceType::DISCRETE_GPU, true),
+            candidate(pipe, vk::PhysicalDeviceType::CPU, true),
+        ];
+        for (set, want, why) in [
+            (
+                Some("llvmpipe"),
+                Some(pipe),
+                "a named device must beat the ranking",
+            ),
+            (
+                Some("LLVMPIPE"),
+                Some(pipe),
+                "the match is case-insensitive",
+            ),
+            (
+                Some("4090"),
+                Some(card),
+                "any substring of the name will do",
+            ),
+            (
+                Some("no such device"),
+                None,
+                "a name that matches nothing must REFUSE",
+            ),
+            (
+                Some("   "),
+                Some(card),
+                "blank means unset, not 'match everything'",
+            ),
+            (None, Some(card), "unset is the ranking"),
+        ] {
+            let got = Candidate::choose_from(&seen, set).map(|c| c.name.clone());
+            assert_eq!(
+                got.as_deref(),
+                want,
+                "PIE_VULKAN_DEVICE={set:?} chose {got:?}: {why}"
+            );
+        }
+    }
+
+    /// A device that ran out of time says which knob would have given it more.
+    ///
+    /// `PIE_VULKAN_FENCE_TIMEOUT_SECS` is only useful to somebody who knows it
+    /// exists, and the three wait sites used to report `wait: ERROR_TIMEOUT`
+    /// and nothing else. On `llvmpipe` that is the single most likely failure
+    /// this crate produces, and it sent the reader looking for a bug in the
+    /// shader rather than at a deadline written for a 4090.
+    ///
+    /// The other half of the assertion matters as much. `ERROR_DEVICE_LOST` is
+    /// not a slow device and raising a deadline will not help it, so it must
+    /// NOT collect the timeout advice -- an error message that offers the
+    /// wrong remedy costs more than one that offers none.
+    #[test]
+    fn a_wait_that_ran_out_of_time_names_the_knob_that_buys_more() {
+        let ns = 7_000_000_000u64;
+        let Failed::Vulkan(timed_out) = super::waited_too_long("fire", vk::Result::TIMEOUT, ns)
+        else {
+            panic!("a timeout is a Vulkan failure");
+        };
+        assert!(
+            timed_out.contains("PIE_VULKAN_FENCE_TIMEOUT_SECS"),
+            "the one refusal a slow device produces must name the variable that \
+             raises the deadline, or the knob is reachable only by reading this \
+             file: {timed_out}"
+        );
+        assert!(
+            timed_out.contains("7s"),
+            "and it must say how long it actually waited, because the deadline \
+             is configurable and the default is not the whole story: {timed_out}"
+        );
+
+        let Failed::Vulkan(lost) =
+            super::waited_too_long("fire", vk::Result::ERROR_DEVICE_LOST, ns)
+        else {
+            panic!("a lost device is a Vulkan failure");
+        };
+        assert!(
+            !lost.contains("PIE_VULKAN_FENCE_TIMEOUT_SECS"),
+            "a device that fell off the bus is not a slow one, and telling its \
+             owner to wait longer sends them the wrong way: {lost}"
+        );
+    }
+
+    /// The fence deadline is one number, and a bad one cannot buy a hang.
+    ///
+    /// The whole point of the constant is that a submit has a deadline at
+    /// all: an un-timed `vkWaitForFences` on a device that has stopped
+    /// signalling wedges the calling thread with no way to report it. So the
+    /// interesting cases are not the ones that parse -- they are `0`, the
+    /// typo, and the enormous value, each of which is a way to end up with no
+    /// deadline if the parsing is written carelessly.
+    ///
+    /// `u64::MAX` nanoseconds is how Vulkan spells "wait forever", so the
+    /// clamp is not tidiness: without it, `PIE_VULKAN_FENCE_TIMEOUT_SECS`
+    /// set to something around 18 billion multiplies straight into it and the
+    /// driver silently loses its only protection against a hang.
+    #[test]
+    fn the_fence_deadline_is_bounded_however_it_is_asked_for() {
+        let ten = 10_000_000_000u64;
+        let _hold = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (set, want, why) in [
+            (
+                None,
+                Some(ten),
+                "unset is ten seconds, the value this replaced",
+            ),
+            (
+                Some("30"),
+                Some(30_000_000_000),
+                "a plain number is seconds",
+            ),
+            (
+                Some(" 30 "),
+                Some(30_000_000_000),
+                "surrounding space is not a parse error",
+            ),
+            (
+                Some("0"),
+                Some(ten),
+                "zero is not 'no deadline', it is a mistake",
+            ),
+            (Some("soon"), Some(ten), "a typo must not disarm the guard"),
+            (Some("-5"), Some(ten), "nor may a negative"),
+            (Some(""), Some(ten), "nor may an empty value"),
+            (
+                Some("99999999999999999999"),
+                Some(ten),
+                "nor may an overflowing one",
+            ),
+            (
+                Some("18446744074"),
+                None,
+                "a value that saturates the multiply is clamped",
+            ),
+        ] {
+            unsafe {
+                match set {
+                    Some(v) => std::env::set_var("PIE_VULKAN_FENCE_TIMEOUT_SECS", v),
+                    None => std::env::remove_var("PIE_VULKAN_FENCE_TIMEOUT_SECS"),
+                }
+            }
+            let got = super::fence_timeout_ns();
+            assert!(
+                got < u64::MAX,
+                "PIE_VULKAN_FENCE_TIMEOUT_SECS={set:?} produced u64::MAX, which \
+                 Vulkan reads as 'wait forever'. The deadline is the only thing \
+                 standing between a stopped device and a wedged thread"
+            );
+            if let Some(want) = want {
+                assert_eq!(got, want, "PIE_VULKAN_FENCE_TIMEOUT_SECS={set:?}: {why}");
+            }
+        }
+        unsafe { std::env::remove_var("PIE_VULKAN_FENCE_TIMEOUT_SECS") };
+    }
+
+    /// Serialises the one test that writes the environment. `set_var` is
+    /// unsound only when another thread READS the environment concurrently,
+    /// and this is the only test here that touches it -- the device choice is
+    /// tested through `choose_from`, which takes the override as an argument
+    /// for exactly this reason.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

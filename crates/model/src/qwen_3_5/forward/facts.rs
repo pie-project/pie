@@ -6,7 +6,7 @@
 //! store's dtype -- is known only when that backend's aspect is compiled,
 //! so it stays here.
 
-use model_compiler::dsl::WeightRepr;
+use model_dsl::WeightRepr;
 use serde::{Deserialize, Serialize};
 
 /// The shape, re-exported so a declaration reaches its facts and the
@@ -22,7 +22,7 @@ pub use super::super::spec::{
 /// defaults and kernel-eligibility predicates the hand-written
 /// `linear_attn_layer_body` / `declared_forward.cpp` derive per fire
 /// today, hoisted to where a fact belongs. The N-thresholds are VALUES
-/// carried into [`model_compiler::trace::GuardPred`]s — the one branch kind a
+/// carried into [`model_ir::trace::GuardPred`]s — the one branch kind a
 /// lowered trace keeps — because only N varies per fire; the predicates
 /// AROUND them (env gates, head geometry) resolve here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -131,7 +131,7 @@ pub struct Qwen35CudaFacts {
     #[serde(default)]
     pub gate_up_fused: bool,
     /// How this deployment STORES its linear projections — the weight
-    /// representation axis ([`model_compiler::dsl::WeightRepr`]).
+    /// representation axis ([`model_dsl::WeightRepr`]).
     ///
     /// [`LlamaLikeCudaFacts::proj_repr`]'s reasoning applies verbatim,
     /// and this family had EIGHT of the eighteen `make_weight_view`
@@ -140,7 +140,7 @@ pub struct Qwen35CudaFacts {
     #[serde(default)]
     pub proj_repr: WeightRepr,
     /// The SLIDING WINDOW each layer attends over, `-1` for none —
-    /// read through [`model_compiler::facts::window_left_at`], which is
+    /// read through [`model_ir::facts::window_left_at`], which is
     /// where the shape of this list is documented.
     ///
     /// The dispatch statements carry it, so no executor reaches into

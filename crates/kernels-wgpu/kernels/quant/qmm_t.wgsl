@@ -64,7 +64,7 @@
 // past the row's buffer count.
 
 //#if defined(PIE_CAST_INPUT)
-@group(0) @binding(0) var<storage, read> cast_in: array<u32>;
+@group(0) @binding(0) var<storage, read_write> cast_in: array<u32>;
 @group(0) @binding(1) var<storage, read_write> half_out: array<atomic<u32>>;
 struct Params {
 //#if defined(PIE_STRIDED)
@@ -77,9 +77,9 @@ struct Params {
 //#elif defined(PIE_REDUCE)
 @group(0) @binding(0) var<storage, read_write> reduce_y: array<atomic<u32>>;
 //#if defined(PIE_PARTIAL_F32)
-@group(0) @binding(1) var<storage, read> partial_f32: array<f32>;
+@group(0) @binding(1) var<storage, read_write> partial_f32: array<f32>;
 //#else
-@group(0) @binding(1) var<storage, read> partial_bf16: array<u32>;
+@group(0) @binding(1) var<storage, read_write> partial_bf16: array<u32>;
 //#endif
 // `n`, the partition stride and the partition COUNT. Metal's `split_k` is
 // buffer 11 and not 9 on purpose -- 9 is the GEMM half's `k_partition_size`,
@@ -91,15 +91,15 @@ struct Params {
     split_k: i32,
 }
 //#else
-@group(0) @binding(0) var<storage, read> w: array<u32>;
-@group(0) @binding(1) var<storage, read> scales: array<u32>;
-@group(0) @binding(2) var<storage, read> biases: array<u32>;
+@group(0) @binding(0) var<storage, read_write> w: array<u32>;
+@group(0) @binding(1) var<storage, read_write> scales: array<u32>;
+@group(0) @binding(2) var<storage, read_write> biases: array<u32>;
 // The activation. `_fp16_precast` does not have one: its input is the fp16
 // staging buffer `half_in`, which the plan passes LAST (Metal buffer 12), so
 // every later binding in a precast variant shifts down by one. That shift is
 // the whole reason these are written out arm by arm instead of once.
 //#if !defined(PIE_FP16_PRECAST)
-@group(0) @binding(3) var<storage, read> x: array<u32>;
+@group(0) @binding(3) var<storage, read_write> x: array<u32>;
 //#endif
 // The result. Split-K writes its `[split_k, M, N]` partial through the same
 // operand slot -- Metal gives it buffer 8 and the plain output buffer 4, but
@@ -119,14 +119,14 @@ struct Params {
 // disjunctive form because the directive grammar has no parentheses and `&&`
 // binds tighter than `||`.)
 //#if defined(PIE_FP16_PRECAST) && defined(PIE_BIAS) || defined(PIE_FP16_PRECAST) && defined(PIE_RESIDUAL)
-@group(0) @binding(4) var<storage, read> extra: array<u32>;
+@group(0) @binding(4) var<storage, read_write> extra: array<u32>;
 //#elif defined(PIE_BIAS) || defined(PIE_RESIDUAL)
-@group(0) @binding(5) var<storage, read> extra: array<u32>;
+@group(0) @binding(5) var<storage, read_write> extra: array<u32>;
 //#endif
 //#if defined(PIE_FP16_PRECAST) && defined(PIE_BIAS) || defined(PIE_FP16_PRECAST) && defined(PIE_RESIDUAL)
-@group(0) @binding(5) var<storage, read> half_in: array<u32>;
+@group(0) @binding(5) var<storage, read_write> half_in: array<u32>;
 //#elif defined(PIE_FP16_PRECAST)
-@group(0) @binding(4) var<storage, read> half_in: array<u32>;
+@group(0) @binding(4) var<storage, read_write> half_in: array<u32>;
 //#endif
 // Variant-shaped, and it has to be: `uniform_layout()` sizes the buffer from
 // the row's scalars, so a field the row does not state is a field the shell

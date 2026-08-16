@@ -42,14 +42,14 @@
 //! [`logits`]: crate::serve::logits
 //! [`Frame`]: crate::resources::Frame
 
-use model_compiler::lower::{Fire as LowerFire, Uncovered, lower};
-use model_compiler::trace::ForwardPlan;
+use model_compiler::lower::{Fire as LowerFire, Lowered, Row, Uncovered, lower};
+use model_ir::trace::ForwardPlan;
 
 use crate::device::{Device, Pipelines};
 use crate::dispatch::Geometry;
 use crate::pages::{Book, Unhoused};
 use crate::resources::{Frame, Model, Pool, Request, Unstageable, Weights};
-use crate::serve::{Fire, Fired, Logits, Modules, Unfired, Unread, fire, logits};
+use crate::serve::{Fire, Fired, Logits, Modules, Unfired, Unread, fire, logits_of};
 use kernels_vulkan::Capability;
 
 /// What one conversation wants out of one fire.
@@ -89,6 +89,98 @@ pub struct Held<'a> {
     pub pool: &'a mut Pool,
     /// The checkpoint.
     pub weights: &'a Weights,
+    /// Lowerings already computed, by the row shape that produced them.
+    pub lowerings: &'a mut Lowerings,
+}
+
+/// Lowerings kept between fires, by the row shape they were lowered for.
+///
+/// # Why this is sound
+///
+/// [`model_compiler::lower::lower`] is a pure function of a plan, a slice of
+/// [`Row`], and a [`LowerFire`] — and a `Row` is six booleans and an optional
+/// depth. It carries no position, no history length, no page and no token.
+/// Everything that varies between two decodes of the same conversation
+/// reaches the GPU through [`Pool::stage`] and the state tables, not through
+/// here. So two steps whose rows compare equal have identical lowerings, and
+/// the second one need not be computed.
+///
+/// # Why it was worth doing
+///
+/// Measured on a decode of the real 4-bit qwen3-0.6B, phase by phase:
+/// `lower` was **1.38 ms** of an 8.9 ms step, second only to the 6.6 ms of
+/// dispatches and larger than everything else combined. A server decodes with
+/// the same row shape for as long as a conversation runs, so every one of
+/// those milliseconds after the first was spent recomputing an answer it
+/// already had.
+///
+/// # Why a small vector and not a map
+///
+/// The key is a `Vec<Row>` as tall as the fire, so hashing it is
+/// proportional to the thing being avoided, while comparing it stops at the
+/// first difference. A deployment sees very few distinct shapes — one per
+/// batch width it actually runs — and [`Lowerings::CAP`] bounds it. Eviction
+/// is oldest-first rather than least-recently-used, which for this access
+/// pattern is the same thing and is one line instead of a counter per entry.
+#[derive(Default)]
+pub struct Lowerings {
+    held: Vec<(bool, Vec<Row>, Lowered)>,
+    lowered: u32,
+}
+
+impl Lowerings {
+    /// How many shapes to keep.
+    ///
+    /// Eight because a lowering is small — launches, symbols and offsets, no
+    /// weights and no arena — and because a deployment that runs more than
+    /// eight distinct batch widths in rotation is one whose lowerings are not
+    /// its problem.
+    const CAP: usize = 8;
+
+    /// How many lowerings this has actually computed.
+    ///
+    /// The saving, stated as a number a test can read rather than as a wall
+    /// time it would have to race. Without it the cache is unfalsifiable from
+    /// outside: a broken one that recomputed every step returns exactly the
+    /// same answers, only slower.
+    #[must_use]
+    pub fn lowered(&self) -> u32 {
+        self.lowered
+    }
+
+    /// The lowering for `rows`, computed only if it is not already held.
+    ///
+    /// `prefill` is part of the key and not a detail: the two plans state
+    /// different projection kernels for identical rows — the whole reason
+    /// [`Serving::prefill`] exists — so a cache keyed on rows alone would
+    /// answer a one-row fire with the prefill's GEMM or the reverse.
+    fn of(
+        &mut self,
+        prefill: bool,
+        plan: &ForwardPlan,
+        rows: &[Row],
+    ) -> Result<&Lowered, Uncovered> {
+        if let Some(at) = self
+            .held
+            .iter()
+            .position(|(p, k, _)| *p == prefill && k.as_slice() == rows)
+        {
+            return Ok(&self.held[at].2);
+        }
+        self.lowered += 1;
+        let low = lower(
+            plan,
+            rows,
+            LowerFire {
+                captures_across_splits: false,
+            },
+        )?;
+        if self.held.len() == Self::CAP {
+            self.held.remove(0);
+        }
+        self.held.push((prefill, rows.to_vec(), low));
+        Ok(&self.held.last().expect("just pushed").2)
+    }
 }
 
 /// Why a step did not run.
@@ -158,7 +250,16 @@ pub struct Step {
     /// the turn order.
     ///
     /// `logits.row(step.readout_of[i])` is turn `i`'s distribution.
+    ///
+    /// A turn naming SEVERAL readout rows has all of them in
+    /// [`Step::readouts_of`]; this stays its LAST, which is what a caller
+    /// wanting one answer means and what every decode wants.
     pub readout_of: Vec<usize>,
+    /// Every row turn `i` reads out, in WHOLE-fire row order.
+    ///
+    /// A decode names one and this is a one-element vector; a speculative
+    /// verifier names one per drafted token.
+    pub readouts_of: Vec<Vec<usize>>,
     /// The position of each row, in the order the rows were fired.
     ///
     /// Here so a caller can read the pool's `Positions` table back and check
@@ -320,6 +421,10 @@ impl Serving<'_> {
             ));
         }
         step.readout_of = last_row_of(requests.len(), &request_of_row);
+        // Re-derived here for the same reason `readout_of` is: `over` is the
+        // only caller that knows the WHOLE fire, and a sub-fire numbers rows
+        // from its own start.
+        step.readouts_of = spans_of(requests).map_err(Unstepped::Unstageable)?;
         step.positions = requests
             .iter()
             .flat_map(|r| r.positions.iter().copied())
@@ -502,19 +607,14 @@ impl Serving<'_> {
         // tiled GEMM as much as a four-token prompt does; the row count is
         // what the kernel choice actually depends on, and the name of the
         // class is only how the text spells it.
-        let plan = if frame.rows() > 1 {
-            self.prefill
-        } else {
-            self.plan
-        };
-        let low = lower(
-            plan,
-            &rows,
-            LowerFire {
-                captures_across_splits: false,
-            },
-        )
-        .map_err(Unstepped::Uncovered)?;
+        let prefill = frame.rows() > 1;
+        let plan = if prefill { self.prefill } else { self.plan };
+        // Split from `held` by field, so that the borrow this lowering is
+        // returned behind does not stand in the way of `held.pool` below.
+        let low = held
+            .lowerings
+            .of(prefill, plan, &rows)
+            .map_err(Unstepped::Uncovered)?;
 
         held.pool.stage(device, &frame).map_err(Unstepped::Failed)?;
         // AND THE TABLE MUST SAY THE SAME THING THE LOWERING WAS TOLD.
@@ -550,9 +650,7 @@ impl Serving<'_> {
             .state(device, crate::binding::FireTable::TokenIds, &ids)
             .map_err(Unstepped::Failed)?;
 
-        let arena = device
-            .buffer(&vec![0u8; low.arena_bytes])
-            .map_err(Unstepped::Failed)?;
+        let arena = arena_for(device, low.arena_bytes)?;
         let model = Model {
             weights: held.weights,
             pool: held.pool,
@@ -561,7 +659,7 @@ impl Serving<'_> {
             device,
             pipelines,
             modules,
-            &low,
+            low,
             Fire {
                 arena: crate::binding::Arena {
                     buffer: &arena,
@@ -573,12 +671,38 @@ impl Serving<'_> {
                 one_at_a_time: false,
             },
         );
-        let read =
-            ran.map_err(Unstepped::Unfired)
-                .and_then(|fired| match logits(device, &arena, &low) {
-                    Ok(l) => Ok((fired, l)),
-                    Err(e) => Err(Unstepped::Unread(e)),
-                });
+        // THE ROWS A CALLER WILL ASK ABOUT, and not every row the text
+        // computed. The two differ by three orders of magnitude on a prefill:
+        // "every row samples" above makes the readout as tall as the fire, so
+        // a 1024-token prompt produces 155 million logits and its turn wants
+        // 151,936 of them.
+        //
+        // Safe to narrow to exactly this because `Serving::over` recomputes
+        // `readout_of` from the requests' own order, and `Frame::of` pushes a
+        // row per position walking the requests in that same order -- so the
+        // rows it names are the rows named here. In a SPLIT fire each piece
+        // names the last row of each request it contains, and a request's
+        // last row lies in the piece that contains it, so every row `over`
+        // can reach was read by the sub-fire that produced it.
+        let readout_of = last_row_of(requests.len(), &frame.request_of_token);
+        // This piece's own last rows, PLUS every row its requests asked for.
+        // `slice` carries `samples` through the cut for exactly this: without
+        // it the frame names only last rows and a verifier's earlier rows are
+        // never read back, which is a `Logits::row` of `None` four layers
+        // later. A read is ONE span from the lowest wanted row to the highest
+        // (see `serve::logits_of`), so widening it costs the widening and not
+        // a submission -- widening it to EVERY row instead would cost 1.2 GB
+        // on a 4096-row prefill, which is what that design exists to avoid.
+        let mut wanted = readout_of.clone();
+        wanted.extend(frame.sampling_indices.iter().map(|&r| r as usize));
+        wanted.sort_unstable();
+        wanted.dedup();
+        let read = ran.map_err(Unstepped::Unfired).and_then(|fired| {
+            match logits_of(device, &arena, low, &wanted) {
+                Ok(l) => Ok((fired, l)),
+                Err(e) => Err(Unstepped::Unread(e)),
+            }
+        });
         // Freed on both paths: a step that refused and leaked its arena would
         // run a server out of memory in exactly the situations where it was
         // already in trouble.
@@ -588,8 +712,11 @@ impl Serving<'_> {
             logits,
             fired,
             rows: frame.rows(),
+            // This piece's, left empty: `over` replaces it with the whole
+            // fire's and `join` renumbers the logits to match.
+            readouts_of: Vec::new(),
             positions: frame.positions.clone(),
-            readout_of: last_row_of(requests.len(), &frame.request_of_token),
+            readout_of,
             pipelines: pipelines.built(),
         })
     }
@@ -602,6 +729,56 @@ impl Serving<'_> {
 /// refusal has to pass through it untouched. Matching the whole path by hand
 /// is how a later variant that happens to carry a `tile` field stays
 /// unhandled instead of quietly becoming a split.
+/// A zeroed arena, zeroed BY THE DEVICE.
+///
+/// # Why not `Device::buffer(&vec![0u8; n])`
+///
+/// That is what this was, and it made a zero-filled `Vec` in system memory
+/// and then uploaded it. Both halves are paid in full: the host memset, and
+/// then the whole arena across the bus. For a decode the arena is 326 KB and
+/// nobody would notice. For a prefill it is `rows * vocab * 4` -- 384 rows of
+/// qwen3-0.6b's 151,936-entry vocabulary is **233 megabytes** -- and the
+/// measurement is not subtle:
+///
+/// | arena | host `vec!` + upload | `empty` + `vkCmdFillBuffer` |
+/// |---|---|---|
+/// | 326 KB (a decode) | 0.20 ms | 0.14 ms |
+/// | 233 MB (a 384-row prefill) | **35.5 ms** | **1.5 ms** |
+///
+/// 35.5 ms was 21% of that prefill's 167 ms. The upload runs at the 10 GB/s
+/// `Device::write` documents, which is the bus behaving correctly -- the
+/// mistake is not slow bytes, it is sending 233 MB of zeros over a bus at all
+/// when the card can fill them in place at its own memory bandwidth.
+///
+/// This is the same fault this crate found in `Pool::resize` and then again
+/// in `Device::copy_within`, one verb further over: those two MOVED bytes the
+/// device already had through the host, and this one MADE bytes on the host
+/// that the device could have made itself. Nothing was ever wrong with the
+/// contents, which is why no test went red for any of the three.
+///
+/// # Why it is still zeroed at all
+///
+/// `Device::empty` alone would be faster still, and the arena is written
+/// before it is read by every op that reads it -- `tests/arena.rs` measures
+/// the fit as exact with nothing to spare. But "every op writes before it
+/// reads" is a property of the LOWERING, not of this function, and a text
+/// whose ops leave a gap would then read whatever the allocator last had in
+/// that memory: another conversation's logits, and fluent text. The fill
+/// costs 1.5 ms on the largest arena here and buys the guarantee outright.
+///
+/// # Errors
+///
+/// [`Unstepped::Failed`], if the allocation or the fill is refused.
+fn arena_for(device: &Device, bytes: usize) -> Result<crate::device::Buffer, Unstepped> {
+    // Rounded up because `Device::zero` fills whole words, and an arena whose
+    // size is not a multiple of four would otherwise leave its last bytes
+    // holding whatever the allocation came with.
+    let size = (bytes as u64).max(4).next_multiple_of(4);
+    let arena = device.empty(size).map_err(Unstepped::Failed)?;
+    device.zero(&arena, 0, size).map_err(Unstepped::Failed)?;
+    Ok(arena)
+}
+
 fn partial_tile(why: &Unstepped) -> Option<usize> {
     match why {
         Unstepped::Unfired(Unfired::Unplannable {
@@ -636,10 +813,42 @@ fn slice(
             continue;
         }
         let (from, to) = (lo - (base - n), hi - (base - n));
-        cut.push(Request::of(
-            request.positions[from..to].to_vec(),
-            request.pages.clone(),
-        ));
+        let mut piece = Request::of(request.positions[from..to].to_vec(), request.pages.clone());
+        // A piece of a traced request is still traced: the pages it carries
+        // are the same pages the program stated, and cutting the fire into
+        // sub-fires does not turn them into a scheduler's placement.
+        piece.traced = request.traced;
+        // And its write targets are per ROW, so they are cut with the rows.
+        if !request.writes.is_empty() {
+            piece.writes = request.writes
+                [from.min(request.writes.len())..to.min(request.writes.len())]
+                .to_vec();
+        }
+        // The mask rows are per ROW, so they are cut with the rows. Left whole
+        // they would be read against the piece's own row numbering, which is
+        // another row's allow-bytes; dropped they would silently unmask -- an
+        // empty mask is not a mask of zeros, it is the causal rule alone.
+        if !request.mask.is_empty() {
+            piece.mask =
+                request.mask[from.min(request.mask.len())..to.min(request.mask.len())].to_vec();
+        }
+        // The readout rows that land in THIS piece, renumbered to it.
+        //
+        // Left empty when none do, which `Request::read` takes as "the last
+        // row" -- one extra row read back and nothing else, because `over`
+        // rewrites the whole fire's readout afterwards. That is why this
+        // needs no third state for "reads nothing": the only consumer of a
+        // piece's readout is the READBACK, and reading one row more than
+        // asked is a wider span, not a wrong answer.
+        piece.samples = request
+            .samples
+            .iter()
+            .filter_map(|&row| {
+                let row = row as usize;
+                (row >= from && row < to).then(|| u32::try_from(row - from).unwrap_or(u32::MAX))
+            })
+            .collect();
+        cut.push(piece);
         cuts.push(
             tokens
                 .get(r)
@@ -663,32 +872,44 @@ fn join(first: Step, second: Step, overlap: usize) -> Step {
     } else {
         first.logits.vocab
     };
+    // Both halves hold only the rows they were asked for -- see
+    // `serve::Logits::read` -- so the join is over those lists and not over a
+    // row count. The second fire's row `k` is the whole fire's row
+    // `first.rows + k - overlap`, and its first `overlap` rows are the ones
+    // the first fire already computed and already holds.
     let mut values = first.logits.values;
-    values.extend_from_slice(
-        second
-            .logits
-            .values
-            .get(overlap * vocab..)
-            .unwrap_or_default(),
-    );
+    let mut read = first.logits.read;
+    for (at, &row) in second.logits.read.iter().enumerate() {
+        if row < overlap {
+            continue;
+        }
+        let Some(one) = second.logits.values.get(at * vocab..(at + 1) * vocab) else {
+            continue;
+        };
+        values.extend_from_slice(one);
+        read.push(first.logits.rows + row - overlap);
+    }
     let kept = second.logits.rows.saturating_sub(overlap);
     Step {
         logits: Logits {
             rows: first.logits.rows + kept,
             vocab,
             values,
+            read,
         },
         fired: Fired {
             dispatches: first.fired.dispatches + second.fired.dispatches,
             submissions: first.fired.submissions + second.fired.submissions,
             blocks: first.fired.blocks + second.fired.blocks,
             parsed: first.fired.parsed + second.fired.parsed,
+            tiered: 0,
         },
         rows: first.rows + second.rows.saturating_sub(overlap),
         // Both rewritten by `over`, which is the only caller that knows the
         // whole fire. Stated from the pieces anyway so that a `Step` out of
         // `join` is never half-filled.
         readout_of: first.readout_of.clone(),
+        readouts_of: first.readouts_of.clone(),
         positions: first
             .positions
             .iter()
@@ -699,17 +920,77 @@ fn join(first: Step, second: Step, overlap: usize) -> Step {
     }
 }
 
-/// The last row each turn contributes, by row order.
+/// Every row each request reads out, in WHOLE-fire row numbering.
 ///
-/// Every row samples, so the readout's rows ARE the fire's rows in order, and
-/// a turn's answer is the distribution of its last token -- the only one that
-/// has seen the whole prompt.
+/// The same walk `Frame::of` does -- requests in order, a base per request --
+/// so the two cannot disagree about placement without disagreeing about the
+/// row order itself.
 ///
-/// A turn with no row gets zero. That cannot happen for a turn a step grew,
-/// and answering with a row that exists beats a panic in a server loop.
+/// # Why the rows are bounds-checked HERE, and not left to `Frame::of`
+///
+/// `Request::read` answers in the request's OWN numbering, so `base + row`
+/// places an out-of-range row inside the NEXT request -- the same silent
+/// cross-request read this crate chased through `envelope` and `frames`. Two
+/// requests of two rows each, the first naming row 2, gives `[[2], [3]]`:
+/// request 0's answer is request 1's first row, and nothing faults.
+///
+/// This was written first as a comment claiming no guard was needed, because
+/// `over` only reaches this after `tiled`, and `tiled` builds a `Frame` per
+/// sub-fire where `Frame::of` refuses the row by name with `NotItsRow`. That
+/// is true of the WHOLE-fire path and false of the split one: `slice` keeps
+/// only the samples landing in its own piece (`row >= from && row < to`), so
+/// an out-of-range row is FILTERED OUT of every piece, each piece falls back
+/// to "the last row", no `Frame::of` ever sees it -- and `over` then walks
+/// the ORIGINAL requests here. The guard upstream cannot fire precisely when
+/// this arithmetic is reached with a bad row.
+///
+/// So the check sits with the arithmetic it protects, where it is reachable
+/// by a test that needs no device.
+fn spans_of(requests: &[Request]) -> Result<Vec<Vec<usize>>, Unstageable> {
+    let mut out = Vec::with_capacity(requests.len());
+    let mut base = 0usize;
+    for (r, request) in requests.iter().enumerate() {
+        let rows = request.positions.len();
+        let mut span = Vec::new();
+        for row in request.read() {
+            if row as usize >= rows {
+                return Err(Unstageable::NotItsRow {
+                    request: r,
+                    row,
+                    rows,
+                });
+            }
+            span.push(base + row as usize);
+        }
+        out.push(span);
+        base += rows;
+    }
+    Ok(out)
+}
+
+/// A row index no fire has: what a request that contributed no rows gets, so
+/// that reading it is a refusal rather than another request's answer.
+pub const NO_ROW: usize = usize::MAX;
+
+/// The last fire row each request contributed, or [`NO_ROW`] for one that
+/// contributed none.
+///
+/// # Why an ownerless request is not row zero
+///
+/// It used to be: the vector started at `0` and only requests owning a token
+/// overwrote their slot, so a request with no rows kept row 0 -- the FIRST
+/// request's. `frames::serve` reads this as the fallback when a read-out span
+/// is empty, so such a request would have been handed another conversation's
+/// distribution and returned its token. That is the `driver-metal` defect
+/// `member_requests` exists to prevent, reached through a different door.
+///
+/// `NO_ROW` is not a row, so the bound check in `serve` refuses it by name.
+/// No new code path, because none is warranted: a probe over the whole
+/// curated suite counted ZERO ownerless requests, and that is a property of
+/// what the ENGINE emits, so it holds for this driver too.
 #[must_use]
 fn last_row_of(requests: usize, request_of_token: &[u32]) -> Vec<usize> {
-    let mut last = vec![0usize; requests];
+    let mut last = vec![NO_ROW; requests];
     for (t, which) in request_of_token.iter().enumerate() {
         if let Some(slot) = last.get_mut(*which as usize) {
             *slot = t;
@@ -752,6 +1033,96 @@ fn place(tokens: &[&[u32]], request_of_token: &[u32]) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A read-out row past its own request is refused, not renumbered.
+    ///
+    /// Without the check `spans_of` answers `[[2], [3]]` for this: request 0
+    /// reading fire row 2, which is request 1's FIRST row. That is a request
+    /// answering out of another conversation's distribution, and it is silent
+    /// -- the row exists, the read succeeds, the text is fluent.
+    #[test]
+    fn a_read_out_row_past_its_own_request_is_refused_before_it_is_renumbered() {
+        let mut mine = Request::of(vec![0, 1], vec![0]);
+        mine.samples = vec![2];
+        let theirs = Request::of(vec![0, 1], vec![1]);
+        assert_eq!(
+            spans_of(&[mine, theirs]),
+            Err(Unstageable::NotItsRow {
+                request: 0,
+                row: 2,
+                rows: 2
+            }),
+            "the row belongs to nobody, so it is named rather than placed"
+        );
+    }
+
+    /// And the rows that ARE its own still come back in fire numbering.
+    #[test]
+    fn every_request_s_own_rows_are_numbered_from_its_start_in_the_fire() {
+        let mut mine = Request::of(vec![0, 1, 2], vec![0]);
+        mine.samples = vec![0, 2];
+        let theirs = Request::of(vec![0, 1], vec![1]);
+        assert_eq!(
+            spans_of(&[mine, theirs]),
+            Ok(vec![vec![0, 2], vec![4]]),
+            "request 1 spans fire rows 3..5, so its own last row is 4"
+        );
+    }
+
+    /// A piece of a request keeps everything that is stated per ROW.
+    ///
+    /// `slice` rebuilds each piece with `Request::of`, which knows only
+    /// positions and pages. Every field added since is one this walk can drop
+    /// in silence, and two already were: a traced request came out of a split
+    /// fire looking scheduler-placed, which put beam search's two lanes back on
+    /// the page-sharing refusal, and its mask rows came out whole -- read
+    /// against the piece's own row numbering, which is another row's
+    /// allow-bytes.
+    #[test]
+    fn a_piece_of_a_request_carries_its_rows_mask_and_write_targets() {
+        let mut whole = Request::of(vec![0, 1, 2], vec![3]);
+        whole.traced = true;
+        whole.mask = vec![vec![1, 0], vec![1, 1], vec![0, 1]];
+        whole.writes = vec![(3, 0), (3, 2), (3, 3)];
+
+        let (cut, _) = slice(&[whole], &[vec![7, 8, 9]], 1..3);
+        let piece = &cut[0];
+        assert_eq!(piece.positions, [1, 2]);
+        assert!(piece.traced, "the program placed these pages either way");
+        assert_eq!(
+            piece.mask,
+            [vec![1, 1], vec![0, 1]],
+            "the rows the piece carries, and only those"
+        );
+        assert_eq!(
+            piece.writes,
+            [(3, 2), (3, 3)],
+            "cut with the rows, or row 0's slot would be written twice"
+        );
+    }
+
+    /// `slice` drops an out-of-range row, which is why `Frame::of` cannot
+    /// catch one on a split fire.
+    ///
+    /// This is the measurement behind `spans_of`'s guard: the piece comes out
+    /// with NO samples, so `Request::read` answers "the last row", so nothing
+    /// downstream is ever handed the bad row to refuse.
+    #[test]
+    fn a_split_fire_filters_the_bad_row_away_instead_of_refusing_it() {
+        let mut mine = Request::of(vec![0, 1], vec![0]);
+        mine.samples = vec![2];
+        let (cut, _) = slice(&[mine], &[vec![7, 8]], 0..2);
+        assert_eq!(
+            cut[0].samples,
+            Vec::<u32>::new(),
+            "the row landed in no piece, so the piece states no read-out"
+        );
+        assert_eq!(
+            cut[0].read(),
+            vec![1],
+            "and an empty table reads the last row, which faults nowhere"
+        );
+    }
 
     fn turn(who: u64, tokens: &[u32]) -> Turn {
         Turn {
@@ -798,7 +1169,12 @@ mod tests {
             vec![4, 2],
             "and it follows the frame's order, not the turns'"
         );
-        assert_eq!(last_row_of(3, &[0, 1]), vec![0, 1, 0], "a turn with no row");
+        // A request that contributed no rows. This used to answer `0` -- the
+        // FIRST request's row -- and `frames::serve` reads exactly this as
+        // the fallback when a read-out span is empty, so it would have
+        // returned another conversation's token. The test named the case and
+        // pinned the wrong answer.
+        assert_eq!(last_row_of(3, &[0, 1]), vec![0, 1, NO_ROW]);
     }
 
     /// A row past its turn's tokens is zero and not a panic.

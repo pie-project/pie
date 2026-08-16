@@ -271,7 +271,7 @@ pub fn sort_desc_order(row: &[f32]) -> Vec<u32> {
 /// Draw `n` RNG lanes from `seed_eff`, uniform or Gumbel-transformed.
 ///
 /// Reuses the canonical RNG contract in [`tensor_ir::rng`] — the Rust source of
-/// truth the C++ `rng_contract.generated.h` is projected from — rather than
+/// truth every backend's device RNG is projected from — rather than
 /// transcribing the hash. Gumbel noise is `-ln(-ln(u))`; because
 /// [`tensor_ir::rng::hash_uniform`] is bounded strictly below `1.0`, the inner
 /// `-ln(u)` is finite and the transform never produces `+inf`.

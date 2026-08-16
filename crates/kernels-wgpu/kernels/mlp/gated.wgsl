@@ -43,9 +43,10 @@
 // for that with an `atomic<u32>` output and a compare-exchange on the edge.
 
 //#include "common/bf16.inc.wgsl"
+//#include "common/math.inc.wgsl"
 
-@group(0) @binding(0) var<storage, read> gate: array<u32>;
-@group(0) @binding(1) var<storage, read> up: array<u32>;
+@group(0) @binding(0) var<storage, read_write> gate: array<u32>;
+@group(0) @binding(1) var<storage, read_write> up: array<u32>;
 //#if defined(PIE_GEGLU_STRIDED)
 // Atomic in this variant ALONE: it is the only one whose invocation can own
 // half a word. See `store_half`. The host binds the same read_write storage
@@ -60,7 +61,7 @@
 // above. It stays because the row states `params: Buf`, and the bind group
 // layout a shell builds from the row is the same on all three backends.
 struct GegluParams { unused: u32 }
-@group(0) @binding(3) var<storage, read> params: GegluParams;
+@group(0) @binding(3) var<storage, read_write> params: GegluParams;
 //#elif defined(PIE_GEGLU_STRIDED)
 // gemma4's per-layer-embedding GeGLU reads a NARROW gate out of a WIDE table:
 // the PLE table is `[rows, n_layers * ple_dim]`, so layer L's slice is
@@ -76,7 +77,7 @@ struct GegluStridedParams {
     up_pitch: u32,
     out_pitch: u32,
 }
-@group(0) @binding(3) var<storage, read> params: GegluStridedParams;
+@group(0) @binding(3) var<storage, read_write> params: GegluStridedParams;
 //#elif defined(PIE_GPTOSS)
 struct GptOssSwiGluParams {
     // Was a per-row element count. See `GegluParams`.
@@ -84,7 +85,7 @@ struct GptOssSwiGluParams {
     limit: f32,
     alpha: f32,
 }
-@group(0) @binding(3) var<storage, read> params: GptOssSwiGluParams;
+@group(0) @binding(3) var<storage, read_write> params: GptOssSwiGluParams;
 //#endif
 
 //#if defined(PIE_SILU_STRIDED)
@@ -112,7 +113,7 @@ fn sigmoid_mlx(x: f32) -> f32 {
 fn gelu_tanh(x: f32) -> f32 {
     let k = 0.7978845608028654;  // sqrt(2/pi)
     let inner = k * (x + 0.044715 * x * x * x);
-    return 0.5 * x * (1.0 + tanh(inner));
+    return 0.5 * x * (1.0 + pie_tanh(inner));
 }
 //#endif
 

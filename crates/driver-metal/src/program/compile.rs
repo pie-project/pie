@@ -545,9 +545,31 @@ impl Math {
     /// Apply to freshly made compile options.
     fn apply(self, options: &MTLCompileOptions) {
         match self {
-            // Left alone rather than set to the fast constants. The default
-            // IS fast, and writing it would claim this crate has an opinion
-            // about a value it would rather inherit if the SDK changes it.
+            // Left alone, and the reason is NOT the one that used to stand
+            // here. That said "the default IS fast", which is false under
+            // the dialect this driver pins: `MTLCompileOptions.mathMode`
+            // defaults to `Fast` only below MSL 3.2, and `LANGUAGE_VERSION`
+            // above is 4.0, so the inherited mode is `Safe`. Every kernel in
+            // the tree compiles in safe mode and always has.
+            //
+            // Writing `Fast` here was tried and MEASURED, because a uniform
+            // 1.4x against mlx-lm on a kernel that is MLX's own — same tile,
+            // same `BlockMMA`, same loader, same two-fence K loop — looks
+            // exactly like a lost fma contraction. It is not: on
+            // Llama-3.2-1B, one 2048-token prefill, with the PSO archive
+            // disabled so the old binaries could not be served
+            // (`Math::tag` does not distinguish a changed meaning of the
+            // same tag, which is its own trap):
+            //
+            //                    inherited   Fast written
+            //     q_proj            5.54       5.43
+            //     gate_proj        19.44      19.44
+            //     down_proj        19.45      19.71
+            //
+            // Noise. So the mode stays inherited — not because the default
+            // is what this crate wants named, but because changing it moves
+            // numerics and moves nothing else, and `Precise` remains the
+            // spelling for a caller that wants the strict one.
             Self::Fast => {}
             Self::Precise => {
                 options.setMathMode(MTLMathMode::Safe);

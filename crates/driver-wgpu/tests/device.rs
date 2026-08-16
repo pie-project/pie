@@ -53,7 +53,7 @@
 use driver_wgpu::binding::Bound;
 use driver_wgpu::device::{Buffer, Ceiling, Device, Failed, Pipelines, Recorded};
 use driver_wgpu::geometry::Dims;
-use driver_wgpu::resources::{Frame, Request, Shape};
+use driver_wgpu::resources::{Frame, Pool, Request, Shape};
 use driver_wgpu::serve::{Embedded, pick};
 use kernels_wgpu::Capability;
 use std::sync::{Mutex, MutexGuard};
@@ -133,6 +133,77 @@ fn adapter() -> Option<(Device, MutexGuard<'static, ()>)> {
             None
         }
     }
+}
+
+/// THE RUNNER SAYS WHETHER IT HAS A DEVICE, and this is the only test here
+/// that is not gated on having one.
+///
+/// All but one of the tests in this file open through [`adapter`] and
+/// `return` when it hands back `None`, printing a `SKIP:` line that
+/// `cargo test` swallows unless someone passed `--nocapture`. So the step's
+/// summary reads the same on a runner that measured all of them and on a
+/// runner that measured none of them, and no one reading the log can tell
+/// which run they are looking at.
+///
+/// No number is written in this paragraph on purpose. It said "sixteen" for a
+/// while, and "eighteen" before that, and both were the file's test count at
+/// some earlier hour. The scan below is what knows; prose that repeats it is
+/// prose that will be wrong by the next test anyone adds -- as this was.
+///
+/// This one always runs and always says which. `PIE_WGPU_REQUIRE_DEVICE=1`
+/// turns the absence into a failure, and CI is where that belongs: the
+/// workflow installs `mesa-vulkan-drivers` immediately above this step for
+/// the express purpose of GUARANTEEING an adapter, and nothing checked that
+/// the install took. A green step is not evidence the guarantee held.
+///
+/// It asks [`adapter`] rather than [`Device::open`] because the claim it
+/// prints is about THOSE TESTS, not about this process. A first draft
+/// opened its own device to avoid taking the lock, and an injected failure
+/// inside `adapter` had it print PRESENT while every one of them skipped -- the
+/// exact lie it was written to catch, told by the catcher. Sharing the code
+/// path is what makes the line evidence; the serialisation it costs is the
+/// same serialisation every other test here already pays.
+///
+/// The reason for an absence is printed by `adapter` as its `SKIP:` line and
+/// is deliberately not repeated on the `ABSENT` line: one place in this crate
+/// knows why there is no device, and that place already says so.
+///
+/// The count is read off this file rather than kept as a number beside it,
+/// for the reason every hand-kept count in this workspace has eventually
+/// earned. The needle is split with `concat!` because a literal that looks
+/// for itself finds itself: the same scan spelled in one piece returns one
+/// too many.
+#[test]
+fn the_runner_states_whether_it_has_a_device() {
+    const NEEDLE: &str = concat!("= adapter", "() else");
+    let gated = include_str!("device.rs").matches(NEEDLE).count();
+    let required = std::env::var_os("PIE_WGPU_REQUIRE_DEVICE").is_some_and(|v| v != "0");
+
+    match adapter() {
+        Some(_) => println!("WGPU DEVICE: PRESENT -- the {gated} gated test(s) here ran"),
+        None => {
+            println!("WGPU DEVICE: ABSENT -- the {gated} gated test(s) here did NOT run");
+            assert!(
+                !required,
+                "`PIE_WGPU_REQUIRE_DEVICE` is set and `adapter()` opened no \
+                 device; its `SKIP:` line above says why. A suite that skips \
+                 in silence is what this test exists to prevent; on a Linux \
+                 runner, `PIE_WGPU_FALLBACK=1` takes the software adapter, \
+                 which is a real implementation of the same WGSL and not a \
+                 way of passing."
+            );
+        }
+    }
+
+    // A control on the count: this file gates its tests the way the doc says
+    // it does, so the number above is a measurement rather than a zero that
+    // reads like one.
+    assert!(
+        gated >= 15,
+        "only {gated} test(s) in this file are gated on `adapter()`, which is \
+         fewer than it visibly has -- the scan has lost its needle and the \
+         line printed above is not a count of anything."
+    );
 }
 
 /// Round an `f32` to a bf16 bit pattern, round to nearest even.
@@ -689,7 +760,10 @@ fn one_pass_and_one_submission_each_agree_over_a_chained_plan() {
             })
             .collect();
         if all_at_once {
-            device.run_all(&recorded).expect("the whole plan ran")
+            device
+                .run_all(&recorded)
+                .expect("the whole plan ran")
+                .shadowed
         } else {
             for one in &recorded {
                 device
@@ -734,56 +808,73 @@ fn one_pass_and_one_submission_each_agree_over_a_chained_plan() {
     }
 }
 
-/// The arena bound both ways is diagnosed by name, and run anyway.
+/// A `read` binding aliased with a `read_write` one is diagnosed by name, and
+/// run anyway.
 ///
-/// **The largest divergence in the device half**, and it is a fact about WebGPU
-/// rather than about `wgpu`: a dispatch is one usage scope, and a buffer in a
-/// usage scope may carry any number of readable usages or exactly one writable
-/// one, never both. Disjoint ranges do not help — a buffer has no subresources.
-/// Every launch of every real plan does this, since the plan's input and its
-/// output are two ranges of one arena.
+/// **A fact about WebGPU rather than about `wgpu`**: a dispatch is one usage
+/// scope, and a buffer in a usage scope may carry any number of INCLUSIVE
+/// usages or exactly one EXCLUSIVE one, never both. `STORAGE_READ_ONLY` is
+/// inclusive and `STORAGE_READ_WRITE` is exclusive, so the pair is refused,
+/// and disjoint ranges do not help — a buffer has no subresources.
 ///
-/// So this checks both halves of the answer. [`Device::check`] names it, with
-/// the two bindings and the two offsets, which is the diagnosis a caller wants;
-/// [`Device::run_all`] shadows the read side into a scratch buffer and produces
-/// the right numbers, which is what makes the driver usable at all. The numbers
-/// are compared against the SAME closed form the un-aliased norm is checked
-/// against, so "it ran" and "it was right" are one assertion.
+/// # This used to use a real kernel, and cannot any more
+///
+/// Every launch of every real plan bound one arena both ways, and this test
+/// took `rms_single_row_bfloat16` off the tree to show it. The shader tree no
+/// longer declares a single `var<storage, read>`: two `read_write` bindings
+/// of one buffer are the same bit, `is_power_of_two` holds, and the dispatch
+/// is legal — which deleted 451 shadow copies from a 452-launch decode and
+/// took it from 25.1 ms to 11.2 ms. `kernels-wgpu`'s
+/// `no_shader_declares_a_read_only_storage_binding` is that decision, kept.
+///
+/// So the shader here is written out. The MACHINERY still has to work: a
+/// `read` binding is legal WGSL, a future kernel may want one, and without
+/// the shadow such a kernel would be refused by `wgpu` rather than run. This
+/// is what keeps that true after its last real caller went away — the shape
+/// of test that would otherwise have been deleted along with its subject.
+///
+/// Both halves: [`Device::check`] names it, with the two bindings and the two
+/// offsets; [`Device::run_all`] shadows the read side and produces the right
+/// numbers.
 #[test]
 fn an_arena_bound_both_ways_is_diagnosed_by_name_and_run_anyway() {
     let Some((device, _held)) = adapter() else {
         return;
     };
     let mut cache = Pipelines::new();
-    let name = "rms_single_row_bfloat16";
-    let (source, tier) = pick(&Embedded, name, Capability::Baseline).expect("the tree holds it");
-    let pipeline = cache.get(&device, name, tier, &source).expect("it builds");
+    // `src` is `read` DELIBERATELY. It is the only one left in either tree.
+    let source = r"
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+@compute @workgroup_size(64)
+fn twice(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i < arrayLength(&dst)) { dst[i] = src[i] * 2u; }
+}
+";
+    let pipeline = cache
+        .get(&device, "twice", Capability::Baseline, source)
+        .expect("it builds");
 
-    let eps = 1e-6f32;
-    let n = (ROWS * WIDTH) as usize;
-    let (x_bytes, x_seen) = pack(&spread(n, 23));
-    let (w_bytes, w_seen) = pack(&spread(WIDTH as usize, 31));
-    let w = device.buffer(&w_bytes).expect("w");
-    let params = device
-        .buffer(&rms_params(eps, WIDTH, 1, 0, 1.0))
-        .expect("params");
-
-    // ONE arena, input at 0 and output one region along -- which is the shape
-    // `binding::Arena` produces and the shape WebGPU refuses.
     let align = device.min_storage_offset();
-    let span = x_bytes.len() as u64;
+    let n = 64usize;
+    let span = n as u64 * 4;
     let stride = span.next_multiple_of(align);
-    let mut fill = SENTINEL.to_le_bytes().repeat((stride * 2) as usize / 4);
-    fill[..x_bytes.len()].copy_from_slice(&x_bytes);
+    // ONE arena, input at 0 and output one region along -- the shape
+    // `binding::Arena` produces and the shape WebGPU refuses.
+    let mut fill = SENTINEL.to_le_bytes().repeat((stride + span) as usize / 4);
+    for (i, word) in fill.chunks_mut(4).take(n).enumerate() {
+        word.copy_from_slice(&u32::try_from(i).expect("small").to_le_bytes());
+    }
     let arena = device.buffer(&fill).expect("arena");
 
     let input = Bound::within(&arena, 0, span, align).expect("the input range");
     let output = Bound::within(&arena, stride, span, align).expect("the output range");
     let one = Recorded {
         pipeline,
-        buffers: &[input, Bound::whole(&w), output, Bound::whole(&params)],
+        buffers: &[input, output],
         uniform: &[],
-        groups: [ROWS, 1, 1],
+        groups: [1, 1, 1],
     };
 
     // The diagnosis, by name and with both offsets.
@@ -791,7 +882,7 @@ fn an_arena_bound_both_ways_is_diagnosed_by_name_and_run_anyway() {
         device.check(&one),
         Err(Failed::Aliased {
             reader: 0,
-            writer: 2,
+            writer: 1,
             read_at: 0,
             write_at: stride,
         }),
@@ -800,20 +891,28 @@ fn an_arena_bound_both_ways_is_diagnosed_by_name_and_run_anyway() {
     );
 
     // And it runs, through the shadow, with the right numbers.
-    let shadowed = device
+    let ran = device
         .run_all(&[one])
         .expect("the shadow made it dispatchable");
     assert_eq!(
-        shadowed, 1,
+        ran.shadowed, 1,
         "one read operand shares the arena with the write, so exactly one \
          range should have been copied"
     );
-    let got = unpack(&device.read_at(&arena, stride, span).expect("readback"), n);
-    for row in 0..ROWS as usize {
-        let at = row * WIDTH as usize..(row + 1) * WIDTH as usize;
-        let want = rms_reference(&x_seen[at.clone()], &w_seen, eps);
-        agrees(&got[at], &want, &format!("row {row}")).expect("the shadowed norm agrees");
-    }
+    assert_eq!(
+        ran.buffers, 1,
+        "a shadow point ends a compute PASS, not an encoder; a fire is one \
+         command buffer however much it copies"
+    );
+    let got = device.read_at(&arena, stride, span).expect("readback");
+    let words: Vec<u32> = got
+        .chunks(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let want: Vec<u32> = (0..n)
+        .map(|i| u32::try_from(i * 2).expect("small"))
+        .collect();
+    assert_eq!(words, want, "the shadowed dispatch read the wrong bytes");
 }
 
 /// A grid one short leaves the last row holding its sentinel, and reports
@@ -1360,4 +1459,1085 @@ fn a_buffer_outlives_the_device_handle_that_made_it() {
     };
     assert_eq!(held.size(), 8, "the allocation is still there");
     drop(held);
+}
+
+/// A pool that grows keeps every page it was holding, at the same number.
+///
+/// # Why this needed a test and did not have one
+///
+/// Because it is the sentence the whole elastic pool rests on, and it was
+/// only a sentence. `Pool::resize`'s own doc says "the pages that survive
+/// keep their contents, at the same page numbers", and nothing read it back:
+/// the pool's tests are `pages.rs`'s, which are about the BOOK -- who holds
+/// which page -- and never touch a buffer. Meanwhile two callers depend on
+/// the claim. `Shell::admit` grows mid-conversation, so a growth that lost
+/// the cache would answer a decode from zeros, fluently, with no fault
+/// anywhere; and `Shell::copy_kv` now grows before copying, so a growth that
+/// renumbered would copy the right bytes to the wrong page.
+///
+/// A pattern rather than a model, because what is under test is the transfer
+/// and not the attention: distinct bytes per page, per layer, and per half of
+/// the pair, so a resize that copied the key buffers over the value buffers,
+/// or layer 1 over layer 0, is a different failure from one that lost the
+/// tail.
+///
+/// The shrink is here too, and it is the same claim from the other side: the
+/// pages BELOW the new size keep their contents. `Shell::resize_pool` refuses
+/// a shrink that would strand a held page, so the tail being dropped is by
+/// then nobody's, and this only asserts that the survivors survived.
+#[test]
+fn a_pool_that_resizes_keeps_the_pages_it_still_has() {
+    let Some((device, _held)) = adapter() else {
+        return;
+    };
+    let shape = Shape {
+        layers: 2,
+        kv_heads: 2,
+        head_dim: 4,
+        page_size: 3,
+        pages: 4,
+        bytes: 2,
+    };
+    let mut pool = Pool::open(&device, shape).expect("a four-page pool");
+
+    // A byte per page, per layer, per half, none of them zero -- zero is what
+    // a fresh buffer holds, so a resize that allocated and copied nothing
+    // would pass a check written against it.
+    let mark = |page: u32, layer: u16, values: bool| -> u8 {
+        1 + page as u8 * 8 + layer as u8 * 2 + u8::from(values)
+    };
+    let page_bytes = (shape.page_size as u64 * shape.row() * shape.bytes as u64) as usize;
+    for layer in 0..shape.layers {
+        for values in [false, true] {
+            let buffer = pool.cache(layer, values).expect("a layer");
+            for page in 0..shape.pages {
+                let at = shape.slot(page, 0, 0, 0) * shape.bytes as u64;
+                device
+                    .write(buffer, at, &vec![mark(page, layer, values); page_bytes])
+                    .expect("a page of marks");
+            }
+        }
+    }
+
+    let holds = |pool: &Pool, page: u32, layer: u16, values: bool| -> Vec<u8> {
+        let buffer = pool.cache(layer, values).expect("a layer");
+        let at = shape.slot(page, 0, 0, 0) * shape.bytes as u64;
+        device
+            .read_at(buffer, at, page_bytes as u64)
+            .expect("a page back")
+    };
+
+    pool.resize(&device, 7).expect("room to grow into");
+    assert_eq!(pool.shape().pages, 7);
+    for layer in 0..shape.layers {
+        for values in [false, true] {
+            for page in 0..4 {
+                assert_eq!(
+                    holds(&pool, page, layer, values),
+                    vec![mark(page, layer, values); page_bytes],
+                    "page {page} of layer {layer} (values={values}) did not \
+                     survive the growth as itself"
+                );
+            }
+            assert_eq!(
+                holds(&pool, 6, layer, values),
+                vec![0u8; page_bytes],
+                "a page the pool grew into holds somebody's old bytes"
+            );
+        }
+    }
+
+    // ...and the same from the other side. Pages 0..2 keep their contents;
+    // the tail is gone, which is the caller's business to have checked.
+    pool.resize(&device, 2).expect("a shrink");
+    assert_eq!(pool.shape().pages, 2);
+    for layer in 0..shape.layers {
+        for values in [false, true] {
+            for page in 0..2 {
+                assert_eq!(
+                    holds(&pool, page, layer, values),
+                    vec![mark(page, layer, values); page_bytes],
+                    "the shrink moved page {page} of layer {layer}"
+                );
+            }
+        }
+    }
+
+    // A pool of no pages is not a smaller pool.
+    pool.resize(&device, 0).expect_err("a cache of zero pages");
+    assert_eq!(pool.shape().pages, 2, "a refused resize changed the pool");
+}
+
+/// One device cannot be handed another device's buffer -- and what stops it
+/// is a PANIC inside `wgpu-core`, not a refusal this driver can report.
+///
+/// # Why this test exists
+///
+/// `driver-vulkan` pointed the Vulkan validation layer at its own suite for
+/// the first time and found two tests spending a lock as if it owned the
+/// shell's memory: one read a pool's buffers through a second `VkDevice`, and
+/// one passed that device to `copy_page`, putting two `VkDevice`s in one
+/// `vkCmdCopyBuffer`. That is a `commonparent` violation -- undefined, not
+/// untidy -- and the card tolerated it silently, so both tests had been green
+/// throughout.
+///
+/// This suite has the same SHAPE: `adapter()` hands back a device and a lock
+/// together, `tests/serving.rs` opens a `Shell` that owns another one, and
+/// nothing but care keeps the two apart.
+///
+/// The layer was pointed here too, on the copy the sibling downloaded, and
+/// CONFIRMED LOADED rather than assumed -- `VK_LOADER_DEBUG=layer` printing
+/// "Insert instance layer" and "Inserted device layer" for
+/// `VK_LAYER_KHRONOS_validation`. The first attempt did not have it loaded at
+/// all (`VK_LAYER_PATH` is empty on this box and the package is not
+/// installed), and reported clean, which is exactly the trap the sibling
+/// documented. With it genuinely loaded: 14 device tests, 53 kernel proofs and
+/// 13 serving proofs, no VUID.
+///
+/// # What actually stops the mistake, measured
+///
+/// Not this driver, and not the Vulkan layer. `wgpu-core` keeps its resources
+/// in a per-device registry and IDs are per-device, so the other device's
+/// buffer is simply not there:
+///
+/// ```text
+/// panicked at wgpu-core-30.0.0/src/storage.rs:143:
+/// Cannot get non-existent resource BufferId(0,1)
+/// ```
+///
+/// Three things follow, and the middle one is the useful one:
+///
+/// * it is NOT undefined behaviour, so the sibling's defect cannot silently
+///   pass here the way it did there;
+/// * it is NOT a named refusal either. It is a panic in a dependency with a
+///   message about an ID, raised before `Device::drained` ever sees anything,
+///   so this crate's "the layer below reports rather than aborts" discipline
+///   does not reach it. A caller cannot catch this and carry on;
+/// * therefore the guarantee is real but it belongs to `wgpu`, and it is
+///   pinned here so that a version which downgrades the panic to a silent
+///   miss is a red test rather than a quiet return to the sibling's world.
+///
+/// # It wanted two DEVICES, asked for two ADAPTERS, and was red where it ran
+///
+/// This test used to carry `#[should_panic]` above a `Device::software()` and
+/// a comment claiming the software adapter "is the one that ALWAYS exists
+/// beside whatever `adapter()` opened, so this cannot be a test that only runs
+/// on a two-GPU box". Three things were wrong, and each covered for the next.
+///
+/// `Device::software` asks wgpu for `PowerPreference::None` with
+/// `force_fallback_adapter`. On Linux that finds `llvmpipe`, which is why CI
+/// installs `mesa-vulkan-drivers`. **On macOS the Metal backend ships no
+/// fallback adapter at all**, so `software()` returned `Unavailable` and this
+/// test took its skip branch. Under `#[should_panic]` a skip is a FAILURE,
+/// reported as `test did not panic as expected` -- a sentence that names the
+/// wrong thing entirely, telling the reader the wgpu guarantee broke when what
+/// happened is that the box has one adapter. So the test was RED on every Mac
+/// and had never run on one.
+///
+/// And it never needed a second adapter. `wgpu-core`'s registry is per-DEVICE;
+/// the adapter behind it is not what makes an ID foreign. A second
+/// `Device::open()` on the very same GPU is a second registry, and binding
+/// across the pair raises the identical `BufferId(0,1)` panic -- measured on a
+/// single-adapter Mac, which is where the old spelling could not run at all.
+/// The pair is now two `open()`s, so the proof runs EVERYWHERE rather than
+/// only where a fallback driver happens to be installed.
+///
+/// The panic is caught here instead of declared in an attribute, which is a
+/// strictly stronger pin: `#[should_panic]` accepts a panic from ANYWHERE in
+/// the body, including the `expect` below, whereas this catches only the bind
+/// and requires the message. The default hook is muted across the catch so the
+/// backtrace of an EXPECTED panic does not read like a failure in the log.
+#[test]
+fn a_buffer_cannot_be_bound_by_the_device_that_did_not_make_it() {
+    let Some((device, _held)) = adapter() else {
+        return;
+    };
+    // A SECOND device, not a second adapter: see the heading above.
+    let Ok(other) = Device::open() else {
+        println!("SKIP: a second device would not open, so there is no pair to mix");
+        return;
+    };
+    let theirs = other
+        .buffer(&[1u8, 2, 3, 4])
+        .expect("a buffer on the other");
+
+    let layout = device
+        .raw()
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mixed"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let bound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        device.raw().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mixed"),
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: theirs.raw().as_entire_binding(),
+            }],
+        })
+    }));
+    std::panic::set_hook(hook);
+
+    let why = match bound {
+        // Reached only if `wgpu-core` stopped panicking, in which case this
+        // test is the thing that says so.
+        Ok(_) => {
+            let _ = device.drained();
+            panic!(
+                "binding another device's buffer was ACCEPTED. Whatever \
+                 stopped this is no longer stopping it, and the sibling \
+                 driver's defect can now be written here too."
+            );
+        }
+        Err(payload) => payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_else(|| "a panic with no string payload".to_string()),
+    };
+    assert!(
+        why.contains("non-existent resource"),
+        "the bind panicked, but for a different reason than the registry \
+         miss this pins: {why}"
+    );
+}
+
+/// Are the two adapters this crate offers actually two?
+///
+/// `Device::software`'s doc makes the strongest claim in this crate: "a shader
+/// that agrees on a discrete GPU and on `llvmpipe` has been checked by two
+/// independent compilers and two independent schedulers, where one that agrees
+/// only on the card it was written on has been checked by neither."
+///
+/// That claim is worth exactly as much as the two adapters being DIFFERENT,
+/// and nothing checked it. On a machine with one adapter, `open()` and
+/// `software()` return the same implementation and every cross-check between
+/// them proves nothing twice.
+///
+/// # Why this was written
+///
+/// `.wiki/new-driver/wgpu.md` said, in a section of its own, "There is no GPU
+/// on the machine", and discounted every timing in the file accordingly. The
+/// default adapter here is an RTX 4090; `PIE_WGPU_FALLBACK=1` is what selects
+/// llvmpipe. The knob was documented in three files and nobody had checked
+/// which one its ABSENCE picks — because the answer is printed by a passing
+/// test, and `cargo test` hides a passing test's stdout.
+///
+/// So the answer goes in an assertion message instead, where a failure has to
+/// show it, and the test says plainly when the cross-check is vacuous rather
+/// than letting a one-adapter machine look like a two-adapter one.
+///
+/// It does not FAIL on one adapter: a CI runner with only `llvmpipe` is a
+/// legitimate machine and this suite runs there. `PIE_WGPU_REQUIRE_TWO_ADAPTERS`
+/// turns it into a failure for anyone who means to be measuring both.
+#[test]
+fn the_two_adapters_this_crate_offers_are_two_implementations_or_say_so() {
+    let Some((hardware, _held)) = adapter() else {
+        return;
+    };
+    let fast = hardware.name().to_string();
+    let api = format!("{:?}", hardware.backend());
+    drop(hardware);
+
+    let Ok(soft) = Device::software() else {
+        println!("SKIP: this instance offers no software adapter; `{fast}` is all there is");
+        return;
+    };
+    let slow = soft.name().to_string();
+
+    println!("open() -> {fast} ({api});  software() -> {slow}");
+    if fast == slow {
+        assert!(
+            std::env::var_os("PIE_WGPU_REQUIRE_TWO_ADAPTERS").is_none(),
+            "`open()` and `software()` both answer `{fast}`, so every claim in \
+             this crate about agreeing on TWO implementations is vacuous here, \
+             and PIE_WGPU_REQUIRE_TWO_ADAPTERS says that is not acceptable"
+        );
+        println!(
+            "NOTE: one adapter only (`{fast}`). Cross-adapter agreement is \
+             UNMEASURED on this machine -- any claim of two implementations \
+             needs a machine with two."
+        );
+        return;
+    }
+
+    // Both answer, and they are different. That is the premise every
+    // cross-adapter claim in this crate rests on, and it is now written down
+    // where a reader of a NUMBER can find which device produced it.
+    assert!(
+        !fast.is_empty() && !slow.is_empty(),
+        "an adapter with no name cannot be attributed a measurement"
+    );
+}
+
+/// The documented way to ask the second implementation actually asks it.
+///
+/// `Device::open`'s doc used to say `WGPU_POWER_PREF` was "how a machine with
+/// two adapters is asked the same question twice … the way to ask has to be
+/// reachable without editing anything". Measured on this machine — an RTX 4090
+/// beside `llvmpipe` — unset, `low` and `high` all answer the 4090. A power
+/// preference RANKS adapters; it never reaches a software one, which needs
+/// `force_fallback_adapter`, the flag [`Device::software`] sets and no
+/// preference implies.
+///
+/// So the stated mechanism could not do the stated thing, and the only paths
+/// that could reach the second adapter were the three test files that spell
+/// `PIE_WGPU_FALLBACK` themselves. No gate, no curated run and no server could
+/// — which is to say the crate's strongest claim was available to unit tests
+/// and to nothing that runs a model end to end.
+///
+/// `Device::open` reads the variable now, so every path gets it. This asserts
+/// the behaviour rather than the wiring: with it set, `open()` answers what
+/// `software()` answers.
+#[test]
+fn the_fallback_knob_reaches_the_second_adapter_through_open() {
+    let Some((_probe, _held)) = adapter() else {
+        return;
+    };
+    let Ok(soft) = Device::software() else {
+        println!("SKIP: no software adapter on this instance");
+        return;
+    };
+    let want = soft.name().to_string();
+    drop(soft);
+
+    // SAFETY: single-threaded here -- the suite's lock is held above, and this
+    // is the one test that needs the process environment to differ.
+    unsafe { std::env::set_var("PIE_WGPU_FALLBACK", "1") };
+    let asked = Device::open().map(|d| d.name().to_string());
+    unsafe { std::env::remove_var("PIE_WGPU_FALLBACK") };
+
+    let got = asked.expect("a software adapter answered a moment ago");
+    assert_eq!(
+        got, want,
+        "`PIE_WGPU_FALLBACK` did not reach the software adapter through \
+         `Device::open`, so the gates, the curated suite and the server cannot \
+         be run on the second implementation -- which is the cross-check this \
+         crate's `software()` doc calls its strongest"
+    );
+}
+
+/// Every entrypoint the table ships becomes a real pipeline on this adapter.
+///
+/// `kernels-wgpu`'s `every_module_parses_and_validates` proves all 481 survive
+/// `naga`. That is the LANGUAGE, and it is not the same question as whether an
+/// adapter will build one: `create_compute_pipeline` applies limits naga knows
+/// nothing about, and the two adapters this machine offers differ by 16x on
+/// the one that binds.
+///
+/// Nothing swept it. The gap showed up as a difference between adapters in the
+/// curated suite -- `quest-attention` and `h2o-attention` come back
+/// `channel is poisoned: pipeline: ...` on `llvmpipe` and as clean intrinsic
+/// refusals on an RTX 4090 -- which is a twenty-minute round trip to learn
+/// that SOMETHING did not build. This is the same question asked directly, in
+/// seconds, naming the entrypoint.
+///
+/// Run it on both: `cargo test ... builds_a_pipeline_on_this_adapter` and again with
+/// `PIE_WGPU_FALLBACK=1`. A row that builds on one and not the other is the
+/// portability defect this backend exists to not have.
+#[test]
+fn every_entrypoint_in_the_tree_builds_a_pipeline_on_this_adapter() {
+    let Some((device, _held)) = adapter() else {
+        return;
+    };
+    println!("building every entrypoint on {}", device.name());
+
+    let mut cache = Pipelines::new();
+    let (mut built, mut refused) = (0usize, Vec::new());
+    // Walks the SHADER TREE, not the table.
+    //
+    // It walked `entrypoints()` until Stage 3 deleted its first row, at which
+    // point `argmax_logits_bfloat16` stopped being built here at all — the
+    // shader was still in the tree and still fired by a routine, and the one
+    // sweep that compiles every entrypoint on a real adapter had quietly
+    // stopped covering it. Nothing failed, and the loss would have compounded
+    // to a sweep that builds nothing.
+    //
+    // `kernels-wgpu::RETIRED` now keeps those names in `entrypoints()`, so
+    // both readings agree again. This one stays on `source::declared()`
+    // anyway, because it is the reading that does not depend on a
+    // hand-written list being right — and `RETIRED` is hand-written.
+    let all: std::collections::BTreeSet<String> = kernels_wgpu::source::declared()
+        .into_iter()
+        .map(|(_, v)| v.entrypoint)
+        .collect();
+    for name in all {
+        let Some((source, tier)) = pick(&Embedded, &name, Capability::Baseline) else {
+            refused.push(format!("{name}: the tree holds no source for it"));
+            continue;
+        };
+        match cache.get(&device, &name, tier, &source) {
+            Ok(_) => built += 1,
+            Err(why) => refused.push(format!("{name} @{tier:?}: {why}")),
+        }
+    }
+
+    println!("{built} built, {} refused", refused.len());
+    assert!(
+        refused.is_empty(),
+        "{} of {} entrypoints do not become a pipeline on `{}`. A row that \
+         builds on one adapter and not another is the portability this backend \
+         exists for, failing:\n  {}",
+        refused.len(),
+        built + refused.len(),
+        device.name(),
+        refused.join("\n  ")
+    );
+    assert!(
+        built >= 481,
+        "only {built} entrypoints were built; the shader tree declares 481 \
+         and a sweep that reads nothing agrees with everything"
+    );
+}
+
+/// One launch over `symbol`, with one weight operand.
+///
+/// The smallest plan `serve::fire` will look at: one rectangle, a 256-byte
+/// arena, and an operand that exists so the resolver in these tests is
+/// something `fire` could reach. Shared by the three refusals below, which
+/// differ only in what they point it at.
+fn one_launch(symbol: &str) -> model_compiler::lower::Lowered {
+    model_compiler::lower::Lowered {
+        launches: vec![model_compiler::lower::Launch {
+            kernel: 0,
+            rows: 0..4,
+            layers: 0..1,
+            op: 11,
+            args: 0..1,
+            params: 0..0,
+            peel: None,
+            cond: model_compiler::lower::Launch::NO_COND,
+        }],
+        kernels: vec![symbol.to_owned()],
+        rectangles: 1,
+        arena_bytes: 256,
+        value_offset: Vec::new(),
+        value_owner: Vec::new(),
+        epilogue_gather: usize::MAX,
+        epilogue_norm: usize::MAX,
+        args: vec![model_compiler::lower::Arg::Weight(
+            "model.layers.0.mlp.down_proj.weight".to_owned(),
+        )],
+        structural: Vec::new(),
+        residue: Vec::new(),
+        params: Vec::new(),
+        n_requests: 1,
+        conds: Vec::new(),
+        readout: None,
+    }
+}
+
+/// A resolver that panics if anything asks it for anything.
+struct NothingResolves;
+
+impl driver_wgpu::binding::Resolve for NothingResolves {
+    type Buffer = Buffer;
+    fn weight(&self, name: &str) -> Option<&Buffer> {
+        unreachable!("`fire` asked for the weight `{name}` of a plan it should have refused first")
+    }
+    fn named(&self, value: model_ir::trace::ValueId) -> Option<&Buffer> {
+        unreachable!(
+            "`fire` asked for the named value {value:?} of a plan it should have refused first"
+        )
+    }
+}
+
+/// `serve::fire` over [`one_launch`], against whatever module store is given.
+fn fire_one<M: driver_wgpu::serve::Modules>(
+    device: &Device,
+    modules: &M,
+    lowered: &model_compiler::lower::Lowered,
+) -> Result<driver_wgpu::serve::Fired, driver_wgpu::serve::Unfired> {
+    let arena = device.zeroed(256).expect("a 256-byte arena");
+    let mut pipelines = Pipelines::default();
+    driver_wgpu::serve::fire(
+        device,
+        &mut pipelines,
+        modules,
+        lowered,
+        driver_wgpu::serve::Fire {
+            arena: driver_wgpu::binding::Arena {
+                buffer: &arena,
+                bytes: 256,
+            },
+            resolver: &NothingResolves,
+            geometry: driver_wgpu::dispatch::Geometry {
+                q_heads: 16,
+                kv_heads: 8,
+                head_dim: 128,
+                rotary_dims: 128,
+                n_experts: 0,
+                experts_per_token: 0,
+            },
+            tier: Capability::Baseline,
+            one_at_a_time: false,
+        },
+    )
+}
+
+/// A launch naming a symbol no module has is refused BY THAT NAME, and refused
+/// before anything is resolved.
+///
+/// `Unfired::NoModule` sat on the census of refusals no test names — see
+/// `every_refusal_this_crate_builds_is_one_a_test_names` — in its "reachable
+/// and untested" group, which is the group worth closing. Reachable it is: a
+/// plan carries kernel names as strings, and a table that renames a row
+/// without renaming its shader produces exactly this.
+///
+/// **The resolver here panics if it is asked for anything**, and the honest
+/// account of that is worth more than the guard. It was written claiming to
+/// prove that `fire` looks up every DISTINCT module before it resolves an
+/// operand — and then the claim was checked, by pointing this same fixture at
+/// a symbol the tree DOES have. It does not fire either: the planner refuses
+/// first, with
+///
+/// ```text
+/// launch 0 (`rms_single_row_bfloat16`): operand 0: the row names an operand
+/// this statement does not state
+/// ```
+///
+/// so the resolver is unreachable from this fixture whatever the ordering is,
+/// and the `unreachable!` could never have failed. **The control is the
+/// variant assertion below**, which catches an inversion as a wrong `Unfired`
+/// rather than as a panic. The resolver stays because a guard that cannot fire
+/// still costs nothing and still documents the expectation; it is described
+/// here as what it is rather than as what it looked like.
+#[test]
+fn a_launch_naming_a_symbol_no_module_has_is_refused_before_anything_resolves() {
+    let Some((device, _held)) = adapter() else {
+        return;
+    };
+
+    const MISSING: &str = "rms_single_row_bfloat16_but_spelled_wrong";
+    assert!(
+        pick(&Embedded, MISSING, Capability::Baseline).is_none(),
+        "this test is only about a missing module if the module is missing"
+    );
+
+    // A real operand, so that the resolver above is something `fire` WOULD
+    // reach. With no args it could never be called and the `unreachable!`
+    // would prove nothing -- which is what this test said it proved until the
+    // claim was checked.
+    let lowered = one_launch(MISSING);
+
+    let refused =
+        fire_one(&device, &Embedded, &lowered).expect_err("a symbol no module has cannot fire");
+
+    match &refused {
+        driver_wgpu::serve::Unfired::NoModule { at, symbol } => {
+            assert_eq!(*at, 0, "the launch index, and there is one launch");
+            assert_eq!(symbol, MISSING, "the refusal names the symbol it wanted");
+        }
+        other => panic!("expected `NoModule`, got `{other}`"),
+    }
+    assert!(
+        refused.to_string().contains(MISSING),
+        "and the MESSAGE names it too, which is the whole point of the variant \
+         carrying the string: {refused}"
+    );
+}
+
+/// A module the WGSL front end cannot read is refused by the module's name.
+///
+/// `Unfired::Unreadable` is what `reflect::declared` failing becomes, and it
+/// is reachable without inventing anything exotic: [`Modules`] is a one-method
+/// trait, so a store that hands back text `naga` will not parse is four lines.
+///
+/// It matters more than it looks. The embedded tree is generated — includes
+/// spliced, `//#if` arms resolved, defines substituted — and an expansion that
+/// produces text no front end accepts is a build-time mistake that arrives at
+/// runtime. This is the refusal that has to name WHICH entrypoint, because the
+/// generated source is not what anyone wrote and the symbol is the only handle
+/// back to the file that produced it.
+#[test]
+fn a_module_the_front_end_cannot_read_is_refused_by_the_entrypoint_that_named_it() {
+    let Some((device, _held)) = adapter() else {
+        return;
+    };
+
+    struct NotWgsl;
+    impl driver_wgpu::serve::Modules for NotWgsl {
+        fn source(&self, _entrypoint: &str, _tier: Capability) -> Option<String> {
+            Some("this is prose, not a shading language".to_owned())
+        }
+    }
+
+    const SYMBOL: &str = "rms_single_row_bfloat16";
+    let refused = fire_one(&device, &NotWgsl, &one_launch(SYMBOL))
+        .expect_err("text that is not WGSL cannot be reflected, let alone fired");
+
+    match &refused {
+        driver_wgpu::serve::Unfired::Unreadable { at, symbol, .. } => {
+            assert_eq!(*at, 0, "the launch index, and there is one launch");
+            assert_eq!(symbol, SYMBOL, "the refusal names the entrypoint it read");
+        }
+        other => panic!("expected `Unreadable`, got `{other}`"),
+    }
+    assert!(
+        refused.to_string().contains(SYMBOL),
+        "and the message names it, which is the only handle back to the file \
+         whose expansion produced the text: {refused}"
+    );
+}
+
+/// A row whose operands the statement does not state is refused before the
+/// device is touched.
+///
+/// `Unfired::Unplannable` carries an [`Undispatchable`] from the planner, and
+/// this is the cheapest way to reach one: a real entrypoint, a real module,
+/// and a plan that hands it an operand its kernel row does not declare.
+///
+/// This refusal was met by accident while checking a different test's guard —
+/// pointing a fixture built for `NoModule` at a symbol the tree DOES have
+/// produced it immediately — which is the only reason it is cheap. It had sat
+/// in the census's "needs a fire built to fail in one specific way" group on
+/// the assumption that building one was the expensive part.
+#[test]
+fn a_row_whose_operands_the_statement_does_not_state_is_unplannable() {
+    let Some((device, _held)) = adapter() else {
+        return;
+    };
+
+    const SYMBOL: &str = "rms_single_row_bfloat16";
+    assert!(
+        pick(&Embedded, SYMBOL, Capability::Baseline).is_some(),
+        "this test needs the module to be FOUND, or it is testing `NoModule`"
+    );
+
+    let refused = fire_one(&device, &Embedded, &one_launch(SYMBOL))
+        .expect_err("an operand the statement does not state cannot be planned");
+
+    match &refused {
+        driver_wgpu::serve::Unfired::Unplannable { at, symbol, .. } => {
+            assert_eq!(*at, 0, "the launch index, and there is one launch");
+            assert_eq!(
+                symbol, SYMBOL,
+                "the refusal names the row it could not plan"
+            );
+        }
+        other => panic!("expected `Unplannable`, got `{other}`"),
+    }
+    let said = refused.to_string();
+    assert!(
+        said.contains(SYMBOL) && said.contains("operand"),
+        "and it says which operand of which symbol, because a planner refusal \
+         naming neither is a bug report nobody can act on: {said}"
+    );
+}
+
+/// Every way a read-out can be refused, and each says which.
+///
+/// The four `Unread` variants were the rest of the census's "reachable and
+/// untested" group, kept there by the same estimate that kept the `Unfired`
+/// three — that reaching them meant building a fire. It does not.
+/// `serve::logits` takes a device, a buffer and a `Lowered`, and every one of
+/// its refusals is decided from the `Readout` the plan states. No dispatch is
+/// involved and nothing has to have run.
+///
+/// `Refused` is the one worth the paragraph. Its check is deliberately made
+/// against `lowered.arena_bytes` and NOT against the buffer, so that a caller
+/// who allocated a larger arena than the plan asked for is still told when a
+/// range runs off the plan's own end. The consequence is that a plan claiming
+/// a bigger arena than the buffer it is handed passes the range check and is
+/// refused by the DEVICE instead — which is exactly the split this test pins,
+/// because the two refusals mean different things to a caller: one is a
+/// malformed plan and the other is a device that would not answer.
+#[test]
+fn the_four_ways_a_read_out_is_refused_each_say_which() {
+    let Some((device, _held)) = adapter() else {
+        return;
+    };
+
+    let readout = |at: usize, rows: u32, vocab: u32, bytes: u32| model_compiler::lower::Readout {
+        at,
+        rows,
+        vocab,
+        bytes,
+    };
+    // The plan is otherwise irrelevant: `logits` reads the exit and the arena
+    // size and nothing else.
+    let with = |exit: Option<model_compiler::lower::Readout>, arena_bytes: usize| {
+        let mut low = one_launch("rms_single_row_bfloat16");
+        low.readout = exit;
+        low.arena_bytes = arena_bytes;
+        low
+    };
+
+    let arena = device.zeroed(256).expect("a 256-byte arena");
+
+    // 1. No exit at all. A text that computes something other than a
+    //    distribution is a legitimate text; the caller asked the wrong thing.
+    match driver_wgpu::serve::logits(&device, &arena, &with(None, 256)) {
+        Err(driver_wgpu::serve::Unread::NoExit) => {}
+        other => panic!("expected `NoExit`, got {other:?}"),
+    }
+
+    // 2. A range that runs off the arena the LOWERING sized.
+    match driver_wgpu::serve::logits(&device, &arena, &with(Some(readout(0, 4, 64, 4)), 256)) {
+        Err(driver_wgpu::serve::Unread::PastArena { at, extent, arena }) => {
+            assert_eq!((at, extent, arena), (0, 1024, 256));
+        }
+        other => panic!("expected `PastArena`, got {other:?}"),
+    }
+
+    // 3. A width this crate does not widen. Two and four are bf16 and f32;
+    //    everything else is a plan this reader cannot honour, and guessing
+    //    would read two elements as one.
+    for odd in [1u32, 3, 8] {
+        match driver_wgpu::serve::logits(&device, &arena, &with(Some(readout(0, 1, 4, odd)), 256)) {
+            Err(driver_wgpu::serve::Unread::Width(b)) => assert_eq!(b, odd),
+            other => panic!("expected `Width({odd})`, got {other:?}"),
+        }
+    }
+
+    // 4. The device would not give the bytes back: a plan whose arena is
+    //    bigger than the buffer it was handed passes the range check above and
+    //    is refused here instead.
+    let refused =
+        driver_wgpu::serve::logits(&device, &arena, &with(Some(readout(0, 4, 256, 4)), 1 << 20));
+    match refused {
+        Err(driver_wgpu::serve::Unread::Refused(why)) => assert!(
+            !why.to_string().is_empty(),
+            "a device refusal that says nothing is the shape this whole error \
+             surface exists to avoid"
+        ),
+        other => panic!("expected `Refused`, got {other:?}"),
+    }
+
+    // And the four read differently, which is the point of there being four.
+    let said: Vec<String> = [
+        driver_wgpu::serve::Unread::NoExit,
+        driver_wgpu::serve::Unread::PastArena {
+            at: 0,
+            extent: 1024,
+            arena: 256,
+        },
+        driver_wgpu::serve::Unread::Width(3),
+    ]
+    .iter()
+    .map(std::string::ToString::to_string)
+    .collect();
+    assert_eq!(
+        said.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        said.len(),
+        "two of these refusals print the same thing: {said:?}"
+    );
+}
+
+/// The first ported routine runs on a real adapter and computes what it says.
+///
+/// `the_first_ported_routine_asks_for_the_grid_its_row_asked_for` proves the
+/// body asks for the same GRID the row's `LaunchRule` asked for. This proves
+/// the rest of the path: that a `kernels-wgpu` routine, dispatched through
+/// `driver_wgpu::encode::Encoder`, reaches the adapter and produces the
+/// numbers gemma's PLE join is defined to produce.
+///
+/// Nothing in `kernels-wgpu` can do this — it names no adapter — and nothing
+/// in the table shape needed it, because the driver assembled the dispatch and
+/// the row only described it. In the routine shape the body IS the dispatch,
+/// so the body is what has to be run.
+#[test]
+fn the_first_ported_routine_runs_on_this_adapter_and_averages_two_streams() {
+    let Some((device, _held)) = adapter() else {
+        return;
+    };
+
+    /// Two bf16 in one `u32`, low half first — the shader's own packing.
+    fn pack(lo: f32, hi: f32) -> u32 {
+        (lo.to_bits() >> 16) | ((hi.to_bits() >> 16) << 16)
+    }
+    /// The low and high bf16 of a word, widened.
+    fn unpack(word: u32) -> (f32, f32) {
+        (
+            f32::from_bits((word & 0xffff) << 16),
+            f32::from_bits((word >> 16) << 16),
+        )
+    }
+
+    const WORDS: usize = 512;
+    let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+
+    let proj: Vec<u32> = (0..WORDS)
+        .map(|i| {
+            #[allow(clippy::cast_precision_loss)]
+            pack(i as f32 * 0.5, i as f32 * -0.25)
+        })
+        .collect();
+    let token: Vec<u32> = (0..WORDS)
+        .map(|i| {
+            #[allow(clippy::cast_precision_loss)]
+            pack(i as f32 * 0.125, 1.0)
+        })
+        .collect();
+
+    let bytes = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|w| w.to_le_bytes()).collect() };
+    let proj_b = device.buffer(&bytes(&proj)).expect("proj");
+    let token_b = device.buffer(&bytes(&token)).expect("token");
+    let out_b = device
+        .zeroed(u64::try_from(WORDS * 4).expect("fits"))
+        .expect("out");
+    // `PleCombineParams { inv_sqrt2: f32, n: u32 }`.
+    let mut params = inv_sqrt2.to_le_bytes().to_vec();
+    params.extend_from_slice(&u32::try_from(WORDS).expect("fits").to_le_bytes());
+    let params_b = device.buffer(&params).expect("params");
+
+    let mut pipelines = Pipelines::default();
+    let held = [&proj_b, &token_b, &out_b, &params_b];
+    let encoder = driver_wgpu::encode::Encoder::new(
+        &device,
+        &mut pipelines,
+        &Embedded,
+        Capability::Baseline,
+        &held,
+    );
+
+    kernels_wgpu::layout::ple_combine(
+        &encoder,
+        kernels_wgpu::routine::Buf(0),
+        kernels_wgpu::routine::Buf(1),
+        kernels_wgpu::routine::BufMut(2),
+        kernels_wgpu::routine::Buf(3),
+        kernels_wgpu::routine::Env(i32::try_from(WORDS).expect("fits")),
+        kernels_wgpu::routine::Env(1),
+    )
+    .expect("the routine dispatches on this adapter");
+
+    let got = device
+        .read_at(&out_b, 0, u64::try_from(WORDS * 4).expect("fits"))
+        .expect("readback");
+    let words: Vec<u32> = got
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    let mut checked = 0usize;
+    for (i, word) in words.iter().enumerate() {
+        let (glo, ghi) = unpack(*word);
+        let (plo, phi) = unpack(proj[i]);
+        let (tlo, thi) = unpack(token[i]);
+        // The reference rounds to bf16 the way the shader does -- to nearest,
+        // ties to even -- and the comparison is exact rather than within a
+        // tolerance. A first draft TRUNCATED, and this test caught it: at word
+        // 1's high half the shader said 0.53125 and the truncating reference
+        // said 0.52734375. `pie_pack_bf16` rounds, and a reference that did
+        // not would have made every ported kernel look wrong by a half-ulp.
+        let want = |a: f32, b: f32| {
+            let bits = ((a + b) * inv_sqrt2).to_bits();
+            let round = 0x7fff + ((bits >> 16) & 1);
+            f32::from_bits((bits.wrapping_add(round)) & 0xffff_0000)
+        };
+        assert_eq!(glo, want(plo, tlo), "word {i}, low half");
+        assert_eq!(ghi, want(phi, thi), "word {i}, high half");
+        checked += 2;
+    }
+    assert_eq!(checked, WORDS * 2, "every half of every word was compared");
+}
+
+/// Two `read_write` bindings into one buffer are LEGAL, and this is the whole
+/// reason the shader tree declares no `read` storage binding.
+///
+/// # The rule, and the exception in it
+///
+/// `wgpu-core-30.0.0/src/track/mod.rs:333`:
+///
+/// ```text
+/// fn invalid_resource_state<T: ResourceUses>(state: T) -> bool {
+///     state.any_exclusive() && !state.bits().is_power_of_two()
+/// }
+/// ```
+///
+/// `STORAGE_READ_ONLY` is INCLUSIVE and `STORAGE_READ_WRITE` is EXCLUSIVE, so
+/// one buffer bound both ways is two bits with an exclusive one among them —
+/// refused. Two `read_write` bindings are the SAME BIT: `is_power_of_two`
+/// holds, and the dispatch is fine. That is WebGPU's "usage scope storage
+/// exception", and it is the difference between 451 shadow copies per decode
+/// and none.
+///
+/// # Why it is a test and not a paragraph
+///
+/// The whole shader tree was changed on the strength of it —
+/// `kernels-wgpu`'s `no_shader_declares_a_read_only_storage_binding` — and a
+/// claim that load-bearing, about behaviour of a device rather than of this
+/// code, is exactly the kind that stops being true when a version moves.
+/// [`an_arena_bound_both_ways_is_diagnosed_by_name_and_run_anyway`] is its
+/// other half: the same two ranges, one binding declared `read`, refused and
+/// then shadowed.
+#[test]
+fn two_read_write_bindings_into_one_buffer_are_legal() {
+    let Some((device, _held)) = adapter() else {
+        return;
+    };
+    let mut cache = Pipelines::new();
+    let source = r"
+@group(0) @binding(0) var<storage, read_write> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+@compute @workgroup_size(64)
+fn twice(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i < arrayLength(&dst)) { dst[i] = src[i] * 2u; }
+}
+";
+    let pipeline = cache
+        .get(&device, "twice", Capability::Baseline, source)
+        .expect("it builds");
+    let align = device.min_storage_offset();
+    let n = 64usize;
+    let span = n as u64 * 4;
+    let stride = span.next_multiple_of(align);
+    let mut fill = vec![0u8; (stride + span) as usize];
+    for (i, word) in fill.chunks_mut(4).take(n).enumerate() {
+        word.copy_from_slice(&u32::try_from(i).expect("small").to_le_bytes());
+    }
+    let arena = device.buffer(&fill).expect("arena");
+    let one = Recorded {
+        pipeline,
+        buffers: &[
+            Bound::within(&arena, 0, span, align).expect("src"),
+            Bound::within(&arena, stride, span, align).expect("dst"),
+        ],
+        uniform: &[],
+        groups: [1, 1, 1],
+    };
+    assert_eq!(
+        device.check(&one),
+        Ok(()),
+        "two `read_write` bindings of one buffer are one usage bit, so \
+         nothing here is aliased"
+    );
+    let ran = device.run_all(&[one]).expect("it dispatches");
+    assert_eq!(
+        ran.shadowed, 0,
+        "nothing was read-only, so there was nothing to copy"
+    );
+    assert_eq!(ran.buffers, 1);
+    let got = device.read_at(&arena, stride, span).expect("readback");
+    let words: Vec<u32> = got
+        .chunks(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let want: Vec<u32> = (0..n)
+        .map(|i| u32::try_from(i * 2).expect("small"))
+        .collect();
+    assert_eq!(
+        words, want,
+        "it ran, but it did not read the values that were there"
+    );
+}
+
+/// Two operands covering the same bytes PARTIALLY is a named refusal.
+///
+/// # Why this exists now and could not before
+///
+/// While every read operand was shadowed into scratch, an overlap was
+/// harmless: the shader read a copy of what was there before the dispatch,
+/// whatever the write did. Now that the tree declares every storage binding
+/// `read_write` and nothing is copied, an overlap is a race — WGSL orders the
+/// invocations of one dispatch not at all, so which value is read is whatever
+/// the scheduler did, and it would be a plausible number rather than an
+/// error.
+///
+/// Disjoint is the ordinary case, an arena launch's input and output.
+/// IDENTICAL is the in-place case a kernel authors, where invocation `i`
+/// reads and writes element `i`. Partial overlap is what no kernel authors,
+/// and no real plan raises it —
+/// `a_run_of_decodes_derives_one_lowering_and_says_the_same_thing` and
+/// `a_real_fire_is_one_command_buffer_and_shadows_nothing` run 452-launch
+/// fires through `check_bindable` and come back clean.
+///
+/// Neither sibling has this check. Both bind the arena both ways without
+/// comment and would run the race.
+#[test]
+fn two_operands_that_partly_cover_each_other_are_refused_by_name() {
+    let Some((device, _held)) = adapter() else {
+        return;
+    };
+    let mut cache = Pipelines::new();
+    let source = r"
+@group(0) @binding(0) var<storage, read_write> a: array<u32>;
+@group(0) @binding(1) var<storage, read_write> b: array<u32>;
+@compute @workgroup_size(64)
+fn twice(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i < arrayLength(&a)) { a[i] = b[i] * 2u; }
+}
+";
+    let pipeline = cache
+        .get(&device, "twice", Capability::Baseline, source)
+        .expect("it builds");
+    let align = device.min_storage_offset();
+    let arena = device
+        .buffer(&vec![0u8; (align * 4) as usize])
+        .expect("arena");
+
+    // `a` covers [0, 2*align) and `b` covers [align, 3*align): they share
+    // [align, 2*align), and neither contains the other.
+    let one = Recorded {
+        pipeline,
+        buffers: &[
+            Bound::within(&arena, 0, align * 2, align).expect("a"),
+            Bound::within(&arena, align, align * 2, align).expect("b"),
+        ],
+        uniform: &[],
+        groups: [1, 1, 1],
+    };
+    assert_eq!(
+        device.check(&one),
+        Err(Failed::Overlapping {
+            writer: 0,
+            other: 1,
+            overlap: align..align * 2,
+        }),
+        "a partial overlap has to be named, or it is a race that returns a \
+         number"
+    );
+    // And `run_all` pays it too -- this is not a diagnosis a caller has to
+    // ask for, because there is no workaround that makes it safe.
+    assert!(
+        device.run_all(&[one]).is_err(),
+        "`run_all` ran a dispatch whose two operands overlap"
+    );
+
+    // The two ordinary shapes are NOT refused. Without these the check could
+    // be refusing everything and this test would not know.
+    let disjoint = Recorded {
+        pipeline,
+        buffers: &[
+            Bound::within(&arena, 0, align, align).expect("a"),
+            Bound::within(&arena, align, align, align).expect("b"),
+        ],
+        uniform: &[],
+        groups: [1, 1, 1],
+    };
+    assert_eq!(
+        device.check(&disjoint),
+        Ok(()),
+        "disjoint ranges are normal"
+    );
+    let in_place = Recorded {
+        pipeline,
+        buffers: &[
+            Bound::within(&arena, 0, align, align).expect("a"),
+            Bound::within(&arena, 0, align, align).expect("b"),
+        ],
+        uniform: &[],
+        groups: [1, 1, 1],
+    };
+    assert_eq!(
+        device.check(&in_place),
+        Ok(()),
+        "an operand bound to the same range twice is the in-place case, which \
+         a kernel authors on purpose"
+    );
 }

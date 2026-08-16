@@ -477,6 +477,10 @@ mod tests {
     }
 
     /// A channel this crate can bind an instance of `echo` to.
+    ///
+    /// `native` only, for the reason `three_rows` gives above: every caller is
+    /// a `native` test, so the portable half compiles this as dead code.
+    #[cfg(feature = "native")]
     fn ring(id: u64, vocab: u32) -> driver_api::ChannelRegistrationPlan {
         driver_api::ChannelRegistrationPlan {
             channel_id: id,
@@ -497,24 +501,35 @@ mod tests {
     }
 
     /// A step of three fired rows whose two requests answer from rows 0 and 2.
+    /// `native` only: `turns` and `serve` are gated, and this crate's
+    /// PORTABLE half has to compile on its own -- `default = []` says so, and
+    /// the test targets are part of "compile".
+    #[cfg(feature = "native")]
     fn three_rows() -> crate::turns::Step {
         crate::turns::Step {
             logits: crate::serve::Logits {
                 rows: 3,
                 vocab: 2,
                 values: vec![10.0, 11.0, 20.0, 21.0, 30.0, 31.0],
+                // All three, because this fixture's point is the
+                // `readout_of` indirection and holding every row keeps the
+                // two indexings independent: a bug that read row `r` for
+                // request `r` gets the WRONG row here rather than `None`.
+                read: vec![0, 1, 2],
             },
             fired: crate::serve::Fired {
                 dispatches: 0,
                 submissions: 0,
                 blocks: 0,
                 parsed: 0,
+                tiered: 0,
             },
             rows: 3,
             // Request 0 answers from fire row 0 and request 1 from fire row
             // 2 -- a prefill of two tokens followed by a decode, which is the
             // shape that makes "row `r`" and "request `r`" different numbers.
             readout_of: vec![0, 2],
+            readouts_of: vec![vec![0], vec![2]],
             positions: vec![0, 1, 0],
             pipelines: 0,
         }
@@ -540,6 +555,7 @@ mod tests {
     /// member 1 row 1 -- a real distribution, of the second token of the
     /// first request's prompt, and fluent nonsense.
     #[test]
+    #[cfg(feature = "native")]
     fn each_member_is_fired_over_its_own_requests_distribution() {
         let mut programs = Programs::new();
         let program = programs
@@ -629,6 +645,7 @@ mod tests {
     /// fires and lands its row. Without it, a `run_programs` that refused
     /// every ticketed member would pass.
     #[test]
+    #[cfg(feature = "native")]
     fn a_member_whose_ring_moved_since_the_batch_was_composed_is_not_fired() {
         let ticketed = |tail: u64| driver_api::StepSubmission {
             plan: driver_api::LaunchPlan::default(),
@@ -728,6 +745,7 @@ mod tests {
     /// A closed ring is the reachable version of this: the consumer has gone
     /// away and said so.
     #[test]
+    #[cfg(feature = "native")]
     fn a_member_whose_ring_is_closed_is_faulted_rather_than_retried() {
         let mut programs = Programs::new();
         let program = programs.register_program(&echo(2)).expect("the package");

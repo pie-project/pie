@@ -46,11 +46,11 @@
 //#if defined(PIE_SCAN)
 @group(0) @binding(0) var<storage, read_write> rstate: array<f32>;
 @group(0) @binding(1) var<storage, read_write> core_out: array<atomic<u32>>;
-@group(0) @binding(2) var<storage, read> pre_q: array<f32>;
-@group(0) @binding(3) var<storage, read> pre_k: array<f32>;
-@group(0) @binding(4) var<storage, read> pre_gate: array<f32>;
-@group(0) @binding(5) var<storage, read> p: GdnCoreParams;
-@group(0) @binding(6) var<storage, read> slot_ids: array<u32>;
+@group(0) @binding(2) var<storage, read_write> pre_q: array<f32>;
+@group(0) @binding(3) var<storage, read_write> pre_k: array<f32>;
+@group(0) @binding(4) var<storage, read_write> pre_gate: array<f32>;
+@group(0) @binding(5) var<storage, read_write> p: GdnCoreParams;
+@group(0) @binding(6) var<storage, read_write> slot_ids: array<u32>;
 
 // The two SCALAR operands, which is why they are here and the eleven fields of
 // `GdnCoreParams` are not: the row states these two as numbers and the rest as
@@ -65,40 +65,40 @@ struct Params {
 }
 @group(1) @binding(0) var<uniform> params: Params;
 //#else
-@group(0) @binding(0) var<storage, read> mixed: array<u32>;
-@group(0) @binding(1) var<storage, read> conv_state: array<f32>;
+@group(0) @binding(0) var<storage, read_write> mixed: array<u32>;
+@group(0) @binding(1) var<storage, read_write> conv_state: array<f32>;
 //#if defined(PIE_RECURRENT)
 @group(0) @binding(2) var<storage, read_write> rstate: array<f32>;
 @group(0) @binding(3) var<storage, read_write> core_out: array<atomic<u32>>;
-@group(0) @binding(4) var<storage, read> conv_w: array<u32>;
-@group(0) @binding(5) var<storage, read> conv_b: array<u32>;
-@group(0) @binding(6) var<storage, read> pre_q: array<f32>;
-@group(0) @binding(7) var<storage, read> pre_k: array<f32>;
-@group(0) @binding(8) var<storage, read> pre_gate: array<f32>;
+@group(0) @binding(4) var<storage, read_write> conv_w: array<u32>;
+@group(0) @binding(5) var<storage, read_write> conv_b: array<u32>;
+@group(0) @binding(6) var<storage, read_write> pre_q: array<f32>;
+@group(0) @binding(7) var<storage, read_write> pre_k: array<f32>;
+@group(0) @binding(8) var<storage, read_write> pre_gate: array<f32>;
 @group(0) @binding(9) var<storage, read_write> new_conv_state: array<f32>;
-@group(0) @binding(10) var<storage, read> p: GdnCoreParams;
+@group(0) @binding(10) var<storage, read_write> p: GdnCoreParams;
 //#if defined(PIE_SLOTTED)
-@group(0) @binding(11) var<storage, read> slot_ids: array<u32>;
+@group(0) @binding(11) var<storage, read_write> slot_ids: array<u32>;
 //#endif
 //#else
-@group(0) @binding(2) var<storage, read> conv_w: array<u32>;
-@group(0) @binding(3) var<storage, read> conv_b: array<u32>;
-@group(0) @binding(4) var<storage, read> A_log: array<f32>;
-@group(0) @binding(5) var<storage, read> dt_bias: array<u32>;
-@group(0) @binding(6) var<storage, read> a_gate: array<u32>;
-@group(0) @binding(7) var<storage, read> b_gate: array<u32>;
+@group(0) @binding(2) var<storage, read_write> conv_w: array<u32>;
+@group(0) @binding(3) var<storage, read_write> conv_b: array<u32>;
+@group(0) @binding(4) var<storage, read_write> A_log: array<f32>;
+@group(0) @binding(5) var<storage, read_write> dt_bias: array<u32>;
+@group(0) @binding(6) var<storage, read_write> a_gate: array<u32>;
+@group(0) @binding(7) var<storage, read_write> b_gate: array<u32>;
 // The prep arm WRITES the scratch the recurrent arm reads: same three tensors,
 // opposite access, which is the whole reason the split exists.
 @group(0) @binding(8) var<storage, read_write> pre_q: array<f32>;
 @group(0) @binding(9) var<storage, read_write> pre_k: array<f32>;
 @group(0) @binding(10) var<storage, read_write> pre_gate: array<f32>;
 @group(0) @binding(11) var<storage, read_write> new_conv_state: array<f32>;
-@group(0) @binding(12) var<storage, read> p: GdnCoreParams;
+@group(0) @binding(12) var<storage, read_write> p: GdnCoreParams;
 //#if defined(PIE_SLOTTED) || defined(PIE_PREFILL)
 // Prefill is always slotted -- it writes the conv state of the sequence it is
 // filling -- so it binds `slot_ids` whether or not `PIE_SLOTTED` is set, and
 // reads slot 0 because one prefill is one sequence.
-@group(0) @binding(13) var<storage, read> slot_ids: array<u32>;
+@group(0) @binding(13) var<storage, read_write> slot_ids: array<u32>;
 //#endif
 //#if defined(PIE_PREFILL)
 struct Params {

@@ -39,8 +39,8 @@
 
 use model::catalog::{self, Backend, Deployed, MetalBinding};
 use model::deployment::Refusal;
-use model_compiler::kernels::Backend as TracedBackend;
-use model_compiler::trace::FireClass;
+use model_ir::kernels::Backend as TracedBackend;
+use model_ir::trace::FireClass;
 
 /// A load's six observations, as `driver-metal`'s `observed()` builds
 /// them for the encoding every published MLX checkpoint uses.

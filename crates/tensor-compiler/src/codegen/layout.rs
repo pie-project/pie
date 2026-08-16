@@ -12,7 +12,6 @@
 //! | copy | how it is tied here |
 //! |---|---|
 //! | `#[repr(C)]` structs in `tensor-compiler` | `offset_of!` in `static_assertions` |
-//! | C text in [`crate::codegen::header`] → `ptir_abi.h` | printed by [`DeviceStruct::emit_c`] |
 //! | MSL `M1*` in `metal::preamble` | printed by [`DeviceStruct::emit_msl`] |
 //! | MSL `M3*` in `metal::preamble` | printed by [`DeviceStruct::emit_msl`] |
 //! | MSL `M1Status` in the effect emitters | printed by [`DeviceStruct::emit_msl`] |
@@ -22,8 +21,11 @@
 //! The two runtime files are hand-written C++/MSL that cannot be generated
 //! wholesale — they are compiled by NVRTC and the Metal compiler as text and
 //! carry far more than the struct declarations — so they are checked rather
-//! than produced. The drivers do not appear above because they `#include` the
-//! generated `ptir_abi.h` rather than retyping it.
+//! than produced. A seventh row stood above until the C++ drivers were
+//! deleted: a plain-C printing (`DeviceStruct::emit_c`) into the generated
+//! `ptir_abi.h`, which those drivers `#include`d instead of retyping the
+//! table. The Rust drivers that replaced them read this module directly, and a
+//! printer whose only consumer was a deleted header is not a tie to anything.
 //!
 //! A field added on one side and not the other is now a compile error or a
 //! test failure rather than a silent reinterpretation.
@@ -49,14 +51,6 @@ pub enum FieldType {
 }
 
 impl FieldType {
-    /// Spelling in the generated C header.
-    const fn c(self) -> &'static str {
-        match self {
-            FieldType::U32 => "uint32_t",
-            FieldType::U64 => "uint64_t",
-        }
-    }
-
     /// Spelling in Metal Shading Language.
     const fn msl(self) -> &'static str {
         match self {
@@ -153,24 +147,6 @@ pub struct DeviceStruct {
 }
 
 impl DeviceStruct {
-    /// `typedef struct Name { ... } Name;` followed by a blank line.
-    ///
-    /// Members are not indented, which matches the rest of `ptir_abi.h`: the
-    /// hand-written parts are Rust string literals using `\` continuations,
-    /// and a `\` continuation eats the next line's leading whitespace. The
-    /// source looks indented and the output never was. Reproducing that here
-    /// keeps the generated header byte-identical to the checked-in one, so
-    /// `ptir_header.rs` proves this generator is a pure refactor. Indenting
-    /// the whole file is a separate change.
-    pub fn emit_c(&self) -> String {
-        let mut out = format!("typedef struct {} {{\n", self.c_name);
-        for field in self.fields {
-            out.push_str(&format!("{} {};\n", field.ty.c(), field.name));
-        }
-        out.push_str(&format!("}} {};\n\n", self.c_name));
-        out
-    }
-
     /// `struct M1Name { ... };` followed by a newline.
     pub fn emit_msl(&self, prefix: &str) -> String {
         let name = format!("{prefix}{}", self.msl_suffix);

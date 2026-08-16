@@ -38,8 +38,8 @@
 //#include "common/bf16.inc.wgsl"
 //#include "ssm/gdn_params.inc.wgsl"
 
-@group(0) @binding(0) var<storage, read> mixed: array<u32>;
-@group(0) @binding(1) var<storage, read> conv_state: array<f32>;
+@group(0) @binding(0) var<storage, read_write> mixed: array<u32>;
+@group(0) @binding(1) var<storage, read_write> conv_state: array<f32>;
 @group(0) @binding(2) var<storage, read_write> rstate: array<f32>;
 // ATOMIC, because a bf16 tensor is `array<u32>` with two values per word and
 // adjacent `dv_idx` are adjacent invocations -- inside this workgroup for the
@@ -47,19 +47,19 @@
 // sub-word atomic, so the read-modify-write `pie_store_bf16` performs would
 // drop one of the two. See `store_core_out`.
 @group(0) @binding(3) var<storage, read_write> core_out: array<atomic<u32>>;
-@group(0) @binding(4) var<storage, read> conv_w: array<u32>;
-@group(0) @binding(5) var<storage, read> conv_b: array<u32>;
-@group(0) @binding(6) var<storage, read> A_log: array<f32>;
-@group(0) @binding(7) var<storage, read> dt_bias: array<u32>;
-@group(0) @binding(8) var<storage, read> a_gate: array<u32>;
-@group(0) @binding(9) var<storage, read> b_gate: array<u32>;
+@group(0) @binding(4) var<storage, read_write> conv_w: array<u32>;
+@group(0) @binding(5) var<storage, read_write> conv_b: array<u32>;
+@group(0) @binding(6) var<storage, read_write> A_log: array<f32>;
+@group(0) @binding(7) var<storage, read_write> dt_bias: array<u32>;
+@group(0) @binding(8) var<storage, read_write> a_gate: array<u32>;
+@group(0) @binding(9) var<storage, read_write> b_gate: array<u32>;
 // The ping-pong half: the conv state is never updated in place, because a
 // workgroup that shifted its own taps would race every other workgroup reading
 // the same slot's earlier taps.
 @group(0) @binding(10) var<storage, read_write> new_conv_state: array<f32>;
-@group(0) @binding(11) var<storage, read> p: GdnCoreParams;
+@group(0) @binding(11) var<storage, read_write> p: GdnCoreParams;
 //#if defined(PIE_SLOTTED)
-@group(0) @binding(12) var<storage, read> slot_ids: array<u32>;
+@group(0) @binding(12) var<storage, read_write> slot_ids: array<u32>;
 //#endif
 
 var<workgroup> sh_reduce: array<f32, 128>;

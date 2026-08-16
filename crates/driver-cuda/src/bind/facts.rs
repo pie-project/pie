@@ -11,12 +11,12 @@
 //! from inside a generated file. This module is the same reads, named, with
 //! a public caller.
 //!
-//! # Why the trait lives in `kernels-cuda-new` and the impl lives here
+//! # Why the trait lives in `kernels-cuda` and the impl lives here
 //!
-//! A bind body lives in `kernels-cuda-new/src/x/`, holding the `.cuh` it
+//! A bind body lives in `kernels-cuda/src/x/`, holding the `.cuh` it
 //! fires by `include_str!` (northstar §5.1 ①). The facts are the fire's,
 //! which is here.
-//! `driver-cuda` depends on `kernels-cuda-new` and not the other way round,
+//! `driver-cuda` depends on `kernels-cuda` and not the other way round,
 //! so the vocabulary is declared there as a trait and answered here — the
 //! only direction that is not a cycle. `Cx` holds `&dyn Facts`, so a bind
 //! never names a driver type and the driver never names a bind.
@@ -37,7 +37,7 @@
 //! own idea of empty (`0`, `0.0`, null, `false`), and a generated guard
 //! called it. Every method here answers `Option` instead, so the same
 //! question is the language's and a `None` becomes a
-//! [`Refusal::Unstated`](kernels_cuda_new::x::Refusal) that names the fact.
+//! [`Refusal::Unstated`](kernels_cuda::Refusal) that names the fact.
 //! The zero-is-absence conventions did not go anywhere — they are written
 //! into the bodies below, each beside the field it decides.
 
@@ -46,9 +46,11 @@
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use kernels_cuda_new::x::{
-    AttnWorkspace, Gdn, KvDType, KvLayer, KvScheme, MlaLayer, MlaPlan, Plan, Rows, Slab, Yarn,
+use kernels_cuda::attn::{
+    AttnWorkspace, KvDType, KvLayer, KvScheme, MlaLayer, MlaPlan, Plan, Rows,
 };
+use kernels_cuda::rope::Yarn;
+use kernels_cuda::ssm::{Gdn, Slab};
 
 use super::{AttnCtx, BoundLaunch, DispatchCtx, GdnCtx, LaunchSpec};
 
@@ -546,6 +548,41 @@ impl Fire<'_> {
     /// the type. Gemma-2/3/3n are the only deployments that state it.
     pub fn final_logit_softcap(&self) -> Option<f32> {
         (self.ctx.final_logit_softcap > 0.0).then_some(self.ctx.final_logit_softcap)
+    }
+
+    /// The engine's cuBLAS handle, with THIS fire's stream already bound.
+    ///
+    /// A handle is not a fact about a statement, which is why it is not an
+    /// operand and why no `Source` ever named it. It is a fact about the
+    /// fire, and `DispatchCtx` carries it beside `stream` for exactly the
+    /// reason `Ctx::with_cublas` is `unsafe`: the two must be the pair the
+    /// engine bound together, and holding them in one struct is how a caller
+    /// cannot supply half of it.
+    ///
+    /// Null when the shell has not created one. `Ctx::cublas()` refuses on
+    /// null with `the fire does not carry a cuBLAS handle`, so an arm passes
+    /// it through rather than testing it here — the refusal belongs where
+    /// the launch is, and it already reads well.
+    pub fn cublas(&self) -> *mut c_void {
+        self.ctx.cublas
+    }
+
+    /// The statement's PER-HEAD width, when it norms heads rather than rows.
+    ///
+    /// `OpKind::RmsnormPerHead` and the plain `Rmsnorm` lower to ONE symbol,
+    /// and this is the only thing that tells them apart. A per-head statement
+    /// norms `rows * (width / head_dim)` rows of `head_dim`; the plain one
+    /// norms `rows` rows of `width`. Without it a bind would hand gemma-4's
+    /// q/k banks to the kernel as one row per token and norm every head
+    /// together — an answer, and the wrong one, on a model that loads.
+    ///
+    /// `None` is the plain kind. The kernel spells that absence `0` and
+    /// branches on it (`norm::rmsnorm_bf16` opens with
+    /// `if per_head_dim == 0 { width }`), so the arm passes zero rather than
+    /// choosing a row count itself — the branch belongs beside the `<<<>>>`
+    /// that depends on it.
+    pub fn per_head_dim(&self) -> Option<i32> {
+        self.spec.per_head_dim.map(|d| i32::try_from(d).unwrap_or(0))
     }
 
     /// GPT-J adjacent-pair rotation, vs NeoX half/half.

@@ -361,8 +361,8 @@ pub const NO_METAL: &str = "kimi-k2 has no Metal text in this build: its forward
 pub fn trace(
     f: &KimiFacts,
     rope_yarn_original: bool,
-    class: model_compiler::trace::FireClass,
-) -> model_compiler::trace::ForwardPlan {
+    class: model_ir::trace::FireClass,
+) -> model_ir::trace::ForwardPlan {
     super::forward::kimi_cuda(f, &cuda_facts(rope_yarn_original), class)
 }
 
@@ -682,7 +682,7 @@ mod tests {
     /// even though this build refuses to serve it.
     #[test]
     fn every_fire_class_traces() {
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
         for class in [FireClass::Prefill, FireClass::Decode] {
             let plan = trace(&k2(), true, class);
             assert!(!plan.ops.is_empty(), "{class:?} traced nothing");

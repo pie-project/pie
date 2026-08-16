@@ -28,10 +28,10 @@
 //#include "common/bf16.inc.wgsl"
 //#include "common/affine.inc.wgsl"
 
-@group(0) @binding(0) var<storage, read> w: array<u32>;
-@group(0) @binding(1) var<storage, read> scales: array<u32>;
-@group(0) @binding(2) var<storage, read> biases: array<u32>;
-@group(0) @binding(3) var<storage, read> id: array<i32>;
+@group(0) @binding(0) var<storage, read_write> w: array<u32>;
+@group(0) @binding(1) var<storage, read_write> scales: array<u32>;
+@group(0) @binding(2) var<storage, read_write> biases: array<u32>;
+@group(0) @binding(3) var<storage, read_write> id: array<i32>;
 @group(0) @binding(4) var<storage, read_write> out_: array<u32>;
 
 //#if defined(PIE_SCALED)

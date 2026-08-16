@@ -9,12 +9,14 @@
 //!
 //! # `run.sh` CANNOT BE RUN AGAIN, and that is deliberate
 //!
-//! `crates/kernels-cuda/csrc/src/gemm/gemm.{cpp,hpp}` are **deleted**. They
-//! were the archive's largest `.cpp` and held zero `__global__` and zero
-//! `<<<>>>` — a host program, not a kernel file — so they fell to the rule
-//! that every piece of CPU-side code is Rust. `CublasHandle` went with them;
+//! `crates/kernels-cuda/csrc/src/gemm/gemm.{cpp,hpp}` are **deleted** — the
+//! ARCHIVE crate's, and every `crates/kernels-cuda/` path in this file is
+//! that crate's, which `85c6c674b` deleted outright. They were the archive's
+//! largest `.cpp` and held zero `__global__` and zero `<<<>>>` — a host
+//! program, not a kernel file — so they fell to the rule that every piece
+//! of CPU-side code is Rust. `CublasHandle` went with them;
 //! [`driver_cuda::device::cublas::CublasHandle`] is what is left, and
-//! `crates/kernels-cuda/csrc/CMakeLists.txt` records where the rest went.
+//! `crates/kernels-cuda/csrc/CMakeLists.txt` recorded where the rest went.
 //!
 //! So [`GOLDEN_FNV1A64`] is now a **permanent record of behaviour that can be
 //! read but not re-derived**, and `run.sh` is kept as the description of how

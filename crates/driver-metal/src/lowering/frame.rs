@@ -38,10 +38,10 @@
 //! region covering everything, which is precisely the monomorphic case the
 //! Metal text serves today.
 //!
-//! [`ForwardPlan`]: model_compiler::trace::ForwardPlan
+//! [`ForwardPlan`]: model_ir::trace::ForwardPlan
 
 use model_compiler::lower::Row;
-use model_compiler::trace::FireClass;
+use model_ir::trace::FireClass;
 
 /// The region-signature bits, restated so this module does not depend on the
 /// C ABI surface that [Task 9] retires. `driver`'s `local.rs` is where
@@ -89,8 +89,15 @@ pub struct Step<'a> {
     pub region_sig: &'a [u32],
     /// Depth operand per region, parallel to the CSR's segments.
     pub region_k: &'a [u32],
-    /// The rows whose logits are read.
+    /// The rows whose logits are read, each in ITS OWN REQUEST's numbering.
+    ///
+    /// Request `i` names rows relative to `qo_indptr[i]`, so a value here is
+    /// an offset into that request's span and not a row of the fire. See
+    /// `rows_of` for why this cost five backends a silent bug each.
     pub sampling_indices: &'a [u32],
+    /// Request → readout CSR over [`Self::sampling_indices`], or empty when
+    /// the fire names no read-outs at all.
+    pub sampling_indptr: &'a [u32],
 }
 
 /// Why a step could not become rows.
@@ -107,6 +114,34 @@ pub enum Unbridgeable {
         sigs: usize,
         /// Entries in `region_k`.
         ks: usize,
+    },
+    /// The read-out table has values but no CSR that says whose they are.
+    ///
+    /// Refused rather than guessed. The tempting fallback -- treat the whole
+    /// list as every request's, or let each request read its own last row --
+    /// is silent and wrong in opposite directions, and the numbering is only
+    /// readable through the CSR.
+    RaggedReadoutTable {
+        /// Read-out rows the table states.
+        rows: usize,
+        /// Segments the CSR describes.
+        segments: usize,
+        /// Requests the fire has.
+        requests: usize,
+    },
+    /// A read-out names a row past the end of the request that named it.
+    ///
+    /// Under the request-local numbering this is the only way the table can
+    /// be wrong that the fire-wide bound does not already catch, and it is
+    /// the interesting one: the row still lands inside the FIRE, so without
+    /// this refusal it silently reads a different conversation's logits.
+    NotItsRow {
+        /// Which request named it.
+        request: usize,
+        /// The row it named, in that request's own numbering.
+        row: u32,
+        /// How many rows that request has.
+        span: u32,
     },
     /// A region names rows outside the fire, so the table was built against a
     /// different step.
@@ -142,26 +177,6 @@ pub fn fire_class(step: &Step<'_>) -> FireClass {
     }
 }
 
-/// The row a region's signature describes.
-fn row_of(sig: u32, k: u32, samples: bool) -> Row {
-    Row {
-        multi_token: sig & sig::MULTI_TOKEN != 0,
-        custom_mask: sig & sig::MASK != 0,
-        // Both hook bits mean "this row runs hook programs". They differ in
-        // what the hook WRITES, which changes the attention path rather than
-        // the row's shape, so the row folds them.
-        hooked: sig & (sig::HOOK | sig::HOOK_PAGE_MASK) != 0,
-        lora: sig & sig::LORA != 0,
-        // The bit says truncated; the sentinel says how far. A region that
-        // sets the bit and states the sentinel is full depth, and reading only
-        // the bit would truncate the whole fire at `u32::MAX` layers.
-        depth_k: (sig & sig::TRUNCATED != 0 && k != MAX_LAYERS_FULL).then_some(k),
-        write_desc: false,
-        wants_scores: false,
-        samples,
-    }
-}
-
 /// The rows a step lowers over.
 ///
 /// # Errors
@@ -174,69 +189,62 @@ pub fn rows_of(step: &Step<'_>) -> Result<Vec<Row>, Unbridgeable> {
     if n == 0 {
         return Err(Unbridgeable::NoRows);
     }
+    // ONE COPY OF THE RULE, and not this crate's own.
+    //
+    // What stood here was a line-for-line duplicate of
+    // `model_compiler::lower::rows_from_regions` -- the same region walk, the
+    // same tiling refusals, the same readout flag -- which is exactly what
+    // `Row`'s own doc warns against: "two chances for a bit to be read wrongly
+    // and no way to notice". It was not hypothetical. BOTH copies read
+    // `sampling_indices` as rows of the FIRE when they are numbered inside the
+    // request that named them, and correcting one would have left the other.
+    // The refusals keep this crate's vocabulary; the rule does not.
+    model_compiler::lower::rows_from_regions(
+        n,
+        model_compiler::lower::Readouts {
+            indices: step.sampling_indices,
+            indptr: step.sampling_indptr,
+            qo_indptr: step.qo_indptr,
+        },
+        step.region_row_indptr,
+        step.region_sig,
+        step.region_k,
+    )
+    .map_err(Unbridgeable::from)
+}
 
-    // A row whose logits nobody reads still runs; `samples` is what says its
-    // readout is live, and it is per row rather than per region because the
-    // sampling CSR is not an axis the seriation groups on.
-    let mut samples = vec![false; n];
-    for &row in step.sampling_indices {
-        if let Some(slot) = samples.get_mut(row as usize) {
-            *slot = true;
-        }
-    }
-    // A step that names no readout at all is one whose last row is read —
-    // the decode case, where the fire exists to produce that token.
-    if step.sampling_indices.is_empty() {
-        samples[n - 1] = true;
-    }
-
-    let segments = step.region_row_indptr.len().saturating_sub(1);
-    if step.region_row_indptr.is_empty() {
-        // The legacy discipline: no seriation ran, so the fire is one region
-        // of the default point. Not a refusal — this is the monomorphic case.
-        return Ok((0..n)
-            .map(|i| row_of(0, MAX_LAYERS_FULL, samples[i]))
-            .collect());
-    }
-    if segments != step.region_sig.len() || segments != step.region_k.len() {
-        return Err(Unbridgeable::RaggedRegionTable {
-            segments,
-            sigs: step.region_sig.len(),
-            ks: step.region_k.len(),
-        });
-    }
-
-    let mut rows: Vec<Option<Row>> = vec![None; n];
-    for region in 0..segments {
-        let start = step.region_row_indptr[region];
-        let end = step.region_row_indptr[region + 1];
-        if end as usize > n || start > end {
-            return Err(Unbridgeable::RegionOutOfRange {
-                region,
-                end,
-                rows: n,
-            });
-        }
-        for row in start..end {
-            let slot = &mut rows[row as usize];
-            if slot.is_some() {
-                return Err(Unbridgeable::RegionsDoNotTile { at: row });
-            }
-            *slot = Some(row_of(
-                step.region_sig[region],
-                step.region_k[region],
-                samples[row as usize],
-            ));
-        }
-    }
-    rows.into_iter()
+/// The rows of the FIRE this step reads out, in fire order.
+///
+/// The one translation between the two numberings, and it exists because
+/// there are two READERS. `sampling_indices` arrives numbered inside the
+/// request that named it -- request `r`'s value `k` is row `qo_indptr[r] + k`
+/// -- and `rows_of` reads it that way to set `Row::samples`, which is what
+/// sizes the epilogue's gather. The gather's index list is the other reader:
+/// `row_gather` binds `Source::SamplingIndices` and indexes the fire's stream
+/// with it directly, so it needs the absolute row and nothing else will do.
+///
+/// Handing it the wire values instead is not a refusal, it is a wrong answer:
+/// on `qo_indptr = [0, 2, 5]` with `[1, 2]` the gather takes stream rows 1 and
+/// 2, and row 2 is the second request's FIRST token rather than its last. The
+/// fire still runs, still produces two finite distributions of the right
+/// width, and the second one is the wrong token's --
+/// `a_request_prefills_the_same_way_beside_another_one` is what noticed, by
+/// running the same request alone and comparing.
+///
+/// Derived from `Row::samples` rather than recomputed from `qo_indptr`, so
+/// the list the gather reads and the count the epilogue sizes on cannot come
+/// apart: they are one predicate, read once.
+///
+/// # Errors
+///
+/// Whatever [`rows_of`] refuses, and for the same reasons.
+pub fn sampled_rows(step: &Step<'_>) -> Result<Vec<u32>, Unbridgeable> {
+    Ok(rows_of(step)?
+        .iter()
         .enumerate()
-        .map(|(i, row)| {
-            row.ok_or(Unbridgeable::RegionsDoNotTile {
-                at: u32::try_from(i).unwrap_or(u32::MAX),
-            })
-        })
-        .collect()
+        .filter(|(_, r)| r.samples)
+        .map(|(i, _)| u32::try_from(i).unwrap_or(u32::MAX))
+        .collect())
 }
 
 /// A step, lowered: the whole host path from a sealed frame to rectangles.
@@ -255,9 +263,9 @@ pub fn rows_of(step: &Step<'_>) -> Result<Vec<Row>, Unbridgeable> {
 /// [`Unbridged::Uncovered`] when the text states something the lowering cannot
 /// yet flatten — which is a text-side gap, not a frame-side one.
 ///
-/// [`ForwardPlan`]: model_compiler::trace::ForwardPlan
+/// [`ForwardPlan`]: model_ir::trace::ForwardPlan
 pub fn lower_step(
-    plan: &model_compiler::trace::ForwardPlan,
+    plan: &model_ir::trace::ForwardPlan,
     step: &Step<'_>,
 ) -> Result<model_compiler::lower::Lowered, Unbridged> {
     let rows = rows_of(step).map_err(Unbridged::Step)?;
@@ -272,6 +280,27 @@ pub fn lower_step(
         },
     )
     .map_err(|why| Unbridged::Uncovered(format!("{why:?}")))
+}
+
+impl From<model_compiler::lower::RegionDrift> for Unbridgeable {
+    fn from(drift: model_compiler::lower::RegionDrift) -> Self {
+        use model_compiler::lower::RegionDrift as D;
+        match drift {
+            D::Ragged { segments, sigs, ks } => Self::RaggedRegionTable { segments, sigs, ks },
+            D::OutOfRange { region, end, rows } => Self::RegionOutOfRange { region, end, rows },
+            D::DoNotTile { at } => Self::RegionsDoNotTile { at },
+            D::NotItsRow { request, row, span } => Self::NotItsRow { request, row, span },
+            D::RaggedReadout {
+                rows,
+                segments,
+                requests,
+            } => Self::RaggedReadoutTable {
+                rows,
+                segments,
+                requests,
+            },
+        }
+    }
 }
 
 /// Why a step did not reach rectangles.
@@ -320,6 +349,7 @@ mod tests {
             region_sig: &[sig::TRUNCATED, sig::LORA | sig::MASK],
             region_k: &[4, MAX_LAYERS_FULL],
             sampling_indices: &[3],
+            sampling_indptr: &[0, 1],
         };
         let rows = rows_of(&s).expect("a fire");
         assert_eq!(
@@ -405,11 +435,173 @@ mod tests {
     }
 
     #[test]
-    fn a_step_naming_no_readout_reads_its_last_row() {
-        // The decode case: the fire exists to produce that token, and a fire
+    fn a_step_naming_no_readout_reads_each_requests_own_last_row() {
+        // The decode case: the fire exists to produce those tokens, and a fire
         // whose logits nobody reads would lower with every readout dead.
+        //
+        // What this asserted before was `!rows[0].samples`: only the LAST row
+        // of the whole fire. That is right for one request and wrong for two,
+        // and two decoding requests in one fire is the ordinary case -- the
+        // first request's readout was simply dead. The fire-wide reading and
+        // the per-request one agree exactly when there is one request, which
+        // is the entire reason this passed.
         let rows = rows_of(&step(&[1, 2], &[0, 1, 2])).expect("a fire");
-        assert!(!rows[0].samples);
-        assert!(rows[1].samples);
+        assert!(rows[0].samples, "request 0 reads its own last row");
+        assert!(rows[1].samples, "and so does request 1");
+
+        // One request, many rows: still exactly one readout, the last.
+        let rows = rows_of(&step(&[1, 2, 3], &[0, 3])).expect("a fire");
+        assert_eq!(
+            rows.iter().map(|r| r.samples).collect::<Vec<_>>(),
+            [false, false, true]
+        );
+    }
+
+    /// The gather reads the FIRE's rows, not the wire's numbers.
+    ///
+    /// The two agree at one request and disagree at two, which is why this
+    /// shipped: `row_gather` binds `Source::SamplingIndices` and indexes the
+    /// stream with it, and every fixture with one request read correctly.
+    /// On `[0, 2, 5]` the second request's last row is fire row 4 and its own
+    /// number for it is 2 -- and 2 is a real row of the fire, belonging to
+    /// that same request, so nothing refuses and the wrong token's hidden
+    /// state goes to the head.
+    #[test]
+    fn the_gather_reads_fire_rows_where_the_wire_names_request_rows() {
+        let two = Step {
+            token_ids: &[1, 2, 3, 4, 5],
+            qo_indptr: &[0, 2, 5],
+            sampling_indices: &[1, 2],
+            sampling_indptr: &[0, 1, 2],
+            ..Step::default()
+        };
+        assert_eq!(sampled_rows(&two), Ok(vec![1, 4]));
+
+        // One request: the two numberings coincide, which is the whole
+        // reason the difference could ship.
+        let one = Step {
+            token_ids: &[1, 2, 3],
+            qo_indptr: &[0, 3],
+            sampling_indices: &[2],
+            sampling_indptr: &[0, 1],
+            ..Step::default()
+        };
+        assert_eq!(sampled_rows(&one), Ok(vec![2]));
+
+        // A decode names nothing, and each request still reads its own last
+        // row rather than the fire's.
+        let decode = Step {
+            token_ids: &[1, 2],
+            qo_indptr: &[0, 1, 2],
+            ..Step::default()
+        };
+        assert_eq!(sampled_rows(&decode), Ok(vec![0, 1]));
+
+        // And it refuses exactly what `rows_of` refuses, rather than
+        // returning a shorter list.
+        assert!(
+            sampled_rows(&Step {
+                token_ids: &[1, 2, 3],
+                qo_indptr: &[0, 3],
+                sampling_indices: &[2],
+                sampling_indptr: &[],
+                ..Step::default()
+            })
+            .is_err()
+        );
+    }
+
+    /// A read-out table with no CSR is refused, not spread over the requests.
+    #[test]
+    fn readout_rows_without_a_csr_to_place_them_are_refused() {
+        let s = Step {
+            token_ids: &[1, 2, 3, 4],
+            qo_indptr: &[0, 3, 4],
+            sampling_indices: &[2, 0],
+            sampling_indptr: &[],
+            ..Step::default()
+        };
+        assert_eq!(
+            rows_of(&s),
+            Err(Unbridgeable::RaggedReadoutTable {
+                rows: 2,
+                segments: 0,
+                requests: 2
+            })
+        );
+        // And an empty table still needs no CSR -- that is the decode case.
+        assert!(rows_of(&step(&[1, 2], &[0, 1, 2])).is_ok());
+    }
+
+    /// A read-out row is numbered inside its own request, not inside the fire.
+    ///
+    /// This is the case that cannot be told from the absolute reading by any
+    /// single-request fixture, because `qo_indptr[0]` is zero and the offset
+    /// IS the row. Two requests is the smallest fire that distinguishes them.
+    #[test]
+    fn a_readout_row_is_numbered_inside_its_own_request() {
+        let s = Step {
+            token_ids: &[1, 2, 3, 4],
+            qo_indptr: &[0, 3, 4],
+            // Request 0 reads its own row 2; request 1 reads its own row 0.
+            sampling_indices: &[2, 0],
+            sampling_indptr: &[0, 1, 2],
+            ..Step::default()
+        };
+        assert_eq!(
+            rows_of(&s)
+                .expect("a fire")
+                .iter()
+                .map(|r| r.samples)
+                .collect::<Vec<_>>(),
+            [false, false, true, true],
+            "read absolutely this marks rows 0 and 2, which hands request 1 \
+             request 0's first token"
+        );
+    }
+
+    /// A row past the end of the request that named it is refused, rather than
+    /// read out of the request next door.
+    #[test]
+    fn a_readout_past_its_own_request_is_refused() {
+        let s = Step {
+            token_ids: &[1, 2, 3, 4],
+            qo_indptr: &[0, 2, 4],
+            // Request 0 has two rows and names a third.
+            sampling_indices: &[2],
+            sampling_indptr: &[0, 1, 1],
+            ..Step::default()
+        };
+        assert_eq!(
+            rows_of(&s),
+            Err(Unbridgeable::NotItsRow {
+                request: 0,
+                row: 2,
+                span: 2
+            }),
+            "it lands inside the FIRE, so only a per-request bound catches it"
+        );
+    }
+
+    /// A request that names no read-out in a fire where another does still
+    /// reads its own last row.
+    #[test]
+    fn a_request_naming_none_beside_one_that_does_still_reads_its_last_row() {
+        let s = Step {
+            token_ids: &[1, 2, 3, 4],
+            qo_indptr: &[0, 3, 4],
+            sampling_indices: &[0],
+            sampling_indptr: &[0, 1, 1],
+            ..Step::default()
+        };
+        assert_eq!(
+            rows_of(&s)
+                .expect("a fire")
+                .iter()
+                .map(|r| r.samples)
+                .collect::<Vec<_>>(),
+            [true, false, false, true],
+            "request 0 names its row 0; request 1 names none and falls back"
+        );
     }
 }

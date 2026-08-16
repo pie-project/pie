@@ -1,10 +1,11 @@
 // The two things this oracle replaces: `DeviceTensor::allocate` and the CUDA
 // runtime entry points the three cache builders call.
 //
-// `kernels-cuda/csrc/src/tensor.cpp` ends in a `cudaMalloc`, so every shape
-// the shipping code computes is consumed by the driver and leaves only a
-// pointer behind. The class is declared in the REAL `tensor.hpp`, which is
-// copied verbatim; only this implementation differs.
+// `tensor.cpp` in the archive crate's `csrc/src` -- deleted with that crate
+// at `85c6c674b` -- ends in a `cudaMalloc`, so every shape the shipping code
+// computes is consumed by the driver and leaves only a pointer behind. The
+// class is declared in the REAL `tensor.hpp`, which is copied verbatim; only
+// this implementation differs.
 //
 // Unlike the kv_cache oracle's recorder, allocations here are REAL host
 // memory rather than fabricated addresses, because `dsv4_compress_cache.cpp`

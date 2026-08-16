@@ -5,6 +5,12 @@
 # ../kv_cache/stub — one recorder, one elastic stub, one seed stub) and
 # drives the live object instead of the allocation sweep: layer views,
 # accessors, page buffers, envelope seeding, elastic forwarding.
+#
+# `KSRC` below points into the ARCHIVE crate `kernels-cuda` — CMake+nvcc, a
+# `csrc/` of host `.hpp` and `.cpp` — deleted whole at `85c6c674b`, and the
+# two headers this copies out of it went with it. The line is left unchanged
+# because it records the command that took the golden, not a path anyone can
+# follow.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

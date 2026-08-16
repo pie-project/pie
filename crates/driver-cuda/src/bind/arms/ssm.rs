@@ -1,6 +1,6 @@
 //! What happens when a trace states one of `ssm`'s symbols.
 //!
-//! These were `bind!` arms inside `kernels-cuda-new`. They read the driver's
+//! These were `bind!` arms inside `kernels-cuda`. They read the driver's
 //! own vocabulary through [`Cx`], so they belong on this side of the seam:
 //! the kernels crate exposes routines, and joining a statement to one is the
 //! driver's job.
@@ -8,10 +8,10 @@
 use core::ffi::c_void;
 
 use kernels::Refusal;
-use kernels_cuda_new::jit::Ctx;
-use kernels_cuda_new::x::Slab;
-use kernels_cuda_new::x::abi::{MaybeConst, bf16};
-use kernels_cuda_new::x::ssm::*;
+use kernels_cuda::jit::Ctx;
+use kernels_cuda::ssm::Slab;
+use kernels_cuda::jit::abi::{MaybeConst, bf16};
+use kernels_cuda::ssm::*;
 
 use super::super::cx::Cx;
 use super::Bound;
@@ -106,7 +106,7 @@ fn kda_gate_beta_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
         i32::try_from(cx.param(0)?).map_err(|_| Refusal::Unstated { what: "the KDA head dim" })?;
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    kda_gate_beta_bf16(
+    kda_gate_beta::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.arg_in(1)?.cast_const().cast::<bf16>(),
@@ -129,7 +129,7 @@ fn kda_o_norm_gated_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal>
         i32::try_from(cx.param(1)?).map_err(|_| Refusal::Unstated { what: "the KDA head dim" })?;
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    kda_o_norm_gated_bf16(
+    kda_o_norm_gated::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<f32>(),
         cx.arg_in(1)?.cast_const().cast::<bf16>(),
@@ -150,7 +150,7 @@ fn gdn_conv_update_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> 
         .map_or_else(MaybeConst::none, |p| MaybeConst::new(p.cast_const().cast::<bf16>()));
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    causal_conv1d_update_batched_bf16(
+    causal_conv1d_update_batched::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.weight(0)?.cast_const().cast::<bf16>(),
@@ -174,7 +174,7 @@ fn gdn_conv_prefill_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal>
         .map_or_else(MaybeConst::none, |p| MaybeConst::new(p.cast_const().cast::<bf16>()));
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    causal_conv1d_prefill_batched_bf16(
+    causal_conv1d_prefill_batched::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.weight(0)?.cast_const().cast::<bf16>(),
@@ -514,7 +514,7 @@ fn zamba_rmsnorm_gated_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refus
     let gdn = cx.gdn()?;
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    zamba_rmsnorm_gated_bf16(
+    zamba_rmsnorm_gated::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.arg_in(1)?.cast_const().cast::<bf16>(),
@@ -530,6 +530,26 @@ fn zamba_rmsnorm_gated_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refus
 
 /// Every symbol this family binds.
 pub static ARMS: &[Bound] = &[
+    // DECLARED IN `sigs()` AND ARMED BY NOBODY, which is a state this
+    // registry can hold and a bare absence cannot. Before the declaration
+    // landed a fire naming it refused `NoArm` -- a message about dispatch,
+    // naming neither what was missing nor who would supply it.
+    Bound {
+        symbol: "ssm::qwen_gdn_post_conv_prep_bf16",
+        arm: None,
+        unbound: Some(
+            "this symbol has a HOST PROGRAM and no arm. \
+             kernels_cuda::driver_internal::qwen_gdn_post_conv_prep_bf16 \
+             is the body -- a plain pub fn the driver is meant to call by \
+             path -- and nothing in this crate calls it. The gap is not the \
+             kernel: OpKind::GdnPrep arrives with no bind written, so a \
+             fire reaching it refused NoArm and named neither the body nor \
+             its module. FLOOR: call \
+             driver_internal::qwen_gdn_post_conv_prep_bf16 from an arm \
+             here, over the conv output and the layer's prepared state",
+        ),
+    },
+
     Bound {
         symbol: "ssm::nemotron_mamba_split_bf16",
         arm: Some(nemotron_mamba_split_arm),

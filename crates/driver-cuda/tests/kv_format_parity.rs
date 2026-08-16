@@ -31,6 +31,11 @@
 //! bytes, no differing line. [`GOLDEN_FNV1A64`] is the hash of the C++ side of
 //! that run, so the proof survives the C++ being deleted -- which is the whole
 //! point of taking it before rather than after.
+//!
+//! Both `-I` trees above are now gone, which is why the recipe is a record
+//! and not an instruction: `crates/driver-cuda/csrc` at `4569b9e4b`, and
+//! `crates/kernels-cuda/csrc` -- the ARCHIVE crate's -- with that crate at
+//! `85c6c674b`.
 
 use std::fmt::Write as _;
 

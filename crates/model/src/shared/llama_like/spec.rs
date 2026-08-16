@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 // The shared vocabulary stayed with the toolchain -- more than one family
 // is written in these words. Re-exported so a declaration reaches its
 // facts and the words they are stated in from one place.
-pub use model_compiler::facts::{NormPlacement, QkNorm};
-use model_compiler::trace::{NormVariant, RopeKind};
+pub use model_ir::facts::{NormPlacement, QkNorm};
+use model_ir::trace::{NormVariant, RopeKind};
 
 /// The llama_like family's facts: covers qwen3, mistral3, phi3, olmo2/3
 /// (pie-application-plan.md §7 stage 3 scope). Declared so far: the qwen3
@@ -105,14 +105,14 @@ pub struct LlamaLikeFacts {
 
 impl LlamaLikeFacts {
     /// This family's projection into the DSL's family-neutral
-    /// [`ModelShape`](model_compiler::dsl::ModelShape) — the dense-transformer weight
+    /// [`ModelShape`](model_dsl::ModelShape) — the dense-transformer weight
     /// namespace, and nothing about llama in particular.
     ///
     /// The toolchain cannot name `LlamaLikeFacts` -- that edge would point the
     /// wrong way -- so the projection is written here, on the family side,
     /// once per family.
-    pub fn shape(&self) -> model_compiler::dsl::ModelShape {
-        model_compiler::dsl::ModelShape {
+    pub fn shape(&self) -> model_dsl::ModelShape {
+        model_dsl::ModelShape {
             hidden: self.hidden,
             intermediate: self.intermediate,
             n_experts: self.n_experts,
@@ -129,7 +129,7 @@ impl LlamaLikeFacts {
             // no backend cannot name the kernel a scaled weight needs,
             // so the representation reaches the namespace from the
             // BACKEND facts (`llama_like_cuda` overrides it below).
-            proj_repr: model_compiler::dsl::WeightRepr::Bf16,
+            proj_repr: model_dsl::WeightRepr::Bf16,
         }
     }
 
@@ -177,6 +177,58 @@ impl LlamaLikeFacts {
             fused_qkv: true,
             tied_embeddings: true,
             qkv_bias: true,
+            o_bias: false,
+            router_bias: false,
+        }
+    }
+
+    /// Llama-3.2-1B-Instruct, the checkpoint every Metal device gate
+    /// measures against MLX — and, until this fixture, the only one of them
+    /// with no llama_like fact of its own.
+    ///
+    /// It is here for a shape no other fixture has: `head_dim` **64**
+    /// without sinks. gpt-oss is the only other 64-wide entry and it has
+    /// them, so a text built from these fixtures could reach
+    /// `sdpa_paged_mma_sink` and never `sdpa_paged_mma` — a kernel the
+    /// driver dispatches on this very checkpoint, twelve times per device
+    /// run, that no conformance text named.
+    ///
+    /// GQA (32 q / 8 kv heads), head_dim 64 STATED by the config rather
+    /// than derived (2048 / 32 agrees, but llama-3 states it and a family
+    /// that states it is not one to derive it for). Dense, plain RMS norms
+    /// pre-attention, no qk-norm, no biases anywhere, tied embeddings, and
+    /// the three projections ship separately in the MLX layout.
+    ///
+    /// `rope: Standard` where the config says `rope_type: "llama3"`, and it
+    /// is not a mistranscription. [`RopeKind`] names the SHAPE of the
+    /// rotation, and llama-3's scaling is a remap of the inverse-frequency
+    /// table -- factor 32 above 8192 positions, interpolated between the low
+    /// and high frequency cuts -- computed once into the table the kernel
+    /// reads. There is no second kernel and no third value to state, the
+    /// same way phi-3's LongRoPE has none.
+    pub fn llama_3_2_1b() -> Self {
+        Self {
+            // DENSE: no mixture. Stated rather than defaulted because a
+            // fixture is a measurement of a real checkpoint, and "this one has
+            // no experts" is part of the measurement.
+            n_experts: 0,
+            experts_per_token: 0,
+            moe_intermediate: 0,
+            shared_intermediate: 0,
+            hidden: 2048,
+            layers: 16,
+            q_heads: 32,
+            kv_heads: 8,
+            head_dim: 64,
+            intermediate: 8192,
+            vocab: 128_256,
+            rope: RopeKind::Standard,
+            norm_variant: NormVariant::Plain,
+            norm_placement: NormPlacement::Pre,
+            qk_norm: QkNorm::Off,
+            fused_qkv: false,
+            tied_embeddings: true,
+            qkv_bias: false,
             o_bias: false,
             router_bias: false,
         }
@@ -258,7 +310,9 @@ impl LlamaLikeFacts {
             norm_variant: NormVariant::Plain,
             norm_placement: NormPlacement::Pre,
             qk_norm: QkNorm::PerHead,
-            fused_qkv: false,
+            // An ATTENTION number, so the doc above binds it: qwen3-0.6b
+            // states `true` and this said `false`.
+            fused_qkv: true,
             tied_embeddings: false,
             qkv_bias: false,
             o_bias: false,
@@ -289,17 +343,25 @@ impl LlamaLikeFacts {
             // No shared expert.
             shared_intermediate: 0,
             vocab: 201_088,
-            rope: RopeKind::Standard,
+            // gpt-oss is the only YaRN row in this table, and this said
+            // `Standard` until `the_llama_like_fixture_measures_the_same_checkpoint`
+            // was made to compare the whole struct.
+            rope: RopeKind::Yarn,
             norm_variant: NormVariant::Plain,
             norm_placement: NormPlacement::Pre,
             // No QK norm; gpt-oss normalizes neither.
             qk_norm: QkNorm::Off,
             fused_qkv: false,
             tied_embeddings: false,
-            // `attention_bias: true` — every projection carries one.
+            // `attention_bias: true` — every projection carries one, and
+            // "every" includes the LANDING and the router. The checkpoint
+            // ships `self_attn.o_proj.bias [2880]` and `mlp.router.bias
+            // [32]` beside q/k/v, `gpt_oss::project::metal_shape` states
+            // all three, and these two read `false` here for as long as
+            // the guard compared fields one at a time.
             qkv_bias: true,
-            o_bias: false,
-            router_bias: false,
+            o_bias: true,
+            router_bias: true,
         }
     }
 
@@ -447,10 +509,153 @@ mod tests {
             ("qwen3-0.6b", LlamaLikeFacts::qwen3_0_6b()),
             ("qwen3-30b-a3b", LlamaLikeFacts::qwen3_30b_a3b()),
             ("gpt-oss-20b", LlamaLikeFacts::gpt_oss_20b()),
-            ("phi3-mini", LlamaLikeFacts::phi3_mini()),
+            // The CATALOG ids, so `every_fixture_is_the_row_it_names` can
+            // resolve them. These read "phi3-mini" and "olmo2-1b" until it
+            // tried, and a label that names no row is a label nothing can
+            // check.
+            ("phi-3-mini-4k", LlamaLikeFacts::phi3_mini()),
             ("mistral-7b-v0.3", LlamaLikeFacts::mistral_7b_v03()),
-            ("olmo2-1b", LlamaLikeFacts::olmo2_1b()),
+            ("olmo-2-1b", LlamaLikeFacts::olmo2_1b()),
         ]
+    }
+
+    /// The same question as `every_metal_predicate_is_stated_more_than_
+    /// one_way_or_excused`, asked of the SHAPE half.
+    ///
+    /// `LlamaLikeMetalFacts` describes what a deployment binds and this
+    /// describes what a checkpoint IS; `llama_like_metal` branches on
+    /// both. A predicate every fixture states identically is a branch
+    /// that compiles and is never emitted -- which is what `o_bias` and
+    /// `router_bias` were until the gpt-oss row's total comparison found
+    /// them false against a projection that says true.
+    ///
+    /// Numbers and not only booleans, because the two worst defects this
+    /// pair of structs has had were numeric: `embed_scale: 0.0` and
+    /// `attn_scale: 0.0`, both of them SENTINELS meaning "derive it",
+    /// both left in a fixture named for a family that derives nothing of
+    /// the kind. A number identical in every fixture is the same dark
+    /// branch as a boolean nobody flips, and asking for two distinct
+    /// values rather than for a zero avoids inventing a rule about which
+    /// numbers may be zero -- widths vary on their own.
+    ///
+    /// Seven fixtures, and the whole struct produces ONE excuse.
+    #[test]
+    fn every_shape_predicate_is_stated_more_than_one_way_or_excused() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        // `(field, why)` -- a fact about the crate, not an intention.
+        const EXCUSED: &[(&str, &str)] = &[
+            // Zero in all seven, and correctly: no row in this catalog
+            // that Metal serves has a shared expert. The rows that do --
+            // glm-5, kimi-k2, kimi-k3, qwen3.5-moe -- state their own
+            // texts and none of them is `llama_like_metal`. The branch is
+            // exercised by `forward`'s own test, which sets it to 512
+            // inline and checks the dense leg is blended in.
+            //
+            // The DRIVER side had the same hole, seen from the kernel:
+            // `shared_expert_combine` is compiled into every Metal build
+            // and no text named it, so `driver-metal`'s slot conformance
+            // had never inspected it. Closed there by a "qwen3-moe, shared
+            // expert" text at this same 512 -- which is `Qwen3.6-35B-A3B`'s
+            // measured `shared_expert_intermediate_size`, a real number
+            // rather than a plausible one.
+            (
+                "shared_intermediate",
+                "no Metal-served row has a shared expert",
+            ),
+        ];
+
+        let scalars = |f: &LlamaLikeFacts| match serde_json::to_value(f) {
+            Ok(serde_json::Value::Object(o)) => o
+                .into_iter()
+                .filter(|(_, v)| v.is_boolean() || v.is_number())
+                .map(|(k, v)| (k, v.to_string()))
+                .collect::<BTreeMap<_, _>>(),
+            other => panic!("these facts serialise as a struct, not {other:?}"),
+        };
+        let every: Vec<BTreeMap<String, String>> = all().iter().map(|(_, f)| scalars(f)).collect();
+        assert!(every.len() >= 7, "the fixture table shrank");
+        // Not vacuous: a serialisation that stopped emitting scalars would
+        // make every assertion below trivially true.
+        assert!(every[0].len() >= 15, "this struct is mostly scalars");
+
+        let dark: BTreeSet<&str> = every[0]
+            .keys()
+            .filter(|name| every.iter().all(|f| f[*name] == every[0][*name]))
+            .map(String::as_str)
+            .collect();
+        let excused: BTreeSet<&str> = EXCUSED.iter().map(|(f, _)| *f).collect();
+
+        let opened: Vec<&&str> = dark.difference(&excused).collect();
+        assert!(
+            opened.is_empty(),
+            "shape predicate(s) every fixture states identically, and none \
+             is excused. A branch only one value reaches compiles and is \
+             never emitted: {opened:?}"
+        );
+        let closed: Vec<&&str> = excused.difference(&dark).collect();
+        assert!(
+            closed.is_empty(),
+            "excuse(s) that stopped being needed: {closed:?}"
+        );
+    }
+
+    /// Every fixture IS a catalog row's own shape, field for field.
+    ///
+    /// These fixtures exist so that a text can be traced without a
+    /// deployment, and every one of them is named for a row that this
+    /// build actually serves — so the two are one document read twice,
+    /// and the only honest relation between them is equality.
+    ///
+    /// Written as a total comparison and not a list of fields, because
+    /// the two drifts found the day this was added were both in fields
+    /// no list contained: `gemma_like`'s `embed_scale` fell through its
+    /// base fixture at zero, which is the branch that picks
+    /// `embed_gather` over `embed_gather_scaled`, and the gpt-oss
+    /// fixture said `Standard` rope and no landing or router bias
+    /// against a row that states YaRN and both. Each was guarded by an
+    /// enumeration whose doc named exactly that defect.
+    #[test]
+    fn every_fixture_is_the_row_it_names() {
+        let rows: Vec<(&str, LlamaLikeFacts)> = crate::qwen_2::VARIANTS
+            .iter()
+            .map(|v| (v.id, v.shape.clone()))
+            .chain(
+                crate::qwen_3::VARIANTS
+                    .iter()
+                    .map(|v| (v.id, v.shape.clone())),
+            )
+            .chain(
+                crate::phi_3::VARIANTS
+                    .iter()
+                    .map(|v| (v.id, v.shape.clone())),
+            )
+            .chain(
+                crate::mistral_3::VARIANTS
+                    .iter()
+                    .map(|v| (v.id, v.shape.clone())),
+            )
+            .chain(
+                crate::olmo_2::VARIANTS
+                    .iter()
+                    .map(|v| (v.id, v.shape.clone())),
+            )
+            .collect();
+        for (name, f) in all() {
+            // gpt-oss is not a llama-like row: it has its own facts type
+            // and its own text, and `metal_shape` is the projection that
+            // makes it one. `gpt_oss::tests::
+            // the_llama_like_fixture_measures_the_same_checkpoint` holds
+            // that comparison, against the projection AND against the row.
+            if name == "gpt-oss-20b" {
+                continue;
+            }
+            let (_, row) = rows
+                .iter()
+                .find(|(id, _)| *id == name)
+                .unwrap_or_else(|| panic!("{name}: no catalog row carries that id"));
+            assert_eq!(&f, row, "{name}: the fixture and the row have drifted");
+        }
     }
 
     #[test]
@@ -547,7 +752,7 @@ mod tests {
             assert_eq!(s.tied_embeddings, f.tied_embeddings, "{name}");
             assert_eq!(
                 s.proj_repr,
-                model_compiler::dsl::WeightRepr::Bf16,
+                model_dsl::WeightRepr::Bf16,
                 "{name}: the semantic shape cannot name a backend's encoding"
             );
         }

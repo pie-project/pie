@@ -1,23 +1,25 @@
 //! Which optional Vulkan device features a compiled module is allowed to use.
 //!
 //! This module is deliberately free of dependencies -- it imports nothing, not
-//! even `kernels`. `build.rs` pulls it in with `#[path]`, the same trick
-//! `kernels-cuda`'s build script uses to read its own tables, and that only
-//! works while the file needs nothing a build script cannot have. The tier
-//! vocabulary has to be shared because the build STAMPS the module names and
-//! the library TELLS a driver what to look for; two copies would drift.
+//! even `kernels`. `build.rs` pulls it in with `#[path]`, the same trick the
+//! archive crate `kernels-cuda` (deleted at `85c6c674b`) used to read its own
+//! tables, fourteen modules of them, and that only works while the file needs
+//! nothing a build script cannot have. The tier vocabulary has to be shared
+//! because the build STAMPS the module names and the library TELLS a driver
+//! what to look for; two copies would drift.
 
 /// Which optional device features a module was compiled to use.
 ///
 /// # Why a Vulkan backend needs this and the other two do not
 ///
-/// `kernels-cuda` gates on `CMAKE_CUDA_ARCHITECTURES` and `driver-metal`
-/// refuses a device below `MTLGPUFamily::Metal4`. Both can do that because
-/// both know the hardware before the code exists: a CUDA archive is built FOR
-/// an arch, and Metal is one vendor. Neither is true here. One SPIR-V tree
-/// ships to AMD, Intel, NVIDIA, Qualcomm and lavapipe, and the features that
-/// matter for speed — cooperative matrix above all — are OPTIONAL in the
-/// Vulkan sense: a conformant driver may simply not have them.
+/// `kernels-cuda` hands NVRTC the architecture the device reported and
+/// `driver-metal` refuses a device below `MTLGPUFamily::Metal4`. Both can do
+/// that for reasons this backend does not have: CUDA's compiler runs IN the
+/// process, so the code is built after the hardware is known, and Metal is one
+/// vendor, so refusing costs a known set of Macs. Neither is true here. One
+/// SPIR-V tree ships to AMD, Intel, NVIDIA, Qualcomm and lavapipe, and the
+/// features that matter for speed — cooperative matrix above all — are
+/// OPTIONAL in the Vulkan sense: a conformant driver may simply not have them.
 ///
 /// So refusing (Metal's answer) would refuse most of the market, and building
 /// per-device (CUDA's answer) is not available. What is left is the answer
@@ -35,7 +37,7 @@
 /// understands no tier at all is still correct, only slower.
 ///
 /// This is also why the tier does not appear in the signature table. The table
-/// is what `model-compiler` reads, and the compiler must not learn which device
+/// is what `model-ir` reads, and the compiler must not learn which device
 /// it is compiling for — a plan that named a tier would stop being portable
 /// between two machines running the same build.
 // `Hash` because a driver's pipeline cache is keyed by entrypoint AND tier:
@@ -100,7 +102,8 @@ impl Capability {
     /// The device features a driver must find before it may load this tier.
     ///
     /// Named as Vulkan names them, because the driver checks them against
-    /// `vkGetPhysicalDeviceFeatures2` and not against GLSL's `#extension`
+    /// `vkGetPhysicalDeviceFeatures2` and not against a shader's declared
+    /// capability
     /// spelling.
     ///
     /// `Coopmat` names `shaderFloat16` as well as `cooperativeMatrix`, and that
@@ -127,7 +130,7 @@ impl Capability {
     /// for EVERY module the device loads, not just the tier's: with it on, an
     /// instruction may use `Device` memory scope only if the device-scope
     /// feature is on too (`VUID-RuntimeSpirv-vulkanMemoryModel-06265`), and
-    /// `moe/route.comp` -- a BASELINE module -- counts token histograms with a
+    /// `moe/route.slang` -- a BASELINE module -- counts token histograms with a
     /// device-scoped `atomicAdd`. So a shell that turns on the coopmat tier
     /// without this name breaks a kernel that has nothing to do with matrices.
     ///

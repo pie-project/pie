@@ -31,27 +31,27 @@
 //#include "common/affine.inc.wgsl"
 //#include "common/mxfp4.inc.wgsl"
 
-@group(0) @binding(0) var<storage, read> w: array<u32>;
+@group(0) @binding(0) var<storage, read_write> w: array<u32>;
 // `scales` is one bf16 per group in the affine arm and one E8M0 BYTE per
 // 32-element block in the MXFP4 one -- same binding, same operand, two
 // completely different element widths, which is why every read of it goes
 // through a named accessor below rather than a bare subscript.
-@group(0) @binding(1) var<storage, read> scales: array<u32>;
+@group(0) @binding(1) var<storage, read_write> scales: array<u32>;
 // The MXFP4 codec has no separate bias PLANE -- its codes are not linear, so
 // there is nothing for a per-group bias to be -- and the row still lists the
 // operand. Binding 2 is therefore simply absent from that arm: a bind group
 // entry the module does not use is legal, and declaring an unread
 // `array<u32>` here would only invite a reader to believe MXFP4 has one.
 //#if !defined(PIE_MXFP4)
-@group(0) @binding(2) var<storage, read> biases: array<u32>;
+@group(0) @binding(2) var<storage, read_write> biases: array<u32>;
 //#endif
-@group(0) @binding(3) var<storage, read> x: array<u32>;
+@group(0) @binding(3) var<storage, read_write> x: array<u32>;
 @group(0) @binding(4) var<storage, read_write> y: array<atomic<u32>>;
 // Read only by the `_bias` variants. The row lists the operand either way,
 // because a row is positional and dropping the slot would shift `expert_ids`
 // down a binding; a declared-and-unread buffer costs nothing.
-@group(0) @binding(5) var<storage, read> bias: array<u32>;
-@group(0) @binding(6) var<storage, read> expert_ids: array<i32>;
+@group(0) @binding(5) var<storage, read_write> bias: array<u32>;
+@group(0) @binding(6) var<storage, read_write> expert_ids: array<i32>;
 
 // The five scalars, in the row's operand order. `x_slot_stride` and
 // `x_row_stride` are both here and are different numbers: a routed decode

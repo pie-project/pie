@@ -14,10 +14,13 @@
 // and it was prose. This measures it.
 //
 // Both halves are the ARCHIVE'S OWN CODE, linked out of
-// `libpie_kernels_cuda.a`: `gemm::gemv_bf16` with a bias, against
-// `gemm::gemv_bf16` with `nullptr` followed by `norm::add_bias_bf16`. If the
-// hashes agree on every shape, the composition writes the archive's bytes; if
-// they do not, the header is wrong and §45 changed an answer.
+// `libpie_kernels_cuda.a` — the `.a` the archive crate's CMake+nvcc build
+// produced, gone with that crate at `85c6c674b`: `gemm::gemv_bf16` with a
+// bias, against `gemm::gemv_bf16` with `nullptr` followed by
+// `norm::add_bias_bf16`. If the hashes agree on every shape, the composition
+// writes the archive's bytes; if they do not, the header is wrong and §45
+// changed an answer. `bias_fold.txt` beside this file is the reading that
+// was taken while both existed.
 //
 // Hostile input, same generator as `oracle.cu`: wide exponents, uniform sign,
 // every seventeenth element exactly zero. A bias fold is exactly where a

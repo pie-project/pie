@@ -26,8 +26,8 @@ use crate::manifest::Manifest;
 use crate::shared::llama_like::project;
 use crate::shared::llama_like::spec::LlamaLikeFacts;
 
-use model_compiler::facts::{NormPlacement, QkNorm};
-use model_compiler::trace::{NormVariant, RopeKind};
+use model_ir::facts::{NormPlacement, QkNorm};
+use model_ir::trace::{NormVariant, RopeKind};
 
 /// One Qwen 3 checkpoint.
 ///
@@ -305,7 +305,15 @@ pub const VARIANTS: &[Qwen3] = &[
             experts_per_token: 8,
             moe_intermediate: 768,
             shared_intermediate: 0,
-            intermediate: 6144,
+            // `config.json` says `intermediate_size: 6144` and this row has
+            // no dense block to spend it on: `decoder_sparse_step` is 1 and
+            // `mlp_only_layers` is empty, so every one of the 48 blocks is
+            // routed. Stated as zero for the reason
+            // `LlamaLikeFacts::qwen3_30b_a3b` gives -- a text that reaches
+            // for the wrong width should compute nothing visible rather than
+            // something plausible -- and `shard_divides` is a text that
+            // reaches for it.
+            intermediate: 0,
             vocab: 151_936,
             rope: RopeKind::Standard,
             norm_variant: NormVariant::Plain,
@@ -455,9 +463,9 @@ impl Variant for Qwen3 {
     /// weights carry.
     fn trace(
         &self,
-        class: model_compiler::trace::FireClass,
+        class: model_ir::trace::FireClass,
         load: Deployed<'_>,
-    ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
+    ) -> Result<model_ir::trace::ForwardPlan, crate::deployment::Refusal> {
         project::trace(&self.shape, self.row(), class, load)
     }
 

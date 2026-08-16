@@ -1158,6 +1158,36 @@ mod page_declaration_tests {
 }
 
 impl<W: PassWit> Pass<W> {
+    /// Does this pass bind a dense `AttnMask` CHANNEL?
+    ///
+    /// The one per-pass fact a run-ahead lane has to know, and the reason it
+    /// is asked HERE rather than of [`live_slots`]: `live_slots` has no pass
+    /// in hand and its own doc says it is not the place for per-pass
+    /// restrictions.
+    ///
+    /// The engine classifies such a pass as pool-owned device geometry
+    /// (`lease::detect_pooled_device_geometry`), and every descriptor port of
+    /// one -- the mask included -- is read back at FRAME ENTRY, before any
+    /// slot of the frame has run. So slot 1 of a frame cannot see a token
+    /// slot 0 publishes, which is exactly what a run-ahead lane chains.
+    /// `validate_frame` refuses that frame by name and says a linear lane
+    /// should size its run-ahead to avoid building it.
+    ///
+    /// Every entry of `ports` binds a channel, so the port's presence IS the
+    /// channel binding the engine tests for. This is a safe
+    /// over-approximation of the engine's rule -- which also requires the
+    /// channel to be republished by a traced stage, something no builder can
+    /// see -- and it over-approximates in the direction that costs a masked
+    /// lane some run-ahead width rather than the direction that submits a
+    /// frame the engine refuses.
+    pub fn binds_device_mask(&self) -> bool {
+        self.inner
+            .borrow()
+            .ports
+            .iter()
+            .any(|(port, _)| *port == Port::AttnMask)
+    }
+
     pub fn new() -> Pass<W> {
         let vocab = crate::model::output_vocab_size();
         let page_size = kv_page_size();
@@ -1754,7 +1784,16 @@ pub async fn run_ahead<W: PassWit>(
     if budget == 0 {
         return Ok(0);
     }
-    let r = live_slots();
+    // A pass that binds a dense device mask takes ONE slot per frame: the
+    // engine resolves its descriptors at frame entry, so a second slot
+    // chained off the first would read a value that does not exist yet, and
+    // `validate_frame` refuses the frame rather than run it. See
+    // `Pass::binds_device_mask`.
+    let r = if pass.binds_device_mask() {
+        1
+    } else {
+        live_slots()
+    };
     // `channel_capacity()` carries the staging margin, so the window is what
     // remains once that margin is set aside — in FRAMES of `r` live slots.
     // Dividing by `r` rather than assuming k keeps the ring just as full for

@@ -63,6 +63,24 @@ Usage
          crates/driver-cuda/csrc/tests/gemma4_vision_full_parity_bf16.cu -o /tmp/g4v
     /tmp/g4v /tmp/gemma4_vision_parity          # synthetic  0.99978
     /tmp/g4v /tmp/gemma4_vision_parity real     # real       0.99980
+
+That nvcc line no longer runs
+-----------------------------
+The two cosines above are what it printed, which is why the command is kept:
+it says what the numbers were measured with. Every path in it is deleted now.
+`crates/driver-cuda/csrc` went at `b58db6c16` and took
+`gemma4_vision_full_parity_bf16.cu` with it, and `crates/kernels-cuda/csrc/src`
+was the ARCHIVE crate's host header tree, deleted with that whole crate at
+`85c6c674b`. `gemma4_vision_forward.cu:48`, cited above for `k_scale`, is in
+the first of those.
+
+The second `-I` deserves the warning, because the name was reused.
+`crates/kernels-cuda/csrc/src` EXISTS again -- it is the JIT crate's device
+text, `.cuh` compiled by NVRTC at run time, with no host header in it. nvcc
+would accept the flag and find none of what this command asked it for, which
+is a worse failure than a missing directory.
+
+The dump below is unaffected: it reads a checkpoint and writes `.npy`.
 """
 
 from __future__ import annotations

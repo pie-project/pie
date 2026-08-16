@@ -64,9 +64,26 @@ const SPV_DIR: Option<&str> = option_env!("PIE_KERNELS_VULKAN_SPV_DIR");
 static GPU: OnceLock<Option<Mutex<Device>>> = OnceLock::new();
 
 /// A borrow of the shared device, or `None` to skip.
+/// Whether the device this suite opened is a CPU implementation.
+///
+/// Set when the device is opened and read without locking, for the reason
+/// given there. `false` before the first open, which is the right answer for
+/// a suite that has not got a device yet: nothing has been timed either.
+static SOFTWARE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn on_software() -> bool {
+    *SOFTWARE.get().unwrap_or(&false)
+}
+
 fn gpu() -> Option<MutexGuard<'static, Device>> {
     let held = GPU.get_or_init(|| match Device::open() {
-        Ok(d) => Some(Mutex::new(d)),
+        Ok(d) => {
+            // Recorded HERE, not read later, because every caller of
+            // `on_software` already holds this mutex -- a helper that took it
+            // again to ask one bool would deadlock the suite.
+            let _ = SOFTWARE.set(d.software());
+            Some(Mutex::new(d))
+        }
         Err(e) => {
             eprintln!("skipped: {e}");
             None
@@ -95,7 +112,47 @@ macro_rules! gpu {
     }};
 }
 
-/// The bf16 narrowing `common/bf16.glsl` does, in Rust.
+/// A wall-clock ceiling, and what it means on a device that has no clock worth
+/// asserting against.
+///
+/// Five tests in this file hold a time. Every one of them is a real regression
+/// guard -- they are how "the 370 s KV copy" and "attention reading the
+/// history far too many times" were caught -- and every one of them is a
+/// statement about a particular piece of hardware, because that is the only
+/// way a millisecond ceiling can mean anything.
+///
+/// Run on Mesa's `llvmpipe` they fail, and they fail for no interesting
+/// reason: an LLVM JIT on the host's cores is not the card the number was
+/// calibrated on. Deleting them there would be worse than useless -- a suite
+/// that skips in silence reports success for work it did not do -- so the
+/// ceiling is widened by a stated factor instead, and the widening is
+/// announced every time it happens.
+///
+/// Sixty is not arbitrary. Every defect these budgets were written against is
+/// two to four orders of magnitude over its ceiling -- 370 s against 250 ms,
+/// 503 ms against 15 ms -- so all of them still fail at sixty times. What is
+/// given up is the ability to notice a two-fold regression on a device where
+/// a two-fold difference is the host being busy.
+fn within_budget(took: std::time::Duration, base: std::time::Duration, what: &str) {
+    if !on_software() {
+        assert!(took < base, "{what}");
+        return;
+    }
+    const SLACK: u32 = 60;
+    let ceiling = base * SLACK;
+    eprintln!(
+        "SOFTWARE ADAPTER: {took:?} against a hardware budget of {base:?}, \
+         checked at {SLACK}x ({ceiling:?}) instead. This is not a timing \
+         measurement of anything."
+    );
+    assert!(
+        took < ceiling,
+        "{what}\n\n...and this is {SLACK}x the hardware budget on a software \
+         adapter, so it is not the calibration that is wrong"
+    );
+}
+
+/// The bf16 narrowing `common/bf16.slang` does, in Rust.
 ///
 /// Round to nearest even. A truncating `(bits >> 16) as u16` agrees on most
 /// inputs and disagrees on exactly the ones a tolerance check is least likely
@@ -549,7 +606,7 @@ fn a_grid_past_what_this_device_dispatches_is_refused_and_one_at_the_limit_is_no
 ///
 /// `layer_scalar_mul_bfloat16` is one of the eleven entrypoints where the two
 /// counts disagree: the row lists four buffers and the compiled module
-/// decorates three, because glslc drops the `OpDecorate Binding` of one the
+/// decorates three, because slangc drops the `OpDecorate Binding` of one the
 /// shader never reads. Building the layout from the module alone gives three
 /// descriptors, and the caller -- who has the row, and four buffers to bind --
 /// is then refused at `run` for a call that is perfectly legal.
@@ -1440,7 +1497,7 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
     use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
     use model::shared::llama_like::forward::llama_like_metal;
     use model_compiler::lower::{Fire, Row, lower};
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     let (device, dir) = gpu!();
 
@@ -1452,10 +1509,7 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
         fn weight(&self, _: &str) -> Option<&driver_vulkan::device::Buffer> {
             Some(self.0)
         }
-        fn named(
-            &self,
-            _: model_compiler::trace::ValueId,
-        ) -> Option<&driver_vulkan::device::Buffer> {
+        fn named(&self, _: model_ir::trace::ValueId) -> Option<&driver_vulkan::device::Buffer> {
             Some(self.0)
         }
         // The same stand-in for the KV cache and the fire tables. What this
@@ -1475,6 +1529,7 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
 
     let mut cache = Pipelines::new();
     let mut ran = 0u32;
+    let mut crossed = 0u32;
     let mut refused = Vec::new();
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
@@ -1548,6 +1603,17 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
                 if !seen.insert(symbol.to_owned()) {
                     continue;
                 }
+                // A CROSSED symbol is not reached this way any more. This
+                // walk is the table path, spelled out: `plan_one` against a
+                // `kernel!` row, spliced and submitted by hand. A symbol
+                // whose family has landed has no row, so it is counted
+                // separately rather than dropped -- the total below is still
+                // every symbol these six texts reach, and it still moves only
+                // when a text does.
+                if driver_vulkan::arm::arm_for(symbol).is_some() {
+                    crossed += 1;
+                    continue;
+                }
                 let Ok(code) = std::fs::read(dir.join(format!("{symbol}.spv"))) else {
                     continue;
                 };
@@ -1562,6 +1628,7 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
                     launch,
                     kernels_vulkan::KERNELS,
                     driver_vulkan::dispatch::Built {
+                        sig: None,
                         module,
                         declared: &declared,
                     },
@@ -1687,11 +1754,20 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
     // `neox_freqs_mb` is the rotation whose ladder is handed over as a buffer
     // rather than raised from a base, and `rope.rs` builds that buffer.
     //
-    // Equality rather than a floor: twenty-two is all of them, so this number
-    // moving in either direction is news.
+    // Then twenty-four, when a text quantised at 8 bits arrived upstream: a
+    // point carries the bit width, so the same projection at 8 bits names a
+    // symbol its 4-bit sibling does not, twice -- once for the GEMM and once
+    // for the GEMV.
+    //
+    // Then twenty-six, when the two `sdpa_paged_tiled` rows stopped being
+    // bare axes and started stating their operands: a prefill reaches the
+    // tile, a decode reaches the decode kernel, and both are in these texts.
+    //
+    // Equality rather than a floor: twenty-six is all of them, so this
+    // number moving in either direction is news.
     assert_eq!(
-        ran,
-        22,
+        ran + crossed,
+        26,
         "a different number of distinct symbols reached the device: {}",
         seen.iter().cloned().collect::<Vec<_>>().join(", ")
     );
@@ -1706,7 +1782,7 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
 /// inside its buffer, the layer was silent, and the operands were in the wrong
 /// slots.
 ///
-/// `rms_single_row` is the whole story in one row. `norm/rms.comp` decorates
+/// `rms_single_row` is the whole story in one row. `norm/rms.slang` decorates
 /// `0=x, 1=w, 2=out`; the kernel row says `In(0), Weight(0), Out(0)`; and
 /// `Launch::args` states inputs, then outputs, then weights. Bound
 /// positionally, the shader reads the arena range the plan meant for its
@@ -1720,7 +1796,7 @@ fn a_norm_a_real_plan_states_computes_what_a_host_reference_computes() {
     use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
     use model::shared::llama_like::forward::llama_like_metal;
     use model_compiler::lower::{Fire, Row, lower};
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     let (device, dir) = gpu!();
     let symbol = "rms_single_row_bfloat16";
@@ -1804,6 +1880,7 @@ fn a_norm_a_real_plan_states_computes_what_a_host_reference_computes() {
         launch,
         kernels_vulkan::KERNELS,
         driver_vulkan::dispatch::Built {
+            sig: None,
             module: driver_vulkan::geometry::Module::named(
                 symbol,
                 [declared.local[0], declared.local[1], declared.local[2]],
@@ -2007,8 +2084,13 @@ fn a_chain_recorded_once_says_what_the_chain_submitted_one_at_a_time_says() {
             let run: Vec<driver_vulkan::device::Recorded<'_, '_>> = sets
                 .iter()
                 .map(|b| driver_vulkan::device::Recorded {
+                    symbol: "chained",
                     pipeline,
                     buffers: b,
+                    // Empty: no mask, so every slot counts as written and
+                    // every pair gets a barrier. This test is about the
+                    // chain, and a chain is what the coarse reading records.
+                    writes: &[],
                     push: &[],
                     groups,
                 })
@@ -2126,8 +2208,10 @@ fn fires_of_different_sizes_in_a_row_reuse_the_scratch_and_still_agree() {
         let run: Vec<driver_vulkan::device::Recorded<'_, '_>> = sets
             .iter()
             .map(|b| driver_vulkan::device::Recorded {
+                symbol: "batched",
                 pipeline,
                 buffers: b,
+                writes: &[],
                 push: &[],
                 groups,
             })
@@ -2270,8 +2354,8 @@ fn a_whole_real_plan_records_into_one_command_buffer_and_submits() {
         ),
     ] {
         for (class, rows) in [
-            (model_compiler::trace::FireClass::Decode, 1),
-            (model_compiler::trace::FireClass::Prefill, 64),
+            (model_ir::trace::FireClass::Decode, 1),
+            (model_ir::trace::FireClass::Prefill, 64),
         ] {
             fired += whole_plan(
                 &device,
@@ -2297,13 +2381,13 @@ fn a_whole_real_plan_records_into_one_command_buffer_and_submits() {
     // fire classes, every one of them recorded and submitted on this card, and
     // it moves when a text does.
     //
-    // It is also, exactly, the 6584 the arena walk in `tests/arena.rs` counts
+    // It is also, exactly, the 6680 the arena walk in `tests/arena.rs` counts
     // over the same six texts and the same two classes -- which is the point
     // of firing the prefills. Until they were added this test ran half of what
     // that walk measures, so the tiled `Qmm` GEMMs, the largest kernel family
     // in the tree, had never reached the card inside a real plan.
     assert_eq!(
-        fired, 6584,
+        fired, 6680,
         "the six texts fired a different number of rectangles"
     );
 }
@@ -2354,7 +2438,28 @@ fn whole_plan(
         } else if n.ends_with(".scales") || n.ends_with(".zeros") || n.contains("norm") {
             vec![0x3F; len]
         } else {
-            (0..len).map(|i| (i * 31 % 251) as u8).collect()
+            // A HASH AND NOT `i * 31 % 251`, which is what this was and which
+            // made a whole family of claims vacuous.
+            //
+            // That expression repeats every 251 bytes. The tied head reads
+            // rows of the same buffer, and a row stride coprime with 251 --
+            // which every one of these models has -- means vocabulary rows
+            // 251 apart are byte-identical. Measured on qwen3-30b-a3b: the
+            // top logit of every row of a 16-row prefill was attained by 688
+            // DIFFERENT tokens at exactly the same value. Any argmax over
+            // that is a report of which index the scan saw first, and
+            // `a_routed_prefill_answers_the_same_twice` flipped roughly one
+            // run in three because a hundredth of a percent of noise on one
+            // row reshuffled the plateau.
+            //
+            // A multiplicative hash has no period this side of 2^64, so
+            // distinct rows get distinct weights and a maximum is a maximum.
+            (0..len)
+                .map(|i| {
+                    let h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    (h >> 33) as u8
+                })
+                .collect()
         }
     };
     use model::shared::llama_like::forward::llama_like_metal;
@@ -2466,6 +2571,9 @@ fn whole_plan(
             positions: (0..rows as u32).map(|p| p + 5).collect(),
             pages: vec![3, 1, 0, 2, 6, 4, 7, 5],
             samples: Vec::new(),
+            mask: Vec::new(),
+            traced: false,
+            writes: Vec::new(),
         }],
     )
     .expect("the fire stages");
@@ -2553,6 +2661,7 @@ fn whole_plan(
         one_at_a_time: false,
     };
     let before = device.allocations();
+    let barriers_before = device.barriers();
     let fired = driver_vulkan::serve::fire(device, &mut cache, &modules, &low, firing)
         .unwrap_or_else(|e| panic!("{e}"));
     // Every launch the plan states, in one command buffer. Without this a
@@ -2565,6 +2674,7 @@ fn whole_plan(
             submissions: 1,
             blocks: fired.blocks,
             parsed: fired.parsed,
+            tiered: fired.tiered,
         }
     );
     // One device allocation for all of them. `blocks` is what this fire used
@@ -2598,6 +2708,12 @@ fn whole_plan(
     //
     // Against the plan's own count of distinct kernels rather than a
     // constant, so it says the same thing for every text and both classes.
+    //
+    // It counts the kernel TABLE lookup too, since that moved into the same
+    // cache-miss arm: `kernels::sig_in` is a linear scan of every row and
+    // then, for a specialised name, of every row's axis points, and a decode
+    // was doing it 452 times for nine distinct symbols. There is no second
+    // counter because there is no second walk -- one miss, both lookups.
     let symbols: std::collections::BTreeSet<u16> = low.launches.iter().map(|l| l.kernel).collect();
     assert_eq!(
         fired.parsed,
@@ -2613,6 +2729,35 @@ fn whole_plan(
          to mean anything",
         fired.dispatches,
         symbols.len()
+    );
+    // Fewer barriers than rectangles, and more than none.
+    //
+    // The recording used to put a full pipeline barrier between every pair of
+    // dispatches, which is `dispatches - 1` of them, and on this card that was
+    // 3.8 milliseconds of a 7.2 millisecond decode -- eight microseconds each,
+    // which is what serialising a dispatch that takes two costs. Most
+    // neighbouring pairs of a plan do not touch the same bytes, and
+    // `device::hazards` is what tells which do.
+    //
+    // Stated as a range rather than a number because the count is the plan's,
+    // and both ends are load-bearing. A `hazards` that answered `true` for
+    // everything would be the old recording and would pass every other
+    // assertion in this file, including the byte-for-byte comparison below;
+    // one that answered `false` for everything would race, which the
+    // comparison catches on most runs and not on all of them. Measured over
+    // the six texts this helper fires, decode and prefill alike: 311 of 452
+    // for qwen3-0.6b, 311 of 480 for qwen2.5-1.5b, 227 of 292 for olmo2-1b,
+    // 323 of 452 for mistral-7b, 459 of 604 for gpt-oss-20b and 819 of 1060
+    // for the 30B mixture. Between three fifths and four fifths, which is the
+    // shape of a transformer: a layer is a chain, and the handful of things
+    // inside it that are not -- the three projections, the per-head writes --
+    // are what this recovers.
+    let barriers = device.barriers() - barriers_before;
+    assert!(
+        barriers > 0 && barriers < fired.dispatches as u32 - 1,
+        "{name}: {barriers} barriers over {} rectangles, which is either the \
+         coarse recording or no ordering at all",
+        fired.dispatches
     );
     let recorded = device.read(&arena_buffer).expect("the arena reads back");
     // Read HERE and not at the end, because the slow run below overwrites the
@@ -2665,6 +2810,7 @@ fn whole_plan(
                 submissions: low.launches.len(),
                 blocks: slow.blocks,
                 parsed: slow.parsed,
+                tiered: slow.tiered,
             }
         );
         let one_at_a_time = device.read(&arena_buffer).expect("the arena reads back");
@@ -2830,7 +2976,7 @@ fn whole_plan(
 #[derive(Clone, Copy)]
 struct Wanted {
     /// Which trace the plan comes from.
-    class: model_compiler::trace::FireClass,
+    class: model_ir::trace::FireClass,
     /// How many rows the fire has.
     rows: usize,
     /// How many bytes the `embed` blocks get.
@@ -2964,15 +3110,17 @@ fn gemm_agrees(
     moe: bool,
 ) {
     use model::shared::llama_like::forward::facts::LlamaLikeMetalFacts;
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     let metal = LlamaLikeMetalFacts::synthetic();
-    // SIXTEEN and not four. Measured over 1, 2, 3, 4, 5, 8, 16, 17, 32 and 64
-    // rows: the prefill plan lowers to zero `qmm` symbols below sixteen and
-    // two at sixteen and above, because the tile is `bm = 16`. At four rows
-    // this test would fire the same kernels twice and pass without comparing
-    // anything.
-    let rows = 16;
+    // THE TILE, and not four and not a round number. Measured over 1, 2, 3,
+    // 4, 5, 8, 16, 17, 32 and 64 rows: the prefill plan lowers to zero `qmm`
+    // symbols below the tile and two at the tile and above. At four rows this
+    // test would fire the same kernels twice and pass without comparing
+    // anything -- which is what it silently began doing at sixteen rows the
+    // day `QMM_TILE` widened to 32, and is why it is read from the constant
+    // now instead of transcribed.
+    let rows = model::shared::llama_like::project::QMM_TILE.0 as usize;
     let mut answers = Vec::new();
     for class in [FireClass::Decode, FireClass::Prefill] {
         answers.push(whole_plan(
@@ -3144,13 +3292,31 @@ fn gemm_agrees(
 /// router owns, not past it -- and it is why a byte comparison cannot be the
 /// claim here.
 ///
-/// So the claim is what the ordering cannot move: the ANSWER. Not merely
-/// close, which the old second line already said, but the same choice --
-/// every row's argmax identical across both fires, which is what a caller
-/// actually consumes and what a rank flip would break. The relative bound
-/// stays beside it because an argmax can survive a distribution that has
-/// drifted badly. Both were measured over two fires: 0 flips of 16 rows, and
-/// a worst relative difference of 0.0067 against the 0.05 the bound allows.
+/// So the claim is what the ordering cannot move: the ANSWER. That was first
+/// spelled as every row's argmax agreeing, and it was wrong a THIRD time --
+/// which is the third correction kept here.
+///
+/// It flaked, about one run in three, always on row 0. The diagnosis: this
+/// fixture's logits sit near 9728, where bf16's seven mantissa bits space the
+/// representable values exactly 64 apart, and 3271 different tokens held the
+/// top value. A plateau that wide makes an argmax a report of scan order, and
+/// the run-to-run difference that reshuffled it was 64 -- one ULP, the
+/// smallest difference expressible there. The test called that "the router's
+/// ordering reached the ranking".
+///
+/// Two things came out of chasing it. The fixture's weight fill was
+/// `i * 31 % 251`, whose 251-byte period aliases with every one of these
+/// models' head row strides, so hundreds of vocabulary rows were byte
+/// identical; `whole_plan`'s `fill_of` explains the hash that replaced it.
+/// And the ULP itself is not the driver's ordering: it survives
+/// `one_at_a_time`, which submits every dispatch on its own fence and is the
+/// strongest ordering Vulkan has. What it was, was the router being handed
+/// tied scores by a periodic fixture and breaking the tie with an atomic.
+///
+/// The claim now is EQUALITY OF THE WHOLE DISTRIBUTION, which is strictly
+/// stronger than the argmax it replaced and cannot go quiet on a plateau.
+/// The relative bound stays beside it as the weaker, more legible statement
+/// of the same thing.
 ///
 /// What this no longer catches is an overrun that changes the arena without
 /// changing the answer. That is `whole_plan`'s job and it does it properly:
@@ -3160,7 +3326,7 @@ fn gemm_agrees(
 #[test]
 fn a_routed_prefill_answers_the_same_twice() {
     use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     let (device, dir) = gpu!();
     let facts = LlamaLikeFacts::qwen3_30b_a3b();
@@ -3214,28 +3380,30 @@ fn a_routed_prefill_answers_the_same_twice() {
          choice a caller makes"
     );
 
-    // THE CHOICE. The sharp half: an argmax is what a caller consumes, and a
-    // router whose ordering reached the ranking would flip one here. Per row,
-    // because a single flipped row in sixteen is exactly the failure a
-    // whole-distribution norm would average away.
-    let argmax = |s: &[f32]| {
-        s.iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(i, _)| i)
-            .expect("a row has a widest logit")
-    };
-    let flipped: Vec<usize> = (0..rows)
-        .filter(|r| {
-            argmax(&once.answer.values[r * per..(r + 1) * per])
-                != argmax(&twice.answer.values[r * per..(r + 1) * per])
-        })
-        .collect();
-    assert!(
-        flipped.is_empty(),
-        "two fires of one routed prefill chose different tokens on rows {flipped:?}: \
-         the router's ordering reached the ranking, which is the one place it must \
-         not"
+    // BIT FOR BIT, and the argmax check this replaced is the reason it has
+    // to be.
+    //
+    // These logits sit near 9728, and bf16 has seven explicit mantissa bits,
+    // so the representable values there are spaced exactly 64 apart. The
+    // consequence is a plateau: 3271 different tokens hold the top value at
+    // the same bf16 bucket. An argmax over that reports which index the scan
+    // reached first, and a difference of ONE ULP anywhere reshuffles it --
+    // which is exactly what used to happen, on row 0 only, in about one run
+    // in three. The test named that flip "the router's ordering reached the
+    // ranking" and it was a rounding difference of one bf16 step.
+    //
+    // Equality of the whole distribution is the claim that was wanted. It is
+    // strictly stronger than the argmax one -- a router whose permutation
+    // reached the arithmetic changes bits long before it changes a winner --
+    // and it cannot go quiet on a plateau. It holds because this fire has no
+    // order-dependent accumulation left to expose once the fixture stops
+    // handing the router tied scores.
+    assert_eq!(
+        once.answer.values, twice.answer.values,
+        "two fires of one routed plan produced different logits. The plan, the
+         weights and the arena are identical, so what differs is an ordering:
+         either the router's permutation reached the arithmetic, or an expert's
+         contribution was accumulated in a different sequence"
     );
 
     // THE DISTRIBUTION. The blunt half, kept from the original: an argmax can
@@ -3270,7 +3438,7 @@ fn a_routed_prefill_answers_the_same_twice() {
 /// land at slot 0 and an identity table would call that correct.
 ///
 /// The destination arithmetic comes from [`Shape::slot`], which transcribes
-/// `attn/kv_write.comp`. `attn/sdpa_paged.comp` computes the same expression
+/// `attn/kv_write.slang`. `attn/sdpa_paged.slang` computes the same expression
 /// from separate source, so the layout is two modules agreeing rather than
 /// this crate deciding.
 #[test]
@@ -3280,7 +3448,7 @@ fn a_real_plans_kv_append_puts_the_row_where_the_page_table_says() {
     use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
     use model::shared::llama_like::forward::llama_like_metal;
     use model_compiler::lower::{Fire, Row, lower};
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     let (device, dir) = gpu!();
     let symbol = "kv_append_paged_bfloat16";
@@ -3347,6 +3515,7 @@ fn a_real_plans_kv_append_puts_the_row_where_the_page_table_says() {
         launch,
         kernels_vulkan::KERNELS,
         driver_vulkan::dispatch::Built {
+            sig: None,
             module: driver_vulkan::geometry::Module::named(
                 symbol,
                 [declared.local[0], declared.local[1], declared.local[2]],
@@ -3466,8 +3635,8 @@ fn a_real_plans_kv_append_puts_the_row_where_the_page_table_says() {
 ///
 /// `resources` transcribes one slot expression and says it is a fact because
 /// two shaders compute it. This is the test that makes that a measurement:
-/// `attn/kv_write.comp` puts six positions into a pool through the page table,
-/// and `attn/sdpa_paged.comp` attends over them without either shader or this
+/// `attn/kv_write.slang` puts six positions into a pool through the page table,
+/// and `attn/sdpa_paged.slang` attends over them without either shader or this
 /// file ever agreeing on anything but the pool.
 ///
 /// The reference never mentions a slot. It is stated entirely in terms of "the
@@ -3673,7 +3842,7 @@ fn what_the_append_writes_through_the_page_table_is_what_the_attention_reads() {
 /// The two appends put a row in the same place, and the pool is what says
 /// where.
 ///
-/// `attn/kv_write.comp` compiles to two shaders from one file. The paged one
+/// `attn/kv_write.slang` compiles to two shaders from one file. The paged one
 /// computes `slot * (kv_heads * head_dim) + h * head_dim + d`. The contiguous
 /// one computes `h * k_head_stride + pos * k_seq_stride + d` and takes both
 /// strides from the driver. Those two expressions describe the same memory
@@ -3883,7 +4052,7 @@ fn the_two_appends_put_a_row_in_the_same_place_and_the_pool_says_where() {
 
 /// The contiguous decode reads the pool the paged append wrote.
 ///
-/// The other direction of the same two numbers. `attn/sdpa_vector.comp` never
+/// The other direction of the same two numbers. `attn/sdpa_vector.slang` never
 /// sees a page table; it walks the cache by `kv_head * k_head_stride + i *
 /// k_seq_stride`, so the driver's strides are the only thing telling it where
 /// a position is. If they were the pair the row's comment describes -- a head
@@ -4106,11 +4275,17 @@ fn two_requests_in_one_fire_do_not_read_each_others_history() {
             positions: (0..6).collect(),
             pages: vec![5, 2],
             samples: Vec::new(),
+            mask: Vec::new(),
+            traced: false,
+            writes: Vec::new(),
         },
         Request {
             positions: (0..3).collect(),
             pages: vec![6, 1],
             samples: Vec::new(),
+            mask: Vec::new(),
+            traced: false,
+            writes: Vec::new(),
         },
     ];
     let frame = Frame::of(shape, &requests).expect("a stageable fire");
@@ -4306,7 +4481,7 @@ fn two_requests_in_one_fire_do_not_read_each_others_history() {
 
 /// The ladder this driver builds is the one the shader raises.
 ///
-/// `rope/neox.comp` compiles to two shaders from one file. `neox_mb` raises
+/// `rope/neox.slang` compiles to two shaders from one file. `neox_mb` raises
 /// its own ladder -- `exp2(-(i / pair_half) * base)` -- and `neox_freqs_mb`
 /// reads one from a buffer. They exist as a pair because a deployment that
 /// rescales its ladder (llama-3, YaRN) has no base to state, and the second
@@ -4500,7 +4675,7 @@ fn the_rows_the_frame_reads_out_are_the_rows_the_gather_moves() {
     use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
     use model::shared::llama_like::forward::llama_like_metal;
     use model_compiler::lower::{Fire, lower};
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     let (device, dir) = gpu!();
     let symbol = "row_gather_bfloat16";
@@ -4522,6 +4697,9 @@ fn the_rows_the_frame_reads_out_are_the_rows_the_gather_moves() {
             positions: vec![0, 1, 2, 3],
             pages: vec![1],
             samples: vec![1, 3],
+            mask: Vec::new(),
+            traced: false,
+            writes: Vec::new(),
         },
         Request::of(vec![5], vec![2]),
     ];
@@ -4585,6 +4763,7 @@ fn the_rows_the_frame_reads_out_are_the_rows_the_gather_moves() {
         launch,
         kernels_vulkan::KERNELS,
         driver_vulkan::dispatch::Built {
+            sig: None,
             module: driver_vulkan::geometry::Module::named(
                 symbol,
                 [declared.local[0], declared.local[1], declared.local[2]],
@@ -4742,7 +4921,7 @@ fn a_fire_that_cannot_run_says_which_launch() {
     use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
     use model::shared::llama_like::forward::llama_like_metal;
     use model_compiler::lower::{Fire as LowerFire, Row, lower};
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     let (device, dir) = gpu!();
 
@@ -4932,7 +5111,7 @@ fn the_logits_a_fire_leaves_are_one_row_per_readout_and_are_not_f32() {
     use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
     use model::shared::llama_like::forward::llama_like_metal;
     use model_compiler::lower::{Fire as LowerFire, lower};
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     let (device, dir) = gpu!();
 
@@ -5294,6 +5473,9 @@ fn a_conversation_keeps_its_pages_while_another_is_seated_between_its_fires() {
         positions: vec![book.tokens(1).expect("A is seated") as u32 - 1],
         pages: book.pages(1).expect("A is seated").to_vec(),
         samples: Vec::new(),
+        mask: Vec::new(),
+        traced: false,
+        writes: Vec::new(),
     };
     let a_frame = Frame::of(shape, std::slice::from_ref(&a_now)).expect("A's decode stages");
     pool.stage(&device, &a_frame).expect("A's tables");
@@ -5428,7 +5610,7 @@ fn a_deployment_fires_step_after_step_and_stops_building_pipelines() {
     use driver_vulkan::turns::{Held, Serving, Turn, Unstepped};
     use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
     use model::shared::llama_like::forward::llama_like_metal;
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     let (device, dir) = gpu!();
     let shape = Shape {
@@ -5436,7 +5618,12 @@ fn a_deployment_fires_step_after_step_and_stops_building_pipelines() {
         kv_heads: 8,
         head_dim: 128,
         page_size: 8,
-        pages: 6,
+        // EIGHT, and it was six. The prefill below is a whole `QMM_TILE` of
+        // rows and the tile widened from 16 to 32, so that one turn now needs
+        // four pages instead of two and the mixed batch after it had none
+        // left. Sixty-four token slots rather than forty-eight; nothing here
+        // asserts on the count, only that the seatings below fit.
+        pages: 8,
         bytes: 2,
     };
 
@@ -5542,10 +5729,12 @@ fn a_deployment_fires_step_after_step_and_stops_building_pipelines() {
     };
     load(&mut modules);
 
+    let mut lowerings = driver_vulkan::turns::Lowerings::default();
     let mut held = Held {
         book: &mut book,
         pool: &mut pool,
         weights: &weights,
+        lowerings: &mut lowerings,
     };
 
     // A prefill of four tokens for one conversation.
@@ -5628,16 +5817,22 @@ fn a_deployment_fires_step_after_step_and_stops_building_pipelines() {
             .any(|p| a_pages.contains(p)),
         "B was given a page A still holds"
     );
-    // The same count, even though this step lowers the PREFILL plan and the
-    // first lowered the decode plan. Measured rather than assumed: the tiled
-    // GEMM has `bm = 16`, so a prefill plan at fewer than sixteen rows lowers
-    // to exactly the matrix-vector products the decode plan does. Two rows,
-    // three, eight -- all `affine_qmv_fast`; at sixteen two `affine_qmm_t`
-    // symbols appear and stay. The sixteen-row step below is where the plans
-    // actually diverge, and it is the only step here that builds anything.
+    // ONE more, and exactly one: `sdpa_paged_tiled`. This step lowers the
+    // PREFILL plan and the first lowered the decode plan, and the only thing
+    // the two disagree about at two rows is which attention kernel they
+    // reach. The projections do NOT diverge here -- the tiled GEMM has
+    // `bm = 16`, so a prefill at fewer than sixteen rows lowers to exactly
+    // the matrix-vector products a decode does. Two rows, three, eight -- all
+    // `affine_qmv_fast`; at sixteen two `affine_qmm_t` symbols appear and
+    // stay, which is what the sixteen-row step below is for.
+    //
+    // This was `second.pipelines == first.pipelines` while the two
+    // `sdpa_paged_tiled` rows stated nothing but their axes and `dsl::sdpa`
+    // could only reach the decode kernel. The count going up by one is the
+    // evidence the tiled kernel is now actually selected for a prefill.
     assert_eq!(
         second.pipelines,
-        first.pipelines,
+        first.pipelines + 1,
         "the second step built {} pipelines the first did not",
         second.pipelines - first.pipelines
     );
@@ -5657,7 +5852,9 @@ fn a_deployment_fires_step_after_step_and_stops_building_pipelines() {
         .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(third.rows, 1);
     assert_eq!(third.logits.rows, 1);
-    assert_eq!(third.pipelines, first.pipelines);
+    // The decode shape again, so nothing new: the count is what the prefill
+    // step above left it at, not what the first decode step did.
+    assert_eq!(third.pipelines, second.pipelines);
     assert_eq!(held.book.tokens(1), Some(2), "A did not move this step");
 
     // A prefill: one turn of four tokens, and a mixed batch after it.
@@ -5678,6 +5875,12 @@ fn a_deployment_fires_step_after_step_and_stops_building_pipelines() {
     // seen the whole prompt. `readout_of` is what says which one that is, and
     // a caller sampling `logits.row(i)` for turn `i` would read a model that
     // had seen one token.
+    // EXACTLY THE TILE, because the divergence this test ends on is that a
+    // prefill of a whole tile builds the two GEMM pipelines a decode never
+    // does. A prompt one row short of the tile takes the matrix-vector arm
+    // and builds neither -- so this number is `QMM_TILE`'s and not a round
+    // sixteen, which is what it was until the tile widened underneath it.
+    let tile = model::shared::llama_like::project::QMM_TILE.0;
     let prefill = serving
         .step(
             &device,
@@ -5686,25 +5889,50 @@ fn a_deployment_fires_step_after_step_and_stops_building_pipelines() {
             &mut held,
             &[Turn {
                 who: 3,
-                tokens: (0..16).map(|t| 7 + t).collect(),
+                tokens: (0..tile).map(|t| 7 + t).collect(),
             }],
         )
         .unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(prefill.rows, 16);
+    assert_eq!(prefill.rows, tile as usize);
     assert_eq!(
-        prefill.logits.rows, 16,
-        "every row samples, so a prefill of sixteen gives sixteen distributions"
+        prefill.logits.rows, tile as usize,
+        "every row samples, so a prefill of a whole tile COMPUTES a tile of distributions"
     );
     assert_eq!(
         prefill.readout_of,
-        vec![15],
+        vec![tile as usize - 1],
         "the turn's answer is its last row"
     );
     assert!(
         prefill.logits.row(prefill.readout_of[0]).is_some(),
         "the turn's own distribution is addressable"
     );
-    assert_eq!(held.book.tokens(3), Some(16));
+
+    // ...and the fifteen it computed and nobody asked for did not come back.
+    //
+    // This is the claim that makes a prefill affordable. The lowering says
+    // every row samples -- see the comment above -- so the exit really is
+    // sixteen distributions wide in the arena, and a 1024-token prompt's exit
+    // is 155 million values. Reading all of them cost 0.5 s a step through
+    // the copy engine and thirty seconds through the mapping; the turn wants
+    // one row of it.
+    //
+    // Stated as two separate facts because either alone is satisfiable
+    // wrongly: `read` alone could name a row `values` does not hold, and a
+    // short `values` alone could be a truncated dense read, which would give
+    // every request after the first someone else's distribution.
+    assert_eq!(
+        prefill.logits.read, prefill.readout_of,
+        "the rows a step holds are the rows its requests read"
+    );
+    assert_eq!(
+        prefill.logits.values.len(),
+        prefill.logits.vocab,
+        "a sixteen-row prefill answering one request came back {} values wide, \
+         so it is carrying rows nothing will ever address",
+        prefill.logits.values.len()
+    );
+    assert_eq!(held.book.tokens(3), Some(tile as usize));
     // The pool's own `SamplingIndices` says what the lowering was told.
     //
     // The frame names one readout for this turn, so `Pool::stage` writes ONE
@@ -5728,13 +5956,13 @@ fn a_deployment_fires_step_after_step_and_stops_building_pipelines() {
             .collect();
         assert_eq!(
             got,
-            (0..16).collect::<Vec<u32>>(),
+            (0..tile).collect::<Vec<u32>>(),
             "the gather would read {} entries out of {} the pool holds",
             prefill.rows,
             got.len()
         );
     }
-    // AND HERE THEY DIVERGE. Sixteen rows is the tile height, so this step is
+    // AND HERE THEY DIVERGE. This step is a whole tile of rows, so it is
     // the first in the crate's serving loop to lower `affine_qmm_t` -- the
     // tiled GEMM, which a deployment carrying only the decode plan would never
     // build and never run. Two of them, measured, and they are two pipelines
@@ -5745,10 +5973,13 @@ fn a_deployment_fires_step_after_step_and_stops_building_pipelines() {
     // and it was passing because `Serving` held one plan: the prefill was
     // being answered with sixteen matrix-VECTOR products. The claim was true
     // and it was the wrong claim.
+    // Three, not two: the tiled GEMM's two plus `sdpa_paged_tiled`, which the
+    // two-row prefill above already built and the one-row decode `first`
+    // never does.
     assert_eq!(
         prefill.pipelines,
-        first.pipelines + 2,
-        "a sixteen-row step built {} pipelines a one-row step had not, and the tiled \
+        first.pipelines + 3,
+        "a {tile}-row step built {} pipelines a one-row step had not, and the tiled \
          GEMM is two of them",
         prefill.pipelines - first.pipelines
     );
@@ -5829,6 +6060,78 @@ fn a_deployment_fires_step_after_step_and_stops_building_pipelines() {
     assert!(
         held.book.pages(9).is_none(),
         "a refused conversation kept a seat"
+    );
+
+    // SIX MORE DECODES OF A SHAPE ALREADY SEEN, so that the counts below are
+    // claims about REPETITION and not about how many shapes this test happens
+    // to fire. Without them, disabling the lowering cache moves its number by
+    // one -- which a reader could take for a rounding argument. With them it
+    // moves by seven.
+    let restaged = held.pool.restaged();
+    for _ in 0..6 {
+        serving
+            .step(
+                &device,
+                &mut cache,
+                &modules,
+                &mut held,
+                &[Turn {
+                    who: 1,
+                    tokens: vec![9],
+                }],
+            )
+            .unwrap_or_else(|e| panic!("a repeat decode: {e}"));
+    }
+
+    // AND THE LOWERINGS WERE NOT RECOMPUTED. This test fired thirteen steps
+    // above -- decodes of one row, a prefill of a whole tile, a mixed batch
+    // of four rows, and the refusals, which never reach the lowering. Four
+    // DISTINCT row shapes reached it, and `lower` ran four times.
+    //
+    // Stated as a count and not as a duration because a cache that never hits
+    // returns exactly the same answers as one that always does; the only
+    // difference is 1.38 ms a step, and a wall-clock assertion on a shared
+    // box measures the neighbours. See `turns::Lowerings` for why the row
+    // shape is a sound key.
+    // AND THE STATE TABLES WERE WRITTEN OVER, NOT REALLOCATED.
+    //
+    // A step writes eleven tables -- the nine `Pool::stage` fills plus the
+    // token ids and the sampling identity `Serving::once` states -- and
+    // `Pool::state` used to allocate a fresh buffer for each and free the old,
+    // sixty-six allocations and sixty-six frees over these six steps, measured at 1.30 ms a step of
+    // an 8.1 ms decode. A conversation decoding states the same row count and
+    // the same page count for eight tokens at a stretch, so step after step
+    // the tables are the same SIZE and can be written over in place.
+    //
+    // NINE, and each one is a table whose size genuinely changed:
+    //
+    // * eight at the first of these steps, because the step before it was the
+    //   four-row mixed batch and eight of the eleven tables are a different
+    //   length at four rows than at one. The two attention-mask tables are
+    //   not: they are a byte a row rounded up to a word, so one row and four
+    //   rows are both one word;
+    // * one more partway through, when this conversation crossed a page
+    //   boundary and `kv_page_indices` grew by a word.
+    //
+    // The other fifty-seven writes went into the buffer already there.
+    // Counted and not timed for the reason `Pool::restaged` gives.
+    assert_eq!(
+        held.pool.restaged() - restaged,
+        9,
+        "six repeated decodes allocated {} table buffers",
+        held.pool.restaged() - restaged
+    );
+
+    // `held` borrows `lowerings` mutably and every step above needs it, so
+    // the count is read only once nothing will step again. Not `drop`, which
+    // clippy rightly points out does nothing to a type with no `Drop`: this
+    // is a borrow ending, and `let _ =` is how a reader is told so.
+    let _ = held;
+    assert_eq!(
+        lowerings.lowered(),
+        4,
+        "the deployment lowered {} times over four distinct row shapes",
+        lowerings.lowered()
     );
 
     cache.clear(&device);
@@ -6180,7 +6483,7 @@ fn names_a_decode_binds(real: &Real) -> Vec<String> {
     use model::shared::llama_like::forward::facts::LlamaLikeMetalFacts;
     use model::shared::llama_like::forward::llama_like_metal;
     use model_compiler::lower::{Arg, Fire, Row, lower};
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     // The SAME fact set `shelled` builds its text from, and it has to be:
     // `add_bias` decides whether the text states three bias weights a layer,
@@ -6245,7 +6548,7 @@ fn names_a_decode_binds(real: &Real) -> Vec<String> {
 #[test]
 fn a_whole_plan_fires_with_the_weights_a_real_checkpoint_holds() {
     use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     let (device, dir) = gpu!();
     let Some(real) = checkpoint_weights() else {
@@ -6261,10 +6564,11 @@ fn a_whole_plan_fires_with_the_weights_a_real_checkpoint_holds() {
 
     let facts = LlamaLikeFacts::qwen3_0_6b();
     let metal = LlamaLikeMetalFacts::synthetic();
-    // Sixteen, because that is where the prefill plan starts stating a tiled
+    // The tile, because that is where the prefill plan starts stating a tiled
     // GEMM -- below it the two classes lower to the same kernels and the
-    // comparison at the end would be vacuous.
-    let rows = 16;
+    // comparison at the end would be vacuous. Read from the constant rather
+    // than transcribed, for the reason `gemm_agrees` gives at its own `rows`.
+    let rows = model::shared::llama_like::project::QMM_TILE.0 as usize;
     let mut answers = Vec::new();
     for class in [FireClass::Decode, FireClass::Prefill] {
         answers.push(whole_plan(
@@ -6509,10 +6813,37 @@ fn shelled(
     real: &'static std::collections::BTreeMap<String, Vec<u8>>,
     pages: u32,
 ) -> driver_vulkan::shell::Shell {
+    shelled_at_tile(dir, model, real, pages, None, true)
+}
+
+/// [`shelled`], with the GEMM's instantiation point overridden.
+///
+/// `None` is the tile the shared model code states, which is what every
+/// other test wants. A tile is stated here only by
+/// `the_cooperative_matrix_gemm_answers_what_the_baseline_one_does`, which
+/// needs to hold the tile FIXED across its two runs so that the tier is the
+/// only thing that differs.
+///
+/// This used to say the override existed because the default, `(16, 32)`,
+/// "deliberately has none" -- no cooperative-matrix module. Both halves of
+/// that stopped being true when `QMM_TILE` widened to `(32, 32)`, which is a
+/// point that HAS one, and the sentence stayed. Measured on the default
+/// path: a 64-row prefill resolves 2 of its 10 symbols above baseline, and a
+/// decode resolves 0 of 9 -- the GEMM is built at the tier and the GEMV is
+/// not built at it at all. `the_default_tile_reaches_the_tier_in_production`
+/// is that measurement kept.
+fn shelled_at_tile(
+    dir: &std::path::Path,
+    model: &Real,
+    real: &'static std::collections::BTreeMap<String, Vec<u8>>,
+    pages: u32,
+    tile: Option<(u32, u32)>,
+    tiered: bool,
+) -> driver_vulkan::shell::Shell {
     use driver_vulkan::shell::{Deployment, Shell, Text};
     use model::shared::llama_like::forward::facts::LlamaLikeMetalFacts;
     use model::shared::llama_like::forward::llama_like_metal;
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     let facts = (model.facts)();
     // FROM THE FACTS, not from qwen3's numbers, because the second model this
@@ -6533,6 +6864,7 @@ fn shelled(
     // measures against a whole distribution.
     let metal = LlamaLikeMetalFacts {
         add_bias: true,
+        qmm_tile: tile.unwrap_or(LlamaLikeMetalFacts::synthetic().qmm_tile),
         ..LlamaLikeMetalFacts::synthetic()
     };
     let text = Text {
@@ -6556,7 +6888,14 @@ fn shelled(
         if path.extension().is_some_and(|e| e == "spv")
             && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
         {
-            modules.insert(stem.to_string(), std::fs::read(&path).expect("a module"));
+            // `tiered` false drops every `<symbol>.<tag>` key, which is how
+            // a caller asks for the scalar answer on a device that would
+            // otherwise load a tiered module. Nothing else can express it:
+            // the tier comes from the DEVICE, and a store cannot be asked to
+            // pretend the hardware is smaller than it is.
+            if tiered || !stem.contains('.') {
+                modules.insert(stem.to_string(), std::fs::read(&path).expect("a module"));
+            }
         }
     }
 
@@ -6655,9 +6994,15 @@ fn continued(
         );
         fires += 1;
         widest = widest.max(step.rows);
-        let vocab = step.logits.vocab;
-        let at = (a_rows - 1) * vocab;
-        let row = &step.logits.values[at..at + vocab];
+        // `row` and not a slice of `values`: a step holds only the rows some
+        // request will read (see `serve::Logits::read`), so the arithmetic
+        // that used to find row `a_rows - 1` now lands on a different row's
+        // distribution or past the end. `row` is the addressing that stays
+        // true whichever rows the fire kept.
+        let row = step
+            .logits
+            .row(a_rows - 1)
+            .expect("the last row of the fire is a row some request reads");
         if first.is_empty() {
             first = row.to_vec();
         }
@@ -6919,8 +7264,7 @@ fn a_prompt_that_is_not_whole_tiles_is_answered_the_way_the_decode_answers_it() 
         step.logits.rows, 29,
         "every row samples, so there is one distribution a row"
     );
-    let vocab = step.logits.vocab;
-    let split = step.logits.values[28 * vocab..29 * vocab].to_vec();
+    let split = step.logits.row(28).expect("the prompt's last row").to_vec();
 
     // The same tokens, one fire each, on a cache of its own.
     let mut apart = shelled(dir, &REALS[0], real, 8);
@@ -7398,7 +7742,7 @@ fn a_shell_refuses_a_model_assembled_out_of_two() {
     use driver_vulkan::shell::Text;
     use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
     use model::shared::llama_like::forward::llama_like_metal;
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     // No device needed: every check is over the text. Kept in this file
     // anyway, because it is about a type whose other half needs one.
@@ -7594,16 +7938,18 @@ fn a_forked_conversation_carries_the_history_it_was_forked_from() {
             turns.iter().map(|t| t.tokens.len()).sum::<usize>(),
             "the fire answered a different number of rows than the turns state"
         );
-        let vocab = step.logits.vocab;
         let mut at = 0;
         turns
             .iter()
             .map(|t| {
                 // The LAST row of each turn: the only one that has seen the
-                // whole of what that turn appended.
+                // whole of what that turn appended, and -- not by coincidence
+                // -- the only row of that turn the fire kept.
                 at += t.tokens.len();
-                let row = (at - 1) * vocab;
-                step.logits.values[row..row + vocab].to_vec()
+                step.logits
+                    .row(at - 1)
+                    .expect("each turn's last row is the row it reads")
+                    .to_vec()
             })
             .collect()
     }
@@ -7987,9 +8333,10 @@ fn a_cache_resized_under_a_conversation_does_not_change_its_answer() {
                 tokens: tokens.to_vec(),
             }])
             .unwrap_or_else(|e| panic!("{e}"));
-        let vocab = step.logits.vocab;
-        let at = (step.rows - 1) * vocab;
-        step.logits.values[at..at + vocab].to_vec()
+        step.logits
+            .row(step.rows - 1)
+            .expect("the last row of the fire is the turn's own")
+            .to_vec()
     }
     let resize = |shell: &mut driver_vulkan::shell::Shell, pages: u64| {
         shell
@@ -8072,6 +8419,46 @@ fn a_cache_resized_under_a_conversation_does_not_change_its_answer() {
         pages,
         "the state pool's target was applied to the KV pool"
     );
+
+    // Control 4. That same absent pool, asked for STORAGE.
+    //
+    // Control 3 passing is not enough, and for a while it was all there was:
+    // `resize_pool` answered `Ok(())` to every target on a non-KV id, so it
+    // passed control 3 by being right about zero and would have passed it just
+    // as well by being indiscriminate. The two are told apart only here.
+    //
+    // Why a lie here is expensive rather than merely untidy: `bootstrap`'s
+    // trim task records a successful target in `applied` and then skips that
+    // pool on every later tick. So one false `Ok` does not lose one request,
+    // it convinces the engine for the rest of the process that a pool with no
+    // bytes behind it is holding the pages it asked for.
+    for (id, what) in [
+        (driver_api::PIE_ELASTIC_POOL_STATE, "the state pool"),
+        (driver_api::PIE_ELASTIC_POOL_WORKSPACE, "the workspace pool"),
+        (u64::MAX, "an id no driver defines"),
+    ] {
+        let refused = shell
+            .resize_pool(&driver_api::PoolResizePlan {
+                pool_id: id,
+                target_pages: 8,
+                ..driver_api::PoolResizePlan::default()
+            })
+            .unwrap_err();
+        let said = format!("{refused}");
+        assert!(
+            said.contains('8') && said.contains("no such pool"),
+            "the refusal for {what} does not say what could not be done: {said}"
+        );
+        assert_eq!(
+            shell.shape().pages,
+            pages,
+            "{what}'s target was applied to the KV pool"
+        );
+    }
+
+    // And the KV pool still answers, so none of those refusals touched it.
+    let after = last(&mut shell, 2, &[PERIOD[3]]);
+    assert!(after.iter().all(|v| v.is_finite()));
 }
 
 /// A decode step answers in tens of milliseconds, not in seconds.
@@ -8090,8 +8477,7 @@ fn a_cache_resized_under_a_conversation_does_not_change_its_answer() {
 /// 4 bits, a single conversation decoding one token at a time. 18 ms a step,
 /// about 55 tokens a second at this context.
 ///
-/// The shape of the step, taken when it still cost 44 ms and still true in
-/// proportion:
+/// The shape of the step, taken when it still cost 44 ms:
 ///
 /// | phase | share |
 /// |---|---|
@@ -8104,9 +8490,39 @@ fn a_cache_resized_under_a_conversation_does_not_change_its_answer() {
 /// | ...of which recording the command buffer | 0.3 ms |
 /// | ...of which **submit and wait on the GPU** | **almost all of it** |
 ///
-/// That is the useful half of the measurement: this crate's own CPU work is
-/// under a millisecond, so a regression in the driver's bookkeeping would
-/// have to be enormous before it showed up beside the fire.
+/// That table used to be followed by "and still true in proportion". It is
+/// not, and remeasuring it is what found the arena defect below. At today's
+/// 5.4 ms, release, per phase:
+///
+/// | phase | then | now |
+/// |---|---|---|
+/// | `lower` | 0.8-6 ms | **0.3 us** |
+/// | pool stage | 2.5-6 ms | **3 us** |
+/// | state upload | (above) | **0.6 us** |
+/// | the arena | 0.2 ms | 0.19 ms |
+/// | `fire` | the rest | **5.25 ms, 89%** |
+///
+/// The two multi-millisecond host phases are gone -- the lowering because it
+/// is cached per step, the stage because the pool stopped rewriting tables
+/// that had not changed -- and they did not shrink, they collapsed, by three
+/// and four orders of magnitude. So the CONCLUSION survived while every
+/// number under it stopped being true, which is the failure mode a
+/// proportional claim invites.
+///
+/// The conclusion, restated from the measurement rather than inherited: this
+/// crate's own CPU work is now about 0.2 ms of 5.4, and essentially all of
+/// that is the arena's allocation. The fire is 89%.
+///
+/// # What remeasuring it found
+///
+/// On a DECODE the arena is 326 KB and 0.19 ms, which is where it always was
+/// and is dull. On the 384-row prefill in the sibling test it was **35.5 ms
+/// of a 167 ms step**, because there the arena is 233 MB -- and it was being
+/// zero-filled in system memory and then uploaded whole. See
+/// `a_prefills_arena_does_not_cross_the_bus`, and `turns::arena_for` for the
+/// route it takes now. The decode profile above could not have found that:
+/// the phase is 3% of a decode and 21% of a prefill, and this test only ever
+/// looked at the decode.
 ///
 /// # Where the other half went, and four wrong answers on the way
 ///
@@ -8154,11 +8570,21 @@ fn a_cache_resized_under_a_conversation_does_not_change_its_answer() {
 ///
 /// # Why the ceiling is where it is
 ///
-/// 400 ms per step, against 18 ms measured in release and about 70 ms in the
-/// debug build this suite runs under two validation layers. The margin is
-/// for the shared box rather than the driver: the number to catch is a stall
-/// of seconds, not a slow afternoon, and a tighter bound would be a
-/// benchmark -- which on a shared machine is a flaky test.
+/// 250 ms per step, against 5.4 ms measured in release and 12.0 to 20.1 ms
+/// across five debug runs of this suite. Those numbers are not the ones this
+/// header carried for most of its life -- it said 18 ms release and about
+/// 70 ms debug, from before the wider `QMM_TILE`, the cached per-step
+/// lowering and the hazard-analysed barriers landed. A stale figure in a
+/// timing note is worse than none: it is what a reader compares against when
+/// deciding whether a slowdown is real, and 44 ms would have looked like an
+/// improvement.
+///
+/// The margin is for the shared box rather than the driver, and the spread
+/// above is why it stays wide: the same build varies by 1.7x between runs
+/// depending on what else holds the card. The number to catch is a stall of
+/// seconds, not a slow afternoon, and a tighter bound would be a benchmark --
+/// which on a shared machine is a flaky test. 250 ms is twelve times the
+/// slowest run observed, which is as tight as that spread allows.
 #[test]
 fn a_decode_step_does_not_stall() {
     let (device, dir) = gpu!();
@@ -8193,11 +8619,232 @@ fn a_decode_step_does_not_stall() {
     }
     let each = at.elapsed() / STEPS;
     eprintln!("a decode step: {each:?}");
-    assert!(
-        each < std::time::Duration::from_millis(400),
-        "a decode step took {each:?}, and the measured cost on this card is about 44 ms: \
-         something is stalling, which is how the 370 s KV copy looked from here"
+    within_budget(
+        each,
+        std::time::Duration::from_millis(250),
+        &format!(
+            "a decode step took {each:?}, and the measured cost on this card is 5.4 ms in \
+             release and 12 to 20 ms in this debug suite: something is stalling, which is \
+             how the 370 s KV copy looked from here"
+        ),
     );
+}
+
+/// Where a decode step's time actually goes, and how that changes with context.
+///
+/// # Why this test exists
+///
+/// Because until `PIE_VULKAN_TIMING` existed, every performance number in this
+/// crate was wall-clock around a submit, and a decode is four hundred and
+/// fifty dispatches. "The step takes 7 ms" does not say which dispatch to go
+/// and look at, so the choice of what to optimise next was being made from an
+/// argument rather than a measurement.
+///
+/// The first thing the timestamps said looked like the argument was wrong.
+/// The 4-bit qwen3-0.6b on this card, device time per decode step at
+/// twenty-four tokens of history:
+///
+/// | kernel | ms/step | share |
+/// | --- | --- | --- |
+/// | `affine_qmv_fast` | 2.16 | 48% |
+/// | `affine_qmv_fast_residual` | 0.95 | 21% |
+/// | `sdpa_paged_decode` | 0.86 | 19% |
+/// | `rms_single_row` | 0.30 | 7% |
+/// | `neox_mb` | 0.16 | 4% |
+/// | `kv_append_paged` | 0.05 | 1% |
+/// | `silu_mul` | 0.04 | 1% |
+///
+/// Attention a fifth, the projections seven tenths -- which reads as a flat
+/// contradiction of the standing next target, occupancy in
+/// `sdpa_paged_decode`. It is not. Run the same measurement at 384 tokens and
+/// it turns over completely:
+///
+/// | kernel | ms/step | share |
+/// | --- | --- | --- |
+/// | `sdpa_paged_decode` | 10.14 | 75% |
+/// | `affine_qmv*` | 2.92 | 22% |
+/// | everything else | 0.51 | 3% |
+///
+/// Both are true, and neither is the whole cost model. The projections read
+/// the weights, which do not grow, so their cost is FIXED per step; attention
+/// reads the history, so its cost is LINEAR in it. At twenty-four tokens the
+/// fixed part is everything and at 384 it is a fifth. A single number for
+/// "where a decode goes" does not exist, and this test is written to hold
+/// both ends of that rather than to pick one -- because picking one is how a
+/// tuning effort ends up aimed at the phase that was already cheap.
+///
+/// A caution about the absolute numbers, which is why only shares are
+/// asserted below: the tool perturbs what it measures. The submit-and-wait
+/// around a short-context fire is 3.47 ms with timing off and 5.78 ms with it
+/// on -- see [`Device::timings`] -- so the device milliseconds above are an
+/// upper bound. The shares survive because the effect they describe, a fifth
+/// against three quarters, is far larger than two thirds of overhead.
+///
+/// The host was measured separately, with timing OFF and the phases of
+/// `run_all` timed against the wall, which is the only way to get it
+/// unperturbed. Release, per decode step:
+///
+/// | phase | short (24 tok) | long (384 tok) |
+/// | --- | --- | --- |
+/// | argument checks | 0.007 ms | 0.010 ms |
+/// | descriptor sets | 0.134 ms | 0.113 ms |
+/// | command recording | 0.421 ms | 0.349 ms |
+/// | submit and wait | 3.469 ms | 12.961 ms |
+/// | everything outside `run_all` | 1.917 ms | 1.867 ms |
+/// | wall | 5.949 ms | 15.300 ms |
+///
+/// The host is **2.48 ms and it does not move with context** -- 42% of a
+/// short step and 15% of a long one -- and three quarters of it is outside
+/// `run_all` entirely, in the lowering, the plan and the scalar blocks. That
+/// is not a defect, it is what a driver costs; it is written down because at
+/// short context it is nearly three times the whole attention kernel, and it
+/// had never appeared in any measurement here.
+///
+/// # What is asserted, and why they are ratios
+///
+/// Absolute milliseconds on a shared box vary by 1.7x between runs, so the
+/// claims are about shares, which do not: the shape of a decode is a property
+/// of the model and the kernels, not of what else holds the card. The bounds
+/// are wide enough to survive any single kernel getting faster and tight
+/// enough to fail if an end inverts -- which is the event worth catching,
+/// since it would mean the next optimisation belongs somewhere else.
+#[test]
+fn attention_is_a_fifth_of_a_short_step_and_three_quarters_of_a_long_one() {
+    let (device, dir) = gpu!();
+    let _ = &device;
+    let Some(real) = checkpoint_weights() else {
+        eprintln!("no readable 4-bit qwen3-0.6b, so the step's shape is unmeasured");
+        return;
+    };
+    if std::env::var_os("PIE_VULKAN_TIMING").is_none() {
+        eprintln!(
+            "PIE_VULKAN_TIMING is not set, so the device wrote no timestamps. \
+             Re-run with it set to see where a step goes."
+        );
+        return;
+    }
+
+    // `repeats` copies of PERIOD is the history; `pages` has to hold it.
+    let shape = |repeats: usize, pages: u32| -> (f64, f64, f64, std::time::Duration) {
+        let mut shell = shelled(dir, &REALS[0], real, pages);
+        let mut prompt: Vec<u32> = Vec::new();
+        for _ in 0..repeats {
+            prompt.extend_from_slice(&PERIOD);
+        }
+        let step = |shell: &mut driver_vulkan::shell::Shell, tokens: Vec<u32>| {
+            shell
+                .step(&[driver_vulkan::turns::Turn { who: 1, tokens }])
+                .unwrap_or_else(|e| panic!("{e}"));
+        };
+        step(&mut shell, prompt);
+        // Warm: the first decode after a prefill builds pipelines, and the
+        // prefill's own dispatches are in these totals until they are
+        // subtracted off as the baseline below.
+        for _ in 0..2 {
+            step(&mut shell, vec![PERIOD[0]]);
+        }
+        let base = shell.device().timings();
+        const STEPS: u32 = 4;
+        let at = std::time::Instant::now();
+        for _ in 0..STEPS {
+            step(&mut shell, vec![PERIOD[0]]);
+        }
+        let wall = at.elapsed() / STEPS;
+        let rows = shell.device().timings();
+        assert_eq!(
+            shell.device().timings_skipped(),
+            0,
+            "a fire was too big to time, so these totals are missing part of a step"
+        );
+        let since = |name: &str| -> f64 {
+            let sum = |v: &[(String, f64, u32)]| -> f64 {
+                v.iter()
+                    .filter(|(k, _, _)| k.starts_with(name))
+                    .map(|(_, ms, _)| ms)
+                    .sum()
+            };
+            sum(&rows) - sum(&base)
+        };
+        let total = since("");
+        assert!(total > 0.0, "the device reported no time for four steps");
+        for (name, ms, n) in &rows {
+            eprintln!("  {name:<48} {ms:>9.3} ms  x{n}");
+        }
+        eprintln!(
+            "  {} tokens: wall {wall:?}/step, device {:.3} ms/step",
+            repeats * PERIOD.len(),
+            total / f64::from(STEPS)
+        );
+        (
+            since("sdpa_paged_decode") / total,
+            since("affine_qmv") / total,
+            total / f64::from(STEPS),
+            wall,
+        )
+    };
+
+    let (short_attn, short_proj, short_gpu, short_wall) = shape(4, 64);
+    let (long_attn, long_proj, long_gpu, long_wall) = shape(64, 512);
+    eprintln!(
+        "short: attention {:.0}%, projections {:.0}%, {:.0}% of the wall step off-device\n\
+         long:  attention {:.0}%, projections {:.0}%, {:.0}% of the wall step off-device",
+        short_attn * 100.0,
+        short_proj * 100.0,
+        (1.0 - short_gpu / short_wall.as_secs_f64() / 1000.0) * 100.0,
+        long_attn * 100.0,
+        long_proj * 100.0,
+        (1.0 - long_gpu / long_wall.as_secs_f64() / 1000.0) * 100.0,
+    );
+
+    // Short context: the fixed cost is the whole cost.
+    assert!(
+        short_attn < 0.35,
+        "at 24 tokens attention is {:.0}% of device time, measured at 19%",
+        short_attn * 100.0
+    );
+    assert!(
+        short_proj > 0.45,
+        "at 24 tokens the projections are {:.0}% of device time, measured at 69%",
+        short_proj * 100.0
+    );
+    // Long context: attention has overtaken everything, which is what makes
+    // its occupancy the target it is written down as.
+    assert!(
+        long_attn > 0.55,
+        "at 384 tokens attention is {:.0}% of device time, measured at 75%: if it \
+         really has fallen this far the occupancy work is no longer the next target",
+        long_attn * 100.0
+    );
+    assert!(
+        long_proj < 0.40,
+        "at 384 tokens the projections are {:.0}% of device time, measured at 22%",
+        long_proj * 100.0
+    );
+    // And the crossover itself, which is the claim neither end makes alone.
+    assert!(
+        long_attn > short_attn * 2.0,
+        "attention went from {:.0}% to {:.0}% of device time over 16x the history; \
+         it is supposed to be the part that grows with context",
+        short_attn * 100.0,
+        long_attn * 100.0
+    );
+}
+
+/// The timing tool is off unless it is asked for.
+///
+/// Not a formality. Two `vkCmdWriteTimestamp`s per dispatch and a
+/// `vkGetQueryPoolResults` per fire is a cost every user of this driver would
+/// pay for a number none of them read, and "it is opt-in" is exactly the kind
+/// of claim that is true when written and quietly false a year later.
+#[test]
+fn timing_costs_nothing_when_it_was_not_asked_for() {
+    let (device, _dir) = gpu!();
+    if std::env::var_os("PIE_VULKAN_TIMING").is_some() {
+        eprintln!("PIE_VULKAN_TIMING is set, so there is nothing to say about it unset");
+        return;
+    }
+    assert!(device.timings().is_empty());
+    assert_eq!(device.timings_skipped(), 0);
 }
 
 /// A LONG conversation's decode step does not stall either.
@@ -8225,7 +8872,7 @@ fn a_decode_step_does_not_stall() {
 ///
 /// # What that measurement found
 ///
-/// A decode workgroup in `attn/sdpa_paged.comp` has one thread per head
+/// A decode workgroup in `attn/sdpa_paged.slang` has one thread per head
 /// dimension, and every one of those threads was walking the entire query and
 /// key vectors to arrive at the same scalar score. A hundred and twenty-eight
 /// threads computing one number a hundred and twenty-eight times. Having the
@@ -8245,11 +8892,17 @@ fn a_decode_step_does_not_stall() {
 ///
 /// # Why the ceiling is where it is, and why 384 and not 1536
 ///
-/// One second, against 31.8 ms measured in release at this context and about
-/// 107 ms in the debug build this suite runs under two validation layers.
-/// Thirty times the release cost and nine times the debug one, margin for a shared
-/// box rather than for the kernel; it would still catch the
-/// hundred-and-twenty-eight-fold regression it was written for.
+/// 500 ms, against 15.0 ms measured in release at this context and 21.4 to
+/// 32.6 ms across debug runs of this suite. As with the short sibling, the
+/// figures this header used to carry -- 31.8 ms release, about 107 ms debug
+/// -- predate the `QMM_TILE` widening and the cached lowering, and a stale
+/// number in a timing note is what a reader compares a real slowdown
+/// against.
+///
+/// Fifteen times the slowest debug run observed: margin for a shared box
+/// rather than for the kernel, and the spread between those runs is itself
+/// 1.5x. It would still catch the hundred-and-twenty-eight-fold regression
+/// it was written for by a wide margin.
 ///
 /// The context is 384 tokens and not the 1536 the table above measures,
 /// because a 1536-token prefill does not finish inside `run_all`'s
@@ -8296,84 +8949,234 @@ fn a_long_conversations_decode_step_does_not_stall() {
     }
     let each = at.elapsed() / STEPS;
     eprintln!("a decode step at {context} tokens: {each:?}");
-    assert!(
-        each < std::time::Duration::from_millis(1000),
-        "a decode step at {context} tokens of history took {each:?}, and the measured cost \
-         is about 110 ms in release: attention is reading the history far too many times, \
-         which is exactly the defect this test was written for"
+    within_budget(
+        each,
+        std::time::Duration::from_millis(500),
+        &format!(
+            "a decode step at {context} tokens of history took {each:?}, and the measured \
+             cost is 15 ms in release and 21 to 33 ms in this debug suite: attention is \
+             reading the history far too many times, which is exactly the defect this test \
+             was written for"
+        ),
     );
 }
 
-/// Giving back ONE page costs what giving back HALF THE POOL costs.
+/// The pages a GROW adds read as zeros, not as whatever was in that memory.
 ///
-/// # Why this is a test and not a benchmark
+/// # Why this is its own test
 ///
-/// The Vulkan seam publishes `elastic_page_bytes: 0` and
-/// `elastic_budget_pages: 0`, and `bootstrap` reads those two together: a
-/// trim task starts only when both are non-zero. So this backend's pool is
-/// never trimmed in production, even though `Shell::resize_pool` is
-/// implemented, contents-preserving, and refusal-safe -- proven by
+/// It was not, and a mutation proved the gap. Deleting the zero-fill from
+/// `Pool::resize`'s grow path left all sixty-one tests in this file green,
+/// including the one that grows a pool under a live conversation and checks
+/// its answer -- because that conversation never READS the pages the grow
+/// added, so the garbage in them never reaches a softmax.
+///
+/// It would reach one later. `sdpa_paged` reads a whole page and lets
+/// `kv_len` decide what counts, and the first version of this pool zeroed by
+/// construction: it built the new buffer as `vec![0u8; bytes]` on the host.
+/// Moving the resize onto `vkCmdCopyBuffer` removed the host buffer and with
+/// it, silently, the zeros -- Vulkan does not clear a fresh allocation, and
+/// bf16 garbage includes NaN.
+///
+/// # What this can prove here, and what it cannot
+///
+/// It proves the OBSERVABLE property, which is the one a reader of the pool
+/// cares about: the tail a grow adds reads as zeros. That is asserted on the
+/// real pool, over every layer of both halves.
+///
+/// It does NOT kill the mutation that deletes the `vkCmdFillBuffer`. Removing
+/// the fill leaves this test green, because this driver zeroes fresh device
+/// memory for its own reasons -- most do, as a process-isolation guarantee --
+/// and no fixture available here can produce an allocation that does not. The
+/// fill stays because the guarantee is the IMPLEMENTATION's and not the
+/// specification's, and this crate runs on whatever card is in front of it.
+/// `zero_writes_only_the_range_it_names` below covers the part that is
+/// actually this crate's: that `Device::zero` clears what it names and
+/// nothing else.
+///
+/// Stated rather than left as a green tick, because a test whose subject is
+/// unfalsifiable on the box it runs on is worth having and worth labelling.
+#[test]
+fn the_pages_a_grow_adds_are_zero() {
+    let (_device, dir) = gpu!();
+    let Some(real) = checkpoint_weights() else {
+        eprintln!("no readable 4-bit qwen3-0.6b, so a grown page is unread");
+        return;
+    };
+    let mut shell = shelled(dir, &REALS[0], real, 4);
+
+    // Dirty the pool first, so "zero" cannot be satisfied by an allocator
+    // that happened to hand back fresh pages. A conversation writes real KV
+    // into the low pages, and the grow below reuses that memory or does not
+    // -- either way the tail it adds is the part under test.
+    let mut prompt: Vec<u32> = Vec::new();
+    for _ in 0..3 {
+        prompt.extend_from_slice(&PERIOD);
+    }
+    shell
+        .step(&[driver_vulkan::turns::Turn {
+            who: 1,
+            tokens: prompt,
+        }])
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    let before = shell.shape();
+    let kept = before.layer_bytes();
+    shell
+        .resize_pool(&driver_api::PoolResizePlan {
+            pool_id: driver_api::PIE_ELASTIC_POOL_KV,
+            target_pages: 8,
+            ..driver_api::PoolResizePlan::default()
+        })
+        .unwrap_or_else(|e| panic!("grow: {e}"));
+    let after = shell.shape();
+    assert_eq!(after.pages, 8, "the pool did not grow");
+
+    let added = after.layer_bytes() - kept;
+    assert!(added > 0, "the premise: a grow adds bytes");
+    let pool = shell.pool();
+    assert_eq!(
+        pool.keys().len(),
+        usize::from(after.layers),
+        "one key buffer per layer"
+    );
+    for (which, buffers) in [("keys", pool.keys()), ("values", pool.values())] {
+        for (layer, buffer) in buffers.iter().enumerate() {
+            // `shell.device()`, not the suite's lock: a `Shell` opens its OWN
+            // device, so these buffers were allocated from a different
+            // `VkDevice` than `gpu!()` handed back. Reading them through that
+            // one is a `commonparent` violation -- this card tolerates it and
+            // the validation layer does not.
+            let tail = shell
+                .device()
+                .read_at(buffer, kept, added)
+                .unwrap_or_else(|e| panic!("{which} layer {layer}: {e}"));
+            if let Some(at) = tail.iter().position(|b| *b != 0) {
+                panic!(
+                    "{which} layer {layer}: byte {at} of the {added} a grow added is \
+                     {:#04x}, not zero. A fresh Vulkan allocation holds whatever was \
+                     there, and `sdpa_paged` reads a whole page",
+                    tail[at]
+                );
+            }
+        }
+    }
+}
+
+/// `Device::zero` clears exactly the range it names.
+///
+/// The primitive under the grow above, tested where it CAN be falsified: on a
+/// buffer this test dirtied itself, so "already zero" is not available as an
+/// answer. Both edges matter -- a fill that ran long would erase a page the
+/// pool still holds, and one that ran short would leave the garbage this
+/// exists to remove.
+#[test]
+fn zero_writes_only_the_range_it_names() {
+    let (device, _dir) = gpu!();
+    const N: usize = 4096;
+    let dirty = vec![0xABu8; N];
+    let buffer = device.buffer(&dirty).expect("a buffer");
+
+    device.zero(&buffer, 1024, 2048).expect("zero the middle");
+    let back = device.read(&buffer).expect("read it back");
+    assert_eq!(back.len(), N);
+    assert!(
+        back[..1024].iter().all(|b| *b == 0xAB),
+        "the bytes before the range were cleared"
+    );
+    assert!(
+        back[1024..3072].iter().all(|b| *b == 0),
+        "the range was not cleared"
+    );
+    assert!(
+        back[3072..].iter().all(|b| *b == 0xAB),
+        "the bytes after the range were cleared"
+    );
+
+    // Both refusals, because a fill that silently rounded to alignment or
+    // silently clipped to the buffer would be a partial write reported as a
+    // success -- and `vkCmdFillBuffer` requires the alignment rather than
+    // handling it.
+    let said = format!(
+        "{}",
+        device
+            .zero(&buffer, 1, 8)
+            .expect_err("an unaligned offset is refused")
+    );
+    assert!(said.contains("four-byte aligned"), "{said}");
+    let said = format!(
+        "{}",
+        device
+            .zero(&buffer, 0, N as u64 + 4)
+            .expect_err("a range past the end is refused")
+    );
+    assert!(said.contains("in a"), "{said}");
+    device.free(buffer);
+}
+
+/// A trim costs milliseconds, and a shallow one is not dearer than a deep one.
+///
+/// # What this replaced, and why the replacement is the interesting part
+///
+/// This test used to assert the OPPOSITE, and it was right to. The Vulkan
+/// seam published `elastic_page_bytes: 0` and `elastic_budget_pages: 0`,
+/// which is the pair `bootstrap` reads together before it starts a trim task
+/// at all, so `Shell::resize_pool` was implemented, contents-preserving and
+/// refusal-safe -- proven by
 /// `a_cache_resized_under_a_conversation_does_not_change_its_answer` just
-/// above.
+/// above -- and never reached in production.
 ///
-/// Advertising zero for a thing that works needs a REASON, and the seam
-/// stated the wrong one for as long as it stated any: "nothing can be given
-/// back page-wise". That is false. A shrink frees the old buffers and takes
-/// smaller ones, so bytes do come back, at any page granularity the caller
-/// names.
+/// The seam's first reason for the zero was "nothing can be given back
+/// page-wise", which was false: a shrink frees the old buffers and takes
+/// smaller ones. The measured reason was better. `Pool::resize` read every
+/// layer's whole old buffer down to HOST memory and wrote the survivors back
+/// up, through a mapping that reads at ten megabytes a second because
+/// mappable VRAM is write-combined. So the charge was the pool twice, and the
+/// delta did not enter it:
 ///
-/// The true reason is the COST, and the cost has nothing to do with the
-/// delta. `Pool::resize` reads every layer's whole old buffer down to host
-/// memory and writes the survivors up into a fresh one, so a caller is
-/// charged for the POOL, twice, however few pages it asked to move.
-///
-/// Measured on this box, at 1024 pages of qwen3-0.6b -- 28 layers, both
-/// halves, about 1.8 GB of cache:
-///
-/// | shrink | cost |
-/// |---|---|
-/// | 1024 -> 1023 (one page) | 5.5 s |
-/// | 1023 -> 1022 (one page) | 9.3 s |
-/// | 1022 -> 512 (510 pages) | 10.3 s |
-/// | 512 -> 511 (one page) | 5.7 s |
-///
-/// ...and at the 256 pages this test uses, where it is not merely
-/// delta-independent but INVERTED:
-///
-/// | shrink | cost |
+/// | shrink, 256 pages of qwen3-0.6b | cost |
 /// |---|---|
 /// | 255 -> 254 (one page) | 2.77 s |
 /// | 254 -> 128 (126 pages) | 0.74 s |
 ///
-/// Handing back one page costs nearly four times what handing back half the
-/// pool costs, and that is not noise: the charge is `old + new`, so the
-/// deeper cut allocates and fills a smaller destination and finishes sooner.
-/// The cheapest trim this pool offers is the largest one.
+/// Handing back one page cost nearly four times what handing back half the
+/// pool cost, because the deeper cut filled a smaller destination. The
+/// cheapest trim that pool offered was the largest one.
 ///
-/// A trim task ticking every few seconds against a pool that charges seconds
-/// to hand back a single page does not relieve pressure, it manufactures it
-/// -- and it peaks at BOTH sizes at once while it works, since `Pool::resize`
-/// takes all the new buffers before freeing any old one. A shrink asked for
-/// under memory pressure needs more memory than not shrinking. That is the
-/// reason for the zero, and it is now written where the zero is.
+/// That test carried an instruction: it "still fails hard the day the premise
+/// changes ... this assertion would go red, and the failure is the reminder
+/// to go and advertise what by then would be true." The premise changed on
+/// purpose. `Pool::resize` now moves what survives with `vkCmdCopyBuffer` and
+/// zero-fills a grow's tail with `vkCmdFillBuffer`, so nothing crosses the
+/// bus and no host memory is held. The same two shrinks:
+///
+/// | shrink | cost |
+/// |---|---|
+/// | 255 -> 254 (one page) | 20.5 ms |
+/// | 254 -> 128 (126 pages) | 18.6 ms |
+/// | 128 -> 256 (a grow) | 20.0 ms |
+///
+/// A hundred and thirty-five times cheaper, and flat rather than inverted:
+/// what is left is dominated by taking and binding fifty-six allocations, not
+/// by moving bytes. So the seam now advertises both numbers and the trim task
+/// runs.
 ///
 /// # What this asserts, and why so loosely
 ///
-/// That a one-page shrink costs at least half of what a half-pool shrink
-/// costs. Measured, it costs about four times as much. The margin is eight-
-/// fold and deliberate: this is a shared box behind two validation layers,
-/// and an assertion that tracked the measurement would fail whenever the
-/// other tenant got busy.
+/// Two things, both lower bounds, both an order of magnitude clear of the
+/// measurement, because this is a shared box behind two validation layers and
+/// an assertion that tracked the number would fail whenever the other tenant
+/// got busy:
 ///
-/// It still fails hard the day the premise changes. A genuinely page-wise
-/// pool -- Vulkan sparse binding, behind a `sparseResidencyBuffer` tier --
-/// would make one page a rounding error against half the pool, this
-/// assertion would go red, and the failure is the reminder to go and
-/// advertise what by then would be true.
+/// - a shrink of any depth completes in under 500 ms, which is the property
+///   that makes a ten-second trim tick sane. Measured: about 20 ms.
+/// - a one-page shrink is not more than four times a half-pool shrink, which
+///   is the INVERSION going away. Measured: 1.10x.
 ///
-/// It is a lower bound only. An upper bound would be a benchmark, would fail
-/// whenever the other agent on this box got busy, and would be measuring the
-/// machine rather than the pool.
+/// The second is the one that matters, and it is stated as a ratio rather
+/// than as two durations so that it says something about the pool rather than
+/// about the box. It goes red if a resize ever again charges for the pool
+/// instead of for what it keeps.
 #[test]
 fn giving_back_one_page_costs_what_giving_back_half_the_pool_costs() {
     let (device, dir) = gpu!();
@@ -8413,11 +9216,31 @@ fn giving_back_one_page_costs_what_giving_back_half_the_pool_costs() {
     let one = cost(&mut shell, FULL - 2);
     let half = cost(&mut shell, FULL / 2);
 
+    // A grow, too: the seam advertises elasticity in both directions and the
+    // trim task's target rises as well as falls.
+    let grow = cost(&mut shell, FULL);
+
+    for (what, took) in [
+        ("one-page shrink", one),
+        ("half-pool shrink", half),
+        ("grow", grow),
+    ] {
+        within_budget(
+            took,
+            std::time::Duration::from_millis(500),
+            &format!(
+                "a {what} took {took:?}. A resize this dear cannot be on a ten-second tick, \
+                 so `elastic_page_bytes` and `elastic_budget_pages` at the Vulkan seam are \
+                 now overstating this pool and must go back to zero"
+            ),
+        );
+    }
     assert!(
-        one * 2 >= half,
-        "a one-page shrink took {one:?} and a {}-page shrink took {half:?}: this pool has \
-         become page-wise, so `elastic_page_bytes` and `elastic_budget_pages` at the Vulkan \
-         seam are now understating it and should be revisited",
+        one <= half * 4,
+        "a one-page shrink took {one:?} and a {}-page shrink took {half:?}. A resize is \
+         charging for the POOL rather than for what it KEEPS -- which is what the host \
+         round-trip did before `Pool::resize` moved to `vkCmdCopyBuffer` -- and the \
+         cheapest trim this pool offers is once again the largest one",
         FULL / 2 - 2,
     );
 }
@@ -8527,6 +9350,136 @@ fn a_pool_growth_the_host_cannot_stage_is_retryable_rather_than_fatal() {
         fresh, want,
         "the same prompt answered differently after a refused growth, so the \
          refusal left the pool or the book in a state it did not start in"
+    );
+}
+
+/// A copy plan whose destination is above the pool GROWS it rather than being
+/// refused.
+///
+/// # What found this, and why nothing else could
+///
+/// The curated inferlet sweep, on `prefix-tree-kv-cache`, and only when it
+/// ran after the other thirty-eight:
+///
+/// ```text
+///   next_token take: channel is poisoned: pipeline: forward failed:
+///   pre-launch KV copy rejected: driver-vulkan: page move 0's destination
+///   names page 3 row 0, and the pool has 3 pages of 16 rows
+/// ```
+///
+/// Run alone it passed. That is the signature of a driver whose answer
+/// depends on what preceded it, and the reason is that this pool is ELASTIC:
+/// it holds what the frames so far have needed, not what the scheduler is
+/// entitled to hand out. `Shell::admit` knows that and grows to the highest
+/// page a frame NAMES. `Shell::copy_kv` is the other door a page number comes
+/// through, and it did not: it went straight to `Pool::copy_plan`, whose
+/// bounds check is right about the pool as it IS and has no way to know what
+/// it could be. So a prefix share aimed one page past the last prefill's
+/// high-water mark died, and the conversation died with it.
+///
+/// # What this measures
+///
+/// Both directions of the asymmetry, because the fix is not "grow for
+/// anything named":
+///
+/// 1. A DESTINATION above the pool grows it, and the bytes land -- read back
+///    from the grown pool and compared against the source page, so a growth
+///    that reallocated without carrying the contents over is caught too.
+/// 2. A SOURCE above the pool is still REFUSED. This pool only ever grows on
+///    demand, so a page it has never held is a page nothing has ever written;
+///    growing for it would turn a refusal into a copy of fresh zeros, which
+///    is history-shaped silence rather than an error.
+///
+/// # Mutations this kills
+///
+/// * The growth removed: the first copy is refused with the sweep's message.
+/// * `need` taken over sources as well as destinations: the second half
+///   returns `Ok` and the refusal is gone.
+/// * The growth done with `resize` to `need` but the pool rebuilt empty: the
+///   bytes read back are zeros rather than the source page's.
+#[test]
+fn a_copy_plan_that_names_a_page_past_the_pool_grows_it_instead_of_refusing() {
+    let (device, dir) = gpu!();
+    let _ = &device;
+    let Some(real) = checkpoint_weights() else {
+        eprintln!("no readable 4-bit qwen3-0.6b, so the copy growth is unmeasured");
+        return;
+    };
+    // Small on purpose: the sweep's pool was three pages because three was
+    // all its prefills had asked for.
+    let mut shell = shelled(dir, &REALS[0], real, 3);
+
+    // Real history in page 0, so "the bytes land" is about a cache and not
+    // about a buffer someone wrote a pattern into.
+    shell
+        .step(&[driver_vulkan::turns::Turn {
+            who: 1,
+            tokens: PERIOD[..4].to_vec(),
+        }])
+        .expect("a first turn");
+    let was = shell.shape().pages;
+    assert_eq!(was, 3, "this test wants a pool it can name past the end of");
+
+    let layer_bytes = |shell: &driver_vulkan::shell::Shell, page: u32| -> Vec<u8> {
+        let shape = shell.shape();
+        let buffer = shell.pool().cache(0, false).expect("layer 0 keys");
+        let all = shell.device().read(buffer).expect("read the keys");
+        let at = shape.slot(page, 0, 0, 0) as usize * shape.bytes as usize;
+        let n = shape.page_size as usize * shape.row() as usize * shape.bytes as usize;
+        all[at..at + n].to_vec()
+    };
+    let source = layer_bytes(&shell, 0);
+    assert!(
+        source.iter().any(|b| *b != 0),
+        "page 0 holds no history, so a copy of it proves nothing"
+    );
+
+    // The sweep's plan, in miniature: page 0 to a page the pool does not have.
+    let moved = shell
+        .copy_kv(&driver_api::KvCopyPlan {
+            src_domain: driver_api::PIE_MEMORY_DOMAIN_VULKAN_DEVICE,
+            dst_domain: driver_api::PIE_MEMORY_DOMAIN_VULKAN_DEVICE,
+            src_page_ids: vec![0],
+            dst_page_ids: vec![3],
+            ..driver_api::KvCopyPlan::default()
+        })
+        .expect("a copy to page 3 of a 3-page pool grows the pool");
+    assert_eq!(moved, 1, "one page move");
+    assert_eq!(
+        shell.shape().pages,
+        4,
+        "the pool grew to something other than the page the plan named"
+    );
+    assert_eq!(
+        layer_bytes(&shell, 3),
+        source,
+        "the destination does not hold the source's bytes, so either the copy \
+         did not happen or the growth dropped what the pool was holding"
+    );
+    assert_eq!(
+        layer_bytes(&shell, 0),
+        source,
+        "the growth lost the page the copy read from"
+    );
+
+    // The other direction stays a refusal.
+    let refused = shell
+        .copy_kv(&driver_api::KvCopyPlan {
+            src_domain: driver_api::PIE_MEMORY_DOMAIN_VULKAN_DEVICE,
+            dst_domain: driver_api::PIE_MEMORY_DOMAIN_VULKAN_DEVICE,
+            src_page_ids: vec![9],
+            dst_page_ids: vec![1],
+            ..driver_api::KvCopyPlan::default()
+        })
+        .expect_err("a source the pool has never held holds no history");
+    assert!(
+        format!("{refused}").contains("page 9"),
+        "the refusal does not name the page that caused it: {refused}"
+    );
+    assert_eq!(
+        shell.shape().pages,
+        4,
+        "a refused copy grew the pool anyway"
     );
 }
 
@@ -8756,7 +9709,14 @@ fn a_frame_the_engine_built_answers_what_the_driver_s_own_turns_do() {
                 kv_page_indptr: vec![0, 2, 4],
                 kv_last_page_lens: vec![0, 0],
                 qo_indptr: vec![0, prompt.len() as u32, prompt.len() as u32 * 2],
-                sampling_indices: vec![prompt.len() as u32 - 1, prompt.len() as u32 * 2 - 1],
+                // Each request's OWN last row. This said `2 * len - 1` for
+                // the second, which is that row counted across the fire --
+                // the numbering the driver used to read and nothing ever
+                // wrote. A decode envelope resolves its read-out from the
+                // instance and never looks at this table, so the wrong value
+                // sat here unexamined until the host-wire case below made
+                // the same table load-bearing.
+                sampling_indices: vec![prompt.len() as u32 - 1, prompt.len() as u32 - 1],
                 sampling_indptr: vec![0, 1, 2],
                 ..driver_api::LaunchPlan::default()
             },
@@ -8790,6 +9750,84 @@ fn a_frame_the_engine_built_answers_what_the_driver_s_own_turns_do() {
             "request {which} of a two-request frame answered differently from \
              the same prompt fired alone, so the page CSR was not split at the \
              boundary it names"
+        );
+    }
+
+    // ── The same two conversations, through the HOST-WIRE class. ──
+    //
+    // The batch above is a DECODE_ENVELOPE, which resolves its geometry from
+    // the instance's channels and never reads the plan's read-out table at
+    // all. The engine's other class states everything on the wire, and that
+    // is the path `envelope::fill` splits per request -- the path where a
+    // read-out row is numbered WITHIN its request rather than across the
+    // fire.
+    //
+    // Nothing here covered it. `vulkan_many_conversations` did, three layers
+    // up and a whole engine away, and what it reported was this driver
+    // refusing a correct plan: "request 1 reads out row 91, which is not in
+    // its own rows 92..184", 91 being request 1's own last row and also
+    // request 0's. With the refusal lifted the wrong way, the same numbering
+    // hands request 1 request 0's distribution and both conversations answer
+    // fluently.
+    //
+    // So: the same prompt twice, on pages nobody shares, with each request
+    // naming its own last row the way `driver::resolve` writes it -- and both
+    // must answer what one alone answered.
+    let wired = driver_api::FrameSubmission {
+        instance_ids: vec![1, 2],
+        kv_translation: mine.iter().chain(&theirs).copied().collect(),
+        kv_translation_indptr: vec![0, 2, 4],
+        required_kv_pages: 4,
+        steps: vec![driver_api::StepSubmission {
+            plan: driver_api::LaunchPlan {
+                token_ids: prompt.iter().chain(&prompt).copied().collect(),
+                position_ids: (0..prompt.len() as u32)
+                    .chain(0..prompt.len() as u32)
+                    .collect(),
+                // Physical pages: `Shell::launch` takes a plan as stated,
+                // and it is `envelope::fill` -- the engine's entry, not this
+                // one -- that places working-set pages through the frame.
+                kv_page_indices: mine.iter().chain(&theirs).copied().collect(),
+                kv_page_indptr: vec![0, 2, 4],
+                kv_last_page_lens: vec![0, 0],
+                qo_indptr: vec![0, prompt.len() as u32, prompt.len() as u32 * 2],
+                // ITS OWN last row, twice -- not `2 * len - 1` for the second.
+                sampling_indices: vec![prompt.len() as u32 - 1, prompt.len() as u32 - 1],
+                sampling_indptr: vec![0, 1, 2],
+                ..driver_api::LaunchPlan::default()
+            },
+            roster_rows: vec![0, 1],
+            sub_batch_indptr: vec![0, 2],
+            sub_batch_class: vec![driver_api::PIE_GEOMETRY_CLASS_HOST],
+            terminal_cells: Vec::new(),
+            program_row_indptr: vec![0, 1, 2],
+            logical_fire_ids: vec![0, 1],
+            channel_expected_head: Vec::new(),
+            channel_expected_tail: Vec::new(),
+            channel_ticket_indptr: vec![0, 0, 0],
+            region_row_indptr: Vec::new(),
+            region_sig: Vec::new(),
+            region_k: Vec::new(),
+        }],
+    };
+    let ran = shell
+        .launch(&wired)
+        .expect("a host-wire frame of two requests");
+    let driver_vulkan::frames::Launched::Ran(wire_steps) = ran else {
+        panic!("the host-wire frame did not run");
+    };
+    assert_eq!(
+        wire_steps[0].readout_of.len(),
+        2,
+        "two requests in, two readouts out"
+    );
+    for (which, row) in wire_steps[0].readout_of.iter().enumerate() {
+        assert_eq!(
+            wire_steps[0].logits.row(*row).expect("a readout row"),
+            want,
+            "request {which} of a host-wire batch answered differently from \
+             the same prompt fired alone: either its read-out row was taken \
+             across the fire instead of within itself, or its pages were"
         );
     }
 
@@ -8869,9 +9907,9 @@ fn a_serving_shell_can_be_moved_to_another_thread_and_still_fires() {
                 tokens: tokens.to_vec(),
             }])
             .unwrap_or_else(|e| panic!("{e}"));
-        let vocab = step.logits.vocab;
-        let at = (step.rows - 1) * vocab;
-        step.logits.values[at..at + vocab]
+        step.logits
+            .row(step.rows - 1)
+            .expect("the turn's last row")
             .iter()
             .enumerate()
             .max_by(|a, b| a.1.total_cmp(b.1))
@@ -9032,9 +10070,9 @@ fn a_frame_naming_an_unserved_feature_is_refused_before_the_cache_moves() {
             panic!("the plain frame did not run");
         };
         let step = &steps[0];
-        let vocab = step.logits.vocab;
-        let at = (step.rows - 1) * vocab;
-        step.logits.values[at..at + vocab]
+        step.logits
+            .row(step.rows - 1)
+            .expect("the frame's last row")
             .iter()
             .enumerate()
             .max_by(|a, b| a.1.total_cmp(b.1))
@@ -9058,5 +10096,1249 @@ fn a_frame_naming_an_unserved_feature_is_refused_before_the_cache_moves() {
         before, after,
         "the refused frame wrote to the cache on its way out, so a retry of \
          it would read pages that already hold its keys"
+    );
+}
+
+/// The tile PRODUCTION states reaches the cooperative-matrix build.
+///
+/// `the_cooperative_matrix_gemm_answers_what_the_baseline_one_does` overrides
+/// both the tile and the tier, which is right for what it asks -- it needs
+/// two runs differing in one thing -- and is exactly why it cannot answer
+/// this. It would pass unchanged on a build where `QMM_TILE` named a point
+/// with no cooperative-matrix module, because it never asks the default what
+/// it resolves.
+///
+/// Measured, at the tile shipped today: a 64-row prefill resolves 2 of its 10
+/// symbols above baseline, and they are the two that should be --
+/// `affine_qmm_t` and `affine_qmm_t_residual`, both at `bm_32_bn_32`. Every
+/// other symbol in the fire is a norm, a rope, a gather, the paged attention
+/// or the GEMV, and none of those has a cooperative-matrix build.
+///
+/// That gap is not hypothetical. All 146 coopmat modules were unreachable on
+/// every device for the whole life of this crate, and nothing failed: the
+/// device reported the tier, the shell set it, the pipeline cache keyed on
+/// it. A forced-tile test would not have noticed, and the constant has moved
+/// once already -- `(16, 32)` to `(32, 32)` -- with a comment about its
+/// coopmat modules left behind that had become false in both halves.
+///
+/// So this asks the shipped configuration, and states the numbers rather
+/// than just "more than zero", because the interesting failure is a DROP.
+#[test]
+fn the_default_tile_reaches_the_tier_in_production() {
+    let (device, dir) = gpu!();
+    if !device
+        .tiers()
+        .contains(&kernels_vulkan::Capability::Coopmat)
+    {
+        eprintln!("SKIP: this device does not offer cooperativeMatrix");
+        return;
+    }
+    let Some(real) = checkpoint_weights() else {
+        eprintln!("no readable 4-bit qwen3-0.6b, so the tier is unmeasured");
+        return;
+    };
+
+    // A whole number of tiles, or the GEMM's `TokensMultipleOf` guard sends
+    // every projection down the GEMV arm and the answer is 0 for a reason
+    // that has nothing to do with the tier.
+    //
+    // READ FROM THE SAME PLACE `shelled` READS IT. There are deliberately two
+    // statements of this tile -- `project::QMM_TILE` and the fixture's
+    // `qmm_tile`, written out rather than read so that a fixture and a
+    // projection can be COMPARED, which is how the last widening was caught.
+    // The first version of this test sized its prompt from the constant while
+    // the shell it built took the fixture's, so a mutation of the constant
+    // changed nothing and the failure message named a tile that was not the
+    // one that ran.
+    let tile = model::shared::llama_like::forward::facts::LlamaLikeMetalFacts::synthetic()
+        .qmm_tile
+        .0 as usize;
+    let mut prompt: Vec<u32> = Vec::new();
+    while prompt.len() < 2 * tile {
+        prompt.push(PERIOD[prompt.len() % PERIOD.len()]);
+    }
+    assert_eq!(prompt.len() % tile, 0);
+
+    let mut shell = shelled(dir, &REALS[0], real, 256);
+    let prefill = shell
+        .step(&[driver_vulkan::turns::Turn {
+            who: 1,
+            tokens: prompt,
+        }])
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        prefill.fired.tiered > 0,
+        "a {}-row prefill at the shipped tile of {tile} resolved NO module \
+         above baseline: the tile this driver actually serves does not reach \
+         the cooperative-matrix build, however green the forced-tile \
+         comparison is. Parsed {} symbols.",
+        2 * tile,
+        prefill.fired.parsed
+    );
+
+    // A decode is GEMV, and `affine_qmv_fast` has no cooperative-matrix build
+    // and never will -- the tier is a matrix unit and a matvec has no matrix.
+    // Stated so that a day when it DOES resolve something is a day someone
+    // looks, rather than a silently better number.
+    let decode = shell
+        .step(&[driver_vulkan::turns::Turn {
+            who: 1,
+            tokens: vec![PERIOD[0]],
+        }])
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        decode.fired.tiered, 0,
+        "a decode resolved {} modules above baseline out of {} symbols; the \
+         GEMV arm has no cooperative-matrix build, so either one was added or \
+         a decode is now taking the GEMM arm",
+        decode.fired.tiered, decode.fired.parsed
+    );
+}
+
+/// The cooperative-matrix GEMM answers what the scalar one does, on a real
+/// checkpoint, through the whole driver.
+///
+/// # Why this test had to exist the moment the tier started working
+///
+/// `Modules::code` used to take only a symbol, and every module store here is
+/// keyed by file stem, so the cooperative-matrix build of an entrypoint --
+/// stored under `<symbol>.coopmat` -- was named by nothing and loaded by
+/// nobody. All 146 of them were dead. `serve.rs` carries that story; this is
+/// the consequence for testing.
+///
+/// Turning them on is not a small change. It swaps the arithmetic of the
+/// largest kernel family in the tree for a different one: a subgroup matrix
+/// unit with `float16_t` A and B operands, accumulating through shared
+/// memory. `kernels-vulkan` checks that kernel against its own baseline in
+/// isolation, which is worth having and is not the same claim as this one --
+/// a kernel can be right about a matrix and wrong about which bytes of a real
+/// quantised weight it was handed.
+///
+/// And the existing suite could not have caught it. Every other test here
+/// runs at the tile the shared model code states, `(16, 32)`, and 16 is the
+/// one row tile `quant/qmm_t.slang` deliberately does NOT compile a
+/// cooperative-matrix module for. **The whole device suite passed with the
+/// tier switched on and exercised precisely zero of it.** This is the only
+/// place in this crate where a cooperative-matrix module runs against a real
+/// model at all.
+///
+/// # What is held fixed
+///
+/// The tile and the tier are two knobs and this moves ONE. Both runs of a
+/// pair state the same tile, and the control gets a module store with every
+/// `<symbol>.<tag>` key removed, so it falls back to the scalar module on
+/// the same device, over the same weights, through the same launches.
+/// Comparing `(16, 32)` against `(32, 32)` instead would have changed the
+/// batching and the grid as well, and any difference would have been
+/// unattributable.
+///
+/// Both tiles that HAVE a cooperative-matrix build are covered, 32 and 64,
+/// because the reason to care about this claim is mostly the case for
+/// widening `QMM_TILE` -- and 64 is the width the prefill measurement in
+/// `crates/model` points at. The two tiles agree on the error to the last
+/// digit reported below, which is itself worth something: the discrepancy is
+/// the operand format and not the tiling.
+///
+/// # Why this is a tolerance and not an equality
+///
+/// It was written as an equality first, on the strength of `qmm_t.slang`'s
+/// header saying the dequantisation is kept byte-for-byte identical. It is --
+/// and the MULTIPLY is not. The scalar path multiplies in fp32; the matrix
+/// unit takes `float16_t` operands. So the two disagree by a little, and the
+/// question is only how much.
+///
+/// Measured over qwen3-0.6b's 151,936 logits, at both tiles: **greatest
+/// difference 0.25, mean 0.036, against a largest logit of 25.6** -- and the
+/// same argmax. The
+/// bound below is 0.5, twice the observed error; the run is deterministic --
+/// same weights, same prompt, same launches -- so the margin is there for a
+/// different device's matrix unit rounding differently, not for run-to-run
+/// noise.
+///
+/// The argmax assertion is the one that matters. A sampler reads the
+/// ranking, and a tier that changed which token won would be a different
+/// model however small its residuals looked.
+#[test]
+fn the_cooperative_matrix_gemm_answers_what_the_baseline_one_does() {
+    let (device, dir) = gpu!();
+    if !device
+        .tiers()
+        .contains(&kernels_vulkan::Capability::Coopmat)
+    {
+        eprintln!("SKIP: this device does not offer cooperativeMatrix");
+        return;
+    }
+    let Some(real) = checkpoint_weights() else {
+        eprintln!("no readable 4-bit qwen3-0.6b, so the tier is unmeasured");
+        return;
+    };
+
+    // EXACTLY TWO WHOLE TILES, and the count is the point.
+    //
+    // `llama_like/forward/mod.rs` puts the GEMM behind a
+    // `TokensMultipleOf(tile)` guard, because `qmm_t` has no row argument and
+    // reads its tile from the grid. A prompt of 48 rows at a tile of 32 is
+    // not a multiple of it, so every projection takes the GEMV arm instead --
+    // and a run that never launches `affine_qmm_t` compares the
+    // cooperative-matrix tier against itself. Measured, on the way here: at
+    // 48 rows the two runs below agreed to the last bit and the only symbols
+    // resolved were `affine_qmv_fast*`.
+    let mut prompt: Vec<u32> = Vec::new();
+    while prompt.len() < 64 {
+        prompt.push(PERIOD[prompt.len() % PERIOD.len()]);
+    }
+    assert_eq!(
+        prompt.len() % 32,
+        0,
+        "the GEMM arm needs a whole number of tiles"
+    );
+
+    let answer = |tile: u32, tiered: bool| {
+        let mut shell = shelled_at_tile(dir, &REALS[0], real, 256, Some((tile, 32)), tiered);
+        let step = shell
+            .step(&[driver_vulkan::turns::Turn {
+                who: 1,
+                tokens: prompt.clone(),
+            }])
+            .unwrap_or_else(|e| panic!("{e}"));
+        (
+            step.logits
+                .row(step.readout_of[0])
+                .expect("a readout row")
+                .to_vec(),
+            step.fired.tiered,
+        )
+    };
+
+    // BOTH tiles that have a cooperative-matrix build, because the value of
+    // this claim is mostly to whoever widens `QMM_TILE`, and 64 is where the
+    // measurement says they should widen it to. 64 rows is a whole number of
+    // either.
+    for tile in [32u32, 64] {
+        let (scalar, scalar_tiered) = answer(tile, false);
+        let (matrix, matrix_tiered) = answer(tile, true);
+
+        // DIRECTLY, before comparing any numbers.
+        //
+        // The comparison below infers that the cooperative-matrix module
+        // loaded, from the two runs disagreeing. That is a proxy, and when it
+        // failed -- three times, intermittently, on a shared box -- it could
+        // only report that the two agreed, which says nothing about why.
+        // `Fired::tiered` counts the symbols that resolved above Baseline, so
+        // this says whether the tier ran instead of guessing from its
+        // effects, and a future failure names which half broke.
+        assert_eq!(
+            scalar_tiered, 0,
+            "the untiered run resolved {scalar_tiered} module(s) above baseline \
+             at a tile of {tile}, so it is not the control it claims to be"
+        );
+        assert!(
+            matrix_tiered > 0,
+            "the tiered run resolved NO module above baseline at a tile of \
+             {tile}: the cooperative-matrix build was not reached, which is \
+             the defect this test exists for. Check `Modules::code` still \
+             takes a tier and that the store holds `*.coopmat` entries"
+        );
+
+        assert!(
+            scalar.iter().all(|v| v.is_finite()) && matrix.iter().all(|v| v.is_finite()),
+            "a run produced non-finite logits, so the comparison below would be \
+         between two kinds of nothing"
+        );
+        assert_ne!(
+            scalar, matrix,
+            "the two runs agree to the last bit at a tile of {tile}, which means \
+         the cooperative-matrix module was NOT loaded -- the exact defect this \
+         test exists for. Check `Modules::code` still takes a tier."
+        );
+
+        let top = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .expect("a logit")
+                .0
+        };
+        assert_eq!(
+            top(&scalar),
+            top(&matrix),
+            "the cooperative-matrix tier chose a different token than the scalar \
+         one. A sampler reads the ranking, so this is a different model and \
+         not a rounding difference"
+        );
+
+        let worst = scalar
+            .iter()
+            .zip(&matrix)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 0.5,
+            "the cooperative-matrix GEMM differs from the scalar one by {worst}, \
+         where 0.172 was measured and fp16 operands explain about that much. \
+         Something beyond precision changed: the dequantisation point, the \
+         tile the grid states, or the operand order"
+        );
+    }
+}
+
+/// At the tile the shared model code actually states, the two module stores
+/// answer identically -- because at a row tile of 16 there is no
+/// cooperative-matrix module to reach.
+///
+/// The control for the test above, and it is worth as much as that test is.
+/// A difference between two runs proves nothing unless the same comparison
+/// can also come out equal: if the store-stripping harness were simply
+/// perturbing something -- a different allocation order, a different pipeline
+/// cache shape -- it would perturb this run too.
+///
+/// It also pins the claim `serve.rs` makes about the tier walk from the other
+/// side. `Capability::PREFERENCE` is walked from the device's tier DOWN, and
+/// on this GPU that walk starts at `Coopmat` for every symbol in the plan.
+/// The 146 cooperative-matrix modules in the tree are all `affine_qmm_t*` and
+/// `sdpa_paged_mma*`, and `quant/qmm_t.slang` deliberately compiles none at a
+/// row tile of 16 -- its header explains that a 16-row tile does not amortise
+/// a 16x16x16 matrix operation, which was measured and confirmed. So the walk
+/// runs, finds nothing above baseline, and falls through. Equal answers are
+/// what that looks like from outside.
+///
+/// This is why the pre-existing device suite could not have caught the tier
+/// being turned on: every other test here runs at this point.
+#[test]
+fn at_the_default_tile_the_tier_has_nothing_to_reach() {
+    let (device, dir) = gpu!();
+    if !device
+        .tiers()
+        .contains(&kernels_vulkan::Capability::Coopmat)
+    {
+        eprintln!("SKIP: this device does not offer cooperativeMatrix");
+        return;
+    }
+    let Some(real) = checkpoint_weights() else {
+        eprintln!("no readable 4-bit qwen3-0.6b, so the tier is unmeasured");
+        return;
+    };
+
+    // The same 64 tokens the test above uses, so the only difference between
+    // the two tests is the tile.
+    let mut prompt: Vec<u32> = Vec::new();
+    while prompt.len() < 64 {
+        prompt.push(PERIOD[prompt.len() % PERIOD.len()]);
+    }
+
+    let answer = |tiered: bool| {
+        let mut shell = shelled_at_tile(dir, &REALS[0], real, 256, Some((16, 32)), tiered);
+        let step = shell
+            .step(&[driver_vulkan::turns::Turn {
+                who: 1,
+                tokens: prompt.clone(),
+            }])
+            .unwrap_or_else(|e| panic!("{e}"));
+        step.logits
+            .row(step.readout_of[0])
+            .expect("a readout row")
+            .to_vec()
+    };
+
+    assert_eq!(
+        answer(false),
+        answer(true),
+        "stripping the tiered modules changed the answer at a tile of 16, \
+         where no cooperative-matrix module is compiled. Either `qmm_t.slang` \
+         gained a bm_16 build -- in which case the test above should move to \
+         it -- or the harness perturbs something other than the tier, which \
+         would make that test's difference unattributable"
+    );
+}
+
+/// How much of the tiered build any text in this tree can actually name, and
+/// how much of THAT the shipped tile can reach.
+///
+/// # Why a census and not a behaviour
+///
+/// The milestone before this one found that `Modules::code` took a symbol and
+/// no tier, so every `<symbol>.<tag>` module was named by nothing. That is
+/// fixed and two tests above measure the fix on real weights. This one
+/// answers the question the fix raised and did not settle: **granted the
+/// resolver now walks the tiers, how many modules does the walk have to walk
+/// to?**
+///
+/// Three numbers, and the third is the one that matters.
+///
+/// * **185 tiered modules are compiled** -- 146 at `coopmat`, 39 at `fp16`.
+/// * **52 belong to an entrypoint any text names.** `model_compiler`'s
+///   `dsl::metal` emits exactly two quantised-GEMM stems, `affine_qmm_t` and
+///   `affine_qmm_t_residual` (`dsl.rs`, the `format!` at each). Every other
+///   tiered module -- `_bias`, `_splitk`, `_strided`, all seven
+///   `*_fp16_precast*` families, and `sdpa_paged_mma{,_sink}` -- is stamped
+///   for a symbol no plan in this repository states. That includes ALL 39
+///   fp16 ones, so the fp16 tier is unreachable by NAMING, which no resolver
+///   change can lift.
+/// * **Zero are reachable at the tile the shipped constant states.**
+///   `QMM_TILE` is `(16, 32)` and `quant/qmm_t.slang` compiles no
+///   cooperative-matrix build at a row tile of 16, deliberately.
+///
+/// So the honest account of the resolver fix is: it unblocked an eight-fold
+/// prefill win and, on its own, takes none of it. Both halves are needed and
+/// the other half lives in `crates/model`. That is recorded at `QMM_TILE`
+/// itself, with the measurement and the tradeoff.
+///
+/// # What this pins
+///
+/// The day someone widens `QMM_TILE`, or compiles a `bm_16` cooperative build,
+/// or has a text name `affine_qmm_t_bias`, this goes red -- and every one of
+/// those is a moment to re-read the paragraph above rather than a moment to
+/// update a number quietly. It needs no GPU: it is a question about the build
+/// tree and the lowering, and both are readable from here.
+#[test]
+fn the_tiered_builds_this_driver_can_actually_reach() {
+    use model_dsl as dsl;
+
+    let Some(dir) = SPV_DIR else {
+        eprintln!("skipped: built without kernels-vulkan/native, so there are no modules");
+        return;
+    };
+    let mut tiered: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("the spirv dir").flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "spv")
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            && stem.contains('.')
+        {
+            tiered.push(stem.to_string());
+        }
+    }
+    let at = |tag: &str| tiered.iter().filter(|s| s.ends_with(tag)).count();
+    assert_eq!(at(".coopmat"), 146, "a different number of coopmat builds");
+    assert_eq!(at(".fp16"), 39, "a different number of fp16 builds");
+
+    // A module belongs to a text-nameable launch when its stem is exactly
+    // `<stem>_bfloat16_gs_<g>_b_<b>_bm_<bm>_bn_<bn>`: `dsl::metal` writes the
+    // two stems, `affine_point` writes the middle, `affine_gemm_point` writes
+    // the tile. Split on the middle rather than testing a prefix, because
+    // `affine_qmm_t` is a prefix of `affine_qmm_t_bias` and of every other
+    // family, and a prefix test would count all of them.
+    let reachable = |tile: (u32, u32), tag: &str| -> usize {
+        let suffix = dsl::metal::affine_gemm_point(dsl::WeightRepr::Bf16, 0, tile)
+            .split_once("_bm_")
+            .map(|(_, t)| format!("_bm_{t}"))
+            .expect("the gemm point states a tile");
+        tiered
+            .iter()
+            .filter(|s| s.ends_with(tag))
+            .filter(|s| {
+                let base = s.trim_end_matches(tag).trim_end_matches('.');
+                let Some((stem, rest)) = base.split_once("_bfloat16_gs_") else {
+                    return false;
+                };
+                ["affine_qmm_t", "affine_qmm_t_residual"].contains(&stem) && rest.ends_with(&suffix)
+            })
+            .count()
+    };
+
+    let (bm, bn) = model::shared::llama_like::project::QMM_TILE;
+    assert_eq!(
+        (bm, bn),
+        (32, 32),
+        "the shipped GEMM tile moved again. The count below is a count of \
+         what one particular tile reaches, so re-derive it rather than \
+         editing it: this test's whole point is that a tile and a build tree \
+         can disagree silently"
+    );
+    // TWELVE, and it was zero. This is the number this test was written to
+    // watch: for as long as `QMM_TILE` was `(16, 32)`, none of the 146
+    // cooperative-matrix builds in the tree could be named by any text, so
+    // the resolver's tier machinery ran nothing whatever the device
+    // advertised. Widening the tile is what made it reachable, and
+    // `crates/model`'s `QMM_TILE` carries the 4.5x that came with it.
+    //
+    // Twelve rather than two, because a stem is stamped once per
+    // `(group x bits)` point and a text picks the point from the checkpoint
+    // it loaded. The directory holds more at this tile carrying `_wm_` and
+    // `_wn_` suffixes; those are not counted, and correctly so -- no text can
+    // name them, because `affine_gemm_point` writes a tile and stops.
+    assert_eq!(
+        reachable((bm, bn), ".coopmat"),
+        12,
+        "the shipped tile no longer reaches a cooperative-matrix build, which \
+         is the state this driver spent its whole life in without saying so"
+    );
+    assert_eq!(
+        reachable((bm, bn), ".fp16"),
+        0,
+        "an fp16 build became reachable at the shipped tile"
+    );
+
+    // The tile that was shipped, kept as the control: it is the reason the
+    // count above is a fact about the TILE and not about the matcher.
+    assert_eq!(
+        reachable((16, 32), ".coopmat"),
+        0,
+        "a cooperative-matrix build now exists at a row tile of 16, which \
+         means `qmm_t.slang` grew a bm_16 module. Measure it: the last time \
+         that was tried, 91 generated twins were worth nothing and were \
+         discarded"
+    );
+    assert_eq!(
+        reachable((64, 32), ".coopmat"),
+        12,
+        "tile 64 lost its builds"
+    );
+    assert_eq!(
+        reachable((32, 32), ".fp16"),
+        0,
+        "the fp16 tier is unreachable by naming: all 39 of its builds are \
+         `*_fp16_precast*` entrypoints and no text states one"
+    );
+}
+
+/// A buffer reads back at an offset what was written there, through the DMA.
+///
+/// # What this is guarding
+///
+/// `Device::buffer` prefers the memory type that is both `DEVICE_LOCAL` and
+/// `HOST_VISIBLE`, which on this card is mappable VRAM behind resizable BAR.
+/// That preference is worth five times the decode rate and it is not in
+/// question. What was never examined is the OTHER direction: mappable VRAM is
+/// write-combined, and reading it back through the mapping is uncached,
+/// unprefetched and one PCIe round trip deep.
+///
+/// Measured, on a 1024-token prefill of qwen3-0.6B before this changed:
+///
+/// | phase | before | after |
+/// |---|---|---|
+/// | allocate and zero the 334 MB arena | 82 ms | 82 ms |
+/// | every dispatch of every layer | 588 ms | 588 ms |
+/// | read the answer back | **32 967 ms** | **220 ms** |
+/// | widen the logits to f32 | 278 ms | 278 ms |
+/// | the whole step | **33 847 ms** | **1 107 ms** |
+///
+/// Ninety-eight per cent of a prefill was one `memcpy` from uncached memory,
+/// at ten megabytes a second on a bus that does twelve gigabytes. The copy
+/// engine reads the same memory at the bus's rate into host-cached system
+/// memory, and the host then reads THAT at the cache's.
+///
+/// So this test asks three things of `read_at`, and the third is the one that
+/// would go quiet: the bytes are right, an offset is honoured, and the read
+/// actually went through the copy engine rather than through a mapping.
+#[test]
+fn a_read_of_device_memory_goes_through_the_copy_engine() {
+    let (device, _) = gpu!();
+
+    // Big enough that the two paths are not the same number. At the measured
+    // ten megabytes a second the mapped path would need six seconds for this
+    // and the staged one needs tens of milliseconds.
+    let bytes: Vec<u8> = (0..64 << 20u32).map(|i| (i % 251) as u8).collect();
+    let before = device.staged();
+    let buffer = device.buffer(&bytes).expect("a 64 MiB buffer");
+
+    let whole = device.read(&buffer).expect("read it back");
+    assert_eq!(whole.len(), bytes.len(), "a short read");
+    assert_eq!(whole, bytes, "the bytes came back changed");
+
+    // An offset, and one that is not a multiple of anything: a staged copy
+    // states `src_offset` on the copy region and a mapped one adds it to the
+    // pointer, and a path that dropped it would still return the right NUMBER
+    // of bytes.
+    let at = 1_000_003usize;
+    let len = 4096usize;
+    let part = device
+        .read_at(&buffer, at as u64, len as u64)
+        .expect("read a slice back");
+    assert_eq!(
+        part,
+        &bytes[at..at + len],
+        "the offset was not where the read started"
+    );
+
+    assert!(
+        at as u64 + len as u64 <= buffer.size(),
+        "this test's own arithmetic left the buffer"
+    );
+    assert!(
+        device.read_at(&buffer, buffer.size(), 1).is_err(),
+        "a read that starts at the end of the buffer was allowed"
+    );
+    assert!(
+        device.read_at(&buffer, 0, buffer.size() + 1).is_err(),
+        "a read longer than the buffer was allowed"
+    );
+
+    // THE ONE THAT WOULD GO QUIET.
+    //
+    // Both reads above answer correctly whichever path they took, so nothing
+    // else in this file would notice the day `read_at` stopped staging --
+    // except the wall clock of every prefill, which no test watches.
+    //
+    // Two, and not "more than none": the two reads that were given a real
+    // range. `Buffer::local` is what decides, so a device with no device-local
+    // host-visible type would fail here, and that is the correct answer for
+    // it -- such a part's buffers are in system memory and the mapped read is
+    // the fast one. This card has one.
+    assert_eq!(
+        device.staged() - before,
+        2,
+        "a read of device-local memory did not go through the copy engine"
+    );
+
+    device.free(buffer);
+}
+
+/// Every row a request NAMES comes back in the read-out.
+///
+/// # Why this claim, on this harness
+///
+/// `serve::logits_of` reads ONE span covering the rows it was asked for, and
+/// `Logits::row` answers `None` for any other. So a request naming rows the
+/// readback did not cover is a `None` four layers from where it is felt --
+/// which is exactly what a first port of multi-readout support produced:
+/// `request 0 reads row 30 of a read-out of 34 rows`.
+///
+/// That claim needs no real weights. The stand-in checkpoint makes every row
+/// the SAME distribution, so nothing here can say the rows are distinct -- and
+/// nothing here needs to. Coverage is the half that was wrong.
+///
+/// The distinctness half belongs with the real-weight tests and cannot run on
+/// a machine without a pre-quantised snapshot, which is every machine this has
+/// been run on. `driver-wgpu`'s `tests/serving.rs` has it, against a bf16
+/// checkpoint it quantises through the load plan -- a difference in what the
+/// two crates' harnesses accept, not in what they could prove.
+#[test]
+fn every_row_a_request_names_is_in_the_read_out() {
+    use driver_vulkan::pages::Book;
+    use driver_vulkan::resources::{Pool, Request, Shape, Weights};
+    use driver_vulkan::turns::{Held, Serving};
+    use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
+    use model::shared::llama_like::forward::llama_like_metal;
+    use model_ir::trace::FireClass;
+
+    let (device, dir) = gpu!();
+    let shape = Shape {
+        layers: 28,
+        kv_heads: 8,
+        head_dim: 128,
+        page_size: 8,
+        pages: 8,
+        bytes: 2,
+    };
+    let plan = llama_like_metal(
+        &LlamaLikeFacts::qwen3_0_6b(),
+        &LlamaLikeMetalFacts::synthetic(),
+        FireClass::Decode,
+    );
+    let prefill_plan = llama_like_metal(
+        &LlamaLikeFacts::qwen3_0_6b(),
+        &LlamaLikeMetalFacts::synthetic(),
+        FireClass::Prefill,
+    );
+    let serving = Serving {
+        plan: &plan,
+        prefill: &prefill_plan,
+        geometry: driver_vulkan::dispatch::Geometry {
+            q_heads: 16,
+            kv_heads: 8,
+            head_dim: 128,
+            rotary_dims: 128,
+            n_experts: 0,
+            experts_per_token: 0,
+        },
+        tier: Capability::Baseline,
+    };
+
+    let mut book = Book::over(shape);
+    let mut pool = Pool::open(&device, shape).expect("the pool");
+    pool.stand_in(&device, 1 << 22).expect("a stand-in");
+    pool.ladder(&device, shape.head_dim, 1_000_000.0, None)
+        .expect("the ladder");
+    let mut weights = Weights::new();
+    weights
+        .seam(&device, 1 << 22)
+        .expect("a stand-in checkpoint");
+    {
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (text, rows) in [(&plan, 1usize), (&prefill_plan, 32)] {
+            let probe = model_compiler::lower::lower(
+                text,
+                &vec![model_compiler::lower::Row::default(); rows],
+                model_compiler::lower::Fire {
+                    captures_across_splits: false,
+                },
+            )
+            .expect("the plan lowers");
+            names.extend(probe.args.iter().filter_map(|a| match a {
+                model_compiler::lower::Arg::Weight(n) => Some(n.clone()),
+                _ => None,
+            }));
+        }
+        let block = vec![0u8; 1 << 22];
+        for name in &names {
+            weights.hold(&device, name, &block).expect("a weight");
+        }
+    }
+    let mut cache = Pipelines::new();
+    let mut modules: std::collections::BTreeMap<String, Vec<u8>> =
+        std::collections::BTreeMap::new();
+    for name in std::fs::read_dir(dir).expect("the spirv dir").flatten() {
+        let path = name.path();
+        if path.extension().is_some_and(|e| e == "spv")
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        {
+            modules.insert(stem.to_string(), std::fs::read(&path).expect("a module"));
+        }
+    }
+    let mut lowerings = driver_vulkan::turns::Lowerings::default();
+    let mut held = Held {
+        book: &mut book,
+        pool: &mut pool,
+        weights: &weights,
+        lowerings: &mut lowerings,
+    };
+
+    // Sixteen rows over two eight-row pages, reading out three of them --
+    // which is a speculative verifier's shape, and the shape this driver
+    // refused by name until the rows could be found again.
+    let rows = 16u32;
+    let mut request = Request::of((0..rows).collect(), vec![0, 1]);
+    let named: Vec<u32> = vec![rows - 3, rows - 2, rows - 1];
+    request.samples = named.clone();
+    let tokens: Vec<u32> = vec![0; rows as usize];
+
+    let step = serving
+        .over(
+            &device,
+            &mut cache,
+            &modules,
+            &mut held,
+            std::slice::from_ref(&request),
+            &[tokens.as_slice()],
+        )
+        .unwrap_or_else(|e| panic!("the fire: {e}"));
+
+    for &at in &named {
+        assert!(
+            step.logits.row(at as usize).is_some(),
+            "row {at} was named by the request and is not in the read-out of {} \
+             rows -- the readback did not cover it",
+            step.logits.rows
+        );
+    }
+    // The control: a row NOBODY named is absent, so the assertion above is
+    // about the naming and not about a readback that happens to hold
+    // everything.
+    assert!(
+        step.logits.row(0).is_none(),
+        "row 0 was not named and came back anyway, so this test cannot see \
+         what it is for"
+    );
+}
+
+/// `Device::copy_within` moves the same bytes whichever route it takes, and a
+/// large move costs the submission rather than the bytes.
+///
+/// # Why this test exists
+///
+/// Because `copy_within` had exactly one route -- a `memmove` through the
+/// mapping -- and it was chosen for being CORRECT, which it is. The cost was
+/// never the argument, and the cost was the whole problem: this card's
+/// mappable VRAM is write-combined, so the load side of that `memmove` runs
+/// uncached at some thirty megabytes a second. `Pool::copy_plan` calls this
+/// once per layer per half for every page the engine moves, so a prefix share
+/// and a fork both paid it. It is the same defect `Pool::resize` had, and it
+/// outlived that fix by hiding behind a doc comment that explained why the
+/// host route was correct without ever asking what it cost.
+///
+/// # What it measures
+///
+/// Both routes, against a host-computed expectation, and both edges of the
+/// choice between them:
+///
+/// 1. **Disjoint** ranges, which take the copy engine -- every move a pool
+///    actually makes, because a page move names two different pages.
+/// 2. **Overlapping** ranges, which must keep the documented `memmove`
+///    promise. A `vkCmdCopyBuffer` whose regions overlap within one buffer is
+///    undefined, so this is the case the mapping is retained for; if the
+///    disjointness test were ever written backwards, this is what says so.
+/// 3. **The cost**, as an order-of-magnitude tripwire and not a benchmark. A
+///    megabyte took 33 ms through the mapping and 27 us on the copy engine,
+///    so a 15 ms ceiling is comfortably clear of the fixed route and nowhere
+///    near the variable one. It started at 5 ms and was raised once, after a
+///    full-suite run on a contended box tripped it while the same test passed
+///    solo twice: the copy engine's cost is a SUBMISSION, so it moves with
+///    whatever else is submitting, and 15 ms still leaves the host route --
+///    which contention would only slow further -- caught by more than double.
+///
+/// The overlap is deliberately a FORWARD one -- destination above source,
+/// overlapping by half -- because that is the direction a naive byte-at-a-time
+/// copy corrupts, and `std::ptr::copy` is the reason it does not.
+#[test]
+fn a_copy_within_a_buffer_moves_the_same_bytes_by_either_route() {
+    let (device, _dir) = gpu!();
+    const N: usize = 1 << 20;
+    // A pattern where every byte says which position it came from, so a copy
+    // that lands at the wrong offset is caught rather than a copy that lands
+    // wholly elsewhere.
+    let source: Vec<u8> = (0..N * 3).map(|i| (i % 251) as u8).collect();
+
+    // 1. Disjoint: the copy engine's path.
+    let disjoint = device.buffer(&source).expect("a buffer");
+    let began = std::time::Instant::now();
+    device
+        .copy_within(&disjoint, 0, (N * 2) as u64, N as u64)
+        .expect("a disjoint copy");
+    let took = began.elapsed();
+    let back = device.read(&disjoint).expect("read it back");
+    assert_eq!(
+        &back[N * 2..],
+        &source[..N],
+        "a disjoint copy did not land the source's bytes at the destination"
+    );
+    assert_eq!(
+        &back[..N * 2],
+        &source[..N * 2],
+        "a disjoint copy wrote outside the range it was given"
+    );
+    within_budget(
+        took,
+        std::time::Duration::from_millis(15),
+        &format!(
+            "a megabyte took {took:?}. Through the mapping it takes about 33 ms and \
+             on the copy engine about 27 us, so this is the host route back"
+        ),
+    );
+
+    // 2. Overlapping, forwards: the mapping's path, and the `memmove` promise.
+    let overlapping = device.buffer(&source).expect("a buffer");
+    device
+        .copy_within(&overlapping, 0, (N / 2) as u64, N as u64)
+        .expect("an overlapping copy");
+    let back = device.read(&overlapping).expect("read it back");
+    let mut expected = source.clone();
+    expected.copy_within(0..N, N / 2);
+    assert_eq!(
+        &back[..N * 2],
+        &expected[..N * 2],
+        "an overlapping forward copy did not behave as a memmove"
+    );
+}
+
+/// Moving a page of a real cache costs milliseconds, not tens of them.
+///
+/// # Why a timing test exists for this
+///
+/// Because `copy_kv` is not a rare verb. Every prefix share and every fork
+/// goes through `Pool::copy_page`, which calls `Device::copy_within` once per
+/// layer per half -- fifty-six times for this model, at thirty-two kilobytes
+/// each. That was a `memmove` through a write-combined mapping, so each of
+/// those fifty-six calls paid an uncached read, and the whole page cost about
+/// sixty-three milliseconds.
+///
+/// Nothing went red. The bytes were always right, which is exactly how the
+/// same defect in `Pool::resize` survived: a correct route nobody had timed.
+/// Measured here on the 4090, eight pages moved back to back:
+///
+/// ```text
+///   through the mapping   502.6 ms   (62.8 ms a page)
+///   on the copy engine     27.3 ms   ( 3.4 ms a page)
+/// ```
+///
+/// # What it measures, and what the ceiling is for
+///
+/// Eight moves rather than one, because the FIRST move of a run carries the
+/// pool's first touch and reads about seventy milliseconds on either route --
+/// a one-page test would therefore pass with the host route in place and
+/// prove nothing. Eight amortise that away, and the two routes are then
+/// eighteen times apart.
+///
+/// The ceiling is 150 ms for the eight, which is five times the copy engine's
+/// measured cost and a third of the mapping's. That gap is deliberately wide:
+/// this box is shared, so the number moves, and an order-of-magnitude
+/// tripwire that never fires spuriously is worth more than a benchmark that
+/// does. Reverting `copy_within` to the mapping fails it by 3.4x.
+#[test]
+fn moving_a_page_costs_milliseconds_rather_than_tens_of_them() {
+    let (_device, dir) = gpu!();
+    let Some(real) = checkpoint_weights() else {
+        eprintln!("no readable 4-bit qwen3-0.6b, so a page move is unmeasured");
+        return;
+    };
+    let shell = shelled(dir, &REALS[0], real, 32);
+    let pool = shell.pool();
+
+    // The first move of a fresh pool is the pool's first touch, on either
+    // route. Spend it before the clock starts.
+    // The shell's own device. `gpu!()`'s is this suite's lock and belongs to
+    // no buffer here; copying between pool buffers through it names two
+    // `VkDevice`s in one `vkCmdCopyBuffer`, which is what the validation
+    // layer aborted on and what made this timing meaningless.
+    let owner = shell.device();
+    pool.copy_page(owner, 0, 1).expect("a warming move");
+
+    let began = std::time::Instant::now();
+    for page in 0..8u32 {
+        pool.copy_page(owner, page, page + 8).expect("a page move");
+    }
+    let took = began.elapsed();
+
+    within_budget(
+        took,
+        std::time::Duration::from_millis(150),
+        &format!(
+            "eight page moves took {took:?}. On the copy engine they take about \
+             27 ms and through the mapping about 503 ms, so this is the host \
+             route back in `Device::copy_within`"
+        ),
+    );
+}
+
+/// A prefill's arena is filled by the card, not shipped to it.
+///
+/// # What this counts and why it is not a timing test
+///
+/// The arena is the scratch a fire writes its intermediates and its logits
+/// into, sized `rows * vocab * 4` for the head. For a decode that is 326 KB.
+/// For a 384-row prefill of qwen3-0.6b it is **233 megabytes**, because every
+/// row samples (see `turns::once` for why) and the vocabulary is 151,936.
+///
+/// It used to be made with `Device::buffer(&vec![0u8; n])`: a zero-filled
+/// `Vec` in system memory, then uploaded whole. Both halves were paid.
+/// Measured on the 384-row prefill, release: the arena phase cost **35.5 ms
+/// of a 167 ms step**, and `Device::empty` plus a `vkCmdFillBuffer` does the
+/// same thing in **1.6 ms**. The bus was not misbehaving -- `Device::write`
+/// runs at the 10 GB/s it documents, and 233 MB at 10 GB/s is 23 ms. Sending
+/// zeros over a bus at all was the mistake.
+///
+/// The obvious tripwire would be a stopwatch, and this crate has one of those
+/// for `copy_page` because there the two routes move IDENTICAL bytes and only
+/// the clock can tell them apart. Here there is a better witness: whether the
+/// bytes crossed the bus at all. `Device::uploaded` counts them, so this
+/// asserts a fact about traffic rather than about a shared machine's mood --
+/// no ceiling to tune, and no flake.
+///
+/// # Why the bound is the arena's own size
+///
+/// A step uploads real things besides the arena: the fire tables, the token
+/// ids, the sampling indices. Those are kilobytes. So the assertion is that
+/// the step's uploads are a small fraction of the arena rather than zero, and
+/// the arena's size is measured here and printed rather than assumed -- if a
+/// future lowering makes the arena small, the test says so instead of passing
+/// on a bound that has stopped meaning anything.
+///
+/// Mutation: restoring `device.buffer(&vec![0u8; low.arena_bytes])` in
+/// `turns::arena_for` uploads the whole arena and fails here by two orders of
+/// magnitude.
+#[test]
+fn a_prefills_arena_does_not_cross_the_bus() {
+    let (device, dir) = gpu!();
+    let _ = &device;
+    let Some(real) = checkpoint_weights() else {
+        eprintln!("no readable 4-bit qwen3-0.6b, so the arena's route is unmeasured");
+        return;
+    };
+    let mut shell = shelled(dir, &REALS[0], real, 512);
+
+    // Warm first, so that the weights' own upload -- which IS a legitimate
+    // host write, and is hundreds of megabytes -- is not counted against the
+    // step being measured.
+    shell
+        .step(&[driver_vulkan::turns::Turn {
+            who: 1,
+            tokens: PERIOD.to_vec(),
+        }])
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    let rows = 384;
+    let mut prompt: Vec<u32> = Vec::new();
+    while prompt.len() < rows {
+        prompt.extend_from_slice(&PERIOD);
+    }
+    prompt.truncate(rows);
+
+    let before = shell.device().uploaded();
+    shell
+        .step(&[driver_vulkan::turns::Turn {
+            who: 2,
+            tokens: prompt,
+        }])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let uploaded = shell.device().uploaded() - before;
+
+    // What the arena for that prefill would have been. Not read out of the
+    // lowering -- which this test has no handle on -- but computed the way
+    // the lowering sizes it, and then sanity-checked against being trivial.
+    let arena = rows as u64 * 151_936 * 4;
+    eprintln!("a {rows}-row prefill uploaded {uploaded} bytes; its arena is {arena}");
+    assert!(
+        arena > 200 * 1024 * 1024,
+        "the arena is only {arena} bytes, so this test no longer separates the routes"
+    );
+    assert!(
+        uploaded < arena / 100,
+        "a {rows}-row prefill uploaded {uploaded} bytes, which is most of its \
+         {arena}-byte arena: the arena is being zero-filled on the host and \
+         shipped over the bus again"
+    );
+}
+
+/// Opening a cache does not send the cache to the card.
+///
+/// # Why this counts bytes
+///
+/// `Pool::open` zeroes every layer-half, and it must: a cache that came up
+/// holding the last model's rows would produce attention over sequences
+/// nobody asked about, and the attention would look plausible. The question
+/// is only WHERE the zeros are made.
+///
+/// It used to make them on the host -- one `vec![0u8; layer_bytes]`, uploaded
+/// to each of the `2 * layers` buffers. Correct, and it cost the whole cache
+/// in bus traffic. Measured on the 28-layer, 512-page pool below: **939 MB
+/// uploaded and 162 ms**, against **0 bytes and 36 ms** through
+/// `Device::empty` plus a `vkCmdFillBuffer` each.
+///
+/// This pool is small. A serving pool is sized to fill the card, so on a
+/// 24 GB 4090 the old route spent seconds of startup sending zeros to memory
+/// that writes them itself at its own bandwidth.
+///
+/// The striking part is that `Pool::resize` already did it the right way --
+/// its grow path zeroes the new tail with `Device::zero` -- three hundred
+/// lines from a function doing the same job the other way. Neither could
+/// notice, because both produce a cache full of zeros.
+///
+/// So the assertion is exact rather than timed: opening a cache uploads
+/// NOTHING. There is no ceiling to tune and nothing for a shared box to make
+/// flaky, and restoring the host route fails it by 939 megabytes.
+#[test]
+fn opening_a_cache_uploads_nothing() {
+    let (device, _dir) = gpu!();
+    let shape = driver_vulkan::resources::Shape {
+        layers: 28,
+        kv_heads: 8,
+        head_dim: 128,
+        page_size: 16,
+        pages: 512,
+        bytes: 2,
+    };
+    let before = device.uploaded();
+    let at = std::time::Instant::now();
+    let pool = driver_vulkan::resources::Pool::open(&device, shape).expect("open");
+    let took = at.elapsed();
+    let uploaded = device.uploaded() - before;
+    let whole = shape.layer_bytes() * 2 * u64::from(shape.layers);
+    eprintln!("opening a {whole}-byte cache took {took:?} and uploaded {uploaded} bytes");
+    pool.close(&device);
+
+    // The cache is worth checking too: a shape that had quietly become tiny
+    // would make the claim below true and meaningless.
+    assert!(
+        whole > 512 * 1024 * 1024,
+        "the cache is only {whole} bytes, so this no longer separates the routes"
+    );
+    assert_eq!(
+        uploaded, 0,
+        "opening a {whole}-byte cache uploaded {uploaded} bytes: it is being \
+         zeroed on the host and shipped over the bus"
+    );
+}
+
+/// A frame that binds a page above the pool grows it, and answers the same as
+/// one fired on a pool that was already large enough.
+///
+/// # The door this closes
+///
+/// `Shell::copy_kv` had this defect and was fixed one commit earlier; this is
+/// the same question asked of the other door. A frame's growth came from
+/// `kv_translation` and `required_kv_pages` -- both of which are the engine's
+/// STATEMENTS about the pages -- and not from `kv_page_indices`, which is the
+/// list the driver actually binds. The two can differ: the translation is
+/// empty whenever nothing was moved, and only one of the engine's two
+/// batch-assembly paths folds the page list into the declared high-water.
+///
+/// Measured on a three-page pool, before the fix:
+///
+/// ```text
+///   a step of this frame did not run:
+///   Unstageable(NoSuchPage { request: 0, page: 7, pages: 3 })
+/// ```
+///
+/// That is not a silent wrong answer -- the bounds check in `Request::stage`
+/// caught it, which is why it stays exactly where it is. It is a REQUEST
+/// KILLED for a page the scheduler was entitled to hand out and the pool
+/// could have grown to hold, which is the same fault the copy door had and
+/// the same one `admit` exists to prevent.
+///
+/// # What is measured
+///
+/// The growth, its size, and the ANSWER -- the same decode fired on the same
+/// page 7 from a pool that started with room for it. A growth that reallocated
+/// without carrying the pool's contents, or that renumbered the pages, gives
+/// a different row.
+#[test]
+fn a_frame_binding_a_page_above_the_pool_grows_it_rather_than_dying() {
+    let (device, dir) = gpu!();
+    let _ = &device;
+    let Some(real) = checkpoint_weights() else {
+        eprintln!("no readable 4-bit qwen3-0.6b, so the frame growth is unmeasured");
+        return;
+    };
+
+    // Page 7, declared as one page, with nothing translated: well-formed, and
+    // above a pool that only three prefills' worth of frames have grown.
+    let held: Vec<u32> = vec![7];
+    let frame = driver_api::FrameSubmission {
+        instance_ids: vec![1],
+        kv_translation: Vec::new(),
+        kv_translation_indptr: vec![0, 0],
+        required_kv_pages: 1,
+        steps: vec![driver_api::StepSubmission {
+            plan: driver_api::LaunchPlan {
+                token_ids: PERIOD[..4].to_vec(),
+                position_ids: (0..4).collect(),
+                kv_page_indices: held.clone(),
+                kv_page_indptr: vec![0, held.len() as u32],
+                kv_last_page_lens: vec![4],
+                qo_indptr: vec![0, 4],
+                sampling_indices: vec![3],
+                sampling_indptr: vec![0, 1],
+                ..driver_api::LaunchPlan::default()
+            },
+            roster_rows: vec![0],
+            sub_batch_indptr: vec![0, 1],
+            sub_batch_class: vec![driver_api::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE],
+            terminal_cells: Vec::new(),
+            program_row_indptr: vec![0, 1],
+            logical_fire_ids: vec![0],
+            channel_expected_head: Vec::new(),
+            channel_expected_tail: Vec::new(),
+            channel_ticket_indptr: vec![0, 0],
+            region_row_indptr: Vec::new(),
+            region_sig: Vec::new(),
+            region_k: Vec::new(),
+        }],
+    };
+
+    let fired = |pages: u32| -> (Vec<f32>, u32) {
+        let mut shell = shelled(dir, &REALS[0], real, pages);
+        let ran = shell
+            .launch(&frame)
+            .expect("a frame naming page 7 is servable from any pool that can hold it");
+        let driver_vulkan::frames::Launched::Ran(steps) = ran else {
+            panic!("a frame the pool can grow to hold was refused: {ran:?}");
+        };
+        let row = steps[0]
+            .logits
+            .row(steps[0].readout_of[0])
+            .expect("a readout row")
+            .to_vec();
+        (row, shell.shape().pages)
+    };
+
+    let (grown, pages) = fired(3);
+    assert_eq!(
+        pages, 8,
+        "the pool did not grow to cover the page the frame binds"
+    );
+    let (roomy, was) = fired(8);
+    assert_eq!(was, 8, "the roomy pool grew when it did not need to");
+    assert_eq!(
+        grown, roomy,
+        "the same tokens on the same page answered differently depending on \
+         whether the pool had to grow first, so the growth does not leave the \
+         cache where a fire expects it"
+    );
+}
+
+/// A child process that opens a device and says which one it got.
+///
+/// Ignored, because it is not a test: it is the other half of
+/// `the_device_that_opens_is_the_one_that_was_chosen`, which re-executes this
+/// binary to read the answer under a different environment. Doing it in a
+/// child rather than with `set_var` is not fastidiousness -- every other test
+/// in this file opens a device, and a variable flipped in this process would
+/// change which device THEY ran on, at whatever moment the scheduler chose.
+#[test]
+#[ignore = "the child half of the device-choice proof"]
+fn report_which_device_opened() {
+    let (device, _) = gpu!();
+    eprintln!("OPENED: {}", device.name());
+}
+
+/// The device that opens is the one that was chosen, and the choice is not
+/// the loader's enumeration order.
+///
+/// `Device::finish` used to be `devices.first()`. The Vulkan specification
+/// places no order on `vkEnumeratePhysicalDevices`, and the machine this crate
+/// was written on offers TWO devices -- an RTX 4090 and a `llvmpipe` software
+/// rasteriser from Mesa's `lvp_icd.json`. Every number in this crate was
+/// measured on the card because the loader happened to list it first. Had that
+/// ever changed, the whole suite would have moved onto a CPU implementation,
+/// passed, and said nothing.
+///
+/// So this asks the real loader on the real machine, twice. The default open
+/// must land on the ranked best; naming a device must land on THAT one. On a
+/// box with one device the two answers are the same and the test still holds,
+/// which is why it asserts a relation rather than a name.
+#[test]
+fn the_device_that_opens_is_the_one_that_was_chosen() {
+    fn open_with(pin: Option<&str>) -> Option<String> {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "report_which_device_opened",
+            "--ignored",
+            "--exact",
+            "--nocapture",
+        ]);
+        match pin {
+            Some(v) => cmd.env("PIE_VULKAN_DEVICE", v),
+            None => cmd.env_remove("PIE_VULKAN_DEVICE"),
+        };
+        let out = cmd.output().expect("cannot re-execute this test binary");
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .find_map(|l| l.strip_prefix("OPENED: ").map(str::to_string))
+    }
+
+    let Some(default) = open_with(None) else {
+        eprintln!("skipped: no device opens here at all");
+        return;
+    };
+    eprintln!("default: {default}");
+
+    // A software adapter must never be the DEFAULT choice while anything else
+    // can compute. Asked by pinning it: if it opens when named, it was there
+    // to be chosen, and the default declining it is then a decision.
+    for pipe in ["llvmpipe", "lavapipe", "swiftshader"] {
+        let Some(got) = open_with(Some(pipe)) else {
+            continue;
+        };
+        assert!(
+            got.to_ascii_lowercase().contains(pipe),
+            "PIE_VULKAN_DEVICE={pipe} opened {got}. The override must take the \
+             name it is given or refuse -- silently opening a different device \
+             turns a deliberate cross-check into a measurement of the wrong \
+             thing"
+        );
+        assert_ne!(
+            got, default,
+            "this machine offers a software adapter ({got}) and it is ALSO \
+             what opens by default. Something is picking by enumeration order \
+             again"
+        );
+        eprintln!("software adapter present and declined by default: {got}");
+    }
+
+    // And the default is reachable by name, which is the other direction: a
+    // ranking that returned something the override cannot address would mean
+    // the two paths disagree about what the device list even is.
+    let pinned = open_with(Some(&default));
+    assert_eq!(
+        pinned.as_deref(),
+        Some(default.as_str()),
+        "naming the device that opens by default did not open it"
+    );
+
+    assert_eq!(
+        open_with(Some("no device is called this")),
+        None,
+        "an override naming nothing opened SOMETHING. A run that asked for one \
+         device and quietly got another looks exactly like a measurement"
     );
 }

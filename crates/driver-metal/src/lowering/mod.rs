@@ -28,16 +28,16 @@
 //!   checkpoint holds. A map, not a switch: it chooses nothing.
 
 pub mod abi;
+pub mod arm;
+pub mod cached;
 pub mod consts;
 pub mod dispatch;
 pub mod executor;
 pub mod frame;
-pub mod grid;
-pub mod launch;
 pub mod resolve;
+pub mod routine;
 
 pub use dispatch::{Dispatch, Geometry, Undispatchable, plan as plan_dispatches};
 pub use executor::{BindRefusal, BoundArg, BoundLaunch, Frame, Resolver, Slice, bind, resolve_arg};
 pub use frame::{Step, Unbridgeable, Unbridged, fire_class, lower_step, rows_of};
-pub use launch::{Dims, Rule, Ungeometric, eval as eval_launch};
 pub use resolve::{Names, Store};

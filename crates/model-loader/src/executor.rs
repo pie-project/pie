@@ -29,9 +29,9 @@ pub mod cuda;
 
 // `cuda` says *that* there is a device; `cuda-12`/`cuda-13` say WHICH
 // libcudart this binary will meet, and the rows in `cuda` cannot be fired
-// without one — `kernels-cuda-new` gates its whole runtime layer, and
+// without one — `kernels-cuda` gates its whole runtime layer, and
 // therefore its generated `api`, on that choice, so `--features cuda` alone
-// would reach a missing `kernels_cuda_new::api` and read as a crate that has
+// would reach a missing `kernels_cuda::api` and read as a crate that has
 // not got the entry points rather than as a build that never said which CUDA
 // it is for.
 //

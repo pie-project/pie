@@ -24,7 +24,7 @@ did NOT fold, and the line between them is what a **guest** imports:
 | `tensor-ir` | *its own crate* | **representation** — types, ops, registry, container + wire format, shape/dtype inference, the bind-time validator, the RNG contract. `no_std`; the dependency floor both ends sit on. |
 | `plan/` | module | **analysis** — normalization, stage signatures, value domains, region partitioning, lane-table ABI → a `CompiledStage` handed straight to emission (nothing is serialized on the way out) |
 | `eval/` | module | **semantics** — the tier-0 reference interpreter and the host partial evaluator |
-| `codegen/` | module | **emission** — the C ABI header, the RNG projections, the CUDA/Metal region emitters, and the launch package the drivers execute |
+| `codegen/` | module | **emission** — the RNG projections, the CUDA/Metal region emitters, and the launch package the drivers execute |
 | `tests/` | the battery | **conformance** — golden traces, container mutation sweeps, generated-artifact drift checks, cross-implementation parity |
 
 ```
@@ -80,14 +80,28 @@ interpreter's `eval_op` so there is no second evaluator to drift.
 
 This crate contains **no hand-written C++**. The only non-Rust files are
 codegen's inputs and outputs: device runtime templates (`.cuh` / `.metal`) under
-`runtime/` that Rust assembles, and the generated C headers checked in under
-`include/` with drift tests. Backend code generation is a pure `Plan -> String`
-function with no device-architecture input, which is what lets it live outside
-the driver and be golden-tested without a GPU. Compilation itself (NVRTC,
-`MTLLibrary`), module caching, and launch stay in the drivers — those need a
-live device.
+`runtime/` that Rust assembles, and the one generated shader preamble checked in
+under `include/` with a drift test. Backend code generation is a pure
+`Plan -> String` function with no device-architecture input, which is what lets
+it live outside the driver and be golden-tested without a GPU. Compilation
+itself (NVRTC, `MTLLibrary`), module caching, and launch stay in the drivers —
+those need a live device.
 
 ## Generated artifacts
 
-`include/` is checked in and verified by `tests/`. Never edit those files by
-hand; change the tables in `tensor-ir` and regenerate.
+`include/ptir_rng.generated.metal` is checked in and verified by
+`tests/rng_contract.rs`. Never edit it by hand; change `tensor-ir`'s
+`RNG_FORMULA` and regenerate with
+`PTIR_REGEN=1 cargo test -p tensor-compiler --test rng_contract`.
+
+It is a file rather than a Rust `const` because Metal's runtime shader compiler
+resolves `#include "..."` against the including file's directory and nothing
+else, so `runtime/metal/ptir_m1_runtime.metal` can only reach the preamble if a
+copy sits beside it — `kernels-metal/build.rs` stages one on a `native` build.
+
+Two C headers stood beside it, `ptir_abi.h` (op tags, dtype/stage/port enums,
+the arity table) and `rng_contract.generated.h` (the RNG contract in C). Both
+existed for the C++ drivers to `#include`. Those drivers were deleted, every
+backend is Rust and reads `tensor-ir` directly, and NVRTC is called with zero
+headers and zero include names — so nothing could have `#include`d them even by
+accident. They were removed with their generators and drift tests.

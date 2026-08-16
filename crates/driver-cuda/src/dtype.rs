@@ -2,6 +2,9 @@
 //!
 //! A faithful mirror of `kernels-cuda/csrc/src/tensor.hpp`'s `DType`, right
 //! down to the discriminants -- see [`DType`] for why that is not incidental.
+//! That header was the ARCHIVE crate's, deleted with it at `85c6c674b`, and
+//! so is every other `kernels-cuda/csrc` path in this file: they are
+//! citations of a tree that is gone, not of one a reader can open.
 //!
 //! # Why not one of the four `DType`s the workspace already has
 //!

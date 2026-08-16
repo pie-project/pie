@@ -17,6 +17,12 @@
 # Everything that decides WHAT to issue -- the dense linear-layer compaction,
 # the slot strides, the pitch arithmetic, the guards, the exception messages --
 # is the shipping source, copied verbatim at build time.
+#
+# `KSRC` below points into the ARCHIVE crate `kernels-cuda` -- CMake+nvcc, a
+# `csrc/` of host `.hpp` and `.cpp` -- deleted whole at `85c6c674b`, and the
+# `tensor.hpp` this copies out of it went with it. The line is left unchanged
+# because it records the command that took the golden, not a path anyone can
+# follow.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

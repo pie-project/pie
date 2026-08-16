@@ -203,7 +203,7 @@ pub fn deployment(
     let head_dim = crate::deployment::round_up_attn_head_dim(f.attn.head_dim);
     let attention = (0..f.layers())
         .map(|l| {
-            let window = model_compiler::facts::window_left_at(f.window_left, l);
+            let window = model_ir::facts::window_left_at(f.window_left, l);
             LayerAttention {
                 // One shape for every layer, which is what this row
                 // was already saying by having no per-layer count.
@@ -340,9 +340,9 @@ pub const NO_METAL: &str = "gemma-3n has no Metal text in this build: its forwar
 #[must_use]
 pub fn trace(
     f: &Gemma3nFacts,
-    class: model_compiler::trace::FireClass,
+    class: model_ir::trace::FireClass,
     load: Deployed<'_>,
-) -> model_compiler::trace::ForwardPlan {
+) -> model_ir::trace::ForwardPlan {
     let _ = load;
     super::forward::gemma3n_cuda(f, class)
 }

@@ -20,8 +20,8 @@
 pub mod facts;
 
 use self::facts::{NemotronHFacts, NemotronLayerKind};
-use model_compiler::dsl::{self, MatW, NormW, WeightRepr, matmul};
-use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
+use model_dsl::{self as dsl, MatW, NormW, WeightRepr, matmul};
+use model_ir::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct NhLayerW {
     norm: NormW,
@@ -94,7 +94,7 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
             // THIS LAYER's sliding window, `-1` for none — a
             // load-time fact the dispatch statements carry, where four
             // executors used to re-derive it per launch.
-            let window_left = model_compiler::facts::window_left_at(facts.window_left, l);
+            let window_left = model_ir::facts::window_left_at(facts.window_left, l);
             let w = NhLayerW::new(l, facts);
             let x = dsl::cuda::rmsnorm(&y, &w.norm);
 

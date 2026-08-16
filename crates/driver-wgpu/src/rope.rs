@@ -20,6 +20,8 @@
 //!
 //! Ported from `driver-metal`'s `model::rope`, and the port is checked against
 //! the shader rather than against the original -- see
+//! `the_ladder_is_what_the_base_form_raises` below, whose counterpart in the
+//! sibling is `driver-vulkan`'s
 //! `the_ladder_this_driver_builds_is_the_one_the_shader_raises`.
 
 /// The rescaling a config asks for.

@@ -8,18 +8,19 @@
 //! twice in a dependency cycle, so `OpKind` from the crate under test is a
 //! different type from `OpKind` in the plan `model` hands back.
 //!
-//! Being an integration test costs nothing here: `check_plan`, `Backend` and
-//! `sig_in` are all public, because a driver-side consumer reads them too.
+//! Being an integration test costs nothing here: `check_plan`, `Backend`,
+//! `sig` and `stated_in` are all public, because a driver-side consumer reads
+//! them too.
 
 use model::qwen_3_5::forward::facts::Qwen35CudaFacts;
 use model::qwen_3_5::forward::facts::Qwen35HybridFacts;
 use model::shared::llama_like::forward::facts::LlamaLikeCudaFacts;
 use model::shared::llama_like::forward::facts::LlamaLikeFacts;
-use model_compiler::kernels::*;
-use model_compiler::trace::FireClass;
-use model_compiler::trace::ForwardPlan;
+use model_ir::kernels::*;
+use model_ir::trace::FireClass;
+use model_ir::trace::ForwardPlan;
 
-use model_compiler::trace::{Op, OpKind};
+use model_ir::trace::{Op, OpKind};
 
 fn launch(symbol: &str) -> Op {
     Op {
@@ -62,7 +63,7 @@ fn the_check_is_not_vacuous() {
         kind: OpKind::Peel {
             prefix_ops: 1,
             tail_ops: 1,
-            window: model_compiler::trace::PeelWindow::HookFreePrefix,
+            window: model_ir::trace::PeelWindow::HookFreePrefix,
         },
         inputs: vec![],
         outputs: vec![],
@@ -127,11 +128,13 @@ fn the_metal_table_admits_its_rows_and_refuses_the_rest() {
     // row's symbol is a BASE and a base is not something a text can launch —
     // every point of every axis contributes text, so `attn_gate` names a
     // kernel and `attn_gate_bfloat16` names the dispatch.
-    let declared = KERNELS_METAL
-        .first()
-        .expect("Metal's table declares at least one kernel")
-        .entrypoints();
-    let declared = declared.first().expect("and that kernel has an entrypoint");
+    // From the CENSUS, not from the table: Metal's is empty, every family
+    // having crossed to a routine. A Metal row's symbol was a BASE and a base
+    // is not something a text can launch -- every point of every axis
+    // contributes text, so `attn_gate` names a kernel and `attn_gate_bfloat16`
+    // names the dispatch -- and the census is the list of dispatches.
+    let entrypoints = metal_entrypoints();
+    let declared = entrypoints.first().expect("Metal's census names a kernel");
     let mut ok = plan_of(vec![launch(declared)]);
     ok.family = "llama_like.metal.decode".to_string();
     assert_eq!(check_plan(&ok), Vec::<String>::new());
@@ -163,20 +166,283 @@ const UNSTATED_ROWS: &[&str] = &[
     // (the fused landing, waiting on a guard whose arms produce a PAIR)
     // and `dist::all_gather_bf16` (no text gathers; column-parallel
     // outputs here are consumed shard-local).
+
+    // THE f16 TWINS (4). Each of `attn::logit_softcap_f16`,
+    // `norm::residual_add_f16`, `norm::tanh_f16` and `rope::rope_partial_f16`
+    // is declared beside a bf16 original that a `dsl::cuda` builder DOES
+    // record -- `attn::logit_softcap_bf16`, `norm::residual_add_bf16`,
+    // `norm::tanh_bf16`, `rope::rope_partial_bf16` are all in `stated` -- and
+    // the twin is the same body over the other element type.
+    //
+    // No text names one because nothing in this tree stays fp16 across an
+    // op. The only fp16 activations here are MXFP4/marlin GEMM OPERANDS:
+    // gpt-oss and kimi-k2 cast with `quant::bf16_to_fp16` immediately before
+    // the call and read bf16 back out of it, so nothing is ever capped,
+    // rotated or residual-added in fp16. Nothing calls the four `fn`s
+    // either, which was checked rather than assumed -- they are reached from
+    // neither end, and `.wiki/kernel-x/northstar-old.md` recorded the same of
+    // the rope one when that family crossed: *"exactly one rope row is f16
+    // (`rope::rope_partial_f16`), it has no ahead-of-time twin and no bind."*
+    //
+    // They are here as contracts for kernels this crate compiles and this
+    // tree does not fire. Which is the honest shape of a dtype variant, and
+    // is why it is worth keeping them separate from the two DEAD groups
+    // below: what a twin is missing is a deployment, not a caller.
+    "attn::logit_softcap_f16",
+    // AN INNER LEG IS NOT A STATEMENT (7). Seven symbols on this list are
+    // called by ANOTHER routine in this crate rather than by anything
+    // holding an op list. A text states the OUTER symbol; the outer `fn`
+    // then picks a shape or a staging step on the host and calls the leg by
+    // path. The leg has a row because someone put its `fn` in its family's
+    // `ROUTINES`, and `sigs()` derives a row from every line there -- which
+    // is right, since a body this crate compiles has an operand contract
+    // whether or not a text wants one. What it does not have is a statement,
+    // and it never will: a caller that has already chosen is not a
+    // declaration.
+    //
+    // This one is the fused decode QKV path's shared body.
+    // `attn::qkv_decode_qk_norm_rope_write_kv_bf16` -- which `dsl::cuda`
+    // records at three sites, including the Peel's output-less form -- calls
+    // it with a null window, the kernel reading null as "no window". The
+    // window parameter that earns it a separate `fn` has no caller in this
+    // tree that passes one.
+    "attn::qkv_decode_fused_dispatch",
     // The epilogue's row gather has no `dsl::cuda` wrapper because no
     // model text states it: `lower::epilogue` emits it when the fire
     // samples fewer rows than it computes (a prefill reads one
     // distribution per request out of a stream of one row per token).
     // A statement the LOWERING makes is real without a text stating it,
     // which is precisely what this list is for.
+    //
+    // SEVEN MORE OF EXACTLY THAT KIND, and they are the clearest instance of
+    // the sentence above. `lower::semantic` maps `OpKind::SplitQkv`,
+    // `SplitQGate`, `SigmoidGateMul`, `GdnPrep`, `Embed`, `AddBias` and
+    // `RmsnormGated` onto seven symbols; those op kinds carry no kernel
+    // string, so no `dsl::cuda` wrapper records one and the scan cannot see
+    // them. `SplitQkv` alone maps onto TWO, because the peel's tail serves
+    // absolute row offsets in a full-N buffer and that is a different
+    // kernel -- the lowering states the pick rather than making the driver
+    // derive it from a window pointer -- so `attn::split_qkv_bf16` and
+    // `attn::split_qkv_bf16_devwin` are the same statement's two regions.
+    // gemma-4 and the llama-like anchor lower the split, gemma3n and the
+    // qwen3.5 hybrid the gate/sigmoid/GDN three, and every text alive lowers
+    // an embed; every one of the seven is named by a live deployment.
+    //
+    // They are DECLARED two different ways and the difference is worth one
+    // line, because it is not the reason any of them is here. Four --
+    // `attn::split_qkv_bf16`, `layout::split_q_gate_bf16`,
+    // `mlp::sigmoid_gate_inplace_bf16`, `ssm::qwen_gdn_post_conv_prep_bf16`
+    // -- have host programs in `kernels_cuda::driver_internal` and are
+    // declared by a `driver_bound!` line each. The other three are ordinary
+    // `routine!`s whose bodies live in their own families. Both spellings
+    // land in `declared`; neither can land in `stated`, because what is
+    // missing in all seven cases is a kernel string on the op kind.
+    //
+    // That the driver really fires them is checked from its side, not
+    // assumed here: `bind/arms/` arms six of the seven for real
+    // (`embed_arm`, `add_bias_arm`, `split_qkv_devwin_arm` and the rest),
+    // and the seventh, `norm::rmsnorm_gated_fp32_in_bf16`, is listed there
+    // as `arm: None` with a sentence saying what a `Cx` would have to grow
+    // to bind it -- a refusal that names the gap, which is the answer this
+    // list wants and could not give itself.
+    "attn::split_qkv_bf16",
+    // The peel-tail half of `OpKind::SplitQkv`. See the block above.
+    "attn::split_qkv_bf16_devwin",
+    // `gemm::act_x_wt_bf16`'s `m == 1` leg, chosen from the shape on the
+    // host and never by a text -- and the dense tuner's `GemmKind::Gemv`
+    // tactic is the same call under timing. See the leg block above
+    // `attn::qkv_decode_fused_dispatch`.
+    //
+    // WORTH KNOWING WHILE READING THIS AND THE FOUR `quant::` LEGS BELOW:
+    // none of the five is fired by a fire today, because none of `gemm`'s
+    // matmul symbols has an arm. `bind/arms/gemm.rs` is a file written to
+    // say so -- `gemm::act_x_w`, the portable spelling `lower::semantic`
+    // emits, is `arm: None` with a reason, which `Route::refusal` turns into
+    // a load-time `Unfireable` -- because the join was written by a
+    // generated dispatch that has been deleted. That is a gap in the fire
+    // path and not a fact about this list: the reason these five have no
+    // text is that they are legs, and a leg will have no text on the day the
+    // arm is written either.
+    "gemm::gemv_bf16",
+    // §54's FOUR DELETED WRAPPERS, BACK AS ROWS AND NOT AS DEMAND (4).
+    // `model-dsl/src/lib.rs` records the deletion in place, and the record
+    // is why this group needs no guessing: `copy_if_valid_slot`,
+    // `concat_rows`, `deinterleave_rows` and `deinterleave_vec` were
+    // wrappers that existed because the dsl surface had been GENERATED from
+    // launcher headers, so a wrapper existed for every launcher whether or
+    // not a model wanted one, and each of the four had zero callers in
+    // `crates/model/src`. The note says the `table::layout` rows went in the
+    // same edit, *"because [this test] asserts this surface and that table
+    // are the same set, and half the edit fails it."*
+    //
+    // The rows are back, and nobody typed them. `sigs()` derives a row from
+    // every line of a family's `ROUTINES` and `layout.rs` still lists all
+    // four `fn`s -- so deleting a wrapper now removes the demand and leaves
+    // the contract, which is the derivation working rather than failing.
+    // What changed is only who has to say why: it used to be the edit, and
+    // it is this list.
+    //
+    // And the answer is that nothing reaches them. No `dsl::cuda` wrapper,
+    // no `lower::semantic` arm, no entry in `bind/arms/layout.rs`, no host
+    // program in this crate -- and the witness the dsl's own note points at
+    // is gone too: `kernels-cuda/tests/launch_rules.rs` fired
+    // `copy_if_valid_slot` three times as the tree's only `LaunchRule::
+    // Single` and was deleted in 1a08b179a, which makes that sentence stale
+    // where it stands. These four are DECLARED AND UNREACHED and the entry
+    // says so, rather than inventing a mechanism to make them look alive.
+    "layout::concat_bf16_rows",
+    "layout::copy_if_valid_slot",
+    "layout::deinterleave_rows_bf16",
+    "layout::deinterleave_vec_bf16",
+    // `OpKind::Embed`, and one of the seven. See the block above
+    // `attn::split_qkv_bf16`.
+    "layout::embed_bf16",
+    // THE KEY-ENVELOPE TIER (3), which is opt-in and OFF. `Boot::
+    // kv_envelopes` defaults false and `boot.rs`'s own default test spells
+    // the reason -- *"envelopes are opt-in; nothing binds them"* -- so on
+    // every deployment this tree ships, all three are compiled and none is
+    // launched. They are not in the dead groups below because their callers
+    // exist and are exact; what gates them is a knob, and a knob is a fact
+    // about deployments rather than about the code.
+    //
+    // Two of the three are legs of the KV WRITES: `attn::write_kv_explicit_
+    // bf16` and `attn::write_kv_to_pages_bf16` each fire one after their own
+    // launch when the layer view answers `has_envelopes`. A text states the
+    // write, and refreshing the tier that write just invalidated is the
+    // write's own obligation rather than a second statement.
+    //
+    // The third, `layout::envelope_seed_empty`, is fired BY PATH and outside
+    // any fire at all: `bind/abi.rs`'s `seed_envelopes_empty` wraps it, and
+    // the live KV pool calls that while materialising a cache's envelope
+    // planes. A cache materialisation has no op list for a text to be part
+    // of.
+    "layout::envelope_merge_written",
+    "layout::envelope_seed_empty",
+    "layout::envelope_update_appended",
+    // `lower::epilogue`'s gather — the paragraph that opens the block above
+    // `attn::split_qkv_bf16` is this entry's, and the seven that follow it
+    // there are the same argument at scale.
     "layout::gather_bf16_rows",
-    // The LOADER's two quantizers, called from `loader/arena.rs` rather
+    // `OpKind::SplitQGate` and `OpKind::SigmoidGateMul`, two of the seven.
+    // See the block above `attn::split_qkv_bf16`.
+    "layout::split_q_gate_bf16",
+    "mlp::sigmoid_gate_inplace_bf16",
+    // I COULD NOT FIND A CALLER, and the tree had already reached the same
+    // answer. `moe::scalar_weighted_add_bf16` has device text, a host
+    // program and now a row, and nothing calls it: not a `dsl::cuda`
+    // builder, not `lower::semantic`, not `bind/arms/moe.rs`, not another
+    // routine in this crate, not the loader. `.wiki/kernel-x/
+    // refactor-plan.md` §12d lists it under "defects the ports found, not
+    // yet acted on" in those very terms -- *"device kernel, host fn, no
+    // contract, no caller anywhere. A second `scatter_add_weighted`; wants
+    // the same evidence pass before deletion"* -- and the first
+    // `scatter_add_weighted` was a confirmed orphan deleted whole, kernel
+    // and row and builder in one commit, which `stated_columns.rs`'s
+    // `DEPARTED` still records.
+    //
+    // So this entry is a FINDING and not a mechanism. The row is real
+    // because the `fn` is; the `fn` is reached by nothing, and the pending
+    // decision is whether it follows its twin out.
+    "moe::scalar_weighted_add_bf16",
+    // `OpKind::AddBias`, and one of the seven. See the block above
+    // `attn::split_qkv_bf16`.
+    "norm::add_bias_bf16",
+    // An f16 twin. See the block above `attn::logit_softcap_f16`.
+    "norm::residual_add_f16",
+    // `OpKind::RmsnormGated`, and the one of the seven the driver refuses by
+    // name. See the block above `attn::split_qkv_bf16`.
+    "norm::rmsnorm_gated_fp32_in_bf16",
+    // An f16 twin. See the block above `attn::logit_softcap_f16`.
+    "norm::tanh_f16",
+    // `norm::rmsnorm_bf16_with_fp16`'s leg for the two cases that do not
+    // take the fused vec8 arm -- no fp16 copy asked for, or operands that do
+    // not vectorise, in which case it norms and then casts. Its own doc
+    // comment says it IS `norm::rmsnorm_bf16`, which is the sharper way to
+    // put why no text names it: the trace symbol for that instantiation is
+    // already spoken for by the `fn` `OpKind::Rmsnorm` lowers to, and this
+    // is the same launch under a second name. See the leg block above
+    // `attn::qkv_decode_fused_dispatch`.
+    "norm::unstrided_bf16",
+    // THE QUANTISED GEMM'S FOUR STAGING LAUNCHES, all legs. `gemm/quant.rs`
+    // fires them by path from inside the int8 and fp8 arms of `gemm::act_x_w`
+    // and the scaled-weight bodies: quantise the activation, run the low
+    // precision GEMM, dequantise the accumulator. A text states the matmul
+    // and the weight REPRESENTATION it carries -- which is what
+    // `a_weight_representation_states_its_kernel` below is about -- and the
+    // staging is what reading that representation costs, chosen inside the
+    // body from the dtypes rather than by anything a trace could say. See
+    // the leg block above `attn::qkv_decode_fused_dispatch`, and the arm gap
+    // recorded at `gemm::gemv_bf16`.
+    "quant::dequant_int32_w8a8_to_bf16",
+    "quant::dequant_int8_to_bf16_per_channel",
+    // The LOADER's two quantizers, fired from `model-loader`'s
+    // `executor/cuda.rs` against an arena-addressed transform plan rather
     // than recorded by any forward text: a weight transform runs once at
     // load and never appears in a fire's op list. Real without a text
     // stating it, which is what this list is for.
+    //
+    // (The address used to read `loader/arena.rs`, which resolves to
+    // nothing. `executor/arena.rs` is the transform DRIVER and
+    // `executor/cuda.rs` holds the launches, with `plan/passes/tile.rs`
+    // naming both symbols as the strings the plan carries.)
     "quant::quantize_bf16_to_fp8_e4m3_per_channel",
+    // Two more of the quantised GEMM's staging four, in sort order rather
+    // than beside their pair. See the block above
+    // `quant::dequant_int32_w8a8_to_bf16`.
+    "quant::quantize_bf16_to_fp8_e4m3_per_token_group",
+    "quant::quantize_bf16_to_int8_per_channel",
+    // The second loader quantizer. See the block above
+    // `quant::quantize_bf16_to_fp8_e4m3_per_channel`.
     "quant::quantize_bf16_to_mxfp4_e2m1_per_block",
-    "rope::rope_partial_bf16_position_delta",
+    // `rope::rope_partial_bf16_position_delta` STOOD HERE, and the line goes
+    // because the symbol did: it left `sigs()` in the kernel-x sweep, and a
+    // remainder of `declared` minus `stated` cannot hold what nothing
+    // declares. Its entry predicted this exact failure and was left standing
+    // to carry the evidence until someone decided which way it went. This is
+    // that decision, and it goes the way the entry expected.
+    //
+    // What the entry established is still true, which is why nothing here
+    // argues for bringing the row back: the symbol is unreachable from BOTH
+    // ends. Its arm is `unbound` at `driver-cuda/src/bind/arms/rope.rs:261`
+    // -- *"the offset added to every position. A fact about a draft/verify
+    // pairing that no statement carries"* -- and no `dsl::cuda` builder
+    // records it, which is what put it on this list to begin with. The
+    // device text is untouched, so a draft/verify deployment that wants it
+    // needs a statement, a row and an arm TOGETHER, exactly as §54's four
+    // `layout` wrappers above do.
+    //
+    // `kernels-cuda/tests/stated_columns.rs`'s `DEPARTED` pins the same
+    // departure from the other side, and its `why` still points here for
+    // *"the second, currently-masked failure this departure causes"*. That
+    // sentence is what this edit makes stale; the departure it records is
+    // unchanged and correct.
+    //
+    // An f16 twin, and the rope family's only one. See the block above
+    // `attn::logit_softcap_f16`.
+    "rope::rope_partial_f16",
+    // THE THREE PLAIN ARGMAXES (3), and what they are missing is not a
+    // caller but a JOB. Sampling is not a model text's to state: the greedy
+    // readout a fire performs is a tensor program, `tensor-ir`'s
+    // `Op::ReduceArgmax` lowered by `tensor-compiler`'s CUDA codegen into
+    // the region's own generated kernel, which never enters this crate at
+    // all. So no `dsl::cuda` builder records these, no arm binds them, and
+    // no host program here calls them -- checked, not assumed.
+    //
+    // The one `sample` routine a text DOES state is the contrast that makes
+    // the rule readable. `sample::lm_head_gemv_argmax_int8` is stated
+    // because it is a GEMM as much as an argmax: it folds the int8 LM head
+    // into the readout, and a weight is exactly the kind of thing a model
+    // text owns. Take the head away and what is left belongs to the sampler.
+    //
+    // Declared and unreached, then, like §54's four `layout` wrappers -- but
+    // for the opposite reason. Those lost a wrapper that had existed; these
+    // never had one, because the work moved to another compiler.
+    "sample::argmax_bf16",
+    "sample::argmax_compact_scatter_bf16",
+    "sample::argmax_f32",
+    // `OpKind::GdnPrep`, and one of the seven, in sort order rather than
+    // beside the rest. See the block above `attn::split_qkv_bf16`.
+    "ssm::qwen_gdn_post_conv_prep_bf16",
 ];
 
 /// The table covers every symbol `dsl::cuda` can record.
@@ -200,7 +466,35 @@ const UNSTATED_ROWS: &[&str] = &[
 /// nothing states is a symbol nothing can reach.
 #[test]
 fn the_table_covers_the_dsl_surface() {
-    let dsl = include_str!("../../model-compiler/src/dsl.rs");
+    // The authoring surface is SIX files since `model-dsl` stopped being one
+    // 7,756-line `lib.rs`, and this scan is a text scan: reading only the
+    // root would now see none of the CUDA wrappers, which is the entire
+    // subject. `concat!` puts the files back into one string rather than
+    // this test learning where a symbol lives -- what it asserts is a
+    // property of the SURFACE, not of any file in it.
+    //
+    // Every file is included, not just `cuda.rs`, because a wrapper moving
+    // between them must not change the answer. That is the same reason the
+    // scan reads source at all instead of calling anything: a symbol that
+    // stops being stated has to show up here.
+    let dsl = concat!(
+        include_str!("../../model-dsl/src/lib.rs"),
+        include_str!("../../model-dsl/src/ops.rs"),
+        include_str!("../../model-dsl/src/guard.rs"),
+        include_str!("../../model-dsl/src/rows.rs"),
+        include_str!("../../model-dsl/src/cuda/mod.rs"),
+        include_str!("../../model-dsl/src/cuda/attn.rs"),
+        include_str!("../../model-dsl/src/cuda/base.rs"),
+        include_str!("../../model-dsl/src/cuda/deepseek_v4.rs"),
+        include_str!("../../model-dsl/src/cuda/gemma.rs"),
+        include_str!("../../model-dsl/src/cuda/mla.rs"),
+        include_str!("../../model-dsl/src/cuda/moe.rs"),
+        include_str!("../../model-dsl/src/cuda/qwen_3_5.rs"),
+        include_str!("../../model-dsl/src/cuda/rope.rs"),
+        include_str!("../../model-dsl/src/cuda/ssm.rs"),
+        include_str!("../../model-dsl/src/cuda/tp.rs"),
+        include_str!("../../model-dsl/src/metal.rs"),
+    );
     let mut stated: Vec<&str> = dsl
         .split('"')
         .skip(1)
@@ -238,7 +532,13 @@ fn the_table_covers_the_dsl_surface() {
                 "mla_absorb_",
                 "merge_",
                 "flashinfer_",
-                "pie_lora",
+                // `"pie_lora"` STOOD HERE and matches nothing now. It existed
+                // for one symbol, `pie_lora_qkv_correction`, which was bare --
+                // no namespace at all -- so no family prefix could reach it and
+                // this list had to name it. It is `gemm::lora_qkv_correction`,
+                // caught by `"gemm::"` two lines down, and the entry it needed
+                // dies with it. That is what a namespace buys, stated as a
+                // deletion.
                 "qwen35_verify",
                 // One line per family as step 3 lands; when the last
                 // `launch_` is gone the first five entries can go too.
@@ -495,7 +795,7 @@ fn live_traces_satisfy_the_table() {
 /// it at load.
 #[test]
 fn a_weight_representation_states_its_kernel() {
-    use model_compiler::dsl::{MatW, ScaleLayout, WeightRepr};
+    use model_dsl::{MatW, ScaleLayout, WeightRepr};
 
     let dense = MatW::dense("layer.0.q_proj".into(), 2048, Some(0));
     assert_eq!(dense.gemm_symbol(), None, "a dense weight chooses nothing");
@@ -540,7 +840,7 @@ fn a_weight_representation_states_its_kernel() {
         // weight's own — not a second naming convention.
         assert!(w.scale_names()[0].starts_with("layer.0.q_proj."));
         assert!(
-            sig_in(Backend::Cuda, symbol).is_some(),
+            sig(symbol).is_some(),
             "{symbol} needs a kernel! row or `check_plan` refuses it at load"
         );
     }
@@ -584,7 +884,7 @@ fn the_kernels_a_semantic_kind_fans_to_are_declared() {
     let mut missing: Vec<String> = Vec::new();
     for (kind, symbols) in FANS {
         for s in *symbols {
-            if sig_in(Backend::Cuda, s).is_none() {
+            if sig(s).is_none() {
                 missing.push(format!("{kind} -> {s}"));
             }
         }

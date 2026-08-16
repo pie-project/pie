@@ -38,6 +38,10 @@
 //! sub-`0x100` class, fails a test instead of quietly widening the damage.
 
 /// One named region of the fault space.
+///
+/// `Copy` and the comparison traits are derived because the drivers re-export
+/// this rather than restating it, and a decoder walks the table by value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FaultClass {
     /// The value written for channel 0. Per-channel classes write `base + channel`.
     pub base: u32,

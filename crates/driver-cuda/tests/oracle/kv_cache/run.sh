@@ -11,6 +11,12 @@
 # shape; the recorder simply writes down what it was handed instead of throwing
 # it away. Everything about WHICH tensors exist -- the aliasing, the scale
 # tier, the dequantisation mirror, the envelope guard -- is shipping code.
+#
+# `kernels-cuda` above and in `KSRC` below is the ARCHIVE crate -- CMake+nvcc,
+# a `csrc/` of host `.hpp` and `.cpp` -- deleted whole at `85c6c674b`, and the
+# headers this copies out of `$KSRC` went with it. The lines are left
+# unchanged because they record the command that took the golden, not a path
+# anyone can follow.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

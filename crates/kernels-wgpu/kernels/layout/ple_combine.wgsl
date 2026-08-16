@@ -14,11 +14,11 @@
 
 //#include "common/bf16.inc.wgsl"
 
-@group(0) @binding(0) var<storage, read> proj: array<u32>;
-@group(0) @binding(1) var<storage, read> token: array<u32>;
+@group(0) @binding(0) var<storage, read_write> proj: array<u32>;
+@group(0) @binding(1) var<storage, read_write> token: array<u32>;
 @group(0) @binding(2) var<storage, read_write> out_: array<u32>;
 struct PleCombineParams { inv_sqrt2: f32, n: u32 }
-@group(0) @binding(3) var<storage, read> params: PleCombineParams;
+@group(0) @binding(3) var<storage, read_write> params: PleCombineParams;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {

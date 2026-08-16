@@ -3,7 +3,7 @@
 //! `driver-metal` answers a [`Rule`] with a thread grid AND a threadgroup,
 //! because `dispatchThreads` takes both and Metal sizes the group at dispatch.
 //! `vkCmdDispatch` takes neither. It takes a count of WORKGROUPS, and the size
-//! of one is `layout(local_size_x = ...)` in the GLSL — fixed when `glslc` ran,
+//! of one is `[numthreads(...)]` on the entrypoint — fixed when `slangc` ran,
 //! months before any fire.
 //!
 //! So this module cannot be a port of `lowering/grid.rs`. The Metal shapes are
@@ -32,7 +32,7 @@
 //! merely honest about it:
 //!
 //! * `SdpaVector` compiles one module per head dimension — 64, 128, 256, 512 —
-//!   and each declares `local_size_x = PIE_HEAD_DIM`. A geometry that assumed
+//!   and each declares `[numthreads(PIE_HEAD_DIM, 1, 1)]`. A geometry that assumed
 //!   256 would launch a quarter of the workgroups for a 64-wide head.
 //! * `Elementwise` is 256 wide in nineteen of its twenty modules and 16x16 in
 //!   `geglu_tanh_strided`, which is laid out per (channel, row).
@@ -114,7 +114,7 @@ impl Tile {
     /// Parsing the NAME rather than carrying a field, because the name is where
     /// the truth is: `kernels-vulkan/src/axes.rs` builds these variants by
     /// appending `_bm_N` and `_bn_N`, and the same suffix is what selects the
-    /// `-D` that `glslc` compiled the tile from. A separate field could drift
+    /// `-D` that `slangc` compiled the tile from. A separate field could drift
     /// from the module; the suffix cannot.
     #[must_use]
     pub fn from_entrypoint(name: &str) -> Option<Self> {
@@ -208,7 +208,7 @@ pub enum Ungeometric {
     /// a fire of another.
     ///
     /// Not an arithmetic condition -- the driver selected the wrong module.
-    /// `sdpa_vector.comp` declares `local_size_x = PIE_HEAD_DIM`, so the
+    /// `sdpa_vector.slang` declares `[numthreads(PIE_HEAD_DIM, 1, 1)]`, so the
     /// module's own workgroup width IS the head width it was built for, and
     /// all 13 entrypoints agree with the `_d_N` in their name. That makes a
     /// mis-selection detectable HERE, before the dispatch, instead of showing
@@ -299,12 +299,32 @@ pub fn lanes(rule: Rule, dims: Dims, module: Module) -> Result<[u32; 3], Ungeome
         // and not behind a `_`, so that the next rule the fleet adds stops
         // this build rather than reaching a fire.
         //
-        // The mamba four (`RecurrentScan`, `PerRow`, `PerChannel`,
-        // `ElementwiseIn`, `WarpTiledScan`, `PerRowNarrow`), MLA's prepare,
-        // the paged-score taps `driver-vulkan` advertises `has_attn_score:
-        // false` for, the packed-head attentions, gemma-4's alt-up, and the
-        // two routed-qmv variants whose transposed and quad forms
-        // `quant/qmv.comp` does not compile.
+        // Every name below is accounted for here, and
+        // `every_refused_rule_is_a_rule_this_comment_accounts_for` is what
+        // keeps that true -- an earlier draft said "the mamba four" and then
+        // named six, and left six more with no mention at all.
+        //
+        // The mamba/recurrent block: `RecurrentScan`, `PerRow`, `PerChannel`,
+        // `ElementwiseIn`, `WarpTiledScan` and `PerRowNarrow`.
+        //
+        // The six CUDA launcher shapes that arrived with the sparse-attention
+        // and rope work, none of which has a shader here: `RowScores` (one
+        // block a row with a float of shared scratch PER ROW of the causal
+        // rectangle, which is not a shape a rounded-up `Rms` may stand in
+        // for), `RowsPerHead` (`Rms`' grid with the per-head reading folded
+        // in), `RowsFlat` (one THREAD a row, not one block), `Slab` (a CAPPED
+        // grid-stride walk, so a launch shape and not a cover), `Tile16` (the
+        // only 2-D block in the vocabulary, whose kernels read
+        // `threadIdx.y`), and `AxialRope` (one warp per (head, row) with
+        // `grid.x` literally one).
+        //
+        // Then MLA's prepare (`MlaPrepare`), the paged-score taps
+        // `PagedScores` and `PagedScoresDecode` that `driver-vulkan`
+        // advertises `has_attn_score: false` for, the three packed-head
+        // attentions `RowsPackedHeads`, `RowsPackedHeadsNarrow` and
+        // `WarpPackedHeads`, gemma-4's alt-up (`AltUpStreams`), and
+        // `RoutedQmvTransposed` and `RoutedQmvQuad`, whose transposed and quad
+        // forms `quant/qmv.slang` does not compile.
         Rule::RecurrentScan
         | Rule::PerRow
         | Rule::PerChannel
@@ -340,7 +360,7 @@ pub fn lanes(rule: Rule, dims: Dims, module: Module) -> Result<[u32; 3], Ungeome
         // buffer therefore kept its zeros while every routed token was
         // combined under `sigmoid(0)`.
         // The ROW goes on x, beside the 32 lanes of one subgroup -- Metal's
-        // `qmv_mb` is `32 * n` wide and `quant/qmv.comp` reads
+        // `qmv_mb` is `32 * n` wide and `quant/qmv.slang` reads
         // `gl_WorkGroupID.x` as exactly that index. A first draft put rows on
         // z instead, where the shader never looks: it computed row 0, left
         // every other row holding its buffer's zeros, and returned success.
@@ -389,7 +409,7 @@ pub fn lanes(rule: Rule, dims: Dims, module: Module) -> Result<[u32; 3], Ungeome
             } else {
                 dims.width.div_ceil(axis)
             };
-            // Every row on ONE axis, because `norm/rms.comp` takes its row
+            // Every row on ONE axis, because `norm/rms.slang` takes its row
             // from `gl_WorkGroupID.x` and never mentions y. A first draft put
             // the count on y: it launched a single workgroup on x, computed
             // row 0, left rows 1.. holding the zeros their buffer was born
@@ -429,10 +449,34 @@ pub fn lanes(rule: Rule, dims: Dims, module: Module) -> Result<[u32; 3], Ungeome
                 });
             }
             // The head count MULTIPLIES the workgroup width rather than
-            // standing on its own axis: `sdpa_vector.comp` is one workgroup
+            // standing on its own axis: `sdpa_vector.slang` is one workgroup
             // per head, and `gl_NumWorkGroups.y` is the row count it reads.
             [head_dim * dims.q_heads, rows, 1]
         }
+        // One workgroup per (query head, TILE of query rows), which is the
+        // shape `attn/sdpa_paged.slang`'s `PIE_TILED` body reads: `group.x` is
+        // the head, `group.y * 32 + local.y` is the row, and `gl_NumWorkGroups
+        // .x` is the head count. The tile height is the module's own `local.y`
+        // -- 32 -- and not a number stated here, for `SdpaVector`'s reason: a
+        // driver that picked a tile the shader was not built for would get a
+        // grid that looks reasonable and an answer that is not.
+        //
+        // The rows round UP, which `groups` does by dividing by `local.y`, and
+        // the rows of the last tile that are past the end are exactly why the
+        // row hands the kernel `Source::Rows`: they stay in the loop, reach
+        // every barrier, and contribute nothing. `driver-metal`'s `sdpa_tiles`
+        // is the same grid with the multiply written out, because a Metal
+        // dispatch takes threads and quantises at the threadgroup.
+        // The matrix-unit tier is the SAME grid here, and that is a real
+        // difference from `driver-metal` rather than a copy. Metal's mma
+        // threadgroup is 128 threads -- four simdgroups of eight query rows --
+        // because a Metal simdgroup owns eight rows on the matrix unit.
+        // `attn/sdpa_paged_mma.slang` is `[numthreads(32, 32, 1)]` like the
+        // scalar tile, with `local.y` the query row and `group.y * 32` its
+        // base, so the workgroup count is identical and only what happens
+        // inside one differs. Taking Metal's 128 would dispatch a quarter of
+        // the tiles this shader needs and leave three rows in four unwritten.
+        Rule::SdpaTiled | Rule::SdpaMma => [dims.q_heads * module.local.at(0), rows, 1],
         Rule::PerHeadElementwise => [dims.q_heads * dims.head_dim, 1, 1],
         Rule::GatedRms => [dims.head_dim, dims.kv_heads, 1],
 
@@ -475,7 +519,7 @@ pub fn lanes(rule: Rule, dims: Dims, module: Module) -> Result<[u32; 3], Ungeome
 ///
 /// That last clause is only true of 631 of the 665 modules, and the exception
 /// is the more interesting half. Thirty-four of them read `gl_NumWorkGroups`
-/// and use it as a QUANTITY rather than a bound: `rope/neox.comp` takes
+/// and use it as a QUANTITY rather than a bound: `rope/neox.slang` takes
 /// `gl_NumWorkGroups.x` as the rotary pair count it strides each pair's partner
 /// by and divides the frequency exponent by. For those an extra workgroup does
 /// not run a guarded lane, it changes the arithmetic every lane does, and the
@@ -571,7 +615,7 @@ mod tests {
                     tile: (rule == Rule::Qmm).then_some(Tile { rows: 32, cols: 64 }),
                 };
                 // Decode attention is compiled per head width -- its
-                // `local_size_x` IS `PIE_HEAD_DIM` -- so a sweep over workgroup
+                // the x extent IS `PIE_HEAD_DIM` -- so a sweep over workgroup
                 // shapes has to move the fire's head width with it. Otherwise
                 // the rule refuses five of the six shapes and the sweep proves
                 // nothing about the family it most needed to.
@@ -609,12 +653,27 @@ mod tests {
         );
     }
 
-    /// Every launch rule this backend has a module for.
+    /// Every launch rule this backend lays a grid out for.
     ///
     /// `kernels::LaunchRule` is the whole fleet's vocabulary, and most of it
     /// is CUDA's: mamba scans, MLA, the paged-score taps, packed-head
-    /// attentions, gemma-4's alt-up. This is the part `kernels-vulkan`
-    /// compiles a shader for, and `lanes` answers for exactly these.
+    /// attentions, gemma-4's alt-up. `lanes` answers for exactly the rules
+    /// below and refuses the rest by name.
+    ///
+    /// This list is NOT the same as "what `kernels-vulkan` has a shader for",
+    /// which is what it used to claim. It is two rules longer. `GatedRms` and
+    /// `PerHeadElementwise` are laid out here and named by no Vulkan row --
+    /// `kernels-cuda` states them on `attn_sink_correction`,
+    /// `per_head_rmsnorm` and three SSM rows, and this backend has no shader
+    /// for any of those. The grids are right; they are simply written ahead
+    /// of the table rather than behind it, and a reader counting coverage off
+    /// this list would have counted two kernels that do not exist here.
+    ///
+    /// `rules.rs`'s `every_rule_the_table_names_is_one_this_driver_can_lay_out`
+    /// is what keeps that gap counted: it reads the table, asserts all
+    /// fifteen rules it names are served, and names those two as the
+    /// difference -- in both directions, so a row that starts naming either
+    /// one fails until the list is corrected.
     const SERVED: &[Rule] = &[
         Rule::Qmv,
         Rule::Rms,
@@ -623,6 +682,8 @@ mod tests {
         Rule::ElementwiseRows,
         Rule::PerHead,
         Rule::SdpaVector,
+        Rule::SdpaTiled,
+        Rule::SdpaMma,
         Rule::PerHeadElementwise,
         Rule::GatedRms,
         Rule::RouterLane,
@@ -682,6 +743,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every rule `lanes` refuses by name is a rule its comment explains.
+    ///
+    /// `the_rules_this_backend_serves_are_exactly_the_ones_with_shaders`
+    /// already keeps the SET honest: a rule the fleet adds is either served or
+    /// refused, and the compiler stops the build until someone chooses. What
+    /// nothing kept honest was the PROSE beside the arm, and it had gone bad
+    /// in both available ways at once -- it opened with "the mamba four" and
+    /// then named six, and six further rules (`RowScores`, `RowsPerHead`,
+    /// `RowsFlat`, `Slab`, `Tile16`, `AxialRope`) appeared in the arm with no
+    /// mention anywhere above it.
+    ///
+    /// That is the same failure `SERVED`'s doc had, and it matters for the
+    /// same reason: the arm says a rule is refused, and only the comment says
+    /// WHY -- whether this backend lacks the shader, lacks the grid, or
+    /// deliberately advertises the capability off. A reader deciding whether
+    /// to implement one reads the comment, and an unnamed rule reads as an
+    /// oversight when it is a decision.
+    ///
+    /// So this reads the comment lines between the arm's opening line and its
+    /// `Unruled` return, and requires each refused rule to be named in
+    /// backticks among them. Adding a rule to the arm without a word about it
+    /// now fails here rather than merely compiling.
+    #[test]
+    fn every_refused_rule_is_a_rule_this_comment_accounts_for() {
+        const SRC: &str = include_str!("geometry.rs");
+
+        let open = SRC
+            .find("// Rules for blocks this backend has no shaders for.")
+            .expect("the arm's opening comment line moved");
+        let close = SRC[open..]
+            .find("=> return Err(Ungeometric::Unruled(rule)),")
+            .expect("the arm's return moved")
+            + open;
+        let prose: String = SRC[open..close]
+            .lines()
+            .filter(|l| l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut unnamed = Vec::new();
+        for &rule in kernels::LaunchRule::ALL {
+            if SERVED.contains(&rule) || rule == Rule::Unstated {
+                continue;
+            }
+            if !prose.contains(&format!("`{rule:?}`")) {
+                unnamed.push(format!("{rule:?}"));
+            }
+        }
+        assert!(
+            unnamed.is_empty(),
+            "`lanes` refuses {unnamed:?} and its comment says nothing about \
+             them. Say which of the three it is -- no shader, no grid, or a \
+             capability this driver advertises off -- rather than leaving the \
+             next reader to guess from the name."
+        );
     }
 
     /// Which rules answer a grid with a zero in it, stated exactly.
@@ -787,6 +905,8 @@ mod tests {
                 "Qmv/width",
                 "Rms/width",
                 "RouteRows/width",
+                "SdpaMma/q_heads",
+                "SdpaTiled/q_heads",
                 "SdpaVector/q_heads",
                 "SplitPacked/in_width",
             ],

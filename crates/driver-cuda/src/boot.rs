@@ -73,10 +73,59 @@ pub const KV_PAGE_SIZE: i32 = 16;
 pub struct Boot {
     /// Run ahead of the device: return from a launch before the fire
     /// retires. `[driver] runahead`, `PIE_CUDA_RUNAHEAD`.
+    ///
+    /// It was OFF, and the reason was honest: `pie_cuda_launch` used to
+    /// finish the fire before it returned, and a caller reading the ring
+    /// on the next line was asserting that. The gate protected a CONTRACT
+    /// CHANGE.
+    ///
+    /// It is on because the contract is now the ABI's: the notify says the
+    /// fire retired, the engine waits for it, and this tree's tests do
+    /// too. And because there is finally something to gain — a warm decode
+    /// issues in 0.68 ms and retires 3.75 ms later, so the call returns
+    /// with 3 ms of GPU work queued behind it. When the gate was written
+    /// those two numbers were the same, and run-ahead bought nothing.
     pub runahead: bool,
     /// Capture fires into a unionized supergraph. `PIE_CUDA_SUPERGRAPH`.
+    ///
+    /// It was OFF, deliberately, with this reason: every A/B in the tree
+    /// pins the EAGER leg, and a capture is an optimisation that has to
+    /// prove itself against that rather than replace it silently. It has
+    /// now proved it, on the three claims that were the actual doubt:
+    ///
+    /// - the whole ABI suite records and replays (19/19 with the gate on),
+    ///   which is every family this shell opens and every fire shape it
+    ///   serves;
+    /// - one exec runs two structurally distinct KV-write programs and
+    ///   returns byte-identical logits, selected by a byte of device
+    ///   memory (`bridge_smoke::the_union_captures_and_replays_the_same_\
+    ///   decode`, in the 5,097-line target deleted with `bind::abi::ffi` —
+    ///   the property is recorded here because nothing else states it);
+    /// - and one exec serves a SECOND fire's tokens
+    ///   (`a_cached_exec_serves_the_next_fire`), which is the property that
+    ///   makes a cached exec worth caching and the only one that can tell
+    ///   a baked address from baked contents.
+    ///
+    /// What cannot be replayed still refuses rather than being captured
+    /// wrong: recurrent-state families stay eager at the LOWERING
+    /// decision, and an arm whose prepared state the fire declines to
+    /// build is refused. So default-on changes which leg runs, not which
+    /// answers are possible.
+    ///
+    /// The knob inverts rather than disappears, because a default is a
+    /// judgement and a judgement should stay reversible without a rebuild.
     pub supergraph: bool,
     /// Trace the supergraph's decisions to stderr.
+    ///
+    /// **Nothing reads this field**, and the knob it names still works:
+    /// `fire::launch::sg_trace` reads `PIE_CUDA_TRACE_SUPERGRAPH` itself,
+    /// lazily, at each of its fourteen call sites. That is the same
+    /// second-parser shape this struct exists to end, and it is left
+    /// standing on purpose rather than by oversight — routing it here
+    /// means threading a `Boot` to fourteen sites deep inside the launch
+    /// walk, for a knob whose only cost when unset is one `getenv`. The
+    /// field is the record that the two are meant to be one; closing it is
+    /// a change to `sg_trace`'s signature, not to this line.
     pub trace_supergraph: bool,
     /// Apply weight transforms on the device rather than the host.
     pub device_transforms: bool,

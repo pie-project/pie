@@ -21,9 +21,9 @@
 //! Nothing reaches the driver as a descriptor to switch on. A width is
 //! a width; a symbol is a symbol.
 
-use model_compiler::dsl::{self, MatW, NormW, ScaleLayout, WeightRepr, matmul, rmsnorm};
 use model_compiler::lower::{Buffers, Fire, Row, lower};
-use model_compiler::trace::{DType, Dim, GuardPred, NormVariant, OpKind, Shape};
+use model_dsl::{self as dsl, MatW, NormW, ScaleLayout, WeightRepr, matmul, rmsnorm};
+use model_ir::trace::{DType, Dim, GuardPred, NormVariant, OpKind, Shape};
 
 /// One deployment's facts, as a load would derive them.
 struct Facts {
@@ -51,7 +51,7 @@ fn awq_int4() -> WeightRepr {
     }
 }
 
-fn spec(f: &Facts) -> model_compiler::trace::ForwardPlan {
+fn spec(f: &Facts) -> model_ir::trace::ForwardPlan {
     let shard = |w: u32| w / f.tp_size;
     let hq = shard(f.q_heads * f.head_dim);
     let hk = shard(f.kv_heads * f.head_dim);

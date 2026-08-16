@@ -22,65 +22,34 @@ use std::ffi::c_void;
 
 use super::sideband_arena::DeviceMemory;
 
-/// `q_proj` — consumed.
-pub const LORA_SITE_Q: u64 = 1 << 0;
-/// `k_proj` — reserved.
-pub const LORA_SITE_K: u64 = 1 << 1;
-/// `v_proj` — consumed.
-pub const LORA_SITE_V: u64 = 1 << 2;
-/// `o_proj` — reserved.
-pub const LORA_SITE_O: u64 = 1 << 3;
-/// gate/up — reserved.
-pub const LORA_SITE_GATE_UP: u64 = 1 << 4;
-/// `down_proj` — reserved.
-pub const LORA_SITE_DOWN: u64 = 1 << 5;
-/// Every bit the vocabulary defines.
-pub const LORA_SITES_KNOWN: u64 =
-    LORA_SITE_Q | LORA_SITE_K | LORA_SITE_V | LORA_SITE_O | LORA_SITE_GATE_UP | LORA_SITE_DOWN;
-/// The bits v0 actually applies. A lane naming any other known bit binds
-/// fine and is refused loudly at first use — a silently ignored site
-/// would be a request whose adapter never applied while every sample
-/// still returned.
-pub const LORA_SITES_CONSUMED: u64 = LORA_SITE_Q | LORA_SITE_V;
-
-/// The adapter FORM — the sink's arity selects it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(u32)]
-pub enum LoraForm {
-    /// 3 args: low-rank `y += B(Ax)`.
-    #[default]
-    LowRank = 0,
-    /// 2 args: SCALE `y = l ⊙ y` (IA3) — `a` holds the l vector, `b`
-    /// null, rank/d_in zero.
-    Scale = 1,
-}
-
-/// One lane's resolved `lora` sink. Ports `LoraLaneView`; the header
-/// carries the field-by-field story.
-#[derive(Debug, Clone, Copy)]
-pub struct LoraLaneView {
-    /// The A channel's committed cell, f32, `[num_layers, R, d_in]`.
-    pub a: *const c_void,
-    /// The B channel's committed cell, f32, `[num_layers, d_out, R]`;
-    /// the LoRA scale is folded into the contents.
-    pub b: *const c_void,
-    /// The SITES placement bitmask — structure, not contents.
-    pub sites_bits: u64,
-    /// The lane's span in fire token rows.
-    pub token_start: u32,
-    /// Rows in the span.
-    pub token_count: u32,
-    /// Adapter geometry, element counts.
-    pub num_layers: u32,
-    /// The rank; zero on a scale lane.
-    pub rank: u32,
-    /// Input width; zero on a scale lane.
-    pub d_in: u32,
-    /// Output width.
-    pub d_out: u32,
-    /// Low-rank or scale.
-    pub form: LoraForm,
-}
+// ── THE LAUNCH HALF OF THIS FILE IS `kernels_cuda::gemm::lora` ────────
+//
+// `LoraFireState::apply` -- the three passes, the slot arithmetic and the
+// four kinds of matmul in them -- descended under
+// `.wiki/kernel-x/refactor-plan.md` §6.3, and `Lane`, `Group`, `bf16_row`
+// and the site vocabulary went with it. The symbol went too:
+// `pie_lora_qkv_correction` is `gemm::lora_qkv_correction`, so that its row
+// can derive from a `fn` in a family instead of being hand-written in
+// `not_yet_crossed.rs` -- a bare symbol has no namespace, and a namespace is
+// what `Family::symbol` is half made of.
+//
+// **What stayed is what could not go**: `stage` reaches
+// `sideband_arena::DeviceMemory`, a trait with five implementors in this
+// crate, and lays its casts down in a per-FIRE bump arena with
+// retire-on-grow. `kernels_cuda`'s two device-memory shapes are per-CALL
+// (`Ctx`) and per-PROCESS (`jit::device`'s scratch); neither is a fire. So
+// the arithmetic went and the lifetime stayed, which is the line FA2's
+// descent drew as well.
+//
+// The vocabulary is re-exported rather than re-spelled: `fire::launch` and
+// `tests/lora_stage_parity.rs` name these through this module, and a
+// re-export makes every one of them keep resolving to the one definition.
+use kernels_cuda::gemm::lora::{Group, Lane, Staged, bf16_row};
+pub use kernels_cuda::gemm::lora::{
+    LORA_SITE_DOWN, LORA_SITE_GATE_UP, LORA_SITE_K, LORA_SITE_O, LORA_SITE_Q, LORA_SITE_V,
+    LORA_SITES_CONSUMED, LORA_SITES_KNOWN, LoraForm, LoraLaneView,
+};
+use kernels_cuda::jit::abi::bf16;
 
 /// The launch's resolved lora configuration — a borrowed view, valid for
 /// the fire. Ports `LoraTable`.
@@ -222,11 +191,11 @@ impl LoraOps for LiveLoraOps {
         // the same assertion this method made when it handed the stream to
         // `ffi::pie_k_quant_cast_fp32_to_bf16`, which put it in a `<<<>>>`.
         let fired = unsafe {
-            let ctx = kernels_cuda_new::jit::Ctx::on(self.stream);
-            kernels_cuda_new::x::quant::cast_fp32_to_bf16(
+            let ctx = kernels_cuda::jit::Ctx::on(self.stream);
+            kernels_cuda::quant::cast_fp32_to::<bf16>(
                 &ctx,
                 src.cast::<f32>(),
-                dst.cast::<kernels_cuda_new::x::abi::bf16>(),
+                dst.cast::<kernels_cuda::jit::abi::bf16>(),
                 elems,
             )
         };
@@ -285,7 +254,7 @@ pub fn lora_grouped_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
 /// Every other piece of the adapter path exists: [`read_lora_sink`]
 /// resolves the plan, [`lane_for_instance`] resolves the addresses,
 /// [`stage_qkv_adapters`] builds the state, and the executor's
-/// `pie_lora_qkv_correction` arm applies it. What is not decided is
+/// `gemm::lora_qkv_correction` arm applies it. What is not decided is
 /// WHICH of the fire's named values these five pointers are.
 ///
 /// It is not plumbing. The staging reads `rows.q` and `rows.v` to build
@@ -297,7 +266,7 @@ pub fn lora_grouped_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
 /// `LlamaLikeFacts::norm_placement`.
 ///
 /// So the resolution is: find the launch that states
-/// `pie_lora_qkv_correction`, read its operand join the way
+/// `gemm::lora_qkv_correction`, read its operand join the way
 /// [`crate::fire::launch::attention_pins`] reads attention's, and
 /// take q and v from there. That is the same shape as the fix that
 /// replaced attention's positional read, and for the same reason — a
@@ -316,31 +285,12 @@ pub struct LoraStageRows {
     pub gate: *mut c_void,
 }
 
-#[derive(Debug)]
-struct Lane {
-    view: LoraLaneView,
-    a_bf16: *mut c_void,
-    b_bf16: *mut c_void,
-    xa_offset: usize,
-    grouped: bool,
-}
-
-#[derive(Debug, Default)]
-struct Group {
-    rank: i32,
-    d_in: i32,
-    d_out: i32,
-    members: Vec<usize>,
-    nq: i32,
-    nv: i32,
-    m: Vec<i32>,
-    mq: Vec<i32>,
-    mv: Vec<i32>,
-    slab_off: usize,
-}
-
-/// The fire-scoped staging — `LoraFireState`, construction half. Slice B
-/// adds `apply`.
+/// The fire-scoped staging — `LoraFireState`, construction half.
+///
+/// `Lane` and `Group` are `kernels_cuda::gemm::lora`'s now, because every
+/// field of both exists to be read by the launch this state was staged for.
+/// This type writes them and hands them over as a [`Staged`]; see
+/// [`Self::staged`].
 #[derive(Debug)]
 pub struct LoraFireState {
     lanes: Vec<Lane>,
@@ -355,15 +305,27 @@ pub struct LoraFireState {
     /// the value and the thing it describes cannot be separated — the
     /// bucket key needs it, and a key that has to be given a number
     /// separately is a key that will one day be given the wrong one.
+    ///
+    /// Its readers — `recordings::capture_digest` and the bucket key in
+    /// `fire::launch` — are both `feature = "abi"`, and this file is not, so
+    /// a build that cannot fire computes the fingerprint and has nothing to
+    /// key on. That is the honest shape rather than a defect: staging an
+    /// adapter is a host job the portable half still does, and gating the
+    /// FIELD would mean gating every line that fills it.
+    #[cfg_attr(
+        not(feature = "abi"),
+        expect(dead_code, reason = "both readers are behind `abi`")
+    )]
     pub(crate) capture_fingerprint: u64,
 }
 
-/// `base + row * width` bf16 elements — the C++ `bf16_row`.
-fn bf16_row(base: *const c_void, row: u32, width: i32) -> *const c_void {
-    let off = row as usize * usize::try_from(width.max(0)).unwrap_or(0) * 2;
-    // SAFETY: offset arithmetic only; the result crosses the ops seam.
-    unsafe { base.cast::<u8>().add(off).cast() }
-}
+// `bf16_row` STOOD HERE and is `kernels_cuda::gemm::lora::bf16_row`. It
+// was the one function this file's two halves BOTH used -- the staging
+// addresses a row to put it in the slab, the launch addresses the same row to
+// accumulate into it -- so leaving a copy behind would have been the same row
+// stride computed on two sides of a crate boundary. That is the shape §6.3
+// exists to find, and finding it in the file being split is the cheapest
+// place it can be found.
 
 impl LoraFireState {
     /// The constructor: validate every lane, stage the bf16 casts, group
@@ -388,7 +350,9 @@ impl LoraFireState {
     ) -> Result<Self, LoraStageError> {
         arena.reset();
         if tp_size != 1 {
-            return Err(LoraStageError("lora is not supported under tensor parallelism".into()));
+            return Err(LoraStageError(
+                "lora is not supported under tensor parallelism".into(),
+            ));
         }
         let mut me = Self {
             // Filled by `stage_qkv_adapters`, which is the only thing
@@ -403,7 +367,9 @@ impl LoraFireState {
         for lane in table.lanes {
             let scale_lane = lane.form == LoraForm::Scale;
             if lane.a.is_null() || (!scale_lane && lane.b.is_null()) {
-                return Err(LoraStageError("lora lane carries a null adapter address".into()));
+                return Err(LoraStageError(
+                    "lora lane carries a null adapter address".into(),
+                ));
             }
             if lane.sites_bits == 0 {
                 return Err(LoraStageError("lora lane names no site".into()));
@@ -490,7 +456,13 @@ impl LoraFireState {
             let b_bf16 = arena.alloc(ops, b_elems * 2);
             ops.cast_fp32_to_bf16(lane.a, a_bf16, a_elems);
             ops.cast_fp32_to_bf16(lane.b, b_bf16, b_elems);
-            me.lanes.push(Lane { view: *lane, a_bf16, b_bf16, xa_offset: 0, grouped: false });
+            me.lanes.push(Lane {
+                view: *lane,
+                a_bf16,
+                b_bf16,
+                xa_offset: 0,
+                grouped: false,
+            });
         }
 
         // Same-shape lane grouping. Key: the GEMM-shape tuple
@@ -558,8 +530,10 @@ impl LoraFireState {
             }
             if me.slab_stride > 0 {
                 let layers = usize::try_from(num_hidden_layers.max(0)).unwrap_or(0);
-                me.ptr_slab = arena
-                    .alloc(ops, layers * me.slab_stride * std::mem::size_of::<*const c_void>());
+                me.ptr_slab = arena.alloc(
+                    ops,
+                    layers * me.slab_stride * std::mem::size_of::<*const c_void>(),
+                );
                 let mut slab_host: Vec<*const c_void> =
                     vec![std::ptr::null(); layers * me.slab_stride];
                 for layer in 0..layers {
@@ -599,7 +573,9 @@ impl LoraFireState {
                             a_run.push(a_l.cast_const().cast::<c_void>());
                             xa_run.push(xa.cast_const().cast::<c_void>());
                             if layer == 0 {
-                                me.groups[gi].m.push(i32::try_from(v.token_count).unwrap_or(0));
+                                me.groups[gi]
+                                    .m
+                                    .push(i32::try_from(v.token_count).unwrap_or(0));
                             }
                             if v.sites_bits & LORA_SITE_Q != 0 {
                                 q_act.push(xa.cast_const().cast::<c_void>());
@@ -623,9 +599,9 @@ impl LoraFireState {
                             }
                         }
                         let mut slot = layer * me.slab_stride + me.groups[gi].slab_off;
-                        for run in
-                            [&staged, &a_run, &xa_run, &q_act, &q_w, &q_y, &v_act, &v_w, &v_y]
-                        {
+                        for run in [
+                            &staged, &a_run, &xa_run, &q_act, &q_w, &q_y, &v_act, &v_w, &v_y,
+                        ] {
                             for &p in run {
                                 slab_host[slot] = p;
                                 slot += 1;
@@ -704,188 +680,40 @@ impl LoraFireState {
         s
     }
 
-    /// SLICE B: the fire-time launches over the staged state — ports
-    /// `LoraFireState::apply` argument for argument. Three passes, in
-    /// the C++'s order: solo lanes (xAᵀ into the shared scratch base,
-    /// then (xAᵀ)Bᵀ accumulated β=1 into the q/v row windows per the
-    /// lane's SITES bits), grouped lanes (slot arithmetic over the
-    /// staged pointer slab + three grouped GEMMs), then the SCALE pass
-    /// last — after every delta, so a same-site low-rank + scale
-    /// composes as s ⊙ (y + B(Ax)), DoRA's order; a lone scale lane is
-    /// IA3 unchanged. The LAYER is the op tag's (never `param1` — the
-    /// bug the C++'s first live A/B caught).
-    #[cfg(feature = "_cuda")]
-    #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
-    pub fn apply(
-        &self,
-        cublas: *mut c_void,
-        layer: i32,
-        qkv_in: *const c_void,
-        h: i32,
-        hq: i32,
-        hk: i32,
-        q_out: *mut c_void,
-        v_out: *mut c_void,
-        xa_scratch: *mut c_void,
-        stream: *mut c_void,
-    ) {
-        use crate::fire::gemm::act_x_wt_bf16;
-        let layer_u = usize::try_from(layer).unwrap_or(0);
-        for lane in &self.lanes {
-            if lane.grouped {
-                continue;
-            }
-            let v = &lane.view;
-            if v.form == LoraForm::Scale {
-                continue; // the scale pass below, after every delta
-            }
-            let t = i32::try_from(v.token_count).unwrap_or(0);
-            let r = i32::try_from(v.rank).unwrap_or(0);
-            let a_l = bf16_row(
-                lane.a_bf16.cast_const(),
-                u32::try_from(layer_u * v.rank as usize).unwrap_or(0),
-                i32::try_from(v.d_in).unwrap_or(0),
-            );
-            let b_l = bf16_row(
-                lane.b_bf16.cast_const(),
-                u32::try_from(layer_u * v.d_out as usize).unwrap_or(0),
-                r,
-            );
-            let x = bf16_row(qkv_in, v.token_start, h);
-            unsafe {
-                // `gemm::act_x_wt_bf16` is `fire::gemm::act_x_wt_bf16` now —
-                // the dense autotuner, in Rust. It used to be
-                // `ffi::pie_k_gemm_act_x_wt_bf16`; that shim entry is gone,
-                // because the row is on `execution::RUST_SERVED` and
-                // `emit_c_shim` skips it.
-                act_x_wt_bf16(cublas, x, a_l, xa_scratch, t, r, h, 0.0);
-                if v.sites_bits & LORA_SITE_Q != 0 {
-                    act_x_wt_bf16(
-                        cublas,
-                        xa_scratch.cast_const(),
-                        b_l,
-                        bf16_row(q_out.cast_const(), v.token_start, hq).cast_mut(),
-                        t,
-                        i32::try_from(v.d_out).unwrap_or(0),
-                        r,
-                        1.0,
-                    );
-                }
-                if v.sites_bits & LORA_SITE_V != 0 {
-                    act_x_wt_bf16(
-                        cublas,
-                        xa_scratch.cast_const(),
-                        b_l,
-                        bf16_row(v_out.cast_const(), v.token_start, hk).cast_mut(),
-                        t,
-                        i32::try_from(v.d_out).unwrap_or(0),
-                        r,
-                        1.0,
-                    );
-                }
-            }
-        }
-        for g in &self.groups {
-            let n = g.members.len();
-            // The slab was fully staged at fire setup — slot arithmetic
-            // and launches, nothing else (what a captured body requires).
-            let slot = unsafe {
-                self.ptr_slab.cast::<*const c_void>().add(layer_u * self.slab_stride + g.slab_off)
-            };
-            let x_ptrs = slot.cast_const();
-            unsafe {
-                let a_ptrs = x_ptrs.add(n);
-                let xa_ptrs = x_ptrs.add(2 * n);
-                grouped_or_panic(
-                    cublas,
-                    x_ptrs,
-                    a_ptrs,
-                    xa_ptrs.cast::<*mut c_void>().cast_mut(),
-                    g.m.as_ptr(),
-                    i32::try_from(n).unwrap_or(0),
-                    g.rank,
-                    g.d_in,
-                    0.0,
-                );
-                if g.nq > 0 {
-                    let base = x_ptrs.add(3 * n);
-                    grouped_or_panic(
-                        cublas,
-                        base,
-                        base.add(g.nq as usize),
-                        base.add(2 * g.nq as usize).cast::<*mut c_void>().cast_mut(),
-                        g.mq.as_ptr(),
-                        g.nq,
-                        g.d_out,
-                        g.rank,
-                        1.0,
-                    );
-                }
-                if g.nv > 0 {
-                    let base = x_ptrs.add(3 * n + 3 * g.nq as usize);
-                    grouped_or_panic(
-                        cublas,
-                        base,
-                        base.add(g.nv as usize),
-                        base.add(2 * g.nv as usize).cast::<*mut c_void>().cast_mut(),
-                        g.mv.as_ptr(),
-                        g.nv,
-                        g.d_out,
-                        g.rank,
-                        1.0,
-                    );
-                }
-            }
-        }
-        for lane in &self.lanes {
-            let v = &lane.view;
-            if v.form != LoraForm::Scale {
-                continue;
-            }
-            let t = i32::try_from(v.token_count).unwrap_or(0);
-            let l_l = bf16_row(
-                lane.a_bf16.cast_const(),
-                u32::try_from(layer_u).unwrap_or(0),
-                i32::try_from(v.d_out).unwrap_or(0),
-            );
-            // SAFETY: `stream` is the fire's and live across both launches —
-            // the assertion this block already made when the two calls were
-            // `ffi::pie_k_quant_scale_rows_bf16`.
-            // SAFETY: as above -- `stream` is live across both launches.
-            let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(stream) };
-            unsafe {
-                if v.sites_bits & LORA_SITE_Q != 0 {
-                    empty_or_panic(
-                        "quant::scale_rows_bf16",
-                        kernels_cuda_new::x::quant::scale_rows_bf16(
-                            &ctx,
-                            bf16_row(q_out.cast_const(), v.token_start, hq)
-                                .cast_mut()
-                                .cast::<kernels_cuda_new::x::abi::bf16>(),
-                            l_l.cast::<kernels_cuda_new::x::abi::bf16>(),
-                            t,
-                            i32::try_from(v.d_out).unwrap_or(0),
-                        ),
-                    );
-                }
-                if v.sites_bits & LORA_SITE_V != 0 {
-                    empty_or_panic(
-                        "quant::scale_rows_bf16",
-                        kernels_cuda_new::x::quant::scale_rows_bf16(
-                            &ctx,
-                            bf16_row(v_out.cast_const(), v.token_start, hk)
-                                .cast_mut()
-                                .cast::<kernels_cuda_new::x::abi::bf16>(),
-                            l_l.cast::<kernels_cuda_new::x::abi::bf16>(),
-                            t,
-                            i32::try_from(v.d_out).unwrap_or(0),
-                        ),
-                    );
-                }
-            }
+    /// What the launch half needs, as one borrow.
+    ///
+    /// The whole of this type's output. `apply` used to be a method here and
+    /// is `kernels_cuda::gemm::lora_qkv_correction` now; this is the seam
+    /// between the two, and it is a BORROW rather than a copy because the two
+    /// vectors are the fire's and outlive every launch made from them.
+    ///
+    /// It is also the reason the fields stay private. A `Staged` is what any
+    /// reader outside this file may have, and it is exactly what the launcher
+    /// reads -- so nothing can reach `capture_fingerprint` or `grouped_\
+    /// enabled` through it, and those two have their own readers for their own
+    /// reasons.
+    #[must_use]
+    pub fn staged(&self) -> Staged<'_> {
+        Staged {
+            lanes: &self.lanes,
+            groups: &self.groups,
+            ptr_slab: self.ptr_slab,
+            slab_stride: self.slab_stride,
         }
     }
 }
+
+// `LoraFireState::apply` STOOD HERE, and `grouped_or_panic` under it. Both
+// are `kernels_cuda::gemm::lora`'s -- see the note at the top of this
+// file for what moved and what could not.
+//
+// `grouped_or_panic` did not survive the move, and its own doc is why: it
+// existed because *"a staged LoRA apply has nowhere to put a `Declined`"*,
+// `apply` having returned `()`. `gemm::lora_qkv_correction` returns
+// `Result<(), Refusal>`, so the three call sites propagate with `?` and the
+// abort is a value the dispatch arm reports like any other decline. The
+// unreachability argument that doc made still holds and now lives beside the
+// guards that establish it, in `stage` above.
 
 /// An empty extent is a no-op; every other decline is a bug.
 ///
@@ -904,48 +732,17 @@ impl LoraFireState {
 ///     built, which the C++ had no way to say and this file has no way to
 ///     handle.
 ///
-/// So the arm is named and the second case aborts with the symbol, in
-/// [`grouped_or_panic`]'s idiom below and for its reason: `let _ =` would
-/// spell "it declined" like "it ran".
-fn empty_or_panic(symbol: &str, fired: Result<(), kernels_cuda_new::x::Refusal>) {
+/// So the arm is named and the second case aborts with the symbol, for the
+/// reason its one remaining caller cannot escape: `let _ =` would spell
+/// "it declined" like "it ran", and `LoraOps::cast_fp32_to_bf16` returns
+/// `()` because the trait's other implementor is a recorder with no device
+/// to be refused by. The launch half had the same problem and no longer
+/// does -- see the note where `apply` stood.
+fn empty_or_panic(symbol: &str, fired: Result<(), kernels_cuda::Refusal>) {
     if let Err(why) = fired
-        && !matches!(why, kernels_cuda_new::x::Refusal::Empty { .. })
+        && !matches!(why, kernels_cuda::Refusal::Empty { .. })
     {
         panic!("{symbol} declined: {why:?}");
-    }
-}
-
-/// `x::gemm::grouped_act_x_wt_bf16` returns `#[must_use] Fired`, and a
-/// staged LoRA apply has nowhere to put a `Declined`.
-///
-/// The three call sites below are inside a fire that has already resolved
-/// its shapes: `group_count` is `n`, `g.nq` or `g.nv`, each guarded above,
-/// so the one refusal the host program can return -- `Refusal::Empty` on a
-/// non-positive `group_count` -- is unreachable here. Unreachable is not the
-/// same as unspellable, though, and `let _ =` would spell "it declined" like
-/// "it ran", which is the whole reason [`Fired`] is `#[must_use]`. So the
-/// arm is named and a decline aborts with the symbol, which is exactly what
-/// `bind::service::gemm_grouped_act_x_wt_bf16` did before it moved.
-#[allow(clippy::too_many_arguments)]
-unsafe fn grouped_or_panic(
-    handle: *mut c_void,
-    a: *const *const c_void,
-    b: *const *const c_void,
-    c: *mut *mut c_void,
-    m: *const i32,
-    group_count: i32,
-    n: i32,
-    k: i32,
-    beta: f32,
-) {
-    // SAFETY: `handle` is the engine's, live for this call, and its stream is
-    // the one this staged apply runs on -- which is what the grouped GEMM
-    // enqueues against.
-    let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(std::ptr::null_mut()).with_cublas(handle) };
-    if let Err(why) =
-        kernels_cuda_new::x::gemm::grouped_act_x_wt_bf16(&ctx, a, b, c, m, group_count, n, k, beta)
-    {
-        panic!("gemm::grouped_act_x_wt_bf16 declined: {why:?}");
     }
 }
 
@@ -1005,7 +802,10 @@ pub fn stage_qkv_adapters<O: DeviceMemory + LoraOps>(
         hk,
         i_width,
         tp_size,
-        &LoraStageRows { norm_x: qkv_in, ..*rows },
+        &LoraStageRows {
+            norm_x: qkv_in,
+            ..*rows
+        },
         grouped_enabled,
     )?;
 
@@ -1027,7 +827,10 @@ pub fn stage_qkv_adapters<O: DeviceMemory + LoraOps>(
     // CARRIED, not merely returned. The bucket key needs it and the call
     // site used to drop it; a value that travels beside the thing it
     // describes cannot be dropped without dropping both.
-    let staged = LoraFireState { capture_fingerprint: h64, ..staged };
+    let staged = LoraFireState {
+        capture_fingerprint: h64,
+        ..staged
+    };
     Ok((h64, Some(staged)))
 }
 
@@ -1110,7 +913,10 @@ pub fn read_lora_sink(
         .iter()
         .find(|op| {
             op.code == SINK_CALL
-                && plan.names.get(op.name_index as usize).is_some_and(|n| n == "lora")
+                && plan
+                    .names
+                    .get(op.name_index as usize)
+                    .is_some_and(|n| n == "lora")
         })
         .ok_or(SinkRefusal::Absent)?;
 
@@ -1118,7 +924,9 @@ pub fn read_lora_sink(
         3 => LoraForm::LowRank,
         2 => LoraForm::Scale,
         _ => {
-            return Err(SinkRefusal::Malformed("a lora sink takes two or three args"));
+            return Err(SinkRefusal::Malformed(
+                "a lora sink takes two or three args",
+            ));
         }
     };
     // The SITES literal is the last arg either way, and it is a constant
@@ -1139,19 +947,26 @@ pub fn read_lora_sink(
     }
 
     let channel_of = |value: u32| -> Option<u32> {
-        let local =
-            plan.channel_rules.iter().find(|rule| rule.value == value).map(|rule| rule.local)?;
+        let local = plan
+            .channel_rules
+            .iter()
+            .find(|rule| rule.value == value)
+            .map(|rule| rule.local)?;
         plan.channel_bindings.get(local as usize).copied()
     };
     let dims_of = |value: u32| -> Option<&[u32]> {
-        plan.value_types.get(value as usize).map(|v| v.dims.as_slice())
+        plan.value_types
+            .get(value as usize)
+            .map(|v| v.dims.as_slice())
     };
 
     let a_value = op.args[0];
-    let a_channel = channel_of(a_value)
-        .ok_or(SinkRefusal::Malformed("the adapter's first operand is not a channel"))?;
-    let a_dims = dims_of(a_value)
-        .ok_or(SinkRefusal::Malformed("the adapter's first operand has no type"))?;
+    let a_channel = channel_of(a_value).ok_or(SinkRefusal::Malformed(
+        "the adapter's first operand is not a channel",
+    ))?;
+    let a_dims = dims_of(a_value).ok_or(SinkRefusal::Malformed(
+        "the adapter's first operand has no type",
+    ))?;
 
     match form {
         // `a` is [layers, R, d_in] and `b` is [layers, d_out, R].
@@ -1160,10 +975,12 @@ pub fn read_lora_sink(
                 return Err(SinkRefusal::Malformed("a low-rank A is [layers, R, d_in]"));
             };
             let b_value = op.args[1];
-            let b_channel = channel_of(b_value)
-                .ok_or(SinkRefusal::Malformed("the adapter's B operand is not a channel"))?;
-            let b_dims = dims_of(b_value)
-                .ok_or(SinkRefusal::Malformed("the adapter's B operand has no type"))?;
+            let b_channel = channel_of(b_value).ok_or(SinkRefusal::Malformed(
+                "the adapter's B operand is not a channel",
+            ))?;
+            let b_dims = dims_of(b_value).ok_or(SinkRefusal::Malformed(
+                "the adapter's B operand has no type",
+            ))?;
             let &[b_layers, d_out, b_rank] = b_dims else {
                 return Err(SinkRefusal::Malformed("a low-rank B is [layers, d_out, R]"));
             };
@@ -1246,15 +1063,28 @@ mod sink_tests {
     /// Value ids are op INDICES here, which is what the plan's stage-local
     /// numbering makes them for a straight-line stage.
     fn value(dims: &[u32]) -> LaunchPlanValue {
-        LaunchPlanValue { dtype: 0, extents: vec![0; dims.len()], dims: dims.to_vec() }
+        LaunchPlanValue {
+            dtype: 0,
+            extents: vec![0; dims.len()],
+            dims: dims.to_vec(),
+        }
     }
 
     fn const_op(bits: u32) -> LaunchOp {
-        LaunchOp { code: 0x81, lit_bits: bits, ..LaunchOp::default() }
+        LaunchOp {
+            code: 0x81,
+            lit_bits: bits,
+            ..LaunchOp::default()
+        }
     }
 
     fn sink(args: Vec<u32>) -> LaunchOp {
-        LaunchOp { code: SINK_CALL, name_index: 0, args, ..LaunchOp::default() }
+        LaunchOp {
+            code: SINK_CALL,
+            name_index: 0,
+            args,
+            ..LaunchOp::default()
+        }
     }
 
     /// A prologue whose sink is the low-rank form: A on channel slot 0,
@@ -1263,7 +1093,12 @@ mod sink_tests {
         LaunchStagePlan {
             names: vec!["lora".to_owned()],
             // 0: A [4, 8, 64]   1: B [4, 128, 8]   2: sites   3: the sink
-            value_types: vec![value(&[4, 8, 64]), value(&[4, 128, 8]), value(&[]), value(&[])],
+            value_types: vec![
+                value(&[4, 8, 64]),
+                value(&[4, 128, 8]),
+                value(&[]),
+                value(&[]),
+            ],
             ops: vec![
                 LaunchOp::default(),
                 LaunchOp::default(),
@@ -1283,7 +1118,11 @@ mod sink_tests {
     #[test]
     fn a_low_rank_sink_names_its_channels_its_sites_and_its_geometry() {
         let read = read_lora_sink(&low_rank_plan()).expect("the sink resolves");
-        assert_eq!(read.form, LoraForm::LowRank, "three args is the low-rank form");
+        assert_eq!(
+            read.form,
+            LoraForm::LowRank,
+            "three args is the low-rank form"
+        );
         assert_eq!(
             (read.a_channel, read.b_channel),
             (5, Some(9)),
@@ -1308,7 +1147,11 @@ mod sink_tests {
         let read = read_lora_sink(&plan).expect("the scale sink resolves");
         assert_eq!(read.form, LoraForm::Scale);
         assert_eq!(read.b_channel, None, "a scale has no B");
-        assert_eq!((read.rank, read.d_in), (0, 0), "and neither a rank nor an input width");
+        assert_eq!(
+            (read.rank, read.d_in),
+            (0, 0),
+            "and neither a rank nor an input width"
+        );
         assert_eq!(read.d_out, 128);
     }
 
@@ -1316,7 +1159,10 @@ mod sink_tests {
     /// as stating a broken one.
     #[test]
     fn a_stage_with_no_sink_is_absent_rather_than_malformed() {
-        let plan = LaunchStagePlan { ops: vec![LaunchOp::default()], ..LaunchStagePlan::default() };
+        let plan = LaunchStagePlan {
+            ops: vec![LaunchOp::default()],
+            ..LaunchStagePlan::default()
+        };
         assert_eq!(read_lora_sink(&plan), Err(SinkRefusal::Absent));
     }
 
@@ -1340,7 +1186,10 @@ mod sink_tests {
     fn an_unknown_site_is_refused_rather_than_masked_off() {
         let mut plan = low_rank_plan();
         plan.ops[2] = const_op(1 << 20);
-        assert!(matches!(read_lora_sink(&plan), Err(SinkRefusal::Malformed(_))));
+        assert!(matches!(
+            read_lora_sink(&plan),
+            Err(SinkRefusal::Malformed(_))
+        ));
     }
 
     /// An operand that is not a channel cannot be an adapter tensor: the
@@ -1350,7 +1199,10 @@ mod sink_tests {
     fn an_operand_off_no_channel_is_refused() {
         let mut plan = low_rank_plan();
         plan.channel_rules.clear();
-        assert!(matches!(read_lora_sink(&plan), Err(SinkRefusal::Malformed(_))));
+        assert!(matches!(
+            read_lora_sink(&plan),
+            Err(SinkRefusal::Malformed(_))
+        ));
     }
 }
 
@@ -1381,11 +1233,19 @@ mod sink_tests {
 /// adapter is the common case.
 // Same seam as `fire::launch`: it reads the shell's instance table,
 // which is the door's own state.
+// `pub(crate)` rather than `pub`, because its `instances` parameter is a map
+// of `serve::state::InstanceEntry` and that type is the shell's own — an entry
+// in the instance table, meaningless outside the door that keeps it. Exported
+// at `pub` the signature named a type nobody outside could spell, which rustc
+// reports as "more private than the item" and which is really the visibility
+// having been chosen for the function alone rather than for its arguments.
+// `fire::launch` is the only caller and is in this crate.
 #[cfg(feature = "abi")]
 #[must_use]
-pub fn lane_for_instance(
+pub(crate) fn lane_for_instance(
     programs: &crate::program::Programs,
     sessions: &std::collections::BTreeMap<u64, crate::program::session::Session>,
+    rings: &crate::program::channel::Rings,
     instances: &std::collections::BTreeMap<u64, crate::serve::state::InstanceEntry>,
     instance_id: u64,
     token_start: u32,
@@ -1402,14 +1262,18 @@ pub fn lane_for_instance(
     let sink = read_lora_sink(plan).ok()?;
 
     let session = sessions.get(&instance_id)?;
-    let rings = session.rings();
     let cursors = rings.cursors(stream).ok()?;
     // THE COMMITTED CELL, not the pending one. An adapter is SEEDED —
     // the host publishes it once and the fire reads it — so what a fire
     // wants is the last value that was committed, which is what `head`
     // names. Reading `tail` would be reading a cell nobody filled.
+    //
+    // THROUGH THE SESSION'S SLOT MAP, because the rings are the driver's now
+    // and `dense` is this instance's own numbering. Indexing the registry with
+    // a dense number would hand the adapter whichever channel happened to be
+    // registered at that position — a real cell, and somebody else's.
     let address = |dense: u32| -> Option<*const std::ffi::c_void> {
-        let c = dense as usize;
+        let c = session.slot(dense as usize)? as usize;
         let cursor = cursors.get(c)?;
         let at = rings.cell_address(c, cursor.head).ok()?;
         (at != 0).then(|| at as *const std::ffi::c_void)

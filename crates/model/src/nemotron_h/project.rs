@@ -360,8 +360,8 @@ pub const NO_METAL: &str = "nemotron-h has no Metal text in this build: its forw
 #[must_use]
 pub fn trace(
     f: &NemotronHFacts,
-    class: model_compiler::trace::FireClass,
-) -> model_compiler::trace::ForwardPlan {
+    class: model_ir::trace::FireClass,
+) -> model_ir::trace::ForwardPlan {
     super::forward::nemotron_h_cuda(f, class)
 }
 

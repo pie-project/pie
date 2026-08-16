@@ -1,0 +1,37 @@
+[package]
+name = "model-ir"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The traced form of a forward pass: the op vocabulary, the plan container that carries it, the seam vocabulary a declaration states, and the signature table it is checked against. The representation layer the model toolchain's other two crates build on."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "model_ir"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+# The signature tables, TABLE ONLY. `default-features = false` is what keeps a
+# toolchain dev loop off nvcc: `check_plan` reads these on every trace, and
+# looking up a symbol's contract must not build a `.cu`. `driver-cuda` is the
+# crate that turns `native` on.
+#
+# These sit on the IR rather than on `model-compiler` because the check they
+# feed is `TraceBuilder::finish`'s -- a declaration is traced when the model
+# LOADS, and a plan that names a symbol no table has must not become a plan at
+# all. Putting the table on the lowering instead would mean the producer of the
+# traced form had to depend on its consumer to validate what it produced, which
+# is the one edge this split exists to remove.
+#
+# The CUDA table comes from the JIT crate DIRECTLY, and never through the
+# ahead-of-time archive crate's re-export of it. The table moved when the
+# dependency between the two was inverted, so the older path was a hop through
+# a crate whose only other content was a CMake project and nvcc's output, and
+# this crate must never be able to reach that. The archive was deleted at
+# `85c6c674b` and the JIT crate answers to its name now, so the two can no
+# longer be told apart by spelling and this paragraph says which is which.
+kernels = { path = "../kernels" }
+kernels-cuda = { path = "../kernels-cuda", default-features = false }
+kernels-metal = { path = "../kernels-metal", default-features = false }

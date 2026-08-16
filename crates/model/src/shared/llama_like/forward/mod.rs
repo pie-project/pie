@@ -9,10 +9,10 @@ pub mod facts;
 use self::facts::{
     Activation, LlamaLikeCudaFacts, LlamaLikeFacts, LlamaLikeMetalFacts, NormPlacement, QkNorm,
 };
-use model_compiler::dsl::{
-    self, MatW, Val, add_bias, attention, cuda, matmul, rmsnorm, rope, split_qkv, swiglu,
+use model_dsl::{
+    self as dsl, MatW, Val, add_bias, attention, cuda, matmul, rmsnorm, rope, split_qkv, swiglu,
 };
-use model_compiler::trace::{DType, Dim, FireClass, ForwardPlan, GuardPred, RopeKind, Shape};
+use model_ir::trace::{DType, Dim, FireClass, ForwardPlan, GuardPred, RopeKind, Shape};
 
 /// The llama_like body — SEMANTIC form: no structural divergence, one
 /// trace serves every fire shape, kernel choice stays with the consumer
@@ -130,7 +130,7 @@ pub fn llama_like(facts: &LlamaLikeFacts) -> ForwardPlan {
 /// buffers, or no custom all-reduce at all — states the NCCL arm alone,
 /// which is the truth rather than a guard whose predicate never holds.
 fn all_reduce(
-    t: &model_compiler::dsl::Trace,
+    t: &model_dsl::Trace,
     x: &Val,
     hidden: u32,
     cuda: &LlamaLikeCudaFacts,
@@ -188,7 +188,7 @@ fn mlp(x: &Val, w: &dsl::Layer, intermediate: u32, packed: bool) -> Val {
 }
 
 /// and the traced form states its kernels as raw signatures
-/// ([`model_compiler::dsl::cuda`]; north-star-dsl.md). One trace per
+/// ([`model_dsl::cuda`]; north-star-dsl.md). One trace per
 /// [`FireClass`]; family names `llama_like.cuda.decode` / `.prefill`.
 pub fn llama_like_cuda(
     facts: &LlamaLikeFacts,
@@ -882,6 +882,7 @@ fn llama_like_metal_text(
                 // it. gpt-oss's, and a deployment without them names none.
                 sink.as_deref(),
                 metal.attn_scale,
+                multi_batch,
             )
             .expect("a plain attention statement produces its value");
 
@@ -1780,7 +1781,7 @@ fn llama_like_cuda_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model_compiler::trace::{Dim, OpKind};
+    use model_ir::trace::{Dim, OpKind};
 
     /// Every kernel symbol a Metal plan states, in order.
     ///
@@ -2547,7 +2548,7 @@ mod tests {
 mod metal_tests {
     use self::facts::LlamaLikeMetalFacts;
     use super::*;
-    use model_compiler::trace::OpKind;
+    use model_ir::trace::OpKind;
 
     /// The Metal text TRACES, and every kernel it states is declared in
     /// Metal's table.
@@ -2568,10 +2569,10 @@ mod metal_tests {
                 class,
             );
             assert_eq!(
-                model_compiler::kernels::Backend::of_family(&plan.family),
-                Some(model_compiler::kernels::Backend::Metal)
+                model_ir::kernels::Backend::of_family(&plan.family),
+                Some(model_ir::kernels::Backend::Metal)
             );
-            assert!(model_compiler::kernels::check_plan(&plan).is_empty());
+            assert!(model_ir::kernels::check_plan(&plan).is_empty());
 
             let launches = plan
                 .ops
@@ -2596,7 +2597,7 @@ mod metal_tests {
             let guards = plan
                 .ops
                 .iter()
-                .filter(|op| matches!(op.kind, model_compiler::trace::OpKind::Guard { .. }))
+                .filter(|op| matches!(op.kind, model_ir::trace::OpKind::Guard { .. }))
                 .count();
             assert_eq!(
                 launches + guards,
@@ -2668,19 +2669,31 @@ mod metal_tests {
         // literal here would fail the moment a checkpoint's heads differ.
         assert_eq!(facts.head_dim, 128, "the fixture this expectation reads");
         let paged = format!("sdpa_paged_decode_bfloat16_d_{}", facts.head_dim);
+        let tiled = format!("sdpa_paged_tiled_bfloat16_d_{}", facts.head_dim);
         let vector = format!("sdpa_vector_decode_bfloat16_d_{}", facts.head_dim);
-        // BOTH lanes take the paged symbol, because the POOL is paged. This
+        // BOTH lanes take a PAGED symbol, because the POOL is paged. This
         // expected the contiguous one at M=1 and the lane was never the
         // question: `model::kv::Pool` allocates `[page, token, head, dim]` for
         // every fire, so a decode naming `sdpa_vector_decode` walks a paged
         // pool with a contiguous kernel's arithmetic -- real memory, wrong
         // tokens, no bounds check anywhere.
         //
+        // The lane is what picks the SHAPE, and only the shape. M=1 takes
+        // the vector kernel because a tile of 32 query rows is 31 rows of
+        // wasted grid at one row; M>1 takes the tiled one because the vector
+        // kernel re-reads the whole key run per query row, and that read is
+        // 39% of prefill time at n = 2048 by the shader's own measurement.
+        //
         // The two also disagree about their scalars: the paged row reads
         // `Param(1)` as `n_kv_heads` and the contiguous row reads it as `n`,
         // the key count. One statement cannot supply both, which is a second
         // reason the choice cannot be per-lane.
-        assert!(count(&mb, &paged) > 0, "the M>1 lane must take {paged}");
+        assert!(count(&mb, &tiled) > 0, "the M>1 lane must take {tiled}");
+        assert_eq!(
+            count(&mb, &paged),
+            0,
+            "the M>1 lane must not walk {paged}, one threadgroup per row"
+        );
         assert!(
             count(&fold, &paged) > 0,
             "the M=1 lane must take {paged} too"

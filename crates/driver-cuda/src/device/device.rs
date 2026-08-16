@@ -128,7 +128,7 @@ impl Device {
     /// `cudaDevAttrMaxSharedMemoryPerMultiprocessor`, in bytes.
     ///
     /// `prefill.cuh:4213-4215` reads it, and
-    /// [`kernels_cuda_new::fa2::Device`] carries it because the FA2 prefill
+    /// [`kernels_cuda::attn::fa2::geometry::Device`] carries it because the FA2 prefill
     /// geometry snaps `NUM_MMA_KV` down against it. It lives here rather than
     /// beside the launcher for §7's reason: `device/` is the only place this
     /// driver spells a vendor attribute name.

@@ -7,28 +7,42 @@
 //! what belongs to the kernel is its symbol and its contract. A [`KernelSig`]
 //! is that contract, once per symbol.
 //!
-//! Four declarations, each replacing something that is a hand-written runtime
+//! Three declarations, each replacing something that is a hand-written runtime
 //! rule today:
 //!
 //! | declaration | replaces |
 //! |---|---|
 //! | `whole`   | `if c.head_dim_padded \|\| (window_one && c.xqa_decode)` in the model body |
 //! | `lacks`   | "a score-wanting program under XQA fails loudly PTIR-side" (a C++ throw) |
-//! | `needs`   | the prepare a stated kernel obligates, named nowhere |
 //! | `sink`    | `emit_cuda::emit_masked_pages_bracket`'s hardcoded page substitution |
 //!
 //! `whole` is CHECKED at trace time — which is load time, since a declaration
-//! is traced when the model loads. The other three are declared but not yet
-//! consumed: `needs`/`sink` are the emitter's knowledge until the launch ABI
-//! flattens (migration step 6), and `lacks` needs the deployment's
-//! servable-seam set, which is the support-matrix work. Declaring them first
-//! is the point — the table is where they land, and it exists.
+//! is traced when the model loads. The other two are declared but not yet
+//! consumed: `sink` is the emitter's knowledge until the launch ABI flattens,
+//! and `lacks` needs the deployment's servable-seam set, which is the
+//! support-matrix work. Declaring them first is the point — the table is where
+//! they land, and it exists. `lacks` earns that: Metal and wgpu both state
+//! `&[Cap::Scores, Cap::PageMaskSink]` on four rows each, and
+//! `driver-metal/src/serve/load.rs` sets `has_attn_score: false` BY HAND with
+//! a comment naming those rows, so the consumer is real and the duplication is
+//! what the column exists to end.
+//!
+//! **`needs` was a fourth and is deleted**, because it never earned it. It
+//! typed a seven-variant `Prepare`, of which every row of every backend stated
+//! `None` — `needs =` appears in no `kernel!` invocation in the tree — and its
+//! one read was a `{:?}` interpolating that constant into a diagnostic. Its
+//! stated waiting-condition was the launch ABI flattening, and when that
+//! landed the obligation it named went with it: the fire-wide prepare
+//! `Prepare::FireWide` described is now two launches inside one XQA routine,
+//! and the FlashInfer plans are `DecodePlan`/`PrefillPlan` descriptors a
+//! routine takes as an ARGUMENT. A tag saying "this launch drags in a plan" is
+//! weaker than a signature that takes the plan.
 //!
 //! ## Why this is its own crate
 //!
 //! The rows are in [`kernels-cuda`](../kernels_cuda/index.html) and
 //! [`kernels-metal`](../kernels_metal/index.html), one crate per backend,
-//! each beside the `.cu`/`.metal` it describes — so a new kernel is one
+//! each beside the `.cuh`/`.metal` it describes — so a new kernel is one
 //! source file and one table row in the same directory and the same diff
 //! hunk. Both tables have to be written in the same words, and neither
 //! backend owns those words, so they are here.
@@ -41,6 +55,12 @@
 //! dependency graph along.
 
 pub mod routine;
+
+// The shader backends' operand vocabulary, written once. Ten types, closed
+// and identical in metal, vulkan and wgpu -- see the module docs. Generic over
+// the backend's own value through `shader::ShaderValue`, because the value is
+// the one thing that is genuinely per-backend. CUDA does not use it.
+pub mod shader;
 
 pub use routine::{Arg, Backend, Env, KernelFn, Provenance, Refusal, Routine};
 
@@ -62,7 +82,7 @@ pub enum Cap {
 /// append, so a new kernel that launches like an existing one costs nothing.
 ///
 /// This is data. The arithmetic each variant names stays in the driver, beside
-/// the doc comment that explains it — the same split [`Prepare`] and
+/// the doc comment that explains it — the same split [`Cap`] and
 /// [`Source`] already make between what a contract STATES and what a backend
 /// DOES about it.
 ///
@@ -103,6 +123,34 @@ pub enum LaunchRule {
     /// Single-pass decode attention: one 1024-thread threadgroup per query
     /// head, rows on the second axis.
     SdpaVector,
+    /// Tiled prefill attention: the same 1024-thread threadgroup per query
+    /// head, but the second axis counts TILES of query rows rather than rows.
+    ///
+    /// One rule apart from [`LaunchRule::SdpaVector`] because the two agree
+    /// at one row and disagree above it, and the disagreement is the whole
+    /// point: a vector launch re-reads the whole key run once per query row,
+    /// so its traffic is quadratic in the fire's length, while a tiled one
+    /// stages a run of keys in threadgroup memory and lets a tile of query
+    /// rows share it. The kernel that does this reads its tile height off
+    /// nothing — the height is `QT` in the shader — so the rule carries it
+    /// here and the grid rounds the fire's rows UP to whole tiles. That
+    /// rounding is why the kernel also takes the true row count as a scalar:
+    /// the threads of a partial last tile have to know they are past the end.
+    SdpaTiled,
+    /// The same 32-row tile as [`LaunchRule::SdpaTiled`], on a threadgroup of
+    /// 128 threads rather than 1024.
+    ///
+    /// The tile height is the same because it is the same decomposition of the
+    /// fire; what differs is who inside the threadgroup owns a query row. The
+    /// tiled kernel gives a row to a SIMDGROUP and walks the scores as scalar
+    /// dot products, so 32 rows want 32 simdgroups. The MMA kernel multiplies
+    /// 8x8 fragments on the matrix unit, where one simdgroup owns EIGHT rows,
+    /// so the same 32 rows want four simdgroups -- 128 threads. A rule of its
+    /// own and not a parameter on the one above, because the width is not a
+    /// tuning knob: `max_total_threads_per_threadgroup(128)` is declared on
+    /// the shader, and a 1024-wide dispatch of it would be refused by the
+    /// device rather than run slowly.
+    SdpaMma,
     /// Pointwise over every head's channels, 256-wide.
     PerHeadElementwise,
     /// Gated norm over the value heads.
@@ -510,6 +558,8 @@ impl LaunchRule {
         Self::ElementwiseRows,
         Self::PerHead,
         Self::SdpaVector,
+        Self::SdpaTiled,
+        Self::SdpaMma,
         Self::PerHeadElementwise,
         Self::GatedRms,
         Self::RouterLane,
@@ -555,38 +605,40 @@ impl LaunchRule {
             Self::ElementwiseRows => 5,
             Self::PerHead => 6,
             Self::SdpaVector => 7,
-            Self::PerHeadElementwise => 8,
-            Self::GatedRms => 9,
-            Self::RouterLane => 10,
-            Self::RouterSort => 11,
-            Self::RouteRows => 12,
-            Self::RoutedQmv => 13,
-            Self::SplitPacked => 14,
-            Self::Qmm => 15,
-            Self::RecurrentScan => 16,
-            Self::PerRow => 17,
-            Self::PerChannel => 18,
-            Self::ElementwiseIn => 19,
-            Self::RowScores => 20,
-            Self::RowsPerHead => 21,
-            Self::RowsFlat => 22,
-            Self::Slab => 23,
-            Self::Tile16 => 24,
-            Self::AxialRope => 25,
-            Self::WarpTiledScan => 26,
-            Self::PerRowNarrow => 27,
-            Self::PagedScores => 28,
-            Self::PagedScoresDecode => 29,
-            Self::MlaPrepare => 30,
-            Self::RowsPackedHeads => 31,
-            Self::RowsPackedHeadsNarrow => 32,
-            Self::WarpPackedHeads => 33,
-            Self::RoutedQmvTransposed => 34,
-            Self::AltUpStreams => 35,
-            Self::RoutedQmvQuad => 36,
-            Self::Single => 37,
-            Self::SingleWarp => 38,
-            Self::PerRequest => 39,
+            Self::SdpaTiled => 8,
+            Self::SdpaMma => 9,
+            Self::PerHeadElementwise => 10,
+            Self::GatedRms => 11,
+            Self::RouterLane => 12,
+            Self::RouterSort => 13,
+            Self::RouteRows => 14,
+            Self::RoutedQmv => 15,
+            Self::SplitPacked => 16,
+            Self::Qmm => 17,
+            Self::RecurrentScan => 18,
+            Self::PerRow => 19,
+            Self::PerChannel => 20,
+            Self::ElementwiseIn => 21,
+            Self::RowScores => 22,
+            Self::RowsPerHead => 23,
+            Self::RowsFlat => 24,
+            Self::Slab => 25,
+            Self::Tile16 => 26,
+            Self::AxialRope => 27,
+            Self::WarpTiledScan => 28,
+            Self::PerRowNarrow => 29,
+            Self::PagedScores => 30,
+            Self::PagedScoresDecode => 31,
+            Self::MlaPrepare => 32,
+            Self::RowsPackedHeads => 33,
+            Self::RowsPackedHeadsNarrow => 34,
+            Self::WarpPackedHeads => 35,
+            Self::RoutedQmvTransposed => 36,
+            Self::AltUpStreams => 37,
+            Self::RoutedQmvQuad => 38,
+            Self::Single => 39,
+            Self::SingleWarp => 40,
+            Self::PerRequest => 41,
         }
     }
 }
@@ -595,37 +647,13 @@ impl LaunchRule {
 // variant makes `index` non-exhaustive, and forgetting to list it here makes
 // this assertion fail. Neither can be missed by a reviewer.
 const _: () = {
-    assert!(LaunchRule::ALL.len() == 40);
+    assert!(LaunchRule::ALL.len() == 42);
     let mut i = 0;
     while i < LaunchRule::ALL.len() {
         assert!(LaunchRule::ALL[i].index() == i);
         i += 1;
     }
 };
-
-/// The host-side plan a kernel's contract obligates: stated so a reader of
-/// the model text can see which prepare a launch drags in, rather than
-/// reading the driver to find out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Prepare {
-    /// No host plan.
-    None,
-    /// The FlashInfer decode plan (per fire, per layer group).
-    DecodePlan,
-    /// The FlashInfer ragged prefill plan.
-    PrefillPlan,
-    /// The custom-mask plan (`attn_page_mask`'s consumer).
-    CustomPlan,
-    /// XQA's fire-wide prepare — R-shaped, so it cannot be built per row
-    /// window. This is why `xqa_decode` is also `whole`.
-    FireWide,
-    /// MLA's plan (`kernels::attn::plan_attention_mla_bf16`), which is its own kind
-    /// rather than a FlashInfer plan under another name: it is built from
-    /// `kv_lora_rank` and `qk_rope_head_dim` — a latent KV geometry no other
-    /// prepare here has a field for — and it is cached in an `MlaPlanCache`
-    /// the dispatch borrows, not in the shared attention workspace.
-    MlaPlan,
-}
 
 /// One point of one instantiation axis, and the text it contributes to a name.
 ///
@@ -763,7 +791,7 @@ pub enum Ty {
     /// ── THE TWO SIXTEEN-BIT FORMATS, NAMED APART ──────────────────
     ///
     /// `Bf16s` and `F16s` are distinct kinds for exactly the reason
-    /// `csrc/src/pie_device.cuh` makes `device::bf16` and `device::f16`
+    /// `kernels/prelude/device.cuh` makes `pie::bf16` and `pie::f16`
     /// distinct STRUCTS rather than two spellings of `unsigned short`:
     /// *"as typedefs they would be ONE type … the generated typecheck would
     /// accept a row that swapped them because there would be nothing to
@@ -778,27 +806,27 @@ pub enum Ty {
     /// neighbours with a fixed `float` or `u8` end escape through
     /// [`Ty::F32s`] and [`Ty::U8s`]; half precision had no such kind.
     ///
-    /// `Bf16s` itself: a read-only device array of `device::bf16` — a fixed
+    /// `Bf16s` itself: a read-only device array of `pie::bf16` — a fixed
     /// bfloat16 operand beside a templated one.
     ///
-    /// The negative control is `kernels-cuda-new`'s
+    /// The negative control is `kernels-cuda`'s
     /// `tests/device_typecheck_types.rs`, which emits `quant::bf16_to_fp16`'s
     /// checker as stated and again with `in_bf16` spelled `F16s`, and
     /// requires the first to compile and the second not to. The refusal is
     /// the mutant's own
-    /// `static_assert(is_same_v<check::at<0>, const device::f16*>)` failing
-    /// against a parameter that is `const device::bf16*` — it was a
+    /// `static_assert(is_same_v<check::at<0>, const pie::f16*>)` failing
+    /// against a parameter that is `const pie::bf16*` — it was a
     /// function-pointer initialisation answering *"no instance of function
     /// template … matches the required type"* until the check moved into the
     /// text NVRTC compiles, where a namespace-scope pointer to a `__global__`
     /// is not a valid initialiser under
     /// `--device-as-default-execution-space`.
     Bf16s,
-    /// A read-only device array of `device::f16`. See [`Ty::Bf16s`].
+    /// A read-only device array of `pie::f16`. See [`Ty::Bf16s`].
     F16s,
     /// ── AND THE SAME TWO, WRITTEN ─────────────────────────────────
     ///
-    /// A device array of `device::bf16` the launcher WRITES.
+    /// A device array of `pie::bf16` the launcher WRITES.
     ///
     /// [`Ty::Bf16s`]' missing twin, and the omission was an asymmetry rather
     /// than a design: [`Ty::F32sMut`], [`Ty::U16sMut`], [`Ty::I32sMut`] and
@@ -818,7 +846,7 @@ pub enum Ty {
     /// every possible kernel, which is the definition of an assertion that
     /// checks nothing.
     ///
-    /// **What this is measured to be worth.** `kernels-cuda-new`'s device
+    /// **What this is measured to be worth.** `kernels-cuda`'s device
     /// typecheck declines a `BufMut` operand outright when the population is
     /// the mixed one the JIT compiles (`abi::self_describing`), because there
     /// the tag is a projection and `void*` is not the parameter. Counted off
@@ -832,7 +860,7 @@ pub enum Ty {
     ///
     /// **This kind is not yet PRODUCED.** `x::abi`'s `ptr_abi!(bf16, …)`
     /// tags `*mut bf16` [`Ty::BufMut`] while already declaring its C++
-    /// spelling to be `::pie_cuda_driver::kernels::device::bf16*` — the
+    /// spelling to be `::pie::bf16*` — the
     /// string `cpp()` returns here — so the two agree by construction and the
     /// remaining change is that tag. `tests/device_typecheck_types.rs` pins
     /// the two strings against each other, and `tests/units.rs`'s
@@ -841,7 +869,7 @@ pub enum Ty {
     /// [`Ty::F16sMut`], so the tag change is evidence-backed rather than
     /// hoped for.
     Bf16sMut,
-    /// A device array of `device::f16` the launcher WRITES. See
+    /// A device array of `pie::f16` the launcher WRITES. See
     /// [`Ty::Bf16sMut`].
     F16sMut,
     /// `const std::int32_t* const*` — an array of int32 buffers the
@@ -897,15 +925,15 @@ pub enum Ty {
     /// A fact about that tree rather than about this vocabulary.
     ///
     /// `cpp()` below spells `::pie_cuda_driver::DType`, and no such type is
-    /// declared anywhere under `kernels-cuda-new/csrc/`. The device tree's
-    /// mirror of it is `attn::device::KvDType`, which has its own kind. So
-    /// `kernels_cuda_new::abi::self_describing` returns false here and a row
+    /// declared anywhere under `kernels-cuda`'s device tree. The device tree's
+    /// mirror of it is `pie::attn::KvDType`, which has its own kind. So
+    /// `kernels_cuda::abi::self_describing` returns false here and a row
     /// carrying this operand is left UNCHECKED, by name, rather than
     /// asserted against a type that does not exist — a red instrument that is
     /// red about the wrong thing is worse than none. A backend that DOES
     /// declare the enum gets the check for free by saying so.
     Dtype,
-    /// `attn::device::KvScheme` — which quantisation a paged KV bank is
+    /// `pie::attn::KvScheme` — which quantisation a paged KV bank is
     /// stored under (`enum class … : ::std::uint8_t`,
     /// `attn/attention_naive_paged.cuh:187`).
     ///
@@ -924,14 +952,14 @@ pub enum Ty {
     /// width, same crossing, same `ArgValue` — and the swap is the classic
     /// same-width hazard [`Ty::Bf16s`] and [`Ty::F16s`] are two kinds for.
     /// Distinct C++ types are what let the CUDA backend's generated
-    /// typecheck catch it: `kernels_cuda_new::abi::device_typecheck` writes
+    /// typecheck catch it: `kernels_cuda::abi::device_typecheck` writes
     /// `static_assert(::std::is_same_v<…, decltype(&instantiation)>)` for
     /// every row it can spell, type identity admits no conversions, and an
     /// `enum class` admits none to begin with.
     ///
     /// # Where that runs, which is the part that used to be untrue
     ///
-    /// `kernels_cuda_new::unit::Unit::source` appends those assertions to the
+    /// `kernels_cuda::unit::Unit::source` appends those assertions to the
     /// unit's own root, so they are compiled by NVRTC on the compile that
     /// produces the cubin — every unit, every machine, no separate artefact.
     ///
@@ -940,7 +968,7 @@ pub enum Ty {
     /// contains. A safety claim in a portable crate is worth exactly the
     /// caller behind it, and this one had none.
     KvScheme,
-    /// `attn::device::KvDType` — which element type a paged KV bank stores
+    /// `pie::attn::KvDType` — which element type a paged KV bank stores
     /// (`enum class … : ::std::uint8_t`,
     /// `attn/attention_naive_paged.cuh:198`). See [`Ty::KvScheme`], whose
     /// parameter it follows in both kernels.
@@ -987,14 +1015,14 @@ pub enum Ty {
     /// that is an observation about a toolchain and not a promise the header
     /// makes, and a `cuLaunchKernel` cell one byte wide against a four-byte
     /// parameter mis-marshals every argument after it. So it is **asserted
-    /// rather than assumed**: `kernels_cuda_new::abi::device_typecheck`
+    /// rather than assumed**: `kernels_cuda::abi::device_typecheck`
     /// emits `static_assert(sizeof(::__nv_fp8_interpretation_t) == 4)`
     /// whenever a row in the set names this kind, FIRST, ahead of every
     /// per-row assertion — it is the only failure in that file's set which
     /// corrupts silently rather than refusing.
     ///
     /// That text is appended to the unit's own root by
-    /// `kernels_cuda_new::unit::Unit::source` and compiled by NVRTC on the
+    /// `kernels_cuda::unit::Unit::source` and compiled by NVRTC on the
     /// compile that produces the cubin, so a wrong row fails the COMPILE
     /// rather than the fire. Two things about that sentence were false until
     /// the consumer was written and are worth keeping visible: it named an
@@ -1002,7 +1030,7 @@ pub enum Ty {
     /// run by hand over a single row list. A typecheck over one table is a
     /// derivation that cannot disagree with the thing it checks, and a
     /// typecheck nothing compiles is a decoration — which is why
-    /// `kernels-cuda-new/tests/units.rs` proves a deliberately drifted row
+    /// `kernels-cuda/tests/units.rs` proves a deliberately drifted row
     /// RED rather than only ever observing green.
     ///
     /// # Why it is not a widened [`Ty::U32`]
@@ -1058,7 +1086,7 @@ pub enum Ty {
     /// `Execution::Service`, where the handle is the service's, or was
     /// deleted with the archive.
     ///
-    /// `kernels_cuda_new::execution`'s `RUST_SERVED` doc states why they must
+    /// `kernels_cuda::execution`'s `RUST_SERVED` doc states why they must
     /// not come back: *a handle is the SERVICE's, not the statement's, and
     /// `Ty::CublasHandle` in a row is the vocabulary leaking one backend's
     /// library into a table two backends share*. Zero Metal, Vulkan or WGPU
@@ -1074,7 +1102,7 @@ pub enum Ty {
     /// ASSERTED where the element type resolves, emitting `cublasHandle_t`
     /// into a translation unit that has never heard of it. It is not a
     /// projection of anything: `cublasHandle_t` comes from `<cublas_v2.h>`,
-    /// which no header under `csrc/` carries and NVRTC cannot be given.
+    /// which no carried header holds and NVRTC cannot be given.
     ///
     /// [`Ty::Stream`] is the near-neighbour and the two are NOT
     /// interchangeable, which matters wherever they share a `|`: a stream is
@@ -1119,7 +1147,7 @@ pub enum Ty {
     /// Original-YaRN scaling, by `const*`. POD, and a pointer rather than a
     /// reference because it is optional: see `nullable`.
     YarnOriginalParams,
-    /// A read-only device array of `attn::device::StructuredMaskParams` —
+    /// A read-only device array of `pie::attn::StructuredMaskParams` —
     /// the per-lane structured-mask descriptors `attn::pack_structured_mask`
     /// reads. POD (three `u32`s), so Rust mirrors it and the array crosses
     /// as `*const StructuredMaskParams`.
@@ -1132,11 +1160,11 @@ pub enum Ty {
     ///
     /// # The namespace outlived the header, and `cpp()` named nothing
     ///
-    /// This said `::pie_cuda_driver::kernels::attn::StructuredMaskParams*`
+    /// This said `::pie::attn::StructuredMaskParams*`
     /// until the JIT's typecheck acquired a consumer. Namespace `attn` was
     /// `attn/pack_dense_mask.hpp`'s; that header is deleted, and one
-    /// definition is left — `attn::device::StructuredMaskParams`, at
-    /// `csrc/src/attn/pack_dense_mask.cuh:136`, which is the one NVRTC
+    /// definition is left — `pie::attn::StructuredMaskParams`, at
+    /// `kernels/attn/pack_dense_mask.cuh:136`, which is the one NVRTC
     /// resolves and the one `x::attn`'s `Abi::CPP` already spelled.
     ///
     /// A type that still exists and can no longer be NAMED does not fail
@@ -1167,7 +1195,7 @@ impl Ty {
             Ty::BufArrayOut => "const void**",
             Ty::BufArrayOutMut => "void**",
             Ty::U8Array => "const ::std::uint8_t* const*",
-            Ty::CustomAllReduce => "::pie_cuda_driver::kernels::comm::CustomAllReduce*",
+            Ty::CustomAllReduce => "::pie::comm::CustomAllReduce*",
             Ty::I8s => "const ::std::int8_t*",
             Ty::I8sMut => "::std::int8_t*",
             // NOT `::std::uint16_t`, and the whole point of these two kinds
@@ -1181,8 +1209,8 @@ impl Ty {
             // Fully qualified, like `Ty::MoeActivation` and
             // `Ty::Mxfp4RowSelect`: the generated file states the whole path
             // rather than relying on where it happens to be included.
-            Ty::Bf16s => "const ::pie_cuda_driver::kernels::device::bf16*",
-            Ty::F16s => "const ::pie_cuda_driver::kernels::device::f16*",
+            Ty::Bf16s => "const ::pie::bf16*",
+            Ty::F16s => "const ::pie::f16*",
             // The written halves, and the strings are `x::abi`'s
             // `ptr_abi!(bf16, …)` and `ptr_abi!(f16, …)` verbatim -- that
             // macro already spells `*mut bf16` this way in `Abi::CPP` while
@@ -1190,16 +1218,16 @@ impl Ty {
             // are `Ty::cpp()`'s "so a row and a declaration describing the
             // same parameter produce the same typecheck line". These two arms
             // are what makes that sentence true of the mutable halves.
-            Ty::Bf16sMut => "::pie_cuda_driver::kernels::device::bf16*",
-            Ty::F16sMut => "::pie_cuda_driver::kernels::device::f16*",
+            Ty::Bf16sMut => "::pie::bf16*",
+            Ty::F16sMut => "::pie::f16*",
             Ty::I32Array => "const ::std::int32_t* const*",
-            Ty::MoeActivation => "::pie_cuda_driver::kernels::moe::MoeActivation",
-            Ty::Mxfp4RowSelect => "::pie_cuda_driver::kernels::quant::Mxfp4RowSelect",
+            Ty::MoeActivation => "::pie::moe::MoeActivation",
+            Ty::Mxfp4RowSelect => "::pie::quant::Mxfp4RowSelect",
             Ty::U16s => "const ::std::uint16_t*",
             Ty::U16sMut => "::std::uint16_t*",
             Ty::Dtype => "::pie_cuda_driver::DType",
-            Ty::KvScheme => "::pie_cuda_driver::kernels::attn::device::KvScheme",
-            Ty::KvDType => "::pie_cuda_driver::kernels::attn::device::KvDType",
+            Ty::KvScheme => "::pie::attn::KvScheme",
+            Ty::KvDType => "::pie::attn::KvDType",
             // CUDA's own, and unqualified by anything of ours: `<cuda_fp8.h>`
             // declares it at global scope. Every `.cuh` whose kernels take it
             // includes that header already -- `attn/kv_paged.cuh` and
@@ -1224,13 +1252,13 @@ impl Ty {
             Ty::AttentionWorkspaceView => "::pie_cuda_driver::AttentionWorkspaceView",
             Ty::KvCacheLayerView => "::pie_cuda_driver::KvCacheLayerView",
             Ty::MlaCacheLayerView => "::pie_cuda_driver::MlaCacheLayerView",
-            Ty::DecodePlanCache => "const ::pie_cuda_driver::kernels::attn::DecodePlanCache&",
-            Ty::PrefillPlanCache => "const ::pie_cuda_driver::kernels::attn::PrefillPlanCache&",
-            Ty::MlaPlanCache => "const ::pie_cuda_driver::kernels::attn::MlaPlanCache&",
-            Ty::HopperPrefillPlan => "const ::pie_cuda_driver::kernels::attn::HopperPrefillPlan&",
-            Ty::YarnOriginalParams => "const ::pie_cuda_driver::kernels::attn::YarnOriginalParams*",
+            Ty::DecodePlanCache => "const ::pie::attn::DecodePlanCache&",
+            Ty::PrefillPlanCache => "const ::pie::attn::PrefillPlanCache&",
+            Ty::MlaPlanCache => "const ::pie::attn::MlaPlanCache&",
+            Ty::HopperPrefillPlan => "const ::pie::attn::HopperPrefillPlan&",
+            Ty::YarnOriginalParams => "const ::pie::attn::YarnOriginalParams*",
             Ty::StructuredMasks => {
-                "const ::pie_cuda_driver::kernels::attn::device::StructuredMaskParams*"
+                "const ::pie::attn::StructuredMaskParams*"
             }
         }
     }
@@ -1267,8 +1295,8 @@ impl Ty {
             // And the written halves, at the same width and for the same
             // reason. `*mut u16` is what `Ty::U16sMut` says too, and that
             // collapse is deliberate on this side of the crossing only: the
-            // format is checked in the C++, where `device::bf16` and
-            // `device::f16` are distinct structs, and a Rust newtype invented
+            // format is checked in the C++, where `pie::bf16` and
+            // `pie::f16` are distinct structs, and a Rust newtype invented
             // here would be a mirror this crate would then have to own.
             Ty::Bf16sMut | Ty::F16sMut => "*mut u16",
             Ty::I32Array => "*const *const i32",
@@ -1558,18 +1586,24 @@ pub enum Source {
     /// prep and the scan consume the SPLIT's raw `dt` and the PARAMS
     /// prep's fp32 tables, none of which their own statements carry. The
     /// C++ hand pass routed them through its workspace; the Rust join
-    /// collects them per layer into [`LaunchSpec::aux`], and this is how a
-    /// row reaches one.
+    /// collects them per layer into `LaunchSpec::aux` -- `driver-cuda`'s
+    /// type, so this is prose and not a link: it is downstream of this crate
+    /// and rustdoc cannot resolve it from here. This is how a row reaches
+    /// one.
     ///
     /// Its own source rather than a use of [`Source::In`] because these
     /// are not the statement's operands -- the statement does not mention
     /// them, and their INDEX is the join's convention rather than the
     /// trace's.
     ///
-    /// **The PUBLISHER half is not here.** Which kernel's output fills
-    /// which slot was a `KernelSig` field until step 9 measured it CUDA-only
-    /// and consolidated it onto `kernels_cuda_new::x::Contract`, where the
-    /// two other CUDA-only claims already lived. This half stays, because
+    /// **The PUBLISHER half is not here, and is nowhere.** Which kernel's
+    /// output fills which slot was a `KernelSig` field until step 9 measured
+    /// it CUDA-only and consolidated it onto a CUDA-side `Contract`, where
+    /// the two other CUDA-only claims already lived. That declaration type
+    /// is deleted: an arm builds its own argument list now, so a statement's
+    /// auxiliary outputs are the arm's business, and `driver-cuda` sizes its
+    /// aux vector from the arm registry rather than from any row. This half
+    /// stays, because
     /// three portable backends read a `Source`; a row in this vocabulary can
     /// still SAY it reads an aux slot, and what puts a value there is the
     /// backend's business. See the census below [`KernelSig`].
@@ -1884,6 +1918,17 @@ pub enum Source {
     /// argument — what differs is the statement, not the kernel, and
     /// `spec.beta_one` is where the lowering already wrote it down.
     Beta,
+    /// Bytes between one query row's custom-mask entry and the next.
+    ///
+    /// A FIRE fact and not a text one, which is the whole reason it is a
+    /// `Source`. A custom mask is a rectangle the DRIVER stages -- one byte per
+    /// `(row, key)` -- so its row pitch is whatever the driver made the widest
+    /// row, and a text that guessed would be right for one fire and silently
+    /// wrong for the next. `llama_like` states a literal `0` in the scalar slot
+    /// this replaces, with the comment "the mask stride is zero because this
+    /// text states no custom mask" -- true of that text, and unstatable by any
+    /// text that does carry one.
+    AttentionMaskStride,
 }
 
 /// What a [`Source::Lit`] holds.
@@ -1927,8 +1972,6 @@ pub struct KernelSig {
     /// buffer) is not row-offsettable. `model-compiler`'s `OpKind::Peel` is
     /// the op this refuses, and its `check_plan` is what enforces the refusal.
     pub whole: bool,
-    /// The host plan its contract obligates.
-    pub needs: Prepare,
     /// Capabilities this kernel cannot serve — a seam asking for one of these
     /// over rows this kernel covers is unservable.
     ///
@@ -2021,7 +2064,7 @@ pub struct KernelSig {
     /// Empty is the CUDA case and the default: a launcher there is an authored
     /// C++ function, so one row is one symbol and [`sig_in`] matches it whole.
     ///
-    /// Metal's are generated. `quantized_qmm_t.metal` holds one template body
+    /// Metal's are generated. `quant/qmm_t.metal` holds one template body
     /// and a macro that stamps it over `(group, bits) × (bm, bn)`, so `54` of
     /// its entrypoints are one kernel evaluated at 54 points. Enumerating them
     /// as 54 rows would state the macro's job a second time, by hand, and
@@ -2131,9 +2174,9 @@ pub struct KernelSig {
 //
 // THE FORWARDER CENSUS IS FIVE, NOT THREE. §5.2 excluded three forwarders BY
 // NAME (`kernels-{vulkan,wgpu,metal}/src/lib.rs`). There are five: those
-// three, plus `kernels-cuda-new/src/table/mod.rs`'s `copy_sig` and
+// three, plus `kernels-cuda/src/table/mod.rs`'s `copy_sig` and
 // `x/contract.rs`'s `Contract::sig`. Both of the missed pair are in
-// `kernels-cuda-new`, which is exactly why four fields measured as
+// `kernels-cuda`, which is exactly why four fields measured as
 // "CUDA-only reads it" -- the exclusion list was blind to the crate the
 // answer was about.
 //
@@ -2148,8 +2191,8 @@ pub struct KernelSig {
 // THE RESULT, forwarders excluded, ranges excluded, comments excluded:
 //
 //   returns          DELETED -- not moved; see below
-//   lowered_as       MOVED -- see `kernels_cuda_new::x::Contract`
-//   publishes_aux    MOVED -- see `kernels_cuda_new::x::Contract`
+//   lowered_as       MOVED -- to a CUDA-side `Contract`, since deleted
+//   publishes_aux    MOVED -- to a CUDA-side `Contract`, since deleted
 //   lacks            NOBODY               see below -- NOT a candidate
 //   needs            model-compiler   1   frontend reads it
 //   depth_prefix_plan  model 2, model-compiler 1   frontend reads it
@@ -2160,15 +2203,21 @@ pub struct KernelSig {
 // census that outlives its subject becomes a census of history, which is
 // what `driver-cuda/BRIDGE_RETIREMENT.md`'s section 2 table turned into.
 //
-// TWO WERE MOVED. `lowered_as` and `publishes_aux` are
-// `kernels_cuda_new::x::Contract`'s now, and neither move was a relocation:
-// `lowered_as` was DECLARED on a contract all along and merely copied onto
-// the derived row, and `publishes_aux` joined it. That is why `Contract` was
-// the right owner and no other candidate was weighed -- it already held two
-// of the three. The measurements that made them safe are recorded there and
-// not here, because the question each turns on -- which lookup answers over
-// which population -- is a fact about CUDA's registries and not about this
-// struct.
+// TWO WERE MOVED, and their destination has since been deleted too.
+// `lowered_as` and `publishes_aux` went to `kernels-cuda`'s `Contract`,
+// and neither move was a relocation: `lowered_as` was DECLARED on a contract
+// all along and merely copied onto the derived row, and `publishes_aux`
+// joined it. That is why `Contract` was the right owner and no other
+// candidate was weighed -- it already held two of the three.
+//
+// `Contract` is gone with the whole declaration table, so the reasoning
+// above is now an account of where each column WENT rather than of where to
+// look. That is the correct shape for it: this census exists to record that
+// the columns left THIS struct and why, and a census that chases its
+// subjects through their subsequent homes becomes the thing the paragraph
+// above warns about. What answers `publishes_aux` today is
+// `driver-cuda`'s arm registry; nothing answers `lowered_as`, because a
+// symbol's lowering is the arm that holds it.
 //
 // ONE WAS DELETED, AND STEP 9 SAID MOVE. `returns` had ZERO non-empty
 // writers in the tree: all eight writers wrote `""`, and the doc that stood
@@ -2191,7 +2240,7 @@ pub struct KernelSig {
 //   kernels-metal/src/attn.rs    x4   lacks = &[Cap::Scores, Cap::PageMaskSink]
 //   kernels-vulkan/src/attn.rs   x4   same
 //   kernels-wgpu/src/attn.rs     x4   same
-//   kernels-cuda-new             x2   lacks = &[Cap::Scores]
+//   kernels-cuda             x2   lacks = &[Cap::Scores]
 //
 // `Cap` has two variants and this field is its only user, so the pair is a
 // closed subsystem the whole fleet populates and nobody consults. The
@@ -2208,12 +2257,11 @@ pub struct KernelSig {
 // that asymmetry matters. Raised as a correctness question. DO NOT DELETE.
 //
 // AND `Cap` IS A HOMONYM THAT COLLIDES ON ITS VARIANTS. `kernels::Cap` is
-// `{Scores, PageMaskSink}`; `model_compiler::dsl::Cap` (`dsl.rs:1681`) is a
+// `{Scores, PageMaskSink}`; `model_ir::seam::Cap` is a
 // SECOND, independent enum `{Transform, Observe, Scores, PageMaskSink, Put,
-// Sample, Emit}`, while `model-compiler/src/kernels.rs:24` re-exports the
+// Sample, Emit}`, while `model-ir/src/kernels.rs:24` re-exports the
 // first. A grep for `Cap::Scores` cannot attribute a hit to either, and no
 // import list disambiguates it for a reader.
-
 
 impl KernelSig {
     /// Does `symbol` name this row at one point of its axes?
@@ -2305,7 +2353,7 @@ impl KernelSig {
 /// from it, and the emitter reads the row rather than knowing a second copy.
 ///
 /// Exported so the two backend tables can declare rows in the same words. It
-/// names [`KernelSig`], [`Prepare`] and [`Cap`] through `$crate`, so a table
+/// names [`KernelSig`] and [`Cap`] through `$crate`, so a table
 /// crate needs no `use` beyond the macro itself.
 ///
 /// # `$symbol` is an `expr` and not a `literal`
@@ -2334,7 +2382,6 @@ macro_rules! kernel {
                 file: None,
                 launch: $crate::LaunchRule::Unstated,
                 whole: false,
-                needs: $crate::Prepare::None,
                 lacks: &[],
                 sink: None,
                 in_place: &[],

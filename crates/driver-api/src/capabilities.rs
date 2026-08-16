@@ -230,6 +230,19 @@ pub struct DriverCapabilities {
     /// Descriptor-port tags the driver can resolve on-device for decode envelopes.
     #[serde(default)]
     pub device_geometry_port_mask: u32,
+    /// Does this driver resolve a step's descriptor ports when the step RUNS?
+    ///
+    /// Default false, which is the frame-entry shape `pipeline::fire` was
+    /// written against: every step's host work happens before any of the
+    /// frame reaches the device, so a slot chained behind an earlier slot of
+    /// the same frame reads a cell nobody has filled and the frame is refused
+    /// by name.
+    ///
+    /// A driver sets this when its `launch` interleaves the halves -- convert
+    /// one step, fire it, let its program run, then convert the next -- which
+    /// makes a chained slot's cell exist by the time it is read.
+    #[serde(default)]
+    pub resolves_geometry_per_step: bool,
     /// Maximum forward-pass tokens accepted in one driver fire.
     pub max_forward_tokens: u32,
     /// Maximum forward-pass requests accepted in one driver fire.

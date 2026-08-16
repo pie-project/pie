@@ -413,7 +413,22 @@ impl<E> Drop for AttentionWorkspace<E> {
     /// A leaked workspace does not leak safely: a pending upload's slot
     /// would be reusable while the GPU still reads it. The obligation is
     /// [`Self::release`]; this only checks it was met.
+    ///
+    /// **Not while the thread is already panicking.** A panic raised in a
+    /// `Drop` that is itself running because of an earlier panic aborts the
+    /// process, and what reaches the terminal is this message instead of the
+    /// one that actually failed. `device/cublas.rs`' `Drop` carries the long
+    /// version; the short one is that a gemma-4 A/B refused with a named
+    /// arm's whole explanation attached, and the run died on SIGABRT saying
+    /// only *"panic in a destructor during cleanup"*.
+    ///
+    /// The unwinding path is also where the check is worth least: a
+    /// workspace not released on the way out of a panic is a consequence of
+    /// the failure, not the failure.
     fn drop(&mut self) {
-        debug_assert!(self.released, "AttentionWorkspace dropped without release(ops)");
+        debug_assert!(
+            self.released || std::thread::panicking(),
+            "AttentionWorkspace dropped without release(ops)"
+        );
     }
 }

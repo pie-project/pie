@@ -141,17 +141,50 @@
 //! binding with a readable one. Buffers have no subresources, so the two ranges
 //! being disjoint does not help — the tracking is per ALLOCATION.
 //!
-//! Every launch of every real plan does exactly this: `rms_single_row`'s `x` is
-//! an arena range and its `out` is another.
+//! ## And the exception is the way out
+//!
+//! Read the predicate again: two `STORAGE_READ_WRITE` usages are the SAME
+//! BIT, so `is_power_of_two` holds and the dispatch is legal. A `read`
+//! declaration is what makes an arena launch illegal, and nothing forces one
+//! — a binding declared `read_write` that the body only reads is read-only in
+//! fact.
+//!
+//! `kernels-wgpu`'s shader tree therefore declares no `var<storage, read>` at
+//! all, and its `no_shader_declares_a_read_only_storage_binding` keeps it that
+//! way. A 452-launch decode went from 451 shadow copies to none, 25.1 ms to
+//! 11.2 ms, 39.8 to 89.3 tok/s on an RTX 4090.
+//! `two_read_write_bindings_into_one_buffer_are_legal` is the claim itself, on
+//! a device, because it is load-bearing and it is about `wgpu` rather than
+//! about this code.
+//!
+//! What the `read` declaration WOULD have caught is two operands covering the
+//! same bytes partially — and that is now [`Failed::Overlapping`], asked of
+//! every dispatch, raised by no real plan. Both siblings bind the arena both
+//! ways with no workaround and no check at all.
 //!
 //! ## What this file does about it
 //!
-//! **It shadows the read side.** Before a dispatch whose read-only operands
+//! **It shadows the read side**, and no kernel in this tree needs it any
+//! more — see the exception above. It is kept because a `read` binding is
+//! legal WGSL that a future kernel may want, and without this such a kernel
+//! would be REFUSED rather than run.
+//!
+//! Before a dispatch whose read-only operands
 //! share a buffer with one of its writable operands, [`Device::run_all`] copies
 //! each offending range into a scratch buffer and binds the scratch instead.
-//! The copies go into a command buffer of their own, submitted ahead of the pass
-//! in the same `queue.submit`, so their ordering is the one the first section of
-//! these docs establishes.
+//! The copies are encoded into the same command buffer as the dispatches, just
+//! ahead of the pass that reads them — a copy cannot go INSIDE a compute pass,
+//! so a shadow point ends one and opens another, but it does not end the
+//! ENCODER. Ordering is the one the first section of these docs establishes,
+//! and `wgpu-core` emits the barrier at the usage transition.
+//!
+//! It did open a fresh encoder per segment until a real decode was measured:
+//! 451 of 452 rectangles shadow something, so the queue was being given 735
+//! command buffers for one token. One encoder instead took a decode from
+//! 31.9 ms to 20.5 ms on an RTX 4090 -- encoding 7.1 to 4.3, submit 5.4 to
+//! 1.0, and the wait itself 13.0 to 9.7, because a command buffer is a unit
+//! the queue schedules and 735 of them are 735 boundaries the GPU had no
+//! reason to draw.
 //!
 //! It is CORRECT rather than merely tolerated: the shader reads the values that
 //! were there before the dispatch, which is what a plan means, and no kernel can
@@ -160,9 +193,11 @@
 //! writes is undefined whatever the shell does.
 //!
 //! It COSTS a copy per aliased read operand, and it breaks the recording into
-//! one pass per shadow point. [`Device::run_all`] returns how many copies it
-//! made, so a caller sees the cost instead of inferring it, and a plan that
-//! needs none is still one encoder and one pass.
+//! one PASS per shadow point. [`Device::run_all`] returns a [`Ran`] saying how
+//! many copies it made and how many command buffers it submitted, so a caller
+//! sees the cost instead of inferring it; a plan that needs no shadow is one
+//! encoder and one pass, and a plan that shadows every rectangle is still one
+//! encoder.
 //!
 //! ## Why this is a workaround and not the answer
 //!
@@ -214,11 +249,68 @@ use crate::reflect::{self, Declared, STORAGE_GROUP, UNIFORM_BINDING, UNIFORM_GRO
 
 /// How long a device wait may take before it is called a failure.
 ///
-/// Generous, and finite for the reason `driver-vulkan`'s fence wait is finite:
-/// a wait with no deadline on a hung device is a test run that never returns
-/// and reports nothing. `wgpu::PollType::wait_indefinitely` is the call this
-/// deliberately does not make.
-const WAIT: Duration = Duration::from_secs(30);
+/// Finite for the reason `driver-vulkan`'s fence wait is finite: a wait with
+/// no deadline on a hung device is a test run that never returns and reports
+/// nothing. `wgpu::PollType::wait_indefinitely` is the call this deliberately
+/// does not make.
+///
+/// It was also called "generous", against nothing. Measured: a decode step of
+/// Qwen3-0.6B is 452 dispatches, submitted as ONE submission with ONE wait
+/// over it, and on `llvmpipe` the `quest-attention` and `h2o-attention` frames
+/// exceed thirty seconds -- which is how they come back from a software
+/// adapter as a wait timeout instead of the clean intrinsic refusal they give
+/// on a GPU. A bound that is generous for a card is not generous for a CPU
+/// rasteriser, and the constant could not say so because nothing had ever
+/// asked it.
+///
+/// So thirty seconds is the DEFAULT and no longer the rule. `PIE_WGPU_WAIT_SECS`
+/// overrides it.
+///
+/// This paragraph used to end "and without a longer bound that implementation
+/// cannot complete one model step". That was a generalisation from the two
+/// curated failures to every frame, and the next measurement refuted it:
+/// `wgpu_padded_causal_mask` boots a real model on `llvmpipe`, prompts it
+/// twice and answers, at the default thirty seconds, in 124 s. Some frames
+/// exceed the bound; a model step as such does not.
+const WAIT_DEFAULT: Duration = Duration::from_secs(30);
+
+/// [`WAIT_DEFAULT`], or what `PIE_WGPU_WAIT_SECS` says.
+///
+/// Read once. A zero or an unparseable value is the default rather than a
+/// refusal: this is a deadline on a wait, and a driver that would not open
+/// because a number was mistyped is worse than one that waits thirty seconds.
+fn wait() -> Duration {
+    static HELD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *HELD.get_or_init(|| {
+        std::env::var("PIE_WGPU_WAIT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .map_or(WAIT_DEFAULT, Duration::from_secs)
+    })
+}
+
+/// The refusal a device wait produces, naming the deadline it was actually
+/// given and the knob that moves it.
+///
+/// `wgpu`'s own text is *"The requested Wait timed out before the submission
+/// was completed."* — true, and it says neither how long the wait was nor
+/// that the length is adjustable. `PIE_WGPU_WAIT_SECS` appears in no README,
+/// no config template and no `--help`; it is named in this crate's source and
+/// nowhere else. The person who needs to know it exists is, by construction,
+/// reading this string.
+///
+/// The number comes from the deadline that was used rather than from
+/// [`WAIT_DEFAULT`], so a run that raised it says the raised value. A message
+/// quoting the default while the wait used something else would be the same
+/// copied-number rot this crate keeps finding in its prose, with a worse
+/// audience.
+fn not_answered(deadline: Duration, why: &impl std::fmt::Display) -> Failed {
+    Failed::Wgpu(format!(
+        "the device did not answer within {}s (raise `PIE_WGPU_WAIT_SECS`): {why}",
+        deadline.as_secs()
+    ))
+}
 
 /// Why there is no device to run on.
 ///
@@ -364,6 +456,33 @@ impl core::fmt::Display for Ceiling {
     }
 }
 
+/// Which part of a fire a [`Failed`] belongs to.
+///
+/// Every check [`Device::run_all`] makes BEFORE the queue names the launch it
+/// was checking. Nothing after `submit` can: the whole plan goes to the device
+/// as one submission and the single wait covers all of it, so a device that
+/// errors or never answers has not singled out a launch.
+///
+/// Reporting that as a launch index does not merely lose information, it
+/// invents some — and it did. A wait timeout on a 452-launch frame came back
+/// as `launch 452`, which is one past the last real index, and it was read in
+/// this repository as *"the 452nd dispatch is slow"* and written up twice that
+/// way. The truth was "all 452 of them, waited once". So the two cases are
+/// different values now, and [`crate::serve::Unfired`] keeps them different
+/// all the way to the message a reader sees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// The launch at this index, checked before anything was submitted.
+    Launch(usize),
+    /// The submission as a whole, after the queue took it. `of` is how many
+    /// launches were in flight, which is the only true thing there is to say
+    /// about where it stopped.
+    Submission {
+        /// How many launches the submission held.
+        of: usize,
+    },
+}
+
 /// Why a dispatch could not be made.
 ///
 /// Compared by value, as `driver-vulkan`'s is, because a test that asserts
@@ -473,6 +592,32 @@ pub enum Failed {
         /// Where the write starts.
         write_at: u64,
     },
+    /// Two operands of one dispatch cover the same bytes, PARTIALLY.
+    ///
+    /// Not [`Self::Aliased`], which is about the WebGPU usage scope and is
+    /// answered by binding both ways round. This is about the DATA, it is a
+    /// defect on every backend, and neither sibling would catch it either.
+    ///
+    /// Disjoint ranges are the ordinary case — a launch's input and its output
+    /// are two places in one arena — and IDENTICAL ranges are the in-place
+    /// case a kernel authors deliberately, where invocation `i` reads and
+    /// writes element `i`. What no kernel authors is a partial overlap: there
+    /// invocation `i`'s write is some other invocation's read, WGSL orders the
+    /// invocations of one dispatch not at all, and the answer is whatever the
+    /// scheduler did.
+    ///
+    /// It was unnameable while the shadow existed, because a copy of the read
+    /// side made every overlap harmless and every plan look sound. Removing
+    /// the shadow is what made this worth asking, and asking it found nothing
+    /// — which is the answer that lets the shadow go.
+    Overlapping {
+        /// The `@group(0)` binding written.
+        writer: u32,
+        /// The other binding, which is not the same range.
+        other: u32,
+        /// The bytes both cover.
+        overlap: std::ops::Range<u64>,
+    },
     /// A grid of zero in some dimension.
     ///
     /// Legal WebGPU and always a defect: it runs nothing, reports success, and
@@ -486,6 +631,36 @@ pub enum Failed {
         /// What it said.
         String,
     ),
+    /// The device would not give the memory.
+    ///
+    /// Separate from [`Self::Wgpu`] because the answer above it differs, and
+    /// that difference is the whole reason [`crate::frames::Launched::
+    /// Exhausted`] exists: a validation slip is a fault, and an allocation the
+    /// device declined is something a scheduler can serve by evicting and
+    /// re-posting.
+    ///
+    /// It is reachable in ordinary service rather than only under abuse.
+    /// [`Device::budget`] reports a heap's SIZE, so `Pool::ceiling` admits any
+    /// frame the device could hold **if it were empty** -- and the device is
+    /// never empty, because the weights are in it.
+    OutOfMemory(
+        /// What it said.
+        String,
+    ),
+}
+
+impl Failed {
+    /// Would evicting something else make this work?
+    ///
+    /// Only [`Self::OutOfMemory`]. [`Self::PastLimit`] is a DECLARED limit and
+    /// no eviction moves it -- `Shell::admit` asks about that one first, with
+    /// `Pool::ceiling`, and answers `Impossible` -- so folding the two here
+    /// would turn a permanent refusal into a scheduler that evicts and
+    /// re-posts forever.
+    #[must_use]
+    pub const fn is_out_of_memory(&self) -> bool {
+        matches!(self, Self::OutOfMemory(_))
+    }
 }
 
 impl core::fmt::Display for Failed {
@@ -534,11 +709,24 @@ impl core::fmt::Display for Failed {
                  at {write_at} in the same buffer, which WebGPU refuses within \
                  one dispatch however far apart the two ranges are"
             ),
+            Self::Overlapping {
+                writer,
+                other,
+                overlap,
+            } => write!(
+                f,
+                "binding {writer} writes {}..{} of a buffer that binding \
+                 {other} also covers, partially -- the invocations of one \
+                 dispatch are unordered, so which value is read is whatever \
+                 the scheduler did",
+                overlap.start, overlap.end
+            ),
             Self::Empty { groups } => write!(
                 f,
                 "a grid of {groups:?} would run nothing and report success"
             ),
             Self::Wgpu(e) => write!(f, "{e}"),
+            Self::OutOfMemory(e) => write!(f, "the device would not give the memory: {e}"),
         }
     }
 }
@@ -828,7 +1016,15 @@ pub struct Device {
     tiers: Vec<Capability>,
     unreachable: Vec<&'static str>,
     /// Where `on_uncaptured_error` parks what would otherwise be a panic.
-    errors: Arc<Mutex<Vec<String>>>,
+    /// Where `on_uncaptured_error` parks what would otherwise be a panic,
+    /// with whether `wgpu` called it an OUT-OF-MEMORY.
+    ///
+    /// The kind is kept because the answer above it differs: a validation slip
+    /// is a fault and a device that would not give the memory is
+    /// `Launched::Exhausted` -- evict and re-post. Storing only
+    /// `e.to_string()` threw that away, and `Shell::admit` had no way to tell
+    /// them apart.
+    errors: Arc<Mutex<Vec<(bool, String)>>>,
 }
 
 impl Device {
@@ -863,12 +1059,31 @@ impl Device {
     /// [`Unavailable`] when no adapter answers, or when the one that does will
     /// not give up a device.
     pub fn open() -> Result<Self, Unavailable> {
-        // `WGPU_POWER_PREF` overrides, which is how a machine with two adapters
-        // is asked the same question twice. That is not a convenience: the whole
-        // argument for this backend is that one WGSL tree runs on several
-        // implementations, and two adapters DISAGREEING about a number is the
-        // most useful signal it can produce -- so the way to ask has to be
-        // reachable without editing anything.
+        // `PIE_WGPU_FALLBACK` asks for the SOFTWARE adapter, and it is read
+        // HERE rather than only in the test harnesses because of what the
+        // paragraph below used to claim and could not deliver.
+        //
+        // `WGPU_POWER_PREF` was said to be "how a machine with two adapters is
+        // asked the same question twice". Measured on a machine with an RTX
+        // 4090 and `llvmpipe`, all three of unset, `low` and `high` answer the
+        // 4090: a power preference RANKS adapters and never reaches a software
+        // one, which needs `force_fallback_adapter` -- the flag
+        // [`Self::software`] sets and no preference implies. So the stated way
+        // to ask the second implementation could not ask it, and the three
+        // test files that spell `PIE_WGPU_FALLBACK` themselves were the only
+        // paths that could: no gate, no curated run and no server could reach
+        // the second adapter at all.
+        //
+        // Reading it here makes the crate's own strongest claim -- a shader
+        // that agrees on a discrete GPU and on `llvmpipe` "has been checked by
+        // two independent compilers and two independent schedulers" -- true of
+        // every path rather than of three test files.
+        if std::env::var_os("PIE_WGPU_FALLBACK").is_some() {
+            return Self::software();
+        }
+        // `WGPU_POWER_PREF` still overrides, and it is the right knob for what
+        // it can actually do: choosing between two HARDWARE adapters, which is
+        // a machine this has not been run on.
         Self::open_with(
             wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::HighPerformance),
         )
@@ -950,7 +1165,7 @@ impl Device {
             }
         }
 
-        let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let errors: Arc<Mutex<Vec<(bool, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&errors);
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("pie driver-wgpu"),
@@ -966,9 +1181,10 @@ impl Device {
         // handler panics the process on a validation error, and a driver whose
         // refusals are panics has no refusals.
         device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
+            let oom = matches!(e, wgpu::Error::OutOfMemory { .. });
             sink.lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .push(e.to_string());
+                .push((oom, e.to_string()));
         }));
 
         let limits = Limits::of(&limits);
@@ -1172,14 +1388,32 @@ impl Device {
     ///
     /// # Errors
     ///
-    /// [`Failed::Wgpu`], holding every message since the last drain, joined.
+    /// [`Failed::OutOfMemory`] when `wgpu` called any of the parked errors an
+    /// out-of-memory, and [`Failed::Wgpu`] otherwise, each holding every
+    /// message since the last drain, joined.
+    ///
+    /// ANY rather than all: a drain that mixes a validation slip with an
+    /// allocation failure is one where the allocation still failed, and the
+    /// retryable reading is the safe direction -- a caller that re-posts a
+    /// frame it could have faulted loses time, and one that faults a frame it
+    /// could have re-posted loses the request.
     pub fn drained(&self) -> Result<(), Failed> {
         let mut sink = self.errors.lock().unwrap_or_else(|p| p.into_inner());
         if sink.is_empty() {
             return Ok(());
         }
-        let all = core::mem::take(&mut *sink).join("; ");
-        Err(Failed::Wgpu(all))
+        let parked = core::mem::take(&mut *sink);
+        let oom = parked.iter().any(|(oom, _)| *oom);
+        let all = parked
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(if oom {
+            Failed::OutOfMemory(all)
+        } else {
+            Failed::Wgpu(all)
+        })
     }
 
     /// Throw away whatever `wgpu` complained about.
@@ -1364,7 +1598,8 @@ impl Device {
     /// # Errors
     ///
     /// [`Failed::Wgpu`] when the range leaves the buffer, when the map fails,
-    /// or when the device does not answer within [`WAIT`].
+    /// or when the device does not answer within the deadline [`Self::wait`]
+    /// applies.
     pub fn read_at(&self, buffer: &Buffer, offset: u64, len: u64) -> Result<Vec<u8>, Failed> {
         if len == 0 {
             return Ok(Vec::new());
@@ -1410,12 +1645,13 @@ impl Device {
         // The poll is what runs the callback: `map_async` queues it and
         // nothing else drives it. Waiting on the LAST submission is what makes
         // the copy above have happened.
+        let deadline = wait();
         self.device
             .poll(wgpu::PollType::Wait {
                 submission_index: None,
-                timeout: Some(WAIT),
+                timeout: Some(deadline),
             })
-            .map_err(|e| Failed::Wgpu(format!("the device did not answer: {e}")))?;
+            .map_err(|e| not_answered(deadline, &e))?;
         self.drained()?;
         match answer.lock().unwrap_or_else(|p| p.into_inner()).take() {
             Some(Ok(())) => {}
@@ -1570,14 +1806,16 @@ impl Device {
     ///
     /// # Errors
     ///
-    /// [`Failed::Wgpu`] if the device does not answer within [`WAIT`].
+    /// [`Failed::Wgpu`] if the device does not answer within the deadline:
+    /// `WAIT_DEFAULT`, or what `PIE_WGPU_WAIT_SECS` says.
     pub fn wait(&self) -> Result<(), Failed> {
+        let deadline = wait();
         self.device
             .poll(wgpu::PollType::Wait {
                 submission_index: None,
-                timeout: Some(WAIT),
+                timeout: Some(deadline),
             })
-            .map_err(|e| Failed::Wgpu(format!("the device did not answer: {e}")))?;
+            .map_err(|e| not_answered(deadline, &e))?;
         self.drained()
     }
 
@@ -1650,22 +1888,26 @@ impl Device {
     ///
     /// # Errors
     ///
-    /// [`Failed`], with the index of the dispatch that produced it.
-    pub fn run_all(&self, run: &[Recorded<'_, '_>]) -> Result<usize, (usize, Failed)> {
+    /// [`Failed`], with the [`Stage`] it belongs to — a dispatch index for
+    /// everything checked before the queue, and [`Stage::Submission`] for
+    /// anything after it, which singles out no dispatch and must not pretend
+    /// to.
+    pub fn run_all(&self, run: &[Recorded<'_, '_>]) -> Result<Ran, (Stage, Failed)> {
         if run.is_empty() {
-            return Ok(0);
+            return Ok(Ran::default());
         }
         // Every check first, so a refusal has submitted nothing. `Failed::Aliased`
         // is deliberately NOT among them: the shadow below is what answers it.
         for (at, one) in run.iter().enumerate() {
-            self.check_bindable(one).map_err(|e| (at, e))?;
+            self.check_bindable(one)
+                .map_err(|e| (Stage::Launch(at), e))?;
         }
         // The scratch copies each dispatch needs, and the ranges it will bind in
         // place of its own. Taken before any bind group is made, because a bind
         // group has to name the scratch rather than the arena.
         let mut shadows = Vec::with_capacity(run.len());
         for (at, one) in run.iter().enumerate() {
-            shadows.push(self.shadow(one).map_err(|e| (at, e))?);
+            shadows.push(self.shadow(one).map_err(|e| (Stage::Launch(at), e))?);
         }
         let copies: usize = shadows.iter().map(|s| s.len()).sum();
 
@@ -1675,20 +1917,46 @@ impl Device {
         // rather than at submit.
         let mut bound = Vec::with_capacity(run.len());
         for (at, (one, shadow)) in run.iter().zip(&shadows).enumerate() {
-            bound.push(self.bind(one, shadow).map_err(|e| (at, e))?);
+            bound.push(self.bind(one, shadow).map_err(|e| (Stage::Launch(at), e))?);
         }
 
         let encoder = |label| {
             self.device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) })
         };
+        // ONE command buffer for the whole fire, copies and passes alike.
+        //
+        // A shadow point still ends the pass -- `copy_buffer_to_buffer` is not
+        // encodable inside one -- but ending a pass is not ending an ENCODER,
+        // and this loop used to do both: an encoder per copy group and another
+        // per run of dispatches, which for a real decode is 735 command
+        // buffers for 452 launches, because 451 of them shadow something.
+        //
+        // Measured on an RTX 4090, qwen3-0.6B, one decode of 452 launches:
+        //
+        // |            | 735 buffers | 1 buffer |
+        // | encoding   |     7.1 ms  |   4.3 ms |
+        // | submit     |     5.4     |   1.0    |
+        // | wait       |    13.0     |   9.7    |
+        // | whole fire |    31.9     |  20.5    |
+        //
+        // The wait falls too, which is the part worth explaining: a command
+        // buffer is a unit of work the queue schedules, and 735 of them are
+        // 735 chances to stall on a boundary the GPU had no reason to draw.
+        //
+        // The ORDERING is the one the first section of these docs establishes,
+        // unchanged. Command buffers in a single `submit` execute in order,
+        // and commands within one command buffer execute in order; the copies
+        // still land before the pass that reads them, and `wgpu-core` tracks
+        // the usage transition and emits the barrier either way. What was
+        // bought by the split was nothing.
         let mut submission: Vec<wgpu::CommandBuffer> = Vec::new();
         let mut at = 0;
+        let mut work = encoder("fire");
         while at < run.len() {
             if !shadows[at].is_empty() {
-                let mut copy = encoder("shadow");
                 for one in &shadows[at] {
-                    copy.copy_buffer_to_buffer(
+                    work.copy_buffer_to_buffer(
                         &one.from.inner,
                         one.at,
                         &one.into,
@@ -1696,9 +1964,7 @@ impl Device {
                         Some(one.bytes),
                     );
                 }
-                submission.push(copy.finish());
             }
-            let mut work = encoder("fire");
             {
                 let mut pass = work.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("fire"),
@@ -1721,18 +1987,23 @@ impl Device {
                     }
                 }
             }
-            submission.push(work.finish());
         }
+        submission.push(work.finish());
+        let buffers = submission.len();
         self.queue.submit(submission);
-        self.drained().map_err(|e| (run.len(), e))?;
+        let whole = Stage::Submission { of: run.len() };
+        self.drained().map_err(|e| (whole, e))?;
         // The wait is what makes a caller's next `read` see this fire, and it
         // is also what makes the scalar blocks and the scratch buffers safe to
         // drop: they go when `bound` and `shadows` do, which is after the queue
         // is done with them.
-        self.wait().map_err(|e| (run.len(), e))?;
+        self.wait().map_err(|e| (whole, e))?;
         drop(bound);
         drop(shadows);
-        Ok(copies)
+        Ok(Ran {
+            shadowed: copies,
+            buffers,
+        })
     }
 
     /// The read-only ranges this dispatch cannot bind where they are.
@@ -1858,6 +2129,37 @@ impl Device {
                 });
             }
         }
+        // Two operands covering the same bytes PARTIALLY. See
+        // `Failed::Overlapping` for why identical is fine and disjoint is the
+        // ordinary case. In `check_bindable` and not in `check`, so `run_all`
+        // pays it: this one is not answered by a workaround.
+        let read_only = one.pipeline.read_only.as_slice();
+        for (i, a) in one.buffers.iter().enumerate() {
+            if read_only.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            for (j, b) in one.buffers.iter().enumerate() {
+                if i == j || a.buffer() != b.buffer() {
+                    continue;
+                }
+                let (x, y) = (
+                    a.offset()..a.offset() + a.len(),
+                    b.offset()..b.offset() + b.len(),
+                );
+                if x == y {
+                    continue;
+                }
+                let lo = x.start.max(y.start);
+                let hi = x.end.min(y.end);
+                if lo < hi {
+                    return Err(Failed::Overlapping {
+                        writer: pipeline.slots.get(i).copied().unwrap_or(i as u32),
+                        other: pipeline.slots.get(j).copied().unwrap_or(j as u32),
+                        overlap: lo..hi,
+                    });
+                }
+            }
+        }
         if one.groups.contains(&0) {
             return Err(Failed::Empty { groups: one.groups });
         }
@@ -1976,6 +2278,32 @@ impl Device {
     }
 }
 
+/// What one [`Device::run_all`] actually did.
+///
+/// Two numbers, both of which used to be unobservable in different ways.
+/// [`Self::shadowed`] was returned bare as a `usize`, which is fine until
+/// there is a second number; [`Self::buffers`] was not returned at all, and
+/// `serve::Fired::submissions` — a field whose doc says "how many command
+/// buffers were submitted", one unless a caller asked for a submission per
+/// launch — was HARDCODED to
+/// `1` because it was counting `queue.submit` CALLS.
+///
+/// It was wrong by a factor of 735 on a real decode, and being wrong is what
+/// let the cost hide: `Fired` exists because "a caller that cannot observe
+/// them cannot tell a fire that ran from one that quietly ran less", and the
+/// caller was observing a constant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ran {
+    /// How many read-only ranges were copied out of a buffer their own
+    /// dispatch also writes. See this module's docs for the rule.
+    pub shadowed: usize,
+    /// How many COMMAND BUFFERS went into the queue.
+    ///
+    /// One per `run_all`, whatever the shadowing costs — a shadow point ends
+    /// a compute pass but not an encoder.
+    pub buffers: usize,
+}
+
 /// One page move within one buffer. See [`Device::shuffle`].
 #[derive(Clone, Copy, Debug)]
 pub struct Move<'a> {
@@ -2044,6 +2372,54 @@ fn access(module: &naga::Module) -> BTreeMap<u32, bool> {
 /// symbols four thousand times.
 pub struct Pipelines {
     built: BTreeMap<(String, Capability), Pipeline>,
+    /// The expanded source and its reflection, per (entrypoint, requested
+    /// tier).
+    ///
+    /// Beside the pipelines because it has the same lifetime and the same key,
+    /// and because the alternative -- recomputing it -- was 95% of a decode
+    /// step and then 22% of one. Expanding a module means splicing includes,
+    /// resolving `//#if` arms and substituting defines out of the embedded
+    /// tree; reflecting it means a `naga` front-end parse of the result. Both
+    /// are functions of the key and neither changes for the life of a shell.
+    ///
+    /// The tier in the KEY is the one that was ASKED for and the one in the
+    /// value is where [`crate::serve::pick`] landed, which are different
+    /// whenever an adapter asks for a tier the tree has no variant of. Keying
+    /// on the request is what makes the second lookup unnecessary.
+    read: BTreeMap<(String, Capability), Read>,
+    /// How many times [`Pipelines::remember`] has been told something.
+    ///
+    /// Not `read.len()`, which is the number of distinct KEYS and would sit
+    /// still while a caller that had stopped consulting the cache re-expanded
+    /// the same module on every step. This counts the expansions.
+    reads: usize,
+    /// How many times [`Pipelines::module`] has been consulted.
+    ///
+    /// The other half, and it catches the other regression: a caller that
+    /// consults the cache once per LAUNCH rather than once per distinct symbol
+    /// is cheap but wrong-shaped, and this is the number that says so.
+    asks: usize,
+}
+
+/// What reading a module once yields: the expanded source, where the tier
+/// search landed, the reflection, and the table row the symbol resolves to.
+///
+/// A tuple struct rather than a tuple because the fourth field arrived after
+/// the first three and a four-tuple stops being readable at a use site.
+///
+/// The ROW is here because `kernels::sig_in` walks the table for an exact
+/// match and then walks it again matching axis points, and that is a function
+/// of the symbol like everything else in this type. `driver-vulkan` caches it
+/// beside its reflection for the same reason.
+pub struct Read {
+    /// The expanded WGSL.
+    pub source: String,
+    /// Where [`crate::serve::pick`] landed, which is not always what was asked.
+    pub tier: Capability,
+    /// What the module binds and how it must be launched.
+    pub declared: crate::reflect::Declared,
+    /// The table row, or `None` for a symbol the table does not state.
+    pub sig: Option<&'static kernels::KernelSig>,
 }
 
 impl Default for Pipelines {
@@ -2058,7 +2434,45 @@ impl Pipelines {
     pub fn new() -> Self {
         Self {
             built: BTreeMap::new(),
+            read: BTreeMap::new(),
+            reads: 0,
+            asks: 0,
         }
+    }
+
+    /// How many modules have been expanded and reflected.
+    ///
+    /// [`Self::built`]'s sibling, and it exists for the same reason: a
+    /// server's caches must stop growing, and this one is the difference
+    /// between a 28 ms decode step and a 700 ms one. Every entry is one cache
+    /// MISS, because a miss is the only thing that inserts -- so a fire that
+    /// re-read a module it had already read shows up here as a number that
+    /// went up.
+    #[must_use]
+    pub const fn modules_read(&self) -> usize {
+        self.reads
+    }
+
+    /// How many times the module cache has been CONSULTED.
+    ///
+    /// See [`Self::modules_read`] for why both numbers exist.
+    #[must_use]
+    pub const fn modules_asked(&self) -> usize {
+        self.asks
+    }
+
+    /// The expanded source and reflection for `entrypoint` at `tier`, if this
+    /// cache has read it before.
+    #[must_use]
+    pub fn module(&mut self, entrypoint: &str, tier: Capability) -> Option<&Read> {
+        self.asks += 1;
+        self.read.get(&(entrypoint.to_owned(), tier))
+    }
+
+    /// Remember what [`Self::module`] will answer with next time.
+    pub fn remember(&mut self, entrypoint: &str, tier: Capability, what: Read) {
+        self.reads += 1;
+        self.read.insert((entrypoint.to_owned(), tier), what);
     }
 
     /// How many distinct pipelines have been built.
@@ -2322,4 +2736,201 @@ pub fn groups_for(
         device.limits.workgroups_per_dimension,
     )
     .map_err(Failed::Geometry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every feature a TIER names is a feature this file can look up.
+    ///
+    /// # Why this is the one seam worth a test with no adapter
+    ///
+    /// `open` builds its tier list by asking [`feature`] for every name in
+    /// `Capability::requires()` and dropping the tier when any name is
+    /// unknown. That is the right shape -- an unknown name must not be read
+    /// as "not needed" -- but it makes a TYPO indistinguishable from a
+    /// missing GPU feature: the tier is quietly absent on every adapter
+    /// forever, the baseline body runs, every number is right, and nothing
+    /// anywhere says a tier was dropped.
+    ///
+    /// Nothing else covers it. `kernels-wgpu`'s side asserts the tiers name
+    /// what their bodies need; the device tests ask a real adapter what it
+    /// has. The mapping BETWEEN those two -- string to `wgpu::Features` bit
+    /// -- is this file's alone, and it is two match arms.
+    #[test]
+    fn every_feature_a_tier_names_is_one_this_file_can_look_up() {
+        for tier in Capability::PREFERENCE {
+            for name in tier.requires() {
+                assert!(
+                    feature(name).is_some(),
+                    "`Capability::{tier:?}` requires `{name}`, which `feature()` does not \
+                     know -- so the tier is dropped on EVERY adapter, silently, and the \
+                     baseline body runs forever"
+                );
+            }
+        }
+    }
+
+    /// And the negative half, which is what gives the test above its teeth: a
+    /// name that is not a `wgpu` feature must not resolve to one.
+    #[test]
+    fn a_name_that_is_not_a_feature_does_not_resolve() {
+        assert!(feature("SHADER_F32").is_none());
+        assert!(feature("shader_f16").is_none(), "the lookup is exact");
+        assert!(feature("").is_none());
+    }
+}
+
+#[cfg(test)]
+mod retryable {
+    use super::{Ceiling, Failed};
+
+    /// Which refusals a scheduler may re-post, in BOTH directions.
+    ///
+    /// `Shell::admit` turns `Failed::is_out_of_memory` into
+    /// [`crate::frames::Launched::Exhausted`], which the engine re-posts, and
+    /// everything else into a fault. Both mistakes are expensive and they are
+    /// expensive differently: calling a validation slip retryable has the
+    /// scheduler evict and re-post against a device that will refuse it again
+    /// forever, and calling an allocation failure a fault kills a request that
+    /// would have succeeded once something else finished.
+    ///
+    /// So the classification is pinned rather than left to the one call site.
+    /// `PastLimit` is the case worth naming: it is a refusal about MEMORY and
+    /// it is not retryable, because the limit is one the adapter declares and
+    /// no eviction moves it. `admit` asks about that one first, through
+    /// `Pool::ceiling`, and answers `Impossible`.
+    #[test]
+    fn only_a_device_that_would_not_give_memory_is_worth_re_posting() {
+        assert!(Failed::OutOfMemory("device is full".to_string()).is_out_of_memory());
+
+        for permanent in [
+            Failed::Wgpu("validation: binding 3 is not a storage buffer".to_string()),
+            Failed::PastLimit {
+                which: Ceiling::BufferSize,
+                want: 1 << 40,
+                limit: 1 << 28,
+            },
+            Failed::Bindings {
+                module: 11,
+                bound: 10,
+            },
+            Failed::Empty { groups: [0, 1, 1] },
+        ] {
+            assert!(
+                !permanent.is_out_of_memory(),
+                "`{permanent}` is not something evicting fixes, so a scheduler \
+                 told to re-post it would re-post it forever"
+            );
+        }
+    }
+
+    /// The message survives the classification.
+    ///
+    /// The sink joins every parked message and the kind is a flag beside them,
+    /// so a drain that decides "out of memory" must still say what `wgpu`
+    /// said -- a refusal naming nothing is the shape this crate's whole error
+    /// surface exists to avoid.
+    #[test]
+    fn a_refusal_that_is_retryable_still_names_what_the_device_said() {
+        let said = "Not enough memory left to allocate a buffer of 4294967296 bytes";
+        let failed = Failed::OutOfMemory(said.to_string());
+        let shown = failed.to_string();
+        assert!(shown.contains(said), "got: {shown}");
+        assert!(
+            shown.contains("would not give the memory"),
+            "and it says which KIND of refusal it is: {shown}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod deadline {
+    use super::{WAIT_DEFAULT, not_answered, wait};
+
+    /// The timeout refusal says how long it waited and how to wait longer.
+    ///
+    /// `wgpu` says "The requested Wait timed out before the submission was
+    /// completed", which names neither. This is the only place
+    /// `PIE_WGPU_WAIT_SECS` is written where someone who needs it will be
+    /// looking -- it is in no README, no config template and no `--help` -- so
+    /// the two facts are pinned rather than left to survive the next edit of a
+    /// format string.
+    ///
+    /// The number asserted is 600 and NOT the default, which is the point: the
+    /// message quotes the deadline the wait was actually given. A run that
+    /// raised the bound and then read "30s" in its own failure would be chasing
+    /// the wrong thing.
+    #[test]
+    fn a_wait_that_timed_out_names_its_deadline_and_the_knob_that_moves_it() {
+        let said = not_answered(
+            std::time::Duration::from_secs(600),
+            &"The requested Wait timed out before the submission was completed.",
+        )
+        .to_string();
+
+        assert!(
+            said.contains("within 600s"),
+            "the deadline the wait was GIVEN, not the default: {said}"
+        );
+        assert!(
+            !said.contains("within 30s"),
+            "and not the default, which this run did not use: {said}"
+        );
+        assert!(
+            said.contains("PIE_WGPU_WAIT_SECS"),
+            "a reader who cannot find the knob cannot raise it, and it is \
+             documented in no README: {said}"
+        );
+        assert!(
+            said.contains("Wait timed out"),
+            "without losing what `wgpu` said: {said}"
+        );
+    }
+
+    /// The wait bound is a default, and the override is read.
+    ///
+    /// It cannot be tested by setting the variable here — [`wait`] reads the
+    /// environment ONCE, into a `OnceLock`, and a test that raced another test
+    /// for who initialises it would be the flakiest thing in this crate. So
+    /// what is asserted is the shape: the default is what it says, and the
+    /// parse rules are exercised through the same expression the reader uses.
+    ///
+    /// The rules matter more than they look. A wait bound that REFUSED a
+    /// mistyped number would be a driver that will not open because an
+    /// operator fat-fingered an env var, which is worse than one that waits
+    /// thirty seconds; and a zero would be a deadline no submission can meet,
+    /// which is a hang reported as a fault on every device.
+    #[test]
+    fn a_mistyped_deadline_is_the_default_and_not_a_refusal() {
+        assert_eq!(WAIT_DEFAULT.as_secs(), 30);
+
+        let read = |v: Option<&str>| -> u64 {
+            v.and_then(|v| v.parse::<u64>().ok())
+                .filter(|secs| *secs > 0)
+                .map_or(WAIT_DEFAULT, std::time::Duration::from_secs)
+                .as_secs()
+        };
+        assert_eq!(read(Some("600")), 600, "a number is taken");
+        assert_eq!(read(None), 30, "absent is the default");
+        assert_eq!(read(Some("")), 30, "empty is the default");
+        assert_eq!(read(Some("ten minutes")), 30, "unparseable is the default");
+        assert_eq!(read(Some("-5")), 30, "negative does not parse as u64");
+        assert_eq!(
+            read(Some("0")),
+            30,
+            "zero is a deadline no submission can meet, which would report \
+             every device as hung"
+        );
+
+        // And the live reader agrees with the default in this process, which
+        // is the one thing that would catch the `OnceLock` being wired to
+        // something else entirely.
+        assert!(
+            wait().as_secs() >= 1,
+            "the deadline in force is {:?}, which no submission could meet",
+            wait()
+        );
+    }
 }

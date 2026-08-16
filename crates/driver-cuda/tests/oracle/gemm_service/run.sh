@@ -27,11 +27,23 @@ echo "wrote $HERE/golden.txt ($(wc -l < "$HERE/golden.txt") rows)" >&2
 # The bias fold: the archive's own `gemv_bf16` against the archive's own
 # `gemv_bf16` + `add_bias_bf16`, out of the real archive. This is the one
 # behavioural change §45 makes, and `gemv.hpp:25-28` claimed it costs nothing.
+#
+# THIS HALF CANNOT RUN ANY MORE, on any machine. `libpie_kernels_cuda.a` was
+# the output of the ARCHIVE crate `kernels-cuda` — CMake+nvcc, `native`
+# feature — and `85c6c674b` deleted that crate, the feature and the build
+# together. `bias_fold.txt` is therefore a golden that is read and not
+# re-derived, exactly like the sixteen dead oracles' (tests/oracle_census.rs);
+# the lines below are kept as the description of how it was taken. The half
+# ABOVE, which needs only nvcc and cuBLAS, is still re-derivable on a CUDA
+# host.
 ROOT="$(cd "$HERE/../../../../.." && pwd)"
 ARCHIVE="$(find "$ROOT/target" -name libpie_kernels_cuda.a -printf '%T@ %p\n' 2>/dev/null \
            | sort -rn | head -1 | cut -d' ' -f2-)"
 if [[ -z "$ARCHIVE" ]]; then
-    echo "no libpie_kernels_cuda.a in $ROOT/target -- build kernels-cuda --features native first" >&2
+    echo "no libpie_kernels_cuda.a in $ROOT/target -- the ARCHIVE crate that" \
+         "built it (kernels-cuda, --features native) was deleted at" \
+         "85c6c674b, so this half can no longer be re-derived anywhere;" \
+         "bias_fold.txt beside this script is the record it took" >&2
     exit 1
 fi
 echo "linking bias_fold against $ARCHIVE" >&2

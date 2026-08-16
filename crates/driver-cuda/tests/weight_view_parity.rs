@@ -2,8 +2,9 @@
 //!
 //! The oracle in `tests/oracle/weight_view/` compiles the real
 //! `kernels-cuda/csrc/src/weight_view.hpp`, `quant_meta.hpp` and `tensor.cpp`
-//! and prints two things: the struct's ABI as `offsetof` sees it, and every
-//! field of every view its five factories produce. This test reproduces both.
+//! — the ARCHIVE crate's headers, gone with it at `85c6c674b` — and prints
+//! two things: the struct's ABI as `offsetof` sees it, and every field of
+//! every view its five factories produce. This test reproduces both.
 //!
 //! `tests/oracle/weight_view/run.sh` can no longer be run — its inputs were deleted, see `oracle_census.rs`. It is kept as the description of how this golden was taken, which is read but not re-derived. It once regenerated [`GOLDEN_FNV1A64`].
 //!

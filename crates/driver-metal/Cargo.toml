@@ -74,6 +74,17 @@ tensor-ir = { path = "../tensor-ir" }
 # it, so every call site in `src/metal/` still spells `crate::pipeline::`.
 driver = { path = "../driver" }
 
+# `codegen::metal::fused::METAL_M3_REGION_THREADS` — the threadgroup width the
+# emitted grouped kernels size their reduction buffer for. This crate carried a
+# `program::grouped::REGION_THREADS = 512` copy of it and a dev-dependency test
+# comparing the two; `driver` did the same for four more of the compiler's
+# declarations and that whole arrangement is gone, so this one goes with it.
+#
+# `driver`'s own table says the rest: importing a number the EMITTER decided is
+# better than copying it and is still not the end state, which is for it to
+# ride on the emitted kernel beside the entry name and the source.
+tensor-compiler = { path = "../tensor-compiler" }
+
 # The kernel contract vocabulary: `LaunchRule` (which grid shape a row states)
 # and `sig_in` (how an instantiated point resolves to its row). Tables only --
 # no shader is built by reading one.
@@ -86,8 +97,11 @@ kernels = { path = "../kernels" }
 # host-portable.
 # The lowering the executor runs: `model_compiler::lower` states a fire as a
 # flat list of launches naming kernel symbols. Host-portable — reading a
-# lowered trace builds no shader.
+# lowered trace builds no shader. `model-ir` alongside it for the traced form
+# those launches are stated over, and for `kernels`, the signature table this
+# crate's binding checks itself against.
 model-compiler = { path = "../model-compiler" }
+model-ir = { path = "../model-ir" }
 # The Metal signature table. A real dependency and not a dev one: the executor
 # resolves every symbol the lowering states through `sig_in` AT RUN TIME -- the
 # row is where a kernel's file and launch rule live, so a driver that dispatches
@@ -207,14 +221,6 @@ features = [
 [dev-dependencies]
 tempfile = "3"
 
-
-
-# Tests only. The driver deliberately does not depend on the compiler at build
-# time -- see the `identity::Versions` comment -- but `pipeline::status` mirrors
-# the compiler's fault-code table, and a hand-copied table that nothing checks
-# drifts. The dev-dependency makes the mirror a test rather than a promise.
-tensor-compiler = { path = "../tensor-compiler" }
-
 # Tests only. The binder is proved against a REAL lowering, and the texts live
 # behind `model`'s `forward` feature -- which the driver itself does not need,
 # so it is enabled here rather than in the dependency table above.
@@ -247,6 +253,10 @@ name = "device_add_bias"
 required-features = ["metal-4"]
 
 [[test]]
+name = "device_attention"
+required-features = ["metal-4"]
+
+[[test]]
 name = "device_checkpoint_names"
 required-features = ["metal-4"]
 
@@ -276,6 +286,18 @@ required-features = ["metal-4"]
 
 [[test]]
 name = "device_fire"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_saturation"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_presence"
+required-features = ["metal-4"]
+
+[[test]]
+name = "device_gdn"
 required-features = ["metal-4"]
 
 [[test]]

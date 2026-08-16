@@ -161,6 +161,13 @@ impl Shell {
                 rotary_dims: d.shape.head_dim_alloc(),
                 n_experts: 0,
                 experts_per_token: 0,
+                // What the BYTES arrived in, which is the one pair of facts a
+                // catalog row cannot state: `mlx-community` publishes one
+                // model at g64/b4 and at g128/b8 and the two pack to
+                // identical extents, so `Loaded::affine_point` asks the
+                // tensors and refuses a checkpoint that answers twice.
+                group: binding.quant_group,
+                bits: binding.quant_bits,
             }
         };
         let named = std::collections::HashMap::new();
@@ -193,6 +200,7 @@ impl Shell {
                 region_sig: &step.region_sig,
                 region_k: &step.region_k,
                 sampling_indices: &step.plan.sampling_indices,
+                sampling_indptr: &step.plan.sampling_indptr,
             };
             let class = crate::lowering::frame::fire_class(&s);
             // THE ROW'S OWN TEXT for this fire class, and the driver's only
@@ -215,9 +223,30 @@ impl Shell {
             // is propagated anyway, because "unreachable" is a claim about
             // today's `serves` and this is the place that would find out it
             // had stopped being true.
-            let plan = crate::model::binding::text(row, class, &binding).map_err(Error::from)?;
-            let lowered =
-                crate::lowering::frame::lower_step(&plan, &s).map_err(|why| Error::Program {
+            //
+            // CACHED, by the fire shape. Both halves of this -- the plan and
+            // the lowering -- are pure functions of things that do not change
+            // between the steps of a generation, and deriving them per token
+            // cost 0.21 ms and 0.60 ms of a 4.9 ms decode. The closure is why
+            // the refusal above is still propagated on a miss and not paid
+            // for on a hit.
+            let lowered = self
+                .lowerings
+                .for_step(class, &s, || {
+                    crate::model::binding::text(row, class, &binding)
+                })
+                .map_err(|why| match why {
+                    crate::lowering::cached::Miss::Plan(refusal) => Error::from(refusal),
+                    crate::lowering::cached::Miss::Lower(why) => Error::Program {
+                        message: format!("step did not lower: {why:?}"),
+                    },
+                })?;
+            // The gather's index list, in the fire's own numbering. Taken
+            // beside the lowering because it comes from the same read of the
+            // same table -- the wire's numbers are request-local and the
+            // gather's must not be.
+            let sampled =
+                crate::lowering::frame::sampled_rows(&s).map_err(|why| Error::Program {
                     message: format!("step did not lower: {why:?}"),
                 })?;
 
@@ -277,6 +306,7 @@ impl Shell {
             // frame's, which is the direction that is safe.
             let staged = crate::bind::tables::stage(
                 &self.context,
+                &self.scratch,
                 crate::bind::tables::Frame {
                     token_ids: &step.plan.token_ids,
                     position_ids: &step.plan.position_ids,
@@ -286,7 +316,9 @@ impl Shell {
                     kv_write_page: &w_page,
                     kv_write_offset: &w_off,
                     rope_frequencies: &self.inv_freq,
-                    sampling_indices: &step.plan.sampling_indices,
+                    // The FIRE's rows, translated from the request-local
+                    // numbering the wire uses. See `sampled_rows`.
+                    sampling_indices: &sampled,
                 },
             )?;
             // The fire's tables, and the stand-in for an operand that
@@ -295,8 +327,8 @@ impl Shell {
             // command cannot. The tables region serves as that stand-in: it
             // is real, resident, and no statement writes through a slot it
             // did not fill.
-            self.regions.add(&staged.region);
-            self.regions.set_null(&staged.region);
+            self.regions.add(staged.region());
+            self.regions.set_null(staged.region());
             let tables = |which| staged.at(which);
 
             let names = crate::lowering::resolve::Names::mlx();
@@ -354,16 +386,18 @@ impl Shell {
             // the fire rather than looked up again.
             //
             // `staged` travels with it, and that is not tidiness. A fire's
-            // tables are an `Allocation`: resident for exactly as long as the
-            // value lives, and dropped here they would leave the residency
-            // set while the fire that binds their address is still running.
-            // Under the old bare `allocate` the region was never removed at
-            // all, so this loop leaked one tables region PER STEP, forever,
-            // and the leak was the only thing making the lifetime look
-            // right. `fire::run::InFlight` already carries the argument table
-            // and the scalars for exactly this reason ("held for the GPU, not
-            // for the caller"); the tables are staged out here, so this is
-            // where they have to be held.
+            // tables are a LEASE from `self.scratch`, returned to the pool
+            // when the value drops -- and a returned region is one the next
+            // fire may be handed. Dropped here, the next step would stage its
+            // token ids over the ones a running fire is still reading. Under
+            // the old bare `Allocation::new` the failure was the mirror of
+            // that: the region was never returned at ALL, so this loop leaked
+            // one tables region per step forever, and the leak was the only
+            // thing making the lifetime look right.
+            // `fire::run::InFlight` already carries the argument table and
+            // the scalars for exactly this reason ("held for the GPU, not for
+            // the caller"); the tables are staged out here, so this is where
+            // they have to be held.
             in_flight.push((step, (fire, lowered.readout, staged)));
         }
 

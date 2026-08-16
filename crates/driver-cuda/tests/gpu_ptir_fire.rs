@@ -131,7 +131,7 @@ fn run_both(container: TraceContainer, seed: &[f32]) -> Option<Answers> {
             0xF1E,
             &plan,
             &kernels,
-            Versions::mirrored(Backend::Cuda.emitter_version()),
+            Versions::from_compiler(Backend::Cuda.emitter_version()),
             Target {
                 major,
                 minor,
@@ -209,6 +209,9 @@ fn run_both(container: TraceContainer, seed: &[f32]) -> Option<Answers> {
         stage_plan,
         &[Lane {
             rings: &rings,
+            // The identity map: this fixture registers its channels at
+            // slots 0..n, so the instance's dense index IS its slot.
+            slots: &[0, 1],
             extents,
         }],
         stream.as_ref(),
@@ -507,6 +510,7 @@ fn every_lane_binds_its_own_row_of_the_logits() {
         stage_plan,
         &lane_extents.map(|extents| Lane {
             rings: &rings,
+            slots: &[0, 1],
             extents,
         }),
         stream.as_ref(),
@@ -533,7 +537,7 @@ fn every_lane_binds_its_own_row_of_the_logits() {
         .bind_intrinsic(
             IntrinsicId::Logits,
             address,
-            DType::F32,
+            driver_cuda::program::params::INTRINSIC_STORAGE_F32,
             vocab,
             vocab,
             // `lane + 3`, NOT the identity, and that is the point at one
@@ -638,7 +642,7 @@ fn a_program_fires_from_a_host_mirror_and_publishes_back_into_one() {
             0x5E5,
             &plan,
             &kernels,
-            Versions::mirrored(Backend::Cuda.emitter_version()),
+            Versions::from_compiler(Backend::Cuda.emitter_version()),
             Target {
                 major,
                 minor,
@@ -668,8 +672,20 @@ fn a_program_fires_from_a_host_mirror_and_publishes_back_into_one() {
         .map(|s| vec![0u8; s.cell_bytes() * s.ring().expect("ring") as usize])
         .collect();
     let mut words: Vec<Vec<u64>> = vec![vec![0u64; 4], vec![0u64; 4]];
+    // WHICH SIDE THE ENGINE IS ON, per channel. The bridge is directional
+    // now: the driver takes only from a plane the engine writes and publishes
+    // only into one it reads, because the mirror has ONE head/tail pair for
+    // both and a driver that did both would read back its own writes.
+    const ROLES: [u8; 2] = [
+        driver_api::local::PIE_CHANNEL_HOST_ROLE_WRITER,
+        driver_api::local::PIE_CHANNEL_HOST_ROLE_READER,
+    ];
 
-    let mut session = Session::new(&alloc, &shapes, stream.as_ref()).expect("session");
+    // The registry, and the instance's map into it: registered in order, so
+    // the dense index is the slot. `Session` no longer owns rings — a channel
+    // has ONE ring wherever it is named from.
+    let mut rings = Rings::new(&alloc, &shapes, stream.as_ref()).expect("rings");
+    let mut session = Session::new(vec![0, 1], shapes.to_vec()).expect("session");
     let _sets = stage_channels(stage_plan).expect("sets");
 
     // The engine's side: publish the seed into the input's host mirror.
@@ -678,12 +694,14 @@ fn a_program_fires_from_a_host_mirror_and_publishes_back_into_one() {
             .iter_mut()
             .zip(words.iter_mut())
             .zip(shapes.iter())
-            .map(|((m, w), s)| unsafe {
+            .enumerate()
+            .map(|(index, ((m, w), s))| unsafe {
                 HostChannel::new(
                     m.as_mut_ptr().cast(),
                     w.as_mut_ptr().cast(),
                     s.cell_bytes(),
                     s.ring().expect("ring"),
+                    ROLES[index],
                 )
             })
             .collect();
@@ -697,17 +715,20 @@ fn a_program_fires_from_a_host_mirror_and_publishes_back_into_one() {
             .iter_mut()
             .zip(words.iter_mut())
             .zip(shapes.iter())
-            .map(|((m, w), s)| unsafe {
+            .enumerate()
+            .map(|(index, ((m, w), s))| unsafe {
                 HostChannel::new(
                     m.as_mut_ptr().cast(),
                     w.as_mut_ptr().cast(),
                     s.cell_bytes(),
                     s.ring().expect("ring"),
+                    ROLES[index],
                 )
             })
             .collect();
         session
             .fire(
+                &mut rings,
                 &compiled,
                 stage_plan,
                 &control,
@@ -739,12 +760,14 @@ fn a_program_fires_from_a_host_mirror_and_publishes_back_into_one() {
         .iter_mut()
         .zip(words.iter_mut())
         .zip(shapes.iter())
-        .map(|((m, w), s)| unsafe {
+        .enumerate()
+        .map(|(index, ((m, w), s))| unsafe {
             HostChannel::new(
                 m.as_mut_ptr().cast(),
                 w.as_mut_ptr().cast(),
                 s.cell_bytes(),
                 s.ring().expect("ring"),
+                ROLES[index],
             )
         })
         .collect();

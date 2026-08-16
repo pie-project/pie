@@ -37,8 +37,8 @@ use model::qwen_3_5::forward::qwen3_5_moe_mlp_block_cuda;
 use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
 use model::shared::llama_like::forward::llama_like;
 use model::shared::llama_like::forward::llama_like_cuda;
-use model_compiler::dsl::WeightRepr;
-use model_compiler::{FireClass, ForwardPlan};
+use model_dsl::WeightRepr;
+use model_ir::{FireClass, ForwardPlan};
 
 fn golden_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

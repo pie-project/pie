@@ -46,7 +46,7 @@ pub use waker;
 
 pub use backend::{
     DriverBackend, DriverSpec, RemoteDisconnectHandle, RemoteDriver, SchedulerLimits, get_spec,
-    open, register_driver, register_driver_backend, take_driver_backend, unregister_driver,
+    open, register_driver_backend, take_driver_backend, unregister_driver,
 };
 pub use channel::{ChannelCloser, ChannelEndpoint, ChannelValue, RegisteredChannel};
 

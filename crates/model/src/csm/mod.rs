@@ -155,9 +155,9 @@ impl Variant for Csm {
     /// call into.
     fn trace(
         &self,
-        class: model_compiler::trace::FireClass,
+        class: model_ir::trace::FireClass,
         load: Deployed<'_>,
-    ) -> Result<model_compiler::trace::ForwardPlan, Refusal> {
+    ) -> Result<model_ir::trace::ForwardPlan, Refusal> {
         let _ = (class, load);
         project::trace(&self.shape)
     }
@@ -341,7 +341,7 @@ mod tests {
     /// The trace refuses too, and names the module that is not there.
     #[test]
     fn the_row_refuses_to_trace_and_names_the_missing_module() {
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
         for class in [FireClass::Prefill, FireClass::Decode] {
             let err = only_row()
                 .trace(class, Deployed::single())

@@ -8,14 +8,17 @@
 //! three sidecar buffers beside the table — [`ChannelMeta`], [`GroupLayout`]
 //! and [`RowMeta`] — that the grouped kernels index per lane.
 //!
-//! The table structs are declared authoritatively in
-//! `tensor_compiler::plan::lane_table` and pinned into the generated C header
-//! and both MSL preambles by the compiler's own `codegen::layout`. This crate
-//! deliberately does not depend on the compiler at build time — the same
-//! reason `identity::Versions` is a parameter — so the structs are *mirrored*
-//! here and a dev-dependency test compares every field offset against the
-//! compiler's, the same arrangement `status::FAULT_CLASSES` uses. A
-//! hand-copied ABI that nothing checks drifts.
+//! The table structs are declared in `tensor_compiler::plan::lane_table` and
+//! re-exported here; `codegen::layout` prints the same field list into both
+//! MSL preambles, so the kernel's declaration is generated from the one this
+//! crate packs against. They were *mirrored* here until this crate took the
+//! compiler as a dependency — see `Cargo.toml` — and a drift test compared
+//! every field offset. There is nothing left to compare.
+//!
+//! The three grouped sidecars below are NOT re-exports and could not be: the
+//! compiler declares them only as MSL text in the emitted preamble, whose own
+//! comment concedes there is "nothing to pin them to". These declarations are
+//! the something, and their drift test reads that text.
 //!
 //! ## What the C++ got wrong, and this module is shaped against
 //!
@@ -47,12 +50,15 @@
 
 use core::mem::size_of;
 
-/// The lane-table ABI version.
+/// The table structs, from the compiler that declares them.
 ///
-/// Mirror of `tensor_compiler::plan::lane_table::LANE_TABLE_ABI_VERSION`; the
-/// effect kernels reject a table stamped with anything else, recording the
-/// version they saw in the status word's guard fields.
-pub const ABI_VERSION: u32 = 3;
+/// Re-exported under this module's shorter names — `lane::Header` reads better
+/// than `lane::LaneTableHeader` — so every call site here is unchanged from
+/// when these were local declarations.
+pub use tensor_compiler::plan::lane_table::{
+    LANE_TABLE_ABI_VERSION as ABI_VERSION, LaneChannelSlot as ChannelSlot, LaneRecord as Record,
+    LaneTableHeader as Header,
+};
 
 /// [`Header::flags`] bit recorded when lanes disagree on their logits row
 /// count.
@@ -63,103 +69,6 @@ pub const ABI_VERSION: u32 = 3;
 /// [`Record::active_row_mask`] instead); it is recorded for the table's other
 /// reader, a human with a debugger.
 pub const FLAG_RAGGED: u32 = 1;
-
-/// Table header: the counts a decoder needs before it can address anything.
-///
-/// Mirror of the compiler's `LaneTableHeader`. The MSL preamble spells
-/// `channel_slots_per_lane` as `channel_count`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub struct Header {
-    /// Copy of [`ABI_VERSION`]; the kernels refuse a table that differs.
-    pub abi_version: u32,
-    /// Number of [`Record`]s that follow.
-    pub lane_count: u32,
-    /// [`ChannelSlot`]s per lane — the stride from one lane's slots to the
-    /// next.
-    pub channel_slots_per_lane: u32,
-    /// Flag bits; see [`FLAG_RAGGED`].
-    pub flags: u32,
-}
-
-/// One lane's dispatch state: buffer bases, runtime extents, and the window
-/// into the flat channel-slot array.
-///
-/// Mirror of the compiler's `LaneRecord`. The `u64` fields are three
-/// different kinds of number wearing one type — *addresses* the kernel
-/// dereferences, *tickets* it only compares, and *opaque values* — and each
-/// field says which it is, because nothing else distinguishes a wild
-/// dereference from a comparison.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub struct Record {
-    /// *Address.* Base of this lane's logits buffer.
-    pub logits_base: u64,
-    /// First row of [`logits_base`](Self::logits_base) belonging to this lane
-    /// — a row count, not a byte offset.
-    pub logits_row_offset: u32,
-    /// Rows of [`logits_base`](Self::logits_base) belonging to this lane.
-    pub logits_row_count: u32,
-    /// Live KV-cache entries. This and the six extents after it match
-    /// [`Extents`](crate::Extents) field for field; they never enter
-    /// a stage signature, which is what lets one plan serve many batch shapes.
-    pub kv_len: u32,
-    /// KV-cache pages for this lane.
-    pub page_count: u32,
-    /// Batch rows for this lane.
-    pub row_count: u32,
-    /// Input tokens for this lane.
-    pub token_count: u32,
-    /// Rows this lane reads out for sampling.
-    pub sampled_rows: u32,
-    /// Attention query length for this lane.
-    pub query_len: u32,
-    /// Attention key length for this lane.
-    pub key_len: u32,
-    /// Index of this lane's first [`ChannelSlot`] in the flat slot array;
-    /// stage-local channel `n` is at `channel_slot_offset + n`. See
-    /// [`Shape::slot_index`].
-    pub channel_slot_offset: u32,
-    /// *Opaque value.* The lane's counter-mode RNG key. Not an address — it
-    /// sits next to several, and swapping it with one preserves every size.
-    pub rng_state: u64,
-    /// *Address.* Where the kernel writes this lane's status record.
-    pub commit_slot: u64,
-    /// *Address.* Optional device bitset of active rows in a ragged lane;
-    /// zero means every row is active.
-    pub active_row_mask: u64,
-    /// *Opaque value.* Bitset over stage-local channels whose puts publish
-    /// the sampled token.
-    pub sample_output_channel_mask: u64,
-    /// *Address.* Optional device byte mask for model rows.
-    pub row_valid: u64,
-    /// Row index into [`row_valid`](Self::row_valid).
-    pub row_valid_offset: u32,
-    /// Must be zero; the drivers treat a non-zero reserved word as a corrupt
-    /// table.
-    pub reserved0: u32,
-}
-
-/// One stage-local channel's per-lane state: the cells a put/take touches and
-/// the ring tickets the kernel checks.
-///
-/// Mirror of the compiler's `LaneChannelSlot`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub struct ChannelSlot {
-    /// *Address.* The cell a `take`/`read` reads from.
-    pub committed_cell: u64,
-    /// *Address.* The cell a `put` writes before commit advances the ring.
-    pub pending_cell: u64,
-    /// *Ticket.* The ring head the host observed when it built the table;
-    /// the kernel compares and refuses a stale table, never dereferences.
-    /// [`NO_TICKET`](crate::NO_TICKET) means "not consuming".
-    pub expected_head: u64,
-    /// *Ticket.* The tail counterpart of
-    /// [`expected_head`](Self::expected_head); `NO_TICKET` means "not
-    /// publishing".
-    pub expected_tail: u64,
-}
 
 /// Per-`(lane, channel)` grouped-dispatch metadata, one per [`ChannelSlot`].
 ///
@@ -373,63 +282,6 @@ mod tests {
     /// The compiler owns the table declarations; this mirror exists because
     /// the driver refuses a build dependency on it. Field by field, offset by
     /// offset, or the mirror has drifted.
-    #[test]
-    fn the_mirror_still_matches_the_compilers_lane_table() {
-        use tensor_compiler::plan::lane_table as theirs;
-
-        assert_eq!(ABI_VERSION, theirs::LANE_TABLE_ABI_VERSION);
-
-        macro_rules! same {
-            ($ours:ty, $their:ty, $($field:ident),+ $(,)?) => {
-                assert_eq!(size_of::<$ours>(), size_of::<$their>());
-                $(assert_eq!(
-                    offset_of!($ours, $field),
-                    offset_of!($their, $field),
-                    concat!("field `", stringify!($field), "` has drifted"),
-                );)+
-            };
-        }
-
-        same!(
-            Header,
-            theirs::LaneTableHeader,
-            abi_version,
-            lane_count,
-            channel_slots_per_lane,
-            flags,
-        );
-        same!(
-            Record,
-            theirs::LaneRecord,
-            logits_base,
-            logits_row_offset,
-            logits_row_count,
-            kv_len,
-            page_count,
-            row_count,
-            token_count,
-            sampled_rows,
-            query_len,
-            key_len,
-            channel_slot_offset,
-            rng_state,
-            commit_slot,
-            active_row_mask,
-            sample_output_channel_mask,
-            row_valid,
-            row_valid_offset,
-            reserved0,
-        );
-        same!(
-            ChannelSlot,
-            theirs::LaneChannelSlot,
-            committed_cell,
-            pending_cell,
-            expected_head,
-            expected_tail,
-        );
-    }
-
     /// The sidecars exist on the kernel side only as text in the emitted
     /// preamble — the compiler's own comment concedes there is "nothing to
     /// pin them to". Holding the exact declarations against this mirror is

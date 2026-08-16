@@ -108,7 +108,7 @@ tokenizer = { path = "../tokenizer", optional = true }
 # side needs the algebra, never the host executor.
 model-loader = { path = "../model-loader", default-features = false, optional = true }
 # The tracing eDSL a declaration is written in, plus the traced form it
-# produces, plus -- the reason this one is NOT optional -- the shared shape
+# produces, plus -- the reason NEITHER is optional -- the shared shape
 # VOCABULARY (`facts::{NormPlacement, QkNorm}`, `trace::{RopeKind,
 # NormVariant}`) that a catalog row is written in.
 #
@@ -119,16 +119,33 @@ model-loader = { path = "../model-loader", default-features = false, optional = 
 # is compiled in cannot be that.
 #
 # The cost is bounded and was measured before taking it: `kernels`,
-# `kernels-cuda` and `kernels-metal` all arrive `default-features = false`,
-# which is the TABLE and not a `.cu` -- `pie model convert` still builds
-# without nvcc, which is what the `forward` gate was protecting.
-model-compiler = { path = "../model-compiler" }
+# `kernels-cuda` and `kernels-metal` all arrive `default-features = false`
+# through `model-ir`, which is the TABLE and not a `.cu` -- `pie model convert`
+# still builds without nvcc, which is what the `forward` gate was protecting.
+#
+# TWO ENTRIES where there was one (`model-compiler`, before the toolchain
+# split). This crate is the ONLY consumer of `model-dsl` in the workspace: a
+# declaration is the one thing that writes the authoring surface, and every
+# other consumer of the old crate wanted the lowering instead. The lowering is
+# not here at all -- it is a `[dev-dependencies]` entry below, because the
+# only code in this crate that lowers anything is a test asserting a
+# declaration lowers the way it says it does.
+model-dsl = { path = "../model-dsl" }
+model-ir = { path = "../model-ir" }
 anyhow = { version = "1.0", optional = true }
 serde_json = { version = "1.0", features = ["preserve_order"], optional = true }
 # Host-side media decode for the model-agnostic multimodal API.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"], optional = true }
 
 [dev-dependencies]
+# The lowering, DEV-ONLY -- the split's sharpest single result. Seven test
+# targets here (`lowering`, `lowering_cost`, `arena_soundness`,
+# `regions_surface`, `seam_names`, `tp_quantized_spec`, `kernels_table`) lower
+# a declaration to check that what it says and what it costs agree; not one
+# line of `src/` does. While the toolchain was one crate that distinction had
+# nowhere to be recorded, so `pie model convert` linked a lowering it can
+# never call.
+model-compiler = { path = "../model-compiler" }
 # The contract tests compile and verify what the authors declare, which is the
 # loader's whole job; the marshalled-view verifier they finish with lives in
 # the ABI crate, the same pipeline a driver boot runs.

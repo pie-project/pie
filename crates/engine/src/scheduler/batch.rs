@@ -353,7 +353,7 @@ pub(crate) fn build_frame_submission(
                 truncated: req.request.max_layers.is_some(),
                 max_layers: req.request.max_layers,
                 multi_token: req.request.qo_indptr.windows(2).any(|w| w[1] - w[0] > 1),
-                device_resolved_geometry: req.request.device_resolved_geometry,
+                geometry_class: req.request.geometry_class,
                 arrival,
             })
             .collect();
@@ -364,20 +364,28 @@ pub(crate) fn build_frame_submission(
             .iter()
             .map(|&index| slots[index].take().expect("member_order is a permutation"))
             .collect();
-        let wire_count = group
-            .iter()
-            .take_while(|req| !req.request.device_resolved_geometry)
-            .count();
-        let envelope_count = group.len() - wire_count;
+        // One sub-batch per RUN of equal class. The planner's sort key has
+        // the class as its primary term, so the runs are exactly the classes
+        // and the table below is a description of the order rather than a
+        // second opinion about it.
+        //
+        // This used to count a wire prefix and call everything after it
+        // `DecodeEnvelope`, which is the same partition while there are two
+        // classes and the wrong one as soon as there are three: a pooled
+        // device-geometry member states its pages in a channel and picks a
+        // SUBSET of them in-graph, and the envelope's contract is that pages
+        // are DERIVED from positions. Naming it `DecodeEnvelope` would hand
+        // `quest-attention` the pages its own graph did not choose.
         let mut sub_batch_indptr: Vec<u32> = vec![0];
         let mut sub_batch_class: Vec<u32> = Vec::new();
-        if wire_count > 0 {
-            sub_batch_indptr.push(wire_count as u32);
-            sub_batch_class.push(::driver_api::PIE_GEOMETRY_CLASS_HOST);
-        }
-        if envelope_count > 0 {
-            sub_batch_indptr.push(group.len() as u32);
-            sub_batch_class.push(::driver_api::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE);
+        for (index, req) in group.iter().enumerate() {
+            let class = req.request.geometry_class;
+            if sub_batch_class.last() == Some(&class) {
+                *sub_batch_indptr.last_mut().expect("a run has a boundary") = (index + 1) as u32;
+            } else {
+                sub_batch_class.push(class);
+                sub_batch_indptr.push((index + 1) as u32);
+            }
         }
         let build = build_batch_request(&group, page_size, stats);
         let mut roster_rows: Vec<u32> = Vec::with_capacity(build.instance_ids.len());
@@ -706,6 +714,77 @@ mod tests {
         );
         assert!(sub.plan.has_user_mask);
         assert!(!sub.plan.single_token_mode);
+    }
+
+    /// A pooled device-geometry member is stamped as its OWN class.
+    ///
+    /// # The bug this pins
+    ///
+    /// The stamp used to be derived: count a prefix of members whose
+    /// `device_resolved_geometry` was false, call that `Host`, call the rest
+    /// `DecodeEnvelope`. A pooled device-geometry fire has
+    /// `decode_envelope == None` by construction -- `host/forward.rs` guards
+    /// the pooled route on exactly that -- so the bool was false for the fires
+    /// the class was written for, and they went out as class 0. The driver
+    /// then read geometry out of the wire plan, which such a fire leaves
+    /// empty, and refused with `no page span in a CSR of 0 entries`.
+    #[test]
+    fn a_pooled_device_geometry_member_is_stamped_its_own_class() {
+        let mut plan = wire_decode(11, 3);
+        plan.geometry_class = ::driver_api::PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY;
+        // Such a fire states its pages in a channel, not in the plan.
+        plan.kv_page_indices.clear();
+        plan.kv_page_indptr.clear();
+        plan.kv_last_page_lens.clear();
+
+        let (frame, _) = build_frame_submission(
+            vec![vec![pending(plan, 12, false)]],
+            SchedulerLimits {
+                max_forward_requests: 8,
+                max_forward_tokens: 64,
+                max_page_refs: 64,
+            },
+            16,
+            &SchedulerStats::default(),
+        );
+        assert_eq!(
+            frame.steps[0].sub_batch_class,
+            vec![::driver_api::PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY],
+            "the class the fire was classified as is the class on the wire"
+        );
+    }
+
+    /// Classes partition into RUNS, and the planner's sort makes the runs
+    /// contiguous, so a mixed step names both.
+    #[test]
+    fn a_mixed_step_names_a_sub_batch_per_class() {
+        let host = wire_decode(11, 3);
+        let mut pooled = wire_decode(11, 3);
+        pooled.geometry_class = ::driver_api::PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY;
+        pooled.kv_page_indices.clear();
+        pooled.kv_page_indptr.clear();
+        pooled.kv_last_page_lens.clear();
+
+        let (frame, _) = build_frame_submission(
+            vec![vec![pending(pooled, 13, false), pending(host, 12, false)]],
+            SchedulerLimits {
+                max_forward_requests: 8,
+                max_forward_tokens: 64,
+                max_page_refs: 64,
+            },
+            16,
+            &SchedulerStats::default(),
+        );
+        let step = &frame.steps[0];
+        assert_eq!(
+            step.sub_batch_class,
+            vec![
+                ::driver_api::PIE_GEOMETRY_CLASS_HOST,
+                ::driver_api::PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY
+            ],
+            "host first, device-resolved as the suffix run"
+        );
+        assert_eq!(step.sub_batch_indptr, vec![0, 1, 2]);
     }
 
     #[test]

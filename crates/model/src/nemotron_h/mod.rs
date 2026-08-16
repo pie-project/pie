@@ -203,9 +203,9 @@ impl Variant for NemotronH {
     /// path is the one the guard in [`forward`] restored.
     fn trace(
         &self,
-        class: model_compiler::trace::FireClass,
+        class: model_ir::trace::FireClass,
         load: Deployed<'_>,
-    ) -> Result<model_compiler::trace::ForwardPlan, Refusal> {
+    ) -> Result<model_ir::trace::ForwardPlan, Refusal> {
         // METAL, refused by name. `llama_like_metal` is the only Metal
         // text in this build and it is not this model's — see
         // [`project::NO_METAL`] for what it states instead and why
@@ -466,7 +466,7 @@ mod tests {
     /// the dense path is now the one the published stacks take.
     #[test]
     fn every_row_traces_both_fire_classes_through_its_dense_mlp() {
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
         for v in VARIANTS {
             assert!(!v.shape.is_mixture(), "'{}' should be dense", v.id);
             for class in [FireClass::Prefill, FireClass::Decode] {
@@ -529,7 +529,7 @@ mod tests {
     fn a_metal_load_is_refused_by_name_and_not_traced_as_a_llama() {
         use crate::catalog::{Backend, Deployed, MetalBinding};
         use crate::deployment::Refusal;
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
 
         let bind = MetalBinding {
             quant_group: 64,

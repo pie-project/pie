@@ -7,11 +7,11 @@
 //! an entry name to the Metal compiler and gets a pipeline state object back,
 //! so `kernels-metal`'s build script copies one generated file and stops.
 //! Vulkan has no such door. `vkCreateShaderModule` takes SPIR-V words, and
-//! nothing in the loader turns GLSL into them — so the GLSL -> SPIR-V hop is a
+//! nothing in the loader turns Slang into them — so the Slang -> SPIR-V hop is a
 //! BUILD-time obligation, and this is where it is paid.
 //!
 //! That is also what makes the entrypoint set mechanical here in a way it is
-//! not on Metal. A GLSL compute shader has exactly one entry point and it is
+//! not on Metal. A Slang compute shader has exactly one entry point and it is
 //! always called `main`; what distinguishes `rms_single_row_bfloat16` from
 //! `rms_strided_row_bfloat16` is the `-D` set the module was compiled with and
 //! the FILE the resulting words are written to. So an entrypoint is a SPIR-V
@@ -29,23 +29,26 @@
 //! This is the same decision `.wiki/kernel-metal-refactor.md` §2 records for
 //! the Metal tree — the macro that stamps the instantiations sits next to the
 //! template, so a reader checking coverage reads one file — with the one
-//! difference GLSL forces: a `#define` matrix cannot be expanded by the
+//! difference the shading language forces: a `#define` matrix cannot be expanded by the
 //! preprocessor into differently-NAMED entry points, so the matrix is a
 //! directive a build reads rather than a macro a compiler expands.
 //!
-//! `scripts/vulkan-kernel-audit.py` reads the same lines to write
-//! `entrypoints.generated.txt`, and `tests/entrypoints.rs` pins that against
-//! the table's product. Three readers, one source of truth.
+//! `scripts/vulkan-kernel-audit.py` reads the same lines to print the census
+//! and to run `slangc` over every variant, and `tests/entrypoints.rs` reads
+//! them again to pin the table's product against them. Three readers, one
+//! source of truth.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 // The tier vocabulary, read straight out of the library's source. A build
-// script cannot depend on the crate it builds, and `kernels-cuda`'s build
-// script has the same problem with its tables and solves it the same way. The
-// point is that the names a module is STAMPED with here and the names a driver
-// LOOKS UP through `kernels_vulkan::Capability` are one definition.
+// script cannot depend on the crate it builds, so a script that needs
+// something the crate declares has to include the source instead; the archive
+// crate `kernels-cuda` (deleted at `85c6c674b`) had the same problem with its
+// tables and solved it the same way, fourteen modules over. The point is that
+// the names a module is STAMPED with here and the names a driver LOOKS UP
+// through `kernels_vulkan::Capability` are one definition.
 #[path = "src/capability.rs"]
 // The build stamps module names; it does not resolve device features, so the
 // half of the vocabulary a DRIVER uses is unreachable from here.
@@ -75,7 +78,7 @@ fn main() {
     // `include` is the host include path: `include/pie/kernels/` holds the
     // launch shapes and the name grammar the shell's own C++/Rust reads.
     //
-    // `kernels_dir` is the GLSL tree. A shell that ships prebuilt SPIR-V never
+    // `kernels_dir` is the Slang tree. A shell that ships prebuilt SPIR-V never
     // needs it; a tool that re-derives the variant set does.
     println!("cargo:include={}", include.display());
     println!("cargo:kernels_dir={}", kernels.display());
@@ -88,7 +91,7 @@ fn main() {
     let spv = out.join("spv");
     std::fs::create_dir_all(&spv).expect("create the SPIR-V output directory");
 
-    let glslc = glslc();
+    let slangc = slangc();
     let variants = collect(&kernels);
     assert!(
         !variants.is_empty(),
@@ -98,7 +101,7 @@ fn main() {
     );
 
     for ((entrypoint, _), variant) in &variants {
-        compile(&glslc, &kernels, &spv, entrypoint, variant);
+        compile_slang(&slangc, &kernels, &spv, entrypoint, variant);
     }
 
     println!("cargo:spv_dir={}", spv.display());
@@ -118,7 +121,7 @@ fn main() {
 
 /// One `(shader, tier, define set)` triple — one SPIR-V module.
 struct Variant {
-    /// The `.comp` this is stamped from, relative to `kernels/`.
+    /// The `.slang` this is stamped from, relative to `kernels/`.
     file: PathBuf,
     /// Which optional device features the module is allowed to use.
     tier: Capability,
@@ -232,17 +235,21 @@ fn collect(kernels: &Path) -> BTreeMap<(String, Capability), Variant> {
     out
 }
 
-/// The SPIR-V compiler.
+/// Where `slangc` is, for the shaders that have been ported to Slang.
 ///
-/// `PIE_GLSLC` first, so a build on a box whose `glslc` is not on `PATH` — the
-/// Vulkan SDK installs to a versioned prefix — can say where it is rather than
-/// having to shim it. Failing to FIND it is a build error and not a warning:
-/// `native` means "produce the modules", and a `native` build that quietly
-/// produced none would hand the shell an empty pipeline cache and let the
-/// failure surface at model load, one layer away from its cause.
-fn glslc() -> PathBuf {
-    println!("cargo:rerun-if-env-changed=PIE_GLSLC");
-    std::env::var_os("PIE_GLSLC").map_or_else(|| PathBuf::from("glslc"), PathBuf::from)
+/// The build asks the environment first so a machine with an unusual toolchain
+/// does not have to patch this file. Failing to FIND it is a build error and
+/// not a warning: `native` means "produce the modules", and a `native` build
+/// that quietly produced none would hand the shell an empty pipeline cache and
+/// let the failure surface at model load, one layer away from its cause.
+///
+/// Slang is not in Ubuntu and is not part of the Vulkan SDK's default install,
+/// so unlike the `slangc` this tree used to call there is no version a runner
+/// is likely to have by accident. What this tree is measured against is the release binary,
+/// **2026.14.1**, from `shader-slang/slang`; CI fetches exactly that.
+fn slangc() -> PathBuf {
+    println!("cargo:rerun-if-env-changed=PIE_SLANGC");
+    std::env::var_os("PIE_SLANGC").map_or_else(|| PathBuf::from("slangc"), PathBuf::from)
 }
 
 /// The directive's payload, if this line is one.
@@ -263,42 +270,78 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.expect("a readable directory entry").path();
         if path.is_dir() {
             walk(&path, out);
-        } else if path.extension().is_some_and(|e| e == "comp") {
+        } else if path.extension().is_some_and(|e| e == "slang") {
             out.push(path);
         }
     }
 }
 
-fn compile(glslc: &Path, kernels: &Path, spv: &Path, entrypoint: &str, variant: &Variant) {
+/// One Slang module.
+///
+/// The flags are all forced, and each is worth naming because a reader will
+/// otherwise assume they are arbitrary -- several of them exist only because
+/// this tree was once GLSL compiled by `glslc`, and the SPIR-V it emitted is
+/// what every reflection and every test here was written against.
+///
+/// `-fvk-use-entrypoint-name` is the important one. Slang names the SPIR-V
+/// entry point after the Slang function by default only for some targets; this
+/// tree's shell looks a module up by its ENTRYPOINT, and the reflection in
+/// `spirv.rs` reads that name out of the binary. Forcing it means a Slang
+/// module is the same object to everything downstream that the GLSL module it
+/// replaced was.
+///
+/// There is deliberately NO `-profile`. Passing `-profile glsl_450` is the
+/// obvious thing to write for a tree ported out of `#version 450` GLSL and it is
+/// wrong: it puts Slang into the SPIR-V 1.0 dialect, where a storage buffer is
+/// a `BufferBlock` in the `Uniform` storage class rather than a `Block` in
+/// `StorageBuffer`. Both load, which is why this was nearly missed -- the
+/// difference is visible only by disassembling. Without the flag Slang emits
+/// the modern form, which is what `glslc --target-env=vulkan1.3` emitted and
+/// therefore what every reflection and every test in this tree was written
+/// against.
+///
+/// `-allow-glsl` is on for one construct: the scalar parameter BLOCK. The
+/// driver finds a launch's parameter block by its SIZE -- see
+/// `binding::params`, and the two kernels that put theirs at a binding with
+/// operands after it -- so a module has to declare "a storage buffer holding
+/// exactly these bytes". Slang's own `StructuredBuffer<T>` cannot say that: it
+/// is a runtime array, whose extent is the descriptor's business and not the
+/// module's, so reflection correctly reports no size and the launch is refused
+/// with "2 scalars stated, room for 0". A GLSL-style `buffer` block is the
+/// only construct in either language that states a fixed extent, Slang
+/// supports it as a first-class input, and it produces byte-for-byte the same
+/// block `slangc` did. Everything else in these shaders is ordinary Slang.
+///
+/// `-matrix-layout-column-major` is off, because nothing here uses a matrix
+/// type in an interface block; stating it anyway would be a claim about the
+/// layout of something that does not exist.
+///
+/// The optimisation split is the same as `slangc`'s and rests on the same
+/// borrowed finding (ggml #15344): the cooperative-matrix tier is built
+/// unoptimised. Slang runs spirv-opt through the same library `slangc` does, so
+/// the miscompile is the same miscompile.
+fn compile_slang(slangc: &Path, kernels: &Path, spv: &Path, entrypoint: &str, variant: &Variant) {
     let src = kernels.join(&variant.file);
     let dst = spv.join(variant.tier.module(entrypoint));
 
-    let mut cmd = Command::new(glslc);
-    cmd.arg("-fshader-stage=compute")
-        // 1.3 is what the subgroup and 16-bit-storage extensions the tree uses
-        // are core or promoted in, and what llama.cpp's Vulkan backend targets
-        // for everything but its cooperative-matrix path.
-        .arg("--target-env=vulkan1.3");
-
-    // spirv-opt is skipped for the cooperative-matrix tier, and this is a
-    // borrowed finding rather than caution: llama.cpp's `vulkan-shaders-gen`
-    // disables optimization for its coopmat and bf16 shaders because spirv-opt
-    // miscompiles them (ggml #15344). The baseline tier keeps `-O` -- its bf16
-    // is plain `uint16_t` storage with integer shifts, which is not the pattern
-    // that bug is about.
-    if variant.tier != Capability::Coopmat {
-        cmd.arg("-O");
-    }
-
-    cmd
-        // The tree's own headers (`common/*.glsl`, `*_params.glsl`) resolve
-        // relative to the shader root, so an include reads the same in every
-        // family.
+    let mut cmd = Command::new(slangc);
+    cmd.arg("-target")
+        .arg("spirv")
+        .arg("-stage")
+        .arg("compute")
+        .arg("-entry")
+        .arg("main")
+        .arg("-fvk-use-entrypoint-name")
+        .arg("-emit-spirv-directly")
+        .arg("-allow-glsl")
         .arg("-I")
         .arg(kernels)
-        // The name a module knows itself by. It is what the shell looks a
-        // pipeline up under, so it has to be the entrypoint and not the file.
         .arg(format!("-DPIE_ENTRYPOINT={entrypoint}"));
+    if variant.tier == Capability::Coopmat {
+        cmd.arg("-O0");
+    } else {
+        cmd.arg("-O2");
+    }
     for (k, v) in &variant.defines {
         cmd.arg(format!("-D{k}={v}"));
     }
@@ -306,14 +349,14 @@ fn compile(glslc: &Path, kernels: &Path, spv: &Path, entrypoint: &str, variant: 
 
     let status = cmd.status().unwrap_or_else(|e| {
         panic!(
-            "cannot run `{}` (set PIE_GLSLC, or install the Vulkan SDK / \
-             shaderc): {e}",
-            glslc.display()
+            "cannot run `{}` (set PIE_SLANGC, or put slangc on PATH — see \
+             `slangc()` for the release this tree is measured against): {e}",
+            slangc.display()
         )
     });
     assert!(
         status.success(),
-        "glslc failed for `{entrypoint}` at tier `{}` ({}): {status}",
+        "slangc failed for `{entrypoint}` at tier `{}` ({}): {status}",
         variant.tier.tag(),
         variant.file.display()
     );

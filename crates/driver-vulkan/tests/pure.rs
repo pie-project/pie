@@ -123,7 +123,7 @@ fn nothing_this_crate_needs_to_build_compiles_c() {
     // enables the feature on none, and each script does nothing without it.
     //
     // The evidence is not this list. It is that this suite RUNS on a machine
-    // with no CUDA and no Metal and no `glslc` in the default builds: if any
+    // with no CUDA and no Metal and no `slangc` in the default builds: if any
     // of those scripts compiled anything, none of it would build here at all.
     // The list is here so that a fourth appearing is a decision somebody makes
     // rather than one that happens.
@@ -131,22 +131,25 @@ fn nothing_this_crate_needs_to_build_compiles_c() {
         // Reads `DEP_PIE_KERNELS_VULKAN_SPV_DIR`. No compiler, no C.
         "driver-vulkan",
         // The CUDA table crate `model-compiler` reads its rows from. Its
-        // script writes RUST into `OUT_DIR` -- one typed function per row --
-        // and declares no `links`, because unlike `kernels-cuda` it builds no
-        // archive. It replaced `kernels-cuda` in this closure when
-        // `model-compiler` moved to the new tables; the swap is why this list
-        // is compared as a SET and not counted.
-        "kernels-cuda-new",
+        // script writes into `OUT_DIR` and declares no `links`, because it
+        // builds no archive -- unlike the ahead-of-time archive crate it
+        // replaced in this closure and whose name it now carries, which was
+        // deleted at `85c6c674b`. The swap is why this list is compared as a
+        // SET and not counted.
+        "kernels-cuda",
         // The Metal shader build, behind `native`, and macOS-only besides.
         "kernels-metal",
-        // glslc over the shader tree, behind `native`. This crate depends on
+        // slangc over the shader tree, behind `native`. This crate depends on
         // it with `default-features = false` precisely so a driver consumes
         // modules rather than producing them.
         "kernels-vulkan",
-        // Content-hashes its own `.rs` files to fingerprint the tracer. No
-        // compiler and no library -- it declares no `links` and appears here
-        // only because it has a script at all.
-        "model-compiler",
+        // `model-compiler` STOOD HERE, described as *"content-hashes its own
+        // `.rs` files to fingerprint the tracer"*. That script is `model-dsl`'s
+        // now, and `model-dsl` is the AUTHORING surface -- a driver lowers a
+        // traced form and never writes one, so it is not in this closure at
+        // all. The entry left because the toolchain split, not because a
+        // script was deleted. `driver-wgpu`'s copy of this list lost the same
+        // row for the same reason.
     ]
     .into_iter()
     .collect();
@@ -198,7 +201,7 @@ fn metadata() -> Option<serde_json::Value> {
         // without it is not the one anybody ships. The features that stay OFF
         // are the ones that matter: this does not enable `native` on
         // `kernels-vulkan`, `kernels-cuda` or `kernels-metal`, which is what
-        // keeps glslc and nvcc out of the answer. `--all-features` would turn
+        // keeps slangc and nvcc out of the answer. `--all-features` would turn
         // all of those on and measure a build nothing performs.
         .args([
             "metadata",

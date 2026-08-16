@@ -46,7 +46,7 @@
 use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
 use model::shared::llama_like::forward::llama_like_metal;
 use model_compiler::lower::{Arg, Fire, Lowered, Row, lower};
-use model_compiler::trace::FireClass;
+use model_ir::trace::FireClass;
 
 /// The strictest `minStorageBufferOffsetAlignment` a conformant Vulkan device
 /// may report.
@@ -276,10 +276,23 @@ enum Reaches {
 /// Transcribed, so that a text that starts launching something new, or a
 /// shader that changes its binding count, is a failure here rather than a
 /// surprise in an executor that does not exist yet.
+/// The `_bm_32_bn_32` in the three GEMM symbols is `project::QMM_TILE`,
+/// transcribed rather than interpolated: the tile moved from 16 to 32 for a
+/// 4.5x prefill win, and a table that formatted itself from the constant
+/// would have followed it without anyone reading the three lines that had to
+/// change.
 const REACHES: &[(&str, Reaches)] = &[
-    ("affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_32", Reaches::Push),
+    ("affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32", Reaches::Push),
+    // The 8-bit twins, which arrived with a text upstream added rather than
+    // with anything here. A point is `(group x bits)` and the bit width is
+    // the checkpoint's, so a catalog row quantised at 8 bits names a symbol
+    // no 4-bit row does -- and it reaches its module exactly the way its
+    // 4-bit sibling does, because the bit width lives inside the shader and
+    // not in the calling convention.
+    ("affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_32", Reaches::Push),
+    ("affine_qmv_fast_bfloat16_gs_64_b_8", Reaches::Push),
     (
-        "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_16_bn_32",
+        "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
         Reaches::Push,
     ),
     ("affine_qmv_fast_bfloat16_gs_64_b_4", Reaches::Push),
@@ -331,6 +344,21 @@ const REACHES: &[(&str, Reaches)] = &[
     ),
     (
         "sdpa_paged_decode_sink_bfloat16_d_64",
+        Reaches::DriverSupplies(8),
+    ),
+    // The tiled prefill pair. Same operand list as decode plus the true row
+    // count, which is a SCALAR, so the descriptors the driver supplies are
+    // the same eight.
+    //
+    // The SINK half is the cooperative-matrix tier rather than the scalar
+    // tile: `sdpa_paged_mma` is compiled at `_d_64` alone and the only text
+    // here with sinks has 64-wide heads, so it is what the selection reaches.
+    (
+        "sdpa_paged_tiled_bfloat16_d_128",
+        Reaches::DriverSupplies(8),
+    ),
+    (
+        "sdpa_paged_mma_sink_bfloat16_d_64",
         Reaches::DriverSupplies(8),
     ),
 ];
@@ -416,7 +444,7 @@ fn every_symbol_a_real_text_launches_has_a_module() {
 #[test]
 fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
     let Some(dir) = SPV_DIR else {
-        eprintln!("no modules: build with `--features native` and `glslc` on PATH");
+        eprintln!("no modules: build with `--features native` and `slangc` on PATH");
         return;
     };
     let dir = std::path::Path::new(dir);
@@ -526,7 +554,7 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
 ///
 /// A weight and a seam value are not the plan's to place, so this stands in
 /// for the driver's tables with placeholders sized generously. Every arena
-/// operand, though -- 14948 of them across six texts in both fire classes --
+/// operand, though -- 15140 of them across six texts in both fire classes --
 /// goes through the real arithmetic: `rows × width × bytes` from the plan,
 /// checked against the plan's arena and then against 256-byte addressing.
 ///
@@ -545,10 +573,7 @@ fn the_binder_this_crate_ships_resolves_every_operand_of_every_real_launch() {
         fn weight(&self, _: &str) -> Option<&driver_vulkan::device::Buffer> {
             Some(&self.0)
         }
-        fn named(
-            &self,
-            _: model_compiler::trace::ValueId,
-        ) -> Option<&driver_vulkan::device::Buffer> {
+        fn named(&self, _: model_ir::trace::ValueId) -> Option<&driver_vulkan::device::Buffer> {
             Some(&self.0)
         }
     }
@@ -613,7 +638,7 @@ fn the_binder_this_crate_ships_resolves_every_operand_of_every_real_launch() {
     // Stated so that a plan which stops producing arena operands -- or starts
     // producing far fewer -- cannot make the zero above true by emptiness.
     assert_eq!(
-        arena_operands, 14948,
+        arena_operands, 15140,
         "the texts produced a different number of arena operands than when this \
          was measured, so the zero above is about a different plan"
     );
@@ -624,7 +649,7 @@ fn the_binder_this_crate_ships_resolves_every_operand_of_every_real_launch() {
     // end of the arena is refused nowhere and is the exact defect
     // `tests/device.rs` shows corrupting a neighbour. Both change this sum.
     assert_eq!(
-        total, 2_964_655_200,
+        total, 2_982_826_080,
         "the arena ranges this binder produces cover a different number of \
          bytes than `rows x width x bytes` over these plans did when it was \
          measured"
@@ -652,10 +677,7 @@ fn an_arena_one_byte_short_of_what_the_plan_placed_refuses_what_runs_off_it() {
         fn weight(&self, _: &str) -> Option<&driver_vulkan::device::Buffer> {
             Some(&self.0)
         }
-        fn named(
-            &self,
-            _: model_compiler::trace::ValueId,
-        ) -> Option<&driver_vulkan::device::Buffer> {
+        fn named(&self, _: model_ir::trace::ValueId) -> Option<&driver_vulkan::device::Buffer> {
             Some(&self.0)
         }
     }
@@ -715,7 +737,7 @@ fn an_arena_one_byte_short_of_what_the_plan_placed_refuses_what_runs_off_it() {
 #[test]
 fn every_launchs_scalars_land_where_its_module_reads_them() {
     let Some(dir) = SPV_DIR else {
-        eprintln!("no modules: build with `--features native` and `glslc` on PATH");
+        eprintln!("no modules: build with `--features native` and `slangc` on PATH");
         return;
     };
     let dir = std::path::Path::new(dir);
@@ -805,6 +827,17 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
         "row_gather_bfloat16",
         "sdpa_paged_decode_bfloat16_d_128",
         "sdpa_paged_decode_sink_bfloat16_d_64",
+        // The tiled prefill pair, which is the decode operand list with the
+        // true row count added, so it is short of exactly what decode is
+        // short of and for the same reason: the paged KV cache and its page
+        // table are the driver's resources, so the numbers describing them
+        // are the driver's too.
+        "sdpa_paged_tiled_bfloat16_d_128",
+        // The sink text has 64-wide heads, so it reaches the COOPERATIVE
+        // MATRIX tier rather than the scalar tile -- `sdpa_paged_mma` is
+        // compiled at `_d_64` alone. Short of the same eight descriptors as
+        // every other row that walks a paged cache.
+        "sdpa_paged_mma_sink_bfloat16_d_64",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -836,7 +869,7 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
 /// a set of built modules and an arena, how many of its rectangles can be
 /// recorded?
 ///
-/// All 6584, across SIX texts in both fire classes. It began at 3180 of 3992
+/// All 6680, across SIX texts in both fire classes. It began at 3180 of 3992
 /// over three texts, and the 812 that refused were six symbols short of
 /// something nobody had built; each one leaving that list was a defect in
 /// this crate rather than a gap in a plan, and the list is now empty.
@@ -869,7 +902,7 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
 #[test]
 fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     let Some(dir) = SPV_DIR else {
-        eprintln!("no modules: build with `--features native` and `glslc` on PATH");
+        eprintln!("no modules: build with `--features native` and `slangc` on PATH");
         return;
     };
     let dir = std::path::Path::new(dir);
@@ -882,10 +915,7 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         fn weight(&self, _: &str) -> Option<&driver_vulkan::device::Buffer> {
             Some(&self.0)
         }
-        fn named(
-            &self,
-            _: model_compiler::trace::ValueId,
-        ) -> Option<&driver_vulkan::device::Buffer> {
+        fn named(&self, _: model_ir::trace::ValueId) -> Option<&driver_vulkan::device::Buffer> {
             Some(&self.0)
         }
         // The KV cache and the fire tables are the driver's own, and this
@@ -946,6 +976,7 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
                 launch,
                 kernels_vulkan::KERNELS,
                 driver_vulkan::dispatch::Built {
+                    sig: None,
                     module,
                     declared: &declared,
                 },
@@ -977,6 +1008,7 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
                         launch,
                         kernels_vulkan::KERNELS,
                         driver_vulkan::dispatch::Built {
+                            sig: None,
                             module,
                             declared: &declared,
                         },
@@ -1073,12 +1105,13 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
                         }
                         fn named(
                             &self,
-                            _: model_compiler::trace::ValueId,
+                            _: model_ir::trace::ValueId,
                         ) -> Option<&driver_vulkan::device::Buffer> {
                             Some(&self.0)
                         }
                         fn number(&self, which: driver_vulkan::binding::FireNumber) -> Option<u32> {
                             Some(match which {
+                                driver_vulkan::binding::FireNumber::AttentionMaskStride => 0,
                                 driver_vulkan::binding::FireNumber::KvPageSize => 0x0011_1111,
                                 driver_vulkan::binding::FireNumber::KvHeadStride => 0x0022_2222,
                                 driver_vulkan::binding::FireNumber::KvSeqStride => 0x0033_3333,
@@ -1286,10 +1319,10 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     }
 
     assert_eq!(
-        launches, 6584,
+        launches, 6680,
         "a different number of rectangles is lowered"
     );
-    assert_eq!(planned, 6584, "a different number of rectangles records");
+    assert_eq!(planned, 6680, "a different number of rectangles records");
 
     // Nothing is refused, so nothing is named. Every rectangle all six
     // texts state, in both fire classes, becomes a dispatch.
@@ -1396,8 +1429,15 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     // too, and the 144 that arrived needed nothing here: an `AddBias` states
     // no scalars whatever states it, so the row deriving the width was
     // already the whole of it.
+    //
+    // 312 until `crates/model` corrected gpt-oss's fixture: that checkpoint
+    // ships `self_attn.o_proj.bias` and `mlp.router.bias`, and a test that
+    // compared thirteen named fields instead of the whole struct had let both
+    // read false. Two more biases across 24 layers in both fire classes is
+    // the 96 that arrived, and it needed nothing here -- which is the point
+    // of pinning a census rather than a shape.
     assert_eq!(
-        derived_widths, 312,
+        derived_widths, 408,
         "a different number of rectangles names a width the row derives"
     );
     // ZERO, and asserted as zero because that is the fact `dims_of`'s
@@ -1437,8 +1477,23 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     // evidence the guess was wrong in the safe direction here; it is the other
     // direction -- a text routing to fewer than four -- that the guess would
     // have answered with silence and stale arena bytes.
+    //
+    // Was 49_083_842 at `QMM_TILE = (16, 32)`. A wider row tile is fewer
+    // workgroups over the same output -- the tile is what one workgroup
+    // covers -- so this going DOWN by 208,400 as the tile doubled is the
+    // arithmetic working. The prefill it belongs to got 4.5x faster; see
+    // `QMM_TILE`.
+    //
+    // Was 48_875_442 while the two `sdpa_paged_tiled` rows stated nothing but
+    // their axes, so `dsl::sdpa` could only reach the DECODE kernel and every
+    // prefill row got its own workgroup walking the whole key run alone. The
+    // tile is 32 query rows sharing one staged run of keys, so a prefill's
+    // workgroup count divides by 32 -- 318,432 fewer here. That is a small
+    // share of the total because these plans are mostly projections, and the
+    // point of the tile is the KEY TRAFFIC it does not repeat rather than the
+    // workgroups it does not start.
     assert_eq!(
-        workgroups, 49_063_562,
+        workgroups, 48_557_010,
         "the plans dispatch a different amount of work"
     );
     // The third dimension was 1 across every text until the paged decodes
@@ -1510,14 +1565,12 @@ fn every_row_naming_a_pool_number_is_handed_that_number_and_not_another() {
         fn weight(&self, _: &str) -> Option<&driver_vulkan::device::Buffer> {
             Some(&self.0)
         }
-        fn named(
-            &self,
-            _: model_compiler::trace::ValueId,
-        ) -> Option<&driver_vulkan::device::Buffer> {
+        fn named(&self, _: model_ir::trace::ValueId) -> Option<&driver_vulkan::device::Buffer> {
             Some(&self.0)
         }
         fn number(&self, which: driver_vulkan::binding::FireNumber) -> Option<u32> {
             Some(match which {
+                driver_vulkan::binding::FireNumber::AttentionMaskStride => 0,
                 driver_vulkan::binding::FireNumber::KvPageSize => 0x0011_1111,
                 driver_vulkan::binding::FireNumber::KvHeadStride => 0x0022_2222,
                 driver_vulkan::binding::FireNumber::KvSeqStride => 0x0033_3333,
@@ -1579,6 +1632,7 @@ fn every_row_naming_a_pool_number_is_handed_that_number_and_not_another() {
             local: [1, 1, 1],
             bindings: 1,
             used: vec![true],
+            writable: vec![true],
             reads_workgroup_count: false,
             grid_axes: [true, false, false],
             push_offsets: (0..words).map(|i| i * 4).collect(),
@@ -1643,11 +1697,15 @@ fn every_row_naming_a_pool_number_is_handed_that_number_and_not_another() {
     // row losing its source is not an error anywhere -- the number simply
     // stops being written and the shader reads whatever the statement left
     // in that slot.
-    assert_eq!(rows, 6, "a different number of rows names a pool number");
-    // Three of the six ROWS walk the cache contiguously -- `kv_append`,
+    //
+    // Was six. The four that joined are `sdpa_paged_tiled` and
+    // `sdpa_paged_mma` with their sink twins, which name `KvPageSize` like the
+    // decodes they were copied from.
+    assert_eq!(rows, 10, "a different number of rows names a pool number");
+    // Three of the ten ROWS walk the cache contiguously -- `kv_append`,
     // `sdpa_vector_decode` and `sdpa_vector_decode_swa`. (The strides appear
     // five times each in the tally below because a row names both a key and a
-    // value stride; this counts rows.) The other three name only `KvPageSize`
+    // value stride; this counts rows.) The other seven name only `KvPageSize`
     // and are answered.
     assert_eq!(
         refused_rows, 3,
@@ -1657,7 +1715,7 @@ fn every_row_naming_a_pool_number_is_handed_that_number_and_not_another() {
         named,
         [
             ("KvHeadStride".to_string(), 5u32),
-            ("KvPageSize".to_string(), 3),
+            ("KvPageSize".to_string(), 7),
             ("KvSeqStride".to_string(), 5),
         ]
         .into_iter()
@@ -1679,7 +1737,15 @@ fn run_words(sig: &kernels::KernelSig, params: u32) -> u32 {
             _ if o.ty == kernels::Ty::InPacked => n += 1,
             kernels::Source::KvPageSize
             | kernels::Source::KvHeadStride
-            | kernels::Source::KvSeqStride => n += 1,
+            | kernels::Source::KvSeqStride
+            // The fire's mask pitch, which the POOL answers rather than the
+            // model text: `sdpa_paged_decode` names it where it used to name
+            // the text's literal zero. A word either way, and this sweep
+            // counts words.
+            | kernels::Source::AttentionMaskStride
+            // The fire's true row count, which tiled attention needs because
+            // its grid states the rounded-up one. A word like the rest.
+            | kernels::Source::Rows => n += 1,
             kernels::Source::Param(i) | kernels::Source::ParamF32(i) => {
                 if matches!(o.ty, kernels::Ty::Buf | kernels::Ty::BufMut) {
                     n += params.saturating_sub(u32::from(i));
@@ -1715,6 +1781,9 @@ fn expected_run(
             continue;
         }
         match o.source {
+            kernels::Source::AttentionMaskStride => run.push(0),
+            // The synthetic launch above is one row wide.
+            kernels::Source::Rows => run.push(1),
             kernels::Source::KvPageSize => run.push(0x0011_1111),
             kernels::Source::KvHeadStride => run.push(0x0022_2222),
             kernels::Source::KvSeqStride => run.push(0x0033_3333),

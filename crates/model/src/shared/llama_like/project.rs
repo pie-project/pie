@@ -24,7 +24,7 @@ use crate::manifest::{Manifest, TensorSpec};
 
 use super::spec::LlamaLikeFacts;
 
-use model_compiler::facts::{NormPlacement as SpecNorm, QkNorm};
+use model_ir::facts::{NormPlacement as SpecNorm, QkNorm};
 
 /// This row's tensors.
 ///
@@ -238,7 +238,7 @@ pub fn cuda_facts(
         head_dim_padded: kernel != f.head_dim,
         head_dim_kernel: if kernel == f.head_dim { 0 } else { kernel },
         gate_up_fused: true,
-        proj_repr: model_compiler::dsl::WeightRepr::Bf16,
+        proj_repr: model_dsl::WeightRepr::Bf16,
         tp_size: load.tp_size.max(1),
         window_left: Vec::new(),
         all_reduce_p2p_max_rows: 0,
@@ -262,7 +262,118 @@ pub fn cuda_facts(
 /// failure and the one the runtime compiler reports by listing what the
 /// shader does export — which is why `qmm_tile` is stated rather than
 /// left at the serde default of `(0, 0)`.
-pub const QMM_TILE: (u32, u32) = (16, 32);
+///
+/// # What 16 costs on Vulkan, measured
+///
+/// Reported here rather than changed, because this constant is shared by
+/// every backend and the evidence comes from one of them.
+///
+/// `kernels-vulkan` compiles cooperative-matrix builds of `affine_qmm_t` at
+/// row tiles of 32 and 64 and NONE at 16 — `quant/qmm_t.comp`'s header says
+/// a 16-row tile does not amortise a 16x16x16 matrix operation, which was
+/// tested by generating the missing builds and measuring them: no win, so
+/// the header is right.
+///
+/// The `TokensMultipleOf(tile)` guard in `forward/mod.rs` makes the two arms
+/// directly comparable: a prompt the tile divides takes the tiled GEMM and
+/// one token shorter takes the GEMV, at almost identical work. Minimum of
+/// seven runs each, real 4-bit qwen3-0.6b through `driver-vulkan::Shell`, on
+/// an RTX 4090:
+///
+/// | rows | GEMV | GEMM, tile 16 | tile 32 | tile 64 |
+/// |---|---|---|---|---|
+/// | 15/16 | 20 ms | 107 ms | | |
+/// | 31/32 | 34 ms | | 52 ms | |
+/// | 63/64 | 62 ms | | | 90 ms |
+/// | 127/128 | 146 ms | 350 ms | 111 ms | 126 ms |
+/// | 511/512 | **632 ms** | **1449 ms** | **420 ms** | **416 ms** |
+///
+/// At 512 rows the tile that ships is **2.3x slower than having no GEMM at
+/// all**, and a tile of 32 or 64 is **1.5x faster than having none**. So
+/// `(16, 32)` is the one setting that gets neither half: no
+/// cooperative-matrix build to compile into, and a loss to the matrix-vector
+/// path it exists to replace. This is an argument for a WIDER tile, not a
+/// narrower one.
+///
+/// An earlier version of this table, and a 56.1 / 39.4 / 6.8 s comparison of
+/// the three tiles at 1536 tokens, are struck from it. They were taken before
+/// `driver-vulkan` read its answers through the copy engine, and a readback
+/// of uncached write-combined VRAM was nine tenths of every one of those
+/// numbers — a measurement of the memcpy and not of the kernel. See
+/// `driver_vulkan::device::Device::read_at`.
+///
+/// The tradeoff is not free. A wider tile means more prompts the guard sends
+/// down the GEMV arm — but the table says that arm is faster than the tile-16
+/// GEMM anyway at every size measured, so `(32, 32)` is not a gamble against
+/// the short-prompt case: it is faster than the old setting whether the guard
+/// passes or fails.
+///
+/// # And what widening it was worth, once the readback stopped hiding it
+///
+/// Taken, and here is the measurement that decided it. Same card, same 4-bit
+/// qwen3-0.6B, a 1024-token prefill through `driver-vulkan::Shell` with the
+/// tile overridden and everything else held — best of three after a warm-up:
+///
+/// | tile | 1024-token prefill |
+/// |---|---|
+/// | `(16, 32)`, as shipped | 2563 ms |
+/// | `(32, 32)` | **565 ms** |
+/// | `(64, 32)` | 580 ms |
+///
+/// **4.5x.** Phase-profiled, the dispatches were 2694 ms of a 2799 ms step at
+/// the old tile, so this is nearly the whole of a prefill and not a corner of
+/// it. The same prompt one token SHORTER — which the `TokensMultipleOf` guard
+/// sends down the GEMV arm — took 1054 ms, so the old tile was also 2.6x
+/// slower than firing no GEMM at all.
+///
+/// Widths other than 1024 were an open question when that table was taken,
+/// and 32 wins or ties at all of them. Same card, same model, same method,
+/// after the driver's readback, lowering cache, table reuse and barrier
+/// analysis had all landed:
+///
+/// | width | `(32, 32)` | `(64, 32)` |
+/// |---|---|---|
+/// | 256 | **122 ms** | 134 ms |
+/// | 512 | **246 ms** | 258 ms |
+/// | 1024 | **558 ms** | 565 ms |
+/// | 2048 | 1488 ms | 1484 ms |
+///
+/// 64 is behind by a tenth on short prompts, level by 2048, and refuses more
+/// prompts at the guard. There is no width where it pays.
+///
+/// What the 4.5x actually BUYS is the cooperative-matrix tier, and that is
+/// measurable on its own: the same 1024-token prefill at `(32, 32)` with the
+/// tiered modules stripped from the store — the only thing changed — takes
+/// **2592 ms** against 570. So the tile is not faster arithmetic; it is the
+/// instantiation point at which the hardware's matrix units become
+/// nameable at all.
+///
+/// It stayed at 16 for as long as it did because the number that would have
+/// shown this was buried: every prefill timing this repository had taken
+/// included a readback of every row the fire computed, through an uncached
+/// mapping of write-combined VRAM, and that memcpy was most of the wall time.
+///
+/// # Why one constant is still enough
+///
+/// This is shared by every backend, which is what held the change back. It
+/// turns out not to be a per-backend question after all:
+///
+/// * `kernels-metal`, `kernels-wgpu` and `kernels-vulkan` all declare
+///   `TILE_M` as `_bm_16 | _bm_32 | _bm_64`, so `(32, 32)` resolves in all
+///   three exactly as `(16, 32)` did.
+/// * All three ALSO hand-list a `bm_32_bn_32_wm_1_wn_2` build beside the
+///   templated ones and hand-list nothing at `bm_16` — so 32 is the point
+///   each of those trees was tuned for, and 16 was the point none of them
+///   was.
+/// * The CUDA backend does not read this field: it resolves its GEMM without
+///   `dsl::metal::affine_gemm_point`, so nothing there moves.
+///
+/// The measurement is from one backend and the argument above is why it
+/// generalises. A backend that later wants its own tile has somewhere to put
+/// it — `qmm_tile` is already a field on [`MetalBinding`] rather than read
+/// from this constant at the point of use — so this is a default and not a
+/// hard-coding.
+pub const QMM_TILE: (u32, u32) = (32, 32);
 
 /// Why a SHARDED load has no Metal text here.
 ///
@@ -620,8 +731,8 @@ pub fn metal_facts(
         // than inferred from a tensor's shape because g64/b8 and g128/b4
         // pack to identical extents. A pipeline built for the wrong
         // point returns fluent nonsense rather than failing.
-        proj_repr: model_compiler::dsl::WeightRepr::Scaled {
-            layout: model_compiler::dsl::ScaleLayout::PerGroup,
+        proj_repr: model_dsl::WeightRepr::Scaled {
+            layout: model_dsl::ScaleLayout::PerGroup,
             group: bind.quant_group,
             axis: 0,
             zero_point: true,
@@ -640,18 +751,18 @@ pub fn metal_facts(
         // getting it wrong is the QUIET failure: a bank read at the wrong
         // format is 909,207 NaNs, and a gate read at the wrong width is a
         // fluent model routing every token to almost the right experts.
-        router_repr: (bind.router_quant_group != 0).then(|| {
-            model_compiler::dsl::WeightRepr::Scaled {
-                layout: model_compiler::dsl::ScaleLayout::PerGroup,
+        router_repr: (bind.router_quant_group != 0).then_some(
+            model_dsl::WeightRepr::Scaled {
+                layout: model_dsl::ScaleLayout::PerGroup,
                 group: bind.router_quant_group,
                 axis: 0,
                 zero_point: true,
-            }
-        }),
+            },
+        ),
         router_bits: bind.router_quant_bits,
         moe_repr: bind
             .moe_mxfp4
-            .then_some(model_compiler::dsl::WeightRepr::Mxfp4Marlin),
+            .then_some(model_dsl::WeightRepr::Mxfp4Marlin),
         // FOUR by the format's own definition — MXFP4 is a four-bit
         // mantissa under a shared block exponent — so it is a constant
         // and not a second thing for the load to observe. It is read
@@ -843,9 +954,9 @@ pub fn metal_facts(
 pub fn trace(
     f: &LlamaLikeFacts,
     row: RowScalars,
-    class: model_compiler::trace::FireClass,
+    class: model_ir::trace::FireClass,
     load: Deployed<'_>,
-) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
+) -> Result<model_ir::trace::ForwardPlan, crate::deployment::Refusal> {
     match load.backend {
         Backend::Cuda => Ok(super::forward::llama_like_cuda(
             f,
@@ -1179,8 +1290,8 @@ mod tests {
         assert_eq!(m.affine_bits, 4, "the checkpoint's own bit width");
         assert_eq!(
             m.proj_repr,
-            model_compiler::dsl::WeightRepr::Scaled {
-                layout: model_compiler::dsl::ScaleLayout::PerGroup,
+            model_dsl::WeightRepr::Scaled {
+                layout: model_dsl::ScaleLayout::PerGroup,
                 group: 64,
                 axis: 0,
                 zero_point: true,
@@ -1366,10 +1477,12 @@ mod tests {
     fn the_gemm_tile_is_the_builds_stamp_and_not_the_rows() {
         let bind = binding(64, 4);
         let m = metal_facts(qwen3_row(), Deployed::metal(&bind), &bind);
-        assert_eq!(QMM_TILE, (16, 32));
+        assert_eq!(QMM_TILE, (32, 32));
         assert_eq!(m.qmm_tile, QMM_TILE);
-        // The narrowest rung `qmm_bm` can pick, and the only column tile
-        // the residual variant carries.
+        // A rung `TILE_M` states in all three kernel trees, and the only
+        // column tile the residual variant carries. Not the narrowest rung:
+        // that is 16, and it is 4.5x slower on a 1024-token prefill for the
+        // reason the constant's own comment measures.
         assert_ne!(m.qmm_tile, (0, 0), "a stem does not resolve");
     }
 
@@ -1395,7 +1508,7 @@ mod tests {
         let split = metal_facts(qwen3_row(), Deployed::metal(&mixed), &mixed);
         assert_eq!(
             split.moe_repr,
-            Some(model_compiler::dsl::WeightRepr::Mxfp4Marlin)
+            Some(model_dsl::WeightRepr::Mxfp4Marlin)
         );
         assert_eq!(
             split.moe_bits, 4,
@@ -1433,7 +1546,7 @@ mod tests {
     /// the question.
     #[test]
     fn one_row_traces_on_either_backend_and_says_which() {
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
         let f = LlamaLikeFacts::qwen3_0_6b();
         let bind = binding(64, 4);
         for class in [FireClass::Prefill, FireClass::Decode] {
@@ -1467,7 +1580,7 @@ mod tests {
     #[test]
     fn a_sharded_metal_load_is_refused_rather_than_traced_at_full_width() {
         use crate::deployment::Refusal;
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
         let f = LlamaLikeFacts::qwen3_0_6b();
         let bind = binding(64, 4);
         let sharded = Deployed {
@@ -1509,7 +1622,7 @@ mod tests {
     #[test]
     fn a_head_width_no_metal_shader_compiled_is_refused_by_name() {
         use crate::deployment::Refusal;
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
         let bind = binding(64, 4);
         let phi3 = LlamaLikeFacts::phi3_mini();
         assert_eq!(phi3.head_dim, 96, "the fixture this test reads");
@@ -1551,7 +1664,7 @@ mod tests {
     #[test]
     fn a_routed_bank_at_an_uninstantiated_affine_point_is_refused() {
         use crate::deployment::Refusal;
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
         let moe = LlamaLikeFacts::qwen3_30b_a3b();
         assert!(moe.n_experts > 0, "the fixture this test reads");
 

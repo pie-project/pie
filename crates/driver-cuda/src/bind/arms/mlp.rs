@@ -1,6 +1,6 @@
 //! What happens when a trace states one of `mlp`'s symbols.
 //!
-//! These were `bind!` arms inside `kernels-cuda-new`. They read the driver's
+//! These were `bind!` arms inside `kernels-cuda`. They read the driver's
 //! own vocabulary through [`Cx`], so they belong on this side of the seam:
 //! the kernels crate exposes routines, and joining a statement to one is the
 //! driver's job.
@@ -8,9 +8,9 @@
 use core::ffi::c_void;
 
 use kernels::Refusal;
-use kernels_cuda_new::jit::Ctx;
-use kernels_cuda_new::x::abi::bf16;
-use kernels_cuda_new::x::mlp::*;
+use kernels_cuda::jit::Ctx;
+use kernels_cuda::jit::abi::bf16;
+use kernels_cuda::mlp::*;
 
 use super::super::cx::Cx;
 use super::Bound;
@@ -24,7 +24,7 @@ fn elements(cx: &Cx<'_>) -> Result<i32, Refusal> {
 fn chunked_swiglu_bf16_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    chunked_swiglu_bf16(
+    chunked_swiglu::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.arg_out(0)?.cast::<bf16>(),
@@ -39,7 +39,7 @@ fn relu2_bf16_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     let n = elements(cx)?;
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    relu2_bf16(&ctx, cx.arg_in(0)?.cast_const().cast::<bf16>(), cx.arg_out(0)?.cast::<bf16>(), n)
+    relu2::<bf16>(&ctx, cx.arg_in(0)?.cast_const().cast::<bf16>(), cx.arg_out(0)?.cast::<bf16>(), n)
 }
 
 /// `mlp::geglu_tanh_bf16`
@@ -47,7 +47,7 @@ fn geglu_tanh_bf16_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> 
     let n = elements(cx)?;
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    geglu_tanh_bf16(
+    geglu_tanh::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.arg_in(1)?.cast_const().cast::<bf16>(),
@@ -60,7 +60,7 @@ fn geglu_tanh_bf16_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> 
 fn chunked_geglu_tanh_bf16_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    chunked_geglu_tanh_bf16(
+    chunked_geglu_tanh::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.arg_out(0)?.cast::<bf16>(),
@@ -75,7 +75,7 @@ fn gpt_oss_glu_bf16_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal>
     let n = elements(cx)?;
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    gpt_oss_glu_bf16(
+    gpt_oss_glu::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.arg_in(1)?.cast_const().cast::<bf16>(),
@@ -91,7 +91,7 @@ fn gpt_oss_glu_bf16_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal>
 fn moe_shared_gate_dot_bf16_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    sigmoid_dot_scalar_gate_add_bf16(
+    sigmoid_dot_scalar_gate_add::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.weight(0)?.cast_const().cast::<bf16>(),
@@ -104,6 +104,26 @@ fn moe_shared_gate_dot_bf16_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), 
 
 /// Every symbol this family binds.
 pub static ARMS: &[Bound] = &[
+    // DECLARED IN `sigs()` AND ARMED BY NOBODY, which is a state this
+    // registry can hold and a bare absence cannot. Before the declaration
+    // landed a fire naming it refused `NoArm` -- a message about dispatch,
+    // naming neither what was missing nor who would supply it.
+    Bound {
+        symbol: "mlp::sigmoid_gate_inplace_bf16",
+        arm: None,
+        unbound: Some(
+            "this symbol has a HOST PROGRAM and no arm. \
+             kernels_cuda::driver_internal::sigmoid_gate_inplace_bf16 \
+             is the body -- a plain pub fn the driver is meant to call by \
+             path -- and nothing in this crate calls it. The gap is not the \
+             kernel: OpKind::SigmoidGateMul arrives with no bind written, \
+             so a fire reaching it refused NoArm and named neither the body \
+             nor its module. FLOOR: call \
+             driver_internal::sigmoid_gate_inplace_bf16 from an arm here, \
+             over the gated activation, updated in place",
+        ),
+    },
+
     Bound { symbol: "mlp::chunked_swiglu_bf16", arm: Some(chunked_swiglu_bf16_arm), unbound: None },
     Bound { symbol: "mlp::relu2_bf16", arm: Some(relu2_bf16_arm), unbound: None },
     Bound { symbol: "mlp::geglu_tanh_bf16", arm: Some(geglu_tanh_bf16_arm), unbound: None },
@@ -184,7 +204,7 @@ pub static ARMS: &[Bound] = &[
         standard-deviation multiplier, which is a per-layer model constant, \
         and a bind cannot ask for it. FLOOR: the row bound \
         Source::CtxByLayer(\"altup_std_mult\") and \
-        DispatchCtx::altup_std_mult(layer) (bind/mod.rs:1310) is the \
+        DispatchCtx::altup_std_mult(layer) is the \
         accessor; needs `Facts::altup_std_mult(layer) -> Option<f32>`, and \
         `Cx::layer()` already answers the index",
         ),

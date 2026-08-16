@@ -73,6 +73,27 @@ impl Drop for PyEngineHandle {
     }
 }
 
+/// Install the global `tracing` subscriber, once per process.
+///
+/// The CLI does this in `bootstrap::observe::init_tracing`; the wheel did it
+/// nowhere, so every engine-side `warn!`/`error!` was dropped on the floor and
+/// `RUST_LOG` had no observable effect. That matters most exactly when
+/// something goes wrong: a request that fails inside the engine reaches Python
+/// as a terse channel error ("channel is poisoned", "pipeline is closed") whose
+/// actual cause is only ever stated in a WARN.
+///
+/// Same conventions as the CLI: level from `RUST_LOG`, stderr as the writer so
+/// stdout stays clean for piping, and `try_init` so a host process that has
+/// already installed a subscriber keeps it rather than panicking.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 /// Boot the engine from a TOML config string (same schema `pie serve
 /// --config <path>` reads). Returns an [`EngineHandle`] that the caller
 /// can query and shut down.
@@ -83,6 +104,7 @@ impl Drop for PyEngineHandle {
 #[pyfunction]
 #[pyo3(text_signature = "(toml_str)")]
 fn bootstrap(py: Python<'_>, toml_str: &str) -> PyResult<PyEngineHandle> {
+    init_tracing();
     let cfg: ServeConfig = toml::from_str(toml_str)
         .map_err(|e| PyValueError::new_err(format!("parse config TOML: {e}")))?;
     cfg.validate()

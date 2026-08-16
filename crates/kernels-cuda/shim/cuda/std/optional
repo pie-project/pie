@@ -1,0 +1,128 @@
+//===-- cuda/std/optional - the third CCCL door, one template wide -------===//
+//
+// `cuda::std::optional<T>` and `cuda::std::nullopt`, and nothing else. This
+// is what `#include <cuda/std/optional>` resolves to when the compiler is
+// NVRTC and the include path is a header set carried in the binary.
+//
+// `cuda/std/limits` beside this file makes the whole argument for why a door
+// into CCCL has to be answered with a file rather than opened: libcu++ on
+// this box is 13,691,725 bytes across 1,691 files under
+// `/usr/local/cuda-13.0/targets/x86_64-linux/include/cccl`, none of which can
+// be handed to NVRTC without reading `$CUDA_HOME` at build time and giving up
+// this crate's toolkit-free build. That argument is not restated here. What
+// IS this file's own is the site and the surface.
+//
+// # The site
+//
+// `flashinfer/comm/trtllm_allreduce_fusion.cuh:10` is the only `#include
+// <cuda/std/optional>` in the carried set, and it has exactly two askers,
+// both `__device__` and both in the FP4 scale-factor addressing that the
+// fused all-reduce's quant epilogues use:
+//
+//   * `utils::get_sf_out_offset_128x4(cuda::std::optional<int> batchIdx,
+//     int mIdx, int kIdx, cuda::std::optional<int> numRows, int numCols)`
+//     -- `:446`, which reads `batchIdx.value_or(0)` and `numRows.value_or(0)`
+//     and nothing else off either parameter.
+//   * `utils::cvt_quant_to_fp4_get_sf_out_offset<SFType, N>` -- `:488`, which
+//     forwards both through unchanged.
+//
+// and one construction site, `FusedOp::operator()` at `:997`, which passes
+// `cuda::std::nullopt` for both.
+//
+// **Nothing pie fires reaches any of the three.** `comm::INSTANTIATED` holds
+// one pattern, `kARResidualRMSNorm`, whose `GetQuantType` is `kNone`, so the
+// `if constexpr` around the call site is false in every instantiation this
+// tree names. The names still have to EXIST, because a template's body is
+// parsed before it is instantiated and `get_sf_out_offset_128x4` is not a
+// template at all -- it is a plain `inline __device__` function that is
+// compiled whether or not anything calls it.
+//
+// # The surface is `value_or` and a disengaged state, because that is all
+// that is read
+//
+// A real `optional` is a hundred-odd members: `operator*`, `operator->`,
+// `value()`, `has_value()`, `emplace`, `reset`, comparison operators, monadic
+// `and_then`/`transform`/`or_else`, a converting constructor per reference
+// category, and a trivially-destructible specialisation. This is not that
+// file and must not grow into one, for `cuda/std/limits`' reason exactly: a
+// second standard library is a second set of semantics to disagree with the
+// first.
+//
+// What is here is what the three sites above read: construct engaged from a
+// `T`, construct disengaged from `nullopt_t`, and `value_or`. A site that
+// reaches for anything else fails to compile naming the member, which is the
+// right way round -- an incomplete shim is a hard error under the carried
+// set, never a silent wrong build. `csrc/shim/README.md`'s "you cannot fall
+// through" paragraph is the general statement of that.
+//
+// # What is deliberately NOT here
+//
+//   * **`operator*`, `operator->`, `value()`, `has_value()`.** Zero uses
+//     across the carried set. `value()` in particular is a decision rather
+//     than an omission: the standard says it throws `bad_optional_access`
+//     when disengaged, and there is no `throw` in device code, so a shim
+//     `value()` would have to pick some other behaviour and call it the same
+//     name.
+//   * **`std::optional`.** This file is `cuda::std::`, matching the directive
+//     and the call sites. The `csrc/shim/type_traits` next door is the `std::`
+//     tree and the two do not alias, because upstream spells them apart.
+//   * **A trivially-destructible specialisation.** `T` is `int` at every
+//     site; a union-based storage with a manual destructor would buy nothing
+//     and could only introduce a difference.
+//
+//===----------------------------------------------------------------------===//
+#pragma once
+
+// Includes nothing, like everything else in this set.
+
+namespace cuda::std {
+
+/// The disengaged tag's type. `nullopt_t` is a distinct type rather than an
+/// alias of anything so that `optional<int> x = nullopt;` selects the
+/// disengaged constructor and not the `int` one.
+struct nullopt_t {
+    /// A tagged constructor, as the standard's has, so that `nullopt_t{}`
+    /// cannot be written by accident where `{}` was meant.
+    __host__ __device__ explicit constexpr nullopt_t(int) {}
+};
+
+/// The disengaged value, passed at `trtllm_allreduce_fusion.cuh:997`.
+///
+/// `constexpr` rather than `__device__ constexpr`: NVRTC gives a `constexpr`
+/// variable at namespace scope implicit `__device__` reachability for reads
+/// like this one, and marking it `__device__` would make it a distinct object
+/// per translation unit for no reader.
+inline constexpr nullopt_t nullopt{0};
+
+/// An optionally-engaged `T`, with the two constructors and the one accessor
+/// the carried set reaches.
+template <class T>
+class optional {
+   public:
+    /// Disengaged, and the default. Both spellings reach the same state --
+    /// `optional<int> x;` and `optional<int> x = nullopt;`.
+    __host__ __device__ constexpr optional() : value_{}, engaged_{false} {}
+
+    /// Disengaged, explicitly.
+    __host__ __device__ constexpr optional(nullopt_t) : value_{}, engaged_{false} {}
+
+    /// Engaged, holding `value`. NOT `explicit`, matching the standard: the
+    /// call sites pass a bare `int` where an `optional<int>` is expected.
+    __host__ __device__ constexpr optional(T value) : value_{value}, engaged_{true} {}
+
+    /// The held value, or `fallback` when disengaged.
+    ///
+    /// The one member the carried set reads, at
+    /// `trtllm_allreduce_fusion.cuh:476`, `:480` and `:515-517`. `const&` in
+    /// the standard is `T` by value here because `T` is `int` at every site
+    /// and a reference to a `__device__` local buys nothing.
+    __host__ __device__ constexpr T value_or(T fallback) const {
+        return engaged_ ? value_ : fallback;
+    }
+
+   private:
+    T value_;
+    bool engaged_;
+};
+
+}  // namespace cuda::std

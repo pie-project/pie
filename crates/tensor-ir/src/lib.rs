@@ -21,8 +21,7 @@
 //!   [`ValueType`], [`Literal`], [`Predicate`], [`RngKind`]). A value's type is
 //!   `{ shape: list<u32>, dtype }`.
 //! * [`op`] — the PTIR op enum + the **op table** (ids, names, families,
-//!   arities): the single source of truth the generated C++ header
-//!   (`crates/tensor-compiler/include/ptir_abi.h`) is emitted from.
+//!   arities): the single source of truth every backend dispatches from.
 //! * [`container`] — the trace container data model + canonical LE
 //!   encode/decode. Program identity = [`container_hash`] (FNV-1a 64) over the
 //!   canonical container bytes (contract C3).

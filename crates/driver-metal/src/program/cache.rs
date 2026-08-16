@@ -86,12 +86,15 @@ const CHAN_PUT: u16 = tags::CHAN_PUT as u16;
 /// `PTIR_OP_TOP_K`.
 const TOP_K: u16 = tags::TOP_K as u16;
 
-/// `PTIR_LIBRARY_NUCLEUS_SAMPLE`. Mirror of
-/// `tensor_compiler::plan::LibraryOp::NucleusSample`, checked by a
-/// dev-dependency test.
-const LIBRARY_NUCLEUS_SAMPLE: u8 = 0;
-/// `PTIR_LIBRARY_TOP_K`. Mirror of `LibraryOp::TopK`.
-const LIBRARY_TOP_K: u8 = 1;
+/// `PTIR_LIBRARY_NUCLEUS_SAMPLE`, from the planner that assigns it.
+///
+/// These were `= 0` and `= 1` with a dev-dependency test holding them against
+/// the enum, which is what a `pub const` copy of a discriminant costs. The
+/// enum is `plan`'s -- what the planner decided a region lowers to -- and this
+/// crate reads it directly now.
+const LIBRARY_NUCLEUS_SAMPLE: u8 = tensor_compiler::plan::LibraryOp::NucleusSample as u8;
+/// `PTIR_LIBRARY_TOP_K`, on the same terms.
+const LIBRARY_TOP_K: u8 = tensor_compiler::plan::LibraryOp::TopK as u8;
 
 /// The most channel slots one stage may bind directly on the fused path.
 ///
@@ -996,15 +999,9 @@ impl std::fmt::Debug for Runtime {
 mod tests {
     use super::*;
 
-    /// The library-op ids are mirrored because this crate does not build
-    /// against the compiler; the dev-dependency holds them still.
-    #[test]
-    fn the_library_op_mirror_still_matches_the_compiler() {
-        use tensor_compiler::plan::LibraryOp;
-        assert_eq!(LIBRARY_NUCLEUS_SAMPLE, LibraryOp::NucleusSample as u8);
-        assert_eq!(LIBRARY_TOP_K, LibraryOp::TopK as u8);
-    }
-
+    /// The library-op ids were mirrored because this crate did not build
+    /// against the compiler; they are `as u8` on the enum now, and there is
+    /// nothing left for a test to hold still.
     #[test]
     fn the_ordinal_base_clears_the_prefill_namespace() {
         // The C++ derivation: base 3 strides of 4096, plus 1024 rows of one

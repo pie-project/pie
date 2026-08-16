@@ -66,8 +66,8 @@ use std::collections::BTreeSet;
 use driver_metal::batch::{AffineFormat, geometry_from_deployment};
 use model::catalog::{self, Deployed, MetalBinding};
 use model::deployment::{Deployment, KvStyle, RopeScaling};
-use model_compiler::kernels::Backend;
-use model_compiler::trace::FireClass;
+use model_ir::kernels::Backend;
+use model_ir::trace::FireClass;
 
 /// The affine point every row is measured at.
 ///

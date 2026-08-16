@@ -49,7 +49,7 @@
 //! distributions, as it does one layer down.
 
 use kernels_wgpu::Capability;
-use model_compiler::trace::ForwardPlan;
+use model_ir::trace::ForwardPlan;
 
 use crate::device::{Device, Failed, Pipelines, Unavailable};
 use crate::dispatch::Geometry;
@@ -117,10 +117,10 @@ impl Default for Deployment {
 /// set of facts went in and cannot notice when two did.
 pub struct Text {
     /// The text a one-row step lowers, traced at
-    /// [`FireClass::Decode`](model_compiler::trace::FireClass::Decode).
+    /// [`FireClass::Decode`](model_ir::trace::FireClass::Decode).
     pub decode: ForwardPlan,
     /// The text a wider step lowers, traced at
-    /// [`FireClass::Prefill`](model_compiler::trace::FireClass::Prefill). See
+    /// [`FireClass::Prefill`](model_ir::trace::FireClass::Prefill). See
     /// [`Serving::prefill`] for the measurement that says why one plan will not
     /// do.
     pub prefill: ForwardPlan,
@@ -158,7 +158,7 @@ impl Text {
                 .iter()
                 .flat_map(|v| v.shape.0.iter())
                 .filter_map(|d| match d {
-                    model_compiler::trace::Dim::Const(n) => Some(*n),
+                    model_ir::trace::Dim::Const(n) => Some(*n),
                     _ => None,
                 })
                 .collect()
@@ -366,7 +366,7 @@ impl std::error::Error for Unresized {}
 /// intuition a reader arrives with from the sibling. That costs nothing and the
 /// day this crate holds something that is NOT `Arc`-backed — a mapped buffer, a
 /// raw handle borrowed through `wgpu-hal` — it is already right.
-/// `a_shell_can_be_dropped_with_its_buffers_still_alive` in `tests/device.rs`
+/// `a_buffer_outlives_the_device_handle_that_made_it` in `tests/device.rs`
 /// is the evidence for the paragraph above rather than for this one.
 pub struct Shell {
     pipelines: Pipelines,
@@ -374,6 +374,13 @@ pub struct Shell {
     book: Book,
     weights: Weights,
     text: Text,
+    /// Lowerings already derived, by fire shape.
+    ///
+    /// Beside `text` because it is derived from it and from nothing else the
+    /// shell can change: `text` is set once at [`Shell::on`] and never
+    /// replaced (`a_shell_never_replaces_its_text` is what makes that a
+    /// checked claim), so no path here has to remember to clear this.
+    lowerings: crate::lowering::cached::Lowerings,
     /// The shader tree, which is a unit struct: see this module's own docs for
     /// why there is nothing to load and nothing to configure.
     modules: Embedded,
@@ -471,6 +478,7 @@ impl Shell {
             pool,
             weights,
             text,
+            lowerings: crate::lowering::cached::Lowerings::new(),
             modules: Embedded,
             programs: Programs::new(),
             // Best first, and an adapter always reports at least `Baseline`,
@@ -497,6 +505,31 @@ impl Shell {
         self.weights.hold(&self.device, name, bytes)
     }
 
+    /// How many lowerings this shell has derived.
+    ///
+    /// The number that says whether [`crate::lowering::cached`] is doing
+    /// anything: a hundred decodes over one deployment should move it by one.
+    /// Exposed because the claim is about a RUN and cannot be made from
+    /// inside the cache's own unit tests, which have no device and no text.
+    #[must_use]
+    pub fn lowerings_derived(&self) -> usize {
+        self.lowerings.derived()
+    }
+
+    /// Forget every lowering derived so far.
+    ///
+    /// **For the control**, and for a path that one day replaces a text.
+    /// `a_run_of_decodes_derives_one_lowering_and_says_the_same_thing` runs a
+    /// generation twice — once normally and once calling this before every
+    /// step — and compares the tokens. The second run is this driver with the
+    /// cache switched off, taking the same kernels down the same path, which
+    /// is the only comparison that isolates the cache: re-prefilling a
+    /// growing history instead would swap the matvec for the tiled GEMM and
+    /// compare two different kernel families.
+    pub fn forget_lowerings(&mut self) {
+        self.lowerings.clear();
+    }
+
     /// Take one step over `turns`.
     ///
     /// # Errors
@@ -515,6 +548,7 @@ impl Shell {
             book: &mut self.book,
             pool: &mut self.pool,
             weights: &self.weights,
+            lowerings: &mut self.lowerings,
         };
         serving.step(
             &self.device,
@@ -561,7 +595,10 @@ impl Shell {
         // them twice.
         let mut work = Vec::with_capacity(frame.steps.len());
         for step in &frame.steps {
-            work.push(self.prepare(&step.plan)?);
+            // A wire frame states no write descriptor: the class that does
+            // reaches this driver through `envelope::fill`, which is a
+            // different entry (`crates/engine/src/driver/backend/wgpu.rs`).
+            work.push(self.prepare(&step.plan, &[])?);
         }
 
         let mut out = Vec::with_capacity(work.len());
@@ -597,9 +634,28 @@ impl Shell {
             return Ok(Some(Launched::Impossible));
         }
         if need > self.pool.shape().pages {
-            self.pool
-                .resize(&self.device, need)
-                .map_err(|e| Unlaunched::Unstepped(crate::turns::Unstepped::Failed(e)))?;
+            // A resize the device would not give memory for is `Exhausted`,
+            // not a fault. That distinction is the whole reason the variant
+            // exists, and until this it was produced NOWHERE in this crate --
+            // declared here, documented here, matched on at the engine seam
+            // in `crates/engine/src/driver/backend/wgpu.rs`, and never
+            // returned. Every full device took the fault path.
+            //
+            // Reachable in ordinary service and not only under abuse: the
+            // ceiling above is measured against `Device::budget`, which is a
+            // heap's SIZE, so it admits any frame the device could hold if it
+            // were EMPTY -- and the device is never empty, because the weights
+            // are in it. Faulting there fails a request the scheduler could
+            // have served by evicting first.
+            //
+            // `driver-vulkan` found this first and its `lib.rs` states it at
+            // length; this is the same fix on the same seam.
+            if let Err(e) = self.pool.resize(&self.device, need) {
+                if e.is_out_of_memory() {
+                    return Ok(Some(Launched::Exhausted));
+                }
+                return Err(Unlaunched::Unstepped(crate::turns::Unstepped::Failed(e)));
+            }
         }
         Ok(None)
     }
@@ -613,6 +669,7 @@ impl Shell {
     pub fn prepare(
         &self,
         plan: &driver_api::LaunchPlan,
+        writes: &[Option<(u32, u32)>],
     ) -> Result<(Vec<crate::resources::Request>, Vec<Vec<u32>>), Unlaunched> {
         plan.validate_geometry()
             .map_err(|e| Unlaunched::Malformed(format!("this frame's geometry: {e}")))?;
@@ -624,7 +681,32 @@ impl Shell {
         if let Some(what) = crate::frames::unserved_in(plan) {
             return Err(Unlaunched::Unserved(what));
         }
-        Ok((requests_of(plan)?, tokens_of(plan)?))
+        let mut requests = requests_of(plan)?;
+        crate::frames::writes_stay_in_the_declared_span(
+            plan,
+            &requests,
+            self.pool.shape().page_size,
+        )?;
+        // The STATED write descriptor, cut into the requests it belongs to.
+        // Flat and row-indexed on the way in, because that is how the program
+        // states it and how `envelope::fill` translates it; per request from
+        // here, because that is what a `Request` is.
+        if !writes.is_empty() {
+            let rows: usize = requests.iter().map(|r| r.positions.len()).sum();
+            if writes.len() != rows {
+                return Err(Unlaunched::Malformed(format!(
+                    "this step states {} write slot(s) for {rows} row(s)",
+                    writes.len()
+                )));
+            }
+            let mut at = 0;
+            for request in &mut requests {
+                let end = at + request.positions.len();
+                request.writes = writes[at..end].to_vec();
+                at = end;
+            }
+        }
+        Ok((requests, tokens_of(plan)?))
     }
 
     /// Fire one prepared step.
@@ -658,6 +740,7 @@ impl Shell {
             book: &mut self.book,
             pool: &mut self.pool,
             weights: &self.weights,
+            lowerings: &mut self.lowerings,
         };
         serving
             .over(
@@ -707,10 +790,61 @@ impl Shell {
     /// The work is [`crate::resources::Pool::copy_plan`]'s, so that a test of
     /// the arithmetic does not need a model.
     ///
+    /// # Why this grows the pool first, and only for destinations
+    ///
+    /// Because this pool is elastic and grows ON DEMAND: [`Self::admit`]
+    /// raises it to the highest page a frame NAMES, so it holds what the
+    /// frames so far have needed and not what the scheduler is entitled to
+    /// hand out. A copy plan is the other door a page number arrives through,
+    /// and it did not carry that reasoning -- so a plan whose destination sat
+    /// one page above the last frame's high-water mark was REFUSED, by a
+    /// bounds check that was right about the pool as it is and had no way to
+    /// know what it could be.
+    ///
+    /// `driver-vulkan` found this in the curated sweep, on
+    /// `prefix-tree-kv-cache`, and only when it ran after the other
+    /// thirty-eight: "page move 0's destination names page 3 row 0, and the
+    /// pool has 3 pages of 16 rows", passing whenever it ran alone. This
+    /// backend's pool is elastic in exactly the same way and had exactly the
+    /// same gap, so the fix is ported rather than waited for.
+    ///
+    /// DESTINATIONS only -- see [`crate::frames::copy_pages_named`] for why a
+    /// source above the pool stays a refusal.
+    ///
     /// # Errors
     ///
-    /// See [`crate::resources::Pool::copy_plan`].
+    /// See [`crate::resources::Pool::copy_plan`], plus a [`Failed`] from the
+    /// growth itself. There is no `Exhausted` answer on this verb: a copy the
+    /// device cannot find memory for is a failure of a copy the engine had
+    /// already committed to, not a scheduling fact it can act on.
     pub fn copy_kv(&mut self, plan: &driver_api::KvCopyPlan) -> Result<usize, Failed> {
+        let need = crate::frames::copy_pages_named(plan);
+        // The ceiling BEFORE the growth, which is what `admit` does one screen
+        // up and this verb did not. Without it a plan naming a page number the
+        // adapter could never hold reaches `Pool::resize`, and the refusal
+        // that comes back is the allocator's -- `PastLimit { want:
+        // 32768000032768, limit: 4294967295 }` -- which names a buffer size
+        // and not the page the caller asked for.
+        //
+        // A `Failed` and not an `Impossible`: this verb has no such answer and
+        // should not grow one. A copy the device cannot serve is a failure of
+        // a copy the engine had already committed to, not a scheduling fact it
+        // can act on -- see this method's own `# Errors`.
+        if need > self.pool.ceiling(&self.device) {
+            return Err(Failed::Wgpu(format!(
+                "this copy plan writes into page {} and the pool could hold at \
+                 most {} pages on this adapter",
+                need.saturating_sub(1),
+                self.pool.ceiling(&self.device),
+            )));
+        }
+        if need > self.pool.shape().pages {
+            // The pool and not the book, exactly as `admit` does it: a copy
+            // plan arrives on the engine-driven path, where the scheduler owns
+            // page allocation and the book is not the allocator. Handing these
+            // pages to the book as well would put two allocators on them.
+            self.pool.resize(&self.device, need)?;
+        }
         self.pool.copy_plan(&self.device, plan)
     }
 
@@ -749,6 +883,27 @@ impl Shell {
                 plan.target_pages
             )))
         })?;
+        // The CEILING first, before either half moves.
+        //
+        // `Book::resize` builds the free list for the new size -- a `Vec<u32>`
+        // with one entry per page it grew by -- so a target of a billion
+        // allocates four gigabytes of HOST memory and only then asks the
+        // device, which refuses in a comparison. The two guards this verb
+        // already had cover the neighbouring dimensions and not this one:
+        // `u32::try_from` catches a target past `u32::MAX`, and
+        // `Device::zeroed` catches one past the adapter's buffer limit, and
+        // between them sits every number that fits in a `u32`, is past what
+        // the adapter could hold, and is large enough for the free list to
+        // hurt.
+        //
+        // Where `admit` asks it, and for the same reason.
+        let ceiling = self.pool.ceiling(&self.device);
+        if target > ceiling {
+            return Err(Unresized::Device(Failed::Wgpu(format!(
+                "a target of {target} pages is past the {ceiling} this adapter \
+                 could hold"
+            ))));
+        }
         let was = self.pool.shape().pages;
         // The book first, because it is the half that can refuse and the half
         // that can be put back.
@@ -778,6 +933,18 @@ impl Shell {
     #[must_use]
     pub fn export_kv_handle(&self) -> Option<driver_api::KvHandle> {
         None
+    }
+
+    /// The KV pool this shell holds, for a caller that needs to READ it.
+    ///
+    /// Shared, never handed out mutably: everything that changes the pool goes
+    /// through a verb on this type, so that the book and the pool cannot get
+    /// different ideas of how many pages there are. `driver-vulkan` exposes
+    /// the same accessor for the same reason -- a test that asks whether a
+    /// growth kept the cache has to be able to look at the cache.
+    #[must_use]
+    pub const fn pool(&self) -> &Pool {
+        &self.pool
     }
 
     /// The device this shell runs on.
@@ -854,7 +1021,7 @@ impl Shell {
     ///
     /// # Why the driver answers this and the engine used to
     ///
-    /// Every field below except the six in [`ModelFacts`] is a statement
+    /// Every field below except the six in [`driver_api::ModelFacts`] is a statement
     /// about the DEVICE — how many pages the pool holds, which copy
     /// directions the pool serves, which sinks the kernels honour, how wide a
     /// fire the scratch can run. `engine`'s seam built the whole struct on
@@ -908,6 +1075,30 @@ impl Shell {
             has_lora: false,
             model_site_summary: driver_api::ModelSiteSummary::default(),
             device_geometry_port_mask: 0,
+            // FALSE, and deliberately unlike the engine seam's `true`.
+            //
+            // These are two different launch paths and the flag is a fact
+            // about whichever one runs. This block describes the HOST-WIRE
+            // path, whose entry is `Self::launch`, and that converts every
+            // step of a frame before it fires any of them -- see the comment
+            // there for why: a frame whose third step does not close its CSR
+            // would otherwise have appended the first two steps' keys, and the
+            // scheduler's retry of the same frame would append them twice.
+            // That is the frame-entry shape `pipeline::fire` was written
+            // against, and the shape this flag calls `false`.
+            //
+            // `crates/engine/src/driver/backend/wgpu.rs` answers `true` for
+            // the in-process seam, correctly: that path interleaves -- fill,
+            // prepare, serve and `run_programs` per step, in order -- and it
+            // says in so many words that it does not call `Self::launch`.
+            //
+            // Zero above is the reason the difference costs nothing here.
+            // This path advertises no device-geometry ports at all, so no
+            // frame reaching it carries a slot chained behind an earlier slot
+            // of the same frame, and there is nothing for a per-step resolve
+            // to be needed for. Answering `true` would be a claim about an
+            // interleaving this path does not do.
+            resolves_geometry_per_step: false,
             // The ceilings a batch is formed under. `Shell::open` sizes one
             // fire's scratch from `Deployment::seam`, and a fire wider than
             // this has nothing to run in.
@@ -956,5 +1147,23 @@ impl Shell {
     #[must_use]
     pub fn built(&self) -> usize {
         self.pipelines.built()
+    }
+
+    /// How many distinct shader modules have been expanded and reflected.
+    ///
+    /// See [`Pipelines::modules_read`]. Public for the same reason
+    /// [`Self::built`] is: it is a number a test can hold across a run of
+    /// steps, and the claim it holds is worth 25x on a decode.
+    #[must_use]
+    pub const fn modules_read(&self) -> usize {
+        self.pipelines.modules_read()
+    }
+
+    /// How many times the module cache has been consulted.
+    ///
+    /// See [`Pipelines::modules_asked`].
+    #[must_use]
+    pub const fn modules_asked(&self) -> usize {
+        self.pipelines.modules_asked()
     }
 }

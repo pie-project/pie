@@ -5,9 +5,11 @@
 //! The three siblings each answer "the hardware may not have this" differently,
 //! and none of the three answers transfers.
 //!
-//! `kernels-cuda` asks CMake `pie_cuda_has_arch(90)` and compiles either the
-//! real Hopper source or a stub, because a CUDA archive is built FOR an
-//! architecture. `driver-metal` asks `supportsFamily(MTLGPUFamily::Metal4)` and
+//! `kernels-cuda` asks the DEVICE — `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_*`
+//! — and hands NVRTC `--gpu-architecture=sm_90`, so an `#if __CUDA_ARCH__ >=
+//! 900` in the source answers itself and no variant is ever enumerated. It can
+//! do that because its compiler runs in the process, after the device is in
+//! hand. `driver-metal` asks `supportsFamily(MTLGPUFamily::Metal4)` and
 //! **refuses the device**, because "a fallback path would be a second driver"
 //! and Metal is one vendor, so refusing costs a known and small set of Macs.
 //! `kernels-vulkan` compiles the same entrypoint once per tier and chooses at
@@ -17,7 +19,10 @@
 //! Metal, D3D12 and a browser, and the two things worth having —
 //! [`Capability::Fp16`] and [`Capability::Subgroup`] — are `wgpu::Features`
 //! bits an adapter may simply not report. Refusing would refuse most of the
-//! market. Building per-device is not available, because there is no build.
+//! market, and letting the compiler answer the question the way CUDA's does is
+//! not available either: `naga` takes no architecture, and an absent feature is
+//! not a version number a front end can be told about — `enable f16;` either
+//! parses or it does not.
 //!
 //! So this crate takes Vulkan's answer, one layer cheaper: a tier is a set of
 //! defines, the module is expanded and compiled at pipeline-creation time
@@ -45,7 +50,7 @@
 //!
 //! ## Why the tier is not in the signature table
 //!
-//! `model-compiler` reads the table, and the compiler must not learn which
+//! `model-ir` reads the table, and the compiler must not learn which
 //! device it is compiling for. A plan that named a tier would stop being
 //! portable between two machines running the same build. The tier lives one
 //! layer down, where the module is selected — the same seam `Prepare` and
@@ -53,9 +58,11 @@
 //! about it.
 //!
 //! This module therefore depends on nothing, so `build.rs` can pull it in with
-//! `#[path]` — the trick `kernels-cuda`'s build script uses for its tables. The
-//! build STAMPS the variant names and the library TELLS a driver what to look
-//! for; two copies of that vocabulary would drift.
+//! `#[path]` — the trick the archive crate `kernels-cuda` (deleted at
+//! `85c6c674b`) used for the fourteen table modules its build script read, and
+//! which nothing in the tree does at that scale any more. The build STAMPS the
+//! variant names and the library TELLS a driver what to look for; two copies of
+//! that vocabulary would drift.
 
 /// A tier of optional device features a variant may require.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

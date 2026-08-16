@@ -80,7 +80,7 @@
 //! cannot follow it answers "every axis" rather than "no axis", because the
 //! unknown answer must not let a wrong grid pass a check. Where it CAN follow
 //! it is exact, and the pair in
-//! [`tests::two_entrypoints_of_one_file_are_told_apart_by_the_axis_they_read`]
+//! `tests::two_entrypoints_of_one_file_are_told_apart_by_the_axis_they_read`
 //! is the measurement: two bodies of one file, one `//#if` apart, differing in
 //! exactly the axis they read.
 //!
@@ -1006,7 +1006,10 @@ fn main(@builtin(workgroup_id) w: vec3<u32>) { out_[w.x] = 1u; }
             kernels_wgpu::entrypoints().len(),
             "every entrypoint the table names has a source and reads"
         );
-        assert_eq!(read, 481, "the table is 100 rows over 481 entrypoints");
+        assert_eq!(
+            read, 481,
+            "99 rows and one retired family over 481 entrypoints"
+        );
     }
 
     /// And the module's own uniform block agrees with the row's.
@@ -1050,8 +1053,8 @@ fn main(@builtin(workgroup_id) w: vec3<u32>) { out_[w.x] = 1u; }
             }
         }
         assert_eq!(
-            compared, 189,
-            "44 rows state operands, over 189 entrypoints, and every one of \
+            compared, 196,
+            "48 rows state operands, over 196 entrypoints, and every one of \
              them is compared -- a floor here would let the sweep shrink"
         );
     }

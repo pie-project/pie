@@ -262,9 +262,9 @@ impl Variant for KimiK3 {
     /// gets a fire to begin with.
     fn trace(
         &self,
-        class: model_compiler::trace::FireClass,
+        class: model_ir::trace::FireClass,
         load: Deployed<'_>,
-    ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
+    ) -> Result<model_ir::trace::ForwardPlan, crate::deployment::Refusal> {
         // METAL, refused by name. `llama_like_metal` is the only Metal
         // text in this build and it is not this model's — see
         // [`project::NO_METAL`] for what it states instead and why
@@ -424,7 +424,7 @@ mod tests {
     /// panic inside a walk into an answer at the boundary.
     #[test]
     fn the_row_refuses_to_trace_the_gate_its_text_cannot_state() {
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
         for class in [FireClass::Decode, FireClass::Prefill] {
             let err = row("kimi-k3")
                 .trace(class, Deployed::single())
@@ -593,7 +593,7 @@ mod tests {
     fn a_metal_load_is_refused_by_name_and_not_traced_as_a_llama() {
         use crate::catalog::{Backend, Deployed, MetalBinding};
         use crate::deployment::Refusal;
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
 
         let bind = MetalBinding {
             quant_group: 64,

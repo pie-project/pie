@@ -24,6 +24,23 @@
 //! needs no code written to receive it. A `match` on entrypoint here would be
 //! a list to keep in step with a list that already exists.
 //!
+//! # Who calls this
+//!
+//! Nothing in a serving path, today. The live dispatch binds from the
+//! COMPILED MODULE instead — [`crate::binding::Params`] reads whether a
+//! kernel takes its scalars as a push block or as a struct in a storage
+//! buffer off the SPIR-V, because the row and the module disagree about that
+//! and the module is the one the GPU obeys.
+//!
+//! This half is kept because it is the part that is provable without a
+//! device, and it is the statement the module is checked AGAINST. But an ABI
+//! derivation with no caller is one that rots without symptom, so
+//! `every_row_packs_and_every_scalar_lands_on_its_own_field` in `tests/rules`
+//! packs all 44 rows that state operands and reads every scalar back out of
+//! the block it landed in. The two `unreachable!`s below are unreachable
+//! twice over: the counts cannot disagree, and no serving path would reach
+//! them if they did.
+//!
 //! # What a caller still owes
 //!
 //! [`Call::buffers`] holds the caller's own buffer handles in BINDING order,
@@ -475,6 +492,11 @@ mod tests {
             assert_eq!(call.push.len() as u32, kernels_vulkan::push_size(sig));
             packed += 1;
         }
-        assert!(packed >= 40, "only {packed} rows were packed");
+        // The floor falls with the crossing and with nothing else: a row a
+        // family retires is a row this path will never pack again, and the
+        // check that has to survive is "every row it CAN pack, it packs from
+        // its own description" -- not a count.
+        let floor = 40usize.saturating_sub(kernels_vulkan::retired_rows().len());
+        assert!(packed >= floor, "only {packed} rows were packed");
     }
 }

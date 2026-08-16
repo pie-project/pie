@@ -84,11 +84,38 @@ impl std::error::Error for Unlaunched {}
 ///
 /// `u32::MAX` is the translation's hole and is skipped; a maximum over it
 /// would size the pool for four billion pages.
+///
+/// # Why the steps' own page lists are read too
+///
+/// Because those are the pages this driver will BIND, and the other two
+/// sources are the engine's statements ABOUT them. Both statements can be
+/// short of the fact: `required_kv_pages` is documented on the engine side as
+/// a "declared high-water", the frame's translation is a placement table that
+/// is empty whenever nothing was moved, and only one of the engine's two
+/// batch-assembly paths folds `kv_page_indices` into either. A frame whose
+/// page list ran past both was answered with
+/// `Unstageable(NoSuchPage { page: 7, pages: 3 })` -- measured, on a
+/// three-page elastic pool -- which fails the request for a page the
+/// scheduler was entitled to hand out and the pool could have grown to hold.
+///
+/// This is the same defect `Shell::copy_kv` had one door over, and the same
+/// cure: size the pool by what will be bound rather than by what was
+/// declared. It is strictly more permissive than trusting the declarations,
+/// never less, because the declarations are still maxed in. The bounds check
+/// in `Request::stage` stays exactly where it is -- growth removes the cases
+/// where it was wrong, and it is still the thing that catches a page number
+/// no growth could justify.
 #[must_use]
 pub fn pages_named(frame: &FrameSubmission) -> u32 {
     frame
         .kv_translation
         .iter()
+        .chain(
+            frame
+                .steps
+                .iter()
+                .flat_map(|step| step.plan.kv_page_indices.iter()),
+        )
         .copied()
         .filter(|&p| p != u32::MAX)
         .max()
@@ -177,17 +204,17 @@ pub fn pages_named(frame: &FrameSubmission) -> u32 {
 /// # Where the missing piece actually is
 ///
 /// Not in the kernels, which was the assumption worth checking.
-/// `attn/sdpa_paged.comp` already declares all three of the things these
+/// `attn/sdpa_paged.slang` already declares all three of the things these
 /// inferlets want: a dense per-row mask at bindings 8 and 9 with an
 /// `attention_mask_stride`, a `window` that starts the key scan at
 /// `q_pos - window + 1`, and `PIE_WITH_SINK` variants that merge a per-head
 /// learned logit into the softmax -- `sdpa_paged_decode_sink_bfloat16_d_64`
-/// and three siblings are in the built entrypoint list. `sdpa_sliding.comp`
+/// and three siblings are in the built entrypoint list. `sdpa_sliding.slang`
 /// adds `sdpa_vector_decode_swa_bfloat16_d_{256,512}`, and those two widths
 /// are the whole of it: there is no `_swa_d_128`, which is the width the
 /// checkpoint served here uses.
 ///
-/// The gap is one layer up. `model_compiler::dsl`'s `sdpa` states its
+/// The gap is one layer up. `model_dsl`'s `sdpa` states its
 /// operands as the query and the KV state and nothing else, and passes a mask
 /// stride of a literal `0` -- so no rectangle NAMES a mask, and a driver
 /// cannot bind a buffer no operand asks for. The `window` is already a
@@ -207,32 +234,43 @@ pub fn unserved_in(plan: &LaunchPlan) -> Option<&'static str> {
     if !plan.rs_slot_ids.is_empty() || !plan.rs_buffer_slot_ids.is_empty() {
         return Some("recurrent state: no model this driver serves holds any");
     }
-    // A mask is refused by its CONTENT, not by the flag that says a guest
-    // named one. `has_user_mask` alone short-circuited this for as long as it
-    // was the first half of the condition, so a guest that named a mask this
-    // driver could serve exactly -- a rectangle whose true cells are the
-    // diagonal -- was refused without the cells ever being read. What is still
-    // refused unconditionally is a mask nobody can read: the flag is set and
-    // no row is on the wire, so there is nothing to check it against.
+    // A mask is APPLIED now, so the only thing left to refuse is one nobody
+    // can read: the flag is set and no row is on the wire, which leaves
+    // nothing to build a rectangle from.
+    //
+    // What used to follow refused any mask that was not exactly causal. That
+    // was honest while `Pool::stage` shipped the tables as zeros -- a mask
+    // that would be dropped is worse than a refusal -- and it is now the
+    // wrong answer: `requests_of` decodes each row's runs into allow-bytes,
+    // `Frame::of` packs them into a rectangle as wide as the fire's widest
+    // row, `Pool::number` hands the shader its pitch, and
+    // `attn/sdpa_paged.slang` reads `attention_mask[row * stride + kp]` for
+    // every row whose enable byte is set.
+    //
+    // Safe against the row that CANNOT read it, by construction rather than
+    // by a check here: `llama_like`'s text sets `paged = true` for every fire
+    // on this backend, so the only attention symbol it names is
+    // `sdpa_paged_decode`, which is one of the two rows that carry the mask
+    // operands. `sdpa_vector_decode` has none, and a fire that reached it
+    // would drop a mask silently -- which is why that `let paged = true;`
+    // is load-bearing here and not only in the pool's arithmetic.
+    //
+    // [`causal_only`] stays, because it is still the thing that says a
+    // SYNTHESIZED mask and no mask are the same computation. It is no longer
+    // a gate.
     if plan.has_user_mask && !carries(&plan.mask_indptr) {
         return Some(
-            "a user mask: attention here is causal, and a plan's mask \
-                     would be dropped rather than applied",
+            "a user mask with no rows on the wire: the flag is set and \
+                     there is nothing to read it from",
         );
     }
-    if !causal_only(plan) {
-        return Some(
-            "a user mask: attention here is causal, and a plan's mask \
-                     would be dropped rather than applied",
-        );
-    }
-    // A request that names SEVERAL read-out rows. This driver reads out ONE
-    // per request -- `Step::readout_of` is a row per turn, and `Serving::over`
-    // rewrites the sampling table to the identity because every row samples --
-    // so a program that asks for a span of them runs off the end of the
-    // distribution it was handed.
+    // A request that names SEVERAL read-out rows was once REFUSED here, on
+    // the grounds that this driver reads out one row per request. That
+    // refusal is gone -- the rows are served, see below -- and what is left
+    // is the account of the failure it was standing in for, kept because
+    // nothing else in this crate records it.
     //
-    // What that looks like today, measured on this backend running
+    // What that looked like, measured on this backend running
     // `cacheback-speculative-decoding` and `constrained-speculative-decoding`:
     //
     // ```text
@@ -243,7 +281,7 @@ pub fn unserved_in(plan: &LaunchPlan) -> Option<&'static str> {
     // engine's log, at WARN, as `logits intrinsic row range exceeds the
     // forward's readout rows`.
     //
-    // THIS GUARD DOES NOT CATCH THAT, and the comment that said it did was
+    // THE GUARD DID NOT CATCH THAT, and the comment that said it did was
     // wrong. The plans those two inferlets produce arrive with
     // `sampling_indptr=[]` -- probed under an `eprintln!` right here -- so
     // there is nothing at admission to read a width from. The width is a
@@ -253,15 +291,34 @@ pub fn unserved_in(plan: &LaunchPlan) -> Option<&'static str> {
     // question -- the poison is a WORD, an epoch, with nowhere to put a
     // sentence -- and not this crate's to answer.
     //
-    // The guard is kept because it is correct for the plan that states its
-    // table, and it costs a comparison. It is not kept as an explanation of
-    // the two failures above.
-    if widest_readout(plan).is_some_and(|most| most > 1) {
-        return Some(
-            "a request naming several read-out rows: this driver reads out \
-                     one row per request, the last one",
-        );
-    }
+    // The guard outlived its own removal: it was deleted when multi-row
+    // read-out landed, but the sentence saying it was "kept because it is
+    // correct for the plan that states its table" stayed, and so did
+    // `widest_readout`, which by then no caller and no test read. Both are
+    // gone now. A comment describing a check that is not there is the same
+    // defect as a check that cannot fire, and this crate has corrected the
+    // second shape often enough to owe the first one the same treatment.
+    //
+    // A request naming SEVERAL readout rows is SERVED now, and getting there
+    // took locating a fault this refusal had been standing in for.
+    //
+    // The machinery is `Frame::sampling_indptr`, `Step::readouts_of`, a
+    // gather over the span in `serve`, `requests_of` filling
+    // `Request::samples`, and `slice` carrying a request's rows through a
+    // tile cut. `tests/device.rs`'s `every_row_a_request_names_is_in_the_
+    // read_out` proves the read-out covers them.
+    //
+    // That proof was not enough on its own, and the gap is worth recording:
+    // with it in hand the refusal was lifted once and the workload still
+    // faulted, `logits intrinsic row range exceeds the forward's readout
+    // rows` -- because `envelope::fill` was still DROPPING the sampling
+    // table, so the gather fell back to one row per request. The read-out
+    // covered the rows and nothing asked for them. A proof about one layer is
+    // not a proof about the path.
+    //
+    // Measured after the remap: `cacheback-speculative-decoding` runs, and
+    // `draft_length` 0 and 4 produce identical output -- which is what greedy
+    // verification owes its own sequential control.
     if plan.max_layers.is_some() {
         return Some(
             "`max_layers`: a layer truncation this driver would run \
@@ -355,6 +412,7 @@ pub fn unserved_in(plan: &LaunchPlan) -> Option<&'static str> {
 /// What matters is the TRUE set: it must be `0..=position` and nothing else.
 /// False cells past the diagonal are what a causal kernel does anyway, so
 /// dropping them drops nothing.
+#[cfg(test)]
 fn causal_only(plan: &LaunchPlan) -> bool {
     if plan.masks.is_empty() {
         return true;
@@ -393,6 +451,7 @@ fn causal_only(plan: &LaunchPlan) -> bool {
 ///
 /// The row's TRUE cells must be exactly `0..=position`. The row may be wider
 /// than that -- everything past the diagonal must simply be false.
+#[cfg(test)]
 fn causal_row(mask: &driver_api::plan::EncodedMask, position: u32) -> bool {
     let want = u64::from(position) + 1;
     let mut at = 0u64;
@@ -436,22 +495,6 @@ fn causal_row(mask: &driver_api::plan::EncodedMask, position: u32) -> bool {
 /// zero holds nothing. An empty table holds nothing either.
 fn carries(indptr: &[u32]) -> bool {
     indptr.last().is_some_and(|&total| total > 0)
-}
-
-/// The most read-out rows any one request in this plan names.
-///
-/// `None` when the table names no requests at all, which is the shape a plan
-/// that states no sampling carries -- and is not the same as every request
-/// naming one row. Refusing on an ABSENT table would refuse every frame whose
-/// read-out this driver derives itself.
-fn widest_readout(plan: &LaunchPlan) -> Option<u32> {
-    if plan.sampling_indptr.len() < 2 {
-        return None;
-    }
-    plan.sampling_indptr
-        .windows(2)
-        .map(|w| w[1].saturating_sub(w[0]))
-        .max()
 }
 
 /// A program pass that faulted: the instance, and what it said.
@@ -552,17 +595,39 @@ pub fn run_programs(
                 )));
             }
         }
-        let (lo, hi) = member_requests(&sub.program_row_indptr, member, step.readout_of.len());
-        let mut values = Vec::with_capacity((hi - lo) * vocab);
-        for r in lo..hi {
-            let at = step.readout_of[r];
-            let one = step.logits.row(at).ok_or_else(|| {
+        let rows_named = step.readout_of.len();
+        let (lo, hi) =
+            member_requests(&sub.program_row_indptr, member, rows_named).ok_or_else(|| {
                 Unlaunched::Malformed(format!(
-                    "request {r} reads row {at} of a read-out of {} rows",
-                    step.logits.rows
+                    "instance {id} is member {member}, which the frame's \
+                     `program_row_indptr` {:?} does not place among {rows_named} request(s)",
+                    sub.program_row_indptr
                 ))
             })?;
-            values.extend_from_slice(one);
+        let mut values = Vec::with_capacity((hi - lo) * vocab);
+        let mut rows = 0usize;
+        for r in lo..hi {
+            // Every row this request named, not just its last. The empty
+            // case falls back to `readout_of[r]`, and a request that
+            // contributed no rows has none -- `turns::last_row_of` says so
+            // with `NO_ROW` rather than answering row 0, so the bound check
+            // below refuses it instead of handing over a neighbour's answer.
+            let span = step.readouts_of.get(r).map_or(&[][..], Vec::as_slice);
+            let span: &[usize] = if span.is_empty() {
+                std::slice::from_ref(&step.readout_of[r])
+            } else {
+                span
+            };
+            for &at in span {
+                let one = step.logits.row(at).ok_or_else(|| {
+                    Unlaunched::Malformed(format!(
+                        "request {r} reads row {at} of a read-out of {} rows",
+                        step.logits.rows
+                    ))
+                })?;
+                values.extend_from_slice(one);
+                rows += 1;
+            }
         }
         // An empty span is the device-geometry placeholder -- a member that
         // owns no read-out row -- and it fires with NO forward rather than
@@ -573,7 +638,7 @@ pub fn run_programs(
         } else {
             driver::PassInputs {
                 logits: Some(&values),
-                rows: (hi - lo) as u32,
+                rows: rows as u32,
                 vocab: vocab as u32,
                 mtp_draft_row: None,
             }
@@ -678,21 +743,40 @@ fn tickets_for(sub: &driver_api::StepSubmission, member: usize) -> Option<Vec<dr
 /// One fire, three answers, all the same, nothing faulted -- and no
 /// single-request test can see it.
 ///
-/// An absent or unusable CSR gives the whole read-out to the member, which is
-/// the single-member case and the behaviour `driver-metal` falls back to for
-/// the same shape.
+/// An ABSENT CSR gives the whole read-out to the member, which is the
+/// single-member case and the behaviour `driver-metal` falls back to for the
+/// same shape.
+///
+/// # Why an unusable CSR is `None` rather than the same fallback
+///
+/// It used to be the same fallback, and that reproduced the defect described
+/// above for exactly the member the frame got wrong. Measured on
+/// `[0, 1, 2, 9]` with three requests: members 0 and 1 answer `(0, 1)` and
+/// `(1, 2)` -- correct -- and member 2 answers `(0, 3)`, taking all three
+/// requests' rows and sampling request 0's distribution first. One member out
+/// of three, silently answering another conversation, in a frame whose other
+/// members are fine. A CSR too short for the roster does the same.
+///
+/// "Absent" and "present but not describing this member" are different
+/// claims. The first is a frame that states no attribution and means the
+/// single-member case; the second is a frame whose tables disagree with its
+/// own roster, which is what both callers already refuse by name a few lines
+/// earlier. So this returns `None` and they refuse it too.
 #[must_use]
 pub fn member_requests(
     program_row_indptr: &[u32],
     member: usize,
     requests: usize,
-) -> (usize, usize) {
+) -> Option<(usize, usize)> {
+    if program_row_indptr.len() < 2 {
+        return Some((0, requests));
+    }
     match (
         program_row_indptr.get(member),
         program_row_indptr.get(member + 1),
     ) {
-        (Some(&s), Some(&e)) if e >= s && e as usize <= requests => (s as usize, e as usize),
-        _ => (0, requests),
+        (Some(&s), Some(&e)) if e >= s && e as usize <= requests => Some((s as usize, e as usize)),
+        _ => None,
     }
 }
 
@@ -761,10 +845,160 @@ pub fn requests_of(plan: &LaunchPlan) -> Result<Vec<Request>, Unlaunched> {
                 "request {r} contributes no rows, so its readout has no answer to be"
             )));
         }
-        out.push(Request::of(
+        let mut request = Request::of(
             plan.position_ids[lo..hi].to_vec(),
             plan.kv_page_indices[plo..phi].to_vec(),
-        ));
+        );
+        request.samples = sample_rows_of(plan, r, lo, hi)?;
+        request.mask = mask_rows_of(plan, r, hi - lo)?;
+        out.push(request);
+    }
+    Ok(out)
+}
+
+/// One request's mask, decoded from its BRLE runs into allow-bytes.
+///
+/// Empty when the request states none, which is NOT a mask of zeros: the first
+/// leaves the row's enable byte clear and lets the causal rule alone apply,
+/// the second forbids every key and softmaxes over nothing.
+///
+/// # Why the decode is here and not in `resources`
+///
+/// `resources` is the portable half and `EncodedMask` is a wire type. This
+/// module already reads the same runs for [`causal_only`], so the two readings
+/// live side by side where they can be compared -- which is the whole reason
+/// the causal reader survives as an oracle now that it is no longer a gate.
+///
+/// # Errors
+///
+/// [`Unlaunched::Malformed`] for a CSR whose length is not the plan's, a span
+/// that does not close, or a request whose mask names a different number of
+/// rows than it contributes. Every one of those would otherwise index one
+/// row's mask at another row's offset.
+fn mask_rows_of(plan: &LaunchPlan, r: usize, rows: usize) -> Result<Vec<Vec<u8>>, Unlaunched> {
+    if plan.mask_indptr.len() != plan.qo_indptr.len() {
+        // No table at all is the ordinary case; a table of the wrong length is
+        // one nobody can read, and reading it anyway takes another request's
+        // runs.
+        if plan.mask_indptr.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(Unlaunched::Malformed(format!(
+            "mask_indptr has {} boundaries and qo_indptr has {}",
+            plan.mask_indptr.len(),
+            plan.qo_indptr.len()
+        )));
+    }
+    let (lo, hi) = (
+        plan.mask_indptr[r] as usize,
+        plan.mask_indptr[r + 1] as usize,
+    );
+    if lo == hi {
+        return Ok(Vec::new());
+    }
+    if lo > hi || hi > plan.masks.len() {
+        return Err(Unlaunched::Malformed(format!(
+            "request {r} spans masks {lo}..{hi} of {}",
+            plan.masks.len()
+        )));
+    }
+    if hi - lo != rows {
+        return Err(Unlaunched::Malformed(format!(
+            "request {r} states {} mask row(s) and contributes {rows}",
+            hi - lo
+        )));
+    }
+    let mut out = Vec::with_capacity(rows);
+    for mask in &plan.masks[lo..hi] {
+        let total = usize::try_from(mask.total_size).unwrap_or(usize::MAX);
+        let mut row = vec![0u8; total];
+        // The encoding starts with a FALSE run and alternates, which is the
+        // reading `causal_row` uses too: an even index is a forbidden run, an
+        // odd one allowed. A row that begins allowed opens with a zero-length
+        // false run, which is not a special case.
+        let mut at = 0usize;
+        for (i, &run) in mask.runs.iter().enumerate() {
+            let run = usize::try_from(run).unwrap_or(usize::MAX);
+            let end = at.saturating_add(run).min(total);
+            if i % 2 == 1 {
+                row[at..end].fill(1);
+            }
+            at = end;
+        }
+        if at != total {
+            return Err(Unlaunched::Malformed(format!(
+                "request {r} states a mask row of {at} key(s) over {total}"
+            )));
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
+/// The rows request `r` reads out, in ITS OWN row numbering.
+///
+/// Which is the numbering the plan already uses, so there is no conversion
+/// here -- only a bounds check, and it is the half with teeth: a row past the
+/// request's own width is a real distribution belonging to another
+/// conversation.
+///
+/// # The subtraction that used to be here
+///
+/// This rebased each row through `lo`, on the reading that a plan states
+/// read-out rows across the whole fire. Nothing states them that way.
+/// `driver::resolve` writes `span - 1` per request under a test that says
+/// "both relative to their own request"; `scheduler::wire` merges requests by
+/// appending their indices unchanged and asserts `index < row_len` doing it.
+///
+/// Rebasing is the identity when `lo == 0`, which is every single-request
+/// plan -- so the whole unit suite here agreed with it, and eight
+/// conversations at once did not. The one thing that made the two readings
+/// hard to tell apart was `envelope::fill`, which flattened the rows on the
+/// way through and so handed THIS function a different convention than the
+/// one `Shell::launch` hands it. It no longer does: the numbering is the
+/// same from the engine's geometry to `resources::Request::samples`.
+///
+/// # Errors
+///
+/// [`Unlaunched::Malformed`] for a CSR that does not close or a row outside
+/// the request that claims it.
+fn sample_rows_of(
+    plan: &LaunchPlan,
+    r: usize,
+    lo: usize,
+    hi: usize,
+) -> Result<Vec<u32>, Unlaunched> {
+    if plan.sampling_indptr.is_empty() {
+        return Ok(Vec::new());
+    }
+    if plan.sampling_indptr.len() != plan.qo_indptr.len() {
+        return Err(Unlaunched::Malformed(format!(
+            "sampling_indptr has {} boundaries and qo_indptr has {}",
+            plan.sampling_indptr.len(),
+            plan.qo_indptr.len()
+        )));
+    }
+    let (slo, shi) = (
+        plan.sampling_indptr[r] as usize,
+        plan.sampling_indptr[r + 1] as usize,
+    );
+    if slo > shi || shi > plan.sampling_indices.len() {
+        return Err(Unlaunched::Malformed(format!(
+            "request {r} spans readouts {slo}..{shi} of {}",
+            plan.sampling_indices.len()
+        )));
+    }
+    let width = hi - lo;
+    let mut out = Vec::with_capacity(shi - slo);
+    for &row in &plan.sampling_indices[slo..shi] {
+        let row = row as usize;
+        if row >= width {
+            return Err(Unlaunched::Malformed(format!(
+                "request {r} reads out its own row {row}, past the {width} row(s) it \
+                 spans ({lo}..{hi})"
+            )));
+        }
+        out.push(u32::try_from(row).unwrap_or(u32::MAX));
     }
     Ok(out)
 }
@@ -797,7 +1031,53 @@ pub fn tokens_of(plan: &LaunchPlan) -> Result<Vec<Vec<u32>>, Unlaunched> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Each member owns its own slice of the read-out, and no other.
+    #[test]
+    fn a_member_owns_the_requests_its_frame_attributes_to_it() {
+        assert_eq!(member_requests(&[0, 1, 3], 0, 3), Some((0, 1)));
+        assert_eq!(
+            member_requests(&[0, 1, 3], 1, 3),
+            Some((1, 3)),
+            "a speculative member owns several"
+        );
+    }
+
+    /// A frame stating no attribution means the single-member case.
+    #[test]
+    fn an_absent_attribution_gives_the_one_member_the_whole_read_out() {
+        assert_eq!(member_requests(&[], 0, 3), Some((0, 3)));
+        assert_eq!(member_requests(&[0], 0, 3), Some((0, 3)));
+    }
+
+    /// A CSR that does not place a member is refused, not fallen back on.
+    ///
+    /// The fallback was `(0, requests)`, and for `[0, 1, 2, 9]` over three
+    /// requests that gave member 2 all three -- so it sampled request 0's
+    /// distribution while members 0 and 1 stayed correct. One member of a
+    /// frame answering another conversation, with nothing faulting. That is
+    /// the `driver-metal` defect this function's own doc describes, reached
+    /// through the function meant to prevent it.
+    #[test]
+    fn a_member_the_attribution_does_not_place_is_refused() {
+        assert_eq!(
+            member_requests(&[0, 1, 2, 9], 2, 3),
+            None,
+            "the last entry runs past the read-out"
+        );
+        assert_eq!(
+            member_requests(&[0, 1], 2, 3),
+            None,
+            "a roster longer than the CSR that describes it"
+        );
+        assert_eq!(
+            member_requests(&[0, 2, 1], 1, 3),
+            None,
+            "and a window that ends before it starts"
+        );
+    }
     use super::*;
+    use driver_api::StepSubmission;
 
     fn plan(qo: &[u32], toks: &[u32], pos: &[u32], pidx: &[u32], pptr: &[u32]) -> LaunchPlan {
         LaunchPlan {
@@ -851,6 +1131,43 @@ mod tests {
         );
         assert_eq!(requests[1].pages, vec![2]);
         assert_eq!(tokens, vec![vec![100, 101, 102], vec![200]]);
+    }
+
+    /// A read-out row is numbered within its own request, here too.
+    ///
+    /// `Shell::launch` hands this function a plan straight off the wire,
+    /// where the rows are per request; the engine hands it one through
+    /// `envelope::fill`, which now leaves that numbering alone. One
+    /// convention, so one test shape -- and this is the shape neither path
+    /// could have caught alone, because a single request makes rebasing
+    /// through `lo` the identity.
+    #[test]
+    fn a_read_out_row_is_numbered_within_its_own_request() {
+        let mut p = plan(
+            &[0, 3, 6, 7],
+            &[10, 11, 12, 20, 21, 22, 30],
+            &[0, 1, 2, 0, 1, 2, 0],
+            &[1, 2, 3],
+            &[0, 1, 2, 3],
+        );
+        // What `driver::resolve` writes with no read-out port bound: the last
+        // row of each request, counted from that request's own start.
+        p.sampling_indices = vec![2, 2, 0];
+        p.sampling_indptr = vec![0, 1, 2, 3];
+
+        let requests = requests_of(&p).expect("rows a request numbers itself");
+        assert_eq!(
+            requests[1].samples,
+            vec![2],
+            "request 1 reads its own third row; rebasing through `lo` refuses \
+             it for naming row 2 of the fire, which belongs to request 0"
+        );
+        assert_eq!(requests[2].samples, vec![0], "a decode reads its only row");
+
+        // And the check still has teeth: one past the request's own width is
+        // a neighbour's distribution.
+        p.sampling_indices = vec![2, 3, 0];
+        requests_of(&p).expect_err("request 1 spans three rows and named a fourth");
     }
 
     /// A CSR that does not close is refused, rather than sliced.
@@ -907,6 +1224,62 @@ mod tests {
             "u32::MAX is the translation's hole, and a pool sized from it \
              would want sixteen terabytes a layer"
         );
+    }
+
+    /// A frame is sized by the pages its STEPS name, not only by what the
+    /// frame declares about them.
+    ///
+    /// # What this is about
+    ///
+    /// `kv_translation` is a placement table -- empty whenever nothing moved
+    /// -- and `required_kv_pages` is a declared high-water that only one of
+    /// the engine's two batch-assembly paths folds `kv_page_indices` into. A
+    /// frame that names page 7 while declaring one page and translating
+    /// nothing is therefore well-formed, and on a three-page elastic pool it
+    /// was answered `Unstageable(NoSuchPage { page: 7, pages: 3 })`: a failed
+    /// request for a page the scheduler was entitled to hand out.
+    ///
+    /// The pages a step lists are the pages the driver BINDS, so they are the
+    /// ones the pool has to cover.
+    #[test]
+    fn a_frame_is_sized_by_the_pages_its_steps_bind() {
+        let step = |pidx: &[u32]| StepSubmission {
+            plan: plan(&[0, 1], &[1], &[0], pidx, &[0, pidx.len() as u32]),
+            ..StepSubmission::default()
+        };
+        let frame = FrameSubmission {
+            instance_ids: vec![1],
+            kv_translation: Vec::new(),
+            kv_translation_indptr: vec![0, 0],
+            required_kv_pages: 1,
+            steps: vec![step(&[7])],
+        };
+        assert_eq!(
+            pages_named(&frame),
+            8,
+            "a frame declaring one page and binding page 7 was sized from the \
+             declaration, so the fire addresses a page the pool does not have"
+        );
+
+        // Every step, not the first: a frame's later steps read pages its
+        // first one never mentions, and a pool grown for step 0 alone would
+        // fail step 1 halfway through a frame that had already appended keys.
+        let frame = FrameSubmission {
+            steps: vec![step(&[1]), step(&[4])],
+            ..frame
+        };
+        assert_eq!(
+            pages_named(&frame),
+            5,
+            "only the first step's pages were counted"
+        );
+
+        // And the declarations still win when they are the larger claim.
+        let frame = FrameSubmission {
+            required_kv_pages: 40,
+            ..frame
+        };
+        assert_eq!(pages_named(&frame), 40, "the declared high-water was lost");
     }
 
     /// Every field `unserved_in` names actually refuses, and a plain plan
@@ -1040,20 +1413,27 @@ mod tests {
         let mut window = mixed.clone();
         window.masks[2] = all_true(2);
         assert!(
-            unserved_in(&window).is_some(),
-            "a sliding window is served as though it were causal"
+            !causal_only(&window),
+            "the oracle calls a sliding window causal"
+        );
+        // And it is SERVED, which is the change: the oracle above says this
+        // mask is a real restriction, and a real restriction is now a
+        // rectangle the shader reads rather than a refusal at the door.
+        assert!(
+            unserved_in(&window).is_none(),
+            "a sliding window is refused, and this driver now applies one"
         );
         let mut holed = mixed.clone();
         holed.masks[2] = driver_api::plan::EncodedMask::new(vec![1, 2], 3);
         assert!(
-            unserved_in(&holed).is_some(),
-            "a mask that hides a token is served as though it were causal"
+            !causal_only(&holed),
+            "the oracle calls a mask that hides a token causal"
         );
         let mut short = mixed.clone();
         short.mask_indptr = vec![0, 2, 3];
         assert!(
-            unserved_in(&short).is_some(),
-            "a request whose mask rows do not cover its query rows is read anyway"
+            !causal_only(&short),
+            "the oracle calls a mask whose rows do not cover its queries causal"
         );
 
         // A rectangle, which is how a guest that builds a mask by hand builds
@@ -1088,9 +1468,9 @@ mod tests {
         let mut narrow = rectangle.clone();
         narrow.masks[2] = padded(2, 48);
         assert!(
-            unserved_in(&narrow).is_some(),
-            "a sliding window padded to the pool's width is served as though \
-             it were causal, which is the failure the padding rule risks"
+            !causal_only(&narrow),
+            "the oracle calls a sliding window padded to the pool's width causal, \
+             which is the failure the padding rule risks"
         );
         // And a true cell PAST the diagonal is a row attending to its own
         // future, which the width rule used to make unrepresentable. The
@@ -1100,9 +1480,9 @@ mod tests {
         let mut ahead = rectangle.clone();
         ahead.masks[2] = driver_api::plan::EncodedMask::new(vec![1, 3, 44], 48);
         assert!(
-            unserved_in(&ahead).is_some(),
-            "a row shifted one cell right attends to its own future and is \
-             served as causal, because it counts the same"
+            !causal_only(&ahead),
+            "the oracle calls a row shifted one cell right causal, because it \
+             counts the same"
         );
         // A row narrower than its own diagonal is a window stated as a width,
         // and the clamp is what makes the count see it: three true cells over
@@ -1110,15 +1490,15 @@ mod tests {
         let mut narrow_row = rectangle.clone();
         narrow_row.masks[2] = driver_api::plan::EncodedMask::new(vec![0, 3], 2);
         assert!(
-            unserved_in(&narrow_row).is_some(),
-            "a row too narrow to hold its own history is served as causal"
+            !causal_only(&narrow_row),
+            "the oracle calls a row too narrow to hold its own history causal"
         );
         // A hole is still a hole at any width.
         let mut holed_wide = rectangle.clone();
         holed_wide.masks[2] = driver_api::plan::EncodedMask::new(vec![1, 2, 45], 48);
         assert!(
-            unserved_in(&holed_wide).is_some(),
-            "a mask that hides a token is served once the row is padded"
+            !causal_only(&holed_wide),
+            "the oracle calls a padded row that hides a token causal"
         );
         // A row that STOPS short is the case the count rule exists for, and
         // the reason coverage of `total_size` could not stand in for it: the
@@ -1128,9 +1508,9 @@ mod tests {
         let mut stops_short = rectangle.clone();
         stops_short.masks[2] = driver_api::plan::EncodedMask::new(vec![0, 1], 48);
         assert!(
-            unserved_in(&stops_short).is_some(),
-            "a row whose true cells stop short of its own position is served \
-             as causal, so a window encoded economically is dropped"
+            !causal_only(&stops_short),
+            "the oracle calls a row whose true cells stop short of its own \
+             position causal, so a window encoded economically reads as one"
         );
         // And the economy itself is legal: a row that names its true cells and
         // nothing after them is the same row as one that spells the false tail
@@ -1175,12 +1555,8 @@ mod tests {
                 sampling_indptr: vec![0, 3],
                 ..base.clone()
             }),
-            Some(
-                "a request naming several read-out rows: this driver reads out \
-                 one row per request, the last one"
-            ),
-            "a request asking for three distributions is launched, and faults \
-             inside the interpreter instead of being refused by name"
+            None,
+            "a request asking for three distributions is served"
         ); // Both halves of the boundary. One row per request is the ordinary
         // shape and must be served; a table that names nothing at all is a
         // plan whose read-out this driver derives, and must be served too --

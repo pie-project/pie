@@ -7,8 +7,8 @@
 //! | # | copy | where |
 //! |---|---|---|
 //! | 1 | Rust | [`driver_cuda::bind::abi::KvCacheScheme`], `driver_cuda::dtype::DType` |
-//! | 2 | host C++ | `kernels-cuda/csrc/src/attn/kv_cache_view.hpp`, `tensor.hpp` |
-//! | 3 | device | `kernels-cuda-new/csrc/src/attn/attention_naive_paged.cuh` |
+//! | 2 | host C++ | the ARCHIVE crate's `attn/kv_cache_view.hpp`, `tensor.hpp` |
+//! | 3 | device | `kernels-cuda/kernels/attn/attention_naive_paged.cuh` |
 //!
 //! **The driver fills a view from (1) and NVRTC's kernel switches on (3), so
 //! (1) → (3) is the live pair.** For most of this migration the only
@@ -27,12 +27,12 @@
 //!
 //! The obvious home is `emit_device_typecheck`, and it is the wrong one: that
 //! machinery exists so a **row's declaration** can be checked against a
-//! `__global__`, and it runs inside `kernels-cuda-new`. Asking it to reach for
+//! `__global__`, and it runs inside `kernels-cuda`. Asking it to reach for
 //! `driver-cuda`'s Rust would point the dependency backwards — `driver-cuda`
-//! depends on `kernels-cuda-new`, not the other way round. So the comparison
+//! depends on `kernels-cuda`, not the other way round. So the comparison
 //! belongs on this side, and on this side the device text is a `.cuh` we read
-//! rather than a type we can name. `kernels-cuda/tests/sources.rs` established
-//! the idiom.
+//! rather than a type we can name. The archive crate's `tests/sources.rs`
+//! established the idiom, and went with it at `85c6c674b`.
 //!
 //! # What this cannot catch, stated so nobody assumes otherwise
 //!
@@ -137,7 +137,7 @@ fn mirrors(what: &str, rust: &[(String, u8)], device: &[(String, u8)]) {
     }
 }
 
-const DEVICE: &str = "crates/kernels-cuda-new/csrc/src/attn/attention_naive_paged.cuh";
+const DEVICE: &str = "crates/kernels-cuda/kernels/attn/attention_naive_paged.cuh";
 
 /// The KV cache scheme, Rust against device.
 ///

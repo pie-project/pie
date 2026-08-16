@@ -38,15 +38,15 @@ path = "src/lib.rs"
 # build until a human says which runtime this binary will meet. `lib.rs`
 # turns the omission into a compile_error that says so.
 #
-# `kernels-cuda-new/cuda-1X` rides along, and it is not optional politeness:
+# `kernels-cuda/cuda-1X` rides along, and it is not optional politeness:
 # that crate's runtime layer is the one that now COMPILES AND FIRES the JIT
 # rows (`bind::jit`), so it loads a libcudart in this process. Two crates in
 # one binary that disagreed about which would be one set of `cudarc` bindings
 # calling the other's runtime -- the `cudaGraphAddNode` arity trap above,
 # reached from a second direction. The version is selected in exactly one
 # place, here, and inherited.
-cuda-12 = ["_cuda", "cudarc/cuda-12080", "model-loader?/cuda-12", "kernels-cuda-new/cuda-12"]
-cuda-13 = ["_cuda", "cudarc/cuda-13000", "model-loader?/cuda-13", "kernels-cuda-new/cuda-13"]
+cuda-12 = ["_cuda", "cudarc/cuda-12080", "model-loader?/cuda-12", "kernels-cuda/cuda-12"]
+cuda-13 = ["_cuda", "cudarc/cuda-13000", "model-loader?/cuda-13", "kernels-cuda/cuda-13"]
 
 # Private: "some CUDA version was chosen". Modules are gated on this so that a
 # build with no version selected emits one actionable error instead of burying
@@ -64,8 +64,10 @@ _cuda = ["dep:cudarc"]
 # target that runs. See `src/lib.rs` for why that is safer than refusing
 # to build, and `src/gpu/mod.rs` for where the line runs.
 
-# `bridge` STOOD HERE — `["_cuda", "kernels-cuda/native"]` — and north star
-# §6 has retired it. Its whole payload was the ARCHIVE: `build.rs` generated
+# `bridge` STOOD HERE — `["_cuda", "kernels-cuda/native"]`, naming the ARCHIVE
+# crate that held that name and was deleted at `85c6c674b`, not the JIT crate
+# that holds it now — and north star §6 has retired it. Its whole payload was
+# that archive: `build.rs` generated
 # the `extern "C"` shim and the Rust bindings from the kernel table, compiled
 # the shim against the real headers, and linked `libpie_launch_shim.a` so
 # `bind::abi::ffi` could be called.
@@ -81,8 +83,10 @@ _cuda = ["dep:cudarc"]
 #
 # The archive is not "ported". `libpie_launch_shim.a` had ZERO members at the
 # cut: `emit_c_shim` emits one `pie_k_*` forwarder per STATED row, and no row
-# states operands since `table::ROW_TABLES` emptied. `kernels-cuda` still
-# builds it under its own `native` feature; nothing in this crate asks.
+# states operands since `table::ROW_TABLES` emptied. The archive kept building
+# it under its own `native` feature for as long as it existed and nothing here
+# ever asked; then it was deleted, and the crate answering to `kernels-cuda`
+# now is the JIT one below, which has no `native` and builds no archive.
 
 # Phase D's door: the thirteen `pie_cuda_*` exports the engine binds
 # (retirement plan — "the cutover boundary, measured"). Implies `bridge`
@@ -95,7 +99,7 @@ abi = ["_cuda", "dep:driver-api", "dep:model-loader", "model/contract"]
 # `jit-parity` STOOD HERE and is deleted with `bind::dispatch_jit_probe`.
 #
 # It was the AOT-vs-JIT parity harness's half of the seam: a SECOND generated
-# `match` in which every row a `kernels-cuda-new` unit hosts took its JIT arm
+# `match` in which every row a `kernels-cuda` unit hosts took its JIT arm
 # whether or not it was routed, so one `BoundLaunch` could be fired both ways
 # and compared. Two dispatchers, because one cannot hold two arms for a
 # symbol.
@@ -216,7 +220,12 @@ model = { path = "../model", default-features = false, features = ["contract"] }
 
 # The executor's input: `lower()`'s flat launch list and the trace types
 # its operands name. Pure Rust — the toolkit-free build is unaffected.
+#
+# Two entries since the toolchain split, and the split is why the AUTHORING
+# surface is no longer here: `dsl::cuda` is 4,469 lines this crate's `src/`
+# never called, and the only paths in it that named `dsl` were doc links.
 model-compiler = { path = "../model-compiler" }
+model-ir = { path = "../model-ir" }
 
 # The PTIR channel plane, shared with the Metal shell: launch-package
 # adoption, the compile-cache identity, the emitted-table index, the bounded
@@ -246,8 +255,10 @@ model-loader = { path = "../model-loader", optional = true }
 # driver states its own configuration behind the ABI feature.
 toml = "1.1"
 
-# `kernels-cuda` STOOD HERE, and this paragraph is kept rather than deleted
-# because it is the reason someone would put it back.
+# THE ARCHIVE CRATE STOOD HERE — it answered to `kernels-cuda` until it was
+# deleted at `85c6c674b`, after which the JIT crate below took the name — and
+# this paragraph is kept rather than deleted because it is the reason someone
+# would put the edge back. Every `kernels-cuda` in it is the archive.
 #
 # It said: *"THIS EDGE IS THE ONE THAT MATTERS, and after §21.11 it is the
 # only one: it is what turns on `native`, and `DEP_PIE_KERNELS_CUDA_LAUNCH_SHIM`
@@ -266,7 +277,7 @@ toml = "1.1"
 # The run-time argument in the deleted text — *"`bind::device` resolves a
 # row's `pie_g_*` entry point AT RUN TIME, so the driver cannot load a kernel
 # image without the table"* — is still true and is still paid for. The table
-# arrives through `kernels-cuda-new` below, which is where the rows have lived
+# arrives through `kernels-cuda` below, which is where the rows have lived
 # since §19; the archive's crate only ever `pub use`d them.
 
 # THE JIT, and where a migrated row now actually fires from.
@@ -278,14 +289,15 @@ toml = "1.1"
 # on two option sets, so the same row could be launched from cubins built with
 # different float flags depending on which half of the tree called it.
 #
-# `default-features = false` and NOT optional, exactly like `kernels-cuda`
-# above: layers 1 and 2 are rows and text, they cost no CUDA to depend on, and
+# `default-features = false` and NOT optional, for the reason the archive's
+# edge above carried the same flag: layers 1 and 2 are rows and text, they
+# cost no CUDA to depend on, and
 # the runtime layer arrives with the `cuda-1X` feature that selects the
 # version for everything else. That is why the feature lines above name it
 # rather than an `optional = true` here -- a binary that has chosen a runtime
 # gets this crate's runtime too, on the same libcudart, or it does not get one
 # at all.
-kernels-cuda-new = { path = "../kernels-cuda-new", default-features = false }
+kernels-cuda = { path = "../kernels-cuda", default-features = false }
 
 # The kernel contract vocabulary: `KernelSig`, `Ty`, and `LaunchRule` -- the
 # grid shape a row states, which `bind::launch` evaluates. A regular
@@ -294,7 +306,8 @@ kernels-cuda-new = { path = "../kernels-cuda-new", default-features = false }
 kernels = { path = "../kernels" }
 
 # The launch ABI pilot reads the kernel table and generates both halves of the
-# flat entry points from it (`kernels_cuda::abi`). A dev-dependency rather
+# flat entry points from it (`kernels_cuda::abi` — the ARCHIVE crate's
+# top-level module, which went with it at `85c6c674b`). A dev-dependency rather
 # than a dependency: nothing in the library calls a launcher yet, and the
 # generated Rust bindings are only compiled by `tests/rope_abi.rs`. This moves
 # to `[dependencies]` when the first launcher is actually called.
@@ -302,26 +315,38 @@ kernels = { path = "../kernels" }
 # `default-features = false` is the point of the split in that crate -- it
 # leaves `native` off, so reading the table costs no nvcc.
 [dev-dependencies]
+# TEST-ONLY, and the split is what proved it can be: the tests here spell
+# `model_dsl::WeightRepr::Bf16` when building a fixture's declaration, and
+# `src/` spells nothing from this crate at all. It used to arrive as part of
+# `model-compiler`, so the 4,469-line `dsl::cuda` surface was in every build
+# of this driver rather than only in its test binaries.
+model-dsl = { path = "../model-dsl" }
 kernels = { path = "../kernels" }
-# `kernels-cuda` STOOD HERE TOO, and it is the line that predicted its own
-# removal: *"This line is kept because removing it is a separate decision from
-# fixing the mechanism … **When it goes, nothing about linking changes.**"*
-# This is that separate decision, and the prediction is discharged unaltered.
+# THE ARCHIVE CRATE STOOD HERE TOO, and its line is the one that predicted
+# its own removal: *"This line is kept because removing it is a separate
+# decision from fixing the mechanism … **When it goes, nothing about linking
+# changes.**"* This is that separate decision, and the prediction is
+# discharged unaltered. Every `kernels_cuda` and `libkernels_cuda` in what
+# follows is the archive, which answered to those spellings until `85c6c674b`.
 #
 # The measurement behind it is kept, because it is what stops the edge being
 # re-added as a link fix. It was never text: the tests spelled
 # `kernels_cuda::abi::*`, `kernels_cuda::norm_device::*` and
 # `kernels_cuda::<family>::KERNELS`, every one of which had become a `pub use`
-# of `kernels-cuda-new`, and they name `kernels_cuda_new` directly now. It was
-# never linkage either, and the experiment that said otherwise could not have
-# told: `cc`'s `cargo:rustc-link-lib=static=pie_launch_shim` defaults to
-# `+bundle`, so rustc copied the members into `libkernels_cuda.rlib` rather
+# of the JIT crate, and they name that crate directly now. It was never
+# linkage either, and the experiment that said otherwise could not have told:
+# `cc`'s `cargo:rustc-link-lib=static=pie_launch_shim` defaults to `+bundle`,
+# so rustc copied the members into the archive's `libkernels_cuda.rlib` rather
 # than re-emitting a `-l`, and never loaded an `--extern` no source path
-# names — of the 118 rlibs on that link line, `libkernels_cuda-*.rlib` was not
-# one. Both sides of that experiment were the same failure.
+# names — of the 118 rlibs on that link line, the archive's was not one. Both
+# sides of that experiment were the same failure.
 #
-# `cargo tree -e normal,build,dev | grep -c "kernels-cuda v"` was 2 across this
-# manifest and is now 0.
+# `cargo tree -e normal,build,dev | grep -c "kernels-cuda v"` was 2 across
+# this manifest and went to 0 when both edges went. **That command stopped
+# being the instrument when the JIT crate took the name** — it counts 2 again
+# today, and it is counting the crate this manifest is supposed to depend on.
+# What it measured is settled by a stronger fact than a grep: the archive is
+# not in the workspace.
 # The executor's binder test lowers a REAL deployment's traced form, which
 # needs no feature of its own: the family texts are ungated.
 model = { path = "../model", default-features = false, features = ["contract"] }
@@ -340,27 +365,30 @@ driver-api = { path = "../driver-api" }
 # writes both halves of the flat ABI to OUT_DIR. Table-only — generating text
 # costs no nvcc; compiling the shim is `cc`'s job below.
 #
-# `kernels-cuda` IS NOT HERE, and its absence is the point of this round.
+# THE ARCHIVE CRATE IS NOT HERE, and its absence is the point of this round.
 # It was, for as long as `abi::{emit_rust_bindings, emit_rust_dispatch}` lived
-# in the archive's crate — so a script that wanted a function from rows to
-# text named a crate whose other content is a CMake project, an nvcc build and
-# a `links` key. The emitters are `kernels_cuda_new::abi`'s now (they read
-# `table` and `device`, and always did), so this list is one line shorter and
-# `cargo tree -e normal,build,dev | grep -c "kernels-cuda v"` was 2 rather
-# than 3. THE TWO THAT REMAINED ARE BOTH GONE with this commit — they were
-# the archive under two names, one turning on `native` for a `bridge` feature
-# that no longer exists and one compiling the same archive under test — so
-# the count from this manifest is 0 and no section here names the crate.
-[build-dependencies]
-# EMPTY, and it was `kernels-cuda-new` + `cc`.
+# in it — so a script that wanted a function from rows to text named a crate
+# whose other content is a CMake project, an nvcc build and a `links` key. The
+# emitters moved to the JIT crate (they read `table` and `device`, and always
+# did), which made this list one line shorter; they have since been deleted
+# with the rest of the generator, and this section is empty.
 #
-# `kernels-cuda-new` supplied the family tables, `device::jit_dispatched` and
+# The count that tracked it — `cargo tree -e normal,build,dev |
+# grep -c "kernels-cuda v"` — went 3, then 2, then 0. The last two edges were
+# the archive under two names, one turning on `native` for a `bridge` feature
+# that no longer exists and one compiling the same archive under test. The
+# command does not mean that any more, for the reason given at the
+# dev-dependency headstone above: the JIT crate holds the name now.
+[build-dependencies]
+# EMPTY, and it was `kernels-cuda` + `cc`.
+#
+# `kernels-cuda` supplied the family tables, `device::jit_dispatched` and
 # `unit::unit_of` so the generator could emit from the rows and refuse a
 # routed symbol no unit hosts — all of which answered with no feature, no
 # cudarc and no device, which is what let the check be a BUILD error instead
 # of an `Error::Unknown` on the first fire of a model text. There is nothing
 # left to generate, and `unit::unit_of` still answers that question in
-# `kernels-cuda-new`'s own tests. `cc` compiled nothing here; it was the
+# `kernels-cuda`'s own tests. `cc` compiled nothing here; it was the
 # shim's, one crate over.
 #
 # `build.rs` is 136 lines and prints link directives.
@@ -517,7 +545,7 @@ required-features = ["_cuda"]
 #
 # It proved the plumbing, and the plumbing is what north star §5 replaced. A
 # row's launch is a `unit!` plus a `fn` now, and what smokes one is the
-# family's own tests in `kernels-cuda-new`.
+# family's own tests in `kernels-cuda`.
 
 
 [[test]]

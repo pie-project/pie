@@ -59,7 +59,7 @@
 //! point of the split is that the arithmetic does not.
 
 use model_compiler::lower::{Arg, Launch, Lowered};
-use model_compiler::trace::ValueId;
+use model_ir::trace::ValueId;
 
 /// What binding needs to know about a device allocation.
 ///
@@ -402,6 +402,24 @@ pub enum FireNumber {
     KvHeadStride,
     /// The stride between positions in the cache.
     KvSeqStride,
+    /// Bytes between one query row's custom-mask entry and the next.
+    ///
+    /// The FIRE's, not the pool's, which is why the resolver answers it from
+    /// what it staged rather than from [`crate::resources::Shape`]: a mask
+    /// rectangle is as wide
+    /// as the widest row of the fire that supplied it, and the next fire's is
+    /// a different number.
+    AttentionMaskStride,
+    /// How many rows the fire has.
+    ///
+    /// The FIRE's, like the mask pitch beside it and for the same reason: a
+    /// `Shape` outlives every fire it serves, so the pool answers this from
+    /// what it last staged.
+    ///
+    /// `LaunchRule::SdpaTiled` is why it exists. That grid rounds the rows UP
+    /// to whole tiles, so the threads of a partial last tile are past the end
+    /// and this scalar is what tells them -- see `geometry::grid`.
+    Rows,
 }
 
 /// The fire-wide tables a kernel row may name.
@@ -562,6 +580,15 @@ impl std::error::Error for Unbindable {}
 /// `None` only for a WEIGHT, whose extent is its tensor's and which the plan
 /// does not carry. Everything else states a rectangle and an element width,
 /// so everything else can be measured.
+///
+/// # It measures the rectangle the launch WRITES, and one kind of statement
+/// reads a different one
+///
+/// `launch.rows` is the output's row space. For every statement in this tree
+/// that is also the input's, so nothing has ever forced the two apart — and
+/// where they part, this is wrong and quietly so. See
+/// `a_gathers_input_is_measured_by_its_output_and_that_is_the_open_defect`,
+/// which pins the arithmetic and names what it costs.
 #[must_use]
 pub fn extent(arg: &Arg, launch: &Launch) -> Option<u64> {
     match arg {
@@ -642,14 +669,14 @@ pub fn resolve<'a, R: Resolve>(
             // The seam is 4 MiB by default and the values that ride it are
             // small, so this refuses nothing the engine builds today. It is
             // the deployment knob a caller may lower.
-            if let Some(extent) = extent(arg, launch) {
-                if extent > held.size() {
-                    return Err(Unbindable::PastSeam {
-                        value: *value,
-                        extent,
-                        seam: held.size(),
-                    });
-                }
+            if let Some(extent) = extent(arg, launch)
+                && extent > held.size()
+            {
+                return Err(Unbindable::PastSeam {
+                    value: *value,
+                    extent,
+                    seam: held.size(),
+                });
             }
             Ok(Bound::whole(held))
         }
@@ -995,6 +1022,7 @@ pub fn reorder<'a, R: Resolve>(
             | kernels::Source::KvHeadStride
             | kernels::Source::KvSeqStride
             | kernels::Source::KvPageSize
+            | kernels::Source::AttentionMaskStride
             | kernels::Source::KvLayerView
             | kernels::Source::KvLayerField(_)
             | kernels::Source::RequestCount
@@ -1348,6 +1376,8 @@ pub fn scalars<R: Resolve>(
         }
         let number = match operand.source {
             kernels::Source::KvPageSize => Some(FireNumber::KvPageSize),
+            kernels::Source::AttentionMaskStride => Some(FireNumber::AttentionMaskStride),
+            kernels::Source::Rows => Some(FireNumber::Rows),
             _ => None,
         };
         if let Some(want) = number {
@@ -1621,6 +1651,78 @@ pub fn descriptors<'a, B: Allocation>(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod gathers {
+    use super::extent;
+    use model_compiler::lower::{Arg, Launch};
+
+    /// A launch over `rows` rows, with nothing else stated.
+    fn over(rows: u32) -> Launch {
+        Launch {
+            kernel: 0,
+            rows: 0..rows,
+            layers: 0..1,
+            op: 0,
+            args: 0..0,
+            params: 0..0,
+            peel: None,
+            cond: Launch::NO_COND,
+        }
+    }
+
+    /// [`extent`] measures the OUTPUT's rectangle, and a gather reads another.
+    ///
+    /// This is the open half of the lm-head fix, pinned so the diagnosis in
+    /// `turns.rs` cannot rot into prose nobody checks — and so that whoever
+    /// closes it has an oracle that fails when they do.
+    ///
+    /// `row_gather` compacts the rows a fire samples: its OUTPUT is one row
+    /// per sampled row and its INPUT is the whole stream. Both are the same
+    /// `Arg::Arena`-shaped operand, and this measures both by `launch.rows`.
+    /// So the moment the launch is narrowed to what it writes — which is the
+    /// point of narrowing it — the input binds one row and the shader reads
+    /// row 31 of the stream. WGSL clamps that to ZERO rather than faulting, so
+    /// the gathered row is zeros, the lm head projects zeros, every logit is
+    /// equal, and argmax returns the last index.
+    ///
+    /// Measured on a 32-row prefill of Qwen3-0.6B sampling row 31: the input
+    /// wanted 32 * 1024 * 2 bytes and was bound 1 * 1024 * 2.
+    ///
+    /// `KernelSig::whole` is NOT the signal, which is the obvious first guess:
+    /// it means the kernel refuses a row SPLIT inside a peel's regions, which
+    /// is a different question. Nothing in `Arg::Arena` carries a row count of
+    /// its own, so the driver cannot state this locally — the lowering has to.
+    #[test]
+    fn a_gathers_input_is_measured_by_its_output_and_that_is_the_open_defect() {
+        let row = Arg::Arena {
+            at: 65536,
+            width: 1024,
+            bytes: 2,
+        };
+
+        // What the gather's OUTPUT wants when the launch is narrowed: one row.
+        assert_eq!(extent(&row, &over(1)), Some(1024 * 2));
+        // And what its INPUT needs over the same launch: the whole stream.
+        // The two are the same call, so today they cannot differ.
+        assert_eq!(extent(&row, &over(32)), Some(32 * 1024 * 2));
+        assert_ne!(
+            extent(&row, &over(1)),
+            extent(&row, &over(32)),
+            "if these ever agree this test is measuring nothing"
+        );
+
+        // The consequence, as arithmetic: bound one row, the shader's read of
+        // row 31 is 63488 bytes past the end of its binding.
+        let bound = extent(&row, &over(1)).expect("an arena operand measures");
+        let wants = u64::from(31u32) * 1024 * 2;
+        assert!(
+            wants >= bound,
+            "row 31 is inside a one-row binding, so the defect this pins is \
+             gone and the test should be rewritten as the fix's oracle"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2573,8 +2675,8 @@ mod tests {
             unresolved.join("\n  ")
         );
         assert_eq!(
-            checked, 44,
-            "44 rows state operands; if that moved, upstream added or filled in \
+            checked, 48,
+            "48 rows state operands; if that moved, upstream added or filled in \
              a row and this sweep should have been the thing that noticed"
         );
     }
@@ -2628,6 +2730,101 @@ mod tests {
     }
 
     /// A `Lowered` holding nothing but the operands under test.
+    /// Three refusals `reorder` builds that no test named.
+    ///
+    /// From the census in `tests/citations.rs`: sixty of ninety-seven refusal
+    /// variants are asserted by name and thirty-seven are not, of which the
+    /// `Unbindable` three are in the group it calls "reachable and untested".
+    /// They are also the cheapest to reach — `reorder` is in the portable half,
+    /// so none of this needs an adapter.
+    ///
+    /// Each asks a DIFFERENT question, which is why one test per refusal
+    /// rather than one that takes what it gets:
+    ///
+    /// * `NoOperand` is the statement being shorter than the row;
+    /// * `NoKvCache` is a resolver with no cache, and it must name the LAYER
+    ///   and which half, because a fire binds one layer's keys and values as
+    ///   two separate slots;
+    /// * `NoDriverResource` is a fire table the driver never staged, and it
+    ///   must name WHICH — `Positions` and `TokenIds` are staged by the same
+    ///   call and a refusal that said only "a table" would not say which of
+    ///   the six went missing.
+    ///
+    /// The test `Store` leaves `kv`, `number` and `table` defaulted, which is
+    /// exactly the shape of a resolver serving a text that needs none — so the
+    /// last two need no fixture at all beyond choosing a row that reads one.
+    #[test]
+    fn the_three_ways_a_row_outruns_what_the_driver_can_hand_it() {
+        let buf = buffer(1 << 20);
+        let arena = Arena {
+            buffer: &buf,
+            bytes: 1 << 20,
+        };
+        let store = Store::default();
+        let arg = || Arg::Arena {
+            at: 0,
+            width: 8,
+            bytes: 2,
+        };
+
+        // `neox_decode` states `x: Out(0)` first, so a statement with no args
+        // cannot satisfy the row's first operand.
+        let rope = kernels_wgpu::sig("neox_decode").expect("the table ships a rope row");
+        let (slot, why) = reorder(
+            rope,
+            &lowered(Vec::new()),
+            &launch(1, 0),
+            arena,
+            &store,
+            256,
+        )
+        .expect_err("a row cannot bind an operand the statement never stated");
+        assert_eq!(slot, 0, "the refusal names the slot it stopped at");
+        assert_eq!(why, Unbindable::NoOperand);
+
+        // The same row's SECOND operand is `Source::Positions`, a fire table.
+        // One arg satisfies `Out(0)`; nothing satisfies the table, because
+        // this resolver stages none.
+        let (slot, why) = reorder(
+            rope,
+            &lowered(vec![arg()]),
+            &launch(1, 1),
+            arena,
+            &store,
+            256,
+        )
+        .expect_err("a table the driver never staged is not bindable");
+        assert_eq!(slot, 1);
+        assert_eq!(why, Unbindable::NoDriverResource(FireTable::Positions));
+        assert!(
+            why.to_string().contains("Positions"),
+            "the refusal must name which table: {why}"
+        );
+
+        // `sdpa_paged_decode` reads the cache. Two args satisfy `In(0)` and
+        // `Out(0)`; the keys have nowhere to come from.
+        let attn =
+            kernels_wgpu::sig("sdpa_paged_decode").expect("the table ships a paged attention");
+        let (_, why) = reorder(
+            attn,
+            &lowered(vec![arg(), arg()]),
+            &launch(1, 2),
+            arena,
+            &store,
+            256,
+        )
+        .expect_err("a paged attention cannot bind a cache the resolver has not got");
+        assert_eq!(
+            why,
+            Unbindable::NoKvCache {
+                layer: 0,
+                values: false
+            },
+            "the KEYS are asked for before the values, and the refusal says \
+             which half as well as which layer"
+        );
+    }
+
     fn lowered(args: Vec<Arg>) -> Lowered {
         Lowered {
             launches: Vec::new(),

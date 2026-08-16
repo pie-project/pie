@@ -154,7 +154,7 @@ mod fire_class {
     use driver_api::local::{PIE_RS_FLAG_BUFFER_WRITE, PIE_RS_FLAG_FOLD};
     use driver_api::{LaunchPlan, StepSubmission};
     use driver_cuda::serve::fire_class_of;
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     /// A step carrying `requests` rows of recurrent state, with the given
     /// flags and buffer CSR. Everything else is a fire's ordinary shape.

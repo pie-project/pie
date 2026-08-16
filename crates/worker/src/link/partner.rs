@@ -272,6 +272,7 @@ impl PartnerLinkManager {
                     max_page_refs: hello.capabilities.max_page_refs as usize,
                 },
                 device_geometry_port_mask: hello.capabilities.device_geometry_port_mask,
+                resolves_geometry_per_step: hello.capabilities.resolves_geometry_per_step,
             },
             Box::new(remote),
         );

@@ -32,7 +32,7 @@
 //! check.
 
 use model_compiler::lower::{Arg, Launch, Lowered};
-use model_compiler::trace::ValueId;
+use model_ir::trace::ValueId;
 
 /// The frame's activation arena: one block of [`Lowered::arena_bytes`],
 /// allocated per fire or reused across them. The binder only addresses it.
@@ -84,6 +84,22 @@ pub trait Resolver {
     /// [`Source::KvKeys`]: kernels::Source::KvKeys
     /// [`Source::KvValues`]: kernels::Source::KvValues
     fn kv(&mut self, _layer: u16, _values: bool) -> Option<Slice> {
+        None
+    }
+
+    /// This statement's layer's entry in a per-layer GDN slab -- the conv
+    /// window, the recurrent state.
+    ///
+    /// The recurrent family's answer to [`Resolver::kv`], and a THREE-way
+    /// where that one is two: a fire may carry no GDN context at all, and a
+    /// context it carries may still hold no slab at this layer. Both decline,
+    /// and so does a driver that has never allocated one -- which is this
+    /// backend today, and why the default is `None` rather than a panic.
+    ///
+    /// [`Source::GdnSlab`] is what a row uses to ask.
+    ///
+    /// [`Source::GdnSlab`]: kernels::Source::GdnSlab
+    fn slab(&mut self, _layer: u16, _which: &'static str) -> Option<Slice> {
         None
     }
 
@@ -224,6 +240,27 @@ pub enum BindRefusal {
         want: u32,
         /// How many weight names the statement carries.
         held: usize,
+    },
+    /// The row states a POINTER operand whose [`kernels::Source`] the operand
+    /// walk has no arm for.
+    ///
+    /// This used to be a zero-length region, because the walk ends `_ =>
+    /// nothing` and that arm is right about SCALARS -- they ride
+    /// `Dispatch::params` and their operand slot addresses nothing on purpose.
+    /// For a pointer it is a null the kernel was told to read.
+    ///
+    /// It is the wall the GDN family hits first. `Source::Gdn` and
+    /// `Source::GdnSlab` exist in `kernels`, `driver-cuda` binds them and
+    /// `kernels-cuda` already states one; the arm here does not exist, so
+    /// a Metal row stating either would lower, dispatch, and read a recurrent
+    /// state of zeros in silence. Now it says which row and which source.
+    UnboundPointer {
+        /// The kernel whose row states it.
+        kernel: &'static str,
+        /// The operand's name in the row, which is the C++ parameter's name.
+        operand: &'static str,
+        /// The source with no arm, as [`kernels::Source`] spells it.
+        source: String,
     },
 }
 

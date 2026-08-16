@@ -115,9 +115,8 @@ const SEMANTIC_EXACT: u8 = 0;
 /// The version numbers a compilation depends on.
 ///
 /// Each is owned by a component upstream of this driver and none can be derived
-/// from the program, which is why they are a parameter rather than a constant:
-/// this crate deliberately does not depend on the compiler, so it cannot read
-/// the compiler's own version and must be told.
+/// from the program. They stay a struct rather than four constants because the
+/// last one is not a fact about this build: see [`Versions::from_compiler`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Versions {
     /// `tensor_compiler::plan::COMPILER_VERSION` — bumped when the normalized
@@ -135,40 +134,39 @@ pub struct Versions {
     pub emitter: u32,
 }
 
-/// `tensor_compiler::plan::COMPILER_VERSION`, mirrored.
+/// The two `plan`-side version numbers, from the crate that owns them.
 ///
-/// Mirrored rather than imported for the reason [`Versions`] gives: this crate
-/// does not depend on the compiler, because the compiler produces what it
-/// consumes and the dependency would run the wrong way. Mirrored rather than
-/// left to each shell because there is no such thing as a per-backend answer —
-/// it is one number, owned upstream — and two shells each writing their own
-/// copy is two chances to be a version behind.
+/// These were mirrored here — two `pub const`s carrying the compiler's values
+/// by hand, and a test comparing them — because this crate refused a
+/// dependency on the compiler. It takes one now (see `Cargo.toml`), for
+/// exactly the reason these existed: a copy that is only safe because
+/// something watches it costs the watch. There is nothing left to watch.
 ///
-/// A hand-copied constant that nothing checks drifts, so a test compares it
-/// against the compiler's through the dev-dependency, exactly as
-/// [`lane::ABI_VERSION`](crate::LANE_ABI_VERSION) and `status::FAULT_CLASSES`
-/// are checked.
-pub const COMPILER_VERSION: u16 = 3;
-
-/// `tensor_compiler::plan::REGION_PLAN_VERSION`, mirrored on the same terms as
-/// [`COMPILER_VERSION`].
-pub const REGION_PLAN_VERSION: u16 = 4;
+/// [`Versions::emitter`] is still NOT one of them, and that is the distinction
+/// the whole struct is built on: these two are facts about the toolchain THIS
+/// BINARY was built against, so importing them is right. The emitter version
+/// belongs to the host that produced the program, which can bump it without
+/// this driver being rebuilt, so it arrives on the wire.
+pub use tensor_compiler::plan::{COMPILER_VERSION, REGION_PLAN_VERSION};
 
 impl Versions {
-    /// The three compiler-side numbers from their mirrors, and the emitter
-    /// from the wire.
+    /// The three compiler-side numbers as this build knows them, and the
+    /// emitter from the wire.
     ///
     /// This is the constructor a driver shell should use, and the split it
     /// encodes is the whole point. Three of the four are facts about the
-    /// toolchain that produced the program and are mirrored here, checked
-    /// against the compiler by test. The fourth cannot be: the C++ hardcoded
-    /// `kMetalM1EmitterVersion = 23` — a driver-side copy of a number the HOST
-    /// owns — and it had already drifted to 36 by the time anyone looked. A
-    /// copy of another process's version cannot do the job of noticing when
-    /// that process changes, so `emitter` is a parameter and comes from
+    /// toolchain that produced this binary and are imported from it. The
+    /// fourth cannot be: the C++ hardcoded `kMetalM1EmitterVersion = 23` — a
+    /// driver-side copy of a number the HOST owns — and it had already drifted
+    /// to 36 by the time anyone looked. A copy of another process's version
+    /// cannot do the job of noticing when that process changes, so `emitter`
+    /// is a parameter and comes from
     /// [`PieProgramDesc::emitter_version`](driver_api::local::PieProgramDesc).
+    ///
+    /// It was called `mirrored` while the other three were. They are imports
+    /// now and the name would be the last thing still claiming otherwise.
     #[must_use]
-    pub const fn mirrored(emitter: u32) -> Self {
+    pub const fn from_compiler(emitter: u32) -> Self {
         Self {
             compiler: COMPILER_VERSION,
             region_plan: REGION_PLAN_VERSION,
@@ -438,45 +436,24 @@ mod tests {
         );
     }
 
-    /// The one test that makes the mirrors safe. A hand-copied version number
-    /// that nothing checks drifts — the C++ proved it, with a driver-side
-    /// `kMetalM1EmitterVersion = 23` that was still 23 when the host reached
-    /// 36 — and a stale version in the key does not fail loudly: it makes a
-    /// cache HIT that should have been a miss, so the driver runs code the
-    /// current compiler would not have produced.
-    #[test]
-    fn the_mirrored_versions_still_match_the_compilers() {
-        assert_eq!(
-            COMPILER_VERSION,
-            tensor_compiler::plan::COMPILER_VERSION,
-            "the normalized form changed shape and this mirror did not"
-        );
-        assert_eq!(
-            REGION_PLAN_VERSION,
-            tensor_compiler::plan::REGION_PLAN_VERSION,
-            "region partitioning changed and this mirror did not"
-        );
-        assert_eq!(
-            crate::lane::ABI_VERSION,
-            tensor_compiler::plan::lane_table::LANE_TABLE_ABI_VERSION,
-            "the lane table's layout changed and this mirror did not"
-        );
-    }
-
-    /// The emitter is the one field that must NOT be mirrored: it belongs to
-    /// the host, which can bump it without this driver being rebuilt. The
-    /// constructor takes it and everything else is a mirror, and that split is
-    /// the correction to the C++'s hardcoded copy.
+    /// The emitter is the one field that must NOT come from this build: it
+    /// belongs to the host, which can bump it without this driver being
+    /// rebuilt. The constructor takes it and imports the rest, and that split
+    /// is the correction to the C++'s hardcoded copy.
+    ///
+    /// A companion test stood above this one, comparing three `pub const`
+    /// mirrors against the compiler's. The mirrors are imports now and the
+    /// comparison is `assert_eq!(x, x)`.
     #[test]
     fn only_the_emitter_version_comes_from_the_caller() {
-        let versions = Versions::mirrored(41);
+        let versions = Versions::from_compiler(41);
         assert_eq!(versions.emitter, 41);
         assert_eq!(versions.compiler, COMPILER_VERSION);
         assert_eq!(versions.region_plan, REGION_PLAN_VERSION);
         assert_eq!(versions.lane_table, crate::lane::ABI_VERSION);
         assert_ne!(
-            cache_identity(Backend::Cuda, 0, 0, Versions::mirrored(41)),
-            cache_identity(Backend::Cuda, 0, 0, Versions::mirrored(42)),
+            cache_identity(Backend::Cuda, 0, 0, Versions::from_compiler(41)),
+            cache_identity(Backend::Cuda, 0, 0, Versions::from_compiler(42)),
             "a host-side emitter bump must miss the cache, which is the whole reason the number crosses the ABI instead of being written here"
         );
     }

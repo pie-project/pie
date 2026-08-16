@@ -9,10 +9,14 @@
 //! validated seeds to send at instantiation plus the host-channel index map.
 //!
 //! There is no module-level `dead_code` allow: the per-channel introspection
-//! helpers ([`Instance::host_channels`]/[`Instance::host_role`]) and the
-//! `KvPageSpan::open`/`KvDeclaration::all` constructors exist for this
-//! module's tests and are `#[cfg(test)]`, so the compiler keeps guarding
+//! helpers ([`Instance::host_channels`]/[`Instance::host_role`]) exist for
+//! this module's tests and are `#[cfg(test)]`, so the compiler keeps guarding
 //! everything else.
+//!
+//! `KvPageSpan::open` and `KvDeclaration::all` were named here for the same
+//! reason and are gone: the tests that called them are, and a `#[cfg(test)]`
+//! constructor nothing constructs is a claim the clippy gate reads as dead
+//! code -- which is how they were found.
 
 #[cfg(test)]
 use std::fmt;
@@ -127,11 +131,6 @@ pub struct KvPageSpan {
 }
 
 impl KvPageSpan {
-    #[cfg(test)]
-    pub const fn open(start: u64) -> Self {
-        Self { start, end: None }
-    }
-
     pub fn resolve(self, page_len: u64) -> Result<std::ops::Range<u64>, String> {
         let end = self.end.unwrap_or(page_len);
         if self.start > end || end > page_len {
@@ -150,16 +149,6 @@ impl KvPageSpan {
 pub struct KvDeclaration {
     pub readable: KvPageSpan,
     pub writable: KvPageSpan,
-}
-
-impl KvDeclaration {
-    #[cfg(test)]
-    pub const fn all() -> Self {
-        Self {
-            readable: KvPageSpan::open(0),
-            writable: KvPageSpan::open(0),
-        }
-    }
 }
 
 /// Which WIT forward interface a pass was built through — the host mirror of

@@ -434,6 +434,84 @@ pub fn vulkan_standalone_toml_named(
     )
 }
 
+/// The standalone TOML for the WebGPU driver.
+///
+/// No artifact and no kernels path, which is the whole difference from the
+/// Vulkan block: the shaders are inside the binary, and the weights come from
+/// the `$PIE_HOME` model cache that `pie serve` reads -- so a gate names a
+/// model the cache already holds rather than a file it was handed.
+///
+/// `device` says `gpu:0` and no driver reads it as a selector: `wgpu` asks the
+/// platform for an adapter itself. It is written because `device` is required
+/// of every driver and `cuda:0` would be a lie about the hardware.
+///
+/// `name` is the ARCHITECTURE label. It was hard-coded to `qwen3` here while
+/// the Vulkan twin took it as a parameter, which meant no wgpu gate could
+/// serve a second architecture even though the driver can: the one file whose
+/// whole subject is "a different model" would have been the one place still
+/// saying `qwen3`. See `wgpu_second_model`.
+#[must_use]
+pub fn wgpu_standalone_toml_named(model: &str, name: &str, kv_pages: u32) -> String {
+    format!(
+        "         [server]\n\
+         port = 0\n\
+         \n\
+         [model]\n\
+         name = \"{name}\"\n\
+         model = \"{model}\"\n\
+         \n\
+         [driver]\n\
+         type = \"wgpu\"\n\
+         device = [\"gpu:0\"]\n\
+         activation_dtype = \"bfloat16\"\n\
+         kv_pages = {kv_pages}\n"
+    )
+}
+
+/// [`wgpu_standalone_toml_named`] under the architecture every other gate here
+/// serves.
+#[must_use]
+pub fn wgpu_standalone_toml(model: &str, kv_pages: u32) -> String {
+    wgpu_standalone_toml_named(model, "qwen3", kv_pages)
+}
+
+/// Boot the embedded standalone with the real WebGPU driver.
+///
+/// `PIE_WGPU_MODEL` names the model in `$PIE_HOME`'s cache, defaulting to the
+/// one every other gate here uses. There is no artifact variable because this
+/// driver quantizes through the load plan and reads what the cache holds.
+pub async fn boot_wgpu() -> Result<pie::StandaloneHandle> {
+    boot_wgpu_with_pages(256).await
+}
+
+/// The same, with the pool sized by the caller -- which is how a gate asks for
+/// pool PRESSURE rather than for room.
+pub async fn boot_wgpu_with_pages(kv_pages: u32) -> Result<pie::StandaloneHandle> {
+    let model = std::env::var("PIE_WGPU_MODEL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "Qwen--Qwen3-0.6B-optimized".to_string());
+    boot_wgpu_named(&model, "qwen3", kv_pages).await
+}
+
+/// Boot a NAMED model under a NAMED architecture.
+///
+/// One deployment serves one model, so every other boot here takes the
+/// default. A gate that means to prove a SECOND architecture has to name both
+/// halves: the cache entry, which is a different `.zt`, and the label, which
+/// the engine reports and hashes. The label is not a selector -- the driver
+/// reads the architecture out of the artifact -- but the one gate whose whole
+/// subject is a different model should not be the place that says `qwen3`.
+pub async fn boot_wgpu_named(
+    model: &str,
+    name: &str,
+    kv_pages: u32,
+) -> Result<pie::StandaloneHandle> {
+    let (controller, gateway, worker) =
+        derive_standalone(&wgpu_standalone_toml_named(model, name, kv_pages))?;
+    run_standalone(controller, gateway, worker).await
+}
+
 /// Boot the embedded standalone with the real Vulkan driver.
 ///
 /// `PIE_VULKAN_ARTIFACT` names a `.zt` that `pie model build --backend

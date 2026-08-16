@@ -25,11 +25,11 @@ struct VNormParams {
     axis_size: u32,
 }
 
-@group(0) @binding(0) var<storage, read> x: array<u32>;
+@group(0) @binding(0) var<storage, read_write> x: array<u32>;
 // Atomic for the odd-`axis_size` edge alone; `store_half` says why, and the
 // host binds the same read_write storage buffer either way.
 @group(0) @binding(1) var<storage, read_write> out_: array<atomic<u32>>;
-@group(0) @binding(2) var<storage, read> params: VNormParams;
+@group(0) @binding(2) var<storage, read_write> params: VNormParams;
 
 // The half-index split. A word and an index, not a pointer and an index: core
 // WGSL allows a pointer parameter only in the `function`, `private` and

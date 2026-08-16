@@ -34,7 +34,7 @@ impl Ctx {
 
 impl Backend for Test {
     type Value = Value;
-    type Ctx = Ctx;
+    type Ctx<'a> = Ctx;
 }
 
 /// The backend's own `routine!`, with its [`Backend`] filled in — the
@@ -53,7 +53,10 @@ impl Arg<Test> for Bf16sMut {
     fn unpack(value: &Value, at: usize) -> Result<Self, Refusal> {
         match value {
             Value::Ptr(p) => Ok(Self(*p)),
-            _ => Err(Refusal::Kind { at, want: Self::TY }),
+            _ => Err(Refusal::Kind {
+                at,
+                want: <Self as Arg<Test>>::TY,
+            }),
         }
     }
 }
@@ -70,7 +73,10 @@ impl Arg<Test> for I32s {
     fn unpack(value: &Value, at: usize) -> Result<Self, Refusal> {
         match value {
             Value::Ptr(p) => Ok(Self(*p)),
-            _ => Err(Refusal::Kind { at, want: Self::TY }),
+            _ => Err(Refusal::Kind {
+                at,
+                want: <Self as Arg<Test>>::TY,
+            }),
         }
     }
 }
@@ -81,7 +87,10 @@ impl Arg<Test> for i32 {
     fn unpack(value: &Value, at: usize) -> Result<Self, Refusal> {
         match value {
             Value::I32(v) => Ok(*v),
-            _ => Err(Refusal::Kind { at, want: Self::TY }),
+            _ => Err(Refusal::Kind {
+                at,
+                want: <Self as Arg<Test>>::TY,
+            }),
         }
     }
 }
@@ -92,7 +101,10 @@ impl Arg<Test> for f32 {
     fn unpack(value: &Value, at: usize) -> Result<Self, Refusal> {
         match value {
             Value::F32(v) => Ok(*v),
-            _ => Err(Refusal::Kind { at, want: Self::TY }),
+            _ => Err(Refusal::Kind {
+                at,
+                want: <Self as Arg<Test>>::TY,
+            }),
         }
     }
 }
@@ -122,7 +134,10 @@ fn rope_apply(
     match head_dim {
         64 => ctx.launch("rope::apply_bf16<64>"),
         128 => ctx.launch("rope::apply_bf16<128>"),
-        d => Err(Refusal::Narrow { what: "head_dim", at: d.into() }),
+        d => Err(Refusal::Narrow {
+            what: "head_dim",
+            at: d.into(),
+        }),
     }
 }
 
@@ -141,11 +156,16 @@ fn tanh_bf16(ctx: &Ctx, x: Bf16sMut, n: i32) -> Result<(), Refusal> {
 /// The table, in a `static` — which is the load-bearing claim: the rows are
 /// `const`-promoted from generic associated consts, so nothing is built at
 /// run time and nothing can be built inconsistently.
-static ROUTINES: &[Routine<Test>] =
-    &[routine!(rope_apply, in_place = &[(0, 0)]), routine!(tanh_bf16, whole, in_place = &[(0, 0)])];
+static ROUTINES: &[Routine<Test>] = &[
+    routine!(rope_apply, in_place = &[(0, 0)]),
+    routine!(tanh_bf16, whole, in_place = &[(0, 0)]),
+];
 
 fn find(name: &str) -> &'static Routine<Test> {
-    ROUTINES.iter().find(|r| r.name == name).expect("a routine this test declares")
+    ROUTINES
+        .iter()
+        .find(|r| r.name == name)
+        .expect("a routine this test declares")
 }
 
 #[test]
@@ -162,7 +182,11 @@ fn a_row_is_its_fns_signature() {
         ],
         "the row is read off the parameter list, `Env` and all"
     );
-    assert_eq!(find("tanh_bf16").args.len(), 2, "and a different arity is a different row");
+    assert_eq!(
+        find("tanh_bf16").args.len(),
+        2,
+        "and a different arity is a different row"
+    );
 }
 
 #[test]
@@ -179,17 +203,31 @@ fn the_stated_facts_are_the_ones_stated() {
 #[test]
 fn the_erased_body_is_the_typed_one() {
     let ctx = Ctx::default();
-    let args =
-        [Value::Ptr(0x1000), Value::Ptr(0x2000), Value::I32(4), Value::I32(64), Value::F32(1e4)];
+    let args = [
+        Value::Ptr(0x1000),
+        Value::Ptr(0x2000),
+        Value::I32(4),
+        Value::I32(64),
+        Value::F32(1e4),
+    ];
     (find("rope_apply").body)(&ctx, &args).expect("a live rectangle launches");
-    assert_eq!(*ctx.fired.borrow(), ["rope::apply_bf16<64>"], "the symbol the body chose");
+    assert_eq!(
+        *ctx.fired.borrow(),
+        ["rope::apply_bf16<64>"],
+        "the symbol the body chose"
+    );
 }
 
 #[test]
 fn a_refusal_from_the_body_survives_the_erasure() {
     let ctx = Ctx::default();
-    let empty =
-        [Value::Ptr(0x1000), Value::Ptr(0x2000), Value::I32(0), Value::I32(64), Value::F32(1e4)];
+    let empty = [
+        Value::Ptr(0x1000),
+        Value::Ptr(0x2000),
+        Value::I32(0),
+        Value::I32(64),
+        Value::F32(1e4),
+    ];
     assert_eq!(
         (find("rope_apply").body)(&ctx, &empty),
         Err(Refusal::Empty { what: "rows" }),
@@ -205,11 +243,19 @@ fn a_list_that_does_not_fit_the_signature_is_refused() {
         (find("rope_apply").body)(&ctx, &[Value::I32(1)]),
         Err(Refusal::Arity { want: 5, got: 1 })
     );
-    let swapped =
-        [Value::Ptr(0x1000), Value::Ptr(0x2000), Value::F32(4.0), Value::I32(64), Value::F32(1e4)];
+    let swapped = [
+        Value::Ptr(0x1000),
+        Value::Ptr(0x2000),
+        Value::F32(4.0),
+        Value::I32(64),
+        Value::F32(1e4),
+    ];
     assert_eq!(
         (find("rope_apply").body)(&ctx, &swapped),
-        Err(Refusal::Kind { at: 2, want: Ty::I32 }),
+        Err(Refusal::Kind {
+            at: 2,
+            want: Ty::I32
+        }),
         "same width, different kind -- the position is named"
     );
 }

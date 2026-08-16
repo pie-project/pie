@@ -29,7 +29,7 @@
 //! intended sharing passes while an accidental one still fails.
 
 use model_compiler::lower::{Buffers, Row, value_bytes};
-use model_compiler::trace::{FireClass, ForwardPlan, OpKind, ValueId};
+use model_ir::trace::{FireClass, ForwardPlan, OpKind, ValueId};
 
 /// A decode-shaped fire: every row samples, so the epilogue's row space
 /// is the full row count.
@@ -83,7 +83,7 @@ fn aliases(plan: &ForwardPlan) -> Alias {
                 }
             }
             OpKind::Launch { kernel, .. } => {
-                for &(o, i) in model_compiler::kernels::in_place_pairs(plan, kernel) {
+                for &(o, i) in model_ir::kernels::in_place_pairs(plan, kernel) {
                     if let (Some(&src), Some(&out)) =
                         (op.inputs.get(i as usize), op.outputs.get(o as usize))
                     {
@@ -1048,14 +1048,19 @@ fn what_the_epilogue_hands_each_of_its_rectangles() {
             let args: Vec<String> = out.args[l.args.start as usize..l.args.end as usize]
                 .iter()
                 .map(|a| match a {
-                    Arg::Arena { at, width, .. } => format!("arena@{at}/w{width}"),
-                    // `bytes` printed here and elided for `Arena`, because
-                    // this is the variant with no extent to check: the
-                    // element width is the only thing that says how big the
-                    // rectangle a backend binds whole actually is.
-                    Arg::Named { value, width, bytes } => {
-                        format!("named(v{value})/w{width}x{bytes}B")
+                    Arg::Arena { at, width, bytes } => {
+                        format!("arena@{at}/w{width}/b{bytes}")
                     }
+                    // `bytes` is the ELEMENT width, and it is printed for the
+                    // same reason the seam carries it: a reader working out
+                    // what a rectangle spans from `width` alone has to guess
+                    // the element size, and this dump exists to remove
+                    // guesses.
+                    Arg::Named {
+                        value,
+                        width,
+                        bytes,
+                    } => format!("named(v{value})/w{width}/b{bytes}"),
                     Arg::Weight(w) => format!("weight({w})"),
                 })
                 .collect();

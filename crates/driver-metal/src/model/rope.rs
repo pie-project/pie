@@ -84,7 +84,11 @@ pub enum Rescale {
 /// exists.
 #[must_use]
 pub fn table(geometry: &crate::batch::DecodeGeometry) -> Vec<f32> {
-    frequencies(geometry.head_dim, geometry.rope_theta, geometry.rope_rescale)
+    frequencies(
+        geometry.head_dim,
+        geometry.rope_theta,
+        geometry.rope_rescale,
+    )
 }
 
 /// `[rotary_dims/2]` inverse frequencies for `head_dim` at `theta`.
@@ -138,8 +142,14 @@ pub fn frequencies(head_dim: u32, theta: f32, rescale: Option<Rescale>) -> Vec<f
                     if factor <= 0.0 {
                         return freq;
                     }
-                    let (lo, hi) =
-                        ramp_ends(head_dim, theta, original_max, beta_fast, beta_slow, truncate);
+                    let (lo, hi) = ramp_ends(
+                        head_dim,
+                        theta,
+                        original_max,
+                        beta_fast,
+                        beta_slow,
+                        truncate,
+                    );
                     // Zero at the fast end and one at the slow end, so the
                     // ladder walks from untouched to fully divided across
                     // the band the two betas bound.
@@ -229,7 +239,10 @@ mod tests {
     fn yarn_extrapolates_the_fast_channels_and_interpolates_the_slow_ones() {
         let plain = frequencies(64, 150_000.0, None);
         let scaled = frequencies(64, 150_000.0, Some(gpt_oss()));
-        assert!((plain[0] - scaled[0]).abs() < 1e-9, "channel 0 turns fastest");
+        assert!(
+            (plain[0] - scaled[0]).abs() < 1e-9,
+            "channel 0 turns fastest"
+        );
         let last = plain.len() - 1;
         let rel = (scaled[last] - plain[last] / 32.0).abs() / (plain[last] / 32.0);
         assert!(rel < 1e-5, "the slow end divides by 32: {rel}");
@@ -253,7 +266,14 @@ mod tests {
     /// reason the geometry refused YaRN rather than zeroing it.
     #[test]
     fn truncating_the_ramp_moves_the_channels_between_its_ends() {
-        let Rescale::Yarn { factor, beta_fast, beta_slow, original_max, .. } = gpt_oss() else {
+        let Rescale::Yarn {
+            factor,
+            beta_fast,
+            beta_slow,
+            original_max,
+            ..
+        } = gpt_oss()
+        else {
             unreachable!()
         };
         let snapped = Rescale::Yarn {

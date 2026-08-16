@@ -31,8 +31,8 @@
 pub mod facts;
 
 use self::facts::Gemma3nFacts;
-use model_compiler::dsl::{self, MatW, NormW, Val, WeightRepr, matmul};
-use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
+use model_dsl::{self as dsl, MatW, NormW, Val, WeightRepr, matmul};
+use model_ir::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct G3nLayerW {
     altup_norm: NormW,
@@ -146,7 +146,7 @@ pub fn gemma3n_cuda(facts: &Gemma3nFacts, class: FireClass) -> ForwardPlan {
             // THIS LAYER's sliding window, `-1` for none — a
             // load-time fact the dispatch statements carry, where four
             // executors used to re-derive it per launch.
-            let window_left = model_compiler::facts::window_left_at(facts.window_left, l);
+            let window_left = model_ir::facts::window_left_at(facts.window_left, l);
             let w = G3nLayerW::new(l, facts);
             let active_in = dsl::select(&streams, active);
 

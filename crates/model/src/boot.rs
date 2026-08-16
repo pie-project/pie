@@ -377,9 +377,9 @@ mod tests {
         }
         fn trace(
             &self,
-            _class: model_compiler::trace::FireClass,
+            _class: model_ir::trace::FireClass,
             _load: catalog::Deployed<'_>,
-        ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
+        ) -> Result<model_ir::trace::ForwardPlan, crate::deployment::Refusal> {
             Err(crate::deployment::Refusal::Unsupported(
                 "a boot fixture has no forward text",
             ))

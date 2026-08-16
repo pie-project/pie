@@ -1,7 +1,7 @@
 //! Stages, descriptor ports, intrinsic scoping, well-known sink names, and the
 //! bind-time [`ModelProfile`] — the shared vocabulary between the container,
-//! the validator, and every backend. Wire tags here are frozen constants
-//! (mirrored into `include/ptir_abi.h`).
+//! the validator, and every backend. Wire tags here are frozen constants, read
+//! from this module by every backend rather than mirrored into one.
 
 use alloc::string::String;
 use alloc::vec::Vec;

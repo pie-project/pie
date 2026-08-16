@@ -260,7 +260,32 @@ impl Allocator {
     /// The mode is `Global`, matching `batch/`'s `cudaStreamCaptureModeGlobal`:
     /// it is the strictest of the three and the one that actually catches a
     /// stray synchronous call rather than quietly tolerating it.
+    ///
+    /// # The warm-up, and the stray call it caught
+    ///
+    /// The sentence above was not decoration — Global mode caught one, and it
+    /// was the JIT's. [`fire::supergraph::warm`] compiles the two arming
+    /// kernels HERE, before the capture opens, because they are the only
+    /// device text in the tree launched exclusively from inside a capture:
+    /// their first `jit::cache::resolve` therefore ran with a capture open,
+    /// where its `cudaFree(null)` is a prohibited call, and the capture came
+    /// back `cudaErrorStreamCaptureInvalidated`. Every conditional in the
+    /// engine failed that way.
+    ///
+    /// This is the one door every capture in the crate goes through, which is
+    /// why the warm is here rather than at the eight call sites, any one of
+    /// which could forget it. After the first capture of the process it is
+    /// two `OnceLock` reads.
+    ///
+    /// **A refused warm is not a refused capture.** A graph with no
+    /// conditional in it needs neither kernel, and refusing the whole capture
+    /// because a branch it may never take will not compile would trade a
+    /// working straight-line graph for nothing. `open_cond` refuses on its
+    /// own when the time comes, which is the layer that knows.
+    ///
+    /// [`fire::supergraph::warm`]: crate::fire::supergraph::warm
     pub fn begin_capture<'a>(&'a mut self, stream: StreamRef<'a>) -> Result<CaptureScope<'a>> {
+        let _ = crate::fire::supergraph::warm();
         {
             let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             st.begin()?;
@@ -457,7 +482,7 @@ pub unsafe fn read_raw_span(
 /// planner used to write its descriptor into the workspace's page-locked
 /// mirror and issue its own `cudaMemcpyAsync` (`attention_flashinfer.cu:193`),
 /// and the Rust planner returns the bytes instead —
-/// `kernels_cuda_new::plan::Plan::int_upload` — precisely so that the copy
+/// `kernels_cuda::attn::plan::Plan::int_upload` — precisely so that the copy
 /// lands beside the launch that reads it. This is the copy.
 ///
 /// Prefer [`DeviceBuffer::write_at`], which checks the span against a length

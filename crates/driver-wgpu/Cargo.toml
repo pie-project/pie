@@ -70,7 +70,9 @@ kernels-wgpu = { path = "../kernels-wgpu" }
 # The plan a driver executes: `Lowered`, `Launch`, `Arg`. `src/binding.rs`
 # turns those into bind-group entries, so this is a real dependency and not a
 # testing one -- the same shape both siblings have, for the same reason.
+# `model-ir` beside it for the traced form those name.
 model-compiler = { path = "../model-compiler" }
+model-ir = { path = "../model-ir" }
 
 # The PTIR channel plane: the program/channel/instance registry, the ring and
 # every bind-time derivation. A REAL dependency and not a dev one -- this is
@@ -112,6 +114,10 @@ wgpu = { version = "30", default-features = false, features = [
 ], optional = true }
 
 [dev-dependencies]
+# TEST-ONLY: `tests/arena.rs` states a declaration (`model_dsl::metal::
+# affine_gemm_point`) so the lowering under test is one the surface really
+# produces. `src/` reaches no authoring type, which is why this is a dev edge.
+model-dsl = { path = "../model-dsl" }
 # `tests/arena.rs` and `tests/checkpoint.rs`: real models to lower, so that the
 # offsets, the symbols and the scalar runs under test are the ones
 # `model-compiler` actually assigns rather than ones a test invented. Every

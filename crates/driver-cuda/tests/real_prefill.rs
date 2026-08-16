@@ -28,7 +28,7 @@ use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps}
 use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
 use model::shared::llama_like::forward::llama_like_cuda;
 use model_compiler::lower::{Arg, Fire, Row, lower};
-use model_compiler::trace::{FireClass, ValueId};
+use model_ir::trace::{FireClass, ValueId};
 
 mod common;
 use common::{device_or_skip, gpu_guard};
@@ -202,13 +202,17 @@ fn ab(spec: &Spec) {
     let mut named_widths: BTreeMap<ValueId, u32> = BTreeMap::new();
     for a in &l.args {
         if let Arg::Named { value, width, .. } = a {
-            named_widths.insert(*value, *width);
+            // MAX, not last: several values can now share one id (they
+            // alias in place), and the buffer has to fit the widest read.
+            let slot = named_widths.entry(*value).or_insert(*width);
+            *slot = (*slot).max(*width);
         }
     }
     for i in 0..l.launches.len() {
         for a in &dplan.spec(i).outs {
             if let Arg::Named { value, width, .. } = a {
-                named_widths.insert(*value, *width);
+                let slot = named_widths.entry(*value).or_insert(*width);
+                *slot = (*slot).max(*width);
             }
         }
     }
@@ -292,7 +296,7 @@ fn ab(spec: &Spec) {
         false,
         -1,
     );
-    ws.end_plan_update(&mut sops, raw_stream);
+    ws.end_plan_update(&mut sops, raw_stream).expect("end");
 
     let fi = l
         .launches
@@ -394,8 +398,81 @@ fn ab(spec: &Spec) {
         }
     }
 
-    let ran = run(&l, &dplan, frame, &mut resolver, &ctx, AttnRegions::whole(Some(&attn)), None)
-        .unwrap_or_else(|e| panic!("the walk refused: {e:?}"));
+    // PIE_DUMP_STEP=1 walks the launches one at a time and reads each
+    // output back the MOMENT it is written. The whole-run dump below can
+    // only ever show a value's final state, and the arena is reused — so
+    // an intermediate that is right when written and overwritten later is
+    // invisible there and plain here. Same launches, same order; the only
+    // difference is a synchronize and a D2H between them.
+    let ran = if std::env::var_os("PIE_DUMP_STEP").is_some() {
+        let mut host = vec![0u8; 4 << 20];
+        for (i, launch) in l.launches.iter().enumerate() {
+            let bound = driver_cuda::bind::bind(&l, launch, frame, &mut resolver)
+                .unwrap_or_else(|e| panic!("bind {i}: {e:?}"));
+            driver_cuda::bind::dispatch(
+                &bound,
+                dplan.spec(i),
+                frame,
+                &mut resolver,
+                &ctx,
+                AttnRegions::whole(Some(&attn)).of(&launch.rows),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("dispatch {i}: {e:?}"));
+            stream.as_ref().synchronize().expect("step sync");
+
+            let Some(out) = dplan.spec(i).outs.first() else { continue };
+            let (base, width) = match out {
+                Arg::Named { value, width, .. } => {
+                    (named_bufs[value].as_ptr().cast_const().cast::<u8>(), *width)
+                }
+                Arg::Arena { at, width, .. } => {
+                    // SAFETY: `at` is an offset the lowering assigned inside
+                    // the arena this frame was built from.
+                    (unsafe { arena.as_ptr().cast_const().cast::<u8>().add(*at) }, *width)
+                }
+                Arg::Weight(_) => continue,
+            };
+            let n = tokens * width as usize;
+            let bytes = n * 2;
+            if bytes > host.len() {
+                continue;
+            }
+            // SAFETY: `base` addresses `bytes` live device bytes — the
+            // rectangle the launch just wrote — and `host` is that long.
+            let rc = unsafe {
+                cudarc::runtime::sys::cudaMemcpy(
+                    host.as_mut_ptr().cast(),
+                    base.cast(),
+                    bytes,
+                    cudarc::runtime::sys::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                )
+            };
+            assert_eq!(rc, cudarc::runtime::sys::cudaError::cudaSuccess, "step d2h {i}");
+            let (mut sum, mut max) = (0f64, 0f32);
+            let mut bad = 0usize;
+            for k in 0..n {
+                let bits = u16::from_le_bytes([host[k * 2], host[k * 2 + 1]]);
+                let x = f32::from_bits(u32::from(bits) << 16);
+                if x.is_nan() || x.is_infinite() {
+                    bad += 1;
+                    continue;
+                }
+                sum += f64::from(x.abs());
+                max = max.max(x.abs());
+            }
+            println!(
+                "STEP [{i:4}] {:<46} w={:<26} width={width:5} mean|x|={:>10.5} max={max:>9.3} bad={bad}",
+                l.kernels[launch.kernel as usize],
+                dplan.spec(i).weight.as_deref().unwrap_or("-"),
+                sum / n.max(1) as f64,
+            );
+        }
+        l.launches.len()
+    } else {
+        run(&l, &dplan, frame, &mut resolver, &ctx, AttnRegions::whole(Some(&attn)), None)
+            .unwrap_or_else(|e| panic!("the walk refused: {e:?}"))
+    };
     assert_eq!(ran, l.launches.len());
     stream.as_ref().synchronize().expect("the fire retires");
 
@@ -411,6 +488,108 @@ fn ab(spec: &Spec) {
         let bits = u16::from_le_bytes([back[off], back[off + 1]]);
         f32::from_bits(u32::from(bits) << 16)
     };
+
+    // ── PIE_DUMP_LAUNCHES=1: every launch's output, in fire order. ──
+    //
+    // Not part of the claim; a bisect handle. The logits being wrong says
+    // nothing about WHERE, and every intermediate is already pinned to its
+    // own buffer, so the whole forward pass is readable after the fact.
+    if std::env::var_os("PIE_DUMP_LAUNCHES").is_some() {
+        // The dataflow first: what each launch READS and WRITES, by value.
+        // The buffers below hold only the pass's final state, so the wiring
+        // is what says which launch a zero should be blamed on.
+        for i in 0..l.launches.len() {
+            let lu = &l.launches[i];
+            let ops: Vec<String> = l.args[lu.args.start as usize..lu.args.end as usize]
+                .iter()
+                .map(|a| match a {
+                    Arg::Named { value, width, .. } => format!("v{value}:{width}"),
+                    Arg::Weight(n) => format!("W({n})"),
+                    other => format!("{other:?}"),
+                })
+                .collect();
+            let outs: Vec<String> = dplan
+                .spec(i)
+                .outs
+                .iter()
+                .map(|a| match a {
+                    Arg::Named { value, width, .. } => format!("v{value}:{width}"),
+                    other => format!("{other:?}"),
+                })
+                .collect();
+            println!(
+                "WIRE [{i:4}] {:<44} rows={:?} args=[{}] outs=[{}]",
+                l.kernels.get(lu.kernel as usize).map_or("?", String::as_str),
+                lu.rows,
+                ops.join(" "),
+                outs.join(" "),
+            );
+        }
+        let mut seen: BTreeMap<ValueId, usize> = BTreeMap::new();
+        for i in 0..l.launches.len() {
+            if let Some(Arg::Named { value, .. }) = dplan.spec(i).outs.first() {
+                seen.insert(*value, i);
+            }
+        }
+        for i in 0..l.launches.len() {
+            let Some(Arg::Named { value, width, .. }) = dplan.spec(i).outs.first() else {
+                continue;
+            };
+            // Only the LAST writer of a value holds what the pass ended with.
+            if seen.get(value) != Some(&i) {
+                continue;
+            }
+            let buf = &named_bufs[value];
+            let mut host = vec![0u8; buf.len()];
+            buf.copy_to_host(&mut host, stream.as_ref()).expect("d2h dump");
+            stream.as_ref().synchronize().expect("sync dump");
+            let n = host.len() / 2;
+            let (mut sum, mut max, mut nan, mut zero) = (0f64, 0f32, 0usize, 0usize);
+            for k in 0..n {
+                let bits = u16::from_le_bytes([host[k * 2], host[k * 2 + 1]]);
+                let x = f32::from_bits(u32::from(bits) << 16);
+                if x.is_nan() || x.is_infinite() {
+                    nan += 1;
+                    continue;
+                }
+                if x == 0.0 {
+                    zero += 1;
+                }
+                sum += f64::from(x.abs());
+                max = max.max(x.abs());
+            }
+            let lu = &l.launches[i];
+            println!(
+                "[{i:4}] k={:3} op={:4} rows={:?} w={:<28} width={width:5} \
+                 mean|x|={:>10.5} max|x|={max:>10.4} nan={nan:<5} zero={zero}/{n}",
+                lu.kernel,
+                lu.op,
+                lu.rows,
+                dplan.spec(i).weight.as_deref().unwrap_or("-"),
+                sum / n.max(1) as f64,
+            );
+        }
+    }
+
+    if std::env::var_os("PIE_DUMP_LAUNCHES").is_some() {
+        let mut all: Vec<(usize, f32)> = (0..vocab).map(|t| (t, logit(t))).collect();
+        all.sort_by(|a, b| b.1.total_cmp(&a.1));
+        println!("OURS  top5: {:?}", &all[..5]);
+        let hf_ids = reference["top5_ids"].as_array().expect("top5");
+        let hf_vs = reference["top5_logits"].as_array().expect("top5");
+        println!(
+            "HF    top5: {:?}",
+            hf_ids
+                .iter()
+                .zip(hf_vs)
+                .map(|(i, v)| (i.as_u64().unwrap_or(0), v.as_f64().unwrap_or(0.0)))
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "OURS at HF's ids: {:?}",
+            hf_ids.iter().map(|i| logit(i.as_u64().unwrap_or(0) as usize)).collect::<Vec<_>>()
+        );
+    }
 
     let hf_argmax = reference["argmax"].as_u64().expect("argmax") as usize;
     let (mut best_t, mut best_v) = (0usize, f32::NEG_INFINITY);
@@ -472,7 +651,7 @@ fn cuda_facts(dfp: bool, force_prefill: bool, padded: bool) -> LlamaLikeCudaFact
         head_dim_kernel: if padded { 128 } else { 0 },
         gate_up_fused: true,
         // Dense BF16, one GPU, whole context.
-        proj_repr: model_compiler::dsl::WeightRepr::Bf16,
+        proj_repr: model_dsl::WeightRepr::Bf16,
         tp_size: 1,
         window_left: Vec::new(),
         all_reduce_p2p_max_rows: 0,

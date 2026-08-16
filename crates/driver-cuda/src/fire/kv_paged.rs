@@ -1,7 +1,7 @@
 //! What is left of `attn/kv_paged.cu`'s host side.
 //!
 //! Three launchers and one conversion. The file held eight; **seven moved**
-//! to `kernels_cuda_new::x::attn::kv_paged` and the argument for the move is
+//! to `kernels_cuda::attn::kv_paged` and the argument for the move is
 //! at the head of the code below rather than here, because it is a statement
 //! about where a symbol belongs and not about what this module does.
 //!
@@ -28,7 +28,7 @@
 //! question about a mechanism no reader consulted.** §58 asked whether a
 //! specialised symbol may also be walked; §60.6 dissolved it by splitting
 //! the device rows to `..._dev` names. Both were reasoning about
-//! `device::SPECIALISED`, and this module had been choosing `#hnd`/`#nhd` in
+//! `pie::SPECIALISED`, and this module had been choosing `#hnd`/`#nhd` in
 //! Rust and firing by name through `hand::fire` the whole time — so
 //! `Specialisation::agrees` was asked about none of the five, and the five
 //! base rows and the five `Specialisation`s were each other's only reader.
@@ -42,8 +42,8 @@
 //! — which is the same shape as Half A's stated reason for this very move,
 //! corrected in the code below.
 
-use kernels_cuda_new::ArgValue;
-use kernels_cuda_new::x::{KvDType, KvLayer, KvScheme};
+use kernels_cuda::ArgValue;
+use kernels_cuda::attn::{KvDType, KvLayer, KvScheme};
 
 use crate::bind::abi::{KvCacheLayerView, KvCacheScheme};
 use crate::dtype::DType;
@@ -64,7 +64,7 @@ const BLOCK: u32 = 256;
 // `write_kv_explicit_bf16`, `write_kv_explicit_bf16_devwin`,
 // `dequant_fp8_per_tensor_pages_active` and
 // `dequant_kv_cache_layer_to_bf16_active` are
-// `kernels_cuda_new::x::attn::kv_paged`'s, together with `fp4_block_size`
+// `kernels_cuda::attn::kv_paged`'s, together with `fp4_block_size`
 // and `max_touched_pages`. `Fp8Kind` did not travel as an enum: `x::fp8_kind`
 // is the floor's own newtype and `fp8_kind_of` is the ternary, so the two
 // copies the C++ had are still one copy and it is now the one the binder
@@ -74,7 +74,7 @@ const BLOCK: u32 = 256;
 // symbol whose body needs a driver RESOURCE — a cuBLAS handle, an NCCL comm,
 // a pool, an allocator. `x::gemm`'s twelve are driver ops because
 // `cublasLtMatmul` lives across a seam no `Cx` can reach. Half A said
-// `kernels-cuda-new` cannot call `driver-cuda`; that is true and it is not
+// `kernels-cuda` cannot call `driver-cuda`; that is true and it is not
 // the reason, because the dependency runs the other way and two of these
 // bodies were already calling `x::layout::envelope_*` from the middle of
 // themselves. **These seven need no resource.** They need a KV layer's
@@ -206,7 +206,7 @@ pub enum CopyDecline {
 /// the C++ launcher, its `.hpp` declaration and its `table/driver_internal.rs`
 /// row went in the same edit. The row had to go WITH the launcher: a
 /// `driver_internal` row states `operands` and is in neither
-/// `device::JIT_DISPATCHED` nor `execution::RUST_SERVED`, so `emit_c_shim`
+/// `pie::JIT_DISPATCHED` nor `execution::RUST_SERVED`, so `emit_c_shim`
 /// would keep writing a `pie_k_attn_copy_kv_cells_bf16` forwarder onto a
 /// definition that no longer exists. It cannot be routed instead: a
 /// `driver_internal` row is not in `table::TABLES`, so `table::sig` cannot
@@ -256,16 +256,16 @@ pub unsafe fn copy_kv_cells_bf16(
     // operand, which is what `SPECIALISATIONS`' `COPY_KV_CELLS` states, so
     // the argument list below is built once.
     let instantiation = if layer.hnd_layout {
-        kernels_cuda_new::x::attn::kv_paged::inst::COPY_KV_CELLS_HND
+        "::pie::attn::copy_kv_cells<::pie::true_type::value>"
     } else {
-        kernels_cuda_new::x::attn::kv_paged::inst::COPY_KV_CELLS_NHD
+        "::pie::attn::copy_kv_cells<::pie::false_type::value>"
     };
 
     // `kv_paged.cu:367` / `:373`: `<<<N, BLOCK, 0, stream>>>`, with
     // `constexpr int BLOCK = 256` at `:365` — the same 256 this module
     // already states and the same `LaunchRule::PerRow` fixes.
     let launch =
-        kernels_cuda_new::jit::Launch::grid([n.unsigned_abs(), 1, 1], [BLOCK, 1, 1]).smem(0);
+        kernels_cuda::jit::Launch::grid([n.unsigned_abs(), 1, 1], [BLOCK, 1, 1]).smem(0);
 
     // The operand order is the `__global__`'s, not the launcher's: the
     // launcher took the view whole and carried a stream, and the row takes
@@ -284,7 +284,7 @@ pub unsafe fn copy_kv_cells_bf16(
     ];
 
     super::hand::fire(
-        &kernels_cuda_new::x::attn::kv_paged::ROOT,
+        "attn/kv_paged.cuh",
         instantiation,
         launch,
         &values,
@@ -360,7 +360,7 @@ pub enum PageViewDecline {
 ///
 /// One block of 256, which is `LaunchRule::Single` to the digit. Stated here
 /// rather than taken from the rule because the rule needs a
-/// `kernels_cuda_new::Dims` and this caller has none.
+/// `kernels_cuda::Dims` and this caller has none.
 ///
 /// # Panics
 ///
@@ -387,7 +387,7 @@ pub unsafe fn build_window_page_view(
     if keep_pages <= 0 {
         return PageView::Declined(PageViewDecline::NoKeptPages);
     }
-    let launch = kernels_cuda_new::jit::Launch::grid([1, 1, 1], [256, 1, 1]).smem(0);
+    let launch = kernels_cuda::jit::Launch::grid([1, 1, 1], [256, 1, 1]).smem(0);
     let values = [
         ArgValue::Ptr(src_indices.cast_mut().cast()),
         ArgValue::Ptr(src_indptr.cast_mut().cast()),
@@ -397,8 +397,8 @@ pub unsafe fn build_window_page_view(
         ArgValue::I32(r),
     ];
     super::hand::fire(
-        &kernels_cuda_new::x::attn::kv_paged::ROOT,
-        kernels_cuda_new::x::attn::kv_paged::inst::BUILD_WINDOW_PAGE_VIEW,
+        "attn/kv_paged.cuh",
+        "::pie::attn::build_window_page_view",
         launch,
         &values,
         stream,
@@ -453,7 +453,7 @@ pub unsafe fn build_full_split_view(
     if page_size <= 0 {
         return PageView::Declined(PageViewDecline::NoPageSize);
     }
-    let launch = kernels_cuda_new::jit::Launch::grid([1, 1, 1], [32, 1, 1]).smem(0);
+    let launch = kernels_cuda::jit::Launch::grid([1, 1, 1], [32, 1, 1]).smem(0);
     // The operand order is the `__global__`'s, which puts `src_indices` LAST
     // — after three outputs — and not beside `src_indptr` where a reader
     // expects it. Transcribed rather than tidied: the row states the same
@@ -469,8 +469,8 @@ pub unsafe fn build_full_split_view(
         ArgValue::Ptr(src_indices.cast_mut().cast()),
     ];
     super::hand::fire(
-        &kernels_cuda_new::x::attn::kv_paged::ROOT,
-        kernels_cuda_new::x::attn::kv_paged::inst::BUILD_FULL_SPLIT_VIEW,
+        "attn/kv_paged.cuh",
+        "::pie::attn::build_full_split_view",
         launch,
         &values,
         stream,

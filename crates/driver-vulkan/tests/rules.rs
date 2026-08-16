@@ -2,8 +2,8 @@
 //!
 //! [`driver_vulkan::geometry`] divides a thread extent by a workgroup size. The
 //! extent comes from the row's [`Rule`]; the workgroup size comes from
-//! `layout(local_size_x = ...)` in the GLSL, which no Rust code can see and
-//! `glslc` bakes into the module. Nothing makes them agree. This file is what
+//! `[numthreads(...)]` in the shader, which no Rust code can see and
+//! `slangc` bakes into the module. Nothing makes them agree. This file is what
 //! makes them agree, over all 480 entrypoints at once, by reading the size back
 //! out of the SPIR-V and asking the geometry what it would have launched.
 //!
@@ -13,7 +13,7 @@
 //!
 //! No GPU is involved. The modules are files.
 
-use driver_vulkan::{Declared, Dims, Module, Rule, geometry, spirv};
+use driver_vulkan::{Declared, Dims, Local, Module, Rule, Tile, geometry, spirv};
 
 /// Where a `native` build of `kernels-vulkan` left the modules.
 const SPV_DIR: Option<&str> = option_env!("PIE_KERNELS_VULKAN_SPV_DIR");
@@ -27,7 +27,7 @@ macro_rules! modules {
                 eprintln!(
                     "no modules: build with `-p driver-vulkan --features native` \
                      (or any profile that pulls kernels-vulkan/native) and have \
-                     `glslc` on PATH"
+                     `slangc` on PATH"
                 );
                 return;
             }
@@ -143,7 +143,7 @@ fn every_entrypoint_is_launched_over_its_whole_extent() {
 /// and use it as a QUANTITY, so an extra workgroup does not run a guarded lane,
 /// it changes the arithmetic every lane does.
 ///
-/// `rope/neox.comp` is the clearest. It takes `gl_NumWorkGroups.x` as the
+/// `rope/neox.slang` is the clearest. It takes `gl_NumWorkGroups.x` as the
 /// rotary pair count -- the number it strides the second half of each pair by
 /// and divides the frequency exponent by -- and `gl_NumWorkGroups.y` as the
 /// head count, which sizes the row base. Round its grid up and every pair is
@@ -359,7 +359,7 @@ fn an_awkward_shape_still_covers_its_tail() {
 /// leaves every other row holding the zeros its buffer was born with.
 ///
 /// That is not hypothetical -- it is what `Rule::Rms` did here. It stacked
-/// rows on grid y while `norm/rms.comp` reads `gl_WorkGroupID.x` and never
+/// rows on grid y while `norm/rms.slang` reads `gl_WorkGroupID.x` and never
 /// mentions y. It took a real dispatch on real hardware to see, once. This
 /// asks the module which components of `gl_WorkGroupID` and
 /// `gl_GlobalInvocationID` it is actually indexed by, and answers the same
@@ -494,7 +494,7 @@ fn no_module_reads_a_grid_axis_its_rule_leaves_flat() {
 /// does read z, which is why only one of the two is named here.
 ///
 /// The three `neox_*_decode_*` modules are compiled with `PIE_DECODE`, which
-/// is `row = 0u` -- the assignment discards `gl_WorkGroupID.z` and glslc then
+/// is `row = 0u` -- the assignment discards `gl_WorkGroupID.z` and slangc then
 /// drops the read, which is exactly why the check sees no z. Their `_mb_`
 /// siblings keep it and are checked normally.
 ///
@@ -551,7 +551,7 @@ fn a_shader_indexed_by_an_axis_is_given_that_axis() {
 
 /// A row never describes FEWER buffers than its module decorates.
 ///
-/// The audit `kernels/attn/kv_write.comp` records in prose -- "these read 9
+/// The audit `kernels/attn/kv_write.slang` records in prose -- "these read 9
 /// and 10 until a SPIR-V-level audit compared the compiled `OpDecorate
 /// Binding` set against the table: off by one" -- made permanent. That audit
 /// lives in a script, and a script only runs when someone remembers to run it.
@@ -563,7 +563,7 @@ fn a_shader_indexed_by_an_axis_is_given_that_axis() {
 /// Stated as an inequality because the two counts genuinely disagree, and only
 /// one direction is a defect. Of the 188 stated entrypoints 177 agree exactly
 /// and 11 have a module decorating one binding FEWER than the row lists --
-/// glslc drops the decoration of a buffer the shader never reads, so the
+/// slangc drops the decoration of a buffer the shader never reads, so the
 /// row is describing a real operand the shader happens not to touch. A
 /// descriptor declared and never read costs nothing. The other direction has
 /// no benign reading at all.
@@ -612,7 +612,7 @@ fn no_row_declares_fewer_buffers_than_its_module_binds() {
 /// simply not the one that was written.
 ///
 /// So this compares `kernels_vulkan::push_layout`, which is what a driver
-/// packs from the row, against the `Offset` decorations glslc put on the
+/// packs from the row, against the `Offset` decorations slangc put on the
 /// module's own push block. All 188 stated entrypoints agree today, which is
 /// the reason to fix it now rather than after the first disagreement: this
 /// check cannot find a defect that already exists, only one that is about to
@@ -784,14 +784,22 @@ fn the_parameter_blocks_this_crate_measures_are_the_ones_the_modules_declare() {
 /// The bindings a module skips are the ones this crate reports as holes.
 ///
 /// `Declared::bindings` is one past the highest, so it and the decorated set
-/// disagree wherever `glslc` dropped a binding a variant never reads. On Metal
+/// disagree wherever `slangc` dropped a binding a variant never reads. On Metal
 /// that costs nothing; on Vulkan the descriptor set still carries a slot there
 /// and something has to decide what goes in it, so the count is load-bearing.
 ///
-/// Measured across the whole tree rather than sampled: 165 of 665 modules have
-/// at least one hole and there are 358 in all. Both numbers are stated because
+/// Measured across the whole tree rather than sampled: 165 of 666 modules have
+/// at least one hole and there are 406 in all. Both numbers are stated because
 /// a walk that silently stopped finding holes would otherwise look like a tree
 /// that stopped having them.
+///
+/// The hole COUNT moved when the tree was ported from GLSL to Slang -- 358
+/// became 406 -- while the set of holed modules did not: the same 165, and the
+/// same deepest one. So the change is `slangc` eliminating more unread buffers
+/// than `glslc` did, which is exactly the behaviour this test exists to keep
+/// the driver tolerant of, and not a shader that stopped declaring something
+/// it reads. A module that dropped a binding it USES fails on device, and all
+/// 40 kernel proofs and the on-device rule cross-checks pass.
 #[test]
 fn the_bindings_a_module_skips_are_the_ones_this_crate_calls_holes() {
     let dir = modules!();
@@ -841,10 +849,10 @@ fn the_bindings_a_module_skips_are_the_ones_this_crate_calls_holes() {
 
     assert_eq!(modules, 666, "a different number of modules is built");
     assert_eq!(holed, 165, "a different number of modules has a hole");
-    assert_eq!(holes, 358, "a different number of holes in all");
+    assert_eq!(holes, 406, "a different number of holes in all");
     // `cast_qmm_input_bfloat16_to_float16` is the deepest: it shares a header
     // with the matmul family it feeds, reads two of the thirteen bindings that
-    // header declares, and `glslc` drops the other eleven. A driver counting
+    // header declares, and `slangc` drops the other eleven. A driver counting
     // slots would go looking for eleven buffers that do not exist.
     //
     // Stated so that a module quietly becoming mostly holes is visible, and
@@ -852,4 +860,452 @@ fn the_bindings_a_module_skips_are_the_ones_this_crate_calls_holes() {
     // guess this replaced. The accidental ones are deeper than the intentional
     // one.
     assert_eq!(widest, 11, "the most holes in one module changed");
+}
+
+/// Every row in the table packs, and every scalar lands on its own field.
+///
+/// [`driver_vulkan::lowering::pack`] carries two `unreachable!`s: a buffer
+/// value arriving at a push slot, and a `Binding::Push(n)` whose `n` is past
+/// the end of `push_layout`. A panic audit read both as structural --
+/// `kernels_vulkan::bindings` and `kernels_vulkan::push_layout` walk the same
+/// `sig.operands` under the same predicate, so the counts cannot disagree --
+/// and that reading is correct today. It is correct because of an agreement
+/// between two functions in a different crate that nothing checks.
+///
+/// That is the whole reason for this test. The invariant is real but it is
+/// not local: `bindings` numbers the push operands by counting the ones that
+/// are neither a buffer nor `InPacked`, and `push_layout` builds its vector
+/// by filtering on the same two predicates written out a second time. Either
+/// side could grow a case the other does not -- a new scalar kind that
+/// `is_buffer` rejects and the layout filter skips would shift every field
+/// after it -- and the first report would be an `unreachable!` in a driver,
+/// or worse, no report at all.
+///
+/// # Why it checks the bytes and not just the absence of a panic
+///
+/// A test that only called `pack` and asserted `Ok` would pass on a table
+/// where the two functions agreed about the COUNT and disagreed about the
+/// ORDER, which is the more likely of the two mistakes and the silent one: a
+/// stride written where a head count belongs is a legal dispatch. So each
+/// operand is given a value derived from its own index, and each field of
+/// the layout is read back out of the packed block and compared to the bytes
+/// of the operand that should have filled it. The block is zero-filled, so a
+/// field nobody wrote reads as zero -- and the seeds start at one for that
+/// reason.
+///
+/// # What this does and does not say about the two panics
+///
+/// Following the callers settled it further than expected: `pack` has no
+/// production caller in this crate. The live dispatch path binds from the
+/// COMPILED MODULE -- `binding::Params`, which reads whether a kernel wants a
+/// push block or a storage-buffer struct off the SPIR-V rather than off the
+/// row -- because the two disagree and the module is the one the GPU obeys.
+/// `pack` is the row-derived half, kept because it is the thing that can be
+/// proven with no device, and its `unreachable!`s are therefore not reachable
+/// from a malformed model artifact for a second, simpler reason: nothing in a
+/// serving path calls them.
+///
+/// So this is not a crash guard. It is the check that keeps the row-derived
+/// half honest while it has no caller to keep it honest, which is exactly
+/// when an ABI derivation rots.
+///
+/// # Why only 44 of the 100 rows
+///
+/// Fifty-six state no operands at all -- `sdpa_paged_mma`, the whole
+/// `qmm_t_*` family, `gdn_*` -- and `pack` refuses those by name with
+/// `Mismatch::Unstated`. They are dispatched all the same, through the module
+/// path above. The count is asserted exactly so that a row losing its operand
+/// list, which would silently shrink this test's reach rather than fail it,
+/// has to be noticed here.
+///
+/// No GPU and no modules: this is the table checking itself.
+///
+/// # What it was shown to catch
+///
+/// Three mutations, all killed. Dropping `push_layout`'s `InPacked` filter so
+/// the two functions disagree about the COUNT reports `row_gather` states one
+/// field and has no scalar operands. Striding `bindings`' push counter by two
+/// so they disagree about the INDEX reaches the `unreachable!` above, by name
+/// -- which is the only demonstration that that panic is a real edge and not
+/// a decorative one. Writing every field at `layout[0].offset`, which leaves
+/// every count correct and only the PLACEMENT wrong, is caught by the byte
+/// comparison alone: `kv_append`'s `head_dim` reads 8 where 6 belongs and its
+/// two 8-byte strides read zero, the zero being the empty block showing
+/// through, which is why the seeds start at one.
+#[test]
+fn every_row_packs_and_every_scalar_lands_on_its_own_field() {
+    use driver_vulkan::lowering::{Value, pack};
+    use kernels::Ty;
+
+    // Mirrors `Value::fits`. Written out rather than reached for, because a
+    // driver calling `pack` has to make this same choice from the row's kind,
+    // and a `None` here is a kind no caller could supply.
+    fn value_for(ty: Ty, seed: u32) -> Option<Value> {
+        Some(match ty {
+            Ty::Buf
+            | Ty::BufMut
+            | Ty::I32s
+            | Ty::I64s
+            | Ty::U32s
+            | Ty::U8s
+            | Ty::F32s
+            | Ty::F32sMut
+            | Ty::I32sMut
+            | Ty::U32sMut
+            | Ty::U8sMut => Value::Buffer(seed),
+            Ty::I32 => Value::I32(seed as i32),
+            Ty::U32 | Ty::InPacked => Value::U32(seed),
+            Ty::F32 => Value::F32(seed as f32),
+            Ty::Usize | Ty::I64 => Value::Usize(u64::from(seed)),
+            _ => return None,
+        })
+    }
+
+    fn bytes_of(v: Value) -> Vec<u8> {
+        match v {
+            Value::Buffer(_) => Vec::new(),
+            Value::I32(x) => x.to_le_bytes().to_vec(),
+            Value::U32(x) => x.to_le_bytes().to_vec(),
+            Value::F32(x) => x.to_le_bytes().to_vec(),
+            Value::Usize(x) => x.to_le_bytes().to_vec(),
+        }
+    }
+
+    let mut checked = 0;
+    let mut with_scalars = 0;
+    let mut wrong: Vec<String> = Vec::new();
+    let mut unbindable: Vec<String> = Vec::new();
+
+    for row in kernels_vulkan::KERNELS {
+        if row.operands.is_empty() {
+            continue;
+        }
+        // Seeds from one, so a field left unwritten in a zero-filled block
+        // cannot pass by coincidence.
+        let mut values = Vec::new();
+        let mut ok = true;
+        for (at, op) in row.operands.iter().enumerate() {
+            match value_for(op.ty, at as u32 + 1) {
+                Some(v) => values.push(v),
+                None => {
+                    unbindable.push(format!(
+                        "`{}` operand `{}` is {:?}, which no `Value` fits",
+                        row.name, op.name, op.ty
+                    ));
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+
+        let call = match pack(row, &values) {
+            Ok(c) => c,
+            Err(e) => {
+                wrong.push(format!("`{}` did not pack: {e}", row.name));
+                continue;
+            }
+        };
+
+        if call.buffers.len() != kernels_vulkan::buffer_count(row) as usize {
+            wrong.push(format!(
+                "`{}` packed {} buffers and its layout declares {}",
+                row.name,
+                call.buffers.len(),
+                kernels_vulkan::buffer_count(row)
+            ));
+        }
+        if call.push.len() != kernels_vulkan::push_size(row) as usize {
+            wrong.push(format!(
+                "`{}` packed a {}-byte block and its layout is {} bytes",
+                row.name,
+                call.push.len(),
+                kernels_vulkan::push_size(row)
+            ));
+        }
+
+        // The operands that should have gone into the block, in row order --
+        // the order `push_layout` filters in.
+        let scalars: Vec<Value> = row
+            .operands
+            .iter()
+            .enumerate()
+            .filter(|(at, op)| {
+                !matches!(op.ty, Ty::InPacked) && !matches!(values[*at], Value::Buffer(_))
+            })
+            .map(|(at, _)| values[at])
+            .collect();
+
+        let layout = kernels_vulkan::push_layout(row);
+        if layout.len() != scalars.len() {
+            wrong.push(format!(
+                "`{}` states {} push fields and has {} scalar operands",
+                row.name,
+                layout.len(),
+                scalars.len()
+            ));
+            continue;
+        }
+        if !layout.is_empty() {
+            with_scalars += 1;
+        }
+        for (field, value) in layout.iter().zip(&scalars) {
+            let want = bytes_of(*value);
+            let at = field.offset as usize;
+            let got = &call.push[at..at + field.size as usize];
+            if got != want.as_slice() {
+                wrong.push(format!(
+                    "`{}` field `{}` at {} holds {got:?} and its operand is {want:?}",
+                    row.name, field.name, field.offset
+                ));
+            }
+        }
+        checked += 1;
+    }
+
+    assert!(unbindable.is_empty(), "{}", unbindable.join("\n"));
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    // Was 44, before the two `sdpa_paged_tiled` rows stated their operands,
+    // and 46 before the two `sdpa_paged_mma` rows did.
+    assert_eq!(checked, 48, "a different number of rows state operands");
+    // Agreement about no scalars at all would be agreement about nothing.
+    assert_eq!(with_scalars, 29, "a different number of rows push scalars");
+}
+
+/// The buffers a row marks writable are the ones its module may write.
+///
+/// # The third statement of the same ABI, and the one with a race behind it
+///
+/// `tests/rules` already checks two halves of the row-versus-module contract:
+/// the workgroup size a rule divides by against the one the shader declares,
+/// and the push offsets a driver packs against the ones the shader reads.
+/// This is the third. A row gives every buffer operand a `Ty`, and `BufMut`
+/// is the mark that says the shader writes through it; the source says the same
+/// thing with `readonly`, which `slangc` records as `NonWritable` on the
+/// SPIR-V variable. Nothing made the two agree.
+///
+/// Unlike the other two, this one is not merely wrong-answers-if-broken --
+/// it decides where BARRIERS go. `device::hazards` asks which byte ranges a
+/// dispatch writes and puts a pipeline barrier wherever a later dispatch
+/// touches them, so the two directions fail differently and only one of them
+/// is loud:
+///
+/// * The row says a buffer is read-only and the module writes it. The driver
+///   omits a barrier it needed, and two dispatches race. On this card that is
+///   usually invisible -- the earlier one finishes first most of the time --
+///   which makes it the worst kind of defect: a test that passes on most
+///   runs.
+/// * The row says `BufMut` and the module declares `readonly`. A barrier that
+///   buys nothing. Answers stay right and the step gets slower, which is the
+///   fault this crate has now found four times by measuring and never once by
+///   a test going red.
+///
+/// Both directions are asserted, because on the day this was written both
+/// held exactly: 189 modules, 1011 bound buffers, 813 of them declared
+/// `readonly`, and ZERO disagreements either way.
+///
+/// # Holes are not disagreements
+///
+/// A row covers a family of entrypoints, and `slangc` drops the declaration of
+/// a buffer a variant never reads -- `tests/rules` counts 358 such holes
+/// across 165 modules. `mxfp4_qmv_routed_bias` is the clearest: it declares
+/// bindings 0/1/3/4/5/6 because the MXFP4 codec has no separate bias plane,
+/// and its unread `biases` operand still owns slot 2. So a row's k-th buffer
+/// operand is binding k, an index and not a rank among the declared ones, and
+/// holes are skipped through the same `used` mask `device::slots` writes
+/// descriptors through. Skipping them on the module side only shifts
+/// everything past the first hole by one, which is how the first draft of
+/// this test accused `mxfp4_qmv_routed_bias` of writing through a read-only
+/// binding.
+///
+/// # What this found, and the negative result it explains
+///
+/// No defect -- and finding none is itself the answer to a question that had
+/// been open. `dispatch` marks every bound buffer as written for a row that
+/// states no operands, and 80% of this tree's bindings are `readonly`, so
+/// deriving the mask from the module looked like free barrier removal. It was
+/// measured and the barrier count did not move by one: 311 before and 311
+/// after. Two reasons, and this test is half of the second. The branch is
+/// close to dead -- a specialised name resolves through `sig_in` to a parent
+/// row that DOES state operands -- and the masks those parent rows state are,
+/// as counted above, already exactly what the modules declare. There was
+/// nothing to correct. The barriers this driver records are the genuine
+/// arena chain, and the way to fewer of them is fusion, not bookkeeping.
+///
+/// That is also why this is worth keeping now rather than after the first
+/// disagreement: like the push-block check beside it, it cannot find a defect
+/// that already exists, only one about to be introduced -- and a missing
+/// barrier is not a defect anybody would find by reading, or reliably by
+/// running.
+#[test]
+fn a_rows_writable_buffers_are_the_ones_its_module_may_write() {
+    let _ = modules!();
+    let Some(dir) = SPV_DIR.map(std::path::Path::new) else {
+        return;
+    };
+    let mut checked = 0;
+    let mut buffers = 0;
+    let mut readonly = 0;
+    let mut wider = 0;
+    let mut races: Vec<String> = Vec::new();
+
+    for name in kernels_vulkan::entrypoints() {
+        let Some(row) = kernels::sig_in(kernels_vulkan::KERNELS, &name) else {
+            continue;
+        };
+        if row.operands.is_empty() {
+            continue;
+        }
+        let Some(d) = declared(&dir.join(format!("{name}.spv"))) else {
+            continue;
+        };
+        // The row's buffer operands, in the order the shader binds them,
+        // which is the row's own order.
+        let stated: Vec<bool> = kernels_vulkan::bindings(row)
+            .into_iter()
+            .zip(row.operands)
+            .filter(|(b, _)| matches!(b, kernels_vulkan::Binding::Buffer(_)))
+            .map(|(_, op)| op.ty == kernels::Ty::BufMut)
+            .collect();
+        // A row's k-th buffer operand IS binding k. Holes keep their slot --
+        // `mxfp4_qmv_routed_bias` declares 0/1/3/4/5/6 and its unread
+        // `biases` still owns 2 -- so this is an index, not a rank among the
+        // declared ones. Skipping the holes on one side and not the other
+        // shifts everything past the first hole by one, which is how the
+        // first draft of this test accused a correct row of a race.
+        let mut seen = false;
+        for (b, mark) in stated.iter().enumerate() {
+            if !d.used.get(b).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some(&writable) = d.writable.get(b) else {
+                continue;
+            };
+            seen = true;
+            buffers += 1;
+            if !writable {
+                readonly += 1;
+            }
+            if writable && !mark {
+                races.push(format!(
+                    "`{name}` binding {b} is written by the module and its row \
+                     does not mark it `BufMut`"
+                ));
+            }
+            if !writable && *mark {
+                wider += 1;
+            }
+        }
+        if seen {
+            checked += 1;
+        }
+    }
+
+    assert!(races.is_empty(), "{}", races.join("\n"));
+    assert_eq!(
+        wider, 0,
+        "{wider} bindings are marked `BufMut` by a row whose module declares \
+         them `readonly`, which costs a barrier and buys nothing"
+    );
+    assert!(checked >= 150, "only {checked} modules were compared");
+    eprintln!(
+        "{checked} modules, {buffers} bound buffers, {readonly} declared \
+         readonly, {wider} marked writable by a row that its module does not"
+    );
+    // Agreement about nothing would be agreement all the same: most of this
+    // tree's bindings ARE read-only, and if that stopped being true the
+    // assertion above would be checking an empty set.
+    assert!(
+        readonly * 2 > buffers,
+        "only {readonly} of {buffers} bindings are read-only, so this no \
+         longer checks the direction it was written for"
+    );
+}
+
+/// The rules this driver serves and the rules this backend's table names are
+/// the same set, minus two that are named here.
+///
+/// `geometry`'s own `the_rules_this_backend_serves_are_exactly_the_ones_with_shaders`
+/// checks one direction: every rule in its `SERVED` list answers, and every
+/// other rule the fleet states refuses by name. What it cannot see from
+/// inside `driver-vulkan` is the TABLE -- and the two halves had drifted
+/// apart without anything noticing, in both directions at once:
+///
+/// * `kernels-vulkan` names fifteen rules across its hundred rows. All
+///   fifteen are served, which is the half that matters and is asserted
+///   first.
+/// * `SERVED` holds seventeen. The two spare ones are `GatedRms` and
+///   `PerHeadElementwise`, and no Vulkan row names either. They are not
+///   mistakes -- the grids are right, and `kernels-cuda` states both on
+///   `attn_sink_correction`, `per_head_rmsnorm` and three SSM rows -- but
+///   this backend has no shader for any of those kernels, so the geometry
+///   is written ahead of the row rather than behind it.
+///
+/// That is worth a name rather than a silence. `SERVED`'s comment reads
+/// "this is the part `kernels-vulkan` compiles a shader for", which was two
+/// rules too generous, and a reader counting coverage off that list would
+/// have counted two kernels this backend does not have.
+///
+/// The test is two-directional on purpose: a row that starts naming
+/// `GatedRms` must delete it from `AHEAD_OF_THE_TABLE` here, and a rule that
+/// stops being served fails the first assertion. Neither can pass by
+/// accident.
+#[test]
+fn every_rule_the_table_names_is_one_this_driver_can_lay_out() {
+    /// Served, with no row in `kernels-vulkan` naming it. See above.
+    const AHEAD_OF_THE_TABLE: &[Rule] = &[Rule::GatedRms, Rule::PerHeadElementwise];
+
+    let mut named: Vec<Rule> = kernels_vulkan::KERNELS
+        .iter()
+        .map(|row| row.launch)
+        .filter(|r| *r != Rule::Unstated)
+        .collect();
+    named.sort_by_key(|r| format!("{r:?}"));
+    named.dedup();
+    assert_eq!(named.len(), 15, "the table names a different set of rules");
+
+    // A rule is "laid out" when `lanes` answers for the module the family is
+    // built with. The dims are the sweep's own, so this asks exactly what a
+    // fire would.
+    for &rule in &named {
+        let module = Module {
+            local: Local([32, 2, 2]),
+            tile: (rule == Rule::Qmm).then_some(Tile { rows: 32, cols: 64 }),
+        };
+        let d = if rule == Rule::SdpaVector {
+            Dims {
+                head_dim: 32,
+                ..dims()
+            }
+        } else {
+            dims()
+        };
+        assert!(
+            geometry::lanes(rule, d, module).is_ok(),
+            "{rule:?} is named by a row and this driver cannot lay it out"
+        );
+        assert!(
+            !AHEAD_OF_THE_TABLE.contains(&rule),
+            "{rule:?} is listed as having no row, and a row names it"
+        );
+    }
+
+    // And the other direction: each rule said to be ahead of the table really
+    // is both served and unnamed.
+    for &rule in AHEAD_OF_THE_TABLE {
+        let module = Module {
+            local: Local([32, 2, 2]),
+            tile: None,
+        };
+        assert!(
+            geometry::lanes(rule, dims(), module).is_ok(),
+            "{rule:?} is listed as served ahead of the table and does not answer"
+        );
+        assert!(
+            !named.contains(&rule),
+            "{rule:?} now has a row; take it out of AHEAD_OF_THE_TABLE"
+        );
+    }
 }

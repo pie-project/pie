@@ -143,13 +143,13 @@ mod tests {
     /// The assertion's message says the native GEMM "would want a Marlin
     /// repack no kernel here implements", which is true and is not the whole
     /// reason. The rest was in `kernels-cuda/csrc/src/kernels_manifest.hpp`'s
-    /// sm_100 quarantine block — **archive text, deleted at north star step
-    /// 6** — whose closing line reads *"`new-horizon.md` §47 holds the
-    /// argument and this comment holds the measurement."* That division is
-    /// accurate and it is a single point of failure twice over: §47 held no
-    /// numbers, and that comment goes with the archive at step 6. Both halves
-    /// were on the losing side of the deletion. So it is carried here,
-    /// in a crate that survives and a file that is committed.
+    /// sm_100 quarantine block — **the ARCHIVE crate's text, deleted with it
+    /// at north star step 6** — whose closing line reads *"`new-horizon.md`
+    /// §47 holds the argument and this comment holds the measurement."* That
+    /// division is accurate and it is a single point of failure twice over:
+    /// §47 held no numbers, and that comment goes with the archive at step 6.
+    /// Both halves were on the losing side of the deletion. So it is carried
+    /// here, in a crate that survives and a file that is committed.
     ///
     /// (The first draft of this note said `.wiki/` "is not tracked by this
     /// repository at all". Half right and the wrong half: `.wiki/` is its own

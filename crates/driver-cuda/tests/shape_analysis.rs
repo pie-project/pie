@@ -35,7 +35,7 @@
 use std::collections::BTreeMap;
 
 use model_compiler::lower::{Fire, Lowered, Row, lower};
-use model_compiler::trace::FireClass;
+use model_ir::trace::FireClass;
 
 fn rows(n: usize) -> Vec<Row> {
     vec![
@@ -47,7 +47,7 @@ fn rows(n: usize) -> Vec<Row> {
     ]
 }
 
-fn lower_plan(plan: &model_compiler::trace::ForwardPlan) -> Lowered {
+fn lower_plan(plan: &model_ir::trace::ForwardPlan) -> Lowered {
     lower(
         plan,
         &rows(4),
@@ -68,7 +68,7 @@ fn lower_plan(plan: &model_compiler::trace::ForwardPlan) -> Lowered {
 /// `write_kv_to_pages` is one statement lowering two ways, not two
 /// declarations. An OP shape that differs means the declaration itself
 /// said something else, and only that is work C has to describe.
-fn op_shape(plan: &model_compiler::trace::ForwardPlan, l: &Lowered) -> Vec<String> {
+fn op_shape(plan: &model_ir::trace::ForwardPlan, l: &Lowered) -> Vec<String> {
     l.launches
         .iter()
         .filter(|x| x.layers.start == 1)

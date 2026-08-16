@@ -3,7 +3,7 @@
 //!
 //! This is the Stage 5 "sites come from the traced form" step the
 //! [`SITE_EXPERT_WEIGHTS`](super::SITE_EXPERT_WEIGHTS) doc promised:
-//! [`derive_sites`] walks a `model_compiler::ForwardPlan` and emits the sites
+//! [`derive_sites`] walks a `model_ir::ForwardPlan` and emits the sites
 //! the model's own structure declares — divergence that holds for every
 //! member of every fire against this model, as opposed to the per-fire
 //! attachment divergence [`plan_fire`](super::plan_fire) derives from
@@ -56,7 +56,7 @@
 //! *admission*: the rs-buffer's capacity/aliasing hazard forces such fires
 //! solo today (the scheduler's hand-maintained `touches_rs_buffer()`,
 //! whose traced-form statement is `plan.ops.iter().any(|op|
-//! op.kind.state_ref() ..)` — see `model_compiler::trace::OpKind::state_ref`).
+//! op.kind.state_ref() ..)` — see `model_ir::trace::OpKind::state_ref`).
 //! That is a scheduling constraint, a fact for the admission rule
 //! (`LaunchGrouping::accepts`), not a `Site` with a lowering; deriving it
 //! from the plan belongs to the increment that wires plans to the
@@ -114,7 +114,7 @@
 //! The tests below pin the derivation so the mapping stays correct until
 //! the three links close, and the empty path is the one that runs.
 
-use model_compiler::{Dim, ForwardPlan, OpKind};
+use model_ir::{Dim, ForwardPlan, OpKind};
 
 use super::{Site, expert_weights_site};
 
@@ -208,7 +208,7 @@ mod tests {
     use super::*;
     use model::qwen_3_5::forward::facts::{Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts};
     use model::shared::llama_like::forward::facts::LlamaLikeFacts;
-    use model_compiler::StateStore;
+    use model_ir::StateStore;
 
     /// The qwen3_5_moe MLP fragment (256 experts, top-8): the walk finds
     /// the selector-carrying matmuls, resolves k off the TopK op and the

@@ -1,6 +1,6 @@
 //! What happens when a trace states one of `layout`'s symbols.
 //!
-//! These were `bind!` arms inside `kernels-cuda-new`. They read the driver's
+//! These were `bind!` arms inside `kernels-cuda`. They read the driver's
 //! own vocabulary through [`Cx`], so they belong on this side of the seam:
 //! the kernels crate exposes routines, and joining a statement to one is the
 //! driver's job.
@@ -8,9 +8,9 @@
 use core::ffi::c_void;
 
 use kernels::Refusal;
-use kernels_cuda_new::jit::Ctx;
-use kernels_cuda_new::x::abi::bf16;
-use kernels_cuda_new::x::layout::*;
+use kernels_cuda::jit::Ctx;
+use kernels_cuda::jit::abi::bf16;
+use kernels_cuda::layout::*;
 
 use super::super::cx::Cx;
 use super::Bound;
@@ -34,7 +34,7 @@ fn split_rows_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
 fn split_qwen_gdn_ba_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    split_qwen_gdn_ba_bf16(
+    split_qwen_gdn_ba::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.arg_out(0)?.cast::<bf16>(),
@@ -93,6 +93,25 @@ fn transpose_nld_to_lnd_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refu
 
 /// Every symbol this family binds.
 pub static ARMS: &[Bound] = &[
+    // DECLARED IN `sigs()` AND ARMED BY NOBODY, which is a state this
+    // registry can hold and a bare absence cannot. Before the declaration
+    // landed a fire naming it refused `NoArm` -- a message about dispatch,
+    // naming neither what was missing nor who would supply it.
+    Bound {
+        symbol: "layout::split_q_gate_bf16",
+        arm: None,
+        unbound: Some(
+            "this symbol has a HOST PROGRAM and no arm. \
+             kernels_cuda::driver_internal::split_q_gate_bf16 is the \
+             body -- a plain pub fn the driver is meant to call by path -- \
+             and nothing in this crate calls it. The gap is not the kernel: \
+             OpKind::SplitQGate arrives with no bind written, so a fire \
+             reaching it refused NoArm and named neither the body nor its \
+             module. FLOOR: call driver_internal::split_q_gate_bf16 from an \
+             arm here, over the packed bank in and the q/gate halves out",
+        ),
+    },
+
     Bound { symbol: "layout::split_bf16_rows", arm: Some(split_rows_arm), unbound: None },
     Bound {
         symbol: "layout::split_qwen_gdn_ba_bf16",

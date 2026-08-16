@@ -103,15 +103,15 @@ impl NemotronMambaFacts {
 }
 
 /// This family's attention IS a plain GQA block — see
-/// [`model_compiler::facts::GqaFacts`], which both families carried
+/// [`model_ir::facts::GqaFacts`], which both families carried
 /// field-identically.
-pub type NemotronAttnFacts = model_compiler::facts::GqaFacts;
+pub type NemotronAttnFacts = model_ir::facts::GqaFacts;
 
 /// This family's mixture IS the shared one — see
-/// [`model_compiler::facts::MoeFacts`]. Three families carried
+/// [`model_ir::facts::MoeFacts`]. Three families carried
 /// field-identical copies; the alias keeps every spelling working while
 /// there is one definition.
-pub type NemotronMoeFacts = model_compiler::facts::MoeFacts;
+pub type NemotronMoeFacts = model_ir::facts::MoeFacts;
 
 /// The whole family.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -140,7 +140,7 @@ pub struct NemotronHFacts {
     /// `tie_word_embeddings` defaults to `true` in most of the lineage.
     pub tied_embeddings: bool,
     /// The SLIDING WINDOW each layer attends over, `-1` for none —
-    /// read through [`model_compiler::facts::window_left_at`], which is
+    /// read through [`model_ir::facts::window_left_at`], which is
     /// where the shape of this list is documented.
     ///
     /// The dispatch statements carry it, so no executor reaches into

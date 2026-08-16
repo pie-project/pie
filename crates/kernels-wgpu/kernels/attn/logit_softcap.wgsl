@@ -8,12 +8,13 @@
 // is the whole extent.
 
 //#include "common/bf16.inc.wgsl"
+//#include "common/math.inc.wgsl"
 
-@group(0) @binding(0) var<storage, read> logits: array<u32>;
+@group(0) @binding(0) var<storage, read_write> logits: array<u32>;
 @group(0) @binding(1) var<storage, read_write> out_: array<u32>;
 
 struct SoftcapParams { cap: f32, unused: u32 }
-@group(0) @binding(2) var<storage, read> params: SoftcapParams;
+@group(0) @binding(2) var<storage, read_write> params: SoftcapParams;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -29,8 +30,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x = logits[i];
     let cap = params.cap;
     out_[i] = pie_pack_bf16(
-        cap * tanh(pie_bf16_to_f32(x & 0xffffu) / cap),
-        cap * tanh(pie_bf16_to_f32(x >> 16u) / cap),
+        cap * pie_tanh(pie_bf16_to_f32(x & 0xffffu) / cap),
+        cap * pie_tanh(pie_bf16_to_f32(x >> 16u) / cap),
     );
 }
 

@@ -148,7 +148,7 @@ use driver_metal::pools::kv::Pool;
 use driver_metal::program::Compiler;
 use driver_metal::weights::load::load;
 use model::catalog::MetalBinding;
-use model_compiler::trace::{FireClass, ForwardPlan};
+use model_ir::trace::{FireClass, ForwardPlan};
 
 fn kernels_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -331,7 +331,7 @@ const REFERENCES: &[Reference] = &[
             (12, 9.192_102),
             (198, 9.173_553),
         ],
-        next: Some(9.130_610),
+        next: Some(9.130_61),
         span: (-8.259_116, 10.173_439),
         mid: [(39985, 6.580_502), (43065, 4.287_484), (10303, 1.586_527)],
         widest: Some(42_752.0),
@@ -435,11 +435,11 @@ fn reference_taken_on(snapshot: &Path, model: &str) -> bool {
 fn served(
     context: &Context,
     snapshot: &Path,
-) -> (
+) -> Option<(
     &'static dyn model::catalog::Variant,
     driver_metal::batch::DecodeGeometry,
     driver_metal::weights::load::Loaded,
-) {
+)> {
     let meta = model_loader::checkpoint::read::parse_checkpoint_metadata(snapshot)
         .unwrap_or_else(|e| panic!("{} did not read as a checkpoint: {e:?}", snapshot.display()));
     let row = model::catalog::identify(&meta, &model::catalog::Override::None)
@@ -457,13 +457,19 @@ fn served(
     // that checks anything on it, and quietly printing SKIP twelve times
     // would read as "the device tests ran".
     //
-    // `REFERENCES` still carries `gemma-4-31b-it-4bit`, and it is now exactly
-    // such a snapshot: gemma-4's row refuses Metal in its own words, because
-    // its text is `gemma4_cuda` and this build has no shared-cache attention.
-    // The measurement stays — it cost half an hour of `mlx_lm` and it is
-    // correct — but pointing the runner at it now says so in one sentence
-    // instead of failing on a logit comparison against a text that was never
-    // gemma-4's.
+    // `REFERENCES` carries `gemma-4-31b-it-4bit`, and this paragraph used to
+    // say that row refused Metal because its text was `gemma4_cuda`. It does
+    // not, and the row says so itself: "does NOT refuse: this build reads V
+    // out of the K projection, and the 31b reproduces MLX's logits exactly
+    // doing it". `LlamaLikeMetalFacts::v_from_k` is that read. Measured, not
+    // argued — pointed at the snapshot, this gate passes and the load gets
+    // as far as the arena.
+    //
+    // Where it stops is the THIRD case, handled at the `load` below: the
+    // checkpoint is 17,269,186,048 resident bytes and this machine's ceiling
+    // is 10,319,036,416. That is neither a gap in the rig nor a
+    // misconfigured runner — it is the device, and the driver refusing it by
+    // name is the behaviour under test.
     driver_metal::model::binding::serves(row).unwrap_or_else(|e| {
         panic!(
             "`{}` is `{}`, and this build states no Metal text for it: {e}. \
@@ -485,7 +491,38 @@ fn served(
     let deployment = row
         .deployment(model::catalog::Deployed::single())
         .unwrap_or_else(|e| panic!("`{}` does not deploy: {e}", row.id()));
-    let loaded = load(context, snapshot, row, &encoding).expect("the checkpoint loads");
+    let loaded = match load(context, snapshot, row, &encoding) {
+        Ok(loaded) => loaded,
+        // THE THIRD CASE, and the doctrine above knew only two. This one
+        // is not a gap in the rig and not a misconfigured runner: it is
+        // the DRIVER BEHAVING, and the rig reading a pass as a failure.
+        //
+        // `weights::stage::fits_on_this_gpu` compares the plan's resident
+        // bytes against the device's ceiling and refuses BEFORE staging,
+        // naming both numbers, precisely so the kernel is not left to
+        // decide. gemma-4-31b-it-4bit is 17,269,186,048 bytes and this
+        // machine's ceiling is 10,319,036,416. Nothing about that is a
+        // defect in anything, and panicking on it accuses `driver-metal`
+        // of the one thing it got right.
+        //
+        // Narrow on purpose: `what` is the arena's, so every other
+        // `Create` still panics. And loud on purpose -- the fear the
+        // doctrine above is written against is twelve quiet SKIPs
+        // reading as "the device tests ran", so this one says whose
+        // limit it is and by how much.
+        Err(driver_metal::Error::Create {
+            what: "weight arena",
+            message,
+        }) => {
+            eprintln!(
+                "SKIP: THIS DEVICE cannot hold `{}` -- not a driver defect \
+                 and not a missing measurement. {message}",
+                snapshot.display(),
+            );
+            return None;
+        }
+        Err(e) => panic!("the checkpoint loads: {e:?}"),
+    };
     // THE SECOND PRE-STAGING GATE, and a panic for the reason the first one
     // is: `load_model` refuses this snapshot at this exact question, so
     // there is no version of this suite that checks anything on it.
@@ -503,7 +540,7 @@ fn served(
     });
     let dg = driver_metal::batch::geometry_from_deployment(&deployment, row.load_shape(), quant)
         .unwrap_or_else(|e| panic!("`{}` projects no decodable geometry: {}", row.id(), e.0));
-    (row, dg, loaded)
+    Some((row, dg, loaded))
 }
 
 /// Every arena region the lowering states, each byte in exactly one of them.
@@ -565,7 +602,7 @@ fn arena_regions(
 
 /// How many values a region of `len` bytes holds at `element` bytes each.
 fn len_in_elements(len: usize, element: usize) -> usize {
-    if element == 0 { 0 } else { len / element }
+    len.checked_div(element).unwrap_or(0)
 }
 
 /// What a run of the whole arena found.
@@ -705,7 +742,7 @@ fn text(
 /// now, which is where those numbers were always from — `facts_from` copied
 /// them out of the same `DecodeGeometry` this takes — so nothing about the
 /// dispatch moved, only the number of documents it is read from.
-fn dispatch_geometry(dg: &driver_metal::batch::DecodeGeometry) -> Geometry {
+fn dispatch_geometry(dg: &driver_metal::batch::DecodeGeometry, binding: &MetalBinding) -> Geometry {
     Geometry {
         q_heads: dg.n_q_heads,
         kv_heads: dg.n_kv_heads,
@@ -713,6 +750,11 @@ fn dispatch_geometry(dg: &driver_metal::batch::DecodeGeometry) -> Geometry {
         rotary_dims: dg.head_dim,
         n_experts: dg.n_experts,
         experts_per_token: dg.experts_per_token,
+        // The quantization axes come from the BINDING, not the pool: they are
+        // facts about the checkpoint on disk, and `serve` reads them from the
+        // same place.
+        group: binding.quant_group,
+        bits: binding.quant_bits,
     }
 }
 
@@ -728,7 +770,7 @@ impl Resolver for Live<'_> {
     fn weight(&mut self, name: &str) -> Option<Slice> {
         self.store.weight(name)
     }
-    fn named(&mut self, value: model_compiler::trace::ValueId) -> Option<Slice> {
+    fn named(&mut self, value: model_ir::trace::ValueId) -> Option<Slice> {
         self.store.named(value)
     }
     fn kv(&mut self, layer: u16, values: bool) -> Option<Slice> {
@@ -751,18 +793,18 @@ impl Resolver for Live<'_> {
 fn plan_count(
     lowered: &model_compiler::lower::Lowered,
     dg: &driver_metal::batch::DecodeGeometry,
+    binding: &MetalBinding,
     live: &mut Live<'_>,
 ) -> String {
     let dispatches = driver_metal::lowering::dispatch::plan(
         lowered,
-        driver_metal::lowering::dispatch::table(),
         driver_metal::lowering::executor::Frame {
             arena: Slice {
                 address: 0x1_0000_0000,
                 bytes: 1 << 30,
             },
         },
-        dispatch_geometry(dg),
+        dispatch_geometry(dg, binding),
         live,
     )
     .expect("the fire plans");
@@ -832,6 +874,9 @@ fn stage_tables(
     let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
     driver_metal::bind::tables::stage(
         context,
+        // A pool that lives exactly as long as the `Staged` does -- the lease
+        // keeps it alive, and a helper that stages once wants no more.
+        &driver_metal::fire::Scratch::new(),
         driver_metal::bind::tables::Frame {
             token_ids: step.token_ids,
             position_ids: &positions,
@@ -841,7 +886,12 @@ fn stage_tables(
             kv_write_page: &kv_write_page,
             kv_write_offset: &w_off,
             rope_frequencies: &inv_freq,
-            sampling_indices: step.sampling_indices,
+            // The FIRE's rows, exactly as `serve::launch` stages them: the
+            // wire's numbers are request-local and `row_gather` indexes the
+            // stream. A rig that passed them through would be testing a
+            // staging the driver does not do.
+            sampling_indices: &driver_metal::lowering::frame::sampled_rows(step)
+                .expect("the readout table places its rows"),
         },
     )
     .expect("the tables stage")
@@ -861,14 +911,17 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, dg, loaded) = served(&context, &snapshot);
+    let Some((row, dg, loaded)) = served(&context, &snapshot) else {
+        return;
+    };
     let binding = observed(&dg, &loaded);
 
     // Four lanes, one token each: the decode a scheduler posts.
     let step = Step {
         token_ids: &[128_000, 9906, 1917, 128_001],
         qo_indptr: &[0, 1, 2, 3, 4],
-        sampling_indices: &[0, 1, 2, 3],
+        sampling_indices: &[0, 0, 0, 0],
+        sampling_indptr: &[0, 1, 2, 3, 4],
         ..Step::default()
     };
     let plan = text(row, FireClass::Decode, &binding);
@@ -898,7 +951,7 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
         pages: &pages,
     };
 
-    let geometry = dispatch_geometry(&dg);
+    let geometry = dispatch_geometry(&dg, &binding);
     let (timing, arena) = driver_metal::fire::run::run_keeping_arena(
         &context,
         &compiler,
@@ -1003,24 +1056,11 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     for launch in &lowered.launches {
         let symbol = &lowered.kernels[launch.kernel as usize];
         let args = &lowered.args[launch.args.start as usize..launch.args.end as usize];
-        // The trace states inputs, then OUTPUTS, then weights, and the row
-        // says how many of the widthed operands are results — the same split
-        // `dispatch::reorder` makes. A region that is only ever an INPUT is
-        // one nothing was ever supposed to write.
-        // See the rectangle census below: a row that states no `Out` has no
-        // arena output, and only a MISSING row is unknown.
-        let results = kernels::sig_in(kernels_metal::KERNELS, symbol)
-            .map(|sig| {
-                sig.operands
-                    .iter()
-                    .filter_map(|o| match o.source {
-                        kernels::Source::Out(i) => Some(usize::from(i) + 1),
-                        _ => None,
-                    })
-                    .max()
-                    .unwrap_or(0)
-            })
-            .unwrap_or(1);
+        // The trace states inputs, then OUTPUTS, then weights, and the
+        // ROUTINE says how many of the widthed operands are results. A region
+        // that is only ever an INPUT is one nothing was ever supposed to
+        // write.
+        let results = results_of(symbol);
         let widthed: Vec<&model_compiler::lower::Arg> = args
             .iter()
             .filter(|a| !matches!(a, model_compiler::lower::Arg::Weight(_)))
@@ -1046,7 +1086,7 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     eprintln!(
         "{} launch(es) -> {} dispatch(es)",
         lowered.launches.len(),
-        plan_count(&lowered, &dg, &mut live)
+        plan_count(&lowered, &dg, &binding, &mut live)
     );
 
     let mut c = Census::default();
@@ -1163,7 +1203,9 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     // massive-activation channel -- 42,752 in MLX itself -- as a defect.
     // Four times the measurement, because what is being caught is
     // saturation and not the last bf16 ulp.
-    let ceiling = reference_for(&snapshot).and_then(|r| r.widest).map_or(1e3, |w| w * 4.0);
+    let ceiling = reference_for(&snapshot)
+        .and_then(|r| r.widest)
+        .map_or(1e3, |w| w * 4.0);
     assert!(
         c.max_abs > 1e-4 && c.max_abs < ceiling,
         "the widest value anywhere is {}, against a ceiling of {ceiling}, \
@@ -1242,22 +1284,10 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     for (n, launch) in lowered.launches.iter().enumerate() {
         let symbol = &lowered.kernels[launch.kernel as usize];
         let args = &lowered.args[launch.args.start as usize..launch.args.end as usize];
-        // NO `Out` OPERAND MEANS NO ARENA OUTPUT, which is not the same as
-        // an unknown row. `kv_append_paged` writes the KV POOL -- its
-        // results are `Source::KvKeys` and `Source::KvValues` -- and states
-        // no `Out(i)` at all. `.max()` over an empty iterator is `None`, and
-        // falling that through to the same `unwrap_or(1)` that covers a
-        // MISSING row made the kernel's last input look like its output.
-        let results = kernels::sig_in(kernels_metal::KERNELS, symbol).map_or(1, |sig| {
-            sig.operands
-                .iter()
-                .filter_map(|o| match o.source {
-                    kernels::Source::Out(i) => Some(usize::from(i) + 1),
-                    _ => None,
-                })
-                .max()
-                .unwrap_or(0)
-        });
+        // A kernel that writes no ARENA rectangle still writes: the last
+        // widthed operands of `kv_append_paged` are the KV pool, not the
+        // arena, and the `Arg::Arena` filter below is what drops them.
+        let results = results_of(symbol);
         let widthed: Vec<&model_compiler::lower::Arg> = args
             .iter()
             .filter(|a| !matches!(a, model_compiler::lower::Arg::Weight(_)))
@@ -1426,7 +1456,9 @@ fn bisect(class: FireClass) {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, dg, loaded) = served(&context, &snapshot);
+    let Some((row, dg, loaded)) = served(&context, &snapshot) else {
+        return;
+    };
     let binding = observed(&dg, &loaded);
 
     // The CHECKPOINT'S OWN token, when a reference names one. Posting
@@ -1444,7 +1476,8 @@ fn bisect(class: FireClass) {
         Step {
             token_ids: &four,
             qo_indptr: &[0, 1, 2, 3, 4],
-            sampling_indices: &[0, 1, 2, 3],
+            sampling_indices: &[0, 0, 0, 0],
+            sampling_indptr: &[0, 1, 2, 3, 4],
             ..Step::default()
         }
     } else {
@@ -1454,6 +1487,7 @@ fn bisect(class: FireClass) {
             token_ids: &two,
             qo_indptr: &[0, 2],
             sampling_indices: &[0],
+            sampling_indptr: &[0, 1],
             ..Step::default()
         }
     };
@@ -1486,7 +1520,7 @@ fn bisect(class: FireClass) {
         shape,
         pages: &pages,
     };
-    let geometry = dispatch_geometry(&dg);
+    let geometry = dispatch_geometry(&dg, &binding);
 
     // Every launch's OUTPUT rectangle, so a prefix can be judged by what its
     // last statement was supposed to write rather than by the whole arena.
@@ -1552,7 +1586,6 @@ fn bisect(class: FireClass) {
         unsafe { arena.zero(0, arena.len()).expect("it zeroes") };
         let dispatches = driver_metal::lowering::dispatch::plan(
             &lowered,
-            driver_metal::lowering::dispatch::table(),
             driver_metal::lowering::executor::Frame {
                 arena: Slice {
                     address: arena.gpu_address(),
@@ -1758,18 +1791,21 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, dg, loaded) = served(&context, &snapshot);
+    let Some((row, dg, loaded)) = served(&context, &snapshot) else {
+        return;
+    };
     let binding = observed(&dg, &loaded);
 
     let step = Step {
         token_ids: &[128_000, 9906, 1917, 128_001],
         qo_indptr: &[0, 1, 2, 3, 4],
-        sampling_indices: &[0, 1, 2, 3],
+        sampling_indices: &[0, 0, 0, 0],
+        sampling_indptr: &[0, 1, 2, 3, 4],
         ..Step::default()
     };
     let plan = text(row, FireClass::Decode, &binding);
     let lowered = lower_step(&plan, &step).expect("the step lowers");
-    let geometry = dispatch_geometry(&dg);
+    let geometry = dispatch_geometry(&dg, &binding);
 
     let shape = pool_shape(&dg, 64);
     let pool = Pool::allocate(&context, shape).expect("a pool");
@@ -1784,7 +1820,7 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
         .values
         .iter()
         .enumerate()
-        .filter(|(_, v)| matches!(v.dtype, model_compiler::trace::DType::I32))
+        .filter(|(_, v)| matches!(v.dtype, model_ir::trace::DType::I32))
         .filter_map(|(id, _)| lowered.value_offset.get(id).copied())
         .collect();
     // The SAME reader the census uses. This used to take the stated
@@ -1832,7 +1868,6 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
         };
         let dispatches = driver_metal::lowering::dispatch::plan(
             &lowered,
-            driver_metal::lowering::dispatch::table(),
             driver_metal::lowering::executor::Frame {
                 arena: Slice {
                     address: arena.gpu_address(),
@@ -2268,7 +2303,9 @@ fn one_token_at_position_zero_agrees_with_mlx() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, dg, loaded) = served(&context, &snapshot);
+    let Some((row, dg, loaded)) = served(&context, &snapshot) else {
+        return;
+    };
     let binding = observed(&dg, &loaded);
 
     // ONE request, ONE token, position zero.
@@ -2276,6 +2313,7 @@ fn one_token_at_position_zero_agrees_with_mlx() {
         token_ids: &[reference.bos],
         qo_indptr: &[0, 1],
         sampling_indices: &[0],
+        sampling_indptr: &[0, 1],
         ..Step::default()
     };
     let plan = text(row, FireClass::Decode, &binding);
@@ -2309,7 +2347,7 @@ fn one_token_at_position_zero_agrees_with_mlx() {
         &compiler,
         &mut pipelines,
         &lowered,
-        dispatch_geometry(&dg),
+        dispatch_geometry(&dg, &binding),
         &mut live,
     )
     .expect("the fire runs");
@@ -2409,7 +2447,11 @@ fn one_token_at_position_zero_agrees_with_mlx() {
         let mut d = 0;
         for m in 1..=n {
             // Below the last entry is the sixth logit, which only `next` has.
-            let Some(below) = (if m < n { Some(reference.top[m].1) } else { reference.next }) else {
+            let Some(below) = (if m < n {
+                Some(reference.top[m].1)
+            } else {
+                reference.next
+            }) else {
                 break;
             };
             if reference.top[m - 1].1 - below <= bf16_slack(below) {
@@ -2583,7 +2625,9 @@ fn a_two_token_prefill_agrees_with_mlx() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, dg, loaded) = served(&context, &snapshot);
+    let Some((row, dg, loaded)) = served(&context, &snapshot) else {
+        return;
+    };
     let binding = observed(&dg, &loaded);
 
     // ONE request, TWO tokens: a prefill.
@@ -2597,6 +2641,7 @@ fn a_two_token_prefill_agrees_with_mlx() {
         token_ids: &[128_000, 9906],
         qo_indptr: &[0, 2],
         sampling_indices: &[1],
+        sampling_indptr: &[0, 1],
         ..Step::default()
     };
     let plan = text(row, FireClass::Prefill, &binding);
@@ -2634,7 +2679,7 @@ fn a_two_token_prefill_agrees_with_mlx() {
         &compiler,
         &mut pipelines,
         &lowered,
-        dispatch_geometry(&dg),
+        dispatch_geometry(&dg, &binding),
         &mut live,
     )
     .expect("the prefill runs");
@@ -2740,7 +2785,9 @@ fn a_prefill_rotates_its_second_row() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, dg, loaded) = served(&context, &snapshot);
+    let Some((row, dg, loaded)) = served(&context, &snapshot) else {
+        return;
+    };
     let binding = observed(&dg, &loaded);
 
     // The SAME token twice. Same embedding, same projection, so the two K rows
@@ -2749,6 +2796,7 @@ fn a_prefill_rotates_its_second_row() {
         token_ids: &[9906, 9906],
         qo_indptr: &[0, 2],
         sampling_indices: &[1],
+        sampling_indptr: &[0, 1],
         ..Step::default()
     };
     let plan = text(row, FireClass::Prefill, &binding);
@@ -2804,7 +2852,7 @@ fn a_prefill_rotates_its_second_row() {
         &compiler,
         &mut pipelines,
         &lowered,
-        dispatch_geometry(&dg),
+        dispatch_geometry(&dg, &binding),
         &mut live,
     )
     .expect("the prefill runs");
@@ -2885,7 +2933,9 @@ fn a_prefill_rotates_its_second_row_on_the_base_ladder() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, dg, loaded) = served(&context, &snapshot);
+    let Some((row, dg, loaded)) = served(&context, &snapshot) else {
+        return;
+    };
     let binding = observed(&dg, &loaded);
 
     // The SAME token twice. Same embedding, same projection, so the two K rows
@@ -2894,6 +2944,7 @@ fn a_prefill_rotates_its_second_row_on_the_base_ladder() {
         token_ids: &[9906, 9906],
         qo_indptr: &[0, 2],
         sampling_indices: &[1],
+        sampling_indptr: &[0, 1],
         ..Step::default()
     };
     // This is the BASE lane's fire; the twin above is the FREQS one. See this
@@ -2937,7 +2988,7 @@ fn a_prefill_rotates_its_second_row_on_the_base_ladder() {
         &compiler,
         &mut pipelines,
         &lowered,
-        dispatch_geometry(&dg),
+        dispatch_geometry(&dg, &binding),
         &mut live,
     )
     .expect("the prefill runs");
@@ -3030,6 +3081,9 @@ fn stage_prefill(
     let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
     driver_metal::bind::tables::stage(
         context,
+        // A pool that lives exactly as long as the `Staged` does -- the lease
+        // keeps it alive, and a helper that stages once wants no more.
+        &driver_metal::fire::Scratch::new(),
         driver_metal::bind::tables::Frame {
             token_ids: step.token_ids,
             position_ids: &positions,
@@ -3039,7 +3093,12 @@ fn stage_prefill(
             kv_write_page: &req_of_token,
             kv_write_offset: &w_off,
             rope_frequencies: &inv_freq,
-            sampling_indices: step.sampling_indices,
+            // The FIRE's rows, exactly as `serve::launch` stages them: the
+            // wire's numbers are request-local and `row_gather` indexes the
+            // stream. A rig that passed them through would be testing a
+            // staging the driver does not do.
+            sampling_indices: &driver_metal::lowering::frame::sampled_rows(step)
+                .expect("the readout table places its rows"),
         },
     )
     .expect("the tables stage")
@@ -3079,7 +3138,9 @@ fn a_generation_agrees_with_mlx_token_for_token() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, dg, loaded) = served(&context, &snapshot);
+    let Some((row, dg, loaded)) = served(&context, &snapshot) else {
+        return;
+    };
     let binding = observed(&dg, &loaded);
 
     // ONE pool for the whole generation. That is the point: every fire after
@@ -3123,6 +3184,7 @@ fn a_generation_agrees_with_mlx_token_for_token() {
             token_ids: &tokens,
             qo_indptr: &[0, n],
             sampling_indices: &[n - 1],
+            sampling_indptr: &[0, 1],
             ..Step::default()
         };
         let plan = text(row, class, &binding);
@@ -3134,6 +3196,7 @@ fn a_generation_agrees_with_mlx_token_for_token() {
         let w_off: Vec<u32> = positions.iter().map(|p| p % shape.page_size).collect();
         let staged = driver_metal::bind::tables::stage(
             &context,
+            &driver_metal::fire::Scratch::new(),
             driver_metal::bind::tables::Frame {
                 token_ids: &tokens,
                 position_ids: &positions,
@@ -3160,7 +3223,7 @@ fn a_generation_agrees_with_mlx_token_for_token() {
             &compiler,
             &mut pipelines,
             &lowered,
-            dispatch_geometry(&dg),
+            dispatch_geometry(&dg, &binding),
             &mut live,
         )
         .expect("the fire runs");
@@ -3244,13 +3307,16 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, dg, loaded) = served(&context, &snapshot);
+    let Some((row, dg, loaded)) = served(&context, &snapshot) else {
+        return;
+    };
     let binding = observed(&dg, &loaded);
 
     let step = Step {
         token_ids: &[128_000],
         qo_indptr: &[0, 1],
         sampling_indices: &[0],
+        sampling_indptr: &[0, 1],
         ..Step::default()
     };
     let plan = text(row, FireClass::Decode, &binding);
@@ -3270,7 +3336,7 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
     };
     let freqs = driver_metal::model::rope::table(&dg);
     let staged = stage_tables(&context, &step, shape.page_size, &freqs);
-    let geometry = dispatch_geometry(&dg);
+    let geometry = dispatch_geometry(&dg, &binding);
     let (at, vocab, element) = {
         let r = lowered.readout.expect("the text states an exit seam");
         (r.at, r.vocab as usize, r.bytes as usize)
@@ -3331,8 +3397,8 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
             layer.v.register(&mut regions);
         }
     }
-    regions.add(&staged.region);
-    regions.set_null(&staged.region);
+    regions.add(staged.region());
+    regions.set_null(staged.region());
 
     let mut recordings = driver_metal::fire::Recordings::new();
     let scratch = driver_metal::fire::Scratch::new();
@@ -3473,25 +3539,42 @@ fn stage_prefill_fleet(
 ) -> driver_metal::bind::tables::Staged {
     let bounds = step.qo_indptr;
     let requests = bounds.len() as u32 - 1;
+    let page_size = page_size.max(1);
     let mut positions = Vec::new();
     let mut req_of_token = Vec::new();
     let mut write_page = Vec::new();
     let mut write_offset = Vec::new();
+    // As MANY pages as the request's tokens need, and the count is the whole
+    // point. This staged ONE page per request and wrapped the offset with
+    // `p % page_size`, so a request longer than a page wrote its seventeenth
+    // token over its first one's keys and then attended over sixteen slots of
+    // a sequence it thought was sixty-four. Every gate in this file prefills
+    // five tokens or fewer, so nothing had ever crossed a page — which made
+    // the harness, not the driver, the thing that could not answer a long
+    // prompt.
+    let mut page_indices: Vec<u32> = Vec::new();
+    let mut page_indptr: Vec<u32> = vec![0];
     for r in 0..requests {
         let (lo, hi) = (bounds[r as usize], bounds[r as usize + 1]);
+        let first = page_indices.len() as u32;
+        let pages = (hi - lo).div_ceil(page_size);
         for p in 0..(hi - lo) {
             positions.push(p);
             req_of_token.push(r);
-            write_page.push(r);
-            write_offset.push(p % page_size.max(1));
+            write_page.push(first + p / page_size);
+            write_offset.push(p % page_size);
         }
+        // Distinct pages per request, so nothing one request writes lands in
+        // another's window.
+        page_indices.extend(first..first + pages);
+        page_indptr.push(page_indices.len() as u32);
     }
-    // One page each, so request r's page list is exactly `[r]`.
-    let page_indices: Vec<u32> = (0..requests).collect();
-    let page_indptr: Vec<u32> = (0..=requests).collect();
     let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
     driver_metal::bind::tables::stage(
         context,
+        // A pool that lives exactly as long as the `Staged` does -- the lease
+        // keeps it alive, and a helper that stages once wants no more.
+        &driver_metal::fire::Scratch::new(),
         driver_metal::bind::tables::Frame {
             token_ids: step.token_ids,
             position_ids: &positions,
@@ -3501,7 +3584,12 @@ fn stage_prefill_fleet(
             kv_write_page: &write_page,
             kv_write_offset: &write_offset,
             rope_frequencies: &inv_freq,
-            sampling_indices: step.sampling_indices,
+            // The FIRE's rows, exactly as `serve::launch` stages them: the
+            // wire's numbers are request-local and `row_gather` indexes the
+            // stream. A rig that passed them through would be testing a
+            // staging the driver does not do.
+            sampling_indices: &driver_metal::lowering::frame::sampled_rows(step)
+                .expect("the readout table places its rows"),
         },
     )
     .expect("the tables stage")
@@ -3571,7 +3659,7 @@ fn prefill_logits_on(
     let plan = text(row, FireClass::Prefill, binding);
     let lowered = lower_step(&plan, step).expect("the step lowers");
 
-    let shape = pool_shape(&dg, 16);
+    let shape = pool_shape(dg, 16);
     // The arena outlives the pool: an elastic buffer charges its tiles back
     // on drop, and dropping the arena first would leave nothing to charge.
     let arena_for_pool = driver_metal::device::Arena::new(1024 * 1024 * 1024, 0);
@@ -3593,7 +3681,7 @@ fn prefill_logits_on(
             bytes: shape.layer_bytes_at(0),
         })
     };
-    let freqs = driver_metal::model::rope::table(&dg);
+    let freqs = driver_metal::model::rope::table(dg);
     let staged = stage_prefill_fleet(context, step, shape.page_size, &freqs);
 
     let named = HashMap::new();
@@ -3608,7 +3696,7 @@ fn prefill_logits_on(
         compiler,
         pipelines,
         &lowered,
-        dispatch_geometry(&dg),
+        dispatch_geometry(dg, binding),
         &mut live,
     )
     .expect("the prefill runs");
@@ -3657,7 +3745,9 @@ fn a_request_prefills_the_same_way_beside_another_one() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, dg, loaded) = served(&context, &snapshot);
+    let Some((row, dg, loaded)) = served(&context, &snapshot) else {
+        return;
+    };
     let binding = observed(&dg, &loaded);
 
     let rig = Rig {
@@ -3673,6 +3763,7 @@ fn a_request_prefills_the_same_way_beside_another_one() {
         token_ids: &[128_000, 9906],
         qo_indptr: &[0, 2],
         sampling_indices: &[1],
+        sampling_indptr: &[0, 1],
         ..Step::default()
     };
     let solo = prefill_logits(&rig, &mut pipelines, &alone);
@@ -3683,7 +3774,8 @@ fn a_request_prefills_the_same_way_beside_another_one() {
     let together = Step {
         token_ids: &[128_000, 9906, 128_000, 3923, 374],
         qo_indptr: &[0, 2, 5],
-        sampling_indices: &[1, 4],
+        sampling_indices: &[1, 2],
+        sampling_indptr: &[0, 1, 2],
         ..Step::default()
     };
     let batched = prefill_logits(&rig, &mut pipelines, &together);
@@ -3698,6 +3790,7 @@ fn a_request_prefills_the_same_way_beside_another_one() {
         token_ids: &[128_000, 3923, 374],
         qo_indptr: &[0, 3],
         sampling_indices: &[2],
+        sampling_indptr: &[0, 1],
         ..Step::default()
     };
     let solo_b = prefill_logits(&rig, &mut pipelines, &second_alone);
@@ -3737,6 +3830,214 @@ fn a_request_prefills_the_same_way_beside_another_one() {
     }
 }
 
+/// **The batched GEMM answers what the matvec answers.**
+///
+/// The one claim no gate in this file made, and the gap is structural rather
+/// than accidental. The text guards the tiled GEMM with
+/// `TokensMultipleOf(qmm_tile.0)` — thirty-two — and every correctness oracle
+/// here prefills ONE or TWO tokens. So `affine_qmm_t` was never once compared
+/// against anything: the arm that runs on every real prompt was covered only
+/// by `attention_is_a_minority_of_a_long_prefill`, which measures TIME.
+///
+/// What lived in that gap: the driver derived the GEMM's `(bm, bn)` tile from
+/// the fire's geometry while `model-compiler` compiled the entrypoint for the
+/// tile in its NAME, and at a 512-row prefill the two said `(64, 64)` and
+/// `(32, 32)`. `affine_qmm_t` is a template on `BM`/`BN` — `y_row = tid.y *
+/// BM` — so the grid is threadgroups times the COMPILED tile, and a
+/// threadgroup count computed for a 64-wide tile covers a QUARTER of the
+/// output. Every long prefill's projections were three quarters whatever the
+/// arena held, through sixteen layers, and every gate here passed.
+///
+/// **This needs no reference**, which is why it can exist at all: the two arms
+/// of the guard are two spellings of one matrix product, so the same tokens
+/// through both must give the same distribution. `qmm_multi_batch` is the
+/// load-time fact that chooses between them (`LlamaLikeMetalFacts`), so
+/// flipping it on the binding is exactly the guard's own choice made by hand.
+///
+/// SIXTY-FOUR tokens and not thirty-two, and the difference is the point: at
+/// 32 rows the derivation and the name agreed on `bm` and differed only on
+/// `bn`, so half the output was written. At 64 they differ on both.
+#[test]
+#[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
+fn the_batched_gemm_answers_what_the_matvec_answers() {
+    let Some(snapshot) = snapshot() else {
+        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        return;
+    };
+    let Ok(context) = Context::new() else {
+        eprintln!("SKIP: no Metal 4 device");
+        return;
+    };
+    let compiler = Compiler::new(&context).expect("a compiler");
+    let mut pipelines = Pipelines::new(kernels_dir());
+
+    let Some((row, dg, loaded)) = served(&context, &snapshot) else {
+        return;
+    };
+    let observed = observed(&dg, &loaded);
+    // The matvec side is the SAME binding with one fact flipped, so a
+    // difference between the two answers cannot be a different deployment.
+    let unbatched = MetalBinding {
+        qmm_multi_batch: false,
+        ..observed
+    };
+
+    // A run of distinct real tokens rather than one repeated: a projection
+    // that wrote only its first tile would still agree with itself on a
+    // constant sequence.
+    let tokens: Vec<u32> = (0..64u32).map(|i| 1000 + i * 37).collect();
+    let step = Step {
+        token_ids: &tokens,
+        qo_indptr: &[0, 64],
+        sampling_indices: &[1, 63],
+        sampling_indptr: &[0, 2],
+        ..Step::default()
+    };
+
+    fn rig<'a>(
+        context: &'a Context,
+        compiler: &'a Compiler,
+        loaded: &'a driver_metal::weights::load::Loaded,
+        row: &'static dyn model::catalog::Variant,
+        binding: &'a MetalBinding,
+        dg: &'a driver_metal::batch::DecodeGeometry,
+    ) -> Rig<'a> {
+        Rig {
+            context,
+            compiler,
+            loaded,
+            row,
+            binding,
+            dg,
+        }
+    }
+    // ONE pipeline cache for both fires, so a difference between them cannot
+    // be a shader compiled two ways.
+    let gemm = prefill_logits(
+        &rig(&context, &compiler, &loaded, row, &observed, &dg),
+        &mut pipelines,
+        &step,
+    );
+    let matvec = prefill_logits(
+        &rig(&context, &compiler, &loaded, row, &unbatched, &dg),
+        &mut pipelines,
+        &step,
+    );
+
+    // Without this the test passes by taking the matvec twice: a deployment
+    // whose `qmm_multi_batch` were false would compare nothing.
+    assert!(
+        observed.qmm_multi_batch,
+        "this checkpoint states `qmm_multi_batch: false`, so both sides ran \
+         the matvec and nothing was compared"
+    );
+    assert!(
+        matvec[0].iter().any(|v| v.is_finite() && *v != 0.0),
+        "the matvec side produced no distribution at all"
+    );
+
+    // The CONTROL, and the ARBITER. Two tokens is below the guard, so both
+    // bindings resolve to the matvec and the two fires differ only in a guard
+    // neither takes -- their answers must agree bit for bit, and a failure
+    // here is the harness rather than either kernel.
+    //
+    // It is also the reference the 64-row fires are measured against, and it
+    // needs no MLX: attention is CAUSAL, so row 1 of a sixty-four token
+    // prefill sees tokens 0 and 1 and nothing else. Its distribution is the
+    // two-token prefill's, whichever projection kernel produced it.
+    //
+    // That is what found the defect under this one. `stage_prefill_fleet`
+    // staged ONE page per request and wrapped the write offset, so at 64
+    // tokens over a 16-token page the seventeenth token overwrote the first's
+    // keys -- and row 1 came back 15 logits away from its own two-token
+    // answer on BOTH sides. Every gate in this file prefills five tokens or
+    // fewer; the harness had never crossed a page.
+    let short = Step {
+        token_ids: &tokens[..2],
+        qo_indptr: &[0, 2],
+        sampling_indices: &[1],
+        sampling_indptr: &[0, 1],
+        ..Step::default()
+    };
+    let a = prefill_logits(
+        &rig(&context, &compiler, &loaded, row, &observed, &dg),
+        &mut pipelines,
+        &short,
+    );
+    let b = prefill_logits(
+        &rig(&context, &compiler, &loaded, row, &unbatched, &dg),
+        &mut pipelines,
+        &short,
+    );
+    assert_eq!(
+        a[0], b[0],
+        "below the guard both bindings take the matvec, so this comparison is \
+         of one program with itself -- and it disagreed"
+    );
+
+    let worst_of = |x: &[f32], y: &[f32]| -> (usize, f32, f32) {
+        let (at, (p, q)) = x
+            .iter()
+            .zip(y)
+            .enumerate()
+            .max_by(|m, n| (m.1.0 - m.1.1).abs().total_cmp(&(n.1.0 - n.1.1).abs()))
+            .expect("a vocabulary");
+        (at, *p, *q)
+    };
+    // The scale the arithmetic ran at, which is the distribution's and not any
+    // one logit's: sixteen layers of bf16 rounding accumulate proportionally
+    // to the activations, so a tolerance read off a logit near zero demands a
+    // precision no part of the network has.
+    let span = |v: &[f32]| v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    let slack = 2.0 * bf16_slack(span(&matvec[1]));
+
+    // The matvec is the SAME kernel in both fires, so causality is exact
+    // there -- and this is the direction that fails hardest when the KV
+    // paging is wrong.
+    let (at, p, q) = worst_of(&a[0], &matvec[0]);
+    assert_eq!(
+        a[0], matvec[0],
+        "row 1 of a 64-token prefill is not row 1 of a 2-token prefill under \
+         the SAME kernel. Widest gap at token {at}: short {p}, long {q}. \
+         Attention is causal, so nothing after row 1 may reach it."
+    );
+    // The GEMM's own causality, to a tolerance, because it is a different
+    // kernel summing the same row in a different order.
+    let (at, p, q) = worst_of(&a[0], &gemm[0]);
+    assert!(
+        (p - q).abs() <= slack,
+        "row 1 under the GEMM is {q} at token {at} where the two-token \
+         prefill says {p}, further than {slack}. Causality does not depend on \
+         which projection kernel ran."
+    );
+
+    // NOT bit for bit: the two kernels sum a row in different orders, so the
+    // last bits differ legitimately. A quarter-written projection does not
+    // land within a couple of bf16 ulps of anything -- when the tile was
+    // derived rather than read off the name, this gap was 14.
+    let (at, g, m) = worst_of(&gemm[1], &matvec[1]);
+    assert!(
+        (g - m).abs() <= slack,
+        "the GEMM and the matvec disagree at token {at}: GEMM {g}, matvec {m}, \
+         which is further apart than {slack}. They are two spellings of one \
+         matrix product."
+    );
+
+    // The ORDER too, because a distribution can stay within tolerance
+    // pointwise and still rank differently at the top, which is the only part
+    // a sampler reads.
+    let top5 = |v: &[f32]| {
+        let mut order: Vec<usize> = (0..v.len()).collect();
+        order.sort_by(|&x, &y| v[y].total_cmp(&v[x]));
+        order[..5].to_vec()
+    };
+    assert_eq!(
+        top5(&gemm[1]),
+        top5(&matvec[1]),
+        "the two arms rank the top of the distribution differently"
+    );
+}
+
 /// **An elastic pool answers exactly as a fixed one does.**
 ///
 /// The point of elastic KV is that a pool can be resized without every
@@ -3774,7 +4075,9 @@ fn an_elastic_pool_answers_exactly_as_a_fixed_one_does() {
     let compiler = Compiler::new(&context).expect("a compiler");
     let mut pipelines = Pipelines::new(kernels_dir());
 
-    let (row, dg, loaded) = served(&context, &snapshot);
+    let Some((row, dg, loaded)) = served(&context, &snapshot) else {
+        return;
+    };
     let binding = observed(&dg, &loaded);
 
     let rig = Rig {
@@ -3792,7 +4095,8 @@ fn an_elastic_pool_answers_exactly_as_a_fixed_one_does() {
     let step = Step {
         token_ids: &[128_000, 9906, 128_000, 3923, 374],
         qo_indptr: &[0, 2, 5],
-        sampling_indices: &[1, 4],
+        sampling_indices: &[1, 2],
+        sampling_indptr: &[0, 1, 2],
         ..Step::default()
     };
 
@@ -3825,4 +4129,885 @@ fn an_elastic_pool_answers_exactly_as_a_fixed_one_does() {
              did not clear what a fixed allocation happened to have clear"
         );
     }
+}
+
+/// **Attention is a minority of a long prefill, because the prefill tiles.**
+///
+/// Every other device gate here asks what a fire ANSWERS. This one asks what
+/// it COSTS, and it is here because the answer decided which kernel the text
+/// names. `dsl::metal::sdpa` branches on `multi_batch` to a different shader,
+/// and a branch taken on someone else's measurement is a branch taken on
+/// faith: `sdpa_paged_tiled.metal`'s header measures the 30B checkpoint, and
+/// nothing in this repository had ever measured a Metal prefill.
+///
+/// **The estimator.** Prefill time is `a + b*n + c*n^2` — a constant to
+/// stage the fire, a linear term for everything that touches each token
+/// once, and a quadratic one for attention, where every query row reads
+/// every key before it. Three geometrically spaced points annihilate the
+/// affine part exactly:
+///
+/// ```text
+///   t(4m) - 3*t(2m) + 2*t(m) = 6*c*m^2
+/// ```
+///
+/// because `a` cancels as `1 - 3 + 2` and `b*n` as `4 - 6 + 2`. So `c` falls
+/// out of three timings with no fitting and no assumption about `a` or `b`,
+/// which is the point: whatever the constant costs, it cannot contaminate
+/// the number this gate reads.
+///
+/// **What it measured** (Llama-3.2-1B-Instruct-4bit, M-series, release,
+/// best of six per point, milliseconds):
+///
+/// ```text
+///     n     decode kernel   tiled kernel   mma kernel
+///   512         406.0           347.9         325.6
+///  1024         953.4           741.3         662.7
+///  2048        2486.8          1684.2        1377.6
+///   c       2.788e-4        9.930e-5      2.589e-5   ms per token^2
+///   quadratic term at n=2048:
+///              1169 ms (47%)    417 ms (25%)  109 ms (8%)
+/// ```
+///
+/// The linear term barely moved (634 -> 610 us/token) and the constant not
+/// at all, which is the check on the check: only the attention kernel
+/// changed, so only the quadratic coefficient should have. It fell by 64%,
+/// and the saving grows as `n^2` — 58 ms at 512, 212 at 1024, 803 at 2048,
+/// almost exactly four times per doubling.
+///
+/// **What it measures on a mixture of experts** (gpt-oss-20b-MXFP4-Q4, same
+/// machine, same estimator, milliseconds):
+///
+/// ```text
+///     n     decode kernel   tiled kernel   mma kernel
+///   512        3686.7          3559.9        3503.9
+///  1024        7580.2          7147.9        6994.3
+///  2048       16030.1         14583.8       14051.9
+///   c       4.215e-4        1.654e-4      4.883e-5   ms per token^2
+///   quadratic term at n=2048:
+///             1768 ms (11%)    694 ms (5%)   205 ms (1%)
+/// ```
+///
+/// The kernel is the same 2.5x cheaper on the quadratic term, on a second
+/// family and on the sink variant — which is the only place
+/// `sdpa_paged_tiled_sink` has ever been timed. But the SHARE is 11%
+/// against 5% and the threshold below is 40%, so on THIS checkpoint the
+/// CLAIM holds whichever kernel is wired: routing every token to four of 32
+/// experts across 24 layers is per-token work that swamps attention at
+/// every length this gate can afford to run — a 2048-token prefill costs
+/// 14.6 s here against the 1B's 1.7 s. A
+/// gate that cannot fail is not a gate — it reports a wiring it never
+/// tested — so the sensitivity is asserted as well as the claim, and this
+/// checkpoint does not pass. It fires one of the two refusals: the
+/// sensitivity assert on a quiet machine, and on a busy one the negative
+/// coefficient above, because 5% of the total is at this machine's noise
+/// floor. Both say the same thing, which is that a mixture of experts is
+/// the wrong instrument for this question.
+///
+/// It also reproduces, independently and on a different checkpoint, the
+/// claim the shader's own header makes: the quadratic term is a large
+/// minority of an unsized prefill. The header said 39% at n=2048 on the 30B;
+/// this says 47% on the 1B. Two machines, two models, one shape.
+///
+/// **The claim.** Attention costs less than 40% of a 2048-token prefill.
+/// Measured on the dense checkpoint at 8% with the mma kernel the DSL now
+/// prefers at `_d_64`, 25% with the tiled one behind it, and 47% with the
+/// row-by-row decode kernel both replace -- so the threshold sits above
+/// every wired state and below the unwired one, and names which is in.
+/// Unwiring the tiled branch fires this gate; making attention cheaper still
+/// only widens the margin. The ratio is what is asserted and not the
+/// milliseconds, because the ratio is the part that does not depend on how
+/// fast the machine underneath is: the falsifying run above was repeated on
+/// a contended machine where every timing inflated by half — 603/1461/3924
+/// against 406/953/2487 — and it still read 51% against 47%. The
+/// milliseconds moved and the ratio did not.
+///
+/// **On measuring three things that must be compared.** The estimator
+/// DIFFERENCES its three points, so it amplifies anything that lands on one
+/// of them alone: 250 ms of contention on `t(m)` moves the numerator by
+/// 500 and on `t(2m)` by 750. Measuring all six repetitions of one length
+/// before starting the next puts a contention episode entirely inside one
+/// point, and that is how this gate first behaved — on a busy machine it
+/// returned 103% and 11% on consecutive runs of the SAME wiring, a false
+/// red and a false green from one binary in one minute. Firing one round of
+/// all three lengths instead spreads an episode across all three, where
+/// `1 - 3 + 2` cancels most of it; the same three runs then read 25%, 25%,
+/// 24%. The arrangement is the measurement.
+#[test]
+#[ignore = "needs a real checkpoint and a device, and times a fire"]
+fn attention_is_a_minority_of_a_long_prefill() {
+    let Some(snapshot) = snapshot() else {
+        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        return;
+    };
+    let Ok(context) = Context::new() else {
+        eprintln!("SKIP: no Metal 4 device");
+        return;
+    };
+    let compiler = Compiler::new(&context).expect("a compiler");
+    let mut pipelines = Pipelines::new(kernels_dir());
+    let Some((row, dg, loaded)) = served(&context, &snapshot) else {
+        return;
+    };
+    let binding = observed(&dg, &loaded);
+    let freqs = driver_metal::model::rope::table(&dg);
+
+    // Geometrically spaced, which is what the estimator above needs. The
+    // longest is 2048 because that is the length the shader's header argues
+    // about, and short enough that the pool below is a few hundred megabytes.
+    const M: u32 = 512;
+    const ROUNDS: usize = 6;
+    let plan = text(row, FireClass::Prefill, &binding);
+    let named = HashMap::new();
+
+    // Everything that is not the fire, done once and outside the timing
+    // loop below: that is what lets the loop interleave the three lengths.
+    let prepared: Vec<_> = [M, 2 * M, 4 * M]
+        .into_iter()
+        .map(|n| {
+            // Arbitrary ids inside the vocabulary. Attention's cost does not
+            // depend on WHICH tokens, only on how many, and this gate reads
+            // no logits at all.
+            let tokens: Vec<u32> = (0..n).map(|i| 1000 + i % 5000).collect();
+            let step = Step {
+                token_ids: &tokens,
+                qo_indptr: &[0, n],
+                sampling_indices: &[n - 1],
+                sampling_indptr: &[0, 1],
+                ..Step::default()
+            };
+            let lowered = lower_step(&plan, &step).expect("the step lowers");
+            // Four pages of slack past what the tokens need, so the last page
+            // being partial cannot round the allocation short.
+            let shape = pool_shape(&dg, n.div_ceil(16) + 4);
+            let pool = Pool::allocate(&context, shape).expect("a pool");
+            let staged = stage_prefill_fleet(&context, &step, shape.page_size, &freqs);
+            (n, lowered, shape, pool, staged)
+        })
+        .collect();
+
+    // INTERLEAVED, and that is the whole point of the arrangement. Measuring
+    // all six of one length before starting the next puts a contention
+    // episode entirely inside one point, and the estimator DIFFERENCES the
+    // three points, so it amplifies exactly that: 250 ms landing on `t(m)`
+    // moves the numerator by 500, and on `t(2m)` by 750. Firing one round of
+    // all three lengths spreads an episode across all three instead, where
+    // `1 - 3 + 2` cancels most of it. Measured on a contended machine, the
+    // sequential arrangement returned 103% and 11% on consecutive runs of
+    // the SAME wiring.
+    //
+    // The BEST of six and not the mean. Timing noise on a shared GPU is
+    // one-sided — a slow run means something else was resident, a fast one
+    // cannot mean the work was skipped — so the minimum is the estimate and
+    // the spread is contention. The first round also builds every pipeline
+    // these texts name, which is why it is not the only one.
+    let mut ms = [f64::MAX; 3];
+    let mut worst = [0f64; 3];
+    for _ in 0..ROUNDS {
+        for (slot, (_, lowered, shape, pool, staged)) in prepared.iter().enumerate() {
+            let pages = |layer: u16, values: bool| {
+                pool.layer(u32::from(layer)).map(|l| Slice {
+                    address: if values {
+                        l.v.gpu_address()
+                    } else {
+                        l.k.gpu_address()
+                    },
+                    bytes: shape.layer_bytes_at(0),
+                })
+            };
+            let mut live = Live {
+                store: Store::new(Names::mlx(), &loaded.tensors, &named),
+                tables: staged,
+                shape: *shape,
+                pages: &pages,
+            };
+            let started = std::time::Instant::now();
+            let (_, _arena) = driver_metal::fire::run::run_keeping_arena(
+                &context,
+                &compiler,
+                &mut pipelines,
+                lowered,
+                dispatch_geometry(&dg, &binding),
+                &mut live,
+            )
+            .expect("the prefill runs");
+            let elapsed = started.elapsed().as_secs_f64() * 1e3;
+            ms[slot] = ms[slot].min(elapsed);
+            worst[slot] = worst[slot].max(elapsed);
+        }
+    }
+    for (slot, (n, ..)) in prepared.iter().enumerate() {
+        // The spread is printed because it is how a reader tells a real
+        // regression from a busy machine.
+        println!(
+            "prefill n={n}: {:.1} ms (worst of {ROUNDS}: {:.1} ms)",
+            ms[slot], worst[slot]
+        );
+    }
+
+    let quadratic_per_token_squared =
+        (ms[2] - 3.0 * ms[1] + 2.0 * ms[0]) / (6.0 * f64::from(M) * f64::from(M));
+    let longest = f64::from(4 * M);
+    let attention = quadratic_per_token_squared * longest * longest;
+    let share = attention / ms[2];
+    println!(
+        "c={quadratic_per_token_squared:.3e} ms/token^2, attention at n={longest}: \
+         {attention:.0} ms of {:.0} ms ({:.0}%)",
+        ms[2],
+        share * 100.0
+    );
+
+    // A NEGATIVE coefficient means the three points did not resolve a
+    // quadratic at all — the machine was too noisy, or this build got
+    // something cheaper than attention. Either way the gate has measured
+    // nothing and says so rather than passing on a number it does not
+    // believe.
+    assert!(
+        quadratic_per_token_squared > 0.0,
+        "no quadratic term resolved from {ms:?} ms; \
+         the timings are too noisy to say anything about attention"
+    );
+    // How much dearer the row-by-row kernel's quadratic term is than the one
+    // the DSL actually wires, which at `_d_64` is the matrix-unit form and
+    // not the tiled one. Measured twice: 10.8x on Llama-3.2-1B (2.788e-4
+    // against 2.589e-5) and 8.6x on gpt-oss-20b (4.215e-4 against 4.883e-5).
+    // The smaller is taken, so the sensitivity below is the conservative one.
+    //
+    // It tracks the WIRED kernel by construction. Were the mma preference
+    // removed and the tiled form left to serve 64-wide heads, the ratio
+    // would fall to 2.5x-2.7x and this constant would be wrong in the safe
+    // direction -- it would refuse to answer on checkpoints it could still
+    // have judged, rather than passing one it could not.
+    const DECODE_OVER_WIRED: f64 = 8.6;
+    // A checkpoint whose per-token work swamps attention passes the claim
+    // below whichever kernel is wired, and a gate that cannot fail is worse
+    // than no gate: it reports a wiring it never tested. So the gate asks
+    // first whether it COULD have failed — whether attention at the dearer
+    // kernel's cost would have crossed the threshold — and refuses to
+    // answer where it could not, exactly as it refuses a negative
+    // coefficient above.
+    assert!(
+        share * DECODE_OVER_WIRED >= 0.40,
+        "this checkpoint cannot tell the two attention kernels apart: at \
+         {:.0}% of a {longest:.0}-token prefill, attention would still be \
+         under the 40% threshold at {DECODE_OVER_WIRED}x the cost. Its \
+         per-token work swamps the quadratic term — run this gate on a \
+         dense checkpoint (Llama-3.2-1B measured 8% on the wired mma kernel \
+         against 47% on the decode kernel it replaces) where \
+         the threshold sits between the two states.",
+        share * 100.0
+    );
+    assert!(
+        share < 0.40,
+        "attention is {:.0}% of a {longest:.0}-token prefill ({attention:.0} ms of {:.0} ms). \
+         The mma kernel measured 8%, the tiled one 25% and the row-by-row \
+         decode kernel 47%, so this \
+         reads as a prefill that is naming `sdpa_paged_decode` again.",
+        share * 100.0,
+        ms[2]
+    );
+}
+
+/// Where a long prefill's time actually goes, by kernel symbol.
+///
+/// Not a gate — a measurement, and the tool that attributes the gap against
+/// mlx-lm. It exploits the fact that these kernels branch on no operand
+/// value: a subset of a fire encoded on its own does the same arithmetic on
+/// whatever bytes the arena happens to hold, so its time is the time those
+/// dispatches cost inside the whole. The subsets therefore sum to roughly
+/// the whole, and the residual is what the barriers and the ramp cost.
+#[test]
+#[ignore = "a measurement, not a gate"]
+fn where_a_long_prefill_spends_its_time() {
+    let Some(snapshot) = snapshot() else {
+        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        return;
+    };
+    let Ok(context) = Context::new() else {
+        eprintln!("SKIP: no Metal 4 device");
+        return;
+    };
+    let compiler = Compiler::new(&context).expect("a compiler");
+    let mut pipelines = Pipelines::new(kernels_dir());
+    let Some((row, dg, loaded)) = served(&context, &snapshot) else {
+        return;
+    };
+    let binding = observed(&dg, &loaded);
+    let freqs = driver_metal::model::rope::table(&dg);
+    let plan = text(row, FireClass::Prefill, &binding);
+    let named = HashMap::new();
+
+    const N: u32 = 2048;
+    const ROUNDS: usize = 5;
+    let tokens: Vec<u32> = (0..N).map(|i| 1000 + i % 5000).collect();
+    let step = Step {
+        token_ids: &tokens,
+        qo_indptr: &[0, N],
+        sampling_indices: &[N - 1],
+        sampling_indptr: &[0, 1],
+        ..Step::default()
+    };
+    let whole = lower_step(&plan, &step).expect("the step lowers");
+    let shape = pool_shape(&dg, N.div_ceil(16) + 4);
+    let pool = Pool::allocate(&context, shape).expect("a pool");
+    let staged = stage_prefill_fleet(&context, &step, shape.page_size, &freqs);
+
+    // Wall and host encode. There is no third number: `Timing::gpu` is an
+    // `Option` this path never fills, and reading it as a `f64::MAX` sentinel
+    // printed 1.8e308 where a millisecond count belonged.
+    let mut best = |lowered: &model_compiler::lower::Lowered| -> (f64, f64) {
+        let mut ms = f64::MAX;
+        let mut enc = f64::MAX;
+        for _ in 0..ROUNDS {
+            let pages = |layer: u16, values: bool| {
+                pool.layer(u32::from(layer)).map(|l| Slice {
+                    address: if values {
+                        l.v.gpu_address()
+                    } else {
+                        l.k.gpu_address()
+                    },
+                    bytes: shape.layer_bytes_at(0),
+                })
+            };
+            let mut live = Live {
+                store: Store::new(Names::mlx(), &loaded.tensors, &named),
+                tables: &staged,
+                shape,
+                pages: &pages,
+            };
+            let started = std::time::Instant::now();
+            let (timing, _arena) = driver_metal::fire::run::run_keeping_arena(
+                &context,
+                &compiler,
+                &mut pipelines,
+                lowered,
+                dispatch_geometry(&dg, &binding),
+                &mut live,
+            )
+            .expect("the prefill runs");
+            ms = ms.min(started.elapsed().as_secs_f64() * 1e3);
+            enc = enc.min(timing.encode.as_secs_f64() * 1e3);
+        }
+        (ms, enc)
+    };
+
+    let (total, total_encode) = best(&whole);
+    println!("\nwhole fire: {total:.1} ms wall, {total_encode:.1} ms host encode");
+    let mut rows: Vec<(f64, usize, String)> = Vec::new();
+    for (index, symbol) in whole.kernels.iter().enumerate() {
+        let mut only = whole.clone();
+        only.launches.retain(|l| usize::from(l.kernel) == index);
+        let count = only.launches.len();
+        if count == 0 {
+            continue;
+        }
+        let first = &only.launches[0];
+        let shape = format!("rows {:?} layers {:?}", first.rows, first.layers);
+        let (wall, enc) = best(&only);
+        rows.push((
+            wall,
+            count,
+            format!("{symbol}  [{shape}] wall {wall:.1} enc {enc:.1}"),
+        ));
+    }
+    // And one layer's statements one at a time, which is what compares
+    // against another runtime's per-projection numbers.
+    println!("\nlayer 0, statement by statement (wall minus the ~9.5 ms encode floor):");
+    let layer0: Vec<usize> = whole
+        .launches
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.layers == (0..1) && l.rows == (0..N))
+        .map(|(i, _)| i)
+        .take(20)
+        .collect();
+    let mut slowest = (0.0_f64, 0_usize);
+    for i in layer0 {
+        let mut one = whole.clone();
+        let kept = one.launches[i].clone();
+        one.launches = vec![kept];
+        let (wall, enc) = best(&one);
+        if wall - enc > slowest.0 {
+            slowest = (wall - enc, i);
+        }
+        println!(
+            "  {:7.2} ms  {}",
+            wall - enc,
+            whole.kernels[whole.launches[i].kernel as usize]
+        );
+    }
+
+    // THE SAME LAUNCH, REPEATED. One statement alone in a fire pays whatever a
+    // fire pays once -- a submission, a first touch of every page its operands
+    // name, a cold cache. Copying that one launch k times and fitting the line
+    // separates that constant from the marginal cost of one more dispatch,
+    // which is the number that compares against another runtime's per-op time.
+    let (alone, which) = slowest;
+    println!(
+        "\nthe slowest layer-0 statement ({}) repeated in one fire:",
+        whole.kernels[whole.launches[which].kernel as usize]
+    );
+    let mut marginal = Vec::new();
+    for k in [1_usize, 2, 4, 8] {
+        let mut many = whole.clone();
+        many.launches = vec![whole.launches[which].clone(); k];
+        let (wall, enc) = best(&many);
+        marginal.push((k, wall - enc));
+        println!(
+            "  x{k:<3} {:8.2} ms  ({:6.2} ms each)",
+            wall - enc,
+            (wall - enc) / k as f64
+        );
+    }
+    if let (Some(&(k1, t1)), Some(&(k2, t2))) = (marginal.first(), marginal.last()) {
+        println!(
+            "  marginal {:.2} ms a dispatch, fixed {:.2} ms a fire (alone it read {alone:.2})",
+            (t2 - t1) / (k2 - k1) as f64,
+            t1 - (t2 - t1) / (k2 - k1) as f64,
+        );
+    }
+
+    rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let attributed: f64 = rows.iter().map(|r| r.0).sum();
+    println!("\nprefill n={N}: {total:.1} ms total, {attributed:.1} ms attributed");
+    for (ms, count, symbol) in &rows {
+        println!(
+            "  {ms:8.2} ms  {:5.1}%  x{count:<4} {symbol}",
+            ms / total * 100.0
+        );
+    }
+    println!(
+        "  {:8.2} ms  {:5.1}%        (unattributed: barriers, ramp, encode)",
+        total - attributed,
+        (total - attributed) / total * 100.0
+    );
+}
+
+/// What a DECODE costs, at the context lengths a served request lives at.
+///
+/// Every throughput gate in this file fires one long prompt, which is the half
+/// of serving that saturates the machine. A decode saturates nothing: it reads
+/// the whole weight set to produce one row, so it is bandwidth against a fixed
+/// per-fire host cost, and neither of those shows up in a prefill's profile.
+///
+/// Measured the way a server pays for it -- `submit` on a reused `Stepper`,
+/// through a reused `Lowerings` and a reused `Scratch`, with the lowering
+/// lookup and the table staging inside the timed region because a served step
+/// does both.
+///
+/// # What mlx-lm costs for the same thing
+///
+/// **256 tok/s at 128 of context and 238 at 1024**, on this machine and this
+/// checkpoint, measured to mean the same thing this does: a `make_prompt_cache`
+/// filled to the stated length, then 64 single-token steps of
+/// `model(y[None], cache=cache)` + `argmax` + `mx.eval`, timed as a whole.
+///
+/// That is not the number `mlx_lm.generate` prints. Its `generation_tps` is
+/// **310 and 270**, and the difference is not kernels: `stream_generate` runs
+/// `mx.async_eval` and encodes the next step while the current one is on the
+/// GPU, so its host cost is hidden behind its device cost. Ours is not --
+/// `what_a_decode_costs_at_length` prints the host share, and subtracting it
+/// lands almost exactly on mlx-lm's pipelined figure. The gap named there is a
+/// serving-loop one, and closing it means encoding step N+1 before step N's
+/// sampled token has come back to the host, which means the token ids table
+/// filled on the DEVICE. Nothing here does that yet.
+///
+/// Comparing against 310 would flatter mlx-lm's kernels with a scheduling
+/// trick, and comparing against `generate`'s wall clock would flatter ours
+/// with mlx-lm's detokenizer. Both are avoided by timing the same loop.
+///
+/// Where this has been, on Llama-3.2-1B-Instruct-4bit over an M1 Max:
+///
+///   |                              | @128 | @1024 |
+///   | fresh tables allocation      |  184 |   169 |
+///   | tables leased from `Scratch` |  203 |   170 |
+///   | lowering cached              |  218 |   194 |
+///   | barriers made conditional    |  244 |   207 |
+///   | attention walks pages        | 256-270 |  235 |
+///   | *mlx-lm, same loop*          |  256 |   238 |
+///
+/// The short-context figure moves run to run because a 3.7 ms step with a
+/// 0.5 ms host share is close enough to the scheduler's noise to see it; the
+/// `best` this prints is steady at 3.68 ms.
+///
+/// `PIE_METAL_DECODE_REPLAY=1` runs the same decodes with a `Recordings` on
+/// the side, and what it measures does not agree with the claim the path was
+/// built on. `.wiki/driver/graph-metal.md` §5② has encoding at **76.4 % of a
+/// decode**; here the whole host side is 1.1-1.3 ms of a 4.9 ms step, and
+/// replaying removes 0.18 ms of it while the wall gets *worse*:
+///
+///   at 128 of context | encoded | replayed
+///   wall              | 4.93 ms | 5.24 ms
+///   host              | 1.30 ms | 1.12 ms
+///
+/// So a Metal 4 `execute_commands` is not free on the device side, and this
+/// model's 250-dispatch decode is not encode-bound. The number that motivated
+/// recording came off a 424-dispatch `llama_like` decode in the C++ shell,
+/// which is a different fire. Recording stays -- it is right for a bigger
+/// graph and it is what keeps the address discipline honest -- but nothing
+/// here should be read as it paying for itself yet.
+///
+/// It also only records DECODES: recording the 128-token prefill that builds
+/// the context faults the queue outright (`MTL4CommandQueueErrorDomain error
+/// 1`, on the first fire), which is a defect this test names and does not
+/// chase.
+#[test]
+#[ignore = "needs a checkpoint and a device"]
+fn what_a_decode_costs_at_length() {
+    let Some(snapshot) = snapshot() else {
+        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        return;
+    };
+    let Ok(context) = Context::new() else {
+        eprintln!("SKIP: no Metal 4 device");
+        return;
+    };
+    let replay = std::env::var("PIE_METAL_DECODE_REPLAY").is_ok_and(|v| !v.is_empty());
+    let compiler = Compiler::new(&context).expect("a compiler");
+    let mut pipelines = Pipelines::new(kernels_dir());
+    let Some((row, dg, loaded)) = served(&context, &snapshot) else {
+        return;
+    };
+    let binding = observed(&dg, &loaded);
+    let geometry = dispatch_geometry(&dg, &binding);
+    let freqs = driver_metal::model::rope::table(&dg);
+    let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
+    let named = HashMap::new();
+
+    const STEPS: u32 = 32;
+    for ctx in [128_u32, 1024] {
+        let shape = pool_shape(&dg, (ctx + STEPS).div_ceil(16) + 4);
+        let pool = Pool::allocate(&context, shape).expect("a pool");
+        let pages = |layer: u16, values: bool| {
+            pool.layer(u32::from(layer)).map(|l| Slice {
+                address: if values {
+                    l.v.gpu_address()
+                } else {
+                    l.k.gpu_address()
+                },
+                bytes: shape.layer_bytes_at(0),
+            })
+        };
+        let mut regions = driver_metal::device::Regions::new();
+        for region in &loaded.regions {
+            regions.add(region);
+        }
+        for l in 0..shape.layers {
+            if let Some(layer) = pool.layer(l) {
+                layer.k.register(&mut regions);
+                layer.v.register(&mut regions);
+            }
+        }
+        let mut recordings = driver_metal::fire::Recordings::new();
+        let mut lowerings = driver_metal::lowering::cached::Lowerings::new();
+        let scratch = driver_metal::fire::Scratch::new();
+        let mut stepper = driver_metal::device::Stepper::new(&context).expect("a stepper");
+
+        // One fire, from the position it starts at and how many rows it
+        // carries. The context below and every decode after take this road.
+        let fire = |first: u32,
+                    count: u32,
+                    lowerings: &mut driver_metal::lowering::cached::Lowerings,
+                    pipelines: &mut Pipelines,
+                    regions: &mut driver_metal::device::Regions,
+                    recordings: &mut driver_metal::fire::Recordings,
+                    stepper: &mut driver_metal::device::Stepper|
+         -> (f64, f64) {
+            let started = std::time::Instant::now();
+            let tokens: Vec<u32> = (0..count).map(|i| 1000 + (first + i) % 5000).collect();
+            let positions: Vec<u32> = (first..first + count).collect();
+            let step = Step {
+                token_ids: &tokens,
+                qo_indptr: &[0, count],
+                sampling_indices: &[count - 1],
+                sampling_indptr: &[0, 1],
+                ..Step::default()
+            };
+            let class = if count > 1 {
+                FireClass::Prefill
+            } else {
+                FireClass::Decode
+            };
+            // Through the CACHE, because that is what serves: `serve::launch`
+            // holds a `Lowerings` and a decode's graph is a constant of the
+            // deployment. Timed inside the region anyway -- a hit is not free,
+            // it is `rows_of` plus a hash.
+            let lowered = lowerings
+                .for_step(class, &step, || {
+                    Ok::<_, std::convert::Infallible>(text(row, class, &binding))
+                })
+                .expect("the step lowers");
+            let held = (first + count).div_ceil(shape.page_size);
+            let page_list: Vec<u32> = (0..held).collect();
+            let zeros: Vec<u32> = vec![0; count as usize];
+            let w_page: Vec<u32> = positions.iter().map(|p| p / shape.page_size).collect();
+            let w_off: Vec<u32> = positions.iter().map(|p| p % shape.page_size).collect();
+            let staged = driver_metal::bind::tables::stage(
+                &context,
+                &scratch,
+                driver_metal::bind::tables::Frame {
+                    token_ids: &tokens,
+                    position_ids: &positions,
+                    req_of_token: &zeros,
+                    kv_page_indices: &page_list,
+                    kv_page_indptr: &[0, held],
+                    kv_write_page: &w_page,
+                    kv_write_offset: &w_off,
+                    rope_frequencies: &inv_freq,
+                    sampling_indices: &[count - 1],
+                },
+            )
+            .expect("the tables stage");
+            regions.add(staged.region());
+            regions.set_null(staged.region());
+            let mut live = Live {
+                store: Store::new(Names::mlx(), &loaded.tensors, &named),
+                tables: &staged,
+                shape,
+                pages: &pages,
+            };
+            let mut machine = driver_metal::fire::run::Machine {
+                context: &context,
+                compiler: &compiler,
+                pipelines,
+                stepper,
+                scratch: &scratch,
+                regions,
+                recordings: (replay && count == 1).then_some(recordings),
+            };
+            let submitted =
+                driver_metal::fire::run::submit(&mut machine, &lowered, geometry, &mut live)
+                    .expect("the fire commits");
+            let encoded = started.elapsed().as_secs_f64() * 1e3;
+            machine
+                .stepper
+                .wait_for(submitted.value)
+                .expect("the fire retires");
+            (started.elapsed().as_secs_f64() * 1e3, encoded)
+        };
+
+        // The context, then the decodes that read it. The first decode is
+        // discarded: it is the one that compiles the decode pipelines and, in
+        // replay, records them, and a server pays that once per shape.
+        fire(
+            0,
+            ctx,
+            &mut lowerings,
+            &mut pipelines,
+            &mut regions,
+            &mut recordings,
+            &mut stepper,
+        );
+        fire(
+            ctx,
+            1,
+            &mut lowerings,
+            &mut pipelines,
+            &mut regions,
+            &mut recordings,
+            &mut stepper,
+        );
+        let (mut walls, mut encodes) = (Vec::new(), Vec::new());
+        for i in 1..STEPS {
+            let (wall, encode) = fire(
+                ctx + i,
+                1,
+                &mut lowerings,
+                &mut pipelines,
+                &mut regions,
+                &mut recordings,
+                &mut stepper,
+            );
+            walls.push(wall);
+            encodes.push(encode);
+        }
+        walls.sort_by(f64::total_cmp);
+        encodes.sort_by(f64::total_cmp);
+        let median = walls[walls.len() / 2];
+        println!(
+            "decode at {ctx} of context: {median:.2} ms a token ({:.0} tok/s), \
+             host {:.2} ms of it, best {:.2} worst {:.2}, {} recordings",
+            1e3 / median,
+            encodes[encodes.len() / 2],
+            walls[0],
+            walls[walls.len() - 1],
+            recordings.recorded(),
+        );
+    }
+}
+
+/// Where a DECODE spends its time, per symbol, at two context lengths.
+///
+/// `where_a_long_prefill_spends_its_time` answers this for the other half of
+/// serving, and the two profiles have almost nothing in common: a prefill is
+/// the matrix unit against 2048 rows, a decode is the memory system against
+/// one. What made this worth writing is that `what_a_decode_costs_at_length`
+/// measured the gap to mlx-lm GROWING with context -- 0.95 ms more per token
+/// between 128 and 1024, against mlx-lm's 0.32 -- which says the cost is in
+/// whatever reads the context, not in the projections that do not.
+///
+/// Each symbol is timed as the whole SET of its launches (all sixteen layers'
+/// worth), repeated, so what prints is that symbol's contribution to one
+/// decode rather than one dispatch of it. The repeat is not optional: a lone
+/// statement in a fire pays a submission and a first touch that a statement
+/// in the middle of 250 does not, and that constant is larger than most of
+/// the rows below.
+#[test]
+#[ignore = "needs a checkpoint and a device"]
+fn where_a_decode_spends_its_time() {
+    let Some(snapshot) = snapshot() else {
+        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        return;
+    };
+    let Ok(context) = Context::new() else {
+        eprintln!("SKIP: no Metal 4 device");
+        return;
+    };
+    let compiler = Compiler::new(&context).expect("a compiler");
+    let mut pipelines = Pipelines::new(kernels_dir());
+    let Some((row, dg, loaded)) = served(&context, &snapshot) else {
+        return;
+    };
+    let binding = observed(&dg, &loaded);
+    let geometry = dispatch_geometry(&dg, &binding);
+    let freqs = driver_metal::model::rope::table(&dg);
+    let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
+    let named = HashMap::new();
+    let scratch = driver_metal::fire::Scratch::new();
+    const ROUNDS: usize = 7;
+
+    for ctx in [128_u32, 1024] {
+        let shape = pool_shape(&dg, ctx.div_ceil(16) + 4);
+        let pool = Pool::allocate(&context, shape).expect("a pool");
+        let held = (ctx + 1).div_ceil(shape.page_size);
+        let page_list: Vec<u32> = (0..held).collect();
+        let staged = driver_metal::bind::tables::stage(
+            &context,
+            &scratch,
+            driver_metal::bind::tables::Frame {
+                token_ids: &[1234],
+                position_ids: &[ctx],
+                req_of_token: &[0],
+                kv_page_indices: &page_list,
+                kv_page_indptr: &[0, held],
+                kv_write_page: &[ctx / shape.page_size],
+                kv_write_offset: &[ctx % shape.page_size],
+                rope_frequencies: &inv_freq,
+                sampling_indices: &[0],
+            },
+        )
+        .expect("the tables stage");
+        let step = Step {
+            token_ids: &[1234],
+            qo_indptr: &[0, 1],
+            sampling_indices: &[0],
+            sampling_indptr: &[0, 1],
+            ..Step::default()
+        };
+        let plan = text(row, FireClass::Decode, &binding);
+        let whole = lower_step(&plan, &step).expect("the step lowers");
+
+        let mut best = |lowered: &model_compiler::lower::Lowered| -> (f64, f64) {
+            let (mut ms, mut enc) = (f64::MAX, f64::MAX);
+            for _ in 0..ROUNDS {
+                let pages = |layer: u16, values: bool| {
+                    pool.layer(u32::from(layer)).map(|l| Slice {
+                        address: if values {
+                            l.v.gpu_address()
+                        } else {
+                            l.k.gpu_address()
+                        },
+                        bytes: shape.layer_bytes_at(0),
+                    })
+                };
+                let mut live = Live {
+                    store: Store::new(Names::mlx(), &loaded.tensors, &named),
+                    tables: &staged,
+                    shape,
+                    pages: &pages,
+                };
+                let started = std::time::Instant::now();
+                let (timing, _arena) = driver_metal::fire::run::run_keeping_arena(
+                    &context,
+                    &compiler,
+                    &mut pipelines,
+                    lowered,
+                    geometry,
+                    &mut live,
+                )
+                .expect("the decode runs");
+                ms = ms.min(started.elapsed().as_secs_f64() * 1e3);
+                enc = enc.min(timing.encode.as_secs_f64() * 1e3);
+            }
+            (ms, enc)
+        };
+
+        let (total, encode) = best(&whole);
+        println!(
+            "\ndecode at {ctx} of context: {total:.2} ms wall, {encode:.2} ms host encode, \
+             {} launches over {} symbols",
+            whole.launches.len(),
+            whole.kernels.len(),
+        );
+        let mut rows: Vec<(f64, usize, String)> = Vec::new();
+        for (index, symbol) in whole.kernels.iter().enumerate() {
+            let mut only = whole.clone();
+            only.launches.retain(|l| usize::from(l.kernel) == index);
+            let count = only.launches.len();
+            if count == 0 {
+                continue;
+            }
+            // THE SAME SET, EIGHT TIMES. `(t8 - t1) / 7` is what one decode
+            // pays for this symbol; `t1 - marginal` is the per-fire constant
+            // it was measured through, and printing it is what keeps the
+            // first column from being read as the second.
+            let mut many = whole.clone();
+            many.launches = std::iter::repeat_n(only.launches.clone(), 8)
+                .flatten()
+                .collect();
+            let (one, _) = best(&only);
+            let (eight, _) = best(&many);
+            let marginal = (eight - one) / 7.0;
+            rows.push((
+                marginal,
+                count,
+                format!("{symbol}  x{count}  {marginal:6.3} ms  (alone {one:5.2})"),
+            ));
+        }
+        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let sum: f64 = rows.iter().map(|r| r.0).sum();
+        for (_, _, line) in &rows {
+            println!("  {line}");
+        }
+        println!("  ---- {sum:.2} ms of marginal against a {total:.2} ms fire");
+    }
+}
+
+/// How many of a launch's widthed operands the kernel WRITES.
+///
+/// The trace states inputs, then outputs, then weights, so this is the length
+/// of the tail that is a result -- which is the split
+/// `arena_regions`'s writers and the rectangle census below both need.
+///
+/// It read the row's `operands` column and counted `Source::Out(i)`. Every
+/// Metal family has retired its rows, and the answer moved to where it was
+/// always derivable: a routine spells a written buffer `BufMut` or `F32sMut`
+/// and a read one `Buf`, `I32s`, `U32s`, `U8s`, `F32s`, so the WRITE COUNT is
+/// the count of mutable arguments in the signature. `driver-metal`'s
+/// `directed` reads the same fact for `Touches`, which is the encoder's
+/// hazard analysis -- so an answer that drifted here would have shown up
+/// there as a missing barrier first.
+///
+/// A symbol nothing resolves falls back to ONE, unchanged: an unknown
+/// statement that wrote nothing is far more likely to be one this could not
+/// name than one that truly has no result, and attributing zero writers to it
+/// makes the region it filled look unwritten.
+fn results_of(symbol: &str) -> usize {
+    let Some((routine, _)) = driver_metal::lowering::routine::crossed(symbol) else {
+        return 1;
+    };
+    routine
+        .args
+        .iter()
+        .filter(|(ty, _)| matches!(ty, kernels::Ty::BufMut | kernels::Ty::F32sMut))
+        .count()
 }

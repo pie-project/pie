@@ -111,11 +111,117 @@ pub struct LaunchPlan {
     pub rs_translation_indptr: Vec<u32>,
     pub masks: Vec<EncodedMask>,
     pub mask_indptr: Vec<u32>,
+    /// The rows a request reads out. `sampling_indptr` is the per-request CSR
+    /// over this.
+    ///
+    /// # The numbering, measured
+    ///
+    /// **Request-relative** on every plan the engine builds today. This doc
+    /// said "absolute, not request-relative" and that is not what the engine
+    /// emits. Dumped out of `driver-vulkan`'s envelope on the 8-conversation
+    /// GPU gate, unmodified:
+    ///
+    /// ```text
+    /// qo=[0, 92, 93]  sidx=[91, 0]   sindptr=[0, 1, 2]
+    /// qo=[0,  1,  2]  sidx=[ 0, 0]   sindptr=[0, 1, 2]
+    /// ```
+    ///
+    /// Request 1 spans rows 92..93 and names row **0**. Absolute, that is
+    /// request 0's FIRST row; request-relative, it is the one row request 1
+    /// has. The second line says the same with no prompt to hide behind: two
+    /// one-row requests, and both name 0.
+    ///
+    /// `driver::resolve` writes exactly that. With no read-out port bound it
+    /// pushes `span - 1`, where `span` is `qo_indptr[lane + 1] -
+    /// qo_indptr[lane]` -- the request's OWN row count -- and its test says
+    /// "both relative to their own request". That is the decode case, which
+    /// is nearly every fire.
+    ///
+    /// # Where the "absolute" reading came from, and what is still open
+    ///
+    /// It is a fair description of what `driver-metal` DOES: `rows_of` marks
+    /// `samples[row]` over the whole step. Note that driver-metal also handed
+    /// every program member the whole read-out, so in a three-request frame
+    /// all three sampled request 0's distribution -- a defect recorded in
+    /// `driver-vulkan`'s `frames::member_requests`. A backend reading this
+    /// field absolutely and a scheduler writing it relatively agree exactly
+    /// when `qo_indptr[lane]` is 0, which is every single-request plan, and
+    /// that is why it survived.
+    ///
+    /// The open half is REAL and is not settled by the above: when the guest
+    /// binds `Port::Readout`, these values are whatever the guest wrote, and a
+    /// beam whose lanes are separate requests naming its siblings' rows cannot
+    /// be said in relative numbering. So the two branches of `resolve` may not
+    /// mean the same thing by this field, and the bound one should not be
+    /// inferred from the unbound one.
+    ///
+    /// What IS checked, and it is the most that can be without deciding the
+    /// question: `validate_geometry` refuses a row past the fire's total
+    /// tokens -- "sampling_indices names row {row}, past the {tokens} rows
+    /// this fire has" -- which is true under BOTH readings, and has a test.
+    /// What is NOT checked is that request `r`'s index falls in request `r`'s
+    /// own span, because that check IS the relative reading, and asserting it
+    /// here would settle by fiat a question the guest-bound branch has not
+    /// answered. A backend that reads this field relatively -- as
+    /// `driver-vulkan` does, matching what the engine emits -- refuses that
+    /// case itself, by name, at its own seam.
+    ///
+    /// Since that was written the count of backends reading it relatively has
+    /// gone from one to THREE. `driver-wgpu` was corrected, and
+    /// `driver-metal`'s `lowering::frame::rows_of` -- the very function this
+    /// doc cited as the absolute reading -- was measured and corrected too: it
+    /// indexed `samples[row]` over the whole fire, so on the live
+    /// `qo=[0,92,93] sidx=[91,0]` batch it marked request 0's FIRST token and
+    /// left request 1's only row with a dead readout, and `samples` is what
+    /// `model_compiler::lower` filters to build the gather. Its empty-table
+    /// branch was wrong the same way, marking only the fire's last row where
+    /// every request should read its own.
+    ///
+    /// So there is no longer a backend that reads this absolutely, and the
+    /// disagreement this paragraph was written to preserve no longer exists.
+    /// The per-request bound is STILL not asserted here, and now for a
+    /// smaller reason: every seam that could be wrong about it already
+    /// refuses by name with a better sentence than a shared check would give.
+    /// If a backend is ever added that does not, this is where it belongs.
+    ///
+    /// The rule itself now has ONE implementation:
+    /// `model_compiler::lower::rows_from_regions` takes a `Readouts` -- the
+    /// indices, the CSR that says whose they are, and `qo_indptr` -- and both
+    /// `driver-metal` and `driver-cuda` go through it. A caller that cannot
+    /// state all three cannot read this field, which is the failure said as a
+    /// signature.
+    ///
+    /// `scheduler::wire.rs`'s `index < row_len` assert bounds the rows within
+    /// ONE pre-merge request and the merge copies values unchanged, which is
+    /// consistent with the relative reading and does not disambiguate on its
+    /// own.
+    ///
+    /// An EMPTY table is not "no read-outs" -- it means every request reads
+    /// its own last row, which is the decode case the fire exists for.
     pub sampling_indices: Vec<u32>,
     pub sampling_indptr: Vec<u32>,
     pub context_ids: Vec<u64>,
     pub single_token_mode: bool,
     pub device_resolved_geometry: bool,
+    /// `PIE_GEOMETRY_CLASS_*` for this fire: which of the three ways the
+    /// driver must read its geometry.
+    ///
+    /// # Why a class and not the bool beside it
+    ///
+    /// `device_resolved_geometry` answers two questions at once -- "does the
+    /// host know this fire's geometry" and "which device class is it" -- and
+    /// the second has three answers. A POOL-OWNED device-geometry fire
+    /// (`DevGeo::pooled`) states its pages in a channel and picks a SUBSET of
+    /// them in-graph; `DecodeEnvelope`'s contract is that pages are DERIVED
+    /// from positions. Folding the two together hands `quest-attention` the
+    /// pages its own graph did not choose.
+    ///
+    /// The bool is left exactly as it was, and this is carried beside it, so
+    /// that the classes CUDA already produces keep their scheduling: class 0
+    /// where the bool is false, class 1 where it is true, and class 2 only for
+    /// pooled fires, which need `PIE_DEVICE_PORT_ATTN_MASK` and so cannot
+    /// arise on a driver that does not claim it.
+    pub geometry_class: u32,
     pub has_user_mask: bool,
     /// tart STRUCTURAL v0/S-2 (0.3 re-port): the pass's layer truncation
     /// (`set-max-layers`). Engine-internal — it crosses the driver ABI as
@@ -885,7 +991,7 @@ fn partition(
                 w[0], w[1]
             )));
         }
-        if w[0] as usize % align != 0 || w[1] as usize % align != 0 {
+        if !(w[0] as usize).is_multiple_of(align) || !(w[1] as usize).is_multiple_of(align) {
             return Err(Malformed(format!(
                 "{name} segment {}..{} is not {align}-byte aligned",
                 w[0], w[1]
@@ -1091,7 +1197,7 @@ mod mask_tests {
 
     #[test]
     fn expansion_agrees_with_the_loop_it_replaced() {
-        let cases = vec![
+        let cases = [
             // Empty: no mask, no row.
             plan_with(Vec::new(), Vec::new(), vec![0, 2]),
             // One row that starts false, then true, then false.

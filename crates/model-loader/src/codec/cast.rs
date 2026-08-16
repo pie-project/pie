@@ -81,24 +81,6 @@ pub fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::DType;
-
-    #[test]
-    fn half_casts_round_and_overflow_to_infinity() {
-        let f16_bytes = encode_values(&[100_000.0], DType::F16).unwrap();
-        let f16_value = f16::from_bits(u16::from_le_bytes(f16_bytes.try_into().unwrap()));
-        assert!(f16_value.is_infinite() && !f16_value.is_nan());
-
-        let input = f32::from_bits(0x3f80_8001);
-        let bf16_bytes = encode_values(&[f64::from(input)], DType::BF16).unwrap();
-        let actual = u16::from_le_bytes(bf16_bytes.try_into().unwrap());
-        assert_eq!(actual, bf16::from_f32(input).to_bits());
-    }
-}
-
 /// A `Cast`, dispatched on its dtype pair once and run across every core.
 ///
 /// The generic route below — [`decode_values`] into a `Vec<f64>`, then
@@ -177,7 +159,9 @@ fn cast_chunk(src: &[u8], dst: &mut [u8], from: DType, to: DType) -> Result<(), 
     use DType::{BF16, F16, F32};
     match (from, to) {
         (F32, BF16) => map_elements(src, dst, |v: [u8; 4]| {
-            bf16::from_f32(f32::from_le_bytes(v)).to_bits().to_le_bytes()
+            bf16::from_f32(f32::from_le_bytes(v))
+                .to_bits()
+                .to_le_bytes()
         }),
         (F32, F16) => map_elements(src, dst, |v: [u8; 4]| {
             f16::from_f32(f32::from_le_bytes(v)).to_bits().to_le_bytes()
@@ -230,4 +214,22 @@ fn map_elements<const IN: usize, const OUT: usize>(
         output.copy_from_slice(&convert(input.try_into().unwrap()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::DType;
+
+    #[test]
+    fn half_casts_round_and_overflow_to_infinity() {
+        let f16_bytes = encode_values(&[100_000.0], DType::F16).unwrap();
+        let f16_value = f16::from_bits(u16::from_le_bytes(f16_bytes.try_into().unwrap()));
+        assert!(f16_value.is_infinite() && !f16_value.is_nan());
+
+        let input = f32::from_bits(0x3f80_8001);
+        let bf16_bytes = encode_values(&[f64::from(input)], DType::BF16).unwrap();
+        let actual = u16::from_le_bytes(bf16_bytes.try_into().unwrap());
+        assert_eq!(actual, bf16::from_f32(input).to_bits());
+    }
 }

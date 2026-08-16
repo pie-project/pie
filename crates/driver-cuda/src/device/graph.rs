@@ -40,12 +40,12 @@
 //! was the same `.extern .func`; the two frontends share `cicc`.
 //!
 //! So the device text is a JIT unit like every other:
-//! `kernels-cuda-new/csrc/src/graph/supergraph.cuh`, fired by
+//! `kernels-cuda/kernels/graph/supergraph.cuh`, fired by
 //! [`crate::fire::supergraph`], whose header carries the whole measurement
-//! and the one thing it does not show. It lives outside `kernels-cuda` for
-//! the reason it always did -- its argument is a conditional handle, a SHELL
-//! object, rather than a tensor -- which is now spelled as a family of its
-//! own, `graph`, rather than as a `.cu` beside this file.
+//! and the one thing it does not show. It stayed out of the ARCHIVE crate
+//! for the reason it always did -- its argument is a conditional handle, a
+//! SHELL object, rather than a tensor -- which is now spelled as a family of
+//! its own, `graph`, rather than as a `.cu` beside this file.
 
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -1011,6 +1011,64 @@ pub struct SupergraphBuilder<'a> {
     nodes: Vec<Option<cudaGraphNode_t>>,
 }
 
+/// END ANY CAPTURE STILL RUNNING BEFORE THE POOLED STREAMS ARE DESTROYED.
+///
+/// There was no `Drop` here, and the derived glue was wrong in a way that
+/// only an abandoned capture reaches. `pool` is `Vec<OwnedStream>` — "owned,
+/// so the streams die with the builder" — and `OwnedStream::drop` is a bare
+/// `cudaStreamDestroy`. **Destroying a stream that is still capturing is
+/// undefined**, and CUDA takes it literally: the fault lands inside
+/// `libcuda`'s `cuStreamDestroy_v2`, four frames below anything this tree
+/// wrote, with no error code and no clue that a capture was open.
+///
+/// The path that gets there is a capture that ABORTS. `capture_or_replay`
+/// builds this, arms a conditional, and unwinds if the arming launch
+/// refuses — which is exactly what `gpu_supergraph` does today, because
+/// `graph::supergraph_set_cond` will not launch. The builder then drops with
+/// `active` still deep and every pooled stream mid-capture, and a refusal
+/// that should have been a message becomes a SIGSEGV in the guest process.
+///
+/// So this ends what it finds. It is not a fix for the arming launch — that
+/// is a separate defect and it stays visible, which is the point: after this
+/// the failure reports itself in the words the launch used, instead of
+/// killing the process somewhere else entirely.
+///
+/// Errors are swallowed, deliberately and only here. A destructor has
+/// nowhere to return one, and every reachable cause is already being
+/// reported by whatever unwound us; the alternative is a panic in a `Drop`
+/// during an unwind, which aborts and buries the original.
+#[cfg(feature = "_cuda")]
+impl Drop for SupergraphBuilder<'_> {
+    fn drop(&mut self) {
+        // Innermost first: an outer capture cannot be ended while a nested
+        // one is still open, and `active` is the stack with the root at 0.
+        // The root is NOT ours — `new` took it already capturing, so whoever
+        // owns it ends it.
+        while self.active.len() > 1 {
+            let stream = self.active.pop().expect("len > 1");
+            // SAFETY: `stream` came from `active`, so it is one this builder
+            // began a capture on and has not yet ended.
+            let capturing = unsafe { capture_info(stream) }
+                .is_ok_and(|i| i.status == cudaStreamCaptureStatus::cudaStreamCaptureStatusActive);
+            if capturing {
+                let mut graph: cudaGraph_t = std::ptr::null_mut();
+                // SAFETY: the stream is capturing, which is exactly the
+                // precondition `cudaStreamEndCapture` states.
+                let ended = unsafe {
+                    cudarc::runtime::sys::cudaStreamEndCapture(stream, std::ptr::from_mut(&mut graph))
+                };
+                if ended == cudarc::runtime::sys::cudaError::cudaSuccess && !graph.is_null() {
+                    // The graph is ours now and nothing will instantiate it.
+                    // SAFETY: `cudaStreamEndCapture` handed it over.
+                    unsafe {
+                        let _ = cudarc::runtime::sys::cudaGraphDestroy(graph);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(feature = "_cuda")]
 impl<'a> SupergraphBuilder<'a> {
     /// Start building on an already-capturing stream, reading predicates from
@@ -1312,13 +1370,13 @@ mod tests_2 {
     use super::*;
 
     // No CUDA call here. What this pins is that the slot vocabulary still
-    // matches `model_compiler::trace::GuardPred::wire`, which is the one fact
+    // matches `model_ir::trace::GuardPred::wire`, which is the one fact
     // the device word and the trace have to agree on -- and the one that
     // would otherwise drift silently, because a wrong slot reads a
     // NEIGHBOURING predicate rather than failing.
     #[test]
     fn slots_match_the_guard_wire_vocabulary() {
-        use model_compiler::trace::GuardPred;
+        use model_ir::trace::GuardPred;
         assert_eq!(GuardPred::HasWriteDesc.wire().0, SLOT_HAS_WRITE_DESC);
         assert_eq!(GuardPred::TokensLE(0).wire().0, SLOT_TOKENS_LE);
         assert_eq!(GuardPred::TokensGT(0).wire().0, SLOT_TOKENS_GT);

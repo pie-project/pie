@@ -9,7 +9,12 @@
 //! If the premise holds, the two backends must be unable to run **exactly the
 //! same set of blocks**. So `driver-wgpu`'s `Unruled` list and
 //! `driver-vulkan`'s must be the same twenty-four names, and their served lists
-//! the same fifteen. A divergence is not a difference of opinion about a grid;
+//! the same seventeen. Both numbers are asserted below, which is the only
+//! reason they are written here at all: the served one said "fifteen" while
+//! the assertion beneath it was moved to sixteen and then seventeen, and
+//! `geometry.rs` carried a third copy that still said twenty-one. A count
+//! repeated away from the assertion that owns it is a count nobody updates.
+//! A divergence is not a difference of opinion about a grid;
 //! it means one of the two ports quietly grew or lost a row, and the useful
 //! moment to learn that is here rather than when a model runs on one backend
 //! and is declined by the other.
@@ -133,26 +138,74 @@ fn the_two_ports_of_metals_table_decline_the_same_blocks() {
         theirs.difference(&mine).collect::<Vec<_>>()
     );
 
+    // The two ledgers PARTITION the rule space, which is the arithmetic the
+    // prose in `geometry.rs` narrates and nothing checked. The exhaustive
+    // match makes a NEW rule a compile error -- that is how `SdpaTiled` and
+    // `SdpaMma` were caught -- but it cannot see a rule that is in the
+    // `SERVED` const AND refused by an arm, because the const is a ledger
+    // rather than the code. Served plus refused must be every real rule, once
+    // each.
+    //
+    // `Unstated` is the one that is neither: it means a row that exists and
+    // has not said how to launch, which is a different sentence from a block
+    // that was never ported.
+    let real = kernels::LaunchRule::ALL.len() - 1;
+    assert_eq!(
+        served(&wgpu).len() + mine.len(),
+        real,
+        "this port serves {} rules and refuses {}, which is not the {real} \
+         real ones `LaunchRule::ALL` has. A rule in both ledgers, or in \
+         neither, is one the arms and the const disagree about",
+        served(&wgpu).len(),
+        mine.len(),
+    );
+
     let (mine, theirs) = (served(&wgpu), served(&vulkan));
-    assert_eq!(mine.len(), 15, "this crate's `SERVED` parsed as {mine:?}");
+    assert_eq!(mine.len(), 17, "this crate's `SERVED` parsed as {mine:?}");
     assert_eq!(
         theirs.len(),
-        15,
+        17,
         "`driver-vulkan`'s `SERVED` parsed as {theirs:?}"
     );
+
+    // The rules this port serves and `driver-vulkan` does not. There are
+    // none, and the list stays because an EMPTY difference is a claim while a
+    // missing list is a silence.
+    //
+    // It has held two and shed both, each time by failing rather than by
+    // anyone noticing. `LaunchRule::SdpaTiled` arrived upstream with a stated
+    // `sdpa_paged_tiled` in `kernels-metal` and this backend served it first;
+    // `LaunchRule::SdpaMma` arrived a rebase later and this backend served
+    // that first too. Both times the sibling caught up within a day, and both
+    // times the way this file learned was the assertion below.
+    //
+    // The two rules are ONE arm here. Metal separates them because a
+    // matrix-unit threadgroup is 128 threads where the scalar one is 1024;
+    // WGSL has no matrix unit, so `attn/sdpa_paged_mma.wgsl` is a scalar body
+    // wearing Metal's entrypoint names and takes the tiled grid exactly.
+    const AHEAD: &[&str] = &[];
+    let only_mine: std::collections::BTreeSet<&str> =
+        mine.difference(&theirs).map(String::as_str).collect();
     assert_eq!(
-        mine,
-        theirs,
-        "the two ports serve different blocks. Only in wgpu: {:?}; only in \
-         vulkan: {:?}.",
-        mine.difference(&theirs).collect::<Vec<_>>(),
+        only_mine,
+        AHEAD
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "the rules this port serves and `driver-vulkan` does not are no longer \
+         the ones `AHEAD` names. If vulkan has caught up, empty it; if this \
+         port grew another rule alone, add it and say why."
+    );
+    assert!(
+        theirs.difference(&mine).next().is_none(),
+        "`driver-vulkan` serves a rule this port does not: {:?}",
         theirs.difference(&mine).collect::<Vec<_>>()
     );
 
     // And the two halves partition the fleet, which is the claim that makes
-    // the two comparisons above worth making: fifteen served plus twenty-four
-    // refused plus `Unstated` is every rule there is, so agreeing on both
-    // lists is agreeing on all of it.
+    // the two comparisons above worth making: sixteen served plus the refused
+    // ones plus `Unstated` is every rule there is, so agreeing on both lists
+    // is agreeing on all of it.
     assert_eq!(
         served(&wgpu).len() + unruled(&wgpu).len() + 1,
         kernels::LaunchRule::ALL.len(),
@@ -188,4 +241,223 @@ fn no_row_of_the_wgpu_table_names_a_rule_this_backend_refuses() {
         named.len() > 5,
         "the table's rows name only {named:?}, so this checked almost nothing"
     );
+}
+
+/// The gates the sibling runs and this port does not, named.
+///
+/// `tests/gpu` is the harness where a driver is booted for real and asked for
+/// tokens through the client edge. `driver-vulkan` has twelve files there;
+/// this backend had three, and nothing anywhere said which nine were missing.
+/// A gap nobody names is a gap nobody closes — and one of the nine turned out
+/// to be unwritable rather than unwritten, because `common::wgpu_standalone_
+/// toml` hard-coded `[model] name = "qwen3"` and so no wgpu gate could serve a
+/// second architecture at all.
+///
+/// So the difference is written down, with what covers each here. Two rules,
+/// both self-cleaning: a twin that gets written must leave this list, and a
+/// gate the sibling adds must join it.
+///
+/// It skips when `tests/gpu` is absent, for the reason this file's header
+/// gives about `crates/driver-vulkan`.
+#[test]
+fn the_sibling_gates_this_port_has_no_twin_for_are_named() {
+    /// A sibling gate with no wgpu twin, and what stands in for it here.
+    ///
+    /// "Covered" means something in THIS tree fails if the path breaks —
+    /// not that the subject is unimportant. Where nothing covers it, the
+    /// entry says so, because an excuse and a gap should not read alike.
+    ///
+    /// One entry said exactly that and is gone: `shared_prefix` had no cover,
+    /// so `wgpu_shared_prefix` was written and this list shed it — which is
+    /// what a list like this is for.
+    const NO_TWIN: &[(&str, &str)] = &[
+        (
+            "boot_smoke",
+            "covered: all four wgpu gates boot the same standalone through \
+             `common::boot_wgpu`, so a boot that stopped working fails every \
+             one of them rather than none",
+        ),
+        (
+            "chat_completion_e2e",
+            "covered: `wgpu_second_model` runs that exact inferlet — the same \
+             `chat-completion` wasm, the same greedy `Paris` — through the \
+             whole stack, on a model this driver was not written against",
+        ),
+        (
+            "two_conversations",
+            "covered: `wgpu_many_conversations` is the same proof at EIGHT, \
+             and its own header says why two is the weaker number — a \
+             two-request frame's first request starts at row zero, so an \
+             off-by-a-base and a correct answer are the same table",
+        ),
+        (
+            "grammar_constrained",
+            "covered: `tests/inferlets`' `asap-grammar-aligned-decoding` \
+             passes on this driver, which is a host-held grammar steering a \
+             decode token by token through the client edge",
+        ),
+        (
+            "programmable_sampler",
+            "covered: the curated suite's guest-written samplers — \
+             `gumbel-watermark`, `synthid-tournament-sampling`, `xtc-sampling` \
+             and a dozen more — are PTIR programs the guest wrote, and they \
+             pass here on two architectures",
+        ),
+        (
+            "sampled_completion",
+            "covered: every curated sampler test samples rather than takes an \
+             argmax, and `greedy-decoding-is-the-same-alone-and-in-a-crowd` is \
+             the one that pins the argmax against them",
+        ),
+        (
+            "sampling_primitives",
+            "covered at the kernel rather than the gate: `kernels-wgpu`'s \
+             `tests/gpu.rs` computes the sampler op set on the device and \
+             compares it against host references, and refuses a perturbed one",
+        ),
+    ];
+
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/gpu/tests");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        println!(
+            "SKIP: no {}, so the gate difference is unmeasured",
+            dir.display()
+        );
+        return;
+    };
+
+    let (mut vulkan, mut wgpu) = (BTreeSet::new(), BTreeSet::new());
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(stem) = name.strip_suffix(".rs") else {
+            continue;
+        };
+        if let Some(rest) = stem.strip_prefix("vulkan_") {
+            vulkan.insert(rest.to_string());
+        } else if let Some(rest) = stem.strip_prefix("wgpu_") {
+            wgpu.insert(rest.to_string());
+        }
+    }
+    // The directory is identified by something that IDENTIFIES it, not by a
+    // count of files in it. This read `vulkan.len() >= 10` and went red the
+    // moment upstream deleted three vulkan gates (`244df6054`, "Census 34 ->
+    // 21") -- a hand-kept number about another port's files, which is a number
+    // that drifts every time that port adds or removes one, and whose drift
+    // says nothing about whether this scan found the right directory.
+    //
+    // `common` is what makes it the right directory: every gate in the tree
+    // includes it, and no other directory has it.
+    assert!(
+        dir.join("common").is_dir(),
+        "no `common` module here, so this is not the gate directory: {}",
+        dir.display()
+    );
+    assert!(
+        !vulkan.is_empty() && !wgpu.is_empty(),
+        "found {} vulkan and {} wgpu gates in {}; a port with none of either \
+         is a scan that matched nothing",
+        vulkan.len(),
+        wgpu.len(),
+        dir.display()
+    );
+
+    let listed: BTreeSet<&str> = NO_TWIN.iter().map(|(g, _)| *g).collect();
+    let missing: BTreeSet<&str> = vulkan
+        .iter()
+        .map(String::as_str)
+        .filter(|g| !wgpu.contains(*g))
+        .collect();
+    assert_eq!(
+        missing, listed,
+        "the sibling gates without a wgpu twin are no longer the ones NO_TWIN \
+         names. If a twin was written, drop its entry; if the sibling added a \
+         gate, add it with what covers it here — or with the fact that nothing \
+         does, which is a finding and not a failure."
+    );
+}
+
+/// The first ported routine asks for the grid its row asked for.
+///
+/// `.wiki/kernel-x/wgpu-refactor.md` is the plan: each `kernel!` row becomes a
+/// `fn` whose body states the entrypoint and the lanes, and `LaunchRule` and
+/// `geometry.rs` dissolve into those bodies. The danger of that migration is
+/// silent: a body that computes a *different* grid still dispatches, still
+/// returns `Ok`, and produces wrong numbers rather than a refusal.
+///
+/// So the two are compared for as long as both exist. This reads the REAL
+/// shader's `@workgroup_size` — not a transcription of it — asks
+/// `geometry::groups` what the row's `LaunchRule::Elementwise` wants, asks the
+/// routine what it wants, and requires them equal after the driver's own
+/// `div_ceil`.
+///
+/// It is deliberately in `driver-wgpu`: `kernels-wgpu` cannot depend on this
+/// crate, so its own half of this check (`the_body_asks_for_the_elementwise_grid`)
+/// compares against a transcribed `width * rows`. This one compares against
+/// the function that decides it.
+#[test]
+fn the_first_ported_routine_asks_for_the_grid_its_row_asked_for() {
+    use driver_wgpu::geometry::{Dims, Module, Rule, groups};
+    use kernels_wgpu::routine::{ArgValue, Encode, Fire};
+
+    #[derive(Default)]
+    struct Lanes(std::cell::RefCell<Option<[u32; 3]>>);
+    impl Encode for Lanes {
+        fn dispatch(
+            &self,
+            fire: Fire<'_>,
+            _args: &[ArgValue],
+        ) -> Result<(), kernels::routine::Refusal> {
+            *self.0.borrow_mut() = Some(fire.lanes);
+            Ok(())
+        }
+    }
+
+    // The module's own divisor, read off the shader this routine names.
+    let source =
+        kernels_wgpu::entrypoint_source("ple_combine_bfloat16", kernels_wgpu::Capability::Baseline)
+            .expect("the tree carries the entrypoint the routine names");
+    let declared = driver_wgpu::reflect::declared(&source).expect("it reflects");
+    let module = Module::new(declared.local);
+
+    let row = kernels::sig_in(kernels_wgpu::KERNELS, "ple_combine")
+        .expect("the row this routine is being compared against");
+    assert_eq!(
+        row.launch,
+        Rule::Elementwise,
+        "if the row's rule changed, this comparison is against the wrong thing"
+    );
+
+    for (rows, width) in [(1_u32, 64_u32), (7, 64), (3, 4096), (1, 1)] {
+        let dims = Dims {
+            rows,
+            width,
+            in_width: width,
+            ..Dims::default()
+        };
+        let want = groups(row.launch, dims, module).expect("the rule answers");
+
+        let to = Lanes::default();
+        kernels_wgpu::layout::ple_combine(
+            &to,
+            kernels_wgpu::routine::Buf(0),
+            kernels_wgpu::routine::Buf(1),
+            kernels_wgpu::routine::BufMut(2),
+            kernels_wgpu::routine::Buf(3),
+            kernels_wgpu::routine::Env(i32::try_from(width).expect("fits")),
+            kernels_wgpu::routine::Env(i32::try_from(rows).expect("fits")),
+        )
+        .expect("the body dispatches");
+        let lanes = to.0.borrow().expect("it dispatched once");
+
+        let got = [
+            lanes[0].div_ceil(declared.local[0]),
+            lanes[1].div_ceil(declared.local[1]),
+            lanes[2].div_ceil(declared.local[2]),
+        ];
+        assert_eq!(
+            got, want,
+            "at rows={rows} width={width}, the ported body and \
+             `LaunchRule::Elementwise` disagree about the grid"
+        );
+    }
 }

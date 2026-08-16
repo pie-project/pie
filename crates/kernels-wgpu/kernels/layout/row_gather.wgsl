@@ -16,9 +16,9 @@
 // so the guard below would bound the gather by garbage. `kernels-vulkan`'s table
 // reader made exactly that mistake, inheriting Metal's reading, where a packed
 // slot IS the buffer and a trailing scalar lands in the same argument.
-// `kernels_wgpu::bindings` answers `Binding::Packed` for it; `cargo run -p
-// kernels-wgpu --example dump_layout -- row_gather` prints "0 bytes of uniform
-// block", and this file agrees with it.
+// `kernels_wgpu::bindings` answers `Binding::Packed` for it, and
+// `kernels_wgpu::uniform_size` answers 0 bytes of uniform block; this file
+// agrees with those row-derived facts.
 //
 // ## A gather moves bits, so nothing here widens a bf16
 //
@@ -34,14 +34,14 @@
 // middle of row `i`'s last word, and no invocation can own it. Every hidden
 // size the tree loads is a multiple of 64.
 
-@group(0) @binding(0) var<storage, read> input_: array<u32>;
+@group(0) @binding(0) var<storage, read_write> input_: array<u32>;
 @group(0) @binding(1) var<storage, read_write> out_: array<u32>;
-@group(0) @binding(2) var<storage, read> rows: array<u32>;
+@group(0) @binding(2) var<storage, read_write> rows: array<u32>;
 // Width then count, exactly as `layout/row_gather_params.glsl` and Metal's
 // `row_gather_params.h` spell it. The statement states `[width]` and the driver
 // appends the count, giving `[width, count]`.
 struct RowGatherParams { width: u32, count: u32 }
-@group(0) @binding(3) var<storage, read> params: RowGatherParams;
+@group(0) @binding(3) var<storage, read_write> params: RowGatherParams;
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {

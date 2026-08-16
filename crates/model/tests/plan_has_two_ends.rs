@@ -3,7 +3,7 @@
 //! `cuda.md` §5.C3 asks for the goldens to be the equality — that a
 //! *described* plan lowers to the same `Launch` list a coded one does.
 //! The description does not exist yet (that is C2's endpoint), but part
-//! of it does: the shared blocks in `model_compiler::dsl` are the
+//! of it does: the shared blocks in `model_dsl` are the
 //! vocabulary a description would be written in, and this asks whether
 //! they are a real STRUCTURE or only reused code.
 //!
@@ -25,7 +25,7 @@
 //! backbone. What they may not do is skip the seam, and the assertions
 //! below are written to say exactly that.
 
-use model_compiler::trace::{FireClass, ForwardPlan, OpKind};
+use model_ir::trace::{FireClass, ForwardPlan, OpKind};
 
 /// Every family this crate can trace for CUDA, by name and plan.
 ///
@@ -85,7 +85,7 @@ fn plans() -> Vec<(&'static str, ForwardPlan)> {
 fn seam_values<'a>(
     plan: &'a ForwardPlan,
     name: &str,
-) -> Option<&'a [model_compiler::trace::ValueId]> {
+) -> Option<&'a [model_ir::trace::ValueId]> {
     plan.seams
         .iter()
         .find(|s| s.seam == name)

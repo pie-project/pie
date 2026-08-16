@@ -39,17 +39,17 @@
 //! **`Cast`, `Scale` and `Encode` run HERE**, on the device, when both
 //! operands are already in the arena. The host path for those is a device read
 //! that synchronizes, an arithmetic loop, and a device write — a full round
-//! trip to compute something `kernels-cuda-new` has a kernel for.
+//! trip to compute something `kernels-cuda` has a kernel for.
 //!
 //! # The four rows are fired, not linked
 //!
-//! They used to be `kernels_cuda::ffi::pie_k_*` — `extern "C"` symbols an
-//! ahead-of-time archive defines, each forwarding into a C++ host launcher
-//! holding a `<<<>>>`. That made this feature imply nvcc, CMake and a CUDA
-//! toolkit in the one crate whose toolkit-free build is what lets
-//! `pie model convert` run anywhere. They were then
-//! `kernels_cuda_new::api`'s generated functions, and are now
-//! [`kernels_cuda_new::x::quant`]'s four host programs, which reach the same
+//! They used to be `kernels_cuda::ffi::pie_k_*` — `extern "C"` symbols the
+//! ahead-of-time archive crate (`kernels-cuda`, deleted at `85c6c674b`)
+//! defined, each forwarding into a C++ host launcher holding a `<<<>>>`. That
+//! made this feature imply nvcc, CMake and a CUDA toolkit in the one crate
+//! whose toolkit-free build is what lets `pie model convert` run anywhere.
+//! They were then `kernels_cuda::api`'s generated functions, and are now
+//! [`kernels_cuda::quant`]'s four host programs, which reach the same
 //! device text through NVRTC at run time.
 //!
 //! The paragraph below is kept as written, because the property it names is
@@ -97,7 +97,7 @@
 //!
 //! The first and third bullets stand. The stream is still outside the
 //! argument list, spelled `*mut c_void` because that is what
-//! `x::fire::fire` takes; and a refusal is still a `Result`, now
+//! `jit::Ctx::on` takes; and a refusal is still a `Result`, now
 //! [`declined`] rather than the deleted `refused`, for the same reason and
 //! with one honest narrowing recorded there.
 
@@ -105,7 +105,7 @@ use std::borrow::Cow;
 use std::ffi::c_void;
 
 use cudarc::runtime::sys as rt;
-use kernels_cuda_new::x::quant;
+use kernels_cuda::quant;
 
 use crate::error::Error;
 use crate::executor::arena::{ArenaBacking, TileMapOp};
@@ -511,10 +511,11 @@ impl CudaArena {
     // `fire_on` STOOD HERE. It borrowed `&self` to produce a
     // `runtime::Stream<'_>` whose lifetime could not outlive the arena, and
     // its doc called that *"what the lifetime exists to make unspellable"* —
-    // a launch queued on a destroyed stream. `x::fire::fire` takes a raw
-    // `*mut c_void` and re-wraps it with the same `Stream::from_runtime`, so
-    // the borrow could not be carried across and the four calls below pass
-    // `self.stream.cast()` directly.
+    // a launch queued on a destroyed stream. `jit::Ctx::on` takes a raw
+    // `*mut c_void` instead, so the borrow could not be carried across and
+    // the four calls below pass `self.stream.cast()` directly. The
+    // obligation did not disappear with the lifetime; it moved into
+    // `Ctx::on`'s `unsafe`, which is where each of those four states it.
     //
     // The obligation did not disappear with the type: `CudaArena::new`'s
     // safety contract already says the stream outlives the arena, every call
@@ -562,8 +563,8 @@ impl CudaArena {
         // SAFETY: both spans are in bounds, the plan chose this row for an
         // f32 source and a bf16 destination, and the stream is live for the
         // launch.
-        let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(self.stream.cast()) };
-        let fired = quant::cast_fp32_to_bf16(
+        let ctx = unsafe { kernels_cuda::jit::Ctx::on(self.stream.cast()) };
+        let fired = quant::cast_fp32_to::<kernels_cuda::jit::abi::bf16>(
             &ctx,
             self.at(op.src.offset).cast(),
             self.at(op.dst.offset).cast(),
@@ -597,8 +598,8 @@ impl CudaArena {
         self.bounds(factors.offset, factors.len)?;
         // SAFETY: both spans are in bounds; the kernel writes `dst` in place,
         // which is what the plan checked before naming this row.
-        let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(self.stream.cast()) };
-        let fired = quant::scale_rows_bf16(
+        let ctx = unsafe { kernels_cuda::jit::Ctx::on(self.stream.cast()) };
+        let fired = quant::scale_rows::<kernels_cuda::jit::abi::bf16>(
             &ctx,
             self.at(op.dst.offset).cast(),
             self.at(factors.offset).cast_const().cast(),
@@ -635,7 +636,7 @@ impl CudaArena {
         let scales = self.encode_scales(op)?;
         // SAFETY: every span is bounds-checked by `encode_scales`; the row
         // takes a source, a payload, an E8M0 scale array and one extent.
-        let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(self.stream.cast()) };
+        let ctx = unsafe { kernels_cuda::jit::Ctx::on(self.stream.cast()) };
         let fired = quant::quantize_bf16_to_mxfp4_e2m1_per_block(
             &ctx,
             self.at(op.src.offset).cast_const().cast(),
@@ -669,7 +670,7 @@ impl CudaArena {
         let (rows, cols) = self.extent_2d(op)?;
         let scales = self.encode_scales(op)?;
         // SAFETY: as above; the scales are `f32` for this row.
-        let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(self.stream.cast()) };
+        let ctx = unsafe { kernels_cuda::jit::Ctx::on(self.stream.cast()) };
         let fired = quant::quantize_bf16_to_fp8_e4m3_per_channel(
             &ctx,
             self.at(op.src.offset).cast_const().cast(),
@@ -764,11 +765,11 @@ fn plan_disagrees(what: &str) -> Error {
 /// **One narrowing, and it is real.** `refused` took every variant of
 /// `runtime::Error` — an unknown symbol, a unit NVRTC would not compile, an
 /// argument list that did not match the row, a rectangle that collapsed. In
-/// fn-world only the LAST of those arrives here as a value: `x::fire::fire`
+/// fn-world only the LAST of those arrives here as a value: the launch path
 /// panics on the first three, because a host program has no `Result` to put
 /// them in and every one of them is drift between this build and its own
-/// tables rather than a condition a load can report. So the three that used
-/// to be a `Contract` error are an abort now.
+/// device text rather than a condition a load can report. So the three that
+/// used to be a `Contract` error are an abort now.
 ///
 /// That is a worse diagnostic and a better one at once, and the honest
 /// statement is both halves: worse, because a load that could have named the
@@ -781,7 +782,7 @@ fn plan_disagrees(what: &str) -> Error {
 /// and the arena did not perform leaves a tensor holding whatever was there.
 fn declined(
     symbol: &str,
-    fired: Result<(), kernels_cuda_new::x::Refusal>,
+    fired: Result<(), kernels_cuda::Refusal>,
 ) -> Result<(), Error> {
     fired.map_err(|why| {
         Error::Contract(format!(
@@ -805,14 +806,23 @@ mod tests {
     /// and a row that was renamed or removed fails here instead of becoming a
     /// plan whose kernel `run_tile_map` reports as unknown at load time.
     ///
-    /// It asks `runtime::hosts` rather than scanning a table, and the change
-    /// is not cosmetic. A row present in `kernels_cuda::quant::KERNELS` was a
-    /// row someone had DECLARED; a symbol `hosts` answers for is one a
-    /// compiled unit carries the text of and `fire` will resolve — which is
-    /// the question this file's four launches actually ask. The rows were
-    /// spelled differently on the JIT side until recently
+    /// It asks `routine()` rather than scanning a table, and the change is
+    /// not cosmetic. A row present in the archive crate's
+    /// `kernels_cuda::quant::KERNELS` was a row someone had DECLARED; a symbol
+    /// `routine()` answers for is one with a host program the dispatch will
+    /// actually reach — which is the question this file's four launches
+    /// actually ask. The rows were spelled differently on the JIT side until
+    /// recently
     /// (`quant::cast_f32_to_bf16` for `quant::cast_fp32_to_bf16`), and that
     /// is exactly the drift a table scan would have called green.
+    ///
+    /// It asked `runtime::hosts` until the per-symbol JIT landed. That
+    /// function meant *"does a compiled unit carry the text of this symbol"*,
+    /// and there are no units now — one symbol is one NVRTC compilation,
+    /// keyed and cached on its own. The question survived the answer's
+    /// mechanism, which is why the replacement is a rename and not a
+    /// weakening: all four of these symbols are CROSSED, so `routine()`
+    /// resolves them through the same table `call()` dispatches on.
     #[test]
     fn every_symbol_the_plan_may_name_is_a_row_this_build_can_fire() {
         for symbol in [
@@ -822,9 +832,9 @@ mod tests {
             CUDA_QUANTIZE_BF16_TO_FP8,
         ] {
             assert!(
-                kernels_cuda_new::runtime::hosts(symbol),
-                "the loader may compile a plan naming `{symbol}`, and no unit \
-                 in `kernels-cuda-new` hosts it"
+                kernels_cuda::routine(symbol).is_some(),
+                "the loader may compile a plan naming `{symbol}`, and \
+                 `kernels-cuda` has no routine for it"
             );
         }
     }

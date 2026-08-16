@@ -70,7 +70,7 @@
 //#include "common/bf16.inc.wgsl"
 
 @group(0) @binding(0) var<storage, read_write> out_: array<u32>;
-@group(0) @binding(1) var<storage, read> bias: array<u32>;
+@group(0) @binding(1) var<storage, read_write> bias: array<u32>;
 
 struct Params { width: i32 }
 @group(1) @binding(0) var<uniform> params: Params;

@@ -41,8 +41,8 @@ use crate::manifest::Manifest;
 use crate::shared::llama_like::project;
 use crate::shared::llama_like::spec::LlamaLikeFacts;
 
-use model_compiler::facts::{NormPlacement, QkNorm};
-use model_compiler::trace::{NormVariant, RopeKind};
+use model_ir::facts::{NormPlacement, QkNorm};
+use model_ir::trace::{NormVariant, RopeKind};
 
 /// One Qwen 2.5 checkpoint.
 pub struct Qwen2 {
@@ -416,9 +416,9 @@ impl Variant for Qwen2 {
     /// geometric one at `rope_theta`.
     fn trace(
         &self,
-        class: model_compiler::trace::FireClass,
+        class: model_ir::trace::FireClass,
         load: Deployed<'_>,
-    ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
+    ) -> Result<model_ir::trace::ForwardPlan, crate::deployment::Refusal> {
         project::trace(&self.shape, self.row(), class, load)
     }
 
@@ -752,7 +752,7 @@ mod tests {
 
     #[test]
     fn every_row_traces_both_fire_classes() {
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
 
         for v in VARIANTS {
             for class in [FireClass::Decode, FireClass::Prefill] {

@@ -10,9 +10,10 @@
 // suggest. `kernels-vulkan`'s copy of this shader carried 9 and 10 until a
 // SPIR-V audit compared its `OpDecorate Binding` set against the row: off by
 // one, which made it read `ring_11` as the write page and the write page as the
-// offset. Do not transcribe these. Ask:
-//
-//     cargo run -p kernels-wgpu --example dump_layout -- kv_append_paged
+// offset. Do not transcribe these. Read the row through
+// `kernels_wgpu::bindings`: the storage numbers are derived from the operand
+// order, not copied from a sibling backend. The deleted `dump_layout` example
+// only printed that answer.
 //
 // The row also names `ring_4`, `ring_6`..`ring_9`, `ring_11` and `ring_15`,
 // which belong to a shared ring ABI this kernel does not read. They are real
@@ -33,8 +34,8 @@
 
 //#include "common/bf16.inc.wgsl"
 
-@group(0) @binding(0) var<storage, read> k_new: array<u32>;
-@group(0) @binding(1) var<storage, read> v_new: array<u32>;
+@group(0) @binding(0) var<storage, read_write> k_new: array<u32>;
+@group(0) @binding(1) var<storage, read_write> v_new: array<u32>;
 @group(0) @binding(2) var<storage, read_write> k_dst: array<u32>;
 @group(0) @binding(3) var<storage, read_write> v_dst: array<u32>;
 
@@ -56,8 +57,8 @@ fn v_new_at(i: u32) -> f32 {
 
 //#if defined(PIE_PAGED)
 
-@group(0) @binding(10) var<storage, read> w_page: array<u32>;
-@group(0) @binding(11) var<storage, read> w_off: array<u32>;
+@group(0) @binding(10) var<storage, read_write> w_page: array<u32>;
+@group(0) @binding(11) var<storage, read_write> w_off: array<u32>;
 
 struct Params { head_dim: i32, page_size: i32, n_kv_heads: i32 }
 @group(1) @binding(0) var<uniform> params: Params;
@@ -95,7 +96,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 //#else
 
-@group(0) @binding(4) var<storage, read> pos: array<i32>;
+@group(0) @binding(4) var<storage, read_write> pos: array<i32>;
 
 // `head_dim` at 0, then two 64-bit strides at 8 and 16 -- NOT at 4 and 12. A
 // `vec2<u32>` aligns to eight, so the lone `i32` in front of it is followed by

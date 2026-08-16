@@ -447,10 +447,12 @@ impl Shell {
                 .find(|c| state.channels.get(c).is_some_and(ChannelState::is_extern))
             {
                 eprintln!(
-                    "[driver-cuda] bind_instance: channel {cid} is declared extern \
-                 and this driver allocates one ring per session, so the two \
-                 programs sharing it would not share cells or cursors. \
-                 Refusing rather than binding a ring nobody fills."
+                    "[driver-cuda] bind_instance: channel {cid} is declared extern. \
+                 The RING is shared now — `program::channel::Rings` registers a \
+                 channel once and every instance that names it holds the same \
+                 slot — but nothing here reads the import/export direction, so \
+                 which program may publish and which may consume is unchecked. \
+                 Refusing rather than guessing it."
                 );
                 return Err(driver_api::PIE_STATUS_UNSUPPORTED);
             }
@@ -474,6 +476,13 @@ impl Shell {
                     program_id: desc.program_id,
                     geometry_class,
                     channel_ids: desc.channel_ids.clone(),
+                    // KEPT, not applied: see `InstanceEntry::seeds`. A cell's
+                    // home is a device ring and there is no allocator here.
+                    seeds: desc
+                        .seed_values
+                        .iter()
+                        .map(|value| (value.channel, value.bytes.clone()))
+                        .collect(),
                 },
             );
             Ok(InstanceBinding {
@@ -667,6 +676,7 @@ mod tests {
             program_id: 1,
             geometry_class: 0,
             channel_ids: ids,
+            seeds: Vec::new(),
         };
 
         // The list is the INSTANCE's order, not the map's.

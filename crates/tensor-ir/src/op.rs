@@ -1,7 +1,7 @@
 //! The PTIR op set — the closed first-party core plus the
 //! channel / intrinsic / kernel / sink carrier ops, with its **op table** (the
-//! single source of truth for op ids, names, families, and arities; the C++
-//! header `include/ptir_abi.h` is generated from [`OP_TABLE`]).
+//! single source of truth for op ids, names, families, and arities, which
+//! every backend reads from [`OP_TABLE`] rather than from a copy).
 //!
 //! ## Relation to PSIR v4
 //!

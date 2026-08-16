@@ -41,10 +41,26 @@ lints, which is the same as not firing.
 The gates cannot reach the crates where this bug hides best. `pie`,
 `engine` and `worker` are ungated on warning count; `driver-cuda` and
 `kernels-cuda` need `nvcc`; `kernels-vulkan` and `driver-vulkan` need
-`glslc`; `driver-metal` and `kernels-metal` need a Mac. That is nine of
+`slangc`; `driver-metal` and `kernels-metal` need a Mac. That is nine of
 thirty-five members where `unexpected_cfgs` will not be denied on this
 job, and they are disproportionately the ones with interesting `cfg`s --
 a crate has feature-gated code precisely when it has optional backends.
+
+The `kernels-cuda` in that list is the ARCHIVE crate and its reason has
+since inverted, which is worth catching before someone reads it as still
+true. That crate built `libpie_kernels_cuda.a` with CMake and nvcc under a
+`native` feature, so `nvcc` was exactly what kept a gate off it; it was
+deleted at `85c6c674b` and the JIT crate that took the name needs no toolkit
+at all. Its `build.rs` writes a text file and says so in as many words, its
+`cudarc` is `fallback-dynamic-loading` and optional, and NVRTC compiles the
+device sources at RUN time -- so it builds on a machine that has never seen
+a GPU, and `nvcc` is no longer a reason for anything.
+
+The crate is still uncovered, for a duller reason: it is not among the
+packages the workspace `cargo clippy -- -D warnings` step names. So the tally
+above survives its own argument, and it is left standing rather than
+recounted -- but the entry it rests on should be read as "not selected", not
+as "cannot be built here".
 
 This audit needs no compiler, no toolkit and no GPU, so it covers all of
 them uniformly. It is strictly weaker than the lint on the crates the

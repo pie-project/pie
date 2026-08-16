@@ -10,6 +10,24 @@ repository = "https://github.com/pie-project/pie"
 [features]
 profile-fire = ["worker/profile-fire"]
 
+# Which backends the embedded engine can host.
+#
+# `default` keeps what this wheel has always built, so nothing that builds it
+# today changes. What is new is that the OTHER three are reachable:
+# `maturin build --no-default-features --features driver-wgpu` produces a wheel
+# whose `pie.server.Server` hosts WebGPU, which is what the curated inferlet
+# harness needs to measure a backend other than CUDA.
+#
+# They were not reachable before, and the comment on the `worker` dependency
+# said they were -- "Build the embedded drivers into the Python engine so
+# `pie.server.Server` can host the same local flavors as `pie serve`". `pie
+# serve` can host four; this wheel could host one.
+default = ["driver-cuda"]
+driver-cuda = ["worker/driver-cuda"]
+driver-metal = ["worker/driver-metal"]
+driver-vulkan = ["worker/driver-vulkan"]
+driver-wgpu = ["worker/driver-wgpu"]
+
 [lib]
 name = "pie_engine"
 crate-type = ["cdylib"]
@@ -18,11 +36,20 @@ path = "src/lib.rs"
 [dependencies]
 # `worker` is the engine library — we link the same `serve::start_engine`
 # the CLI uses, so the CLI and the pyo3 wheel can never drift in their boot
-# behavior. Build the embedded drivers into the Python engine so
-# `pie.server.Server` can host the same local flavors as `pie serve`
-# (`driver-metal` is added on Apple-Silicon builds).
-worker = { path = "../../../crates/worker", default-features = false, features = ["driver-cuda"] }
+# behavior.
+#
+# WHICH drivers is a build choice now, made by the `[features]` table above
+# rather than pinned here. It used to say `features = ["driver-cuda"]` under a
+# comment claiming the wheel hosted "the same local flavors as `pie serve`",
+# and a claim nobody could act on is what that was: the feature list was not
+# forwarded, so no build command could select anything else.
+worker = { path = "../../../crates/worker", default-features = false }
 pyo3 = { version = "0.29", features = ["extension-module"] }
 tokio = { version = "1.53", features = ["rt-multi-thread"] }
 toml = "1.1"
 anyhow = "1.0"
+# The embedded engine emits `tracing` events exactly as the CLI does, but a
+# `tracing` event with no subscriber installed is discarded silently. Without
+# this the wheel is mute: an engine-side WARN explaining why a request failed
+# never reaches the Python process, and `RUST_LOG` appears to do nothing.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -37,9 +37,9 @@
 //!
 //! # A verb that has already finished still has to say so
 //!
-//! `copy_kv` and `resize_pool` are host work -- this driver's buffers are
-//! coherent, so the first is a `memmove` and the second an allocation, and
-//! both are done by the time the verb returns. This seam took that to mean
+//! `copy_kv` and `resize_pool` both finish before the verb returns -- the
+//! first submits to the copy engine and waits on it, the second allocates --
+//! so there is nothing in flight either way. This seam took that to mean
 //! there was nothing to settle, minted a completion and dropped its target.
 //!
 //! The engine then waited forever. Measured here, on `prefix-tree-kv-cache`,
@@ -54,38 +54,32 @@
 //! fails elsewhere, with `pipeline is closed` and no driver fault and no
 //! stall, exactly as the wgpu seam does after the same repair.
 //!
-//! That second failure is not this driver's, and it is worth saying WHY
-//! rather than only that. Backtracing every `PipelineScope::close` through
-//! the run puts the call in the GUEST: `run_ahead` closes its pipeline the
-//! instant the budget is spent, which is `Pipeline`'s own documented rule and
-//! is worth +9.5% to +18.7% to a lane that owns its stream. This example does
-//! not own its stream -- it builds four leaves on one `tree_pipeline` and
-//! then generates from each, so the first leaf's `run_ahead` closes the
-//! pipeline the other three still need.
+//! That second failure was not this driver's either, and naming it took
+//! three tries. It reads as an engine/guest contract problem -- `run_ahead`
+//! closes its pipeline the instant the budget is spent, so a stream shared
+//! by four leaves is closed after the first -- and this note once recorded
+//! that as unfixable here, because giving each leaf its own pipeline seemed
+//! to trade the refusal for `KV working set is already scoped to pipeline
+//! ...`. It does not: `claim_pipeline_scope` lets a closed and drained scope
+//! be succeeded, and the example had ALREADY been rewritten to one pipeline
+//! per leaf.
 //!
-//! The obvious repair does not work either, which is what makes it a contract
-//! problem rather than a typo. Giving each leaf its own pipeline trades one
-//! engine refusal for the other:
+//! What was actually left was a stale artifact. The inferlet harness runs
+//! prebuilt `.wasm` files and never builds them, so the fixed guest was
+//! never the guest under test. Probing `pipeline::new` in the host settled
+//! it in one run: five guest `Pipeline::new()` calls reached the host ONCE.
+//! Rebuilt, the example passes. The lesson is worth more than the fix -- a
+//! sweep over prebuilt guests can attribute the GUEST's old shape to the
+//! driver, and it did, for two segments.
 //!
-//! ```text
-//! pipeline: KV working set is already scoped to pipeline 0000..0001
-//! ```
-//!
-//! because a working set is scoped to the first pipeline that fires it and
-//! the scope is reclaimable only once the old one has both closed AND
-//! drained. So the example is caught between two rules, and no `run_ahead`
-//! variant that leaves the stream open exists to escape them. Reported with
-//! the mechanism, not fixed here: the fix is a decode loop's shape, and this
-//! is a driver.
-//!
-//! `beam-search`, the other forking example, obeys both rules -- one
-//! pipeline, one `run_ahead`, forks taken inside the callback -- and stops at
-//! a third wall that is also not a backend's: its per-lane ancestry mask is a
-//! channel-bound dense `AttnMask`, which `fire/geometry.rs` declines to the
-//! pool-owned device-geometry class because "the envelope composes batched
-//! lanes and has no per-lane mask state -- on any backend, not just this
-//! one". So no forking example completes here yet, and none of the three
-//! reasons is a Vulkan one. `Shell::fork` itself is measured, in
+//! `beam-search`, the other forking example, hit a third wall that WAS
+//! reachable from here: its per-lane ancestry mask is a channel-bound dense
+//! `AttnMask`, once declined to the pool-owned device-geometry class. That
+//! class is now served -- the driver reads the pages, the page CSR, the
+//! write descriptor and the mask rectangle, and a request that STATES its
+//! write target is believed over the derivation, which is the only thing
+//! that separates two beam lanes sharing a page and a position. All three
+//! forking examples pass. `Shell::fork` itself is measured, in
 //! `tests/device.rs`: a fork answers as its source does, diverges when fed
 //! different tokens, and refuses three ways.
 //!
@@ -375,36 +369,47 @@ impl Driver for VulkanDriver {
             rs_cache_required: false,
             rs_cache_slots: 0,
             rs_cache_slot_bytes: 0,
-            // Not elastic, and the reason is the COST rather than the
-            // ability. `Shell::resize_pool` works: it preserves the pages
-            // that survive, refuses by name a shrink that would strand a
-            // seated conversation, and leaves the pool untouched when the
-            // machine will not stage the new one. What it cannot be is
-            // CHEAP. `Pool::resize` reads every layer's whole buffer to host
-            // memory and writes the survivors into a fresh one, so the charge
-            // is the pool's size twice over and not the delta's.
+            // ELASTIC, and it took making it true rather than arguing it.
             //
-            // Measured at 256 pages of qwen3-0.6b: handing back one page
-            // takes 2.77 s and handing back a hundred and twenty-six takes
-            // 0.74 s -- the deeper cut is nearly four times cheaper, because
-            // it fills a smaller destination. The cheapest trim this pool
-            // offers is the largest one, which is the opposite of what a trim
-            // task is for. It also peaks at both sizes at once, so a shrink
-            // asked for under memory pressure needs more memory than not
-            // shrinking at all.
+            // These were zero, and the reason given was the COST rather than
+            // the ability: `Pool::resize` read every layer's whole buffer
+            // down to host memory and wrote a fresh one back up, so the
+            // charge was the pool's size TWICE across the bus and not the
+            // delta's. Measured at 256 pages of qwen3-0.6b, handing back one
+            // page took 2.77 s and handing back a hundred and twenty-six took
+            // 0.74 s -- the deeper cut was CHEAPER, because it filled a
+            // smaller destination. The cheapest trim that pool offered was
+            // the largest one, which is the opposite of what a trim task is
+            // for.
             //
-            // So both numbers are zero together, which is the condition
-            // `bootstrap` reads before it starts a trim task at all, and the
-            // task never starts.
+            // The cost was in the route, not the pool. A resize now moves the
+            // pages it keeps with `vkCmdCopyBuffer` and zero-fills a grow's
+            // tail with `vkCmdFillBuffer`, so nothing crosses the bus and no
+            // host memory is held at all. The same two shrinks take 20.5 ms
+            // and 18.6 ms, and a grow back to full takes 20.0 ms: a hundred
+            // and thirty-five times cheaper, and no longer inverted.
             //
-            // This said "nothing can be given back page-wise" until it was
-            // measured, and that was false -- a shrink does free the old
-            // buffers, at any granularity asked for. Right answer, wrong
-            // reason. `giving_back_one_page_costs_what_giving_back_half_the_
-            // pool_costs` in `tests/device.rs` now pins the real one, and
-            // goes red if this pool ever becomes page-wise.
-            elastic_page_bytes: 0,
-            elastic_budget_pages: 0,
+            // The other objection is answered too. A trim exists for when
+            // memory is short, and a shrink that first needs the whole pool
+            // again fails exactly when it is wanted -- so a SHRINK migrates
+            // layer by layer and peaks at the old pool plus one layer of the
+            // new, while a GROW keeps the all-or-nothing swap that makes a
+            // failed grow leave the pool untouched.
+            //
+            // What the engine does with this: `bootstrap` starts its trim
+            // task only when both numbers are non-zero, and the task targets
+            // the committed HIGH WATER, which is monotonic. So a server pays
+            // one resize to come down from its configured capacity to its
+            // working size and then skips every later tick, which is the
+            // shape this pool is now good at.
+            //
+            // `elastic_page_bytes` is what one page costs ACROSS the pool --
+            // both halves of every layer -- because that is what is handed
+            // back per page, and `Shape::page_bytes` says so in one place.
+            // The budget is the pool the driver was opened with; this backend
+            // has no separate device-wide elastic heap to draw on.
+            elastic_page_bytes: shape.page_bytes(),
+            elastic_budget_pages: u64::from(shape.pages),
             has_mtp_logits: false,
             has_mtp_drafts: false,
             has_value_head: false,
@@ -416,7 +421,45 @@ impl Driver for VulkanDriver {
             has_attn_page_mask: false,
             has_lora: false,
             model_site_summary: ::driver_api::ModelSiteSummary::default(),
-            device_geometry_port_mask: ::driver_api::PIE_DECODE_ENVELOPE_PORTS,
+            // The decode envelope's ports, plus the device-geometry class's
+            // four adds and the dense mask.
+            //
+            // `envelope::fill` answers all three from ONE resolution:
+            // `DecodeEnvelope`'s tokens/positions/kv_len are read off it, and
+            // a `DeviceGeometry` member's pages, page CSR, write descriptor
+            // and last-page length are READ rather than derived. ATTN_MASK is
+            // in the claim because the same function resolves it: a dense
+            // per-lane mask off `driver::Geometry::mask`, re-encoded as the
+            // runs every other path in this driver reads, decoded by
+            // `frames::requests_of` into allow-bytes and packed by
+            // `resources::Frame::of` into the rectangle
+            // `attn/sdpa_paged.comp` indexes at the pitch `Pool::number`
+            // hands it.
+            //
+            // Without the mask bit the engine refuses such a program at
+            // classification -- "a channel-bound dense AttnMask belongs to
+            // the pool-owned device-geometry class" -- and sends it down a
+            // host fallback that cannot derive `EmbedTokens`. That cost eight
+            // of the fifteen curated failures on this backend, every one of
+            // them reported as `EmbedTokens is not host-derivable: channel N
+            // has no host-known value`, which names the symptom and not the
+            // claim that produced it.
+            device_geometry_port_mask: ::driver_api::PIE_DECODE_ENVELOPE_PORTS
+                | ::driver_api::PIE_DEVICE_GEOMETRY_PORTS
+                | ::driver_api::PIE_DEVICE_PORT_ATTN_MASK,
+            // Per STEP, and measurably so: `launch` above calls
+            // `envelope::fill` inside the per-step loop and answers
+            // `Filled::Early` for a channel that is still empty, rather than
+            // converting the whole frame up front. That is what lets slot 1
+            // consume what slot 0 published.
+            //
+            // Left at the default this cost the same eight inferlets a second
+            // time, one wall further in: once the mask claim above let the
+            // pass be admitted as device-geometry, `pipeline::fire` refused
+            // the frame with "slot 0 resolves its descriptors on the HOST",
+            // which is a true sentence about `FramePrepare` and a false one
+            // about this driver.
+            resolves_geometry_per_step: true,
             // The ceilings a batch is formed under, and they are the arena's:
             // `Shell::open` sizes one fire's scratch, and a fire wider than
             // this has nothing to run in.
@@ -558,8 +601,12 @@ impl Driver for VulkanDriver {
         for sub in &frame.steps {
             let filled = driver_vulkan::envelope::fill(&self.programs, frame, sub, page)
                 .map_err(|e| anyhow!("driver-vulkan: {e}"))?;
-            let plan = match filled {
-                driver_vulkan::envelope::Filled::Ready(plan) => plan,
+            let (plan, traced, writes) = match filled {
+                driver_vulkan::envelope::Filled::Ready {
+                    plan,
+                    traced,
+                    writes,
+                } => (plan, traced, writes),
                 // Nothing to fire and nothing wrong: the producer has not
                 // run. Every member of this step is told to come back, which
                 // is what the scheduler's re-post is for.
@@ -582,7 +629,7 @@ impl Driver for VulkanDriver {
             };
             let (requests, tokens) = self
                 .shell("launch")?
-                .prepare(&plan)
+                .prepare(&plan, &traced, &writes)
                 .map_err(|e| anyhow!("driver-vulkan: {e}"))?;
             let step = self
                 .shell("launch")?
@@ -648,12 +695,19 @@ impl Driver for VulkanDriver {
 
     /// Move KV pages, and the rows inside them, within this pool.
     ///
-    /// The move itself is finished on return: every buffer this driver
-    /// allocates is host-visible and coherent, so it is a host `memmove` with
-    /// no command buffer and nothing in flight. The COMPLETION is a separate
-    /// fact, and this seam used to get it wrong -- it minted one and dropped
-    /// the target, so the engine waited on an op nobody would ever settle.
-    /// [`settle_control`] does both halves; see it for the order.
+    /// The move itself is finished on return: the copy engine's submission is
+    /// waited on inside [`driver_vulkan::device::Device::copy_within`], so
+    /// there is nothing in flight when this returns. That used to be true for
+    /// a different reason -- it was a host `memmove` through a mapping, with
+    /// no command buffer at all -- and the reason was the problem: mappable
+    /// VRAM here is write-combined, so moving one page of this model's cache
+    /// cost about 63 ms. On the copy engine it costs about 3.4 ms, and the
+    /// bytes were never wrong either way.
+    ///
+    /// The COMPLETION is a separate fact, and this seam used to get it wrong
+    /// -- it minted one and dropped the target, so the engine waited on an op
+    /// nobody would ever settle. [`settle_control`] does both halves; see it
+    /// for the order.
     ///
     /// # Errors
     ///
@@ -1028,7 +1082,7 @@ fn text_of(
     row: &'static dyn model::catalog::Variant,
 ) -> Result<(driver_vulkan::shell::Text, model::deployment::Deployment)> {
     use model::catalog::Deployed;
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     // The build's kernel capabilities, and nothing about the model. g64/b4 is
     // what `mlx-community` publishes and what every measurement in
@@ -1094,7 +1148,7 @@ fn text_of(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     /// A member skipped for being early is FAILED, not RETRY.
     ///

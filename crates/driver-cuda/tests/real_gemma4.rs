@@ -58,7 +58,7 @@ use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps}
 use model::gemma_4::forward::facts::{Gemma4CudaFacts, Gemma4Facts};
 use model::gemma_4::forward::gemma4_cuda;
 use model_compiler::lower::{Arg, Fire, Row, lower};
-use model_compiler::trace::{FireClass, ValueId};
+use model_ir::trace::{FireClass, ValueId};
 
 mod common;
 use common::{device_or_skip, gpu_guard};

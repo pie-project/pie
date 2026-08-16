@@ -8,12 +8,20 @@
 //!
 //! ## The ABI projections — one declaration, many languages
 //!
-//! * [`header`] — the deterministic C ABI header (`include/ptir_abi.h`): op
-//!   tags, dtype/stage/port enums, and the arity table the drivers switch on.
-//! * [`rng`] — the CUDA/C++ (`include/rng_contract.generated.h`) and MSL
-//!   (`include/ptir_rng.generated.metal`) projections of the canonical RNG
-//!   contract in [`tensor_ir::rng`].
-//! * [`layout`] — the lane-table field list, printed as C and as MSL and
+//! A C header (`include/ptir_abi.h`) used to head this list, printing the op
+//! tags, the dtype/stage/port enums and the arity table for the C++ drivers to
+//! `#include`. Those drivers are gone — every backend is Rust now and reads
+//! [`tensor_ir`] directly — and the header went with them: nothing in the tree
+//! had `#include`d it since, and NVRTC is called with no include path at all
+//! (see `driver_cuda::program::compile`), so there was no path by which a
+//! device compile could have reached it.
+//!
+//! * [`rng`] — the MSL projection (`include/ptir_rng.generated.metal`) of the
+//!   canonical RNG contract in [`tensor_ir::rng`], plus the `__device__` CUDA
+//!   text [`cuda`] splices into every emitted source. The C++ header form of
+//!   that same text was deleted for the reason above; the CUDA projection
+//!   survives because the emitter, not a compiler include path, consumes it.
+//! * [`layout`] — the lane-table field list, printed as MSL and as CUDA and
 //!   pinned to the [`crate::codegen::plan`] `#[repr(C)]` structs with `offset_of!`. Adding
 //!   a field to one side without the other is a compile error rather than a
 //!   silent offset shift.
@@ -54,7 +62,6 @@ pub mod alias;
 pub mod cuda;
 pub mod error;
 pub mod fault;
-pub mod header;
 pub mod launch;
 pub mod layout;
 pub mod metal;

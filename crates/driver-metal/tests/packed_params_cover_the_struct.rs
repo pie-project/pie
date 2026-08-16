@@ -21,12 +21,12 @@
 
 use std::collections::BTreeSet;
 
-use driver_metal::lowering::dispatch::{Dispatch, Geometry, plan_one};
+use driver_metal::lowering::dispatch::{Dispatch, Geometry, plan_launch};
 use driver_metal::lowering::executor::{Frame, Resolver, Slice};
 use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
 use model::shared::llama_like::forward::llama_like_metal;
 use model_compiler::lower::{Fire, Lowered, Row, lower};
-use model_compiler::trace::{FireClass, ValueId};
+use model_ir::trace::{FireClass, ValueId};
 
 /// Answers every name with a generous region — this test reads SCALARS.
 #[derive(Default)]
@@ -61,6 +61,7 @@ fn geometry(f: &LlamaLikeFacts) -> Geometry {
         rotary_dims: f.head_dim,
         n_experts: f.n_experts,
         experts_per_token: f.experts_per_token,
+        ..Geometry::default()
     }
 }
 
@@ -92,16 +93,16 @@ fn planned<'a>(low: &'a Lowered, f: &LlamaLikeFacts) -> Vec<Dispatch<'a>> {
     let mut store = Sentinels;
     low.launches
         .iter()
-        .filter_map(|l| {
-            plan_one(
+        .flat_map(|l| {
+            plan_launch(
                 low,
                 l,
-                kernels_metal::KERNELS,
                 frame,
                 geometry(f),
                 &mut store,
             )
             .ok()
+            .unwrap_or_default()
         })
         .collect()
 }

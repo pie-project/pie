@@ -15,16 +15,16 @@
 use serde::{Deserialize, Serialize};
 
 /// This family's MLA geometry IS the shared one — see
-/// [`model_compiler::facts::MlaFacts`]. Three families carried
+/// [`model_ir::facts::MlaFacts`]. Three families carried
 /// field-identical copies of it; the alias keeps every existing spelling
 /// working while there is only one definition to disagree with.
-pub type KimiMlaFacts = model_compiler::facts::MlaFacts;
+pub type KimiMlaFacts = model_ir::facts::MlaFacts;
 
 /// This family's mixture IS the shared one — see
-/// [`model_compiler::facts::MoeFacts`]. Three families carried
+/// [`model_ir::facts::MoeFacts`]. Three families carried
 /// field-identical copies; the alias keeps every spelling working while
 /// there is one definition.
-pub type KimiMoeFacts = model_compiler::facts::MoeFacts;
+pub type KimiMoeFacts = model_ir::facts::MoeFacts;
 
 /// The whole family.
 ///
@@ -50,7 +50,7 @@ impl KimiFacts {
     ///
     /// The shared predicate, named locally. Four families spell this
     /// call and the LOGIC is already shared -- `after_dense_prefix`
-    /// lives in `model_compiler::facts` for exactly that reason, and its
+    /// lives in `model_ir::facts` for exactly that reason, and its
     /// own doc explains why it is named for the PREFIX rather than for
     /// the mixture. What is left here is a one-line projection onto this
     /// family's own field, which is cheaper than the trait that would
@@ -58,7 +58,7 @@ impl KimiFacts {
     /// machinery than the line it replaces.
     #[must_use]
     pub fn is_moe_layer(&self, l: u32) -> bool {
-        model_compiler::facts::after_dense_prefix(self.dense_layers, l)
+        model_ir::facts::after_dense_prefix(self.dense_layers, l)
     }
 
     /// `moonshotai/Kimi-K2-Instruct`, read off its config the way the

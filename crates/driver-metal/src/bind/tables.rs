@@ -11,8 +11,9 @@
 //! One builder, and the resolver's index map beside it. What a caller supplies
 //! is the FRAME's data; what this owns is the order.
 
-use crate::device::{Allocation, Context};
+use crate::device::{Context, Handle};
 use crate::error::Result;
+use crate::fire::scratch::{Lease, Scratch};
 use crate::layout::region::Region as _;
 use crate::lowering::executor::{FireTable, Slice};
 
@@ -40,7 +41,15 @@ pub struct Frame<'a> {
     pub kv_write_offset: &'a [u32],
     /// The rotary inverse frequencies, as f32 bits.
     pub rope_frequencies: &'a [u32],
-    /// Which rows the readout samples, one per request.
+    /// Which rows of the FIRE the readout samples, in fire order.
+    ///
+    /// ABSOLUTE, and not what the wire carries. `Step::sampling_indices` is
+    /// numbered inside the request that named it, and `row_gather` indexes
+    /// the fire's stream with whatever is here -- so the two are different
+    /// numbers wherever a fire has more than one request, and the wrong one
+    /// reads a different token's hidden state without failing.
+    /// [`crate::lowering::frame::sampled_rows`] is the translation, and the
+    /// only one; nothing else may fill this.
     pub sampling_indices: &'a [u32],
 }
 
@@ -50,12 +59,32 @@ pub struct Staged {
     /// The region. **Held, not dropped** — every span points into it, and
     /// it is resident for exactly as long as this `Staged` lives, so it must
     /// outlive the fire that binds it rather than the loop that stages it.
-    pub region: Allocation,
+    ///
+    /// LEASED from the fire's [`Scratch`], for the reason that module's doc
+    /// names: the tables are one of the three regions that vary between two
+    /// fires of one shape, and a region allocated fresh per fire has a new
+    /// address every fire. That is measured, not argued — a 32-step decode
+    /// loop with a `Recordings` on the side made **32 recordings for 32
+    /// decodes**, a 100 % miss rate, because `fingerprint` digests every
+    /// operand's address and nine of them point in here. Pooling the region
+    /// is what turns the recording cache from dead weight into the thing it
+    /// was built to be, and it closes the residency-set leak in the same
+    /// move.
+    region: Lease,
     /// Each table's `(start, len)`, in u32s, indexed as [`Frame`] declares.
     spans: Vec<(usize, usize)>,
 }
 
 impl Staged {
+    /// The region every span points into.
+    ///
+    /// What a caller registers with [`crate::device::Regions`], and what it
+    /// names as the null stand-in.
+    #[must_use]
+    pub fn region(&self) -> &Handle {
+        self.region.region()
+    }
+
     /// Where `which` is, or `None` for a table this fire has none of.
     ///
     /// A zero-length table answers `None` rather than an empty region: a slot
@@ -91,12 +120,12 @@ impl Staged {
     }
 }
 
-/// Stage every table of `frame` into one region.
+/// Stage every table of `frame` into one region, leased from `scratch`.
 ///
 /// # Errors
 ///
 /// The allocation or the write.
-pub fn stage(context: &Context, frame: Frame<'_>) -> Result<Staged> {
+pub fn stage(context: &Context, scratch: &Scratch, frame: Frame<'_>) -> Result<Staged> {
     let mut blob: Vec<u32> = Vec::new();
     let mut spans: Vec<(usize, usize)> = Vec::new();
     // The ORDER is the contract, and it is this list — `Staged::at` indexes
@@ -135,8 +164,11 @@ pub fn stage(context: &Context, frame: Frame<'_>) -> Result<Staged> {
     let enable_words = frame.token_ids.len().max(1);
     spans.push((blob.len(), enable_words));
     blob.extend(std::iter::repeat_n(0u32, enable_words));
-    let region = Allocation::new(context, ((blob.len() * 4).max(4)) as u64, "fire tables")?;
-    // SAFETY: freshly allocated and not yet encoded against.
+    let region = scratch.take(context, ((blob.len() * 4).max(4)) as u64, "fire tables")?;
+    // SAFETY: leased for this fire, and no fire that could still be reading a
+    // previous lease of it is in flight -- `Scratch` hands a region back only
+    // after the `InFlight` holding it has dropped, which is after the step
+    // that bound it retired. Every byte the spans name is written below.
     unsafe {
         let raw = core::slice::from_raw_parts(blob.as_ptr().cast::<u8>(), blob.len() * 4);
         region.write(0, raw)?;
@@ -161,6 +193,7 @@ mod tests {
         let ids = [7u32, 8, 9];
         let staged = stage(
             &context,
+            &Scratch::new(),
             Frame {
                 token_ids: &ids,
                 ..Frame::default()
@@ -217,6 +250,7 @@ mod tests {
         let (a, b) = ([1u32, 2], [3u32, 4, 5]);
         let staged = stage(
             &context,
+            &Scratch::new(),
             Frame {
                 token_ids: &a,
                 position_ids: &b,

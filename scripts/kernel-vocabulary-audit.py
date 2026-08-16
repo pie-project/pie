@@ -14,13 +14,42 @@ cannot be missed.
 import re, pathlib, collections
 
 ROOT = pathlib.Path(".")
-# Every header under csrc/src, at whatever depth. This used to name `ops/` and
+# Every header under the archive crate's `csrc/src`, at whatever depth. This used to name `ops/` and
 # `kernels/` explicitly; the refactor deleted both directories in favour of one
 # per family, and the glob went on matching nothing but `third_party`. The
 # audit did not notice -- it found five launchers, compared them against a
 # 192-row table, and reported ZERO UNDECLARED. A check that passes because it
 # stopped looking is worse than no check, so `rglob` here and the launcher
 # floor below exist together.
+#
+# BOTH PATHS BELOW ARE THE ARCHIVE CRATE'S, and the name has since been reused,
+# so the two strings no longer denote what they denoted when they were written.
+# `kernels-cuda` was the ahead-of-time crate: it built `libpie_kernels_cuda.a`
+# with CMake and nvcc, declared `links = "pie_kernels_cuda"`, and its `csrc/`
+# held the `.cu` translation units -- 138 of them until `345ea1ec6` turned
+# these kernels into a JIT -- the host `.hpp` these globs were written for,
+# and the `third_party/` tree the second one names. `efaad26b4` took the last
+# 46 `.cu`, `third_party/` and the `CMakeLists.txt` together; the crate itself
+# went at `85c6c674b`, seventeen surviving `.hpp` and all.
+#
+# What stands at `crates/kernels-cuda` now is the JIT crate that took the
+# name, and it is a different tree: 120 `.cuh` of DEVICE text under `kernels/`
+# that NVRTC compiles at run time, plus a `shim/` tree of device `.h`. I
+# counted zero `.cu`, zero `.cpp` and zero `.hpp` under either; the one `.hpp`
+# anywhere in that crate was a vendored `boost/math/ccmath/fabs.hpp` beneath
+# `shim/`, outside both globs and not a declaration of anything.
+#
+# So this audit finds zero launchers and the floor below fires. **That failure
+# is correct, and "Fix the glob" is not what it asks for.** A launcher is
+# defined a few lines down as a HOST C++ declaration whose parameter list
+# takes a `cudaStream_t` or a `cublasHandle_t`, and the live crate has no host
+# C++ to declare one in -- a row there names device text and a launch is a
+# `cuLaunchKernel` from Rust, so there is no such declaration to find and no
+# path under `crates/kernels-cuda` that could supply one. Repointing these two
+# globs at it would swap an honest failure for exactly the silent one the
+# paragraph above describes. Making this audit answer again means deciding
+# what "declared" MEANS for a crate whose device text is compiled at run time,
+# which is a design question and not a glob.
 HDRS = list((ROOT/"crates/kernels-cuda/csrc/src").rglob("*.hpp")) + \
        list((ROOT/"crates/kernels-cuda/csrc/third_party").rglob("*.hpp"))
 
@@ -58,9 +87,14 @@ for h in HDRS:
 # because only one side had been fenced. The table is ~192 rows and most rows
 # have a launcher, so anything under 100 means the scan lost the tree, not that
 # the tree lost its launchers.
+#
+# It is firing. I ran this and it exits 1 at zero launchers. The tree it was
+# guarding is deleted rather than moved, and the paragraph above `HDRS` says
+# why the message's "Fix the glob" is the one repair that must NOT be made --
+# read it before touching either path.
 if len(launchers) < 100:
     raise SystemExit(
-        f"only {len(launchers)} launchers found under crates/kernels-cuda/csrc "
+        f"only {len(launchers)} launchers found under crates/kernels-cuda "
         f"-- the headers moved and HDRS above no longer reaches them. This "
         f"audit reports nonsense rather than nothing when that happens: too "
         f"few launchers makes every table symbol look declared, and it prints "
@@ -73,6 +107,24 @@ if len(launchers) < 100:
 # kernel family now (`attn.rs`, `moe.rs`, ...) and `lib.rs` holds only the
 # concatenation. Reading the one file silently produced an EMPTY declared set,
 # which made this audit report every launcher in the tree as undeclared.
+#
+# THIS `crates/kernels-cuda` IS THE LIVE JIT CRATE -- not the archive the two
+# globs above name, and one path prefix denoting two different crates within
+# one file is the whole trap the name reuse laid. Here the path is right: the
+# rows MOVED into the JIT crate rather than being copied there, precisely so
+# that one symbol would have one contract, and the archive then re-exported
+# them back through an edge in the opposite direction. That inversion is why
+# deleting it at `85c6c674b` moved no rows.
+#
+# What this glob actually reaches, measured rather than assumed: 16 top-level
+# `.rs`, 171 symbols, so the floor below does not fire. It does not descend --
+# `glob`, not `rglob` -- and five families are DIRECTORIES in that crate now
+# (`attn/`, `cascade/`, `comm/`, `gemm/`, `jit/`), so their rows are outside
+# `declared`. The parenthesis above still says `attn.rs`, which is the shape
+# that file had before it grew a directory. A symbol declared only under one
+# of those five would be reported here as undeclared; whether that is worth
+# an `rglob` is a live question and not a typo, so it is recorded and not
+# quietly changed.
 tbl_src = "".join(
     p.read_text() for p in sorted((ROOT/"crates/kernels-cuda/src").glob("*.rs"))
 )
@@ -136,6 +188,17 @@ EXPECTED_RESIDUE = [
      "records; declaring one would make the table claim a statement exists\n"
      "that does not."),
     ("prepare_attention_", "prefix", None),   # same reason as the line above
+    # `kernels-cuda/comm/` in the reason below is the ARCHIVE crate's
+    # `csrc/src/comm/`, where `custom_all_reduce.cu` sat until `19a8db2ea`.
+    # Read against the crate holding that name today the sentence inverts, so
+    # it is worth stating which half survived: the ROWS came down into the JIT
+    # crate's `src/comm/mod.rs`, the KERNEL did not. That module resolves the
+    # cross product and then declines every point of it, because the flashinfer
+    # tree it would need is CPM-fetched rather than vendored and its `comm/`
+    # directory is not in `csrc/`. So the excuse below still holds -- no trace
+    # names this, the model C++ reaches it as a method on the TP plane -- but
+    # it holds for the reason it always did, not because a kernel is waiting
+    # somewhere for a row.
     ("all_reduce_", "prefix",
      "a COLLECTIVE, and the shell's to schedule. The kernel moved to\n"
      "kernels-cuda/comm/ because it computes (a reduction fused with a\n"
@@ -193,6 +256,11 @@ if stale:
     print("\nNOTE: nothing matched these entries any more, so they now excuse")
     print("nothing and can go: " + ", ".join(stale))
 
+# `crates/kernels-cuda/src/<family>.rs` in the message below is the LIVE JIT
+# crate -- the same referent as the table read above, and NOT the archive the
+# `HDRS` globs name. Adding a row there is still the right instruction; it is
+# only worth saying which crate it lands in, because this file now spells two
+# different crates the same way.
 unexpected = sorted(n for n in total_gap if not excused(n))
 if unexpected:
     raise SystemExit(

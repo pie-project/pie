@@ -54,7 +54,6 @@
 //! channel path.
 
 use driver::driver_api::plan::{LaunchOp, LaunchStagePlan};
-use driver::tensor_ir::DType;
 use driver::tensor_ir::op::{IntrinsicId, tags};
 use driver::{
     Diagnosis, Extents, LANE_HEADER_BYTES, LANE_RECORD_BYTES, LANE_SLOT_BYTES, LaneChannelSlot,
@@ -88,10 +87,29 @@ const FUSED_ARITY: usize = 16;
 /// somebody else's.
 #[derive(Clone, Copy)]
 pub struct Lane<'a> {
-    /// The instance's own channel rings.
+    /// The driver's channel-ring registry. ONE for every lane: a channel has
+    /// one ring wherever it is named from.
     pub rings: &'a Rings,
+    /// This member's dense channel index → registry slot. What makes the
+    /// lanes different, now that the registry does not.
+    pub slots: &'a [u32],
     /// How much this member submitted.
     pub extents: Extents,
+}
+
+impl Lane<'_> {
+    /// The registry slot this member's dense channel `dense` lives at.
+    fn slot(&self, dense: u32) -> Result<usize> {
+        self.slots
+            .get(dense as usize)
+            .map(|&g| g as usize)
+            .ok_or_else(|| {
+                Error::invalid(
+                    "program::run",
+                    format!("channel {dense} is not one this instance carries"),
+                )
+            })
+    }
 }
 
 /// One fire's device state, ready to launch.
@@ -277,7 +295,7 @@ impl Prepared {
             // its own slot row — so that is a change of caller, not of
             // layout. Nothing groups yet, so nothing here has to choose.
             for (local, &dense) in plan.channel_bindings.iter().enumerate() {
-                let channel = dense as usize;
+                let channel = member.slot(dense)?;
                 let cursor = cursors.get(channel).ok_or_else(|| {
                     Error::invalid(
                         "program::run",
@@ -341,7 +359,8 @@ impl Prepared {
                 // fire binds the SAME plan, so the channel geometry is
                 // the plan's and not the member's — only the cursors
                 // differ, which is why those are read per lane above.
-                let shape = lanes_in[0].rings.shape(dense as usize).ok_or_else(|| {
+                let slot = lanes_in[0].slot(dense)?;
+                let shape = lanes_in[0].rings.shape(slot).ok_or_else(|| {
                     Error::invalid(
                         "program::run",
                         format!(
@@ -451,10 +470,25 @@ impl Prepared {
     /// | table | becomes | is |
     /// |---|---|---|
     /// | `bases` | the operand pointer | the buffer's device address |
-    /// | `modes` | `p.intrinsic_dtype` | a `DType` wire code |
+    /// | `modes` | `p.intrinsic_dtype` | an [`INTRINSIC_STORAGE_*`](super::params) code |
     /// | `widths` | `p.imm` | the row width, e.g. the vocabulary |
     /// | `strides` | `p.intrinsic_row_stride` | ELEMENTS between rows |
     /// | `offsets` | `p.intrinsic_row_offset` | which row THIS lane reads |
+    ///
+    /// # `modes` is a STORAGE mode and was written as a `DType`
+    ///
+    /// `m1_intrinsic_row_base` reads it as one — `mode == 0` strides four
+    /// bytes per element and `mode == 1` strides two and widens
+    /// `value << 16`. It is not a `DType` wire code, and the two agree on
+    /// exactly one value: `DType::F32 as u8` is `0`, which is
+    /// `INTRINSIC_STORAGE_F32`.
+    ///
+    /// So a caller that wrote `DType::F32` for a buffer the fire filled with
+    /// BF16 got a sampler reading every logit as one half of a pair of them,
+    /// widened to a float that is not a number the model produced. It does
+    /// not fault: the argmax picks whichever lane the reinterpretation
+    /// favours, deterministically, so the fire returns the SAME wrong token
+    /// every step and the output is one word repeated.
     ///
     /// The row offset is per lane and everything else is not, which is the
     /// only asymmetry: one buffer, one layout, and each lane reading its
@@ -470,7 +504,7 @@ impl Prepared {
         &mut self,
         intr: IntrinsicId,
         base: u64,
-        dtype: DType,
+        storage: u32,
         width: u32,
         row_stride: u32,
         row_of: impl Fn(u32) -> u32,
@@ -494,11 +528,8 @@ impl Prepared {
             let at = lane as usize * INTRINSIC_SLOTS + slot;
             self.intrinsic_bases
                 .write_at(at * size_of::<u64>(), &base.to_le_bytes(), stream)?;
-            self.intrinsic_modes.write_at(
-                at * size_of::<u32>(),
-                &(dtype as u8 as u32).to_le_bytes(),
-                stream,
-            )?;
+            self.intrinsic_modes
+                .write_at(at * size_of::<u32>(), &storage.to_le_bytes(), stream)?;
             self.intrinsic_widths
                 .write_at(at * size_of::<u32>(), &width.to_le_bytes(), stream)?;
             self.intrinsic_strides.write_at(
@@ -1124,9 +1155,11 @@ mod tests_2 {
 // because on CUDA those are *prebuilt*. The C++ driver's prebuilt copies live
 // in `driver-cuda/csrc/src/pipeline/channels.hpp`, a private header of a
 // crate this one is replacing. They are not in `libpie_kernels_cuda.a`: the
-// kernel table has no row for them, `kernels-cuda/csrc` includes
+// kernel table has no row for them, the ARCHIVE crate's `csrc` includes
 // `channels.hpp` nowhere, and `driver-cuda --features bridge` therefore
-// links an archive containing neither symbol.
+// links an archive containing neither symbol. That crate and its archive are
+// gone, deleted at `85c6c674b`, and `bridge` went before them; the argument
+// below is why neither was the answer here even while both existed.
 //
 // So they have to come from somewhere, and there are two honest options: add
 // them to the kernels crate and build them with nvcc, or compile them here

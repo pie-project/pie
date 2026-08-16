@@ -33,7 +33,7 @@ use crate::lowering::executor::{Resolver, Slice};
 
 /// The scales sidecar, which no checkpoint spells two ways.
 static SCALES: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| ".scales".to_string());
-use model_compiler::trace::ValueId;
+use model_ir::trace::ValueId;
 
 /// How a checkpoint spells what a text names — [`model`]'s map, re-exported.
 ///

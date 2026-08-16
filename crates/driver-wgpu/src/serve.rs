@@ -56,17 +56,19 @@
 //!
 //! Every rectangle of a real plan binds the arena both readable and writable —
 //! its input is one range and its output is another — and **WebGPU refuses a
-//! dispatch that does that**, however far apart the two ranges are. See
+//! dispatch that binds one buffer both READABLE and WRITABLE**, however far
+//! apart the two ranges are. Two WRITABLE bindings are fine, which is the way
+//! out and the reason the shader tree declares no `var<storage, read>`. See
 //! [`crate::device`]'s own section for the rule and the citation.
 //!
 //! Nothing in this file handles it, and that is deliberate:
 //! [`crate::device::Device::run_all`] shadows the read side into a scratch
-//! buffer, so a fire is written the way a fire would be written on any backend
-//! and the workaround lives at the one layer that can see a whole dispatch's
-//! bindings at once. What this file does is REPORT it — [`Fired::shadowed`] is
-//! how many copies a fire paid for — because the number is large, it is the
-//! price of the arena being one allocation, and a cost nobody can see is a cost
-//! nobody fixes.
+//! buffer for any dispatch that still needs it, so a fire is written the way a
+//! fire would be written on any backend. What this file does is REPORT it —
+//! [`Fired::shadowed`] is how many copies a fire paid for — and the number is
+//! now ZERO for every real plan, which is worth reporting for exactly the
+//! reason the large number was: a cost nobody can see is a cost nobody
+//! fixes, and one `read` declaration brings all 451 of them back.
 
 use model_compiler::lower::Lowered;
 
@@ -201,20 +203,29 @@ pub struct Fired {
     /// One, unless [`Fire::one_at_a_time`] asked otherwise — in which case it is
     /// [`Self::dispatches`], and the difference between the two numbers is the
     /// only externally visible sign of which path ran.
+    ///
+    /// **Counted since it was found to be a lie.** This was the literal `1`
+    /// for as long as the field existed, and the queue was getting 735 for a
+    /// real 452-launch decode: [`crate::device::Device::run_all`] opened a
+    /// fresh encoder either side of every shadow point, and 451 of 452
+    /// launches shadow something. Merging them into one encoder took a decode
+    /// from 31.9 ms to 20.5 ms on an RTX 4090. A field whose whole purpose is
+    /// that a caller "cannot tell a fire that ran from one that quietly ran
+    /// less" was reporting a constant.
     pub submissions: usize,
     /// How many read-only operands had to be copied out of a buffer their own
     /// dispatch also writes.
     ///
-    /// **The cost of the arena being one allocation**, and it is reported rather
-    /// than hidden because it is large and because it is not this backend's to
-    /// fix. WebGPU refuses a dispatch that binds one buffer both readable and
-    /// writable — see [`crate::device`]'s module docs for the rule and the
-    /// citation — and a plan's input and output are two ranges of one arena, so
-    /// nearly every rectangle pays a copy of its inputs.
+    /// **Zero, for every real plan**, and it is reported rather than hidden
+    /// because it was 451 of 452 rectangles until the shader tree stopped
+    /// declaring `var<storage, read>`. WebGPU refuses a dispatch that binds
+    /// one buffer both readable and writable; two WRITABLE bindings are one
+    /// usage bit and legal. See [`crate::device`]'s module docs for the rule,
+    /// the citation and the measurement — 25.1 ms to 11.2 ms per decode.
     ///
-    /// Zero is what a plan whose reads and writes lived in different allocations
-    /// would report, which is the shape the arena would have to grow for this
-    /// number to go away.
+    /// So a non-zero here now means a `read` binding came back somewhere in
+    /// the tree, whose only other symptom is that decoding got twice as
+    /// slow.
     pub shadowed: usize,
 }
 
@@ -268,10 +279,32 @@ pub enum Unfired {
         /// What did not hold.
         what: &'static str,
     },
-    /// The device refused.
+    /// The device refused this launch.
+    ///
+    /// A launch, and only a launch: everything that reaches here was checked
+    /// before anything was submitted. A failure of the submission itself is
+    /// [`Self::Undelivered`], which is a different variant precisely so that
+    /// it cannot be printed as a launch index.
     Refused {
-        /// Which launch, or the length of the plan if it was the submission.
+        /// Which launch.
         at: usize,
+        /// What failed.
+        why: Failed,
+    },
+    /// The device never finished the submission.
+    ///
+    /// Not any one launch's refusal. `Device::run_all` submits the whole plan
+    /// at once and waits once, so a device that errors or does not answer has
+    /// named nothing smaller than the submission. `of` is how many launches
+    /// were in it.
+    ///
+    /// This existed before it had a name, as `Refused { at: run.len() }` — an
+    /// index one past the last launch — and a reader who did not know that
+    /// convention read the count as the offending dispatch. See
+    /// [`crate::device::Stage`] for the one that did.
+    Undelivered {
+        /// How many launches the submission held.
+        of: usize,
         /// What failed.
         why: Failed,
     },
@@ -287,6 +320,9 @@ impl std::fmt::Display for Unfired {
             Self::Unplannable { at, symbol, why } => write!(f, "launch {at} (`{symbol}`): {why}"),
             Self::Impossible { at, symbol, what } => write!(f, "launch {at} (`{symbol}`): {what}"),
             Self::Refused { at, why } => write!(f, "launch {at}: {why}"),
+            Self::Undelivered { of, why } => {
+                write!(f, "the submission of {of} launches: {why}")
+            }
         }
     }
 }
@@ -297,7 +333,9 @@ impl std::error::Error for Unfired {}
 ///
 /// # Errors
 ///
-/// [`Unfired`], naming the launch index in every case. A failure part way
+/// [`Unfired`], naming the launch index in every case but one — a failure of
+/// the submission itself names the submission, because it has not singled out
+/// a launch. A failure part way
 /// through the RECORDING has submitted nothing — [`Device::run_all`] checks
 /// every dispatch before it encodes any — so unless
 /// [`Fire::one_at_a_time`] is set, a refusal means the device did nothing at
@@ -323,24 +361,54 @@ pub fn fire<R: Resolve<Buffer = Buffer>, M: Modules>(
     // blocks, which must outlive the submission.
     let mut planned = Vec::with_capacity(lowered.launches.len());
     let mut blocks: Vec<Option<Buffer>> = Vec::with_capacity(lowered.launches.len());
+    // Every DISTINCT module first, expanded and reflected once each.
+    //
+    // # Why this is a pass of its own
+    //
+    // Because it used to be inside the loop below, once per LAUNCH, and that
+    // was 95% of a decode. A Qwen3-0.6B step fires 452 launches over eleven
+    // distinct symbols, and each one was expanding the WGSL from the embedded
+    // tree -- includes spliced, `//#if` arms resolved, defines substituted --
+    // and then handing the result to `naga` for a full parse. Measured on a
+    // real step: `pick` 700 ms, `reflect::declared` 227 ms, everything else in
+    // the fire including the GPU 31 ms.
+    //
+    // The comment that used to sit here said it was "still not where the time
+    // goes, because `create_shader_module` does the same parse plus a whole
+    // backend translation and is cached". Both halves are true and the
+    // conclusion does not follow: the cached thing is paid ONCE PER SYMBOL and
+    // this was paid once per LAUNCH, so the comparison was between eleven of
+    // one and four hundred and fifty-two of the other.
+    //
+    // The lifetime worry in that comment was also unfounded. `entrypoint_source`
+    // returns an owned `String`, so this map borrows nothing from `modules`.
+    let mut seen: std::collections::BTreeMap<&str, crate::device::Read> =
+        std::collections::BTreeMap::new();
     for (at, launch) in lowered.launches.iter().enumerate() {
         let symbol = lowered.kernels[launch.kernel as usize].as_str();
+        if seen.contains_key(symbol) {
+            continue;
+        }
+        // ...and once per SHELL, not once per step: the expansion and the
+        // parse are functions of the key, and a server fires the same nine or
+        // ten symbols for the life of a model. Per step this was 13 ms of a
+        // 58 ms decode.
+        if let Some(hit) = pipelines.module(symbol, tier) {
+            let hit = crate::device::Read {
+                source: hit.source.clone(),
+                tier: hit.tier,
+                declared: hit.declared.clone(),
+                sig: hit.sig,
+            };
+            seen.insert(symbol, hit);
+            continue;
+        }
         let Some((source, at_tier)) = pick(modules, symbol, tier) else {
             return Err(Unfired::NoModule {
                 at,
                 symbol: symbol.to_owned(),
             });
         };
-        // Read per launch rather than cached per symbol. Measured on the Vulkan
-        // side over a real plan of 3992 rectangles across 19 distinct symbols:
-        // reading the module does not show against the pipeline builds, and
-        // caching it would be a map whose entries borrow from `modules`, which
-        // is a lifetime this signature does not need to carry.
-        //
-        // It costs more here than there -- this is a `naga` parse of real WGSL
-        // rather than a walk over a SPIR-V word stream -- and it is still not
-        // where the time goes, because `create_shader_module` does the same
-        // parse plus a whole backend translation and is cached.
         let declared = match crate::reflect::declared(&source) {
             Ok(d) => d,
             Err(why) => {
@@ -351,13 +419,44 @@ pub fn fire<R: Resolve<Buffer = Buffer>, M: Modules>(
                 });
             }
         };
+        pipelines.remember(
+            symbol,
+            tier,
+            crate::device::Read {
+                source: source.clone(),
+                tier: at_tier,
+                declared: declared.clone(),
+                sig: crate::dispatch::row_of(kernels_wgpu::KERNELS, symbol),
+            },
+        );
+        seen.insert(
+            symbol,
+            crate::device::Read {
+                source,
+                tier: at_tier,
+                declared,
+                sig: crate::dispatch::row_of(kernels_wgpu::KERNELS, symbol),
+            },
+        );
+    }
+
+    for (at, launch) in lowered.launches.iter().enumerate() {
+        let symbol = lowered.kernels[launch.kernel as usize].as_str();
+        // Present by construction: the pass above inserted every symbol this
+        // loop can name, and refused the fire if it could not.
+        let read = &seen[symbol];
+        let (source, at_tier, declared, sig) =
+            (read.source.clone(), read.tier, &read.declared, read.sig);
         let planned_one = crate::dispatch::plan_one(
             lowered,
             launch,
             kernels_wgpu::KERNELS,
             Built {
-                module: crate::geometry::Module::loaded(symbol, &declared),
-                declared: &declared,
+                module: crate::geometry::Module::loaded(symbol, declared),
+                declared,
+                // Once per SYMBOL, not once per launch: `sig_in` walks the
+                // table twice and this loop runs 452 times over ten symbols.
+                sig,
             },
             Sources {
                 arena,
@@ -399,6 +498,43 @@ pub fn fire<R: Resolve<Buffer = Buffer>, M: Modules>(
 }
 
 /// Build every pipeline, record every dispatch, submit once and wait.
+///
+/// # Where a step's time goes
+///
+/// Measured on an RTX 4090, qwen3-0.6B, a one-row decode of 452 launches,
+/// release, after the lowering cache, the single command buffer and the
+/// removal of the shadow copies:
+///
+/// | | ms |
+/// |---|---|
+/// | `plan_one` x 452 | 1.5 |
+/// | `check_bindable` x 452 | 0.08 |
+/// | **bind groups x 452** | **2.05** |
+/// | encoding | 1.01 |
+/// | submit | 0.50 |
+/// | **the GPU wait** | **~7** |
+/// | logits readback | 0.35 |
+/// | **whole step** | **12.7** |
+///
+/// ## What is left, and where it is
+///
+/// The wait is 452 dispatches, not bandwidth: this model's staged weights are
+/// 335 MB and a 4090 reads that in well under a millisecond, so ~15 us a
+/// dispatch is the dispatch. **The way down from here is FEWER LAUNCHES**,
+/// which is the model text's shape and the compiler's business.
+///
+/// That sentence was in this doc before any of the above was fixed, against a
+/// table measured on llvmpipe that put ~36 ms in `run_all` — and it was wrong
+/// then, because three quarters of that was host work this file's callers
+/// were doing over and over. It is worth keeping the retraction beside the
+/// claim: "nothing more to find here" is the conclusion that stops the
+/// looking, and it should be the last one reached rather than the first.
+///
+/// The one host item still worth having is the bind groups, 2.05 ms of 452
+/// `create_bind_group` calls plus a uniform buffer each. They are a function
+/// of the lowering, which is now cached, and of the ARENA, which is still a
+/// fresh allocation every step — so caching them means giving the arena a
+/// lifetime first.
 fn record(
     device: &Device,
     pipelines: &mut Pipelines,
@@ -444,6 +580,9 @@ fn record(
     for ((symbol, tier, _, d), b) in planned.iter().zip(&buffers) {
         let Some(pipeline) = pipelines.peek(symbol, *tier) else {
             return Err(Unfired::Impossible {
+                // A real launch index, not the sentinel `Undelivered` replaced:
+                // `run` is being built, so its length IS the index of the entry
+                // this iteration would have pushed.
                 at: run.len(),
                 symbol: symbol.clone(),
                 what: "no pipeline, one pass after every pipeline was built",
@@ -468,24 +607,33 @@ fn record(
 
     if one_at_a_time {
         let mut shadowed = 0;
+        let mut submissions = 0;
         for (at, r) in run.iter().enumerate() {
-            shadowed += device
+            let ran = device
                 .run_all(std::slice::from_ref(r))
+                // A submission of ONE launch does single that launch out, so
+                // the stage carries nothing this loop does not already know.
                 .map_err(|(_, why)| Unfired::Refused { at, why })?;
+            shadowed += ran.shadowed;
+            submissions += ran.buffers;
         }
         return Ok(Fired {
             dispatches: run.len(),
-            submissions: run.len(),
+            submissions,
             shadowed,
         });
     }
-    let shadowed = device
-        .run_all(&run)
-        .map_err(|(at, why)| Unfired::Refused { at, why })?;
+    let ran = device.run_all(&run).map_err(|(stage, why)| match stage {
+        crate::device::Stage::Launch(at) => Unfired::Refused { at, why },
+        crate::device::Stage::Submission { of } => Unfired::Undelivered { of, why },
+    })?;
     Ok(Fired {
         dispatches: run.len(),
-        submissions: 1,
-        shadowed,
+        // COUNTED, not assumed. This was `1` for as long as the field existed
+        // and the queue was getting 735 for a real decode -- see
+        // `crate::device::Ran`.
+        submissions: ran.buffers,
+        shadowed: ran.shadowed,
     })
 }
 
@@ -659,5 +807,73 @@ mod tests {
         let shifted = f32::from_bits(u32::from(bits) << 16);
         assert_eq!(shifted, 1.0);
         assert_eq!(f32::from(bits), 16256.0, "the cast this must not be");
+    }
+
+    /// A submission that failed does not name a launch that does not exist.
+    ///
+    /// `Device::run_all` submits the whole plan and waits ONCE, so a device
+    /// that errors or never answers has singled out nothing. That case used to
+    /// come back as `Refused { at: run.len() }` -- an index one past the last
+    /// launch -- and print as `launch 452:`. Valid indices for that fire were
+    /// 0..=451, so the message named a launch that was not there.
+    ///
+    /// It is not a hypothetical misreading. That exact line was read in this
+    /// repository as "the 452nd dispatch is slow", and written up twice, when
+    /// what happened was that all 452 were submitted together and the one wait
+    /// covering them ran out. The count and the index are the same number and
+    /// the message could not say which it meant.
+    ///
+    /// So the two are different variants, and this is the check that they read
+    /// differently: whatever else changes, the submission case must not print
+    /// as `launch <the count>`.
+    #[test]
+    fn a_submission_that_failed_names_the_submission_and_not_a_launch() {
+        let why = Failed::Wgpu(
+            "the device did not answer: The requested Wait timed out before \
+             the submission was completed."
+                .to_string(),
+        );
+        let whole = Unfired::Undelivered {
+            of: 452,
+            why: why.clone(),
+        }
+        .to_string();
+        let one = Unfired::Refused { at: 452, why }.to_string();
+
+        assert_ne!(
+            whole, one,
+            "the submission of 452 launches and the 452nd launch are different \
+             claims about where a fire stopped, and a reader gets only the string"
+        );
+        assert!(
+            !whole.starts_with("launch "),
+            "a submission-level failure still reads as a launch index: {whole}"
+        );
+        assert!(
+            whole.contains("submission of 452 launches"),
+            "and it should say how many were in flight, which is the only true \
+             thing there is to say about where it stopped: {whole}"
+        );
+        assert!(
+            whole.contains("Wait timed out"),
+            "without losing what the device said: {whole}"
+        );
+    }
+
+    /// The stage a failure carries is the stage `run_all` assigned it.
+    ///
+    /// `Stage` exists so the CALL SITE stops inferring "was this the whole
+    /// submission?" from `at == run.len()`. That inference was correct and it
+    /// was invisible: nothing broke if `run_all` changed which number it sent,
+    /// and the only symptom would have been a wrong message. Pinning the two
+    /// constructors keeps the mapping in `fire` honest.
+    #[test]
+    fn the_two_stages_are_a_launch_and_the_whole_submission() {
+        use crate::device::Stage;
+        assert_ne!(
+            Stage::Launch(452),
+            Stage::Submission { of: 452 },
+            "the whole point is that these two are not the same value"
+        );
     }
 }

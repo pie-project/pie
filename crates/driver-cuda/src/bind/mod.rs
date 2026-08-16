@@ -20,7 +20,7 @@ pub mod abi;
 
 /// Stage C, the other half: the rows the driver executes ITSELF — cuBLAS
 /// through `cudarc`, and the compositions whose steps it issues in order.
-/// `kernels_cuda_new::execution::Execution::Service` classified them; this
+/// `kernels_cuda::execution::Execution::Service` classified them; this
 /// is the consumer that makes the classification cost the C++ its body.
 ///
 /// # WHY THIS WAS `bridge`-GATED, AND WHY IT IS `_cuda` NOW
@@ -57,16 +57,34 @@ pub mod abi;
 #[cfg(feature = "_cuda")]
 pub mod service;
 
-/// Stage C, the quantized half: `gemm/gemm.cpp`'s router on the weight's
-/// dtype and the four cuBLASLt recipes behind it, in Rust. Separated from
-/// [`service`] because it is machinery — a per-device cuBLASLt context, six
-/// growable scratches and a dequantized-weight cache — where `service` is
-/// argument assembly. The three entry points stay in `service` because
-/// `execution::RUST_SERVED`'s spelling test reads that file.
-pub mod quant_gemm;
+// `pub mod quant_gemm;` STOOD HERE — `gemm/gemm.cpp`'s router on the
+// weight's dtype and the four cuBLASLt recipes behind it. It is
+// `kernels_cuda::gemm::quant`, under `.wiki/kernel-x/refactor-plan.md`
+// §6.3, and its three entry points went with it out of [`service`].
+//
+// Its doc here said they could not: *"The three entry points stay in
+// `service` because `execution::RUST_SERVED`'s spelling test reads that
+// file."* **That test is gone**, with the archive crate and the
+// classification table it read, and three comments in `service.rs` were
+// still citing it as a live requirement. The split it had been holding open
+// cost a `WeightView` assembled one crate above the router that consumes it.
+//
+// The router reached DOWN fifteen times — nine `quant::` fires, five bf16
+// GEMMs into what is now `gemm::dense`, and `norm::residual_add_bf16` — and
+// up for nothing, which is what made the boundary the wrong way round rather
+// than merely inconvenient. `gemm::act_x_wt_{channel_scaled,grouped_scaled,mxfp4_marlin}`
+// are `driver_bound!` rows derived from those `fn`s now, where they were
+// three hand-written lines in `not_yet_crossed.rs`.
 
-/// The driver's answer to `kernels_cuda_new::x::Facts` — the fire's facts,
-/// as a bind body beside a `.cuh` may read them.
+/// The driver's answer to what `kernels_cuda::x::Facts` was — the fire's
+/// facts, as a bind body beside a `.cuh` may read them.
+///
+/// That type is deleted and nothing in `kernels-cuda` replaces it, which
+/// is the correct end state rather than a gap: a routine takes its facts as
+/// ARGUMENTS now, derived from its `fn` signature, so there is no facts
+/// object for a body to be handed. This struct is what remains of the pair —
+/// the driver's half, which still has to assemble those arguments from the
+/// fire — and it is named for a counterpart that no longer needs to exist.
 ///
 /// `.wiki/kernel-x/northstar.md` §3.3. The reads are
 /// [`dispatch_generated`]'s scaffolding promoted out of a generated file
@@ -79,7 +97,7 @@ pub mod facts;
 use std::ffi::c_void;
 
 use model_compiler::lower::{Arg, Buffers, Launch, Lowered};
-use model_compiler::trace::ValueId;
+use model_ir::trace::ValueId;
 
 /// The frame's activation arena: one device block of
 /// [`Lowered::arena_bytes`], allocated per fire (or reused across them —
@@ -178,7 +196,7 @@ pub struct LaunchSpec {
     /// The per-request store this op addresses (`OpKind::state_ref`) —
     /// how a GDN arm learns its state layer, the C++ executor's
     /// `op.param1` read.
-    pub state: Option<model_compiler::trace::StateRef>,
+    pub state: Option<model_ir::trace::StateRef>,
     /// `RmsnormPerHead`'s head width: the launch's rows are token rows,
     /// the kernel's rows are `tokens * (width / head_dim)` of `head_dim`.
     pub per_head_dim: Option<u32>,
@@ -221,9 +239,11 @@ pub struct LaunchSpec {
     /// `.wiki/kernel-x/northstar.md` §5 step 4 — the dispatch flip. The
     /// section writes this as `lowered.kernels: Vec<&'static Entry>`; it
     /// cannot go there — `Lowered` is `model-compiler`'s, and a lowering
-    /// that carried an [`Entry`](kernels_cuda_new::x::Entry) would tell a
-    /// GPU-free crate exactly which symbols are JIT'd, which is the one
-    /// thing §3.4 says `model-compiler` must not be able to see. So the
+    /// that carried an `Entry` — the per-symbol handle `x` used to intern,
+    /// now `jit::Routine` — would tell a GPU-free crate exactly which
+    /// symbols are JIT'd, which is the one thing §3.4 says `model-compiler`
+    /// must not be able to see. The type was renamed and the constraint was
+    /// not: `Lowered` is still `model-compiler`'s. So the
     /// intern lives on the op join, which is `driver-cuda`'s own
     /// per-lowering pass and is already computed once and indexed per fire.
     ///
@@ -262,7 +282,7 @@ pub struct DispatchPlan {
 
 /// One symbol a lowering names that nothing can fire, and why.
 ///
-/// The load-time half of [`Refusal`](kernels_cuda_new::x::Refusal), which is
+/// The load-time half of [`Refusal`](kernels_cuda::Refusal), which is
 /// deliberately the SAME type the fire path refuses with. §5 step 4 asks for
 /// "unknown symbols refuse at load"; a second error shape for it would mean
 /// the same fact printed two ways depending on when it was noticed.
@@ -271,7 +291,7 @@ pub struct Unfireable {
     /// The symbol the lowering states.
     pub symbol: String,
     /// Why nothing can fire it.
-    pub why: kernels_cuda_new::x::Refusal,
+    pub why: kernels_cuda::Refusal,
 }
 
 impl core::fmt::Display for Unfireable {
@@ -320,9 +340,9 @@ impl DispatchPlan {
     /// [`Self::unfireable`], asked separately by the load path, so that the
     /// eighteen call sites that only want the join keep their shape.
     #[must_use]
-    pub fn new(plan: &model_compiler::trace::ForwardPlan, lowered: &Lowered) -> Self {
-        use model_compiler::trace::Dim;
-        use model_compiler::trace::OpKind;
+    pub fn new(plan: &model_ir::trace::ForwardPlan, lowered: &Lowered) -> Self {
+        use model_ir::trace::Dim;
+        use model_ir::trace::OpKind;
         let width_of = |v: ValueId| -> u32 {
             plan.values[v as usize]
                 .shape
@@ -345,8 +365,15 @@ impl DispatchPlan {
                         .get(v as usize)
                         .map_or(2, |i| model_compiler::lower::dtype_bytes(i.dtype)),
                 },
+                // Under the alias OWNER, for the reason `Lowerer::slot`
+                // gives at length: `NAMED` is a sentinel and not an offset,
+                // so it is the one path where an in-place group would
+                // otherwise be handed two buffers. This is the same rule as
+                // the operand side's, applied to the output side, and the
+                // two have to agree or a launch reads one buffer and writes
+                // another.
                 _ => Arg::Named {
-                    value: v,
+                    value: lowered.value_owner.get(v as usize).copied().unwrap_or(v),
                     width: width_of(v),
                     bytes: plan
                         .values
@@ -400,32 +427,44 @@ impl DispatchPlan {
         // Some blocks wire values ACROSS statements: nemotron's mamba scan
         // consumes the split's raw `dt` and the params prep's fp32 tables,
         // none of which its own statement carries (the C++ hand pass routed
-        // them through its workspace). Both ends of that wiring are now
-        // STATED — `x::Contract::publishes_aux` says which output fills
-        // which slot, `Source::Aux(i)` says which slot an operand reads — so
-        // this collects publishers into per-layer slots and knows no kernel
-        // by name. What stood here matched four literal symbols, which made
-        // this crate the only place that knew how one architecture's block
-        // is put together.
+        // them through its workspace). Both ends of that wiring USED TO BE
+        // STATED — a declaration's `publishes_aux` said which output fills
+        // which slot, `Source::Aux(i)` said which slot an operand reads — so
+        // this collected publishers into per-layer slots and knew no kernel
+        // by name. What stood before THAT matched four literal symbols, which
+        // made this crate the only place that knew how one architecture's
+        // block is put together.
         //
-        // TWO ORACLES, AND THEY RANGE OVER THE SAME LAUNCHES. The publisher
-        // half reads a `Contract`, because that is where `publishes_aux`
-        // lives once it is out of the portable vocabulary; the consumer half
-        // reads a row, because `operands` stayed there. `x::contract` and
-        // `table::sig` cover the same symbols — `table::KERNELS` is the
-        // concatenation of `x::SIGS` and `ROW_TABLES` is empty — so this is
-        // one population asked two questions, not two populations.
+        // **BOTH ENDS ARE INERT NOW, and this paragraph is the record of it.**
         //
-        // **`x::entry` is not the third way to ask it.** `entry()` searches
-        // `FAMILIES`, which a driver op is deliberately absent from, so it
-        // answers `None` for all twelve of `gemm`'s and for `adapter`'s. The
-        // failure that produces is not a missing lookup: `aux_width` is a
-        // `max`, so a dropped population sizes the vector SHORTER, the
-        // `slots.get_mut` below silently publishes nothing for a slot that
-        // used to exist, and the loss surfaces as the `all slots filled`
-        // test's message — about filling, not about width.
+        // The publisher end went first and says so twenty lines down:
+        // `publishes_aux` left the portable vocabulary with the declaration
+        // table, and sizing the aux vector is the ARM REGISTRY's job
+        // (`bind::facts`). `contract_of` is a closure returning `None`.
+        //
+        // The consumer end went quietly and nothing said so. It reads
+        // `KernelSig::operands`, and that column is `&[]` on every row
+        // `kernels-cuda` produces — the derived half takes `SIG_BASE`'s
+        // default, the stated half never wrote one, and `operands`' own doc
+        // says empty means UNSTATED rather than "takes nothing". So
+        // `consumed` yields nothing either, `aux_width` is 0 on every fire,
+        // and the `BTreeMap` below is constructed empty and stays empty.
+        //
+        // It is left standing rather than deleted because the walk below
+        // reads it and because deleting cross-statement wiring is a decision
+        // about whether the ARM registry has taken over every case it
+        // covered — which is a per-family audit, not a cleanup. What must not
+        // happen is this reading as live: a reader who believes the aux path
+        // works will not look for the reason their operand arrives null.
+        //
+        // The prose that stood here described a THIRD lookup, `x::entry`, and
+        // argued it must not be used as an oracle because it searches
+        // `FAMILIES` and a driver op is deliberately absent from those. That
+        // module is deleted; the same search is `kernels_cuda::routine`,
+        // and the argument still holds for it — it is simply no longer about
+        // a live risk, because there is no population left to drop.
         let sig_of = |launch: &Launch| -> Option<&'static kernels::KernelSig> {
-            kernels::sig_in(kernels_cuda_new::sigs(), &lowered.kernels[launch.kernel as usize])
+            kernels::sig_in(kernels_cuda::sigs(), &lowered.kernels[launch.kernel as usize])
         };
         // `publishes_aux` lived on the old `Contract` and had no reader once
         // the arms moved; nothing sizes the aux vector from a declaration now.
@@ -505,7 +544,7 @@ impl DispatchPlan {
         };
         // THE DISPATCH FLIP — §5 step 4, resolved here and nowhere else.
         //
-        // One scan of the symbol table. `route` lives in `kernels-cuda-new`
+        // One scan of the symbol table. `route` lives in `kernels-cuda`
         // because all three registries it consults are that crate's; what
         // happens here is the mapping and no more.
         let routes = resolve(lowered);
@@ -589,7 +628,7 @@ impl DispatchPlan {
                 {
                     spec.aux = vec![up.clone()];
                 }
-                if lowered.kernels[launch.kernel as usize] == "pie_lora_qkv_correction"
+                if lowered.kernels[launch.kernel as usize] == "gemm::lora_qkv_correction"
                     && let Some(x) = lora_x.get(&launch.layers.start)
                 {
                     spec.aux = vec![x.clone()];
@@ -636,8 +675,8 @@ impl DispatchPlan {
     /// closes when `Route::Rows` does — see its doc for the mechanical
     /// condition.
     ///
-    /// [`Refusal::Undeclared`]: kernels_cuda_new::x::Refusal::Undeclared
-    /// [`Refusal::Unstated`]: kernels_cuda_new::x::Refusal::Unstated
+    /// [`Refusal::Undeclared`]: kernels_cuda::Refusal::Undeclared
+    /// [`Refusal::Unstated`]: kernels_cuda::Refusal::Unstated
     #[must_use]
     pub fn unfireable(&self) -> &[Unfireable] {
         &self.unfireable
@@ -665,7 +704,7 @@ impl DispatchPlan {
 /// said the whole reason they existed was *"a `unique_ptr` with a custom
 /// deleter"*. North star §5 step 7 deleted them along with
 /// `attention_flashinfer.cu`, so the pointee is now
-/// [`crate::fire::flashinfer_fa2::DecodePlanCache`], a plain Rust struct, and
+/// [`kernels_cuda::attn::fa2::plan::DecodePlanCache`], a plain Rust struct, and
 /// the custom deleter is [`Drop`].
 ///
 /// # Why it is still a raw pointer and not a `Box` field
@@ -684,7 +723,7 @@ impl DispatchPlan {
 #[cfg(feature = "_cuda")]
 #[derive(Debug)]
 pub struct DecodePlan {
-    cache: *mut crate::fire::flashinfer_fa2::DecodePlanCache,
+    cache: *mut kernels_cuda::attn::fa2::plan::DecodePlanCache,
 }
 
 #[cfg(feature = "_cuda")]
@@ -693,7 +732,7 @@ impl DecodePlan {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            cache: Box::into_raw(Box::new(crate::fire::flashinfer_fa2::DecodePlanCache::default())),
+            cache: Box::into_raw(Box::new(kernels_cuda::attn::fa2::plan::DecodePlanCache::default())),
         }
     }
 
@@ -713,7 +752,7 @@ impl DecodePlan {
         self.get().set_int_base(bytes);
     }
 
-    fn get(&mut self) -> &mut crate::fire::flashinfer_fa2::DecodePlanCache {
+    fn get(&mut self) -> &mut kernels_cuda::attn::fa2::plan::DecodePlanCache {
         // SAFETY: `cache` came from `Box::into_raw` in `new`, is never
         // reassigned, and `&mut self` proves no other reference is live.
         unsafe { &mut *self.cache }
@@ -768,7 +807,7 @@ impl DecodePlan {
     /// *type* one layer down, where it can be tested without a GPU; this is
     /// the boundary where it stops being one.
     ///
-    /// [`Decline`]: crate::fire::flashinfer_fa2::Decline
+    /// [`Decline`]: kernels_cuda::attn::fa2::plan::Decline
     // Safe by design like the seam methods: the view's pointers are the
     // workspace's own, and the stream is the caller's live handle.
     #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
@@ -785,7 +824,7 @@ impl DecodePlan {
         full_attention_variant: bool,
         window_left: i32,
     ) {
-        use crate::fire::flashinfer_fa2 as fa2;
+        use kernels_cuda::attn::fa2::plan as fa2;
 
         let _ = stream;
         let num_requests =
@@ -800,7 +839,7 @@ impl DecodePlan {
             num_kv_heads,
             head_dim,
             page_size,
-            kernels_cuda_new::plan::Workspace {
+            kernels_cuda::attn::plan::Workspace {
                 float_bytes: workspace.float_bytes,
                 int_bytes: workspace.int_bytes,
             },
@@ -840,7 +879,7 @@ impl Drop for DecodePlan {
 #[cfg(feature = "_cuda")]
 #[derive(Debug)]
 pub struct PrefillPlan {
-    cache: *mut crate::fire::flashinfer_fa2::PrefillPlanCache,
+    cache: *mut kernels_cuda::attn::fa2::plan::PrefillPlanCache,
 }
 
 #[cfg(feature = "_cuda")]
@@ -850,7 +889,7 @@ impl PrefillPlan {
     pub fn new() -> Self {
         Self {
             cache: Box::into_raw(
-                Box::new(crate::fire::flashinfer_fa2::PrefillPlanCache::default()),
+                Box::new(kernels_cuda::attn::fa2::plan::PrefillPlanCache::default()),
             ),
         }
     }
@@ -872,7 +911,7 @@ impl PrefillPlan {
         self.get().set_int_base(bytes);
     }
 
-    fn get(&mut self) -> &mut crate::fire::flashinfer_fa2::PrefillPlanCache {
+    fn get(&mut self) -> &mut kernels_cuda::attn::fa2::plan::PrefillPlanCache {
         // SAFETY: as `DecodePlan::get`.
         unsafe { &mut *self.cache }
     }
@@ -885,7 +924,7 @@ impl PrefillPlan {
     /// from [`Self::as_ptr`]. Handing it out as a reference rather than making
     /// the tower cast the `*mut c_void` back is the point.
     #[must_use]
-    pub fn cache(&self) -> &crate::fire::flashinfer_fa2::PrefillPlanCache {
+    pub fn cache(&self) -> &kernels_cuda::attn::fa2::plan::PrefillPlanCache {
         // SAFETY: as `DecodePlan::get`; `&self` proves no `&mut` is live.
         unsafe { &*self.cache }
     }
@@ -979,7 +1018,7 @@ impl PrefillPlan {
         window_left: i32,
         flags: PrefillPlanFlags,
     ) {
-        use crate::fire::flashinfer_fa2 as fa2;
+        use kernels_cuda::attn::fa2::plan as fa2;
 
         let _ = (stream, kv_last_page_lens_h);
         let num_requests = i32::try_from(qo_indptr_h.len() - 1).expect("request count fits i32");
@@ -996,7 +1035,7 @@ impl PrefillPlan {
             num_kv_heads,
             head_dim,
             page_size,
-            kernels_cuda_new::plan::Workspace {
+            kernels_cuda::attn::plan::Workspace {
                 float_bytes: workspace.float_bytes,
                 int_bytes: workspace.int_bytes,
             },
@@ -1067,7 +1106,7 @@ impl Drop for PrefillPlan {
 /// A table states an operand's extent as `Div(Width(i), CtxNonZero(f))` and
 /// `emit_rust_dispatch` renders it by CONCATENATION — `width_of(b, i)`, which
 /// is always `i32`, over `ctx.<f>` — because the emitter *"does not know the
-/// field's TYPE"* (`kernels_cuda_new::abi`'s own words, and the reason
+/// field's TYPE"* (`kernels_cuda::abi`'s own words, and the reason
 /// [`IsSet`] exists rather than a `!= 0`). There is no coercing `Source`
 /// variant: the vocabulary is `Lit / Width / Mul / Div / IfPresent / Ctx /
 /// CtxNonZero`.
@@ -1081,7 +1120,7 @@ impl Drop for PrefillPlan {
 /// wrote, three hundred arms away from the change. Two readers diagnosed it
 /// as a bad table row; the row was correct.
 ///
-/// THE RULE IS GONE. `kernels_cuda_new::abi::rust_arith_of` narrows a
+/// THE RULE IS GONE. `kernels_cuda::abi::rust_arith_of` narrows a
 /// driver-declared field to the grammar's `i32` before composing it, which is
 /// the same rule `cast_for` always applied to a whole operand — *"a row
 /// declares `I32` and gets an i32, whatever the width of the thing it named"*
@@ -1192,7 +1231,7 @@ pub struct DispatchCtx {
     ///
     /// # Why the fire and not the statement
     ///
-    /// It is a GEOMETRY axis — [`kernels_cuda_new::Dims::experts_per_token`]
+    /// It is a GEOMETRY axis — [`kernels_cuda::Dims::experts_per_token`]
     /// — and a grid is opened before an operand is read, so a rule that needs
     /// it needs it as a fact about the run. `dequant_fp4.cu:56` opened
     /// `dim3 grid(num_tokens * top_k, ..)`, `dequant_wna16.cu` the same,
@@ -1244,7 +1283,7 @@ pub struct DispatchCtx {
     /// gives the region; this gives the lane space it sits in.
     pub rows_total: i32,
     /// The fire's STAGED LoRA state and its xAᵀ scratch (`ws.gate` in
-    /// the C++) — what a stated `pie_lora_qkv_correction` launch
+    /// the C++) — what a stated `gemm::lora_qkv_correction` launch
     /// applies. Null/None on adapter-free fires. A raw pointer because
     /// the state outlives the fire on the caller's side (the plan
     /// state's `lora_staged` slot) and the ctx carries no lifetime.
@@ -1321,6 +1360,14 @@ impl DispatchCtx {
     /// sparse layer, which the kernel reads as "keep everything" -- the
     /// hand arm REFUSED instead, and refusing is wrong here: a layer
     /// outside the sparse set is the normal case, not a missing fact.
+    ///
+    /// **It has no caller, and that is the state the refusal describes.**
+    /// `bind::arms::mlp`'s `mlp::gaussian_topk_bf16` row is `unbound` with a
+    /// FLOOR naming this accessor as the half that already exists; what is
+    /// missing is `Facts::altup_std_mult(layer) -> Option<f32>` on the other
+    /// side. Deleting it would make the refusal cite a method that is not
+    /// there, which turns a stated next step back into a paragraph.
+    #[expect(dead_code, reason = "the FLOOR half of an unbound row; see bind::arms::mlp")]
     pub(crate) fn altup_std_mult(&self, layer: usize) -> f32 {
         self.altup_std_mult_by_layer.get(layer).copied().unwrap_or(0.0)
     }
@@ -1601,7 +1648,7 @@ pub enum DispatchRefusal {
 // a second meaning anywhere in the workspace. Contrast `arm_body`,
 // `OpenCond` and `cond_path`, which the ledger filed in this same class and
 // which interpret `model_compiler::lower::CondRegion` and
-// `device::Cond` — arms of a CUDA-GRAPH CONDITIONAL. They are live, they are
+// `pie::Cond` — arms of a CUDA-GRAPH CONDITIONAL. They are live, they are
 // `_cuda`, and `run_captured` is why.
 
 // ---------------------------------------------------------------------------
@@ -1633,11 +1680,20 @@ pub enum DispatchRefusal {
 // one over is §3.3's forbidden surface exactly — a cache a bind body could
 // re-plan, mid-fire, from inside what is supposed to be a query.
 //
-// So the six take `x::SIGS`' third registration shape: a `contract!` in
-// `x::attn` with **no `Entry` at all**, not even a `none:` arm — which would
-// mint `Route::Unbound` and refuse the model at load — plus an entry in
-// `execution::SERVICE` as `Service::DriverOp`, which is what `x::route` reads
-// to answer `Route::Driver`.
+// So the six took what was then `x::SIGS`' third registration shape: a
+// `contract!` with **no `Entry` at all**, not even a `none:` arm — which
+// would mint `Route::Unbound` and refuse the model at load — plus an entry
+// in `execution::SERVICE` as `Service::DriverOp`, which is what `x::route`
+// read to answer `Route::Driver`.
+//
+// **THREE OF THOSE FOUR NAMES ARE DELETED** — `x::SIGS`, `contract!` and
+// `x::route` — and what took their place is not a rename. A symbol is
+// declared by `sigs()` now, which is `FAMILIES` unioned with
+// `not_yet_crossed::NOT_YET_CROSSED`, and these six are stated rows in the
+// second half rather than contracts in the first. `Route::Driver` is
+// answered by `arms::route`, in this crate. The registration shape survived
+// the machinery that gave it its name, which is why the paragraph is kept
+// and repointed rather than rewritten: what the six ARE has not changed.
 //
 // # What each arm reproduces
 //
@@ -1690,413 +1746,16 @@ pub fn attn_plan(a: &AttnCtx, spec: &LaunchSpec, layer: u32, family: &str) -> *m
     }
 }
 
-/// What all six arms resolve the same way.
-#[cfg(feature = "_cuda")]
-struct Fa2Common<'a> {
-    a: &'a AttnCtx,
-    kv: crate::bind::abi::KvCacheLayerView,
-    layer: u32,
-    q: *const c_void,
-    /// `Source::Or(&Out(0), &Attn("o_out"))` — the stated result if the
-    /// statement declares one, the guard-owned arena slot if it does not.
-    o: *mut c_void,
-}
-
-/// `n_in >= 1 && attn.is_some() && has_kv_layer(..)`, plus the two join
-/// facts and the `o` widening, in the generated guard's order.
-#[cfg(feature = "_cuda")]
-fn fa2_common<'a>(
-    kernel: &str,
-    b: &BoundLaunch<'_>,
-    spec: &LaunchSpec,
-    attn: Option<&'a AttnCtx>,
-) -> Result<Fa2Common<'a>, DispatchRefusal> {
-    if spec.n_in < 1 {
-        return Err(DispatchRefusal::ArgCount {
-            kernel: kernel.to_string(),
-            expected: 1,
-            got: b.args.len(),
-        });
-    }
-    if !spec.aux.is_empty() || spec.per_head_dim.is_some() {
-        return Err(DispatchRefusal::ShapeDeclined {
-            kernel: kernel.to_string(),
-            why: "the op join carries an aux value or a per-head reading, and this launcher \
-                  has neither -- a fact about the STATEMENT that changes the arithmetic \
-                  rather than the operands, so binding it anyway would read right and \
-                  compute wrong"
-                .to_string(),
-        });
-    }
-    let a = attn.ok_or_else(|| DispatchRefusal::NoAttnCtx(kernel.to_string()))?;
-    let layer = usize::from(b.layers.start);
-    let kv = *a.layers.get(layer).ok_or_else(|| DispatchRefusal::NoAttnCtx(kernel.to_string()))?;
-    let o = if spec.n_out > 0 {
-        b.args[spec.n_in].ptr
-    } else if a.o_out.is_null() {
-        return Err(DispatchRefusal::ShapeDeclined {
-            kernel: kernel.to_string(),
-            why: "the statement declares no result and the fire published no `o_out` -- \
-                  the attention output has nowhere to land"
-                .to_string(),
-        });
-    } else {
-        a.o_out
-    };
-    Ok(Fa2Common { a, kv, layer: u32::from(b.layers.start), q: b.args[0].ptr.cast_const(), o })
-}
-
-/// `Source::Or(&Out(1), &Attn("lse_out_d"))` — the decode pair's LSE.
-#[cfg(feature = "_cuda")]
-fn fa2_lse_or(
-    kernel: &str,
-    b: &BoundLaunch<'_>,
-    spec: &LaunchSpec,
-    a: &AttnCtx,
-) -> Result<*mut f32, DispatchRefusal> {
-    if spec.n_out > 1 {
-        return Ok(b.args[spec.n_in + 1].ptr.cast::<f32>());
-    }
-    if a.lse_out_d.is_null() {
-        return Err(DispatchRefusal::ShapeDeclined {
-            kernel: kernel.to_string(),
-            why: "the statement declares no second result and the fire published no \
-                  `lse_out_d` -- gpt-oss' sink rescale reads that LSE, so a null here is a \
-                  launch whose second output nothing owns"
-                .to_string(),
-        });
-    }
-    Ok(a.lse_out_d)
-}
-
-/// The plan the fire raised, or the refusal that says it raised none.
-#[cfg(feature = "_cuda")]
-fn fa2_plan(
-    kernel: &str,
-    spec: &LaunchSpec,
-    a: &AttnCtx,
-    layer: u32,
-    family: &str,
-) -> Result<*const c_void, DispatchRefusal> {
-    let plan = attn_plan(a, spec, layer, family);
-    if plan.is_null() {
-        return Err(DispatchRefusal::ShapeDeclined {
-            kernel: kernel.to_string(),
-            why: format!(
-                "the fire raised no {family} plan -- a pure-prefill fire has no decode plan \
-                 and a pure-decode fire has no prefill plan, and this statement asked for \
-                 the one that is not there"
-            ),
-        });
-    }
-    Ok(plan.cast_const())
-}
-
-/// `Source::AttnNonZero`'s test, which was a guard and is a refusal here.
-#[cfg(feature = "_cuda")]
-fn fa2_set<T>(kernel: &str, p: *const T, what: &str) -> Result<(), DispatchRefusal> {
-    if p.is_null() {
-        return Err(DispatchRefusal::ShapeDeclined {
-            kernel: kernel.to_string(),
-            why: format!(
-                "the fire published no {what}, and this launcher's whole difference from \
-                 its plain sibling is that it writes one"
-            ),
-        });
-    }
-    Ok(())
-}
-
-/// `attn::dispatch_attention_flashinfer_decode`.
-///
-/// # Errors
-///
-/// Every guard the generated branch carried; see this section's banner.
-#[cfg(feature = "_cuda")]
-pub fn fa2_decode(
-    b: &BoundLaunch<'_>,
-    spec: &LaunchSpec,
-    ctx: &DispatchCtx,
-    attn: Option<&AttnCtx>,
-) -> Result<(), DispatchRefusal> {
-    const K: &str = "attn::dispatch_attention_flashinfer_decode";
-    let c = fa2_common(K, b, spec, attn)?;
-    let plan = fa2_plan(K, spec, c.a, c.layer, "decode")?;
-    let lse = fa2_lse_or(K, b, spec, c.a)?;
-    // SAFETY: `plan` is `bind::DecodePlan`'s own boxed cache, non-null by the
-    // test above; every other pointer is a bound arg or a field of the fire's
-    // `AttnCtx`, live on `ctx.stream` for the fire.
-    unsafe {
-        crate::fire::flashinfer_fa2_dispatch::attn_dispatch_attention_flashinfer_decode(
-            plan,
-            c.q,
-            c.kv,
-            c.o,
-            c.a.kv_page_indices_d,
-            c.a.kv_page_indptr_d,
-            c.a.kv_last_page_lens_d,
-            c.a.workspace,
-            ctx.stream,
-            window_of(spec, c.a, c.layer),
-            c.a.logits_soft_cap,
-            c.a.sm_scale,
-            lse,
-        );
-    }
-    Ok(())
-}
-
-/// `attn::dispatch_attention_flashinfer_decode_capture`.
-///
-/// # Errors
-///
-/// [`fa2_decode`]'s, plus a fire that published no score sink -- which was
-/// `Source::AttnNonZero`'s guard and is stated here one layer earlier than
-/// the launcher's own throw.
-#[cfg(feature = "_cuda")]
-pub fn fa2_decode_capture(
-    b: &BoundLaunch<'_>,
-    spec: &LaunchSpec,
-    ctx: &DispatchCtx,
-    attn: Option<&AttnCtx>,
-) -> Result<(), DispatchRefusal> {
-    const K: &str = "attn::dispatch_attention_flashinfer_decode_capture";
-    let c = fa2_common(K, b, spec, attn)?;
-    let plan = fa2_plan(K, spec, c.a, c.layer, "decode")?;
-    let lse = fa2_lse_or(K, b, spec, c.a)?;
-    fa2_set(K, c.a.score_out.cast_const(), "score sink")?;
-    fa2_set(K, c.a.score_indptr_d, "score index")?;
-    // SAFETY: as [`fa2_decode`], plus the two score buffers, non-null by the
-    // tests above. `score_out` addresses `score_indptr[batch]` floats.
-    unsafe {
-        crate::fire::flashinfer_fa2_dispatch::attn_dispatch_attention_flashinfer_decode_capture(
-            plan,
-            c.q,
-            c.kv,
-            c.o,
-            c.a.kv_page_indices_d,
-            c.a.kv_page_indptr_d,
-            c.a.kv_last_page_lens_d,
-            c.a.workspace,
-            ctx.stream,
-            c.a.score_out,
-            c.a.score_indptr_d,
-            window_of(spec, c.a, c.layer),
-            c.a.logits_soft_cap,
-            c.a.sm_scale,
-            lse,
-        );
-    }
-    Ok(())
-}
-
-/// `attn::dispatch_attention_flashinfer_prefill_bf16`.
-///
-/// The PAGES loose rather than the view whole, which is what this launcher
-/// takes; and `prefill_workspace`, not `workspace` -- a FlashInfer plan writes
-/// its schedule into the workspace it was raised against, so a prefill reading
-/// the decode plan's is one clobbering the other.
-///
-/// # Errors
-///
-/// See this section's banner.
-#[cfg(feature = "_cuda")]
-pub fn fa2_prefill(
-    b: &BoundLaunch<'_>,
-    spec: &LaunchSpec,
-    ctx: &DispatchCtx,
-    attn: Option<&AttnCtx>,
-) -> Result<(), DispatchRefusal> {
-    const K: &str = "attn::dispatch_attention_flashinfer_prefill_bf16";
-    let c = fa2_common(K, b, spec, attn)?;
-    let plan = fa2_plan(K, spec, c.a, c.layer, "prefill")?;
-    // SAFETY: as [`fa2_decode`]; the bf16 mirrors are the layer view's own,
-    // and `dequant_kv_cache_layer_to_bf16_active` inside the entry point is
-    // what makes them current.
-    unsafe {
-        crate::fire::flashinfer_fa2_dispatch::attn_dispatch_attention_flashinfer_prefill_bf16(
-            plan,
-            c.q,
-            c.kv.k_bf16_pages,
-            c.kv.v_bf16_pages,
-            c.o,
-            c.a.qo_indptr_d,
-            c.a.kv_page_indices_d,
-            c.a.kv_page_indptr_d,
-            c.a.kv_last_page_lens_d,
-            c.a.prefill_workspace,
-            ctx.stream,
-            c.a.logits_soft_cap,
-            c.a.sm_scale,
-            c.a.lse_out_d,
-        );
-    }
-    Ok(())
-}
-
-/// `attn::dispatch_attention_flashinfer_prefill_capture_bf16`.
-///
-/// `window` here is the OBSERVATION window (`AttnCtx::score_window`), not the
-/// attention one -- deliberately not `Source::AttnWindow`. The launcher
-/// refuses `<= 0` and `window_left` is `-1` on a family that attends the whole
-/// context, so the same number reads as "no window" to one and "invalid" to
-/// the other.
-///
-/// # Errors
-///
-/// See this section's banner.
-#[cfg(feature = "_cuda")]
-pub fn fa2_prefill_capture(
-    b: &BoundLaunch<'_>,
-    spec: &LaunchSpec,
-    ctx: &DispatchCtx,
-    attn: Option<&AttnCtx>,
-) -> Result<(), DispatchRefusal> {
-    const K: &str = "attn::dispatch_attention_flashinfer_prefill_capture_bf16";
-    let c = fa2_common(K, b, spec, attn)?;
-    let plan = fa2_plan(K, spec, c.a, c.layer, "prefill")?;
-    fa2_set(K, c.a.score_out.cast_const(), "score sink")?;
-    fa2_set(K, c.a.score_indptr_d, "score index")?;
-    // SAFETY: as [`fa2_prefill`], plus the score buffers.
-    unsafe {
-        crate::fire::flashinfer_fa2_dispatch::attn_dispatch_attention_flashinfer_prefill_capture_bf16(
-            plan,
-            c.q,
-            c.kv.k_bf16_pages,
-            c.kv.v_bf16_pages,
-            c.o,
-            c.a.qo_indptr_d,
-            c.a.kv_page_indices_d,
-            c.a.kv_page_indptr_d,
-            c.a.kv_last_page_lens_d,
-            c.a.prefill_workspace,
-            ctx.stream,
-            c.a.score_out,
-            c.a.folded_out,
-            c.a.score_indptr_d,
-            i32::try_from(c.a.score_window).unwrap_or(i32::MAX),
-            c.a.logits_soft_cap,
-            c.a.sm_scale,
-            c.a.lse_out_d,
-        );
-    }
-    Ok(())
-}
-
-/// `attn::dispatch_attention_flashinfer_prefill_custom`.
-///
-/// The mask rides the CONTEXT, not the statement, for the reason the score
-/// sink does: the predicate is folded, so one exec serves the fire that stages
-/// a mask and the fire that does not, and the address recorded now must still
-/// be right when it goes true.
-///
-/// # Errors
-///
-/// See this section's banner.
-#[cfg(feature = "_cuda")]
-pub fn fa2_prefill_custom(
-    b: &BoundLaunch<'_>,
-    spec: &LaunchSpec,
-    ctx: &DispatchCtx,
-    attn: Option<&AttnCtx>,
-) -> Result<(), DispatchRefusal> {
-    const K: &str = "attn::dispatch_attention_flashinfer_prefill_custom";
-    let c = fa2_common(K, b, spec, attn)?;
-    let plan = fa2_plan(K, spec, c.a, c.layer, "prefill")?;
-    fa2_set(K, c.a.mask_d, "custom mask")?;
-    fa2_set(K, c.a.mask_indptr_d, "custom mask index")?;
-    // SAFETY: as [`fa2_prefill`], plus the mask pair, non-null by the tests
-    // above. This launcher takes the layer view whole rather than the pages
-    // loose.
-    unsafe {
-        crate::fire::flashinfer_fa2_dispatch::attn_dispatch_attention_flashinfer_prefill_custom(
-            plan,
-            c.q,
-            c.kv,
-            c.o,
-            c.a.qo_indptr_d,
-            c.a.kv_page_indices_d,
-            c.a.kv_page_indptr_d,
-            c.a.kv_last_page_lens_d,
-            c.a.mask_d,
-            c.a.mask_indptr_d,
-            c.a.prefill_workspace,
-            ctx.stream,
-            c.a.logits_soft_cap,
-            c.a.sm_scale,
-            c.a.lse_out_d,
-        );
-    }
-    Ok(())
-}
-
-/// `attn::attention_flashinfer_prefill` -- the PLANLESS prefill.
-///
-/// It builds an R-shaped plan on the way in, so it holds no cache and states
-/// `Prepare::FireWide`. It is still a driver op, and the resource is the pair
-/// `qo_indptr_h` / `kv_page_indptr_h`: **HOST mirrors of the CSR**, which the
-/// planner walks on the CPU. No `Cx` query answers a host pointer, and a
-/// device value read on the host is a synchronise -- which §0 forbids in a
-/// fire.
-///
-/// `whole`, so `Source::Rows` is the fire's full lane count and `o` is the
-/// stated result only -- this row carries no `Or`, because a launcher that
-/// cannot be given a row window cannot be handed the guard's arena slot
-/// either.
-///
-/// # Errors
-///
-/// See this section's banner; plus this one needs a stated result.
-#[cfg(feature = "_cuda")]
-pub fn fa2_prefill_planless(
-    b: &BoundLaunch<'_>,
-    spec: &LaunchSpec,
-    ctx: &DispatchCtx,
-    attn: Option<&AttnCtx>,
-    rows: i32,
-) -> Result<(), DispatchRefusal> {
-    const K: &str = "attn::attention_flashinfer_prefill";
-    let c = fa2_common(K, b, spec, attn)?;
-    if spec.n_out < 1 {
-        return Err(DispatchRefusal::ArgCount {
-            kernel: K.to_string(),
-            expected: spec.n_in + 1,
-            got: b.args.len(),
-        });
-    }
-    // `Source::Div(&Width(&In(0)), &KvLayerField("head_dim"))`: the head COUNT,
-    // which nobody carries -- the query's width over the cache's head dim.
-    // `.max(1)` is the generated divisor's, and it is what keeps a layer view
-    // that states no head dim from dividing by zero.
-    let head_dim = i32::try_from(c.kv.head_dim).unwrap_or(i32::MAX);
-    let q_width = i32::try_from(b.args[0].width).unwrap_or(0);
-    let num_q_heads = q_width / head_dim.max(1);
-    // SAFETY: as [`fa2_prefill`], plus the two HOST mirrors, which the entry
-    // point walks on the CPU to raise its own plan.
-    unsafe {
-        crate::fire::flashinfer_fa2_dispatch::attn_attention_flashinfer_prefill(
-            c.q,
-            c.kv,
-            b.args[spec.n_in].ptr,
-            c.a.qo_indptr_d,
-            c.a.kv_page_indices_d,
-            c.a.kv_page_indptr_d,
-            c.a.kv_last_page_lens_d,
-            c.a.qo_indptr_h,
-            c.a.kv_page_indptr_h,
-            rows,
-            c.a.num_requests,
-            num_q_heads,
-            c.a.workspace,
-            ctx.stream,
-            window_of(spec, c.a, c.layer),
-            c.a.logits_soft_cap,
-            c.a.sm_scale,
-            c.a.lse_out_d,
-        );
-    }
-    Ok(())
-}
+// `Fa2Common`, `fa2_common`, `fa2_lse_or`, `fa2_plan`, `fa2_set` and the six
+// `fa2_*` arms stood here. They are `bind/arms/fa2.rs`'s now, one arm per
+// symbol, because the six symbols crossed: `kernels_cuda::attn::fa2` derives
+// their rows and takes their arguments as scalars and pointers.
+//
+// Every guard survived the move, in the same order, and each is a
+// `kernels::Refusal` rather than a `DispatchRefusal` because that is what an
+// arm answers with. [`attn_plan`] did not move: it is a DECISION about which
+// of a family's two decode plans a layer takes, the arms reach it through
+// `Cx::spec`, and `dispatch_generated` still forwards to it.
 
 /// Dispatch one bound launch through its `pie_k_*` entry.
 ///
@@ -2113,14 +1772,28 @@ pub fn fa2_prefill_planless(
 //
 // `gemm::mla_absorb_q_to_latent_bf16` and `gemm::mla_absorb_latent_to_v_bf16`
 // were `execution::RUST_SERVED` rows with a generated arm each. Their bodies
-// are `kernels_cuda_new::x::attn::mla_absorb_*` now and their rows are gone.
+// are `kernels_cuda::gemm::absorb`'s now, they are ROUTINES of the
+// `gemm` family, and both `not_yet_crossed` rows are gone -- `Family::symbol`
+// answers `gemm::mla_absorb_*` because the host program finally lives in the
+// family whose namespace the trace states. That file's header is the whole
+// argument; what matters HERE is the one thing the move did not change.
+//
+// **THIS ARM STAYS, AND IT IS THE ONLY THING THAT CAN RUN THEM.** Every other
+// crossed routine is armed in `bind/arms/<family>.rs` over a `Cx`, and these
+// two cannot be: an `arms` arm builds its context with `Ctx::on(stream)` and
+// **no `Cx` query answers a `cublasHandle_t`** -- not because one is missing
+// but because a handle is not a fact about a statement. `Ctx::with_cublas`
+// exists for exactly this seam and `DispatchCtx::cublas` is the only holder
+// of the engine's handle on this path, so a `bind/arms/gemm.rs` written today
+// could only carry the two symbols as `unbound`, and adding it would make
+// `route` answer `Unbound` BEFORE reaching this match -- turning a fire that
+// works into a refusal. That is why there is no `gemm` module under
+// `bind/arms/` at all, and the dense GEMMs are in the same position.
 //
 // **The discriminator answers in one line for BOTH, and it is the same line:
 // `ctx.cublas`.** That is worth recording only because the FA2 six split
 // 5-1 on the same test the same evening; run as a set, this group does not
-// split. Neither has a second condition to check either -- `Cx` states
-// nothing here, because a `cublasHandle_t` is not something `Cx` could ever
-// answer.
+// split.
 //
 // The two arms below are ONE arm with a different callee, so the resolution
 // is written once. Every number comes off `BoundLaunch::args`, `rows` and
@@ -2148,8 +1821,8 @@ fn mla_absorb(
     spec: &LaunchSpec,
     ctx: &DispatchCtx,
     rows: i32,
-    call: unsafe fn(
-        *mut c_void,
+    call: fn(
+        &kernels_cuda::jit::Ctx,
         *const c_void,
         *const c_void,
         *mut c_void,
@@ -2158,7 +1831,7 @@ fn mla_absorb(
         i32,
         i32,
         i32,
-    ) -> Result<(), kernels_cuda_new::x::Refusal>,
+    ) -> Result<(), kernels_cuda::Refusal>,
 ) -> Result<(), DispatchRefusal> {
     if spec.n_in < 1 || spec.n_out < 1 || b.args.len() < spec.n_in + spec.n_out + 1 {
         return Err(DispatchRefusal::ArgCount {
@@ -2189,31 +1862,35 @@ fn mla_absorb(
         });
     }
     let p = |i: usize| i32::try_from(spec.params[i]).unwrap_or(i32::MAX);
-    // SAFETY: three bound device pointers, a live `cublasHandle_t` off the
-    // dispatch context with this fire's stream bound, and four widths the
-    // lowering states. The extents are the statement's own, so the bank the
-    // second absorb offsets into is the one the trace named.
-    let fired = unsafe {
-        call(
-            ctx.cublas,
-            b.args[0].ptr.cast_const(),
-            b.args[spec.n_in + spec.n_out].ptr.cast_const(),
-            b.args[spec.n_in].ptr,
-            rows,
-            p(0),
-            p(1),
-            p(2),
-            p(3),
-        )
+    // SAFETY: `ctx.stream` is this fire's and outlives the launch, and
+    // `ctx.cublas` is the engine's handle with that same stream bound --
+    // `with_cublas`' obligation is exactly that pairing, and `DispatchCtx`
+    // carries the two together for the same reason.
+    let cx = unsafe {
+        kernels_cuda::jit::Ctx::on(ctx.stream).with_cublas(ctx.cublas)
     };
+    // The three bound device pointers and four widths the lowering states.
+    // The extents are the statement's own, so the bank the second absorb
+    // offsets into is the one the trace named.
+    let fired = call(
+        &cx,
+        b.args[0].ptr.cast_const(),
+        b.args[spec.n_in + spec.n_out].ptr.cast_const(),
+        b.args[spec.n_in].ptr,
+        rows,
+        p(0),
+        p(1),
+        p(2),
+        p(3),
+    );
     // `Refusal::Empty` is the archive's `tokens <= 0 || heads <= 0`, which
     // was a bare `return` under `()`. Nothing to launch is an ANSWER, so it
     // is `Ok` here; any other refusal is the launcher declining a shape,
-    // which is the variant that exists to say so. `bind::quant_gemm::empty_\
-    // or_panic` applies the same rule by panicking -- one of the two should
+    // which is the variant that exists to say so. `gemm::quant::empty_or_\
+    // panic` applies the same rule by panicking -- one of the two should
     // eventually be the other, and neither file owns both.
     match fired {
-        Ok(()) | Err(kernels_cuda_new::x::Refusal::Empty { .. }) => Ok(()),
+        Ok(()) | Err(kernels_cuda::Refusal::Empty { .. }) => Ok(()),
         Err(why) => Err(DispatchRefusal::ShapeDeclined {
             kernel: kernel.to_string(),
             why: format!("{why:?}"),
@@ -2262,7 +1939,7 @@ pub fn dispatch<R: Resolver>(
     //
     // `.wiki/kernel-x/northstar.md` §5 step 3. A family that has crossed
     // into fn-world has no rows to generate an arm from and no hand-written
-    // arm below — its host programs live in `kernels_cuda_new::x::<family>`,
+    // arm below — its host programs live in `kernels_cuda::x::<family>`,
     // one file per root `.cuh`, holding that `.cuh` by `include_str!`
     // (§5.1 ①: a `.rs` under `csrc/` would be carried to NVRTC as a header).
     //
@@ -2421,7 +2098,7 @@ pub fn dispatch<R: Resolver>(
     //
     // What is left of the hand-written match, and it is NOT a leftover.
     // §5 step 4 says "delete the hand match (its one live arm,
-    // `pie_lora_qkv_correction`, becomes a normal `bind: None`-plus-driver-fn
+    // `gemm::lora_qkv_correction`, becomes a normal `bind: None`-plus-driver-fn
     // entry or a bind that reaches `LoraFireState::apply`)". Neither shape
     // is right, and the reason is mechanical:
     //
@@ -2455,25 +2132,37 @@ pub fn dispatch<R: Resolver>(
     // this session has now catalogued sixteen times; the count is left here
     // because a reader deciding what step 6 deletes needs a right one.
     //
-    // ── AND WHAT THE COUNT DOES NOT COVER ────────────────────────────────
+    // ── AND WHAT THE COUNT DOES NOT COVER — RESOLVED, AND HOW ────────────
     //
-    // `execution::SERVED` names FOUR `gemm::act_x_wt_*` symbols
-    // `Service::DriverOp` — `act_x_wt_bf16`, `_bf16_out_fp32`, `_bias_bf16`,
+    // This heading used to end *"Zero goldens name any of them, so nothing
+    // can observe the difference, which is why it has stayed."* **Something
+    // observes it now**: `executor_bind.rs`'s
+    // `every_lowered_symbol_runs_or_says_why_not` walks thirteen live
+    // lowerings and asks `arms::bound` for every symbol they emit, and a
+    // symbol no registry mentions is a defect it names. The paragraph below
+    // is the state it found and what answers it.
+    //
+    // Four `gemm::act_x_wt_*` symbols were classified `Service::DriverOp`
+    // — `act_x_wt_bf16`, `_bf16_out_fp32`, `_bias_bf16`,
     // `grouped_act_x_wt_bf16` — and **this match has an arm for none of
-    // them**, nor does anything in `driver-cuda/src` call their
-    // `bind::service` bodies.
+    // them**. All four are derived routines in `kernels_cuda::gemm`; what
+    // is missing is the JOIN, which the generated dispatch used to write and
+    // which died with its generator. `bind/arms/gemm.rs` now carries that
+    // account: `gemm::act_x_w` (the PORTABLE spelling the lowering emits, per
+    // `GEMM_XWT`'s `lowered_as`) and `gemm::act_x_wt_bf16_out_fp32` are
+    // `Bound { arm: None, unbound: Some(..) }` there, so the refusal is a
+    // load-time sentence naming the missing arm instead of a token-time
+    // `NoArm`.
     //
-    // That is not a defect this comment is hiding: `x/gemm.rs:1100` records
-    // it, because the lowering emits the PORTABLE spelling `gemm::act_x_w`
-    // (`GEMM_XWT`'s `lowered_as`) and that spelling resolves to
-    // `Route::Unknown` today — *"the state of the floor as this family was
-    // ported, and it is in the report."* Three more `gemm::` contracts
-    // (`act_x_wt_channel_scaled`, `act_x_wt_grouped_scaled`,
-    // `act_x_wt_mxfp4_marlin`) are in neither `SERVED` nor `table::`, so
-    // `route` answers `Route::Unknown` and the arm below prints *"no
-    // contract and no row declares it"* — **which is false; a contract does
-    // declare all three.** Zero goldens name any of them, so nothing can
-    // observe the difference, which is why it has stayed.
+    // The quantised three — `act_x_wt_channel_scaled`,
+    // `act_x_wt_grouped_scaled`, `act_x_wt_mxfp4_marlin` — used to reach a
+    // message this comment convicted: *"no contract and no row declares
+    // it"*, **which was false; a contract declared all three.** They are
+    // `driver_bound!` rows in `kernels_cuda::gemm` now, off `fn`s in
+    // `gemm::quant`, so the row half of that sentence is not merely false but
+    // unsayable. No arm joins them either, and no live lowering emits them,
+    // which is why `bind/arms/gemm.rs` does not list them: an entry for a
+    // symbol nothing states would be an account of nothing.
     //
     // The `moe` member widens the shape rather than repeating it:
     // `moe::build_moe_ptrs_aligned_bf16` IS a `__global__`, so the "a `Cx`
@@ -2521,7 +2210,7 @@ pub fn dispatch<R: Resolver>(
             spec,
             ctx,
             rows,
-            kernels_cuda_new::x::attn::mla_absorb_q_to_latent_bf16,
+            kernels_cuda::gemm::mla_absorb_q_to_latent_bf16,
         )?,
         "gemm::mla_absorb_latent_to_v_bf16" => mla_absorb(
             "gemm::mla_absorb_latent_to_v_bf16",
@@ -2529,50 +2218,17 @@ pub fn dispatch<R: Resolver>(
             spec,
             ctx,
             rows,
-            kernels_cuda_new::x::attn::mla_absorb_latent_to_v_bf16,
+            kernels_cuda::gemm::mla_absorb_latent_to_v_bf16,
         )?,
 
-        "attn::dispatch_attention_flashinfer_decode" => fa2_decode(bound, spec, ctx, attn)?,
-        // args: as the plain decode dispatch, plus the SCORE outputs.
-        // `_capture` is capturing scores, not capturing a graph —
-        // `WantsAttnScore` is the guard that selects this spelling.
-        //
-        // The score buffers ride the ctx rather than the statement because
-        // they must be arena-STABLE: the predicate is folded, so one exec
-        // serves a fire that wants scores and one that does not, and an
-        // address recorded now has to still be right when it goes true.
-        "attn::dispatch_attention_flashinfer_decode_capture" => {
-            fa2_decode_capture(bound, spec, ctx, attn)?
-        }
-        // args: [q]; o is guard-owned ([`AttnCtx::o_out`]); the pages are
-        // the layer's bf16 MIRRORS — the native alias, the decode lesson.
-        "attn::dispatch_attention_flashinfer_prefill_bf16" => fa2_prefill(bound, spec, ctx, attn)?,
-        // The prefill sibling of the score-capturing decode dispatch, and
-        // the same story: `WantsAttnScore` selects it, the score buffers
-        // ride the ctx because they must be arena-stable under a folded
-        // predicate, and it takes one more output than the decode form —
-        // `folded_out` beside `score_out`, since a prefill's raw scores
-        // and their per-request fold are different extents.
-        //
-        // The fold shares `score_out`'s slot here: an empty CSR makes both
-        // zero-length, which is what a fire that wants no scores means,
-        // and a fire that does want them needs `DecodeScoreCapturePlan`'s
-        // layout for both anyway.
-        "attn::dispatch_attention_flashinfer_prefill_capture_bf16" => {
-            fa2_prefill_capture(bound, spec, ctx, attn)?
-        }
-        // args: [q] with the output guard-owned, or [q, o] as SSA. The
-        // custom-mask arm: `HasCustomMask` selects it, and the mask rides
-        // the ctx rather than the statement for the same reason the score
-        // sink does — the predicate is folded, so one exec serves the fire
-        // that stages a mask and the fire that does not, and the address
-        // recorded now has to still be right when it goes true.
-        "attn::dispatch_attention_flashinfer_prefill_custom" => {
-            fa2_prefill_custom(bound, spec, ctx, attn)?
-        }
-        // args: [q, o] — the PLANLESS flashinfer prefill (plans
-        // internally per fire; reads the host CSR mirrors).
-        "attn::attention_flashinfer_prefill" => fa2_prefill_planless(bound, spec, ctx, attn, rows)?,
+        // THE SIX FA2 DISPATCHES ARE NOT HERE ANY MORE. They crossed:
+        // `kernels_cuda::attn::fa2` derives their rows and
+        // `bind/arms/fa2.rs` joins a statement to one, so `arms::route`
+        // answers `Route::Bound` for all six and this match never sees them.
+        // What they needed and no `Cx` query had -- the two plan caches, the
+        // prefill workspace, the score sink, the mask pair and the host CSR
+        // mirrors -- is `Cx::attn_ctx`, one query with the reason written on
+        // it.
         // args: [act, y] with beta 0, or [act, resid_in, y] with beta 1 —
         // the residual fold, where the output aliases the residual's
         // bytes and cuBLAS accumulates in place. M/K/N come from the
@@ -2816,7 +2472,7 @@ pub fn dispatch<R: Resolver>(
                 });
             }
         }
-        "pie_lora_qkv_correction" => {
+        "gemm::lora_qkv_correction" => {
             need(2)?;
             // NO ADAPTERS STAGED IS AN ANSWER, not a refusal, and this
             // line is the one that lets a union capture record the arm at
@@ -2840,9 +2496,15 @@ pub fn dispatch<R: Resolver>(
             };
             let x = aux_slot(0, resolver)?;
             let (q, v) = (bound.args[0], bound.args[1]);
-            unsafe {
-                (*state).apply(
-                    ctx.cublas,
+            // SAFETY: `ctx.stream` is the fire's and `ctx.cublas` the
+            // engine's, both live across the launches; `state` is the
+            // `LoraFireState` this fire staged, and `staged()` borrows the
+            // vectors it owns rather than copying addresses out of them.
+            let fired = unsafe {
+                let jit = kernels_cuda::jit::Ctx::on(ctx.stream).with_cublas(ctx.cublas);
+                kernels_cuda::gemm::lora_qkv_correction(
+                    &jit,
+                    (*state).staged(),
                     i32::from(bound.layers.start),
                     x.ptr.cast_const(),
                     i32::try_from(x.width).expect("hidden"),
@@ -2851,8 +2513,17 @@ pub fn dispatch<R: Resolver>(
                     q.ptr,
                     v.ptr,
                     scratch,
-                    ctx.stream,
-                );
+                )
+            };
+            // The correction ABORTED on a decline before it crossed, because
+            // its signature was `()` and there was nothing else it could do.
+            // It is a `Refusal` now and this arm answers it the way every
+            // arm around it answers one.
+            if let Err(why) = fired {
+                return Err(DispatchRefusal::ShapeDeclined {
+                    kernel: bound.kernel.to_string(),
+                    why: format!("{why:?}"),
+                });
             }
         }
         // ── the pair/chunked activation and router variants ─────────

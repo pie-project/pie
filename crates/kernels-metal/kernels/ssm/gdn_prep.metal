@@ -12,7 +12,22 @@
 //         writes the q/k channels of new_conv_state. Emits to scratch:
 //           pre_q   [R, Hv, Dk]  fp32   (normalized + 1/sqrt(Dk)-prescaled q)
 //           pre_k   [R, Hv, Dk]  fp32   (normalized k)
-//           pre_gate[R, 2*Hv + Hv*Dv] fp32 ({decay,beta} then precomputed V)
+//           pre_gate[R, 2*Hv]    fp32   ({decay, beta} per value head)
+//
+//         This line used to read `pre_gate[R, 2*Hv + Hv*Dv] ({decay,beta}
+//         then precomputed V)`. That is the PREFILL prep's layout, which
+//         really does write V at `pre_gate + t*pitch + 2*Hv` (L374) for the
+//         scan to read back (L466). The DECODE prep writes `pre_gate[2*n+0]`
+//         and `[2*n+1]` and nothing else (L100-101), and the decode recurrent
+//         computes its own `vval` with its own convsilu (L170) because a v
+//         channel is unique per dv and there is no redundancy there to
+//         remove. A host sizing this scratch from the old line allocated
+//         R*Hv*Dv floats of nothing -- harmless, and wrong, and the kind of
+//         wrong that becomes a bug the day someone indexes by it.
+//
+//         `device_gdn.rs` allocates the tail at the OLD size, poisons it, and
+//         asserts the poison survives, so this correction is a claim rather
+//         than a comment.
 //
 //   (2) gdn_core_recurrent<T>  grid {32, Vd, R*Hv}  tg {32,4,1}
 //         one simdgroup per (req, v-head, v-dim); reads pre_q/pre_k/pre_gate
@@ -23,6 +38,20 @@
 // Bit-exactness vs the single fused gdn_core: pre_q/pre_k are stored fp32 with
 // the SAME 32-lane simd_sum reduction over Dk=128 (=32 lanes x 4), so the values
 // the recurrent kernel reads are IDENTICAL to the in-kernel `sh_q/sh_k` floats.
+//
+// MEASURED, not asserted: `device_gdn.rs`'s
+// `the_split_gdn_pair_is_the_fused_kernel_to_the_bit` fires this pair and the
+// fused `gdn_core` over one fixture and compares with `assert_eq!` -- core
+// output, recurrent state and convolution history, sealed and over a permuted
+// slot map. A tolerance would not have tested the claim: the failure a split
+// like this actually has is a reduction that associates differently, which
+// lands a few ulps out and inside any bound wide enough for a bf16 store.
+//
+// The RAW edge is load-bearing and proved so: dropping the prep dispatch, and
+// running the two in the other order, both fail that test. What supplies the
+// edge in the test is `bind::encode`, which puts a `Visibility::Device`
+// barrier after every dispatch it encodes; in production it is the host DAG's
+// GdnPrep-before-GdnCore edge, and no text has ever asked for one.
 // new_conv_state coverage is the same per-channel-once invariant: prep writes
 // every q/k channel exactly once per head, recurrent writes every v channel
 // exactly once per (head,dv). gating (decay/beta) computed once per head in fp32.
@@ -306,6 +335,24 @@ instantiate_gdn_prep_slotted(bfloat16, bfloat)
 //
 // The arithmetic is unchanged: the same taps in the same order, the same
 // simd_sum reductions, the same fp32 scratch round-trip.
+//
+// MEASURED, against the only oracle that settles it -- the decode path
+// itself. `device_gdn.rs`'s
+// `the_prefill_scan_answers_the_decode_walked_token_by_token` fires
+// `gdn_core` once per token with the conv history ping-ponged forward, then
+// fires this prefill pair over the same prompt, at five tokens against a
+// four-tap window so the FIR really does walk off `conv_state` and onto the
+// prompt. Every one of the nine `(LANES, VROWS)` tilings answers that walk on
+// every channel EXACTLY -- `core_out` is bf16 and no reduction width in this
+// family moves a value that far -- and leaves the same convolution history.
+//
+// `rstate` is fp32 and keeps what the output rounds away: it sits 2^-23 from
+// the walk, and it is bit-equal across VROWS and NOT across LANES. That is
+// each parameter's own claim, measured: VROWS changes how many independent
+// rows a lane group carries and nothing that is summed, while LANES changes
+// the width of `gdn_row_sum` and therefore the association.
+//
+// Scanning one token short, and a row pitch off by two, both fail the test.
 template <typename T>
 [[kernel]] void gdn_prep_prefill(
     const device T* mixed [[buffer(0)]], const device float* conv_state [[buffer(1)]],

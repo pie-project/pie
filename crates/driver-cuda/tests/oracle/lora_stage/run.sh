@@ -25,6 +25,12 @@
 # `PIE_LORA_GROUPED` is cached in a function-local static, so its axis is
 # swept across PROCESSES: the second run re-drives the grouping cases with
 # the lowering off.
+#
+# `KSRC` below is an `-I` and nothing else, and it points into the ARCHIVE
+# crate `kernels-cuda` — CMake+nvcc, a `csrc/` of host `.hpp` and `.cpp` —
+# deleted whole at `85c6c674b`. So the include tree it adds is gone too, on
+# top of the two missing inputs above. The line is left unchanged: it records
+# the command that took the golden, not a path anyone can follow.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

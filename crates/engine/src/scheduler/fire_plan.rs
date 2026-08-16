@@ -43,7 +43,7 @@
 //!   itself declares, true for every member of every fire against it. An
 //!   MoE trace's per-token expert selection ([`SITE_EXPERT_WEIGHTS`]) is
 //!   this provenance; [`site_table::derive_sites`] walks a
-//!   `model_compiler::ForwardPlan` and emits them once per model, not per
+//!   `model_ir::ForwardPlan` and emits them once per model, not per
 //!   fire.
 //!
 //! [`plan_fire_with_model`] merges both: `build_frame_submission` passes
@@ -278,9 +278,15 @@ pub(crate) struct MemberFacts {
     /// [prefill | plain-decode] and the plain-decode run can take the
     /// DECODE kernel instead of demoting to the general causal prefill.
     pub(crate) multi_token: bool,
-    /// Device-resolved (chained-decode envelope) geometry: composes as the
-    /// ordered suffix sub-batch, never interleaved with wire members.
-    pub(crate) device_resolved_geometry: bool,
+    /// `PIE_GEOMETRY_CLASS_*`, the sort's primary term: a device-resolved
+    /// member composes as the ordered suffix sub-batch, never interleaved
+    /// with wire members. Order-identical to
+    /// `device_resolved_geometry` for the two classes that existed when this
+    /// sort was measured (0 where the bool is false, 1 where it is true), and
+    /// it puts a pooled device-geometry member in its own suffix run instead
+    /// of scattering it through the wire members -- which is what lets the
+    /// sub-batch table say which class each run is.
+    pub(crate) geometry_class: u32,
     /// Arrival position within the step group; the stable-order tiebreak.
     pub(crate) arrival: usize,
 }
@@ -367,7 +373,13 @@ pub(crate) fn plan_fire_with_model(members: &[MemberFacts], model_sites: &[Site]
             // [plain|trunc|hook|mask] contract lives on only in the
             // stash server, whose family-2 prefix-marker rule already
             // tolerates hook blocks at or before t_start.
-            member.device_resolved_geometry,
+            // The CLASS, not the bool: order-identical for the two classes
+            // this key was measured with (0 where the bool is false, 1 where
+            // it is true), and it gives a pooled device-geometry member its
+            // own suffix run instead of scattering it through the wire
+            // members -- which is what lets the sub-batch table name the
+            // class of each run.
+            member.geometry_class,
             member.custom_mask,
             member.truncated,
             // ④: deepest-first inside the truncated block (banded
@@ -510,7 +522,11 @@ mod tests {
             truncated: false,
             max_layers: None,
             multi_token: false,
-            device_resolved_geometry,
+            geometry_class: if device_resolved_geometry {
+                ::driver_api::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE
+            } else {
+                ::driver_api::PIE_GEOMETRY_CLASS_HOST
+            },
             arrival,
         }
     }
@@ -523,7 +539,7 @@ mod tests {
             truncated: false,
             max_layers: None,
             multi_token: false,
-            device_resolved_geometry: false,
+            geometry_class: ::driver_api::PIE_GEOMETRY_CLASS_HOST,
             arrival,
         }
     }
@@ -621,7 +637,7 @@ mod tests {
     /// The stable sort `plan_fire` replaces, applied to the same facts.
     fn legacy_order(members: &[MemberFacts]) -> Vec<usize> {
         let mut order: Vec<usize> = (0..members.len()).collect();
-        order.sort_by_key(|&i| (members[i].device_resolved_geometry, members[i].hook_program));
+        order.sort_by_key(|&i| (members[i].geometry_class, members[i].hook_program));
         order
     }
 

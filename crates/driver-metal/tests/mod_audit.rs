@@ -175,9 +175,14 @@ fn every_device_test_requires_the_metal_feature() {
 
     let mut undeclared = Vec::new();
     let mut count = 0usize;
-    for entry in std::fs::read_dir(root.join("tests")).expect("tests/").flatten() {
+    for entry in std::fs::read_dir(root.join("tests"))
+        .expect("tests/")
+        .flatten()
+    {
         let path = entry.path();
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
         if path.extension().is_none_or(|e| e != "rs") || !stem.starts_with("device_") {
             continue;
         }

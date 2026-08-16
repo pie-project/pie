@@ -135,7 +135,8 @@ pub(super) fn place_in_scratch(program: &mut LoadPlan, wanted: &[BufferId]) -> R
         return Ok(0);
     }
 
-    let live = live_ranges(program, &views)?;    let base = persistent_end(program)?;
+    let live = live_ranges(program, &views)?;
+    let base = persistent_end(program)?;
     // Longest-lived first, then largest: the buffer hardest to fit is placed
     // while the region is empty, and the order is total so the layout is a
     // function of the plan rather than of a hash iteration.

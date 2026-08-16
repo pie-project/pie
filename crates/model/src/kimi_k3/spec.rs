@@ -20,10 +20,10 @@
 use serde::{Deserialize, Serialize};
 
 /// This generation's MLA geometry IS the shared one — see
-/// [`model_compiler::facts::MlaFacts`]. Three generations carried
+/// [`model_ir::facts::MlaFacts`]. Three generations carried
 /// field-identical copies of it; the alias keeps every existing spelling
 /// working while there is only one definition to disagree with.
-pub type KimiK3MlaFacts = model_compiler::facts::MlaFacts;
+pub type KimiK3MlaFacts = model_ir::facts::MlaFacts;
 
 /// The KDA half — Kimi Delta Attention: a per-KEY-CHANNEL decay, which is
 /// what separates it from qwen3_5's GDN (a per-head scalar).
@@ -48,10 +48,10 @@ impl KimiK3KdaFacts {
 }
 
 /// This generation's mixture IS the shared one — see
-/// [`model_compiler::facts::MoeFacts`]. Three generations carried
+/// [`model_ir::facts::MoeFacts`]. Three generations carried
 /// field-identical copies; the alias keeps every spelling working while
 /// there is one definition.
-pub type KimiK3MoeFacts = model_compiler::facts::MoeFacts;
+pub type KimiK3MoeFacts = model_ir::facts::MoeFacts;
 
 /// The whole generation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -76,7 +76,7 @@ impl KimiK3Facts {
     ///
     /// The shared predicate, named locally. Four families spell this
     /// call and the LOGIC is already shared -- `after_dense_prefix`
-    /// lives in `model_compiler::facts` for exactly that reason, and its
+    /// lives in `model_ir::facts` for exactly that reason, and its
     /// own doc explains why it is named for the PREFIX rather than for
     /// the mixture. What is left here is a one-line projection onto this
     /// family's own field, which is cheaper than the trait that would
@@ -84,13 +84,13 @@ impl KimiK3Facts {
     /// machinery than the line it replaces.
     #[must_use]
     pub fn is_moe_layer(&self, l: u32) -> bool {
-        model_compiler::facts::after_dense_prefix(self.dense_layers, l)
+        model_ir::facts::after_dense_prefix(self.dense_layers, l)
     }
 
     /// MLA or KDA. The hybrid's schedule, said once.
     #[must_use]
     pub fn is_full_attn(&self, l: u32) -> bool {
-        model_compiler::facts::full_attn_at(self.full_attn_interval, l)
+        model_ir::facts::full_attn_at(self.full_attn_interval, l)
     }
 
     /// Whether layer `l` opens with the attention-residual blend.
@@ -171,7 +171,7 @@ mod tests {
     }
 
     /// An interval of zero means NO full-attention layer, which is the
-    /// disagreement [`model_compiler::facts::full_attn_at`] was extracted
+    /// disagreement [`model_ir::facts::full_attn_at`] was extracted
     /// to settle: this generation read a zero as "none" and two others
     /// read it as "every layer". A stack that answered "every" here would
     /// trace MLA in a layer whose checkpoint ships KDA weights.

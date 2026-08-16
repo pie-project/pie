@@ -55,7 +55,7 @@
 //! the activation have nowhere to be written down here.
 
 use model::catalog::MetalBinding;
-use model_compiler::trace::{FireClass, ForwardPlan};
+use model_ir::trace::{FireClass, ForwardPlan};
 
 /// The FIRST of the two tensors this driver asks a question of, and the
 /// question is about an ENCODING.
@@ -204,9 +204,9 @@ pub fn observed(
     // `Some(repr)` on the text where `None` means the same thing -- two
     // spellings of one encoding, which is how a text stops being comparable
     // to itself across two checkpoints of the same row.
-    let router = point_of(ROUTER_GATE).filter(|p| *p != quant).unwrap_or(
-        crate::batch::AffineFormat { bits: 0, group: 0 },
-    );
+    let router = point_of(ROUTER_GATE)
+        .filter(|p| *p != quant)
+        .unwrap_or(crate::batch::AffineFormat { bits: 0, group: 0 });
     build_kernels_at(
         quant.group,
         quant.bits,
@@ -287,8 +287,8 @@ pub fn text(
     binding: &MetalBinding,
 ) -> Result<ForwardPlan, model::deployment::Refusal> {
     let plan = row.trace(class, model::catalog::Deployed::metal(binding))?;
-    if model_compiler::kernels::Backend::of_family(&plan.family)
-        != Some(model_compiler::kernels::Backend::Metal)
+    if model_ir::kernels::Backend::of_family(&plan.family)
+        != Some(model_ir::kernels::Backend::Metal)
     {
         return Err(model::deployment::Refusal::Unsupported(NOT_A_METAL_TEXT));
     }
@@ -355,10 +355,14 @@ mod tests {
     #[test]
     fn exactly_one_tensor_is_asked_about_and_it_decides_an_encoding() {
         let asked = std::cell::RefCell::new(Vec::new());
-        let b = observed(AffineFormat { bits: 4, group: 64 }, |_| None, |name| {
-            asked.borrow_mut().push(name.to_string());
-            name == EXPERT_BANK
-        });
+        let b = observed(
+            AffineFormat { bits: 4, group: 64 },
+            |_| None,
+            |name| {
+                asked.borrow_mut().push(name.to_string());
+                name == EXPERT_BANK
+            },
+        );
         assert_eq!(
             asked.into_inner(),
             vec![EXPERT_BANK.to_string()],
@@ -486,7 +490,7 @@ mod tests {
     /// symbol on a device nobody in CI has.
     #[test]
     fn the_plan_is_the_rows_own_answer_and_it_is_the_metal_one() {
-        use model_compiler::kernels::Backend;
+        use model_ir::kernels::Backend;
 
         let Some(row) = model::catalog::find("qwen3-0.6b") else {
             panic!("`qwen3-0.6b` is the row the device gates open");
@@ -540,7 +544,7 @@ mod tests {
     /// That sentence is true only while this passes.
     #[test]
     fn a_row_that_answers_for_another_backend_is_not_served() {
-        use model_compiler::kernels::Backend;
+        use model_ir::kernels::Backend;
 
         let mut served = 0usize;
         let mut refused = 0usize;

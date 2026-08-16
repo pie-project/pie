@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use driver_metal::bind::encode::{Params, Pipelines, encode};
 use driver_metal::device::{Allocation, ArgumentTable, Context, Stepper};
 use driver_metal::layout::region::Region as _;
-use driver_metal::lowering::dispatch::{Dispatch, ParamSlot};
+use driver_metal::lowering::dispatch::{Dispatch, ParamSlot, Touches};
 
 fn kernels_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -77,6 +77,7 @@ fn the_bias_lands_on_every_row_and_on_the_right_column() {
         // broadcast and the column has to be recoverable from the invocation.
         grid: [WIDTH, ROWS, 1],
         threadgroup: [256, 1, 1],
+        touches: Touches::everything(&[bound(out.gpu_address())]),
         args: vec![bound(out.gpu_address()), bound(bias.gpu_address())],
         params: vec![WIDTH],
         // What `param_layout`'s `derived` arm emits: a lone four-byte scalar

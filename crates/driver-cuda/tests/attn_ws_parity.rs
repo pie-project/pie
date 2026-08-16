@@ -267,12 +267,12 @@ fn transcript() -> String {
     ws.begin_plan_update(&mut ops).unwrap();
     h.view_row(&mut ops, &ws);
     h.call(&mut ops, "end(sA)");
-    ws.end_plan_update(&mut ops, s_a);
+    ws.end_plan_update(&mut ops, s_a).unwrap();
     h.call(&mut ops, "begin");
     ws.begin_plan_update(&mut ops).unwrap();
     h.view_row(&mut ops, &ws);
     h.call(&mut ops, "end(sB)");
-    ws.end_plan_update(&mut ops, s_b);
+    ws.end_plan_update(&mut ops, s_b).unwrap();
     h.call(&mut ops, "drop");
     ws.release(&mut ops);
     h.flush(&mut ops);
@@ -290,7 +290,7 @@ fn transcript() -> String {
         ws.begin_plan_update(&mut ops).unwrap();
         h.view_row(&mut ops, &ws);
         h.call(&mut ops, end_label);
-        ws.end_plan_update(&mut ops, stream);
+        ws.end_plan_update(&mut ops, stream).unwrap();
     }
     h.call(&mut ops, "begin");
     ws.begin_plan_update(&mut ops).unwrap();
@@ -308,13 +308,13 @@ fn transcript() -> String {
     h.call(&mut ops, "a.begin");
     a.begin_plan_update(&mut ops).unwrap();
     h.call(&mut ops, "a.end(sA)");
-    a.end_plan_update(&mut ops, s_a);
+    a.end_plan_update(&mut ops, s_a).unwrap();
     h.call(&mut ops, "allocate-b(16,16,1)");
     let mut b = Ws::allocate(&mut ops, 16, 16, 1).unwrap();
     h.call(&mut ops, "b.begin");
     b.begin_plan_update(&mut ops).unwrap();
     h.call(&mut ops, "b.end(sA)");
-    b.end_plan_update(&mut ops, s_a);
+    b.end_plan_update(&mut ops, s_a).unwrap();
     h.call(&mut ops, "b=move(a)");
     b.release(&mut ops);
     b = a;
@@ -363,7 +363,7 @@ fn transcript() -> String {
     h.call(&mut ops, "begin");
     ws.begin_plan_update(&mut ops).unwrap();
     h.call(&mut ops, "end(sA)");
-    ws.end_plan_update(&mut ops, s_a);
+    ws.end_plan_update(&mut ops, s_a).unwrap();
     h.call(&mut ops, "begin [pin will fail]");
     ops.fail_next_malloc = true;
     let r = ws.begin_plan_update(&mut ops);
@@ -372,7 +372,7 @@ fn transcript() -> String {
     ws.begin_plan_update(&mut ops).unwrap();
     h.view_row(&mut ops, &ws);
     h.call(&mut ops, "end(sB)");
-    ws.end_plan_update(&mut ops, s_b);
+    ws.end_plan_update(&mut ops, s_b).unwrap();
     h.call(&mut ops, "drop");
     ws.release(&mut ops);
     h.flush(&mut ops);
@@ -387,7 +387,7 @@ fn transcript() -> String {
     h.call(&mut ops, "begin");
     ws.begin_plan_update(&mut ops).unwrap();
     h.call(&mut ops, "end(sA)");
-    ws.end_plan_update(&mut ops, s_a);
+    ws.end_plan_update(&mut ops, s_a).unwrap();
     h.call(&mut ops, "begin [event will fail]");
     ops.fail_next_event = true;
     let r = ws.begin_plan_update(&mut ops);

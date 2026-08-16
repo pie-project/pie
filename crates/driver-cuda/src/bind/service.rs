@@ -1,10 +1,25 @@
-//! The rows the DRIVER executes itself — [`Execution::Service`], in Rust.
+//! The rows the DRIVER executes itself — `Execution::Service`, in Rust.
 //!
-//! [`Execution::Service`]: kernels_cuda_new::execution::Execution::Service
+//! # THIS MODULE HOLDS NO CODE, and what is left is the record of where the
+//! code went
 //!
-//! # What this module is
+//! Every entry point this file ever had has been deleted, family by family,
+//! as each one's host program crossed into `kernels-cuda`; the last five
+//! went with `.wiki/kernel-x/refactor-plan.md` §6.3's quantised-GEMM and
+//! collective descents. What remains is ~800 lines of per-family account —
+//! which wrappers stood here, what each one cost, and what answers the
+//! question it was answering now — and that account is the file's whole
+//! value, so it is kept rather than scattered into the modules that took the
+//! bodies.
 //!
-//! `kernels-cuda-new`'s `execution.rs` classifies every row as `Jit`,
+//! **Deleting it is therefore a decision about the record and not about the
+//! code.** The condition is that every paragraph below has a better home, and
+//! several do not yet: the `norm`, `rope` and `ssm` blocks each carry a
+//! measurement that no crossed family repeated.
+//!
+//! # What this module WAS
+//!
+//! `kernels-cuda`'s `execution.rs` classifies every row as `Jit`,
 //! `Composed` or `Service`, and says of the third: *a symbol whose body is
 //! one library call and nothing else is not a kernel, and extracting it as
 //! one is extracting nothing.* Fourteen rows are classified that way. Until
@@ -14,7 +29,8 @@
 //!
 //! **`gemm/gemm.cpp` is now deleted.** §45 took the four pure-cuBLAS bodies
 //! into this module; a later pass took the quantized router into
-//! [`crate::bind::quant_gemm`]; and the last pass took the dense bf16
+//! `bind::quant_gemm`, from which it has since descended to
+//! [`kernels_cuda::gemm::quant`]; and the last pass took the dense bf16
 //! autotuner — the largest single thing in the file, and the reason it
 //! outlived the rest — into [`crate::fire::gemm`]. Nothing in this tree
 //! issues a cuBLAS call from C++ any more. The paragraph above is kept in the
@@ -62,12 +78,14 @@
 //! inside a graph capture invalidates the capture"*, so a speculative first
 //! attempt is worse than no attempt.
 
-use std::ffi::c_void;
+// `use std::ffi::c_void;` AND `use super::DispatchCtx;` STOOD HERE. The
+// second is the sharper receipt: every wrapper this file held took a
+// `_ctx: &DispatchCtx` it did not read, because `abi::emit_rust_dispatch`
+// wrote every arm the same way, and the parameter outlived both the emitter
+// and the classification list that selected it.
 
-use super::DispatchCtx;
 
-
-// ── `attn/dsa_indexer.cu`'S THREE MOVED TO `kernels_cuda_new::x::attn` ─
+// ── `attn/dsa_indexer.cu`'S THREE MOVED TO `kernels_cuda::attn` ─
 //
 // `attn_dsa_index_knorm_rope_bf16`, `attn_dsa_index_q_rope_bf16` and
 // `attn_dsa_index_topk_mask` stood here over `fire::dsa_indexer`, and this
@@ -83,7 +101,7 @@ use super::DispatchCtx;
 // (`tokens <= 0`), and `Fired::Declined(Refusal::Empty { what: "tokens" })`
 // says it in the floor's own vocabulary.
 
-// ── MLA'S ABSORB PAIR MOVED TO `kernels_cuda_new::x::attn` ─────────────
+// ── MLA'S ABSORB PAIR MOVED TO `kernels_cuda::attn` ─────────────
 //
 // `gemm_mla_absorb_q_to_latent_bf16` and `gemm_mla_absorb_latent_to_v_bf16`
 // were `execution::RUST_SERVED` rows resolved by the generated dispatch --
@@ -120,7 +138,7 @@ use super::DispatchCtx;
 // boundary forces rather than one anybody chose. That is stated at the
 // definitions there; it is not stated twice.
 
-// ── `gemm_act_x_wt_bf16_out_fp32` MOVED TO `kernels_cuda_new::x::gemm::act_x_wt_bf16_out_fp32` ──
+// ── `gemm_act_x_wt_bf16_out_fp32` MOVED TO `kernels_cuda::gemm::act_x_wt_bf16_out_fp32` ──
 //
 // §5 step 5. Its body is verbatim where the device text and the tuner
 // are; what stood here was the ~120 lines of argument assembly this
@@ -142,7 +160,7 @@ use super::DispatchCtx;
 // /// is asynchronous on the handle's stream, so "outlive" ends at the next
 // /// synchronisation and not at this call's return.
 
-// ── `gemm_grouped_act_x_wt_bf16` MOVED TO `kernels_cuda_new::x::gemm::grouped_act_x_wt_bf16` ──
+// ── `gemm_grouped_act_x_wt_bf16` MOVED TO `kernels_cuda::gemm::grouped_act_x_wt_bf16` ──
 //
 // §5 step 5. Its body is verbatim where the device text and the tuner
 // are; what stood here was the ~120 lines of argument assembly this
@@ -170,7 +188,7 @@ use super::DispatchCtx;
 // /// addresses (cuBLAS reads them on the host for the grouped form), and
 // /// `m_array` a host array of `group_count` row counts.
 
-// ── `gemm_act_x_wt_bf16` MOVED TO `kernels_cuda_new::x::gemm::act_x_wt_bf16` ──
+// ── `gemm_act_x_wt_bf16` MOVED TO `kernels_cuda::gemm::act_x_wt_bf16` ──
 //
 // §5 step 5. Its body is verbatim where the device text and the tuner
 // are; what stood here was the ~120 lines of argument assembly this
@@ -207,7 +225,7 @@ use super::DispatchCtx;
 // /// composition takes this row as its first step and `Composition::agrees`
 // /// type-checks `Take::From(i)` against the operands as stated. They are the
 // /// same pointer; `ctx.cublas` is the engine's handle, created once at boot by
-// /// `device::cublas`.
+// /// `pie::cublas`.
 // ///
 // /// # Safety
 // ///
@@ -216,7 +234,7 @@ use super::DispatchCtx;
 // /// ends at the next synchronisation and not at this call's return.
 // #[allow(clippy::too_many_arguments)]
 
-// ── `gemm_act_x_wt_bias_bf16` MOVED TO `kernels_cuda_new::x::gemm::act_x_wt_bias_bf16` ──
+// ── `gemm_act_x_wt_bias_bf16` MOVED TO `kernels_cuda::gemm::act_x_wt_bias_bf16` ──
 //
 // §5 step 5. Its body is verbatim where the device text and the tuner
 // are; what stood here was the ~120 lines of argument assembly this
@@ -242,7 +260,7 @@ use super::DispatchCtx;
 // /// double rounding deliberate, *"bit-identical to running `add_bias_bf16`
 // /// afterwards"*. (That was `gemv.hpp`'s wording; the header is deleted and
 // /// the sentence is now at both epilogues of
-// /// `kernels-cuda-new/csrc/src/gemm/gemv.cuh`, which is the text NVRTC
+// /// `kernels-cuda/kernels/gemm/gemv.cuh`, which is the text NVRTC
 // /// compiles.) The composition therefore produces THE SAME BYTES and costs one
 // /// extra launch per biased `M == 1` projection.
 // ///
@@ -279,200 +297,28 @@ use super::DispatchCtx;
 // /// `Source::Ctx("cublas")`/`Source::Ctx("stream")` bind to anyway.
 // #[allow(clippy::too_many_arguments)]
 
-// ─────────────────────────────────────────────────────────────────────────
-// The quantized rows — `gemm.cpp`'s three `WeightView` entry points
-// ─────────────────────────────────────────────────────────────────────────
+// THE THREE QUANTIZED ENTRY POINTS STOOD HERE, AND THEY DESCENDED WITH THE
+// ROUTER THEY BUILT FOR.
 //
-// Bodies in [`super::quant_gemm`]; the spellings are here because
-// `every_rust_served_symbol_is_spelled_here` reads THIS file's text. Each is
-// the `gemm.hpp` inline it replaces: build a `WeightView` from the row's
-// operands, then call the one router. `execution::WALKED` states them as
-// `Control::Switch { on: "w_dtype" }`, which is what the router is.
-
-/// `gemm::act_x_wt_channel_scaled` — `gemm.hpp:160`.
-///
-/// `y[M, N] = act[M, K] x W[N, K]^T`, with `W` quantized per output channel:
-/// one scale per row of `W`. Serves both FP8 E4M3 and INT8 weights, and the
-/// two take completely different routes inside — FP8 per-channel always
-/// dequants to bf16 (cuBLASLt has no per-channel FP8 scale mode this tree
-/// targets), INT8 per-channel runs the native `CUBLAS_COMPUTE_32I` path.
-///
-/// `channel_axis` is accepted and NOT read, exactly as the archive's inline
-/// accepted and did not read it: the row states it because a per-channel
-/// scale has an axis, and every weight this driver materialises is `[N, K]`
-/// row-major with the channel on axis 0. A non-zero value is not refused
-/// here because the C++ did not refuse it either — recording that is worth
-/// more than inventing a check the archive never made.
-///
-/// # Safety
-///
-/// Every pointer must be a device address on the current device, `w` must
-/// hold at least `N * K` elements of `w_dtype` and `scale` at least `N`
-/// values; `y` must be writable for `M * N` bf16. Checked as far as
-/// `validate_quant_weight_view` can check it, which is the byte counts.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn gemm_act_x_wt_channel_scaled(
-    _ctx: &DispatchCtx,
-    handle: *mut c_void,
-    act: *const c_void,
-    w: *const c_void,
-    w_dtype: i32,
-    w_nbytes: usize,
-    scale: *const c_void,
-    scale_dtype: i32,
-    scale_numel: usize,
-    _zero_point: *const c_void,
-    _channel_axis: i32,
-    y: *mut c_void,
-    m: i32,
-    n: i32,
-    k: i32,
-    beta: f32,
-) {
-    let view = super::quant_gemm::WeightView {
-        data: w,
-        dtype: w_dtype,
-        nbytes: w_nbytes,
-        scale_data: scale,
-        scale_dtype,
-        scale_numel,
-        quant_kind: super::quant_gemm::quant_kind::PER_CHANNEL,
-        group_size: 0,
-    };
-    // SAFETY: the caller's obligation, above.
-    unsafe {
-        super::quant_gemm::act_x_w(
-            handle,
-            act,
-            view,
-            y,
-            m,
-            n,
-            k,
-            beta,
-            super::quant_gemm::dtype::BF16,
-            super::quant_gemm::dtype::BF16,
-        );
-    }
-}
-
-/// `gemm::act_x_wt_grouped_scaled` — `gemm.hpp:182`.
-///
-/// The same GEMM with `W` quantized per group along `K`. `group_size` is the
-/// group extent, and for FP8 it is also the extent along `N`: DeepSeek's
-/// `weight_block_size = [128, 128]` is a 2-D block scale, which is why
-/// `validate_quant_weight_view` counts `ceil(N/gs) * ceil(K/gs)` scales for
-/// FP8 and `N * ceil(K/gs)` for everything else.
-///
-/// **This is the row that reaches the block-scaled W8A8 path** — the one
-/// arm here that does not dequant the weight, and the reason it exists is a
-/// measurement: re-expanding a block-quantized FP8 weight to bf16 costs 5x
-/// the weight bandwidth of the matmul and dominates decode.
-///
-/// # Safety
-///
-/// As [`gemm_act_x_wt_channel_scaled`], with the scale count above.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn gemm_act_x_wt_grouped_scaled(
-    _ctx: &DispatchCtx,
-    handle: *mut c_void,
-    act: *const c_void,
-    w: *const c_void,
-    w_dtype: i32,
-    w_nbytes: usize,
-    scale: *const c_void,
-    scale_dtype: i32,
-    scale_numel: usize,
-    _zero_point: *const c_void,
-    group_size: i32,
-    y: *mut c_void,
-    m: i32,
-    n: i32,
-    k: i32,
-    beta: f32,
-) {
-    let view = super::quant_gemm::WeightView {
-        data: w,
-        dtype: w_dtype,
-        nbytes: w_nbytes,
-        scale_data: scale,
-        scale_dtype,
-        scale_numel,
-        quant_kind: super::quant_gemm::quant_kind::PER_GROUP,
-        group_size,
-    };
-    // SAFETY: the caller's obligation, above.
-    unsafe {
-        super::quant_gemm::act_x_w(
-            handle,
-            act,
-            view,
-            y,
-            m,
-            n,
-            k,
-            beta,
-            super::quant_gemm::dtype::BF16,
-            super::quant_gemm::dtype::BF16,
-        );
-    }
-}
-
-/// `gemm::act_x_wt_mxfp4_marlin` — `gemm.hpp:206`.
-///
-/// MXFP4: four-bit elements packed two per byte with one raw E8M0 exponent
-/// byte per 32-element block. The scale dtype is UINT8 and the group size is
-/// 32, and both are asserted rather than defaulted.
-///
-/// **"marlin" in the name is the checkpoint format's, not a kernel's.** The
-/// vendored marlin tree went in §54; this row dequants to bf16 and runs the
-/// classic GEMM, which is what the archive's arm did after the removal too.
-///
-/// # Safety
-///
-/// `w` must hold at least `ceil(N * K / 2)` bytes and `scale` at least
-/// `N * ceil(K / 32)` bytes; `y` writable for `M * N` bf16.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
-    _ctx: &DispatchCtx,
-    handle: *mut c_void,
-    act: *const c_void,
-    w: *const c_void,
-    w_nbytes: usize,
-    scale: *const c_void,
-    scale_numel: usize,
-    y: *mut c_void,
-    m: i32,
-    n: i32,
-    k: i32,
-    beta: f32,
-) {
-    let view = super::quant_gemm::WeightView {
-        data: w,
-        dtype: super::quant_gemm::dtype::MXFP4_PACKED,
-        nbytes: w_nbytes,
-        scale_data: scale,
-        scale_dtype: super::quant_gemm::dtype::UINT8,
-        scale_numel,
-        quant_kind: super::quant_gemm::quant_kind::PER_GROUP,
-        group_size: 32,
-    };
-    // SAFETY: the caller's obligation, above.
-    unsafe {
-        super::quant_gemm::act_x_w(
-            handle,
-            act,
-            view,
-            y,
-            m,
-            n,
-            k,
-            beta,
-            super::quant_gemm::dtype::BF16,
-            super::quant_gemm::dtype::BF16,
-        );
-    }
-}
+// `gemm_act_x_wt_channel_scaled`, `gemm_act_x_wt_grouped_scaled` and
+// `gemm_act_x_wt_mxfp4_marlin` were three `gemm.hpp` inlines: build a
+// `WeightView` out of the row's operands, then call `bind::quant_gemm`'s one
+// router. They are `kernels_cuda::gemm::quant`'s now, with the router,
+// and the three symbols are `driver_bound!` rows derived from
+// `kernels_cuda::gemm`'s own `fn`s.
+//
+// **The reason they were kept apart from their bodies has been dead for some
+// time.** `bind/mod.rs` stated it at the `quant_gemm` module declaration:
+// *"The three entry points stay in `service` because
+// `execution::RUST_SERVED`'s spelling test reads that file."* That test —
+// `every_rust_served_symbol_is_spelled_here` — went with the archive crate
+// and the classification table it read, and the three comments in this file
+// that still cite it as a live requirement went with these functions.
+//
+// What the split cost while it stood was an eight-field `WeightView`
+// assembled on one side of a crate boundary and read on the other, which is
+// the shape §6.3 exists to close, and it is the same shape FA2's descent
+// found in its `#[repr(C)]` params filling.
 
 // `moe::moe_grouped_gemm_bf16` STOOD HERE, as `pub unsafe fn
 // moe_moe_grouped_gemm_bf16`, and is DELETED. §5 step 5 took `moe` into
@@ -542,7 +388,7 @@ pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
 // > can tell that two `__global__`s run behind it.
 //
 // §5 step 5 took `sample` into fn-world. The whole program is
-// `kernels_cuda_new::x::sample::lm_head_gemv_argmax_int8`, and this wrapper
+// `kernels_cuda::sample::lm_head_gemv_argmax_int8`, and this wrapper
 // is gone because there is nothing left for it to do: it existed to turn a
 // generated dispatch arm's argument list into a `fire::` call, and a bind
 // body reads a `Cx` instead.
@@ -560,9 +406,18 @@ pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
 // ── `norm/`: SIX WRAPPERS STOOD HERE AND ARE GONE ─────────────────────
 //
 // `norm` crossed into fn-world (`.wiki/kernel-x/northstar.md` §5 step 5).
-// Its host programs are `kernels-cuda-new/src/x/norm.rs`, beside the six
+// Its host programs are `kernels-cuda/src/norm.rs`, beside the six
 // `csrc/src/norm/*.cuh` roots they fire, and `bind/mod.rs::dispatch` reaches
-// them through `kernels_cuda_new::x::entry` — one lookup, no wrapper.
+// them through the arm registry in `bind/arms/norm.rs` — one lookup, no
+// wrapper.
+//
+// It said `kernels_cuda::x::entry`, and both halves of that name are
+// gone: `x` dissolved, and `entry()` — a search over `FAMILIES` returning a
+// per-symbol handle — is `kernels_cuda::routine` now. The arms do not
+// call it. A crossed family's arm holds a typed call to the host `fn`, which
+// the compiler checks; `routine()` answers the same question for a symbol
+// that is a STRING at run time, which is a trace statement's question and
+// not an arm's.
 //
 // The six were: `norm_rmsnorm_bf16_with_fp16`,
 // `norm_rmsnorm_residual_add_scale_rmsnorm_bf16`,
@@ -590,9 +445,11 @@ pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
 // ── `rope/`: NINE WRAPPERS STOOD HERE AND ARE GONE ──────────────────────
 //
 // `rope` crossed into fn-world (`.wiki/kernel-x/northstar.md` §5 step 3).
-// Its host programs are `kernels-cuda-new/src/x/rope.rs`, beside the
+// Its host programs are `kernels-cuda/src/rope.rs`, beside the
 // `rope.cuh` they fire, and `bind/mod.rs::dispatch` reaches them through
-// `kernels_cuda_new::x::entry` — one lookup, no wrapper.
+// `bind/arms/rope.rs` — one lookup, no wrapper. (`x::entry` was the spelling
+// here; see the `norm` block above for what answers that now and why an arm
+// does not ask it.)
 //
 // # Why the wrappers existed, and why nothing needs them now
 //
@@ -621,10 +478,10 @@ pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
 // ── `ssm/`: ELEVEN WRAPPERS STOOD HERE AND ARE GONE ─────────────────────
 //
 // `ssm` crossed into fn-world (`.wiki/kernel-x/northstar.md` §5 step 5).
-// Its host programs are `kernels-cuda-new/src/x/ssm.rs` — twenty-seven of
+// Its host programs are `kernels-cuda/src/ssm.rs` — twenty-seven of
 // them, in five inline `pub mod`s beside the five `.cuh` they fire — and
-// `bind/mod.rs::dispatch` reaches them through `kernels_cuda_new::x::entry`,
-// one lookup, no wrapper. `driver-cuda/src/fire/{causal_conv1d,
+// `bind/mod.rs::dispatch` reaches them through `bind/arms/ssm.rs`, one
+// lookup, no wrapper. (`x::entry` was the spelling; see the `norm` block.) `driver-cuda/src/fire/{causal_conv1d,
 // gated_delta_net,kda,nemotron_h}.rs` are deleted with them.
 //
 // The eleven were: `ssm_causal_conv1d_prefill_batched_bf16`,
@@ -640,9 +497,16 @@ pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
 // `x::ssm::kda_prefill_batched` beside the `<<<>>>` that uses it.
 //
 // `ssm_qwen_gdn_post_conv_prep_bf16` is the one that did not go to `x::ssm`:
-// it is `x::driver_internal::qwen_gdn_post_conv_prep_bf16`, a `fn` with two
-// `fire` calls and no `contract!`, called by `bind/mod.rs`'s GDN path
-// directly.
+// it is `kernels_cuda::driver_internal::qwen_gdn_post_conv_prep_bf16`, a
+// `fn` with two launches and no `contract!`.
+//
+// **AND NOTHING CALLS IT.** The sentence that stood here said `bind/mod.rs`'s
+// GDN path called it directly; no such call exists anywhere in this crate,
+// and it is the qwen3.5 hybrid's `OpKind::GdnPrep` that names the symbol
+// `ssm::qwen_gdn_post_conv_prep_bf16` at lowering. That symbol is DECLARED
+// now — `ssm::ROUTINES` derives it from the same `fn` — so a fire reaches
+// `bind/arms/ssm.rs`, finds no entry, and refuses with `NoArm`. Declaring a
+// symbol is not arming it, and the arm is this crate's to write.
 //
 // # THE PARAGRAPH THIS BLOCK EXISTED TO WRITE DOWN, and it is now history
 //
@@ -786,8 +650,8 @@ pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
 // Its `Cx` spelling, `x::MlaLayer`, is the same five fields.
 
 // `layout::embed_bf16` — was `layout/embed.hpp`, and that file is DELETED
-// with its `.cu` and the whole of `kernels-cuda/csrc/src/layout/` — STOOD
-// HERE, as `pub unsafe fn layout_embed_bf16`, and is DELETED.
+// with its `.cu` and the whole of the ARCHIVE crate's `kernels/layout/` —
+// STOOD HERE, as `pub unsafe fn layout_embed_bf16`, and is DELETED.
 //
 // Its doc read:
 //
@@ -800,7 +664,7 @@ pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
 // > sizes the grid.
 //
 // §5 step 5 took `layout` into fn-world. The program is
-// `kernels_cuda_new::x::layout::embed_bf16`; the switch is
+// `kernels_cuda::layout::embed_bf16`; the switch is
 // `x::layout::vectorisable`, a `pub fn` a caller staging its own buffers can
 // ask directly; and the bind that reads the operands off a `Cx` is
 // `x::layout`'s `EMBED` arm. Nothing calls this wrapper any more: it existed
@@ -816,7 +680,7 @@ pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
 //
 // A thin resolution over `fire::split_packed::split_qkv_bf16_devwin`, and
 // that module is deleted too. The host program is
-// `kernels_cuda_new::x::attn::split_qkv_bf16_devwin` and the contract is
+// `kernels_cuda::attn::split_qkv_bf16_devwin` and the contract is
 // `x::attn`'s `SPLIT_QKV_DEVWIN`, WITH A REAL BIND.
 //
 // Its doc here carried the precondition that made the whole arrangement
@@ -844,7 +708,7 @@ pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
 
 // `attn_combine_attn_outputs_bf16` STOOD HERE, and it is gone rather than
 // moved: the symbol crossed into fn-world as
-// `kernels_cuda_new::x::attn`'s `COMBINE_ATTN_OUTPUTS`, so its `table::attn`
+// `kernels_cuda::attn`'s `COMBINE_ATTN_OUTPUTS`, so its `table::attn`
 // row is deleted, `emit_rust_dispatch` writes no arm that could call this,
 // and a seam with nothing on either side of it is not a seam. Its
 // `RUST_SERVED` entry and its `execution::WALKED` classification went in the
@@ -867,7 +731,7 @@ pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
 // `attn_qkv_decode_qk_norm_rope_write_kv_bf16` DELETED WITH ITS CROSSING —
 // AND IT WAS THE LAST ROW IN `ROW_TABLES`.
 //
-// The symbol is `kernels_cuda_new::x::attn`'s `QKV_DECODE_FUSED`, a
+// The symbol is `kernels_cuda::attn`'s `QKV_DECODE_FUSED`, a
 // `contract!` and a real `bind!` over the `attn/qkv_fused` unit's eleven
 // device rows, with the host program in `x::attn::qkv_fused`.
 //
@@ -890,109 +754,51 @@ pub unsafe fn gemm_act_x_wt_mxfp4_marlin(
 // requires: it reads this file's text, so a symbol that outlives its entry
 // point here goes red immediately.
 
-/// `comm::all_reduce_bf16` — the custom P2P all-reduce.
-///
-/// Ported from `comm/custom_all_reduce.cu:603-621` by way of
-/// [`crate::fire::all_reduce`], which holds the whole lifecycle. **That file
-/// is deleted**, and with it `custom_all_reduce.hpp` and
-/// `custom_all_reduce_stub.cpp`.
-///
-/// This is the first row in the tree that is on `execution::SERVED` and
-/// `execution::RUST_SERVED` at once, and the pairing is the point: `SERVED`
-/// says *the body is one library call*, `RUST_SERVED` says *Rust issues it*.
-/// Every other `SERVED` row's library is cuBLAS; this one's is a header-only
-/// P2P kernel in a CPM-fetched flashinfer tree, and until that text is
-/// vendored the call **declines** — see
-/// [`crate::fire::all_reduce::Decline::NoDeviceText`].
-///
-/// # A decline here is a panic, and that is faithful
-///
-/// The C++ threw `"custom_all_reduce: not initialised"` and the shim's
-/// `catch` aborted. A decline that this arm swallowed would be a silent
-/// wrong answer — the reduction would not have happened and every rank would
-/// read stale activations. The panic names the refusal, which is the
-/// specification for what would fix it.
-///
-/// # Safety
-///
-/// `car` is an opaque [`crate::fire::all_reduce::CustomAllReduce`] handle;
-/// `input` and `output` address at least `count` bf16 elements on the device.
-pub unsafe fn comm_all_reduce_bf16(
-    _ctx: &DispatchCtx,
-    car: *mut c_void,
-    input: *const c_void,
-    output: *mut c_void,
-    count: usize,
-    stream: *mut c_void,
-) {
-    // SAFETY: forwarded unchanged; the caller's assertion is this function's.
-    let outcome =
-        unsafe { crate::fire::all_reduce::all_reduce_bf16(car, input, output, count, stream) };
-    if let crate::fire::all_reduce::AllReduce::Declined(why) = outcome {
-        panic!("comm::all_reduce_bf16 declined: {why}");
-    }
-}
-
-/// `comm::all_reduce_residual_rmsnorm_bf16` — all-reduce, residual add and
-/// RMSNorm in one landing.
-///
-/// Ported from `comm/custom_all_reduce.cu:623-662`. The four runtime values
-/// that select flashinfer's template point are computed in
-/// [`crate::fire::all_reduce::CustomAllReduce::all_reduce_residual_rmsnorm_bf16`],
-/// so a decline names the exact instantiation rather than the family.
-///
-/// # A decline here is a panic
-///
-/// As above, and more so: this row has no unfused spelling at the call site.
-/// `custom_all_reduce.hpp` said it — *"the fused landing IS this kernel, and
-/// there is no other way to spell it"* — which is why the header threw on a
-/// null handle instead of returning `false`.
-///
-/// # Safety
-///
-/// `car` is an opaque handle; `input`, `residual_inout` and `norm_out`
-/// address at least `tokens * hidden` bf16 elements, and `rms_gamma` at
-/// least `hidden`.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn comm_all_reduce_residual_rmsnorm_bf16(
-    _ctx: &DispatchCtx,
-    car: *mut c_void,
-    input: *const c_void,
-    residual_inout: *mut c_void,
-    rms_gamma: *const c_void,
-    norm_out: *mut c_void,
-    tokens: i32,
-    hidden: i32,
-    eps: f32,
-    stream: *mut c_void,
-) {
-    // SAFETY: forwarded unchanged; the caller's assertion is this function's.
-    let outcome = unsafe {
-        crate::fire::all_reduce::all_reduce_residual_rmsnorm_bf16(
-            car,
-            input,
-            residual_inout,
-            rms_gamma,
-            norm_out,
-            tokens,
-            hidden,
-            eps,
-            stream,
-        )
-    };
-    if let crate::fire::all_reduce::AllReduce::Declined(why) = outcome {
-        panic!("comm::all_reduce_residual_rmsnorm_bf16 declined: {why}");
-    }
-}
+// THE TWO COLLECTIVE ENTRY POINTS STOOD HERE, AND THEY WERE THE LAST CODE IN
+// THIS FILE.
+//
+// `comm_all_reduce_bf16` and `comm_all_reduce_residual_rmsnorm_bf16` each
+// reborrowed nothing, resolved nothing and computed nothing: they called
+// `fire::all_reduce`'s free form and PANICKED on a decline. That panic was
+// the only thing either one contributed, and its doc argued for it —
+// *"the C++ threw `custom_all_reduce: not initialised` and the shim's `catch`
+// aborted. A decline that this arm swallowed would be a silent wrong answer:
+// the reduction would not have happened and every rank would read stale
+// activations."*
+//
+// The argument is right and the place was wrong. **An arm decides what a
+// decline means, and neither of these was an arm** — nothing called them,
+// because the generated dispatch that did was deleted with the classification
+// table, so `bind::route` has answered `Route::Rows` for both symbols and the
+// hand match has had no arm for either. A panic nothing can reach is not a
+// policy; it is a comment with a `panic!` in it.
+//
+// The bodies are `kernels_cuda::comm`'s now — the 240-point cross
+// product, both predicates, the `AllReduceFusionParams` mirror and the two
+// refusals that name the exact template point a vendored `comm/` would
+// supply — and `fire::all_reduce` keeps the lifecycle and the opaque-handle
+// reborrow, which is the one thing that could not descend. When an arm is
+// written for these two it belongs in `bind/arms/comm.rs` with the other
+// families' arms, and it will have a `Decline` to report rather than a
+// `Declined` to abort on.
+//
+// The doc on the first of them also recorded a classification fact worth
+// keeping: it was *"the first row in the tree that is on `execution::SERVED`
+// and `execution::RUST_SERVED` at once — `SERVED` says the body is one
+// library call, `RUST_SERVED` says Rust issues it. Every other `SERVED` row's
+// library is cuBLAS; this one's is a header-only P2P kernel in a CPM-fetched
+// flashinfer tree."*
 
 // ───────────────────────────────────────────────────────────────────────────
 // FLASHINFER'S SIX ENTRY POINTS STOOD HERE, AND THE SIX ARMS BESIDE THEM.
 //
 // `attn_dispatch_attention_flashinfer_decode`, `..._decode_capture`,
 // `..._prefill_bf16`, `..._prefill_capture_bf16`, `..._prefill_custom` and
-// `attn_attention_flashinfer_prefill` are now in
-// `crate::fire::flashinfer_fa2_dispatch`; the `fa2_*` arms that call them
-// are in `crate::bind` beside `window_of` and the driver-op `match`.
+// `attn_attention_flashinfer_prefill` went to `crate::fire::\
+// flashinfer_fa2_dispatch` and then CROSSED: the six symbols are
+// `kernels_cuda::attn::fa2`'s routines now, and the arms that join a
+// statement to one are `crate::bind::arms::fa2`'s. Nothing in this crate
+// composes an FA2 launch by hand any more.
 //
 // **The gate is why, and it is worth stating rather than pointing at.** This
 // module became `#[cfg(feature = "bridge")]` at `f38d199c2`, correctly: it

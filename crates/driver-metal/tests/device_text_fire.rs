@@ -41,7 +41,7 @@ use driver_metal::lowering::frame::{Step, lower_step};
 use driver_metal::program::Compiler;
 use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
 use model::shared::llama_like::forward::llama_like_metal;
-use model_compiler::trace::{FireClass, ValueId};
+use model_ir::trace::{FireClass, ValueId};
 
 fn kernels_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -132,6 +132,7 @@ fn geometry() -> Geometry {
         rotary_dims: 128,
         n_experts: 0,
         experts_per_token: 0,
+        ..Geometry::default()
     }
 }
 
@@ -139,7 +140,7 @@ fn geometry() -> Geometry {
 ///
 /// The point is what is NOT here. There is no mixture-aware code anywhere
 /// between this text and the GPU: the router, the sort, the gather, the routed
-/// matmuls and the combine walk `dispatch::plan_one` exactly as a projection
+/// matmuls and the combine walk `dispatch::plan_launch` exactly as a projection
 /// does, and `LaunchRule::RouteRows`/`RoutedQmv` read the expert counts off
 /// the dims the same way `Qmv` reads `width`.
 ///
@@ -162,7 +163,14 @@ fn a_mixture_fires_on_the_device_through_the_same_executor() {
     let step = Step {
         token_ids: &[11, 22, 33, 44],
         qo_indptr: &[0, 1, 2, 3, 4],
-        sampling_indices: &[0, 1, 2, 3],
+        // Four requests of one row each, and each reads row 0 OF ITS OWN
+        // SPAN. This read `&[0, 1, 2, 3]` -- the rows of the fire -- which
+        // is the same list under the absolute reading and, under the
+        // request-local one every backend now uses, asks request 3 for its
+        // fourth row when it has one. `3ab9db71c` brought the rule to this
+        // driver and `NotItsRow` is what catches the difference.
+        sampling_indices: &[0, 0, 0, 0],
+        sampling_indptr: &[0, 1, 2, 3, 4],
         ..Step::default()
     };
     let facts = LlamaLikeFacts {
@@ -211,6 +219,7 @@ fn a_mixture_fires_on_the_device_through_the_same_executor() {
             rotary_dims: 128,
             n_experts: 128,
             experts_per_token: 8,
+            ..Geometry::default()
         },
         &mut store,
     )
@@ -247,7 +256,14 @@ fn gpt_oss_fires_on_the_device_through_the_same_executor() {
     let step = Step {
         token_ids: &[11, 22, 33, 44],
         qo_indptr: &[0, 1, 2, 3, 4],
-        sampling_indices: &[0, 1, 2, 3],
+        // Four requests of one row each, and each reads row 0 OF ITS OWN
+        // SPAN. This read `&[0, 1, 2, 3]` -- the rows of the fire -- which
+        // is the same list under the absolute reading and, under the
+        // request-local one every backend now uses, asks request 3 for its
+        // fourth row when it has one. `3ab9db71c` brought the rule to this
+        // driver and `NotItsRow` is what catches the difference.
+        sampling_indices: &[0, 0, 0, 0],
+        sampling_indptr: &[0, 1, 2, 3, 4],
         ..Step::default()
     };
     let facts = LlamaLikeFacts {
@@ -305,6 +321,7 @@ fn gpt_oss_fires_on_the_device_through_the_same_executor() {
             rotary_dims: 64,
             n_experts: 32,
             experts_per_token: 4,
+            ..Geometry::default()
         },
         &mut store,
     )
@@ -343,7 +360,14 @@ fn gemmas_side_network_fires_on_the_device() {
     let step = Step {
         token_ids: &[11, 22, 33, 44],
         qo_indptr: &[0, 1, 2, 3, 4],
-        sampling_indices: &[0, 1, 2, 3],
+        // Four requests of one row each, and each reads row 0 OF ITS OWN
+        // SPAN. This read `&[0, 1, 2, 3]` -- the rows of the fire -- which
+        // is the same list under the absolute reading and, under the
+        // request-local one every backend now uses, asks request 3 for its
+        // fourth row when it has one. `3ab9db71c` brought the rule to this
+        // driver and `NotItsRow` is what catches the difference.
+        sampling_indices: &[0, 0, 0, 0],
+        sampling_indptr: &[0, 1, 2, 3, 4],
         ..Step::default()
     };
     let facts = LlamaLikeFacts {
@@ -413,6 +437,110 @@ fn gemmas_side_network_fires_on_the_device() {
     );
 }
 
+/// The OTHER gemma, whose per-layer statement is one scalar.
+///
+/// `metal_facts` states `per_layer_scalar: f.ple_dim == 0`, so this is
+/// the arm gemma-4-31b and 26b-a4b take and the side network above is
+/// the E-series'. It had never been fired: `per_layer_scalar` was on the
+/// list of predicates this crate branches on that no fixture turns on,
+/// and it was the last one there with a shipped Metal row behind it.
+///
+/// The 31b is that row -- it serves, and only its seventeen gigabytes
+/// against this machine's ~9G ceiling keep it out of the real-weights
+/// rig. So this is where the arm reaches a device.
+#[test]
+fn the_other_gemmas_per_layer_scalar_fires_on_the_device() {
+    let Ok(context) = Context::new() else {
+        eprintln!("SKIP: no Metal 4 device");
+        return;
+    };
+    let compiler = Compiler::new(&context).expect("a compiler");
+    let mut pipelines = Pipelines::new(kernels_dir());
+
+    let step = Step {
+        token_ids: &[11, 22, 33, 44],
+        qo_indptr: &[0, 1, 2, 3, 4],
+        // Four requests of one row each, and each reads row 0 OF ITS OWN
+        // SPAN. This read `&[0, 1, 2, 3]` -- the rows of the fire -- which
+        // is the same list under the absolute reading and, under the
+        // request-local one every backend now uses, asks request 3 for its
+        // fourth row when it has one. `3ab9db71c` brought the rule to this
+        // driver and `NotItsRow` is what catches the difference.
+        sampling_indices: &[0, 0, 0, 0],
+        sampling_indptr: &[0, 1, 2, 3, 4],
+        ..Step::default()
+    };
+    let facts = LlamaLikeFacts {
+        layers: 6,
+        ..LlamaLikeFacts::qwen3_0_6b()
+    };
+    let metal = LlamaLikeMetalFacts {
+        window_left: vec![512, 512, 512, 512, 512, -1],
+        kv_shared_layers: 2,
+        per_layer_emb_dim: 0,
+        per_layer_scalar: true,
+        ..LlamaLikeMetalFacts::gemma_like()
+    };
+    let plan = llama_like_metal(&facts, &metal, FireClass::Decode);
+    let lowered = lower_step(&plan, &step).expect("the step lowers");
+
+    assert!(
+        lowered
+            .kernels
+            .iter()
+            .any(|k| k.starts_with("layer_scalar")),
+        "this arm is one kernel and this is it: {:?}",
+        lowered.kernels
+    );
+    assert!(
+        !lowered.kernels.iter().any(|k| k.starts_with("ple_")),
+        "a text without a PLE emits none of its nine: {:?}",
+        lowered.kernels
+    );
+
+    let backing =
+        Allocation::new(&context, 256 << 20, "sentinel weights").expect("a backing region");
+    let zeros = zeroed(&context);
+    let mut store = Sentinels {
+        slice: Slice {
+            address: backing.gpu_address(),
+            bytes: 256 << 20,
+        },
+        tables: Slice {
+            address: zeros.gpu_address(),
+            bytes: 1 << 20,
+        },
+        asked: HashMap::new(),
+    };
+
+    let timing = run(
+        &context,
+        &compiler,
+        &mut pipelines,
+        &lowered,
+        geometry(),
+        &mut store,
+    )
+    .expect("the scalar arm fires");
+
+    assert!(
+        timing.encode > std::time::Duration::ZERO,
+        "the stepper reported no encode time, so nothing was encoded"
+    );
+    // One per layer, and NAMED per layer -- a scalar bound once and reused
+    // would be six layers sharing one number.
+    let scalars: Vec<&String> = store
+        .asked
+        .keys()
+        .filter(|n| n.ends_with(".scalar"))
+        .collect();
+    assert_eq!(
+        scalars.len(),
+        facts.layers as usize,
+        "every layer states its own scalar: {scalars:?}"
+    );
+}
+
 #[test]
 fn the_whole_metal_text_fires_on_the_device() {
     let Ok(context) = Context::new() else {
@@ -426,7 +554,14 @@ fn the_whole_metal_text_fires_on_the_device() {
     let step = Step {
         token_ids: &[11, 22, 33, 44],
         qo_indptr: &[0, 1, 2, 3, 4],
-        sampling_indices: &[0, 1, 2, 3],
+        // Four requests of one row each, and each reads row 0 OF ITS OWN
+        // SPAN. This read `&[0, 1, 2, 3]` -- the rows of the fire -- which
+        // is the same list under the absolute reading and, under the
+        // request-local one every backend now uses, asks request 3 for its
+        // fourth row when it has one. `3ab9db71c` brought the rule to this
+        // driver and `NotItsRow` is what catches the difference.
+        sampling_indices: &[0, 0, 0, 0],
+        sampling_indptr: &[0, 1, 2, 3, 4],
         ..Step::default()
     };
     let plan = llama_like_metal(
@@ -525,7 +660,10 @@ fn a_prefill_step_fires_too_so_both_lanes_reach_the_device() {
     let step = Step {
         token_ids: &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         qo_indptr: &[0, 16],
+        // One request of sixteen rows reading its last: the same number
+        // under either numbering, and the CSR is what says so.
         sampling_indices: &[15],
+        sampling_indptr: &[0, 1],
         ..Step::default()
     };
     let plan = llama_like_metal(
@@ -718,7 +856,14 @@ fn two_whole_text_fires_are_in_flight_at_once() {
     let step = Step {
         token_ids: &[11, 22, 33, 44],
         qo_indptr: &[0, 1, 2, 3, 4],
-        sampling_indices: &[0, 1, 2, 3],
+        // Four requests of one row each, and each reads row 0 OF ITS OWN
+        // SPAN. This read `&[0, 1, 2, 3]` -- the rows of the fire -- which
+        // is the same list under the absolute reading and, under the
+        // request-local one every backend now uses, asks request 3 for its
+        // fourth row when it has one. `3ab9db71c` brought the rule to this
+        // driver and `NotItsRow` is what catches the difference.
+        sampling_indices: &[0, 0, 0, 0],
+        sampling_indptr: &[0, 1, 2, 3, 4],
         ..Step::default()
     };
     let plan = llama_like_metal(

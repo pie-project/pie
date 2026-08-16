@@ -1,10 +1,11 @@
 // The ONE thing this oracle replaces: `DeviceTensor::allocate`.
 //
-// `kernels-cuda/csrc/src/tensor.cpp` ends in a `cudaMalloc`, so every shape
-// the shipping `kv_cache.cpp` computes is consumed by the driver and leaves
-// only a pointer behind. The class is declared in the REAL `tensor.hpp`, which
-// is copied verbatim; only this implementation differs, and all it does is
-// record the (dtype, shape) pair it was handed.
+// `tensor.cpp` in the archive crate's `csrc/src` -- deleted with that crate
+// at `85c6c674b` -- ends in a `cudaMalloc`, so every shape the shipping
+// `kv_cache.cpp` computes is consumed by the driver and leaves only a pointer
+// behind. The class is declared in the REAL `tensor.hpp`, which is copied
+// verbatim; only this implementation differs, and all it does is record the
+// (dtype, shape) pair it was handed.
 //
 // That is the entire boundary. Every decision about WHICH tensors exist, what
 // extents they have, and in what order they are created is made by the

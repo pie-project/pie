@@ -256,11 +256,16 @@ pub enum Ungeometric {
     /// Not drift, and not an arithmetic condition: a legitimate answer.
     /// [`kernels::LaunchRule`] is the union of every backend's blocks -- the
     /// mamba family, MLA's prepare, the paged-score taps, the packed-head
-    /// attentions, gemma-4's alt-up and its axial rope. Thirty-seven variants,
-    /// of which one is [`Self::Unstated`]; of the thirty-six real ones this
-    /// backend has geometry for fifteen. A deployment whose text reaches one of
-    /// the other twenty-one is asking for a block that was never ported, and
-    /// the useful answer names WHICH.
+    /// attentions, gemma-4's alt-up and its axial rope. Forty-two variants, of
+    /// which one is [`Self::Unstated`]; of the forty-one real ones this backend
+    /// has geometry for seventeen and refuses twenty-four. A deployment whose
+    /// text reaches one of those twenty-four is asking for a block that was
+    /// never ported, and the useful answer names WHICH.
+    ///
+    /// Both counts are asserted in `tests/rules.rs` and neither is asserted
+    /// here, which is why this sentence said "thirty-seven ... fifteen ...
+    /// twenty-one" long after the arm had grown: the fleet added rules and the
+    /// test moved with them while the prose did not.
     ///
     /// A different sentence from [`Self::Unstated`], where the row exists and
     /// has not said how to launch it: that one is fixed by filling in `launch`,
@@ -273,12 +278,16 @@ pub enum Ungeometric {
     /// every one of them into a silent refusal -- or, worse, into whatever the
     /// arm above happened to compute.
     ///
-    /// `driver-vulkan` refuses the same twenty-one, which is the answer worth
-    /// having rather than a coincidence to note: the two tables are both
+    /// `driver-vulkan` refuses the same set, which is the answer worth having
+    /// rather than a coincidence to note: the two tables are both
     /// `kernels-metal`'s coverage, so the two backends should be unable to run
     /// exactly the same blocks, and a divergence would mean one of the ports
     /// quietly grew or lost a row. `tests/rules.rs` holds the two ledgers
-    /// against each other rather than leaving that to a reading.
+    /// against each other rather than leaving that to a reading — and it is
+    /// where the COUNT lives, too. It was written here as well, as
+    /// "twenty-one", and stayed that way while the arm grew to twenty-four:
+    /// a number repeated away from the assertion that owns it is a number
+    /// nobody updates.
     Unruled(
         /// The rule no shader here is launched as.
         Rule,
@@ -573,8 +582,122 @@ pub fn lanes(rule: Rule, dims: Dims, module: Module) -> Result<[u32; 3], Ungeome
             // is one.
             [module.local.at(0) * dims.q_heads, rows, 1]
         }
-        Rule::PerHeadElementwise => [dims.q_heads * dims.head_dim, 1, 1],
-        Rule::GatedRms => [dims.head_dim, dims.kv_heads, 1],
+        // The two rules Metal distinguishes and this backend cannot.
+        //
+        // On Metal they are genuinely different launches: the tiled kernel
+        // gives a query row to a SIMDGROUP and walks the scores as scalar dot
+        // products, so a 32-row tile is 32 simdgroups and 1024 threads, while
+        // the MMA kernel multiplies 8x8 fragments on the matrix unit where one
+        // simdgroup owns EIGHT rows -- the same tile in 128 threads, declared
+        // on the shader with `max_total_threads_per_threadgroup(128)`. That is
+        // why `kernels::LaunchRule` has two variants and not a parameter.
+        //
+        // WGSL has no matrix unit to distinguish them WITH.
+        // `wgpu::Features::SUBGROUP_MATRIX` exists and this crate has no tier
+        // for it, deliberately -- `capability.rs` offers Baseline, Fp16 and
+        // Subgroup, and a tier is a promise about a BODY. So
+        // `attn/sdpa_paged_mma.wgsl` is a scalar body wearing Metal's
+        // entrypoint names, `@workgroup_size(32, 8)` over a 32-row tile, which
+        // is `attn/sdpa_paged.wgsl`'s tiled arm exactly.
+        //
+        // The arm is therefore shared, and nothing here asserts the two
+        // shaders agree: the extents below are LANES, read from each module's
+        // own `local`, so if the MMA body were ever rewritten at another width
+        // this keeps returning that width's grid. What the two rules share is
+        // the DECOMPOSITION -- tiles of 32 query rows on y, heads on x -- and
+        // that is what is written here.
+        Rule::SdpaTiled | Rule::SdpaMma => {
+            // TILES of query rows on y, where `SdpaVector` puts rows.
+            //
+            // The tile height is the SHADER's, and this backend's is not
+            // Metal's. `attn/sdpa_paged.wgsl`'s tiled arm is
+            // `@workgroup_size(32, 8)` and its body sweeps `for (var rr =
+            // lid.y; rr < 32u; rr = rr + 8u)`, so a GROUP covers 32 rows with 8
+            // y lanes -- four rows per lane -- while Metal runs one 1024-thread
+            // threadgroup per tile. Reading the height off `local.at(1)` would
+            // give 8 and overshoot the grid four-fold; reading it off the
+            // module at all would be reading a number the shader does not
+            // publish.
+            //
+            // So it is stated here, once, next to the reason: `PIE_QT` in the
+            // shader. A `//#define` would let the two drift with nothing to
+            // notice, and the shader's own `rr < 32u` is the literal this must
+            // agree with.
+            const TILE: u32 = 32;
+            // Rounded UP, which is the one place in this file that rounding a
+            // grid is correct rather than a defect. `sdpa_paged.wgsl` takes the
+            // true row count as `params.n_rows` and its rows loop skips
+            // `row >= n_rows`, so a partial last tile knows it is past the end
+            // -- and the row states `n_rows <- Source::Rows` so that it gets
+            // told. Every other rounded axis in this file is refused because
+            // the shader has no such scalar.
+            let tiles = rows.div_ceil(TILE).max(1);
+            // LANES, not workgroups. `groups` divides what this returns by the
+            // module's own `@workgroup_size`, so a rule that returned the
+            // group count would be divided a second time -- and the tiled arm
+            // is `(32, 8)`, so `[q_heads, tiles, 1]` becomes
+            // `[ceil(q_heads/32), ceil(tiles/8), 1]`: one group on each axis
+            // for any fire this model produces, and every head past the first
+            // and every tile past the eighth never written.
+            //
+            // That is the four-fold undershoot this file's `RoutedQmv` comment
+            // describes, in a new rule, and it is what
+            // `no_module_reads_a_grid_axis_its_rule_leaves_flat` reported
+            // within a minute of the rule being written -- by name, on axis 1.
+            //
+            // So both axes are multiplied back up by the module's own local
+            // size. Both divisions are then exact, which is the property every
+            // other served rule here has.
+            [
+                module.local.at(0) * dims.q_heads,
+                module.local.at(1) * tiles,
+                1,
+            ]
+        }
+        // THE ROW AXIS, which this stated as a literal 1 until `kernels-metal`
+        // crossed `attn` and found it.
+        //
+        // `gate.metal`'s header says `grid = (n_q * head_dim, rows, 1)` and
+        // its body indexes `tgpos.y`; the rule built `(q_heads * head_dim, 1,
+        // 1)`, so a 512-token prefill gated token zero and left the other 511
+        // with an ungated attention output. A decode is one row and looked
+        // correct throughout -- the same reason `RouterLane`'s mixture prefill
+        // and `GatedRms`'s hid for as long as they did. Third of the three.
+        //
+        // **No row in this tree names this rule today**: `attn/gate.wgsl`'s
+        // two entrypoints sit behind `kernel!(gate ...)` and
+        // `kernel!(q_gate_split ...)`, both of which state no `launch`, so
+        // `Rule::Unstated` refuses them BY NAME rather than launching them
+        // short. That is why wgpu never computed the wrong answer here and
+        // also why nothing here would have caught it: the arm is a trap laid
+        // for whoever fills those rows, and this is the trap removed rather
+        // than a defect repaired.
+        //
+        // Stated as metal's corrected header does. wgpu's own shader reads
+        // three axes for `gate_bfloat16` (`gid.x` the channel pair, `gid.y`
+        // the head, `gid.z` the row) and two for `q_gate_split_bfloat16`, so
+        // whoever fills those rows owes this arm another look -- one rule
+        // cannot serve both shapes, exactly as `RouterSort` had to split from
+        // `RouterLane`.
+        Rule::PerHeadElementwise => [dims.q_heads * dims.head_dim, rows, 1],
+        // THE ROW AXIS IS ON Z, and it was a literal 1.
+        //
+        // `norm/gated_rms.wgsl` indexes it both ways it can be built: the
+        // strided arm takes `wg.z * strided.row_pitch + wg.y * vd` with `.z`
+        // the TOKEN, and the dense arm takes `(wg.z * grid.y + wg.y) * vd`,
+        // which is a row-major fold whose outer term is the row. With `z = 1`
+        // every workgroup reads `wg.z == 0`, so a fire normalizes its FIRST
+        // row and leaves every other one exactly as the projection wrote it --
+        // fully written and only partly normalized, so nothing downstream can
+        // report it.
+        //
+        // A decode is one row, which is why nothing here saw it.
+        // `kernels-vulkan` found the same missing axis while crossing `norm`,
+        // and `LaunchRule::RouterLane`'s own doc records the identical finding
+        // about the identical mistake -- "with `grid.y = 1` a mixture prefill
+        // routed row 0 only" -- which is already fixed one line below this.
+        // Third time for this shape in this file's vocabulary.
+        Rule::GatedRms => [dims.head_dim, dims.kv_heads, rows],
 
         Rule::RouterLane => [module.local.at(0), rows, 1],
         // ONE workgroup whatever the rows: the sort is over the expert
@@ -895,6 +1018,8 @@ mod tests {
         Rule::ElementwiseRows,
         Rule::PerHead,
         Rule::SdpaVector,
+        Rule::SdpaTiled,
+        Rule::SdpaMma,
         Rule::PerHeadElementwise,
         Rule::GatedRms,
         Rule::RouterLane,
@@ -1097,6 +1222,8 @@ mod tests {
                 "Qmv/width",
                 "Rms/width",
                 "RouteRows/width",
+                "SdpaMma/q_heads",
+                "SdpaTiled/q_heads",
                 "SdpaVector/q_heads",
                 "SplitPacked/in_width",
             ],
@@ -1629,6 +1756,113 @@ mod tests {
     /// A rectangle of no rows still launches one.
     ///
     /// Zero rows would multiply a grid to nothing, and a dispatch of no
+    /// Which served rules carry a ROW AXIS, stated once so that a missing one
+    /// is a failing test rather than a silent third of a prefill.
+    ///
+    /// # The shape this exists for
+    ///
+    /// A grid axis the shader body indexes and the launch does not state.
+    /// The output is FULLY WRITTEN — every row gets bytes — and only partly
+    /// computed, so nothing downstream sees a hole and no golden gate over a
+    /// one-row decode can notice. It has now happened three times in this
+    /// vocabulary:
+    ///
+    /// * [`Rule::RouterLane`], whose own doc in `kernels` records it: "with
+    ///   `grid.y = 1` a mixture prefill routed row 0 only, and every other
+    ///   row's expert ids were whatever the last layer left there".
+    /// * [`Rule::GatedRms`] here, found by `kernels-vulkan` crossing `norm`.
+    ///   `norm/gated_rms.wgsl` reads `wg.z` as the token in both arms it can
+    ///   be built as, and this file passed a literal `1`.
+    /// * `rms_single_row` on vulkan, whose grid counts AXES rather than rows.
+    ///
+    /// # Why a ledger and not one assertion
+    ///
+    /// Row-independence is a real answer for some rules —
+    /// [`Rule::RouterSort`] is one workgroup over a fire-wide histogram, and
+    /// says so — so "every rule scales with rows" would be false. What can be
+    /// checked is that each answer is DELIBERATE: a rule that stops scaling,
+    /// or a new rule that never started, has to be written down here.
+    #[test]
+    fn every_served_rule_states_whether_it_has_a_row_axis() {
+        // `true` where the grid must grow with the fire's rows.
+        const ROW_AXIS: &[(Rule, bool)] = &[
+            (Rule::Qmv, true),
+            (Rule::Rms, true),
+            (Rule::Rope, true),
+            (Rule::Elementwise, true),
+            (Rule::ElementwiseRows, true),
+            (Rule::PerHead, true),
+            (Rule::SdpaVector, true),
+            (Rule::SdpaTiled, true),
+            (Rule::SdpaMma, true),
+            // WAS `false` here, on the assumption that the caller launched
+            // it per row. `kernels-metal`'s attn crossing proved otherwise --
+            // `gate.metal` indexes `tgpos.y` -- and the ledger is what made
+            // that assumption a written claim somebody could refute. See the
+            // arm in `lanes`.
+            (Rule::PerHeadElementwise, true),
+            (Rule::GatedRms, true),
+            (Rule::RouterLane, true),
+            // One workgroup whatever the rows -- the counting sort reduces
+            // over the whole fire's histogram. Its own arm says so.
+            (Rule::RouterSort, false),
+            (Rule::RouteRows, true),
+            (Rule::RoutedQmv, true),
+            (Rule::SplitPacked, true),
+            (Rule::Qmm, true),
+        ];
+
+        let named: Vec<Rule> = ROW_AXIS.iter().map(|(r, _)| *r).collect();
+        assert_eq!(
+            named,
+            SERVED.to_vec(),
+            "this ledger and `SERVED` have parted; a rule with no entry has \
+             no stated answer about its row axis, which is the whole point"
+        );
+
+        for &(rule, wants_rows) in ROW_AXIS {
+            let m = Module {
+                local: Local(if rule == Rule::SdpaVector {
+                    [64, 1, 1]
+                } else {
+                    [256, 1, 1]
+                }),
+                tile: (rule == Rule::Qmm).then_some(Tile { rows: 32, cols: 64 }),
+            };
+            let base = if rule == Rule::SdpaVector {
+                Dims {
+                    head_dim: 128,
+                    ..dims()
+                }
+            } else {
+                dims()
+            };
+            // THIRTY-TWO against SIXTY-FOUR, and both numbers are chosen.
+            //
+            // Not 1 against 8: the tiled rules count 16-row tiles, so both are
+            // a single tile and `SdpaTiled` came back looking row-independent
+            // -- a probe too coarse to see the thing it was built for, which
+            // is the failure mode a ledger like this is most likely to have.
+            //
+            // Not 1 against 64 either: a GEMM refuses a partial tile, so
+            // `Qmm` at one row is `PartialTile { rows: 1, tile: 32 }` and the
+            // sweep panicked before it compared anything. Both counts are
+            // whole tiles for every tile size in this file.
+            let one = lanes(rule, Dims { rows: 32, ..base }, m).expect("thirty-two rows");
+            let many = lanes(rule, Dims { rows: 64, ..base }, m).expect("sixty-four rows");
+            let grew = one != many;
+            assert_eq!(
+                grew,
+                wants_rows,
+                "`{rule:?}` at 32 rows is {one:?} and at 64 is {many:?}; \
+                 this ledger says its grid {} scale with rows. A rule whose \
+                 SHADER indexes a row axis and whose launch states 1 writes \
+                 every row and computes the first.",
+                if wants_rows { "must" } else { "must not" }
+            );
+        }
+    }
+
     /// workgroups runs nothing and reports success.
     #[test]
     fn a_rectangle_of_no_rows_still_launches_one() {

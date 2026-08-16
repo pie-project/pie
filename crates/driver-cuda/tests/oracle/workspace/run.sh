@@ -12,13 +12,28 @@
 # shape; the recorder writes down what it was handed. Every decision about
 # WHICH tensors exist — the always-on fused buffers, the padded q/k/v branch,
 # the MTP row arithmetic — is shipping code.
+#
+# `KSRC` AND `NSRC` ARE NOW THE SAME STRING AND STILL MEAN TWO DIFFERENT
+# CRATES, which is the one thing about this script a reader has to be told.
+# When it was written they were distinct paths: `KSRC` was the ARCHIVE crate —
+# CMake+nvcc, a `csrc/` of host `.hpp` and `.cpp` — and `NSRC` was the JIT
+# crate that replaced it, then carrying a `-new` suffix. The archive was
+# deleted whole at `85c6c674b` and the JIT crate took its name, so the two
+# assignments below collapsed onto one directory.
+#
+# Only `NSRC` names a tree that answers. The `tensor.hpp` that `KSRC` copies
+# was the archive's and is gone — that line is kept as the record of the
+# command that took the golden, not as one anything can run — while the
+# `kAccumThreads` read further down is a live read out of a file that exists.
+# `KSRC` is deliberately NOT deleted or merged into `NSRC`: the two names are
+# what distinguish a dead citation from a live one now that the paths cannot.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../../../../.." && pwd)"
 SRC="$ROOT/crates/driver-cuda/csrc/src"
 KSRC="$ROOT/crates/kernels-cuda/csrc/src"
-NSRC="$ROOT/crates/kernels-cuda-new/csrc/src"
+NSRC="$ROOT/crates/kernels-cuda/csrc/src"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -34,8 +49,8 @@ cp -r "$HERE/stub/." "$WORK/"
 
 # `kArgmaxAccumSlots` is taken from the real device text rather than retyped
 # into the stub, so the oracle cannot keep using 32 after the kernel changes
-# it. §54 deleted `kernels-cuda/csrc/src/sample/argmax.hpp`, which is where
-# this used to be read from: the launchers in it became
+# it. §54 deleted the archive crate's `csrc/src/sample/argmax.hpp`, which is
+# where this used to be read from: the launchers in it became
 # `driver-cuda/src/fire/lm_head_argmax.rs` and the header went with them. The
 # surviving authority is the kernel's own block width — the deleted header's
 # `kArgmaxAccumSlots` existed to publish `device::kAccumWarps` to callers, and

@@ -131,6 +131,7 @@ fn build_model(
                 has_attn_score: g.caps.has_attn_score,
                 has_lora: g.caps.has_lora,
                 device_geometry_port_mask: g.caps.device_geometry_port_mask,
+                resolves_geometry_per_step: g.caps.resolves_geometry_per_step,
                 limits: ::engine::driver::SchedulerLimits {
                     max_forward_requests: g.caps.max_forward_requests as usize,
                     max_forward_tokens: g.caps.max_forward_tokens as usize,

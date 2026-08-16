@@ -94,10 +94,22 @@
 //! `every_stated_row_is_dispatched_or_named` is the assertion, and [`COVERAGE`]
 //! is the list it holds. All 44 STATED rows are dispatched; the other 56 carry
 //! axes and a name and no operands, so no layout can be derived from them and
-//! this harness cannot bind one. The count is pinned in both directions — the
-//! list must be exactly the table's stated set, every name in it must still
-//! appear in this file, and [`run`] refuses to dispatch a row the list does
-//! not claim — so the number shrinking is a failure rather than a silence.
+//! [`run`] cannot bind one. The count is pinned in both directions — the list
+//! must be exactly the table's stated set, every name in it must still appear
+//! in this file, and [`run`] refuses to dispatch a row the list does not claim
+//! — so the number shrinking is a failure rather than a silence.
+//!
+//! **The 56 are not unreachable, only underivable, and that distinction cost
+//! this file its most important kernel.** `driver-wgpu` runs them constantly:
+//! `binding::reorder` falls back to the TRACE's argument order when a row
+//! states none, and `affine_qmm_t`, `sdpa_paged_tiled` and `gdn_core` are in
+//! that set — "most of what a model runs", as that function's own doc says.
+//! Reading "this harness cannot bind one" as "so it is not proven here" is how
+//! `sdpa_paged_tiled` — the arm every multi-row fire takes, which is most of a
+//! serving deployment's — went unproven while the decode arm beside it had a
+//! thorough one. [`dispatch`] is `run` without the row: the order stated from
+//! the shader's own `@group(0)` declarations. It proves the SHADER and not the
+//! driver's ordering, and it is the strongest claim an unstated row admits.
 
 #![allow(clippy::print_stdout)]
 
@@ -709,9 +721,9 @@ fn every_module_parses_and_validates() {
     );
     assert!(
         checked >= 481,
-        "only {checked} modules were checked; the table declares 481 \
-         entrypoints and a check that silently reads nothing is a check that \
-         passes",
+        "only {checked} modules were checked; the shader tree instantiates \
+         481 entrypoints and a check that silently reads nothing is a check \
+         that passes",
     );
 }
 
@@ -854,6 +866,72 @@ fn adapter() -> Option<(&'static Gpu, MutexGuard<'static, ()>)> {
         Err(why) => {
             println!("SKIP: {why}");
             None
+        }
+    }
+}
+
+/// Say whether this machine has an adapter, and fail only if asked to.
+///
+/// Forty-two tests in this file open with `let Some(..) = adapter() else {
+/// return; }`. That is the right shape -- a test that cannot run should not
+/// fail -- and it has one bad property: a suite that skipped forty-two times
+/// and a suite that measured several thousand numbers both print
+///
+/// ```text
+/// test result: ok. 53 passed
+/// ```
+///
+/// The workspace test step runs this crate, so CI has been printing that line
+/// on a runner whose adapter nobody has ever checked, and the only thing
+/// distinguishing "the WGSL is right" from "there was no GPU" was a `SKIP:`
+/// line in output nobody reads.
+///
+/// This test is not gated, because its whole job is to run everywhere.
+/// `PIE_WGPU_REQUIRE_ADAPTER=1` turns the absence into a failure.
+///
+/// If a runner has no hardware adapter it may still have a SOFTWARE one --
+/// `PIE_WGPU_FALLBACK=1` asks for it, and lavapipe is a real implementation
+/// of this same WGSL. The line this prints is what says which of those is
+/// worth setting.
+#[test]
+fn the_runner_states_whether_it_has_an_adapter() {
+    let required = std::env::var_os("PIE_WGPU_REQUIRE_ADAPTER").is_some_and(|v| v != "0");
+    // Counted off this file rather than written down, so the number cannot
+    // become a lie the next time a test is added.
+    //
+    // The needle is split because an undivided one MATCHES ITSELF: this
+    // literal is in the text `include_str!` reads, and the first count came
+    // back 43 for 42 tests.
+    let needle = concat!("= adapter", "() else");
+    let gated = include_str!("gpu.rs").matches(needle).count();
+    assert!(
+        gated >= 20,
+        "found {gated} adapter-gated tests by reading this file, which is not what it contains"
+    );
+    let held = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+    let opened = OPENED.get_or_init(open);
+    drop(held);
+    let software = if std::env::var_os("PIE_WGPU_FALLBACK").is_some() {
+        " (software fallback)"
+    } else {
+        ""
+    };
+    match opened {
+        Ok(_) => println!(
+            "WGPU ADAPTER: PRESENT{software}. The {gated} adapter-gated tests here measured real numbers."
+        ),
+        Err(why) => {
+            println!("WGPU ADAPTER: ABSENT ({why}).");
+            println!(
+                "All {gated} adapter-gated tests in this file skipped, so a green `--test gpu` here measured NOTHING."
+            );
+            println!(
+                "PIE_WGPU_FALLBACK=1 asks for a software adapter, which is a real implementation of this WGSL."
+            );
+            assert!(
+                !required,
+                "PIE_WGPU_REQUIRE_ADAPTER is set and no adapter opened: {why}. A suite that silently skips is what this test exists to prevent"
+            );
         }
     }
 }
@@ -1344,6 +1422,107 @@ fn writable(ty: kernels::Ty) -> bool {
     )
 }
 
+/// The row's writability flags, against what the shader BODY actually does.
+///
+/// # What this replaces, and why it is stronger
+///
+/// This harness used to make the same check by construction, building the
+/// layout with `read_only: !write` and letting `create_compute_pipeline`
+/// compare it against the module's address space for equality — so a row
+/// saying `Buf` where its shader said `read_write` would not build.
+///
+/// The tree no longer declares a single `var<storage, read>`: two
+/// `read_write` bindings of one buffer are one usage bit, which is what lets
+/// an arena launch bind its input and its output without a shadow copy, and
+/// it is worth 451 copies and 14 ms a decode. So the DECLARATION carries no
+/// direction any more, and the old check would have passed vacuously.
+///
+/// What carries direction now is the BODY. `naga` says, per entry point and
+/// per global, whether it is read, written or untouched — so a row's `BufMut`
+/// must name a global the entrypoint WRITES and a `Buf` one it does not. That
+/// is a stronger claim than the declaration ever made: a shader could always
+/// declare `read_write` and never write.
+fn writes_agree_with_the_body(entrypoint: &str, writes: &[bool]) {
+    let source = match kernels_wgpu::source::entrypoint_source(
+        entrypoint,
+        kernels_wgpu::Capability::Baseline,
+    ) {
+        Ok(s) => s,
+        Err(e) => panic!("`{entrypoint}`: the tree has no source: {e}"),
+    };
+    let module = match naga::front::wgsl::parse_str(&source) {
+        Ok(m) => m,
+        Err(e) => panic!("`{entrypoint}` does not parse: {e}"),
+    };
+    let mut validator = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    );
+    let info = match validator.validate(&module) {
+        Ok(i) => i,
+        Err(e) => panic!("`{entrypoint}` does not validate: {e}"),
+    };
+    // THE SOLE ENTRY POINT, by index and not by name.
+    //
+    // A generated source has exactly one and it is called `main` -- which is
+    // why both `create_compute_pipeline` calls in this workspace pass
+    // `entry_point: None` and let `wgpu` take the only one there is. Looking
+    // it up by the INSTANTIATION name found nothing, every time, so this
+    // function returned before it checked anything and its falsification
+    // passed. Every early `return` above is now a panic for the same reason.
+    assert_eq!(
+        module.entry_points.len(),
+        1,
+        "`{entrypoint}` compiled to {} entry points; this harness and \
+         `driver-wgpu` both rely on there being exactly one",
+        module.entry_points.len()
+    );
+    let f = info.get_entry_point(0);
+
+    // By `@group(0)` binding NUMBER, because the caller's nth buffer is
+    // binding n and a module's set may have holes.
+    let mut written_at: std::collections::BTreeMap<u32, bool> = std::collections::BTreeMap::new();
+    for (handle, global) in module.global_variables.iter() {
+        let Some(binding) = global.binding.as_ref() else {
+            continue;
+        };
+        if binding.group != 0 {
+            continue;
+        }
+        written_at.insert(
+            binding.binding,
+            f[handle].contains(naga::valid::GlobalUse::WRITE),
+        );
+    }
+
+    for (at, want) in writes.iter().enumerate() {
+        let at = u32::try_from(at).expect("a small binding number");
+        // A hole -- a global the entry point never touches -- says nothing
+        // about direction, and the row is free to call it either.
+        let Some(&wrote) = written_at.get(&at) else {
+            continue;
+        };
+        assert_eq!(
+            wrote,
+            *want,
+            "`{entrypoint}` binding {at}: the row says {}, and the body {}. \
+             The tree declares every storage binding `read_write`, so the \
+             DECLARATION cannot say which is right -- this is what the body \
+             does.",
+            if *want {
+                "it is written"
+            } else {
+                "it is read-only"
+            },
+            if wrote {
+                "writes it"
+            } else {
+                "never writes it"
+            }
+        );
+    }
+}
+
 /// One dispatch of one BASELINE entrypoint, bound the way the ROW says.
 ///
 /// `buffers` is the row's buffer-kinded operands in ROW ORDER — which is the
@@ -1405,20 +1584,87 @@ fn run(gpu: &Gpu, entrypoint: &str, buffers: &[&wgpu::Buffer], uniform: &[u8], g
          workgroups per dimension",
     );
 
-    // The `@group(0)` layout, one entry per buffer-kinded operand, in row
-    // order, numbered from zero.
+    let writes: Vec<bool> = sig
+        .operands
+        .iter()
+        .zip(kernels_wgpu::bindings(sig))
+        .filter(|(_, place)| matches!(place, kernels_wgpu::Binding::Storage(_)))
+        .map(|(op, _)| writable(op.ty))
+        .collect();
+    dispatch(gpu, entrypoint, buffers, &writes, uniform, groups);
+}
+
+/// [`run`] without the row: bind these buffers, in this order, with these
+/// writabilities.
+///
+/// # Why this exists
+///
+/// Because 56 rows of this table state no operands at all -- `sdpa_paged_tiled`
+/// among them -- and `run` cannot launch one: there is no order to derive and
+/// no uniform layout to check against. `driver-wgpu` reaches them through the
+/// TRACE's argument order instead (`binding::reorder`'s `sig.operands.is_empty()`
+/// arm), which is most of what a model actually runs.
+///
+/// So a proof of one of those kernels has to state the order itself, from the
+/// shader's own `@group(0) @binding(n)` declarations. That is a weaker claim
+/// than `run`'s -- it proves the SHADER's arithmetic and not the driver's
+/// ordering -- and it is the strongest one available for an unstated row. The
+/// ordering is covered separately, end to end, by `driver-wgpu`'s serving
+/// proofs, which put a real model through these same kernels and compare
+/// against a CPU oracle.
+fn dispatch(
+    gpu: &Gpu,
+    entrypoint: &str,
+    buffers: &[&wgpu::Buffer],
+    writes: &[bool],
+    uniform: &[u8],
+    groups: [u32; 3],
+) {
+    dispatch_n(gpu, entrypoint, buffers, writes, uniform, groups, 1);
+}
+
+/// [`dispatch`], `repeat` times into one submission.
+///
+/// For TIMING, and for nothing else: a correctness proof wants one dispatch
+/// and a benchmark wants the pipeline built once and the encoder reused, or it
+/// measures `create_compute_pipeline`. Every repeat writes the same output
+/// from the same input, so the result is the same as `repeat = 1`.
+fn dispatch_n(
+    gpu: &Gpu,
+    entrypoint: &str,
+    buffers: &[&wgpu::Buffer],
+    writes: &[bool],
+    uniform: &[u8],
+    groups: [u32; 3],
+    repeat: u32,
+) {
+    assert_eq!(
+        buffers.len(),
+        writes.len(),
+        "`{entrypoint}` was handed {} buffers and {} writability flags",
+        buffers.len(),
+        writes.len()
+    );
+    // The row's writability, checked against what the BODY does rather than
+    // against what the declaration says. See `writes_agree_with_the_body`.
+    writes_agree_with_the_body(entrypoint, writes);
+    // The `@group(0)` layout, one entry per buffer, numbered from zero.
+    //
+    // `read_only: false` for every one, because the tree declares every
+    // storage binding `read_write` and `wgpu` compares the two for EQUALITY.
+    // That is not this harness being lax: it is `kernels-wgpu`'s
+    // `no_shader_declares_a_read_only_storage_binding`, which is worth 451
+    // shadow copies a decode. The check the old `read_only: !write` was making
+    // -- that the row and the tree agree about direction -- is now made
+    // properly, one line up.
     let mut entries = Vec::new();
-    for (op, place) in sig.operands.iter().zip(kernels_wgpu::bindings(sig)) {
-        let kernels_wgpu::Binding::Storage(at) = place else {
-            continue;
-        };
+    for (at, _write) in writes.iter().enumerate() {
+        let at = at as u32;
         entries.push(wgpu::BindGroupLayoutEntry {
             binding: at,
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage {
-                    read_only: !writable(op.ty),
-                },
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
                 has_dynamic_offset: false,
                 // Left open: every tensor binding ends in a runtime array
                 // whose length IS the binding's, so a minimum here would be
@@ -1518,22 +1764,53 @@ fn run(gpu: &Gpu, entrypoint: &str, buffers: &[&wgpu::Buffer], uniform: &[u8], g
         (buffer, group)
     });
 
+    fire(
+        gpu,
+        entrypoint,
+        &pipeline,
+        &storage_group,
+        block.as_ref().map(|(_, group)| group),
+        groups,
+        repeat,
+    );
+}
+
+/// Encode `repeat` dispatches of an ALREADY-BUILT pipeline, submit, and wait.
+///
+/// The timed half, split out from the built half, because a benchmark that
+/// includes `create_compute_pipeline` is a compiler benchmark. On llvmpipe
+/// that is not a rounding error: building one of these modules costs about as
+/// much as fifteen milliseconds of dispatch, so a "per dispatch" figure with
+/// the build inside it reads flat no matter how much arithmetic the kernel
+/// does. That is exactly what the first version of
+/// [`how_long_a_decodes_kernels_take`] measured -- 1024x1024, 3072x1024 and
+/// 1024x3072 all came back at 2.2 ms, and a 6144x3072 came back FASTER than
+/// an 8x64, which is the impossibility that gave it away.
+fn fire(
+    gpu: &Gpu,
+    label: &str,
+    pipeline: &wgpu::ComputePipeline,
+    storage_group: &wgpu::BindGroup,
+    uniform_group: Option<&wgpu::BindGroup>,
+    groups: [u32; 3],
+    repeat: u32,
+) {
     let mut encoder = gpu
         .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some(entrypoint),
-        });
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some(entrypoint),
+            label: Some(label),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &storage_group, &[]);
-        if let Some((_, group)) = &block {
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, storage_group, &[]);
+        if let Some(group) = uniform_group {
             pass.set_bind_group(1, group, &[]);
         }
-        pass.dispatch_workgroups(groups[0], groups[1], groups[2]);
+        for _ in 0..repeat {
+            pass.dispatch_workgroups(groups[0], groups[1], groups[2]);
+        }
     }
     gpu.queue.submit([encoder.finish()]);
     gpu.device
@@ -1998,9 +2275,25 @@ fn each_gated_activation_answers_to_its_own_closed_form() {
     let n = (ROWS * WIDTH) as usize;
     let words = over(n as u32 / 2, 256);
 
-    // The inputs every arm sees, with gpt-oss's edges written in. They are
-    // harmless to the other two — silu and gelu are finite everywhere — and
-    // having one input set is what makes the cross-checks below comparable.
+    // The inputs every arm sees, with gpt-oss's edges written in, and gelu's
+    // own edge beside them.
+    //
+    // This comment used to say the gpt-oss edges were "harmless to the other
+    // two — silu and gelu are finite everywhere". Silu is. Gelu, AS WRITTEN
+    // FOR THIS BACKEND, was not, and the sentence is why nobody looked: it
+    // states a fact about the mathematical function as if it were a fact
+    // about the shader. WGSL's `tanh` is `(exp(2x) - 1) / (exp(2x) + 1)`
+    // here, gelu's inner term is `0.798 * (g + 0.0447 g^3)`, and that crosses
+    // the `exp` overflow at a GATE OF 10.5. Measured: 10.0 answered 10.0 and
+    // 10.5 answered NaN.
+    //
+    // A gate of 10.5 is an ordinary FFN activation, so every gemma GeGLU on
+    // this backend was one such number away from a NaN that propagates
+    // through the rest of the layer. It survived because the only large
+    // input any arm had was NEGATIVE (`gate[7]`, below), and the negative
+    // side is correct for a different reason -- `exp(2x)` underflows to zero
+    // and `(0 - 1) / (0 + 1)` is -1. A one-sided defect, and the fixture only
+    // ever pushed on the side that worked.
     let mut gate = spread(n, 101);
     let mut up = spread(n, 103);
     let limit = 1.25f32;
@@ -2014,6 +2307,13 @@ fn each_gated_activation_answers_to_its_own_closed_form() {
     // sigmoid is exactly zero and the product must be a finite zero.
     gate[7] = -1024.0;
     up[7] = 1.5;
+    // Gelu's overflow boundary, pinned from both sides, plus one far past it.
+    gate[9] = 10.0;
+    gate[10] = 10.5;
+    gate[11] = 64.0;
+    up[9] = 1.0;
+    up[10] = 1.0;
+    up[11] = -1.0;
     let (gate_buf, gate_seen) = bf16s(gpu, &gate);
     let (up_buf, up_seen) = bf16s(gpu, &up);
 
@@ -2817,136 +3117,143 @@ fn a_paged_decode_attends_through_its_page_table_and_its_mask() {
     let Some((gpu, _held)) = adapter() else {
         return;
     };
-    let head_dim = 64usize;
-    let q_heads = 6usize;
-    let gqa = 3usize;
-    let kv_heads = q_heads / gqa;
-    let rows = 3usize;
-    let page_size = 3usize;
-    let pages = 7usize;
-    let scale = 0.125f32;
-    let window = 4i32;
-    let mask_stride = 12u32;
+    // Both widths the tree has to halve exactly: `PIE_PAIRS` is `head_dim / 2`,
+    // so the workgroup is 32 lanes at d_64 and 64 at d_128, and the reduction
+    // is five levels or six. d_128 is what Qwen3-0.6B runs -- the ONLY model
+    // this backend has ever served -- and the proof was at d_64 alone until
+    // the body became a reduction.
+    for head_dim in [64usize, 128] {
+        let entrypoint = format!("sdpa_paged_decode_bfloat16_d_{head_dim}");
+        let q_heads = 6usize;
+        let gqa = 3usize;
+        let kv_heads = q_heads / gqa;
+        let rows = 3usize;
+        let page_size = 3usize;
+        let pages = 7usize;
+        let scale = 0.125f32;
+        let window = 4i32;
+        let mask_stride = 12u32;
 
-    let positions = [6i32, 2, 9];
-    let requests = [0i32, 1, 0];
-    // Request 0 owns four pages and request 1 owns three, both REVERSED, so
-    // logical page `p` is nowhere near physical page `p`.
-    let indptr = [0u32, 4, 7];
-    let indices = [6u32, 4, 2, 0, 5, 3, 1];
+        let positions = [6i32, 2, 9];
+        let requests = [0i32, 1, 0];
+        // Request 0 owns four pages and request 1 owns three, both REVERSED, so
+        // logical page `p` is nowhere near physical page `p`.
+        let indptr = [0u32, 4, 7];
+        let indices = [6u32, 4, 2, 0, 5, 3, 1];
 
-    // `[row][head][channel]`, which is NOT the dense decode's layout.
-    let (queries, q_seen) = bf16s(gpu, &spread(rows * q_heads * head_dim, 701));
-    let pool = pages * page_size * kv_heads * head_dim;
-    let (k_pages, k_seen) = bf16s(gpu, &spread(pool, 709));
-    let (v_pages, v_seen) = bf16s(gpu, &spread(pool, 719));
-    let out = sentinelled(gpu, rows * q_heads * head_dim / 2);
-    let position_ids = i32s(gpu, &positions);
-    let req_of_token = i32s(gpu, &requests);
-    let kv_page_indices = u32s(gpu, &indices);
-    let kv_page_indptr = u32s(gpu, &indptr);
+        // `[row][head][channel]`, which is NOT the dense decode's layout.
+        let (queries, q_seen) = bf16s(gpu, &spread(rows * q_heads * head_dim, 701));
+        let pool = pages * page_size * kv_heads * head_dim;
+        let (k_pages, k_seen) = bf16s(gpu, &spread(pool, 709));
+        let (v_pages, v_seen) = bf16s(gpu, &spread(pool, 719));
+        let out = sentinelled(gpu, rows * q_heads * head_dim / 2);
+        let position_ids = i32s(gpu, &positions);
+        let req_of_token = i32s(gpu, &requests);
+        let kv_page_indices = u32s(gpu, &indices);
+        let kv_page_indptr = u32s(gpu, &indptr);
 
-    // `U8s` in the row, and WGSL's smallest storage element is a `u32`, so a
-    // byte is a shift. One row of `mask_stride` bytes each.
-    let mut mask_bytes = vec![1u8; rows * mask_stride as usize];
-    mask_bytes[mask_stride as usize + 1] = 0;
-    let attention_mask = storage(gpu, &mask_bytes);
-    // Enabled for row 1 alone: a mask every row obeyed would not tell an
-    // ignored `attention_mask_enabled` from an honoured one.
-    let attention_mask_enabled = storage(gpu, &[0u8, 1, 0, 0]);
-    // Bound and unread: this entrypoint is the no-sink arm, and a row's bind
-    // group layout does not change with a `//#if`.
-    let (sinks, _) = bf16s(gpu, &spread(q_heads, 727));
+        // `U8s` in the row, and WGSL's smallest storage element is a `u32`, so a
+        // byte is a shift. One row of `mask_stride` bytes each.
+        let mut mask_bytes = vec![1u8; rows * mask_stride as usize];
+        mask_bytes[mask_stride as usize + 1] = 0;
+        let attention_mask = storage(gpu, &mask_bytes);
+        // Enabled for row 1 alone: a mask every row obeyed would not tell an
+        // ignored `attention_mask_enabled` from an honoured one.
+        let attention_mask_enabled = storage(gpu, &[0u8, 1, 0, 0]);
+        // Bound and unread: this entrypoint is the no-sink arm, and a row's bind
+        // group layout does not change with a `//#if`.
+        let (sinks, _) = bf16s(gpu, &spread(q_heads, 727));
 
-    let block = Block::of("sdpa_paged_decode_bfloat16_d_64")
-        .i32("gqa_factor", gqa as i32)
-        .i32("page_size", page_size as i32)
-        .i32("n_kv_heads", kv_heads as i32)
-        .f32("scale", scale)
-        .u32("attention_mask_stride", mask_stride)
-        .i32("window", window)
-        .done();
-    run(
-        gpu,
-        "sdpa_paged_decode_bfloat16_d_64",
-        &[
-            &queries,
-            &k_pages,
-            &v_pages,
-            &out,
-            &position_ids,
-            &req_of_token,
-            &kv_page_indices,
-            &kv_page_indptr,
-            &attention_mask,
-            &attention_mask_enabled,
-            &sinks,
-        ],
-        &block,
-        [q_heads as u32, rows as u32, 1],
-    );
+        let block = Block::of(&entrypoint)
+            .i32("gqa_factor", gqa as i32)
+            .i32("page_size", page_size as i32)
+            .i32("n_kv_heads", kv_heads as i32)
+            .f32("scale", scale)
+            .u32("attention_mask_stride", mask_stride)
+            .i32("window", window)
+            .done();
+        run(
+            gpu,
+            &entrypoint,
+            &[
+                &queries,
+                &k_pages,
+                &v_pages,
+                &out,
+                &position_ids,
+                &req_of_token,
+                &kv_page_indices,
+                &kv_page_indptr,
+                &attention_mask,
+                &attention_mask_enabled,
+                &sinks,
+            ],
+            &block,
+            [q_heads as u32, rows as u32, 1],
+        );
 
-    let slot_of = |req: usize, kp: usize| -> usize {
-        let phys = indices[indptr[req] as usize + kp / page_size] as usize;
-        phys * page_size + kp % page_size
-    };
-    let got = unpack(&read(gpu, &out), rows * q_heads * head_dim);
-    let mut ranges = Vec::new();
-    for row in 0..rows {
-        let req = requests[row] as usize;
-        let q_pos = positions[row];
-        let start = if window > 0 && q_pos >= window {
-            q_pos - window + 1
-        } else {
-            0
+        let slot_of = |req: usize, kp: usize| -> usize {
+            let phys = indices[indptr[req] as usize + kp / page_size] as usize;
+            phys * page_size + kp % page_size
         };
-        let keeps: Vec<usize> = (start..=q_pos)
-            .filter(|kp| {
-                if row != 1 {
-                    return true;
+        let got = unpack(&read(gpu, &out), rows * q_heads * head_dim);
+        let mut ranges = Vec::new();
+        for row in 0..rows {
+            let req = requests[row] as usize;
+            let q_pos = positions[row];
+            let start = if window > 0 && q_pos >= window {
+                q_pos - window + 1
+            } else {
+                0
+            };
+            let keeps: Vec<usize> = (start..=q_pos)
+                .filter(|kp| {
+                    if row != 1 {
+                        return true;
+                    }
+                    (*kp as u32) < mask_stride
+                        && mask_bytes[row * mask_stride as usize + *kp as usize] != 0
+                })
+                .map(|kp| kp as usize)
+                .collect();
+            ranges.push(keeps.clone());
+            for q_head in 0..q_heads {
+                let kv_head = q_head / gqa;
+                let q_base = (row * q_heads + q_head) * head_dim;
+                let scores: Vec<f32> = keeps
+                    .iter()
+                    .map(|kp| {
+                        let base = (slot_of(req, *kp) * kv_heads + kv_head) * head_dim;
+                        (0..head_dim)
+                            .map(|d| scale * q_seen[q_base + d] * k_seen[base + d])
+                            .sum()
+                    })
+                    .collect();
+                let planes: Vec<&[f32]> = keeps
+                    .iter()
+                    .map(|kp| {
+                        let base = (slot_of(req, *kp) * kv_heads + kv_head) * head_dim;
+                        &v_seen[base..base + head_dim]
+                    })
+                    .collect();
+                let want = softmax_attention(&scores, &planes, head_dim);
+                let what = format!("d_{head_dim} row {row} head {q_head} over keys {keeps:?}");
+                agrees(&got[q_base..q_base + head_dim], &want, &what)
+                    .expect("the paged decode attends");
+                if row == rows - 1 && q_head == q_heads - 1 {
+                    refuses_a_perturbed_reference(&got[q_base..q_base + head_dim], &want, &what);
                 }
-                (*kp as u32) < mask_stride
-                    && mask_bytes[row * mask_stride as usize + *kp as usize] != 0
-            })
-            .map(|kp| kp as usize)
-            .collect();
-        ranges.push(keeps.clone());
-        for q_head in 0..q_heads {
-            let kv_head = q_head / gqa;
-            let q_base = (row * q_heads + q_head) * head_dim;
-            let scores: Vec<f32> = keeps
-                .iter()
-                .map(|kp| {
-                    let base = (slot_of(req, *kp) * kv_heads + kv_head) * head_dim;
-                    (0..head_dim)
-                        .map(|d| scale * q_seen[q_base + d] * k_seen[base + d])
-                        .sum()
-                })
-                .collect();
-            let planes: Vec<&[f32]> = keeps
-                .iter()
-                .map(|kp| {
-                    let base = (slot_of(req, *kp) * kv_heads + kv_head) * head_dim;
-                    &v_seen[base..base + head_dim]
-                })
-                .collect();
-            let want = softmax_attention(&scores, &planes, head_dim);
-            let what = format!("row {row} head {q_head} over keys {keeps:?}");
-            agrees(&got[q_base..q_base + head_dim], &want, &what)
-                .expect("the paged decode attends");
-            if row == rows - 1 && q_head == q_heads - 1 {
-                refuses_a_perturbed_reference(&got[q_base..q_base + head_dim], &want, &what);
             }
         }
+        assert_eq!(
+            ranges,
+            vec![vec![3, 4, 5, 6], vec![0, 2], vec![6, 7, 8, 9]],
+            "one dispatch is supposed to cover three DIFFERENT key ranges — a \
+             window that ends in a different place on each row, and a mask that is \
+             enabled on exactly one of them. If they coincide, this test is one \
+             case run three times",
+        );
     }
-    assert_eq!(
-        ranges,
-        vec![vec![3, 4, 5, 6], vec![0, 2], vec![6, 7, 8, 9]],
-        "one dispatch is supposed to cover three DIFFERENT key ranges — a \
-         window that ends in a different place on each row, and a mask that is \
-         enabled on exactly one of them. If they coincide, this test is one \
-         case run three times",
-    );
 }
 
 /// `out[r][c] += bias[c]`, from the bf16 the device was given.
@@ -4859,7 +5166,8 @@ fn a_strided_shared_expert_combine_reads_its_gate_a_full_pitch_apart() {
 ///
 /// The two widths ride in `SplitQkvParams`, a STORAGE struct at binding 4:
 /// the row states `params: Buf`, so there is no `@group(1)` here at all and
-/// this test hands it none. `dump_layout` prints "0 bytes of uniform block".
+/// this test hands it none. `kernels_wgpu::uniform_size` answers 0 bytes of
+/// uniform block for that row.
 ///
 /// The x extent is in channel PAIRS — 54 of them over a 256-wide workgroup —
 /// so plain division dispatches nothing at all.
@@ -4984,6 +5292,20 @@ fn a_logit_softcap_saturates_at_its_cap() {
     // must be the cap, not an infinity and not a NaN.
     values[7] = 3.0e38;
     values[8] = -3.0e38;
+    // The REACHABLE half of the same defect, and the reason the two above
+    // were not enough on their own. WGSL's `tanh` is `(exp(2x) - 1) /
+    // (exp(2x) + 1)` on this backend, so it returns NaN for every `x` past
+    // `ln(f32::MAX) / 2 = 44.36` -- which at this cap is a logit of 555, not
+    // an absurd 3e38. Measured: 512 (`x = 40.96`) returned the cap and 552
+    // (`x = 44.16`) returned NaN, which is the overflow boundary exactly.
+    //
+    // A logit of 552 is what a miscalibrated head or a bad quantisation
+    // produces, and softcap is the op whose whole job is to make such a logit
+    // harmless. So the boundary is pinned from both sides.
+    values[9] = 540.0;
+    values[10] = 560.0;
+    values[11] = -560.0;
+    values[12] = 4096.0;
     let (logits, logits_seen) = bf16s(gpu, &values);
     let out = sentinelled(gpu, n / 2);
     // `cap`, then a field the body does not read — filled with a number that
@@ -5904,20 +6226,29 @@ fn softmax_attention_with_sink(
         .collect()
 }
 
-/// D42. `sdpa_paged_decode_sink` — the sink's value AND its direction.
+/// D42. Every paged sink arm — the sink's value AND its direction.
 ///
-/// The row is `sdpa_paged_decode`'s with one define, so every binding and
-/// every offset is the same and the only difference is that `sinks` — bound
-/// and unread by the no-sink arm — is now read. Both arms are dispatched over
-/// identical inputs, so the comparison between them is exactly the sink's
-/// contribution.
+/// A sink row is a no-sink row with one define, so every binding and every
+/// offset is the same and the only difference is that `sinks` — bound and
+/// unread by the no-sink arm — is now read. All five arms are dispatched over
+/// identical inputs, so the comparison between the halves is exactly the
+/// sink's contribution and nothing else.
 ///
 /// The DIRECTION is checked as well as the value, which rules out a body that
 /// divided by the sink instead of adding its exponential to the denominator: a
 /// sink can only shrink an output, by one factor per head, and never move it
 /// away from zero.
+///
+/// # Three launch rules, one answer
+///
+/// `SdpaVector` walks a row per group, `SdpaTiled` and `SdpaMma` own 32 rows
+/// per group and state the fire's true row count as an eighteenth operand.
+/// Three ways to arrive at the same softmax, fired here at one width against
+/// one CPU reference — which is the only differential this repository has
+/// between the paged bodies, and the only execution proof `sdpa_paged_mma`
+/// has on this backend at all.
 #[test]
-fn a_paged_decode_folds_its_sink_into_the_denominator() {
+fn every_paged_sink_arm_folds_its_sink_into_the_denominator() {
     let Some((gpu, _held)) = adapter() else {
         return;
     };
@@ -5954,20 +6285,38 @@ fn a_paged_decode_folds_its_sink_into_the_denominator() {
     let sink_values: Vec<f32> = vec![-4.0, -1.0, 0.0, 0.75, 1.5, 3.0];
     let (sinks, sink_seen) = bf16s(gpu, &sink_values);
 
+    // The TILED and MMA sinks join the decode pair, and their answers are what
+    // pin that the sink arm of a DIFFERENT LAUNCH RULE folds the same logit
+    // the same way. They state one more scalar -- the fire's true row count --
+    // and take a grid in tiles rather than rows.
+    //
+    // The flag is whether the arm has a sink, because that decides which
+    // reference it is held to. `answers[0]` is the plain DECODE, which the
+    // direction and shrink checks below hold EVERY sunk arm against -- they
+    // named only the decode pair when this was three arms, which left the two
+    // arms of a different launch rule value-checked and never direction-checked.
+    const ARMS: [(&str, bool); 5] = [
+        ("sdpa_paged_decode_bfloat16_d_64", false),
+        ("sdpa_paged_decode_sink_bfloat16_d_64", true),
+        ("sdpa_paged_tiled_sink_bfloat16_d_64", true),
+        ("sdpa_paged_mma_bfloat16_d_64", false),
+        ("sdpa_paged_mma_sink_bfloat16_d_64", true),
+    ];
     let mut answers = Vec::new();
-    for entrypoint in [
-        "sdpa_paged_decode_bfloat16_d_64",
-        "sdpa_paged_decode_sink_bfloat16_d_64",
-    ] {
+    for (entrypoint, _) in ARMS {
+        let tiled = entrypoint.contains("_tiled") || entrypoint.contains("_mma");
         let out = sentinelled(gpu, rows * q_heads * head_dim / 2);
-        let block = Block::of(entrypoint)
+        let mut block = Block::of(entrypoint)
             .i32("gqa_factor", gqa as i32)
             .i32("page_size", page_size as i32)
             .i32("n_kv_heads", kv_heads as i32)
             .f32("scale", scale)
             .u32("attention_mask_stride", mask_stride)
-            .i32("window", window)
-            .done();
+            .i32("window", window);
+        if tiled {
+            block = block.i32("n_rows", rows as i32);
+        }
+        let block = block.done();
         run(
             gpu,
             entrypoint,
@@ -5985,10 +6334,19 @@ fn a_paged_decode_folds_its_sink_into_the_denominator() {
                 &sinks,
             ],
             &block,
-            [q_heads as u32, rows as u32, 1],
+            if tiled {
+                [q_heads as u32, over(rows as u32, 32), 1]
+            } else {
+                [q_heads as u32, rows as u32, 1]
+            },
         );
         answers.push(unpack(&read(gpu, &out), rows * q_heads * head_dim));
     }
+    assert_eq!(
+        answers.len(),
+        ARMS.len(),
+        "one answer per arm, in ARMS order"
+    );
 
     let slot_of = |req: usize, kp: usize| -> usize {
         let phys = indices[indptr[req] as usize + kp / page_size] as usize;
@@ -6025,10 +6383,19 @@ fn a_paged_decode_folds_its_sink_into_the_denominator() {
             let plain = softmax_attention(&scores, &planes, head_dim);
             let want = softmax_attention_with_sink(&scores, &planes, head_dim, *sink);
             let what = format!("row {row} head {q_head} at sink {sink}");
-            agrees(&answers[1][q_base..q_base + head_dim], &want, &what)
-                .expect("the sunk decode attends");
-            agrees(&answers[0][q_base..q_base + head_dim], &plain, &what)
-                .expect("and the no-sink arm is unchanged by the same buffer");
+            // EVERY arm, against the reference its own flag names. Three of
+            // the five answers used to be collected and then never read --
+            // including the tiled sink, whose whole purpose in this test is
+            // the comment above.
+            for (at, (entrypoint, sunk)) in ARMS.iter().enumerate() {
+                let reference = if *sunk { &want } else { &plain };
+                agrees(
+                    &answers[at][q_base..q_base + head_dim],
+                    reference,
+                    &format!("{entrypoint}: {what}"),
+                )
+                .expect("every arm of the family attends the same way");
+            }
             if row == rows - 1 && q_head == q_heads - 1 {
                 refuses_a_perturbed_reference(&answers[1][q_base..q_base + head_dim], &want, &what);
             }
@@ -6037,31 +6404,48 @@ fn a_paged_decode_folds_its_sink_into_the_denominator() {
             // and nothing to the numerator, so every channel shrinks toward
             // zero by ONE factor per head — never away from it, and never by a
             // different factor per channel.
-            for d in 0..head_dim {
-                let with = answers[1][q_base + d];
-                let without = answers[0][q_base + d];
-                assert!(
-                    with.abs() <= without.abs() + (without.abs() / 64.0).max(1e-6),
-                    "row {row} head {q_head} channel {d}: the sink moved {without} \
-                     to {with}, which is AWAY from zero. A sink joins the \
-                     softmax with no value behind it, so it can only shrink",
-                );
+            // EVERY sunk arm against the plain decode, not just the sunk
+            // decode. Two of the three sink arms are a different launch rule
+            // reading the same `sinks` buffer, and a body that divided where
+            // it should have added would be caught by its VALUE above only if
+            // the reference and the tolerance happened to separate them; the
+            // direction separates them always.
+            for (at, (entrypoint, sunk)) in ARMS.iter().enumerate() {
+                if !sunk {
+                    continue;
+                }
+                for d in 0..head_dim {
+                    let with = answers[at][q_base + d];
+                    let without = answers[0][q_base + d];
+                    assert!(
+                        with.abs() <= without.abs() + (without.abs() / 64.0).max(1e-6),
+                        "{entrypoint}: row {row} head {q_head} channel {d}: the \
+                         sink moved {without} to {with}, which is AWAY from \
+                         zero. A sink joins the softmax with no value behind \
+                         it, so it can only shrink",
+                    );
+                }
             }
         }
     }
     // The largest sink must have shrunk its head noticeably, or this test is
     // comparing two tensors that were always going to agree.
     let hot = (q_heads - 1) * head_dim;
-    let shrunk = (0..head_dim)
-        .filter(|d| answers[1][hot + d].to_bits() != answers[0][hot + d].to_bits())
-        .count();
-    assert!(
-        shrunk > head_dim / 2,
-        "the head with the largest sink ({}) moved only {shrunk} of {head_dim} \
-         channels; pick a sink comparable with the scores or this proves \
-         nothing",
-        sink_seen[q_heads - 1],
-    );
+    for (at, (entrypoint, sunk)) in ARMS.iter().enumerate() {
+        if !sunk {
+            continue;
+        }
+        let shrunk = (0..head_dim)
+            .filter(|d| answers[at][hot + d].to_bits() != answers[0][hot + d].to_bits())
+            .count();
+        assert!(
+            shrunk > head_dim / 2,
+            "{entrypoint}: the head with the largest sink ({}) moved only \
+             {shrunk} of {head_dim} channels; pick a sink comparable with the \
+             scores or this proves nothing",
+            sink_seen[q_heads - 1],
+        );
+    }
 }
 
 /// D43. `sdpa_vector_decode_swa` — a window, two row pitches, and a causal end
@@ -6271,9 +6655,30 @@ fn body_without_the_lists() -> &'static str {
         "\n];\n",
         2000,
     );
+    let without_lists = cut(&without_table, "    let entrypoints = [", "\n    ];\n", 100);
+    // COMMENTS TOO, which the two cuts above do not reach.
+    //
+    // The search below is `body.contains(name)`, and a doc comment satisfies
+    // that as readily as a dispatch does. Half this file is prose about the
+    // kernels it fires, so the guard could be held up by a sentence long after
+    // the call it describes was deleted -- which is the precise failure its own
+    // assertion message warns about, passing.
+    //
+    // Found by rewriting `a_paged_decode_attends_through_its_page_table_and_its_mask`
+    // to build its entrypoint with `format!`: that deleted the last literal in
+    // its body and the guard stayed green, held up by the `D14.` line in the
+    // test's own doc comment. It happens that a second dispatch of the same
+    // name exists elsewhere, so the claim was still true -- but the check had
+    // stopped being the reason to believe it.
+    //
     // Leaked so the answer is `'static` like the input; a test binary owns it
     // until it exits, and this runs once.
-    Box::leak(cut(&without_table, "    let entrypoints = [", "\n    ];\n", 100).into_boxed_str())
+    let code: String = without_lists
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Box::leak(code.into_boxed_str())
 }
 
 /// How this suite reaches one stated row.
@@ -6407,6 +6812,25 @@ const COVERAGE: &[(&str, Reached)] = &[
         Reached::By("sdpa_paged_decode_bfloat16_d_64"),
     ),
     (
+        "sdpa_paged_tiled",
+        Reached::ByTemplate(
+            "sdpa_paged_tiled_bfloat16_d_{head_dim}",
+            "sdpa_paged_tiled_bfloat16_d_128",
+        ),
+    ),
+    (
+        "sdpa_paged_tiled_sink",
+        Reached::By("sdpa_paged_tiled_sink_bfloat16_d_64"),
+    ),
+    (
+        "sdpa_paged_mma",
+        Reached::By("sdpa_paged_mma_bfloat16_d_64"),
+    ),
+    (
+        "sdpa_paged_mma_sink",
+        Reached::By("sdpa_paged_mma_sink_bfloat16_d_64"),
+    ),
+    (
         "sdpa_paged_decode_sink",
         Reached::By("sdpa_paged_decode_sink_bfloat16_d_64"),
     ),
@@ -6458,7 +6882,7 @@ fn is_claimed(symbol: &str) -> bool {
 /// 3. Every name — or the `format!` template that builds it — still APPEARS in
 ///    this file. Deleting the test that dispatches a row deletes its string,
 ///    which is what makes this more than a list of intentions.
-/// 4. The count, pinned. It is 44 of 44 with no exclusions; a row that
+/// 4. The count, pinned. It is 48 of 48 with no exclusions; a row that
 ///    genuinely could not be dispatched would be `Reached::Not` with a reason,
 ///    and the count would have to move in the same edit.
 ///
@@ -6522,7 +6946,7 @@ fn every_stated_row_is_dispatched_or_named() {
     );
     assert_eq!(
         dispatched.len(),
-        44,
+        48,
         "this suite dispatches {} of the table's {} stated rows. The number is \
          pinned so that it SHRINKING is a failure rather than a silence — if a \
          row genuinely cannot be dispatched, say so with `Reached::Not` and a \
@@ -6530,14 +6954,601 @@ fn every_stated_row_is_dispatched_or_named() {
         dispatched.len(),
         stated.len(),
     );
-    // The other 56 rows of the table are UNSTATED: they carry axes and a name
+    // The other 50 rows of the table are UNSTATED: they carry axes and a name
     // and no operands, so no layout can be derived from them and this harness
     // cannot bind one. That is not a gap in the testing, it is a row with no
     // ABI — see `.wiki/new-driver/vulkan.md` §13.
     assert_eq!(
         kernels_wgpu::KERNELS.len() - stated.len(),
-        56,
-        "the unstated rows are the ones this suite structurally cannot reach, \
-         and there are supposed to be 56 of them",
+        50,
+        "the unstated rows are the ones `run` structurally cannot reach, and \
+         there are supposed to be 50 of them -- it was 56 until upstream stated \
+         `sdpa_paged_tiled` and its sink in `kernels-metal`, then 54 until it \
+         stated `sdpa_paged_mma` and ITS sink, and this table followed both",
     );
+}
+
+/// `sdpa_paged_tiled` — the arm a SERVING deployment actually runs, and the
+/// one nothing dispatched.
+///
+/// # Why this is the hot path and not the prefill path
+///
+/// `driver_wgpu::turns::Serving` picks a plan by row count: one row takes the
+/// decode text, more than one takes the prefill text — for a model whose
+/// PLAN states this kernel. Qwen3-0.6B does not. A probe on
+/// `Pipelines::build` says a whole run through the engine builds NINE
+/// entrypoints, and `sdpa_paged_decode` serves both fire classes; only the
+/// projections change with row count.
+///
+/// So this kernel is reachable, stated, instantiated at four head dims, and
+/// DEAD on the one model this backend has ever run. That is the strongest
+/// possible reason for it to carry a proof rather than a weaker one: nothing
+/// else in this repository would ever notice it break.
+///
+/// # Why it had no proof
+///
+/// Because the row states no operands. `sdpa_paged_tiled` is one of the 56
+/// unstated rows, so [`run`] refuses it by construction — there is no order to
+/// derive — and it fell out of [`COVERAGE`] rather than being excluded from it.
+/// The result was an asymmetry exactly backwards from the risk: the DECODE arm,
+/// which serves one row at a time, has a thorough proof over pages, mask,
+/// window and GQA, and the arm that serves everything else had none.
+///
+/// [`dispatch`] is the answer — the shader's own binding order, stated here.
+///
+/// # `PIE_LANE_PAIRS`, which is the reason this could not wait
+///
+/// The tiled body gives each x-lane `PIE_PAIRS / 32` output pairs and walks the
+/// keys once for all of them, indexing `(lane + p * 32) * 2`. That is 1 pair at
+/// `d_64`, 2 at `d_128`, 4 at `d_256`, 8 at `d_512` — and every test and every
+/// model in this repository is Qwen3 at `d_128`, so `p >= 2` had never been
+/// executed anywhere. This runs `d_128` and `d_256`, which is `p` up to 3.
+#[test]
+fn a_paged_tiled_fire_attends_through_its_page_table_and_its_mask() {
+    let Some((gpu, _held)) = adapter() else {
+        return;
+    };
+    for head_dim in [128usize, 256] {
+        let entrypoint = format!("sdpa_paged_tiled_bfloat16_d_{head_dim}");
+        let q_heads = 4usize;
+        let gqa = 2usize;
+        let kv_heads = q_heads / gqa;
+        // Three rows in a tile of thirty-two, so the `row >= n_rows` skip is
+        // taken by twenty-nine of them. A body that read past `n_rows` would
+        // gather from a query buffer that ends.
+        let rows = 3usize;
+        let page_size = 3usize;
+        let pages = 7usize;
+        let scale = 0.125f32;
+        let window = 4i32;
+        let mask_stride = 12u32;
+
+        let positions = [6i32, 2, 9];
+        let requests = [0i32, 1, 0];
+        // Both requests' pages REVERSED, so logical page `p` is nowhere near
+        // physical page `p` and a body reading the pool linearly fails.
+        let indptr = [0u32, 4, 7];
+        let indices = [6u32, 4, 2, 0, 5, 3, 1];
+
+        let seed = head_dim as u32;
+        let (queries, q_seen) = bf16s(gpu, &spread(rows * q_heads * head_dim, 801 + seed));
+        let pool = pages * page_size * kv_heads * head_dim;
+        let (k_pages, k_seen) = bf16s(gpu, &spread(pool, 809 + seed));
+        let (v_pages, v_seen) = bf16s(gpu, &spread(pool, 819 + seed));
+        let out = sentinelled(gpu, rows * q_heads * head_dim / 2);
+        let position_ids = i32s(gpu, &positions);
+        let req_of_token = i32s(gpu, &requests);
+        let kv_page_indices = u32s(gpu, &indices);
+        let kv_page_indptr = u32s(gpu, &indptr);
+
+        let mut mask_bytes = vec![1u8; rows * mask_stride as usize];
+        mask_bytes[mask_stride as usize + 1] = 0;
+        let attention_mask = storage(gpu, &mask_bytes);
+        // Row 1 alone: a mask every row obeyed would not tell an ignored
+        // `attention_mask_enabled` from an honoured one.
+        let attention_mask_enabled = storage(gpu, &[0u8, 1, 0, 0]);
+        // Bound and unread — this is the no-sink arm, and a bind group layout
+        // does not change with a `//#if`.
+        let (sinks, _) = bf16s(gpu, &spread(q_heads, 827));
+
+        // Built from the ROW, like every other `run` proof: the row states
+        // seven scalars and `Block` places each by name, so a field that moved
+        // in `struct Params` is caught here rather than silently read as its
+        // neighbour. This was a hand-packed byte vector while the row was
+        // unstated.
+        let block = Block::of(&entrypoint)
+            .i32("gqa_factor", i32::try_from(gqa).expect("fits"))
+            .i32("page_size", i32::try_from(page_size).expect("fits"))
+            .i32("n_kv_heads", i32::try_from(kv_heads).expect("fits"))
+            .f32("scale", scale)
+            .u32("attention_mask_stride", mask_stride)
+            .i32("window", window)
+            .i32("n_rows", i32::try_from(rows).expect("fits"))
+            .done();
+
+        // `ceil(n_rows / 32)` on y, one group per head on x -- which is what
+        // `LaunchRule::SdpaTiled` derives, and `driver-wgpu`'s
+        // `geometry::grid` is the thing that has to agree with it.
+        //
+        // Through `run` and no longer through `dispatch`: this row was
+        // UNSTATED when this proof was written, and upstream has since stated
+        // its eighteen operands in `kernels-metal`. So the layout is derived
+        // from the row rather than transcribed here, which makes this a proof
+        // of the launch ABI as well as of the arithmetic -- and
+        // `every_stated_row_is_dispatched_or_named` is what forced the
+        // upgrade, by refusing to let a row that grew operands stay on the
+        // hand-written path.
+        run(
+            gpu,
+            &entrypoint,
+            &[
+                &queries,
+                &k_pages,
+                &v_pages,
+                &out,
+                &position_ids,
+                &req_of_token,
+                &kv_page_indices,
+                &kv_page_indptr,
+                &attention_mask,
+                &attention_mask_enabled,
+                &sinks,
+            ],
+            &block,
+            [q_heads as u32, over(rows as u32, 32), 1],
+        );
+
+        let slot_of = |req: usize, kp: usize| -> usize {
+            let phys = indices[indptr[req] as usize + kp / page_size] as usize;
+            phys * page_size + kp % page_size
+        };
+        let got = unpack(&read(gpu, &out), rows * q_heads * head_dim);
+        let mut ranges = Vec::new();
+        for row in 0..rows {
+            let req = requests[row] as usize;
+            let q_pos = positions[row];
+            let start = if window > 0 && q_pos >= window {
+                q_pos - window + 1
+            } else {
+                0
+            };
+            let keeps: Vec<usize> = (start..=q_pos)
+                .filter(|kp| {
+                    if row != 1 {
+                        return true;
+                    }
+                    (*kp as u32) < mask_stride
+                        && mask_bytes[row * mask_stride as usize + *kp as usize] != 0
+                })
+                .map(|kp| kp as usize)
+                .collect();
+            ranges.push(keeps.clone());
+            for q_head in 0..q_heads {
+                let kv_head = q_head / gqa;
+                let q_base = (row * q_heads + q_head) * head_dim;
+                let scores: Vec<f32> = keeps
+                    .iter()
+                    .map(|kp| {
+                        let base = (slot_of(req, *kp) * kv_heads + kv_head) * head_dim;
+                        (0..head_dim)
+                            .map(|d| scale * q_seen[q_base + d] * k_seen[base + d])
+                            .sum()
+                    })
+                    .collect();
+                let planes: Vec<&[f32]> = keeps
+                    .iter()
+                    .map(|kp| {
+                        let base = (slot_of(req, *kp) * kv_heads + kv_head) * head_dim;
+                        &v_seen[base..base + head_dim]
+                    })
+                    .collect();
+                let want = softmax_attention(&scores, &planes, head_dim);
+                let what = format!("d_{head_dim} row {row} head {q_head} over keys {keeps:?}");
+                agrees(&got[q_base..q_base + head_dim], &want, &what)
+                    .expect("the paged tiled fire attends");
+                if row == rows - 1 && q_head == q_heads - 1 {
+                    refuses_a_perturbed_reference(&got[q_base..q_base + head_dim], &want, &what);
+                }
+            }
+        }
+        assert_eq!(
+            ranges,
+            vec![vec![3, 4, 5, 6], vec![0, 2], vec![6, 7, 8, 9]],
+            "one dispatch is supposed to cover three DIFFERENT key ranges; if \
+             they coincide this is one case run three times"
+        );
+    }
+}
+
+/// `argmax_logits_bfloat16` — the greedy sampler, on hardware, with ties.
+///
+/// # What it claims, and what nothing was checking
+///
+/// The shader states three things no test dispatched: that it is "bit-exact to
+/// the host scan it replaces", that a value tie keeps the LOWEST index, and
+/// that `eos_flag` is set when the winner is a stop token. Until now the only
+/// evidence for any of them was that the module parses and validates.
+///
+/// The tie rule is the one that matters and the one a reduction gets wrong.
+/// Logits are bf16 — eight bits of mantissa — over a vocabulary of a hundred
+/// and fifty thousand, so exact ties are not a corner case, they are Tuesday.
+/// A tree that keeps "whichever index the schedule reduced last" answers a
+/// different token from the host scan on those, and both answers look like a
+/// plausible model. Every determinism claim in this repository sits on top of
+/// that: `beam-search-greedy-identity`,
+/// `greedy-decoding-is-the-same-alone-and-in-a-crowd` and the two
+/// `*-identity` inferlets all assert that two paths pick the SAME token.
+///
+/// # How the ties are made, and why they are not an accident
+///
+/// The winning value is placed at four indices, in different LANE STRIPES —
+/// the loop strides by 256, so index `i` belongs to lane `i % 256`. Two ties
+/// inside one lane exercise the `>` in the scan; two across lanes exercise the
+/// `(ov == sh_v[lid] && oi < sh_i[lid])` in the tree. Only the lowest of the
+/// four may be returned.
+///
+/// Row 1 starts at an ODD offset (the vocabulary is odd), which is the other
+/// thing the body is careful about: two bf16 logits share a `u32`, so the half
+/// a row starts on is `(base + i) & 1` and not `i & 1`. A body that used `i`
+/// reads every logit of row 1 shifted by one half-word.
+///
+/// The row is UNSTATED, so [`dispatch`] states the binding order the shader
+/// declares: logits 0, next_token 1, params 2, eos_flag 3, with `vocab` and
+/// `n_eos` inside the params BUFFER rather than a uniform block.
+#[test]
+fn a_device_argmax_keeps_the_lowest_index_on_a_tie_and_flags_a_stop_token() {
+    let Some((gpu, _held)) = adapter() else {
+        return;
+    };
+    // Odd, and past one 256-lane stripe, so every lane takes at least two
+    // trips and row 1 begins on the high half of a word.
+    let vocab = 1035usize;
+    let rows = 2usize;
+
+    let mut values = spread(rows * vocab, 903);
+    // Keep everything clear of the plateau so the winner is unambiguous.
+    for v in &mut values {
+        *v = rounded(*v * 0.25);
+    }
+    let peak = 1.5f32;
+    // Row 0: four copies of the winner. 300 and 556 are lane 44 twice — the
+    // in-lane scan's `>` — and 44 and 300 are one lane against itself across
+    // trips, while 45 is a DIFFERENT lane, which is the tree's compare.
+    let ties0 = [300usize, 44, 556, 45];
+    for at in ties0 {
+        values[at] = peak;
+    }
+    // Row 1: the winner is a stop token, and it is also tied.
+    let eos = [2usize, 151_643usize.min(vocab - 1)];
+    let ties1 = [eos[0], eos[0] + 256, eos[0] + 512];
+    for at in ties1 {
+        values[vocab + at] = peak;
+    }
+
+    let (logits, seen) = bf16s(gpu, &values);
+    let next_token = sentinelled(gpu, rows);
+    let eos_flag = sentinelled(gpu, rows);
+    // `vocab`, `n_eos`, then eight slots.
+    let mut params = Vec::new();
+    params.extend_from_slice(&(vocab as u32).to_le_bytes());
+    params.extend_from_slice(&2u32.to_le_bytes());
+    for slot in 0..8usize {
+        let id = match slot {
+            0 => eos[0] as u32,
+            1 => eos[1] as u32,
+            // Deliberately a token that also appears as a NON-winner, so a
+            // body comparing against the wrong list entry is visible.
+            _ => 7u32,
+        };
+        params.extend_from_slice(&id.to_le_bytes());
+    }
+    let params = storage(gpu, &params);
+
+    dispatch(
+        gpu,
+        "argmax_logits_bfloat16",
+        &[&logits, &next_token, &params, &eos_flag],
+        &[false, true, false, true],
+        &[],
+        [1, rows as u32, 1],
+    );
+
+    // The host scan the shader says it is bit-exact to: ascending, strict `>`.
+    let host = |row: usize| -> u32 {
+        let mut best = f32::NEG_INFINITY;
+        let mut at = 0u32;
+        for i in 0..vocab {
+            let v = seen[row * vocab + i];
+            if v > best {
+                best = v;
+                at = i as u32;
+            }
+        }
+        at
+    };
+    let got: Vec<u32> = read(gpu, &next_token)
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        .take(rows)
+        .collect();
+    let flags: Vec<u32> = read(gpu, &eos_flag)
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        .take(rows)
+        .collect();
+
+    assert_eq!(
+        host(0),
+        44,
+        "the fixture is supposed to tie four indices with 44 the lowest; if \
+         the host scan disagrees the tie was never built"
+    );
+    assert_eq!(
+        got[0], 44,
+        "row 0 tied indices {ties0:?} at the top and the device returned \
+         {}, so the tree kept whichever index it reduced last rather than \
+         the lowest",
+        got[0]
+    );
+    assert_eq!(
+        got[1],
+        host(1),
+        "row 1 disagrees with the host scan, and it is the row that starts on \
+         the ODD half of a word"
+    );
+    assert_eq!(
+        got[1] as usize, ties1[0],
+        "row 1's winner should be the lowest of {ties1:?}"
+    );
+    assert_eq!(
+        flags,
+        vec![0, 1],
+        "row 0's winner is not a stop token and row 1's is the first entry of \
+         the list"
+    );
+}
+
+/// How long a decode's two kernels take, per dispatch, at real sizes.
+///
+/// # Why this exists
+///
+/// Because without it a kernel change is timed through the whole stack, on a
+/// SHARED machine, and the answer is whatever else was running. Not a
+/// hypothetical: a change to `sdpa_paged_tiled` was measured end to end at
+/// "1.7x" on `wgpu_many_conversations`, and the truth is that the gate never
+/// dispatches that kernel -- three runs of one identical binary gave 586 s,
+/// 343 s and 357 s. The spread WAS the result.
+///
+/// # How it cancels what it cannot control
+///
+/// By timing the SAME work twice at two repeat counts and subtracting:
+///
+/// ```text
+///   t(R) = build + submit + R * work
+///   work = (t(HIGH) - t(LOW)) / (HIGH - LOW)
+/// ```
+///
+/// Everything that does not scale with the dispatch count falls out --
+/// pipeline creation, bind-group setup, the submission, the fence. That
+/// matters more here than it would on a card: llvmpipe compiles a module with
+/// LLVM, and the first version of this bench left the build inside the timed
+/// region and read **flat** -- 1024x1024, 3072x1024 and 1024x3072 all at
+/// 2.2 ms, and a 6144x3072 at 1.2 ms, FASTER than an 8x64. A benchmark whose
+/// biggest case beats its smallest is measuring something else, and that
+/// impossibility is the only reason it was caught.
+///
+/// Best of `TRIALS` at each count, because contention only ever adds.
+///
+/// # What it does not claim
+///
+/// Nothing about a GPU. The only adapter this backend has ever run on is
+/// llvmpipe, a CPU rasteriser, whose costs are the reverse of a card's for the
+/// two things a decode trades: idle lanes are free there and expensive here,
+/// barriers the other way round.
+///
+/// `#[ignore]` because it is a measurement, not an assertion: no threshold
+/// would either flake or mean anything.
+#[test]
+#[ignore = "a measurement, not an assertion"]
+fn how_long_a_decodes_kernels_take() {
+    let Some((gpu, _held)) = adapter() else {
+        return;
+    };
+    // The gap has to dwarf the fixed cost, not merely exceed it. On llvmpipe
+    // that fixed cost is a shader COMPILE -- about 1.8 ms -- and the first
+    // version of this used 4 and 36, which is fine for a 1.4 ms attention
+    // dispatch and useless for a 0.03 ms matvec: the subtraction of two noisy
+    // ~2 ms numbers produced NEGATIVE times, which is how it was caught.
+    //
+    // At 8 and 200 the cheapest kernel here still moves the total by 6 ms.
+    const LOW: u32 = 8;
+    const HIGH: u32 = 200;
+    const TRIALS: usize = 4;
+
+    // Milliseconds of real work per dispatch, with everything that does not
+    // scale with the count subtracted off.
+    let per_dispatch = |buffers: &[&wgpu::Buffer],
+                        writes: &[bool],
+                        entrypoint: &str,
+                        block: &[u8],
+                        groups: [u32; 3]|
+     -> f64 {
+        let mut best = [f64::MAX; 2];
+        for trial in 0..TRIALS {
+            for (slot, repeat) in [LOW, HIGH].into_iter().enumerate() {
+                let at = std::time::Instant::now();
+                dispatch_n(gpu, entrypoint, buffers, writes, block, groups, repeat);
+                let took = at.elapsed().as_secs_f64() * 1000.0;
+                if trial > 0 {
+                    best[slot] = best[slot].min(took);
+                }
+            }
+        }
+        let ms = (best[1] - best[0]) / f64::from(HIGH - LOW);
+        assert!(
+            ms > 0.0,
+            "a dispatch measured {ms:.4} ms, which is impossible: the repeat \
+             counts are too close together for a kernel this cheap and the \
+             subtraction is reading noise"
+        );
+        ms
+    };
+
+    // Qwen3-0.6B's attention shape, which is what this backend runs.
+    let head_dim = 128usize;
+    let q_heads = 16usize;
+    let kv_heads = 8usize;
+    let gqa = q_heads / kv_heads;
+    let page_size = 16usize;
+
+    for keys in [256usize, 2048] {
+        let pages = keys.div_ceil(page_size);
+        let (queries, _) = bf16s(gpu, &spread(q_heads * head_dim, 601));
+        let pool = pages * page_size * kv_heads * head_dim;
+        let (k_pages, _) = bf16s(gpu, &spread(pool, 607));
+        let (v_pages, _) = bf16s(gpu, &spread(pool, 613));
+        let out = sentinelled(gpu, q_heads * head_dim / 2);
+        let position_ids = i32s(gpu, &[keys as i32 - 1]);
+        let req_of_token = i32s(gpu, &[0]);
+        let indices: Vec<u32> = (0..pages as u32).collect();
+        let kv_page_indices = u32s(gpu, &indices);
+        let kv_page_indptr = u32s(gpu, &[0, pages as u32]);
+        let attention_mask = storage(gpu, &[0u8; 4]);
+        let attention_mask_enabled = storage(gpu, &[0u8; 4]);
+        let (sinks, _) = bf16s(gpu, &spread(q_heads, 619));
+
+        let block = Block::of("sdpa_paged_decode_bfloat16_d_128")
+            .i32("gqa_factor", i32::try_from(gqa).expect("fits"))
+            .i32("page_size", i32::try_from(page_size).expect("fits"))
+            .i32("n_kv_heads", i32::try_from(kv_heads).expect("fits"))
+            .f32("scale", 0.088_388_35)
+            .u32("attention_mask_stride", 0)
+            .i32("window", 0)
+            .done();
+        let ms = per_dispatch(
+            &[
+                &queries,
+                &k_pages,
+                &v_pages,
+                &out,
+                &position_ids,
+                &req_of_token,
+                &kv_page_indices,
+                &kv_page_indptr,
+                &attention_mask,
+                &attention_mask_enabled,
+                &sinks,
+            ],
+            &[
+                false, false, false, true, false, false, false, false, false, false, false,
+            ],
+            "sdpa_paged_decode_bfloat16_d_128",
+            &block,
+            [u32::try_from(q_heads).expect("fits"), 1, 1],
+        );
+        println!("sdpa_paged_decode d_128  keys={keys:5}      {ms:>8.3} ms/dispatch");
+    }
+
+    // THE SWITCH. `driver_wgpu::turns::Serving` picks the decode lowering for
+    // one row and the prefill lowering for more than one, and those state
+    // different projection kernels -- `affine_qmv_fast` against
+    // `affine_qmm_t`. So the driver changes kernel family at TWO ROWS, and
+    // whether two rows is where the tiled GEMM starts winning is a question
+    // nobody had asked with a number.
+    //
+    // Both sides do the same arithmetic: `m` rows against a 1024x1024 affine
+    // plane at the model's own quantisation. The grids are each kernel's own
+    // launch rule.
+    {
+        let k = 1024usize;
+        let n = 1024usize;
+        let plane = Affine::new(64, 4, n, k, 0x7717);
+        let w = storage(gpu, &plane.words());
+        let (scale_buf, _) = bf16s(gpu, &plane.scales);
+        let (bias_buf, _) = bf16s(gpu, &plane.biases);
+        for m in [1usize, 2, 4, 8, 16, 32, 64, 128, 256, 512] {
+            // The tiled GEMM writes whole BM-row tiles, so the output has to
+            // cover the overhang even when `m` does not fill one.
+            let (bm, bn) = (32usize, 32usize);
+            let rows = m.div_ceil(bm) * bm;
+            let (x, _) = bf16s(gpu, &spread(rows * k, 61));
+            let y = sentinelled(gpu, (rows * n).div_ceil(2));
+
+            let vec_block = Block::of("affine_qmv_fast_bfloat16_gs_64_b_4")
+                .i32("in_vec_size", i32::try_from(k).expect("fits"))
+                .i32("out_vec_size", i32::try_from(n).expect("fits"))
+                .done();
+            let vector = per_dispatch(
+                &[&w, &scale_buf, &bias_buf, &x, &y],
+                &[false, false, false, false, true],
+                "affine_qmv_fast_bfloat16_gs_64_b_4",
+                &vec_block,
+                [
+                    u32::try_from(m).expect("fits"),
+                    over(u32::try_from(n).expect("fits"), 8),
+                    1,
+                ],
+            );
+
+            let tiled_name = "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32";
+            let tiled_block = Block::of(tiled_name)
+                .i32("k", i32::try_from(k).expect("fits"))
+                .i32("n", i32::try_from(n).expect("fits"))
+                .done();
+            let tiled = per_dispatch(
+                &[&w, &scale_buf, &bias_buf, &x, &y],
+                &[false, false, false, false, true],
+                tiled_name,
+                &tiled_block,
+                [
+                    over(u32::try_from(n).expect("fits"), bn as u32),
+                    over(u32::try_from(m).expect("fits"), bm as u32),
+                    1,
+                ],
+            );
+            println!(
+                "switch  m={m:2}  qmv {vector:>8.3} ms   qmm_t {tiled:>8.3} ms   \
+                 tiled is {:.2}x the matvec",
+                tiled / vector
+            );
+        }
+    }
+
+    // The other half of a decode, and the larger one: a Qwen3-0.6B step is 28
+    // layers of seven projections, so this runs about 196 times per token
+    // against attention's 28. `FLOOR` is a dispatch with almost no arithmetic
+    // in it -- if the rows below do not rise above it, this bench is measuring
+    // the harness again.
+    for (out_rows, k, what) in [
+        (8usize, 64usize, "FLOOR  "),
+        (1024, 1024, "q      "),
+        (3072, 1024, "gate/up"),
+        (1024, 3072, "down   "),
+        (6144, 3072, "big    "),
+    ] {
+        let plane = Affine::new(
+            64,
+            4,
+            out_rows,
+            k,
+            0x51 ^ u32::try_from(out_rows).expect("fits"),
+        );
+        let w = storage(gpu, &plane.words());
+        let (scale_buf, _) = bf16s(gpu, &plane.scales);
+        let (bias_buf, _) = bf16s(gpu, &plane.biases);
+        let (x, _) = bf16s(gpu, &spread(k, 41));
+        let y = sentinelled(gpu, out_rows.div_ceil(2));
+        let block = Block::of("affine_qmv_fast_bfloat16_gs_64_b_4")
+            .i32("in_vec_size", i32::try_from(k).expect("fits"))
+            .i32("out_vec_size", i32::try_from(out_rows).expect("fits"))
+            .done();
+        let ms = per_dispatch(
+            &[&w, &scale_buf, &bias_buf, &x, &y],
+            &[false, false, false, false, true],
+            "affine_qmv_fast_bfloat16_gs_64_b_4",
+            &block,
+            [1, over(u32::try_from(out_rows).expect("fits"), 8), 1],
+        );
+        println!("affine_qmv_fast   {what}  {out_rows:5}x{k:<5} {ms:>8.3} ms/dispatch");
+    }
 }

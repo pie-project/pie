@@ -1,12 +1,12 @@
 //! `csrc/supergraph.cu`'s two launchers, in Rust — and with them the whole
 //! file and the second of this crate's three nvcc builds.
 //!
-//! The device text is `kernels-cuda-new/csrc/src/graph/supergraph.cuh`,
-//! compiled by NVRTC like every other unit. It stayed OUT of `kernels-cuda`
-//! for the reason `device/graph.rs`'s header gives and this port keeps: its
-//! argument is a conditional handle, a SHELL object, not a tensor. It is its
-//! own family, `graph`, for the same reason — `layout` and `attn` are named
-//! after kinds of value, and a handle is not one.
+//! The device text is `kernels-cuda/kernels/graph/supergraph.cuh`,
+//! compiled by NVRTC like every other unit. It stayed OUT of the ARCHIVE
+//! crate for the reason `device/graph.rs`'s header gives and this port
+//! keeps: its argument is a conditional handle, a SHELL object, not a
+//! tensor. It is its own family, `graph`, for the same reason — `layout` and
+//! `attn` are named after kinds of value, and a handle is not one.
 //!
 //! # The claim this deletes
 //!
@@ -67,7 +67,7 @@
 //!
 //! This module used to SPLIT that from table drift, panicking when a unit was
 //! missing or would not compile and refusing only the launch. **The split is
-//! gone with the unit**: [`kernels_cuda_new::x::graph`] is two `fn`s the
+//! gone with the unit**: [`kernels_cuda::graph`] is two `fn`s the
 //! compiler resolves, so there is no table left to drift from, and what
 //! remains — the compile, the load and the launch — comes back as one
 //! `Refusal`. The worry the split answered was that a broken table would be
@@ -85,8 +85,8 @@
 
 use std::ffi::c_void;
 
-use kernels_cuda_new::jit::Ctx;
-use kernels_cuda_new::x::{Refusal, graph};
+use kernels_cuda::jit::Ctx;
+use kernels_cuda::{Refusal, graph};
 
 use crate::error::{Error, Result};
 
@@ -131,6 +131,30 @@ pub fn set_cond(handle: u64, preds: *const u8, slot: u32, stream: *mut c_void) -
 /// [`set_cond`]'s.
 pub fn set_switch(handle: u64, preds: *const u8, slot: u32, stream: *mut c_void) -> Result<()> {
     arm(SET_SWITCH, graph::supergraph_set_switch, handle, preds, slot, stream)
+}
+
+/// Compile and load both arming kernels, before a capture is opened.
+///
+/// [`kernels_cuda::graph::warm`] carries the argument for why this has to
+/// happen off the capture; this is the driver's spelling of it, so that
+/// `device/` can reach it without naming the kernel crate's refusal type.
+///
+/// Called from [`Allocator::begin_capture`], which is the one door every
+/// capture in this crate goes through — seven test call sites and
+/// `fire/launch.rs`'s, and a warm that any of them could forget is a warm
+/// that would be forgotten. After the first call of the process it is two
+/// `OnceLock` reads.
+///
+/// # Errors
+///
+/// If either arming kernel will not compile or load. The caller does NOT
+/// have to treat that as fatal: a capture that cannot arm a conditional can
+/// still capture a straight-line graph, and only [`set_cond`] and
+/// [`set_switch`] are lost.
+///
+/// [`Allocator::begin_capture`]: crate::device::Allocator::begin_capture
+pub fn warm() -> Result<()> {
+    graph::warm().map_err(|why| Error::invalid("graph::warm", format!("{why:?}")))
 }
 
 /// The body both launchers share: the two conversions the driver's vocabulary

@@ -131,22 +131,49 @@ instantiate_geglu_tanh(bfloat16, bfloat)
 // flat kernel with an offset, which is what the M=1 path keeps doing.
 struct GegluStridedParams {
   uint width;       // elements per row (ple_dim)
-  uint rows;        // token rows
+  uint unused;      // was the row count -- see below
   uint gate_pitch;  // elements between rows of `gate`
   uint up_pitch;    // ... of `up` -- the wide one
   uint out_pitch;   // ... of `out`
 };
 
+// THE GRID IS THE EXTENT, and the second word is dead for the same reason
+// `GegluParams`' is.
+//
+// This body read `gid.y` as the row and bounded itself with
+// `if (k >= p.width || m >= p.rows) return;`. Its row states
+// `LaunchRule::Elementwise`, which is `[width * rows, 1, 1]` -- FLAT -- so
+// `gid.y` was always zero and every row but the first returned without
+// writing. Rows 1..N of gemma's PLE tail kept whatever the arena was born
+// with, on every layer of every prefill longer than one token, and the
+// dispatch succeeded. Measured at 8 rows through `model_dispatch`: a grid of
+// [2048, 1, 1] against a stated `(256 wide, 1 rows)` reached 256 of 2048
+// elements.
+//
+// The second failure is the reason the guard cannot simply be kept and the
+// grid made 2D: `dsl::metal::geglu_strided` states the row count as the
+// literal `1`, with a comment that the count "is the fire's and rides the
+// shape". Nothing fills it. `p.rows` is not a row count and never was, so any
+// bound computed from it clamps to one row -- which is the very defect,
+// wearing the other mask.
+//
+// A count a text cannot state has one honest answer here, and this file
+// already gives it four times: `silu_mul` takes no params at all and indexes
+// `tid` raw. Metal dispatches EXACTLY the threads asked for
+// (`dispatchThreads:threadsPerThreadgroup:`, non-uniform threadgroups), so
+// the grid is the bound, no guard is needed, and the row and the body agree
+// without a table, text or driver edit. `kernels-vulkan` and `kernels-wgpu`
+// flattened their bodies for the same reason; their guard still reads
+// `p.rows` and so is still capped at one row.
 template <typename T>
 [[kernel]] void geglu_tanh_strided(
     const device T* gate            [[buffer(0)]],
     const device T* up              [[buffer(1)]],
     device T* out                   [[buffer(2)]],
     constant GegluStridedParams& p  [[buffer(3)]],
-    uint2 gid [[thread_position_in_grid]]) {
-  const uint k = gid.x;
-  const uint m = gid.y;
-  if (k >= p.width || m >= p.rows) return;
+    uint gid [[thread_position_in_grid]]) {
+  const uint m = gid / p.width;
+  const uint k = gid - m * p.width;
   const float g = float(gate[size_t(m) * size_t(p.gate_pitch) + k]);
   const float u = float(up[size_t(m) * size_t(p.up_pitch) + k]);
   out[size_t(m) * size_t(p.out_pitch) + k] = static_cast<T>(gelu_tanh(g) * u);
@@ -156,7 +183,7 @@ template <typename T>
   template [[host_name("geglu_tanh_strided_" #name)]]              \
   [[kernel]] void geglu_tanh_strided<itype>(                       \
       const device itype*, const device itype*, device itype*,     \
-      constant GegluStridedParams&, uint2);
+      constant GegluStridedParams&, uint);
 
 instantiate_geglu_strided(bfloat16, bfloat)
 

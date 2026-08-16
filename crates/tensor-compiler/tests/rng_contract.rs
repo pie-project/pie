@@ -10,7 +10,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use tensor_compiler::codegen::rng::{generate_cuda_header, generate_msl_preamble};
+use tensor_compiler::codegen::rng::{cuda_device_functions, generate_msl_preamble};
 use tensor_ir::rng::{RNG_FORMULA, UNIFORM_MAX, hash_uniform, keyed_seed};
 
 fn repo_root() -> PathBuf {
@@ -37,15 +37,20 @@ fn check_or_regenerate(path: &Path, expected: &str) {
     );
 }
 
+/// The one generated artifact left, and why there is only one.
+///
+/// `rng_contract.generated.h` stood beside it: the same contract in C, for the
+/// C++ drivers to `#include`. They were deleted, every backend is Rust now,
+/// and the CUDA device text is spliced straight out of
+/// [`cuda_device_functions`] by the emitter rather than compiled from a header
+/// — NVRTC is called with zero headers and zero include names, so no include
+/// path could have reached one. MSL is the exception that keeps this test:
+/// Metal's runtime shader compiler resolves `#include "..."` against the
+/// including file's directory, so the preamble has to exist as a FILE.
 #[test]
 fn generated_rng_artifacts_are_uptodate() {
     let root = repo_root();
-    let cuda = generate_cuda_header();
     let msl = generate_msl_preamble();
-    check_or_regenerate(
-        &root.join("crates/tensor-compiler/include/rng_contract.generated.h"),
-        &cuda,
-    );
     check_or_regenerate(
         &root.join("crates/tensor-compiler/include/ptir_rng.generated.metal"),
         &msl,
@@ -132,7 +137,7 @@ fn uniform_never_reaches_one() {
 #[test]
 fn generated_backends_clamp_the_uniform() {
     for (backend, source) in [
-        ("cuda", generate_cuda_header()),
+        ("cuda", cuda_device_functions()),
         ("metal", generate_msl_preamble()),
     ] {
         assert!(
@@ -226,7 +231,11 @@ fn allowlists() -> Allowlists {
         // — a driver, a kernel, the engine — re-types these constants.
         owners: &[
             "crates/tensor-ir/src/rng.rs",
-            "crates/tensor-compiler/include/rng_contract.generated.h",
+            // `crates/tensor-compiler/include/rng_contract.generated.h` was the
+            // third owner: the contract in C, for the C++ drivers to
+            // `#include`. It was deleted with them -- and this entry in the
+            // same commit, which is what [`allowlisted_paths_still_exist`] is
+            // for.
             "crates/tensor-compiler/include/ptir_rng.generated.metal",
             // See `STAGED_RNG_PREAMBLE`: the same generated text, at the second
             // place the contract requires it.
@@ -253,31 +262,52 @@ fn allowlists() -> Allowlists {
             // boost-style `hash_combine` for the GEMM autotune cache key; the
             // golden-ratio word again, and nothing to do with the PTIR stream.
             // These have moved twice — `driver-cuda/ops/` to `kernels-cuda/ops/`
-            // when the kernel crate split, then into the family layout — and
-            // both times `allowlisted_paths_still_exist` named the stale entry
-            // instead of letting the guard fail somewhere unrelated.
+            // when the kernel crate split, that `kernels-cuda` being the
+            // ahead-of-time archive crate deleted at `85c6c674b`, then into the
+            // family layout — and both times `allowlisted_paths_still_exist`
+            // named the stale entry instead of letting the guard fail somewhere
+            // unrelated.
             //
             // THREE TIMES NOW, and the third is a language change rather than
-            // a move: `kernels-cuda/csrc/src/gemm/gemm.cpp` is deleted. It
-            // held zero `__global__` and zero `<<<>>>` — a host program, not a
-            // kernel file — and its dense autotuner, `tuning_hash` and all, is
-            // `driver-cuda/src/fire/gemm.rs`. Same word, same `tuning_cache`
-            // lineage, same non-transcription.
-            "crates/driver-cuda/src/fire/gemm.rs",
-            // The CUTLASS MoE tactic cache, which is the same `tuning_cache`
-            // format again — `moe/flashinfer_moe.cu` was a host program too,
-            // and its autotuner is `driver-cuda/src/fire/flashinfer_moe.rs`.
-            // Listed here for the reason the paragraph above gives: an entry
-            // that does not follow its magic is how this guard fails far from
-            // the change that caused it.
-            "crates/driver-cuda/src/fire/flashinfer_moe.rs",
-            // `crates/kernels-cuda/csrc/src/tuning_cache.hpp` WAS HERE and is
-            // DELETED, with `cache_root.hpp`, its only includer's only
-            // include. `gemm/gemm.cpp` was the last translation unit that
-            // included it, so the two headers were orphaned the moment that
-            // file went; the format they described is carried in full by the
-            // two Rust entries above, which are the only things that read and
-            // write the file now.
+            // a move: `kernels-cuda/csrc/src/gemm/gemm.cpp` is deleted, with
+            // `tuning_cache.hpp` and `cache_root.hpp` — its only includer's
+            // only include. It held zero `__global__` and zero `<<<>>>` — a
+            // host program, not a kernel file — and its dense autotuner,
+            // `tuning_hash` and all, is Rust now, in the entry below. Same
+            // word, same `tuning_cache` lineage, same non-transcription.
+            //
+            // The CUTLASS MoE tactic cache is the same format again
+            // (`moe/flashinfer_moe.cu` was a host program too), and both
+            // autotuners came to rest in the same module when the families
+            // crossed. ONE entry covers what was briefly two `driver-cuda`
+            // ones, which is the move this list is built to survive.
+            "crates/kernels-cuda/src/gemm/dense.rs",
+            // SEEDS, not streams. The four below fill TEST DATA with a
+            // seeded generator, and the golden-ratio word is the obvious
+            // constant to seed one with -- it is in splitmix64, in boost's
+            // `hash_combine`, and in half the fixtures ever written. None of
+            // them reproduces the PTIR stream, which is what this guard is
+            // for; the scanner cannot tell a seed from a transcription, which
+            // is what this list is for.
+            //
+            // A per-request weight that breaks ties in an argmax plateau: a
+            // multiplicative hash with no period this side of 2^64, so
+            // distinct rows get distinct weights and a maximum is a maximum.
+            "crates/driver-vulkan/tests/device.rs",
+            // The GEMM service parity pair. The seed has to be the SAME word
+            // on both sides -- a Rust harness and a C++ oracle comparing
+            // element for element -- so it cannot be shared through a helper
+            // either crate could call, and the `.cu` half cannot call the
+            // Rust one at all.
+            "crates/driver-cuda/tests/gemm_service_parity.rs",
+            "crates/driver-cuda/tests/oracle/gemm_service/oracle.cu",
+            "crates/driver-cuda/tests/oracle/gemm_service/bias_fold.cu",
+            // A fifth entry, `crates/kernels-cuda/examples/fp8_pipeline_probe.rs`,
+            // held a splitmix state in an example that generated its own
+            // inputs. It went with `kernels-cuda/examples/`, and this entry
+            // went in the same commit -- which is what
+            // [`allowlisted_paths_still_exist`] is for, and what every move
+            // and deletion in that test's own doc failed to do.
         ],
         mask: &["crates/grammar/src/brle.rs"],
         // The float conversion's shift is the weakest needle here: any 64-bit
@@ -305,7 +335,8 @@ fn allowlists() -> Allowlists {
 /// file reappears at a new path the guard has never heard of, and
 /// [`rng_magic_is_owned_by_the_contract`] fails somewhere far from the move
 /// that caused it. That happened three times over one refactor — `ops/gemm.cpp`
-/// and `ops/tuning_cache.hpp` moved to `kernels-cuda`, `program_identity.hpp`
+/// and `ops/tuning_cache.hpp` moved to `kernels-cuda` (the archive crate,
+/// deleted at `85c6c674b`), `program_identity.hpp`
 /// was deleted outright, and the staged MSL preamble moved to `kernels-metal` —
 /// and each was found by the failure rather than by the move.
 ///
@@ -451,34 +482,36 @@ fn rng_magic_is_owned_by_the_contract() {
     );
 }
 
-/// The emitted CUDA source and the checked-in C++ header carry the same device
-/// RNG text, and both must keep coming from `render_cuda_functions`.
+/// The emitted CUDA runtime carries the device RNG text, and gets it from
+/// [`cuda_device_functions`].
 ///
-/// Both callers reach `render_cuda_functions` directly; neither recovers the
-/// preamble by generating the header and searching for the raw literal's
-/// delimiters, which would make the emitter fail on a whitespace edit to a
-/// header. This test is what ties the two outputs together instead: the
-/// header's embedded literal must be exactly what the emitter splices in.
+/// This checked something narrower until the C++ drivers were deleted: a
+/// checked-in `rng_contract.generated.h` embedded the same text in a
+/// `PTIR_RNG_CUDA_PREAMBLE` raw-string literal, and the test found the literal
+/// by its delimiters and compared it against what the emitter splices. The
+/// header is gone with its last includer, so what is left is the half that was
+/// always about the emitter: a runtime template that silently stopped
+/// splicing the preamble would emit sources whose `ptir_rng_*` calls do not
+/// resolve, and NVRTC — called with no include path — has nowhere to find them.
 #[test]
-fn cuda_preamble_matches_the_header_literal() {
-    let header = generate_cuda_header();
-    let open = "inline constexpr char PTIR_RNG_CUDA_PREAMBLE[] = R\"PTIR_RNG_CUDA(";
-    let close = ")PTIR_RNG_CUDA\";";
-    let start = header.find(open).expect("header defines the preamble") + open.len();
-    let end = header[start..].find(close).expect("literal terminates") + start;
-
+fn emitted_cuda_runtime_carries_the_rng_preamble() {
     let spliced = tensor_compiler::codegen::cuda::singleton_runtime_source();
-    let embedded = &header[start..end];
+    let functions = cuda_device_functions();
     assert!(
-        spliced.contains(embedded),
-        "the emitted CUDA runtime does not contain the header's preamble literal"
+        spliced.contains(&functions),
+        "the emitted CUDA runtime does not contain the RNG device functions"
     );
-    assert_eq!(
-        embedded,
-        format!(
-            "\n{}",
-            tensor_compiler::codegen::rng::cuda_device_functions()
-        ),
-        "the header literal and the emitter's preamble have drifted"
-    );
+    for name in [
+        "ptir_rng_splitmix64",
+        "ptir_rng_seed_eff",
+        "ptir_rng_stream_salt",
+        "ptir_rng_seed_eff_stream",
+        "ptir_rng_keyed_seed",
+        "ptir_rng_hash_uniform",
+    ] {
+        assert!(
+            functions.contains(name),
+            "the CUDA projection no longer defines {name}"
+        );
+    }
 }

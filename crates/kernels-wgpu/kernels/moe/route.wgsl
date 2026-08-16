@@ -54,7 +54,7 @@ const ROUTER_MAX_EXPERTS = 1024u;
 const ROUTER_LANES = 256u;
 
 //#if defined(PIE_ROUTER_TOPK)
-@group(0) @binding(0) var<storage, read> logits: array<u32>;
+@group(0) @binding(0) var<storage, read_write> logits: array<u32>;
 @group(0) @binding(1) var<storage, read_write> expert_ids: array<i32>;
 // ATOMIC, and it is the one declaration in this arm that is not obvious.
 //
@@ -67,8 +67,8 @@ const ROUTER_LANES = 256u;
 // `k` of them per row -- and is correct for every `k` rather than for the even
 // ones.
 @group(0) @binding(2) var<storage, read_write> expert_weights: array<atomic<u32>>;
-@group(0) @binding(3) var<storage, read> params: RouterParams;
-@group(0) @binding(4) var<storage, read> per_expert_scale: array<u32>;
+@group(0) @binding(3) var<storage, read_write> params: RouterParams;
+@group(0) @binding(4) var<storage, read_write> per_expert_scale: array<u32>;
 
 var<workgroup> s_logits: array<f32, ROUTER_MAX_EXPERTS>;
 var<workgroup> chosen: array<f32, ROUTER_MAX_TOPK>;
@@ -196,11 +196,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 
 //#elif defined(PIE_ROUTE_SORT)
-@group(0) @binding(0) var<storage, read> expert_ids: array<i32>;
+@group(0) @binding(0) var<storage, read_write> expert_ids: array<i32>;
 @group(0) @binding(1) var<storage, read_write> perm: array<i32>;
 @group(0) @binding(2) var<storage, read_write> row_expert: array<i32>;
 @group(0) @binding(3) var<storage, read_write> tile_expert: array<i32>;
-@group(0) @binding(4) var<storage, read> params: MoeRouteParams;
+@group(0) @binding(4) var<storage, read_write> params: MoeRouteParams;
 @group(0) @binding(5) var<storage, read_write> inv: array<i32>;
 
 // The counting sort's two arrays. See the header for why `counts` being
@@ -296,15 +296,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 }
 
 //#elif defined(PIE_ROUTE_GATHER)
-@group(0) @binding(0) var<storage, read> x: array<u32>;
+@group(0) @binding(0) var<storage, read_write> x: array<u32>;
 // Atomic for the same reason `router_topk`'s weights are: this writes ONE bf16
 // per invocation at `r * width + c`, so the two halves of a word are two
 // invocations -- `c` and `c + 1`, or the last column of a row and the first of
 // the next when `width` is odd. Both cases put them in different workgroups for
 // some `c`, and a read-modify-write then keeps one and drops the other.
 @group(0) @binding(1) var<storage, read_write> out_: array<atomic<u32>>;
-@group(0) @binding(2) var<storage, read> perm: array<i32>;
-@group(0) @binding(3) var<storage, read> params: MoeRouteParams;
+@group(0) @binding(2) var<storage, read_write> perm: array<i32>;
+@group(0) @binding(3) var<storage, read_write> params: MoeRouteParams;
 
 // The gather moves BITS, not numbers: the GLSL sibling assigns `out_[..] =
 // x[..]` with no widening, and a round trip through f32 would be a rounding
@@ -352,16 +352,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 //#elif defined(PIE_COMBINE_SORTED)
-@group(0) @binding(0) var<storage, read> y: array<u32>;
-@group(0) @binding(1) var<storage, read> expert_weights: array<u32>;
+@group(0) @binding(0) var<storage, read_write> y: array<u32>;
+@group(0) @binding(1) var<storage, read_write> expert_weights: array<u32>;
 // Atomic: one bf16 per invocation again, and with a row pitch the pairing is
 // worse than the gather's -- the partner half of a boundary word can be a row's
 // PADDING, which no invocation writes, or the next row's first column, which
 // another workgroup writes. Two atomics settle both without the body having to
 // know which case it is in.
 @group(0) @binding(2) var<storage, read_write> out_: array<atomic<u32>>;
-@group(0) @binding(3) var<storage, read> params: ExpertCombineParams;
-@group(0) @binding(4) var<storage, read> inv: array<i32>;
+@group(0) @binding(3) var<storage, read_write> params: ExpertCombineParams;
+@group(0) @binding(4) var<storage, read_write> inv: array<i32>;
 
 fn load_y(i: u32) -> f32 {
     let word = y[i >> 1u];
@@ -417,9 +417,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 //#else
-@group(0) @binding(0) var<storage, read> routed: array<u32>;
-@group(0) @binding(1) var<storage, read> shared_: array<u32>;
-@group(0) @binding(2) var<storage, read> gate: array<u32>;
+@group(0) @binding(0) var<storage, read_write> routed: array<u32>;
+@group(0) @binding(1) var<storage, read_write> shared_: array<u32>;
+@group(0) @binding(2) var<storage, read_write> gate: array<u32>;
 // May ALIAS `routed`, which is fine and is why `routed[at]` is read before
 // `out_[at]` is written, by the same invocation, in program order. The atomic
 // is for the neighbouring HALF of the word -- see the other arms -- and not for

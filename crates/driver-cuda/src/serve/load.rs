@@ -5,7 +5,7 @@
 //! names, answering what this deployment can do, and adopting a program.
 //! All of it happens before any fire; none of it happens again.
 
-use super::state::{CAPS_JSON, LoadedModel, Shell, retire};
+use super::state::{LoadedModel, Shell, retire};
 use crate::fire::launch::sg_trace;
 use crate::fire::scratch::Scratch;
 use driver_api::CompletionBroker;
@@ -119,42 +119,34 @@ pub(crate) fn create_impl(config_bytes: &[u8], broker: CompletionBroker) -> Resu
         return Err(PIE_STATUS_INVALID_ARGUMENT);
     }
 
-    // A GROUP OF MORE THAN ONE IS REFUSED, and refusing is the whole point.
+    // The key a tensor-parallel group finds itself by. See
+    // `Shell::tp_group_id`: `layout::rendezvous` needs one and this driver
+    // supplied none, so the plan reduction it already calls was inert.
+    let tp_group_id = boot
+        .get("driver")
+        .and_then(|d| d.get("tp_group_id")?.as_str())
+        .unwrap_or_default()
+        .to_owned();
+
+    // A GROUP OF MORE THAN ONE IS STILL REFUSED, and the refusal now NAMES
+    // WHAT IT IS WAITING ON rather than restating a claim about the tree.
     //
-    // The LAYOUT half of tensor parallelism works: `tp_rank`/`tp_size` reach
-    // `cuda_storage_target`, so a rank compiles a plan that reads only its own
-    // bands, and `layout::kv_geometry` divides the cache the same way. A rank
-    // therefore holds a SHARD of every projection.
-    //
-    // The COLLECTIVE that puts the shards back together does not exist. The
-    // three `comm::`/`dist::` all-reduce rows are declared in
-    // `kernels-cuda/src/gemm.rs` and no launch reaches them; there is no NCCL
-    // in this tree and no `CustomAllReduce` handle to pass. So a rank that
-    // accepted `tp_size > 1` would run its own shard, skip the reduction, and
-    // return an answer that is a fraction of the real one -- with no error
-    // anywhere, which is the worst failure a driver has.
-    //
-    // Silence is the bug. Until a collective lands, this is a refusal.
-    if tp_size > 1 {
-        eprintln!(
-            "[driver-cuda] create: [driver] tp_size = {tp_size} is refused. \
-             This driver shards a rank's WEIGHTS and its KV cache correctly, and \
-             has no all-reduce to combine the shards -- so serving would return \
-             one rank's partial answer as if it were the whole one. See \
-             .wiki/new-driver/next.md, Priority 3."
-        );
+    // The LAYOUT half of tensor parallelism works, and so does everything
+    // around the collective now: `bind/arms/comm.rs` binds both `comm::`
+    // symbols and all three `dist::` ones, `build_tp_plane` below constructs
+    // a `CustomAllReduce` out of `layout::rendezvous::tp_host_allgather`, and
+    // `Shell::all_reduce` holds it for the fires. What is missing is one
+    // thing and it is the last one: DEVICE TEXT. See `tp_serving_refusal`.
+    if let Err(why) = tp_serving_refusal(tp_size, &tp_group_id) {
+        eprintln!("[driver-cuda] create: {why}");
         return Err(PIE_STATUS_INVALID_ARGUMENT);
     }
-    let facts: driver_api::DeviceFacts = match serde_json::from_str(CAPS_JSON) {
-        Ok(facts) => facts,
-        Err(error) => {
-            eprintln!("[driver-cuda] create: device facts JSON: {error}");
-            return Err(PIE_STATUS_DRIVER_ERROR);
-        }
-    };
+    // The facts were PARSED here, out of a `CAPS_JSON` that was not a
+    // `DeviceFacts` — see `state::device_facts` for what that cost. Stating
+    // them removes the only failure this function had that no input could
+    // avoid.
     Ok(Shell {
-        caps: CAPS_JSON.as_bytes().to_vec(),
-        facts,
+        facts: super::state::device_facts(),
         boot_config,
         boot_model_id,
         runahead,
@@ -178,6 +170,8 @@ pub(crate) fn create_impl(config_bytes: &[u8], broker: CompletionBroker) -> Resu
         broker,
         fire_arrays: Scratch::default(),
         supergraph: crate::fire::recordings::Recordings::new(),
+        all_reduce: None,
+        tp_group_id,
         kv: None,
         gdn: None,
         channels: std::collections::BTreeMap::new(),
@@ -189,10 +183,210 @@ pub(crate) fn create_impl(config_bytes: &[u8], broker: CompletionBroker) -> Resu
         fire_alloc: None,
         ptir: crate::program::Runtime::default(),
         ptir_control: None,
+        ptir_rings: None,
+        ptir_channel_slots: std::collections::BTreeMap::new(),
         ptir_sessions: std::collections::BTreeMap::new(),
         ptir_programs: crate::program::Programs::new(),
         ptir_plans: std::collections::BTreeMap::new(),
     })
+}
+
+/// World sizes the P2P plane's CONSTRUCTOR takes —
+/// `fire::all_reduce::CustomAllReduce::initialise`, which refuses anything
+/// outside `2 <= w <= 8` with `w % 2 == 0`.
+const CONSTRUCTIBLE_WORLD_SIZES: &[u32] = &[2, 4, 6, 8];
+
+/// The fused landing's world size, and it is a single value —
+/// `custom_all_reduce.cu:308` builds a fusion workspace only for two, and
+/// `Plane::can_fuse_residual_rmsnorm` refuses anything else.
+const FUSED_WORLD_SIZE: u32 = 2;
+
+/// Why this build refuses to SERVE a tensor-parallel group, or `Ok(())`.
+///
+/// # Why this is a function and why it reads a constant from `kernels-cuda`
+///
+/// The refusal it replaced was a paragraph, and the paragraph had already
+/// gone stale in three places: it said the collective rows *"were declared in
+/// the ARCHIVE crate's `src/gemm.rs`"* (deleted), that they are *"the live
+/// kernels crate's `src/not_yet_crossed.rs`'s now"* (also deleted — they are
+/// `comm::ROUTINES` and `dist::ROUTINES`), and that there is *"no
+/// `CustomAllReduce` handle to pass"* (there is one; [`build_tp_plane`] makes
+/// it). Every one of those was a hand-written second account of a fact owned
+/// somewhere else, and each drifted when its owner moved.
+///
+/// So the blocking condition is read from the thing that knows it.
+/// [`kernels_cuda::comm::CAN_LAUNCH`] is the launch half's statement about
+/// itself, pinned to its own bodies by `the_bodies_agree_with_can_launch`.
+/// Flipping it here is not possible; flipping it there requires the bodies to
+/// agree.
+///
+/// # The ceilings, in the order a caller can act on them
+///
+/// 1. **No device text** — `CAN_LAUNCH == false`. **This no longer fires**:
+///    `csrc/src/attn/flashinfer/comm/` holds both headers, `comm::ROOT`
+///    compiles them, and the constant is `true`. The branch stays because the
+///    whole point of reading it is that this file does not decide it — the
+///    launch half does, and it can say `false` again for a reason this file
+///    should not be enumerating.
+/// 2. **The world size the plane can be built for** —
+///    [`CONSTRUCTIBLE_WORLD_SIZES`], which is what
+///    `CustomAllReduce::initialise` admits AND what vllm's plain kernels are
+///    instantiated at (`comm::PLAIN_NRANKS`). The two sets are the same
+///    `{2, 4, 6, 8}`, which is why one constant answers both.
+/// 3. **The fused landing is world size two only** —
+///    [`FUSED_WORLD_SIZE`]. A model text that states
+///    `comm::all_reduce_residual_rmsnorm_bf16` at any other width gets
+///    `Decline::FusionWorldSize` at its first fire. This is a warning rather
+///    than a refusal because the plain reduction still serves at 4, 6 and 8,
+///    and which of the two a checkpoint lowers to is the model's call.
+/// 4. **A group key** — `[driver] tp_group_id`. Without one the ranks cannot
+///    find each other in `layout::rendezvous`, and a group whose members
+///    never meet would bootstrap N planes each pointing at their own memory:
+///    every reduction a no-op, silently.
+///
+/// # WHAT THIS FUNCTION DOES NOT CHECK, AND CANNOT
+///
+/// That a reduction produces the right sum. `CAN_LAUNCH` means there is
+/// device text and a template-id for it, and `kernels_cuda::comm`'s own
+/// header says at length that no launch in it has ever run on more than one
+/// device — the box it was written on has one GPU. So a `tp_size = 2`
+/// deployment that gets past this function is the FIRST thing in this
+/// repository to fire a collective, and that is what an operator is agreeing
+/// to. It is not stated in the returned message because there is no message
+/// on the `Ok` path; it is stated here, where somebody widening this gate
+/// will read it.
+///
+/// What is NOT here is the per-message ceiling — 8 MiB, the 16-byte multiple,
+/// the NCCL crossover. Those are `CustomAllReduce::can_handle`'s, they are
+/// answered per fire, and `bind/arms/comm.rs` falls back rather than failing
+/// on them. A load-time gate on a per-message limit would refuse deployments
+/// that never send a message that large.
+///
+/// # Errors
+///
+/// The sentence to print, naming the condition and its value.
+pub(crate) fn tp_serving_refusal(tp_size: u32, tp_group_id: &str) -> Result<(), String> {
+    if tp_size <= 1 {
+        return Ok(());
+    }
+    if !kernels_cuda::comm::CAN_LAUNCH {
+        return Err(format!(
+            "[driver] tp_size = {tp_size} is refused: `kernels_cuda::comm::CAN_LAUNCH` is false, \
+             which is the launch half saying both `comm::all_reduce_bf16` and \
+             `comm::all_reduce_residual_rmsnorm_bf16` decline every call. `cudarc`'s `nccl` \
+             feature is off, so the `dist::` fallback has no bindings either. A rank that served \
+             anyway would return its own shard as if it were the whole answer, with no error \
+             anywhere -- which is the worst failure a driver has. What that constant means is \
+             `kernels_cuda::comm`'s to say; this refusal does not restate it, because the \
+             version that did went stale twice."
+        ));
+    }
+    if !CONSTRUCTIBLE_WORLD_SIZES.contains(&tp_size) {
+        return Err(format!(
+            "[driver] tp_size = {tp_size} is refused: the vllm P2P plane is built only for world \
+             sizes {CONSTRUCTIBLE_WORLD_SIZES:?} (`CustomAllReduce::initialise`), and vllm's \
+             plain reduction is instantiated at exactly those \
+             (`kernels_cuda::comm::PLAIN_NRANKS`). flashinfer's fused landing is instantiated at \
+             {{2, 4, 8, 16}} and served at 2, which ceiling 3 below covers"
+        ));
+    }
+    if tp_group_id.is_empty() {
+        return Err(format!(
+            "[driver] tp_size = {tp_size} is refused: [driver] tp_group_id is unset, and the \
+             ranks of a group rendezvous on it. Without a key each rank would build a plane \
+             pointing at its own memory and every reduction would silently be a no-op"
+        ));
+    }
+    if tp_size != FUSED_WORLD_SIZE {
+        eprintln!(
+            "[driver-cuda] create: [driver] tp_size = {tp_size}: the FUSED landing \
+             (`comm::all_reduce_residual_rmsnorm_bf16`) is world size {FUSED_WORLD_SIZE} only and \
+             will decline at its first fire. The plain reduction serves at this width."
+        );
+    }
+    Ok(())
+}
+
+/// Build this rank's P2P all-reduce plane, and publish it for the bind arms.
+///
+/// # Where the pieces come from
+///
+/// * **The all-gather** is `layout::rendezvous::tp_host_allgather`, keyed on
+///   `[driver] tp_group_id`, which is the same key `tp_min_plan` reduces the
+///   memory plan on. The ranks of a TP group are threads of one process, so
+///   an in-process barrier IS the bootstrap collective — that is the shape
+///   `HostAllgather` was designed for and the reason its constructor takes a
+///   callback rather than an `NcclComm&`.
+/// * **`group_devices`** is gathered rather than configured. `[driver]
+///   device` is one rank's ordinal and `CustomAllReduce` needs every rank's,
+///   indexed by rank; the first all-gather round supplies exactly that, so
+///   there is no second config key to keep consistent with the first.
+///   `enable_peer_access`'s doc warns these must be real ORDINALS and never
+///   rank indices — a mistake that works on every single-group box and
+///   corrupts the second group on a four-GPU one — and gathering the ordinal
+///   each rank actually bound is what makes that unmistakable.
+/// * **`same_process: true`**, because they are. Raw pointers cross instead
+///   of `cudaIpcMemHandle_t`s, which is what `custom_all_reduce.cu:264-272`
+///   is for.
+/// * **The fusion extents** are the fire ceiling this driver advertises and
+///   the model's FULL hidden width. Full, not this rank's shard: every rank
+///   holds a partial sum of the whole vector, which is what makes the
+///   collective a sum rather than a concatenation.
+///
+/// # Errors
+///
+/// The sentence to print. Every failure is a device or configuration one —
+/// unavailable peer access, a failing IPC exchange, an exhausted `RankData`
+/// slab — and each already names itself through `crate::error::Error`.
+///
+/// # Unexercised
+///
+/// **This has never run**, and the reason narrowed. It used to be that
+/// [`tp_serving_refusal`] refused `tp_size > 1` before any caller reached it,
+/// because `kernels_cuda::comm::CAN_LAUNCH` was `false`; both all-reduce
+/// headers are internalised now and that constant is `true`, so a group with
+/// a key at a world size in [`CONSTRUCTIBLE_WORLD_SIZES`] does reach here.
+/// What has not changed is the box: it has one GPU, so nothing here has met a
+/// second rank.
+pub(crate) fn build_tp_plane(
+    tp_size: u32,
+    tp_rank: u32,
+    tp_group_id: &str,
+    device_ordinal: i32,
+    fusion_max_tokens: i32,
+    fusion_hidden: i32,
+) -> Result<crate::fire::all_reduce::ResidentPlane, String> {
+    use crate::fire::all_reduce::{Config, CustomAllReduce, HostAllgather, ResidentPlane};
+
+    let world = i32::try_from(tp_size).map_err(|_| format!("tp_size {tp_size} is not an i32"))?;
+    let rank = i32::try_from(tp_rank).map_err(|_| format!("tp_rank {tp_rank} is not an i32"))?;
+    let gather = crate::layout::rendezvous::tp_host_allgather(world, tp_group_id, rank)
+        .ok_or_else(|| {
+            format!(
+                "no rendezvous for rank {rank} of {world} on `{tp_group_id}` -- a group of one, \
+                 an unset [driver] tp_group_id, or a rank outside its own group"
+            )
+        })?;
+
+    // ROUND ONE: every rank's device ordinal, so `group_devices` is what the
+    // ranks actually bound rather than what a config file claims.
+    let mut ordinals = vec![0u8; 4 * tp_size as usize];
+    gather(&device_ordinal.to_ne_bytes(), &mut ordinals);
+    let group_devices: Vec<i32> = ordinals
+        .chunks_exact(4)
+        .map(|w| i32::from_ne_bytes([w[0], w[1], w[2], w[3]]))
+        .collect();
+
+    let ag = HostAllgather { rank, world_size: world, gather };
+    let cfg = Config {
+        same_process: true,
+        group_devices,
+        fusion_max_tokens,
+        fusion_hidden,
+        ..Config::default()
+    };
+    let car = CustomAllReduce::new(ag, &cfg).map_err(|e| format!("{e:?}"))?;
+    Ok(ResidentPlane::publish(car))
 }
 
 /// Teardown, as a destructor.
@@ -458,11 +652,74 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
     state.load_generation += 1;
     state.lowerings.clear();
     state.supergraph = crate::fire::recordings::Recordings::new();
+    // AND THE P2P PLANE, for a reason the paragraph above already covers
+    // once: the fusion workspace's `hidden` is compared for EQUALITY, so a
+    // plane built for the previous checkpoint declines every fused fire of
+    // the next one — and if the two happen to share a hidden size, it does
+    // something worse and reduces through buffers sized for a different
+    // token ceiling. Dropped here rather than reused, which is safe because
+    // every rank reloads together and rebuilds together, below.
+    state.all_reduce = None;
     state.model = Some(model);
     // AFTER the model is stored, because a calibration boot fires through the
     // ordinary path and that path reads `state.model`.
     let caps = capabilities_json(state, snapshot)?;
     state.model.as_mut().expect("just stored").load_caps = caps;
+
+    // THE P2P PLANE, BUILT ONCE, HERE.
+    //
+    // Not in `create`, because the fusion workspace's stride is BAKED at
+    // construction — `Plane::can_fuse_residual_rmsnorm` compares `hidden` for
+    // EQUALITY, not against a bound — so it cannot be sized before the
+    // checkpoint says what `hidden` is. And after the caps, because the other
+    // extent it needs is the token ceiling this driver ADVERTISES: sizing the
+    // workspace for anything smaller would decline fires a caller is entitled
+    // to send, and for anything larger would reserve memory no fire can use.
+    // `calibrate_planner` reads the published caps for exactly this reason,
+    // one line down.
+    //
+    // Once, not per fire: the addresses this allocates are what every peer's
+    // mapping points at, so a plane rebuilt mid-serve is a set of addresses
+    // no rank could agree on twice.
+    //
+    // REACHABLE, AND NEVER TAKEN. `tp_serving_refusal` used to turn
+    // `tp_size > 1` away at `create` on `comm::CAN_LAUNCH`, so `state.tp_size`
+    // was 1 here in every configuration the build accepted. That gate is gone
+    // -- the headers are vendored -- and this branch is now what a `tp_size =
+    // 2` deployment with a group key runs. It has still never been taken,
+    // because taking it needs two GPUs.
+    if state.tp_size > 1 && state.all_reduce.is_none() {
+        let hidden = state
+            .model
+            .as_ref()
+            .and_then(|m| i32::try_from(m.deployment.shape.hidden).ok())
+            .unwrap_or(0);
+        let max_tokens = state
+            .model
+            .as_ref()
+            .and_then(|m| {
+                serde_json::from_slice::<driver_api::DriverCapabilities>(&m.load_caps).ok()
+            })
+            .and_then(|c| i32::try_from(c.max_forward_tokens).ok())
+            .unwrap_or(0);
+        match build_tp_plane(
+            state.tp_size,
+            state.tp_rank,
+            &state.tp_group_id,
+            state.device_ordinal,
+            max_tokens,
+            hidden,
+        ) {
+            Ok(plane) => state.all_reduce = Some(plane),
+            Err(why) => {
+                return Err(i32::from(crate::Error::invalid(
+                    "load_model: tensor-parallel plane",
+                    why,
+                )));
+            }
+        }
+    }
+
     if state.calibrating {
         calibrate_planner(state);
     }
@@ -593,6 +850,7 @@ fn calibrate_planner(state: &mut Shell) {
                 program_id: probe_program,
                 geometry_class: driver_api::local::PIE_GEOMETRY_CLASS_HOST,
                 channel_ids: Vec::new(),
+                seeds: Vec::new(),
             },
         );
         instances.push(id);
@@ -911,7 +1169,13 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
         // shapes is fastest — a smaller claim than the C++'s and a true one.
         calibrating: false,
         rs_slot_mult: 1,
-        nccl_unique_id_hex: String::new(),
+        // THE KEY THE RANKS ACTUALLY RENDEZVOUS ON. This was `String::new()`,
+        // which is precisely the value `rendezvous::tp_min_plan` reads as
+        // "no group to reconcile with" — so the cross-rank plan agreement
+        // this driver calls was wired up and inert, and two ranks could leave
+        // the planner with different `max_requests` and deadlock at the first
+        // collective rather than failing here. One key, both rendezvous.
+        nccl_unique_id_hex: state.tp_group_id.clone(),
     };
     // THE ROW'S OWN NUMBERS, so the pool the planner sizes and the
     // pool the fire builds come from one statement of the shape. Both
@@ -1034,7 +1298,43 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
         // arm's no-op rather than to a wrong answer.
         has_lora: true,
         model_site_summary: driver_api::ModelSiteSummary::default(),
-        device_geometry_port_mask: 0,
+        // EXACTLY THE THREE PORTS `fire::envelope::compose` READS, and not
+        // one bit more.
+        //
+        // `PIE_DECODE_ENVELOPE_PORTS` is `EmbedTokens | Positions | KvLen`.
+        // Those three come off the instance's channel rings before the
+        // forward; everything else a decode needs — its pages, its page CSR,
+        // its write descriptor — the class DERIVES from the positions, which
+        // is the class's own contract (`LaunchPlan::geometry_class`).
+        //
+        // `PIE_DEVICE_GEOMETRY_PORTS` is deliberately NOT here. That claim
+        // wins the pool-owned device-geometry class, whose members state their
+        // own pages, page CSR, write descriptor and dense mask cell in-graph;
+        // `compose` reads none of those and would hand the fire the pages the
+        // program did not choose. `driver-vulkan`'s own note on widening this
+        // mask is the rule: "widening the claim alone would have been the
+        // silent version of the bug".
+        //
+        // At `0` the engine classified this driver's decode loops as `Host`
+        // and they died at `EmbedTokens is not host-derivable: channel 0 has
+        // no host-known value` — the whole of what this claim buys.
+        device_geometry_port_mask: driver_api::PIE_DECODE_ENVELOPE_PORTS,
+        // FALSE, and it is a different question from the mask above.
+        //
+        // `pipeline::fire` reads it to decide whether a frame slot may consume
+        // a channel an earlier slot of the same frame publishes — and only for
+        // a pass whose `devgeo` is set, which is the pool-owned class this
+        // driver does not claim. A decode ENVELOPE is not covered by that rule
+        // at all, so the bench's chained frame is admitted with this at
+        // `false` and flipping it would buy nothing this driver can use.
+        //
+        // What it would CLAIM is that `launch` converts one step, fires it,
+        // and only then converts the next. That is in fact what `launch_impl`
+        // now does — `compose_step` runs inside `step_impl`, per step, after
+        // the previous step has synchronized — so the day this driver serves
+        // the pool-owned class, this is the line to revisit. Until it does,
+        // saying `true` would advertise a class it refuses by name.
+        resolves_geometry_per_step: false,
         // TRUE WHEN THIS CHECKPOINT HAS A TOWER `pie_cuda_encode` SERVES,
         // and it was hardwired false while four GPU tests fired the entry
         // point and passed.
@@ -1084,7 +1384,7 @@ pub(crate) fn adopt_and_compile(
     // rather than a diagnostic.
     if plan.executable && state.model.is_some() {
         let target = ptir_target(state.device_ordinal)?;
-        let versions = driver::Versions::mirrored(desc.emitter_version);
+        let versions = driver::Versions::from_compiler(desc.emitter_version);
         match state
             .ptir
             .compile(desc.program_hash, &plan, kernels, versions, target)
@@ -1156,4 +1456,85 @@ pub(crate) fn ptir_target(ordinal: i32) -> Result<crate::program::Target, i32> {
         device: u64::try_from(device.ordinal()).unwrap_or(0),
         nvrtc,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CONSTRUCTIBLE_WORLD_SIZES, tp_serving_refusal};
+
+    #[test]
+    fn a_single_rank_needs_no_collective_and_is_never_refused() {
+        assert!(tp_serving_refusal(1, "").is_ok(), "one rank reduces nothing");
+        assert!(tp_serving_refusal(0, "").is_ok(), "and neither does a mis-stated zero");
+    }
+
+    /// The refusal has to NAME what it is waiting on, because the sentence it
+    /// replaced named three things that had all moved. This asserts on the
+    /// content rather than merely on `is_err`, which is the only way a
+    /// message can be kept true by a test.
+    ///
+    /// **The subject changed when `CAN_LAUNCH` flipped.** It used to assert
+    /// that a two-rank group IS refused and that the message names the
+    /// missing device text; both headers are vendored now, so a two-rank
+    /// group with a key is admitted and the sentence that named their absence
+    /// is gone. What is still checkable is the shape: the first ceiling that
+    /// bites names the value it read.
+    #[test]
+    fn a_group_is_refused_by_the_condition_that_actually_blocks_it() {
+        // A key is what a two-rank group is missing now, and the refusal says
+        // so rather than reaching for something further down.
+        let why = tp_serving_refusal(2, "").expect_err("a group with no key cannot rendezvous");
+        assert!(why.contains("tp_group_id"), "names the value it read: {why}");
+        assert!(
+            !why.contains("CAN_LAUNCH"),
+            "there IS device text, so that is not what blocks it: {why}"
+        );
+        assert!(
+            !why.contains("no `CustomAllReduce` handle to pass"),
+            "the claim that had already gone stale: {why}"
+        );
+        // And a fully configured two-rank group is admitted, which is the
+        // whole of what vendoring the headers bought at this layer.
+        assert!(
+            tp_serving_refusal(2, "group-a").is_ok(),
+            "two ranks with a key is what `CAN_LAUNCH` being true admits"
+        );
+    }
+
+    /// A world size nothing can build a plane for is refused, and the message
+    /// names the set rather than the value.
+    #[test]
+    fn a_world_size_no_plane_can_be_built_for_is_refused() {
+        let odd = tp_serving_refusal(3, "group-a").expect_err("three is refused");
+        assert!(
+            odd.contains(&format!("{CONSTRUCTIBLE_WORLD_SIZES:?}")),
+            "the ceiling is named rather than the number that missed it: {odd}"
+        );
+        assert!(tp_serving_refusal(9, "group-a").is_err(), "and so is nine");
+    }
+
+    /// The ceilings are still stated, and the two sets they are drawn from
+    /// are asked of the crate that owns them rather than copied.
+    #[test]
+    fn the_ceilings_are_written_down() {
+        assert_eq!(
+            CONSTRUCTIBLE_WORLD_SIZES,
+            &[2, 4, 6, 8],
+            "`CustomAllReduce::initialise` takes 2..=8 even, and nothing else"
+        );
+        // The plain reduction is instantiated at exactly the constructible
+        // set, which is what lets one constant answer both.
+        for &size in CONSTRUCTIBLE_WORLD_SIZES {
+            assert!(
+                kernels_cuda::comm::PLAIN_NRANKS.contains(&i32::try_from(size).unwrap()),
+                "the plane can be built at {size} and vllm has no kernel for it"
+            );
+        }
+        // The fused landing's set is a DIFFERENT one, and six is the value
+        // that shows it: the plane builds, the plain kernel exists, and
+        // flashinfer never instantiated a fused launcher for it.
+        assert!(!kernels_cuda::comm::NRANKS.contains(&6));
+        assert!(kernels_cuda::comm::NRANKS.contains(&16));
+        assert!(!CONSTRUCTIBLE_WORLD_SIZES.contains(&16));
+    }
 }

@@ -202,15 +202,25 @@ impl WgpuDriver {
     /// is a promise nobody keeps: a fork hung a real `pie run` for 850 seconds
     /// with the watchdog naming it exactly --
     ///
-    ///     in_flight_control: KV copy pipeline Some(..) settled=false
+    /// ```text
+    /// in_flight_control: KV copy pipeline Some(..) settled=false
+    /// ```
     ///
     /// -- and notifying WITHOUT publishing is caught by the engine on the way
     /// out, `driver callback published before terminal outcome settled`, which
     /// is the assertion that made the ordering legible in the first place.
     ///
-    /// `driver-metal` and `driver-vulkan` both drop the target and notify
-    /// nothing here, with a doc comment that says "settled on return". They
-    /// are not.
+    /// Both halves live in [`settle_control`], beside the test that asserts
+    /// the STATE they leave rather than that they were called.
+    ///
+    /// This seam's doc used to end "`driver-metal` and `driver-vulkan` both
+    /// drop the target and notify nothing here, with a doc comment that says
+    /// 'settled on return'. They are not." That was true when it was written
+    /// and is not now: both siblings call the shared helper, and
+    /// `backend/vulkan.rs` records the same hang in seconds -- 11.8 with it,
+    /// against the 850 above. A sentence about what another crate gets wrong
+    /// is one that goes quietly false the day it is fixed, which is why this
+    /// one is kept as history rather than restated as fact.
     fn settled_control(&mut self) -> SubmissionCompletion {
         settle_control(&self.broker)
     }
@@ -404,7 +414,42 @@ impl Driver for WgpuDriver {
             //     host-known value
             //
             // so the fix was to build the machinery, not to widen the claim.
-            device_geometry_port_mask: ::driver_api::PIE_DECODE_ENVELOPE_PORTS,
+            // Both device-resolved classes, because `envelope::fill` answers
+            // both from one resolution: `DecodeEnvelope`'s three ports plus
+            // the four `DeviceGeometry` adds -- the pages, the CSR and the
+            // write descriptor -- which are READ off `driver::Geometry`
+            // rather than derived from the positions.
+            //
+            // Claiming only the first three cost seven of the fifteen curated
+            // failures on this backend: a program that traced its whole
+            // geometry fell back to host evaluation, which cannot know
+            // `EmbedTokens` and said so.
+            // ATTN_MASK is in the claim because `envelope::fill` resolves it
+            // too: a device-geometry program's dense per-lane mask is read off
+            // `driver::Geometry::mask`, re-encoded as the runs every other
+            // path in the driver reads, and staged as the rectangle
+            // `Frame::of` packs. Without this bit the engine refuses such a
+            // program at classification -- "a channel-bound dense AttnMask
+            // belongs to the pool-owned device-geometry class" -- and sends it
+            // down a host fallback that cannot derive `EmbedTokens`.
+            device_geometry_port_mask: ::driver_api::PIE_DECODE_ENVELOPE_PORTS
+                | ::driver_api::PIE_DEVICE_GEOMETRY_PORTS
+                | ::driver_api::PIE_DEVICE_PORT_ATTN_MASK,
+            // `launch` interleaves conversion and dispatch: it admits the
+            // frame, then for each step in order calls `envelope::fill`,
+            // `prepare`, `serve` and `run_programs` before touching the next.
+            // So a slot chained behind an earlier slot of the same frame
+            // reads a cell that slot's PROGRAM has already put -- and a cell
+            // that is genuinely not there yet comes back `Filled::Early`,
+            // which is a re-post rather than a fault.
+            //
+            // This said `false` with a comment claiming the opposite of what
+            // the loop below does. The flag is a FACT about a driver, not a
+            // preference: `validate_frame` reads it to decide whether a
+            // device-geometry pass counts as host-resolved, and answering
+            // `false` here made the engine refuse frames this backend can
+            // execute.
+            resolves_geometry_per_step: true,
             // The ceilings a batch is formed under. `Shell::open` sizes one
             // fire's scratch from `Deployment::seam`, and a fire wider than
             // this has nothing to run in.
@@ -548,8 +593,8 @@ impl Driver for WgpuDriver {
         for sub in &frame.steps {
             let filled = driver_wgpu::envelope::fill(&self.programs, frame, sub, page)
                 .map_err(|e| anyhow!("driver-wgpu: {e}"))?;
-            let plan = match filled {
-                driver_wgpu::envelope::Filled::Ready(plan) => plan,
+            let (plan, writes) = match filled {
+                driver_wgpu::envelope::Filled::Ready { plan, writes } => (plan, writes),
                 // Nothing to fire and nothing wrong: the producer has not
                 // run. Every member of this step is told to come back, which
                 // is what the scheduler's re-post is for.
@@ -562,7 +607,7 @@ impl Driver for WgpuDriver {
             };
             let (requests, tokens) = self
                 .shell("launch")?
-                .prepare(&plan)
+                .prepare(&plan, &writes)
                 .map_err(|e| anyhow!("driver-wgpu: {e}"))?;
             let step = self
                 .shell("launch")?
@@ -1109,7 +1154,7 @@ fn text_of(
     row: &'static dyn model::catalog::Variant,
 ) -> Result<(driver_wgpu::shell::Text, model::deployment::Deployment)> {
     use model::catalog::Deployed;
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     // The build's kernel capabilities, and nothing about the model. g64/b4 is
     // what `mlx-community` publishes and what every measurement in
@@ -1181,7 +1226,7 @@ fn text_of(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     /// A row's id and the fixture `driver-wgpu`'s own numbers were taken from.
     type Measured = (
@@ -1561,18 +1606,23 @@ kv_pages = 4096
         // reports keeps the two sides independent: a `PIE_DECODE_ENVELOPE_PORTS`
         // that changed under us would fail here rather than agree with itself.
         const MEASURED_REQUIREMENT: u32 = 0x25;
+        // The gate itself, once, so the control below asks the same question
+        // of a different mask rather than restating the arithmetic. Written as
+        // a closure because `0 & MEASURED_REQUIREMENT` spelled inline is
+        // `clippy::erasing_op` -- correct about the expression and wrong about
+        // the intent, which is that the ZERO this driver used to report does
+        // not pass a gate the real one does.
+        let covers = |mask: u32| mask & MEASURED_REQUIREMENT == MEASURED_REQUIREMENT;
         let claimed = ::driver_api::PIE_DECODE_ENVELOPE_PORTS;
-        assert_eq!(
-            claimed & MEASURED_REQUIREMENT,
-            MEASURED_REQUIREMENT,
+        assert!(
+            covers(claimed),
             "the mask this seam reports must cover what a real decode envelope asked for"
         );
         // The control: the value this file used to report fails that same
         // gate, which is why the run took the host fallback and died on
         // `EmbedTokens is not host-derivable`.
-        assert_ne!(
-            0 & MEASURED_REQUIREMENT,
-            MEASURED_REQUIREMENT,
+        assert!(
+            !covers(0),
             "a mask of zero must NOT satisfy the gate, or this test proves nothing"
         );
         // And what is NOT claimed is stated too: the full Track B set is

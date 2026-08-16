@@ -147,7 +147,8 @@ METAL_FUNC void qmm_t_loaded_impl(
 /// open here: the sorted buffer is written by a kernel whose row count only
 /// the GPU knows, and paying the conversion per tile is what MXFP4 measured
 /// as worth it anyway.
-template <typename T, typename LoaderW, int BM, int BK, int BN, bool WITH_BIAS>
+template <typename T, typename LoaderW, int BM, int BK, int BN, bool WITH_BIAS,
+          bool WITH_RESIDUAL = false, int WM = 2, int WN = 2>
 METAL_FUNC void qmm_t_cast_loaded_impl(
     const device T* x,
     device T* y,
@@ -160,8 +161,6 @@ METAL_FUNC void qmm_t_cast_loaded_impl(
     uint simd_gid,
     uint simd_lid,
     thread LoaderW& loader_w) {
-  constexpr int WM = 2;
-  constexpr int WN = 2;
   constexpr int BK_padded = BK + 16 / sizeof(half);
   using loader_x_t = mlx::steel::
       BlockLoaderCast<T, half, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
@@ -184,13 +183,122 @@ METAL_FUNC void qmm_t_cast_loaded_impl(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   device T* yp = y + size_t(y_row) * size_t(N) + y_col;
-  if (WITH_BIAS) {
+  if (WITH_RESIDUAL) {
+    // The same store, fence and read-back `qmm_t_loaded_impl` does, and for
+    // the same reason: `BlockMMA` has no residual epilogue, and the fragment
+    // layout that would let one thread find its own residual element is the
+    // MMA's business. Measured free -- an o_proj with this epilogue times the
+    // same as a q_proj without one.
+    const device T* rp = bias + size_t(y_row) * size_t(N) + y_col;
+    mma_op.store_result(yp, N);
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint idx = simd_gid * 32u + simd_lid; idx < uint(BM * BN);
+         idx += uint(WM * WN * SIMD_SIZE)) {
+      const int r = int(idx) / BN;
+      const int c = int(idx) % BN;
+      yp[r * static_cast<int64_t>(N) + c] = T(
+          float(yp[r * static_cast<int64_t>(N) + c]) +
+          float(rp[r * static_cast<int64_t>(N) + c]));
+    }
+  } else if (WITH_BIAS) {
     mma_op.store_result_bias(yp, N, bias);
   } else {
     mma_op.store_result(yp, N);
   }
 }
 
+/// The dense GEMM's body, with both threadgroup tiles staged as HALF.
+///
+/// Same buffers, same grid, same tile, same `BlockMMA`, same float
+/// accumulator -- the only thing that moves is the element type the two
+/// staging buffers hold, and therefore the type the matrix instruction runs
+/// on. `BK_padded` is `BK + 16/sizeof(...)` either way, so the threadgroup
+/// allocation and the occupancy it buys are unchanged.
+///
+/// This is not a tuning knob, it is a repair, and the measurement is the
+/// argument. Llama-3.2-1B, one 2048-row prefill, gate_proj (8192x2048),
+/// marginal cost of one more dispatch inside a fire, M1 Max:
+///
+///     bf16 tiles, this driver    18.81 ms   3.65 TFLOP/s
+///     bf16 tiles, mlx-lm         19.89 ms   3.45 TFLOP/s
+///     fp16 tiles, mlx-lm         11.34 ms   6.06 TFLOP/s
+///
+/// The two bf16 rows agreeing is the finding: this kernel was never behind
+/// MLX's, and the whole 1.4x that a full prefill showed against mlx-lm was
+/// the ELEMENT TYPE. Apple silicon before M3 has no bfloat matrix path, so
+/// `simdgroup_matrix<bfloat>` lowers to conversions around a float multiply;
+/// `simdgroup_matrix<half>` is native on every family this driver runs on,
+/// and where bfloat is native too the two issue at the same rate. There is no
+/// device on which staging bf16 is the faster choice.
+///
+/// The ABI does not move. `x`, `y`, the scales, the biases and the residual
+/// are all still BF16, the accumulator is still float, and no name changes --
+/// which matters because `kernels-vulkan` and `kernels-wgpu` diff their
+/// entrypoint lists against this crate's, so a metal-only symbol would break
+/// two sibling tables for a change that is an implementation detail.
+///
+/// What DOES move is precision, and only in the multiplicands: bf16 keeps
+/// float's exponent range with 8 mantissa bits, half trades range for 11. The
+/// operands here are a dequantized 4- or 8-bit weight, which spans nothing,
+/// and an activation that is always a norm's output, an attention output or a
+/// gated MLP's -- never the raw residual stream, which is added after the
+/// store in BF16. `a_generation_agrees_with_mlx_token_for_token` runs over
+/// real weights and is the gate on that claim; mlx-lm serves this checkpoint
+/// family in fp16 end to end, which is a stronger version of the same bet.
+///
+/// `affine_qmm_t_routed` deliberately does NOT come here -- see its own
+/// header: a routed model's next-layer top-k moved under FP16, so the mixture
+/// keeps bfloat tiles and `affine_qmm_t_routed_fp16` stays the opt-in.
+template <typename T, int group_size, int bits, int BM, int BK, int BN,
+          bool WITH_RESIDUAL, bool WITH_BIAS = false, int WM = 2, int WN = 2>
+METAL_FUNC void qmm_t_aligned_half_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const device T* residual,
+    threadgroup half* Xs,
+    threadgroup half* Ws,
+    const constant int& K,
+    const constant int& N,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = BK + 16 / sizeof(half);
+  using loader_w_t = QuantizedBlockLoader<
+      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits, half>;
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_col = int(tid.x) * BN;
+
+  auto wl = (const device uint8_t*)w;
+  wl += y_col * K_w;
+  scales += y_col * K_g;
+  biases += y_col * K_g;
+  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
+  // The third value slot is the residual under `WITH_RESIDUAL` and the
+  // projection's additive bias under `WITH_BIAS`, and the two are indexed
+  // differently: the residual is a full [rows, N] block the epilogue walks
+  // itself, the bias a length-N vector `store_result_bias` reads at the
+  // TILE's column. `qmm_t_cast_loaded_impl`'s other callers pre-offset it,
+  // so this one does too.
+  qmm_t_cast_loaded_impl<T, loader_w_t, BM, BK, BN, WITH_BIAS, WITH_RESIDUAL,
+                         WM, WN>(
+      x, y, residual + (WITH_BIAS ? y_col : 0), Xs, Ws, K, N, tid, simd_gid,
+      simd_lid, loader_w);
+}
+
+/// The same body with BFLOAT tiles, which one caller still wants.
+///
+/// `affine_qmm_t_routed` alone comes here. Its own header says why: a routed
+/// model's next-layer top-k moved under FP16 in `llama_numerics_test`, so the
+/// mixture keeps bfloat staging and pays the lowering, and
+/// `affine_qmm_t_routed_fp16` stays the opt-in a host can gate. Every DENSE
+/// projection takes [`qmm_t_aligned_half_impl`] above instead.
 template <typename T, int group_size, int bits, int BM, int BK, int BN,
           bool WITH_RESIDUAL, bool WITH_BIAS = false, int WM = 2, int WN = 2>
 METAL_FUNC void qmm_t_aligned_impl(
@@ -369,10 +477,10 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
     uint3 tid       [[threadgroup_position_in_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
     uint simd_lid   [[thread_index_in_simdgroup]]) {
-  constexpr int BK_padded = (BK + 16 / sizeof(T));
-  threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BN * BK_padded];
-  qmm_t_aligned_impl<T, group_size, bits, BM, BK, BN, false, true>(
+  constexpr int BK_padded = BK + 16 / sizeof(half);
+  threadgroup half Xs[BM * BK_padded];
+  threadgroup half Ws[BN * BK_padded];
+  qmm_t_aligned_half_impl<T, group_size, bits, BM, BK, BN, false, true>(
       w, scales, biases, x, y, bias, Xs, Ws, K, N, tid, simd_gid, simd_lid);
 }
 
@@ -389,10 +497,10 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN,
     uint3 tid       [[threadgroup_position_in_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
     uint simd_lid   [[thread_index_in_simdgroup]]) {
-  constexpr int BK_padded = (BK + 16 / sizeof(T));
-  threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BN * BK_padded];
-  qmm_t_aligned_impl<T, group_size, bits, BM, BK, BN, false, false, WM, WN>(
+  constexpr int BK_padded = BK + 16 / sizeof(half);
+  threadgroup half Xs[BM * BK_padded];
+  threadgroup half Ws[BN * BK_padded];
+  qmm_t_aligned_half_impl<T, group_size, bits, BM, BK, BN, false, false, WM, WN>(
       w, scales, biases, x, y, nullptr, Xs, Ws, K, N, tid, simd_gid, simd_lid);
 }
 
@@ -409,10 +517,10 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
     uint3 tid       [[threadgroup_position_in_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
     uint simd_lid   [[thread_index_in_simdgroup]]) {
-  constexpr int BK_padded = (BK + 16 / sizeof(T));
-  threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BN * BK_padded];
-  qmm_t_aligned_impl<T, group_size, bits, BM, BK, BN, true>(
+  constexpr int BK_padded = BK + 16 / sizeof(half);
+  threadgroup half Xs[BM * BK_padded];
+  threadgroup half Ws[BN * BK_padded];
+  qmm_t_aligned_half_impl<T, group_size, bits, BM, BK, BN, true>(
       w, scales, biases, x, y, residual, Xs, Ws, K, N, tid, simd_gid, simd_lid);
 }
 

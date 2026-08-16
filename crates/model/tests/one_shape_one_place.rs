@@ -8,7 +8,7 @@
 //! because the fork that reads it was written in four OTHER family texts.
 //!
 //! So this is `cuda.md` §5.C2's method as a standing gate. A sweep
-//! collapsed four duplicated shapes into `model_compiler::facts`
+//! collapsed four duplicated shapes into `model_ir::facts`
 //! (`MlaFacts`, `MoeFacts`, `GqaFacts`, and the schedule predicates), and
 //! this refuses to let a fifth appear quietly.
 //!
@@ -185,7 +185,7 @@ fn no_two_families_describe_the_same_shape() {
         twins.is_empty(),
         "two families describe the same shape, which is two places that \
          can disagree about one thing.\n\
-         Put it in `model_compiler::facts` and leave a `pub type` alias \
+         Put it in `model_ir::facts` and leave a `pub type` alias \
          behind, the way `MlaFacts`, `MoeFacts` and `GqaFacts` were done \
          — every call site keeps working and there is one definition.\n\
          If they genuinely must stay apart, add them to `ALLOWED_TWINS` \

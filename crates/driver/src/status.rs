@@ -16,13 +16,12 @@
 //! written down; a driver that prints `160` when the host has a constant saying
 //! `FUSED_GEOMETRY_MISMATCH` is discarding information it already has.
 //!
-//! The constants are restated here rather than imported because this crate does
-//! not depend on `tensor-compiler` at build time — the same reason
-//! `identity::Versions` is a parameter. [`FAULT_CLASSES`] is the mirror and
-//! [`describe_fault`] reads it. A hand-copied table that nothing checks drifts,
-//! so the compiler is a *dev*-dependency and
-//! [`the_mirror_still_matches_the_compilers_table`](tests) compares the two
-//! entry by entry.
+//! The classes are IMPORTED from `codegen::fault` rather than restated. They
+//! were restated — a `pub const` table here, and a dev-dependency test
+//! comparing it to the compiler's entry by entry — because this crate refused
+//! a build dependency on the compiler. It takes one now; see `Cargo.toml`, and
+//! see [`FAULT_CLASSES`] for why this particular import is the least settled
+//! of the ones that change bought.
 
 /// The status word one dispatch writes. `M1Status` in
 /// `compiler/codegen/runtime/metal/ptir_m1_runtime.metal`, 16 bytes.
@@ -146,76 +145,29 @@ impl Site {
     }
 }
 
-/// One named region of the fault space. Mirrors `codegen::fault::FaultClass`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FaultClass {
-    /// The code written for channel 0.
-    pub base: u32,
-    /// The symbolic name, matching the host constant.
-    pub name: &'static str,
-    /// Whether the emitter adds the channel index to [`base`](Self::base).
-    pub per_channel: bool,
-}
-
-/// Every fault class, ascending. Mirrors `codegen::fault::CLASSES`.
+/// One named region of the fault space, and every class, ascending — from
+/// `codegen::fault`, which is where the emitter writes them into the kernels.
+///
+/// These were a hand-written copy of that table until this crate took the
+/// compiler as a dependency, with a test comparing the two entry by entry.
+/// The copy's failure mode was specific and worth keeping in view: a class
+/// added on the host with no entry here decoded as "no class", which looks
+/// like an answer and is worse than the raw number.
+///
+/// UNLIKE THE OTHER IMPORTS THIS CRATE MADE, this one crosses a line the rest
+/// do not. `plan` is vocabulary both ends share; `codegen::fault` is the
+/// emitter's own — `metal::effects` and `metal::fused` write these codes INTO
+/// the kernels, so the driver is not agreeing on a table, it is reading back
+/// what one particular emitter decided. That belongs on the emitted artifact,
+/// beside the entry name and the source it already carries. Importing it is
+/// strictly better than copying it and is not where it lands.
 ///
 /// The per-channel classes own a run `base ..= base + MAX_CHANNELS - 1`; the
 /// tightest gap between two bases is `0x80`, which is what bounds
-/// [`MAX_CHANNELS`](crate::MAX_CHANNELS). That invariant is checked
-/// on the host and again in [`tests`] here, because a driver that decodes a
-/// number is now a second thing that breaks when the classes alias.
-pub const FAULT_CLASSES: &[FaultClass] = &[
-    FaultClass {
-        base: 0xA0,
-        name: "FUSED_GEOMETRY_MISMATCH",
-        per_channel: false,
-    },
-    FaultClass {
-        base: 0xB3,
-        name: "M3_THREADS_EXCEEDED",
-        per_channel: false,
-    },
-    FaultClass {
-        base: 0x100,
-        name: "LANE_HEADER_MISMATCH",
-        per_channel: false,
-    },
-    FaultClass {
-        base: 0x200,
-        name: "M1_RING_CORRUPT",
-        per_channel: true,
-    },
-    FaultClass {
-        base: 0x300,
-        name: "M1_HEAD_STALE",
-        per_channel: true,
-    },
-    FaultClass {
-        base: 0x400,
-        name: "M1_NOT_FULL",
-        per_channel: true,
-    },
-    FaultClass {
-        base: 0x480,
-        name: "M1_NOT_EMPTY",
-        per_channel: true,
-    },
-    FaultClass {
-        base: 0x500,
-        name: "M1_PUT_BLOCKED",
-        per_channel: true,
-    },
-    FaultClass {
-        base: 0x700,
-        name: "M3_RING_CORRUPT",
-        per_channel: true,
-    },
-    FaultClass {
-        base: 0x780,
-        name: "M3_NOT_READY",
-        per_channel: true,
-    },
-];
+/// [`MAX_CHANNELS`](crate::MAX_CHANNELS). That invariant is checked on the
+/// host, and again in [`tests`] here, because a driver that decodes a number
+/// is a second thing that breaks when the classes alias.
+pub use tensor_compiler::codegen::fault::{CLASSES as FAULT_CLASSES, FaultClass};
 
 /// A decoded fault code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -555,32 +507,6 @@ mod tests {
         );
         assert!(line.contains("0xa0"), "{line}");
         assert!(line.contains("no arm claimed this op tag"), "{line}");
-    }
-
-    /// The one test that makes the copy safe. Everything else here checks the
-    /// decoder; this checks that the numbers it decodes against are still the
-    /// numbers the emitter writes. A class added on the host without an entry
-    /// here would otherwise decode as "no class" — a silently worse diagnostic
-    /// than the raw number the C++ printed, because it looks like an answer.
-    #[test]
-    fn the_mirror_still_matches_the_compilers_table() {
-        let theirs = tensor_compiler::codegen::fault::CLASSES;
-        assert_eq!(
-            FAULT_CLASSES.len(),
-            theirs.len(),
-            "the compiler declares {} fault classes and this mirror has {}",
-            theirs.len(),
-            FAULT_CLASSES.len()
-        );
-        for (mine, theirs) in FAULT_CLASSES.iter().zip(theirs) {
-            assert_eq!(mine.name, theirs.name);
-            assert_eq!(mine.base, theirs.base, "{} moved", theirs.name);
-            assert_eq!(
-                mine.per_channel, theirs.per_channel,
-                "{} changed shape",
-                theirs.name
-            );
-        }
     }
 
     #[test]

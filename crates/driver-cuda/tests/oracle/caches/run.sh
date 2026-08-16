@@ -21,6 +21,11 @@
 #
 # The COPY half of swap_pool.cpp is proved separately by tests/oracle/store;
 # this covers the two constructors, which that oracle does not reach.
+#
+# `kernels-cuda` above and in `KSRC` below is the ARCHIVE crate — CMake+nvcc,
+# a `csrc/` of host `.hpp` and `.cpp` — deleted whole at `85c6c674b`, and the
+# files this copies out of `$KSRC` went with it. The line is left unchanged
+# because it records the command that took the golden, not a path to follow.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

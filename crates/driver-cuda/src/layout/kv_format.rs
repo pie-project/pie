@@ -24,10 +24,11 @@ use crate::error::{Error, Result};
 
 /// How a format quantizes, which is what the attention kernels switch on.
 ///
-/// Discriminants mirror `kernels-cuda/csrc/src/kernels/kv_cache_view.hpp`,
-/// which declares them without explicit values -- so they are 0..4 in
-/// declaration order, and this enum must keep that order for the same FFI
-/// reason [`DType`] must keep its own.
+/// Discriminants mirror `kernels-cuda/csrc/src/kernels/kv_cache_view.hpp` --
+/// the archive crate's host header, deleted with it at `85c6c674b` -- which
+/// declared them without explicit values, so they are 0..4 in declaration
+/// order, and this enum must keep that order for the same FFI reason
+/// [`DType`] must keep its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum KvCacheScheme {

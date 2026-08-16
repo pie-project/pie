@@ -40,8 +40,8 @@
 //! [`logits`]: crate::serve::logits
 //! [`Frame`]: crate::resources::Frame
 
-use model_compiler::lower::{Fire as LowerFire, Uncovered, lower};
-use model_compiler::trace::ForwardPlan;
+use model_compiler::lower::{Fire as LowerFire, Uncovered};
+use model_ir::trace::ForwardPlan;
 
 use crate::device::{Device, Pipelines};
 use crate::dispatch::Geometry;
@@ -82,6 +82,14 @@ pub struct Held<'a> {
     pub pool: &'a mut Pool,
     /// The checkpoint.
     pub weights: &'a Weights,
+    /// Lowerings already derived, by fire shape.
+    ///
+    /// Beside the pool and the book because it belongs to the same thing they
+    /// do — a deployment. A lowering is the graph of ONE text, so a cache
+    /// passed from a different deployment would run the other model's graph
+    /// over these weights; holding it here means it travels with the two it
+    /// must agree with.
+    pub lowerings: &'a mut crate::lowering::cached::Lowerings,
 }
 
 /// Why a step did not run.
@@ -150,7 +158,22 @@ pub struct Step {
     /// turn order.
     ///
     /// `logits.row(step.readout_of[i])` is turn `i`'s distribution.
+    ///
+    /// A turn naming SEVERAL readout rows has all of them in
+    /// [`Step::readouts_of`]; this stays its LAST, which is what a caller
+    /// wanting one answer means and what every decode wants.
     pub readout_of: Vec<usize>,
+    /// Every row turn `i` reads out, in fire-row order.
+    ///
+    /// One entry per turn, and each is the whole span rather than a single
+    /// row. A decode names one and this is a one-element vector; a
+    /// speculative verifier names one per drafted token, and answering it
+    /// with the last row alone is a different fire from the one it asked for
+    /// -- which is why this driver used to refuse such a request by name.
+    ///
+    /// Built from the frame's own `sampling_indptr`, so it is the placement
+    /// after seriation and not the plan's numbering.
+    pub readouts_of: Vec<Vec<usize>>,
     /// The position of each row, in the order the rows were fired.
     ///
     /// Here so a caller can read the pool's `Positions` table back and check
@@ -189,6 +212,57 @@ pub struct Serving<'a> {
     /// quiet default, which is exactly the defect this field exists to stop.
     /// Tracing a plan is host-side and cheap, so a deployment that only ever
     /// decodes pays one trace it does not use.
+    ///
+    /// # The PLAN switches at two rows; the KERNEL does not, and I got that
+    /// wrong
+    ///
+    /// [`Serving::over`] takes this plan for any step of more than one row,
+    /// and this file used to claim that therefore a two-row step runs the
+    /// tiled GEMM. **It does not.** Measured by counting what a real step
+    /// dispatches:
+    ///
+    /// | step | projection kernels |
+    /// |---|---|
+    /// | 1 row | `affine_qmv_fast` x141, `..._residual` x56 |
+    /// | 2 rows | `affine_qmv_fast` x141, `..._residual` x56 |
+    /// | 32 rows | `affine_qmm_t` x140, `..._residual` x56 |
+    ///
+    /// The plan is only a TEXT. Which kernel it lowers to is decided by
+    /// `model`'s `TokensMultipleOf(tile)` guard, and that is not a threshold:
+    /// a row count takes the GEMM only when the tile DIVIDES it. Two rows is
+    /// not a multiple of 32, so it lowers to the matvec out of the prefill
+    /// text.
+    ///
+    /// The prediction that caught this: if two rows took the GEMM, a two-row
+    /// step would cost about what a thirty-two-row step costs, because the
+    /// GEMM computes a whole tile whatever `m` is. Measured, 34.4 ms for one
+    /// row, 35.5 ms for two, 234 ms for thirty-two. The middle number is the
+    /// one that says the claim was wrong.
+    ///
+    /// # What the kernels really cost, which stands
+    ///
+    /// `kernels_wgpu`'s `how_long_a_decodes_kernels_take`, both families over
+    /// one 1024x1024 affine plane, llvmpipe:
+    ///
+    /// | rows | `affine_qmv_fast` | `affine_qmm_t` (bm 32) |
+    /// |---|---|---|
+    /// | 1 | 0.025 ms | 0.335 ms |
+    /// | 32 | 0.062 ms | 0.315 ms |
+    /// | 128 | 0.282 ms | 0.335 ms |
+    /// | 256 | 0.498 ms | 0.346 ms |
+    /// | 512 | 1.019 ms | 0.422 ms |
+    ///
+    /// The GEMM costs the same for one row as for thirty-two because it
+    /// computes a whole tile either way, and the crossover is near 150 rows.
+    /// `crates/model`'s own table, measured on a 4090 through
+    /// `driver-vulkan`, puts it in the same place: GEMV 34 ms against tile-32
+    /// GEMM 52 ms at 32 rows, and the GEMM ahead only from 128. Two
+    /// backends, two adapters, the same shape -- which is worth more than
+    /// either number.
+    ///
+    /// So the tile choice is a real question and `crates/model` is where it
+    /// is already being asked, with better data than this backend can take.
+    ///
     pub prefill: &'a ForwardPlan,
     /// The model's shape, for the launch rules that need it.
     pub geometry: Geometry,
@@ -319,6 +393,78 @@ impl Serving<'_> {
         // prompt is most of the fire. It is not a policy choice -- it is the only
         // shape this text lowers into consistently, and it stops being needed the
         // day the shell names its epilogue.
+        //
+        // # HOW MUCH, and how far the removal gets (measured 2026-08-16)
+        //
+        // `driver-metal` has since measured the same waste on its own side and
+        // fixed it: a 2048-token prefill of Llama-3.2-1B spent 904 ms of 2184
+        // computing 2047 distributions nobody reads, 41% of the fire, and
+        // removing it took prefill from 938 to 1640 tok/s. So the prize here is
+        // large and is not hypothetical.
+        //
+        // Half the fix has already landed in the SHARED lowering:
+        // `model-compiler`'s `rectangle_rows` now narrows a statement whose
+        // output is `Requests`-shaped to the sampled rows, from a full window.
+        // Deleting the two overrides below WORKS to that extent -- the logits
+        // arena comes back one row of `vocab` instead of `rows * vocab`, which
+        // is the whole point.
+        //
+        // Two things then have to move with it, and the second is not done:
+        //
+        // 1. The read-out NUMBERING. `readouts_of` and `last_row_of` answer
+        //    fire rows, and the epilogue writes one logits row per SAMPLED row
+        //    once it is narrowed, so they have to answer positions in the
+        //    compacted block -- which `sampling_indptr` already gives, since a
+        //    turn's entries are exactly `[t]..[t+1]`. Written and verified to
+        //    compile; it is not the blocker.
+        // 2. The GATHER AND HEAD CHAIN, which is where it stops -- and the
+        //    plan is NOT the problem. Dumped with both changes applied, a
+        //    32-row prefill sampling row 31 lowers to exactly what it should:
+        //
+        //        seriation   rows=32 sampling_indices=[31] indptr=[0, 1]
+        //        lowered     n_requests=1  readout { at: 2048, rows: 1,
+        //                                           vocab: 151936, bytes: 2 }
+        //        launch 448  affine_qmm_t_residual ... rows=0..32
+        //        launch 450  row_gather_bfloat16      rows=0..1
+        //        launch 451  affine_qmv_fast          rows=0..1
+        //
+        //    The body still covers the stream, the gather and the head are
+        //    one-row rectangles, and the readout is one row of vocab. That is
+        //    the whole point of the fix, arrived at.
+        //
+        //    What comes back is wrong anyway, and the reason is now known.
+        //
+        //    THE OPERAND EXTENT. `binding::extent` measures an `Arg::Arena` as
+        //    `launch.rows * width * bytes` -- the rectangle the launch WRITES.
+        //    For every other statement in the tree that is also the rectangle
+        //    it reads, so nothing had ever forced the two apart. A GATHER is
+        //    where they part: its output is one row per SAMPLED row and its
+        //    input is the whole stream.
+        //
+        //    So with the launch narrowed to `rows=0..1`, `row_gather`'s input
+        //    binds 1 * 1024 * 2 = 2048 bytes at the stream's base, and the
+        //    shader reads `input_[rows[0] * pitch + c]` -- row 31. WGSL
+        //    bounds-clamps an out-of-range read to ZERO, so the gathered row
+        //    is zeros, the head projects zeros, every logit is equal, and
+        //    argmax returns the last index. That is the 151935 exactly.
+        //
+        //    Everything either side of it is right, and was checked rather
+        //    than assumed: the head reads `Arena { at: 0 }`, which is the
+        //    gather's own output, and the gather reads `Arena { at: 65536 }`,
+        //    which is the stream.
+        //
+        //    The fix is therefore not in `model-compiler` and not in the
+        //    shader: it is that an operand whose row space is not the launch's
+        //    has to say so. `Arg::Arena` carries `width` and `bytes` and no
+        //    row count, so today it cannot. Whoever takes it decides whether
+        //    the lowering states the input's own rows or the driver learns
+        //    that a gather's input spans the stream -- and the same question
+        //    is waiting in `kernels-metal`, whose `sample_rows` does this by
+        //    hand.
+        //
+        // Reverted rather than left half-done: the suite is 19/19 with the
+        // overrides and 9/19 without them, and a serving path that computes a
+        // plausible wrong token is worse than one that is slow.
         let mut rows = frame.seriation();
         for row in &mut rows {
             row.samples = true;
@@ -328,19 +474,31 @@ impl Serving<'_> {
         // as much as a four-token prompt does; the row count is what the kernel
         // choice actually depends on, and the name of the class is only how the
         // text spells it.
-        let plan = if frame.rows() > 1 {
-            self.prefill
-        } else {
-            self.plan
-        };
-        let low = lower(
-            plan,
-            &rows,
-            LowerFire {
-                captures_across_splits: false,
-            },
-        )
-        .map_err(Unstepped::Uncovered)?;
+        // ONE binding, two uses, deliberately. `prefill` picks the text AND
+        // is half the cache key, and a cache keyed on a different rule than
+        // the one that chose the plan would serve one text's graph for the
+        // other -- 452 launches over the wrong rectangles, with nothing to
+        // look at afterwards. Deriving both from the same `let` is what makes
+        // that unstateable rather than merely unlikely.
+        let prefill = frame.rows() > 1;
+        let plan = if prefill { self.prefill } else { self.plan };
+        // Derived on the first step of a shape and kept: `lower` is a pure
+        // function of the plan, the rows and the fire flag, and this driver
+        // was paying 0.765 ms of every decode to recompute a constant. See
+        // `lowering::cached`.
+        let low = held
+            .lowerings
+            .get(
+                plan,
+                crate::lowering::cached::Shape {
+                    prefill,
+                    rows: rows.clone(),
+                },
+                LowerFire {
+                    captures_across_splits: false,
+                },
+            )
+            .map_err(Unstepped::Uncovered)?;
 
         held.pool.stage(device, &frame).map_err(Unstepped::Failed)?;
         // AND THE TABLE MUST SAY THE SAME THING THE LOWERING WAS TOLD.
@@ -385,7 +543,7 @@ impl Serving<'_> {
             device,
             pipelines,
             modules,
-            &low,
+            low,
             Fire {
                 arena: crate::binding::Arena {
                     buffer: &arena,
@@ -402,13 +560,14 @@ impl Serving<'_> {
         // of the `?` is standing in for. Nothing here can leak it, and nothing
         // here can free it early either -- the read below still names it.
         let fired = ran.map_err(Unstepped::Unfired)?;
-        let logits = logits(device, &arena, &low).map_err(Unstepped::Unread)?;
+        let logits = logits(device, &arena, low).map_err(Unstepped::Unread)?;
         Ok(Step {
             logits,
             fired,
             rows: frame.rows(),
             positions: frame.positions.clone(),
             readout_of: last_row_of(tokens.len(), &frame.request_of_token),
+            readouts_of: readouts_of(tokens.len(), &frame),
             pipelines: pipelines.built(),
         })
     }
@@ -422,9 +581,60 @@ impl Serving<'_> {
 ///
 /// A turn with no row gets zero. That cannot happen for a turn a step grew, and
 /// answering with a row that exists beats a panic in a server loop.
+/// Every row each turn reads out, by turn order.
+///
+/// The frame's `sampling_indptr` is the CSR and `sampling_indices` the rows,
+/// both already in fire-row placement, so this is a regrouping and not a
+/// derivation -- which is the point: a second derivation would be a second
+/// chance to disagree with `Frame::of` about whose rows are whose.
+///
+/// A turn the frame has no boundary for gets an empty span rather than a
+/// guess. It cannot happen for a turn a step grew.
+#[must_use]
+fn readouts_of(turns: usize, frame: &Frame) -> Vec<Vec<usize>> {
+    (0..turns)
+        .map(|t| {
+            match (
+                frame.sampling_indptr.get(t),
+                frame.sampling_indptr.get(t + 1),
+            ) {
+                (Some(&lo), Some(&hi)) if hi >= lo => frame
+                    .sampling_indices
+                    .get(lo as usize..hi as usize)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|&row| row as usize)
+                    .collect(),
+                _ => Vec::new(),
+            }
+        })
+        .collect()
+}
+
+/// A row index no fire has: what a turn that contributed no rows gets, so
+/// that reading it is a refusal rather than another turn's answer.
+pub const NO_ROW: usize = usize::MAX;
+
+/// The last fire row each turn contributed, or [`NO_ROW`] for a turn that
+/// contributed none.
+///
+/// # Why an ownerless turn is not row zero
+///
+/// It used to be: the vector started at `0` and only turns that owned a token
+/// overwrote their slot, so a turn with no rows kept row 0 -- the FIRST
+/// turn's. `frames::serve` reads this as the fallback when a request's
+/// read-out span is empty, so such a turn would have been handed another
+/// conversation's distribution and returned its token. That is the
+/// `driver-metal` defect `member_requests` exists to prevent, reached through
+/// a different door.
+///
+/// [`NO_ROW`] is not a row, so the bound check in `serve` refuses it by name
+/// instead. **No real plan reaches this**: a probe over the whole curated
+/// suite counted zero ownerless turns, which is why this is a value and not a
+/// new code path.
 #[must_use]
 fn last_row_of(turns: usize, request_of_token: &[u32]) -> Vec<usize> {
-    let mut last = vec![0usize; turns];
+    let mut last = vec![NO_ROW; turns];
     for (t, which) in request_of_token.iter().enumerate() {
         if let Some(slot) = last.get_mut(*which as usize) {
             *slot = t;
@@ -523,7 +733,12 @@ mod tests {
             vec![4, 2],
             "and it follows the frame's order, not the turns'"
         );
-        assert_eq!(last_row_of(3, &[0, 1]), vec![0, 1, 0], "a turn with no row");
+        // A turn that contributed no rows. This used to answer `0` -- the
+        // FIRST turn's row -- and `frames::serve` reads exactly this as the
+        // fallback when a request's read-out span is empty, so the turn would
+        // have returned another conversation's token. The test named the case
+        // and pinned the wrong answer.
+        assert_eq!(last_row_of(3, &[0, 1]), vec![0, 1, NO_ROW]);
     }
 
     /// A row past its turn's tokens is zero and not a panic.

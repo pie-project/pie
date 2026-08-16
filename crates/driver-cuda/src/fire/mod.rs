@@ -21,7 +21,8 @@
 /// `bridge` and not just `_cuda`: the seam is compiled into
 /// `libpie_kernels_cuda.a` beside the CUTLASS instantiations, and `bridge` is
 /// exactly the feature that links that archive — the same reason [`tower`] is
-/// gated.
+/// gated. Both the `.a` and the ARCHIVE crate whose nvcc build produced it
+/// are gone, deleted at `85c6c674b`.
 ///
 /// [`tower`]: crate::tower
 // `pub mod flashinfer_moe;` was here, under `#[cfg(feature = "bridge")]`. It
@@ -35,77 +36,93 @@
 // `out_stage`, the destinations every op in the aligned leg writes into, and
 // it has never had an arm in either world — the fused leg had been covering
 // for it. Until it binds, qwen3.5's MoE has no leg that starts.
-/// `attn/attention_flashinfer.cu`'s PLAN HALF, in Rust — the sixth file this
-/// migration found wearing a `.cu` extension for linkage rather than content:
-/// 1,258 lines with `__global__` 0, `__device__` 0 and one launch, which is
-/// `device::attn_score_fold_heads` and already a row.
-///
-/// The three plan caches, the two real planner factories over
-/// `kernels_cuda_new::plan`, the static non-split short-circuit and its two
-/// environment gates, the descriptor's H2D and the two `fire_*` entry points.
-/// **The C++ file is deleted**, and with it the whole of `driver-cuda/csrc/`;
-/// nothing here forwards anywhere.
-pub mod flashinfer_fa2;
-/// The other half of [`flashinfer_fa2`]: the params structs the FA2
-/// `__global__`s take, filled from a plan and a batch, and the six dispatches
-/// that fire them.
-///
-/// Split from the plan half because the two answer different questions and
-/// have different evidence behind them — the plan half is transcribed from
-/// `attention_flashinfer.cu`, and this half is pinned against **measured**
-/// struct layouts (`nvrtc-probes/params_layout.py`), the two score-capture
-/// mirrors included: they were derived from the Itanium C++ ABI first and
-/// then probed, and the probe agreed in all six places. `fa2/params.rs`
-/// carries both the derivation and the measurement, and states which
-/// `uint_fastdiv` was measured — the shim's, which is what every JIT fire
-/// compiles against.
-pub mod flashinfer_fa2_dispatch;
-/// `cascade.cuh`'s two merge launchers — the fold [`flashinfer_fa2_dispatch`]
-/// needs when a plan splits KV, and the third half of the FA2 seam.
-///
-/// A row that left and came back. `new-horizon.md` §38 deleted
-/// `attn::merge_attention_states_bf16` for having no consumer, and it was
-/// right about the DSL wrapper — `dsl::cuda::merge_attention_states` is still
-/// called by nothing. What the deletion missed is that the FA2 lattice's own
-/// split path calls this fold directly, from inside upstream's dispatch,
-/// which is why closing the seams turned split-KV prefill OFF rather than
-/// leaving it working.
-///
-/// **The `Fired::Split` panics were the visible half of that.** They are
-/// gone: every dispatch that splits now fires this after its attention
-/// kernel, on the same stream, in the order `prefill.cuh:4343-4352` and
-/// `decode.cuh:813-824` fire them.
-pub mod merge_states;
-// `comm/custom_all_reduce.cu`'s HOST PROGRAM, in Rust — 664 lines with zero
-// `__global__` and zero `<<<>>>`, the fifth file this migration found wearing
-// a `.cu` extension for linkage rather than content. The whole lifecycle came
-// here: peer-access enablement, the IPC handle exchange, the `RankData` slab,
-// the fusion plane's four allocations and its Lamport initialisation, the
-// NCCL crossover query, and the 240-point template cross product that
-// `kernels.def`'s `PIE_AR_FUSION_PATTERN` axis existed to prune. What did not
-// cross is two launches into CPM-fetched flashinfer headers this tree does
-// not vendor, and those are refusals naming the exact template point.
+
+// `flashinfer_fa2` AND `flashinfer_fa2_dispatch` ARE GONE FROM THIS
+// DIRECTORY, and they are the largest thing §6.3 asked for.
+//
+// `attn/attention_flashinfer.cu`'s plan half and its dispatch half were the
+// last of FA2's host program still living above the crate boundary. They are
+// `kernels_cuda::attn::fa2::{plan, dispatch}` now, beside the 56-root
+// lattice they fire and the `#[repr(C)]` mirrors they fill.
+//
+// **The mirrors are why it had to be this direction.** The params filling is
+// checked against MEASURED struct layouts (`nvrtc-probes/params_layout.py`),
+// and those assertions live with the mirrors; a filler on this side of the
+// boundary could not be reached by them. The same is true of the plan half
+// for a different reason -- it computes a geometry out of four device
+// attributes and the lattice's own occupancy arithmetic, and half of that
+// arithmetic was already `attn::fa2::geometry`'s.
+//
+// What stayed here is the part that is genuinely the driver's: `bind/arms/
+// fa2.rs` joins a trace statement to one of the six routines, `bind/mod.rs`
+// owns the two plan caches' lifetimes behind raw-pointer handles, and
+// `tower/qwen3_vl/attn.rs` drives the prepare-then-fire pair by path. All
+// three reach down for what they need and none of them holds FA2 arithmetic
+// any more.
+
+// `merge_states` WENT DOWN WITH THEM, and it had been ready to for longer.
+//
+// The whole file imported `kernels_cuda` and `std::ffi::c_void` and
+// nothing else: `VarLen` is `cascade.cuh:687-690`'s operand list in
+// `cascade.cuh`'s own field names, and `variable_length` is one call to
+// `kernels_cuda::cascade::merge_states_varlen`. It was a host program for
+// a kernel one crate down that happened to be compiled one crate up.
+//
+// What made it visible is that `attn::fa2::dispatch` builds the job. Once
+// that file descended, its `merge_job` was a function in `kernels-cuda`
+// whose RETURN TYPE lived here — and `merge_job`'s own doc had recorded the
+// boundary as the reason it was a free function rather than a method on
+// `Partials`. It is `impl Partials` now, which is what that comment was
+// waiting for.
+//
+// `kernels_cuda::cascade::merge_states` is the address.
+// `comm/custom_all_reduce.cu`'s LIFECYCLE, in Rust — peer-access enablement,
+// the IPC handle exchange, the `RankData` slab, the fusion plane's four
+// allocations and its Lamport initialisation, the NCCL crossover query, and
+// the destructor that closes every mapping the constructor opened. The whole
+// 664-line host program came here first (the fifth file this migration found
+// wearing a `.cu` extension for linkage rather than content); §6.3 then split
+// it, and the half that left is the half a LAUNCH reads — the 240-point cross
+// product `kernels.def`'s `PIE_AR_FUSION_PATTERN` axis existed to prune, the
+// `AllReduceFusionParams` mirror, both refusals and both bodies. That half is
+// `kernels_cuda::comm`, and `comm::all_reduce_bf16` and
+// `comm::all_reduce_residual_rmsnorm_bf16` are derived rows off its `fn`s.
+//
+// **The line is `crate::error::Error`.** Every function that stayed reports
+// through it, carrying a `cudaError` and a `String`; `kernels-cuda` can
+// name neither, and `Refusal` deliberately carries no driver code. What is
+// left here therefore owns something — three other processes hold the far end
+// of the IPC handles — and what left owns nothing. `comm::Plane` is the five
+// facts a launch reads off this side, filled per call -- and it grew a
+// `PeerPlane` when the plain reduction's launcher landed, because that
+// kernel takes peer addresses the fused one derives on the device.
+//
+// Both launches cross now. They named two flashinfer headers that were
+// CPM-fetched and unvendored, and were refusals naming the exact template
+// point; `csrc/src/attn/flashinfer/comm/` holds both and
+// `kernels_cuda::comm::CAN_LAUNCH` is `true`. What has not been done is
+// FIRING one: a collective needs a peer and this box has one GPU.
 pub mod all_reduce;
 pub mod attention_workspace;
 pub mod attn_score;
 // `fire::causal_conv1d` IS GONE — §5 step 5 took `ssm` into fn-world and its
-// two host programs are `kernels_cuda_new::x::ssm::causal_conv1d`'s. The
+// two host programs are `kernels_cuda::ssm::causal_conv1d`'s. The
 // two-`__global__` `if` on the request count went with them, unchanged.
-// The three families ported out of `crates/kernels-cuda/csrc/src` — `norm/`
+// The three families ported out of the ARCHIVE crate's `csrc/src` — `norm/`
 // and (until §5 step 3 moved it) `rope/`'s host launchers, in Rust, firing
-// NVRTC-compiled device text out of `kernels-cuda-new/csrc/src/norm/*.cuh`.
+// NVRTC-compiled device text out of `kernels-cuda/csrc/src/norm/*.cuh`.
 // [`hand`] is the launch they share: a `Launch` this driver states, for the
 // geometries no `LaunchRule` does.
 //
 // `dsv4_hc` IS NOT HERE EITHER, and for `rmsnorm`'s reason — see below. Its
-// four launchers are `kernels-cuda-new/src/x/norm.rs`'s `hc_*` fns, beside
+// four launchers are `kernels-cuda/src/x/norm.rs`'s `hc_*` fns, beside
 // the `dsv4_hc.cuh` whose `__global__`s they fire, and the three §43.9 had
 // already deleted for having no launcher (`hc_expand_bf16`,
 // `attn_sink_correction_bf16`, `per_head_rmsnorm_bf16`) are `fn`s there now
 // as well, so all seven of HC's kernels are written in one place for the
 // first time.
 // `fire::dtype_cast` IS GONE — §5 step 5 took its two host programs into
-// `kernels_cuda_new::x::quant`. Its doc read: *"The loader's two dtype casts
+// `kernels_cuda::quant`. Its doc read: *"The loader's two dtype casts
 // — `quant/dtype_cast.cu`'s whole surviving surface, fired through the JIT.
 // Named by `fire::lora`, which called them through `ffi::pie_k_quant_*` until
 // the rows were routed."* Both sentences are still true of
@@ -131,7 +148,7 @@ pub mod attn_score;
 /// a Rust `if`.
 ///
 /// **`fire::envelope` IS GONE.** §5 step 5 took `layout` into fn-world and
-/// the three programs are `kernels_cuda_new::x::layout::envelope_*`, beside
+/// the three programs are `kernels_cuda::layout::envelope_*`, beside
 /// the declarations that name the `__global__`s they fire. `unit!` states
 /// `LaunchRule::Unstated` for every row it generates, so the finding above
 /// is no longer a choice a row makes — it is the only thing a device
@@ -140,14 +157,14 @@ pub mod attn_score;
 /// that were in [`kv_paged`] moved with their bodies into
 /// `x::attn::kv_paged` — where the call is now a sibling module's, which is
 /// the shape the two `envelope_*` calls always wanted.
-/// `layout/embed.cu`'s one launcher, IN FN-WORLD — and with it the whole of
-/// `kernels-cuda/csrc/src/layout/`, which is now EMPTY. The `VEC` choice is a
-/// 16-byte alignment test on two pointers plus `hidden % 8`, and the extent
-/// it launches over depends on the answer; that is the host program the C++
-/// kept the file for.
+/// `layout/embed.cu`'s one launcher, IN FN-WORLD — and with it the last file
+/// in the ARCHIVE crate's `kernels/layout/`, which that left EMPTY. The
+/// `VEC` choice is a 16-byte alignment test on two pointers plus
+/// `hidden % 8`, and the extent it launches over depends on the answer; that
+/// is the host program the C++ kept the file for.
 ///
 /// **`fire::embed` IS GONE**, with `fire::envelope` and in the same change:
-/// the program is `kernels_cuda_new::x::layout::embed_bf16` and the
+/// the program is `kernels_cuda::layout::embed_bf16` and the
 /// predicate is `x::layout::vectorisable`, public because a caller staging
 /// its own buffers may ask the same question. `layout/embed.cuh` is one of
 /// `x::layout`'s five units (`EMBED`, two instantiations of
@@ -162,11 +179,11 @@ pub mod attn_score;
 /// rows carried the same strings as the table rows, and §52.11 forbids
 /// walking a symbol a unit hosts.
 // `attention_naive` DELETED -- the MTP pair crossed into
-// `kernels_cuda_new::x::attn` and refuses on `slot_ids`, which only
+// `kernels_cuda::attn` and refuses on `slot_ids`, which only
 // `Cx::gdn` reaches. `attn/attention_naive.cuh` is
 // `x::attn::attention_naive`'s unit, declaring the two of its five
 // `__global__`s that have a host program.
-// `dsa_indexer` CROSSED WHOLE into `kernels_cuda_new::x::attn`. It held
+// `dsa_indexer` CROSSED WHOLE into `kernels_cuda::attn`. It held
 // `attn/dsa_indexer.cu`'s three launchers and `bind::service`'s three entry
 // points were its only consumer, so the module went with them rather than
 // being left as a body nothing calls. The block width `round_up(n_heads, 32)`
@@ -176,11 +193,11 @@ pub mod attn_score;
 /// `attn/dsv4_compress.cu`'s three surviving launchers, in Rust — the whole
 /// file. Nine went in earlier passes and a tenth,
 /// `combine_attn_outputs_bf16`, has crossed into fn-world as
-/// `kernels_cuda_new::x::attn`'s `COMBINE_ATTN_OUTPUTS`; it is the only one
+/// `kernels_cuda::attn`'s `COMBINE_ATTN_OUTPUTS`; it is the only one
 /// of the four whose every value came out of the statement. The three that
 /// remain needed §60.6's symbol split and nothing else.
 // `dsv4_compress` DELETED -- all four host programs crossed into
-// `kernels_cuda_new::x::attn`, `combine_attn_outputs_bf16` bound and the
+// `kernels_cuda::attn`, `combine_attn_outputs_bf16` bound and the
 // other three `none:` on the compression ratio. `attn/dsv4_compress.cuh` is
 // `x::attn::dsv4_compress`'s unit and holds all five kernels.
 /// `gemm/gemm.cpp`'s HOST PROGRAM, in Rust — **zero `__global__`, zero
@@ -199,45 +216,50 @@ pub mod attn_score;
 /// # BOTH FILES HAVE MOVED, AND THESE TWO NAMES ARE NOW RE-EXPORTS
 ///
 /// §5 step 5 took `gemm` into fn-world. A host program belongs beside its
-/// device text, so `fire/gemm.rs` is `kernels_cuda_new::x::gemm::dense` and
-/// `fire/gemv.rs` is `kernels_cuda_new::x::gemm::gemv`; `x::gemm` itself
+/// device text, so `fire/gemm.rs` is `kernels_cuda::gemm::dense` and
+/// `fire/gemv.rs` is `kernels_cuda::gemm::gemv`; `x::gemm` itself
 /// holds the `unit!` for the GEMV rows, the twelve `contract!`s and the
 /// `bind!`.
 ///
 /// The two names stay HERE as re-exports rather than being deleted, and that
 /// is not softness about a deletion. `crate::fire::gemm::act_x_wt_bf16` is
-/// spelled by `tower::gemma4_vision`, `tower::qwen3_vl`, `fire::lora` and
-/// `bind::quant_gemm`, and by a dozen doc links besides; a re-export makes
+/// spelled by `tower::gemma4_vision`, `tower::qwen3_vl` and `fire::lora`,
+/// and by a dozen doc links besides; a re-export makes
 /// every one of them keep resolving to the one definition, which is exactly
 /// what a re-root is supposed to cost. The alternative — editing four
 /// unrelated modules to say a longer path — would be a rewrite of files this
 /// change has no business in.
-pub use kernels_cuda_new::x::gemm::dense as gemm;
-pub use kernels_cuda_new::x::gemm::gemv;
+pub use kernels_cuda::gemm::dense as gemm;
+pub use kernels_cuda::gemm::gemv;
 // `fire::gated_delta_net` IS GONE — §5 step 5 took it into
-// `kernels_cuda_new::x::ssm::gated_delta_net`, where its four launchers
+// `kernels_cuda::ssm::gated_delta_net`, where its four launchers
 // became ten host programs (six of the ten were rule-driven rows with no
 // `.cu` launcher to move). **The eight-of-seventeen dead-`<<<>>>` audit and
 // the 34 % / nine-fold measurements moved with them**; nothing in it was
 // carried by this file.
 pub mod hand;
+// The step's descriptor resolution: the geometry a `DecodeEnvelope` member
+// leaves off the wire, read off the channel rings before the forward, and the
+// working-set→physical page translation every member needs.
+#[cfg(feature = "abi")]
+pub(crate) mod envelope;
 // `fire::kda` IS GONE — §5 step 5 took it into
-// `kernels_cuda_new::x::ssm::kda`. Its two deliberately UNSOURCED rows are
+// `kernels_cuda::ssm::kda`. Its two deliberately UNSOURCED rows are
 // now two `bind!` `none:` arms, which is the fn-world spelling of the same
 // fact: `state_base` is a driver-owned slab and `Source` has no `Scratch`
 // (`new-horizon.md` §52.3, §56, §57.3), so a load-time refusal prints the
 // sentence the row was carrying as prose.
 // `fire::nemotron_h` IS GONE — §5 step 5 took it into
-// `kernels_cuda_new::x::ssm::nemotron_h`, four launchers becoming seven host
+// `kernels_cuda::ssm::nemotron_h`, four launchers becoming seven host
 // programs. **The two-of-eleven dead-`<<<>>>` audit moved with them.**
 // `fire::quant_int8` IS GONE — §5 step 5 took its three host programs into
-// `kernels_cuda_new::x::quant`. Its doc read: *"`quant/quant_bf16_to_fp8.cu`'s
+// `kernels_cuda::quant`. Its doc read: *"`quant/quant_bf16_to_fp8.cu`'s
 // four launchers, in Rust — three ported and one deleted for having no
 // consumer in any language. It is the file the three hand-written
 // `ffi::pie_k_quant_*` arms in `bind/quant_gemm.rs` held alive; those arms
-// now call this module and `csrc/src/quant/` is gone."*
+// now call this module and `kernels/quant/` is gone."*
 //
-// `bind::quant_gemm` calls `x::quant` directly now, and the two geometries
+// `gemm::quant` calls `x::quant` directly now, and the two geometries
 // this module carried BECAUSE no rule could state them — `<<<(ceil(k /
 // group_size), m), 128>>>` and `<<<(ceil(N / 32), ceil(M / 8)), (32, 8)>>>` —
 // are literal `Launch` values there, which is §5.1's rule that a kernel
@@ -245,7 +267,7 @@ pub mod hand;
 // launcher is still deleted and still has no consumer in any language.
 // `rmsnorm` IS NOT HERE, and its absence is the migration.
 //
-// Its five host programs are `kernels-cuda-new/src/x/norm.rs`, beside the
+// Its five host programs are `kernels-cuda/src/x/norm.rs`, beside the
 // `rmsnorm.cuh` whose `__global__`s they fire — `.wiki/kernel-x/northstar.md`
 // §5 step 5, the fifth family to cross and the one §5.1 named as the first
 // proof of `Composed`/`Walk`. Nothing was lost in the move: the
@@ -255,7 +277,7 @@ pub mod hand;
 // than a `Choose` the row world could not write.
 // `rope` IS NOT HERE, and its absence is the migration.
 //
-// Its nine host programs are `kernels-cuda-new/src/x/rope.rs`, beside the
+// Its nine host programs are `kernels-cuda/src/x/rope.rs`, beside the
 // `rope.cuh` whose `__global__`s they fire — `.wiki/kernel-x/northstar.md`
 // §5 step 3, the first family to cross. Nothing was lost in the move: the
 // measurements came with the fns that carry them, and the family gained
@@ -264,7 +286,7 @@ pub mod hand;
 // What a reader looking for a launcher here should know is that this
 // directory is now the UNPORTED half. A family in `fire/` has its device
 // text in one crate and its host program in another; a family in
-// `kernels-cuda-new/src/x/` has both in one place and a `contract!` that
+// `kernels-cuda/src/x/` has both in one place and a `contract!` that
 // `model-compiler` reads without knowing a GPU exists.
 // GATED ON `abi`, and that is a finding rather than a tidy-up. The
 // forward pass takes `driver_api::PieFrameDesc` and reads
@@ -298,7 +320,7 @@ pub mod launch;
 /// plan building consumes.
 ///
 /// **The seven appenders and dequanters MOVED** to
-/// `kernels_cuda_new::x::attn::kv_paged`, with `fp4_block_size`,
+/// `kernels_cuda::attn::kv_paged`, with `fp4_block_size`,
 /// `max_touched_pages`, and `Fp8Kind` as `fp8_kind_of` over the floor's own
 /// `x::fp8_kind`. The four `Launched`/`Declined` enums did NOT go with them. The head of
 /// [`kv_paged`] states the discriminator that decided it — a driver op is a
@@ -317,15 +339,15 @@ pub mod launch;
 /// rows to `..._dev` names. Both were reasoning about a mechanism no reader
 /// consulted: this module had been picking `#hnd`/`#nhd` in Rust and firing
 /// by name through `hand::fire` the whole time, so `selects()` was asked
-/// about none of the five. `device::SPECIALISED` is empty and terminal.
+/// about none of the five. `pie::SPECIALISED` is empty and terminal.
 pub mod kv_paged;
 /// The fused LM-head GEMV + argmax IS GONE — `sample/argmax.cu`'s last
-/// launcher, and the whole of `csrc/src/sample/`. Two JIT'd kernels with a
+/// launcher, and the whole of `kernels/sample/`. Two JIT'd kernels with a
 /// growable device scratch between them, on grids read off an occupancy
 /// query.
 ///
 /// §5 step 5 took `sample` into fn-world: the program is
-/// `kernels_cuda_new::x::sample::lm_head_gemv_argmax_int8`, beside the two
+/// `kernels_cuda::sample::lm_head_gemv_argmax_int8`, beside the two
 /// declarations it fires. It is no longer reached through `bind::service`
 /// and no model text sees the symbol — the contract carries a written
 /// refusal instead, because the int8 head and its dequant scale are named
@@ -340,34 +362,24 @@ pub mod lora;
 /// function that file held, `write_mla_to_pages_bf16`, had an empty consumer
 /// set on all five channels and is deleted rather than ported.
 // `mla_paged` DELETED -- both host programs crossed into
-// `kernels_cuda_new::x::attn` and refuse on `Cx::mla_layer`.
+// `kernels_cuda::attn` and refuse on `Cx::mla_layer`.
 // `attn/mla_paged.cuh` is `x::attn::mla_paged`'s unit and holds both kernels;
 // `YarnOriginal` dissolved into `x::Yarn` and `MlaDecline` into
 // `Refusal::Empty`.
-/// `attention_mla_naive.cuh`'s two launchers, in Rust — the scalar
-/// flash-softmax MLA kernel and the tensor-core one, plus the shape predicate
-/// that chooses between them and the head-group wave-target search.
-///
-/// **These were the last two launches nvcc could reach, and the whole-tree
-/// census could not see them**: they sat in a `.cuh`, and
-/// `kernels-cuda/tests/sources.rs` counts over `.cu` and `.cpp` because device
-/// text does not launch (`new-horizon.md` §63.3).
-///
-/// **`kernels-cuda/csrc/src/attn/attention_mla.cu` IS NOW DELETED** and this
-/// module is the only Rust that reaches these two. The condition stated here
-/// was that the OTHER arm — FlashInfer's `BatchMLAPagedAttention`, which
-/// passes `MLAParams` by value — become fireable; it did, as
-/// `kernels_cuda_new::x::attn::mla_fa2`, over an `x::Abi` `by_value!` whose
-/// untagged arm landed for it. The row went to `x::attn::ATTENTION_MLA` and
-/// took the shim entry with it, and `kernels-cuda/tests/sources.rs`'
-/// `EXPECTED` is 0.
-///
-/// Still not firing, and now for ONE reason rather than two: this arm is
-/// chosen on `cudaDevAttrComputeCapabilityMajor >= 10`, and neither `Cx` nor
-/// the runtime states a compute capability. The contract's `none:` arm names
-/// that plus the three MLA facts `Cx` lacks. **Both host programs are
-/// written; what is missing is the vocabulary to choose between them.**
-pub mod mla_naive;
+// `mla_naive` DELETED -- `attention_mla_naive.cuh`'s two launchers crossed
+// into `kernels_cuda::attn::mla_naive`, which already held the root
+// and both template-ids. `NaiveShape`, `NaivePtrs`, `NaivePlan`, the
+// wave-target head-group search, `mma_supported` and both shared-memory
+// figures went verbatim; `launch` became `x::attn::mla_naive::fire` over
+// `Ctx` instead of `hand::fire` over a stream, so a compile failure is a
+// `Refusal` and no longer a panic. `MlaNaive` still says which of the pair
+// ran, and a shape neither serves is still `Declined` rather than an error.
+//
+// Nothing in this crate called it before the move and nothing can call it
+// after: `fire/launch.rs`' `kv_pools_for` refuses `KvStyle::Mla`, so the
+// arm choice this module was waiting on -- `cudaDevAttrComputeCapability\
+// Major >= 10`, now answerable as `Ctx::compute_capability_major` -- has no
+// caller to make it.
 // `fire::moe` IS GONE — §5 step 5 took `moe` into fn-world as `x::moe`. It
 // held the routing/gemv/finalize launchers with no doc block of their own;
 // every one of them is a host `fn` in `x/moe.rs` now, under the `csrc` root
@@ -389,7 +401,7 @@ pub mod mla_naive;
 // unsourcedness is what it always meant: `none:` arms, `Route::Unbound` at
 // model load with a sentence, and `Control::Supplies` still the reason.
 //
-// `csrc/src/moe/` is left holding `flashinfer_moe.cu`, which is an
+// `kernels/moe/` is left holding `flashinfer_moe.cu`, which is an
 // `extern "C"` INSTANTIATION SEAM and nothing else — five functions over
 // `CutlassMoeFCRunner` and two standard headers, down from fourteen. Its
 // 817-line host program (workspace arithmetic, arch probe, autotuner,
@@ -428,11 +440,11 @@ pub mod moe_grouped;
 /// first fills; `execution::COMPOSED` has stated that pair since the split
 /// and what was missing was the host. `RUST_SERVED` takes the row.
 // `page_compact` DELETED -- `compact_page_csr` crossed into
-// `kernels_cuda_new::x::attn`, both launches in order with both refusals
+// `kernels_cuda::attn`, both launches in order with both refusals
 // hoisted ahead of the first. `attn/page_compact.cuh` is
 // `x::attn::page_compact`'s unit, written for that crossing.
 // `qkv_fused` DELETED -- `attn::qkv_decode_qk_norm_rope_write_kv_bf16` crossed
-// into `kernels_cuda_new::x::attn` as `QKV_DECODE_FUSED`, and it was THE LAST
+// into `kernels_cuda::attn` as `QKV_DECODE_FUSED`, and it was THE LAST
 // ROW IN `ROW_TABLES`.
 //
 // It was the whole launcher here, and the last `attn` dispatch to fall: one
@@ -455,6 +467,16 @@ pub mod moe_grouped;
 // move** — there was none to name, and `_ctx: &DispatchCtx` went unread from
 // the day it was written.
 pub mod page_mask;
+// `predicate_of` LIVED IN `recordings` and does not any more, and the gate
+// below is the whole reason. It is the one thing in the union machinery that
+// touches no device object — `lower::select`'s body, evaluated against a
+// fire's rows — and its own doc comment insists on that: *"the equivalence
+// between the eager leg and the captured leg is a HOST fact, so it must be
+// provable without a GPU."* The proof is `tests/union_lower.rs`, which gates
+// on `_cuda` because that is all it needs. Behind `abi` the function was
+// still host-only and no longer reachable from the target that proves it, so
+// the gate had quietly made the doc false.
+pub mod predicate;
 // `recordings` and `scratch` are BEHIND THE SAME GATE AS `launch`, because
 // every reader of either is: `fire::launch` and `serve` are both
 // `feature = "abi"`, and nothing outside them constructs a `Scratch`, reads a
@@ -466,7 +488,7 @@ pub mod page_mask;
 pub mod recordings;
 // `split_packed` DELETED. `attn::split_qkv_bf16_devwin` crossed into
 // fn-world with a real bind, so its host program is
-// `kernels_cuda_new::x::attn::split_qkv_bf16_devwin` and the module that
+// `kernels_cuda::attn::split_qkv_bf16_devwin` and the module that
 // held it had nothing else in it.
 #[cfg(feature = "abi")]
 pub mod scratch;
@@ -474,14 +496,15 @@ pub mod sideband_arena;
 pub mod stage_hooks;
 /// `csrc/supergraph.cu`'s two launchers, in Rust — **that file is deleted**,
 /// and with it the second of this crate's three nvcc builds. The device text
-/// is a JIT unit now (`kernels-cuda-new/csrc/src/graph/supergraph.cuh`); the
+/// is a JIT unit now (`kernels-cuda/kernels/graph/supergraph.cuh`); the
 /// claim that stood in the way — *"this needs nvcc"* — was measured and is
 /// false, and the measurement is in this module's header.
 pub mod supergraph;
-/// XQA's two fires and the attention-workspace carve between them. The kernel
-/// halves are `kernels_cuda_new::x::xqa`'s six roots and two routines; what is
-/// here is the carve, because a workspace is the driver's vocabulary and an
-/// offset into one is not a thing a `Source` can name. Implements the
-/// `Prepare::FireWide` that `attn::attention_xqa_decode_bf16_prepared`'s row
-/// states and that no code routes on any reachable channel.
-pub mod xqa;
+// `xqa` DELETED. It was two host programs and the attention-workspace carve
+// between them, kept here on the argument that a workspace is the driver's
+// vocabulary. It is not: a routine takes the workspace's two halves as four
+// arguments, and then the carve is arithmetic over a pointer like any other.
+// Both launches are `kernels_cuda::attn::xqa`'s
+// `attention_xqa_decode_bf16_prepared`, in that order on one stream, which is
+// what retired the `Prepare::FireWide` obligation nothing here discharged.
+// `bind/arms/xqa.rs` is the whole of what is left on this side.

@@ -36,6 +36,24 @@ Usage
          -I crates/driver-cuda/csrc/src -I crates/kernels-cuda/csrc/src \\
          crates/driver-cuda/csrc/tests/csm_depth_decoder_parity.cu -o /tmp/cdp
     /tmp/cdp /tmp/csm_depth_parity
+
+That nvcc line no longer runs
+-----------------------------
+It is kept as the record of what the harness was built against, not as an
+instruction. Every path in it is deleted: `crates/driver-cuda/csrc` went at
+`b58db6c16`, taking `csm_depth_decoder_parity.cu` with it, and
+`crates/kernels-cuda/csrc/src` was the ARCHIVE crate's host header tree --
+`.hpp` declaring the `.cu` launchers -- which went with the whole crate at
+`85c6c674b`.
+
+The second `-I` is the one worth flagging, because that name has been reused
+since. `crates/kernels-cuda/csrc/src` EXISTS again and holds the JIT crate's
+device text, `.cuh` that NVRTC compiles at run time and not one host header.
+nvcc would take the flag and find nothing this command wanted behind it: an
+include root that resolves is not the same as the right one.
+
+The dump below is unaffected. It writes `.npy` and JSON from a checkpoint and
+reaches neither tree.
 """
 
 from __future__ import annotations

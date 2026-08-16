@@ -149,8 +149,17 @@ const DEAD: &[(&str, Dies, &str, &str)] = &[
     // ── Cause B: individual archive files retired by this migration.
     //
     // Two, and they are the ones that will keep happening: an oracle whose
-    // subject is a `kernels-cuda` source dies the day that source is ported.
-    // Both of these were live until this migration reached their file.
+    // subject is a HOST source in the kernels tree dies the day that source
+    // is ported. Both of these were live until this migration reached their
+    // file.
+    //
+    // Their two path strings are the ARCHIVE crate's — `kernels-cuda` when it
+    // was a CMake+nvcc crate whose `csrc/` held `.cu` and host `.hpp`/`.cpp`,
+    // deleted whole at `85c6c674b`. The strings are kept verbatim because
+    // they are what each `run.sh` reaches for. Nothing in this tree holds
+    // either path now and nothing is meant to, so the rows still assert what
+    // they were written to assert; a reader must not take the prefix for a
+    // crate that is alive.
     ("cublas_handle", Dies::Cp, "crates/kernels-cuda/csrc/src/gemm/gemm.cpp",
      "cuBLAS handle and workspace lifetime"),
     ("weight_view", Dies::Compile, "crates/kernels-cuda/csrc/src/tensor.cpp",

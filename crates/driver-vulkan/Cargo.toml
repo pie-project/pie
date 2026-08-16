@@ -51,7 +51,7 @@ driver-api = { path = "../driver-api", default-features = false }
 kernels = { path = "../kernels" }
 
 # The Vulkan signature table, and the SPIR-V it builds. `default-features =
-# false` keeps this to the table -- host-portable, no `glslc` -- and the
+# false` keeps this to the table -- host-portable, no `slangc` -- and the
 # `native` feature does not turn the shader build on here either, because a
 # driver consumes modules rather than producing them.
 kernels-vulkan = { path = "../kernels-vulkan", default-features = false }
@@ -59,7 +59,9 @@ kernels-vulkan = { path = "../kernels-vulkan", default-features = false }
 # The plan a driver executes: `Lowered`, `Launch`, `Arg`. `src/binding.rs`
 # turns those into descriptor ranges, so this is a real dependency and not a
 # testing one -- the same shape `driver-metal` has, for the same reason.
+# `model-ir` beside it for the traced form those name.
 model-compiler = { path = "../model-compiler" }
+model-ir = { path = "../model-ir" }
 
 # The PTIR channel plane: the program/channel/instance registry, the ring and
 # every bind-time derivation. A REAL dependency and not a dev one, unlike
@@ -80,6 +82,11 @@ ash = { version = "0.38", default-features = false, features = [
 ], optional = true }
 
 [dev-dependencies]
+# TEST-ONLY: `tests/device.rs` writes a declaration to lower. `src/` names
+# nothing from the authoring surface, which is what makes this a dev edge --
+# and what it was before the toolchain split is the same 4,469-line
+# `dsl::cuda` surface, linked into a VULKAN driver on every build.
+model-dsl = { path = "../model-dsl" }
 
 # `tests/checkpoint.rs` only: the tensor names and extents a real `.zt` states,
 # which is the one place a weight's SIZE exists -- `Arg::Weight` carries a name
@@ -109,7 +116,7 @@ model = { path = "../model", default-features = false, features = [
 serde_json = "1.0"
 
 # The device tests read the modules `kernels-vulkan` compiles, so the test
-# build is the one that needs `glslc`.
+# build is the one that needs `slangc`.
 kernels-vulkan = { path = "../kernels-vulkan", default-features = false, features = [
     "native",
 ] }
@@ -120,16 +127,21 @@ kernels-vulkan = { path = "../kernels-vulkan", default-features = false, feature
 name = "device"
 required-features = ["native"]
 
-# The rule cross-check reads `.spv` FILES. That needs `glslc` to have run, and
+# The rule cross-check reads `.spv` FILES. That needs `slangc` to have run, and
 # it does not need a GPU -- so it is not gated on `native`, and a machine with
 # no Vulkan device at all still gets the check that carries the defects.
 [[test]]
 name = "rules"
 
-# GPU-free: it lowers a text and looks at byte offsets. Not gated on `native`,
-# so the machines that change a placement are the ones that run it.
+# GPU-free -- it lowers a text and looks at byte offsets -- but it reads
+# `dispatch::Geometry`, which IS `native`-gated, so the portable build of this
+# target does not compile at all. That is worse than gating it: the whole
+# point of `default = []` is that the portable half builds, and a test target
+# that cannot be built is not a check that can be skipped, it is a build
+# failure in `cargo build --workspace --all-targets`.
 [[test]]
 name = "arena"
+required-features = ["native"]
 
 # Neither a GPU nor a shader compiler: it asks the resolver what this crate
 # depends on. Ungated on purpose -- the constraint it checks is about the

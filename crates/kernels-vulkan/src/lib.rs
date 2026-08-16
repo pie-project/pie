@@ -3,12 +3,14 @@
 //!
 //! ## Why this is shaped like Metal's and not like CUDA's
 //!
-//! `kernels-cuda` has one row per launcher symbol, because a CUDA launcher is
-//! an authored C++ function and there is nothing else it could be. A GLSL
-//! compute shader is the other extreme: it has exactly ONE entry point and it
-//! is always called `main`, so a name like
+//! `kernels-cuda` has one row per launcher symbol and no axes at all: its
+//! device text is a C++ template, but a routine there NAMES the single
+//! instantiation it wants and its row is DERIVED from that routine, so a point
+//! of the template that nothing launches is not a row. A Slang compute shader
+//! is the other extreme: it has exactly ONE entry point and it is always
+//! called `main`, so a name like
 //! `affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32` cannot be a symbol at all. It
-//! is the name of a SPIR-V MODULE — one `.spv`, compiled from one `.comp` with
+//! is the name of a SPIR-V MODULE — one `.spv`, compiled from one `.slang` with
 //! one `-D` set, exactly as llama.cpp's `vulkan-shaders-gen` produces its
 //! `matmul_q4_k_f16_f32.spv` and its 900 siblings.
 //!
@@ -21,7 +23,7 @@
 //! **The coverage is `kernels-metal`'s, deliberately.** Row for row, axis for
 //! axis, point for point: 99 kernels over 480 entrypoints, the same names in
 //! the same ten families. That is not imitation for its own sake — it is what
-//! makes the two backends comparable. `model-compiler` checks a lowered plan
+//! makes the two backends comparable. `model-ir` checks a lowered plan
 //! against whichever table the deployment selected, so a text that runs on
 //! Metal either runs here or names exactly which row it wanted; and a
 //! divergence between the two tables is then a STATEMENT that one backend
@@ -63,15 +65,15 @@
 //!
 //! * `kernels`' own unit tests pin the matcher — that a row covers every point
 //!   of its axes and refuses a partial or permuted spelling.
-//! * `tests/entrypoints.rs` pins the table's product against
-//!   `entrypoints.generated.txt`.
-//! * `scripts/vulkan-kernel-audit.py` pins that file against the shaders, by
-//!   reading the `// pie:instantiate` directives the BUILD compiles from — so
-//!   the audit and the build cannot disagree about what exists — and
-//!   `--compile` runs `glslc` over every one of them, which proves a declared
+//! * `tests/entrypoints.rs` pins the table's product against the shader tree,
+//!   by reading the `// pie:instantiate` directives out of `kernels/`.
+//! * `scripts/vulkan-kernel-audit.py` reads those same directives — the ones
+//!   the BUILD compiles from, so the audit and the build cannot disagree about
+//!   what exists — and
+//!   `--compile` runs `slangc` over every one of them, which proves a declared
 //!   variant is a variant that builds.
 //!
-//! And from the other end, `model-compiler`'s `kernels::check_plan` refuses any
+//! And from the other end, `model-ir`'s `kernels::check_plan` refuses any
 //! launched symbol no row declares, so a lowered text cannot state a kernel
 //! this table has not heard of.
 //!
@@ -145,20 +147,29 @@
 //! ## Reading this without a GPU, and without a Vulkan SDK
 //!
 //! All of the above runs anywhere. `default-features = false` gives the table
-//! and nothing else — which is what `model-compiler` wants and all it wants —
-//! and `native` adds the `glslc` pass that turns the GLSL tree into SPIR-V.
+//! and nothing else — which is what `model-ir` wants and all it wants —
+//! and `native` adds the `slangc` pass that turns the Slang tree into SPIR-V.
 //! Unlike Metal, that pass is not optional for a shell that means to RUN:
 //! `vkCreateShaderModule` takes words, not source.
 
 mod capability;
 pub use crate::capability::Capability;
 
-use kernels::{KernelSig, Prepare};
+use kernels::KernelSig;
 // Named only by the doc links above, which rustdoc still has to resolve.
 #[allow(unused_imports)]
 use kernels::Axis;
 
 pub mod axes;
+
+/// The routine machinery, this backend's instantiation of it.
+///
+/// The crossing described by `.wiki/kernel-x/vulkan-refactor.md`: a kernel
+/// becomes an ordinary `fn` whose table row is derived from its signature,
+/// replacing a `kernel!` row whose launch rule and operand list were data for
+/// `driver-vulkan` to interpret. Families cross one at a time and the two
+/// tables coexist until the last one has.
+pub mod routine;
 
 pub mod attn;
 pub mod layout;
@@ -209,7 +220,6 @@ const EMPTY: KernelSig = KernelSig {
     file: None,
     launch: kernels::LaunchRule::Unstated,
     whole: false,
-    needs: Prepare::None,
     lacks: &[],
     sink: None,
     in_place: &[],
@@ -218,9 +228,8 @@ const EMPTY: KernelSig = KernelSig {
     // kernel here is a mamba block, and `Prepare::Ssm` does not appear in
     // this file. That is why the aux-slot field this crate used to carry
     // was always empty. Step 9 measured that field CUDA-only and
-    // consolidated it onto `kernels_cuda_new::x::Contract`, so the reason
+    // consolidated it onto `kernels_cuda::x::Contract`, so the reason
     // outlived the field.
-
     args: &[],
     operands: &[],
     axes: &[],
@@ -237,7 +246,6 @@ const fn copy_sig(k: &KernelSig) -> KernelSig {
         file: k.file,
         launch: k.launch,
         whole: k.whole,
-        needs: k.needs,
         lacks: k.lacks,
         sink: k.sink,
         in_place: k.in_place,
@@ -252,7 +260,13 @@ const fn copy_sig(k: &KernelSig) -> KernelSig {
     }
 }
 
-const CONCAT: [KernelSig; N] = {
+/// The families laid end to end.
+///
+/// A `static` rather than a `const`: `KERNELS` borrows it, and borrowing a
+/// `const` promotes a fresh copy of the whole table rather than pointing at
+/// one. The initialiser is still a const-evaluated loop, because a `static`
+/// may be built by one.
+static CONCAT: [KernelSig; N] = {
     let mut out = [EMPTY; N];
     let mut at = 0;
     let mut f = 0;
@@ -275,8 +289,209 @@ const CONCAT: [KernelSig; N] = {
 /// and — one for one — the set of `.spv` module names a `native` build writes.
 pub fn entrypoints() -> Vec<String> {
     let mut out: Vec<String> = KERNELS.iter().flat_map(KernelSig::entrypoints).collect();
+    out.extend(
+        RETIRED
+            .iter()
+            .flat_map(|family| family.iter().map(|n| (*n).to_owned())),
+    );
     out.sort();
     out
+}
+
+/// The entrypoints of the families whose `kernel!` rows have been RETIRED.
+///
+/// The crossing moves who NAMES an entrypoint, not whether it exists: the
+/// shader is still in the tree, `build.rs` still compiles it, and the driver
+/// still dispatches it -- through `driver-vulkan/src/arm.rs`'s stem lookup
+/// rather than through a row. So the name has to be stated somewhere, or
+/// `tests/entrypoints.rs` would read a family that crossed successfully as a
+/// family whose shaders had vanished, and the comparison against
+/// `kernels-metal` -- which has not retired these rows -- would report drift
+/// where there is none.
+///
+/// This list shrinks to nothing in the other direction: when the last family
+/// crosses, `KERNELS` is empty and this is the whole census. That is
+/// `.wiki/kernel-x/refactor-bigplan.md` §7 Stage 4, and it is why this is a
+/// list of families rather than one flat slice.
+const RETIRED: &[&[&str]] = &[
+    sample::ENTRYPOINTS,
+    ptir::ENTRYPOINTS,
+    mlp::ENTRYPOINTS,
+    layout::ENTRYPOINTS,
+    rope::ENTRYPOINTS,
+    norm::ENTRYPOINTS,
+    ssm::ENTRYPOINTS,
+    moe::ENTRYPOINTS,
+    attn::ENTRYPOINTS,
+    quant::ENTRYPOINTS,
+];
+
+/// The rows that have been retired, by the name their `kernel!` call had.
+///
+/// [`RETIRED`] answers "what can still be dispatched"; this answers "what used
+/// to be a row here and is one in `kernels-metal` still". The parity tests in
+/// `tests/entrypoints.rs` scrape both crates' sources and compare row for row,
+/// so during the crossing they need to know which of the sibling's rows have
+/// no counterpart here on purpose. It empties when the last family crosses and
+/// the parity tests retire with it.
+#[must_use]
+pub fn retired_rows() -> &'static [&'static str] {
+    &[
+        "argmax_logits",
+        "copy_logits_bf16",
+        "geglu_tanh",
+        "geglu_tanh_strided",
+        "gptoss_swiglu",
+        "silu_mul",
+        "embed_gather_4bit",
+        "embed_gather_mb_4bit",
+        "embed_gather_scaled_4bit",
+        "embed_gather_scaled_mb_4bit",
+        "ple_combine",
+        "row_gather",
+        "neox_decode",
+        "neox_mb",
+        "neox_prop_decode",
+        "neox_prop_mb",
+        "neox_freqs_decode",
+        "neox_freqs_mb",
+        "neox_strided",
+        "gated_rms",
+        "gated_rms_strided",
+        "layer_scalar_mul",
+        "add_bias",
+        "residual_add",
+        "residual_add_strided",
+        "rms_residual",
+        "rms_residual_scaled",
+        "rms_single_row",
+        "rms_strided_head_row",
+        "rms_strided_row",
+        "vnorm_single_row",
+        "gdn_core",
+        "gdn_core_recurrent",
+        "gdn_core_recurrent_prefill",
+        "gdn_core_recurrent_slotted",
+        "gdn_core_slotted",
+        "gdn_prep",
+        "gdn_prep_prefill",
+        "gdn_prep_slotted",
+        "router_topk",
+        "router_topk_scaled",
+        "route_sort",
+        "route_gather",
+        "combine_sorted",
+        "shared_expert_combine",
+        "shared_expert_combine_strided",
+        "qmv_routed",
+        "qmv_routed_bias",
+        "mxfp4_qmv_routed_bias",
+        "qmm_t_routed",
+        "qmm_t_routed_fp16",
+        "mxfp4_qmm_t_routed_bias",
+        "sdpa_paged_decode",
+        "sdpa_paged_decode_sink",
+        "sdpa_paged_tiled",
+        "sdpa_paged_tiled_sink",
+        "sdpa_paged_tiled_strided",
+        "sdpa_paged_mma",
+        "sdpa_paged_mma_sink",
+        "sdpa_vector_decode",
+        "sdpa_vector_decode_swa",
+        "sdpa_vector_decode_sink",
+        "kv_append",
+        "kv_append_paged",
+        "split_qkv_bf16",
+        "gate",
+        "q_gate_split",
+        "logit_softcap",
+        "cast_qmm_input_bfloat16_to_float16",
+        "cast_qmm_input_strided_bfloat16_to_float16",
+        "encode_u4_bf16",
+        "encode_u4_f32",
+        "mxfp4_dequant_bf16",
+        "qmm_splitk_reduce",
+        "qmm_splitk_reduce_f32",
+        "qmm_t",
+        "qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
+        "qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
+        "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
+        "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
+        "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
+        "qmm_t_bias",
+        "qmm_t_bias_fp16_precast",
+        "qmm_t_fp16_precast",
+        "qmm_t_residual",
+        "qmm_t_residual_fp16_precast",
+        "qmm_t_splitk",
+        "qmm_t_splitk_f32",
+        "qmm_t_splitk_fp16_precast",
+        "qmm_t_splitk_fp16_precast_f32",
+        "qmm_t_strided",
+        "qmm_t_strided_fp16_precast",
+        "qmm_t_strided_fp16_precast_residual",
+        "qmm_t_strided_residual",
+        "qmv_fast",
+        "qmv_fast_residual",
+        "qmv_tail",
+        "qmv_tail_bias",
+        "qmv_wide_strided",
+    ]
+}
+
+/// Every entrypoint whose row is gone and whose routine now answers for it.
+#[must_use]
+pub fn retired() -> Vec<&'static str> {
+    RETIRED.iter().flat_map(|f| f.iter().copied()).collect()
+}
+
+/// Every routine this backend has crossed, with the backend forgotten.
+///
+/// The other half of [`KERNELS`] during the crossing: a kernel is a ROW until
+/// its family is ported and a ROUTINE afterwards, and the union of the two is
+/// what must still be the hundred.
+/// `.wiki/kernel-x/refactor-bigplan.md` §8 makes that the progress bar, and
+/// `kernels::routine::Declared` is the view three backends' incompatible
+/// `Routine<B>` types can share.
+///
+/// Exposing it is what enters this backend into
+/// `kernels/tests/shader_backends_agree.rs`, which from here on compares every
+/// crossed body's TRACE arguments against the row it still has beside it. That
+/// is the check a port most needs: a body that drops an operand, or takes two
+/// in the other order, compiles, dispatches and returns `Ok` -- it binds the
+/// wrong buffer to the wrong slot and computes a plausible number.
+#[must_use]
+pub fn declared() -> Vec<kernels::routine::Declared> {
+    CROSSED
+        .iter()
+        .flat_map(|family| family.iter().map(kernels::routine::Routine::declared))
+        .collect()
+}
+
+/// The families that have crossed. One line per family, and the list is what
+/// [`KERNELS`] is being emptied into.
+const CROSSED: &[&[routine::Routine]] = &[
+    attn::ROUTINES,
+    layout::ROUTINES,
+    mlp::ROUTINES,
+    moe::ROUTINES,
+    norm::ROUTINES,
+    ptir::ROUTINES,
+    quant::ROUTINES,
+    rope::ROUTINES,
+    sample::ROUTINES,
+    ssm::ROUTINES,
+];
+
+/// Every crossed routine, with its body still attached.
+///
+/// [`declared`] forgets the backend so that three crates can be compared;
+/// this keeps it, which is what lets `tests/routines.rs` actually RUN each
+/// body against a recorder and ask what it bound. The two views exist for
+/// different questions and neither is derivable from the other.
+#[must_use]
+pub fn routines() -> Vec<&'static routine::Routine> {
+    CROSSED.iter().copied().flatten().collect()
 }
 
 /// Where one operand rides. See [`bindings`].
@@ -356,7 +571,7 @@ pub struct PushField {
 /// `Binding::Push(n)` is a field INDEX, and a driver needs an offset. Turning
 /// one into the other is not multiplication, because a push block follows
 /// std430: a member is aligned to its own width, so an eight-byte scalar after
-/// a lone four-byte one starts at 8 and not at 4. `attn/kv_write.comp` is
+/// a lone four-byte one starts at 8 and not at 4. `attn/kv_write.slang` is
 /// exactly that shape --
 ///
 /// ```text
@@ -370,9 +585,14 @@ pub struct PushField {
 /// what the bytes were supposed to mean.
 ///
 /// That padding used to exist only as a hand-computed constant in a GPU test.
-/// It is derived here instead, so the test, `dump_layout`, the audit and any
-/// future driver all get it from one place — which is the same reason
-/// [`bindings`] exists rather than each of them counting buffers by hand.
+/// It is derived here instead, so the test and any future driver get it from
+/// one place — which is the same reason [`bindings`] exists rather than each
+/// of them counting buffers by hand. Two other readers have since gone:
+/// `examples/dump_layout.rs` printed this layout and
+/// `scripts/vulkan-kernel-audit.py --bindings` compared it to what the shaders
+/// declare. Both are deleted, so this function is now the only statement of
+/// the push ABI and a shader that disagrees with it is caught on a device or
+/// not at all.
 #[must_use]
 pub fn push_layout(sig: &KernelSig) -> Vec<PushField> {
     let mut at = 0u32;
@@ -488,35 +708,61 @@ mod tests {
     /// A packed field consumes NEITHER run.
     ///
     /// Found by comparing every shader's push block against the table field by
-    /// field: `row_gather.comp` declared no push constants at all, because the
+    /// field: `row_gather.slang` declared no push constants at all, because the
     /// count it needs is a member of the params struct it already binds. The
     /// table was right and `bindings()` was wrong — it had inherited Metal's
     /// "append to the scalars" reading, which would have had the driver push a
     /// word the shader never reads while `p.count` stayed whatever the params
     /// buffer happened to hold.
+    /// Asked of whatever packed row the table still holds rather than of a
+    /// named one: this used to name `row_gather_bfloat16`, and that row was
+    /// retired when `layout` crossed. What has to stay true is the RULE, and
+    /// the rule is about a kind of operand, not about one kernel.
     #[test]
     fn a_packed_field_takes_no_slot_of_its_own() {
-        let row = kernels::sig_in(KERNELS, "row_gather_bfloat16").expect("a stated row");
-        assert_eq!(
-            bindings(row),
-            vec![
-                Binding::Buffer(0), // input
-                Binding::Buffer(1), // out
-                Binding::Buffer(2), // rows
-                Binding::Buffer(3), // params — the struct the count lives in
-                Binding::Packed,    // count
-            ]
-        );
-        assert_eq!(buffer_count(row), 4);
-        assert!(!bindings(row).iter().any(|b| matches!(b, Binding::Push(_))));
+        let packed: Vec<&KernelSig> = KERNELS
+            .iter()
+            .filter(|r| bindings(r).contains(&Binding::Packed))
+            .collect();
+        for row in packed {
+            let bound = bindings(row);
+            let buffers = bound
+                .iter()
+                .filter(|b| matches!(b, Binding::Buffer(_)))
+                .count();
+            assert_eq!(
+                buffer_count(row),
+                u32::try_from(buffers).expect("a small count"),
+                "`{}`'s packed field took a descriptor slot",
+                row.name
+            );
+            assert!(
+                !bound.iter().any(|b| matches!(b, Binding::Push(_))),
+                "`{}` packs a field into a block it already binds, so it \
+                 pushes nothing -- a pushed word here is one the shader never \
+                 reads, while the struct member stays whatever the params \
+                 buffer happened to hold",
+                row.name
+            );
+        }
     }
 
     /// An unstated row gets no layout rather than a nullary one.
+    ///
+    /// Asked of whatever unstated row the table still holds rather than of a
+    /// named one: this used to name `argmax_logits_bfloat16`, and that row was
+    /// retired when `sample` crossed. A test that pins a row by name is a test
+    /// that fails when the refactor succeeds, which is the wrong way round.
     #[test]
     fn an_unstated_row_has_no_bindings() {
-        let row = kernels::sig_in(KERNELS, "argmax_logits_bfloat16").expect("a row");
-        assert!(row.operands.is_empty());
-        assert!(bindings(row).is_empty());
+        let unstated: Vec<&KernelSig> = KERNELS.iter().filter(|r| r.operands.is_empty()).collect();
+        assert!(
+            !unstated.is_empty(),
+            "no row states nothing, so this proves nothing -- delete it"
+        );
+        for row in unstated {
+            assert!(bindings(row).is_empty(), "`{}` got a layout", row.name);
+        }
     }
 
     /// `maxPushConstantsSize` is 128 bytes on the floor of the desktop Vulkan
@@ -542,7 +788,7 @@ mod tests {
 
     /// The padding is real, and this is the row that has it.
     ///
-    /// `attn/kv_write.comp` declares `int head_dim; uint64_t k_head_stride;
+    /// `attn/kv_write.slang` declares `int head_dim; uint64_t k_head_stride;
     /// uint64_t k_seq_stride;`, so the block is 4 + 4 pad + 8 + 8 = 24 and not
     /// the 20 that adding the widths gives. A driver packing by concatenation
     /// writes both strides four bytes low, and the shader reads two halves of

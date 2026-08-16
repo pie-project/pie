@@ -10,14 +10,22 @@
 //!   to `key <= query` -- causal, padded with false to the pool's width. This
 //!   driver must SERVE it, because dropping cells that are already false
 //!   drops nothing;
-//! * at its default of 8, the mask is a real restriction that no kernel this
-//!   lowering names would apply, so this driver must REFUSE it, by name, at
-//!   the first launch.
+//! * narrowed to 1, the mask is a real restriction -- each query sees one key,
+//!   its own -- and this driver must serve that too, and run.
 //!
-//! One inferlet, one parameter, both answers. That is why this gate is this
-//! inferlet and not a fixture: the two cases differ in the mask's CONTENT and
-//! in nothing else, which is exactly the distinction the driver was not
-//! making.
+//! One inferlet, one parameter, both served. The two cases differ in the
+//! mask's CONTENT and in nothing else, which is exactly the distinction the
+//! driver was not making when it refused the second.
+//!
+//! # The second half used to be a refusal
+//!
+//! It was, for as long as a real window was outside what this driver could
+//! express: `Pool::stage` shipped a rectangle of zeros and `sdpa_paged_decode`
+//! read the model text's literal stride, so a window could only be refused by
+//! name. Both halves are built now -- the pool stages the guest's own
+//! allow-bytes, and `Source::AttentionMaskStride` answers the fire's pitch --
+//! and this gate moved with them rather than being deleted, because what it
+//! guards against is unchanged: a mask that reaches the shader as nothing.
 //!
 //! # What it was doing instead
 //!
@@ -36,13 +44,22 @@
 //! engine wall further on, which is not this driver's to lift; this one runs
 //! and answers.
 //!
-//! # The refusal half is the control
+//! # Where the control went
 //!
-//! A fix that made the driver accept masks would pass the first half of this
-//! test and be a silent correctness disaster -- attention outside its window,
-//! fluently, with nothing said. So the second half asks for the same run with
-//! the default window and requires it to FAIL, carrying this driver's own
-//! sentence. Neither half is meaningful without the other.
+//! A driver that accepted masks and dropped them would pass both halves of
+//! this gate, so neither half is the control. The control is the unit test
+//! `resources::a_windowed_row_is_staged_as_that_window_and_padded_to_the_fires_pitch`,
+//! which pins the rectangle this run stages -- byte for byte, at the fire's
+//! pitch, with the enable byte set -- and is mutation-tested against both.
+//!
+//! That split is a measurement, not a preference. This gate first asked the
+//! two runs to answer DIFFERENTLY, and they do not: with the window at 1 the
+//! wire carries one allowed key per row, this driver decodes and stages
+//! exactly that (both printed at every seam on a 4090), and the inferlet
+//! still returns the same eight tokens. Contrastive decoding subtracts the
+//! amateur from the expert, and this prompt's first eight tokens do not turn
+//! on the difference. An assertion on the text would have pinned the model's
+//! indifference and called it the driver's mask.
 //!
 //! ```text
 //! PIE_KERNELS_VULKAN_SPV_DIR=<abs>/out/spv PIE_VULKAN_ARTIFACT=/tmp/q4full.zt \
@@ -68,8 +85,8 @@ const TOKENS: usize = 8;
 /// Wide enough that the inferlet's own `window.min(pool_len)` makes the
 /// window clause vacuous, whatever the pool turns out to be.
 const OPEN: u32 = 100_000;
-/// The inferlet's default, and a real restriction.
-const NARROW: u32 = 8;
+/// One key per query -- its own -- which is as narrow as a window goes.
+const NARROW: u32 = 1;
 
 async fn run(client: &Client, window: u32) -> Result<String> {
     let input = serde_json::json!({
@@ -137,22 +154,41 @@ async fn a_causal_mask_padded_to_the_pool_is_served_and_a_window_is_not() -> Res
     );
     eprintln!("[vulkan-mask] served: {text:?}");
 
-    // The half it must refuse, in this driver's own words. Without this, a fix
-    // that simply stopped checking masks would pass the half above.
-    let refused = run(&client, NARROW).await;
-    let why = match refused {
-        Ok(text) => anyhow::bail!(
-            "a sliding window of {NARROW} was SERVED, and answered {text:?} -- \
-             attention outside its window, fluently, with nothing said"
-        ),
-        Err(why) => format!("{why:#}"),
-    };
+    // The half that used to be refused, and is now served.
+    //
+    // This gate was written when a real window was outside what this driver
+    // could express: `Pool::stage` shipped a rectangle of zeros and
+    // `sdpa_paged_decode` read the model text's literal stride, so the only
+    // honest answer was a refusal by name. Both halves are built now -- the
+    // pool stages the guest's own allow-bytes and answers the fire's pitch
+    // through `Source::AttentionMaskStride` -- so the refusal this half pinned
+    // is gone, and running is the claim in its place.
+    //
+    // # Why this half no longer compares the two answers
+    //
+    // Because they are the same, and the mask is not why. Measured on a 4090
+    // with the runs and the rectangle printed at every seam: at a window of 1
+    // the wire carries `runs=[26, 1, 21]` per row -- one key allowed, its own
+    // -- `frames::mask_rows_of` decodes exactly that, and `Frame::mask_from`
+    // stages it as a single set byte at a pitch of 48. The mask arrives. The
+    // inferlet still answers "<think>\nOkay, the user wants me" for a window
+    // of 1 and for one of 100000, because contrastive decoding subtracts the
+    // amateur's distribution from the expert's and this prompt's first eight
+    // tokens do not turn on that difference.
+    //
+    // So an end-to-end comparison here would pin the model's indifference, not
+    // the driver's staging. The staging is pinned where it can be READ, by
+    // `resources::a_windowed_row_is_staged_as_that_window_and_padded_to_the_fires_pitch`,
+    // which is the same rectangle this run produces and is mutation-tested
+    // against both the pitch and the enable byte.
+    let narrow = run(&client, NARROW)
+        .await
+        .context("a sliding window of 1 was refused, and this driver now serves one")?;
     anyhow::ensure!(
-        why.contains("does not serve a user mask"),
-        "the window was refused, but for {why:?} rather than by the name of \
-         the capability that is missing"
+        !narrow.trim().is_empty(),
+        "the narrow-window run returned nothing, so the pass ran and said no words"
     );
-    eprintln!("[vulkan-mask] refused, by name");
+    eprintln!("[vulkan-mask] windowed: {narrow:?}");
 
     pie.shutdown().await;
     eprintln!("[vulkan-mask] GREEN — one inferlet, one parameter, both answers");

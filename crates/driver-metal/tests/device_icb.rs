@@ -237,12 +237,12 @@ fn a_whole_fire_records_and_replays_faster_than_it_encodes() {
     use driver_metal::bind::encode::{Params, Pipelines, commands, encode};
     use driver_metal::device::{Regions, Stepper, record};
     use driver_metal::lowering::dispatch::{Geometry, plan};
-    use driver_metal::lowering::dispatch::{table, table_width};
+    use driver_metal::lowering::dispatch::table_width;
     use driver_metal::lowering::executor::{Frame, Slice};
     use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
     use model::shared::llama_like::forward::llama_like_metal;
     use model_compiler::lower::{Fire, Row, lower};
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     let Ok(context) = Context::new() else {
         eprintln!("SKIP: no Metal 4 device");
@@ -303,8 +303,9 @@ fn a_whole_fire_records_and_replays_faster_than_it_encodes() {
         rotary_dims: 128,
         n_experts: 0,
         experts_per_token: 0,
+        ..Geometry::default()
     };
-    let dispatches = plan(&lowered, table(), frame, geometry, &mut store).expect("the fire plans");
+    let dispatches = plan(&lowered, frame, geometry, &mut store).expect("the fire plans");
     let params = Params::stage(&context, &dispatches).expect("scalars stage");
     let argtable = driver_metal::device::ArgumentTable::new(&context, table_width(&dispatches))
         .expect("an argument table");
@@ -458,7 +459,7 @@ impl driver_metal::lowering::executor::Resolver for Everything {
     }
     fn named(
         &mut self,
-        _: model_compiler::trace::ValueId,
+        _: model_ir::trace::ValueId,
     ) -> Option<driver_metal::lowering::executor::Slice> {
         Some(self.slice)
     }

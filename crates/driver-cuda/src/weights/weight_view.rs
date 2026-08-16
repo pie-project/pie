@@ -1,7 +1,10 @@
 //! `WeightView` — how every kernel is handed a weight.
 //!
-//! Port of `kernels-cuda/csrc/src/weight_view.hpp` and of `make_weight_view`
-//! from `driver-cuda/csrc/src/model/llama_like/qwen3.hpp`.
+//! Port of `weight_view.hpp` from the ARCHIVE crate's `csrc/src`, and of
+//! `make_weight_view` from `driver-cuda/csrc/src/model/llama_like/qwen3.hpp`.
+//! Both headers went with the `csrc/` trees that held them — the archive
+//! crate's at `85c6c674b`, this crate's at `4569b9e4b` — and so did the
+//! `quant_meta.hpp` that [`QuantMeta`] below cites.
 //!
 //! # This one crosses the ABI, so the layout is the contract
 //!
@@ -43,8 +46,8 @@
 //!    `if (w.scale_data == nullptr) throw std::runtime_error(std::string(api)
 //!    + ": quant scale data is null");` ahead of the `w.nbytes >=
 //!    expected_weight_bytes` comparison, and the ordering IS the agreement.
-//!    It is [`crate::bind::quant_gemm::validate_quant_weight_view`] now
-//!    (`quant_gemm.rs:581`), which asserts in the same order for the same
+//!    It is [`kernels_cuda::gemm::quant::validate_quant_weight_view`]
+//!    now, which asserts in the same order for the same
 //!    reason; the note above binds that function, not a dead line number.
 //!
 //! 2. **A [`QuantMeta`] with no scale produces a view byte-identical to the

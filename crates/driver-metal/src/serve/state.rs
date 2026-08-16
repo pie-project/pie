@@ -61,6 +61,10 @@ pub struct Shell {
     /// Fires already recorded, by what they are valid for. Replaying one
     /// costs 39.8 us where encoding the same fire costs 14.87 ms.
     pub(crate) recordings: crate::fire::Recordings,
+    /// Graphs already lowered, by the fire shape that produced them. A
+    /// decode's is a constant of the deployment and this driver was deriving
+    /// it once per token -- 0.81 ms of a 4.9 ms step.
+    pub(crate) lowerings: crate::lowering::cached::Lowerings,
     pub(crate) registry: crate::channel::Registry,
     pub(crate) device_facts: driver_api::DeviceFacts,
     /// The checkpoint, once one is loaded. Held because every address in its
@@ -223,6 +227,7 @@ impl Shell {
             scratch: crate::fire::Scratch::new(),
             regions: crate::device::Regions::new(),
             recordings: crate::fire::Recordings::new(),
+            lowerings: crate::lowering::cached::Lowerings::new(),
             registry: crate::channel::Registry::new(),
             device_facts: device_facts(),
             model: None,

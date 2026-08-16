@@ -365,8 +365,8 @@ pub const NO_METAL: &str = "deepseek-v4 has no Metal text in this build: its for
 #[must_use]
 pub fn trace(
     f: &Dsv4Facts,
-    class: model_compiler::trace::FireClass,
-) -> model_compiler::trace::ForwardPlan {
+    class: model_ir::trace::FireClass,
+) -> model_ir::trace::ForwardPlan {
     super::forward::dsv4_cuda(f, class)
 }
 
@@ -824,7 +824,7 @@ mod tests {
     /// fire brings, and a decode's are not a prefill's.
     #[test]
     fn both_fire_classes_have_a_text() {
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
         let decode = trace(&f(), FireClass::Decode);
         let prefill = trace(&f(), FireClass::Prefill);
         assert!(decode.family.ends_with("decode"), "{}", decode.family);

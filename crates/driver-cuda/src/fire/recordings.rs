@@ -31,45 +31,9 @@ use std::collections::HashMap;
 
 use model_compiler::lower::{CondRegion, Row};
 
-use crate::device::{
-    GraphExec, PredicateWord, SLOT_HAS_CUSTOM_MASK, SLOT_HAS_LORA, SLOT_HAS_STAGE_HOOKS,
-    SLOT_HAS_WRITE_DESC, SLOT_TOKENS_GT, SLOT_TOKENS_LE, SLOT_TOKENS_MULTIPLE,
-    SLOT_WANTS_ATTN_SCORE, SLOT_WINDOW_ONE, StreamRef,
-};
+use crate::device::{GraphExec, PredicateWord, StreamRef};
 use crate::error::{Error, Result};
-
-/// Evaluate one predicate slot against a fire's rows.
-///
-/// This is `lower::select`'s body, and it MUST stay that — the resolved
-/// lowering answers a guard by calling `select`, and the captured one
-/// answers the same guard by reading this byte out of device memory. If
-/// the two ever disagree, the eager leg and the replay leg run different
-/// programs and nothing type-checks the difference.
-///
-/// `None` for a slot with no row-level meaning (the Peel endpoint bits,
-/// which are a property of the row SPLIT rather than of the rows).
-///
-/// Public, and deliberately free of any device object: the equivalence
-/// between the eager leg and the captured leg is a HOST fact, so it must
-/// be provable without a GPU.
-#[must_use]
-pub fn predicate_of(slot: u32, param: u32, rows: &[Row]) -> Option<bool> {
-    Some(match slot {
-        SLOT_HAS_WRITE_DESC => rows.iter().any(|r| r.write_desc),
-        SLOT_TOKENS_LE => rows.len() as u32 <= param,
-        SLOT_TOKENS_GT => rows.len() as u32 > param,
-        // `param == 0` is false rather than a division; see
-        // `GuardPred::TokensMultipleOf`, whose evaluation in
-        // `model_compiler::lower` this mirrors.
-        SLOT_TOKENS_MULTIPLE => param != 0 && (rows.len() as u32).is_multiple_of(param),
-        SLOT_WANTS_ATTN_SCORE => rows.iter().any(|r| r.wants_scores),
-        SLOT_HAS_CUSTOM_MASK => rows.iter().any(|r| r.custom_mask),
-        SLOT_HAS_STAGE_HOOKS => rows.iter().any(|r| r.hooked),
-        SLOT_HAS_LORA => rows.iter().any(|r| r.lora),
-        SLOT_WINDOW_ONE => !rows.iter().any(|r| r.multi_token),
-        _ => return None,
-    })
-}
+use crate::fire::predicate::predicate_of;
 
 /// Fill `preds` with a fire's variant bits, ready to upload.
 ///
@@ -172,7 +136,7 @@ impl BucketKey {
     pub const fn new(
         requests: u32,
         tokens: u32,
-        _fire: model_compiler::trace::FireClass,
+        _fire: model_ir::trace::FireClass,
         model: u64,
     ) -> Self {
         Self { requests, tokens, model, lora_shape: 0 }
@@ -238,8 +202,11 @@ pub fn union_eligibility(lora: Option<&crate::fire::lora::LoraFireState>) -> Opt
 pub struct PlanEpoch(u64);
 
 impl PlanEpoch {
-    /// A driver that has grown nothing yet.
-    pub(crate) const START: Self = Self(0);
+    // `START` STOOD HERE — "a driver that has grown nothing yet", `Self(0)`.
+    // The type derives `Default`, so that sentence was already true of
+    // `PlanEpoch::default()`, and every construction in the driver goes
+    // through the derive. Two spellings of one value is the shape where a
+    // reader has to check whether they are the same value; one is not.
 
     /// THE ONLY WAY IT CHANGES, and that is the point of the type.
     ///
@@ -503,7 +470,7 @@ impl Recordings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model_compiler::trace::FireClass;
+    use model_ir::trace::FireClass;
 
     /// THE DIGEST IS A FUNCTION OF WHAT A GRAPH BAKES, and its two
     /// properties are opposite failures.

@@ -42,7 +42,7 @@
 //! # The thirteenth kernel
 //!
 //! The depthwise causal conv is not a vision kernel at all — the `.cu` says
-//! *"`k_depthwise_causal` is `ssm::device::causal_conv1d_prefill<T, false>`
+//! *"`k_depthwise_causal` is `pie::ssm::causal_conv1d_prefill<T, false>`
 //! — bit for bit the same accumulation in the same order"*. That template now
 //! carries a row of its own (`ssm::causal_conv1d_prefill_noact_bf16`), and
 //! `families/ssm.rs` records why it could not have one before: it had no
@@ -66,7 +66,8 @@
 
 use std::ffi::c_void;
 
-use kernels_cuda_new::x::{ssm, vision};
+use kernels_cuda::jit::abi::bf16;
+use kernels_cuda::{ssm, vision};
 use model::shared::tower_names::AUDIO_SLOTS_PER_LAYER;
 
 use super::{Scratch, call};
@@ -106,7 +107,13 @@ pub struct Clip {
 impl Clip {
     /// Five consecutive slots — `gemma4_towers_c.cpp`'s `clip_of`.
     fn of(t: &[*const c_void]) -> Self {
-        Self { w: t[0], imin: t[1], imax: t[2], omin: t[3], omax: t[4] }
+        Self {
+            w: t[0],
+            imin: t[1],
+            imax: t[2],
+            omin: t[3],
+            omax: t[4],
+        }
     }
 }
 
@@ -126,7 +133,12 @@ pub struct Ffn {
 impl Ffn {
     /// Twelve consecutive slots — `gemma4_towers_c.cpp`'s `ffn_of`.
     fn of(t: &[*const c_void]) -> Self {
-        Self { pre_ln: t[0], post_ln: t[1], fc1: Clip::of(&t[2..]), fc2: Clip::of(&t[7..]) }
+        Self {
+            pre_ln: t[0],
+            post_ln: t[1],
+            fc1: Clip::of(&t[2..]),
+            fc2: Clip::of(&t[7..]),
+        }
     }
 }
 
@@ -428,12 +440,12 @@ impl Walk {
     }
 }
 
-
 /// A row-major element count as the `usize` an `Elementwise` row wants.
 fn elems(what: &str, rows: i32, width: i32) -> Result<usize> {
     let r = usize::try_from(rows).map_err(|_| Error::invalid(WHO, format!("{what}: rows")))?;
     let c = usize::try_from(width).map_err(|_| Error::invalid(WHO, format!("{what}: width")))?;
-    r.checked_mul(c).ok_or_else(|| Error::invalid(WHO, format!("{what}: element count overflowed")))
+    r.checked_mul(c)
+        .ok_or_else(|| Error::invalid(WHO, format!("{what}: element count overflowed")))
 }
 
 /// `vd::k_rms<bfd><<<N, 256, 0, S>>>(x, w, o, N, W, EPS)`.
@@ -464,7 +476,9 @@ fn matmul(
     out: i32,
     stream: StreamRef<'_>,
 ) -> Result<()> {
-    call("vision::k_matmul_bf16", stream, |ctx| vision::k_matmul_bf16(ctx, x, w, y, n, kin, out))
+    call("vision::k_matmul_bf16", stream, |ctx| {
+        vision::k_matmul_bf16(ctx, x, w, y, n, kin, out)
+    })
 }
 
 /// `vd::k_clamp<bfd><<<(n+255)/256, 256, 0, S>>>(x, o, lo, hi, n)`.
@@ -476,7 +490,9 @@ fn clamp(
     n: usize,
     stream: StreamRef<'_>,
 ) -> Result<()> {
-    call("vision::k_clamp_bf16", stream, |ctx| vision::k_clamp_bf16(ctx, x, o, lo, hi, n))
+    call("vision::k_clamp_bf16", stream, |ctx| {
+        vision::k_clamp_bf16(ctx, x, o, lo, hi, n)
+    })
 }
 
 /// The clipped linear — `gemma4_audio.cu:163-166`'s `clin` lambda.
@@ -498,7 +514,14 @@ fn clin(
 ) -> Result<()> {
     clamp(x, xc, c.imin, c.imax, elems("clin in", n, kin)?, stream)?;
     matmul(xc.cast_const(), c.w, out, n, kin, o, stream)?;
-    clamp(out.cast_const(), out, c.omin, c.omax, elems("clin out", n, o)?, stream)
+    clamp(
+        out.cast_const(),
+        out,
+        c.omin,
+        c.omax,
+        elems("clin out", n, o)?,
+        stream,
+    )
 }
 
 /// The arena the walk writes through — `DeviceScratch`'s twelve `MAL` calls
@@ -672,7 +695,15 @@ pub fn run(
         pe: scratch.bf16(elems("pos enc", g.pp, hd)?)?,
         relk: scratch.bf16(elems("relative k", g.pp, hd)?)?,
     };
-    matmul(flat.cast_const(), w.sscp_input_proj, a.h, n, flat_w, hd, stream)?;
+    matmul(
+        flat.cast_const(),
+        w.sscp_input_proj,
+        a.h,
+        n,
+        flat_w,
+        hd,
+        stream,
+    )?;
 
     // `:220` — `dim3 g((Hd+15)/16,(P+15)/16); k_rel_pos_enc<bfd><<<g,B2,0,S>>>`.
     // Shared across layers; `relative_k_proj` differs per layer, so `relk` is
@@ -685,7 +716,15 @@ pub fn run(
         ffn(&g, &a, &layer.ff1, w.residual_weight, eps, stream)?;
 
         // ── self-attention, `:238-246` ──────────────────────────────────
-        rms(a.h.cast_const(), layer.norm_pre_attn, a.hn, n, hd, eps, stream)?;
+        rms(
+            a.h.cast_const(),
+            layer.norm_pre_attn,
+            a.hn,
+            n,
+            hd,
+            eps,
+            stream,
+        )?;
         clin(a.hn.cast_const(), a.q, a.xc, &layer.q, n, hd, hd, stream)?;
         clin(a.hn.cast_const(), a.k, a.xc, &layer.k, n, hd, hd, stream)?;
         clin(a.hn.cast_const(), a.v, a.xc, &layer.v, n, hd, hd, stream)?;
@@ -706,7 +745,15 @@ pub fn run(
         })?;
         // `:242` — `relative_k_proj(pe) → relk [P, H*hd]`. NOT a clipped
         // linear: a plain matmul, `G2(Hd, P)`.
-        matmul(a.pe.cast_const(), layer.relative_k, a.relk, g.pp, hd, hd, stream)?;
+        matmul(
+            a.pe.cast_const(),
+            layer.relative_k,
+            a.relk,
+            g.pp,
+            hd,
+            hd,
+            stream,
+        )?;
         // `:243` — `dim3 g((N+127)/128,NH); k_local_attn<bfd><<<g,128,0,S>>>`.
         call("vision::k_local_attn_bf16", stream, |ctx| {
             vision::k_local_attn_bf16(
@@ -723,13 +770,52 @@ pub fn run(
                 w.logit_cap,
             )
         })?;
-        clin(a.attn.cast_const(), a.tmp, a.xc, &layer.post, n, hd, hd, stream)?;
-        rms(a.tmp.cast_const(), layer.norm_post_attn, a.tmp, n, hd, eps, stream)?;
-        add(a.h, a.tmp.cast_const(), elems("attn residual", n, hd)?, stream)?;
+        clin(
+            a.attn.cast_const(),
+            a.tmp,
+            a.xc,
+            &layer.post,
+            n,
+            hd,
+            hd,
+            stream,
+        )?;
+        rms(
+            a.tmp.cast_const(),
+            layer.norm_post_attn,
+            a.tmp,
+            n,
+            hd,
+            eps,
+            stream,
+        )?;
+        add(
+            a.h,
+            a.tmp.cast_const(),
+            elems("attn residual", n, hd)?,
+            stream,
+        )?;
 
         // ── light depthwise-conv module, `:248-271` ─────────────────────
-        rms(a.h.cast_const(), layer.lconv_pre_ln, a.hn, n, hd, eps, stream)?;
-        clin(a.hn.cast_const(), a.start, a.xc, &layer.lconv_start, n, hd, 2 * hd, stream)?;
+        rms(
+            a.h.cast_const(),
+            layer.lconv_pre_ln,
+            a.hn,
+            n,
+            hd,
+            eps,
+            stream,
+        )?;
+        clin(
+            a.hn.cast_const(),
+            a.start,
+            a.xc,
+            &layer.lconv_start,
+            n,
+            hd,
+            2 * hd,
+            stream,
+        )?;
         // `k_glu<bfd><<<G2(Hd,N),B2,0,S>>>` — `hd` is the OUTPUT width, half
         // of `start`'s.
         call("vision::k_glu_bf16", stream, |ctx| {
@@ -751,11 +837,11 @@ pub fn run(
         let k = w.conv_kernel;
         if n > 0 && hd > 0 && k > 0 {
             call("ssm::causal_conv1d_prefill_noact_bf16", stream, |ctx| {
-                ssm::causal_conv1d_prefill_noact_bf16(
+                ssm::causal_conv1d_prefill_noact::<bf16>(
                     ctx,
                     a.glu.cast_const().cast(),
                     layer.depthwise_conv.cast(),
-                    kernels_cuda_new::x::abi::MaybeConst::none(),
+                    kernels_cuda::jit::abi::MaybeConst::none(),
                     a.conv.cast(),
                     core::ptr::null_mut(),
                     n,
@@ -767,10 +853,32 @@ pub fn run(
         // `:267` — the `clamp(±finfo_max)` HF applies here is a no-op in bf16
         // range and the C++ skipped it. Skipped here too, for the same
         // reason and not by omission.
-        rms(a.conv.cast_const(), layer.lconv_conv_norm, a.conv, n, hd, eps, stream)?;
+        rms(
+            a.conv.cast_const(),
+            layer.lconv_conv_norm,
+            a.conv,
+            n,
+            hd,
+            eps,
+            stream,
+        )?;
         silu(a.conv, elems("conv silu", n, hd)?, stream)?;
-        clin(a.conv.cast_const(), a.tmp, a.xc, &layer.lconv_end, n, hd, hd, stream)?;
-        add(a.h, a.tmp.cast_const(), elems("conv residual", n, hd)?, stream)?;
+        clin(
+            a.conv.cast_const(),
+            a.tmp,
+            a.xc,
+            &layer.lconv_end,
+            n,
+            hd,
+            hd,
+            stream,
+        )?;
+        add(
+            a.h,
+            a.tmp.cast_const(),
+            elems("conv residual", n, hd)?,
+            stream,
+        )?;
 
         ffn(&g, &a, &layer.ff2, w.residual_weight, eps, stream)?;
         rms(a.h.cast_const(), layer.norm_out, a.h, n, hd, eps, stream)?;
@@ -855,7 +963,14 @@ fn sscp(s: SscpStage, stream: StreamRef<'_>) -> Result<()> {
         )
     })?;
     call("vision::k_chlast_bf16", stream, |ctx| {
-        vision::k_chlast_bf16(ctx, s.chw.cast_const(), s.chlast, s.out_ch, s.t_out, s.f_out)
+        vision::k_chlast_bf16(
+            ctx,
+            s.chw.cast_const(),
+            s.chlast,
+            s.out_ch,
+            s.t_out,
+            s.f_out,
+        )
     })?;
     // The rows are the `T*F` spatial positions with the channel axis as the
     // width, and the norm reads and writes `chlast` in place.
@@ -884,19 +999,30 @@ fn sscp(s: SscpStage, stream: StreamRef<'_>) -> Result<()> {
         )
     })?;
     call("vision::k_chfirst_bf16", stream, |ctx| {
-        vision::k_chfirst_bf16(ctx, s.chlast.cast_const(), s.chw, s.out_ch, s.t_out, s.f_out)
+        vision::k_chfirst_bf16(
+            ctx,
+            s.chlast.cast_const(),
+            s.chw,
+            s.out_ch,
+            s.t_out,
+            s.f_out,
+        )
     })
 }
 
 /// `vd::k_add<bfd><<<(n+255)/256, 256, 0, S>>>(a, b, n)` — `a += b`, with
 /// operand 0 both the read and the write.
 fn add(y: *mut c_void, x: *const c_void, n: usize, stream: StreamRef<'_>) -> Result<()> {
-    call("vision::k_add_bf16", stream, |ctx| vision::k_add_bf16(ctx, y, x, n))
+    call("vision::k_add_bf16", stream, |ctx| {
+        vision::k_add_bf16(ctx, y, x, n)
+    })
 }
 
 /// `vd::k_silu<bfd><<<(n+255)/256, 256, 0, S>>>(x, x, n)`, in place.
 fn silu(x: *mut c_void, n: usize, stream: StreamRef<'_>) -> Result<()> {
-    call("vision::k_silu_bf16", stream, |ctx| vision::k_silu_bf16(ctx, x.cast_const(), x, n))
+    call("vision::k_silu_bf16", stream, |ctx| {
+        vision::k_silu_bf16(ctx, x.cast_const(), x, n)
+    })
 }
 
 /// The macaron half-FFN — `gemma4_audio.cu:223-231`'s `ffn` lambda.
@@ -918,7 +1044,16 @@ fn ffn(
     rms(a.h.cast_const(), f.pre_ln, a.hn, n, hd, eps, stream)?;
     clin(a.hn.cast_const(), a.ffmid, a.xc, &f.fc1, n, hd, im, stream)?;
     silu(a.ffmid, elems("ffn silu", n, im)?, stream)?;
-    clin(a.ffmid.cast_const(), a.ffout, a.xc, &f.fc2, n, im, hd, stream)?;
+    clin(
+        a.ffmid.cast_const(),
+        a.ffout,
+        a.xc,
+        &f.fc2,
+        n,
+        im,
+        hd,
+        stream,
+    )?;
     rms(a.ffout.cast_const(), f.post_ln, a.ffout, n, hd, eps, stream)?;
     // `k_axpy<bfd><<<(N*Hd+255)/256, 256, 0, S>>>(h, ffout, RW, N*Hd)` —
     // `h += RW * ffout`, the macaron half-step's residual weight.
@@ -1007,7 +1142,15 @@ pub fn encode(
                 .checked_mul(usize::try_from(w.text_hidden).unwrap_or(0))
                 .ok_or_else(|| Error::invalid(WHO, "projected row buffer overflowed"))?,
         )?;
-        run(w, &features[blo..bhi], frames_i, n_mel, rows, projected, stream)?;
+        run(
+            w,
+            &features[blo..bhi],
+            frames_i,
+            n_mel,
+            rows,
+            projected,
+            stream,
+        )?;
         // `:342-346` — the rows come back to the host between clips, because
         // the encode ABI's output is a host buffer.
         let begin = rows_written * row_bytes;

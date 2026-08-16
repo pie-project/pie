@@ -55,7 +55,7 @@ use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps}
 use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
 use model::qwen_3_5::forward::qwen3_5_hybrid_cuda;
 use model_compiler::lower::{Arg, Fire, Row, lower};
-use model_compiler::trace::{FireClass, ValueId};
+use model_ir::trace::{FireClass, ValueId};
 
 mod common;
 use common::{device_or_skip, gpu_guard};
@@ -242,7 +242,7 @@ fn the_hybrid_matches_transformers_on_real_weights() {
         moe_force_general: false,
         gate_up_fused: true,
         // Dense BF16, whole context — this fixture's own frame.
-        proj_repr: model_compiler::dsl::WeightRepr::Bf16,
+        proj_repr: model_dsl::WeightRepr::Bf16,
         window_left: Vec::new(),
     };
     let plan = qwen3_5_hybrid_cuda(&hybrid, &cuda, FireClass::Prefill);
@@ -411,7 +411,7 @@ fn the_hybrid_matches_transformers_on_real_weights() {
         false,
         -1,
     );
-    ws.end_plan_update(&mut sops, raw_stream);
+    ws.end_plan_update(&mut sops, raw_stream).expect("end");
 
     let fi = l
         .launches

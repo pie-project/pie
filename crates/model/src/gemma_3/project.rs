@@ -65,7 +65,7 @@ impl Schedule {
     /// Whether layer `l` attends the whole context.
     #[must_use]
     pub fn is_full_attn(&self, l: u32) -> bool {
-        model_compiler::facts::full_attn_at(self.full_attn_interval, l)
+        model_ir::facts::full_attn_at(self.full_attn_interval, l)
     }
 
     /// The window layer `l` attends over, `-1` for the whole context.
@@ -368,9 +368,9 @@ pub fn trace(
     f: &LlamaLikeFacts,
     s: &Schedule,
     norm_eps: f32,
-    class: model_compiler::trace::FireClass,
+    class: model_ir::trace::FireClass,
     load: Deployed<'_>,
-) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal> {
+) -> Result<model_ir::trace::ForwardPlan, crate::deployment::Refusal> {
     // The family's scalars, which the CUDA arm carries unread — its text
     // states no epsilon and no base at all — and which the Metal arm
     // takes only for the fields gemma-3 does NOT override. The two arms
@@ -405,8 +405,8 @@ pub fn trace(
 mod tests {
     use super::*;
     use crate::manifest::Presence;
-    use model_compiler::facts::{NormPlacement as SpecNorm, QkNorm};
-    use model_compiler::trace::{NormVariant, RopeKind};
+    use model_ir::facts::{NormPlacement as SpecNorm, QkNorm};
+    use model_ir::trace::{NormVariant, RopeKind};
 
     fn shape() -> LlamaLikeFacts {
         // gemma-3-4b's geometry, which is the middle of the generation
@@ -772,7 +772,7 @@ mod tests {
     /// it models.
     #[test]
     fn gemma_3_answers_a_metal_load_with_a_metal_text() {
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
         let f = shape();
         let b = binding();
         for class in [FireClass::Prefill, FireClass::Decode] {
@@ -802,7 +802,7 @@ mod tests {
     #[test]
     fn a_sharded_metal_load_is_refused_with_the_familys_sentence() {
         use crate::deployment::Refusal;
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
         let b = binding();
         let sharded = Deployed {
             backend: Backend::Metal(&b),

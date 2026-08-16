@@ -285,13 +285,18 @@ impl Shell {
         ));
         self.inv_freq = crate::model::rope::table(&geometry)
             .iter()
-        .map(|f| f.to_bits())
-        .collect();
+            .map(|f| f.to_bits())
+            .collect();
         // Which buffer each weight address belongs to, so a fire can be
         // RECORDED. A model reload moves every address, so the old recordings
         // are invalid -- stated rather than left to the fingerprint, which
         // would also catch it but says nothing about why.
         self.recordings.clear();
+        // And the graphs, for the same reason and one step earlier: a
+        // lowering is the graph of the text the OLD row named, and serving it
+        // over a new checkpoint's weights would fire the previous
+        // architecture at whatever the new one staged.
+        self.lowerings.clear();
         self.regions = crate::device::Regions::new();
         self.deployment = Some(deployment);
         for region in &loaded.regions {
@@ -386,6 +391,13 @@ impl Shell {
             has_lora: false,
             model_site_summary: driver_api::ModelSiteSummary::default(),
             device_geometry_port_mask: 0,
+            // No port is resolved on-device, so there is no per-step half to
+            // interleave and the frame-entry shape is the one this driver
+            // has: `launch` converts the whole frame's steps and then fires
+            // them. A `true` here would tell `pipeline::fire` that a slot
+            // chained behind an earlier slot of the same frame reads a cell
+            // that exists by then, and it would not.
+            resolves_geometry_per_step: false,
             // The ceilings a scheduler batches under. Stated rather than
             // unbounded: a fire wider than this has no arena sized for it.
             max_forward_tokens: 4096,

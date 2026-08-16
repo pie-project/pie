@@ -46,10 +46,9 @@ use std::collections::BTreeSet;
 ///
 /// An entry is a claim that something else answers this. A field with no
 /// filler is not "the operator's" — it is a `Default` nobody chose.
-const FILLED_ELSEWHERE: &[(&str, &str)] = &[
-    (
-        "alt_quant",
-        "UNSET, and now REFUSED rather than ignored. The checkpoint's \
+const FILLED_ELSEWHERE: &[(&str, &str)] = &[(
+    "alt_quant",
+    "UNSET, and now REFUSED rather than ignored. The checkpoint's \
          SECOND affine point: mlx_lm quantizes per tensor and spares the \
          two that decide where a token goes, so a routed checkpoint ships \
          an 8-bit router gate inside a 4-bit stack. Reading it at the \
@@ -62,8 +61,7 @@ const FILLED_ELSEWHERE: &[(&str, &str)] = &[
          builds ONE kernel set. The field stays unset because filling it \
          would need a SECOND kernel set to be worth anything; what changed \
          is that its absence is now a refusal instead of a wrong answer.",
-    ),
-];
+)];
 
 fn source() -> String {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/batch/geometry.rs");

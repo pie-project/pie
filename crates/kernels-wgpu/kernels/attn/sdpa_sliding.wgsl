@@ -20,17 +20,18 @@
 //#include "common/bf16.inc.wgsl"
 //#include "attn/sdpa_online.inc.wgsl"
 
-@group(0) @binding(0) var<storage, read> queries: array<u32>;
-@group(0) @binding(1) var<storage, read> keys: array<u32>;
-@group(0) @binding(2) var<storage, read> values: array<u32>;
+@group(0) @binding(0) var<storage, read_write> queries: array<u32>;
+@group(0) @binding(1) var<storage, read_write> keys: array<u32>;
+@group(0) @binding(2) var<storage, read_write> values: array<u32>;
 @group(0) @binding(3) var<storage, read_write> out_: array<u32>;
 //#if defined(PIE_WITH_SINK)
-@group(0) @binding(4) var<storage, read> sinks: array<u32>;
+@group(0) @binding(4) var<storage, read_write> sinks: array<u32>;
 //#endif
 
 // `scale` at 40 and `window` at 44, because the four strides ahead of them are
-// `vec2<u32>` and align to eight. Derived, not counted:
-//     cargo run -p kernels-wgpu --example dump_layout -- sdpa_vector_decode_swa
+// `vec2<u32>` and align to eight. Derived by
+// `kernels_wgpu::uniform_layout` from the row's scalar order, not counted; the
+// deleted `dump_layout` example only printed that layout.
 struct Params {
     gqa_factor: i32,
     n: i32,

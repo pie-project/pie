@@ -56,10 +56,21 @@
 //   * A row that has not yet seen a live key has max_score == -inf and an
 //     accumulator of zeros, so factor == 0 scales nothing.
 //
-// KT is per width because the staged tiles are what bound it: at D=64 three
-// tiles of KT=64 are 20 KB, and at D=128 the same shape would be 40 KB, over
-// the 32 KB a threadgroup gets. The wide head halves KT instead, which doubles
-// the staging barriers and is still far ahead of the scalar path.
+// KT IS BOUNDED BY THE STAGED TILES, and the budget is 32 KB per threadgroup.
+// The three tiles are `qtile[32*D] + ktile[D*KT] + vtile[KT*D]` halves, so the
+// cost is `2*D*(32 + 2*KT)` bytes:
+//
+//         KT=16    KT=32    KT=64
+//   D=64    8 KB    12 KB    20 KB
+//  D=128   16 KB    24 KB    40 KB
+//  D=256   32 KB    48 KB    80 KB
+//
+// The instantiations below take KT=16, so a 128-wide head is 16 KB -- HALF the
+// budget, not over it. An earlier draft of this paragraph did the arithmetic at
+// KT=64 and concluded D=128 could not fit; it can, at the KT this file uses,
+// and what actually keeps it uninstantiated is stated at the bottom of the
+// file. D=256 is the width where the tiles do bind: 32 KB exactly at KT=16,
+// which leaves a threadgroup no room for anything else.
 
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -177,6 +188,24 @@ template <typename T, int D, int KT, bool WITH_SINK>
       kp_lo = min(kp_lo, (window > 0 && p >= window) ? (p - window + 1) : 0);
     }
     const int page_base = int(kv_page_indptr[r]);
+    // `my_req == r`, and NOT "my row is inside [sub, sub_hi)". The two differ
+    // exactly when one request owns rows in two runs of the same tile: this
+    // lane would then join both, and every key in the overlap of the two runs'
+    // ranges would be accumulated TWICE -- once at each pass -- with no mask
+    // to catch it, because `keep` is a bound on the key and not on the run.
+    //
+    // What rules that out is not this file. `req_of_token` is derived from
+    // `qo_indptr` (`driver-api/src/plan.rs:486-502`): request `r` owns the
+    // contiguous token range `[qo_indptr[r], qo_indptr[r+1])`, so the array is
+    // NON-DECREASING by construction and a request has exactly one run
+    // anywhere. `sdpa_paged_decode` and `sdpa_paged_tiled` need no such thing
+    // -- they read `req_of_token[row]` per row and never group -- so this is
+    // the one contract the three interchangeable bodies do not share.
+    //
+    // `driver-metal/tests/device_attention.rs` fires all three over one
+    // fixture and is where that was found: its first draft used
+    // `[0, 1, 0]`, which is a fire the CSR cannot produce, and the matrix unit
+    // alone disagreed. Feed those requests back in and it disagrees again.
     const bool mine = live && my_req == r;
 
     for (int base = kp_lo; base <= kp_hi; base += KT) {
@@ -310,9 +339,36 @@ template <typename T, int D, int KT, bool WITH_SINK>
       const constant int&, const device itype*, const constant int&,         \
       uint3, uint3, uint, uint);
 
-// KT is what the 32 KB of threadgroup memory allows: three tiles of KT*D halves
-// plus the query tile, which at d=64 is 20 KB. A wider head would have to halve
-// it, and none is instantiated until one is measured -- `kSdpaMmaHeadDim` is
-// the list, and it has one entry.
+// KT=16, which the header's table prices at 8 KB here and 16 KB at D=128.
+// So the wider head is NOT kept off this list by threadgroup memory, and
+// that is measured rather than argued: `instantiate_sdpa_paged_mma("",
+// bfloat16, bfloat, 128, 16, false)` was added, and
+// `device_kernels::every_declared_entrypoint_builds_a_pipeline_on_this_device`
+// built `sdpa_paged_mma_bfloat16_d_128` into a COMPUTE PIPELINE on an M-series
+// device -- which is where Metal enforces the budget, and where the same test
+// does refuse an injected `d=256, kt=64` at 80 KB. The line was then removed
+// again, for the two reasons below.
+//
+// ONE: no oracle. Every width this driver can check against MLX is 64 --
+// `device_real_weights` runs Llama-3.2-1B and gpt-oss-20b -- and the 128- and
+// 256-wide checkpoints in the same cache are 15 and 17 gigabytes against a
+// device ceiling near 10. `sdpa_paged_tiled` has therefore never been checked
+// at 128 EITHER; it serves qwen3, mistral and phi-3 there on a correctness
+// argument alone. A wider mma would not be a second unmeasured kernel behind a
+// measured one, but a second beside a first.
+//
+// TWO: this entrypoint list is not this backend's alone. `kernels-vulkan` and
+// `kernels-wgpu` mirror it name for name -- each pins the same 100 rows over
+// 481 entrypoints, and each holds its own table against its own shader tree --
+// and both ship a
+// real `sdpa_paged_mma` (`.slang` and `.wgsl`). One width added here is three
+// shaders and three tables, and the two siblings cannot be compiled on a
+// machine with no `glslc` and no `naga`.
+//
+// So the way to the wider head is one differential fire requiring
+// `sdpa_paged_decode`, `_tiled` and `_mma` to agree at each compiled width,
+// and then the same line in three trees. Until then `dsl::metal::sdpa` keeps
+// 128 on the tiled kernel, which is the incumbent with the longer service
+// record.
 instantiate_sdpa_paged_mma("", bfloat16, bfloat, 64, 16, false)      // llama / qwen d=64
 instantiate_sdpa_paged_mma("_sink", bfloat16, bfloat, 64, 16, true)  // gpt-oss

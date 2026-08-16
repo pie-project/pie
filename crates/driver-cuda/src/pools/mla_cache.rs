@@ -40,9 +40,9 @@ pub struct MlaCacheLayout {
 
 /// The dimensions one layer hands to the MLA attention kernel.
 ///
-/// Port of `kernels-cuda/csrc/src/attn/mla_cache_view.hpp`, minus the two
-/// device pointers -- a layout has no memory yet, and the pointers come from
-/// whatever allocated it.
+/// Port of `attn/mla_cache_view.hpp` from the archive crate's `csrc/src`,
+/// minus the two device pointers -- a layout has no memory yet, and the
+/// pointers come from whatever allocated it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MlaCacheLayerView {
     /// Which layer this describes.

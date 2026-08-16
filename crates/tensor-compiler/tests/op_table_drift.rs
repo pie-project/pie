@@ -17,9 +17,14 @@
 //! `OpCode` with no `case` falling through to `{c, 0xFF, 1, "?"}`, so a new
 //! op made the driver quietly claim an unknown operand count rather than
 //! complain -- was a property of a C++ function that no longer exists. The
-//! drivers that replaced it read `ptir_abi.h`, which `ptir_header.rs`
-//! GENERATES from `OP_TABLE` and forbids re-typing the constants of. A table
-//! that generates its consumer cannot drift from it.
+//! drivers that replaced it are Rust and match on `tensor_ir::op::OP_TABLE`
+//! itself, so there is no second table to drift from.
+//!
+//! A generated `ptir_abi.h` briefly stood between the two, projecting the
+//! table into C for whatever still `#include`d it. Nothing did: it went with
+//! the C++, and `ptir_header.rs` -- which pinned it, and whose companion gate
+//! against re-typed tags had already degraded to a no-op once both files it
+//! named were deleted -- went with it.
 //!
 //! What is left is the half that was always Rust's own: the planner's
 //! library/generated partition, which nothing outside this crate can check.

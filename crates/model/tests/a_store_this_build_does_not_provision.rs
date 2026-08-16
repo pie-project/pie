@@ -27,7 +27,7 @@
 //! nothing about the store.
 
 use model::catalog::{Deployed, catalog};
-use model_compiler::trace::FireClass;
+use model_ir::trace::FireClass;
 
 /// The two sentences `KvStyle::store_refusal` states, by store.
 const NO_MLA: &str = "this build provisions no MLA latent store";

@@ -1,0 +1,36 @@
+[package]
+name = "model-dsl"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The forward-pass authoring eDSL: typed weight handles, tape-carrying values, and the raw kernel-signature surfaces a lowered declaration is written against. What a model family's forward pass is WRITTEN IN; it names no family."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+# No `links`: the C header and the `#[repr(C)]` surface it describes are
+# `crates/model`'s, because they are how a DRIVER reaches a declaration and a
+# declaration is a model's, not the toolchain's. build.rs is here for the
+# tracer fingerprint alone, which needs no `links` -- it is a
+# `cargo:rustc-env`, read back by `compiler_version()`.
+#
+# It follows the fingerprint: the traced form is a pure function of
+# (declaration code, facts), and the code that decides it is THIS crate's
+# surface plus `model-ir`'s recorder, so the hash covers both source trees.
+# It sits here rather than on `model-ir` because this is the crate that
+# PRODUCES plans -- `trace_semantic` / `trace_cuda` / `trace_metal` are the
+# entry points a version number is a claim about.
+build = "build.rs"
+
+[lib]
+name = "model_dsl"
+path = "src/lib.rs"
+
+[dependencies]
+# Only for the two `derive`s on `WeightRepr` / `ScaleLayout`: a weight's
+# representation is a deployment fact that crosses to the loader, so it
+# serializes even though nothing else on this surface does.
+serde = { version = "1.0", features = ["derive"] }
+# The traced form this surface records onto. The ONLY dependency, and that is
+# the point of the split: an authoring surface reaches the IR and nothing else
+# -- not the lowering, and not a device.
+model-ir = { path = "../model-ir" }

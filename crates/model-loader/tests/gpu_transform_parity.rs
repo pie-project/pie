@@ -3,14 +3,14 @@
 //! `arena_transforms.rs` proves the executor OFFERS a transform to its
 //! backing with no GPU in the build. This proves the other half, and it is
 //! the half that had never been proved from inside this crate: that a real
-//! [`CudaArena`] on a real device, reaching `kernels-cuda-new` through NVRTC
+//! [`CudaArena`] on a real device, reaching `kernels-cuda` through NVRTC
 //! rather than an ahead-of-time archive, leaves behind the bytes the host
 //! executor leaves behind.
 //!
 //! # Why bytes and not a build
 //!
-//! Cutting over from `kernels_cuda::ffi::pie_k_*` to
-//! `kernels_cuda_new::api::*` moved two extents out of every argument list
+//! Cutting over from the archive crate's `kernels_cuda::ffi::pie_k_*` to
+//! `kernels_cuda::api::*` moved two extents out of every argument list
 //! and a stream out of a third — a launch that compiles is therefore no
 //! evidence at all, because the rectangle the JIT derives from [`Dims`] is
 //! precisely the thing the C symbols used to be handed and no longer are. A
@@ -54,14 +54,13 @@ use cudarc::runtime::sys as rt;
 use model_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
 use model_loader::contract::{Expr, ModelContract, TensorContract};
 use model_loader::error::Error;
+use model_loader::executor::Execution;
 use model_loader::executor::arena::{ArenaBacking, ArenaSpan, TileMapOp};
 use model_loader::executor::cuda::CudaArena;
-use model_loader::executor::Execution;
 use model_loader::executor::sink::MemorySink;
 use model_loader::plan::passes::tile::CUDA_SCALE_ROWS_BF16;
 use model_loader::plan::{
-    CUDA_TILE_MAP_MASK, LoadPlan, StorageInstr, StorageTarget,
-    compile as compile_load_plan,
+    CUDA_TILE_MAP_MASK, LoadPlan, StorageInstr, StorageTarget, compile as compile_load_plan,
 };
 use model_loader::types::{
     Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec, TensorId,
@@ -488,7 +487,9 @@ fn a_named_row_fires_on_the_device_and_agrees_with_the_host() {
             device.ran
         );
 
-        let host = Execution::new(&plan, &checkpoint()).run().expect("the host executes the same plan");
+        let host = Execution::new(&plan, &checkpoint())
+            .run()
+            .expect("the host executes the same plan");
         assert!(
             host.arena.iter().any(|b| *b != 0),
             "{what}: the reference is all zeros, so a device that wrote \
@@ -555,7 +556,9 @@ fn the_unreachable_scale_row_agrees_with_the_host_when_fired_by_hand() {
          hold and this test should compile the plan instead of hand-building \
          the op"
     );
-    let host = Execution::new(&plan, &checkpoint()).run().expect("the host executes the reference");
+    let host = Execution::new(&plan, &checkpoint())
+        .run()
+        .expect("the host executes the reference");
     let expected = host
         .tensors
         .get("out")

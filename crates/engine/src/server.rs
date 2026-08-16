@@ -245,12 +245,52 @@ enum SessionMessage {
 // Session State
 // =============================================================================
 
+/// Which upload a chunk belongs to.
+///
+/// This was the payload's hash, which is a name for WHAT is being uploaded and
+/// not for WHICH upload -- so two uploads of the same bytes on one session were
+/// one entry in this map. They interleave: the first to finish removes the
+/// entry, and the other's next chunk arrives to find nothing there and is told
+/// its "first chunk index must be 0". Two clients installing the same program
+/// at the same moment is not an exotic case; it is what a test harness does the
+/// instant it stops running its cases one at a time.
+///
+/// The identity of an upload is already on the wire in both paths. An
+/// `add-program` request carries one correlation id across all of its chunks
+/// and no two requests share one. A file transfer carries no correlation id but
+/// does name its process, and a process transfers its files in order, so the
+/// process it is going to is the thing that distinguishes two of them.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(super) enum UploadKey {
+    /// One `add-program` request, named by the correlation id its chunks share.
+    Program(u32),
+    /// One file transfer, named by the process it is bound for and its hash.
+    File(ProcessId, String),
+}
+
+/// How many uploads one session may have part-finished at once.
+///
+/// `InFlightUpload` caps the bytes of any ONE upload, and that cap was written
+/// against exactly this threat -- "so a malicious sender can't grow `buffer`
+/// without bound". It only guards one of the two dimensions. Nothing removes
+/// an entry from `inflight_uploads` until its last chunk arrives or a chunk is
+/// refused, so a sender that opens uploads and never finishes them holds one
+/// buffer per correlation id it cares to invent. Measured before this constant
+/// existed: 2000 first-chunks, 2000 entries retained, which at the default
+/// `max_upload_mb` is far more memory than the per-upload cap suggests anyone
+/// can ask for.
+///
+/// The number is generous on purpose. A real client has one program install in
+/// flight and a handful of file transfers behind it; sixteen is well past that
+/// and still a fixed ceiling.
+pub(super) const MAX_INFLIGHT_UPLOADS: usize = 16;
+
 /// A client session managing a WebSocket connection.
 struct Session {
     pub(super) id: ClientId,
     pub(super) username: String,
     state: Arc<ServerState>,
-    pub(super) inflight_uploads: DashMap<String, InFlightUpload>,
+    pub(super) inflight_uploads: DashMap<UploadKey, InFlightUpload>,
     pub(super) attached_processes: Vec<ProcessId>,
     pub(super) installed_programs: HashSet<ProgramName>,
     /// Per-process file delivery waiters (client → process).

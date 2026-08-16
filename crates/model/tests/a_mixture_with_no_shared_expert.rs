@@ -16,7 +16,7 @@
 //! An op count moves when a kernel is fused and says nothing about which
 //! tensors the bind will look up, which is the thing that fails.
 
-use model_compiler::trace::{FireClass, ForwardPlan, OpKind};
+use model_ir::trace::{FireClass, ForwardPlan, OpKind};
 
 /// Every weight name the plan's ops name.
 fn bound(plan: &ForwardPlan) -> Vec<String> {

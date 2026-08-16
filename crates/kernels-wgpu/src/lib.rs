@@ -3,10 +3,12 @@
 //!
 //! ## Why this crate is the one that needs no toolchain
 //!
-//! `kernels-cuda` costs nvcc. `kernels-vulkan` costs `glslc`, because Vulkan
-//! has no runtime shader compiler and a pipeline is built from a SPIR-V module
-//! that something else had to produce. `kernels-metal` costs a Mac to RUN,
-//! though not to read.
+//! `kernels-cuda` costs nothing at build time and `libnvrtc.so` at RUN time: a
+//! kernel there is text the process compiles when it first fires one, so a
+//! process that cannot `dlopen` NVRTC cannot fire anything. `kernels-vulkan`
+//! costs `glslc`, because Vulkan has no runtime shader compiler at all and a
+//! pipeline is built from a SPIR-V module that something else had to produce.
+//! `kernels-metal` costs a Mac to RUN, though not to read.
 //!
 //! WGSL costs nothing. `wgpu` carries `naga`, a WGSL front end written in Rust,
 //! so the process that dispatches a kernel is the process that compiled it —
@@ -25,7 +27,7 @@
 //! That is not imitation for its own sake. `crates/kernels` is the
 //! backend-neutral vocabulary — [`kernels::KernelSig`], [`kernels::Axis`],
 //! [`kernels::Ty`], [`kernels::Operand`], [`kernels::Source`],
-//! [`kernels::LaunchRule`] — and `model-compiler` resolves a traced program
+//! [`kernels::LaunchRule`] — and `model-ir` resolves a traced program
 //! against it through `kernels::sig_in` without ever learning which backend it
 //! is compiling for. A backend table is therefore not a design surface. It is
 //! an *answer* to a question the compiler already asked, and the answer must be
@@ -120,7 +122,7 @@
 //!   to its own declared width — the defect `kernels-vulkan` records in
 //!   `gated_rms`, which this tree inherits the fix for and not the bug.
 
-pub use kernels::{Axis, Cap, KernelSig, Prepare};
+pub use kernels::{Axis, Cap, KernelSig};
 
 mod capability;
 pub use crate::capability::Capability;
@@ -132,6 +134,11 @@ pub mod source;
 pub use crate::source::{Missing, SOURCES, entrypoint_source, source};
 
 pub mod axes;
+
+// This backend's instantiation of the `kernels` routine machinery: the
+// `Backend` impl, the argument types, and the `Encode` trait a body dispatches
+// through. Declares no routine itself -- the family modules do.
+pub mod routine;
 
 pub mod attn;
 pub mod layout;
@@ -182,7 +189,6 @@ const EMPTY: KernelSig = KernelSig {
     file: None,
     launch: kernels::LaunchRule::Unstated,
     whole: false,
-    needs: Prepare::None,
     lacks: &[],
     sink: None,
     in_place: &[],
@@ -203,7 +209,6 @@ const fn copy_sig(k: &KernelSig) -> KernelSig {
         file: k.file,
         launch: k.launch,
         whole: k.whole,
-        needs: k.needs,
         lacks: k.lacks,
         sink: k.sink,
         in_place: k.in_place,
@@ -218,7 +223,9 @@ const fn copy_sig(k: &KernelSig) -> KernelSig {
     }
 }
 
-const CONCAT: [KernelSig; N] = {
+// `static` and not `const`: `KERNELS` borrows it, so a `const` would be
+// materialised at each use site, and this one is thousands of rows.
+static CONCAT: [KernelSig; N] = {
     let mut out = [EMPTY; N];
     let mut at = 0;
     let mut f = 0;
@@ -237,13 +244,89 @@ const CONCAT: [KernelSig; N] = {
 
 /// Every entrypoint the table names, sorted.
 ///
-/// The set `entrypoints.generated.txt` records, and — one for one — the set of
-/// variants the `// pie:instantiate` directives in `kernels/` declare.
+/// One for one, the set of variants the `// pie:instantiate` directives in
+/// `kernels/` declare.
 #[must_use]
 pub fn entrypoints() -> Vec<String> {
     let mut out: Vec<String> = KERNELS.iter().flat_map(KernelSig::entrypoints).collect();
+    out.extend(
+        RETIRED
+            .iter()
+            .flat_map(|family| family.iter().map(|n| (*n).to_owned())),
+    );
     out.sort();
     out
+}
+
+/// The entrypoints of the families whose `kernel!` rows have been RETIRED.
+///
+/// The crossing moves who NAMES an entrypoint, not whether it exists: the
+/// shader is still in the tree, `Embedded` still holds it, and the driver
+/// still dispatches it — through `driver-wgpu/src/lowering/arm.rs` rather
+/// than through a row. So the name has to be stated somewhere, or every sweep
+/// keyed on [`entrypoints()`] would read a family that crossed SUCCESSFULLY
+/// as a family whose shaders had vanished, and stop covering it in silence.
+///
+/// This list shrinks to nothing in the other direction: when the last family
+/// crosses, `KERNELS` is empty and this is the whole census. That is
+/// `.wiki/kernel-x/refactor-bigplan.md` §7 Stage 4, and it is why this is a
+/// list of families rather than one flat slice.
+const RETIRED: &[&[&str]] = &[sample::ENTRYPOINTS, ptir::ENTRYPOINTS];
+
+/// The rows that have been retired, by the name their `kernel!` call had.
+///
+/// `RETIRED` answers *"what can still be dispatched"*; this answers *"what
+/// used to be a row here and is one in `kernels-metal` still"*. The parity
+/// tests in `tests/entrypoints.rs` scrape both crates' sources and compare row
+/// for row, so during the crossing they need to know which of the sibling's
+/// rows have no counterpart here on purpose.
+#[must_use]
+pub fn retired_rows() -> &'static [&'static str] {
+    &["argmax_logits", "copy_logits_bf16"]
+}
+
+/// Every entrypoint whose row is gone and whose routine now answers for it.
+#[must_use]
+pub fn retired() -> Vec<&'static str> {
+    RETIRED.iter().flat_map(|f| f.iter().copied()).collect()
+}
+
+/// Every routine this backend has crossed.
+///
+/// The families that have crossed, flattened. One line per family in
+/// `CROSSED`, and the list is what [`KERNELS`] is being emptied into.
+#[must_use]
+pub fn routines() -> Vec<&'static routine::Routine> {
+    /// The families that have crossed. One line per family.
+    const CROSSED: &[&[routine::Routine]] = &[
+        attn::ROUTINES,
+        layout::ROUTINES,
+        mlp::ROUTINES,
+        moe::ROUTINES,
+        norm::ROUTINES,
+        rope::ROUTINES,
+        ssm::ROUTINES,
+        sample::ROUTINES,
+        ptir::ROUTINES,
+        quant::ROUTINES,
+    ];
+
+    CROSSED.iter().copied().flatten().collect()
+}
+
+/// Every routine this backend has crossed, with the backend forgotten.
+///
+/// The other half of [`KERNELS`] during the crossing: a kernel is a ROW until
+/// its family is ported and a ROUTINE afterwards, and the union of the two is
+/// what must still be the hundred. `.wiki/kernel-x/refactor-bigplan.md` §8
+/// makes that the progress bar, and `kernels::routine::Declared` is the view
+/// three backends' incompatible `Routine<B>` types can share.
+#[must_use]
+pub fn declared() -> Vec<kernels::routine::Declared> {
+    routines()
+        .into_iter()
+        .map(kernels::routine::Routine::declared)
+        .collect()
 }
 
 /// The row that covers `symbol`, or `None`.
@@ -546,8 +629,10 @@ mod tests {
     /// content of this check.
     #[test]
     fn an_unstated_row_has_no_bindings() {
-        let sig = sig("sdpa_paged_tiled_bfloat16_d_64")
-            .expect("the table covers the tiled paged attention");
+        // `sdpa_paged_tiled` was this row until upstream stated its eighteen
+        // operands in `kernels-metal` and this table followed. `gdn_core` is
+        // the replacement and is unstated in all three tables.
+        let sig = sig("gdn_core_bfloat16").expect("the table covers the GDN core");
         assert!(
             sig.operands.is_empty(),
             "this row is chosen for being unstated; state it and pick another",
@@ -563,14 +648,21 @@ mod tests {
     /// -p kernels-wgpu --lib` should be able to say whether the port is whole.
     #[test]
     fn the_table_is_one_hundred_rows_over_four_hundred_and_eighty_one_entrypoints() {
-        assert_eq!(KERNELS.len(), 100, "one row per kernel in `kernels/`");
+        // Rows PLUS retired rows: `refactor-bigplan.md` §7 empties the table
+        // family by family, and the hundred is what the two together name.
+        assert_eq!(
+            KERNELS.len() + retired_rows().len(),
+            100,
+            "one row per kernel in `kernels/`, retired or not"
+        );
         assert_eq!(entrypoints().len(), 481, "the product of every row's axes");
         assert_eq!(
             KERNELS.iter().filter(|k| k.operands.is_empty()).count(),
-            56,
-            "the rows that state no operands. `kernels-vulkan` carries the same \
-             56, and the decision about whether they should exist belongs with \
-             `kernels-metal`, which carries them too",
+            50,
+            "the rows that state no operands. THIS TABLE IS SHORTER THAN THE \
+             FLEET'S: `sample` and `ptir` came off as their arms landed, so a \
+             sibling's count differs by the families each has retired rather \
+             than by a disagreement. It was 52 with both rows in."
         );
     }
 

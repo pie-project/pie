@@ -8,11 +8,12 @@
 // or a stride off by a head answers that with a matrix full of plausible
 // numbers.
 //
-// This file is the four bodies AS THEY WERE, copied out of
-// `git show 06074cbf3:crates/kernels-cuda/csrc/src/gemm/gemm.cpp` and edited
-// only where a symbol they closed over is not here (`check`,
-// `bf16_compute_type`, the `throw` text). It drives them over the shape
-// table in `SHAPES` below with the pseudo-random bf16 that
+// This file is the four bodies AS THEY WERE, copied out of the ARCHIVE crate
+// — `git show 06074cbf3:crates/kernels-cuda/csrc/src/gemm/gemm.cpp`, a path
+// that has to be reached through `git show` because `85c6c674b` deleted that
+// crate whole — and edited only where a symbol they closed over is not here
+// (`check`, `bf16_compute_type`, the `throw` text). It drives them over the
+// shape table in `SHAPES` below with the pseudo-random bf16 that
 // `tests/gemm_service_parity.rs` generates from the same recurrence, and
 // prints one line per case:
 //

@@ -33,8 +33,8 @@
 // An MXFP4 payload is two codes per byte and an E8M0 plane is one byte per
 // block. WGSL's smallest storage element is a WORD, so both are `array<u32>`
 // and `common/mxfp4.inc.wgsl` owns the split.
-@group(0) @binding(0) var<storage, read> payload: array<u32>;
-@group(0) @binding(1) var<storage, read> exponents: array<u32>;
+@group(0) @binding(0) var<storage, read_write> payload: array<u32>;
+@group(0) @binding(1) var<storage, read_write> exponents: array<u32>;
 @group(0) @binding(2) var<storage, read_write> out_: array<u32>;
 
 struct Params {
@@ -43,9 +43,9 @@ struct Params {
 }
 //#else
 //#if defined(PIE_F32_INPUT)
-@group(0) @binding(0) var<storage, read> input_f32: array<f32>;
+@group(0) @binding(0) var<storage, read_write> input_f32: array<f32>;
 //#else
-@group(0) @binding(0) var<storage, read> input_bf16: array<u32>;
+@group(0) @binding(0) var<storage, read_write> input_bf16: array<u32>;
 //#endif
 @group(0) @binding(1) var<storage, read_write> codes: array<u32>;
 @group(0) @binding(2) var<storage, read_write> scales: array<u32>;

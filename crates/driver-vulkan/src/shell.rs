@@ -36,7 +36,7 @@
 use std::collections::BTreeMap;
 
 use kernels_vulkan::Capability;
-use model_compiler::trace::ForwardPlan;
+use model_ir::trace::ForwardPlan;
 
 use crate::device::{Device, Failed, Pipelines, Unavailable};
 use crate::dispatch::Geometry;
@@ -107,10 +107,10 @@ impl Default for Deployment {
 /// assumes one set of facts went in and cannot notice when two did.
 pub struct Text {
     /// The text a one-row step lowers, traced at
-    /// [`FireClass::Decode`](model_compiler::trace::FireClass::Decode).
+    /// [`FireClass::Decode`](model_ir::trace::FireClass::Decode).
     pub decode: ForwardPlan,
     /// The text a wider step lowers, traced at
-    /// [`FireClass::Prefill`](model_compiler::trace::FireClass::Prefill). See
+    /// [`FireClass::Prefill`](model_ir::trace::FireClass::Prefill). See
     /// [`Serving::prefill`] for the measurement that says why one plan will
     /// not do.
     pub prefill: ForwardPlan,
@@ -152,7 +152,7 @@ impl Text {
                 .iter()
                 .flat_map(|v| v.shape.0.iter())
                 .filter_map(|d| match d {
-                    model_compiler::trace::Dim::Const(n) => Some(*n),
+                    model_ir::trace::Dim::Const(n) => Some(*n),
                     _ => None,
                 })
                 .collect()
@@ -285,6 +285,16 @@ pub enum Unresized {
     Stranded(crate::pages::Unhoused),
     /// The reallocation failed. The pool still holds what it did.
     Device(Failed),
+    /// A pool this driver does not have was asked to hold pages. Sizing it to
+    /// zero is `Ok`; sizing it to anything else cannot be honoured, and
+    /// saying otherwise would have the engine stop asking.
+    Absent {
+        /// The id that was asked, which may be one this driver has never
+        /// heard of rather than one of the three the engine defines.
+        pool_id: u64,
+        /// What it was asked to hold. Never zero: zero is `Ok`.
+        target_pages: u64,
+    },
 }
 
 impl std::fmt::Display for Unresized {
@@ -292,6 +302,24 @@ impl std::fmt::Display for Unresized {
         match self {
             Self::Stranded(e) => write!(f, "{e}"),
             Self::Device(e) => write!(f, "the cache could not be rebuilt: {e:?}"),
+            Self::Absent {
+                pool_id,
+                target_pages,
+            } => {
+                // The id by NAME where there is one. A trim task's log is
+                // read by somebody asking which pool went wrong, and `2`
+                // answers that only for a reader holding `local.rs` open.
+                let which = match *pool_id {
+                    driver_api::PIE_ELASTIC_POOL_STATE => "the recurrent-state pool".to_string(),
+                    driver_api::PIE_ELASTIC_POOL_WORKSPACE => "the workspace pool".to_string(),
+                    other => format!("pool {other}"),
+                };
+                write!(
+                    f,
+                    "{which} cannot hold {target_pages} pages: this backend has no such pool, \
+                     and only a target of 0 is true of a pool that does not exist"
+                )
+            }
         }
     }
 }
@@ -310,6 +338,10 @@ pub struct Shell {
     pool: Pool,
     book: Book,
     weights: Weights,
+    /// Lowerings kept between steps. Not `Drop`-ordered with the fields
+    /// above because it holds no device object: a lowering is launches,
+    /// symbols and offsets.
+    lowerings: crate::turns::Lowerings,
     text: Text,
     tier: Capability,
     /// LAST, so that it outlives every buffer above it even if the [`Drop`]
@@ -392,6 +424,7 @@ impl Shell {
             book: Book::over(shape),
             pool,
             weights,
+            lowerings: crate::turns::Lowerings::default(),
             text,
             // Best first, and a device always reports at least `Baseline`.
             tier: device
@@ -434,6 +467,7 @@ impl Shell {
             book: &mut self.book,
             pool: &mut self.pool,
             weights: &self.weights,
+            lowerings: &mut self.lowerings,
         };
         serving.step(
             &self.device,
@@ -492,10 +526,52 @@ impl Shell {
     /// The work is [`crate::resources::Pool::copy_plan`]'s, so that a test of
     /// the arithmetic does not need a model.
     ///
+    /// # Why this grows the pool first, and only for destinations
+    ///
+    /// Because this pool is elastic and grows ON DEMAND: [`Self::admit`]
+    /// raises it to the highest page a frame NAMES, so the pool holds what
+    /// the frames so far have needed and not what the scheduler is entitled
+    /// to hand out. A copy plan is the other way a page number arrives, and
+    /// it did not carry that reasoning -- so a plan whose destination sat one
+    /// page above the last frame's high-water mark was REFUSED, by a check
+    /// that was right about the pool and wrong about what the pool could be.
+    ///
+    /// `prefix-tree-kv-cache` is what found it, in the curated sweep and only
+    /// there: it needs a destination past the pages its own prefills had
+    /// grown the pool to, and it failed with "page move 0's destination names
+    /// page 3 row 0, and the pool has 3 pages of 16 rows" while passing
+    /// whenever it ran alone. A driver that answers differently depending on
+    /// which requests preceded it is the shape of defect a per-test suite
+    /// cannot see.
+    ///
+    /// DESTINATIONS only. A source above the pool is still refused, and must
+    /// be: this pool only ever grows on demand, so a page number the pool has
+    /// never held is a page nothing has ever written. Growing for it would
+    /// turn a refusal into a copy of freshly zeroed memory -- the same
+    /// history-shaped silence the `Stranded` check exists to prevent, arrived
+    /// at from the other side.
+    ///
     /// # Errors
     ///
-    /// See [`crate::resources::Pool::copy_plan`].
+    /// See [`crate::resources::Pool::copy_plan`], plus a [`Failed`] from the
+    /// growth itself. There is no `Exhausted` answer on this verb: a copy the
+    /// device cannot find memory for is a failure of a copy the engine had
+    /// already committed to, not a scheduling fact it can act on.
     pub fn copy_kv(&mut self, plan: &driver_api::KvCopyPlan) -> Result<usize, Failed> {
+        let need = plan
+            .dst_page_ids
+            .iter()
+            .copied()
+            .chain(plan.cells.iter().map(|cell| cell.dst_page_id))
+            .max()
+            .map_or(0, |page| page.saturating_add(1));
+        if need > self.pool.shape().pages {
+            // The pool and not the book, exactly as `admit` does it: a copy
+            // plan arrives on the engine-driven path, where the scheduler owns
+            // page allocation and the book is not the allocator. Handing these
+            // pages to the book as well would put two allocators on them.
+            self.pool.resize(&self.device, need)?;
+        }
         self.pool.copy_plan(&self.device, plan)
     }
 
@@ -513,6 +589,29 @@ impl Shell {
     /// instead would resize the KV pool to the state pool's target, which is
     /// a high-water mark of zero.
     ///
+    /// # But only down to nothing
+    ///
+    /// "Satisfied by doing nothing" is only true when nothing is what was
+    /// asked for. This answered EVERY target on those ids with `Ok(())`,
+    /// including a request for storage, and the engine does not treat that
+    /// answer as advisory: `bootstrap`'s trim task records the target in
+    /// `applied` on success and then SKIPS that pool on every later tick,
+    /// because a target it has already reached is not worth re-sending. So a
+    /// blanket `Ok` did not merely mislay one request, it permanently
+    /// convinced the engine that a pool with no bytes behind it was holding
+    /// the pages it asked for.
+    ///
+    /// That is the failure the capability literal refuses one seam away, in
+    /// those same words -- a sink that would "bind and then run as a silent
+    /// no-op, which is worse than a refusal at the door". It is worth no less
+    /// here. A target of zero is still `Ok`, because zero is what this
+    /// backend genuinely holds in both of those pools and what the trim task
+    /// actually asks for -- workspace is asked for `0` on every tick, and
+    /// state is not asked at all while `rs_cache_slot_bytes` is zero. Anything
+    /// above zero, on those ids or on an id this driver has never heard of,
+    /// is [`Unresized::Absent`]: a refusal the trim task retries next tick
+    /// rather than a success it stops questioning.
+    ///
     /// The plan's `map_ranges` and `unmap_ranges` are not read. They describe
     /// a sparse pool's commits, and this pool is not sparse -- see
     /// [`crate::resources::Pool::resize`] for why it does not need to be.
@@ -524,10 +623,17 @@ impl Shell {
     /// would drop -- checked BEFORE anything moves, so a refusal leaves the
     /// pool and the book exactly as they were. [`Unresized::Device`] if the
     /// allocation fails, which also leaves the pool unchanged, and the book
-    /// is put back to match it.
+    /// is put back to match it. [`Unresized::Absent`] if a pool this driver
+    /// does not have was asked to hold pages.
     pub fn resize_pool(&mut self, plan: &driver_api::PoolResizePlan) -> Result<(), Unresized> {
         if plan.pool_id != driver_api::PIE_ELASTIC_POOL_KV {
-            return Ok(());
+            if plan.target_pages == 0 {
+                return Ok(());
+            }
+            return Err(Unresized::Absent {
+                pool_id: plan.pool_id,
+                target_pages: plan.target_pages,
+            });
         }
         let target = u32::try_from(plan.target_pages).map_err(|_| {
             Unresized::Device(Failed::Vulkan(format!(
@@ -609,7 +715,7 @@ impl Shell {
         // append them twice.
         let mut work = Vec::with_capacity(frame.steps.len());
         for step in &frame.steps {
-            work.push(self.prepare(&step.plan)?);
+            work.push(self.prepare(&step.plan, &[], &[])?);
         }
 
         let mut out = Vec::with_capacity(work.len());
@@ -670,9 +776,14 @@ impl Shell {
     ///
     /// [`Unlaunched`] naming the CSR that does not close, or the field this
     /// driver does not serve.
+    /// `traced` is one byte per request of `plan`, non-zero where the program
+    /// resolved its own pages; see [`crate::resources::Request::traced`]. An
+    /// empty slice means none did, which is every host-lowered fire.
     pub fn prepare(
         &self,
         plan: &driver_api::LaunchPlan,
+        traced: &[u8],
+        writes: &[Vec<(u32, u32)>],
     ) -> Result<(Vec<crate::resources::Request>, Vec<Vec<u32>>), Unlaunched> {
         plan.validate_geometry()
             .map_err(|e| Unlaunched::Malformed(format!("this frame's geometry: {e}")))?;
@@ -684,7 +795,32 @@ impl Shell {
         if let Some(what) = crate::frames::unserved_in(plan) {
             return Err(Unlaunched::Unserved(what));
         }
-        Ok((requests_of(plan)?, tokens_of(plan)?))
+        let mut requests = requests_of(plan)?;
+        if !traced.is_empty() {
+            if traced.len() != requests.len() {
+                return Err(Unlaunched::Malformed(format!(
+                    "this frame states {} traced flag(s) for {} request(s)",
+                    traced.len(),
+                    requests.len()
+                )));
+            }
+            for (request, &flag) in requests.iter_mut().zip(traced) {
+                request.traced = flag != 0;
+            }
+        }
+        if !writes.is_empty() {
+            if writes.len() != requests.len() {
+                return Err(Unlaunched::Malformed(format!(
+                    "this frame states write targets for {} request(s) and carries {}",
+                    writes.len(),
+                    requests.len()
+                )));
+            }
+            for (request, stated) in requests.iter_mut().zip(writes) {
+                request.writes.clone_from(stated);
+            }
+        }
+        Ok((requests, tokens_of(plan)?))
     }
 
     /// Fire one prepared step.
@@ -718,6 +854,7 @@ impl Shell {
             book: &mut self.book,
             pool: &mut self.pool,
             weights: &self.weights,
+            lowerings: &mut self.lowerings,
         };
         serving
             .over(
@@ -817,6 +954,16 @@ impl Shell {
             has_lora: false,
             model_site_summary: driver_api::ModelSiteSummary::default(),
             device_geometry_port_mask: driver_api::PIE_DECODE_ENVELOPE_PORTS,
+            // True here and false almost everywhere, and the difference is
+            // real rather than an exemption taken to get a frame through.
+            // `launch` converts ONE step, fires it, lets its program run, and
+            // only then converts the next -- `envelope::fill` is called inside
+            // the per-step loop, and answers `Filled::Early` for a channel
+            // that is still empty. So a slot chained behind an earlier slot of
+            // the same frame reads a cell that exists by the time it reads it.
+            // CUDA's `FramePrepare` does every step's host work at frame entry
+            // and cannot say this.
+            resolves_geometry_per_step: true,
             // The ceilings a batch is formed under, and they are the arena's:
             // `Shell::open` sizes one fire's scratch, and a fire wider than
             // this has nothing to run in.
@@ -851,6 +998,17 @@ impl Shell {
         // have addressed pages that were no longer there. Found by
         // `a_cache_resized_under_a_conversation_does_not_change_its_answer`.
         self.pool.shape()
+    }
+
+    /// The cache itself, read-only.
+    ///
+    /// The counterpart of [`Shell::book`]: that one says who holds which
+    /// page, and this one is what the pages are IN. For a caller checking the
+    /// cache -- a test reading a row back, an eviction proving it moved what
+    /// it named -- rather than dispatching against it.
+    #[must_use]
+    pub fn pool(&self) -> &crate::resources::Pool {
+        &self.pool
     }
 
     /// Who owns which page.

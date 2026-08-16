@@ -261,9 +261,9 @@ pub const NO_METAL: &str = "gemma-2 has no Metal text in this build: its forward
 #[must_use]
 pub fn trace(
     f: &Gemma2Facts,
-    class: model_compiler::trace::FireClass,
+    class: model_ir::trace::FireClass,
     load: Deployed<'_>,
-) -> model_compiler::trace::ForwardPlan {
+) -> model_ir::trace::ForwardPlan {
     let _ = load;
     super::forward::gemma2_cuda(f, class)
 }

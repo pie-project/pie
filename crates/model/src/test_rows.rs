@@ -34,8 +34,8 @@
 use crate::catalog::Variant;
 use crate::llama_3::Llama3;
 use crate::shared::llama_like::spec::LlamaLikeFacts;
-use model_compiler::facts::{NormPlacement, QkNorm};
-use model_compiler::trace::{NormVariant, RopeKind};
+use model_ir::facts::{NormPlacement, QkNorm};
+use model_ir::trace::{NormVariant, RopeKind};
 
 /// The id a test names with `--as`, and the one it will see reported back.
 ///

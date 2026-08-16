@@ -187,7 +187,7 @@ fn the_hosts_own_emitted_cuda_compiles_in_this_driver() {
 
     let (disk, directory) = scratch_disk("compile");
     let mut runtime = Runtime::new(disk);
-    let versions = Versions::mirrored(Backend::Cuda.emitter_version());
+    let versions = Versions::from_compiler(Backend::Cuda.emitter_version());
 
     let compiled = runtime
         .compile(0xC3, &plan, &kernels, versions, target(&device))
@@ -248,7 +248,7 @@ fn a_second_registration_of_one_program_compiles_nothing() {
 
     let (disk, directory) = scratch_disk("dedup");
     let mut runtime = Runtime::new(disk);
-    let versions = Versions::mirrored(Backend::Cuda.emitter_version());
+    let versions = Versions::from_compiler(Backend::Cuda.emitter_version());
     let target = target(&device);
 
     runtime
@@ -294,7 +294,7 @@ fn a_fresh_runtime_answers_from_the_disk_the_last_one_wrote() {
     let plan = adopt_launch_package(package).expect("adopts");
 
     let (_, directory) = scratch_disk("restart");
-    let versions = Versions::mirrored(Backend::Cuda.emitter_version());
+    let versions = Versions::from_compiler(Backend::Cuda.emitter_version());
     let target = target(&device);
 
     let mut first = Runtime::new(Disk::at(&directory));
@@ -352,14 +352,14 @@ fn a_host_side_emitter_bump_recompiles_rather_than_reusing() {
 
     let mut runtime = Runtime::new(Disk::at(&directory));
     runtime
-        .compile(0xC3, &plan, &kernels, Versions::mirrored(real), target)
+        .compile(0xC3, &plan, &kernels, Versions::from_compiler(real), target)
         .expect("the real emitter version");
     let after_first = runtime.stats().compilations;
 
     // A DIFFERENT program hash, so the program tier cannot answer and the
     // question is really about the identity the stage and disk tiers key on.
     runtime
-        .compile(0xC4, &plan, &kernels, Versions::mirrored(real + 1), target)
+        .compile(0xC4, &plan, &kernels, Versions::from_compiler(real + 1), target)
         .expect("a bumped emitter version");
     assert!(
         runtime.stats().compilations > after_first,

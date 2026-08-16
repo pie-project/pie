@@ -28,9 +28,9 @@
 //!
 //! [`ScoreOps`] is the seam every kernel this module fires goes through, and
 //! what is on the far side of it is now a `fn` call:
-//! `kernels_cuda_new::x::attn::attention_score_post::*` for three of them and
+//! `kernels_cuda::attn::attention_score_post::*` for three of them and
 //! `x::attn::attention_flashinfer::attn_score_fold_heads` for the fourth,
-//! each taking a [`Ctx`](kernels_cuda_new::jit::Ctx) on the fire's own stream.
+//! each taking a [`Ctx`](kernels_cuda::jit::Ctx) on the fire's own stream.
 //! The chain that used to be here — `unit_of` -> `cache::module` ->
 //! `Args::bind` -> a hand-built `Launch` — is gone with the units: a routine
 //! names its own instantiation, and its argument list is a `fn` signature the
@@ -51,9 +51,9 @@
 //! is written down rather than assumed: it is a template cross-product with
 //! hundreds of instantiations and no table rows (`new-horizon.md` §53).
 //! Everything downstream of it in the capture is Rust firing NVRTC'd device
-//! text out of `kernels-cuda-new/csrc/src/attn/attention_score_post.cuh`,
+//! text out of `kernels-cuda/kernels/attn/attention_score_post.cuh`,
 //! whose root and three instantiations are
-//! [`kernels_cuda_new::x::attn::attention_score_post`].
+//! [`kernels_cuda::attn::attention_score_post`].
 //!
 //! **Stream order is why `publish` is the home.** The launches were the tail
 //! of the capture dispatch, after `CUDA_CHECK(status)` and before it
@@ -264,7 +264,7 @@ pub trait ScoreOps {
 /// `bind::abi::ffi::pie_k_attn_attn_score_fold_heads`, a generated shim entry
 /// into `attention_flashinfer.cu`'s launcher, which exists only when the
 /// kernels archive is linked. **It no longer calls it.** The fold's device
-/// text is `kernels-cuda-new`'s `attn/attention_flashinfer` unit, NVRTC
+/// text is `kernels-cuda`'s `attn/attention_flashinfer` unit, NVRTC
 /// compiles it, and this method builds its own [`Launch`]. Nothing on this
 /// path needs the archive, so nothing on this path is gated on it — which is
 /// the whole claim of the migration made checkable: `_cuda` without `bridge`
@@ -312,9 +312,9 @@ fn or_panic(what: &str, fired: Result<(), kernels::Refusal>) {
 /// the same assertion the `pie_k_*` call made when it handed `self.stream` to
 /// a C++ launcher that put it in a `<<<>>>`.
 #[cfg(feature = "_cuda")]
-fn ctx_on(stream: *mut std::ffi::c_void) -> kernels_cuda_new::jit::Ctx {
+fn ctx_on(stream: *mut std::ffi::c_void) -> kernels_cuda::jit::Ctx {
     // SAFETY: as stated above.
-    unsafe { kernels_cuda_new::jit::Ctx::on(stream) }
+    unsafe { kernels_cuda::jit::Ctx::on(stream) }
 }
 
 #[cfg(feature = "_cuda")]
@@ -383,7 +383,7 @@ impl ScoreOps for LiveScoreOps {
         num_requests: i32,
         num_q_heads: i32,
     ) {
-        use kernels_cuda_new::x::attn::attention_score_post::attn_score_normalize;
+        use kernels_cuda::attn::attention_score_post::attn_score_normalize;
 
         if num_requests <= 0 || num_q_heads <= 0 {
             return;
@@ -442,7 +442,7 @@ impl ScoreOps for LiveScoreOps {
         num_q_heads: i32,
         window: i32,
     ) {
-        use kernels_cuda_new::x::attn::attention_score_post::attn_prefill_score_normalize;
+        use kernels_cuda::attn::attention_score_post::attn_prefill_score_normalize;
 
         if num_requests <= 0 || num_q_heads <= 0 || window <= 0 {
             return;
@@ -510,7 +510,7 @@ impl ScoreOps for LiveScoreOps {
         num_q_heads: i32,
         window: i32,
     ) {
-        use kernels_cuda_new::x::attn::attention_score_post::attn_prefill_score_fold;
+        use kernels_cuda::attn::attention_score_post::attn_prefill_score_fold;
 
         if num_requests <= 0 {
             return;
@@ -547,11 +547,11 @@ impl ScoreOps for LiveScoreOps {
     ///
     /// # What this replaced, line for line
     ///
-    /// `attn::attn_score_fold_heads` in
-    /// `kernels-cuda/csrc/src/attn/attention_flashinfer.cu:812-832` — a
-    /// nine-argument host launcher whose whole body is two guards, a `dim3`
-    /// and a `<<<>>>`. The seven-argument kernel it launched is now
-    /// `kernels-cuda-new`'s `attn/attention_flashinfer` unit; the two guards
+    /// `attn::attn_score_fold_heads` in the ARCHIVE crate's
+    /// `csrc/src/attn/attention_flashinfer.cu:812-832` — a nine-argument
+    /// host launcher whose whole body is two guards, a `dim3` and a
+    /// `<<<>>>`. The seven-argument kernel it launched is now
+    /// `kernels-cuda`'s `attn/attention_flashinfer` unit; the two guards
     /// and the `dim3` are here. The launcher's remaining two arguments were
     /// `num_requests`, which was only ever `grid.x`, and `stream`, which was
     /// only ever the launch's — neither is a kernel operand, and this is
@@ -562,7 +562,7 @@ impl ScoreOps for LiveScoreOps {
     /// `num_requests <= 0` returns, exactly as the C++ did. An empty fire is
     /// not an error — the capture publishes an empty payload — and it must be
     /// caught HERE, because a zero `grid.x` reaching
-    /// [`kernels_cuda_new::runtime::KernelModule::fire`] is `Error::Geometry`
+    /// [`kernels_cuda::runtime::KernelModule::fire`] is `Error::Geometry`
     /// and would turn a legal no-op into a refusal.
     ///
     /// A null buffer PANICS, because the C++ threw. This crate's C++ threw
@@ -585,7 +585,7 @@ impl ScoreOps for LiveScoreOps {
         num_q_heads: i32,
         folded: *mut f32,
     ) {
-        use kernels_cuda_new::x::attn::attention_flashinfer::attn_score_fold_heads;
+        use kernels_cuda::attn::attention_flashinfer::attn_score_fold_heads;
 
         // `attention_flashinfer.cu:817` — `if (num_requests <= 0) return;`
         if num_requests <= 0 {

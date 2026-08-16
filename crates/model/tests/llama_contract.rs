@@ -209,9 +209,9 @@ impl Variant for LlamaFixture {
 
     fn trace(
         &self,
-        _class: model_compiler::trace::FireClass,
+        _class: model_ir::trace::FireClass,
         _load: Deployed<'_>,
-    ) -> Result<model_compiler::trace::ForwardPlan, Refusal> {
+    ) -> Result<model_ir::trace::ForwardPlan, Refusal> {
         Err(Refusal::Unsupported(
             "llama-fixture is a contract fixture and has no forward text",
         ))

@@ -355,6 +355,21 @@ fn report(
     } else {
         kl_total / scored as f64
     };
+    // KL(P||Q) is non-negative by Jensen, so a negative one is float error in
+    // the sum and not a measurement. At gamma = 1 the guided log-probs equal
+    // the conditional ones up to rounding, every term is that rounding, and
+    // the total lands either side of zero at around 1e-9 -- which printed as
+    // `mean_kl=-0.0000` and made the sign bit of a value indistinguishable
+    // from zero decide whether the identity looked like it held.
+    //
+    // Clamped only inside the noise. A mean KL genuinely below -1e-6 is a
+    // defect in this arithmetic or in the backend under it, and stays visible
+    // and negative so that it can be seen.
+    let mean_kl = if (-1e-6..0.0).contains(&mean_kl) {
+        0.0
+    } else {
+        mean_kl
+    };
     let identity = if (gamma - 1.0).abs() < 1e-6 && (shifts > 0 || mean_kl > 1e-3) {
         " IDENTITY-VIOLATION"
     } else {

@@ -1,7 +1,7 @@
 //! The query-only fire vocabulary, and the context a bind arm reads it
 //! through.
 //!
-//! This lived in `kernels-cuda-new` and had exactly ONE implementor, here.
+//! This lived in `kernels-cuda` and had exactly ONE implementor, here.
 //! A backend kernels crate cannot know what a trace states -- that is the
 //! driver's vocabulary -- so the trait and its wrapper live beside the
 //! implementation, and the kernels crate keeps only the DATA types a routine
@@ -13,9 +13,9 @@ use core::ptr::NonNull;
 use kernels::Refusal;
 
 use super::facts::Fire;
-use kernels_cuda_new::x::{
-    AttnWorkspace, Gdn, KvLayer, MlaLayer, MlaPlan, Plan, Rows, Slab, Yarn,
-};
+use kernels_cuda::attn::{AttnWorkspace, KvLayer, MlaLayer, MlaPlan, Plan, Rows};
+use kernels_cuda::rope::Yarn;
+use kernels_cuda::ssm::{Gdn, Slab};
 
 /// The query-only fire context a bind arm reads.
 ///
@@ -274,6 +274,26 @@ impl<'a> Cx<'a> {
         self.fire.layer()
     }
 
+    /// The engine's cuBLAS handle for this fire — see [`Fire::cublas`].
+    ///
+    /// Not a `query!` and not an `Option`: null IS the answer when no handle
+    /// exists, and `Ctx::cublas()` already turns that into a refusal that
+    /// names it. Two refusals for one absence would be one too many.
+    #[must_use]
+    pub fn cublas(&self) -> *mut c_void {
+        self.fire.cublas()
+    }
+
+    /// The statement's per-head width, or `None` for the plain kind.
+    ///
+    /// NOT a `query!`: absence is a legal answer here rather than an unstated
+    /// fact, so it must not become a `Refusal`. `Fire::per_head_dim`'s doc has
+    /// which statement means which.
+    #[must_use]
+    pub fn per_head_dim(&self) -> Option<i32> {
+        self.fire.per_head_dim()
+    }
+
     /// The rotation pairs adjacent elements rather than halves.
     #[must_use]
     pub fn rope_interleaved(&self) -> bool {
@@ -283,5 +303,45 @@ impl<'a> Cx<'a> {
     /// The `i`th statement parameter as a float.
     pub fn param_f32(&self, i: usize) -> Result<f32, Refusal> {
         self.param(i).map(f32::from_bits)
+    }
+
+    /// The attention half of the fire, whole.
+    ///
+    /// # Why this one query is not a dozen
+    ///
+    /// The FlashInfer FA2 arms read twelve [`AttnCtx`] fields TOGETHER — the
+    /// two plan handles and the full-attention plan beside them, the two
+    /// workspaces, the score sink and its CSR, the mask pair, the host CSR
+    /// mirrors and `o_out` — and each is used by exactly one arm. Twelve
+    /// `query!` lines with one caller each would state the same fact twelve
+    /// times without checking any of it.
+    ///
+    /// # And why handing it over is not §3.3's forbidden surface
+    ///
+    /// `bind/mod.rs`' FA2 banner argued that a `Cx` able to hand over a plan
+    /// cache would be *"a cache a bind body could re-plan, mid-fire, from
+    /// inside what is supposed to be a query"*. The reference here is SHARED,
+    /// and [`kernels_cuda::attn::fa2::plan::plan_decode`] takes `&mut`: the
+    /// re-plan the objection is about is not writable through this. What an
+    /// arm does with it is destructure it into a
+    /// [`kernels_cuda::attn::fa2::params::DecodePlan`], which is `Copy` and is
+    /// the whole of what a launch reads out of a cache.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Unstated`] for a fire with no attention half.
+    pub fn attn_ctx(&self) -> Result<&'a super::AttnCtx, Refusal> {
+        self.fire.attn.ok_or(Refusal::Unstated { what: "the fire's attention context" })
+    }
+
+    /// The op join this statement was bound under.
+    ///
+    /// Reached by exactly one caller, and for one decision:
+    /// [`super::attn_plan`] picks between a family's two decode plans on
+    /// `window_of(spec, ..) == -1`, and that decision is written once there
+    /// rather than re-derived in an arm.
+    #[must_use]
+    pub const fn spec(&self) -> &'a super::LaunchSpec {
+        self.fire.spec
     }
 }

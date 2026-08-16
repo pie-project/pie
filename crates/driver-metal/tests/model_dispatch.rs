@@ -14,13 +14,13 @@
 use std::collections::BTreeSet;
 
 use driver_metal::lowering::dispatch::{
-    Dispatch, Geometry, Undispatchable, dims_of, pipelines_needed, plan_one,
+    Dispatch, Geometry, Undispatchable, facts_of, named_tile, pipelines_needed, plan_launch,
 };
 use driver_metal::lowering::executor::{Frame, Resolver, Slice};
 use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
 use model::shared::llama_like::forward::llama_like_metal;
 use model_compiler::lower::{Fire, Lowered, Row, lower};
-use model_compiler::trace::{FireClass, ValueId};
+use model_ir::trace::{FireClass, ValueId};
 
 /// Answers every name with a generous region: this test is about grids, and
 /// `model_bind.rs` already owns whether the names resolve.
@@ -51,6 +51,9 @@ fn geometry() -> Geometry {
         rotary_dims: 128,
         n_experts: 0,
         experts_per_token: 0,
+        // qwen3-0.6b's checkpoint is 4-bit over groups of 64.
+        group: 64,
+        bits: 4,
     }
 }
 
@@ -92,19 +95,67 @@ fn planned(low: &Lowered) -> (Vec<Dispatch<'_>>, Vec<Undispatchable>) {
     let mut ok = Vec::new();
     let mut refused = Vec::new();
     for launch in &low.launches {
-        match plan_one(
-            low,
-            launch,
-            kernels_metal::KERNELS,
-            frame,
-            geometry(),
-            &mut store,
-        ) {
-            Ok(d) => ok.push(d),
+        match plan_launch(low, launch, frame, geometry(), &mut store) {
+            Ok(d) => ok.extend(d),
             Err(e) => refused.push(e),
         }
     }
     (ok, refused)
+}
+
+#[test]
+fn the_gemm_covers_exactly_the_output_it_writes() {
+    // `affine_qmm_t` is a C++ template over `(dtype x group x bits x BM x BK x
+    // BN)` -- `y_row = tid.y * BM`, `y_col = tid.x * BN` -- so the tile is
+    // COMPILED into the entrypoint and the grid must be threadgroups times
+    // that tile. The driver used to derive the tile from the fire's geometry
+    // rather than read it off the name, and at this shape the two disagreed:
+    // `(64, 64)` derived against `_bm_32_bn_32` named. A threadgroup count
+    // computed for a 64-wide tile and handed to a 32-wide kernel covers a
+    // QUARTER of the output, so every long prefill's projections were three
+    // quarters whatever the arena held, and no layer reported anything.
+    //
+    // 512 rows and not the 16 the test below uses, because 16 never reaches
+    // this arm: the GEMM is guarded by `TokensMultipleOf(32)`, so every
+    // correctness oracle in this crate -- each of which prefills one or two
+    // tokens -- resolved to the matvec and could not have seen it. The one
+    // test that did reach it measured TIME.
+    let low = lowered(FireClass::Prefill, 512);
+    let frame = frame(&low);
+    let mut store = Sentinels;
+    let mut seen = 0usize;
+    for launch in &low.launches {
+        let symbol = &low.kernels[launch.kernel as usize];
+        // The tile in the NAME is the only tile there is; a symbol carrying
+        // none is not a GEMM point.
+        let Some((bm, bn)) = named_tile(symbol) else {
+            continue;
+        };
+        let dims = facts_of(&low, launch, geometry());
+        let d = plan_launch(&low, launch, frame, geometry(), &mut store)
+            .map(|d| d.into_iter().next().expect("one statement, one dispatch"))
+            .unwrap_or_else(|e| panic!("`{symbol}` dispatches: {e:?}"));
+
+        // `dispatchThreads` takes THREADS, so the threadgroup count -- which
+        // is what the kernel indexes by -- is the quotient.
+        let groups = [
+            d.grid[0] / d.threadgroup[0],
+            d.grid[1] / d.threadgroup[1],
+            d.grid[2] / d.threadgroup[2],
+        ];
+        assert_eq!(
+            (groups[0] * bn, groups[1] * bm),
+            (dims.width, dims.rows),
+            "`{symbol}`: {groups:?} threadgroups at ({bm}, {bn}) do not cover \
+             {} rows of {}",
+            dims.rows,
+            dims.width
+        );
+        seen += 1;
+    }
+    // Without this the test passes by planning no GEMM at all, which is
+    // exactly how the disagreement survived for as long as it did.
+    assert!(seen > 0, "no GEMM was planned, so nothing was checked");
 }
 
 #[test]
@@ -166,10 +217,10 @@ fn there_is_no_symbol_this_backend_cannot_dispatch() {
     for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 16)] {
         for why in planned(&lowered(class, rows)).1 {
             refusals.insert(match why {
-                Undispatchable::NoRow { symbol, .. }
-                | Undispatchable::NoFile { symbol, .. }
-                | Undispatchable::Ungeometric { symbol, .. }
+                Undispatchable::Unclaimed { symbol, .. }
                 | Undispatchable::Unbound { symbol, .. }
+                | Undispatchable::Refused { symbol, .. }
+                | Undispatchable::Misspelled { symbol, .. }
                 | Undispatchable::Conditional { symbol, .. } => symbol,
             });
         }
@@ -314,9 +365,7 @@ fn a_rectangles_dims_come_from_the_rectangle_and_the_fire_and_nowhere_else() {
         let low = lowered(class, rows as usize);
         for launch in &low.launches {
             let symbol = low.kernels[launch.kernel as usize].as_str();
-            let sig = kernels::sig_in(driver_metal::lowering::dispatch::table(), symbol)
-                .expect("every symbol this text states has a row");
-            let dims = dims_of(sig, &low, launch, geometry());
+            let dims = facts_of(&low, launch, geometry());
             assert_eq!(dims.rows, rows, "`{symbol}` at {rows} rows");
             assert_eq!(dims.q_heads, geometry().q_heads, "the fire states the rest");
             assert!(
@@ -333,8 +382,14 @@ fn the_batched_lane_is_the_row_count_and_not_a_second_vocabulary() {
     // as a question to answer before M>1 could be dispatched. It dissolves:
     // where the lanes differ they are DIFFERENT SYMBOLS, each stating its own
     // row, and the rest is `dims.rows`.
+    // SIXTY-FOUR rows, and the number is load-bearing. The tiled matmul is
+    // guarded by `GuardPred::TokensMultipleOf(k)`, and `k` grew from 16 to 32
+    // -- so a 16-row prefill stopped being a multiple of it, fell back to the
+    // vector kernel, and named exactly the symbols a decode names. The
+    // assertion below then failed as "untestable here", which is true and
+    // reads like the claim was wrong rather than the fixture stale.
     let decode: BTreeSet<String> = lowered(FireClass::Decode, 1).kernels.into_iter().collect();
-    let prefill: BTreeSet<String> = lowered(FireClass::Prefill, 16)
+    let prefill: BTreeSet<String> = lowered(FireClass::Prefill, 64)
         .kernels
         .into_iter()
         .collect();
@@ -361,7 +416,7 @@ mod from_a_frame {
     use super::*;
     use driver_metal::lowering::frame::{Step, fire_class, lower_step, sig};
 
-    fn plan_for(class: FireClass) -> model_compiler::trace::ForwardPlan {
+    fn plan_for(class: FireClass) -> model_ir::trace::ForwardPlan {
         llama_like_metal(
             &LlamaLikeFacts::qwen3_0_6b(),
             &LlamaLikeMetalFacts::synthetic(),
@@ -375,7 +430,14 @@ mod from_a_frame {
         let step = Step {
             token_ids: &[11, 22, 33, 44],
             qo_indptr: &[0, 1, 2, 3, 4],
-            sampling_indices: &[0, 1, 2, 3],
+            // Each lane reads ITS OWN only row, so each names 0. This said
+            // `[0, 1, 2, 3]` -- the fire's row numbers -- which is a table the
+            // engine never emits: it was written to match a driver that read
+            // the field absolutely, not to state the contract. Under the
+            // numbering the scheduler actually uses, lane 3 naming row 3 of a
+            // one-row request is now refused by name.
+            sampling_indices: &[0, 0, 0, 0],
+            sampling_indptr: &[0, 1, 2, 3, 4],
             ..Step::default()
         };
         assert_eq!(fire_class(&step), FireClass::Decode);
@@ -384,17 +446,12 @@ mod from_a_frame {
         let mut store = Sentinels;
         let mut grids = 0;
         for launch in &low.launches {
-            match plan_one(
-                &low,
-                launch,
-                kernels_metal::KERNELS,
-                frame(&low),
-                geometry(),
-                &mut store,
-            ) {
+            match plan_launch(&low, launch, frame(&low), geometry(), &mut store) {
                 Ok(d) => {
-                    assert!(d.grid.iter().all(|&n| n > 0));
-                    grids += 1;
+                    for d in &d {
+                        assert!(d.grid.iter().all(|&n| n > 0));
+                        grids += 1;
+                    }
                 }
                 Err(other) => panic!("a frame-driven launch refused: {other:?}"),
             }
@@ -573,15 +630,9 @@ mod state {
             if !low.kernels[launch.kernel as usize].starts_with("kv_append") {
                 continue;
             }
-            let d = plan_one(
-                &low,
-                launch,
-                kernels_metal::KERNELS,
-                frame(&low),
-                geometry(),
-                &mut store,
-            )
-            .expect("a kv write plans");
+            let d = plan_launch(&low, launch, frame(&low), geometry(), &mut store)
+                .map(|d| d.into_iter().next().expect("one statement, one dispatch"))
+                .expect("a kv write plans");
             let layer = launch.layers.start;
             // Buffers 2 and 3 are the cache, which the ROW says and this
             // reads back: keys then values, of this statement's own layer.
@@ -625,15 +676,9 @@ mod state {
             .iter()
             .find(|l| low.kernels[l.kernel as usize].starts_with("neox"))
             .expect("the text rotates");
-        let d = plan_one(
-            &low,
-            launch,
-            kernels_metal::KERNELS,
-            frame(&low),
-            geometry(),
-            &mut store,
-        )
-        .expect("a rotation plans");
+        let d = plan_launch(&low, launch, frame(&low), geometry(), &mut store)
+            .map(|d| d.into_iter().next().expect("one statement, one dispatch"))
+            .expect("a rotation plans");
         // Buffer 1 is `position`, which the row says and this reads back.
         assert_eq!(d.args[1].slice.address, 0x5150_0000);
         assert_eq!(d.args.len(), 5, "x, position, and three scalars");
@@ -653,15 +698,9 @@ mod state {
             .iter()
             .find(|l| low.kernels[l.kernel as usize].starts_with("kv_append"))
             .expect("the text writes KV");
-        let d = plan_one(
-            &low,
-            launch,
-            kernels_metal::KERNELS,
-            frame(&low),
-            geometry(),
-            &mut store,
-        )
-        .expect("it still plans");
+        let d = plan_launch(&low, launch, frame(&low), geometry(), &mut store)
+            .map(|d| d.into_iter().next().expect("one statement, one dispatch"))
+            .expect("it still plans");
         assert_eq!(d.args[2].slice.address, 0);
         assert_eq!(d.args[2].slice.bytes, 0);
         // SIXTEEN, which is `kv_append_paged`'s width. The text names the
@@ -720,7 +759,6 @@ fn a_row_can_say_its_grid_extent_comes_from_the_statement() {
     )
     .expect("the gemma-shaped text lowers");
 
-    let table = driver_metal::lowering::dispatch::table();
     let geometry = Geometry {
         q_heads: 32,
         kv_heads: 16,
@@ -728,6 +766,8 @@ fn a_row_can_say_its_grid_extent_comes_from_the_statement() {
         // The FIRE's number, which is the sliding layers' and which the full
         // layers must NOT take.
         rotary_dims: 256,
+        group: 64,
+        bits: 4,
         ..Geometry::default()
     };
     let mut by_layer: BTreeSet<(u16, u32)> = BTreeSet::new();
@@ -736,10 +776,9 @@ fn a_row_can_say_its_grid_extent_comes_from_the_statement() {
         if !symbol.starts_with("neox") {
             continue;
         }
-        let sig = kernels::sig_in(table, symbol).expect("a rope row");
         by_layer.insert((
             launch.layers.start,
-            dims_of(sig, &low, launch, geometry).rotary_dims,
+            facts_of(&low, launch, geometry).rotary_dims,
         ));
     }
     assert!(!by_layer.is_empty(), "the text states rope launches");
@@ -813,9 +852,23 @@ fn the_mxfp4_expert_bank_reads_a_bias_and_is_handed_one() {
         rotary_dims: facts.head_dim,
         n_experts: facts.n_experts,
         experts_per_token: facts.experts_per_token,
+        // gpt-oss's MXFP4: blocks of 32, four bits.
+        group: 32,
+        bits: 4,
     };
     let frame = frame(&low);
-    let table = driver_metal::lowering::dispatch::table();
+    // The kernel's own parameter names, by slot. This asked the ROW, whose
+    // `operands` column listed them -- and `quant` has retired its rows, so
+    // there is no column left to ask. Reading `quant/qmv.metal` is the
+    // stronger question anyway: the row was a transcription of this list and
+    // could be wrong about it, where the shader IS the ABI the pipeline is
+    // built from.
+    let slots = buffer_names(&kernels_dir(), "quant/qmv.metal", "mxfp4_qmv_routed_bias");
+    assert!(
+        slots.len() > 4,
+        "the parameter list for `mxfp4_qmv_routed_bias` was not found in \
+         quant/qmv.metal; this test reads the shader for its slot names"
+    );
 
     // The symbol carries its instantiation point, which is the OTHER half of
     // the same omission: the arm returned a bare `mxfp4_qmv_routed_bias` and
@@ -828,17 +881,21 @@ fn the_mxfp4_expert_bank_reads_a_bias_and_is_handed_one() {
             continue;
         }
         seen += 1;
-        let sig = kernels::sig_in(table, symbol).expect("the MXFP4 routed row");
         let mut store = Sentinels;
-        let d = plan_one(&low, launch, table, frame, geometry, &mut store)
+        let d = plan_launch(&low, launch, frame, geometry, &mut store)
+            .map(|d| d.into_iter().next().expect("one statement, one dispatch"))
             .expect("the routed MXFP4 leg plans");
-        for (slot, operand) in sig.operands.iter().enumerate() {
-            let bound = d.args[slot].slice;
-            // `biases` is in the ABI because a row is positional, and unread
-            // because the codec has no such plane. `bias` is read per output
-            // row. Naming them off the row rather than by index, so that a
-            // row reordered upstream is still being asked the right question.
-            match operand.name {
+        for (slot, name) in slots.iter().enumerate() {
+            let Some(arg) = d.args.get(slot) else {
+                continue;
+            };
+            let bound = arg.slice;
+            // `biases` is in the ABI because the argument list is positional,
+            // and unread because the codec has no such plane. `bias` is read
+            // per output row. Naming them off the SHADER rather than by
+            // index, so that a list reordered upstream is still being asked
+            // the right question.
+            match name.as_str() {
                 "biases" => assert_eq!(
                     bound.bytes, 0,
                     "the zero-point slot MXFP4 does not have addresses {bound:?}"
@@ -916,7 +973,8 @@ fn the_bias_add_is_handed_the_width_it_derives() {
     ];
     let mut seen = Vec::new();
     for launch in &low.launches {
-        let d = plan_one(&low, launch, kernels_metal::KERNELS, frame, g, &mut store)
+        let d = plan_launch(&low, launch, frame, g, &mut store)
+            .map(|d| d.into_iter().next().expect("one statement, one dispatch"))
             .expect("every launch of this text plans");
         if !d.symbol.starts_with("add_bias") {
             continue;
@@ -949,4 +1007,315 @@ fn the_bias_add_is_handed_the_width_it_derives() {
             i / 3
         );
     }
+}
+
+/// gemma's PLE tail, whose middle statement is the one strided kernel a live
+/// text names.
+fn gemma_lowered(class: FireClass, rows: usize) -> Lowered {
+    let plan = llama_like_metal(
+        &LlamaLikeFacts {
+            layers: 4,
+            ..LlamaLikeFacts::qwen3_0_6b()
+        },
+        &LlamaLikeMetalFacts::gemma_like(),
+        class,
+    );
+    lower(
+        &plan,
+        &vec![
+            Row {
+                samples: true,
+                ..Row::default()
+            };
+            rows
+        ],
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("the gemma text lowers")
+}
+
+/// The strided activation can reach every row it is given.
+///
+/// `geglu_tanh_strided` is FLAT — its row states `LaunchRule::Elementwise`,
+/// so the grid is `[width * rows, 1, 1]` and the body recovers the row by
+/// dividing the thread id by `p.width`. Two things therefore have to hold, and
+/// neither held before this test was written:
+///
+/// * the thread count is the whole rectangle, not one row of it, and
+/// * `params[0]` is the rectangle's TRUE width, because it is the divisor.
+///
+/// The kernel exists for M>1 and for nothing else — its own header says
+/// gemma's PLE slice "at M=1 is a byte offset and the flat kernel above
+/// serves; at M>1 it is not" — so a launch that covers one row makes the
+/// symbol pointless. It covered one row: a grid of [2048, 1, 1] against a
+/// `uint2` body whose `gid.y` was structurally zero, on every gemma layer of
+/// every prefill.
+#[test]
+fn the_strided_activation_reaches_every_row_it_is_given() {
+    const ROWS: usize = 8;
+    let low = gemma_lowered(FireClass::Prefill, ROWS);
+    let frame = frame(&low);
+    let mut store = Sentinels;
+    let mut seen = 0usize;
+    for launch in &low.launches {
+        let symbol = &low.kernels[launch.kernel as usize];
+        if !symbol.starts_with("geglu_tanh_strided") {
+            continue;
+        }
+        let dims = facts_of(&low, launch, geometry());
+        let d = plan_launch(&low, launch, frame, geometry(), &mut store)
+            .map(|d| d.into_iter().next().expect("one statement, one dispatch"))
+            .unwrap_or_else(|e| panic!("`{symbol}` dispatches: {e:?}"));
+
+        assert_eq!(
+            (d.grid[0] as u64, d.grid[1], d.grid[2]),
+            (u64::from(dims.width) * u64::from(dims.rows), 1, 1),
+            "`{symbol}`: a grid of {:?} over a {} x {} rectangle",
+            d.grid,
+            dims.rows,
+            dims.width
+        );
+        // `GegluStridedParams` is `{width, unused, gate_pitch, up_pitch,
+        // out_pitch}` and the body divides by the first word.
+        assert_eq!(
+            d.params[0], dims.width,
+            "`{symbol}`: the body divides the thread id by params[0] to get \
+             its row, so a stated {} against a real width of {} puts every \
+             row but the first at the wrong offset",
+            d.params[0], dims.width
+        );
+        seen += 1;
+    }
+    assert!(
+        seen > 0,
+        "no strided activation was planned, so nothing was checked"
+    );
+}
+
+/// The readout covers the rows the fire READS OUT, and not its stream.
+///
+/// A prefill of one request samples one row, so the gather that compacts it
+/// and the head that projects it are one-row rectangles. They were the
+/// fire's whole row window instead, and `Rule::Qmv` reads that window as its
+/// M: on Llama-3.2-1B the head ran as a 2048-row matvec against a 128256
+/// vocabulary and cost 904 ms of a 2184 ms prefill — 41% of the fire —
+/// producing 2047 distributions nothing reads. The answer stayed right,
+/// which is why only a profile found it.
+///
+/// Stated here rather than in `model-compiler` because it takes a real
+/// text: the two statements are metal's own (`dsl::metal::sample_rows` and
+/// `dsl::metal::lm_head`), not the shared epilogue, and it is the pairing of
+/// a `[Requests, ..]` output with a launch rule that reads the rectangle
+/// that does the damage.
+#[test]
+fn the_readout_covers_the_sampled_rows_and_not_the_stream() {
+    const ROWS: usize = 2048;
+    let plan = llama_like_metal(
+        &LlamaLikeFacts::qwen3_0_6b(),
+        &LlamaLikeMetalFacts::synthetic(),
+        FireClass::Prefill,
+    );
+    let mut rows = vec![Row::default(); ROWS];
+    // One request, sampled at its last row — what a prefill step is.
+    rows[ROWS - 1].samples = true;
+    let low = lower(
+        &plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("the metal text lowers");
+
+    let readout: Vec<_> = low
+        .launches
+        .iter()
+        .filter(|l| {
+            let k = low.kernels[l.kernel as usize].as_str();
+            k.starts_with("row_gather") || k.starts_with("affine_qmv_fast")
+        })
+        .collect();
+    assert_eq!(
+        readout.len(),
+        2,
+        "a prefill states exactly the gather and the head; found {:?}",
+        readout
+            .iter()
+            .map(|l| &low.kernels[l.kernel as usize])
+            .collect::<Vec<_>>()
+    );
+    for l in readout {
+        assert_eq!(
+            l.rows,
+            0..1,
+            "`{}` covers {:?} of a {ROWS}-row fire that samples ONE row",
+            low.kernels[l.kernel as usize],
+            l.rows,
+        );
+    }
+
+    // And the body is untouched: every other statement still covers the
+    // stream, so the narrowing above is about the readout's row space and
+    // not a rule that leaked into the layers.
+    let body = low
+        .launches
+        .iter()
+        .filter(|l| {
+            let k = low.kernels[l.kernel as usize].as_str();
+            !k.starts_with("row_gather") && !k.starts_with("affine_qmv_fast")
+        })
+        .count();
+    assert!(body > 0, "a prefill lowers a body");
+    assert!(
+        low.launches
+            .iter()
+            .filter(|l| {
+                let k = low.kernels[l.kernel as usize].as_str();
+                !k.starts_with("row_gather") && !k.starts_with("affine_qmv_fast")
+            })
+            .all(|l| l.rows == (0..ROWS as u32)),
+        "a body statement stopped covering the stream"
+    );
+}
+
+/// The shader tree, as the driver finds it.
+fn kernels_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("a crates directory")
+        .join("kernels-metal/kernels")
+}
+
+/// A Metal entrypoint's buffer parameter NAMES, indexed by `[[buffer(n)]]`.
+///
+/// The row's `operands` column used to carry this list, and a row is a
+/// transcription: it could disagree with the kernel and nothing would notice
+/// until a dispatch bound the wrong plane. The `.metal` is the declaration
+/// the pipeline is actually built from, so a test that wants to say "the
+/// slot called `bias`" should read it here.
+///
+/// Slots the list skips come back empty. `[[buffer(n)]]` is explicit and may
+/// have gaps -- `kv_append_paged` declares 0,1,2,3,5,10,12..15 -- so the
+/// vector is sized by the HIGHEST index, not by the count.
+fn buffer_names(root: &std::path::Path, file: &str, stem: &str) -> Vec<String> {
+    let Ok(src) = std::fs::read_to_string(root.join(file)) else {
+        return Vec::new();
+    };
+    let Some(list) = param_list(&src, stem) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for param in list.split(',') {
+        let Some(mark) = param.find("[[buffer(") else {
+            continue;
+        };
+        let rest = &param[mark + "[[buffer(".len()..];
+        let Some(end) = rest.find(')') else { continue };
+        let Ok(slot) = rest[..end].trim().parse::<usize>() else {
+            continue;
+        };
+        // The identifier immediately before the attribute: `const device
+        // bfloat* bias [[buffer(7)]]` -> `bias`.
+        let name = param[..mark]
+            .split_whitespace()
+            .next_back()
+            .unwrap_or("")
+            .trim_start_matches('*')
+            .trim_start_matches('&')
+            .to_owned();
+        if out.len() <= slot {
+            out.resize(slot + 1, String::new());
+        }
+        out[slot] = name;
+    }
+    out
+}
+
+/// The parameter list of the declaration `stem` names, `[[buffer(` and all.
+///
+/// Three shapes, and the third is most of this tree.
+///
+/// 1. Written out: `template <...> [[kernel]] void stem(...)`.
+/// 2. STAMPED: `gptoss_qmv_kernel(qmv_routed_bias, true, true, 1)`, where the
+///    list lives once inside `#define gptoss_qmv_kernel(name, ...)` with
+///    `name` substituted -- so `void qmv_routed_bias(` appears nowhere.
+/// 3. Stamped and then INSTANTIATED:
+///    `instantiate_gptoss_qmv(mxfp4_qmv_routed_bias, qmv_routed_bias, ...)`,
+///    whose own `#define` declares `void fn<itype, codec>(...)` with the
+///    types alone and no names at all.
+///
+/// So a macro body is accepted only when its list carries `[[buffer(`, and
+/// the invocation's remaining arguments are followed when it does not: (3)
+/// hands off to (2), which is where the names are. Bounded at three hops,
+/// and a chain that does not end returns `None` rather than a guess.
+fn param_list(src: &str, stem: &str) -> Option<String> {
+    fn between(src: &str, at: usize) -> Option<String> {
+        let open = at + src[at..].find('(')?;
+        // Depth-counted, because a parameter list is full of parentheses:
+        // `[[buffer(0)]]` closes one the signature did not open, and stopping
+        // at the first `)` finds a list of one operand for every kernel.
+        let mut depth = 0i32;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(src[open + 1..open + i].to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn named(list: Option<String>) -> Option<String> {
+        list.filter(|l| l.contains("[[buffer("))
+    }
+
+    fn resolve(src: &str, stem: &str, depth: u32) -> Option<String> {
+        if depth > 3 {
+            return None;
+        }
+        if let Some(at) = src.find(&format!("void {stem}("))
+            && let Some(list) = named(between(src, at))
+        {
+            return Some(list);
+        }
+        for line in src.lines() {
+            let head = line.split("//").next().unwrap_or(line).trim();
+            if head.starts_with('#') {
+                continue;
+            }
+            let Some(open) = head.find('(') else { continue };
+            let call = head[..open].trim();
+            if call.is_empty() || !call.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                continue;
+            }
+            let args: Vec<&str> = head[open + 1..]
+                .split(',')
+                .map(|a| a.trim().trim_end_matches(')'))
+                .collect();
+            if args.first() != Some(&stem) {
+                continue;
+            }
+            if let Some(define) = src.find(&format!("#define {call}("))
+                && let Some(off) = src[define..].find("void ")
+                && let Some(list) = named(between(src, define + off))
+            {
+                return Some(list);
+            }
+            for arg in &args[1..] {
+                if let Some(list) = resolve(src, arg, depth + 1) {
+                    return Some(list);
+                }
+            }
+        }
+        None
+    }
+
+    resolve(src, stem, 0)
 }

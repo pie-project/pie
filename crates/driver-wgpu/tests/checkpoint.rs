@@ -47,7 +47,7 @@
 //! measured by [`every_name_the_six_texts_bind_is_one_this_table_can_spell`]
 //! and again on a real checkpoint by [`the_loader_states_the_names_this_driver_binds`]:
 //!
-//! - **228 of the 4664 names** the six texts in `tests/arena.rs` bind are
+//! - **228 of the 4712 names** the six texts in `tests/arena.rs` bind are
 //!   outside this table's shape entirely -- `spellings` answers with an empty
 //!   vector, which the table's own doc calls "drift rather than a spelling
 //!   this table has not learned".
@@ -58,8 +58,8 @@
 //! - Every one of them is a tensor the loader DOES publish. Measured against
 //!   the `openai/gpt-oss-20b` plan: `layers.0.self_attn.q_proj.bias` and
 //!   `layers.0.mlp.experts.down_proj.bias` are both there, and
-//!   `driver-vulkan`'s three extra roles resolve all 144 -- 727 of 727 rather
-//!   than 583 of 727, and 11_177_235_072 bytes rather than 11_163_718_272.
+//!   `driver-vulkan`'s three extra roles resolve all 144 -- 775 of 775 rather
+//!   than 583 of 775, and 11_177_374_848 bytes rather than 11_163_718_272.
 //!
 //! So this is not a checkpoint that lacks something. It is this crate's copy of
 //! the table having been left behind when the texts gained attention biases
@@ -167,7 +167,7 @@
 use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
 use model::shared::llama_like::forward::llama_like_metal;
 use model_compiler::lower::{Arg, Fire, Row, lower};
-use model_compiler::trace::FireClass;
+use model_ir::trace::FireClass;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// The block a sibling shell holds every non-`embed` weight under.
@@ -257,7 +257,7 @@ fn texts() -> Vec<(&'static str, LlamaLikeFacts, LlamaLikeMetalFacts)> {
 ///
 /// A `scale.` marker is left out: it is a constant riding the weight slot
 /// rather than a tensor, so no loader publishes one and no binder looks one
-/// up. None of these six states any -- measured, zero of 4664 -- and the
+/// up. None of these six states any -- measured, zero of 4712 -- and the
 /// filter stays because the marker is `model-compiler`'s to reintroduce and a
 /// driver that bound one would be asking a checkpoint for a scalar.
 fn names_a_text_binds(
@@ -416,16 +416,16 @@ const FIXTURES: &[Fixture] = &[
         embed: &[201_088, 2880],
         layers: 24,
         quantised: true,
-        bound: 727,
+        bound: 775,
         raw_agree: 1,
         // MEASURED WITH THE SIX ROLES THIS CRATE'S TABLE IS MISSING, spelled
         // by hand the way `driver-vulkan`'s table spells them, because the
         // shipped table cannot name 144 of these and a total over the 583 it
         // CAN name would be a number that changes when the defect is fixed.
         // What is pinned is the model's size, which is a fact about the
-        // artifact: 11_177_235_072 bytes, of which the shipped table reaches
+        // artifact: 11_177_374_848 bytes, of which the shipped table reaches
         // 11_163_718_272.
-        total: 11_177_235_072,
+        total: 11_177_374_848,
         embed_bytes: 289_566_720,
         q_proj_bytes: 5_898_240,
         over: 198,
@@ -655,7 +655,7 @@ fn the_names_a_plan_states_are_names_a_checkpoint_holds() {
             &shared[..shared.len().min(8)]
         );
 
-        // MEASURED: zero of 704 on `Qwen/Qwen3-0.6B` and zero of 727 on
+        // MEASURED: zero of 704 on `Qwen/Qwen3-0.6B` and zero of 775 on
         // `openai/gpt-oss-20b`. The plan says `layer.0.down` and both
         // checkpoints say `model.layers.0.mlp.down_proj.weight`; the plan also
         // wants `embed.scales` and `embed.zeros`, which neither release holds
@@ -695,7 +695,7 @@ fn the_names_a_plan_states_are_names_a_checkpoint_holds() {
 ///
 /// # It fails, and that is the finding
 ///
-/// 228 of 4664, over two of the six texts. qwen2.5-1.5B: `{q,k,v}_bias`, three
+/// 228 of 4712, over two of the six texts. qwen2.5-1.5B: `{q,k,v}_bias`, three
 /// a layer over 28. gpt-oss-20B: the same three over 24 layers, plus
 /// `expert_{gate,up,down}.bias`, the additive term a routed expert bank carries
 /// beside its codec's planes. `driver-vulkan`'s copy of this table spells all
@@ -737,8 +737,8 @@ fn every_name_the_six_texts_bind_is_one_this_table_can_spell() {
     // The floor `tests/arena.rs` argues for: a sweep that walked nothing
     // passes exactly as loudly as one that walked everything and agreed.
     assert_eq!(
-        total, 4664,
-        "the six texts bind {total} weights, not 4664 -- a text changed, so read which \
+        total, 4712,
+        "the six texts bind {total} weights, not 4712 -- a text changed, so read which \
          direction this moved before repinning it"
     );
 
@@ -930,7 +930,7 @@ fn compiled_plan_for(dir: &str, fixture: &Fixture) -> model_loader::plan::LoadPl
 /// # It passes for qwen3 and fails for gpt-oss
 ///
 /// 704 of 704 raw disagreements, nothing left over after translation. And 726
-/// of 727 for gpt-oss, of which 144 are names `Naming` cannot decompose at
+/// of 775 for gpt-oss, of which 144 are names `Naming` cannot decompose at
 /// all. See the module doc: six roles, all of them in `driver-vulkan`'s copy of
 /// this table and none in this one.
 #[test]
@@ -964,7 +964,7 @@ fn names_agree(plan: &model_loader::plan::LoadPlan, fixture: &Fixture) {
     // Pinned per fixture rather than asserted zero, because zero was one
     // model's answer: gpt-oss is untied, so its head keeps the name `lm_head`
     // on both sides and `lm_head.scales` agrees by itself. One name out of
-    // 727 is a coincidence with a reason, and it is stated so that a SECOND
+    // 775 is a coincidence with a reason, and it is stated so that a SECOND
     // one has to be explained rather than absorbed.
     let agreeing: Vec<&String> = wanted
         .iter()

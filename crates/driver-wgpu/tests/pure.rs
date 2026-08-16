@@ -118,7 +118,24 @@ const COMPILES_C: &[&str] = &["cc", "cmake", "bindgen", "pkg-config", "autotools
 /// twice over. That is a stronger arrangement than the alternative of dropping
 /// the suffix check, which would silently admit every real `-sys` crate as
 /// well.
-const SYS_IN_NAME_ONLY: &[&str] = &["renderdoc-sys"];
+const SYS_IN_NAME_ONLY: &[&str] = &["renderdoc-sys", "js-sys", "windows-sys"];
+
+/// Crates that declare `links` without owning a native library to link.
+///
+/// `wasm-bindgen-shared` declares `links = "wasm_bindgen"`, which reads like
+/// the strongest signal this file has. It is not one: the key is how
+/// `wasm-bindgen` refuses to let two incompatible versions of itself into one
+/// build — cargo enforces `links` uniqueness, and the crate borrows that for a
+/// version check. There is no library, and its build script has no build
+/// dependencies, so there is nothing for it to compile with.
+///
+/// Re-checked structurally by [`links_is_only_a_version_lock`], the same way
+/// the suffix exceptions are. Both it and `js-sys` are in the closure only
+/// through `wgpu`'s wasm target, and `windows-sys` only through its Windows
+/// one; this crate exists to run in a browser and on every desktop, so
+/// filtering the graph down to the host triple would be answering an easier
+/// question than the one this file asks.
+const LINKS_WITHOUT_A_LIBRARY: &[&str] = &["wasm-bindgen-shared"];
 
 /// Every allow-listed `-sys` crate is in the closure and owns nothing.
 ///
@@ -164,6 +181,47 @@ fn sys_is_only_a_name() {
     }
 }
 
+/// A `links` exception owns no library and cannot compile one.
+///
+/// The mirror of [`sys_is_only_a_name`] for [`LINKS_WITHOUT_A_LIBRARY`]. The
+/// claim being allowed is narrow — *"this `links` key is a version lock"* — so
+/// what is re-checked is the part that would make it false: a build script
+/// with something to build WITH. `cc` or `bindgen` appearing among its build
+/// dependencies is the whole of the risk, and it is the same signal
+/// `nothing_this_crate_needs_to_build_compiles_c` uses everywhere else.
+#[test]
+fn links_is_only_a_version_lock() {
+    let meta = metadata().expect("cargo resolved the workspace");
+    let packages = packages(&meta);
+    let closure = closure(&meta, &packages);
+
+    for want in LINKS_WITHOUT_A_LIBRARY {
+        let found = closure
+            .iter()
+            .filter_map(|id| packages.get(id))
+            .find(|p| p.name == *want);
+        let Some(p) = found else {
+            panic!(
+                "`{want}` is allow-listed and is no longer in `{ROOT}`'s \
+                 closure, so the exception outlived its reason and should be \
+                 deleted"
+            );
+        };
+        assert!(
+            p.links.is_some(),
+            "`{want}` no longer declares `links`, so it does not need this \
+             exception and the entry is dead weight"
+        );
+        for driver in &p.build_deps {
+            assert!(
+                !COMPILES_C.contains(driver),
+                "`{want}` builds with `{driver}`, so its `links` key is no \
+                 longer just a version lock and the exception does not hold"
+            );
+        }
+    }
+}
+
 /// Every crate `driver-wgpu` needs to build, and none of them compiles C.
 ///
 /// Dev-dependencies are excluded on purpose. They are what this suite needs to
@@ -190,7 +248,9 @@ fn nothing_this_crate_needs_to_build_compiles_c() {
             continue;
         }
         if let Some(links) = p.links {
-            suspect.push(format!("`{}` owns the native library `{links}`", p.name));
+            if !LINKS_WITHOUT_A_LIBRARY.contains(&p.name) {
+                suspect.push(format!("`{}` owns the native library `{links}`", p.name));
+            }
         }
         // NOT "has a build script". Several crates in this closure have one and
         // none of them compiles anything -- `serde` and `proc-macro2` and
@@ -229,15 +289,23 @@ fn nothing_this_crate_needs_to_build_compiles_c() {
     // none of it would build here at all. The list is here so that a fifth
     // appearing is a decision somebody makes rather than one that happens.
     let want: BTreeSet<&str> = [
-        // nvcc, behind `native`, which nothing here turns on. Reached through
-        // `model-compiler`, which names every backend's table.
+        // Here for its build script, which writes the carried-header list into
+        // `OUT_DIR` and prints nothing but `rerun-if-changed`. Reached through
+        // `model-ir`, which names every backend's table.
         //
-        // `kernels-cuda-NEW` and not `kernels-cuda`: the two exist side by side
-        // in `crates/` while the CUDA table is being replaced, and it is the
-        // new one `model-compiler` resolves to. This list caught the rename
-        // rather than being told about it, which is the whole reason it is
-        // pinned as a set instead of asserted to be small.
-        "kernels-cuda-new",
+        // This entry carried a `-new` suffix while two CUDA kernel crates
+        // stood side by side in `crates/`: the ahead-of-time archive held the
+        // plain name and the JIT replacement wore the suffix, and it was the
+        // suffixed one `model-ir` resolved to. The archive was deleted at
+        // `85c6c674b` and the suffix came off after it. This list caught both
+        // moves rather than being told about them, which is the whole reason
+        // it is pinned as a set instead of asserted to be small.
+        //
+        // AND IT IS GONE, at `bac4fa327`: a launch now names its file and its
+        // symbol, so `model-ir` no longer reaches every backend's table to
+        // find them and `kernels-cuda` is not in this closure at all. Third
+        // move this entry has recorded, and the first that was an improvement
+        // — one fewer crate whose build script a wgpu build waits on.
         // The Metal shader build, behind `native`, and macOS-only besides.
         // Same edge.
         "kernels-metal",
@@ -247,10 +315,13 @@ fn nothing_this_crate_needs_to_build_compiles_c() {
         // `driver-vulkan` has one: there is no `DEP_..._SPV_DIR` to relay,
         // because the shaders are in the rlib.
         "kernels-wgpu",
-        // Content-hashes its own `.rs` files to fingerprint the tracer. No
-        // compiler and no library -- it declares no `links` and appears here
-        // only because it has a script at all.
-        "model-compiler",
+        // `model-compiler` STOOD HERE, described as *"content-hashes its own
+        // `.rs` files to fingerprint the tracer"*. That script is `model-dsl`'s
+        // now, and `model-dsl` is the AUTHORING surface -- a driver lowers a
+        // traced form and never writes one, so it is not in this closure at
+        // all. The entry left because the toolchain split, not because a
+        // script was deleted, and the list noticing is the point of it.
+        //
         // NOT `kernels-vulkan`, which `driver-vulkan`'s version of this list
         // has and this one does not: nothing in this closure names it. That is
         // worth an assertion rather than an omission, because the crate that

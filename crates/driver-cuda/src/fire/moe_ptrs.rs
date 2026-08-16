@@ -47,7 +47,7 @@
 //! Stating them properly therefore means stating an operand only ONE of two
 //! lowerings reads, which is the thing this migration is retiring. So the
 //! arrays stay the driver's, and the symbol takes the shape
-//! `moe::flashinfer_cutlass_moe_bf16` and `pie_lora_qkv_correction` already
+//! `moe::flashinfer_cutlass_moe_bf16` and `gemm::lora_qkv_correction` already
 //! have: `contract!` yes, `Entry` no, body here.
 //!
 //! # What the arena is, and why not the sideband one
@@ -151,17 +151,27 @@ impl Arrays {
     }
 
     /// The `(activations, weights, output)` triple for a half, in the order
-    /// [`kernels_cuda_new::x::gemm::dense::batched_act_x_wt_bf16`] takes them.
+    /// [`kernels_cuda::gemm::dense::batched_act_x_wt_bf16`] takes them.
     #[must_use]
     pub fn triple(
         &self,
         half: Half,
-    ) -> (*const *const c_void, *const *const c_void, *const *mut c_void) {
+    ) -> (
+        *const *const c_void,
+        *const *const c_void,
+        *const *mut c_void,
+    ) {
         match half {
-            Half::GateUp => {
-                (self.a_gu.cast_const(), self.b_gu.cast_const(), self.c_gu.cast_const())
-            }
-            Half::Down => (self.a_dn.cast_const(), self.b_dn.cast_const(), self.c_dn.cast_const()),
+            Half::GateUp => (
+                self.a_gu.cast_const(),
+                self.b_gu.cast_const(),
+                self.c_gu.cast_const(),
+            ),
+            Half::Down => (
+                self.a_dn.cast_const(),
+                self.b_dn.cast_const(),
+                self.c_dn.cast_const(),
+            ),
         }
     }
 }
@@ -243,7 +253,7 @@ pub struct Bounds {
 pub enum Decline {
     /// The host program declined — today only `max_blocks <= 0`
     /// (`moe_dispatch.cu:245`), an empty padded batch.
-    Refused(kernels_cuda_new::x::Refusal),
+    Refused(kernels_cuda::Refusal),
     /// The bump arena could not grow to hold six arrays of this many
     /// pointers.
     NoArena {
@@ -399,7 +409,7 @@ impl MoePtrArena {
 /// dispatch's later statements, so `DispatchCtx::moe_ptrs` holds this
 /// `Arrays` for the fire and [`crate::fire::moe_grouped`] hands it to the
 /// batched fallback when
-/// [`x::moe::supported`](kernels_cuda_new::x::moe::supported) refuses the
+/// [`x::moe::supported`](kernels_cuda::moe::supported) refuses the
 /// WMMA form. On qwen3.5 that is not hypothetical: gate/up has `K = 2048`
 /// against a `SHORT_K` of 512, so the fallback is the only GEMM on that half.
 ///
@@ -421,7 +431,7 @@ pub unsafe fn build<M: DeviceMemory>(
     bounds: Bounds,
     stream: *mut c_void,
 ) -> Built {
-    use kernels_cuda_new::x::abi::bf16;
+    use kernels_cuda::jit::abi::bf16;
 
     // The shape test is the HOST PROGRAM'S and is made there, not here. What
     // is made here is the one refusal the host program cannot see, because
@@ -433,8 +443,8 @@ pub unsafe fn build<M: DeviceMemory>(
         });
     };
     // SAFETY: the caller's obligation, above.
-    let ctx = unsafe { kernels_cuda_new::jit::Ctx::on(stream) };
-    let fired = kernels_cuda_new::x::moe::build_moe_ptrs_aligned_bf16(
+    let ctx = unsafe { kernels_cuda::jit::Ctx::on(stream) };
+    let fired = kernels_cuda::moe::build_moe_ptrs_aligned_bf16(
         &ctx,
         expert_ids.cast::<i32>(),
         banks.gate_up.cast::<bf16>(),
@@ -566,6 +576,10 @@ pub unsafe fn build_for_fire(
     ARENA.with(|arena| {
         let mut arena = arena.borrow_mut();
         // SAFETY: the caller's obligation, forwarded unchanged.
-        unsafe { build(&mut arena, &mut mem, expert_ids, aligned_in, banks, stage, bounds, stream) }
+        unsafe {
+            build(
+                &mut arena, &mut mem, expert_ids, aligned_in, banks, stage, bounds, stream,
+            )
+        }
     })
 }

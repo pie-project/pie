@@ -405,8 +405,8 @@ pub fn metal_shape(
     mixture: Option<Gemma4Mixture>,
 ) -> crate::shared::llama_like::spec::LlamaLikeFacts {
     use crate::shared::llama_like::spec::LlamaLikeFacts;
-    use model_compiler::facts::{NormPlacement as SpecNorm, QkNorm};
-    use model_compiler::trace::{NormVariant, RopeKind};
+    use model_ir::facts::{NormPlacement as SpecNorm, QkNorm};
+    use model_ir::trace::{NormVariant, RopeKind};
 
     LlamaLikeFacts {
         hidden: f.hidden,
@@ -497,7 +497,7 @@ pub fn metal_facts(
         k_eq_v,
     } = row;
     use crate::shared::llama_like::forward::facts::{Activation, LlamaLikeMetalFacts};
-    use model_compiler::dsl::{ScaleLayout, WeightRepr};
+    use model_dsl::{ScaleLayout, WeightRepr};
 
     LlamaLikeMetalFacts {
         // TRUE and unread: the row this projection serves is gemma-4's DENSE
@@ -524,7 +524,7 @@ pub fn metal_facts(
         // getting it wrong is the QUIET failure: a bank read at the wrong
         // format is 909,207 NaNs, and a gate read at the wrong width is a
         // fluent model routing every token to almost the right experts.
-        router_repr: (bind.router_quant_group != 0).then(|| WeightRepr::Scaled {
+        router_repr: (bind.router_quant_group != 0).then_some(WeightRepr::Scaled {
             layout: ScaleLayout::PerGroup,
             group: bind.router_quant_group,
             axis: 0,
@@ -622,8 +622,8 @@ pub fn metal_facts(
 pub fn trace(
     f: &Gemma4Facts,
     sliding_window: i32,
-    class: model_compiler::trace::FireClass,
-) -> model_compiler::trace::ForwardPlan {
+    class: model_ir::trace::FireClass,
+) -> model_ir::trace::ForwardPlan {
     let cuda = super::forward::facts::Gemma4CudaFacts {
         fused_qkv: true,
         gate_up_fused: true,
@@ -1292,6 +1292,118 @@ mod tests {
             deployment(&f, row(true), Deployed::single()),
             deployment(&f, row(false), Deployed::single()),
             "a projection that is not V's does not change what a rank reserves"
+        );
+    }
+
+    /// The shared gemma fixture must be off the default wherever EVERY
+    /// gemma row is.
+    ///
+    /// `LlamaLikeMetalFacts::gemma_like()` is what the gemma4 Metal
+    /// texts fire, and its own doc says it is not a measurement -- the
+    /// widths are plausible rather than any published config's. So
+    /// equality with a projection is the wrong relation, and there is no
+    /// single row to compare it against anyway.
+    ///
+    /// The right relation is weaker and still total: a field that every
+    /// shipped gemma-4 moves off `synthetic()`, this fixture must move
+    /// too. Because a field left at the default is not a smaller value
+    /// of that field, it is the OTHER BRANCH -- `embed_scale: 0.0`
+    /// selects `embed_gather` over `embed_gather_scaled`,
+    /// `global_head_dim: 0` says one attention shape for the whole
+    /// stack, `full_partial_rotary: 0.0` says rotate every channel.
+    ///
+    /// Every-row and not any-row, because the three rows disagree with
+    /// each other and a fixture is allowed to pick a side: `e4b` carries
+    /// the per-layer embeddings and so states `per_layer_scalar: false`
+    /// where the two without a PLE state `true`, and only the A4B norms
+    /// its V. Those are the fields no fixture in this crate exercises,
+    /// and the honest reason is that one fixture cannot be three rows.
+    ///
+    /// Read through `serde` rather than by naming fields, because the
+    /// defects this fixture family has had were all in fields no
+    /// enumeration contained -- `embed_scale` here, `attn_scale` and
+    /// `rope_freq_table` in gpt-oss's. A field added to the struct
+    /// tomorrow is covered the day it is added.
+    #[test]
+    fn the_shared_gemma_fixture_moves_wherever_every_gemma_row_moves() {
+        use crate::shared::llama_like::forward::facts::LlamaLikeMetalFacts;
+        // gemma-4's OWN binding, the one `catalog_backends` publishes --
+        // five of these fields are a deployment's observation rather
+        // than the row's claim, so reading them off anything else would
+        // compare the fixture against a gemma nobody ships.
+        let bind = crate::catalog::MetalBinding {
+            quant_group: 64,
+            quant_bits: 4,
+            router_quant_group: 0,
+            router_quant_bits: 0,
+            moe_mxfp4: false,
+            fuse_residual_gemv: true,
+            paged_multi_batch: true,
+            qmm_multi_batch: true,
+            add_bias: false,
+        };
+        let row = RowScalars {
+            mixture: None,
+            sliding_window: E4B_WINDOW,
+            norm_eps: NORM_EPS,
+            k_eq_v: false,
+        };
+        let fields = |m: &LlamaLikeMetalFacts| match serde_json::to_value(m) {
+            Ok(serde_json::Value::Object(o)) => o,
+            other => panic!("these facts serialise as a struct, not {other:?}"),
+        };
+        let plain = fields(&LlamaLikeMetalFacts::synthetic());
+        let fixture = fields(&LlamaLikeMetalFacts::gemma_like());
+
+        // Two fields the projection moves that nothing then READS,
+        // because each is ANDed with a shape fact this deployment
+        // states as false. Written as a table whose reason is checked
+        // rather than asserted away: if either operand ever becomes
+        // true the entry stops being an excuse and this test says so.
+        let pair = crate::shared::llama_like::spec::LlamaLikeFacts::qwen3_0_6b();
+        let unread = [
+            ("add_bias", pair.qkv_bias || pair.router_bias),
+            ("moe_bits", bind.moe_mxfp4),
+        ];
+        for (name, operand) in unread {
+            assert!(
+                !operand,
+                "`{name}` is excused here only because the text never \
+                 reaches it; it does now, so the fixture owes a value"
+            );
+        }
+
+        let mut owed: Vec<String> = Vec::new();
+        for name in plain.keys() {
+            if unread.iter().any(|(n, _)| n == name) || fixture[name] != plain[name] {
+                continue;
+            }
+            let every = [
+                Gemma4Facts::gemma_4_e4b(),
+                Gemma4Facts::gemma_4_31b(),
+                Gemma4Facts::gemma_4_26b_a4b(),
+            ]
+            .into_iter()
+            .map(|f| fields(&super::metal_facts(&f, row, &bind))[name].clone())
+            .collect::<Vec<_>>();
+            if every.iter().all(|v| v != &plain[name]) {
+                owed.push(format!(
+                    "{name}: every gemma moves it ({}), the fixture stays \
+                     at {}",
+                    every
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                    plain[name],
+                ));
+            }
+        }
+        assert!(
+            owed.is_empty(),
+            "a field left at the default is the OTHER branch, under a \
+             gemma name:\n  {}",
+            owed.join("\n  "),
         );
     }
 

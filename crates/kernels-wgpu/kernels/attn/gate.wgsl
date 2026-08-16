@@ -16,7 +16,7 @@
 
 //#if defined(PIE_Q_GATE_SPLIT)
 
-@group(0) @binding(0) var<storage, read> qg: array<u32>;
+@group(0) @binding(0) var<storage, read_write> qg: array<u32>;
 @group(0) @binding(1) var<storage, read_write> q_out: array<u32>;
 @group(0) @binding(2) var<storage, read_write> gate_out: array<u32>;
 
@@ -75,7 +75,7 @@ fn main(
 //#else
 
 @group(0) @binding(0) var<storage, read_write> attn: array<u32>;
-@group(0) @binding(1) var<storage, read> gate: array<u32>;
+@group(0) @binding(1) var<storage, read_write> gate: array<u32>;
 
 struct Params { row_stride: i32 }
 @group(1) @binding(0) var<uniform> params: Params;

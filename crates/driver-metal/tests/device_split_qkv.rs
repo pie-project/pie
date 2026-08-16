@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use driver_metal::bind::encode::{Params, Pipelines, encode};
 use driver_metal::device::{Allocation, ArgumentTable, Context, Stepper};
 use driver_metal::layout::region::Region as _;
-use driver_metal::lowering::dispatch::Dispatch;
+use driver_metal::lowering::dispatch::{Dispatch, Touches};
 use driver_metal::program::Compiler;
 
 fn kernels_dir() -> PathBuf {
@@ -62,6 +62,8 @@ fn the_split_puts_every_channel_where_its_width_says() {
         file: "attn/split_qkv.metal",
         grid: [PACKED, ROWS, 1],
         threadgroup: [256, 1, 1],
+        // One dispatch, so nothing to order against.
+        touches: Touches::default(),
         args: vec![
             bound(packed.gpu_address()),
             bound(q.gpu_address()),

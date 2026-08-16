@@ -40,13 +40,13 @@ struct GatedRmsParams {
     vd: u32,
 }
 
-@group(0) @binding(0) var<storage, read> x: array<u32>;
-@group(0) @binding(1) var<storage, read> z: array<u32>;
-@group(0) @binding(2) var<storage, read> w: array<u32>;
+@group(0) @binding(0) var<storage, read_write> x: array<u32>;
+@group(0) @binding(1) var<storage, read_write> z: array<u32>;
+@group(0) @binding(2) var<storage, read_write> w: array<u32>;
 // Atomic for the odd-`vd` edge alone -- `store_half` says why -- and the host
 // binds the same read_write storage buffer of 4-byte words either way.
 @group(0) @binding(3) var<storage, read_write> out_: array<atomic<u32>>;
-@group(0) @binding(4) var<storage, read> params: GatedRmsParams;
+@group(0) @binding(4) var<storage, read_write> params: GatedRmsParams;
 
 //#if defined(PIE_STRIDED)
 struct Strided { row_pitch: i32 }

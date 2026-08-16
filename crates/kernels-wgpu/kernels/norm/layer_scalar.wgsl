@@ -27,10 +27,10 @@ struct LayerScalarParams {
     hidden: u32,
 }
 
-@group(0) @binding(0) var<storage, read> x: array<u32>;
-@group(0) @binding(1) var<storage, read> scalar: array<u32>;
+@group(0) @binding(0) var<storage, read_write> x: array<u32>;
+@group(0) @binding(1) var<storage, read_write> scalar: array<u32>;
 @group(0) @binding(2) var<storage, read_write> out_: array<u32>;
-@group(0) @binding(3) var<storage, read> params: LayerScalarParams;
+@group(0) @binding(3) var<storage, read_write> params: LayerScalarParams;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {

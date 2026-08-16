@@ -13,10 +13,10 @@ use anyhow::{Context, Result};
 use driver_api::{
     ExecutorRequest, ExecutorResponse, ExecutorRpc, ExecutorRpcRequest, ExecutorRpcResponse,
     HelloRequest, HelloResponse, InlineKvPayload, MemoryDomain, ModelIdentity,
-    PIE_TERMINAL_OUTCOME_FAILED, PIE_TERMINAL_OUTCOME_SUCCESS, TerminalCell, PushKv,
-    REMOTE_WIRE_VERSION, RemoteBindInstance, RemoteBindResponse, RemoteChannelBinding,
-    RemoteEncode, RemoteError, RemoteErrorKind, RemoteLaunch, RemoteMediaBlob, RemoteMediaKind,
-    RemotePeerConn, RemoteRegisterChannel, RemoteTerminal, RemoteTransferKind, ScratchGrant,
+    PIE_TERMINAL_OUTCOME_FAILED, PIE_TERMINAL_OUTCOME_SUCCESS, PushKv, REMOTE_WIRE_VERSION,
+    RemoteBindInstance, RemoteBindResponse, RemoteChannelBinding, RemoteEncode, RemoteError,
+    RemoteErrorKind, RemoteLaunch, RemoteMediaBlob, RemoteMediaKind, RemotePeerConn,
+    RemoteRegisterChannel, RemoteTerminal, RemoteTransferKind, ScratchGrant, TerminalCell,
     TerminalCellState,
 };
 use futures::StreamExt;
@@ -166,10 +166,12 @@ fn zero_grant(handle: &driver_api::KvHandle, grant: ScratchGrant) -> Result<()> 
     Ok(())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn connect(addr: &str) -> Result<driver_api::ExecutorRpcClient> {
-    Ok(connect_with_local_ip(addr).await?.0)
-}
+// `connect(addr)` -- the local-IP-discarding wrapper over the function below
+// -- was `#[cfg_attr(not(test), allow(dead_code))]`, which says "the tests
+// use it". The allow held it up in every build but the one that would have
+// reported it, and `--all-targets` did. Deleted; the wrapper is
+// `connect_with_local_ip(addr).await?.0`, which is what
+// `embedded_driver`'s test now spells at its one call site.
 
 pub(crate) async fn connect_with_local_ip(
     addr: &str,
@@ -449,7 +451,15 @@ pub(crate) struct ExecutorServer {
 }
 
 impl ExecutorServer {
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The one caller is `embedded_driver`'s
+    /// `gemma4_encode_component_loads_and_encodes`, which is
+    /// `#[cfg(feature = "driver-cuda")]` inside a `#[cfg(test)]` module -- so
+    /// the gate that builds this crate with no driver feature sees a
+    /// `#[cfg_attr(not(test), allow(dead_code))]` function nothing calls, and
+    /// `-D warnings` refuses it. Gated to match its caller instead of allowed
+    /// past: an allow that hides a real absence is how the accessor two
+    /// modules over survived with no observer.
+    #[cfg(all(test, feature = "driver-cuda"))]
     pub(crate) async fn bind(
         addr: &str,
         drivers: ModelDrivers,

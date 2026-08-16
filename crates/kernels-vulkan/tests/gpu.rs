@@ -11,12 +11,27 @@
 //! cargo test -p kernels-vulkan --features native --test gpu -- --nocapture
 //! ```
 //!
-//! `native` is required because a test cannot dispatch GLSL -- it needs the
+//! `native` is required because a test cannot dispatch Slang -- it needs the
 //! SPIR-V that only a `native` build produces. Without it, or without a Vulkan
 //! device, every test here SKIPS rather than fails. That is deliberate: this
-//! suite has to stay green on the machines that build `model-compiler`, which
-//! have no GPU and no `glslc`, while still being the thing that proves the
+//! suite has to stay green on the machines that build `model-ir`, which
+//! have no GPU and no `slangc`, while still being the thing that proves the
 //! shaders on a machine that has one. A skip prints why.
+//!
+//! ## Why CI does not hand this suite a software device
+//!
+//! The obvious way to make these run on a runner is Mesa's `lavapipe`, a CPU
+//! Vulkan implementation -- it is exactly what the `kernels-wgpu` suite uses
+//! to be genuinely runnable in CI. It does not work here, and the failure is
+//! worth writing down so nobody spends the afternoon rediscovering it: Mesa
+//! 26.0's `lavapipe` presents a device, reports the tier as loadable, and
+//! then SIGSEGVs inside the ICD partway through
+//! `affine_qmm_t_is_right_at_every_tile_shape_and_quantization_point`.
+//! Reproducibly, in isolation, on a shader that is correct on real hardware.
+//!
+//! So the CI job installs `slangc` and no driver, every test here skips, and
+//! what CI proves is that all 666 modules COMPILE. Running them is the
+//! hardware gates' job.
 //!
 //! # What a failure here means
 //!
@@ -42,7 +57,7 @@ const SPV_DIR: Option<&str> = option_env!("PIE_KERNELS_VULKAN_SPV_DIR");
 // bf16, on the host
 // ---------------------------------------------------------------------------
 
-/// The same narrowing `common/bf16.glsl` does, in Rust.
+/// The same narrowing `common/bf16.slang` does, in Rust.
 ///
 /// Round to nearest even, with the NaN case broken out -- a truncating
 /// `(bits >> 16) as u16` would agree on most inputs and disagree on exactly the
@@ -114,7 +129,7 @@ fn assert_close(got: &[f32], want: &[f32], what: &str) {
     }
 }
 
-/// A component type, spelled the way GLSL spells it.
+/// A component type, spelled the way the shader spells it.
 fn component(t: vk::ComponentTypeKHR) -> String {
     match t {
         vk::ComponentTypeKHR::FLOAT16 => "float16_t".into(),
@@ -150,6 +165,14 @@ struct Gpu {
     /// `maxPushConstantsSize`. Used as the range for a module whose row
     /// states no scalars, since any block it declares fits inside it.
     max_push: u32,
+    /// Whether `VK_KHR_cooperative_matrix` is present AT ALL, which is a
+    /// different question from whether the tier was admitted -- and the gap
+    /// between the two is exactly what
+    /// `the_coopmat_tier_is_offered_only_for_a_matrix_the_device_advertises`
+    /// exists to check. Kept because querying the configuration list through
+    /// a loader wrapper for an extension the device does not have is a null
+    /// function pointer, not an empty answer.
+    has_coopmat_ext: bool,
     /// Which tiers this device can actually load. The claim
     /// `Capability::requires` makes, checked against real hardware.
     tiers: Vec<Capability>,
@@ -208,6 +231,13 @@ fn unavailable() -> Option<&'static str> {
 /// half a value, which is the mistake this exists to catch. An UNSTATED row has
 /// no layout to check against, and the two dispatches that use one say so.
 fn check_push_against_the_row(entrypoint: &str, push: &[u8]) {
+    // A RETIRED entrypoint has no row and cannot be checked against one. Its
+    // block is stated by its routine's signature instead, and
+    // `tests/routines.rs` is what holds a body to it -- so this is a check
+    // that leaves with the table rather than one that has been weakened.
+    if kernels_vulkan::retired().contains(&entrypoint) {
+        return;
+    }
     let Some(row) = kernels::sig_in(kernels_vulkan::KERNELS, entrypoint) else {
         panic!("`{entrypoint}` is not an entrypoint of any row");
     };
@@ -227,8 +257,9 @@ fn check_push_against_the_row(entrypoint: &str, push: &[u8]) {
     assert!(
         boundaries.contains(&push.len()) || push.len() == size,
         "`{entrypoint}` was pushed {} bytes, which is inside a field rather \
-         than after one -- the row's fields end at {boundaries:?}. Ask \
-         `cargo run -p kernels-vulkan --example dump_layout -- {entrypoint}`",
+         than after one -- the row's fields end at {boundaries:?}. The row's \
+         own layout is what `kernels_vulkan::push_layout` returns; read it \
+         against the row's operand order",
         push.len()
     );
 }
@@ -251,7 +282,7 @@ fn spv_words(path: &std::path::Path) -> Vec<u32> {
 ///
 /// The highest `binding = N` the module decorates, plus one -- not the COUNT of
 /// them, because the set is often not contiguous. 79 of the 292 unstated
-/// modules have holes, and the holes are benign: they are `glslc` eliminating
+/// modules have holes, and the holes are benign: they are `slangc` eliminating
 /// a buffer the variant does not read. `affine_qmm_t_fp16_precast` declares
 /// 0, 1, 2, 4, 7 because under that macro `load_x` reads `half_in` at 7 and
 /// never touches `x` at 3, so the declaration is dropped from the SPIR-V. The
@@ -389,26 +420,67 @@ impl Gpu {
             None
         };
 
-        let physical = unsafe { instance.enumerate_physical_devices() }
+        // NOT `.first()`. Nothing in the Vulkan specification orders
+        // `vkEnumeratePhysicalDevices`, and this box offers two devices: an
+        // RTX 4090 and a `llvmpipe` software rasteriser, from an
+        // `lvp_icd.json` that sorts BEFORE `nvidia_icd.json` in the loader's
+        // manifest directory. Every number this file has ever proved was
+        // proved on the card by the loader's grace. `driver-vulkan`'s
+        // `Device::finish` had the same line and the same reasoning is
+        // written out at length there.
+        //
+        // `PIE_VULKAN_DEVICE` names one by a case-insensitive substring and
+        // refuses if it matches nothing that can compute -- which is how
+        // these proofs get run against llvmpipe on purpose, a second SPIR-V
+        // compiler and a second scheduler for the same modules.
+        let devices = unsafe { instance.enumerate_physical_devices() }
             .map_err(|e| format!("cannot enumerate devices: {e}"))?;
-        let physical = *physical
-            .first()
-            .ok_or_else(|| "the loader found no physical device".to_string())?;
-
-        let props = unsafe { instance.get_physical_device_properties(physical) };
-        let name = props
-            .device_name_as_c_str()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "<unnamed>".into());
-
-        let family = unsafe { instance.get_physical_device_queue_family_properties(physical) }
+        let seen: Vec<(vk::PhysicalDevice, String, u8, Option<u32>)> = devices
             .iter()
-            .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
-            .ok_or_else(|| format!("{name} has no compute queue"))? as u32;
+            .map(|&d| {
+                let props = unsafe { instance.get_physical_device_properties(d) };
+                let name = props
+                    .device_name_as_c_str()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "<unnamed>".into());
+                let rank = match props.device_type {
+                    vk::PhysicalDeviceType::DISCRETE_GPU => 0,
+                    vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
+                    vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
+                    vk::PhysicalDeviceType::CPU => 4,
+                    _ => 3,
+                };
+                let family = unsafe { instance.get_physical_device_queue_family_properties(d) }
+                    .iter()
+                    .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
+                    .map(|i| i as u32);
+                (d, name, rank, family)
+            })
+            .collect();
+        let pin = std::env::var("PIE_VULKAN_DEVICE").ok();
+        let pin = pin.as_deref().map(str::trim).filter(|p| !p.is_empty());
+        let usable = || seen.iter().filter(|(_, _, _, f)| f.is_some());
+        let chosen = match pin {
+            Some(want) => {
+                let want = want.to_ascii_lowercase();
+                usable().find(|(_, n, _, _)| n.to_ascii_lowercase().contains(&want))
+            }
+            None => usable().min_by_key(|(_, _, r, _)| *r),
+        };
+        let Some((physical, name, _, family)) = chosen else {
+            let roster: Vec<&str> = seen.iter().map(|(_, n, _, _)| n.as_str()).collect();
+            return Err(match pin {
+                Some(want) => format!("no device here matches {want:?}. Saw {roster:?}"),
+                None => format!("no device here can compute. Saw {roster:?}"),
+            });
+        };
+        let (physical, name) = (*physical, name.clone());
+        let family = family.expect("only devices with a compute family are chosen");
+        let props = unsafe { instance.get_physical_device_properties(physical) };
 
         // Ask the device what it has, then hand the SAME structs back when
         // creating it. Enabling exactly what was reported is the shortest way
-        // to be sure a shader's `#extension` has its feature behind it -- and
+        // to be sure a shader's declared capability has its feature behind it -- and
         // the tier machinery is precisely about features that may be absent, so
         // hard-coding a list here would test the list and not the device.
         let extensions = unsafe { instance.enumerate_device_extension_properties(physical) }
@@ -451,11 +523,35 @@ impl Gpu {
         // `GL_KHR_memory_scope_semantics` and so every module in the tier
         // declares `OpCapability VulkanMemoryModel` -- which may not be
         // declared unless the feature is enabled.
+        // And the CONFIGURATION. `coopmat_configs()` below already says why
+        // -- the list is the contract, and a matrix off it is undefined
+        // behaviour -- but until this line nothing ASKED. Mesa's `lavapipe`
+        // advertises the extension, the feature, `float16` and the memory
+        // model, and publishes four configurations, all 8x8x8, against the
+        // 16x16x16 every `@coopmat` module here declares. It was admitted to
+        // the tier and `vkCreateComputePipelines` segfaulted, with the
+        // validation layer silent, because undefined is not invalid.
         if has_coopmat
             && fcm.cooperative_matrix == vk::TRUE
             && f12.shader_float16 == vk::TRUE
             && f12.vulkan_memory_model == vk::TRUE
             && f12.vulkan_memory_model_device_scope == vk::TRUE
+            && {
+                let ext = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
+                let props =
+                    unsafe { ext.get_physical_device_cooperative_matrix_properties(physical) }
+                        .unwrap_or_default();
+                props.iter().any(|c| {
+                    c.m_size == 16
+                        && c.n_size == 16
+                        && c.k_size == 16
+                        && c.a_type == vk::ComponentTypeKHR::FLOAT16
+                        && c.b_type == vk::ComponentTypeKHR::FLOAT16
+                        && c.c_type == vk::ComponentTypeKHR::FLOAT32
+                        && c.result_type == vk::ComponentTypeKHR::FLOAT32
+                        && c.scope == vk::ScopeKHR::SUBGROUP
+                })
+            }
         {
             tiers.push(Capability::Coopmat);
         }
@@ -467,7 +563,7 @@ impl Gpu {
         // the baseline at all.
         //
         //   - 16-bit storage + shaderInt16: bf16 is stored as `uint16_t`
-        //     throughout, per `common/bf16.glsl`.
+        //     throughout, per `common/bf16.slang`.
         //   - shaderFloat16: the `@fp16` tier's genuine `float16_t` math.
         //   - cooperativeMatrix: the `@coopmat` tier.
         //   - vulkanMemoryModel: also the `@coopmat` tier, and it was missing
@@ -478,7 +574,7 @@ impl Gpu {
         //     built the pipeline regardless, which is precisely why the gap
         //     survived until something checked.
         //   - vulkanMemoryModelDeviceScope: enabling the memory model above
-        //     re-reads every OTHER module too, and `moe/route.comp` -- which is
+        //     re-reads every OTHER module too, and `moe/route.slang` -- which is
         //     baseline, and nothing to do with matrices -- histograms tokens
         //     with a device-scoped `atomicAdd`. Turning the tier on without
         //     this name breaks that kernel.
@@ -491,6 +587,19 @@ impl Gpu {
             .shader_float16(f12.shader_float16 == vk::TRUE)
             .shader_int8(f12.shader_int8 == vk::TRUE)
             .storage_buffer8_bit_access(f12.storage_buffer8_bit_access == vk::TRUE)
+            // And the uniform half, which `slangc` makes necessary: the
+            // shaders put `uint8_t` in storage buffers only, but Slang
+            // declares that access as `UniformAndStorageBuffer8BitAccess`
+            // where `glslc` declared the narrow `StorageBuffer8BitAccess`,
+            // and a module may not declare a capability whose feature is off.
+            //
+            // This block is a deliberate SECOND copy of `driver_vulkan`'s
+            // device setup -- this crate does not depend on that one -- which
+            // is exactly why the omission survived being fixed there: the
+            // validation layer reported it here on the next run.
+            .uniform_and_storage_buffer8_bit_access(
+                f12.uniform_and_storage_buffer8_bit_access == vk::TRUE,
+            )
             .vulkan_memory_model(f12.vulkan_memory_model == vk::TRUE)
             .vulkan_memory_model_device_scope(f12.vulkan_memory_model_device_scope == vk::TRUE);
         let mut ecm = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default()
@@ -499,7 +608,7 @@ impl Gpu {
             .features(
                 vk::PhysicalDeviceFeatures::default()
                     .shader_int16(core.shader_int16 == vk::TRUE)
-                    // `quant/qmm_t.comp` accumulates over the whole BM x BN
+                    // `quant/qmm_t.slang` accumulates over the whole BM x BN
                     // tile and guards only the STORE, so at a ragged shape it
                     // deliberately fetches weights and activations outside the
                     // matrix and expects them to read as zero. Without
@@ -553,6 +662,7 @@ impl Gpu {
             name,
             max_push: props.limits.max_push_constants_size,
             tiers,
+            has_coopmat_ext: has_coopmat,
         })
     }
 
@@ -1061,7 +1171,7 @@ fn row_gather_reads_its_count_from_the_packed_struct() {
 /// buffer because the row says `Buf`, while `row_pitch` -- absent in this
 /// unstrided variant -- would be a push constant. It also exercises the
 /// subgroup reduction, whose width the implementation chooses, so a result that
-/// matches here is evidence for the argument in `common/reduce.glsl`.
+/// matches here is evidence for the argument in `common/reduce.slang`.
 #[test]
 fn rms_single_row_matches_a_scalar_reference() {
     let gpu = gpu!();
@@ -1160,7 +1270,8 @@ fn rms_folds_plus_one_before_the_bf16_round() {
 /// the BODY and not of the ABI: it shows the arithmetic and the pitch handling
 /// are right, and it cannot show the driver would bind them the same way,
 /// because there is nothing for the driver to read. Every other dispatch here
-/// takes its layout from `dump_layout`.
+/// takes its layout from `kernels_vulkan::push_layout`, which derives it from
+/// the row.
 #[test]
 fn rms_strided_row_reads_its_pitch_from_the_push_block() {
     let gpu = gpu!();
@@ -1213,7 +1324,7 @@ fn rms_strided_row_reads_its_pitch_from_the_push_block() {
 // ---------------------------------------------------------------------------
 
 /// A deterministic affine-quantized weight matrix, in the layout
-/// `common/affine.glsl` states: codes little-endian within a 32-bit word,
+/// `common/affine.slang` states: codes little-endian within a 32-bit word,
 /// lowest code in the lowest bits; `scales`/`biases` one bf16 per group, laid
 /// out `[out_vec_size, in_vec_size / group]`.
 ///
@@ -1373,7 +1484,7 @@ fn qmm_t(
     x: &[u8],
 ) -> Vec<f32> {
     // The shader's push block carries no `m`, so its row overhang cannot be
-    // guarded inside the kernel (see `write_out` in `quant/qmm_t.comp`). The
+    // guarded inside the kernel (see `write_out` in `quant/qmm_t.slang`). The
     // contract is that the caller allocates a whole number of `bm` rows; this
     // helper honours it and hands back only the real ones.
     let m_padded = m.div_ceil(bm) * bm;
@@ -1492,17 +1603,70 @@ fn the_coopmat_tier_agrees_with_its_baseline() {
 /// a device advertises a LIST, and using a `coopmat` type outside that list is
 /// undefined behaviour which a driver is free to accept and then miscompute.
 /// So this prints the list, and the `@coopmat` tier has to be written against
-/// it rather than against what reads naturally in GLSL.
+/// it rather than against what reads naturally in the shader.
 #[test]
 fn the_device_lists_its_cooperative_matrix_configurations() {
     let gpu = gpu!();
-    if !gpu.tiers.contains(&Capability::Coopmat) {
-        eprintln!("SKIP: {} does not offer cooperativeMatrix", gpu.name);
+    if !gpu.has_coopmat_ext {
+        eprintln!("SKIP: {} has no VK_KHR_cooperative_matrix", gpu.name);
         return;
     }
     for (m, n, k, a, c) in gpu.coopmat_configs() {
         eprintln!("  {m}x{n}x{k}  A/B={a}  C/Result={c}");
     }
+}
+
+/// The coopmat tier is offered only for a matrix the device advertises.
+///
+/// The tier used to be admitted on FEATURE BITS -- the extension, the
+/// `cooperativeMatrix` feature, `shaderFloat16`, the memory model -- and none
+/// of those promises a shape. The list is the contract, and this tree uses
+/// exactly one entry of it: `quant/qmm_t.slang` declares 16x16x16 with `half`
+/// A and B and a `float` accumulator, at subgroup scope.
+///
+/// The gap was not hypothetical and was not found by reading. Mesa's
+/// `llvmpipe` passes every one of those feature checks and advertises four
+/// configurations, all 8x8x8. Admitted to the tier, it segfaulted inside
+/// `vkCreateComputePipelines` while the validation layer reported nothing --
+/// correctly, because undefined behaviour is not invalid usage, and a layer
+/// checks the second. With the list consulted, the tier is declined there and
+/// all 47 proofs in this file pass on llvmpipe as well as on the card.
+///
+/// So this is the check, both ways, and it is meaningful on any machine:
+/// wherever the tier is offered the matrix must be on the list, and wherever
+/// the matrix is on the list with the features present the tier must be
+/// offered -- otherwise the whole tier could quietly stop being tested and
+/// every proof in this file would still pass.
+#[test]
+fn the_coopmat_tier_is_offered_only_for_a_matrix_the_device_advertises() {
+    let gpu = gpu!();
+    let offered = gpu.tiers.contains(&Capability::Coopmat);
+    if !gpu.has_coopmat_ext {
+        assert!(
+            !offered,
+            "{} offers the coopmat tier without the extension",
+            gpu.name
+        );
+        eprintln!("SKIP: {} has no VK_KHR_cooperative_matrix", gpu.name);
+        return;
+    }
+    let configs = gpu.coopmat_configs();
+    let ours = configs.iter().any(|(m, n, k, a, c)| {
+        (*m, *n, *k) == (16, 16, 16) && a == "float16_t" && c == "float32_t"
+    });
+    assert_eq!(
+        offered,
+        ours,
+        "{} advertises {} cooperative matrix configurations, ours (16x16x16, \
+         A/B float16_t, C float32_t) {} among them, and the tier is {}. A tier \
+         offered without the matrix is undefined behaviour the driver may \
+         accept and then miscompute; a tier withheld with the matrix present \
+         silently stops testing a third of this table. Saw {configs:?}",
+        gpu.name,
+        configs.len(),
+        if ours { "IS" } else { "is NOT" },
+        if offered { "offered" } else { "withheld" },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1521,7 +1685,7 @@ fn the_device_lists_its_cooperative_matrix_configurations() {
 ///
 /// It also exercises the page table (a logical position becomes a physical slot
 /// through `kv_page_indices`/`kv_page_indptr`), grouped-query attention via
-/// `gqa_factor`, and the online-softmax recurrence in `attn/sdpa_online.glsl`.
+/// `gqa_factor`, and the online-softmax recurrence in `attn/sdpa_online.slang`.
 /// The pages are deliberately shuffled so a shader that ignored the indirection
 /// and read the cache linearly would fail.
 #[test]
@@ -2261,7 +2425,7 @@ fn embed_gather_dequantizes_the_row_the_id_names() {
     assert_close(&bf16_read(&got[4]), &want, "embed_gather scaled mb");
 }
 
-/// The other three gated activations in `mlp/gated.comp`.
+/// The other three gated activations in `mlp/gated.slang`.
 ///
 /// One file, one binding contract, five bodies chosen by `-D`. That is exactly
 /// the arrangement where a preprocessor typo compiles into the WRONG
@@ -2351,15 +2515,29 @@ fn geglu_strided_uses_each_of_its_three_pitches() {
     let g = bf16_read(&operands[0]);
     let u = bf16_read(&operands[1]);
     let got = bf16_read(&out[2]);
+    // A ROW at a time, not an element at a time. `assert_close` scales its
+    // tolerance by the largest magnitude it is handed, so checking single
+    // elements makes every element its own scale -- and `gelu_tanh` produces
+    // elements where that is meaningless. At `gate[0] = -5` the function is
+    // `0.5 * x * (1 + tanh(-8.45))`, and `1 + tanh` there is the difference of
+    // two numbers that agree to seven digits: the answer, 6.6e-7, is entirely
+    // decided by the last bit of whatever `tanh` the device's compiler
+    // emitted. Per element, this asked two independent implementations to
+    // agree bit for bit on cancellation noise.
+    //
+    // Measured, not supposed: this element is the ONE disagreement between
+    // the RTX 4090 and Mesa's `llvmpipe` across all 47 proofs in this file.
+    // llvmpipe's `tanh` returns exactly -1 there and so the product is 0;
+    // neither implementation is wrong, and SPIR-V's `Tanh` does not promise
+    // enough for either to be. Against the row's own scale -- around 5, four
+    // million times larger -- the question becomes the one worth asking,
+    // which is whether the shader read the right three pitches.
     for m in 0..rows {
-        for k in 0..width {
-            let want = gelu_tanh(g[m * gate_pitch + k]) * u[m * up_pitch + k];
-            assert_close(
-                &[got[m * out_pitch + k]],
-                &[want],
-                &format!("geglu_strided row {m} col {k}"),
-            );
-        }
+        let want: Vec<f32> = (0..width)
+            .map(|k| gelu_tanh(g[m * gate_pitch + k]) * u[m * up_pitch + k])
+            .collect();
+        let got_row: Vec<f32> = (0..width).map(|k| got[m * out_pitch + k]).collect();
+        assert_close(&got_row, &want, &format!("geglu_strided row {m}"));
     }
 
     // Past `width` the row is padding the shader must not have touched.
@@ -2496,7 +2674,7 @@ fn kv_append_writes_one_position_and_leaves_the_rest() {
 
 /// `kv_append_paged_bfloat16` — the same scatter through a page table.
 ///
-/// The comment at the top of `kv_write.comp` records that these two bindings
+/// The comment at the top of `kv_write.slang` records that these two bindings
 /// were off by one until a SPIR-V audit caught it, which is precisely the
 /// failure a test should be able to reproduce: the paged row keeps Metal's
 /// placeholder ring operands, so `w_page` and `w_off` sit at bindings 10 and
@@ -3913,6 +4091,183 @@ fn sdpa_paged_mma_agrees_with_a_softmax_reference_on_both_tiers() {
     }
 }
 
+/// `sdpa_paged_mma` past one K tile and past one row block.
+///
+/// # What its sibling could not see
+///
+/// The test above is the shape check -- paging, GQA, masks, sinks -- and its
+/// longest request is five tokens. `PIE_KT` is sixteen, so the tile loop it
+/// runs executes exactly ONCE, and its eight rows fit in the first block of
+/// thirty-two. Both loops that carry state ACROSS iterations were therefore
+/// covered only in the case where there is no second iteration to carry it
+/// to.
+///
+/// That is the whole risk surface of an online softmax. The running maximum
+/// and the running denominator exist precisely to let tile `n + 1` correct
+/// what tile `n` already accumulated, and a body that rescales wrongly, or
+/// re-initialises per tile, or reduces a stale score, agrees with any
+/// reference whose sequences are shorter than a tile.
+///
+/// So this one runs a forty-token request -- three tiles, with a ragged last
+/// one -- beside a short request that still has to be addressed through its
+/// own page list, and forty-three rows so that `gl_WorkGroupID.y` reaches its
+/// second block and the `row_lo + rr` arithmetic is exercised rather than
+/// assumed. The masked row is chosen at key 20 of row 37: both past the first
+/// tile, so the mask has to survive being applied in a later iteration, and
+/// in the second row block.
+#[test]
+fn sdpa_paged_mma_carries_its_softmax_across_tiles_and_row_blocks() {
+    let gpu = gpu!();
+
+    let head_dim = 64usize;
+    let page_size = 8usize;
+    let n_kv_heads = 2usize;
+    let gqa = 2usize;
+    let n_q_heads = n_kv_heads * gqa;
+    let scale = 0.125f32;
+
+    let lengths = [40usize, 3];
+    let mut req_of_token: Vec<i32> = Vec::new();
+    let mut positions: Vec<i32> = Vec::new();
+    for (r, l) in lengths.iter().enumerate() {
+        for p in 0..*l {
+            req_of_token.push(r as i32);
+            positions.push(p as i32);
+        }
+    }
+    let n_rows = req_of_token.len();
+
+    let pages_per: Vec<usize> = lengths.iter().map(|l| l.div_ceil(page_size)).collect();
+    let total_pages: usize = pages_per.iter().sum();
+    let physical: Vec<u32> = (0..total_pages as u32).rev().collect();
+    let mut indptr = vec![0u32];
+    for p in &pages_per {
+        indptr.push(indptr.last().unwrap() + *p as u32);
+    }
+
+    let slots = total_pages * page_size;
+    let kv_elems = slots * n_kv_heads * head_dim;
+    let kf: Vec<f32> = (0..kv_elems)
+        .map(|i| ((i % 31) as f32 - 15.0) / 40.0)
+        .collect();
+    let vf: Vec<f32> = (0..kv_elems)
+        .map(|i| ((i % 23) as f32 - 11.0) / 30.0)
+        .collect();
+    let qf: Vec<f32> = (0..n_rows * n_q_heads * head_dim)
+        .map(|i| ((i % 19) as f32 - 9.0) / 20.0)
+        .collect();
+
+    let mask_stride = 48usize;
+    let masked_row = 37usize;
+    let dropped_key = 20usize;
+    let mut mask = vec![1u8; n_rows * mask_stride];
+    mask[masked_row * mask_stride + dropped_key] = 0;
+    let mut mask_enabled = vec![0u8; n_rows];
+    mask_enabled[masked_row] = 1;
+
+    let sinks: Vec<f32> = (0..n_q_heads).map(|h| -0.25 + h as f32 * 0.5).collect();
+
+    let operands = vec![
+        bf16_bytes(&qf),
+        bf16_bytes(&kf),
+        bf16_bytes(&vf),
+        vec![0u8; n_rows * n_q_heads * head_dim * 2],
+        positions.iter().flat_map(|p| p.to_le_bytes()).collect(),
+        req_of_token.iter().flat_map(|r| r.to_le_bytes()).collect(),
+        physical.iter().flat_map(|p| p.to_le_bytes()).collect(),
+        indptr.iter().flat_map(|p| p.to_le_bytes()).collect(),
+        mask,
+        mask_enabled,
+        bf16_bytes(&sinks),
+    ];
+
+    let mut push = Vec::new();
+    for v in [gqa as i32, page_size as i32, n_kv_heads as i32] {
+        push.extend_from_slice(&v.to_le_bytes());
+    }
+    push.extend_from_slice(&scale.to_le_bytes());
+    push.extend_from_slice(&(mask_stride as u32).to_le_bytes());
+    push.extend_from_slice(&0i32.to_le_bytes()); // window: off
+    push.extend_from_slice(&(n_rows as i32).to_le_bytes());
+
+    let q = bf16_read(&operands[0]);
+    let k = bf16_read(&operands[1]);
+    let v = bf16_read(&operands[2]);
+    let sq = bf16_read(&operands[10]);
+    let slot_of = |req: usize, kp: usize| {
+        let phys = physical[indptr[req] as usize + kp / page_size] as usize;
+        phys * page_size + kp % page_size
+    };
+
+    let reference = |with_sink: bool| -> Vec<f32> {
+        let mut want = vec![0.0f32; n_rows * n_q_heads * head_dim];
+        for row in 0..n_rows {
+            let req = req_of_token[row] as usize;
+            let q_pos = positions[row] as usize;
+            let keys: Vec<usize> = (0..=q_pos)
+                .filter(|kp| !(row == masked_row && *kp == dropped_key))
+                .collect();
+            for h in 0..n_q_heads {
+                let kv_head = h / gqa;
+                let q_base = (row * n_q_heads + h) * head_dim;
+                let scores: Vec<f32> = keys
+                    .iter()
+                    .map(|&kp| {
+                        let kb = (slot_of(req, kp) * n_kv_heads + kv_head) * head_dim;
+                        (0..head_dim)
+                            .map(|d| scale * q[q_base + d] * k[kb + d])
+                            .sum::<f32>()
+                    })
+                    .collect();
+                let mut hi = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                if with_sink {
+                    hi = hi.max(sq[h]);
+                }
+                let exps: Vec<f32> = scores.iter().map(|s| (s - hi).exp()).collect();
+                let mut denom: f32 = exps.iter().sum();
+                if with_sink {
+                    denom += (sq[h] - hi).exp();
+                }
+                for d in 0..head_dim {
+                    let acc: f32 = keys
+                        .iter()
+                        .zip(&exps)
+                        .map(|(&kp, e)| {
+                            e * v[(slot_of(req, kp) * n_kv_heads + kv_head) * head_dim + d]
+                        })
+                        .sum();
+                    want[q_base + d] = acc / denom;
+                }
+            }
+        }
+        want
+    };
+
+    assert!(
+        n_rows > 32 && lengths[0] > 16,
+        "this test is only worth more than its sibling if it reaches a second \
+         row block and a second K tile"
+    );
+    let groups = [n_q_heads as u32, n_rows.div_ceil(32) as u32, 1];
+    let mut tiers = vec![Capability::Baseline];
+    if gpu.tiers.contains(&Capability::Coopmat) {
+        tiers.push(Capability::Coopmat);
+    }
+    for tier in tiers {
+        for (entrypoint, with_sink) in [
+            ("sdpa_paged_mma_bfloat16_d_64", false),
+            ("sdpa_paged_mma_sink_bfloat16_d_64", true),
+        ] {
+            let out = gpu.dispatch(entrypoint, tier, &operands, &push, groups);
+            assert_close(
+                &bf16_read(&out[3]),
+                &reference(with_sink),
+                &format!("{entrypoint} @{}", tier.tag()),
+            );
+        }
+    }
+}
+
 /// `affine_qmm_t` across its whole axis grid, on every tier the device offers.
 ///
 /// This is the crate's largest kernel — 54 stated entrypoints — and until now
@@ -4095,7 +4450,7 @@ fn the_pointwise_kernels_do_not_write_past_a_ragged_width() {
 /// workgroup.
 ///
 /// `V_d` is 128 on every GDN checkpoint the tree has seen, and the port read
-/// one channel per lane under a fixed `local_size_x = 256` because Metal
+/// one channel per lane under a fixed `[numthreads(256, 1, 1)]` because Metal
 /// launches `tg = (V_d, 1, 1)` and genuinely has one. That is fine at 128 and
 /// silently wrong above 256: channels past the workgroup were left out of the
 /// sum of squares AND never written, so the mean was taken over a prefix and
@@ -4174,13 +4529,16 @@ fn gated_rms_normalizes_an_axis_wider_than_its_workgroup() {
 /// It is not redundant with the checks that already exist, because each of
 /// those stops short of the driver:
 ///
-/// * `--compile` proves `glslc` accepts the GLSL. A module can compile and
+/// * `--compile` proves `slangc` accepts the Slang. A module can compile and
 ///   still be unloadable -- it may want a capability this device lacks, or
-///   exceed a limit `glslc` knows nothing about.
-/// * `--bindings` reads `OpDecorate Binding` out of the SPIR-V and compares it
-///   to the row. That is a static comparison between two descriptions; it
-///   cannot tell whether the DRIVER agrees that a layout with that many
-///   descriptors, and a push range of that size, is one it will accept.
+///   exceed a limit `slangc` knows nothing about.
+/// * `--bindings` read `OpDecorate Binding` out of the SPIR-V and compared it
+///   to the row. That was a static comparison between two descriptions; it
+///   could not tell whether the DRIVER agrees that a layout with that many
+///   descriptors, and a push range of that size, is one it will accept. It is
+///   also gone -- the mode read the row's half by running
+///   `examples/dump_layout.rs`, which is deleted -- so the static half of this
+///   list is now unheld and what follows is the only half left.
 /// * `check_push_against_the_row` compares a hand-packed push block to the
 ///   row's derived layout, and only for the dispatches a test performs.
 ///
@@ -4212,10 +4570,17 @@ fn every_module_this_device_claims_it_can_load_builds_a_pipeline() {
     let mut failures: Vec<String> = Vec::new();
 
     for name in kernels_vulkan::entrypoints() {
-        let row = kernels::sig_in(kernels_vulkan::KERNELS, &name)
-            .unwrap_or_else(|| panic!("`{name}` does not resolve, which entrypoints.rs covers"));
-        let buffers = kernels_vulkan::buffer_count(row);
-        let push = kernels_vulkan::push_size(row) as usize;
+        // A RETIRED entrypoint has no row, and takes the same from-module
+        // path an unstated one does -- which is the honest one for it: its
+        // layout is now stated by a routine's signature, and reflecting the
+        // module is exactly what the driver does for it at launch time.
+        let row = kernels::sig_in(kernels_vulkan::KERNELS, &name);
+        assert!(
+            row.is_some() || kernels_vulkan::retired().contains(&name.as_str()),
+            "`{name}` does not resolve, which entrypoints.rs covers"
+        );
+        let buffers = row.map_or(0, kernels_vulkan::buffer_count);
+        let push = row.map_or(0, |r| kernels_vulkan::push_size(r) as usize);
 
         // An UNSTATED row cannot supply the layout, and the first version of
         // this test skipped those 292 entrypoints. Finding out why cost a
@@ -4250,8 +4615,8 @@ fn every_module_this_device_claims_it_can_load_builds_a_pipeline() {
                 declared_binding_count(&spv_words(&dir.join(Capability::Baseline.module(&name)))),
                 // The device's maximum, which any block fits inside. The
                 // row-derived size is the interesting check and a row that
-                // says nothing cannot make it; `--bindings` owns that
-                // comparison for the rows that can.
+                // says nothing cannot make it; `--bindings` used to own that
+                // comparison for the rows that can, and nothing owns it now.
                 gpu.max_push as usize,
                 true,
             )
@@ -4302,4 +4667,1169 @@ fn every_module_this_device_claims_it_can_load_builds_a_pipeline() {
          declared bindings, their row stating nothing), {skipped} skipped as \
          unsupported tiers"
     );
+}
+
+/// What the three page-shape tails of `sdpa_paged_decode` actually are.
+///
+/// The row's axis carries seven points: four plain widths and three tails,
+/// `_d_64_p32`, `_d_128_p32` and `_d_64_p32_sg8`. `kernels-metal` states the
+/// same seven, and on THAT backend all three diverge from the plain points in
+/// ways a caller has to know -- `FAST_FULL` deletes the window and mask
+/// operands, and `_sg8` is a genuinely different threadgroup (`BN = 8`, 256
+/// threads) whose shared arrays are sized for eight simdgroups, so launching
+/// it at the row's 1024 walks off them.
+///
+/// A reader who checks the Metal comment and then looks at the Vulkan point of
+/// the same name will conclude this tree has the same three shapes. It has
+/// two-and-a-bit, and the difference is measured here rather than asserted:
+///
+/// * `_p32` really does differ from the plain point. `PIE_FAST_FULL` pins
+///   `start = 0`, so a module built for a tail serves FULL attention and
+///   ignores `window` -- the bytes differ, and that is the check.
+/// * `_p32_sg8` is BYTE-IDENTICAL to `_p32`, the name included: the variant
+///   name lives in the `.spv` FILENAME and every module's entrypoint is
+///   spelled `main`, so the two are one file written twice.
+///   `PIE_SHORT_GROUP=8` is set by the instantiate line and read by nothing,
+///   so on Vulkan this point is a name and not a shape. It is allow-listed in
+///   `scripts/vulkan-kernel-audit.py`'s `INERT_DEFINES`, which is how it stays
+///   allowed rather than merely unnoticed.
+///
+/// None of the three is reachable. A text names
+/// `sdpa_paged_decode_bfloat16_d_<width>` from its row's head dim and
+/// `deployment::ATTN_HEAD_DIMS` is the four plain widths, so no width spells a
+/// tail; `driver-vulkan`'s reachability census lists no `_p32` symbol either.
+/// That is what makes the inert one survivable, and it is also why this is a
+/// module comparison and not a dispatch: there is nothing to fire.
+///
+/// The reason to write it down at all is that the two halves fail in opposite
+/// directions. If someone wires a tail on Vulkan believing the Metal
+/// description, they get full attention where they asked for a window and the
+/// same 64-wide workgroup where they asked for a short group -- silently, on
+/// both counts.
+#[test]
+fn the_page_shape_tails_are_one_real_variant_and_one_bare_name() {
+    let Some(dir) = SPV_DIR.map(std::path::Path::new) else {
+        eprintln!("no modules: build with `--features native` and `slangc` on PATH");
+        return;
+    };
+    let read = |name: &str| {
+        std::fs::read(dir.join(format!("{name}.spv")))
+            .unwrap_or_else(|e| panic!("`{name}.spv` reads: {e}"))
+    };
+
+    let plain = read("sdpa_paged_decode_bfloat16_d_64");
+    let tail = read("sdpa_paged_decode_bfloat16_d_64_p32");
+    let short = read("sdpa_paged_decode_bfloat16_d_64_p32_sg8");
+
+    assert_ne!(
+        plain, tail,
+        "`_p32` compiles to the same module as the plain point, so \
+         `PIE_FAST_FULL` and `PIE_PAGE_SIZE` are both inert and the tail is \
+         claiming a shape it does not have"
+    );
+    assert_eq!(
+        tail, short,
+        "`_p32_sg8` differs from `_p32`, so `PIE_SHORT_GROUP` has grown a \
+         body -- rewrite this test and take the pair out of the audit's \
+         `INERT_DEFINES`"
+    );
+}
+
+/// The nine routed `_fp16` modules are copies of their bf16 siblings.
+///
+/// `moe/qmm_t_routed.slang` takes `PIE_FP16` on nine of its instantiate lines
+/// and reads it on none. The name comes from `quant/qmm_t.slang`, which really
+/// does have an fp16 activation path -- a separate pre-cast buffer at binding
+/// 7, and a `load_x` that reads it instead of `x` at 3. The routed file never
+/// grew one, so the define has been carried along by the name alone.
+///
+/// It was allow-listed in the audit's `INERT_DEFINES` with that reasoning
+/// written out, which is an argument and not a measurement: nine table rows
+/// and nine modules of build time ride on it, and the argument would go on
+/// reading true for exactly as long as it took someone to add the body and
+/// forget the comment. Compiled bytes settle it. The pairs are IDENTICAL, the
+/// entrypoint included -- every module's entry is spelled `main` and the
+/// variant lives in the filename, so an inert define makes one file twice.
+///
+/// Harmless only because `affine_qmm_t_routed_fp16`'s row is UNSTATED:
+/// `geometry::lanes` refuses an unstated rule before it computes a grid, so
+/// the row cannot be dispatched at all. If it is ever stated, the body has to
+/// exist FIRST -- otherwise a driver hands fp16 activations to a shader
+/// reading bf16 and the name is the only thing that says otherwise. This test
+/// failing is that day arriving, and the right response is to check the new
+/// body is really the fp16 path rather than to delete the assertion.
+#[test]
+fn the_routed_fp16_modules_are_their_bf16_siblings_under_another_name() {
+    let Some(dir) = SPV_DIR.map(std::path::Path::new) else {
+        eprintln!("no modules: build with `--features native` and `slangc` on PATH");
+        return;
+    };
+
+    let mut pairs = 0usize;
+    for entry in std::fs::read_dir(dir).expect("the module dir reads") {
+        let name = entry
+            .expect("a dir entry reads")
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        if !name.starts_with("affine_qmm_t_routed_fp16_") || !name.ends_with(".spv") {
+            continue;
+        }
+        let sibling = name.replace("_fp16", "");
+        let sibling_path = dir.join(&sibling);
+        assert!(
+            sibling_path.exists(),
+            "`{name}` has no bf16 sibling `{sibling}`, so the pairing this \
+             test rests on has changed shape"
+        );
+        assert_eq!(
+            std::fs::read(dir.join(&name)).expect("the fp16 module reads"),
+            std::fs::read(&sibling_path).expect("the bf16 module reads"),
+            "`{name}` now differs from `{sibling}`: `PIE_FP16` has a body in \
+             `moe/qmm_t_routed.slang`. Check it is the pre-cast path \
+             `quant/qmm_t.slang` has -- a separate activation buffer at \
+             binding 7 -- then state the row and drop this test"
+        );
+        pairs += 1;
+    }
+    assert_eq!(
+        pairs, 9,
+        "the routed fp16 axis is {pairs} points, not the nine the audit's \
+         `INERT_DEFINES` entry and this test both describe"
+    );
+}
+
+/// The GDN fixture: shapes chosen so the parts that can be wrong are exercised.
+///
+/// `Hk = 2, Hv = 4` makes `rep = 2`, which is the only setting under which
+/// indexing q and k by the VALUE head differs from indexing by the key head.
+/// Every checkpoint anyone runs locally has `rep == 1`, where the two
+/// expressions are the same and a wrong one is invisible; `kernels-metal`'s
+/// header records that this family shipped with exactly that bug. This tree
+/// has the fixed form (`hk_idx = hv_idx / rep`), and the fixture is what makes
+/// the fix load-bearing rather than incidental.
+///
+/// `Dk = 64` gives `n_per_t = 2`, so every per-lane loop runs twice -- at
+/// `Dk = 32` the loops execute once and a body that ignored `i` would pass.
+/// `Dv = 8` is two groups of the shader's four y-threads, so `dv_idx` has to
+/// come from `SV_DispatchThreadID` and not `SV_GroupThreadID`.
+struct GdnShape {
+    b: usize,
+    hk: usize,
+    hv: usize,
+    dk: usize,
+    dv: usize,
+    kc: usize,
+}
+
+impl GdnShape {
+    const FIXTURE: Self = Self {
+        b: 2,
+        hk: 2,
+        hv: 4,
+        dk: 64,
+        dv: 8,
+        kc: 4,
+    };
+
+    fn conv_dim(&self) -> usize {
+        2 * self.hk * self.dk + self.hv * self.dv
+    }
+    fn q_off(&self) -> usize {
+        0
+    }
+    fn k_off(&self) -> usize {
+        self.hk * self.dk
+    }
+    fn v_off(&self) -> usize {
+        2 * self.hk * self.dk
+    }
+    /// The 44-byte block `PARAM_BLOCKS` records at binding 11.
+    fn params(&self, eps: f32) -> Vec<u8> {
+        let ints = [
+            self.dk as i32,
+            self.dv as i32,
+            self.hk as i32,
+            self.hv as i32,
+            self.conv_dim() as i32,
+            self.kc as i32,
+            self.q_off() as i32,
+            self.k_off() as i32,
+            self.v_off() as i32,
+        ];
+        let mut out: Vec<u8> = ints.iter().flat_map(|v| v.to_le_bytes()).collect();
+        out.extend(eps.to_le_bytes());
+        out.extend((1.0f32 / (self.dk as f32).sqrt()).to_le_bytes());
+        out
+    }
+}
+
+/// Deterministic values in a range where bf16 rounding is the dominant error.
+fn gdn_spread(n: usize, seed: u32, scale: f32) -> Vec<f32> {
+    (0..n)
+        .map(|i| {
+            let h = (i as u32)
+                .wrapping_mul(2654435761)
+                .wrapping_add(seed.wrapping_mul(40503));
+            let u = ((h >> 8) & 0xffff) as f32 / 65535.0;
+            (u - 0.5) * 2.0 * scale
+        })
+        .collect()
+}
+
+/// The buffers a GDN core dispatch reads, in binding order 0..=10.
+struct GdnInputs {
+    mixed: Vec<f32>,
+    conv_state: Vec<f32>,
+    rstate: Vec<f32>,
+    conv_w: Vec<f32>,
+    conv_b: Vec<f32>,
+    a_log: Vec<f32>,
+    dt_bias: Vec<f32>,
+    a_gate: Vec<f32>,
+    b_gate: Vec<f32>,
+}
+
+impl GdnInputs {
+    /// `slots` is how many recurrent slots the state slab holds; the unslotted
+    /// form uses `b_idx` directly, so it needs at least `b` of them.
+    fn build(s: &GdnShape, slots: usize) -> Self {
+        let cd = s.conv_dim();
+        Self {
+            mixed: gdn_spread(s.b * cd, 1, 1.0),
+            conv_state: gdn_spread(slots * s.kc * cd, 2, 1.0),
+            rstate: gdn_spread(slots * s.hv * s.dv * s.dk, 3, 0.5),
+            conv_w: gdn_spread(cd * s.kc, 4, 0.5),
+            conv_b: gdn_spread(cd, 5, 0.25),
+            // `exp(A_log)` is the decay's inner exponent, so keeping it small
+            // and negative keeps `decay` inside (0, 1) the way a trained
+            // model's does rather than saturating it to zero.
+            a_log: gdn_spread(s.hv, 6, 1.0).iter().map(|v| v - 1.0).collect(),
+            dt_bias: gdn_spread(s.hv, 7, 0.5),
+            a_gate: gdn_spread(s.b * s.hv, 8, 1.0),
+            b_gate: gdn_spread(s.b * s.hv, 9, 1.0),
+        }
+    }
+
+    /// Binding order, with `mixed` and the gates rounded through bf16 first so
+    /// the reference reads the same numbers the shader does. Only the ROUNDING
+    /// is shared; every arithmetic step below is written out independently.
+    fn operands(&self, s: &GdnShape, eps: f32, slots: usize) -> Vec<Vec<u8>> {
+        let cd = s.conv_dim();
+        vec![
+            bf16_bytes(&self.mixed),
+            self.conv_state
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            self.rstate.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            vec![0u8; s.b * s.hv * s.dv * 2],
+            bf16_bytes(&self.conv_w),
+            bf16_bytes(&self.conv_b),
+            self.a_log.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            bf16_bytes(&self.dt_bias),
+            bf16_bytes(&self.a_gate),
+            bf16_bytes(&self.b_gate),
+            vec![0u8; slots * s.kc * cd * 4],
+            s.params(eps),
+        ]
+    }
+}
+
+/// What the fused core is supposed to compute, written from the algorithm.
+///
+/// Returns `(core_out, rstate_after, new_conv_state)`. Deliberately a plain
+/// sequential walk in f32: the shader reduces across 32 lanes through shared
+/// memory and this sums in order, so agreement is a statement about the
+/// arithmetic and not about the reduction tree.
+fn gdn_reference(
+    s: &GdnShape,
+    inp: &GdnInputs,
+    eps: f32,
+    slot_of: &dyn Fn(usize) -> usize,
+    slots: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let cd = s.conv_dim();
+    let rep = s.hv / s.hk;
+
+    // The shader reads these through `PIE_LOAD`, so the reference must see the
+    // bf16-rounded values and not the f32 ones it was handed.
+    let r = |v: &[f32]| bf16_read(&bf16_bytes(v));
+    let (mixed, conv_w, conv_b) = (r(&inp.mixed), r(&inp.conv_w), r(&inp.conv_b));
+    let (dt_bias, a_gate, b_gate) = (r(&inp.dt_bias), r(&inp.a_gate), r(&inp.b_gate));
+
+    let convsilu = |slot: usize, b: usize, c: usize| -> f32 {
+        let mut acc = conv_b[c];
+        for j in 0..s.kc - 1 {
+            acc += inp.conv_state[(slot * s.kc + (j + 1)) * cd + c] * conv_w[c * s.kc + j];
+        }
+        acc += mixed[b * cd + c] * conv_w[c * s.kc + (s.kc - 1)];
+        acc / (1.0 + (-acc).exp())
+    };
+
+    let mut core_out = vec![0.0f32; s.b * s.hv * s.dv];
+    let mut rstate = inp.rstate.clone();
+    let mut new_conv = vec![0.0f32; slots * s.kc * cd];
+
+    let roll = |slot: usize, b: usize, c: usize, new_conv: &mut Vec<f32>| {
+        for j in 0..s.kc - 1 {
+            new_conv[(slot * s.kc + j) * cd + c] = inp.conv_state[(slot * s.kc + (j + 1)) * cd + c];
+        }
+        new_conv[(slot * s.kc + (s.kc - 1)) * cd + c] = mixed[b * cd + c];
+    };
+
+    for n in 0..s.b * s.hv {
+        let (b, hv) = (n / s.hv, n % s.hv);
+        let hk = hv / rep;
+        let slot = slot_of(b);
+
+        let q: Vec<f32> = (0..s.dk)
+            .map(|d| convsilu(slot, b, s.q_off() + hk * s.dk + d))
+            .collect();
+        let k: Vec<f32> = (0..s.dk)
+            .map(|d| convsilu(slot, b, s.k_off() + hk * s.dk + d))
+            .collect();
+        let qinv =
+            (1.0 / (s.dk as f32).sqrt()) / (q.iter().map(|v| v * v).sum::<f32>() + eps).sqrt();
+        let kinv = 1.0 / (k.iter().map(|v| v * v).sum::<f32>() + eps).sqrt();
+
+        let ad = a_gate[b * s.hv + hv] + dt_bias[hv];
+        let sp = ad.max(0.0) + (1.0 + (-ad.abs()).exp()).ln();
+        let decay = (-inp.a_log[hv].exp() * sp).exp();
+        let beta = 1.0 / (1.0 + (-b_gate[b * s.hv + hv]).exp());
+
+        for dv in 0..s.dv {
+            let vval = convsilu(slot, b, s.v_off() + hv * s.dv + dv);
+            let base = ((slot * s.hv + hv) * s.dv + dv) * s.dk;
+            let mut st: Vec<f32> = (0..s.dk).map(|d| inp.rstate[base + d] * decay).collect();
+            let kv: f32 = (0..s.dk).map(|d| st[d] * (k[d] * kinv)).sum();
+            let delta = (vval - kv) * beta;
+            let mut outv = 0.0f32;
+            for d in 0..s.dk {
+                st[d] += (k[d] * kinv) * delta;
+                outv += st[d] * (q[d] * qinv);
+                rstate[base + d] = st[d];
+            }
+            core_out[(b * s.hv + hv) * s.dv + dv] = outv;
+        }
+
+        // q and k roll once per KEY head -- the shader guards it with
+        // `hk_first`, so a second v-head of the same group must not repeat it.
+        if hv % rep == 0 {
+            for d in 0..s.dk {
+                roll(slot, b, s.q_off() + hk * s.dk + d, &mut new_conv);
+                roll(slot, b, s.k_off() + hk * s.dk + d, &mut new_conv);
+            }
+        }
+        for dv in 0..s.dv {
+            roll(slot, b, s.v_off() + hv * s.dv + dv, &mut new_conv);
+        }
+    }
+    (core_out, rstate, new_conv)
+}
+
+/// Read the f32 slab a GDN operand comes back as.
+fn f32_read(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// What the output slab may be off by, as a fraction of the slab's own scale.
+///
+/// MEASURED, not reasoned. This device delivers 2.9e-3 over the fixture, and
+/// the bound is a shade over twice that. `BF16_TOLERANCE` is 0.02, which is
+/// seven times the truth here -- see `GDN_STATE_TOL` for what lived in the gap.
+const GDN_OUT_TOL: f32 = 6e-3;
+
+/// What the recurrent state may be off by, as a fraction of its own scale.
+///
+/// Four orders tighter than the output's, and the reason is structural rather
+/// than lucky: `core_out` is stored through bf16 while `rstate` is f32 in and
+/// f32 out, so the state's only error is the order of a 64-term reduction.
+/// This device delivers 1.1e-7 -- f32 epsilon -- against the 2.9e-3 the output
+/// carries.
+///
+/// Checking it at `BF16_TOLERANCE` was therefore not slightly loose but
+/// 170,000 times loose, and that is not an abstract complaint. Scaling the
+/// reference's `decay` by 1.01 PASSED: a one-percent error in the central gate
+/// of the whole kernel, invisible. `kernels-metal` records the same injection
+/// getting through in the same place. This bound fails it by four orders.
+const GDN_STATE_TOL: f32 = 1e-6;
+
+/// Check a slab against its bound and return how much of the bound it used.
+///
+/// Returning the ratio is the point. A pass says the kernel is within the
+/// bound; the ratio says whether the bound still describes the DEVICE, and a
+/// bound that has drifted far above what the hardware does is the thing that
+/// silently stops testing.
+fn gdn_check(got: &[f32], want: &[f32], tol: f32, what: &str) -> f32 {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    let scale = want
+        .iter()
+        .fold(0.0f32, |m, w| m.max(w.abs()))
+        .max(f32::MIN_POSITIVE);
+    let mut worst = 0.0f32;
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        let off = (g - w).abs() / scale;
+        worst = worst.max(off);
+        assert!(
+            off <= tol,
+            "{what}: element {i} is {g}, reference says {w} -- off by {off} of \
+             the slab scale {scale}, and the bound is {tol}"
+        );
+    }
+    worst
+}
+
+/// The measured ratio has to sit in a band, not merely under the bound.
+///
+/// Too high and the test is one element from flaking; too LOW and the bound
+/// has stopped describing the device. `kernels-metal` had a guard here whose
+/// stated job was this and which asserted that a perturbation of twice the
+/// bound exceeds the bound -- `2b > b`, true of every bound ever written, and
+/// read as assurance for as long as it stood.
+fn gdn_band(worst: f32, tol: f32, what: &str) {
+    let used = worst / tol;
+    assert!(
+        (0.0625..=1.0).contains(&used),
+        "{what} used {used} of its {tol} bound (worst {worst}). Outside a \
+         sixteenth-to-one band the bound no longer describes this device: \
+         re-measure it rather than widening it"
+    );
+}
+
+/// `gdn_core_bfloat16` computes the gated delta rule, on the GPU.
+///
+/// Sixteen GDN entry points are compiled into every native build of this crate
+/// and none had ever been asked for a number. `ssm.rs` records why they cannot
+/// be reached -- no `Source` for the recurrent state, and a tracer that emits
+/// three ops where this is one fused dispatch -- and that is a statement about
+/// LOWERING. It says nothing about whether the four hundred lines of
+/// arithmetic underneath are right, and the lowering work would land on top of
+/// them. So this builds the dispatch by hand, the way the paged-attention
+/// proofs do, and reachability stops being a prerequisite for correctness.
+///
+/// Every term here is a place a port can be quietly wrong in a way that does
+/// not crash: a softplus that overflows at large `|a|` (the shader spells the
+/// stable `max(a,0) + log1p(exp(-|a|))` form and the reference spells it
+/// again), an `eps` inside or outside the square root, a decay applied after
+/// the delta instead of before, or a `1/sqrt(Dk)` folded into `k` rather than
+/// `q`. The reference is a sequential f32 walk while the shader reduces
+/// through shared memory across 32 lanes, so agreement is a claim about the
+/// arithmetic rather than about the reduction order.
+///
+/// The three outputs are all checked. `core_out` alone would miss the whole
+/// recurrent half: `rstate` is written IN PLACE, and a kernel that returned
+/// the right value while leaving the state at its pre-decay contents would
+/// pass a one-slab test and diverge on the second token. `new_conv_state` is
+/// the shift-and-append, whose `hk_first` guard means the q and k channels are
+/// rolled once per KEY head -- a body that rolled them per value head would
+/// write the same bytes twice here and be wrong only in what it cost.
+/// # What was injected
+///
+/// This test passed the first time it was run, which is not a thing to be
+/// pleased about, so six faults were put through it and two got past:
+///
+/// * q and k indexed by the VALUE head -- caught.
+/// * `decay` scaled by 1.01 -- PASSED, and the reason is the whole of
+///   `GDN_STATE_TOL`'s note.
+/// * `decay` applied after the delta instead of before -- caught.
+/// * `1/sqrt(Dk)` folded into k rather than q -- caught.
+/// * `eps` moved outside the square root -- PASSED, and the fix is the loud
+///   pass at the end.
+/// * the conv roll done per value head instead of per key head -- passed, and
+///   correctly. `roll` writes a function of read-only inputs, so doing it
+///   twice writes the same bytes; the `hk_first` guard saves work and cannot
+///   change an answer. That one is not a fault this test should catch, and
+///   noting it is how it stays out of the list of things believed tested.
+#[test]
+fn gdn_core_computes_the_gated_delta_rule() {
+    let gpu = gpu!();
+    let s = GdnShape::FIXTURE;
+    let eps = 1e-6f32;
+    let inp = GdnInputs::build(&s, s.b);
+
+    let operands = inp.operands(&s, eps, s.b);
+    let out = gpu.dispatch(
+        "gdn_core_bfloat16",
+        Capability::Baseline,
+        &operands,
+        &[],
+        [1, (s.dv / 4) as u32, (s.b * s.hv) as u32],
+    );
+
+    let (want_out, want_state, want_conv) = gdn_reference(&s, &inp, eps, &|b| b, s.b);
+
+    let out_used = gdn_check(
+        &bf16_read(&out[3]),
+        &want_out,
+        GDN_OUT_TOL,
+        "gdn_core core_out",
+    );
+    let state_used = gdn_check(
+        &f32_read(&out[2]),
+        &want_state,
+        GDN_STATE_TOL,
+        "gdn_core rstate",
+    );
+    // The conv roll is a copy, not arithmetic: every element is either an f32
+    // moved unchanged or a bf16-rounded `mixed`, so it is exact and an
+    // approximate check here would hide an off-by-one in the shift.
+    assert_eq!(f32_read(&out[10]), want_conv, "gdn_core new_conv_state");
+
+    // Both slabs, because the two are four orders of magnitude apart and one
+    // number cannot describe both.
+    gdn_band(out_used, GDN_OUT_TOL, "gdn_core core_out");
+    gdn_band(state_used, GDN_STATE_TOL, "gdn_core rstate");
+
+    // Once more at an eps large enough to observe, which the realistic value
+    // is not. `eps = 1e-6` sits under a q norm of about four, so moving it
+    // outside the square root -- `1/(sqrt(s) + eps)` instead of
+    // `1/sqrt(s + eps)` -- changes the answer by about 1e-7 and this test
+    // passed the injection. That is a fixture limit and not a kernel
+    // property: the two forms differ by a whole percent when eps is
+    // comparable to the sum, and the only reason a model never sees it is
+    // that a trained norm is never near zero. Firing the same fixture at
+    // `eps = 4.0` puts the placement back inside what the test can see, and
+    // it is still ordinary arithmetic -- the reference spells the same
+    // formula, so agreement pins WHERE the term goes.
+    let loud = 4.0f32;
+    let out = gpu.dispatch(
+        "gdn_core_bfloat16",
+        Capability::Baseline,
+        &inp.operands(&s, loud, s.b),
+        &[],
+        [1, (s.dv / 4) as u32, (s.b * s.hv) as u32],
+    );
+    let (want_out, want_state, _) = gdn_reference(&s, &inp, loud, &|b| b, s.b);
+    gdn_check(
+        &bf16_read(&out[3]),
+        &want_out,
+        GDN_OUT_TOL,
+        "gdn_core core_out at a loud eps",
+    );
+    gdn_check(
+        &f32_read(&out[2]),
+        &want_state,
+        GDN_STATE_TOL,
+        "gdn_core rstate at a loud eps",
+    );
+}
+
+/// `gdn_core_slotted_bfloat16` is the same kernel, and its slot map is real.
+///
+/// The two entry points are one template at `PIE_SLOTTED = 0` and `1`, and the
+/// file's claim is that at identity slots they are the same kernel. This tree
+/// has been bitten by believing that shape of claim before -- `sdpa_paged_mma`
+/// had three bodies answering one softmax that did not share one contract --
+/// so it is fired rather than read.
+///
+/// At identity slots the two must agree to the LAST BIT, not to a tolerance:
+/// they execute the same instructions over the same bytes, and any difference
+/// at all means the indirection changed something it had no business
+/// changing. Then the same map is PERMUTED over a permuted state slab, where
+/// the answer must come back unchanged. That second half is the only check
+/// that `slot_ids` is an indirection rather than a second spelling of
+/// `b_idx`: under identity every wrong implementation that ignores the map
+/// still passes, because ignoring it and following it are the same thing.
+#[test]
+fn the_slotted_gdn_core_follows_its_slot_map() {
+    let gpu = gpu!();
+    let s = GdnShape::FIXTURE;
+    let eps = 1e-6f32;
+    let inp = GdnInputs::build(&s, s.b);
+    let groups = [1u32, (s.dv / 4) as u32, (s.b * s.hv) as u32];
+
+    let plain = gpu.dispatch(
+        "gdn_core_bfloat16",
+        Capability::Baseline,
+        &inp.operands(&s, eps, s.b),
+        &[],
+        groups,
+    );
+
+    let mut identity = inp.operands(&s, eps, s.b);
+    identity.push((0..s.b as u32).flat_map(|i| i.to_le_bytes()).collect());
+    let same = gpu.dispatch(
+        "gdn_core_slotted_bfloat16",
+        Capability::Baseline,
+        &identity,
+        &[],
+        groups,
+    );
+    for (i, what) in [(3usize, "core_out"), (2, "rstate"), (10, "new_conv_state")] {
+        assert_eq!(
+            plain[i], same[i],
+            "at identity slots the slotted form's {what} differs from the \
+             unslotted form's. They are one template at `PIE_SLOTTED`, so a \
+             difference here is the indirection changing the arithmetic"
+        );
+    }
+
+    // Now the same problem wearing a permutation: slot `perm[b]` holds what
+    // slot `b` held, and the map says so. Every slab the kernel indexes BY
+    // SLOT moves -- `conv_state`, `rstate` and `new_conv_state` -- while
+    // `mixed` and the gates stay indexed by `b_idx` and do not.
+    let perm: Vec<usize> = (0..s.b).map(|b| (b + 1) % s.b).collect();
+    let cd = s.conv_dim();
+    let mut moved = GdnInputs::build(&s, s.b);
+    for b in 0..s.b {
+        let (from, to) = (b, perm[b]);
+        for j in 0..s.kc {
+            for c in 0..cd {
+                moved.conv_state[(to * s.kc + j) * cd + c] =
+                    inp.conv_state[(from * s.kc + j) * cd + c];
+            }
+        }
+        let width = s.hv * s.dv * s.dk;
+        moved.rstate[to * width..(to + 1) * width]
+            .copy_from_slice(&inp.rstate[from * width..(from + 1) * width]);
+    }
+    let mut permuted = moved.operands(&s, eps, s.b);
+    permuted.push(
+        perm.iter()
+            .flat_map(|p| (*p as u32).to_le_bytes())
+            .collect(),
+    );
+    let after = gpu.dispatch(
+        "gdn_core_slotted_bfloat16",
+        Capability::Baseline,
+        &permuted,
+        &[],
+        groups,
+    );
+
+    assert_eq!(
+        after[3], plain[3],
+        "moving every slot one place and saying so changed the OUTPUT, so \
+         `slot_ids` is not being followed the whole way through"
+    );
+    // The state and the conv history come back permuted, since they are the
+    // slabs the map addresses -- unpermuting them is what says the kernel
+    // wrote through the map rather than past it.
+    let (got_state, got_conv) = (f32_read(&after[2]), f32_read(&after[10]));
+    let (want_state, want_conv) = (f32_read(&plain[2]), f32_read(&plain[10]));
+    let width = s.hv * s.dv * s.dk;
+    for b in 0..s.b {
+        assert_eq!(
+            got_state[perm[b] * width..(perm[b] + 1) * width],
+            want_state[b * width..(b + 1) * width],
+            "slot {} of the permuted rstate is not what slot {b} of the plain \
+             run holds",
+            perm[b]
+        );
+        for j in 0..s.kc {
+            let (g, w) = ((perm[b] * s.kc + j) * cd, (b * s.kc + j) * cd);
+            assert_eq!(
+                got_conv[g..g + cd],
+                want_conv[w..w + cd],
+                "tap {j} of slot {} of the permuted conv history is not what \
+                 slot {b} of the plain run holds",
+                perm[b]
+            );
+        }
+    }
+}
+
+impl GdnInputs {
+    /// `gdn_prep`'s binding order, which is not the fused kernel's.
+    ///
+    /// The split pair rearranges the whole set: the prep drops `rstate` and
+    /// `core_out` entirely and gains the three f32 scratch slabs, so a test
+    /// that reused the fused operand vector would bind `conv_w` where the
+    /// shader reads `rstate` and still run.
+    fn prep_operands(&self, s: &GdnShape, eps: f32, slots: usize) -> Vec<Vec<u8>> {
+        let cd = s.conv_dim();
+        let n = s.b * s.hv;
+        vec![
+            bf16_bytes(&self.mixed),
+            self.conv_state
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            bf16_bytes(&self.conv_w),
+            bf16_bytes(&self.conv_b),
+            self.a_log.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            bf16_bytes(&self.dt_bias),
+            bf16_bytes(&self.a_gate),
+            bf16_bytes(&self.b_gate),
+            vec![0u8; n * s.dk * 4],
+            vec![0u8; n * s.dk * 4],
+            // The DECODE prep's gate slab is `2 * Hv` per row and nothing
+            // more. `kernels-metal`'s header claimed `2*Hv + Hv*Dv` here for
+            // as long as the file existed; that is the PREFILL layout, where
+            // the scan really does read V back at `+ 2*Hv`. The decode
+            // recurrent recomputes its own `vval`, because a v channel is
+            // unique per `dv` and there is no redundancy to remove.
+            vec![0u8; 2 * n * 4],
+            vec![0u8; slots * s.kc * cd * 4],
+            s.params(eps),
+        ]
+    }
+}
+
+/// The split GDN pair is the fused kernel, to the bit.
+///
+/// `gdn_prep` and `gdn_core_recurrent` exist to kill redundant q/k work:
+/// every value channel of a head recomputes the same convolution, the same
+/// pair of L2 norms and the same gates, so the split stages them once in f32
+/// scratch and the recurrent half reads them back. The file's claim is that
+/// this is the same arithmetic, and it has never been run.
+///
+/// `assert_eq!` and not a tolerance, deliberately. The failure a split like
+/// this actually has is a reduction that associates differently -- prep
+/// reduces under `[numthreads(32,1,1)]` and the fused kernel under
+/// `[numthreads(32,4,1)]` -- and that lands a few ulps out, which is inside
+/// any bound wide enough for a bf16 store. A tolerance would not have tested
+/// the claim it was written to test.
+///
+/// The two halves also split the convolution writeback between them: prep
+/// rolls the q and k channels under `hk_first` and the recurrent rolls the v
+/// channels, so `new_conv_state` is only whole if BOTH ran and neither wrote
+/// the other's. It is threaded from the first dispatch into the second rather
+/// than allocated twice, which is what makes that checkable -- and each
+/// dispatch here is its own submit, so the ordering edge is real rather than
+/// a barrier someone remembered to encode.
+#[test]
+fn the_split_gdn_pair_is_the_fused_kernel_to_the_bit() {
+    let gpu = gpu!();
+    let s = GdnShape::FIXTURE;
+    let eps = 1e-6f32;
+    let inp = GdnInputs::build(&s, s.b);
+    let n = s.b * s.hv;
+
+    let fused = gpu.dispatch(
+        "gdn_core_bfloat16",
+        Capability::Baseline,
+        &inp.operands(&s, eps, s.b),
+        &[],
+        [1, (s.dv / 4) as u32, n as u32],
+    );
+
+    let prepped = gpu.dispatch(
+        "gdn_prep_bfloat16",
+        Capability::Baseline,
+        &inp.prep_operands(&s, eps, s.b),
+        &[],
+        [1, 1, n as u32],
+    );
+
+    // The recurrent half, reading the scratch the prep just wrote and
+    // CONTINUING its convolution history rather than starting a fresh one.
+    let recurrent = gpu.dispatch(
+        "gdn_core_recurrent_bfloat16",
+        Capability::Baseline,
+        &[
+            bf16_bytes(&inp.mixed),
+            inp.conv_state
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            inp.rstate.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            vec![0u8; n * s.dv * 2],
+            bf16_bytes(&inp.conv_w),
+            bf16_bytes(&inp.conv_b),
+            prepped[8].clone(),
+            prepped[9].clone(),
+            prepped[10].clone(),
+            prepped[11].clone(),
+            s.params(eps),
+        ],
+        &[],
+        [1, (s.dv / 4) as u32, n as u32],
+    );
+
+    assert_eq!(
+        recurrent[3], fused[3],
+        "the split pair's core_out is not the fused kernel's, bit for bit"
+    );
+    assert_eq!(
+        recurrent[2], fused[2],
+        "the split pair's rstate is not the fused kernel's, bit for bit"
+    );
+    assert_eq!(
+        recurrent[9], fused[10],
+        "the split pair's new_conv_state is not the fused kernel's. The q and \
+         k channels come from the prep and the v channels from the recurrent, \
+         so a mismatch is one half writing the other's or neither writing some"
+    );
+
+    // The prep's own scratch, checked against the reference rather than only
+    // against the fused kernel -- otherwise two halves that agreed with each
+    // other and with nothing else would pass. `pre_q` carries the
+    // `1/sqrt(Dk)` prescale and `pre_k` does not, which is the one asymmetry
+    // in the pair and the one a port most easily mirrors.
+    let (pre_q, pre_k) = (f32_read(&prepped[8]), f32_read(&prepped[9]));
+    let gate = f32_read(&prepped[10]);
+    let r = |v: &[f32]| bf16_read(&bf16_bytes(v));
+    let (mixed, conv_w, conv_b) = (r(&inp.mixed), r(&inp.conv_w), r(&inp.conv_b));
+    let cd = s.conv_dim();
+    let rep = s.hv / s.hk;
+    let convsilu = |b: usize, c: usize| -> f32 {
+        let mut acc = conv_b[c];
+        for j in 0..s.kc - 1 {
+            acc += inp.conv_state[(b * s.kc + (j + 1)) * cd + c] * conv_w[c * s.kc + j];
+        }
+        acc += mixed[b * cd + c] * conv_w[c * s.kc + (s.kc - 1)];
+        acc / (1.0 + (-acc).exp())
+    };
+    let mut want_q = Vec::new();
+    let mut want_k = Vec::new();
+    for i in 0..n {
+        let (b, hv) = (i / s.hv, i % s.hv);
+        let hk = hv / rep;
+        let q: Vec<f32> = (0..s.dk)
+            .map(|d| convsilu(b, s.q_off() + hk * s.dk + d))
+            .collect();
+        let k: Vec<f32> = (0..s.dk)
+            .map(|d| convsilu(b, s.k_off() + hk * s.dk + d))
+            .collect();
+        let qinv =
+            (1.0 / (s.dk as f32).sqrt()) / (q.iter().map(|v| v * v).sum::<f32>() + eps).sqrt();
+        let kinv = 1.0 / (k.iter().map(|v| v * v).sum::<f32>() + eps).sqrt();
+        want_q.extend(q.iter().map(|v| v * qinv));
+        want_k.extend(k.iter().map(|v| v * kinv));
+    }
+    gdn_check(&pre_q, &want_q, GDN_STATE_TOL, "gdn_prep pre_q");
+    gdn_check(&pre_k, &want_k, GDN_STATE_TOL, "gdn_prep pre_k");
+
+    // And the gate slab is two floats a head, in that order. A prep that
+    // wrote beta first would still produce a `decay` and a `beta` of the
+    // right values and hand them to the recurrent the wrong way round.
+    let (dt_bias, a_gate, b_gate) = (r(&inp.dt_bias), r(&inp.a_gate), r(&inp.b_gate));
+    assert_eq!(
+        gate.len(),
+        2 * n,
+        "the decode gate slab is two floats a head"
+    );
+    for i in 0..n {
+        let (b, hv) = (i / s.hv, i % s.hv);
+        let ad = a_gate[b * s.hv + hv] + dt_bias[hv];
+        let sp = ad.max(0.0) + (1.0 + (-ad.abs()).exp()).ln();
+        let decay = (-inp.a_log[hv].exp() * sp).exp();
+        let beta = 1.0 / (1.0 + (-b_gate[b * s.hv + hv]).exp());
+        for (at, want, what) in [(2 * i, decay, "decay"), (2 * i + 1, beta, "beta")] {
+            assert!(
+                (gate[at] - want).abs() <= 1e-6 * want.abs().max(1.0),
+                "gate slot {at} holds {} and the {what} for head {i} is {want}",
+                gate[at]
+            );
+        }
+    }
+}
+
+/// The nine `(LANES, VROWS)` tilings the prefill scan is compiled at.
+const GDN_SCAN_TILINGS: &[(&str, u32, u32)] = &[
+    ("gdn_core_recurrent_prefill_bfloat16_l_4_v_1", 4, 1),
+    ("gdn_core_recurrent_prefill_bfloat16_l_8_v_1", 8, 1),
+    ("gdn_core_recurrent_prefill_bfloat16_l_8_v_2", 8, 2),
+    ("gdn_core_recurrent_prefill_bfloat16_l_16_v_1", 16, 1),
+    ("gdn_core_recurrent_prefill_bfloat16_l_16_v_2", 16, 2),
+    ("gdn_core_recurrent_prefill_bfloat16_l_16_v_4", 16, 4),
+    ("gdn_core_recurrent_prefill_bfloat16_l_32_v_2", 32, 2),
+    ("gdn_core_recurrent_prefill_bfloat16_l_32_v_4", 32, 4),
+    ("gdn_core_recurrent_prefill_bfloat16_l_32_v_8", 32, 8),
+];
+
+/// The prompt-prefill scan answers the decode, walked token by token.
+///
+/// Ten of this family's sixteen modules are the prefill path -- one prep and
+/// nine `(LANES, VROWS)` tilings of the scan -- and none had ever run. There
+/// is no reference worth writing for them, because the thing they have to
+/// agree with is not an equation but the DECODE path: a prompt pushed through
+/// the fused kernel one token at a time, with the convolution history
+/// ping-ponged forward, is what the model would have computed had it decoded
+/// the prompt instead of prefilling it. That walk is the oracle.
+///
+/// Five tokens against a four-tap window, so the FIR really does walk off
+/// `conv_state` and onto the prompt: at `t = 0` three of its four taps come
+/// from the carried history and at `t = 3` none do. A prompt shorter than
+/// `Kc` would never leave the history and a much longer one would only repeat
+/// the interior case.
+///
+/// # The pitch, which is not the one you would guess
+///
+/// `row_pitch` counts elements of the bf16 prompt, and the f32 scratch shares
+/// its BYTE pitch -- so the scratch's row stride is `row_pitch / 2` floats,
+/// which is the shader's `pitch_f`. That makes the pitch a real constraint
+/// rather than bookkeeping: it has to cover `Hv * Dk` floats for `pre_q` AND
+/// `2 * Hv + Hv * Dv` for the gate slab, whose tail is the precomputed V the
+/// decode prep does not write. The fixture's natural `conv_dim` of 288 gives
+/// a `pitch_f` of 144 against a `pre_q` row of 256, so the prompt rows are
+/// PADDED to 512 and the shader reads only the meaningful head of each. A
+/// pitch chosen by shape rather than by constraint would have run off the end
+/// of one row into the next and returned plausible numbers.
+#[test]
+fn the_prefill_scan_answers_the_decode_walked_token_by_token() {
+    let gpu = gpu!();
+    let s = GdnShape {
+        b: 1,
+        ..GdnShape::FIXTURE
+    };
+    let eps = 1e-6f32;
+    let tokens = 5usize;
+    let cd = s.conv_dim();
+    let pitch = 512usize;
+    assert!(
+        pitch / 2 >= (s.hv * s.dk).max(2 * s.hv + s.hv * s.dv) && pitch >= cd,
+        "the fixture's pitch has to cover the widest scratch row and the prompt"
+    );
+
+    let inp = GdnInputs::build(&s, 1);
+    let prompt: Vec<f32> = gdn_spread(tokens * pitch, 11, 1.0);
+    let prompt_bytes = bf16_bytes(&prompt);
+    // The prefill reads its gates per TOKEN, at `t * row_pitch + hv`, where
+    // the decode reads them per request at `b * Hv + hv`. So the walk has to
+    // be handed token `t`'s slice and not the same four values five times --
+    // getting that wrong is what the first run of this test did, and it
+    // agreed at token 0 and diverged at token 1, which is exactly what a
+    // stale gate looks like.
+    let pa = gdn_spread(tokens * pitch, 8, 1.0);
+    let pb = gdn_spread(tokens * pitch, 9, 1.0);
+
+    // The oracle: `gdn_core` once per token, carrying both slabs forward.
+    let mut conv = inp.conv_state.clone();
+    let mut state = inp.rstate.clone();
+    let mut walked: Vec<Vec<u8>> = Vec::new();
+    for t in 0..tokens {
+        let mut step = GdnInputs::build(&s, 1);
+        step.mixed = prompt[t * pitch..t * pitch + cd].to_vec();
+        step.conv_state = conv.clone();
+        step.rstate = state.clone();
+        let (a_log, dt_bias) = (inp.a_log.clone(), inp.dt_bias.clone());
+        let a_gate = pa[t * pitch..t * pitch + s.hv].to_vec();
+        let b_gate = pb[t * pitch..t * pitch + s.hv].to_vec();
+        let (conv_w, conv_b) = (inp.conv_w.clone(), inp.conv_b.clone());
+        step.a_log = a_log;
+        step.dt_bias = dt_bias;
+        step.a_gate = a_gate;
+        step.b_gate = b_gate;
+        step.conv_w = conv_w;
+        step.conv_b = conv_b;
+        let out = gpu.dispatch(
+            "gdn_core_bfloat16",
+            Capability::Baseline,
+            &step.operands(&s, eps, 1),
+            &[],
+            [1, (s.dv / 4) as u32, (s.hv) as u32],
+        );
+        walked.push(out[3].clone());
+        state = f32_read(&out[2]);
+        conv = f32_read(&out[10]);
+    }
+
+    // The prefill prep, over the whole prompt at once.
+    let push: Vec<u8> = [pitch as i32, tokens as i32]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let scratch = tokens * (pitch / 2) * 4;
+    let prep = gpu.dispatch(
+        "gdn_prep_prefill_bfloat16",
+        Capability::Baseline,
+        &[
+            prompt_bytes.clone(),
+            inp.conv_state
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            bf16_bytes(&inp.conv_w),
+            bf16_bytes(&inp.conv_b),
+            inp.a_log.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            bf16_bytes(&inp.dt_bias),
+            // The prefill reads its gates per TOKEN at `t * row_pitch + hv`,
+            // not per request, so these are prompt-shaped too.
+            bf16_bytes(&pa),
+            bf16_bytes(&pb),
+            vec![0u8; scratch],
+            vec![0u8; scratch],
+            vec![0u8; scratch],
+            vec![0u8; s.kc * cd * 4],
+            s.params(eps),
+            vec![0u8; 4],
+        ],
+        &push,
+        [1, 1, (tokens * s.hv) as u32],
+    );
+
+    // Every tiling answers the same walk. They differ in how many lanes carry
+    // a reduction and how many value rows a lane group holds, which is a
+    // statement about scheduling and not about arithmetic -- but `LANES`
+    // changes the WIDTH of the reduction and so its association, which is why
+    // this is checked and not assumed.
+    let mut states: Vec<(&str, u32, u32, Vec<u8>)> = Vec::new();
+    for &(name, lanes, vrows) in GDN_SCAN_TILINGS {
+        let rows = 32 / lanes;
+        let scan = gpu.dispatch(
+            name,
+            Capability::Baseline,
+            &[
+                inp.rstate.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                vec![0u8; tokens * pitch * 2],
+                prep[8].clone(),
+                prep[9].clone(),
+                prep[10].clone(),
+                s.params(eps),
+                vec![0u8; 4],
+            ],
+            &push,
+            [1, (s.dv as u32).div_ceil(rows * vrows), s.hv as u32],
+        );
+
+        let got = bf16_read(&scan[1]);
+        for t in 0..tokens {
+            let want = bf16_read(&walked[t]);
+            let row = &got[t * pitch..t * pitch + s.hv * s.dv];
+            assert_eq!(
+                row,
+                &want[..],
+                "{name} disagrees with the token-by-token walk at token {t}. \
+                 `core_out` is bf16 and no reduction width in this family \
+                 moves a value that far, so this is arithmetic and not \
+                 association"
+            );
+        }
+        states.push((name, lanes, vrows, scan[0].clone()));
+    }
+    // What `core_out` rounds away, `rstate` keeps. The output is bf16 and
+    // agrees with the walk exactly; the state is f32 and sits 1.4e-7 from it,
+    // which is where the difference between the tilings actually lives.
+    //
+    // And it lives there in a shape worth stating: two tilings hold the same
+    // state BIT for bit exactly when they share `LANES`. That is each
+    // parameter's own claim, measured rather than assumed -- `VROWS` changes
+    // how many independent value rows a lane group carries and nothing that
+    // is summed, while `LANES` changes the width of the lane reduction and so
+    // its association. Written as an equivalence in both directions, so a
+    // `VROWS` that started perturbing a sum fails here just as loudly as a
+    // `LANES` that stopped.
+    for (name, lanes, _, st) in &states {
+        for (other, olanes, _, ost) in &states {
+            assert_eq!(
+                st == ost,
+                lanes == olanes,
+                "{name} and {other} hold {} recurrent states and their LANES \
+                 are {}. Bit-equality here follows LANES and only LANES",
+                if st == ost { "identical" } else { "different" },
+                if lanes == olanes {
+                    "the same"
+                } else {
+                    "different"
+                },
+            );
+        }
+    }
+
+    let worst = states
+        .iter()
+        .map(|(n, _, _, st)| gdn_check(&f32_read(st), &state, GDN_STATE_TOL, n))
+        .fold(0.0f32, f32::max);
+    gdn_band(worst, GDN_STATE_TOL, "the prefill scan's rstate");
+}
+
+/// The slotted split pair follows the same map as the slotted fused kernel.
+///
+/// `gdn_prep_slotted` and `gdn_core_recurrent_slotted` are the last two of the
+/// family's sixteen modules with no number to their name. They are the split
+/// pair and the slot indirection at once, which is exactly the combination
+/// where a port drops one of the two: the prep reads `slot_ids[b_idx]` for its
+/// convolution history while the recurrent reads it again for the recurrent
+/// state, and a half that quietly fell back to `b_idx` would agree with
+/// everything under an identity map.
+///
+/// So the map is a permutation from the start, and the oracle is the slotted
+/// FUSED kernel over the same permuted slabs -- which
+/// `the_slotted_gdn_core_follows_its_slot_map` has already tied back to the
+/// unslotted form. Bit for bit, for the reason the unslotted split has it:
+/// the two halves reduce under different workgroup shapes, and a tolerance
+/// wide enough for a bf16 store would not see the only failure this pair
+/// actually has.
+#[test]
+fn the_slotted_split_pair_follows_the_same_map() {
+    let gpu = gpu!();
+    let s = GdnShape::FIXTURE;
+    let eps = 1e-6f32;
+    let n = s.b * s.hv;
+    let cd = s.conv_dim();
+    let inp = GdnInputs::build(&s, s.b);
+
+    // Slot `perm[b]` holds what request `b` carries, so every slab addressed
+    // BY SLOT moves and the per-request inputs stay where they are.
+    let perm: Vec<usize> = (0..s.b).map(|b| (b + 1) % s.b).collect();
+    let mut moved = GdnInputs::build(&s, s.b);
+    for b in 0..s.b {
+        for j in 0..s.kc {
+            for c in 0..cd {
+                moved.conv_state[(perm[b] * s.kc + j) * cd + c] =
+                    inp.conv_state[(b * s.kc + j) * cd + c];
+            }
+        }
+        let width = s.hv * s.dv * s.dk;
+        moved.rstate[perm[b] * width..(perm[b] + 1) * width]
+            .copy_from_slice(&inp.rstate[b * width..(b + 1) * width]);
+    }
+    let slots: Vec<u8> = perm
+        .iter()
+        .flat_map(|p| (*p as u32).to_le_bytes())
+        .collect();
+
+    let mut fused_ops = moved.operands(&s, eps, s.b);
+    fused_ops.push(slots.clone());
+    let fused = gpu.dispatch(
+        "gdn_core_slotted_bfloat16",
+        Capability::Baseline,
+        &fused_ops,
+        &[],
+        [1, (s.dv / 4) as u32, n as u32],
+    );
+
+    let mut prep_ops = moved.prep_operands(&s, eps, s.b);
+    prep_ops.push(slots.clone());
+    let prepped = gpu.dispatch(
+        "gdn_prep_slotted_bfloat16",
+        Capability::Baseline,
+        &prep_ops,
+        &[],
+        [1, 1, n as u32],
+    );
+
+    let recurrent = gpu.dispatch(
+        "gdn_core_recurrent_slotted_bfloat16",
+        Capability::Baseline,
+        &[
+            bf16_bytes(&moved.mixed),
+            moved
+                .conv_state
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            moved.rstate.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            vec![0u8; n * s.dv * 2],
+            bf16_bytes(&moved.conv_w),
+            bf16_bytes(&moved.conv_b),
+            prepped[8].clone(),
+            prepped[9].clone(),
+            prepped[10].clone(),
+            prepped[11].clone(),
+            s.params(eps),
+            slots,
+        ],
+        &[],
+        [1, (s.dv / 4) as u32, n as u32],
+    );
+
+    for (split, whole, what) in [
+        (3usize, 3usize, "core_out"),
+        (2, 2, "rstate"),
+        (9, 10, "new_conv_state"),
+    ] {
+        assert_eq!(
+            recurrent[split], fused[whole],
+            "under a permuted slot map the split pair's {what} is not the \
+             fused kernel's. One of the two halves is reading a slot the \
+             other is not"
+        );
+    }
 }

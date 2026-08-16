@@ -52,13 +52,26 @@ fn pie_bf16_at(word: u32, i: u32) -> f32 {
 
 // One half of a word replaced, for a caller that owns the whole word.
 //
-// Returns the new word rather than writing it, for the same pointer reason —
-// and the shape is better anyway. `out_[at] = pie_bf16_into(out_[at], i, v)` is
-// a read-modify-write the caller can SEE, so the question "does another
-// invocation own the other half of this word?" is asked where it can be
-// answered. WGSL has no sub-word atomic, so a body that cannot answer it must
-// either write both halves at once with `pie_pack_bf16` or use an
-// `atomicCompareExchangeWeak` loop over an `array<atomic<u32>>`.
+// This is the function the tree's comments call `pie_store_bf16` when they are
+// describing what a store helper WOULD do if WGSL let one take a pointer. It
+// does not take one, for the reason `pie_bf16_at` gives above, so it returns
+// the new word rather than writing it — and the shape is better anyway.
+// `out_[at] = pie_bf16_into(out_[at], i, v)` is a read-modify-write the caller
+// can SEE, so the question "does another invocation own the other half of this
+// word?" is asked where it can be answered. WGSL has no sub-word atomic, so a
+// body that cannot answer it must do one of three things:
+//
+//   - write both halves at once with `pie_pack_bf16` (`rope/neox.wgsl`),
+//   - loop on `atomicCompareExchangeWeak` over an `array<atomic<u32>>`
+//     (`norm/rms.wgsl` and three others), or
+//   - clear its own half with `atomicAnd` and set it with `atomicOr`
+//     (`moe/route.wgsl` and five others).
+//
+// The last two are both race-free for writers of DISJOINT halves, which is the
+// only case that arises: the And/Or pair touches only its own sixteen bits, so
+// two lanes writing opposite halves commute. It is the cheaper of the two and
+// the CAS is the more general — a CAS survives two writers of the SAME half,
+// which would be a duplicate-writer bug rather than a tearing one.
 fn pie_bf16_into(word: u32, i: u32, x: f32) -> u32 {
     let v = pie_f32_to_bf16(x);
     if ((i & 1u) == 1u) {

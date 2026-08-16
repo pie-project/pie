@@ -103,8 +103,32 @@ members = [
     # `model-config`) that every one of them is parameterized by -- one crate,
     # module per generation, feature per aspect.
     "crates/model",
-    # Forward-pass declarations: a tracing eDSL whose static control flow runs
-    # at model-load time; the traced form is what a driver executes.
+    # The forward-pass toolchain, in the three layers `tensor-*` is already in
+    # and for the same reason. It was ONE crate (`model-compiler`, all five
+    # modules) until the consumer sets were read off the tree and found to be
+    # DISJOINT: `crates/model` writes declarations and never lowers one,
+    # every driver lowers and never writes one, and no crate in the workspace
+    # wanted both halves. What that cost was `driver-metal`, `driver-vulkan`
+    # and `driver-wgpu` each compiling `dsl::cuda`'s 4,469 lines -- an
+    # authoring surface for a backend they are not -- to reach `lower`, which
+    # they reached without calling a line of it.
+    #
+    # The traced form: the op vocabulary, the plan container and the
+    # `TraceBuilder` a declaration records onto, the seam words, and the
+    # signature tables a plan is checked against at trace time. The floor both
+    # halves stand on, and it names no family, no `Val` and no device.
+    "crates/model-ir",
+    # The authoring eDSL: typed weight handles, tape-carrying values, and the
+    # raw kernel-signature surfaces (`cuda`, `metal`) a lowered declaration is
+    # written against. Depended on by `crates/model` and NOTHING else -- which
+    # is the fact the split turned from a convention into a build rule. Carries
+    # the tracer fingerprint (`compiler_version()`), whose hash covers this
+    # tree and `model-ir`'s, because the tracer is both of them.
+    "crates/model-dsl",
+    # Lowering alone now: traced form + the engine's rows + one fire ->
+    # rectangles, operands, buffers. Keeps the name because a compiler is what
+    # turns a representation into what a machine runs, which is what is left
+    # here once the surface and the IR are their own crates.
     "crates/model-compiler",
     # Weight loader: checkpoints -> verified device-memory layouts. Consumed by
     # drivers at cold start, not by the serving runtime. One crate: the drivers
@@ -117,23 +141,37 @@ members = [
     # under the prefixed backends, holding what all of their tables are
     # written in rather than anything any one of them does.
     "crates/kernels",
-    # `crates/kernels-cuda` STOOD HERE, and the sentence above it used to end
-    # "-- the two implementation crates default to table-only, `native` is
-    # what costs nvcc." There is no longer a CUDA pair to be the floor under
-    # and no `native` on this side to cost anything: the archive crate is
-    # deleted and the JIT below is the CUDA half entire.
     # The JIT-native shape of the CUDA half: the table, the device sources
     # carried in the binary, and the runtime that NVRTC-compiles and fires
-    # them. No CMake, no archive, no `links` key -- a kernel is text, so there
-    # is nothing to build ahead of time and nothing to link. It built beside
-    # `kernels-cuda` while both paths had to run, and HOLDS the rows both
-    # read: the seam that had it borrow them closed by moving the table here
-    # and inverting the edge, so `kernels-cuda` depended on this and
-    # re-exported what it used to own. That inversion is why the archive could
-    # be deleted at all -- the arrow pointed at this crate, so nothing here
-    # had to move when the other end went. A symbol still has exactly one
-    # contract; the crate that authors it is the one a row is written for.
-    "crates/kernels-cuda-new",
+    # them. No CMake, no archive, no `links` key -- a kernel is text, so
+    # there is nothing to build ahead of time and nothing to link.
+    #
+    # It carried a `-new` suffix until it took this line, and a headstone
+    # STOOD HERE in its place: the plain name belonged to an ahead-of-time
+    # archive crate -- `libpie_kernels_cuda.a` out of CMake, a
+    # `links = "pie_kernels_cuda"` key, a `native` feature that cost nvcc --
+    # deleted at `85c6c674b`. The `-new` was never a version. It was the
+    # contrast with that crate, and a name that distinguishes A from B
+    # distinguishes nothing once B is gone; holding the plain name vacant for
+    # a crate that will not return is the same mistake pointing the other
+    # way. So the suffix came off. The archive is still discussed all over
+    # this tree's comments, because it is where most of this device code came
+    # from, and every one of those mentions now says which crate it means at
+    # the point where it stands.
+    #
+    # The sentence above this block used to end "-- the two implementation
+    # crates default to table-only, `native` is what costs nvcc." There is no
+    # CUDA pair left to be the floor under, and nothing on this side costs
+    # nvcc.
+    #
+    # What let the archive go was inverting the edge between the two while
+    # both paths still had to run: the rows moved HERE, and the archive took
+    # them back through a `default-features = false` dependency, re-exporting
+    # them under the paths it used to own. The arrow pointed at this crate,
+    # so nothing here had to move when the other end went. A symbol still has
+    # exactly one contract; the crate that authors it is the one a row is
+    # written for.
+    "crates/kernels-cuda",
     "crates/kernels-metal",
     # The Vulkan tree. Its table is `kernels-metal`'s coverage, row for row, so
     # the two are comparable rather than merely parallel; what differs is the
@@ -203,10 +241,12 @@ default-members = [
     # should carry it where it does not carry `driver-vulkan` or `driver-metal`.
     "crates/driver-wgpu",
     "crates/model",
+    "crates/model-ir",
+    "crates/model-dsl",
     "crates/model-compiler",
     "crates/model-loader",
     "crates/kernels",
-    "crates/kernels-cuda-new",
+    "crates/kernels-cuda",
     "crates/kernels-metal",
     "crates/kernels-vulkan",
     "crates/kernels-wgpu",

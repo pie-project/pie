@@ -11,10 +11,11 @@
 //   neox_freqs_decode / _freqs_mb scale, head_dim, mscale   (inv_freq is a buffer)
 //   neox_strided                  scale, base, head_dim, row_pitch
 //
-// `cargo run -p kernels-wgpu --example dump_layout -- neox_freqs_decode` prints
-// that: `scale` at byte 0, `head_dim` at 4, `mscale` at 8. Transcribing Metal's
-// buffer numbers instead -- where `inv_freq` is buffer 3 and `head_dim` is 4 --
-// is how a rotation reads the frequency table's address as its head width.
+// `kernels_wgpu::uniform_layout` derives that from the row: `scale` at byte 0,
+// `head_dim` at 4, `mscale` at 8. The deleted `dump_layout` example used to
+// print the same answer. Transcribing Metal's buffer numbers instead -- where
+// `inv_freq` is buffer 3 and `head_dim` is 4 -- is how a rotation reads the
+// frequency table's address as its head width.
 //
 // ## Why the workgroup is ONE invocation
 //
@@ -62,11 +63,11 @@
 //#include "common/bf16.inc.wgsl"
 
 @group(0) @binding(0) var<storage, read_write> x: array<u32>;
-@group(0) @binding(1) var<storage, read> position: array<i32>;
+@group(0) @binding(1) var<storage, read_write> position: array<i32>;
 //#if defined(PIE_FREQS)
 // The rescaled ladder: llama-3's piecewise interpolation and YaRN's are tables,
 // not bases, so no exponent can express them.
-@group(0) @binding(2) var<storage, read> inv_freq: array<f32>;
+@group(0) @binding(2) var<storage, read_write> inv_freq: array<f32>;
 //#endif
 
 //#if defined(PIE_FREQS)

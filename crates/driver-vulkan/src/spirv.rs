@@ -26,6 +26,8 @@ const OP_DECORATE: u32 = 71;
 const MODE_LOCAL_SIZE: u32 = 17;
 /// Decoration `Binding`.
 const DECORATION_BINDING: u32 = 33;
+/// Decoration `NonWritable` — `readonly` on a storage buffer.
+const DECORATION_NON_WRITABLE: u32 = 24;
 /// Decoration `BuiltIn`.
 const DECORATION_BUILTIN: u32 = 11;
 /// Builtin `NumWorkgroups`.
@@ -62,7 +64,7 @@ const STORAGE_PUSH_CONSTANT: u32 = 9;
 /// Storage class `StorageBuffer`, which is what an SSBO block is.
 const STORAGE_BUFFER: u32 = 12;
 /// Storage class `Uniform`, which is what an SSBO block is under the older
-/// `BufferBlock` spelling glslc still emits for some targets.
+/// `BufferBlock` spelling slangc still emits for some targets.
 const STORAGE_UNIFORM: u32 = 2;
 /// `OpTypeInt`, `OpTypeFloat`, `OpTypeBool` — the scalars a block is built of.
 const OP_TYPE_INT: u32 = 21;
@@ -94,7 +96,7 @@ pub struct Declared {
     /// One past the highest `binding = N` the module decorates.
     ///
     /// The COUNT of them is the wrong number and using it is a crash. 79 of
-    /// this tree's modules decorate a non-contiguous set — `glslc` drops the
+    /// this tree's modules decorate a non-contiguous set — `slangc` drops the
     /// declaration of a buffer a variant never reads, so
     /// `affine_qmm_t_fp16_precast` decorates 0, 1, 2, 4, 7 — and a few hole
     /// theirs on purpose, since `kv_append_paged` keeps Metal's ring-ABI
@@ -113,7 +115,7 @@ pub struct Declared {
     /// The component of `gl_WorkGroupID` or `gl_GlobalInvocationID` it reads.
     /// This is what makes a grid on the WRONG AXIS detectable, and that is not
     /// a hypothetical: this crate's first `Rule::Rms` put the row count on y,
-    /// while `norm/rms.comp` reads its row from `gl_WorkGroupID.x`. Every row
+    /// while `norm/rms.slang` reads its row from `gl_WorkGroupID.x`. Every row
     /// but the first was left holding the zeros its buffer was born with, four
     /// dispatches returned success, and the lane-coverage sweeps all passed --
     /// they counted lanes and never asked which axis carried them.
@@ -134,7 +136,7 @@ pub struct Declared {
     ///
     /// [`Self::bindings`] is one past the HIGHEST, so the two disagree
     /// wherever the set has a hole -- and 79 of this tree's modules have one.
-    /// `glslc` drops the declaration of a buffer a variant never reads, so
+    /// `slangc` drops the declaration of a buffer a variant never reads, so
     /// `affine_qmm_t_fp16_precast` decorates 0, 1, 2, 4, 7 and nothing at all
     /// at 3, 5 or 6. `kv_append_paged` holes its 10 and 11 on purpose, keeping
     /// Metal's ring-ABI slots.
@@ -151,6 +153,35 @@ pub struct Declared {
     /// Indexed by binding number and [`Self::bindings`] long, so a hole reads
     /// as `false` rather than as an absence a caller has to notice.
     pub used: Vec<bool>,
+    /// Which bindings the shader may WRITE through.
+    ///
+    /// Indexed by binding number and [`Self::bindings`] long, like
+    /// [`Self::used`]; a hole reads as `false`, which is right, since nothing
+    /// is there to write.
+    ///
+    /// # Why the module and not the row
+    ///
+    /// Because for 56 of this table's 100 rows the row does not say. A row
+    /// that states its operands gives each one a `Ty`, and `BufMut` is the
+    /// write mark; a row that states none -- the whole `qmm_t_*` family, the
+    /// `sdpa_paged_*` family, `gdn_*` -- left the driver marking EVERY buffer
+    /// it bound as written, weights included.
+    ///
+    /// That is not a correctness problem and it is an expensive one.
+    /// `device::hazards` decides where a pipeline barrier goes by asking
+    /// which byte ranges a dispatch writes, so a matmul that claims to write
+    /// the weights it only reads manufactures a dependency on every later
+    /// dispatch that touches them. Across this tree's 666 modules, 3060 of
+    /// 3795 buffer bindings -- 80% -- are declared `readonly` in the shader and
+    /// were being counted as writes.
+    ///
+    /// The rule this follows is the crate's existing one, applied one place
+    /// further: which scalars a kernel takes and where is read off the
+    /// compiled module rather than off a name or a list (see
+    /// [`crate::binding::Params`]), and so is this. `slangc` puts `readonly`
+    /// on the SPIR-V variable as `NonWritable`, and the module is what the
+    /// GPU obeys.
+    pub writable: Vec<bool>,
     /// The bytes each binding's block requires, when that is knowable.
     ///
     /// Indexed by binding number, so it is [`Self::bindings`] long and a hole
@@ -262,6 +293,10 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
     let mut types: HashMap<u32, (u32, Vec<u32>)> = HashMap::new();
     let mut strides: HashMap<u32, (Option<u32>, Option<u32>)> = HashMap::new();
     let mut bound_variables: Vec<(u32, u32)> = Vec::new();
+    // Result ids the module marks `NonWritable`. Collected by id rather than
+    // by binding because the decoration is emitted before the binding is
+    // known -- `OpDecorate` is not sorted, which the walk above already says.
+    let mut non_writable: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let mut variable_types: HashMap<u32, u32> = HashMap::new();
 
     let mut i = 5;
@@ -287,6 +322,11 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
 
         if op == OP_EXECUTION_MODE && count >= 6 && words[i + 2] == MODE_LOCAL_SIZE {
             local = Some([words[i + 3], words[i + 4], words[i + 5]]);
+        }
+        // `OpDecorate <target> NonWritable` takes no literal, so it is three
+        // words and would be skipped by the `count >= 4` arm below.
+        if op == OP_DECORATE && count >= 3 && words[i + 2] == DECORATION_NON_WRITABLE {
+            non_writable.insert(words[i + 1]);
         }
         if op == OP_DECORATE && count >= 4 {
             match words[i + 2] {
@@ -329,8 +369,8 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
         // Reading one component of a grid-position builtin. `OpAccessChain`
         // indexes the variable through a pointer and its index is a constant
         // ID; `OpCompositeExtract` indexes a loaded vector and its index is a
-        // literal. Both appear in this tree, from the same GLSL, depending on
-        // whether glslc loaded the whole vector first.
+        // literal. Both appear in this tree, from the same source, depending on
+        // whether slangc loaded the whole vector first.
         if op == OP_ACCESS_CHAIN
             && count >= 5
             && position_ids.contains(&words[i + 3])
@@ -392,6 +432,17 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
         // A module that binds nothing needs a layout of no descriptors, which
         // is legal and is what a push-constant-only kernel wants.
         bindings: highest_binding.map_or(0, |h| h + 1),
+        writable: {
+            let mut writable = vec![false; highest_binding.map_or(0, |h| h + 1) as usize];
+            for &(variable, binding) in &bound_variables {
+                if !non_writable.contains(&variable)
+                    && let Some(slot) = writable.get_mut(binding as usize)
+                {
+                    *slot = true;
+                }
+            }
+            writable
+        },
         used: {
             let mut used = vec![false; highest_binding.map_or(0, |h| h + 1) as usize];
             for &(_, binding) in &bound_variables {
@@ -403,7 +454,7 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
         },
         reads_workgroup_count,
         grid_axes,
-        // Members come out in declaration order, not in the order glslc
+        // Members come out in declaration order, not in the order slangc
         // happened to emit their decorations, because the driver writes the
         // block front to back and an out-of-order comparison would agree with
         // a shader that reads its scalars transposed.
@@ -658,8 +709,8 @@ mod tests {
 
     /// Which components of the grid a module is indexed by, both ways round.
     ///
-    /// Both instruction forms appear in this kernel tree from identical GLSL,
-    /// depending on whether glslc loaded the whole vector before indexing it,
+    /// Both instruction forms appear in this kernel tree from identical source,
+    /// depending on whether slangc loaded the whole vector before indexing it,
     /// so a reader that handles one and not the other is a reader that is
     /// right about some modules and silently wrong about the rest.
     #[test]
@@ -766,7 +817,7 @@ mod tests {
 
     /// Members come back in declaration order, not decoration order.
     ///
-    /// glslc emits these in whatever order it likes, and the driver packs the
+    /// slangc emits these in whatever order it likes, and the driver packs the
     /// block front to back. A reader that kept emission order would agree
     /// with a shader that reads its scalars transposed.
     #[test]

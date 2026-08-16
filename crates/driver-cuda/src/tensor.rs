@@ -1,7 +1,8 @@
 //! A typed, shaped region of device memory, and the shape arithmetic that
 //! decides how large it is.
 //!
-//! Port of `kernels-cuda/csrc/src/tensor.hpp`'s `DeviceTensor`. The C++ class
+//! Port of `DeviceTensor` in `kernels-cuda/csrc/src/tensor.hpp` -- the
+//! archive crate's header, deleted with it at `85c6c674b`. The C++ class
 //! fuses two things that fail in different ways and are testable by different
 //! means:
 //!

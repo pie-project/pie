@@ -15,7 +15,13 @@ path = "src/lib.rs"
 [dependencies]
 # tart: the declared-forward toolchain — the fire planner's site table
 # maps driver-reported model sites onto its vocabulary.
+#
+# Two entries since the toolchain split, and they are the two HALVES this
+# crate actually touches: `lower` (the launch list, read by the site table's
+# cost model) and the traced form's vocabulary. The authoring eDSL is not in
+# the graph — the engine schedules forward passes and does not write them.
 model-compiler = { path = "../model-compiler" }
+model-ir = { path = "../model-ir" }
 driver-api = { path = "../driver-api" }
 tensor-ir = { path = "../tensor-ir" }
 tensor-compiler = { path = "../tensor-compiler" }

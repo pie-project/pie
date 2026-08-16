@@ -14,8 +14,9 @@ doubled, and answering it meant diffing the list against
 `cargo metadata` by hand.
 
 The second time was worse and silent. Sixteen of the twenty ungated
-crates had drifted out of rustfmt -- `engine` by 146 hunks,
-`kernels-cuda` by 144 -- because they had never been in the fmt list at
+crates had drifted out of rustfmt -- `engine` by 146 hunks, and by 144 the
+ahead-of-time CUDA archive crate that has since been deleted -- because
+they had never been in the fmt list at
 all. There was no signal. A crate that is not in the list is
 indistinguishable, from CI's output, from a crate that passes.
 
@@ -82,17 +83,18 @@ EXCLUSIONS = {
             "benefit to files that are being replaced. Add it when the "
             "rewrite lands."
         ),
-        "driver-vulkan": (
-            "same, and it is already rustfmt-clean -- so the only thing "
-            "adding it buys today is a merge conflict. Add it when the "
-            "rewrite lands."
-        ),
+        # The ahead-of-time archive crate had an entry of its own here --
+        # "144 drifted hunks against 57 commits in three days" -- and it was
+        # dropped when the crate was deleted at `85c6c674b`, because an
+        # exclusion naming a non-member is what the check below refuses. The
+        # JIT crate that has its name now is the entry that remains.
         "kernels-cuda": (
-            "144 drifted hunks against 57 commits in three days, five of "
-            "them in the last day and none of them mine. `engine` carried "
-            "this same reason until its churn turned out to have been my "
-            "own and stopped; this one has not stopped. Re-measure with "
-            "`git log --since='24 hours ago' -- crates/kernels-cuda`."
+            "1,320 drifted hunks against 47 commits in three days, three "
+            "of them in the last day: the crate the CUDA rewrite moved "
+            "INTO, so it is the churn itself rather than a crate that "
+            "drifted once. Re-measure with `cargo fmt --check -p "
+            "kernels-cuda | grep -c '^Diff'` and `git log "
+            "--since='24 hours ago' -- crates/kernels-cuda`."
         ),
     },
     "clippy": {
@@ -103,10 +105,26 @@ EXCLUSIONS = {
         # replays nothing and reports zero, which is how several of these
         # looked clean for months.
         "driver-cuda": "needs nvcc, and is being rewritten",
-        "driver-vulkan": "needs glslc, and is being rewritten",
-        "kernels-cuda": "needs nvcc",
+        # These two are NOT waiting on warnings any more -- both are at zero
+        # under `-D warnings`, driver-vulkan in both feature halves. What
+        # they wait on is the runner: `kernels-vulkan`'s build script shells
+        # out to `slangc` and panics without it, and driver-vulkan depends on
+        # that crate, so neither can be linted without a shader compiler.
+        #
+        # So the entry to remove here is an install step, not a lint. The
+        # `driver-vulkan` job now has one -- it fetches the pinned Slang
+        # release tarball, since `slangc` is in no distribution -- and runs
+        # clippy over both crates with `-D warnings`.
+        "driver-vulkan": "needs slangc on the runner; zero warnings otherwise",
+        # 52 sites, and the crate is where the CUDA rewrite landed. The
+        # ahead-of-time archive crate stood here under this same key with
+        # the reason "needs nvcc"; it was deleted at `85c6c674b` and this
+        # crate took its name, and nothing on this side needs nvcc -- a
+        # kernel is text NVRTC compiles at run time. The entry to remove is
+        # the last warning, not this line.
+        "kernels-cuda": "52 warnings, and the rewrite is landing in it",
         "kernels-metal": "needs a Mac",
-        "kernels-vulkan": "needs glslc",
+        "kernels-vulkan": "needs slangc on the runner; zero warnings otherwise",
         "pie-gpu-tests": "needs a GPU to be worth compiling",
         "pie-server-py": "a pyo3 extension; built by maturin, not by this job",
     },

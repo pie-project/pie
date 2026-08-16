@@ -46,7 +46,7 @@ use driver_metal::lowering::resolve::{Names, Store};
 use driver_metal::weights::load::load;
 use model::catalog::{MetalBinding, Variant};
 use model_compiler::lower::{Arg, Fire, Row, lower};
-use model_compiler::trace::FireClass;
+use model_ir::trace::FireClass;
 
 fn snapshot() -> Option<PathBuf> {
     std::env::var_os("PIE_METAL_SMOKE_CHECKPOINT").map(PathBuf::from)
@@ -286,11 +286,7 @@ fn the_checkpoint_answers_the_names_the_text_states() {
     ) {
         Ok(g) => g,
         Err(why) => {
-            eprintln!(
-                "SKIP: the geometry refuses `{}` -- {}",
-                row.id(),
-                why.0
-            );
+            eprintln!("SKIP: the geometry refuses `{}` -- {}", row.id(), why.0);
             return;
         }
     };

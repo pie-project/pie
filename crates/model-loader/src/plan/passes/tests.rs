@@ -331,7 +331,8 @@ fn rejects_a_named_kernel_that_still_reads_the_checkpoint() {
 }
 
 #[test]
-fn bulk_merge_respects_target_tile_bound() {    let make = |id, file_offset, dest_offset| StorageInstr::BulkExtentWrite {
+fn bulk_merge_respects_target_tile_bound() {
+    let make = |id, file_offset, dest_offset| StorageInstr::BulkExtentWrite {
         id: InstrId(id),
         source: SourceExtent {
             file_id: FileId(0),

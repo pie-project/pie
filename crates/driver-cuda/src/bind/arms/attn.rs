@@ -1,6 +1,6 @@
 //! What happens when a trace states one of `attn`'s symbols.
 //!
-//! These were `bind!` arms inside `kernels-cuda-new`. They read the driver's
+//! These were `bind!` arms inside `kernels-cuda`. They read the driver's
 //! own vocabulary through [`Cx`], so they belong on this side of the seam:
 //! the kernels crate exposes routines, and joining a statement to one is the
 //! driver's job.
@@ -8,12 +8,12 @@
 use core::ffi::c_void;
 
 use kernels::Refusal;
-use kernels_cuda_new::jit::Ctx;
-use kernels_cuda_new::x::abi::bf16;
-use kernels_cuda_new::x::attn::qkv_fused::{
+use kernels_cuda::jit::Ctx;
+use kernels_cuda::jit::abi::bf16;
+use kernels_cuda::attn::qkv_fused::{
     qkv_decode_qk_norm_rope_write_kv_bf16, qkv_packed_qk_norm_rope_vnorm_write_kv_bf16,
 };
-use kernels_cuda_new::x::attn::*;
+use kernels_cuda::attn::*;
 
 use super::super::cx::Cx;
 use super::Bound;
@@ -33,7 +33,7 @@ fn lse_log2_to_ln_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
 fn attention_sink_rescale_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    attention_sink_rescale_bf16(
+    attention_sink_rescale::<bf16>(
         &ctx,
         cx.arg_out(0)?.cast::<bf16>(),
         cx.arg_in(1)?.cast_const().cast::<f32>(),
@@ -50,7 +50,7 @@ fn attn_res_blend_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     let b = cx.in_width(1)? / h;
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    attn_res_blend_bf16(
+    attn_res_blend::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.arg_in(1)?.cast_const().cast::<bf16>(),
@@ -75,7 +75,7 @@ fn pad_head_dim_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     }
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    pad_head_dim_bf16(
+    pad_head_dim::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.arg_out(0)?.cast::<bf16>(),
@@ -96,7 +96,7 @@ fn strip_head_dim_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     }
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    strip_head_dim_bf16(
+    strip_head_dim::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.arg_out(0)?.cast::<bf16>(),
@@ -116,7 +116,7 @@ fn logit_softcap_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     };
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    logit_softcap_bf16(&ctx, cx.arg_out(0)?.cast::<bf16>(), cap, n)
+    logit_softcap::<bf16>(&ctx, cx.arg_out(0)?.cast::<bf16>(), cap, n)
 }
 
 /// `attn::kimi_split_q_b_bf16`
@@ -127,7 +127,7 @@ fn kimi_split_q_b_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     let rope = param(2)?;
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    kimi_split_q_b_bf16(
+    kimi_split_q_b::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.arg_out(0)?.cast::<bf16>(),
@@ -143,7 +143,7 @@ fn kimi_split_q_b_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
 fn kimi_split_kv_a_norm_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    kimi_split_kv_a_norm_bf16(
+    kimi_split_kv_a_norm::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.weight(0)?.cast_const().cast::<bf16>(),
@@ -193,6 +193,33 @@ fn split_qkv_devwin_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal>
     )
 }
 
+/// `attn::split_qkv_bf16`
+///
+/// The plain twin of [`split_qkv_devwin_arm`] below, and the difference is
+/// where the token count comes from: this one is told, the device-window one
+/// is handed a pointer to a window the DEVICE writes. Both split one packed
+/// `[tokens, q_dim + 2 * kv_dim]` bank into three.
+///
+/// The body is `driver_internal`'s rather than a routine, because it takes
+/// `*const c_void` where the crossed `_devwin` twin takes `*const bf16` --
+/// the driver hands a `void*` and the module exists to hold exactly that
+/// difference. Declaring the symbol was one change; this is the other, and
+/// the registry entry that stood here said so in the words this replaces.
+fn split_qkv_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
+    // SAFETY: `stream` is the fire's own, live across the launch.
+    let ctx = unsafe { Ctx::on(stream) };
+    kernels_cuda::driver_internal::split_qkv_bf16(
+        &ctx,
+        cx.arg_in(0)?.cast_const(),
+        cx.arg_out(0)?,
+        cx.arg_out(1)?,
+        cx.arg_out(2)?,
+        cx.rows().count,
+        cx.out_width(0)?,
+        cx.out_width(1)?,
+    )
+}
+
 /// `attn::combine_attn_outputs_bf16`
 fn combine_attn_outputs_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     let param = |i: usize| cx.param(i).map(|v| i32::try_from(v).unwrap_or(0));
@@ -200,7 +227,7 @@ fn combine_attn_outputs_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refu
     let head_dim = param(1)?;
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
-    combine_attn_outputs_bf16(
+    combine_attn_outputs::<bf16>(
         &ctx,
         cx.arg_in(0)?.cast_const().cast::<bf16>(),
         cx.arg_in(1)?.cast_const().cast::<f32>(),
@@ -354,6 +381,30 @@ fn qkv_decode_fused_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal>
 /// `attn::dequant_kv_cache_layer_to_bf16_active`
 fn dequant_kv_active_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     let layer = cx.kv_layer()?;
+    // A BF16 CACHE HAS NOTHING TO DEQUANTISE, and that is a no-op rather
+    // than a refusal.
+    //
+    // The statement is unconditional: `lower::walk` describes this kernel as
+    // the one that *"stages a quantized cache before a prefill dispatch"*,
+    // and the text names it whether or not the deployment quantised its
+    // pages -- `[driver] kv_cache_dtype` is a BOOT choice and a trace cannot
+    // see one. So every bf16 deployment reaches here, which is the default
+    // and was every fire of this benchmark.
+    //
+    // The host program answers `Refusal::Absent { what: "quantised pages on
+    // a bf16 layer" }`, which is correct FOR IT -- it declines a case it does
+    // not cover, exactly as `write_kv_to_pages` declines a quantised writer
+    // for native storage. What it cannot know is whether the caller wanted
+    // that case. This one did not: dequantising bf16 to bf16 is the identity,
+    // so the work is already done and the arm says so.
+    //
+    // Tested here rather than by catching the refusal, because the two are
+    // not the same claim. Catching `Absent` would swallow any future decline
+    // this host program grows; asking `is_native_bf16` says which case is
+    // being called a no-op and would not survive that meaning changing.
+    if layer.is_native_bf16 {
+        return Ok(());
+    }
     // SAFETY: `stream` is the fire's own, live across the launch.
     let ctx = unsafe { Ctx::on(stream) };
     kv_paged::dequant_kv_cache_layer_to_bf16_active(
@@ -366,6 +417,8 @@ fn dequant_kv_active_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal
 
 /// Every symbol this family binds.
 pub static ARMS: &[Bound] = &[
+    Bound { symbol: "attn::split_qkv_bf16", arm: Some(split_qkv_arm), unbound: None },
+
     Bound { symbol: "attn::lse_log2_to_ln", arm: Some(lse_log2_to_ln_arm), unbound: None },
     Bound {
         symbol: "attn::attention_sink_rescale_bf16",
@@ -627,9 +680,14 @@ pub static ARMS: &[Bound] = &[
              does not build one: `fire/launch.rs`' `kv_pools_for` refuses \
              `KvStyle::Mla` and `serve/load.rs` refuses the checkpoint at model \
              load, so `Cx::mla_layer` and `Cx::mla_plan` have nothing to answer \
-             with — both host programs are written, in `x::attn::mla_fa2` and \
-             `driver-cuda/src/fire/mla_naive.rs`, and choosing between them needs \
-             a device compute capability besides",
+             with. BOTH host programs are now in the kernels crate and both \
+             fire: `x::attn::mla_fa2::fire` over the six instantiations its \
+             `mod inst` names, and `x::attn::mla_naive::fire` over the \
+             Blackwell pair. Choosing between them is `Ctx::compute_capability\
+             _major` — `>= 10` picks naive, because FA2 MLA writes ZERO OUTPUT \
+             on sm_100 — so the capability is no longer the missing fact \
+             either. What is missing is a caller: nothing reaches these two \
+             until a latent cache exists to attend over",
         ),
     },
 ];

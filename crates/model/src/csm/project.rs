@@ -283,10 +283,10 @@ pub fn deployment(f: &CsmFacts) -> Result<Deployment, Refusal> {
 /// Gating it would make the honest answer available only to the
 /// configuration that could act on it, which is the shape of the
 /// problem this generation is here to illustrate. The `Ok` type is
-/// nevertheless [`ForwardPlan`](model_compiler::trace::ForwardPlan) and
+/// nevertheless [`ForwardPlan`](model_ir::trace::ForwardPlan) and
 /// not a never-type, so the day a `csm/forward` lands this signature
 /// does not move.
-pub fn trace(f: &CsmFacts) -> Result<model_compiler::trace::ForwardPlan, Refusal> {
+pub fn trace(f: &CsmFacts) -> Result<model_ir::trace::ForwardPlan, Refusal> {
     let _ = f;
     Err(Refusal::Unsupported(NO_TRACE))
 }

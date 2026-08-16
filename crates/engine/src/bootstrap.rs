@@ -181,6 +181,8 @@ pub struct DriverConfig {
     pub has_attn_page_mask: bool,
     pub has_lora: bool,
     pub device_geometry_port_mask: u32,
+    /// See [`crate::driver::DriverSpec::resolves_geometry_per_step`].
+    pub resolves_geometry_per_step: bool,
     pub limits: crate::driver::SchedulerLimits,
     pub driver_backend: crate::driver::DriverBackend,
 }
@@ -442,6 +444,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     num_kv_pages: d.total_pages,
                     limits: d.limits,
                     device_geometry_port_mask: d.device_geometry_port_mask,
+                    resolves_geometry_per_step: d.resolves_geometry_per_step,
                 },
                 d.driver_backend,
             )

@@ -41,10 +41,29 @@ driver-api = { path = "../driver-api", default-features = false }
 # this is where the contract is written down.
 tensor-ir = { path = "../tensor-ir" }
 
-# The producer, for tests only: `tests/oracle_interp.rs` runs ONE bound trace
-# through both `tensor_compiler::eval::interp` (the golden model) and
-# `pipeline::step` (this crate), and `lane.rs` drift-checks the emitted
-# preamble against the lane-table ABI it packs. A regular dependency would
-# invert the layering — the compiler produces what this crate consumes.
-[dev-dependencies]
+# WAS A DEV-DEPENDENCY, and the sentence that kept it there was right about the
+# layering and wrong about what follows from it: "a regular dependency would
+# invert the layering -- the compiler produces what this crate consumes."
+#
+# The inversion it names is real for `codegen` and `eval`. It is not what this
+# crate mostly reaches for. What it needs is `plan` -- the backend-neutral
+# middle end, whose own docs say "backends consume the result and supply only
+# code generation": the lane-table ABI this crate PACKS, the version numbers it
+# keys a compiled-module cache on. That is vocabulary both ends must agree on,
+# not machinery this crate drives, and the arrow does not invert by naming it.
+#
+# Refusing the whole crate to keep out the rest cost five copies in PRODUCTION
+# code -- `lane::{ABI_VERSION, Header, Record, ChannelSlot}`,
+# `identity::{COMPILER_VERSION, REGION_PLAN_VERSION}`, `status::FAULT_CLASSES`
+# -- each with a drift test whose doc explained why the copy was safe. A copy
+# that is only safe because something watches it is a copy that costs the watch.
+#
+# ONE OF THE FIVE IS NOT LIKE THE OTHERS, and it is worth naming rather than
+# smoothing over: `status::FAULT_CLASSES` mirrors `codegen::fault`, which is
+# genuinely the emitter's -- `metal::effects` and `metal::fused` write those
+# codes INTO the kernels. The driver needs them to decode what a kernel
+# reported, so it is not vocabulary the two share, it is a decision the emitter
+# made that the driver has to be told. The end state for that one is a field on
+# the emitted artifact, not an import; importing it is what this line does
+# today and it is strictly better than the copy, but it is not where it lands.
 tensor-compiler = { path = "../tensor-compiler" }

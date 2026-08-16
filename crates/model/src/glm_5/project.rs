@@ -346,8 +346,8 @@ pub const NO_METAL: &str = "glm-5 has no Metal text in this build: its forward i
 #[must_use]
 pub fn trace(
     f: &Glm5Facts,
-    class: model_compiler::trace::FireClass,
-) -> model_compiler::trace::ForwardPlan {
+    class: model_ir::trace::FireClass,
+) -> model_ir::trace::ForwardPlan {
     super::forward::glm5_cuda(f, class)
 }
 
@@ -840,7 +840,7 @@ mod tests {
     /// a rename here is a rename of every recorded plan.
     #[test]
     fn the_text_traces_for_both_fire_classes() {
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
         let f = glm5();
         for (class, suffix) in [
             (FireClass::Decode, "decode"),

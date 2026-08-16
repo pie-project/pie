@@ -75,14 +75,21 @@ impl AffineFormat {
 
     /// Whether any Metal kernel is compiled to read this format.
     ///
-    /// # Why the table is asked rather than a list kept here
+    /// # Why the shader census is asked rather than a list kept here
     ///
     /// `quantized_qmv.metal` stamps one template over
     /// `(dtype × group × bits)`, so a format is readable exactly when the
     /// entrypoint carrying its suffix was instantiated. Asking
-    /// `kernels_metal::KERNELS` makes that a fact of the table — a point
-    /// added or dropped there moves this answer with it, where a list here
-    /// would drift and answer for a shader that no longer exists.
+    /// `kernels_metal::entrypoints()` makes that a fact of the shader tree —
+    /// a point added or dropped there moves this answer with it, where a list
+    /// here would drift and answer for a shader that no longer exists.
+    ///
+    /// It reads the census rather than `KERNELS` because `quant`'s rows are
+    /// RETIRED: every symbol in that family crosses, the driver resolves it
+    /// through the stem the routine registry states, and the row that used to
+    /// generate these names is an empty slice. `entrypoints()` is rows plus
+    /// [`kernels_metal::RETIRED`], so it answers the same question across the
+    /// crossing.
     ///
     /// The C++ shell refused an unreadable scheme by name at load
     /// (`heap_bind.cpp:845-890`, *"no metal kernel here reads `'<name>'`"*) and
@@ -99,10 +106,16 @@ impl AffineFormat {
         // The DENSE projection, which every text names for every layer. A
         // format it cannot read is a format this driver cannot serve, whatever
         // else happens to be instantiated.
-        kernels_metal::KERNELS
+        //
+        // The prefix is matched with the same stem rule the dispatcher uses --
+        // the name is `affine_qmv_fast` or continues with `_` -- so a sibling
+        // symbol that merely begins with those letters cannot answer for it.
+        kernels_metal::entrypoints()
             .iter()
-            .filter(|k| k.symbol == "affine_qmv_fast")
-            .flat_map(kernels::KernelSig::entrypoints)
+            .filter(|e| {
+                e.strip_prefix("affine_qmv_fast")
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('_'))
+            })
             .any(|e| e.ends_with(&suffix))
     }
 

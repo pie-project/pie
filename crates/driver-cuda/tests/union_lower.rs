@@ -21,11 +21,11 @@
 
 use std::collections::BTreeSet;
 
-use driver_cuda::fire::recordings::predicate_of;
+use driver_cuda::fire::predicate::predicate_of;
 use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
 use model::shared::llama_like::forward::llama_like_cuda;
 use model_compiler::lower::{CondRegion, Fire, GuardMode, Launch, Lowered, Row, lower_with};
-use model_compiler::trace::FireClass;
+use model_ir::trace::FireClass;
 
 fn lowered(class: FireClass, rows: usize, guards: GuardMode) -> Lowered {
     let plan = llama_like_cuda(

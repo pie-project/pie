@@ -14,14 +14,14 @@
 //!
 //! # The cache layout is the shaders', not this module's
 //!
-//! `attn/kv_write.comp` writes
+//! `attn/kv_write.slang` writes
 //!
 //! ```text
 //! slot = page[i] * page_size + off[i]
 //! at   = slot * (kv_heads * head_dim) + h * head_dim + d
 //! ```
 //!
-//! and `attn/sdpa_paged.comp` reads
+//! and `attn/sdpa_paged.slang` reads
 //! `(slot * n_kv_heads + kv_head) * head_dim + d_out`, the same expression. Two modules compiled separately
 //! from separate sources agree on it, so this file transcribes a fact rather
 //! than choosing a convention, and [`Shape::slot`] is where a driver can ask
@@ -29,7 +29,7 @@
 
 use crate::binding::{FireNumber, FireTable, Resolve};
 use crate::device::{Buffer, Device, Failed};
-use model_compiler::trace::ValueId;
+use model_ir::trace::ValueId;
 use std::collections::BTreeMap;
 
 /// What a deployment decided about its cache.
@@ -66,6 +66,18 @@ impl Shape {
         self.elements() * self.bytes as u64
     }
 
+    /// Bytes ONE page costs across the whole pool.
+    ///
+    /// Every layer holds the page twice, once in keys and once in values, so
+    /// this is what a caller gets back per page it hands over -- and it is
+    /// what the Vulkan seam publishes as `elastic_page_bytes`. Not
+    /// `layer_bytes` divided by pages, which is one layer's half of it and
+    /// would understate the saving by `2 * layers`.
+    #[must_use]
+    pub const fn page_bytes(&self) -> u64 {
+        self.page_size as u64 * self.row() * self.bytes as u64 * self.layers as u64 * 2
+    }
+
     /// Where the element `(page, offset, head, at)` lives, in ELEMENTS.
     ///
     /// Transcribed from the two shaders rather than chosen. A driver that
@@ -92,7 +104,7 @@ impl Shape {
     /// claim about the cache's arithmetic that can only be made against a card
     /// gets checked on the handful of positions a card test has time for.
     ///
-    /// The two strides are in ELEMENTS: `attn/kv_write.comp` adds them to an
+    /// The two strides are in ELEMENTS: `attn/kv_write.slang` adds them to an
     /// index, not to a byte offset. Which of them is which is fixed by
     /// [`Shape::slot`] and not free -- see
     /// `the_two_stride_numbers_are_the_only_pair_that_agrees_with_slot`.
@@ -102,8 +114,30 @@ impl Shape {
             FireNumber::KvPageSize => Some(self.page_size),
             FireNumber::KvHeadStride => Some(self.head_dim),
             FireNumber::KvSeqStride => u32::try_from(self.row()).ok(),
+            // Not a fact about the cache. A shape cannot know the pitch of a
+            // rectangle built from one fire's requests, and answering zero
+            // here would be a shape claiming a fire states no mask.
+            FireNumber::AttentionMaskStride => None,
         }
     }
+}
+
+/// Four allow-bytes to the word, little-endian, the tail zero-filled.
+///
+/// The narrowing the shader does in reverse: `attn/sdpa_paged.slang` indexes
+/// these buffers as bytes and Vulkan hands them over as words, so the packing
+/// has to be the same one on both sides. Zero-filling the tail is what makes a
+/// rectangle whose byte count is not a multiple of four end in forbidden keys
+/// rather than in whatever the last word held.
+fn pack_bytes(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks(4)
+        .map(|c| {
+            let mut word = [0u8; 4];
+            word[..c.len()].copy_from_slice(c);
+            u32::from_le_bytes(word)
+        })
+        .collect()
 }
 
 /// One request in a fire: the rows it contributes and the pages it owns.
@@ -140,6 +174,41 @@ pub struct Request {
     /// because something wants its answer -- and a third meaning for a vector
     /// that already has two would be worse than the gap.
     pub samples: Vec<u32>,
+    /// One allow-byte row per row this request contributes, or empty.
+    ///
+    /// A byte per KEY: non-zero admits that key, zero forbids it. Empty is not
+    /// a mask of zeros -- it leaves this request's rows with their enable byte
+    /// clear, and `attn/sdpa_paged.slang` then applies the causal rule alone. A
+    /// mask of zeros would forbid every key and produce a softmax over
+    /// nothing.
+    ///
+    /// Rows may be RAGGED. A guest builds its mask as `[queries, pool_len]`
+    /// and the pool it names need not be the widest in the fire; the missing
+    /// tail is forbidden either way, by the shader's own `kp >= stride` bound.
+    pub mask: Vec<Vec<u8>>,
+    /// This request's pages were TRACED by the program, not derived here.
+    ///
+    /// A device-geometry pass resolves its own paging on the device and states
+    /// it; `envelope::fill` reads the statement, translates it, and checks the
+    /// stated write target against the same arithmetic `Frame::of` would have
+    /// used. What it does NOT get is `Frame::of`'s [`Unstageable::SharedPage`]
+    /// refusal, which asks a scheduler question -- "did two requests get placed
+    /// on one page" -- of a request the scheduler did not place.
+    pub traced: bool,
+    /// Where each row WRITES its key and value: `(physical page, offset)`, one
+    /// per row of [`Self::positions`], or empty.
+    ///
+    /// Empty is the derivation: page `position / page_size` of [`Self::pages`],
+    /// offset `position % page_size`, which is the placement for every fire the
+    /// scheduler pages itself.
+    ///
+    /// It is NOT the placement when a device-geometry program states its own,
+    /// and beam search is where the two part: two lanes of one instance share
+    /// the page they forked from and take separate SLOTS inside it, so the
+    /// second lane writes offset 2 of a page the division puts it at offset 1
+    /// of. The derivation cannot express that -- it reads the offset off the
+    /// position, and both lanes are at the same position. Stated, it is exact.
+    pub writes: Vec<(u32, u32)>,
 }
 
 impl Request {
@@ -150,6 +219,9 @@ impl Request {
             positions,
             pages,
             samples: Vec::new(),
+            mask: Vec::new(),
+            traced: false,
+            writes: Vec::new(),
         }
     }
 
@@ -159,7 +231,7 @@ impl Request {
     /// two meanings of an empty vector are separated -- a caller that means no
     /// rows says so by putting a row index out of range, which [`Frame::of`]
     /// refuses.
-    fn read(&self) -> Vec<u32> {
+    pub(crate) fn read(&self) -> Vec<u32> {
         if self.samples.is_empty() {
             self.positions
                 .len()
@@ -227,6 +299,32 @@ pub enum Unstageable {
         /// And second.
         second: usize,
     },
+    /// A request states a write target for a different number of rows than it
+    /// contributes.
+    ///
+    /// One short would leave its last rows on the derivation, which is the
+    /// placement the statement exists to correct.
+    WriteRows {
+        /// Which request.
+        request: usize,
+        /// How many targets it stated.
+        stated: usize,
+        /// How many rows it contributes.
+        rows: usize,
+    },
+    /// A stated write target is outside the pool.
+    NoSuchSlot {
+        /// Which request.
+        request: usize,
+        /// The page it named.
+        page: u32,
+        /// The offset within it.
+        offset: u32,
+        /// How many pages the pool holds.
+        pages: u32,
+        /// How many slots a page holds.
+        slots: u32,
+    },
     /// The shape says a page holds no slots.
     ///
     /// Found by deleting a `.max(1)` and watching nothing fail. The clamp was
@@ -247,6 +345,29 @@ pub enum Unstageable {
     /// where it can still be named instead of at the first table that trips
     /// over it.
     NoRows,
+    /// A request states a mask for some of its rows and not all of them.
+    ///
+    /// The rectangle is indexed by the FIRE's row number, so a request that
+    /// states three rows of mask for four rows of tokens does not leave the
+    /// fourth unmasked -- it shifts every later request's rows one place up
+    /// the rectangle and masks them against another request's keys. There is
+    /// no partial reading of this that is safe, so it is refused.
+    MaskRows {
+        /// Which request.
+        request: usize,
+        /// How many mask rows it stated.
+        stated: usize,
+        /// How many rows it contributes.
+        rows: usize,
+    },
+    /// A mask row is wider than a `u32` can express as a stride.
+    ///
+    /// The shader takes the pitch as a `u32` and multiplies it by a row index,
+    /// so a pitch that does not fit is a rectangle nobody can address.
+    MaskTooWide {
+        /// The widest row.
+        widest: usize,
+    },
 }
 
 impl std::fmt::Display for Unstageable {
@@ -277,8 +398,38 @@ impl std::fmt::Display for Unstageable {
                 f,
                 "request {request} reads out its row {row} and contributes {rows}"
             ),
+            Self::WriteRows {
+                request,
+                stated,
+                rows,
+            } => write!(
+                f,
+                "request {request} states {stated} write target(s) for {rows} row(s)"
+            ),
+            Self::NoSuchSlot {
+                request,
+                page,
+                offset,
+                pages,
+                slots,
+            } => write!(
+                f,
+                "request {request} writes page {page} offset {offset}, and the pool holds \
+                 {pages} page(s) of {slots} slot(s)"
+            ),
             Self::NoSlots => write!(f, "the shape says a page holds no slots"),
             Self::NoRows => write!(f, "the fire has no rows"),
+            Self::MaskRows {
+                request,
+                stated,
+                rows,
+            } => write!(
+                f,
+                "request {request} states {stated} mask row(s) and contributes {rows}"
+            ),
+            Self::MaskTooWide { widest } => {
+                write!(f, "a mask row of {widest} key(s) has no u32 stride")
+            }
         }
     }
 }
@@ -315,6 +466,25 @@ pub struct Frame {
     /// So this is the only table whose length is not the fire's row count, and
     /// the count is what the row calls `RequestCount`.
     pub sampling_indices: Vec<u32>,
+    /// The dense mask rectangle: one allow-byte per key, `rows * stride` long.
+    ///
+    /// Empty when no request in the fire states a mask, which is the ordinary
+    /// case and the reason [`Self::attention_mask_stride`] is zero there.
+    pub attention_mask: Vec<u8>,
+    /// One byte per ROW saying whether its rectangle row is to be read.
+    ///
+    /// Separate from the rectangle because "no mask" and "a mask that forbids
+    /// everything" are different fires and the bytes cannot tell them apart:
+    /// `attn/sdpa_paged.slang` reads this unconditionally and falls back to the
+    /// causal rule where it is clear.
+    pub attention_mask_enabled: Vec<u8>,
+    /// The rectangle's pitch in keys: the widest mask row in the WHOLE fire.
+    ///
+    /// One pitch and not one per request, because the rectangle is indexed by
+    /// the fire's row number. A request whose own mask is narrower is padded
+    /// with forbidding zeros, which is what the shader would do anyway past
+    /// its own `kp >= stride` bound.
+    pub attention_mask_stride: u32,
 }
 
 impl Frame {
@@ -351,7 +521,41 @@ impl Frame {
                         pages: shape.pages,
                     });
                 }
-                if let Some(&first) = owner.get(&page) {
+                frame.kv_page_indices.push(page);
+            }
+            // The pages this request WRITES: one per row, the page its
+            // position lands in. Two requests may NAME one page -- a grafted
+            // prefix is read by both and written by neither -- but two that
+            // write it would each append over the other, which is what this
+            // refusal is for and all it is for.
+            //
+            // `vulkan_shared_prefix`'s own doc predicted this: "named twice"
+            // stops implying "written twice" the day
+            // `pipeline::fire::kv::match_prefix` is wired in, and "this
+            // driver will refuse a correct plan, in a fault rather than in
+            // silence". Narrowed before that day rather than after.
+            //
+            // And narrowed once more, for the same reason and by measurement:
+            // a request whose pages the PROGRAM traced (`Request::traced`) did
+            // not have its write target placed by the scheduler -- it stated
+            // it, the engine bounded it in `LaunchPlan::validate_kv_writes`,
+            // and `envelope::fill` checks the statement against this very
+            // arithmetic. Beam search fire 0 is the case: one instance, two
+            // lanes, both still the conversation they forked from, both
+            // tracing their first page. Both write the same slot because at
+            // that moment they ARE the same rows, and refusing it refused
+            // beam search and consensus decoding outright.
+            for &position in &request.positions {
+                if request.traced {
+                    break;
+                }
+                let virt = (position / page_size) as usize;
+                let Some(&page) = request.pages.get(virt) else {
+                    continue;
+                };
+                if let Some(&first) = owner.get(&page)
+                    && first != r
+                {
                     return Err(Unstageable::SharedPage {
                         page,
                         first,
@@ -359,7 +563,6 @@ impl Frame {
                     });
                 }
                 owner.insert(page, r);
-                frame.kv_page_indices.push(page);
             }
             // Before the rows are pushed, so `base` is where this request's
             // rows start in the fire.
@@ -374,27 +577,108 @@ impl Frame {
                 }
                 frame.sampling_indices.push(base + row);
             }
-            for &position in &request.positions {
-                let virt = (position / page_size) as usize;
-                let Some(&page) = request.pages.get(virt) else {
-                    return Err(Unstageable::PastItsPages {
-                        request: r,
-                        position,
-                        pages: request.pages.len(),
-                    });
+            if !request.writes.is_empty() && request.writes.len() != request.positions.len() {
+                return Err(Unstageable::WriteRows {
+                    request: r,
+                    stated: request.writes.len(),
+                    rows: request.positions.len(),
+                });
+            }
+            for (row, &position) in request.positions.iter().enumerate() {
+                // Stated first, derived otherwise. Both are checked against the
+                // pool's own shape here rather than trusted, because a page
+                // past the pool is another model's memory and an offset past a
+                // page is the next page's first rows.
+                let (page, offset) = match request.writes.get(row) {
+                    Some(&(page, offset)) => {
+                        if page >= shape.pages || offset >= page_size {
+                            return Err(Unstageable::NoSuchSlot {
+                                request: r,
+                                page,
+                                offset,
+                                pages: shape.pages,
+                                slots: page_size,
+                            });
+                        }
+                        (page, offset)
+                    }
+                    None => {
+                        let virt = (position / page_size) as usize;
+                        let Some(&page) = request.pages.get(virt) else {
+                            return Err(Unstageable::PastItsPages {
+                                request: r,
+                                position,
+                                pages: request.pages.len(),
+                            });
+                        };
+                        (page, position % page_size)
+                    }
                 };
                 frame.positions.push(position);
                 frame
                     .request_of_token
                     .push(u32::try_from(r).unwrap_or(u32::MAX));
                 frame.kv_write_page.push(page);
-                frame.kv_write_offset.push(position % page_size);
+                frame.kv_write_offset.push(offset);
             }
         }
         frame
             .kv_page_indptr
             .push(u32::try_from(frame.kv_page_indices.len()).unwrap_or(u32::MAX));
+        frame.mask_from(requests)?;
         Ok(frame)
+    }
+
+    /// Build the mask rectangle, after every row is placed.
+    ///
+    /// After, and not inside the loop above, because the pitch is the widest
+    /// row of the WHOLE fire and no request knows it while its own rows are
+    /// being pushed. Two passes over the requests is the price of one pitch.
+    ///
+    /// # Errors
+    ///
+    /// [`Unstageable::MaskRows`] for a request that masks some of its rows and
+    /// not all of them, [`Unstageable::MaskTooWide`] for a pitch with no
+    /// `u32`.
+    fn mask_from(&mut self, requests: &[Request]) -> Result<(), Unstageable> {
+        let mut widest = 0usize;
+        for (r, request) in requests.iter().enumerate() {
+            if request.mask.is_empty() {
+                continue;
+            }
+            if request.mask.len() != request.positions.len() {
+                return Err(Unstageable::MaskRows {
+                    request: r,
+                    stated: request.mask.len(),
+                    rows: request.positions.len(),
+                });
+            }
+            widest = widest.max(request.mask.iter().map(Vec::len).max().unwrap_or(0));
+        }
+        if widest == 0 {
+            return Ok(());
+        }
+        let stride = u32::try_from(widest).map_err(|_| Unstageable::MaskTooWide { widest })?;
+        let rows = self.positions.len();
+        let mut bytes = vec![0u8; rows * widest];
+        let mut enabled = vec![0u8; rows];
+        let mut at = 0usize;
+        for request in requests {
+            for (j, row) in request.mask.iter().enumerate() {
+                enabled[at + j] = 1;
+                let into = (at + j) * widest;
+                // Shorter than the pitch is the ragged case and the zeros are
+                // correct: a key this row's mask does not mention is a key it
+                // does not see, and the shader forbids it either way -- a zero
+                // byte within the rectangle, `kp >= stride` past it.
+                bytes[into..into + row.len()].copy_from_slice(row);
+            }
+            at += request.positions.len();
+        }
+        self.attention_mask = bytes;
+        self.attention_mask_enabled = enabled;
+        self.attention_mask_stride = stride;
+        Ok(())
     }
 
     /// How many rows the fire has.
@@ -468,9 +752,34 @@ pub struct Pool {
     tables: BTreeMap<FireTable, Buffer>,
     /// The stand-in for a weight or a seam value, if the caller gave one.
     named: Option<Buffer>,
+    /// How many table buffers [`Pool::state`] has allocated, ever.
+    ///
+    /// The saving in `state` stated as a number a test can read. A pool that
+    /// reallocated every table every step would answer identically and only
+    /// be slower, and on a shared box a duration measures the neighbours --
+    /// so the claim is counted. It is also not only a matter of speed:
+    /// `maxMemoryAllocationCount` is a hard device ceiling, which is the
+    /// argument `Device::allocations` makes at greater length.
+    restaged: u32,
+    /// The pitch of the mask rectangle [`Pool::stage`] last staged.
+    ///
+    /// On the POOL and not on [`Shape`], because it is a fact about one fire
+    /// rather than about the cache: two fires of the same pool mask against
+    /// different pool lengths. Zero means the last fire stated no mask, which
+    /// is what a row reading `Source::AttentionMaskStride` needs to see so the
+    /// shader takes its causal path.
+    mask_stride: u32,
 }
 
 impl Pool {
+    /// How many table buffers this pool has allocated, ever.
+    ///
+    /// See the field. A steady decode should not move this.
+    #[must_use]
+    pub fn restaged(&self) -> u32 {
+        self.restaged
+    }
+
     /// Allocate one key and one value buffer per layer.
     ///
     /// Zeroed. A cache that came up holding the previous fire's rows would
@@ -481,14 +790,30 @@ impl Pool {
     ///
     /// [`Failed`] from the first allocation that does not fit.
     pub fn open(device: &Device, shape: Shape) -> Result<Self, Failed> {
-        let zeros = vec![0u8; usize::try_from(shape.layer_bytes()).unwrap_or(usize::MAX)];
+        let bytes = shape.layer_bytes();
+        // Filled BY THE DEVICE, one `vkCmdFillBuffer` a layer-half, rather
+        // than by uploading a zeroed `Vec` of `layer_bytes` to each of them.
+        //
+        // The upload version was correct and cost the whole cache in bus
+        // traffic: measured on a 28-layer, 512-page pool, opening it wrote
+        // **939 MB and took 162 ms** -- and a serving pool is sized to fill
+        // the card, so on this 24 GB 4090 that is seconds of startup spent
+        // sending zeros to memory that can write them itself. `Pool::resize`
+        // three hundred lines below already zeroes its new tail with
+        // `Device::zero`; this is the same call at the same job, and the two
+        // being different was the whole defect.
+        let zeroed = |device: &Device| -> Result<crate::device::Buffer, Failed> {
+            let b = device.empty(bytes)?;
+            device.zero(&b, 0, bytes).inspect_err(|_| device.free(b))?;
+            Ok(b)
+        };
         let mut keys = Vec::with_capacity(shape.layers as usize);
         let mut values = Vec::with_capacity(shape.layers as usize);
         // Freed on the way out of a partial failure: an allocator that leaks
         // the layers it did get is an allocator whose second call fails for a
         // reason that has nothing to do with the second call.
         for _ in 0..shape.layers {
-            match device.buffer(&zeros) {
+            match zeroed(device) {
                 Ok(b) => keys.push(b),
                 Err(e) => {
                     for b in keys.into_iter().chain(values) {
@@ -497,7 +822,7 @@ impl Pool {
                     return Err(e);
                 }
             }
-            match device.buffer(&zeros) {
+            match zeroed(device) {
                 Ok(b) => values.push(b),
                 Err(e) => {
                     for b in keys.into_iter().chain(values) {
@@ -513,6 +838,8 @@ impl Pool {
             values,
             tables: BTreeMap::new(),
             named: None,
+            restaged: 0,
+            mask_stride: 0,
         })
     }
 
@@ -579,30 +906,44 @@ impl Pool {
     /// A shrink drops the tail; the caller owes the check that nobody holds a
     /// page in it, which [`crate::shell::Shell::resize_pool`] makes.
     ///
-    /// # What it costs, which is why nobody calls it
+    /// # What it costs
     ///
-    /// The POOL, twice: every layer's old buffer is read down to host memory
-    /// and a fresh one is written back up. The delta does not enter. Measured
-    /// at 256 pages of qwen3-0.6b, dropping ONE page takes 2.77 s and
-    /// dropping a hundred and twenty-six takes 0.74 s -- the deeper cut is
-    /// cheaper, because the destination it fills is smaller.
+    /// The bytes that SURVIVE, moved on the device, plus a zero-fill of the
+    /// tail a grow adds. Nothing crosses the bus and no host memory is held.
     ///
-    /// That is why the Vulkan seam publishes `elastic_page_bytes: 0`, so the
-    /// engine's trim task never starts and this is reached only by
-    /// `Shell::admit` growing to a frame's own demand.
-    /// `giving_back_one_page_costs_what_giving_back_half_the_pool_costs`
-    /// pins it.
+    /// It did not start there. The first version read every layer's whole old
+    /// buffer down to host memory and wrote a fresh one back up, which is the
+    /// pool's size TWICE across a bus, through a mapping that reads at ten
+    /// megabytes a second because mappable VRAM is write-combined. Measured
+    /// at 256 pages of qwen3-0.6b, dropping ONE page took 2.77 s and dropping
+    /// a hundred and twenty-six took 0.74 s -- the DEEPER cut was cheaper,
+    /// because the destination it filled was smaller. The cheapest trim that
+    /// pool offered was the largest one, which is the opposite of what a trim
+    /// task is for.
     ///
-    /// # Errors
+    /// `vkCmdCopyBuffer` inverts that into the shape a caller expects: the
+    /// charge follows what is kept, so a shallow trim is cheap and a deep one
+    /// is cheaper still, and neither pays for the delta.
+    /// `a_deep_trim_is_not_cheaper_than_a_shallow_one` pins the inversion
+    /// itself rather than any number, since the numbers are a card's.
     ///
-    /// [`Failed`] from the allocation, in which case the pool is UNCHANGED
-    /// and still usable -- the new buffers are all taken before any old one
-    /// is freed, which is why the peak is both sizes at once. A pool that
-    /// half-resized would have some layers at the new page count and some at
-    /// the old, and `Shape::slot` would index every one of them wrongly.
+    /// # Peak memory, and why a shrink is not a grow
     ///
-    /// Refuses a target of zero: a cache with no page is not a smaller cache,
-    /// it is one that cannot answer.
+    /// A GROW takes every new buffer before freeing any old one, so it peaks
+    /// at both sizes at once and either wholly happens or wholly does not. A
+    /// pool that half-resized would have some layers at the new page count
+    /// and some at the old, and `Shape::slot` would index every one of them
+    /// wrongly.
+    ///
+    /// A SHRINK cannot afford that. The reason to shrink is that memory is
+    /// short, and a trim that first needs the whole pool again is a trim that
+    /// fails exactly when it is wanted. So a shrink goes layer by layer --
+    /// take the smaller buffer, move what survives, free the larger one --
+    /// and peaks at the old pool plus ONE layer of the new. It is monotonic
+    /// after the first step, because each step frees more than the next one
+    /// takes, so the allocation that could fail is the first, before anything
+    /// has moved.
+    ///
     pub fn resize(&mut self, device: &Device, pages: u32) -> Result<(), Failed> {
         if pages == 0 {
             return Err(Failed::Vulkan(
@@ -612,48 +953,70 @@ impl Pool {
         if pages == self.shape.pages {
             return Ok(());
         }
-        let mut grown = self.shape;
-        grown.pages = pages;
-        let kept = usize::try_from(
-            self.shape.pages.min(pages) as u64
-                * self.shape.page_size as u64
-                * self.shape.row()
-                * self.shape.bytes as u64,
-        )
-        .unwrap_or(usize::MAX);
-        let bytes = usize::try_from(grown.layer_bytes()).unwrap_or(usize::MAX);
-        // ASKED FOR, before it is taken. The staging buffer below is a plain
-        // `vec![0u8; bytes]`, and a `Vec` that cannot be allocated ABORTS the
-        // process -- it does not return. Found by mutating `Shell::launch`'s
-        // admission check to admit everything: the frame asked for two billion
-        // pages, this line asked the allocator for seventy terabytes, and the
-        // test binary died with SIGABRT instead of reporting a refusal.
-        //
-        // The admission check is still the right place to answer a scheduler,
-        // and it is still there. This is the second line of defence, because a
-        // pool that can be killed by an arithmetic slip in a caller is not one
-        // a server can be built on.
-        {
-            let mut probe: Vec<u8> = Vec::new();
-            probe
-                .try_reserve_exact(bytes)
-                .map_err(|_| Failed::OutOfMemory {
-                    bytes: bytes as u64,
-                    // The HOST refused, not the device, and the caller's move is
-                    // the same either way: this is "not now", not "never". It
-                    // reads as a device refusal in the log, which is why `during`
-                    // says which allocation it was.
-                    during: "stage a resized cache",
-                })?;
+        let mut resized = self.shape;
+        resized.pages = pages;
+        let kept = self.shape.pages.min(pages) as u64
+            * self.shape.page_size as u64
+            * self.shape.row()
+            * self.shape.bytes as u64;
+        let bytes = resized.layer_bytes();
+
+        // A shrink migrates in place, one layer at a time, so the pool never
+        // needs the whole of itself again to give part of it back. Safe to do
+        // in place BECAUSE it is a shrink: the first allocation is the only
+        // one that can meaningfully fail, and it fails before anything moves.
+        if pages < self.shape.pages {
+            let layers = self.keys.len();
+            for index in 0..layers + self.values.len() {
+                let old = if index < layers {
+                    &self.keys[index]
+                } else {
+                    &self.values[index - layers]
+                };
+                let fresh = device.empty(bytes)?;
+                if let Err(e) = device.copy_between(old, 0, &fresh, 0, kept) {
+                    device.free(fresh);
+                    // Layers before this one are already at the new size and
+                    // this one is not, so the pool's shape no longer
+                    // describes it. Say so rather than report a failure a
+                    // caller would read as "nothing happened".
+                    return Err(Failed::Vulkan(format!(
+                        "a shrink to {pages} pages stopped at layer buffer {index} of \
+                         {}: {e}. The pool is no longer one shape and must be rebuilt",
+                        layers + self.values.len()
+                    )));
+                }
+                let old = if index < layers {
+                    std::mem::replace(&mut self.keys[index], fresh)
+                } else {
+                    std::mem::replace(&mut self.values[index - layers], fresh)
+                };
+                device.free(old);
+            }
+            self.shape = resized;
+            return Ok(());
         }
 
+        // A grow takes everything before it gives anything back, so a failure
+        // leaves the pool exactly as it was.
         let mut fresh = Vec::with_capacity(self.keys.len() + self.values.len());
         for old in self.keys.iter().chain(&self.values) {
-            // Read before allocate, so a failure has nothing half-written.
-            let held = device.read(old)?;
-            let mut filled = vec![0u8; bytes];
-            filled[..kept].copy_from_slice(&held[..kept]);
-            match device.buffer(&filled) {
+            let made = (|| {
+                let new = device.empty(bytes)?;
+                // The tail a grow adds is zeroed, because the pages in it are
+                // read before they are written -- `sdpa_paged` reads a whole
+                // page and lets `kv_len` decide what counts -- and a fresh
+                // Vulkan allocation holds whatever was there.
+                if let Err(e) = device
+                    .copy_between(old, 0, &new, 0, kept)
+                    .and_then(|()| device.zero(&new, kept, bytes - kept))
+                {
+                    device.free(new);
+                    return Err(e);
+                }
+                Ok(new)
+            })();
+            match made {
                 Ok(b) => fresh.push(b),
                 Err(e) => {
                     // Nothing of the pool has changed yet.
@@ -671,8 +1034,26 @@ impl Pool {
         {
             device.free(b);
         }
-        self.shape = grown;
+        self.shape = resized;
         Ok(())
+    }
+
+    /// One buffer per layer, holding that layer's KEYS.
+    ///
+    /// Read-only, and for a caller that needs to CHECK the cache rather than
+    /// dispatch against it: [`Shape::slot`] says where a row lives and this
+    /// is what it lives in. Nothing in the fire path takes them this way --
+    /// `turns::Serving::step` binds them by handle from inside the pool -- so
+    /// handing them out cannot make a descriptor outlive its step.
+    #[must_use]
+    pub fn keys(&self) -> &[Buffer] {
+        &self.keys
+    }
+
+    /// One buffer per layer, holding that layer's VALUES. See [`Pool::keys`].
+    #[must_use]
+    pub fn values(&self) -> &[Buffer] {
+        &self.values
     }
 
     /// What the cache was built to.
@@ -701,6 +1082,36 @@ impl Pool {
         for w in words {
             bytes.extend_from_slice(&w.to_le_bytes());
         }
+        // OVER THE OLD BUFFER when it is exactly the right size, which for a
+        // server it almost always is: a conversation decoding states the same
+        // one row and the same page count for eight tokens at a stretch, and
+        // then one table grows by one word.
+        //
+        // Worth caring about because the nine tables were nine
+        // `vkAllocateMemory` calls and nine frees EVERY STEP -- measured as
+        // 1.30 ms of an 8.1 ms decode, second only to the dispatches
+        // themselves. Writing into the mapping instead is a memcpy of a few
+        // hundred bytes into ReBAR, which is the direction that mapping is
+        // fast in (see `Device::read_at` for the direction it is not).
+        //
+        // EXACTLY, and not "big enough". A larger buffer would be bound
+        // `whole` with the previous fire's numbers in its tail, and while no
+        // shader here reads past the extent it was pushed, `Device::read` of
+        // a table would then answer with that tail -- so a test reading a
+        // table back would be reading a different object than the one the
+        // fire was given. Growing by reallocating keeps the buffer's size and
+        // the table's length the same fact.
+        //
+        // Safe against the GPU because `Serving::once` waits on the fire's
+        // fence before it returns, so nothing is reading these tables when
+        // the next step writes them. That was already true of the free below,
+        // which would otherwise have been unmapping memory in flight.
+        if let Some(old) = self.tables.get(&which)
+            && old.size() == bytes.len() as u64
+        {
+            return device.write(old, &bytes);
+        }
+        self.restaged += 1;
         let buffer = device.buffer(&bytes)?;
         if let Some(old) = self.tables.insert(which, buffer) {
             device.free(old);
@@ -716,7 +1127,7 @@ impl Pool {
     /// from six chances to be inconsistent. [`Frame::of`] derives all six
     /// from one description.
     ///
-    /// The attention mask goes in too, as zeros: `attn/sdpa_paged.comp` reads
+    /// The attention mask goes in too, as zeros: `attn/sdpa_paged.slang` reads
     /// `attention_mask_enabled[row]` unconditionally, and a slot nobody filled
     /// is a slot bound to something else. Zero is the true answer for causal
     /// attention, which is the only kind this pool can describe.
@@ -743,9 +1154,29 @@ impl Pool {
         // (`Unstageable::NoRows`), so the round-up below cannot reach zero.
         // The clamp that used to be here would have let one through to
         // allocate a word and dispatch nothing.
+        //
+        // Zeros only while the fire states no mask. A fire that states one
+        // ships its own rectangle here, and `Pool::number` hands the shader
+        // the pitch that indexes it -- the two travel together because a
+        // rectangle read at another fire's pitch is a row masked against
+        // another row's keys.
         let bytes = frame.rows().div_ceil(4);
-        self.state(device, FireTable::AttentionMask, &vec![0; bytes])?;
-        self.state(device, FireTable::AttentionMaskEnabled, &vec![0; bytes])?;
+        if frame.attention_mask_stride == 0 {
+            self.state(device, FireTable::AttentionMask, &vec![0; bytes])?;
+            self.state(device, FireTable::AttentionMaskEnabled, &vec![0; bytes])?;
+        } else {
+            self.state(
+                device,
+                FireTable::AttentionMask,
+                &pack_bytes(&frame.attention_mask),
+            )?;
+            self.state(
+                device,
+                FireTable::AttentionMaskEnabled,
+                &pack_bytes(&frame.attention_mask_enabled),
+            )?;
+        }
+        self.mask_stride = frame.attention_mask_stride;
         Ok(())
     }
 
@@ -831,7 +1262,7 @@ impl Pool {
     /// The unit is a PAGE and not a row range, because a page is the unit the
     /// book hands out and the only one whose bytes are contiguous:
     /// [`Shape::slot`] puts a page's rows next to each other, so one page in
-    /// one layer is one `memmove` of `page_size * row()` elements. A row range
+    /// one layer is one copy of `page_size * row()` elements. A row range
     /// inside a page is contiguous too and would be a second entry point with
     /// a second off-by-one; a caller that wants rows can copy the page and
     /// grow the destination to fewer tokens.
@@ -860,7 +1291,7 @@ impl Pool {
     /// Each side is `(page, offset in tokens within that page)`. This is what
     /// [`Pool::copy_page`] is written in terms of, because a whole page and a
     /// run of rows differ only in the length: [`Shape::slot`] lays a page's
-    /// rows out contiguously, so both are one `memmove` per layer per side.
+    /// rows out contiguously, so both are one copy per layer per side.
     /// One implementation, so a fork and a partial prefix share cannot
     /// disagree about where a row is.
     ///
@@ -1033,7 +1464,12 @@ impl Resolve for Pool {
     }
 
     fn number(&self, which: FireNumber) -> Option<u32> {
-        self.shape.number(which)
+        match which {
+            // The one number that is a fact about the FIRE and not about the
+            // cache, so it is answered here rather than delegated.
+            FireNumber::AttentionMaskStride => Some(self.mask_stride),
+            which => self.shape.number(which),
+        }
     }
 }
 
@@ -1052,6 +1488,41 @@ mod tests {
         bytes: 2,
     };
 
+    /// One page costs what the whole pool costs, divided by its pages.
+    ///
+    /// `Shape::page_bytes` is what the Vulkan seam publishes as
+    /// `elastic_page_bytes`, so it is a NUMBER THE ENGINE ACTS ON: the trim
+    /// task converts a recurrent-state high water into pages with it, and an
+    /// answer that forgot a factor would understate every saving this pool
+    /// reports. It is stated against `layer_bytes`, which the pool itself
+    /// allocates with, rather than against a second copy of the arithmetic --
+    /// the two agreeing is the whole claim.
+    ///
+    /// The factor a hand-written version drops is the TWO: every layer holds
+    /// each page once in keys and once in values.
+    #[test]
+    fn a_page_is_the_pool_divided_by_its_pages() {
+        for shape in [
+            SMALL,
+            Shape { pages: 1, ..SMALL },
+            Shape {
+                layers: 28,
+                kv_heads: 8,
+                head_dim: 128,
+                page_size: 16,
+                pages: 256,
+                bytes: 2,
+            },
+        ] {
+            let whole = shape.layer_bytes() * u64::from(shape.layers) * 2;
+            assert_eq!(
+                shape.page_bytes() * u64::from(shape.pages),
+                whole,
+                "a page of {shape:?} does not tile the pool"
+            );
+        }
+    }
+
     /// A shape with a zero page size is refused rather than treated as one.
     ///
     /// The refusal replaced a `.max(1)`, which had been unwitnessed: deleting
@@ -1067,6 +1538,9 @@ mod tests {
             positions: vec![0],
             pages: vec![0],
             samples: vec![0],
+            mask: Vec::new(),
+            traced: false,
+            writes: Vec::new(),
         };
         let zero = Shape {
             page_size: 0,
@@ -1116,6 +1590,9 @@ mod tests {
             positions: Vec::new(),
             pages: vec![0],
             samples: Vec::new(),
+            mask: Vec::new(),
+            traced: false,
+            writes: Vec::new(),
         };
         assert!(
             matches!(
@@ -1130,6 +1607,9 @@ mod tests {
             positions: vec![0],
             pages: vec![1],
             samples: vec![0],
+            mask: Vec::new(),
+            traced: false,
+            writes: Vec::new(),
         };
         let frame = Frame::of(SMALL, &[hollow, real]).expect("one row is a fire");
         assert_eq!(frame.rows(), 1, "the surviving row was lost");
@@ -1171,7 +1651,7 @@ mod tests {
     /// The two strides are the only pair that describes the same memory as
     /// [`Shape::slot`].
     ///
-    /// `attn/kv_write.comp`'s contiguous half writes
+    /// `attn/kv_write.slang`'s contiguous half writes
     /// `h * k_head_stride + pos * k_seq_stride + d`; its paged half writes
     /// what `slot` says. Both are
     /// checked on a card over six positions and two heads. Here the same
@@ -1244,6 +1724,253 @@ mod tests {
         }
     }
 
+    /// A window reaches the rectangle as the window, at the fire's own pitch.
+    ///
+    /// The rows here are `contrastive-decoding`'s own shape with its window at
+    /// 1: each query sees one key, its own. That mask was measured all the way
+    /// to `Pool::stage` on a 4090 and reached it intact, which is what says the
+    /// staging is not the reason the inferlet answers a window of 1 and a
+    /// window of 100000 with the same eight tokens -- see
+    /// `tests/gpu/tests/vulkan_padded_causal_mask.rs`.
+    ///
+    /// The pitch is the FIRE's widest row and not each request's own, because
+    /// one rectangle is bound for the whole fire and `sdpa_paged.slang` reads
+    /// `attention_mask[row * stride + key]`. A per-request pitch would read
+    /// every later row against the wrong keys.
+    #[test]
+    fn a_windowed_row_is_staged_as_that_window_and_padded_to_the_fires_pitch() {
+        let window = |query: usize, keys: usize| {
+            (0..keys)
+                .map(|key| u8::from(key == query))
+                .collect::<Vec<u8>>()
+        };
+        let requests = [
+            // The WIDEST request first, so that "the last request's pitch" and
+            // "the fire's widest" are different answers. They were the same
+            // when this fixture had them the other way round, which a mutation
+            // of `mask_from` walked straight through.
+            Request {
+                positions: vec![0],
+                pages: vec![0],
+                samples: Vec::new(),
+                // One row of SEVEN, which is the fire's pitch.
+                mask: vec![window(0, 7)],
+                traced: false,
+                writes: Vec::new(),
+            },
+            Request {
+                positions: vec![1, 2],
+                pages: vec![1],
+                samples: Vec::new(),
+                // Two rows of FIVE keys: the narrower request, and the one
+                // that is padded rather than read past.
+                mask: vec![window(1, 5), window(2, 5)],
+                traced: false,
+                writes: Vec::new(),
+            },
+        ];
+        let frame = Frame::of(SMALL, &requests).expect("a stageable fire");
+
+        assert_eq!(frame.attention_mask_stride, 7, "the fire's widest row");
+        assert_eq!(
+            frame.attention_mask_enabled,
+            [1, 1, 1],
+            "every row states a mask, so every row's rule is the mask's"
+        );
+        assert_eq!(
+            frame.attention_mask,
+            [
+                1, 0, 0, 0, 0, 0, 0, //
+                0, 1, 0, 0, 0, 0, 0, //
+                0, 0, 1, 0, 0, 0, 0,
+            ],
+            "each row's own window, padded with the forbidding byte"
+        );
+    }
+
+    /// A row count that is not the request's is refused, not padded.
+    #[test]
+    fn a_mask_is_stated_for_every_row_of_a_request_or_none() {
+        let short = [Request {
+            positions: vec![0, 1],
+            pages: vec![0],
+            samples: Vec::new(),
+            mask: vec![vec![1, 0]],
+            traced: false,
+            writes: Vec::new(),
+        }];
+        assert_eq!(
+            Frame::of(SMALL, &short).err(),
+            Some(Unstageable::MaskRows {
+                request: 0,
+                stated: 1,
+                rows: 2
+            })
+        );
+    }
+
+    /// No mask is not a mask of zeros: the enable byte stays clear.
+    ///
+    /// The distinction is the whole difference between "the causal rule alone"
+    /// and "a softmax over nothing", and it lives in one byte per row.
+    #[test]
+    fn a_fire_that_states_no_mask_stages_no_rectangle_and_no_pitch() {
+        let plain = [Request::of(vec![0, 1], vec![0])];
+        let frame = Frame::of(SMALL, &plain).expect("a stageable fire");
+        assert_eq!(frame.attention_mask_stride, 0);
+        assert!(frame.attention_mask.is_empty());
+        assert!(frame.attention_mask_enabled.is_empty());
+    }
+
+    /// A stated write target is used, and it is one the derivation cannot say.
+    ///
+    /// Both requests are at position 1 of the same page, which is beam search's
+    /// own shape: two lanes forked from one prefix, sharing the page and taking
+    /// separate slots inside it. The derivation reads the offset off the
+    /// position, so it can only ever name slot 1 for both -- and `Frame::of`
+    /// refused the pair for sharing a page, which is how this was found.
+    #[test]
+    fn a_stated_write_target_places_two_lanes_of_one_page_in_separate_slots() {
+        let requests = [
+            Request {
+                positions: vec![1],
+                pages: vec![3],
+                samples: Vec::new(),
+                mask: Vec::new(),
+                traced: true,
+                writes: vec![(3, 1)],
+            },
+            Request {
+                positions: vec![1],
+                pages: vec![3],
+                samples: Vec::new(),
+                mask: Vec::new(),
+                traced: true,
+                writes: vec![(3, 2)],
+            },
+        ];
+        let frame = Frame::of(SMALL, &requests).expect("two lanes of one page");
+        assert_eq!(frame.kv_write_page, [3, 3], "both lanes share the page");
+        assert_eq!(
+            frame.kv_write_offset,
+            [1, 2],
+            "and the second lane takes the slot it stated, not the one its \
+             position divides to"
+        );
+
+        // The same pair with the statement dropped is the refusal that was
+        // there before: without it, nothing distinguishes the two lanes.
+        let derived: Vec<Request> = requests
+            .iter()
+            .cloned()
+            .map(|mut r| {
+                r.writes = Vec::new();
+                r.traced = false;
+                r
+            })
+            .collect();
+        assert_eq!(
+            Frame::of(SMALL, &derived).err(),
+            Some(Unstageable::SharedPage {
+                page: 3,
+                first: 0,
+                second: 1
+            })
+        );
+    }
+
+    /// The page-sharing refusal asks a question a traced request has answered.
+    #[test]
+    fn a_traced_request_is_not_refused_for_sharing_a_page() {
+        let shared = |traced| {
+            [
+                Request {
+                    positions: vec![0],
+                    pages: vec![3],
+                    samples: Vec::new(),
+                    mask: Vec::new(),
+                    traced,
+                    writes: Vec::new(),
+                },
+                Request {
+                    positions: vec![0],
+                    pages: vec![3],
+                    samples: Vec::new(),
+                    mask: Vec::new(),
+                    traced,
+                    writes: Vec::new(),
+                },
+            ]
+        };
+        assert!(
+            Frame::of(SMALL, &shared(true)).is_ok(),
+            "the program placed these, and the engine bounded them"
+        );
+        assert!(
+            Frame::of(SMALL, &shared(false)).is_err(),
+            "and a scheduler-placed pair on one page is still two appends over \
+             each other"
+        );
+    }
+
+    /// A statement for the wrong number of rows is refused, not padded.
+    #[test]
+    fn a_write_target_is_stated_for_every_row_or_none() {
+        let short = [Request {
+            positions: vec![0, 1],
+            pages: vec![3],
+            samples: Vec::new(),
+            mask: Vec::new(),
+            traced: true,
+            writes: vec![(3, 0)],
+        }];
+        assert_eq!(
+            Frame::of(SMALL, &short).err(),
+            Some(Unstageable::WriteRows {
+                request: 0,
+                stated: 1,
+                rows: 2
+            })
+        );
+    }
+
+    /// A stated target outside the pool is refused by both of its numbers.
+    #[test]
+    fn a_stated_write_target_is_checked_against_the_pools_own_shape() {
+        let far = |page, offset| {
+            [Request {
+                positions: vec![0],
+                pages: vec![3],
+                samples: Vec::new(),
+                mask: Vec::new(),
+                traced: true,
+                writes: vec![(page, offset)],
+            }]
+        };
+        assert_eq!(
+            Frame::of(SMALL, &far(SMALL.pages, 0)).err(),
+            Some(Unstageable::NoSuchSlot {
+                request: 0,
+                page: SMALL.pages,
+                offset: 0,
+                pages: SMALL.pages,
+                slots: SMALL.page_size
+            }),
+            "a page past the pool is another model's memory"
+        );
+        assert_eq!(
+            Frame::of(SMALL, &far(3, SMALL.page_size)).err(),
+            Some(Unstageable::NoSuchSlot {
+                request: 0,
+                page: 3,
+                offset: SMALL.page_size,
+                pages: SMALL.pages,
+                slots: SMALL.page_size
+            }),
+            "and an offset past a page is the next page's first rows"
+        );
+    }
+
     /// Two requests, one prefill and one decode, and every table follows.
     #[test]
     fn a_frame_states_each_row_once_and_puts_it_in_its_own_requests_page() {
@@ -1255,11 +1982,17 @@ mod tests {
                 positions: (0..6).collect(),
                 pages: vec![5, 2],
                 samples: Vec::new(),
+                mask: Vec::new(),
+                traced: false,
+                writes: Vec::new(),
             },
             Request {
                 positions: vec![4],
                 pages: vec![6, 1],
                 samples: Vec::new(),
+                mask: Vec::new(),
+                traced: false,
+                writes: Vec::new(),
             },
         ];
         let frame = Frame::of(SMALL, &requests).expect("a stageable fire");
@@ -1310,11 +2043,17 @@ mod tests {
                 positions: vec![8],
                 pages: vec![5, 2],
                 samples: Vec::new(),
+                mask: Vec::new(),
+                traced: false,
+                writes: Vec::new(),
             },
             Request {
                 positions: vec![0],
                 pages: vec![6],
                 samples: Vec::new(),
+                mask: Vec::new(),
+                traced: false,
+                writes: Vec::new(),
             },
         ];
         assert_eq!(
@@ -1331,6 +2070,9 @@ mod tests {
             positions: vec![7],
             pages: vec![5, 2],
             samples: Vec::new(),
+            mask: Vec::new(),
+            traced: false,
+            writes: Vec::new(),
         }];
         assert_eq!(
             Frame::of(SMALL, &ok)
@@ -1340,6 +2082,32 @@ mod tests {
         );
     }
 
+    /// Two requests may share a page they only READ, and not one they write.
+    ///
+    /// A grafted prefix is read by both and written by neither, which is the
+    /// case `vulkan_shared_prefix`'s doc says this refusal gets wrong the day
+    /// the prefix probe is wired in. Narrowed before that day.
+    #[test]
+    fn two_requests_share_a_page_they_read_and_not_one_they_write() {
+        // `SMALL` pages four positions, so position 5 lands in virtual page 1
+        // and page 0 is read-only for both.
+        let lane = |last: u32, pages: Vec<u32>| Request {
+            positions: vec![last],
+            pages,
+            samples: Vec::new(),
+            mask: Vec::new(),
+            traced: false,
+            writes: Vec::new(),
+        };
+        assert!(
+            Frame::of(SMALL, &[lane(5, vec![1, 2]), lane(5, vec![1, 2])]).is_err(),
+            "both write virtual page 1, which is physical page 2"
+        );
+        let frame = Frame::of(SMALL, &[lane(5, vec![1, 2]), lane(5, vec![1, 3])])
+            .expect("physical page 1 is read by both and written by neither");
+        assert_eq!(frame.kv_page_indices, vec![1, 2, 1, 3]);
+    }
+
     /// A page the pool does not have, and a page two requests both claim.
     #[test]
     fn a_frame_refuses_pages_that_are_not_the_pools_or_not_its_own() {
@@ -1347,6 +2115,9 @@ mod tests {
             positions: vec![0],
             pages: vec![SMALL.pages],
             samples: Vec::new(),
+            mask: Vec::new(),
+            traced: false,
+            writes: Vec::new(),
         }];
         assert_eq!(
             Frame::of(SMALL, &past),
@@ -1361,11 +2132,17 @@ mod tests {
                 positions: vec![0],
                 pages: vec![3],
                 samples: Vec::new(),
+                mask: Vec::new(),
+                traced: false,
+                writes: Vec::new(),
             },
             Request {
                 positions: vec![0],
                 pages: vec![3],
                 samples: Vec::new(),
+                mask: Vec::new(),
+                traced: false,
+                writes: Vec::new(),
             },
         ];
         assert_eq!(
@@ -1383,11 +2160,17 @@ mod tests {
                 positions: vec![0],
                 pages: vec![3],
                 samples: Vec::new(),
+                mask: Vec::new(),
+                traced: false,
+                writes: Vec::new(),
             },
             Request {
                 positions: vec![0],
                 pages: vec![4],
                 samples: Vec::new(),
+                mask: Vec::new(),
+                traced: false,
+                writes: Vec::new(),
             },
         ];
         assert!(Frame::of(SMALL, &apart).is_ok());
@@ -1396,7 +2179,7 @@ mod tests {
     /// The CSR a frame builds is the one `kv_write_page` was read through.
     ///
     /// Stated separately because the shaders use both: the append takes
-    /// `kv_write_page` directly, and `attn/sdpa_paged.comp` walks
+    /// `kv_write_page` directly, and `attn/sdpa_paged.slang` walks
     /// `kv_page_indices[indptr[r] .. indptr[r+1]]`. If those two disagreed,
     /// every fire would append somewhere its own attention does not look.
     #[test]
@@ -1406,11 +2189,17 @@ mod tests {
                 positions: (0..9).collect(),
                 pages: vec![5, 2, 6],
                 samples: Vec::new(),
+                mask: Vec::new(),
+                traced: false,
+                writes: Vec::new(),
             },
             Request {
                 positions: (0..5).collect(),
                 pages: vec![1, 4],
                 samples: Vec::new(),
+                mask: Vec::new(),
+                traced: false,
+                writes: Vec::new(),
             },
         ];
         let frame = Frame::of(SMALL, &requests).expect("a stageable fire");
@@ -1496,18 +2285,27 @@ mod tests {
                 positions: vec![0, 1, 2],
                 pages: vec![0],
                 samples: vec![1],
+                mask: Vec::new(),
+                traced: false,
+                writes: Vec::new(),
             },
             // Two rows, reads both -- so `readouts` is not the request count.
             Request {
                 positions: vec![0, 1],
                 pages: vec![1],
                 samples: vec![0, 1],
+                mask: Vec::new(),
+                traced: false,
+                writes: Vec::new(),
             },
             // One row and says nothing, which is the decode default.
             Request {
                 positions: vec![7],
                 pages: vec![2, 3],
                 samples: Vec::new(),
+                mask: Vec::new(),
+                traced: false,
+                writes: Vec::new(),
             },
             // FOUR rows and says nothing, which is the prefill default. The
             // decode above cannot tell "the last row" from "row zero" -- it
@@ -1517,6 +2315,9 @@ mod tests {
                 positions: vec![0, 1, 2, 3],
                 pages: vec![4],
                 samples: Vec::new(),
+                mask: Vec::new(),
+                traced: false,
+                writes: Vec::new(),
             },
         ];
         let frame = Frame::of(SMALL, &requests).expect("a fire");
@@ -1539,6 +2340,9 @@ mod tests {
                 positions: vec![0, 1, 2],
                 pages: vec![0],
                 samples: vec![3],
+                mask: Vec::new(),
+                traced: false,
+                writes: Vec::new(),
             },
             Request::of(vec![0], vec![1]),
         ];
@@ -1557,6 +2361,9 @@ mod tests {
                 positions: vec![0, 1, 2],
                 pages: vec![0],
                 samples: vec![2],
+                mask: Vec::new(),
+                traced: false,
+                writes: Vec::new(),
             },
             Request::of(vec![0], vec![1]),
         ];
@@ -1584,7 +2391,7 @@ mod tests {
         use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
         use model::shared::llama_like::forward::llama_like_metal;
         use model_compiler::lower::{Fire, lower};
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
 
         let fires: [(&str, Vec<Request>); 3] = [
             (
@@ -1607,6 +2414,9 @@ mod tests {
                         positions: vec![0, 1, 2, 3],
                         pages: vec![1],
                         samples: vec![0, 2, 3],
+                        mask: Vec::new(),
+                        traced: false,
+                        writes: Vec::new(),
                     },
                     Request::of(vec![2], vec![2]),
                 ],

@@ -6,18 +6,25 @@
 //!
 //! ```text
 //! for launch in &lowered.launches {
-//!     let sig  = sig_in(KERNELS, symbol)?;   // the row states the contract
-//!     let args = bind(lowered, launch, ..)?; // the driver resolves names
-//!     let grid = eval(sig.launch, dims)?;    // the row names the rule
+//!     let (routine, arm) = crossed(symbol)?;  // the stem names the body
+//!     let args = bind(lowered, launch, ..)?;  // the driver resolves names
+//!     let facts = facts_of(lowered, launch, geometry);
+//!     routine.body(arm(handles, facts)?, planner)?; // the body states the rest
 //! }
 //! ```
 //!
-//! **There is no per-family branch and no per-kernel arm.** A symbol is a
-//! name: on this backend an entry point is compiled from one, so a text that
-//! states a symbol the table knows needs no code written to receive it. That
-//! is the difference the north star measures — `driver-cuda`'s executor
-//! grows an arm per kernel "beside the bridge", and this one does not grow at
-//! all.
+//! **No row is consulted.** There was a table here: a row per entry point,
+//! stating its operands as a `Source` enum and its rectangle as a
+//! `LaunchRule`, and two interpreters — `reorder` and `eval` — that walked
+//! them. Both are deleted. What replaced them is a routine per kernel,
+//! written as ordinary Rust in `kernels-metal` and shared with every other
+//! backend, plus an arm here that says which of THIS driver's handles fill
+//! its parameters.
+//!
+//! The trade is deliberate and it is the north star's: an arm per routine is
+//! more code than a row per kernel, but a row could only ever state what its
+//! enum could spell, and every kernel that needed something the enum could
+//! not say went unreachable in silence rather than failing to compile.
 //!
 //! # Portable, and that is deliberate
 //!
@@ -27,15 +34,13 @@
 //! provable in a build with no GPU. `encode` is the half that needs one.
 //!
 //! [`executor`]: crate::lowering::executor
-//! [`geometry`]: crate::lowering::launch
+//! [`geometry`]: crate::lowering::executor
 
 use core::ops::Range;
 
-use kernels::KernelSig;
 use model_compiler::lower::{Arg, Launch, Lowered};
 
-use crate::lowering::executor::{BindRefusal, BoundArg, FireTable, Frame, Resolver, bind};
-use crate::lowering::launch::{Dims, Ungeometric, eval};
+use crate::lowering::executor::{BindRefusal, BoundArg, Frame, Resolver, Slice, bind};
 
 /// The fire-invariant half of [`Dims`]: what every launch of one fire shares.
 ///
@@ -59,6 +64,22 @@ pub struct Geometry {
     pub n_experts: u32,
     /// Experts each token routes to.
     pub experts_per_token: u32,
+    /// The deployment's affine quantisation group size, and the bits per
+    /// weight.
+    ///
+    /// The one pair of facts a `kernel!` row never had to state, because the
+    /// TRACE stated them: `embed_gather_mb_4bit_bfloat16_gs_64_b_4` carries
+    /// its own instantiation in its name and `covers_point` peeled it off. A
+    /// routine composes that spelling instead of receiving it, so the numbers
+    /// have to arrive as numbers.
+    ///
+    /// `plan_routine` checks the composition against the trace's own
+    /// spelling, which is what makes carrying them here safe: a deployment
+    /// whose embedding is quantised differently from the rest of it refuses
+    /// by name rather than gathering from the wrong plane.
+    pub group: u32,
+    /// See [`Geometry::group`].
+    pub bits: u32,
 }
 
 /// One encodable dispatch: everything a command encoder needs, and nothing
@@ -69,7 +90,7 @@ pub struct Dispatch<'a> {
     /// lowering's own spelling, unmodified, because the shader exports it
     /// under that name.
     pub symbol: &'a str,
-    /// The shader that defines `symbol`, from its row's [`KernelSig::file`].
+    /// The shader that defines `symbol`, from the family's `ENTRYPOINTS`.
     pub file: &'static str,
     /// Total threads per axis.
     pub grid: [u32; 3],
@@ -88,6 +109,13 @@ pub struct Dispatch<'a> {
     /// got before and is wrong for most of them. That is why
     /// `tests/text_conformance.rs` counts them.
     pub args: Vec<BoundArg>,
+    /// The byte ranges this dispatch reads and the ones it may write.
+    ///
+    /// The reason an encoder can stop putting a barrier after every single
+    /// dispatch. Two launches that write different ranges and read only ranges
+    /// nobody has written since the last barrier are independent, and a
+    /// decode's `q`/`k`/`v` and `gate`/`up` projections are exactly that.
+    pub touches: Touches,
     /// Where each scalar binds, and how wide it is there.
     ///
     /// Three facts, because three are needed and the row states all of them.
@@ -155,33 +183,50 @@ pub enum Undispatchable {
         /// Which rule could not be applied.
         why: BindRefusal,
     },
-    /// The lowering states a symbol no `kernel!` row declares, so nothing
-    /// knows its contract. `attn::split_qkv_bf16` is today's instance.
-    NoRow {
-        /// The symbol with no row.
+    /// The lowering states a symbol no ROUTINE claims, so nothing in this
+    /// tree can fire it. `attn::split_qkv_bf16` is today's instance.
+    ///
+    /// It was `NoRow`, and the rename is the crossing: the contract lived in
+    /// a `kernel!` row and the refusal was "no row declares this". There are
+    /// no rows. `lowering::routine::crossed` matches the symbol against the
+    /// stems the registry states, and a symbol no stem claims is a name
+    /// nothing can dispatch -- which is the same refusal about a different
+    /// statement, and it is worth saying which one is missing.
+    Unclaimed {
+        /// The symbol no routine claims.
         symbol: String,
         /// The traced op that named it.
         op: u32,
     },
-    /// The row exists but does not say which shader defines the symbol.
-    /// Metal compiles at run time from `(path, entry name)`, so a row without
-    /// a file cannot be reached. Fill it in the row, demand-driven.
-    NoFile {
-        /// The symbol whose row states no file.
+    /// The routine composed an entrypoint the trace did not name.
+    ///
+    /// Both strings say which kernel to run and they were derived by
+    /// unrelated readings -- the trace's by `model-compiler` from the
+    /// checkpoint, the routine's by its body from this fire's
+    /// [`Geometry`]. A disagreement means one of the two readings is wrong
+    /// about the deployment, and running either is worse than running
+    /// neither.
+    Misspelled {
+        /// What the trace named.
         symbol: String,
         /// The traced op that named it.
         op: u32,
+        /// What the routine composed instead.
+        composed: &'static str,
     },
-    /// The row states no launch rule, so no grid can be produced from it.
-    /// A guessed grid runs a kernel over the wrong extent, which no hardware
-    /// reports — see [`Ungeometric`].
-    Ungeometric {
-        /// The symbol whose row states no rule.
+    /// The routine declined the rectangle. See [`kernels::routine::Refusal`].
+    ///
+    /// Distinct from [`Undispatchable::Ungeometric`] in who spoke, not in what
+    /// went wrong: a rule refuses from a table row, a routine refuses from its
+    /// own body, and only the second can say which of ITS parameters was at
+    /// fault by the name its signature gives it.
+    Refused {
+        /// The symbol whose launch refused.
         symbol: String,
         /// The traced op that named it.
         op: u32,
-        /// Which refusal the rule made.
-        why: Ungeometric,
+        /// What the routine would not accept.
+        why: kernels::routine::Refusal,
     },
     /// The rectangle sits under a conditional region, so whether it runs is a
     /// question this walk cannot answer.
@@ -238,155 +283,98 @@ fn widths<'a>(lowered: &'a Lowered, launch: &Launch) -> impl DoubleEndedIterator
         })
 }
 
-/// The dims one launch evaluates its rule at.
+/// What a dispatch reads and what it may write, as byte ranges.
 ///
-/// `sig` is the launch's own row, and it is here for one reason: a row may
-/// say that its rule's extent comes from the STATEMENT rather than from the
-/// fire. See [`kernels::KernelSig::grid_param`] — gemma-4 rotates a quarter
-/// of each full-attention head and all of each sliding one, and one
-/// fire-wide `rotary_dims` cannot be both.
-#[must_use]
-pub fn dims_of(
-    sig: &kernels::KernelSig,
-    lowered: &Lowered,
-    launch: &Launch,
-    geometry: Geometry,
-) -> Dims {
-    // What the ROW says its extent is, when it says anything. Read out of the
-    // statement's own scalar run, which is the channel the trace already
-    // carries — the only new thing is that the driver reads one for the GRID
-    // instead of only forwarding it to the kernel.
-    //
-    // A row naming a param the statement does not carry falls back to the
-    // fire's geometry rather than to zero: a grid of zero launches nothing at
-    // all, which is a silent no-op, and the fire-wide number is right for
-    // every deployment that states one shape.
-    let stated = sig.grid_param.and_then(|i| {
-        let at = launch.params.start as usize + i as usize;
-        (at < launch.params.end as usize)
-            .then(|| lowered.params.get(at).copied())
-            .flatten()
-            .filter(|n| *n > 0)
-    });
-    // The head width the KERNEL will use, when the row states one. Read the
-    // same way, because it is the same question: a number the fire cannot
-    // answer for every layer.
-    let stated_head = sig.head_param.and_then(|i| {
-        let at = launch.params.start as usize + i as usize;
-        (at < launch.params.end as usize)
-            .then(|| lowered.params.get(at).copied())
-            .flatten()
-            .filter(|n| *n > 0)
-    });
-    // The head COUNT the KERNEL will use, when the row states one. The third
-    // reading of the same statement, and it is here because a head SHAPE is
-    // two numbers: gemma-4's full-attention layers carry four 512-wide KV
-    // heads where its sliding layers carry sixteen 256-wide ones, and a grid
-    // that takes the width from the statement and the count from the fire is
-    // still describing neither layer.
-    let stated_heads = sig.heads_param.and_then(|i| {
-        let at = launch.params.start as usize + i as usize;
-        (at < launch.params.end as usize)
-            .then(|| lowered.params.get(at).copied())
-            .flatten()
-            .filter(|n| *n > 0)
-    });
-    // The ROW COUNT the statement's own rectangle has, when the fire's row
-    // window is not it. The fourth reading, and the one that admits a
-    // statement may have a row axis the fire does not spell: a mixture's
-    // sorted stack is one row per ROUTE, and there are `tokens *
-    // experts_per_token` of those. See [`kernels::KernelSig::rows_param`].
-    let stated_rows = sig.rows_param.and_then(|i| {
-        let at = launch.params.start as usize + i as usize;
-        (at < launch.params.end as usize)
-            .then(|| lowered.params.get(at).copied())
-            .flatten()
-            .filter(|n| *n > 0)
-    });
-    let width = sizing_width(lowered, launch);
-    Dims {
-        rows: stated_rows.unwrap_or(launch.rows.end - launch.rows.start),
-        width,
-        in_width: input_width(lowered, launch),
-        q_heads: geometry.q_heads,
-        kv_heads: stated_heads.unwrap_or(geometry.kv_heads),
-        head_dim: stated_head.unwrap_or(geometry.head_dim),
-        // The SAME stated number, read by whichever rule asked for it: a
-        // rope's rotated channels, a norm's reduction axis. A row names one
-        // scalar as its extent and its rule knows which dimension that is.
-        axis: stated.unwrap_or(width),
-        rotary_dims: stated.unwrap_or(geometry.rotary_dims),
-        n_experts: geometry.n_experts,
-        experts_per_token: geometry.experts_per_token,
+/// Ranges, not operands, because the question an encoder asks is whether two
+/// launches can run at once and the answer is whether their bytes meet.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Touches {
+    /// Every range the dispatch may read. A superset of nothing — a weight,
+    /// a fire table and an input all sit here.
+    pub reads: Vec<Slice>,
+    /// Every range the dispatch may write. A subset of the operands, and
+    /// **conservative in every direction the row leaves unstated.**
+    pub writes: Vec<Slice>,
+}
+
+impl Touches {
+    /// Every operand as both a read and a write.
+    ///
+    /// What a dispatch built by hand means: nothing told it which of its
+    /// operands are results, so an encoder must order it against everything.
+    /// Also what [`touches`] answers for a row that states no operands at all
+    /// — those are bound positionally and have said nothing about direction,
+    /// and guessing "no writes" would let them race silently.
+    #[must_use]
+    pub fn everything(args: &[BoundArg]) -> Self {
+        let all: Vec<Slice> = args.iter().map(|a| a.slice).collect();
+        Self {
+            reads: all.clone(),
+            writes: all,
+        }
     }
 }
 
-/// Turn one launch into a dispatch, against `table`.
+/// Record a range, merging into an identical one rather than growing the set.
 ///
-/// `table` is `kernels_metal::KERNELS` in every caller; it is a parameter so
-/// that this module depends on the kernel *vocabulary* rather than on one
-/// table, which is what lets a test state its own rows.
-///
-/// # Errors
-///
-/// [`Undispatchable`] naming the symbol and the traced op, in every case.
-pub fn plan_one<'a, S: Resolver>(
-    lowered: &'a Lowered,
-    launch: &Launch,
-    table: &'static [KernelSig],
-    frame: Frame,
-    geometry: Geometry,
-    resolver: &mut S,
-) -> Result<Dispatch<'a>, Undispatchable> {
-    let symbol = &lowered.kernels[launch.kernel as usize];
-    // A conditional rectangle's guard was NOT answered by the lowering, and
-    // this walk has no way to answer it: encoding it would run every arm.
-    if launch.cond != Launch::NO_COND {
-        return Err(Undispatchable::Conditional {
-            symbol: symbol.clone(),
-            op: launch.op,
-            cond: launch.cond,
-        });
+/// A fire binds the same weight and the same table over and over, and the sets
+/// this feeds are scanned linearly.
+pub(crate) fn merge(set: &mut Vec<Slice>, slice: Slice) {
+    if slice.address == 0 || slice.bytes == 0 {
+        return;
     }
-    let sig = kernels::sig_in(table, symbol).ok_or_else(|| Undispatchable::NoRow {
-        symbol: symbol.clone(),
-        op: launch.op,
-    })?;
-    let file = sig.file.ok_or_else(|| Undispatchable::NoFile {
-        symbol: symbol.clone(),
-        op: launch.op,
-    })?;
-    let grid = eval(sig.launch, dims_of(sig, lowered, launch, geometry)).map_err(|why| {
-        Undispatchable::Ungeometric {
-            symbol: symbol.clone(),
-            op: launch.op,
-            why,
-        }
-    })?;
-    let bound = bind(lowered, launch, frame, resolver).map_err(|why| Undispatchable::Unbound {
-        symbol: symbol.clone(),
-        op: launch.op,
-        why,
-    })?;
-    let args = reorder(sig, &bound.args, lowered, launch, resolver).map_err(|why| {
-        Undispatchable::Unbound {
-            symbol: symbol.clone(),
-            op: launch.op,
-            why,
-        }
-    })?;
-    let (param_slots, params) = param_layout(sig, &args, lowered, launch, resolver);
-    Ok(Dispatch {
-        symbol: bound.kernel,
-        params,
-        file,
-        grid: grid.grid,
-        threadgroup: grid.tg,
-        args,
-        param_slots,
-        layers: bound.layers,
-        op: launch.op,
-    })
+    if let Some(seen) = set.iter_mut().find(|s| s.address == slice.address) {
+        seen.bytes = seen.bytes.max(slice.bytes);
+        return;
+    }
+    set.push(slice);
+}
+
+/// The GEMM tile a symbol names, as `(bm, bn)`.
+///
+/// `model-compiler` chooses the tile when it builds the entrypoint and writes
+/// it into the name; nothing else in the trace carries it. So a routine that
+/// needs the two numbers -- `quant::qmm_t` composes the same name back from
+/// them -- gets them by reading the string, and the spelling check below is
+/// what holds the two readings to each other.
+///
+/// `rsplit_once` rather than a suffix test, because the shipped names do not
+/// all end at the tile: `affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32` and
+/// `..._bm_32_bn_32_wm_1_wn_2` are both in `entrypoints.generated.txt`, and
+/// the warp split after the tile is not part of it.
+#[must_use]
+pub fn named_tile(symbol: &str) -> Option<(u32, u32)> {
+    let (_, tail) = symbol.rsplit_once("_bm_")?;
+    let (bm, rest) = leading_number(tail)?;
+    let (bn, _) = leading_number(rest.strip_prefix("_bn_")?)?;
+    Some((bm, bn))
+}
+
+/// The decimal run at the front of `s`, and what follows it.
+fn leading_number(s: &str) -> Option<(u32, &str)> {
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    Some((s[..end].parse().ok()?, &s[end..]))
+}
+
+/// What an arm is told about a launch, before its routine is asked anything.
+///
+/// The statement carries the widths and the layer, the fire carries the head
+/// counts, and the SYMBOL carries the tile — three sources, one struct, and
+/// no arm reaches past it. Read it to see what a routine can possibly know.
+#[must_use]
+pub fn facts_of(
+    lowered: &Lowered,
+    launch: &Launch,
+    geometry: Geometry,
+) -> crate::lowering::arm::Facts {
+    crate::lowering::arm::facts(
+        launch,
+        geometry,
+        lowered.n_requests,
+        sizing_width(lowered, launch),
+        input_width(lowered, launch),
+        named_tile(&lowered.kernels[launch.kernel as usize]),
+    )
 }
 
 /// Every launch of a lowered fire, in order, as dispatches.
@@ -402,343 +390,152 @@ pub fn plan_one<'a, S: Resolver>(
 /// nonsense.
 pub fn plan<'a, S: Resolver>(
     lowered: &'a Lowered,
-    table: &'static [KernelSig],
     frame: Frame,
     geometry: Geometry,
     resolver: &mut S,
 ) -> Result<Vec<Dispatch<'a>>, Undispatchable> {
-    lowered
-        .launches
-        .iter()
-        .map(|launch| plan_one(lowered, launch, table, frame, geometry, resolver))
-        .collect()
+    let mut out = Vec::with_capacity(lowered.launches.len());
+    for launch in &lowered.launches {
+        // A body may state more than one dispatch, which the table path could
+        // not: a two-pass reduction is two entrypoints over one statement,
+        // and a plane carrying only one would push the second back into the
+        // lowering. So this extends rather than pushes.
+        out.extend(plan_launch(lowered, launch, frame, geometry, resolver)?);
+    }
+    Ok(out)
 }
 
-/// The launch's operands in the order the KERNEL reads them.
+/// ONE launch, as the dispatches its routine asked for.
 ///
-/// A row states its buffers as [`Operand`]s, each carrying a [`Source`] that
-/// says where the value comes from — the statement's `i`-th input, its `i`-th
-/// result, the `i`-th weight it names, its `i`-th scalar. This walks the row
-/// and picks.
-///
-/// # What "the statement's i-th input" means here
-///
-/// The trace concatenates inputs, then outputs, then weights, and the binder
-/// keeps that order. A weight is an [`Arg::Weight`]; everything before the
-/// last widthed operand is an input and the widthed ones after are the
-/// results. That is the same reading `sizing_width` makes, and the two must
-/// agree or a rule sizes on an operand the row calls an input.
-///
-/// A row that states no operands is returned unchanged — bound positionally,
-/// which is what every row got before any of them stated anything.
-///
-/// A [`Source`] the row leaves `Unbound` contributes a **zero slot**: an
-/// operand that addresses nothing, which is the same honest answer
-/// `resolve_arg` gives a `scale.` marker. It is not silently skipped, because
-/// a skipped slot shifts every operand after it.
-///
-/// # Why a missing WEIGHT is not that
-///
-/// This paragraph used to cover a second case in the same breath — "or one
-/// naming an operand the statement does not have" — and the two are opposite
-/// claims. `Unbound` is the row saying *nothing goes here*, and a zero slot is
-/// what it asked for. `Weight(2)` against a statement holding two weights is
-/// the row saying *the third weight goes here* and being wrong; answering it
-/// with an address of zero hands the kernel a pointer it was told to read.
-///
-/// It is not hypothetical. `mxfp4_qmv_routed_bias` reads an additive bias per
-/// output row and its row named `Weight(3)` for it, which the only weight list
-/// that symbol can be given never reaches. The launch bound zero, the kernel
-/// added `bias_row[out_row + row]` off a null pointer to every expert logit,
-/// and nothing in the path said a word. So the reading here is now: a row
-/// naming a weight the statement does not have is [`Undispatchable`], by name
-/// and at plan time.
-///
-/// The input and output cases stay a zero slot deliberately. Those indices are
-/// positions in a statement's own argument list, which the trace builds and
-/// the row follows, and a row that over-reads them is caught by the arity
-/// checks in `kernels`. A weight index is a claim about a NAME LIST the text
-/// builds separately, which is exactly the seam that had no check.
+/// [`plan`] is this in a loop. It is public because a launch is the unit a
+/// test can put a single statement to, and because a caller that wants to
+/// know which launches of a plane are dispatchable — rather than whether the
+/// whole plane is — has to ask one at a time.
 ///
 /// # Errors
 ///
-/// [`Undispatchable::Unbound`] carrying [`BindRefusal::UnstatedWeight`].
-fn reorder<S: Resolver>(
-    sig: &'static KernelSig,
-    bound: &[BoundArg],
-    lowered: &Lowered,
+/// [`Undispatchable::Unclaimed`] for a symbol no row names or no routine has an
+/// arm for, and whatever [`plan_routine`] refuses.
+pub fn plan_launch<'a, S: Resolver>(
+    lowered: &'a Lowered,
     launch: &Launch,
+    frame: Frame,
+    geometry: Geometry,
     resolver: &mut S,
-) -> Result<Vec<BoundArg>, BindRefusal> {
-    if sig.operands.is_empty() {
-        return Ok(bound.to_vec());
-    }
-    let args = &lowered.args[launch.args.start as usize..launch.args.end as usize];
-    let widthed: Vec<usize> = args
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| !matches!(a, Arg::Weight(_)))
-        .map(|(i, _)| i)
-        .collect();
-    let weights: Vec<usize> = args
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| matches!(a, Arg::Weight(_)))
-        .map(|(i, _)| i)
-        .collect();
-    // How many of the widthed operands are RESULTS: the row says, because the
-    // row is what knows how many values its kernel produces. A QKV split
-    // writes three and a norm writes one, and the trace states them all after
-    // its inputs, so the split is at `len - results`.
-    let results = sig
-        .operands
-        .iter()
-        .filter_map(|o| match o.source {
-            kernels::Source::Out(i) => Some(usize::from(i) + 1),
-            _ => None,
-        })
-        .max()
-        // ZERO when the row names no `Out` at all, and that is not a
-        // degenerate case: `kv_append` writes the POOL and produces no traced
-        // value, so it has inputs and no outputs.
-        //
-        // This defaulted to ONE, which took `v_new` -- the last input -- for
-        // an output, so `In(1)` had nothing left to resolve to and the append
-        // bound a region addressing nothing where the values were. Measured
-        // against a real checkpoint: the K pages filled and the V pages were
-        // entirely zero, every layer, and the attention that read them
-        // answered zero without failing.
-        //
-        // A row with no operands at all returns above, so nothing needs the
-        // old default.
-        .unwrap_or(0)
-        .min(widthed.len());
-    let (ins, outs) = widthed.split_at(widthed.len() - results);
-
-    let nothing = BoundArg {
-        slice: crate::lowering::executor::Slice {
-            address: 0,
-            bytes: 0,
-        },
-        width: 0,
-    };
-    // The layer this statement runs in, for the state lookups. A rolled trace
-    // states a span and an unrolled one states a layer; the span's first is
-    // the answer either way, because a rolled statement runs once per layer
-    // and reaches this once per layer with it.
-    let layer = launch.layers.start;
-    sig.operands
-        .iter()
-        .map(|operand| {
-            Ok(match operand.source {
-                kernels::Source::In(i) => pick(bound, ins.get(i as usize)),
-                kernels::Source::Out(i) => pick(bound, outs.get(i as usize)),
-                kernels::Source::Weight(i) => {
-                    let Some(at) = weights.get(i as usize) else {
-                        return Err(BindRefusal::UnstatedWeight {
-                            want: u32::from(i),
-                            held: weights.len(),
-                        });
-                    };
-                    pick(bound, Some(at))
-                }
-                // The KV cache is STATE, not an operand: no traced value stands
-                // for it, so the pointer comes from the driver's own pool through
-                // the resolver rather than from the statement's args.
-                kernels::Source::KvKeys => resolver
-                    .kv(layer, false)
-                    .map_or(nothing, |slice| BoundArg { slice, width: 0 }),
-                kernels::Source::KvValues => resolver
-                    .kv(layer, true)
-                    .map_or(nothing, |slice| BoundArg { slice, width: 0 }),
-                // The fire's own tables. The row names which; this forwards the
-                // name and never reads what it means.
-                kernels::Source::TokenIds => fire(resolver, FireTable::TokenIds),
-                kernels::Source::Positions => fire(resolver, FireTable::Positions),
-                kernels::Source::RequestOfToken => fire(resolver, FireTable::RequestOfToken),
-                kernels::Source::KvPageIndices => fire(resolver, FireTable::KvPageIndices),
-                kernels::Source::KvPageIndptr => fire(resolver, FireTable::KvPageIndptr),
-                kernels::Source::KvWritePage => fire(resolver, FireTable::KvWritePage),
-                kernels::Source::KvWriteOffset => fire(resolver, FireTable::KvWriteOffset),
-                kernels::Source::RopeFrequencies => fire(resolver, FireTable::RopeFrequencies),
-                kernels::Source::SamplingIndices => fire(resolver, FireTable::SamplingIndices),
-                kernels::Source::AttentionMask => fire(resolver, FireTable::AttentionMask),
-                kernels::Source::AttentionMaskEnabled => {
-                    fire(resolver, FireTable::AttentionMaskEnabled)
-                }
-                // A scalar does not come out of the operand list at all — it rides
-                // `Dispatch::params`, bound at the slot the row placed it — so its
-                // slot here addresses nothing and the encoder's binding is what
-                // the kernel reads.
-                _ => nothing,
-            })
-        })
-        .collect()
-}
-
-/// Where each of a statement's scalars binds, and how wide.
-///
-/// A row that states no operands has them appended as one packed struct after
-/// the operands — the only convention available when nothing said otherwise,
-/// and right for the `RouterParams` shape.
-///
-/// A row that states them places each itself, and its `Ty` gives the width.
-/// The staged run is laid out in the row's order with each scalar naturally
-/// aligned, so an eight-byte stride starts on an eight-byte boundary rather
-/// than wherever the previous four-byte extent happened to end.
-fn param_layout<S: Resolver>(
-    sig: &'static KernelSig,
-    args: &[BoundArg],
-    lowered: &Lowered,
-    launch: &Launch,
-    resolver: &mut S,
-) -> (Vec<ParamSlot>, Vec<u32>) {
-    let operands = args.len();
-    let mut params: Vec<u32> =
-        lowered.params[launch.params.start as usize..launch.params.end as usize].to_vec();
-    if sig.operands.is_empty() {
-        return (
-            vec![ParamSlot {
-                slot: operands,
-                at: 0,
-                bytes: 4,
-                packed: true,
-                value: Some(0),
-            }],
-            params,
-        );
-    }
-    let mut at = 0u32;
-    let mut out = Vec::new();
-    for (slot, operand) in sig.operands.iter().enumerate() {
-        // A pool number is not one of the statement's scalars: the driver
-        // resolves it and APPENDS it, so the slot points at a value the
-        // statement never carried. That is the whole reason it is a `Source`
-        // — a stride is the pool's shape, and a text that guessed one would be
-        // right for a deployment and silently wrong for the next.
-        // A field of the PRECEDING packed struct: append the value and bind
-        // nothing. The packed slot's run covers every scalar after it, so the
-        // field lands where the struct expects it.
-        if operand.ty == kernels::Ty::InPacked {
-            params.push(match operand.source {
-                kernels::Source::RequestCount => lowered.n_requests,
-                _ => 0,
-            });
-            continue;
-        }
-        let pooled = match operand.source {
-            kernels::Source::KvHeadStride => Some(FireTable::KvHeadStride),
-            kernels::Source::KvSeqStride => Some(FireTable::KvSeqStride),
-            kernels::Source::KvPageSize => Some(FireTable::KvPageSize),
-            _ => None,
-        };
-        let (which, bytes, packed) = if let Some(want) = pooled {
-            let value = resolver.pool(want).unwrap_or(0);
-            params.push(value);
-            let i = u8::try_from(params.len() - 1).unwrap_or(u8::MAX);
-            (
-                Some(i),
-                if operand.ty == kernels::Ty::Usize {
-                    8
-                } else {
-                    4
-                },
-                false,
-            )
-        } else if let Some(width) = derived(sig, args, operand.source) {
-            // A width the STATEMENT already carries. `norm::add_bias` takes
-            // one and states nothing: a bias vector's length is the
-            // projection's width, so the row derives it rather than asking a
-            // text to repeat a number the trace holds.
-            //
-            // This arm did not exist, and the `_ => continue` below swallowed
-            // the source — no slot, so the kernel's `width` was whatever the
-            // encoder had left at that index. `LlamaLikeMetalFacts::add_bias`
-            // named the gap in those words and defaulted itself off, which is
-            // why the Qwen-2 family has been served on Metal with no q/k/v
-            // biases at all: `driver-vulkan`'s numpy oracle measured the two
-            // answers and the driver matched the one without them.
-            params.push(width);
-            let i = u8::try_from(params.len() - 1).unwrap_or(u8::MAX);
-            (Some(i), 4, false)
-        } else {
-            match operand.source {
-                kernels::Source::Param(i) | kernels::Source::ParamF32(i) => match operand.ty {
-                    kernels::Ty::Usize => (Some(i), 8, false),
-                    // A pointer where a scalar could be is the packed struct.
-                    kernels::Ty::Buf | kernels::Ty::BufMut => (Some(i), 4, true),
-                    _ => (Some(i), 4, false),
-                },
-                _ => continue,
-            }
-        };
-        at = at.next_multiple_of(bytes);
-        out.push(ParamSlot {
-            slot,
-            at,
-            bytes,
-            packed,
-            value: which,
+) -> Result<Vec<Dispatch<'a>>, Undispatchable> {
+    // Every launch takes the ROUTINE path. There is no other one left to
+    // take: all ninety-nine routines this backend builds have an arm, so a
+    // symbol that reaches here without one is not a family waiting its turn
+    // -- it is a name nothing in this tree can dispatch, and saying so is the
+    // whole of what the fallback used to hide.
+    let symbol = &lowered.kernels[launch.kernel as usize];
+    // The trace names the fully INSTANTIATED entrypoint --
+    // `silu_mul_bfloat16`, `affine_qmv_fast_bfloat16_gs_64_b_4` -- and a
+    // routine is named after the row without the axis points. The registry
+    // states the mapping itself, as a stem, so that no row is asked: routing
+    // through `sig_in` was circular, and a family whose rows were deleted
+    // would have made its own routines unreachable.
+    let Some((routine, arm)) = crate::lowering::routine::crossed(symbol) else {
+        return Err(Undispatchable::Unclaimed {
+            symbol: symbol.clone(),
+            op: launch.op,
         });
-        at += bytes;
-    }
-    (out, params)
-}
-
-/// A scalar the row DERIVES from an operand this launch already bound.
-///
-/// The row names an operand by role — `OutWidth(0)` is "the row width of my
-/// first result" — and the answer is that operand's own stated width, in
-/// elements. Nothing here recomputes it: `reorder` has already placed every
-/// operand at the slot its row asked for, so this looks the operand up the
-/// same way the kernel will and reads the width off it.
-///
-/// `None` for a source that is not derived, and for one whose operand the row
-/// does not state — a row naming `OutWidth(1)` with one result is a row
-/// disagreeing with itself, and `every_scalar_source_the_table_names_is_one_
-/// this_binder_resolves` is what says so.
-fn derived(sig: &'static KernelSig, args: &[BoundArg], source: kernels::Source) -> Option<u32> {
-    let width = |want: kernels::Source| {
-        sig.operands
-            .iter()
-            .position(|o| o.source == want)
-            .and_then(|slot| args.get(slot))
-            .map(|a| a.width)
-            .filter(|w| *w > 0)
     };
-    match source {
-        kernels::Source::OutWidth(i) => width(kernels::Source::Out(i)),
-        kernels::Source::InWidth(i) => width(kernels::Source::In(i)),
-        _ => None,
-    }
+    plan_routine(lowered, launch, routine, arm, frame, geometry, resolver)
 }
 
-/// One of the fire's tables, or a region addressing nothing.
-fn fire<S: Resolver>(resolver: &mut S, table: FireTable) -> BoundArg {
-    resolver.fire(table).map_or(
-        BoundArg {
-            slice: crate::lowering::executor::Slice {
-                address: 0,
-                bytes: 0,
-            },
-            width: 0,
-        },
-        |slice| BoundArg { slice, width: 0 },
-    )
-}
-
-/// The bound operand at `at`, or one that addresses nothing.
+/// One launch of a crossed routine, as the dispatches its body asked for.
 ///
-/// Nothing rather than a skip: a skipped slot shifts every operand after it,
-/// which turns one missing pointer into a whole misbound launch.
-fn pick(bound: &[BoundArg], at: Option<&usize>) -> BoundArg {
-    at.and_then(|&i| bound.get(i).copied()).unwrap_or(BoundArg {
-        slice: crate::lowering::executor::Slice {
-            address: 0,
-            bytes: 0,
-        },
-        width: 0,
-    })
+/// The arm resolves the statement's operands into handles and states the
+/// routine's argument list; the body states the rectangle and the entrypoint.
+/// Neither half can state the other's, which is the point.
+///
+/// # Errors
+///
+/// [`Undispatchable::Unbound`] for an operand the statement does not carry,
+/// and [`Undispatchable::Refused`] for a rectangle the routine will not
+/// launch — an extent of zero, a width no shader is compiled at.
+fn plan_routine<'a, S: Resolver>(
+    lowered: &'a Lowered,
+    launch: &Launch,
+    routine: &'static kernels::routine::Routine<kernels_metal::routine::Metal>,
+    arm: crate::lowering::arm::Arm,
+    frame: Frame,
+    geometry: Geometry,
+    resolver: &mut S,
+) -> Result<Vec<Dispatch<'a>>, Undispatchable> {
+    let symbol = &lowered.kernels[launch.kernel as usize];
+    if launch.cond != Launch::NO_COND {
+        return Err(Undispatchable::Conditional {
+            symbol: symbol.clone(),
+            op: launch.op,
+            cond: launch.cond,
+        });
+    }
+    let bound = bind(lowered, launch, frame, resolver).map_err(|why| Undispatchable::Unbound {
+        symbol: symbol.clone(),
+        op: launch.op,
+        why,
+    })?;
+    // How many of the widthed operands are RESULTS: the ROUTINE says, by
+    // counting the `BufMut` in its own signature. The table path read this off
+    // a row's `Out` sources, which is the same fact stated in a place the
+    // compiler cannot check against the kernel.
+    let results = routine
+        .args
+        .iter()
+        .filter(|(ty, _)| *ty == kernels::Ty::BufMut)
+        .count();
+    let args = &lowered.args[launch.args.start as usize..launch.args.end as usize];
+    let (ins, outs, weights) = crate::lowering::arm::split(args, results);
+    let params: Vec<Option<u32>> = lowered.params
+        [launch.params.start as usize..launch.params.end as usize]
+        .iter()
+        .map(|&p| Some(p))
+        .collect();
+    let facts = facts_of(lowered, launch, geometry);
+    let mut handles =
+        crate::lowering::arm::Handles::new(&bound.args, &ins, &outs, &weights, &params, resolver);
+    let refused = |why| Undispatchable::Refused {
+        symbol: symbol.clone(),
+        op: launch.op,
+        why,
+    };
+    let values = arm(&mut handles, facts).map_err(refused)?;
+    let staged = handles.staged();
+    let planner = crate::lowering::routine::Planner::new(
+        routine,
+        handles.bound(),
+        staged,
+        launch.layers.clone(),
+        launch.op,
+    );
+    (routine.body)(&planner, &values).map_err(refused)?;
+    let plan = planner.finish();
+    // The two spellings, held to each other.
+    //
+    // The trace names the fully instantiated entrypoint and the body composes
+    // one from the facts its arm supplied, so for a statement that becomes
+    // ONE dispatch the two strings are the same string derived twice -- once
+    // by `model-compiler` from the checkpoint, once here from `Geometry`.
+    // Nothing else compares them, and the failure they would otherwise hide
+    // is the worst kind this backend has: a `_gs_64_b_4` gather over a
+    // `_gs_128_b_8` table does not fault, it returns fluent nonsense, because
+    // the two pack to identical extents.
+    //
+    // Only for a single dispatch. A body may state two -- a two-pass
+    // reduction is two entrypoints over one statement -- and then neither is
+    // "the" symbol the trace named.
+    if let [only] = plan.as_slice() {
+        if only.symbol != symbol {
+            return Err(Undispatchable::Misspelled {
+                symbol: symbol.clone(),
+                op: launch.op,
+                composed: only.symbol,
+            });
+        }
+    }
+    Ok(plan)
 }
 
 /// The distinct `(file, entry point)` pairs a dispatch list needs compiled.
@@ -767,16 +564,6 @@ pub fn pipelines_needed<'a>(dispatches: &[Dispatch<'a>]) -> Vec<(&'static str, &
 // `.wiki/driver/real-metal-north-star.md` §7's own instruction -- *move the
 // arithmetic, not the crate* -- and the build is what noticed.
 
-/// The signature table this backend dispatches against.
-///
-/// A function rather than a re-export so that the one place naming the table
-/// is here: [`plan`] takes the vocabulary as a parameter, which
-/// keeps it testable against a table of its own, and this is the answer every
-/// real caller gives it.
-#[must_use]
-pub fn table() -> &'static [KernelSig] {
-    kernels_metal::KERNELS
-}
 /// The widest operand count any statement of a fire binds, plus its scalars.
 ///
 /// An argument table is created with a fixed bind count and a binding past it
@@ -802,108 +589,11 @@ pub fn table_width(dispatches: &[Dispatch<'_>]) -> usize {
         .max(1)
 }
 
-/// Every source any row of this table names is one some half of this binder
-/// resolves.
-///
-/// # Why this is the instrument and not a style check
-///
-/// Both halves of the binder end in a catch-all that is SILENT. `reorder`'s
-/// `_ => nothing` binds address 0, length 0; `param_layout`'s `_ => continue`
-/// emits no slot at all, so the kernel reads that argument at an index nobody
-/// wrote. Neither refuses. The row is right, the kernel is right, the plan
-/// binds, the fire launches, and one operand is garbage.
-///
-/// `Source::OutWidth` sat in exactly that hole. `norm::add_bias` was written
-/// for all three backends so that a Qwen-2 would stop being served without its
-/// q/k/v projection biases, and on Metal the row stayed unreachable: the
-/// capability flag `LlamaLikeMetalFacts::add_bias` defaulted itself off and
-/// explained, in prose, that this binder had no arm for the source. A comment
-/// is not a check. This is.
-///
-/// The claim is over the TABLE and not over the texts, deliberately — a row
-/// nothing launches yet is precisely the row whose source goes unnoticed until
-/// the day something launches it.
-#[cfg(test)]
-#[test]
-fn every_source_the_table_names_is_one_this_binder_resolves() {
-    use kernels::Source as S;
-    // Split the way the binder is split, because the two halves fail
-    // differently and a source has to be claimed by the right one: an operand
-    // `reorder` misses is a null pointer, and a scalar `param_layout` misses
-    // is an unwritten index.
-    let by_reorder = |s: &S| {
-        matches!(
-            s,
-            // The one source whose correct answer IS a null: a row saying
-            // `Unbound` has said, in the table, that this slot addresses
-            // nothing -- `mxfp4_qmv_routed_bias`'s `biases` is the ABI's
-            // zero-point plane that an MXFP4 bank does not have. It is
-            // listed here rather than falling through so that "stated as
-            // empty" and "nobody thought about it" stop sharing a code path.
-            S::Unbound
-                | S::In(_)
-                | S::Out(_)
-                | S::Weight(_)
-                | S::KvKeys
-                | S::KvValues
-                | S::TokenIds
-                | S::Positions
-                | S::RequestOfToken
-                | S::KvPageIndices
-                | S::KvPageIndptr
-                | S::KvWritePage
-                | S::KvWriteOffset
-                | S::RopeFrequencies
-                | S::SamplingIndices
-                | S::AttentionMask
-                | S::AttentionMaskEnabled
-        )
-    };
-    let by_params = |s: &S| {
-        matches!(
-            s,
-            S::Param(_)
-                | S::ParamF32(_)
-                | S::KvHeadStride
-                | S::KvSeqStride
-                | S::KvPageSize
-                | S::RequestCount
-                // The `derived` arm. Asked by discriminant rather than by
-                // calling it, because `derived` answers `None` both for "no
-                // arm" and for "this plan has no such operand", and only the
-                // first is a hole.
-                | S::OutWidth(_)
-                | S::InWidth(_)
-        )
-    };
-    let mut orphans = Vec::new();
-    for sig in table() {
-        for operand in sig.operands {
-            // A packed field is appended whole by the layout's first branch,
-            // whatever it names.
-            if operand.ty == kernels::Ty::InPacked
-                || by_reorder(&operand.source)
-                || by_params(&operand.source)
-            {
-                continue;
-            }
-            orphans.push((sig.name, operand.name, format!("{:?}", operand.source)));
-        }
-    }
-    assert!(
-        orphans.is_empty(),
-        "these slots name a source this binder drops on the floor -- each is \
-         either a null pointer or an argument read at an index nobody wrote, \
-         and neither refuses: {orphans:#?}"
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lowering::executor::Slice;
-    use kernels::{LaunchRule, kernel};
-    use model_compiler::trace::ValueId;
+    use crate::lowering::executor::FireTable;
+    use model_ir::trace::ValueId;
 
     /// Answers every name, so a test is about the walk rather than the store.
     #[derive(Default)]
@@ -923,12 +613,6 @@ mod tests {
             })
         }
     }
-
-    static TABLE: &[KernelSig] = &[
-        kernel!(sized "sized", file = Some("f.metal"), launch = LaunchRule::Rms),
-        kernel!(no_file "no_file", launch = LaunchRule::Rms),
-        kernel!(no_rule "no_rule", file = Some("f.metal")),
-    ];
 
     /// One launch of `symbol` over `rows`, with the args given.
     fn one(symbol: &str, rows: u32, args: Vec<Arg>) -> Lowered {
@@ -999,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn a_launch_evaluates_its_rows_and_the_fires_geometry_together() {
+    fn a_launch_states_its_rows_and_the_fire_states_the_rest() {
         let low = one(
             "sized",
             5,
@@ -1015,15 +699,11 @@ mod tests {
             head_dim: 128,
             ..Geometry::default()
         };
-        // A row that names no `grid_param` takes the fire's geometry, which
-        // is every row but the rope's.
-        let sig = kernels::sig_in(kernels_metal::KERNELS, "rms_norm_bf16")
-            .or_else(|| kernels_metal::KERNELS.first())
-            .expect("the table has rows");
-        let dims = dims_of(sig, &low, &low.launches[0], geometry);
-        assert_eq!(dims.rows, 5, "the rectangle states the rows");
-        assert_eq!(dims.width, 64, "the operand states the width");
-        assert_eq!(dims.q_heads, 16, "the fire states the rest");
+        let launch = &low.launches[0];
+        let facts = facts_of(&low, launch, geometry);
+        assert_eq!(facts.rows, 5, "the rectangle states the rows");
+        assert_eq!(facts.width, 64, "the operand states the width");
+        assert_eq!(facts.q_heads, 16, "the fire states the rest");
     }
 
     #[test]
@@ -1038,50 +718,10 @@ mod tests {
             }],
         );
         assert_eq!(
-            plan(&low, TABLE, frame(), Geometry::default(), &mut Anything),
-            Err(Undispatchable::NoRow {
+            plan(&low, frame(), Geometry::default(), &mut Anything),
+            Err(Undispatchable::Unclaimed {
                 symbol: "attn::split_qkv_bf16".into(),
                 op: 7
-            })
-        );
-    }
-
-    #[test]
-    fn a_row_that_states_no_file_cannot_be_reached_on_this_backend() {
-        // Metal compiles at run time from `(path, entry name)`. A row without
-        // a file is not a kernel this driver can find.
-        let low = one(
-            "no_file",
-            1,
-            vec![Arg::Arena {
-                at: 0,
-                width: 8,
-                bytes: 2,
-            }],
-        );
-        assert!(matches!(
-            plan(&low, TABLE, frame(), Geometry::default(), &mut Anything),
-            Err(Undispatchable::NoFile { .. })
-        ));
-    }
-
-    #[test]
-    fn a_row_that_states_no_rule_refuses_rather_than_launching_something_plausible() {
-        let low = one(
-            "no_rule",
-            1,
-            vec![Arg::Arena {
-                at: 0,
-                width: 8,
-                bytes: 2,
-            }],
-        );
-        assert_eq!(
-            plan(&low, TABLE, frame(), Geometry::default(), &mut Anything),
-            Err(Undispatchable::Ungeometric {
-                symbol: "no_rule".into(),
-                op: 7,
-                why: Ungeometric::Unstated
             })
         );
     }
@@ -1105,7 +745,7 @@ mod tests {
             ..low.launches[0].clone()
         };
         low.launches.push(second);
-        assert!(plan(&low, TABLE, frame(), Geometry::default(), &mut Anything).is_err());
+        assert!(plan(&low, frame(), Geometry::default(), &mut Anything).is_err());
     }
 
     #[test]
@@ -1126,7 +766,7 @@ mod tests {
         );
         low.launches[0].cond = 3;
         assert_eq!(
-            plan(&low, TABLE, frame(), Geometry::default(), &mut Anything),
+            plan(&low, frame(), Geometry::default(), &mut Anything),
             Err(Undispatchable::Conditional {
                 symbol: "sized".into(),
                 op: 7,
@@ -1143,6 +783,7 @@ mod tests {
             grid: [1, 1, 1],
             threadgroup: [1, 1, 1],
             args: Vec::new(),
+            touches: Touches::default(),
             param_slots: vec![ParamSlot {
                 slot: 0,
                 at: 0,
@@ -1165,6 +806,353 @@ mod tests {
         assert_eq!(
             pipelines_needed(&list),
             vec![("f.metal", "sized"), ("f.metal", "other")]
+        );
+    }
+
+    /// A crossed symbol takes the routine path, and the plan is the body's.
+    ///
+    /// `sample` is the first family wired, and its row is why: it states no
+    /// `launch` rule, so `eval` refuses it `Unstated` and the table path has
+    /// never been able to dispatch `argmax_logits` at all. The rectangle below
+    /// is therefore the FIRST statement of this kernel's grid anywhere in the
+    /// driver -- there is no prior behaviour to preserve, which is the
+    /// cheapest possible place to prove a seam.
+    #[test]
+    fn a_crossed_symbol_plans_through_its_routine() {
+        let args = vec![
+            Arg::Arena {
+                at: 0,
+                width: 128,
+                bytes: 2,
+            },
+            Arg::Arena {
+                at: 512,
+                width: 4,
+                bytes: 4,
+            },
+            Arg::Arena {
+                at: 1024,
+                width: 1,
+                bytes: 4,
+            },
+            Arg::Arena {
+                at: 1536,
+                width: 1,
+                bytes: 4,
+            },
+        ];
+        let lowered = one("argmax_logits_bfloat16", 3, args);
+
+        assert!(
+            crate::lowering::routine::crossed(&lowered.kernels[0]).is_some(),
+            "the stem resolves the spelling the TRACE states"
+        );
+
+        let plan = plan(&lowered, frame(), Geometry::default(), &mut Anything)
+            .expect("the routine plans it");
+
+        assert_eq!(plan.len(), 1, "one statement, one dispatch");
+        let got = &plan[0];
+        assert_eq!(got.symbol, "argmax_logits_bfloat16", "the whole spelling");
+        assert_eq!(got.file, "sample/argmax.metal");
+        assert_eq!(got.grid[1], 3, "one row of the rectangle per token");
+        assert_eq!(got.grid[0], got.threadgroup[0], "one group reduces a row");
+        // The trace's order is inputs then results -- logits, params, token,
+        // flag. The kernel's order interleaves them, and the arm is what
+        // turns one into the other.
+        assert_eq!(
+            got.args.iter().map(|a| a.slice.address).collect::<Vec<_>>(),
+            vec![0x8000, 0x8000 + 1024, 0x8000 + 512, 0x8000 + 1536],
+            "the operands, in the KERNEL's order"
+        );
+    }
+
+    /// An empty rectangle is a refusal from the routine, not a dispatch of
+    /// nothing.
+    #[test]
+    fn a_routine_refusing_the_rectangle_refuses_the_walk() {
+        let lowered = one(
+            "argmax_logits_bfloat16",
+            0,
+            vec![
+                Arg::Arena {
+                    at: 0,
+                    width: 128,
+                    bytes: 2,
+                },
+                Arg::Arena {
+                    at: 512,
+                    width: 4,
+                    bytes: 4,
+                },
+                Arg::Arena {
+                    at: 1024,
+                    width: 1,
+                    bytes: 4,
+                },
+                Arg::Arena {
+                    at: 1536,
+                    width: 1,
+                    bytes: 4,
+                },
+            ],
+        );
+        let why = plan(&lowered, frame(), Geometry::default(), &mut Anything)
+            .expect_err("no row to sample");
+        assert!(
+            matches!(
+                why,
+                Undispatchable::Refused {
+                    why: kernels::routine::Refusal::Empty { what: "rows" },
+                    ..
+                }
+            ),
+            "{why:?}"
+        );
+    }
+
+    /// Answers the fire's tables too, so an operand that comes from one is
+    /// distinguishable from an operand that does not.
+    #[derive(Default)]
+    struct Tables;
+
+    impl Resolver for Tables {
+        fn weight(&mut self, name: &str) -> Option<Slice> {
+            // Distinct per name, so a swap of two weight operands is visible
+            // rather than an equality between two copies of `0x1000`.
+            Some(Slice {
+                address: 0x1000 + 0x100 * u64::from(name.len() as u32),
+                bytes: 1 << 20,
+            })
+        }
+        fn named(&mut self, _: ValueId) -> Option<Slice> {
+            Some(Slice {
+                address: 0x2000,
+                bytes: 1 << 20,
+            })
+        }
+        fn fire(&mut self, which: FireTable) -> Option<Slice> {
+            Some(Slice {
+                address: 0x4000 + 0x100 * which as u64,
+                bytes: 1 << 20,
+            })
+        }
+    }
+
+    /// The fire's own axes, for the families that read them.
+    fn geom() -> Geometry {
+        Geometry {
+            q_heads: 4,
+            kv_heads: 4,
+            head_dim: 64,
+            rotary_dims: 32,
+            group: 64,
+            bits: 4,
+            ..Geometry::default()
+        }
+    }
+
+    /// The two rotations that had no row now dispatch, and `neox_strided`
+    /// still refuses the statement that cannot say its stride.
+    ///
+    /// `neox_prop_mb` is gemma's prefill rotation and `neox_strided` is the
+    /// packed-QKV one. Both rows were bare -- `kernel!(neox_prop_mb
+    /// "neox_prop_mb", file = ..., axes = &[BF16])` and nothing else -- so
+    /// `eval` had no rule and refused, which on gemma meant the prefill's
+    /// rotation silently did not happen. A routine states its own bindings,
+    /// so there is nothing left to leave out.
+    ///
+    /// The stride is the exception. Every other scalar here has a fire-wide
+    /// fallback that is right for a single-shape deployment; a row pitch does
+    /// not, because a pitch equal to the row width is exactly the case this
+    /// kernel is NOT for. So it is read from the statement or refused.
+    #[test]
+    fn the_two_rotations_no_row_could_reach_now_dispatch() {
+        let scale = 1.0f32.to_bits();
+        let base = 500_000.0f32.to_bits();
+        let arena = vec![Arg::Arena {
+            at: 0,
+            width: 256,
+            bytes: 2,
+        }];
+
+        let mut prop = one("neox_prop_mb_bfloat16", 5, arena.clone());
+        prop.launches[0].params = 0..4;
+        prop.params = vec![scale, base, 64, 32];
+        let plan =
+            plan(&prop, frame(), geom(), &mut Tables).expect("the routine states its own bindings");
+        assert_eq!(
+            plan[0].grid,
+            [16, 4, 5],
+            "half the rotation, per head, per row"
+        );
+
+        // The stride, missing.
+        let mut strided = one("neox_strided_bfloat16", 5, arena.clone());
+        strided.launches[0].params = 0..4;
+        strided.params = vec![scale, base, 64, 32];
+        let why =
+            super::plan(&strided, frame(), geom(), &mut Tables).expect_err("no pitch, no dispatch");
+        assert!(
+            matches!(why, Undispatchable::Refused { .. }),
+            "a stride the statement does not carry is a refusal, not the row \
+                 width: {why:?}"
+        );
+
+        // The stride, stated, and narrower than the row it strides over.
+        strided.launches[0].params = 0..5;
+        strided.params = vec![scale, base, 64, 32, 128];
+        let why = super::plan(&strided, frame(), geom(), &mut Tables)
+            .expect_err("a pitch narrower than the row makes consecutive rows overlap");
+        assert!(
+            matches!(
+                why,
+                Undispatchable::Refused {
+                    why: kernels::routine::Refusal::Narrow { at: 128, .. },
+                    ..
+                }
+            ),
+            "{why:?}"
+        );
+
+        strided.params = vec![scale, base, 64, 32, 512];
+        let plan = super::plan(&strided, frame(), geom(), &mut Tables)
+            .expect("a pitch wider than the row tiles");
+        assert_eq!(plan[0].grid, [16, 4, 5]);
+    }
+
+    /// Every strided norm this backend has now dispatches, and none of them
+    /// could before.
+    ///
+    /// `rms_strided_row`, `rms_strided_head_row`, `gated_rms`,
+    /// `gated_rms_strided` and `residual_add_strided` were all bare rows --
+    /// `kernel!(name "name", file = ..., axes = &[BF16])` and nothing more --
+    /// so `eval` refused every one. That is the whole prefill path over a
+    /// packed layout: a QK-norm across a prompt, a gated head norm, a
+    /// residual over non-contiguous rows.
+    #[test]
+    fn the_strided_norms_no_row_could_reach_now_dispatch() {
+        let eps = 1e-5f32.to_bits();
+        let arena = |at: usize| Arg::Arena {
+            at,
+            width: 256,
+            bytes: 2,
+        };
+        // Four 64-wide reductions inside each 256-wide row, five rows.
+        let block = vec![eps, 64, 1, 0, 1.0f32.to_bits()];
+
+        for (symbol, args, params, grid, tg) in [
+            (
+                "rms_strided_row",
+                vec![arena(0), Arg::Weight("norm".into()), arena(2048)],
+                block.clone(),
+                // One threadgroup per ROW: the base is `gid * row_pitch`, so
+                // a row holds one norm and the axis only sizes the group.
+                [16 * 5, 1, 1],
+                [16, 1, 1],
+            ),
+            (
+                "rms_strided_head_row",
+                vec![arena(0), Arg::Weight("norm".into()), arena(2048)],
+                block.clone(),
+                // Four heads on their own axis, five rows on a third.
+                [16, 4, 5],
+                [16, 1, 1],
+            ),
+            (
+                "gated_rms",
+                vec![
+                    arena(0),
+                    arena(1024),
+                    Arg::Weight("norm".into()),
+                    arena(2048),
+                ],
+                block.clone(),
+                // The pool's shape, not the statement's: four 64-wide value
+                // heads. The old rule had no row axis at all.
+                [64, 4, 5],
+                [64, 1, 1],
+            ),
+            (
+                "gated_rms_strided",
+                vec![
+                    arena(0),
+                    arena(1024),
+                    Arg::Weight("norm".into()),
+                    arena(2048),
+                ],
+                block.clone(),
+                [64, 4, 5],
+                [64, 1, 1],
+            ),
+            (
+                "residual_add_strided",
+                vec![arena(0), arena(1024), arena(2048)],
+                // The pitch, which nothing else can supply.
+                vec![512],
+                [256, 5, 1],
+                [256, 1, 1],
+            ),
+        ] {
+            let mut lowered = one(&format!("{symbol}_bfloat16"), 5, args);
+            lowered.launches[0].params = 0..params.len() as u32;
+            lowered.params = params;
+
+            let by_routine = plan(&lowered, frame(), geom(), &mut Tables)
+                .unwrap_or_else(|why| panic!("{symbol}: the routine states its bindings: {why:?}"));
+            assert_eq!(by_routine[0].grid, grid, "{symbol}: the rectangle");
+            assert_eq!(by_routine[0].threadgroup, tg, "{symbol}: the group");
+        }
+    }
+
+    /// A routine handed the wrong axis facts composes a name the trace never
+    /// stated, and the walk refuses rather than gathering over the wrong
+    /// table.
+    ///
+    /// This is the failure the spelling check exists for and it is otherwise
+    /// silent: a `_gs_64_b_4` kernel over a `_gs_128_b_8` weight reads the
+    /// same extent, faults nothing, and returns fluent garbage. Here the
+    /// `Geometry` says 64/4 while the trace says 128/8 -- which is what a
+    /// misread of `MetalBinding`'s quantization bytes would produce.
+    #[test]
+    fn a_routine_composing_a_name_the_trace_did_not_state_is_refused() {
+        let mut lowered = one(
+            "embed_gather_mb_4bit_bfloat16_gs_128_b_8",
+            3,
+            vec![
+                Arg::Weight("embed".into()),
+                Arg::Weight("embed_scales".into()),
+                Arg::Weight("embed_biases".into()),
+                Arg::Arena {
+                    at: 0,
+                    width: 64,
+                    bytes: 2,
+                },
+            ],
+        );
+        lowered.launches[0].params = 0..1;
+        lowered.params = vec![64];
+
+        let why = plan(
+            &lowered,
+            frame(),
+            Geometry {
+                group: 64,
+                bits: 4,
+                ..Geometry::default()
+            },
+            &mut Tables,
+        )
+        .expect_err("the composed spelling is not the traced one");
+        assert!(
+            matches!(
+                why,
+                Undispatchable::Misspelled {
+                    composed: "embed_gather_mb_4bit_bfloat16_gs_64_b_4",
+                    ..
+                }
+            ),
+            "{why:?}"
         );
     }
 }

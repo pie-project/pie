@@ -20,6 +20,12 @@
 # `attn/page_compact.hpp` is copied from kernels-cuda at build time rather than
 # kept as a stub, so a change to the kernel's signature breaks this build
 # instead of being silently absorbed.
+#
+# That `kernels-cuda`, and the one in `KSRC` below, is the ARCHIVE crate —
+# CMake+nvcc, a `csrc/` of host `.hpp` and `.cpp` — deleted whole at
+# `85c6c674b`, and `attn/page_compact.hpp` went with it. The line is left
+# unchanged because it records the command that took the golden, not a path
+# anyone can follow.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

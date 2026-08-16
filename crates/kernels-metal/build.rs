@@ -10,7 +10,7 @@
 //!
 //! What `native` gates is the staging below, which reads out of
 //! `tensor-compiler`. Without it this crate is the signature table and a
-//! directory of shaders, which is what `model-compiler` wants and all it
+//! directory of shaders, which is what `model-ir` wants and all it
 //! wants.
 
 use std::path::{Path, PathBuf};
@@ -21,24 +21,30 @@ fn main() {
 
     let kernels = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernels");
 
-    // Two keys, two DIRECTORIES, and they are different roles.
+    // One key and one DIRECTORY, which is a narrowing rather than a
+    // simplification.
     //
-    // `include` is the C++ include path: `include/pie/kernels/` holds the host
-    // library — the launch shapes, the name grammar, the `Grid` PODs — plus
-    // `kernels/<family>/` for the `*_params.h` a shader and its host caller
-    // must agree on, which is why both are published.
+    // There were two. `include` named `include/pie/kernels/`, a host C++
+    // library — launch shapes, the name grammar, the `Grid` PODs — published
+    // as `DEP_PIE_KERNELS_METAL_INCLUDE` for the C++ Metal driver to compile
+    // against. That driver was deleted whole, and `driver-metal` has been
+    // Rust since: no build script, so nothing was left that could read the
+    // key, and the launch shapes it carried live in
+    // `driver-metal/src/lowering/grid.rs` now. The headers outlived their
+    // last caller by the length of the port and were deleted with it.
     //
-    // `kernels_dir` is what becomes `PIE_METAL_KERNELS_DIR_DEFAULT`, a path
-    // baked into the binary for the RUNTIME shader compiler to read `.metal`
-    // out of. It is the shader tree and nothing else.
+    // The `*_params.h` a shader and its host caller must agree on did NOT go
+    // with them, and could not: `.metal` files `#include` them directly, and
+    // MSL has no Rust. They sit in `kernels/<family>/`, inside the tree
+    // below, and `driver-metal`'s `layout::shader` splices them in by hand
+    // because Metal's runtime compiler resolves no includes of its own. The
+    // Rust half of each is a mirrored `#[repr(C)]` struct with a `size_of`
+    // assertion, which is the check a shared header would otherwise be.
     //
-    // They used to be one directory, and the note here said so. That put a
-    // host-only C++ header inside the runtime shader search path and left the
-    // two roles indistinguishable; `.wiki/kernel-metal-refactor.md` §4 is why
-    // they are separate now.
-    let include = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("include");
-    println!("cargo:rerun-if-changed=include");
-    println!("cargo:include={};{}", include.display(), kernels.display());
+    // So what is left is `kernels_dir`: `PIE_METAL_KERNELS_DIR_DEFAULT`, a
+    // path baked into the binary for the RUNTIME shader compiler to read
+    // `.metal` out of. The shader tree and nothing else — which is what the
+    // split was for, now that there is only one thing to publish.
     println!("cargo:kernels_dir={}", kernels.display());
 
     if std::env::var_os("CARGO_FEATURE_NATIVE").is_none() {

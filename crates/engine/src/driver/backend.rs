@@ -58,6 +58,21 @@ pub struct DriverSpec {
     pub num_kv_pages: usize,
     pub limits: SchedulerLimits,
     pub device_geometry_port_mask: u32,
+    /// Does this driver resolve a step's descriptor ports when the step RUNS,
+    /// rather than for the whole frame before any of it runs?
+    ///
+    /// False is the safe answer and the CUDA one: `FramePrepare` does every
+    /// step's host work at frame entry, so a slot chained behind an earlier
+    /// slot of the same frame asks for a cell nobody has produced yet, and
+    /// `pipeline::fire` refuses that frame by name.
+    ///
+    /// True says the driver's `launch` interleaves the two halves -- convert
+    /// one step, fire it, let its program run, then convert the next -- which
+    /// is what makes a chained slot's tokens exist by the time they are read.
+    /// `driver-vulkan` does this: its `launch` calls `envelope::fill` inside
+    /// the per-step loop and answers `Filled::Early` for a channel that is
+    /// still empty, rather than reading every step up front.
+    pub resolves_geometry_per_step: bool,
     /// Which memory a KV page of this driver's lives in.
     ///
     /// Set by [`register_driver_backend`] from the BACKEND, not by whoever
@@ -92,6 +107,15 @@ impl DriverSpec {
 /// the second thing entitled to an opinion about the file's shape, and the
 /// two would drift.
 pub mod open {
+    // Every function below is gated on a driver feature, so with none
+    // selected -- which is how the workspace clippy gate builds this crate --
+    // the import has no user and `-D warnings` refuses the crate.
+    #[cfg(any(
+        feature = "driver-cuda",
+        feature = "driver-metal",
+        feature = "driver-vulkan",
+        feature = "driver-wgpu"
+    ))]
     use super::{DriverBackend, Result};
 
     /// Open a CUDA device.
@@ -316,6 +340,67 @@ mod tests {
     /// So the test asserts the STATE, not the call: after `settled_control`
     /// the completion answers `is_settled`, and its cell holds SUCCESS rather
     /// than `Pending`. Either omission fails it.
+    /// Every HOST-SIDE seam settles its control ops through the helper.
+    ///
+    /// The test above proves the helper is right. This one proves the seams
+    /// use it, which is a different claim and the one that regressed: the
+    /// 850-second hang was a seam that minted a completion and dropped the
+    /// target, and nothing about the helper being correct would have caught
+    /// that.
+    ///
+    /// # Why only three of the five
+    ///
+    /// `cuda` and `remote` call `control_completion` directly and must: they
+    /// are asynchronous, so they hand the whole target to whatever finishes
+    /// the work -- CUDA to the shell, `remote` to its RPC task -- and each
+    /// publishes and notifies there. A host-side seam has nobody to hand it
+    /// to, because the work is already done when the call returns.
+    ///
+    /// # Why it reads the source
+    ///
+    /// Because `metal.rs` is `#[cfg(target_vendor = "apple")]` and this test
+    /// runs on Linux. Compiling the Mac seam is a Mac's job; reading it is
+    /// anyone's, and a seam nobody on this platform can build is exactly the
+    /// one whose regression nobody on this platform would see.
+    ///
+    /// The wgpu seam's own doc used to say both siblings got this wrong. They
+    /// did, and they no longer do -- which is how a sentence about another
+    /// crate rots. This asks the question instead of asserting the answer.
+    #[test]
+    fn every_host_side_seam_settles_its_control_ops_through_the_helper() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/driver/backend");
+        let mut wrong = Vec::new();
+        let mut checked = 0;
+        for seam in ["metal.rs", "vulkan.rs", "wgpu.rs"] {
+            let path = dir.join(seam);
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                wrong.push(format!("{seam} is not where this test looks for it"));
+                continue;
+            };
+            checked += 1;
+            let code: Vec<&str> = text
+                .lines()
+                .map(|l| l.split_once("//").map_or(l, |(before, _)| before))
+                .collect();
+            if code.iter().any(|l| l.contains("control_completion(")) {
+                wrong.push(format!(
+                    "{seam} mints a control completion itself. A host-side seam \
+                     has nobody to hand the target to, so dropping it parks \
+                     the scheduler on an op nobody will settle -- call \
+                     `settle_control` instead"
+                ));
+            }
+            if !code.iter().any(|l| l.contains("settle_control(")) {
+                wrong.push(format!(
+                    "{seam} never calls `settle_control`, so either it settles \
+                     control ops some other way or it does not settle them"
+                ));
+            }
+        }
+        assert_eq!(checked, 3, "a seam went missing and this read {checked}");
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
     #[test]
     #[cfg(any(feature = "driver-vulkan", feature = "driver-wgpu"))]
     fn a_control_op_that_already_happened_publishes_then_notifies() {

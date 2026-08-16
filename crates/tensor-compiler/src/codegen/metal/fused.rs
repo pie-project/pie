@@ -35,11 +35,12 @@ fn value_ptr(value: u32) -> String {
 /// the kernel faults `0xB3` on a wider launch rather than reading past the
 /// buffer.
 ///
-/// Emitted into `ptir_abi.h` as `PTIR_METAL_M3_REGION_THREADS`, which is what
-/// `m1_runtime.cpp`'s `kM3RegionThreads` reads. It must not be transcribed on
-/// the driver side: a hand-kept copy carrying a "must equal" comment has
-/// nothing comparing the two, and the failure mode is a threadgroup sized for
-/// one count reducing over a buffer built for another.
+/// It must not be transcribed on the driver side: a hand-kept copy carrying a
+/// "must equal" comment has nothing comparing the two, and the failure mode is
+/// a threadgroup sized for one count reducing over a buffer built for another.
+/// This was published as `PTIR_METAL_M3_REGION_THREADS` in the generated
+/// `ptir_abi.h` while the driver was C++; the Rust `driver-metal` reads this
+/// constant itself, and `grouped.rs` asserts its mirror against it.
 ///
 /// 512 measured against 256 with the model DAG truncated away, interleaved to
 /// cancel thermal drift: 0.951ms vs 1.557ms for the sampler region, reproduced

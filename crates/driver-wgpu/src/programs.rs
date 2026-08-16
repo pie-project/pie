@@ -47,6 +47,42 @@
 //! carry emitted kernels for a backend that codegens them; this driver
 //! advertises no codegen backend, holds them, and runs the stages the
 //! interpreter can. That is the same shape `driver-metal` serves.
+//!
+//! # What a registration carries that this driver does not read
+//!
+//! Audited the way `frames::unserved_in`'s coverage was, and worth recording
+//! because the answer is "nothing is silently dropped" and establishing that
+//! took a probe.
+//!
+//! `ProgramRegistration` has six fields and this crate names three.
+//! `emitted_kernels` and `region_analysis` are the other two that matter, and
+//! both are EMPTY on every program of a full curated sweep -- the sentence
+//! above about holding emitted kernels describes a path nothing currently
+//! takes.
+//!
+//! `LaunchStagePlan` has fourteen and this crate names six. Of the eight it
+//! does not: `signature_hash`, `source_ops`, `value_types`, `used_extents`,
+//! `singleton` and `fused` describe how to EXECUTE a stage's ops, which is
+//! the thing this driver does not do on the device; `mtp_rows` is zero on
+//! every program measured. `channel_rules` is populated on every one of them
+//! -- one to seventeen -- and its only consumer anywhere is
+//! `driver-cuda/src/fire/lora.rs`.
+//!
+//! # Why ignoring the LoRA rules is safe, which is not obvious
+//!
+//! Not because this driver checks a capability. `PIE_REGION_SIG_LORA` rides
+//! in `StepSubmission::region_sig` and this crate reads that field only in
+//! test fixtures, so a region marked LoRA gets no refusal here.
+//!
+//! It is safe because a LoRA program cannot be LOWERED for this backend. The
+//! kernel table states no LoRA symbol, so the model text cannot name one, and
+//! a plan that named one anyway dies at `dispatch::row` with
+//! `Undispatchable::Unknown` -- by symbol, with `a_symbol_no_row_states_is_
+//! refused_by_name` as its control. The enforcement is the TABLE, one layer
+//! down, and not a capability test in this file.
+//!
+//! That is worth knowing before adding one: a capability check here would be a
+//! second gate on the same fact, and the two could disagree.
 
 use driver::{ChannelSpec, Direction, EmittedKernel, Geometry, HostRole, Registry};
 
@@ -477,6 +513,10 @@ mod tests {
     }
 
     /// A channel this crate can bind an instance of `echo` to.
+    ///
+    /// `native` only, like the fires that use it: the tests below that bind a
+    /// ring go through `frames::run_programs`, which is gated.
+    #[cfg(feature = "native")]
     fn ring(id: u64, vocab: u32) -> driver_api::ChannelRegistrationPlan {
         driver_api::ChannelRegistrationPlan {
             channel_id: id,
@@ -497,6 +537,11 @@ mod tests {
     }
 
     /// A step of three fired rows whose two requests answer from rows 0 and 2.
+    ///
+    /// `native` only: `turns` and `serve` are gated, and this crate's PORTABLE
+    /// half has to compile on its own -- `default = []` says so, and the test
+    /// targets are part of "compile".
+    #[cfg(feature = "native")]
     fn three_rows() -> crate::turns::Step {
         crate::turns::Step {
             logits: crate::serve::Logits {
@@ -518,6 +563,10 @@ mod tests {
             // 2 -- a prefill of two tokens followed by a decode, which is the
             // shape that makes "row `r`" and "request `r`" different numbers.
             readout_of: vec![0, 2],
+            // One row each, which is the shape `readout_of` alone could
+            // express. A request naming SEVERAL is what `readouts_of` exists
+            // for, and it has its own test.
+            readouts_of: vec![vec![0], vec![2]],
             positions: vec![0, 1, 0],
             pipelines: 0,
         }
@@ -543,6 +592,7 @@ mod tests {
     /// member 1 row 1 -- a real distribution, of the second token of the
     /// first request's prompt, and fluent nonsense.
     #[test]
+    #[cfg(feature = "native")]
     fn each_member_is_fired_over_its_own_requests_distribution() {
         let mut programs = Programs::new();
         let program = programs
@@ -632,6 +682,7 @@ mod tests {
     /// fires and lands its row. Without it, a `run_programs` that refused
     /// every ticketed member would pass.
     #[test]
+    #[cfg(feature = "native")]
     fn a_member_whose_ring_moved_since_the_batch_was_composed_is_not_fired() {
         let ticketed = |tail: u64| driver_api::StepSubmission {
             plan: driver_api::LaunchPlan::default(),
@@ -731,6 +782,7 @@ mod tests {
     /// A closed ring is the reachable version of this: the consumer has gone
     /// away and said so.
     #[test]
+    #[cfg(feature = "native")]
     fn a_member_whose_ring_is_closed_is_faulted_rather_than_retried() {
         let mut programs = Programs::new();
         let program = programs.register_program(&echo(2)).expect("the package");

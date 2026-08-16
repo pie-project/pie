@@ -35,7 +35,7 @@ pub(crate) struct Scratch {
     /// The per-row live flags — see [`Self::row_valid`].
     pub(crate) row_valid: Option<crate::device::DeviceBuffer>,
     pub(crate) named:
-        std::collections::BTreeMap<model_compiler::trace::ValueId, crate::device::DeviceBuffer>,
+        std::collections::BTreeMap<model_ir::trace::ValueId, crate::device::DeviceBuffer>,
     /// The small per-fire u32 descriptor arrays, by slot — see [`slot`].
     pub(crate) slots: Vec<Option<crate::device::DeviceBuffer>>,
     /// PINNED host staging for those uploads, ONE PER SLOT.
@@ -278,7 +278,7 @@ impl Scratch {
     pub(crate) fn named(
         &mut self,
         alloc: &crate::device::Allocator,
-        v: model_compiler::trace::ValueId,
+        v: model_ir::trace::ValueId,
         bytes: usize,
         stream: crate::device::StreamRef<'_>,
     ) -> crate::Result<()> {

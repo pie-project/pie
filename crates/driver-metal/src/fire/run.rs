@@ -23,7 +23,7 @@ use crate::bind::encode::{Params, Pipelines, encode};
 use crate::device::{Allocation, ArgumentTable, Context, Stepper, Timing};
 use crate::error::Result;
 use crate::layout::region::Region as _;
-use crate::lowering::dispatch::{Dispatch, Geometry, Undispatchable, plan, table, table_width};
+use crate::lowering::dispatch::{Dispatch, Geometry, Undispatchable, plan, table_width};
 use crate::lowering::executor::{Frame, Resolver, Slice};
 use crate::program::Compiler;
 use model_compiler::lower::Lowered;
@@ -322,7 +322,7 @@ pub fn submit<R: Resolver>(
             bytes: arena.len(),
         },
     };
-    let dispatches = plan(lowered, table(), frame, geometry, resolver).map_err(refusal)?;
+    let dispatches = plan(lowered, frame, geometry, resolver).map_err(refusal)?;
     let params = Params::stage_in(context, scratch, &dispatches)?;
     // What this fire leased, so a recording can turn its operand addresses
     // back into buffers. Pooled, so re-registering is the same span and the
@@ -370,9 +370,13 @@ pub fn submit<R: Resolver>(
         }
     };
     let value = match recorded {
-        Some((icb, commands)) => {
-            stepper.submit(|encoder| encoder.execute_commands(&icb, 0..commands))?
-        }
+        Some((icb, commands)) => stepper.submit(|encoder| {
+            encoder.execute_commands(&icb, 0..commands)?;
+            // The encode path closes its fire with one; a replay must too, or
+            // whatever reads the arena next races the last recorded command.
+            encoder.barrier(crate::device::Visibility::Device);
+            Ok(())
+        })?,
         None => {
             stepper.submit(|encoder| encode(encoder, &table, pipelines, &params, &dispatches))?
         }

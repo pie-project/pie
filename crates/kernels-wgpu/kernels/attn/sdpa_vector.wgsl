@@ -20,16 +20,17 @@
 //#include "common/bf16.inc.wgsl"
 //#include "attn/sdpa_online.inc.wgsl"
 
-@group(0) @binding(0) var<storage, read> queries: array<u32>;
-@group(0) @binding(1) var<storage, read> keys: array<u32>;
-@group(0) @binding(2) var<storage, read> values: array<u32>;
+@group(0) @binding(0) var<storage, read_write> queries: array<u32>;
+@group(0) @binding(1) var<storage, read_write> keys: array<u32>;
+@group(0) @binding(2) var<storage, read_write> values: array<u32>;
 @group(0) @binding(3) var<storage, read_write> out_: array<u32>;
 
 // Two `i32`s, then four 64-bit strides, then a float: 0, 4, 8, 16, 24, 32, 40.
 // A `vec2<u32>` aligns to eight, so `k_head_stride` starts at 8 and not at 8
 // by accident -- `n` at 4 is followed by no padding only because 8 is already
-// the next multiple. Derived, not counted:
-//     cargo run -p kernels-wgpu --example dump_layout -- sdpa_vector_decode
+// the next multiple. Derived by `kernels_wgpu::uniform_layout` from the row's
+// scalar order, not counted; the deleted `dump_layout` example only printed
+// that layout.
 struct Params {
     gqa_factor: i32,
     n: i32,
@@ -67,10 +68,25 @@ fn v_at(i: u32) -> f32 {
 
 // The whole Q.K^T for one key, recomputed by every lane of the workgroup.
 //
-// That is the Vulkan baseline's shape and it is kept on purpose: the
-// alternative is a workgroup reduction per key, which costs a barrier tree
-// inside the key loop and buys nothing on a decode row that is memory bound on
-// the KV cache anyway.
+// This used to say it was "the Vulkan baseline's shape and kept on purpose",
+// and both halves have expired. `kernels-vulkan` reduces cooperatively here
+// now, and it measured the rationale false rather than arguing with it: 67.7
+// ms to 42.5 ms at d_128 with 16 heads, timing n=4096 against n=256 so the
+// difference is the key loop and not the buffer setup.
+//
+// It is NOT fixed here, and that is a decision with a reason rather than an
+// omission. `sdpa_paged`'s decode arm took the fix in the same commit that
+// wrote this comment, because that is the arm every fire in the curated suite
+// takes: `model-compiler`'s `sdpa` lowers to this kernel only when `paged` is
+// false, and the model text this backend runs is paged throughout.
+// `driver-wgpu` binds and dispatches this module if a plan names it -- see
+// `dispatch.rs` -- so it is reachable and unexercised, which is the worst
+// place to make an unmeasurable change. `driver-vulkan` says the same of its
+// twin: "the dense decode, off this model's path".
+//
+// If a dense entrypoint ever arrives, the fix is `sdpa_paged`'s `decode_row`,
+// which is uniform for the same reason this kernel would be -- one workgroup
+// is one row and one head.
 fn dot_qk(q_base: u32, k_base: u32) -> f32 {
     var acc = 0.0;
     for (var d = 0u; d < PIE_HEAD_DIM; d = d + 1u) {

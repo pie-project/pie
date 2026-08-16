@@ -3,7 +3,7 @@
 //! The port of `driver-cuda/csrc/vision/qwen3_vl_tower.cu` (522 lines),
 //! `qwen3_vl_tower_c.cpp` (114) and `vis_helpers.cpp` (136) — 772 lines that
 //! were host C++ over device text which had already moved to
-//! `kernels-cuda-new/csrc/src/vision/qwen3_vl_tower.cuh` and
+//! `kernels-cuda/kernels/vision/qwen3_vl_tower.cuh` and
 //! `tower_naive_kernels.cuh`. What is here is that same walk with the
 //! `<<<>>>` written by [`super::fire`] and [`super::fire_stated`] instead of
 //! by nvcc, and with the last `.cu` in `driver-cuda/csrc/vision/` deleted
@@ -94,7 +94,7 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
-use kernels_cuda_new::x::vision;
+use kernels_cuda::vision;
 
 use super::call;
 use crate::device::{
@@ -635,8 +635,8 @@ struct Grid {
 ///    freed if the cache is ever cleared instead of leaked by construction —
 ///    and a `DeviceBuffer` is `Send` without an `unsafe impl` because
 ///    `DevPtr` is a `usize`, so this whole struct is `Send` by derivation.
-///    Compare `bind/quant_gemm.rs:484`, which needs `unsafe impl Send` for a
-///    cache holding raw pointers.
+///    Compare `kernels_cuda::gemm::quant`'s `DequantWeightCache`, which
+///    needs `unsafe impl Send` for a cache holding raw pointers.
 ///
 /// # And the arena, which is the third thing the C++ needed and did not name
 ///

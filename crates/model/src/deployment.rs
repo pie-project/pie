@@ -692,10 +692,10 @@ pub struct Deployment {
     /// it is a CONVENTION the stack was trained under, not a size. And
     /// here at all because `driver-cuda`'s launch hardcoded
     /// `moe_norm_topk: false` beside a dozen fields it read off this
-    /// struct — `kernels-cuda`'s `topk_sigmoid_bias` and its two
-    /// siblings take it as `Source::Ctx`, so every routed CUDA fire in
-    /// the workspace routed on unnormalized weights whatever its row
-    /// said.
+    /// struct — the archive crate `kernels-cuda`'s `topk_sigmoid_bias`
+    /// and its two siblings took it as `Source::Ctx`, so every routed
+    /// CUDA fire in the workspace routed on unnormalized weights
+    /// whatever its row said.
     ///
     /// A DENSE stack states `true` and nothing reads it, the same way a
     /// dense row states it for the Metal text: "this one has no router"

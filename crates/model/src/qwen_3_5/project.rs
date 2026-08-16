@@ -132,7 +132,6 @@ pub fn manifest(f: &Qwen35HybridFacts) -> Manifest {
         //
         // Nothing reads it either way: `dsl::ConvW` is `name`, `kernel`,
         // `layer`, with no bias to bind.
-
         // One decay parameter and one step bias per VALUE head — the
         // scan is per head, and this is the extent that says so.
         .with(TensorSpec::required(
@@ -383,7 +382,7 @@ pub fn cuda_facts(
         moe_streamed_experts: false,
         moe_force_general: false,
         gate_up_fused: true,
-        proj_repr: model_compiler::dsl::WeightRepr::Bf16,
+        proj_repr: model_dsl::WeightRepr::Bf16,
         // Empty reads as "no window" — see `window_left_at`.
         window_left: Vec::new(),
     }
@@ -424,9 +423,9 @@ pub const NO_METAL: &str = "qwen-3.5 has no Metal text in this build: its forwar
 #[must_use]
 pub fn trace(
     f: &Qwen35HybridFacts,
-    class: model_compiler::trace::FireClass,
+    class: model_ir::trace::FireClass,
     load: Deployed<'_>,
-) -> model_compiler::trace::ForwardPlan {
+) -> model_ir::trace::ForwardPlan {
     super::forward::qwen3_5_hybrid_cuda(f, &cuda_facts(f, load), class)
 }
 
@@ -817,7 +816,7 @@ mod tests {
     /// The trace is the row's, for every class a fire can carry.
     #[test]
     fn every_fire_class_traces() {
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
         for class in [FireClass::Decode, FireClass::Prefill] {
             let plan = trace(&dense(), class, Deployed::single());
             assert!(!plan.ops.is_empty(), "{class:?} traced nothing");

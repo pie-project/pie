@@ -124,11 +124,7 @@ struct Staging {
 ///
 /// `None` means "leave it alone", which is the answer for every transform the
 /// target has no row for — the host runs those and always did.
-fn decide(
-    program: &LoadPlan,
-    index: &PlanIndex,
-    instr: &StorageInstr,
-) -> Result<Option<Decision>> {
+fn decide(program: &LoadPlan, index: &PlanIndex, instr: &StorageInstr) -> Result<Option<Decision>> {
     let StorageInstr::TileMap {
         source,
         dest,

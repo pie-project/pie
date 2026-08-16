@@ -11,22 +11,29 @@ use tensor_ir::rng::RNG_FORMULA;
 /// `f32` to this text is exactly `UNIFORM_MAX`, so host and device agree bit
 /// for bit.
 const UNIFORM_MAX_LITERAL: &str = "0.99999994";
-enum CudaProjection {
-    Header,
-    Source,
-}
 
-fn render_cuda_functions(projection: CudaProjection) -> String {
+/// The `__device__` projection, as spliced into emitted CUDA sources.
+///
+/// There were two CUDA projections until the C++ drivers were deleted: this
+/// one, and a `PTIR_RNG_INLINE`/`<stdint.h>` spelling printed into
+/// `include/rng_contract.generated.h` for a C++ translation unit to
+/// `#include`. Nothing includes a header on the device path any more — NVRTC
+/// is called with zero headers and zero include names — so the header spelling
+/// and the enum that selected between the two went with it.
+///
+/// The emitter calls this directly rather than generating a header and slicing
+/// a raw-string literal back out of it. That shortcut made the emitter depend
+/// on the header's punctuation: a whitespace change around the raw-string
+/// delimiters turned into a runtime failure in a function whose job had
+/// nothing to do with headers.
+pub fn cuda_device_functions() -> String {
     let mut out = String::new();
-    let (inline, u64_ty, u32_ty, u64_suffix) = match projection {
-        CudaProjection::Header => ("PTIR_RNG_INLINE", "uint64_t", "uint32_t", "ULL"),
-        CudaProjection::Source => (
-            "__device__ __forceinline__",
-            "unsigned long long",
-            "unsigned int",
-            "ULL",
-        ),
-    };
+    let (inline, u64_ty, u32_ty, u64_suffix) = (
+        "__device__ __forceinline__",
+        "unsigned long long",
+        "unsigned int",
+        "ULL",
+    );
     let denominator = 1u64 << RNG_FORMULA.uniform_mantissa_bits;
     let uniform_max = UNIFORM_MAX_LITERAL;
     let _ = writeln!(out, "{inline} {u64_ty} ptir_rng_splitmix64({u64_ty} x) {{");
@@ -65,47 +72,6 @@ fn render_cuda_functions(projection: CudaProjection) -> String {
         RNG_FORMULA.uniform_midpoint
     );
     out
-}
-
-/// The `__device__` projection, as spliced into emitted CUDA sources.
-///
-/// [`generate_cuda_header`] embeds the same text in a raw string literal for
-/// the C++ side. Both call this; neither recovers the text by generating the
-/// header and slicing the literal back out of it. That shortcut makes the
-/// emitter depend on the header's punctuation — any whitespace change around
-/// the raw-string delimiters turns into a runtime failure in a function whose
-/// job has nothing to do with headers.
-pub fn cuda_device_functions() -> String {
-    render_cuda_functions(CudaProjection::Source)
-}
-
-/// Renders the `rng_contract.generated.h` C header — the RNG device functions
-/// (guarded for CUDA or plain host inlining) plus the `PTIR_RNG_CUDA_PREAMBLE`
-/// constant NVRTC splices into emitted sources.
-pub fn generate_cuda_header() -> String {
-    let implementation = render_cuda_functions(CudaProjection::Header);
-    let source = cuda_device_functions();
-    format!(
-        "// rng_contract.generated.h — GENERATED from crates/tensor-ir/src/rng.rs.\n\
-// DO NOT EDIT. Regenerate: PTIR_REGEN=1 cargo test -p pie-compiler-tests --test rng_contract\n\
-#pragma once\n\
-#include <stdint.h>\n\
-\n\
-#if defined(__CUDACC__)\n\
-#define PTIR_RNG_INLINE static __host__ __device__ __forceinline__\n\
-#else\n\
-#define PTIR_RNG_INLINE static inline\n\
-#endif\n\
-\n\
-{implementation}\
-#undef PTIR_RNG_INLINE\n\
-\n\
-#ifdef __cplusplus\n\
-inline constexpr char PTIR_RNG_CUDA_PREAMBLE[] = R\"PTIR_RNG_CUDA(\n\
-{source}\
-)PTIR_RNG_CUDA\";\n\
-#endif\n"
-    )
 }
 
 /// Renders the `ptir_rng.generated.metal` preamble — the same RNG contract in
@@ -164,7 +130,7 @@ mod tests {
 
     #[test]
     fn projections_are_deterministic() {
-        assert_eq!(generate_cuda_header(), generate_cuda_header());
+        assert_eq!(cuda_device_functions(), cuda_device_functions());
         assert_eq!(generate_msl_preamble(), generate_msl_preamble());
     }
 }

@@ -105,7 +105,7 @@ impl Gemma4Facts {
     /// layer kinds the same way.
     #[must_use]
     pub fn is_full_attn(&self, l: u32) -> bool {
-        model_compiler::facts::full_attn_at(self.full_attn_interval, l)
+        model_ir::facts::full_attn_at(self.full_attn_interval, l)
     }
 
     /// Whether layer `l` reuses another layer's KV pages, projecting and

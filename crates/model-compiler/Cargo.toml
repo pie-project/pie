@@ -3,36 +3,28 @@ name = "model-compiler"
 version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "Forward-pass declarations: a tracing eDSL from model facts to the traced form a driver executes."
+description = "Forward-pass lowering: a traced form plus the engine's rows to the flat launch list, operands and buffers a driver executes."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
-# No `links` any more: the C header and the `#[repr(C)]` surface it describes
-# are `crates/model`'s, because they are how a DRIVER reaches a declaration and
-# a declaration is a model's, not the toolchain's. build.rs stays for the
-# tracer fingerprint alone, which needs no `links` -- it is a
-# `cargo:rustc-env`, read back by `compiler_version()`.
-build = "build.rs"
+# No `build.rs` here any more. It fingerprinted the TRACER, and the tracer is
+# `model-dsl` + `model-ir` -- this crate consumes traced forms and does not
+# decide what one is, so hashing its sources would have produced a number that
+# moved for changes the fingerprint is not about. `compiler_version()` moved
+# with it, to the crate that produces plans.
 
 [lib]
 name = "model_compiler"
 path = "src/lib.rs"
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-# The signature tables, TABLE ONLY. `default-features = false` is what keeps a
-# compiler dev loop off nvcc: `check_plan` reads these on every trace, and
-# looking up a symbol's contract must not build a `.cu`. `driver-cuda` is the
-# crate that turns `native` on.
+# The traced form, and the signature tables that come with it. The ONLY
+# dependency: lowering reads an IR and writes rectangles, so it needs the
+# vocabulary and nothing else -- no authoring surface, no device, no backend.
 #
-# `kernels-cuda-new` DIRECTLY, not through `kernels-cuda`'s re-export. The
-# table moved into the new crate when the dependency was inverted, so the old
-# path was a hop through a crate whose only other content is nvcc's, and this
-# crate must never be able to reach that. It also removes one name from the
-# set that has to go before `kernels-cuda` can be deleted.
-kernels = { path = "../kernels" }
-kernels-cuda-new = { path = "../kernels-cuda-new", default-features = false }
-kernels-metal = { path = "../kernels-metal", default-features = false }
-
-[dev-dependencies]
+# The kernel tables are reached THROUGH `model-ir` (`model_ir::kernels`)
+# rather than depended on here, which is what stops a second, differently
+# featured view of the same table from existing: `check_plan` at trace time
+# and `sig_in` at lowering time must agree about what a symbol's contract is,
+# and they agree by being the same table.
+model-ir = { path = "../model-ir" }

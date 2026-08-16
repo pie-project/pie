@@ -14,6 +14,28 @@
 //   nvcc -O2 -std=c++20 -arch=sm_89 -I crates/kernels-cuda/csrc/src \
 //        scripts/tier_a_baseline.cu crates/kernels-cuda/csrc/src/norm/altup_aux.cu \
 //        -o /tmp/tier_a_baseline && /tmp/tier_a_baseline
+//
+// Neither of those two paths is what it was, and this file no longer builds.
+// Both name the ARCHIVE crate: `kernels-cuda` compiled `.cu` with nvcc and
+// declared them in host `.hpp`, and `norm/altup_aux.cu` with its header went
+// at `345ea1ec6`, the commit that turned these kernels into a JIT. The crate
+// itself followed at `85c6c674b`. `tests/tier_a_pilot.rs`, named above as
+// what this number is compared against, went at `4f9ccba92`.
+//
+// The name has been REUSED, so the wreckage is uneven and worth spelling out.
+// `-I crates/kernels-cuda/csrc/src` now resolves -- to the JIT crate's device
+// text -- while nothing it needs is behind it: that tree's `norm/altup_aux.cuh`
+// is six `__global__` templates with no host function, no `<<<>>>` and no
+// `tanh_bf16` at all, because the launcher this file times is Rust now and
+// `tanh_bf16` survives only as the row name `norm::tanh_bf16`. So the include
+// path succeeds, `#include "norm/altup_aux.hpp"` below fails, and the second
+// source on the command line does not exist.
+//
+// Kept, not repointed: what this measured -- the host cost of one `<<<>>>`
+// against the same kernel -- is the baseline any successor to `tier_a_pilot`
+// would still have to beat, and the argument just above the command for WHY
+// it calls a real launcher instead of a bare launch is the part worth keeping.
+// Reviving it means writing a new comparand, not fixing a path.
 
 #include <chrono>
 #include <cstdio>

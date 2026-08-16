@@ -383,9 +383,9 @@ pub trait Variant: Sync + Send + 'static {
     /// build has no text for the row, or none for the backend asking.
     fn trace(
         &self,
-        class: model_compiler::trace::FireClass,
+        class: model_ir::trace::FireClass,
         load: Deployed<'_>,
-    ) -> Result<model_compiler::trace::ForwardPlan, crate::deployment::Refusal>;
+    ) -> Result<model_ir::trace::ForwardPlan, crate::deployment::Refusal>;
 
     /// The chat template that formats for this variant.
     ///
@@ -1139,7 +1139,7 @@ mod tests {
     /// removes rather than papers.
     #[test]
     fn a_row_that_cannot_deploy_cannot_trace_either() {
-        use model_compiler::trace::FireClass;
+        use model_ir::trace::FireClass;
         for row in catalog() {
             let deploys = row.deployment(Deployed::single()).is_ok();
             for class in [FireClass::Prefill, FireClass::Decode] {

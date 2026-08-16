@@ -57,7 +57,7 @@ pub struct Gemma2Facts {
     pub sliding_window: i32,
     /// Every `interval`-th layer attends the WHOLE context — gemma-2's
     /// alternation is `interval = 2`, and the shared predicate
-    /// [`model_compiler::facts::full_attn_at`] spells it the way
+    /// [`model_ir::facts::full_attn_at`] spells it the way
     /// gemma-4 and qwen3_5 spell theirs.
     pub full_attn_interval: u32,
     pub attn: Gemma2AttnFacts,
@@ -71,7 +71,7 @@ impl Gemma2Facts {
     /// panic.
     #[must_use]
     pub fn is_global(&self, l: u32) -> bool {
-        model_compiler::facts::full_attn_at(self.full_attn_interval, l)
+        model_ir::facts::full_attn_at(self.full_attn_interval, l)
     }
 
     /// The window layer `l` attends over, `-1` for the whole context —

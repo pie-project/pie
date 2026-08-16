@@ -30,6 +30,11 @@
 //! ./oracle > cpp.txt
 //! ```
 //!
+//! The recipe is kept verbatim, as the record of how the golden was taken
+//! rather than as a command that still resolves: `$SRC` went with
+//! `crates/driver-cuda/csrc` at `4569b9e4b`, and the `-I` beside it names the
+//! ARCHIVE crate's tree, deleted with that crate at `85c6c674b`.
+//!
 //! `oracle.cpp` declares a stub `HfConfig` carrying only
 //! `num_key_value_heads`, `num_hidden_layers`, and `head_dim_kernel` -- the
 //! entire config surface these functions read -- and `#include`s `geo.inc`

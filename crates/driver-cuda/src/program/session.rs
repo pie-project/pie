@@ -10,11 +10,22 @@
 //!
 //! # What a session owns, and why it is per instance
 //!
-//! The rings are sized from the instance's OWN channels, in the order its
-//! `channel_ids` lists them, because a program names a channel by index
-//! into that list. So they cannot be shared and cannot be rebuilt per
-//! fire — rebuilding would zero the cursors, and a cursor is the only
-//! record of what a previous fire published.
+//! A program names a channel by INDEX into its instance's `channel_ids`, so
+//! a session is that list — a map from the instance's dense channel index to
+//! the driver-wide slot whose ring holds the cells. The map is per instance;
+//! the RINGS are not, and that is the correction this module carries.
+//!
+//! They used to be. `Rings` was sized from the instance's own channels and
+//! allocated per session, so two instances naming ONE channel got two rings
+//! and the second read a zeroed cell where the first had published. That is
+//! the bench's decode loop exactly — the prefill's epilogue puts its sampled
+//! token on a channel the DECODE instance binds to `EmbedTokens` — and it is
+//! why a chained frame could not be served. [`super::channel::Rings`] is now
+//! one registry for the whole driver and this holds indices into it.
+//!
+//! The map cannot be rebuilt per fire, for the reason the rings could not be:
+//! rebuilding would renumber, and a slot is the only thing tying a program's
+//! channel to the cursors that record what a previous fire published.
 //!
 //! The control modules are the opposite: they depend on the architecture
 //! and nothing else, so they are compiled once and shared. They are
@@ -39,7 +50,6 @@
 use super::run::Lane;
 use driver::Extents;
 use driver::driver_api::plan::LaunchStagePlan;
-use driver::tensor_ir::DType;
 use driver::tensor_ir::op::IntrinsicId;
 
 use super::channel::{ChannelShape, Rings};
@@ -51,11 +61,13 @@ use super::runtime::Compiled;
 use crate::device::{Allocator, StreamRef};
 use crate::error::{Error, Result};
 
-/// The device rings of one bound instance, and what a fire needs to know
-/// about them.
+/// Where one bound instance's channels live in the driver's ring registry,
+/// and what a fire needs to know about them.
 #[derive(Debug)]
 pub struct Session {
-    rings: Rings,
+    /// Dense channel index → registry slot, in the order the instance's
+    /// `channel_ids` lists them.
+    slots: Vec<u32>,
     shapes: Vec<ChannelShape>,
 }
 
@@ -85,22 +97,55 @@ pub enum Fired {
 }
 
 impl Session {
-    /// Build the rings for an instance's channels.
+    /// Name an instance's channels: `slots[dense]` is the registry slot whose
+    /// ring holds channel `dense`'s cells, and `shapes[dense]` its geometry.
     ///
     /// # Errors
     ///
-    /// If the shapes are empty or the device refuses the allocation.
-    pub fn new(alloc: &Allocator, shapes: &[ChannelShape], stream: StreamRef<'_>) -> Result<Self> {
-        Ok(Self {
-            rings: Rings::new(alloc, shapes, stream)?,
-            shapes: shapes.to_vec(),
-        })
+    /// If the instance has no channels, or the two lists disagree in length —
+    /// which would silently give some channel another's cell width.
+    pub fn new(slots: Vec<u32>, shapes: Vec<ChannelShape>) -> Result<Self> {
+        if slots.is_empty() {
+            return Err(Error::invalid(
+                "ptir::session",
+                "an instance with no channels",
+            ));
+        }
+        if slots.len() != shapes.len() {
+            return Err(Error::invalid(
+                "ptir::session",
+                format!(
+                    "{} channel slot(s) and {} shape(s)",
+                    slots.len(),
+                    shapes.len()
+                ),
+            ));
+        }
+        Ok(Self { slots, shapes })
     }
 
-    /// The rings, for the control kernels and for tests.
+    /// The registry slot channel `dense` lives at.
     #[must_use]
-    pub const fn rings(&self) -> &Rings {
-        &self.rings
+    pub fn slot(&self, dense: usize) -> Option<u32> {
+        self.slots.get(dense).copied()
+    }
+
+    /// Every channel's registry slot, in the instance's own order.
+    #[must_use]
+    pub fn slots(&self) -> &[u32] {
+        &self.slots
+    }
+
+    /// This instance's dense channel indices as registry slots.
+    fn global(&self, dense: &[u32]) -> Result<Vec<u32>> {
+        dense
+            .iter()
+            .map(|&c| {
+                self.slots.get(c as usize).copied().ok_or_else(|| {
+                    Error::invalid("ptir::session", format!("no channel {c} in this instance"))
+                })
+            })
+            .collect()
     }
 
     /// Copy every cell the host has published, for the channels `sets`
@@ -116,63 +161,119 @@ impl Session {
     /// width, or if a copy fails.
     pub fn pull(
         &mut self,
+        rings: &mut Rings,
         host: &mut [HostChannel],
         sets: &StageChannels,
         stream: StreamRef<'_>,
     ) -> Result<usize> {
+        self.pull_channels(rings, host, &sets.need_full, stream)
+    }
+
+    /// [`Session::pull`], for a stated list of the instance's dense channels.
+    ///
+    /// Split out because the DESCRIPTOR ports need the same copy and are not a
+    /// stage's channel set. It is the port channels a HOST WRITER feeds that
+    /// this moves — the seed an instance is bound with reaches its ring at
+    /// registration instead (`launch::ensure_sessions`), because a seed's ring
+    /// does not exist until then and the mirror is not where the engine leaves
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Session::pull`].
+    pub fn pull_channels(
+        &mut self,
+        rings: &mut Rings,
+        host: &mut [HostChannel],
+        dense: &[u32],
+        stream: StreamRef<'_>,
+    ) -> Result<usize> {
         let mut moved = 0;
-        for &c in &sets.need_full {
+        for &c in dense {
             let index = c as usize;
             let shape = *self.shapes.get(index).ok_or_else(|| {
                 Error::invalid("ptir::session", format!("no channel {c} in this instance"))
             })?;
+            let global = self.slots[index] as usize;
             let Some(plane) = host.get_mut(index) else {
                 return Err(Error::invalid(
                     "ptir::session",
                     format!("channel {c} has no host plane"),
                 ));
             };
+            // ONLY A PLANE THE ENGINE WRITES. See `HostChannel::role`: the
+            // mirror has one head/tail pair for both directions, so taking
+            // from a plane this driver also publishes into re-injects the
+            // program's OWN output as an input — one extra cell per fire on
+            // every loop-carried channel.
+            if !plane.engine_writes() {
+                continue;
+            }
             // EVERYTHING the host has, not one cell: the device ring is as
             // deep as the host's, and a fire that pulled one would leave a
             // backlog that never drains.
             while let Some(wire) = plane.take() {
                 let native = super::channel::wire_to_native(shape.dtype, shape.numel, &wire)
                     .map_err(|why| Error::invalid("ptir::session", why))?;
-                let slot = self.rings.cursors(stream)?[index].tail;
-                self.rings.seed(index, slot, &native, stream)?;
+                let slot = rings.cursors(stream)?[global].tail;
+                rings.seed(global, slot, &native, stream)?;
                 moved += 1;
             }
         }
         Ok(moved)
     }
 
-    /// Copy everything the stage published back into the host mirror.
+    /// Copy everything the stage published back into the host mirror, and
+    /// consume the device cells that landed there.
     ///
-    /// Returns how many cells moved. A host ring the engine has not
-    /// drained refuses the publish, which is a DROPPED output rather than
-    /// an error — the alternative is a fire that blocks on a reader.
+    /// Returns how many cells moved.
+    ///
+    /// # The mirror is the CONSUMER of a reader channel
+    ///
+    /// A `chan_put` advances the device ring's TAIL and nothing advances its
+    /// head: no stage takes an output channel, and the commit kernel is only
+    /// handed what the stage named. So a reader channel's ring filled up after
+    /// `capacity` fires and the epilogue's own put then failed readiness —
+    /// which is a decode loop that produces `capacity` tokens and then stops,
+    /// silently, with the fire reporting `NotReady`. Measured at 21 tokens on
+    /// the bench's `out`, whose ring is 22.
+    ///
+    /// Consuming here says what is true: the value has crossed to the plane
+    /// the engine reads, so the device cell is spent.
+    ///
+    /// # A refused publish is BACK-PRESSURE, not a drop
+    ///
+    /// This used to say a full host ring was "a DROPPED output rather than an
+    /// error — the alternative is a fire that blocks on a reader". The
+    /// alternative is not blocking: the device cell simply stays unconsumed,
+    /// so the next fire's readiness declines and the fire is retried once the
+    /// engine drains. Nothing waits and no token is lost, which is strictly
+    /// better than dropping one, so the cell is consumed only when the
+    /// publish actually took it.
     ///
     /// # Errors
     ///
     /// If a channel index is past the instance's, or a copy fails.
     pub fn push(
         &mut self,
+        rings: &mut Rings,
         host: &mut [HostChannel],
         sets: &StageChannels,
         before: &[u32],
         stream: StreamRef<'_>,
     ) -> Result<usize> {
-        let after = self.rings.cursors(stream)?;
+        let after = rings.cursors(stream)?;
         let mut moved = 0;
         for &c in &sets.put {
             let index = c as usize;
             let shape = *self.shapes.get(index).ok_or_else(|| {
                 Error::invalid("ptir::session", format!("no channel {c} in this instance"))
             })?;
+            let global = self.slots[index] as usize;
             let ring = shape.ring()?;
             let (was, now) = (
                 *before.get(index).unwrap_or(&0),
-                after.get(index).map_or(0, |c| c.tail),
+                after.get(global).map_or(0, |c| c.tail),
             );
             // The tails are ring-modular, so the count is the forward
             // distance rather than a subtraction — a fire that wrapped
@@ -181,7 +282,7 @@ impl Session {
             let produced = (now + ring - was % ring) % ring;
             for step in 0..produced {
                 let slot = (was + step) % ring;
-                let native = self.rings.read_cell(index, slot, stream)?;
+                let native = rings.read_cell(global, slot, stream)?;
                 let wire = super::channel::native_to_wire(shape.dtype, shape.numel, &native)
                     .map_err(|why| Error::invalid("ptir::session", why))?;
                 let Some(plane) = host.get_mut(index) else {
@@ -190,8 +291,26 @@ impl Session {
                         format!("channel {c} has no host plane"),
                     ));
                 };
-                if plane.publish(&wire) {
-                    moved += 1;
+                // ONLY A PLANE THE ENGINE READS — the mirror of `pull`'s rule
+                // and for the same reason. Publishing into a device-only
+                // channel's plane fills a ring nobody drains, and then the
+                // driver reads its own writes back.
+                if !plane.engine_reads() {
+                    continue;
+                }
+                if !plane.publish(&wire) {
+                    // The engine is behind. Leave the cell where it is: the
+                    // next fire's readiness declines on this channel and
+                    // retries, which is what makes the back-pressure above
+                    // lossless.
+                    break;
+                }
+                moved += 1;
+                // NOT for a channel the stage also TAKES: the commit kernel
+                // has already advanced that head, and a second advance here
+                // would skip a cell nobody read.
+                if !sets.taken.contains(&c) {
+                    rings.consume_front(global, stream)?;
                 }
             }
         }
@@ -236,6 +355,7 @@ impl Session {
     #[allow(clippy::too_many_arguments)]
     pub fn fire(
         &mut self,
+        rings: &mut Rings,
         compiled: &Compiled,
         plan: &LaunchStagePlan,
         control: &Control,
@@ -250,31 +370,70 @@ impl Session {
         let sets = super::channel::stage_channels(plan)
             .map_err(|why| Error::invalid("ptir::session", why))?;
 
-        self.pull(host, &sets, stream)?;
-        if !launch_control::readiness(
-            control,
-            &self.rings,
-            &sets.need_full,
-            &sets.need_empty,
-            alloc,
-            stream,
-        )? {
+        self.pull(rings, host, &sets, stream)?;
+        // The control kernels index the registry's flat arrays, so the sets
+        // cross as SLOTS. A stage names its channels densely, and handing the
+        // dense number straight through would gate on whichever channel
+        // happened to be registered at that position.
+        let (need_full, need_empty) = (self.global(&sets.need_full)?, self.global(&sets.need_empty)?);
+        if !launch_control::readiness(control, rings, &need_full, &need_empty, alloc, stream)? {
+            // WHICH CHANNEL, and in which direction. A bare `NotReady` says a
+            // fire waited and nothing else, and the two causes are opposite —
+            // an input nobody filled, or an output nobody drained — so the
+            // trace names the cursors that decided rather than the verdict.
+            // The env check inline rather than `fire::launch::sg_trace`: that
+            // module is `feature = "abi"` and this one is not, so naming it
+            // would make the trace decide whether the program plane compiles.
+            if std::env::var_os("PIE_CUDA_TRACE_SUPERGRAPH").is_some() {
+                let cursors = rings.cursors(stream).unwrap_or_default();
+                let say = |what: &str, dense: &[u32]| -> String {
+                    dense
+                        .iter()
+                        .map(|&c| {
+                            let g = self.slots.get(c as usize).copied().unwrap_or(u32::MAX);
+                            let ring = self.shapes.get(c as usize).and_then(|s| s.ring().ok());
+                            match cursors.get(g as usize) {
+                                Some(k) => format!(
+                                    " {what} chan {c} (slot {g}) head={} tail={} ring={:?} \
+                                     full[head]={}",
+                                    k.head,
+                                    k.tail,
+                                    ring,
+                                    u8::from(k.is_readable())
+                                ),
+                                None => format!(" {what} chan {c} (slot {g}) unringed"),
+                            }
+                        })
+                        .collect()
+                };
+                eprintln!(
+                    "[sg]   ptir readiness refused:{}{}",
+                    say("needs-full", &sets.need_full),
+                    say("needs-room", &sets.need_empty)
+                );
+            }
             return Ok(Fired::NotReady);
         }
 
         // The tails BEFORE, because the push below counts what this fire
-        // added and the control kernels are what move them.
-        let before: Vec<u32> = self.rings.cursors(stream)?.iter().map(|c| c.tail).collect();
+        // added and the control kernels are what move them. Indexed DENSELY,
+        // which is how `push` reads it back.
+        let cursors = rings.cursors(stream)?;
+        let before: Vec<u32> = self
+            .slots
+            .iter()
+            .map(|&g| cursors.get(g as usize).map_or(0, |c| c.tail))
+            .collect();
 
-        // ONE LANE PER MEMBER, each with its OWN rings — which for a
-        // single-instance fire is this session's, and for a grouped one
-        // would be each member's. The fire takes the pairing rather
-        // than one ring set, so the caller cannot group instances and
-        // silently have them share channels.
+        // ONE LANE PER MEMBER. The lanes of a grouped fire are different
+        // INSTANCES, so each carries its own dense→slot map; the registry
+        // behind them is one, because a channel has one ring wherever it is
+        // named from.
         let members: Vec<Lane<'_>> = lane_extents
             .iter()
             .map(|&extents| Lane {
-                rings: &self.rings,
+                rings,
+                slots: &self.slots,
                 extents,
             })
             .collect();
@@ -284,7 +443,23 @@ impl Session {
             prepared.bind_intrinsic(
                 IntrinsicId::Logits,
                 base,
-                DType::F32,
+                // RAW BF16, which is what the fire writes into the pin.
+                //
+                // `publish_seam_pins` sizes a named pin `rows * width * 4` and
+                // says why: "the GDN seam pins are f32; llama-like's are bf16
+                // and simply leave half the pin unread". `deliver_logits`
+                // reads that same buffer as bf16 and widens it
+                // `(bits as u32) << 16` on the way to the wire, which is the
+                // same widening `m1_intrinsic_row_base` does on the device —
+                // for `mode == 1`.
+                //
+                // This said `DType::F32`, whose wire byte is `0`, and mode `0`
+                // strides FOUR bytes per logit through a two-byte buffer. See
+                // `Prepared::bind_intrinsic`: the table is a STORAGE mode and
+                // the two vocabularies agree on exactly that one value, which
+                // is how it went unnoticed. Measured: the two modes select
+                // different tokens from the same fire.
+                crate::program::params::INTRINSIC_STORAGE_RAW_BF16,
                 vocab,
                 row_stride,
                 row_of,
@@ -299,20 +474,13 @@ impl Session {
         stream.synchronize()?;
 
         let committed = prepared.committed(stream)?;
-        launch_control::commit(
-            control,
-            &self.rings,
-            &sets.taken,
-            &sets.put,
-            committed,
-            alloc,
-            stream,
-        )?;
+        let (taken, put) = (self.global(&sets.taken)?, self.global(&sets.put)?);
+        launch_control::commit(control, rings, &taken, &put, committed, alloc, stream)?;
         stream.synchronize()?;
         if !committed {
             return Ok(Fired::Declined);
         }
-        let published = self.push(host, &sets, &before, stream)?;
+        let published = self.push(rings, host, &sets, &before, stream)?;
         Ok(Fired::Committed { published })
     }
 }

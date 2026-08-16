@@ -15,16 +15,18 @@ use driver_api::local::PIE_STATUS_DRIVER_ERROR;
 /// `cast::<Shell>().as_mut()` on every one of thirteen entry points. The
 /// entry points are methods now, so the receiver IS this.
 pub struct Shell {
-    /// The capabilities JSON.
-    ///
-    /// It was owned here so the `{ptr, len}` in a `PieDriverCaps`
-    /// out-parameter would outlive the `create` call. Nothing hands out a
-    /// pointer to it now.
-    pub(crate) caps: Vec<u8>,
+    // `caps: Vec<u8>` STOOD HERE, and its own doc had already retired it:
+    // *"It was owned here so the `{ptr, len}` in a `PieDriverCaps`
+    // out-parameter would outlive the `create` call. Nothing hands out a
+    // pointer to it now."* An owning field exists to outlive something, and
+    // once nothing borrows from it there is no third reading — it was written
+    // once from `CAPS_JSON` and read never. `LoadedModel::load_caps` is the
+    // one that is still live, and it is live because `serve::mod` parses it.
     /// What this device is, parsed once at create.
     ///
-    /// The engine used to parse [`Self::caps`] itself, from a `{ptr, len}` it
-    /// was handed back. One parse, on the side that authored the JSON.
+    /// The engine used to parse the capabilities JSON itself, from a
+    /// `{ptr, len}` it was handed back. One parse, on the side that authored
+    /// the JSON — which is why `CAPS_JSON` no longer needs an owner here.
     pub(crate) facts: driver_api::DeviceFacts,
     /// `[model] config` from the boot TOML, for HF snapshots whose
     /// config does not ride inside the checkpoint.
@@ -42,7 +44,9 @@ pub struct Shell {
     /// checkpoint as something it is not.
     pub(crate) boot_model_id: Option<String>,
     /// Does this driver hand its completions to a stream callback and
-    /// return with the fire still queued? See `runahead_env`.
+    /// return with the fire still queued? Copied from
+    /// [`boot::Boot::runahead`](crate::boot::Boot::runahead), which is where
+    /// the reasoning for the default lives.
     pub(crate) runahead: bool,
     /// THE parse of this driver's knobs. See [`crate::boot`] for why one
     /// struct rather than ten `env::var` reads scattered across six
@@ -133,9 +137,17 @@ pub struct Shell {
     ///
     /// It was hardwired to 0 in both places that bind, which is wrong on any
     /// box with more than one GPU: an operator who asks for device 1 gets
-    /// device 0 and no diagnostic. A rank of a tensor-parallel group would
-    /// need one per rank; that is refused for other reasons, so this is the
-    /// single-device answer and honest about being one.
+    /// device 0 and no diagnostic.
+    ///
+    /// **A tensor-parallel group needs every rank's ordinal, and it does not
+    /// get them from here.** `CustomAllReduce::Config::group_devices` is
+    /// indexed by rank and `enable_peer_access` reads real ORDINALS out of
+    /// it, so `super::load::build_tp_plane` ALL-GATHERS this field rather
+    /// than reading a second config key: what crosses is the ordinal each
+    /// rank actually bound. That is one field to keep true instead of two,
+    /// and it makes the group's map impossible to fill with rank indices —
+    /// a mistake that works on every single-group box and corrupts the
+    /// second group on a four-GPU one.
     pub(crate) device_ordinal: i32,
     /// This driver's place in its tensor-parallel group, from
     /// `[driver] tp_rank` / `tp_size`. One rank, rank zero, unless told
@@ -196,6 +208,50 @@ pub struct Shell {
     /// fire that recorded it. See [`Scratch`]. Dropped AFTER the execs
     /// that address it — see above.
     pub(crate) fire_arrays: Scratch,
+    /// This rank's custom P2P all-reduce plane, when the group has one.
+    ///
+    /// A device-lifetime handle, held here for [`Self::cublas`]'s reason and
+    /// with [`Self::preds`]' one on top: the plane's signal slab, its
+    /// `RankData` table and its fusion buffers are `cudaMalloc`'d ONCE and
+    /// their addresses are what every peer's IPC mapping points at, so a
+    /// per-fire plane would be a peer exchange per fire and a set of
+    /// addresses no rank could agree on twice.
+    ///
+    /// **Declared AFTER [`Self::supergraph`], for that field's reason read
+    /// the other way.** A captured graph bakes the addresses its launches
+    /// used, and a fired all-reduce's are these; freeing them while an exec
+    /// that recorded them is still alive is the same fault, so the execs go
+    /// first.
+    ///
+    /// `None` on a single-rank driver, and that used to be every driver this
+    /// build served: `super::load::tp_serving_refusal` refused `tp_size > 1`
+    /// before `build_tp_plane` was reached, because
+    /// `kernels_cuda::comm::CAN_LAUNCH` was `false`. Both all-reduce headers
+    /// are internalised now and that constant is `true`, so a group with a
+    /// key and a world size in `{2, 4, 6, 8}` reaches `build_tp_plane` and
+    /// this field is `Some`. It is `Option` rather than absent because a rank
+    /// of a group is the case the type exists for, not an error case.
+    ///
+    /// # This field is what makes `Shell` `!Send`
+    ///
+    /// `crate::fire::all_reduce::CustomAllReduce` holds raw device pointers
+    /// and peer mappings that belong to the thread that created them, and
+    /// `ResidentPlane` publishes its address into a THREAD-LOCAL for the bind
+    /// arms to find. A `Shell` that could move threads would leave that
+    /// publication behind on the old one. Nothing moves a `Shell` between
+    /// threads today — `create` binds the device on the thread that fires —
+    /// and this is what stops that from silently changing.
+    pub(crate) all_reduce: Option<crate::fire::all_reduce::ResidentPlane>,
+    /// The key this rank's tensor-parallel group rendezvouses on —
+    /// `[driver] tp_group_id`, empty when unstated.
+    ///
+    /// `layout::rendezvous` needs a string to find the other ranks by, and
+    /// this driver had none: `capabilities_json` passed
+    /// `nccl_unique_id_hex: String::new()` to the memory planner, which is
+    /// exactly the value `tp_min_plan` treats as *"no group to reconcile
+    /// with"* — so the cross-rank plan agreement was wired up and inert.
+    /// One key serves both rendezvous.
+    pub(crate) tp_group_id: String,
     /// The driver-owned KV pools, allocated on first launch and grown on
     /// demand — decode continuity across launches lives here.
     pub(crate) kv: Option<KvState>,
@@ -263,13 +319,27 @@ pub struct Shell {
     /// finds them built. Built lazily because a driver that never fires a
     /// program should not pay NVRTC for two kernels it will not call.
     pub(crate) ptir_control: Option<crate::program::Control>,
-    /// One instance's device rings, by instance id.
+    /// Every registered channel's device ring, by driver-wide SLOT.
     ///
-    /// Per INSTANCE by necessity rather than by choice: the rings are
-    /// sized from that instance's own `channel_ids`, in that order,
-    /// because a program names a channel by index into it. And they must
-    /// outlive a fire — rebuilding zeroes the cursors, and a cursor is the
-    /// only record of what a previous fire published.
+    /// One registry rather than one per instance, which is the correction
+    /// [`ChannelState::is_extern`] describes the cost of: a channel two
+    /// instances name is ONE ring, so the exporter's publish is what the
+    /// importer reads. Built lazily, because it needs the fire allocator and
+    /// a driver that never fires a program should not allocate for one.
+    pub(crate) ptir_rings: Option<crate::program::channel::Rings>,
+    /// Which slot each registered channel's ring lives at, by channel id.
+    ///
+    /// Assigned on first use rather than at registration, because
+    /// `register_channel` has no allocator: the shell's device state is
+    /// readied by the first fire.
+    pub(crate) ptir_channel_slots: std::collections::BTreeMap<u64, u32>,
+    /// One instance's dense channel index → registry slot, by instance id.
+    ///
+    /// Per INSTANCE by necessity: a program names a channel by index into
+    /// its own `channel_ids`, and that numbering is the instance's. It must
+    /// outlive a fire — rebuilding renumbers, and a slot is what ties a
+    /// program's channel to the cursors that record what a previous fire
+    /// published.
     pub(crate) ptir_sessions: std::collections::BTreeMap<u64, crate::program::session::Session>,
     /// The adopted plans, by program id. Separate from the compiled
     /// modules because a program can be adopted and REJECTED — an
@@ -398,24 +468,24 @@ impl ChannelState {
     /// cursors, because the cursors are how a producer tells a consumer
     /// that a cell is full.
     ///
-    /// This driver allocates a `program::channel::Rings` PER SESSION and a
-    /// session per instance (`Session::new` → `Rings::new`), so two
-    /// instances naming one extern channel get two rings. The exporter
-    /// would fill its own and the importer would block forever on an
-    /// empty one — or, worse, read a zeroed cell and call it a value.
+    /// THE RING IS SHARED NOW, and this paragraph used to say it was not.
     ///
-    /// So `bind_instance` refuses. What the real fix needs, recorded
-    /// because the shape of it is not obvious from here: `Rings` holds
-    /// ONE `cells` block with per-channel `offsets`, and one `full`,
-    /// `head`, `tail` and `cap1` array indexed densely by channel. Every
-    /// one of those five would have to become per-channel and adoptable
-    /// from a driver-owned registry keyed by channel id — the control
-    /// kernels take `full_ptr()`/`head_ptr()` as flat arrays, so they
-    /// need pointer arrays rather than base pointers. The contract's
-    /// reference used to be `driver-dummy` (its `ExternChannel` and the
-    /// `shared` ring in `register_channel`); that crate is deleted, so the
-    /// contract is now `driver-api`'s vocabulary and this comment is the
-    /// record of where the worked example went.
+    /// It read: "this driver allocates a `Rings` PER SESSION and a session
+    /// per instance, so two instances naming one extern channel get two
+    /// rings", and it went on to describe the fix — a driver-owned registry
+    /// keyed by channel id, with all five arrays per channel. That registry
+    /// exists ([`crate::program::channel::Rings`]): a channel is registered
+    /// once, at one slot, and every instance that names it holds the same
+    /// slot. So two programs sharing a channel now share its cells AND its
+    /// cursors, which is what an extern channel needs.
+    ///
+    /// `bind_instance` still refuses one, and the refusal is now about what
+    /// has NOT been done rather than about what cannot be: nothing in this
+    /// driver reads `PIE_CHANNEL_EXTERN_IMPORT`/`EXPORT` to decide who may
+    /// publish and who may consume, no test in the tree binds one, and the
+    /// engine's own path for them is untried here. Serving one would be a
+    /// guess about a direction nobody has checked. The mechanical blocker is
+    /// gone; the unmeasured half is not.
     pub const fn is_extern(&self) -> bool {
         self.extern_dir != driver_api::local::PIE_CHANNEL_EXTERN_NONE
     }
@@ -457,6 +527,13 @@ pub(crate) struct InFlight {
     /// Ordinary scratch. Named for what it is rather than listed, because
     /// the point is that nothing here is read again — it is held only so
     /// that dropping it does not synchronize at the wrong moment.
+    ///
+    /// `expect` rather than `allow`: never-read is this field's JOB, and
+    /// the paragraph above is why, so the lint is right about the fact and
+    /// wrong about what to do. `expect` also turns the day someone gives
+    /// it a reader into a build error, which is the day this reasoning
+    /// needs revisiting rather than the day it silently stops applying.
+    #[expect(dead_code, reason = "owned to defer the drop; see the type's doc")]
     pub(crate) scratch: Vec<crate::device::DeviceBuffer>,
     /// Channels closed while this fire was queued, freed when it retires.
     ///
@@ -500,7 +577,7 @@ pub(crate) const RUNAHEAD_DEPTH: usize = 2;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) struct LoweringKey {
     pub model_id: u64,
-    pub class: model_compiler::trace::FireClass,
+    pub class: model_ir::trace::FireClass,
     pub rows: u32,
     /// A digest of the fire's ROWS, not just how many.
     ///
@@ -543,7 +620,7 @@ pub(crate) fn digest_rows(rows: &[model_compiler::lower::Row]) -> u64 {
 
 /// A traced, lowered and joined program, and whether it kept its union.
 pub(crate) struct LoweredFire {
-    pub plan: model_compiler::trace::ForwardPlan,
+    pub plan: model_ir::trace::ForwardPlan,
     pub lowered: model_compiler::lower::Lowered,
     pub dplan: crate::bind::DispatchPlan,
     pub union: bool,
@@ -690,6 +767,7 @@ impl ChannelState {
                 self.words,
                 self.cell_bytes,
                 self.ring,
+                self.host_role,
             )
         }
     }
@@ -784,16 +862,12 @@ impl KvState {
             .collect()
     }
 
-    /// Every layer owns pages, and every page is `page_bytes`.
-    ///
-    /// The host swap path needs both halves: it has ONE page stride for
-    /// all layers, so a per-layer head dim breaks it, and it has no way
-    /// to skip a layer that owns nothing. A wrong-sized host page is
-    /// corruption rather than degradation, so a shared-page stack is
-    /// refused rather than approximated.
-    pub(crate) fn uniform_stride(&self, page_bytes: usize) -> bool {
-        (0..self.layers()).all(|l| self.page_bytes(l) == Some(page_bytes))
-    }
+    // `uniform_stride` STOOD HERE. It asked whether every layer owns pages
+    // and every page is one size, for a host swap path that had ONE stride
+    // for the whole stack. That path asks per layer now — `serve::transfer`
+    // takes `fresh.page_bytes(i)` inside the loop — so the question has no
+    // asker, and a whole-stack answer would be the weaker one anyway: it can
+    // only refuse a stack a per-layer walk would serve correctly.
 }
 
 /// The hybrid's driver-owned GDN state, addressed through the ported
@@ -826,8 +900,12 @@ pub(crate) struct GdnState {
     pub num_slots: u32,
     pub conv_stride_elems: i64,
     pub state_stride_elems: i64,
-    /// Bytes per element of the recurrent store (2 = bf16 state).
-    pub state_elem_bytes: usize,
+    // `state_elem_bytes` STOOD HERE — "bytes per element of the recurrent
+    // store (2 = bf16 state)". It was set from `shape.state_elem` at
+    // construction and read by nothing: every consumer of this pool addresses
+    // it in ELEMENTS, through `conv_stride_elems` and `state_stride_elems`
+    // beside it, which is the whole reason those two carry the unit in their
+    // names. A width nothing multiplies by is a width nobody agreed on.
 }
 
 impl GdnState {
@@ -1127,6 +1205,21 @@ pub(crate) struct InstanceEntry {
     #[allow(dead_code)]
     pub geometry_class: u32,
     pub channel_ids: Vec<u64>,
+    /// The value each seeded channel starts with, in WIRE form, by channel id.
+    ///
+    /// Held rather than applied at bind because a cell's home is a device ring
+    /// and `bind_instance` has no allocator — the shell's device state is
+    /// readied by the first fire. `launch::ensure_sessions` applies them when
+    /// it registers the channel, which is the one moment the ring is known
+    /// empty.
+    ///
+    /// They were DROPPED. `InstanceBindingPlan::seed_values` arrived and
+    /// nothing read it, so a seeded channel held nothing in either plane: the
+    /// shared `driver::registry` pushes each one into the ring at bind and this
+    /// shell did not, which is why an epilogue that reads a seeded `rng` or a
+    /// decode whose first `Positions` is a seed found an empty cell and the
+    /// fire declined.
+    pub seeds: Vec<(u64, Vec<u8>)>,
 }
 
 /// What a successful `load_model` leaves behind: the parsed config and
@@ -1201,8 +1294,86 @@ impl LoadedModel {
     }
 }
 
-/// The capabilities this shell can honestly claim today.
-pub(crate) const CAPS_JSON: &str = r#"{"driver":"driver-cuda","status":"phase-d-shell","abi":24}"#;
+// `CAPS_JSON` STOOD HERE, and `serve::load` parsed it into a
+// `driver_api::DeviceFacts`. It was
+//
+//     {"driver":"driver-cuda","status":"phase-d-shell","abi":24}
+//
+// which is the C-era status blob and not a `DeviceFacts` at all: none of its
+// three keys is one of that struct's nine, and `DeviceFacts` is
+// `#[serde(deny_unknown_fields)]`. **So the parse failed, `Shell::open`
+// returned `PIE_STATUS_DRIVER_ERROR`, and this driver could not be created —
+// unconditionally, on every path, since `2ef431d02`.** `tests/serve.rs`'s
+// twenty-eight tests all fail on their first line for this reason, and so
+// does `pie` itself: the engine reports `cuda rank 0 create failed with
+// status -5`.
+//
+// The facts are STATED now, which is what the other three drivers already
+// did. `driver-metal`'s says why in one sentence — *"stated from what this
+// backend IS rather than parsed out of a config; a config that disagreed with
+// the hardware would simply be believed"* — and that is the whole argument. A
+// JSON literal cannot disagree with a struct at compile time; a struct
+// literal cannot disagree with itself.
+
+/// The facts a scheduler reads, stated from what this backend IS.
+///
+/// Four of the nine are not this file's to choose: they are the STORAGE
+/// compiler's, and `model_loader::plan::StorageTarget::for_backend` states
+/// them for `BackendKind::Cuda` already. Three are repeated with the reason
+/// their author gave, because they are plain numbers a reader here needs to
+/// see; the fourth is IMPORTED, because it is a mask and a transcribed mask
+/// is a bug waiting for a fifth bit:
+///
+/// * `storage_alignment` 256 — what cuBLAS wants for a matrix operand and
+///   what `cudaMalloc` itself guarantees, so a view into the arena is as
+///   aligned as its own allocation would have been.
+/// * `storage_max_tile_bytes` 64 MiB — how much host staging one load-time
+///   transform may take at once.
+/// * `storage_tile_map_mask` — `CAST | ENCODE | SCALE`, which is
+///   `passes::tile::CUDA_TILE_MAP_MASK`. `REBLOCK` and `DECODE` are not
+///   there: the first has no device kernel in this tree and the second reads
+///   scales that live inside the payload, which no device kernel reads.
+/// * `native_mxfp4_moe` false — **and the name is the trap.** It does not
+///   mean "reads MXFP4"; it means "has a native MXFP4 *GEMM*", which in
+///   gpt-oss's contract selects a Marlin REPACK of the expert banks, work
+///   this tree did not port. A driver whose GEMM reads the stored banks
+///   directly wants the other branch, which is this one.
+///
+/// The remaining five are this backend's own:
+pub(crate) fn device_facts() -> driver_api::DeviceFacts {
+    driver_api::DeviceFacts {
+        abi_version: driver_api::PIE_DRIVER_ABI_VERSION,
+        backend: "cuda".to_string(),
+        // FALSE, and it is the one that changes SCHEDULING. On a discrete
+        // card the KV pool and the host do not share physical memory, so
+        // "the device is full" is a question about the card alone —
+        // the opposite of `driver-metal`, which answers `true` for exactly
+        // that reason and says so.
+        unified_memory: false,
+        // TRUE, on the same rule `driver-metal` applies to reach `false`:
+        // the table says which kernels exist. This one has
+        // `quant::quantize_bf16_to_fp8_e4m3_per_channel` and
+        // `quant::quantize_bf16_to_fp8_e4m3_per_token_group`, and `KvDType`
+        // names `Fp8E4M3` and `Fp8E5M2` as page storage the paged-attention
+        // kernels read. Metal has neither and answers `false`.
+        fp8_native: true,
+        native_mxfp4_moe: false,
+        storage_alignment: 256,
+        storage_max_tile_bytes: 64 * 1024 * 1024,
+        // NOT transcribed. `CUDA_TILE_MAP_MASK` is
+        // `TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE`, and those bits
+        // are 1, 4 and 128 rather than the 1, 2, 4 a reader would guess — so
+        // writing the number here would have been wrong on the first try and
+        // silently wrong afterwards. `serve` is `feature = "abi"` and that
+        // feature brings `model-loader`, so the constant is simply in scope.
+        storage_tile_map_mask: model_loader::plan::passes::tile::CUDA_TILE_MAP_MASK,
+        // The paged KV pool's rows per page, which every `kv_translation`
+        // index is in units of. `boot::KV_PAGE_SIZE` is the same sixteen and
+        // is not a preference: the paged-attention kernels are compiled for
+        // it.
+        page_size: crate::boot::KV_PAGE_SIZE.unsigned_abs(),
+    }
+}
 
 /// The device-ring shapes of one instance's channels, in the order the
 /// program indexes them.
@@ -1246,11 +1417,8 @@ pub(crate) fn channel_dtype(byte: u8) -> driver::tensor_ir::DType {
     driver::tensor_ir::DType::from_wire(byte).unwrap_or(driver::tensor_ir::DType::F32)
 }
 
-/// A borrowed ABI slice as a Rust slice; empty for null.
-pub(crate) fn slice_of<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
-    if ptr.is_null() || len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(ptr, len) }
-    }
-}
+// `slice_of` STOOD HERE — a `{ptr, len}` pair as a `&[T]`, empty for null.
+// It was the marshalling half of a C descriptor surface (`PieU32Slice`,
+// `PieBytes` and the rest), and `50fa127a3` deleted the descriptors: the
+// verbs take Rust values now, so there is no borrowed ABI slice to reconstruct
+// and no unsafe block to justify.

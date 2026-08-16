@@ -1053,7 +1053,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let client = crate::executor::connect(server.endpoint()).await.unwrap();
+        let client = crate::executor::connect_with_local_ip(server.endpoint())
+            .await
+            .unwrap()
+            .0;
         let hello = client
             .execute(
                 tarpc::context::current(),

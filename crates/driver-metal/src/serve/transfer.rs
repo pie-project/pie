@@ -44,9 +44,8 @@
 //! build cannot ever do that" from "that request was malformed".
 
 use driver_api::local::{
-    PIE_ELASTIC_POOL_KV, PIE_ELASTIC_POOL_STATE, PIE_ELASTIC_POOL_WORKSPACE,
+    DeviceDomain, PIE_ELASTIC_POOL_KV, PIE_ELASTIC_POOL_STATE, PIE_ELASTIC_POOL_WORKSPACE,
     PIE_MEMORY_DOMAIN_METAL_SHARED, PIE_STATUS_INVALID_ARGUMENT, PIE_STATUS_UNSUPPORTED,
-    DeviceDomain,
 };
 use driver_api::plan::{KvCopyPlan, PoolResizePlan, StateCopyPlan};
 
@@ -359,8 +358,7 @@ pub fn plan_pool_resize(plan: &PoolResizePlan, caps: Capabilities) -> Result<Res
 #[cfg(test)]
 mod tests {
     use driver_api::local::{
-        PIE_MEMORY_DOMAIN_HOST_PINNED, PIE_MEMORY_DOMAIN_METAL_PRIVATE, KvMoveCell,
-        StateCopyRange,
+        KvMoveCell, PIE_MEMORY_DOMAIN_HOST_PINNED, PIE_MEMORY_DOMAIN_METAL_PRIVATE, StateCopyRange,
     };
 
     use super::*;

@@ -13,10 +13,13 @@ const BODY: &str = include_str!("../../../runtime/cuda/ptir_m1_runtime_body.cuh"
 
 /// The `__device__` projection of the RNG contract, as the C++ spliced it in.
 ///
-/// The C++ read this out of `PTIR_RNG_CUDA_PREAMBLE`, whose raw-string literal
-/// opens immediately after `(` — so its leading newline is part of the
-/// constant's value, and is reproduced here. `rng_contract`'s
-/// `cuda_preamble_matches_the_header_literal` holds the two forms together.
+/// The C++ read this out of a `PTIR_RNG_CUDA_PREAMBLE` raw-string literal in
+/// the generated `rng_contract.generated.h`, which opened immediately after
+/// `(` — so its leading newline was part of the constant's value, and is
+/// reproduced here to keep the emitted bytes identical to what the goldens
+/// record. That header was deleted with its last includer; the text now comes
+/// straight from [`crate::codegen::rng`], and `rng_contract`'s
+/// `emitted_cuda_runtime_carries_the_rng_preamble` checks it arrives.
 fn rng_preamble() -> String {
     let mut preamble = String::from("\n");
     preamble.push_str(&crate::codegen::rng::cuda_device_functions());

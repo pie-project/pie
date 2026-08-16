@@ -20,10 +20,11 @@
 // scalar to a push block. WebGPU has no push constants at all, so `row_pitch`
 // is the one field of the `@group(1) @binding(0)` uniform block, while
 // `RmsParams` stays a STORAGE buffer at binding 3 -- the row says `params: Buf`
-// and a struct is a struct. `src/lib.rs` states the rule and
-// `cargo run -p kernels-wgpu --example dump_layout -- rms_single_row_bfloat16`
-// prints this row's answer. The strided pair is UNSTATED, so its buffers follow
-// the sibling kernels' order and its scalar follows `norm/residual_add.wgsl`.
+// and a struct is a struct. `src/lib.rs` states the rule:
+// `kernels_wgpu::bindings` picks the storage and uniform runs, and
+// `kernels_wgpu::uniform_layout` gives this row's scalar offset. The strided
+// pair is UNSTATED, so its buffers follow the sibling kernels' order and its
+// scalar follows `norm/residual_add.wgsl`.
 //
 // **Every bf16 index.** WGSL has no 16-bit storage type, so `x`, `w`, `out`
 // and the residual cross as `array<u32>` with TWO values per word
@@ -55,18 +56,18 @@ struct RmsParams {
     gain: f32,
 }
 
-@group(0) @binding(0) var<storage, read> x: array<u32>;
-@group(0) @binding(1) var<storage, read> w: array<u32>;
+@group(0) @binding(0) var<storage, read_write> x: array<u32>;
+@group(0) @binding(1) var<storage, read_write> w: array<u32>;
 // Atomic ONLY because of the odd-width edge `store_half` handles; see there.
 // The element type does not change what the host binds -- it is still a
 // read_write storage buffer of 4-byte words -- so the row's ABI is untouched.
 @group(0) @binding(2) var<storage, read_write> out_: array<atomic<u32>>;
-@group(0) @binding(3) var<storage, read> params: RmsParams;
+@group(0) @binding(3) var<storage, read_write> params: RmsParams;
 
 //#if defined(PIE_RESIDUAL)
-@group(0) @binding(4) var<storage, read> r: array<u32>;
+@group(0) @binding(4) var<storage, read_write> r: array<u32>;
 //#if defined(PIE_SCALED)
-@group(0) @binding(5) var<storage, read> s: array<u32>;
+@group(0) @binding(5) var<storage, read_write> s: array<u32>;
 //#endif
 //#endif
 

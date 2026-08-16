@@ -5,7 +5,7 @@
 // Qwen2 served through it computed its q/k/v projections without them --
 // fluent, wrong text, which nothing downstream can detect.
 //
-// Written to match `kernels-cuda-new`'s `norm::add_bias_bf16` and
+// Written to match `kernels-cuda`'s `norm::add_bias_bf16` and
 // `kernels-vulkan`'s `norm/add_bias.comp` operand for operand, so one
 // statement means one thing on all three backends: IN PLACE over the value it
 // biases (`out` is both operand and result, and the trace hands the same

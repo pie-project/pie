@@ -30,10 +30,10 @@
 // `residual` is buffer 7 while the row puts it at 5, and a shader that
 // transcribes the 7 binds a buffer the shell never wrote.
 
-@group(0) @binding(0) var<storage, read> w: array<u32>;
-@group(0) @binding(1) var<storage, read> scales: array<u32>;
-@group(0) @binding(2) var<storage, read> biases: array<u32>;
-@group(0) @binding(3) var<storage, read> x: array<u32>;
+@group(0) @binding(0) var<storage, read_write> w: array<u32>;
+@group(0) @binding(1) var<storage, read_write> scales: array<u32>;
+@group(0) @binding(2) var<storage, read_write> biases: array<u32>;
+@group(0) @binding(3) var<storage, read_write> x: array<u32>;
 // `atomic` for the CAS in `store_y`, not because anything here accumulates.
 @group(0) @binding(4) var<storage, read_write> y: array<atomic<u32>>;
 // Declared only by the variants whose row has a sixth buffer operand:
@@ -41,7 +41,7 @@
 // declared unconditionally -- a module that binds past the row's buffer count
 // is a pipeline-layout error, while a HOLE in the set is fine (§13).
 //#if defined(PIE_RESIDUAL) || defined(PIE_BIAS)
-@group(0) @binding(5) var<storage, read> extra: array<u32>;
+@group(0) @binding(5) var<storage, read_write> extra: array<u32>;
 //#endif
 
 // The block is variant-shaped, and it has to be. `uniform_layout()` builds the

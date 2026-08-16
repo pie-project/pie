@@ -242,11 +242,12 @@ pub(crate) fn notify_pipeline_join(_pid: ProcessId) {}
 pub(crate) static BACKSTOP_RETIREMENTS: AtomicU64 = AtomicU64::new(0);
 static NEXT_LOGICAL_FIRE_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Total backstop-path retirements since process start (test observability).
-#[cfg(test)]
-pub(crate) fn backstop_retirements() -> u64 {
-    BACKSTOP_RETIREMENTS.load(Ordering::Relaxed)
-}
+// `backstop_retirements()` -- a `#[cfg(test)]` reader for the counter above
+// -- was deleted rather than allowed: nothing called it, and a test-only
+// accessor nobody accesses is an observability claim with no observer. The
+// counter itself stays; it is written on the live path and read through the
+// stats surface. `BACKSTOP_RETIREMENTS.load(Ordering::Relaxed)` is the whole
+// body if a test ever wants it back.
 
 pub(crate) struct PendingRequest {
     pub(crate) logical_fire_id: u64,

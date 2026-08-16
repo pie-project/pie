@@ -196,9 +196,9 @@ impl Variant for Fixture {
 
     fn trace(
         &self,
-        _class: model_compiler::trace::FireClass,
+        _class: model_ir::trace::FireClass,
         _load: Deployed<'_>,
-    ) -> Result<model_compiler::trace::ForwardPlan, Refusal> {
+    ) -> Result<model_ir::trace::ForwardPlan, Refusal> {
         Err(Refusal::Unsupported(
             "a contract fixture has no forward text; its family's own row does",
         ))

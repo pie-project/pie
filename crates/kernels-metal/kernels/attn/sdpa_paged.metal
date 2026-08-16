@@ -39,9 +39,26 @@ using namespace metal;
 // the final cross-group reduction. The launch must match the instantiation:
 // missing simdgroups mean missing keys, not a smaller version of the same work.
 //
-// At D=512 the compiler's default register allocation only admits 896, and a
-// 1024-thread dispatch does not run AT ALL. The attribute is the ceiling needed
-// by the generic form; a short specialization may launch fewer threads.
+// The attribute is the ceiling needed by the generic form; a short
+// specialization may launch fewer threads.
+//
+// This carried a second sentence -- "at D=512 the compiler's default register
+// allocation only admits 896, and a 1024-thread dispatch does not run AT ALL"
+// -- and it is not true of this toolchain.
+// `device_kernels::every_declared_entrypoint_builds_a_pipeline_on_this_device`
+// reads `maxTotalThreadsPerThreadgroup` off every built pipeline and
+// `sdpa_paged_decode_bfloat16_d_512` admits 1024; `device_attention` then
+// dispatches it at 1024 and gets the reference answer. 180 of the 481
+// pipelines DO admit fewer than 1024 -- the quantised GEMMs mostly, down to
+// 576 -- so the effect the sentence described is real, just not here. That
+// test now asserts the thing that matters instead of the anecdote: a pipeline
+// must admit at least what its own launch rule dispatches.
+//
+// It is worth saying why a stale ceiling is dangerous rather than merely
+// wrong. Metal does not refuse an over-wide threadgroup: it skips the
+// dispatch, leaves the output holding whatever it held, and reports success.
+// `device::encoder::dispatch` is what turns that into an error, and it is a
+// guard, not a licence to guess the number.
 // WITH_SINK adds gpt-oss's learned per-head scalar to the softmax denominator,
 // as though it were one more key with no value to contribute. It is what lets a
 // head attend to nothing. A template parameter rather than a second kernel: the
@@ -85,6 +102,7 @@ template <
   typedef float U;
   thread U q[qk_per_thread];
   thread U k[qk_per_thread];
+  thread U v[v_per_thread];
   thread U o[v_per_thread];
 
   threadgroup U outputs[BN * BD];
@@ -120,54 +138,107 @@ template <
   U max_score = NEG_INF;
   U sum_exp_score = 0;
 
-  // Online-softmax over kv positions kp = simd_gid, +BN, ... up to and including q_pos.
-  int fast_page_ix = 0;
-  int fast_page_off = simd_gid;
-  for (int kp = kv_start + simd_gid; kp <= q_pos; kp += BN) {
-    if constexpr (!FAST_FULL) {
-      if (attention_mask_enabled[row] != 0 &&
-          (uint(kp) >= attention_mask_stride ||
-           attention_mask[size_t(row) * attention_mask_stride + uint(kp)] == 0)) {
-        continue;
-      }
-    }
-    // Page-table gather (== delta's kv_append phys_slot, byte-for-byte).
-    int page;
-    size_t slot;
-    if constexpr (PAGE_SIZE == 32 && FAST_FULL) {
-      page = int(kv_page_indices[page_base + fast_page_ix]);
-      slot = size_t(page) * 32 + fast_page_off;
-      fast_page_off += BN;
-      if (fast_page_off >= 32) {
-        fast_page_off -= 32;
-        ++fast_page_ix;
-      }
-    } else {
-      int page_ix;
-      int page_off;
-      if constexpr (PAGE_SIZE == 32) {
-        page_ix = kp >> 5;
-        page_off = kp & 31;
-      } else {
-        page_ix = kp / page_size;
-        page_off = kp % page_size;
-      }
-      page = int(kv_page_indices[page_base + page_ix]);
-      const int stride = PAGE_SIZE == 0 ? page_size : PAGE_SIZE;
-      slot = size_t(page) * stride + page_off;
-    }
-    const device T* kptr = k_pages + (slot * n_kv_heads + kv_head_idx) * D + simd_lid * qk_per_thread;
-    const device T* vptr = v_pages + (slot * n_kv_heads + kv_head_idx) * D + simd_lid * v_per_thread;
+  // HOISTED, because it is the ROW's and the loop is over keys. Read inside
+  // the loop this was one device load per kv position -- cached, but also a
+  // dependency the scheduler has to satisfy before it can decide whether to
+  // issue the key load at all, which is the one thing this loop cannot
+  // afford. See the note on `v` below.
+  const bool masked = !FAST_FULL && attention_mask_enabled[row] != 0;
 
+  // ONE KV POSITION: the page table has already been walked for it, so this
+  // is only the two loads, the dot product and the online update.
+  //
+  // A lambda so the two loops below share it. They differ in nothing but
+  // which simdgroup takes which position, and two copies of an online softmax
+  // would be two things to keep true.
+  //
+  // BOTH LOADS ISSUED BEFORE EITHER IS USED, and that is the whole structure
+  // of it. The value read used to be `vptr[j]` in the accumulate -- after the
+  // dot product, after `simd_sum`, and after the online update that depends on
+  // it. So each position was two round trips to memory in series. Costs
+  // `v_per_thread` registers, which at D=64 is two.
+  auto absorb = [&](size_t slot) {
+    const device T* kptr =
+        k_pages + (slot * n_kv_heads + kv_head_idx) * D + simd_lid * qk_per_thread;
+    const device T* vptr =
+        v_pages + (slot * n_kv_heads + kv_head_idx) * D + simd_lid * v_per_thread;
     for (int j = 0; j < qk_per_thread; j++) k[j] = kptr[j];
+    for (int j = 0; j < v_per_thread; j++) v[j] = static_cast<U>(vptr[j]);
     U score = 0;
     for (int j = 0; j < qk_per_thread; j++) score += q[j] * k[j];
     score = simd_sum(score);
-
     U factor, exp_score;
-    sdpa_online_update(
-        score, max_score, sum_exp_score, factor, exp_score);
-    for (int j = 0; j < v_per_thread; j++) o[j] = o[j] * factor + exp_score * vptr[j];
+    sdpa_online_update(score, max_score, sum_exp_score, factor, exp_score);
+    for (int j = 0; j < v_per_thread; j++) o[j] = o[j] * factor + exp_score * v[j];
+  };
+
+  // Whether a kv position is attended at all: the row's mask, when it has one.
+  auto attends = [&](int kp) {
+    if constexpr (FAST_FULL) {
+      return true;
+    } else {
+      return !masked ||
+          (uint(kp) < attention_mask_stride &&
+           attention_mask[size_t(row) * attention_mask_stride + uint(kp)] != 0);
+    }
+  };
+
+  const int stride = PAGE_SIZE == 0 ? page_size : PAGE_SIZE;
+  const int first_page = kv_start / stride;
+  const int last_page = q_pos / stride;
+
+  // WHICH SIMDGROUP TAKES WHICH POSITION, and it is the whole reason this
+  // kernel was 32 GB/s.
+  //
+  // Striding the POSITIONS by BN -- `kp = simd_gid, +32, ...` -- puts every
+  // iteration in a different page at page_size 16, so every iteration begins
+  // with `kv_page_indices[page_base + kp / page_size]`: a load the address of
+  // the key load depends on. The key cannot even be issued until the page
+  // index comes back, so each iteration is a dependent pair of round trips to
+  // memory and the loop is a pointer chase 32 links long. Measured over
+  // Llama-3.2-1B at 1024 of context: 1.033 ms for sixteen launches reading
+  // 2 MB each, which is 32 GB/s on a 400 GB/s part.
+  //
+  // Striding the PAGES instead gives a simdgroup a whole page at a time: one
+  // page-index load, then `page_size` key loads whose addresses are all known
+  // the moment it lands, so they issue together and the latency is paid once
+  // per page rather than once per position.
+  //
+  // It is only the better shape when there are pages enough to go round. At
+  // 128 of context a request holds eight pages and twenty-four of the
+  // thirty-two simdgroups would sit idle, so the position-strided loop stays
+  // for that case -- it is not a fallback, it is the right answer when the
+  // context is short, and `what_a_decode_costs_at_length` measures both.
+  if (last_page - first_page + 1 >= BN) {
+    for (int pix = first_page + simd_gid; pix <= last_page; pix += BN) {
+      const size_t base = size_t(kv_page_indices[page_base + pix]) * stride;
+      const int lo = max(kv_start, pix * stride);
+      const int hi = min(q_pos, pix * stride + stride - 1);
+      for (int kp = lo; kp <= hi; ++kp) {
+        if (attends(kp)) absorb(base + size_t(kp - pix * stride));
+      }
+    }
+  } else {
+    int fast_page_ix = 0;
+    int fast_page_off = simd_gid;
+    for (int kp = kv_start + simd_gid; kp <= q_pos; kp += BN) {
+      // The incremental page walk the `_p32` arms exist for: a page index and
+      // an offset carried across iterations instead of a divide.
+      size_t slot;
+      if constexpr (PAGE_SIZE == 32 && FAST_FULL) {
+        slot = size_t(kv_page_indices[page_base + fast_page_ix]) * 32 + fast_page_off;
+        fast_page_off += BN;
+        if (fast_page_off >= 32) {
+          fast_page_off -= 32;
+          ++fast_page_ix;
+        }
+      } else {
+        const int page_ix = PAGE_SIZE == 32 ? (kp >> 5) : (kp / page_size);
+        const int page_off = PAGE_SIZE == 32 ? (kp & 31) : (kp % page_size);
+        slot = size_t(kv_page_indices[page_base + page_ix]) * stride + page_off;
+      }
+      if (attends(kp)) absorb(slot);
+    }
   }
 
   if (simd_lid == 0) {

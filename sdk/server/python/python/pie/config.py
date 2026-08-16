@@ -101,6 +101,20 @@ class ModelConfig:
     hf_repo: str = ""
     driver: DriverConfig = field(default_factory=DriverConfig)
     scheduler: Optional[SchedulerConfig] = None
+    # How many KV pages a shell opens with. `None` is the backend's own
+    # default, which is what every ordinary run wants.
+    #
+    # It is here because `[model] kv_pages` is a key two backends already read
+    # -- `driver-vulkan` and `driver-wgpu` both take it, and both document it
+    # in those words -- and this emitter could not write it. A boot key no
+    # config object can express is reachable only by hand-writing TOML, which
+    # means the harnesses that would most want it cannot ask.
+    #
+    # What wants it is a SMALL number. Two defects in `driver-vulkan`'s
+    # elastic pool were found by running the curated sweep and both lived in
+    # the growth path, which the default of 1024 pages barely enters; a sweep
+    # run at a handful of pages exercises it on every request.
+    kv_pages: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +142,8 @@ class Config:
         buf.write(f"\n[{prefix}model]\n")
         _emit_kv(buf, "name", m.name)
         _emit_kv(buf, "hf_repo", m.hf_repo)
+        if m.kv_pages is not None:
+            _emit_kv(buf, "kv_pages", m.kv_pages)
         _emit_table(buf, f"{prefix}model.driver", _driver_block(m.driver),
                     leading_newline=True)
         if m.driver.options:

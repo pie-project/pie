@@ -78,6 +78,16 @@ fn default_prompt() -> String {
     "Generate a profile for a fictional software engineer named Alice.".into()
 }
 
+/// `maxItems` is load-bearing, not decoration. Without it the array is
+/// unbounded and TERMINATION is left entirely to the model: measured on
+/// Qwen3-0.6B, greedy masked decoding writes a coherent, schema-valid skills
+/// list and is still writing it at 768 tokens ("Python", "JavaScript",
+/// "Java", "C++", "Rust", "Databases", ...), so the example fails on its own
+/// token cap with nothing wrong anywhere. A bound the GRAMMAR enforces makes
+/// the example about what it claims to be about -- that speculation does not
+/// change constrained output -- rather than about a small model's taste in
+/// list length. With it, both arms return the identical 37 tokens and
+/// speculation cuts 37 forward passes to 33.
 fn default_schema() -> String {
     r#"{
         "type": "object",
@@ -87,7 +97,8 @@ fn default_schema() -> String {
             "skills": {
                 "type": "array",
                 "items": { "type": "string" },
-                "minItems": 1
+                "minItems": 1,
+                "maxItems": 3
             }
         },
         "required": ["name", "age", "skills"],
@@ -360,8 +371,9 @@ async fn main(input: Input) -> Result<Output> {
 
     if !constraint.is_terminated() {
         return Err(format!(
-            "JSON generation did not terminate within {} tokens",
-            input.max_tokens
+            "JSON generation did not terminate within {} tokens; got {:?}",
+            input.max_tokens,
+            model::decode(&generated).unwrap_or_default()
         ));
     }
 

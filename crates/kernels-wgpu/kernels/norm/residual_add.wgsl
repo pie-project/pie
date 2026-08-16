@@ -5,8 +5,8 @@
 
 //#include "common/bf16.inc.wgsl"
 
-@group(0) @binding(0) var<storage, read> x: array<u32>;
-@group(0) @binding(1) var<storage, read> residual: array<u32>;
+@group(0) @binding(0) var<storage, read_write> x: array<u32>;
+@group(0) @binding(1) var<storage, read_write> residual: array<u32>;
 @group(0) @binding(2) var<storage, read_write> out_: array<u32>;
 
 //#if defined(PIE_STRIDED)

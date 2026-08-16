@@ -114,10 +114,14 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "s
 # fixture builder, CPU executor). Nothing under `ffi/` reaches them, and this is
 # what keeps that true.
 model-loader = { path = "../model-loader", default-features = false }
-# tart: no Rust in this process calls the forward toolchain — the drivers
-# reach it over its C ABI — so the dependency exists to put the rlib in the
-# link and to order the build-script include handoff.
-model-compiler = { path = "../model-compiler" }
+# `model-compiler` STOOD HERE, with the note "no Rust in this process calls the
+# forward toolchain — the drivers reach it over its C ABI — so the dependency
+# exists to put the rlib in the link and to order the build-script include
+# handoff." Neither half survives inspection: `build.rs` is a no-op since the
+# drivers started building their own `csrc/`, and each driver names the
+# toolchain itself, so the rlib is in the link because a driver put it there.
+# The toolchain split made the dead edge visible — `model-compiler` means the
+# LOWERING now, and this crate does not lower anything — so it went.
 # The loader's C ABI. Depended on for two build-time reasons: the entry-point
 # anchor in `embedded_driver.rs`, and `DEP_PIE_LOADER_INCLUDE` — this crate's
 # `links = "pie_loader"` metadata — which `build.rs` hands to the C++ drivers.

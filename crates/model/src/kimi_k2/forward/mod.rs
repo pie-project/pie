@@ -23,8 +23,8 @@
 pub mod facts;
 
 use self::facts::{KimiCudaFacts, KimiFacts};
-use model_compiler::dsl::{self, MatW, NormW, WeightRepr, matmul};
-use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
+use model_dsl::{self as dsl, MatW, NormW, WeightRepr, matmul};
+use model_ir::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct KimiLayerW {
     attn_norm: NormW,

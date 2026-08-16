@@ -11,9 +11,9 @@ use crate::inferlet::program;
 use crate::inferlet::{Manifest, ProcessId, ProgramName};
 use crate::model;
 
-use super::Session;
 use super::data_transfer::{ChunkResult, InFlightUpload};
 use super::inbox;
+use super::{MAX_INFLIGHT_UPLOADS, Session, UploadKey};
 
 // =============================================================================
 // Query Handlers
@@ -392,15 +392,27 @@ impl Session {
         total_chunks: usize,
         chunk_data: Vec<u8>,
     ) {
-        // Initialize upload on first chunk
-        if !self.inflight_uploads.contains_key(&program_hash) {
+        // Initialize upload on first chunk. Keyed by the correlation id every
+        // chunk of THIS request carries, not by the hash of the program, so two
+        // clients installing the same program at once do not share one entry.
+        let key = UploadKey::Program(corr_id);
+        if !self.inflight_uploads.contains_key(&key) {
             if chunk_index != 0 {
                 self.send_response(corr_id, false, "First chunk index must be 0".to_string())
                     .await;
                 return;
             }
+            if self.inflight_uploads.len() >= MAX_INFLIGHT_UPLOADS {
+                self.send_response(
+                    corr_id,
+                    false,
+                    format!("Too many uploads in flight (limit {MAX_INFLIGHT_UPLOADS})"),
+                )
+                .await;
+                return;
+            }
             self.inflight_uploads.insert(
-                program_hash.clone(),
+                key.clone(),
                 InFlightUpload::new(
                     total_chunks,
                     manifest,
@@ -410,14 +422,14 @@ impl Session {
             );
         }
 
-        let mut inflight = self.inflight_uploads.get_mut(&program_hash).unwrap();
+        let mut inflight = self.inflight_uploads.get_mut(&key).unwrap();
 
         match inflight.process_chunk(chunk_index, total_chunks, chunk_data) {
             ChunkResult::InProgress => {}
             ChunkResult::Error(msg) => {
                 self.send_response(corr_id, false, msg).await;
                 drop(inflight);
-                self.inflight_uploads.remove(&program_hash);
+                self.inflight_uploads.remove(&key);
             }
             ChunkResult::Complete {
                 buffer,
@@ -425,7 +437,28 @@ impl Session {
                 force_overwrite,
             } => {
                 drop(inflight);
-                self.inflight_uploads.remove(&program_hash);
+                self.inflight_uploads.remove(&key);
+
+                // The bytes are what the sender said they were.
+                //
+                // The client hashes the program with blake3 and sends the digest
+                // with every chunk; the file path below has always checked its
+                // own. This one did not, because the digest was being spent as a
+                // map key and a key that is used is easy to mistake for a value
+                // that is checked. Now that the upload is keyed by its request,
+                // the digest is free to do the job it was sent for.
+                let uploaded_hash = blake3::hash(&buffer).to_hex().to_string();
+                if uploaded_hash != program_hash {
+                    self.send_response(
+                        corr_id,
+                        false,
+                        format!(
+                            "Program hash mismatch: declared {program_hash}, uploaded {uploaded_hash}"
+                        ),
+                    )
+                    .await;
+                    return;
+                }
 
                 // Parse manifest string before adding
                 let manifest = match Manifest::parse(&manifest_str) {
@@ -659,14 +692,25 @@ impl Session {
             return;
         }
 
-        // Initialize upload on first chunk
-        if !self.inflight_uploads.contains_key(&file_hash) {
+        // Initialize upload on first chunk. Keyed by the process this file is
+        // bound for as well as its hash: one process transfers its files in
+        // order, so the destination is what tells two concurrent transfers of
+        // the same bytes apart.
+        let key = UploadKey::File(process_id, file_hash.clone());
+        if !self.inflight_uploads.contains_key(&key) {
             if chunk_index != 0 {
                 tracing::error!("TransferFile: first chunk index must be 0");
                 return;
             }
+            if self.inflight_uploads.len() >= MAX_INFLIGHT_UPLOADS {
+                tracing::error!(
+                    "TransferFile: too many uploads in flight (limit {})",
+                    MAX_INFLIGHT_UPLOADS
+                );
+                return;
+            }
             self.inflight_uploads.insert(
-                file_hash.clone(),
+                key.clone(),
                 InFlightUpload::new(
                     total_chunks,
                     String::new(),
@@ -676,18 +720,18 @@ impl Session {
             );
         }
 
-        let mut inflight = self.inflight_uploads.get_mut(&file_hash).unwrap();
+        let mut inflight = self.inflight_uploads.get_mut(&key).unwrap();
 
         match inflight.process_chunk(chunk_index, total_chunks, chunk_data) {
             ChunkResult::InProgress => {}
             ChunkResult::Error(msg) => {
                 tracing::error!("TransferFile error: {}", msg);
                 drop(inflight);
-                self.inflight_uploads.remove(&file_hash);
+                self.inflight_uploads.remove(&key);
             }
             ChunkResult::Complete { buffer, .. } => {
                 drop(inflight);
-                self.inflight_uploads.remove(&file_hash);
+                self.inflight_uploads.remove(&key);
 
                 // Verify hash matches
                 let final_hash = blake3::hash(&buffer).to_hex().to_string();
@@ -764,5 +808,187 @@ mod tests {
         let received = inbox::receive(process_id.to_string()).await.unwrap();
         assert_eq!(received, "hello");
         let _ = inbox::clear(process_id.to_string());
+    }
+
+    fn upload_session(out_tx: mpsc::Sender<ServerMessage>) -> Session {
+        Session::new_inproc(
+            1,
+            Arc::new(ServerState {
+                next_client_id: AtomicU32::new(2),
+                max_upload_bytes: 1024,
+            }),
+            out_tx,
+        )
+    }
+
+    fn responses(rx: &mut mpsc::Receiver<ServerMessage>) -> Vec<(u32, bool, String)> {
+        let mut seen = Vec::new();
+        while let Ok(ServerMessage::Response {
+            corr_id,
+            ok,
+            result,
+        }) = rx.try_recv()
+        {
+            seen.push((corr_id, ok, result));
+        }
+        seen
+    }
+
+    /// Two clients installing the same program at the same moment.
+    ///
+    /// The chunks interleave, which is the whole point: uploads used to be
+    /// keyed by the program's hash, so both requests were one entry in the map
+    /// and the first to finish removed it out from under the other. The second
+    /// upload's next chunk then arrived to an empty map and was told its first
+    /// chunk index must be 0 -- an answer about a request that had sent its
+    /// chunk 0 several messages ago.
+    #[tokio::test]
+    async fn two_uploads_of_one_program_do_not_share_a_slot() {
+        let (out_tx, mut out_rx) = mpsc::channel(16);
+        let mut session = upload_session(out_tx);
+
+        let program = b"a wasm module, near enough".to_vec();
+        let hash = blake3::hash(&program).to_hex().to_string();
+        let (first, second) = program.split_at(8);
+
+        for (corr, index, bytes) in [
+            (10, 0, first),
+            (20, 0, first),
+            (10, 1, second),
+            (20, 1, second),
+        ] {
+            session
+                .handle_add_program(
+                    corr,
+                    hash.clone(),
+                    "not a manifest".to_string(),
+                    false,
+                    index,
+                    2,
+                    bytes.to_vec(),
+                )
+                .await;
+        }
+
+        let seen = responses(&mut out_rx);
+        for (corr_id, _, result) in &seen {
+            assert!(
+                !result.contains("First chunk index"),
+                "corr {corr_id} was told its upload had not started: {result}"
+            );
+        }
+        // Both got as far as the manifest, which is as far as a fake one goes.
+        let complained: Vec<u32> = seen
+            .iter()
+            .filter(|(_, _, r)| r.contains("Invalid manifest"))
+            .map(|(c, _, _)| *c)
+            .collect();
+        assert_eq!(complained, vec![10, 20], "responses were {seen:?}");
+    }
+
+    /// A sender that starts uploads and never finishes them is stopped.
+    ///
+    /// Each entry is capped in bytes; the map holding them was not capped in
+    /// entries, so 2000 first-chunks used to leave 2000 buffers alive on one
+    /// session. The refusal has to be an answer rather than silence, because
+    /// the client is waiting on the correlation id it sent.
+    #[tokio::test]
+    async fn a_session_will_not_hold_unlimited_half_finished_uploads() {
+        let (out_tx, mut out_rx) = mpsc::channel(4096);
+        let mut session = upload_session(out_tx);
+
+        for corr in 0..(MAX_INFLIGHT_UPLOADS as u32 + 8) {
+            session
+                .handle_add_program(
+                    corr,
+                    String::new(),
+                    String::new(),
+                    false,
+                    0,
+                    2,
+                    vec![0u8; 8],
+                )
+                .await;
+        }
+
+        assert_eq!(session.inflight_uploads.len(), MAX_INFLIGHT_UPLOADS);
+        let refused: Vec<u32> = responses(&mut out_rx)
+            .into_iter()
+            .filter(|(_, ok, r)| !ok && r.contains("Too many uploads in flight"))
+            .map(|(c, _, _)| c)
+            .collect();
+        assert_eq!(
+            refused,
+            (MAX_INFLIGHT_UPLOADS as u32..).take(8).collect::<Vec<_>>()
+        );
+    }
+
+    /// Reaching the ceiling must not strand the uploads already under it.
+    #[tokio::test]
+    async fn uploads_already_in_flight_still_finish_after_the_ceiling_is_hit() {
+        let (out_tx, mut out_rx) = mpsc::channel(4096);
+        let mut session = upload_session(out_tx);
+
+        let program = b"a wasm module, near enough".to_vec();
+        let hash = blake3::hash(&program).to_hex().to_string();
+        let (first, second) = program.split_at(8);
+
+        for corr in 0..(MAX_INFLIGHT_UPLOADS as u32 + 8) {
+            session
+                .handle_add_program(
+                    corr,
+                    hash.clone(),
+                    "not a manifest".to_string(),
+                    false,
+                    0,
+                    2,
+                    first.to_vec(),
+                )
+                .await;
+        }
+        session
+            .handle_add_program(
+                0,
+                hash.clone(),
+                "not a manifest".to_string(),
+                false,
+                1,
+                2,
+                second.to_vec(),
+            )
+            .await;
+
+        // corr 0 got all the way to its manifest, and finishing freed a slot.
+        let seen = responses(&mut out_rx);
+        assert!(
+            seen.iter()
+                .any(|(c, _, r)| *c == 0 && r.contains("Invalid manifest")),
+            "responses were {seen:?}"
+        );
+        assert_eq!(session.inflight_uploads.len(), MAX_INFLIGHT_UPLOADS - 1);
+    }
+
+    /// The declared hash is checked against the bytes that arrived.
+    #[tokio::test]
+    async fn a_program_whose_bytes_do_not_match_its_hash_is_refused() {
+        let (out_tx, mut out_rx) = mpsc::channel(16);
+        let mut session = upload_session(out_tx);
+
+        session
+            .handle_add_program(
+                7,
+                blake3::hash(b"what was promised").to_hex().to_string(),
+                "not a manifest".to_string(),
+                false,
+                0,
+                1,
+                b"what arrived".to_vec(),
+            )
+            .await;
+
+        let seen = responses(&mut out_rx);
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(!seen[0].1, "{seen:?}");
+        assert!(seen[0].2.contains("hash mismatch"), "{seen:?}");
     }
 }

@@ -62,6 +62,22 @@ impl InFlightUpload {
         total_chunks: usize,
         mut chunk_data: Vec<u8>,
     ) -> ChunkResult {
+        // An upload of no chunks is one that can never finish.
+        //
+        // `next_chunk_index` starts at 0 and the completion test is
+        // `next_chunk_index == total_chunks`, so it is checked AFTER the
+        // first chunk has already pushed the counter to 1. With
+        // `total_chunks == 0` the equality is 1 == 0, then 2 == 0, and so on:
+        // every chunk returns `InProgress` forever. Neither caller answers an
+        // `InProgress`, so the client that sent the malformed frame is not
+        // told it was malformed -- it waits, and the session holds the entry
+        // and its buffer until the byte cap finally trips or the connection
+        // drops. A rejection is the only honest reply, and it belongs here
+        // rather than in either handler because both share this function.
+        if total_chunks == 0 {
+            return ChunkResult::Error("Upload must have at least one chunk".to_string());
+        }
+
         // Validate chunk consistency
         if total_chunks != self.total_chunks {
             return ChunkResult::Error(format!(
@@ -172,6 +188,31 @@ mod tests {
         match u.process_chunk(0, 3, vec![0u8; 10]) {
             ChunkResult::Error(msg) => assert!(msg.contains("Chunk count mismatch")),
             _ => panic!("expected count error"),
+        }
+    }
+
+    #[test]
+    fn zero_total_chunks_is_refused_rather_than_left_hanging() {
+        // Without the guard this returns `InProgress` for every chunk it is
+        // ever given, because the completion test `next_chunk_index ==
+        // total_chunks` is only reached once the counter has passed 0.
+        let mut u = upload(0, 1024);
+        match u.process_chunk(0, 0, vec![0u8; 10]) {
+            ChunkResult::Error(msg) => assert!(msg.contains("at least one chunk")),
+            _ => panic!("expected a refusal, not silence"),
+        }
+    }
+
+    #[test]
+    fn a_later_chunk_cannot_shrink_the_count_to_zero() {
+        let mut u = upload(2, 1024);
+        assert!(matches!(
+            u.process_chunk(0, 2, vec![0u8; 10]),
+            ChunkResult::InProgress
+        ));
+        match u.process_chunk(1, 0, vec![0u8; 10]) {
+            ChunkResult::Error(msg) => assert!(msg.contains("at least one chunk")),
+            _ => panic!("expected a refusal"),
         }
     }
 

@@ -7,9 +7,10 @@
 
 use model::shared::llama_like::forward::facts::LlamaLikeCudaFacts;
 use model::shared::llama_like::forward::facts::LlamaLikeFacts;
+use model_ir::kernels::Backend;
 use model_compiler::lower::*;
-use model_compiler::trace::FireClass;
-use model_compiler::trace::{ForwardPlan, OpKind, PeelWindow, ValueId};
+use model_ir::trace::FireClass;
+use model_ir::trace::{ForwardPlan, OpKind, PeelWindow, ValueId};
 use std::ops::Range;
 
 /// A fire whose rows are all plain AND all sampled — the ordinary
@@ -1351,7 +1352,11 @@ fn a_lora_row_states_the_correction_and_a_plain_one_does_not() {
     // built the way the wire states them.
     let from_wire = model_compiler::lower::rows_from_regions(
         4,
-        &[3],
+        model_compiler::lower::Readouts {
+            indices: &[3],
+            indptr: &[0, 1],
+            qo_indptr: &[0, 4],
+        },
         &[0, 2, 4],
         &[0, model_compiler::lower::region_sig::LORA],
         &[model_compiler::lower::region_sig::MAX_LAYERS_FULL; 2],
@@ -1363,7 +1368,11 @@ fn a_lora_row_states_the_correction_and_a_plain_one_does_not() {
     );
     let no_bit = model_compiler::lower::rows_from_regions(
         4,
-        &[3],
+        model_compiler::lower::Readouts {
+            indices: &[3],
+            indptr: &[0, 1],
+            qo_indptr: &[0, 4],
+        },
         &[0, 2, 4],
         &[0, 0],
         &[model_compiler::lower::region_sig::MAX_LAYERS_FULL; 2],
@@ -1373,4 +1382,367 @@ fn a_lora_row_states_the_correction_and_a_plain_one_does_not() {
         !launches(&no_bit).iter().any(|k| k.contains("lora")),
         "and its absence does not"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The SEMANTIC GDN fragment, read against the Metal table.
+// ---------------------------------------------------------------------------
+
+/// What a `qwen3_5_hybrid_metal` would have to state for itself.
+///
+/// `LEDGER_QWEN35_DECODE` above is empty, and that is a fact about
+/// `qwen3_5_hybrid_cuda` rather than about the family: that text names every
+/// GDN kernel as a `Launch`, so the lowering never reads a semantic GDN kind
+/// at all. The kinds are still there — `qwen3_5_gdn_block` is the same body
+/// without the `Some(lower)` arms — and nobody had asked what they lower to.
+///
+/// This asks, and it asks against METAL, because that is the backend with
+/// eight dark `gdn_*` rows waiting on the answer
+/// (`driver-metal/tests/text_conformance.rs`'s `DARK`, whose reason on all
+/// eight is "no plan in this workspace names a GDN symbol").
+///
+/// # Why the family is renamed
+///
+/// `lower` picks its kernel table from the plan's family name —
+/// `Backend::of_family` reads the segment after the first `.` and knows
+/// `cuda` and `metal`. The fragment is deliberately backend-free, so it has
+/// no such segment and lowering refuses it outright with `UnknownBackend`.
+/// Renaming is therefore not a trick around the check; it is how a
+/// backend-free trace is asked a backend question at all, and it is the same
+/// question a real `qwen3_5_hybrid_metal` would ask by being named that way.
+///
+/// # Two ledgers, because there are two ways to have no kernel
+///
+/// A kind can have no rule (`residue` — `semantic()` falls through), or it
+/// can have a rule that names a symbol **this backend's table does not
+/// declare**. The second is invisible to `lower`: `emit_bound` looks the
+/// symbol up only to enforce the `whole` rule and treats a miss as "nothing
+/// to enforce", so a Metal fire can be lowered to CUDA symbol names without
+/// a word. `driver-metal`'s `every_symbol_every_text_states_has_a_row_...`
+/// catches it for the texts that crate ships; nothing catches it here, which
+/// is exactly why the second list is measured beside the first.
+#[test]
+fn the_semantic_gdn_fragment_states_what_metal_cannot_serve() {
+    let facts = model::qwen_3_5::forward::facts::Qwen35GdnFacts::qwen3_5_0_8b();
+    let mut plan = model::qwen_3_5::forward::qwen3_5_gdn_block(&facts);
+    plan.family = format!("{}.metal", plan.family);
+    let out = lower(&plan, &sampled(4), Fire::default()).expect("the fragment lowers");
+
+    let mut unlowered: std::collections::BTreeMap<String, usize> = Default::default();
+    for u in &out.residue {
+        *unlowered
+            .entry(format!("{}: {}", u.kind, u.why))
+            .or_default() += 1;
+    }
+    let seen: Vec<String> = unlowered
+        .iter()
+        .map(|(k, n)| format!("{n:>4}  {k}"))
+        .collect();
+    let want: Vec<String> = GDN_FRAGMENT_NO_RULE.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        seen, want,
+        "the GDN fragment's UNLOWERED ledger moved. A line leaving it means \
+         `semantic()` learned a GDN kind; a line arriving means the fragment \
+         grew a statement no backend-neutral rule can read."
+    );
+
+    let undeclared: Vec<String> = out
+        .kernels
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|s| model_ir::kernels::stated_in(Backend::Metal, s).is_none())
+        .map(String::from)
+        .collect();
+    let want: Vec<String> = GDN_FRAGMENT_NOT_IN_METAL
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        undeclared, want,
+        "the GDN fragment's UNDECLARED ledger moved. Every line is a symbol \
+         `semantic()` names for a Metal fire that Metal does not state, from \
+         either plane -- a launch that would reach `check_plan` only if some \
+         text stated it, and reach a device never."
+    );
+}
+
+/// Kinds of [`the_semantic_gdn_fragment_states_what_metal_cannot_serve`]
+/// that `semantic()` has no rule for at all.
+const GDN_FRAGMENT_NO_RULE: &[&str] = &[
+    "   1  CausalConv1d: no lowering rule for this kind",
+    "   1  GatedDelta: no lowering rule for this kind",
+];
+
+/// Symbols that test's fragment lowers to which Metal does not state.
+const GDN_FRAGMENT_NOT_IN_METAL: &[&str] = &[
+    // The GEMM, the two norms and the prep -- CUDA spellings, every one,
+    // and NOT because the fragment asked for CUDA. `semantic()`'s own doc
+    // says where its list comes from ("read off the executor that launches
+    // them today, `driver-cuda/csrc/.../declared_forward.cpp`"), and
+    // nothing downstream re-reads it per backend. So this list is not a
+    // fact about gated DeltaNet; it is what ANY Metal text would get the
+    // moment it left one op semantic, and the reason every Metal text in
+    // this workspace states all of its launches.
+    "gemm::act_x_w",
+    "norm::rmsnorm_gated_fp32_in_bf16",
+    "norm::rmsnorm_gemma_bf16",
+    "ssm::qwen_gdn_post_conv_prep_bf16",
+];
+
+/// The workspace root, from this test binary's own manifest.
+fn workspace_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("crates/model has a workspace above it")
+        .to_path_buf()
+}
+
+/// Every symbol `semantic()` can name, and which backend tables declare it.
+///
+/// [`the_semantic_gdn_fragment_states_what_metal_cannot_serve`] found four
+/// symbols the Metal table does not carry, and the obvious reading -- "Metal
+/// is behind" -- is wrong. Three of those four are not in the CUDA table
+/// either. `sig_in` answering `None` does not mean "this backend cannot do
+/// it"; it means "this TABLE states no contract for that name", and the CUDA
+/// table is mid-migration (`kernels-cuda`, the JIT cutover) and
+/// legitimately partial.
+///
+/// So the useful artefact is not a refusal, it is a census: for anyone
+/// writing the first Metal text that leaves an op semantic, exactly which
+/// arms of `semantic()` are already backed on their backend and which are
+/// not. Both columns, side by side, so neither can be read as a fact about
+/// the other.
+///
+/// # Why this parses the source
+///
+/// `semantic` is a private function of `OpKind`, and `OpKind`'s variants
+/// carry payloads, so there is no value-level way to ask it for its whole
+/// range. The symbols are string literals in one match, and reading them out
+/// of it is the same move `driver-metal`'s `declared_buffers` makes against a
+/// shader and `every_workflow_feature_names_a_feature_its_package_declares`
+/// makes against YAML: parse the file that KNOWS, rather than keep a second
+/// copy that can disagree. `the_census_reads_the_function_it_claims_to`
+/// below is the check that the parse still finds anything at all.
+#[test]
+fn the_semantic_rules_name_symbols_each_backend_declares_or_does_not() {
+    /// The leader column, wide enough for the longest symbol plus a gap.
+    const WIDTH: usize = 44;
+    let mut seen: Vec<String> = Vec::new();
+    for symbol in semantic_symbols() {
+        let cuda = model_ir::kernels::sig(&symbol).is_some();
+        let metal = model_ir::kernels::stated_in(Backend::Metal, &symbol).is_some();
+        // Dot leaders and not space padding: a run of six or more spaces
+        // inside a string literal is what `no_message_carries_a_swallowed_
+        // indent` looks for, and it is right to -- it cannot tell an aligned
+        // COLUMN from a source line joined without dropping its indent. A
+        // leader aligns and says which it is.
+        let mark = |b: bool| if b { "yes" } else { "-" };
+        let lead = ".".repeat(WIDTH.saturating_sub(symbol.len() + 1));
+        seen.push(format!(
+            "{symbol} {lead} cuda {} metal {}",
+            mark(cuda),
+            mark(metal)
+        ));
+    }
+    let want: Vec<String> = SEMANTIC_CENSUS.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        seen, want,
+        "the semantic-rule census moved. A `-` becoming `yes` is a table \
+         gaining a contract; a `yes` becoming `-` is a table LOSING one, \
+         which for CUDA means a row was deleted while a semantic rule still \
+         names it, and for Metal means the same. A new line is a new arm in \
+         `semantic()`."
+    );
+}
+
+/// The string literals inside `semantic()`'s `Semantic::Kernels(&[..])`
+/// arms, in source order, deduplicated.
+fn semantic_symbols() -> Vec<String> {
+    // `lower.rs` is a DIRECTORY since the lowering was split by what a reader
+    // asks for, and the semantic rules are the file this scan is about. The
+    // markers below are unchanged: `semantic()` is still spelled the same way
+    // and `kind_name` still follows it, which is what the scan actually pins.
+    let src = std::fs::read_to_string(
+        workspace_root().join("crates/model-compiler/src/lower/semantics.rs"),
+    )
+    .expect("lower/semantics.rs is readable");
+    let body = {
+        let from = src
+            .find("fn semantic(kind: &OpKind")
+            .expect("`semantic` is still spelled that way");
+        let to = src[from..]
+            .find("\n/// The kind's name")
+            .expect("`kind_name` still follows `semantic`");
+        &src[from..from + to]
+    };
+    let mut out: Vec<String> = Vec::new();
+    // Only the literals INSIDE a `Kernels(&[..])` list: the function's prose
+    // names files and kernels too, and a comment is not a rule.
+    for (n, line) in body.lines().enumerate() {
+        let code = line.trim_start();
+        if code.starts_with("//") {
+            continue;
+        }
+        let _ = n;
+        let mut rest = line;
+        while let Some(i) = rest.find('"') {
+            let after = &rest[i + 1..];
+            let Some(j) = after.find('"') else { break };
+            let lit = &after[..j];
+            if lit.contains("::") && !out.iter().any(|s| s == lit) {
+                out.push(lit.to_string());
+            }
+            rest = &after[j + 1..];
+        }
+    }
+    out
+}
+
+/// The census of
+/// [`the_semantic_rules_name_symbols_each_backend_declares_or_does_not`].
+const SEMANTIC_CENSUS: &[&str] = &[
+    // READ THE METAL COLUMN FIRST, and read it as one fact rather than
+    // eighteen. It is not that Metal is behind on nine symbols and level on
+    // none; it is that `semantic()` speaks CUDA's NAMESPACE and Metal's
+    // census does not contain a single `module::name` spelling -- its symbols
+    // are bare Metal entrypoints (`sdpa_paged_mma_sink`,
+    // `affine_qmm_t_bfloat16_gs_64_...`). So no semantic arm can ever resolve
+    // on Metal, and that is structural, not a gap someone forgot to fill.
+    //
+    // What follows from it is the useful part, and it is the answer to
+    // `driver-metal`'s eight dark `gdn_*` stems: a `qwen3_5_hybrid_metal`
+    // buys NOTHING from the semantic arms. Every op it wants has to be a
+    // `Launch` naming a Metal symbol, exactly as `llama_like_metal` already
+    // does for every op it has -- which is why that text has never tripped
+    // over this and why the whole question was invisible.
+    //
+    // The CUDA column is the other half of the same care. ONE of the
+    // eighteen is absent there now, and that is NOT the same phenomenon:
+    // that spelling is in CUDA's namespace and simply has no row yet,
+    // because `kernels-cuda` is mid-JIT-cutover and its table is
+    // partial by construction. A `-` in this column is a row that has not
+    // arrived; a `-` in the Metal column is a row that cannot.
+    //
+    // FOUR ARRIVED WHEN THE JIT BRANCH LANDED: `layout::embed_bf16`,
+    // `norm::add_bias_bf16`, `norm::rmsnorm_gated_fp32_in_bf16` and
+    // `attn::split_qkv_bf16_devwin` read `-` when this census was written
+    // and read `yes` now. That is the direction the assertion calls "a table
+    // gaining a contract", and it is the cutover doing exactly what the
+    // paragraph above predicts, so the four are updated rather than
+    // exempted. The Metal column did not move and could not have.
+    //
+    // AND FOUR MORE HAVE JUST ARRIVED, for a reason worth separating from
+    // that one. `attn::split_qkv_bf16`, `layout::split_q_gate_bf16`,
+    // `mlp::sigmoid_gate_inplace_bf16` and `ssm::qwen_gdn_post_conv_prep_bf16`
+    // did not get a kernel or a port -- their host programs have been in
+    // `kernels_cuda::driver_internal` all along, and that module DECLARED
+    // nothing, so four symbols these very arms name had no row on the backend
+    // every one of them is spelled for. They are `driver_bound!` lines in
+    // `attn`, `layout`, `mlp` and `ssm` now. Nothing about the lowering
+    // changed; what changed is that the census can no longer be read as "CUDA
+    // cannot do these", which is what four `-`s in a table headed "declares or
+    // does not" invited.
+    //
+    // A ROW IS NOT AN ARM. All four still refuse at the fire with `NoArm` --
+    // `driver-cuda/tests/executor_bind.rs` is where that half is recorded --
+    // and this census has never measured arms. `sig_in` answering `Some` is
+    // what it asks and all it asks.
+    "layout::embed_bf16 ......................... cuda yes metal -",
+    "norm::add_bias_bf16 ........................ cuda yes metal -",
+    "norm::residual_add_bf16 .................... cuda yes metal -",
+    "ssm::qwen_gdn_post_conv_prep_bf16 .......... cuda yes metal -",
+    "norm::rmsnorm_gated_fp32_in_bf16 ........... cuda yes metal -",
+    "layout::split_q_gate_bf16 .................. cuda yes metal -",
+    "mlp::sigmoid_gate_inplace_bf16 ............. cuda yes metal -",
+    "norm::rmsnorm_bf16 ......................... cuda yes metal -",
+    "norm::rmsnorm_gemma_bf16 ................... cuda yes metal -",
+    "attn::split_qkv_bf16_devwin ................ cuda yes metal -",
+    "attn::split_qkv_bf16 ....................... cuda yes metal -",
+    "rope::rope_partial_bf16 .................... cuda yes metal -",
+    "rope::rope_bf16 ............................ cuda yes metal -",
+    "gemm::act_x_w .............................. cuda - metal -",
+    "moe::moe_grouped_gemm_bf16 ................. cuda yes metal -",
+    "moe::topk_softmax_bf16 ..................... cuda yes metal -",
+    "moe::token_batched_weighted_sum_bf16 ....... cuda yes metal -",
+    "mlp::sigmoid_dot_scalar_gate_add_bf16 ...... cuda yes metal -",
+];
+
+/// The census's own control: the parse finds a plausible number of symbols
+/// and finds one it can name.
+///
+/// A source scan that silently matched nothing would make the census above
+/// pass with an empty list forever, which is the failure mode every parsing
+/// gate has. Two numbers rather than one: an exact symbol proves the shape
+/// is right, and a floor proves the walk did not stop at it.
+#[test]
+fn the_census_reads_the_function_it_claims_to() {
+    let found = semantic_symbols();
+    assert!(
+        found.len() >= 12,
+        "the scan of `semantic()` found {} symbols, which is fewer than the \
+         arms that function visibly has -- the parse has probably lost its \
+         anchor. Found: {found:?}",
+        found.len()
+    );
+    assert!(
+        found.iter().any(|s| s == "norm::rmsnorm_bf16"),
+        "the scan did not find `norm::rmsnorm_bf16`, which `semantic()` \
+         names for a plain `Rmsnorm`. Found: {found:?}"
+    );
+}
+
+/// The two namespaces do not overlap, and could not.
+///
+/// The census above says so in a comment, and a comment is checked by
+/// nothing -- which is the failure this workspace keeps rediscovering (the
+/// seven kernel rows that named `quantized_qmm_t.metal` years after that
+/// file became `quant/qmm_t.metal`; the `--features forward` that four CI
+/// steps named after the feature was deleted). So the claim is a test.
+///
+/// Both directions, because either one alone is a coincidence: every symbol
+/// `semantic()` names is `module::name`, and NO symbol Metal can dispatch
+/// is. Together they say a semantic arm cannot resolve on Metal for a
+/// reason no amount of filling in rows would change -- someone would have
+/// to make `semantic` take a backend, and THAT is the change the eight dark
+/// `gdn_*` stems are actually waiting on if a Metal text ever wants to leave
+/// an op semantic.
+///
+/// The Metal half asked `Backend::Metal.table()` until every Metal family
+/// retired its rows, at which point the table answered nothing and the
+/// control below -- the one that keeps "disjoint" from being a statement
+/// about the empty set -- went red. It went red rather than quiet because
+/// the control was there, which is the only reason this is a correction and
+/// not a silently weakened test. The namespace outlived the rows: it is the
+/// CENSUS, every entrypoint the backend ships, which is both the set a text
+/// may name and a wider set than the rows ever were.
+#[test]
+fn the_semantic_namespace_and_the_metal_namespace_are_disjoint_by_shape() {
+    let unqualified: Vec<String> = semantic_symbols()
+        .into_iter()
+        .filter(|s| !s.contains("::"))
+        .collect();
+    assert!(
+        unqualified.is_empty(),
+        "`semantic()` names {} symbol(s) with no `module::` qualifier, so the \
+         census's claim that its namespace is CUDA's no longer holds by \
+         shape: {unqualified:?}",
+        unqualified.len()
+    );
+
+    let metal = model_ir::kernels::metal_entrypoints();
+    let qualified: Vec<&String> = metal.iter().filter(|s| s.contains("::")).collect();
+    assert!(
+        qualified.is_empty(),
+        "{} Metal entrypoint(s) now spell a `module::name` symbol, so the two \
+         namespaces have started to overlap and a semantic arm could resolve \
+         on Metal by accident: {qualified:?}",
+        qualified.len()
+    );
+
+    // A control on both halves: the sets are not empty, so "disjoint" is a
+    // statement about two populated namespaces rather than about nothing.
+    // This is the assertion that caught the retirement.
+    assert!(!semantic_symbols().is_empty() && !metal.is_empty());
 }
