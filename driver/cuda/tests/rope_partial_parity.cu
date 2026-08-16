@@ -204,28 +204,54 @@ std::vector<std::uint16_t> read_back_table(Path path) {
     return table;
 }
 
-int count_table_mismatches(const std::vector<std::uint16_t>& got, bool report) {
+bool listed(const pie_rope_golden::Entry* list, int count, int row, int entry) {
+    for (int i = 0; i < count; ++i)
+        if (list[i].row == row && list[i].entry == entry) return true;
+    return false;
+}
+
+struct TableDiff {
+    int total = 0;       // every mismatch; the bar is that this is zero
+    int expected = 0;    // the standing residual recorded in the fixture
+    int unexpected = 0;  // NEW -- a regression, or a stale/wrong-ISA fixture
+    int guards_broken = 0;
+};
+
+// Classifies mismatches but does NOT excuse any of them. `expected` is a
+// diagnostic label, not an allowance: the parity check requires `total == 0`.
+// The split exists so that a run which is red for the known SLEEF residual
+// reads differently from one that is red because something broke.
+TableDiff diff_table(const std::vector<std::uint16_t>& got, bool report) {
     namespace g = pie_rope_golden;
-    int bad = 0, printed = 0;
+    TableDiff d;
+    int printed = 0;
     for (int n = 0; n < g::kRows; ++n) {
         for (int e = 0; e < g::kRotaryDim; ++e) {
             const std::uint16_t want = g::kCosSinCache[n].entry[e];
             const std::uint16_t have = got[n * g::kRotaryDim + e];
+            const bool guard =
+                listed(g::kRegressionGuards, g::kRegressionGuardCount, n, e);
             if (have == want) continue;
-            ++bad;
-            if (!report || printed >= 10) continue;
+            ++d.total;
+            const bool known = listed(g::kKnownReferenceMismatches,
+                                      g::kKnownReferenceMismatchCount, n, e);
+            if (known) ++d.expected; else ++d.unexpected;
+            if (guard) ++d.guards_broken;
+            if (!report || printed >= 12) continue;
             ++printed;
-            const int ulp = static_cast<int>(have) - static_cast<int>(want);
-            std::printf("      pos=%-6d %s[%2d]  got=0x%04x want=0x%04x  "
-                        "delta=%+d bf16 ulp\n",
+            std::printf("      %-10s pos=%-6d %s[%2d]  got=0x%04x want=0x%04x  "
+                        "delta=%+d bf16 ulp%s\n",
+                        known ? "[residual]" : "[NEW]",
                         g::kCosSinCache[n].pos,
                         e < g::kAngles ? "cos" : "sin",
-                        e < g::kAngles ? e : e - g::kAngles, have, want, ulp);
+                        e < g::kAngles ? e : e - g::kAngles, have, want,
+                        static_cast<int>(have) - static_cast<int>(want),
+                        guard ? "   <== REGRESSION GUARD" : "");
         }
     }
-    if (report && bad > printed)
-        std::printf("      ... and %d more\n", bad - printed);
-    return bad;
+    if (report && d.total > printed)
+        std::printf("      ... and %d more\n", d.total - printed);
+    return d;
 }
 
 struct Case {
@@ -332,28 +358,54 @@ void run_case(const Case& c) {
 
 // ── Is the fixture capable of catching anything? ───────────────────────────
 //
-// A bf16 table can only disagree where the fp32 value it was rounded from sits
-// near a rounding midpoint. The first version of this slice contained no such
-// entry at all, so it passed 832/832 with zero tolerance while being blind to
-// the only defect that can occur. This asserts the sample has teeth, before
-// any GPU work, so a future regeneration cannot quietly reintroduce a
-// decorative green.
+// This slice has been blind TWICE, the same way both times.
+//
+//   v1 sampled 13 positions, and not one of its 832 entries lay within even
+//   3 fp32 ulp of a bf16 rounding midpoint. A bf16 table can only disagree
+//   near a midpoint, so it could not fail. It passed with zero tolerance and
+//   proved nothing.
+//
+//   v2 added the four positions where DEVICE-side trig differed. Moving the
+//   table build onto the host fixed all four and moved the residual to
+//   entirely different positions -- so a slice holding only the old four was
+//   blind again, one iteration later.
+//
+// The interesting positions are a property of the current implementation pair,
+// not a constant. Two things are asserted here, before any GPU work, because a
+// fixture that cannot fail is itself the defect:
+//
+//   1. the slice contains boundary-adjacent entries at all
+//   2. it contains at least one entry MEASURED to differ, whenever the survey
+//      found one -- if the survey found none, there is nothing to require
 void run_golden_slice_is_not_blind() {
     namespace g = pie_rope_golden;
     constexpr int kFloor = 8;
-    const bool ok = g::kEntriesWithinOneUlp >= kFloor;
+
+    const bool has_boundary_entries = g::kEntriesWithinOneUlp >= kFloor;
+    // A survey that found nothing legitimately yields no known mismatch; a
+    // survey that found something and is not represented here means the slice
+    // is stale, most likely derived on the wrong ISA.
+    const bool can_fail = g::kKnownReferenceMismatchCount >= 1;
+    const bool ok = has_boundary_entries && can_fail;
     if (!ok) ++g_failures;
+
     std::printf("[%s] %-28s rows=%d entries=%d  boundary_adjacent<=1ulp=%d "
-                "(required: >=%d, else the sample cannot fail)\n",
+                "(>=%d)  known_mismatches=%d (>=1)  guards=%d\n",
                 ok ? "ok" : "FAIL", "golden slice has teeth", g::kRows,
-                g::kRows * g::kRotaryDim, g::kEntriesWithinOneUlp, kFloor);
+                g::kRows * g::kRotaryDim, g::kEntriesWithinOneUlp, kFloor,
+                g::kKnownReferenceMismatchCount, g::kRegressionGuardCount);
+    // Printed every run: the residual is ISA-dependent (torch's fp32 trig is
+    // SLEEF, and arm64 u10 and x86_64 u35 do not share one), so a slice derived
+    // on the wrong host is a slice that cannot fail. Loud beats subtle.
+    std::printf("      reference ISA: %s  (residual surveyed to position %d)\n",
+                g::kReferenceIsa, g::kResidualSurveyMax);
 }
 
 // ── The parity assertion: knob-on must reproduce vLLM's table exactly ──────
 void run_vllm_golden_table() {
     namespace g = pie_rope_golden;
     const std::vector<std::uint16_t> got = read_back_table(Path::VllmTable);
-    const int bad = count_table_mismatches(got, /*report=*/true);
+    const TableDiff d = diff_table(got, /*report=*/true);
 
     // The host-built table must actually have covered every position used. If
     // it ran short the kernel silently degrades to device trig, which is the
@@ -367,13 +419,22 @@ void run_vllm_golden_table() {
     for (int n = 0; n < g::kRows; ++n)
         max_pos = std::max(max_pos, g::kCosSinCache[n].pos);
 
-    const bool ok = bad == 0 && oob == 0u && capacity > max_pos;
+    // Zero is the bar. `expected` is a label on the standing residual, not an
+    // allowance -- widening this to `d.unexpected == 0` would bless a token
+    // flip, since one bf16 ulp in cos can move a logit across a decision
+    // boundary. Whether closing the last entries justifies vendoring SLEEF is
+    // a cost decision to be taken deliberately, not by relaxing an assertion.
+    const bool ok = d.total == 0 && oob == 0u && capacity > max_pos;
     if (!ok) ++g_failures;
-    std::printf("[%s] %-28s entries=%d  mismatches_vs_vllm=%d (required: 0)  "
-                "table_capacity=%d (max_pos=%d)  device_trig_fallback_blocks=%u"
-                " (required: 0)\n",
+    std::printf("[%s] %-28s entries=%d  mismatches=%d (required: 0; residual=%d"
+                " new=%d guards_broken=%d)  capacity=%d (max_pos=%d)  "
+                "device_trig_fallback_blocks=%u (required: 0)\n",
                 ok ? "ok" : "FAIL", "vllm-table matches cache",
-                g::kRows * g::kRotaryDim, bad, capacity, max_pos, oob);
+                g::kRows * g::kRotaryDim, d.total, d.expected, d.unexpected,
+                d.guards_broken, capacity, max_pos, oob);
+    if (d.guards_broken > 0)
+        std::printf("      REGRESSION: an entry the host-side table build "
+                    "already fixed has come undone\n");
 }
 
 // ── The knob-off assertion: it must NOT reproduce vLLM's table ─────────────
@@ -390,7 +451,7 @@ void run_default_path_differs() {
     namespace g = pie_rope_golden;
     const int entries = g::kRows * g::kRotaryDim;
     const std::vector<std::uint16_t> got = read_back_table(Path::Default);
-    const int bad = count_table_mismatches(got, /*report=*/false);
+    const int bad = diff_table(got, /*report=*/false).total;
     const int floor = entries / 100;  // 1%, vs ~4% measured
     const bool ok = bad >= floor;
     if (!ok) ++g_failures;
