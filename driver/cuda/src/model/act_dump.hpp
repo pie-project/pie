@@ -85,7 +85,12 @@ inline bool act_dump_capturing(cudaStream_t stream) {
 /// Later decode steps would otherwise bury the prefill under hundreds of files.
 inline bool act_dump_active() {
     if (!act_dump_enabled()) return false;
-    constexpr int limit = 1;
+    static const int limit = [] {
+        const char* v = std::getenv("PIE_ACT_DUMP_STEPS");
+        if (v == nullptr || v[0] == '\0') return 1;
+        const int parsed = std::atoi(v);
+        return parsed > 0 ? parsed : 1;
+    }();
     const int step = act_dump_step();
     return step >= 0 && step < limit;
 }

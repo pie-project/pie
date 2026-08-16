@@ -103,9 +103,13 @@ pub struct ChannelCell {
     /// Reader channel. Submission completion publishes each endpoint's visible tail; the
     /// guest host operation copies only then.
     reader: Option<ReaderMirror>,
-    /// `Some(reason)` once a fire that feeds this channel failed: every later
-    /// host `take`/`read` errors with the reason. Under run-ahead the submit
-    /// returns before the fire resolves, so poison IS the error channel.
+    /// `Some(reason)` once a fire that feeds this channel failed: host
+    /// `take`/`read` error with the reason until a `take` consumes it. Under
+    /// run-ahead the submit returns before the fire resolves, so poison IS
+    /// the error channel — and like an error channel it is drained by the
+    /// consuming read, so a long-lived session channel recovers once the
+    /// failed fire's waiter has observed the error. Driver-published poison
+    /// epochs (device faults) are separate and stay sticky.
     poisoned: Option<String>,
     /// Host replacement for the current committed front. The per-pass host
     /// shadow consults this after a staged Writer put, so `set` changes the
@@ -748,8 +752,8 @@ impl ChannelCell {
     /// simply empty.
     pub fn take(&mut self) -> Result<Vec<u8>, ChannelError> {
         self.refresh_reader_mirrors()?;
-        if let Some(reason) = &self.poisoned {
-            return Err(ChannelError::Poisoned(reason.clone()));
+        if let Some(reason) = self.poisoned.take() {
+            return Err(ChannelError::Poisoned(reason));
         }
         if let Some(role) = self.role {
             if role != HostRole::Reader {
@@ -779,9 +783,11 @@ impl ChannelCell {
         self.produced.front().cloned().ok_or(ChannelError::Empty)
     }
 
-    /// Poison the cell with the failed fire's error: every later host
-    /// `take`/`read` errors with it. First poison wins (the earliest failure
-    /// is the root cause).
+    /// Poison the cell with the failed fire's error: host `take`/`read`
+    /// error with it until a `take` consumes the poison. First poison wins
+    /// (the earliest failure is the root cause). One-shot delivery keeps a
+    /// long-lived session channel usable after an admission-time rejection
+    /// (e.g. an over-budget frame) instead of failing every later request.
     pub fn poison(&mut self, reason: &str) {
         if self.poisoned.is_none() {
             self.poisoned = Some(reason.to_string());
@@ -1578,20 +1584,25 @@ mod tests {
         let out_id = cells[1].lock().unwrap().global_id;
         publish_wire(&cells[1], out_id, &7i32.to_le_bytes());
         cells[1].lock().unwrap().poison("fire 3 failed: OOM");
-        assert_eq!(
-            cells[1].lock().unwrap().take().unwrap_err(),
-            ChannelError::Poisoned("fire 3 failed: OOM".into())
-        );
+        // First poison wins — a later failure doesn't mask the root cause.
+        cells[1].lock().unwrap().poison("fire 4 cascade");
+        // `read` peeks the poison without consuming it.
         assert_eq!(
             cells[1].lock().unwrap().read().unwrap_err(),
             ChannelError::Poisoned("fire 3 failed: OOM".into())
         );
-        // First poison wins — a later failure doesn't mask the root cause.
-        cells[1].lock().unwrap().poison("fire 4 cascade");
+        // `take` delivers the poison exactly once...
         assert_eq!(
             cells[1].lock().unwrap().take().unwrap_err(),
             ChannelError::Poisoned("fire 3 failed: OOM".into())
         );
+        // ...after which the session channel is usable again: the cell the
+        // wire published is still there for the next fire's waiter.
+        assert_eq!(
+            cells[1].lock().unwrap().take().unwrap(),
+            7i32.to_le_bytes().to_vec()
+        );
+        assert_eq!(cells[1].lock().unwrap().take().unwrap_err(), ChannelError::Empty);
     }
 
     #[test]
